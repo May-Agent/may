@@ -48,6 +48,7 @@ struct EventSignatures {
     session_runtimes: String,
     profile_sessions: String,
     remote_access: String,
+    session_background: String,
 }
 
 pub(super) async fn stream_events(
@@ -82,6 +83,20 @@ pub(super) async fn stream_events(
     // a distinct event kind, per AGENTS.md.
     let mut lifecycle_rx = state.browser_lifecycle_subscribe();
     let lifecycle_subscribed = subscribed_topics.contains(UiEventTopics::BROWSER_LIFECYCLE);
+    // Live turn frames of the filtered session, replayed from the turn's
+    // start for a client attaching mid-turn.
+    let turn_kinds = TurnKinds {
+        turn: subscribed_topics.contains(UiEventTopics::SESSION_TURN),
+        agent: subscribed_topics.contains(UiEventTopics::SESSION_AGENT),
+    };
+    let turns = session_id
+        .as_deref()
+        .filter(|_| turn_kinds.turn || turn_kinds.agent)
+        .map(|session_id| state.turn_hub.subscribe(session_id));
+    let (turn_replay, mut turn_rx) = match turns {
+        Some(subscription) => (subscription.replay, Some(subscription.live)),
+        None => (Vec::new(), None),
+    };
 
     state.tokio_handle.spawn(async move {
         let mut signatures = EventSignatures::default();
@@ -101,9 +116,36 @@ pub(super) async fn stream_events(
         {
             return;
         }
+        for frame in &turn_replay {
+            if turn_kinds.wants(frame) && !send_frame(&sender, frame).await {
+                return;
+            }
+        }
 
         loop {
             tokio::select! {
+                frame = async {
+                    match turn_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    match frame {
+                        Ok(frame) => {
+                            if turn_kinds.wants(&frame) && !send_frame(&sender, &frame).await {
+                                break;
+                            }
+                        }
+                        Err(RecvError::Lagged(skipped)) => {
+                            tracing::warn!(skipped, "turn stream lagged; asking the client to resync");
+                            let resync = SessionResync { session_id: session_id.as_deref().unwrap_or_default() };
+                            if !send_event(&sender, "session_resync", &resync).await {
+                                break;
+                            }
+                        }
+                        Err(RecvError::Closed) => turn_rx = None,
+                    }
+                }
                 changed = topic_rx.recv() => {
                     let mut dirty_topics = match changed {
                         Ok(topics) => topics & subscribed_topics,
@@ -164,6 +206,40 @@ pub(super) async fn stream_events(
     });
 
     Ok(sse)
+}
+
+/// Which live turn kinds a subscriber asked for.
+#[derive(Debug, Clone, Copy)]
+struct TurnKinds {
+    turn: bool,
+    agent: bool,
+}
+
+impl TurnKinds {
+    fn wants(self, frame: &super::chat::TurnFrame) -> bool {
+        match frame.kind {
+            "session_turn" => self.turn,
+            "session_agent" => self.agent,
+            _ => false,
+        }
+    }
+}
+
+/// Tells a client it missed live turn frames and must reload the session.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionResync<'a> {
+    session_id: &'a str,
+}
+
+async fn send_frame(
+    sender: &skyzen::responder::sse::Sender,
+    frame: &super::chat::TurnFrame,
+) -> bool {
+    sender
+        .send(skyzen::responder::sse::Event::data(&frame.data).event(frame.kind))
+        .await
+        .is_ok()
 }
 
 async fn emit_topics_if_changed(
@@ -248,6 +324,39 @@ async fn emit_topics_if_changed(
         && !emit_remote_access_if_changed(state, sender, &mut signatures.remote_access).await
     {
         return false;
+    }
+    if topics.contains(UiEventTopics::SESSION_BACKGROUND)
+        && !emit_session_background_if_changed(
+            state,
+            sender,
+            session_filter,
+            &mut signatures.session_background,
+        )
+        .await
+    {
+        return false;
+    }
+    true
+}
+
+/// The filtered session's background jobs and subagent runs.
+async fn emit_session_background_if_changed(
+    state: &Arc<UiServerState>,
+    sender: &skyzen::responder::sse::Sender,
+    session_filter: Option<&str>,
+    last_sig: &mut String,
+) -> bool {
+    let Some(session_id) = session_filter else {
+        return true;
+    };
+    let payload = state.session_background.snapshot(session_id).await;
+    if let Ok(sig) = serde_json::to_string(&payload)
+        && sig != *last_sig
+    {
+        if !send_event(sender, "session_background", &payload).await {
+            return false;
+        }
+        *last_sig = sig;
     }
     true
 }

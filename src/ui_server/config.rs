@@ -127,12 +127,6 @@ pub(super) fn build_ui_full_config(config: &MayConfig) -> UiFullConfig {
                 .iter()
                 .map(ToString::to_string)
                 .collect(),
-            embedding_model: config
-                .models
-                .embedding_model
-                .as_ref()
-                .map(ToString::to_string),
-            embedding_dimensions: config.models.embedding_dimensions,
             compaction_model: config
                 .models
                 .compaction_model
@@ -276,17 +270,6 @@ async fn run_save_full_config(
         config.models.balanced = parse_selector_list(&req.models.balanced);
         config.models.fast = parse_selector_list(&req.models.fast);
         config.models.image_generation = parse_selector_list(&req.models.image_generation);
-        config.models.embedding_model = req
-            .models
-            .embedding_model
-            .clone()
-            .filter(|value| !value.trim().is_empty())
-            .map(|value| {
-                value
-                    .parse::<ModelSelector>()
-                    .expect("ui config save must receive valid model selectors")
-            });
-        config.models.embedding_dimensions = req.models.embedding_dimensions;
         config.models.compaction_model = req
             .models
             .compaction_model
@@ -342,18 +325,9 @@ async fn run_save_full_config(
         config.remote_access.enabled = req.remote_access.enabled;
         config
             .remote_access
-            .cloudflared_binary
-            .clone_from(&req.remote_access.cloudflared_binary);
-        config.remote_access.tunnel_token = req
-            .remote_access
-            .tunnel_token
-            .clone()
-            .filter(|value| !value.trim().is_empty());
-        config.remote_access.public_url = req
-            .remote_access
-            .public_url
-            .clone()
-            .filter(|value| !value.trim().is_empty());
+            .tailscale_binary
+            .clone_from(&req.remote_access.tailscale_binary);
+        config.remote_access.https_port = req.remote_access.https_port;
         config.remote_access.allow_local_environment = req.remote_access.allow_local_environment;
     });
 

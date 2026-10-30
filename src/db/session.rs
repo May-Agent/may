@@ -90,6 +90,32 @@ impl ChatDb {
             .ok_or_else(|| session_not_found_db_error(id))
     }
 
+    /// Records the host directory `id` works in.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] when the update fails.
+    pub async fn set_session_cwd(&self, id: &str, cwd: &str) -> Result<(), ChatDbError> {
+        query!(self.db, "UPDATE sessions SET cwd = ? WHERE id = ?", cwd, id)
+            .execute()
+            .await?;
+        Ok(())
+    }
+
+    /// Marks `id` as a session nobody answers prompts for.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] when the update fails.
+    pub async fn set_session_non_interactive(&self, id: &str) -> Result<(), ChatDbError> {
+        query!(
+            self.db,
+            "UPDATE sessions SET non_interactive = 1 WHERE id = ?",
+            id
+        )
+        .execute()
+        .await?;
+        Ok(())
+    }
+
     /// Get a session by ID.
     ///
     /// # Errors

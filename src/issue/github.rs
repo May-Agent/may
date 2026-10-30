@@ -204,6 +204,49 @@ impl<T: GitHubTokenSource> IssueStore for GitHubIssueStore<T> {
         }
     }
 
+    fn search_key(&self) -> String {
+        format!("github:{}", self.repository)
+    }
+
+    async fn updated_since(
+        &self,
+        since: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<IssueSummary>, IssueError> {
+        let mut url = format!(
+            "{}/repos/{}/issues?state=all&sort=updated&direction=asc&per_page={}",
+            self.api_base,
+            self.repository,
+            limit.clamp(1, 100)
+        );
+        if let Some(since) = since {
+            url.push_str("&since=");
+            url.push_str(since);
+        }
+        let response = self.request(Method::GET, url, None).await?;
+        let issues = response
+            .into_json::<Vec<GhIssue>>()
+            .await
+            .map_err(|error| IssueError::GitHub(error.to_string()))?;
+        issues
+            .into_iter()
+            .filter(|issue| issue.pull_request.is_none())
+            // GitHub's `since` is inclusive; the issue at the watermark is
+            // already indexed.
+            .filter(|issue| since.is_none_or(|since| issue.updated_at.as_str() > since))
+            .map(|issue| {
+                let labels = issue.label_names();
+                Ok(IssueSummary {
+                    number: issue.number,
+                    title: issue.title,
+                    state: parse_state(&issue.state, issue.number)?,
+                    labels,
+                    updated_at: issue.updated_at,
+                })
+            })
+            .collect()
+    }
+
     async fn create(
         &self,
         title: &str,

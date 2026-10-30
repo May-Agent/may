@@ -258,21 +258,22 @@ pub struct App {
     /// When and where the last plain click finished; a second press at the
     /// same spot inside `DOUBLE_CLICK_WINDOW` selects the word under it.
     last_click: Option<(Instant, SelectionPoint)>,
-    /// Session background-job registry (set when the agent worker installs)
-    pub job_registry: Option<aither_sandbox::JobRegistry>,
-    /// In-flight subagent runs for the session (list/cancel handle)
-    pub subagent_runs: Option<aither_agent::specialized::SubagentRuns>,
+    /// The session's background jobs and subagent runs in the daemon (set
+    /// when the agent worker installs).
+    pub background: Option<crate::client::background::RemoteBackground>,
     /// Model clone for `/btw` side questions (outside conversation history).
     pub btw_llm: Option<crate::agent::RequestParameterizedModel<aither_cloud::CloudProvider>>,
+    /// Daemon that answers `/btw` when the agent runs there.
+    pub btw_daemon: Option<crate::client::DaemonClient>,
     /// Latest job list shown in `AppMode::Jobs`
     pub jobs: Vec<aither_sandbox::JobInfo>,
     /// Selected row in `AppMode::Jobs`
     pub jobs_selected: usize,
-    /// Last jobs refresh (panel auto-refreshes on tick while open)
-    pub jobs_refreshed: Option<std::time::Instant>,
-    /// Live tracker of `subagent` runs, shared with the session worker's
-    /// `subagent` IPC command (set when the agent worker installs)
-    pub subagent_tracker: crate::agent::SubagentTracker,
+    /// The session's subagent runs in flight, as the daemon last reported
+    /// them.
+    pub subagents: Vec<crate::agent::SubagentRunSnapshot>,
+    /// Last live terminal-output read from the daemon.
+    pub live_output_read_at: Option<std::time::Instant>,
     /// The lease of the run in flight, held from its start until the TUI has
     /// persisted its last message.
     pub run_guard: Option<crate::session::SessionRunGuard>,
@@ -334,6 +335,9 @@ pub(super) fn utf8_complete_len(buf: &[u8]) -> usize {
         }
     }
 }
+
+/// How often live terminal output is read from the daemon while calls run.
+const LIVE_OUTPUT_READ_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
 impl App {
     /// Create a new application.
@@ -517,13 +521,13 @@ impl App {
             frame_stats: super::perf::FrameStats::default(),
             collapse_regions: Vec::new(),
             last_click: None,
-            job_registry: None,
-            subagent_runs: None,
+            background: None,
             btw_llm: None,
+            btw_daemon: None,
             jobs: Vec::new(),
             jobs_selected: 0,
-            jobs_refreshed: None,
-            subagent_tracker: crate::agent::SubagentTracker::default(),
+            subagents: Vec::new(),
+            live_output_read_at: None,
             run_guard: None,
             live_reads: std::collections::HashMap::new(),
             diff_preview_at: None,
@@ -709,58 +713,89 @@ impl App {
 
     /// Re-fetch the session's background jobs from the registry.
     pub fn refresh_jobs(&mut self) {
-        let Some(registry) = self.job_registry.clone() else {
+        let Some(background) = self.background.clone() else {
             return;
         };
         let tx = self.event_tx.clone();
         spawn(async move {
-            let _ = tx.send(AppEvent::JobsLoaded(registry.list().await)).await;
+            match background.snapshot().await {
+                Ok((jobs, subagents)) => {
+                    let _ = tx
+                        .send(AppEvent::BackgroundLoaded { jobs, subagents })
+                        .await;
+                }
+                Err(error) => tracing::debug!(%error, "failed to load background jobs"),
+            }
         })
         .detach();
-        self.jobs_refreshed = Some(std::time::Instant::now());
     }
 
-    /// Cancel the subagent run matching a tracked snapshot. The tool's own
-    /// registry keys runs by its internal id; both registries record the run
-    /// back-to-back, so the earliest name+prompt match is the same
-    /// invocation.
+    /// Cancel one subagent run; the daemon matches it to the `subagent`
+    /// command's own registry.
     pub fn cancel_subagent(&mut self, run: &crate::agent::SubagentRunSnapshot) {
-        let agent = run.agent.clone();
-        let prompt = run.prompt.clone();
-        let hit = self.subagent_runs.as_ref().and_then(|runs| {
-            runs.list()
-                .into_iter()
-                .filter(|info| info.subagent == agent && info.prompt == prompt)
-                .min_by_key(|info| info.id)
-                .map(|info| (info.id, runs.clone()))
-        });
-        match hit {
-            Some((id, runs)) if runs.cancel(id) => {
-                self.set_status(format!("Stopping subagent {}…", run.agent));
+        let Some(background) = self.background.clone() else {
+            self.set_status(format!("No live registry entry for subagent {}", run.agent));
+            return;
+        };
+        self.set_status(format!("Stopping subagent {}…", run.agent));
+        let (run_id, agent) = (run.run_id, run.agent.clone());
+        let tx = self.event_tx.clone();
+        spawn(async move {
+            let stopped = background.cancel(run_id).await.unwrap_or(0);
+            if stopped == 0 {
+                let _ = tx
+                    .send(AppEvent::Status(format!(
+                        "No live registry entry for subagent {agent}"
+                    )))
+                    .await;
             }
-            _ => {
-                self.set_status(format!("No live registry entry for subagent {}", run.agent));
-            }
+        })
+        .detach();
+    }
+
+    /// Stops every subagent run of the session; `false` when none runs.
+    pub fn cancel_all_subagents(&mut self) -> bool {
+        let Some(background) = self.background.clone() else {
+            return false;
+        };
+        let count = self.subagents.len();
+        if count == 0 {
+            return false;
         }
+        self.set_status(format!(
+            "Stopping {count} subagent{} — Esc again to abort turn",
+            if count == 1 { "" } else { "s" }
+        ));
+        spawn(async move {
+            if let Err(error) = background.cancel_all().await {
+                tracing::warn!(%error, "failed to stop subagents");
+            }
+        })
+        .detach();
+        true
     }
 
     /// Kill a background job by pid, then refresh the panel.
     pub fn kill_job(&mut self, pid: u32) {
-        let Some(registry) = self.job_registry.clone() else {
+        let Some(background) = self.background.clone() else {
             return;
         };
         let tx = self.event_tx.clone();
         spawn(async move {
-            let ok = registry.kill(pid).await;
+            let ok = background.kill(pid).await.unwrap_or(false);
             let _ = tx.send(AppEvent::JobKilled { pid, ok }).await;
-            let _ = tx.send(AppEvent::JobsLoaded(registry.list().await)).await;
+            if let Ok((jobs, subagents)) = background.snapshot().await {
+                let _ = tx
+                    .send(AppEvent::BackgroundLoaded { jobs, subagents })
+                    .await;
+            }
         })
         .detach();
     }
 
     /// Open the `/btw` side-question overlay.
     pub fn open_btw(&mut self) {
-        if self.btw_llm.is_none() {
+        if self.btw_llm.is_none() && self.btw_daemon.is_none() {
             self.chat
                 .push_notice("No model available for /btw — start a session first");
             return;
@@ -771,7 +806,7 @@ impl App {
     /// Submit the question typed in the `/btw` overlay. Streams the answer
     /// back through [`AppEvent`]s; nothing touches the conversation history.
     pub fn submit_btw(&mut self) {
-        let (AppMode::Btw(state), Some(llm)) = (&self.mode, self.btw_llm.clone()) else {
+        let AppMode::Btw(state) = &self.mode else {
             return;
         };
         let question = state.input.trim().to_string();
@@ -780,32 +815,35 @@ impl App {
         }
         let messages = self.btw_messages(&question);
         let tx = self.event_tx.clone();
+        if let Some(llm) = self.btw_llm.clone() {
+            if let AppMode::Btw(state) = &mut self.mode {
+                state.loading = true;
+            }
+            spawn(stream_btw_answer(llm, messages, tx)).detach();
+            return;
+        }
+        let (Some(client), Some(session)) =
+            (self.btw_daemon.clone(), self.session_manager.current())
+        else {
+            return;
+        };
+        let path = crate::client::session_path(session.id.as_str(), "/btw");
         if let AppMode::Btw(state) = &mut self.mode {
             state.loading = true;
         }
         spawn(async move {
-            use aither_core::LanguageModel;
-            use futures_lite::StreamExt;
-            let request = aither_core::llm::LLMRequest::new(messages);
-            let mut stream = std::pin::pin!(llm.respond(request));
-            let mut failed = false;
-            while let Some(result) = stream.next().await {
-                match result {
-                    Ok(aither_core::llm::Event::Text(text)) => {
-                        if tx.send(AppEvent::BtwDelta(text)).await.is_err() {
-                            return;
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        failed = true;
-                        let _ = tx.send(AppEvent::BtwFailed(error.to_string())).await;
-                        break;
+            let answer: Result<crate::ui_server::BtwResponse, _> = client
+                .post(&path, &crate::ui_server::BtwRequest { messages })
+                .await;
+            match answer {
+                Ok(answer) => {
+                    if tx.send(AppEvent::BtwDelta(answer.answer)).await.is_ok() {
+                        let _ = tx.send(AppEvent::BtwFinished).await;
                     }
                 }
-            }
-            if !failed {
-                let _ = tx.send(AppEvent::BtwFinished).await;
+                Err(error) => {
+                    let _ = tx.send(AppEvent::BtwFailed(error.to_string())).await;
+                }
             }
         })
         .detach();
@@ -824,11 +862,10 @@ impl App {
 
     /// Build the `/btw` request: system contract, recent chat as context,
     /// then the question itself.
-    fn btw_messages(&self, question: &str) -> Vec<aither_core::llm::Message> {
+    fn btw_messages(&self, question: &str) -> Vec<crate::ui_server::BtwMessage> {
         use super::ui::chat::{ChatElement, ToolDisplay};
-        use aither_core::llm::Message;
 
-        let mut messages = vec![Message::system(Self::BTW_SYSTEM)];
+        let mut messages = vec![btw_message("system", Self::BTW_SYSTEM)];
         for element in self
             .chat
             .elements()
@@ -837,9 +874,9 @@ impl App {
             .take(Self::BTW_CONTEXT_ELEMENTS)
         {
             let message = match element {
-                ChatElement::UserMessage { content, .. } => Some(Message::user(content.as_str())),
+                ChatElement::UserMessage { content, .. } => Some(btw_message("user", content)),
                 ChatElement::AssistantText { content, .. } => {
-                    (!content.is_empty()).then(|| Message::assistant(content.as_str()))
+                    (!content.is_empty()).then(|| btw_message("assistant", content))
                 }
                 ChatElement::ToolCall { display, .. } => {
                     let summary = match display {
@@ -884,7 +921,7 @@ impl App {
                             format!("hosted tool {tool}: {detail}")
                         }
                     };
-                    Some(Message::assistant(summary))
+                    Some(btw_message("assistant", summary))
                 }
                 _ => None,
             };
@@ -896,13 +933,21 @@ impl App {
         let (system, history) = messages.split_first().expect("system message present");
         let mut ordered = vec![system.clone()];
         ordered.extend(history.iter().rev().cloned());
-        ordered.push(Message::user(question));
+        ordered.push(btw_message("user", question));
         ordered
+    }
+
+    /// The subagent run `run_id`, while it runs.
+    fn subagent(&self, run_id: u64) -> Option<crate::agent::SubagentRunSnapshot> {
+        self.subagents
+            .iter()
+            .find(|run| run.run_id == run_id)
+            .cloned()
     }
 
     /// Open the jobs/subagents panel.
     pub fn open_jobs(&mut self) {
-        if self.job_registry.is_none() {
+        if self.background.is_none() {
             self.chat
                 .push_error("No active session — jobs list unavailable");
             return;
@@ -910,16 +955,6 @@ impl App {
         self.mode = AppMode::Jobs;
         self.jobs_selected = 0;
         self.refresh_jobs();
-    }
-
-    /// Whether any background job or tracked subagent is currently running.
-    #[must_use]
-    pub fn has_running_background(&self) -> bool {
-        !self.subagent_tracker.running().is_empty()
-            || self
-                .jobs
-                .iter()
-                .any(|job| matches!(job.status, aither_sandbox::JobStatus::Running))
     }
 
     /// Poll live output and file-diff previews for running terminal calls —
@@ -931,7 +966,7 @@ impl App {
         self.live_reads
             .retain(|call_id, _| self.chat.is_tool_running(call_id));
 
-        if let Some(registry) = self.job_registry.clone() {
+        if let Some(background) = self.background.clone() {
             // Bind each unbound running call to the newest unbound running
             // job executing the same script. Two concurrent calls with an
             // identical script bind in order of `started_at`.
@@ -966,7 +1001,13 @@ impl App {
                 }
             }
 
-            if !self.live_reads.is_empty() {
+            // Reads cross the daemon's socket; a few a second keep the
+            // output live.
+            let read_due = self
+                .live_output_read_at
+                .is_none_or(|at| at.elapsed() >= LIVE_OUTPUT_READ_INTERVAL);
+            if !self.live_reads.is_empty() && read_due {
+                self.live_output_read_at = Some(std::time::Instant::now());
                 let tx = self.event_tx.clone();
                 let reads: Vec<(String, String, usize)> = self
                     .live_reads
@@ -976,13 +1017,12 @@ impl App {
                 spawn(async move {
                     let mut deltas = Vec::with_capacity(reads.len());
                     for (call_id, task_id, cursor) in reads {
-                        if let Ok(delta) = registry.terminal_read(&task_id, cursor, 64 * 1024).await
-                        {
+                        if let Ok(delta) = background.read(&task_id, cursor).await {
                             deltas.push(super::event::TerminalOutputDelta {
                                 call_id,
                                 cursor: delta.cursor,
                                 bytes: delta.bytes,
-                                status: delta.status,
+                                status: delta.status.into(),
                             });
                         }
                     }
@@ -1016,7 +1056,7 @@ impl App {
                 state.finished = state.job.is_none();
             }
             crate::tui::state::JobDetailTarget::Subagent(run_id) => {
-                state.subagent = self.subagent_tracker.get(run_id);
+                state.subagent = self.subagent(run_id);
                 state.finished = state.subagent.is_none();
             }
         }
@@ -1036,21 +1076,24 @@ impl App {
         let target = state.target;
         match target {
             crate::tui::state::JobDetailTarget::Job(pid) => {
-                let Some(registry) = self.job_registry.clone() else {
+                let Some(background) = self.background.clone() else {
                     state.finished = true;
                     return;
                 };
                 let tx = self.event_tx.clone();
                 spawn(async move {
-                    let (job, output) =
-                        futures_lite::future::zip(registry.get(pid), registry.terminal_output(pid))
-                            .await;
+                    let (job, output) = background.job(pid).await.unwrap_or((None, None));
                     let _ = tx.send(AppEvent::JobDetailLoaded { job, output }).await;
                 })
                 .detach();
             }
             crate::tui::state::JobDetailTarget::Subagent(run_id) => {
-                match self.subagent_tracker.get(run_id) {
+                match self
+                    .subagents
+                    .iter()
+                    .find(|run| run.run_id == run_id)
+                    .cloned()
+                {
                     Some(snapshot) => {
                         state.subagent = Some(snapshot);
                         state.finished = false;
@@ -1239,8 +1282,8 @@ impl App {
 
     /// Resolve a background task id into a user-facing label: the job's
     /// script when the registry knows it, else the description (or command)
-    /// of the call whose output introduced the id — the `terminal_background`
-    /// result that named it. The id itself is never surfaced.
+    /// of the call whose output introduced the id — the `terminal` result
+    /// that named it. The id itself is never surfaced.
     fn resolve_task_label(&self, task_id: &str) -> Option<String> {
         use super::ui::chat::ChatElement;
         if let Some(job) = self.jobs.iter().find(|job| job.task_id == task_id) {
@@ -1377,6 +1420,61 @@ impl App {
         }
     }
 
+    /// Rebuilds the chat view from `messages`.
+    async fn render_history(&mut self, messages: &[ChatMessage]) {
+        self.chat = ChatStream::new();
+        for (history_index, msg) in messages.iter().enumerate() {
+            match msg.role {
+                MessageRole::User => {
+                    let restored = futures_util::future::join_all(msg.attachments.iter().map(
+                        |att| async move {
+                            super::runtime::tui_attachment_from_persisted(att.clone())
+                                .await
+                                .map_err(|error| (att.name.clone(), error))
+                        },
+                    ))
+                    .await;
+                    let mut attachments = Vec::with_capacity(restored.len());
+                    for result in restored {
+                        match result {
+                            Ok(attachment) => attachments.push(attachment),
+                            Err((name, error)) => {
+                                tracing::warn!("failed to restore attachment {name}: {error}");
+                                attachments.push(Attachment::FileReference {
+                                    path: PathBuf::from(&name),
+                                });
+                            }
+                        }
+                    }
+                    self.chat
+                        .push_user(&msg.content, attachments, history_index);
+                }
+                MessageRole::Assistant => {
+                    self.chat.push_text(&msg.content);
+                    self.chat.end_text();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Re-reads the current session from the database and rebuilds the chat
+    /// view, keeping what the user is typing: a turn another client or the
+    /// daemon's queue ran wrote rows this view has not seen.
+    pub async fn reload_chat(&mut self) {
+        if let Err(error) = self.session_manager.refresh_history().await {
+            tracing::warn!(%error, "failed to reload the session history");
+            return;
+        }
+        let messages = self
+            .session_manager
+            .current()
+            .map(|session| session.history.messages().to_vec())
+            .unwrap_or_default();
+        self.render_history(&messages).await;
+        self.scroll = usize::MAX;
+    }
+
     /// Initialize for a session (sets up image manager and status).
     ///
     /// Takes the session ID and a slice of messages to avoid borrow conflicts
@@ -1417,47 +1515,14 @@ impl App {
         self.image_cache.clear();
         self.image_fetching.clear();
         self.image_failed.clear();
-        self.jobs_refreshed = None;
-        self.subagent_runs = None;
-        self.subagent_tracker = crate::agent::SubagentTracker::default();
+        self.background = None;
+        self.subagents.clear();
+        self.live_output_read_at = None;
         self.live_reads.clear();
         self.diff_preview_at = None;
 
         // Load chat history into display
-        self.chat = ChatStream::new();
-        for (history_index, msg) in messages.iter().enumerate() {
-            match msg.role {
-                MessageRole::User => {
-                    let restored = futures_util::future::join_all(msg.attachments.iter().map(
-                        |att| async move {
-                            super::runtime::tui_attachment_from_persisted(att.clone())
-                                .await
-                                .map_err(|error| (att.name.clone(), error))
-                        },
-                    ))
-                    .await;
-                    let mut attachments = Vec::with_capacity(restored.len());
-                    for result in restored {
-                        match result {
-                            Ok(attachment) => attachments.push(attachment),
-                            Err((name, error)) => {
-                                tracing::warn!("failed to restore attachment {name}: {error}");
-                                attachments.push(Attachment::FileReference {
-                                    path: PathBuf::from(&name),
-                                });
-                            }
-                        }
-                    }
-                    self.chat
-                        .push_user(&msg.content, attachments, history_index);
-                }
-                MessageRole::Assistant => {
-                    self.chat.push_text(&msg.content);
-                    self.chat.end_text();
-                }
-                _ => {}
-            }
-        }
+        self.render_history(messages).await;
 
         let session_dir = self.session_manager.current().map_or_else(
             || {
@@ -2096,7 +2161,7 @@ impl App {
                     self.input = entry.to_string();
                     self.input_char_count = self.input.chars().count();
                     self.cursor = self.input_char_count;
-                } else if self.job_registry.is_some() {
+                } else if self.background.is_some() {
                     // ↓ past the newest history entry opens the background
                     // jobs/subagents panel (status bar hint: "↓ jobs").
                     self.open_jobs();
@@ -3231,8 +3296,9 @@ pub enum SendAction {
     RespondWorkspace {
         /// ID of the pending workspace request being answered.
         request_id: String,
-        /// The workspace request that was presented to the user.
-        request: crate::workspace_request::WorkspaceRequest,
+        /// The in-process request that was presented to the user; `None`
+        /// when the daemon holds it.
+        request: Option<crate::workspace_request::WorkspaceRequest>,
         /// Whether the user approved the request.
         approved: bool,
     },
@@ -3282,6 +3348,49 @@ pub enum SendAction {
         /// Secret value — never persisted to transcript or input history.
         value: String,
     },
+}
+
+fn btw_message(role: &str, content: impl Into<String>) -> crate::ui_server::BtwMessage {
+    crate::ui_server::BtwMessage {
+        role: role.to_string(),
+        content: content.into(),
+    }
+}
+
+/// Streams a `/btw` answer from the session's model into the overlay.
+async fn stream_btw_answer(
+    llm: crate::agent::RequestParameterizedModel<aither_cloud::CloudProvider>,
+    messages: Vec<crate::ui_server::BtwMessage>,
+    tx: EventSender,
+) {
+    use aither_core::LanguageModel;
+    use aither_core::llm::Message;
+    use futures_lite::StreamExt;
+    let messages = messages
+        .into_iter()
+        .map(|message| match message.role.as_str() {
+            "system" => Message::system(message.content),
+            "assistant" => Message::assistant(message.content),
+            _ => Message::user(message.content),
+        })
+        .collect::<Vec<_>>();
+    let request = aither_core::llm::LLMRequest::new(messages);
+    let mut stream = std::pin::pin!(llm.respond(request));
+    while let Some(result) = stream.next().await {
+        match result {
+            Ok(aither_core::llm::Event::Text(text)) => {
+                if tx.send(AppEvent::BtwDelta(text)).await.is_err() {
+                    return;
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                let _ = tx.send(AppEvent::BtwFailed(error.to_string())).await;
+                return;
+            }
+        }
+    }
+    let _ = tx.send(AppEvent::BtwFinished).await;
 }
 
 #[cfg(test)]

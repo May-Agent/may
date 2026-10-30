@@ -11,6 +11,7 @@
 
 pub mod github;
 pub mod may;
+pub mod search;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -189,6 +190,9 @@ pub enum IssueError {
     /// The operation was rejected (for example a self-relation).
     #[error("{0}")]
     Invalid(String),
+    /// The search index could not be reached or refreshed.
+    #[error("issue search is unavailable: {0}")]
+    Search(String),
     /// The operation is reserved for the main agent; the text is rendered from
     /// the refusal template.
     #[error("{0}")]
@@ -224,6 +228,18 @@ pub struct IssueBackendInfo {
 pub trait IssueStore: Send + Sync + fmt::Debug {
     /// Backend identity for the system prompt.
     fn info(&self) -> IssueBackendInfo;
+
+    /// Stable name of this backend's issue set, keying its search index.
+    fn search_key(&self) -> String;
+
+    /// Issues updated after `since` (every issue when `None`), oldest
+    /// update first, at most `limit`. Drives the search index's
+    /// incremental sync.
+    fn updated_since(
+        &self,
+        since: Option<&str>,
+        limit: i64,
+    ) -> impl Future<Output = Result<Vec<IssueSummary>, IssueError>> + Send;
 
     /// Create an issue; returns the created detail.
     fn create(
@@ -296,6 +312,24 @@ impl IssueStore for ResolvedIssueStore {
         match self {
             Self::May(store) => store.info(),
             Self::GitHub(store) => store.info(),
+        }
+    }
+
+    fn search_key(&self) -> String {
+        match self {
+            Self::May(store) => store.search_key(),
+            Self::GitHub(store) => store.search_key(),
+        }
+    }
+
+    async fn updated_since(
+        &self,
+        since: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<IssueSummary>, IssueError> {
+        match self {
+            Self::May(store) => store.updated_since(since, limit).await,
+            Self::GitHub(store) => store.updated_since(since, limit).await,
         }
     }
 

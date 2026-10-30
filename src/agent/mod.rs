@@ -22,7 +22,6 @@ mod provider;
 pub(crate) mod register_tool;
 pub mod runner;
 mod runtime_context;
-mod search_match;
 /// Session tool registration for the agent.
 pub mod session_tool;
 /// Authorization for `terminal` ssh-mode targets.
@@ -53,9 +52,11 @@ pub use provider::{
     RequestParameterizedModel, ResolvedProviderRuntime, build_fast_provider_chain,
     provider_candidate_count, resolve_provider_runtime,
 };
-pub use runner::{AgentHandle, AgentWorker, RunLease, TuiEvent, spawn_worker};
+pub use runner::{
+    AgentHandle, AgentWorker, ForeignTurn, RemoteTurn, RunLease, TuiEvent, spawn_worker,
+};
 pub use subagent_tracker::{
-    SubagentRunSnapshot, SubagentTracker, TrackedSubagentTool, UsageObservedModel,
+    SubagentHandles, SubagentRunSnapshot, SubagentTracker, TrackedSubagentTool, UsageObservedModel,
 };
 pub use task_tool::{
     TaskBroker, TaskCreateRequest, TaskCreateResult, TaskRuntimeKind, channel as task_channel,
