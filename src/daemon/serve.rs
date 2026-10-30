@@ -13,9 +13,9 @@ use futures_util::TryStreamExt as _;
 use http_body_util::{BodyDataStream, StreamBody};
 use hyper::body::{Frame, Incoming};
 use hyper_util::rt::TokioIo;
+use skyzen::BodyError;
 use skyzen::extract::PeerAddr;
 use skyzen::routing::Router;
-use skyzen::BodyError;
 
 type ResponseBody =
     StreamBody<futures_util::stream::MapOk<skyzen::Body, fn(bytes::Bytes) -> Frame<bytes::Bytes>>>;

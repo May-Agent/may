@@ -22,6 +22,16 @@ use serde::de::DeserializeOwned;
 
 use crate::ui_server::DaemonHealth;
 
+/// Path of the session endpoint `tail` (such as `/stop`) under
+/// `/api/sessions/{session_id}`.
+#[must_use]
+pub fn session_path(session_id: &str, tail: &str) -> String {
+    let mut path = String::from("/api/sessions/");
+    path.push_str(session_id);
+    path.push_str(tail);
+    path
+}
+
 /// Why a daemon request failed.
 #[derive(Debug, thiserror::Error)]
 pub enum DaemonClientError {

@@ -80,7 +80,12 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
         AskUser(may_agent::ask_user::AskUserRequest),
         Workspace(may_agent::workspace_request::WorkspaceRequest),
         Agent(TuiEvent),
+        /// Time to look for prompts the daemon's run waits on.
+        Poll,
     }
+
+    /// How often prompts the daemon holds are looked for.
+    const DAEMON_PROMPT_POLL: std::time::Duration = std::time::Duration::from_millis(300);
 
     const ONESHOT_IDLE_FINISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -125,12 +130,29 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
         may_agent::agent::ToolEnvironmentCache::spawn(),
     )
     .with_oneshot_overrides(args.model.clone(), args.reasoning_effort);
+    // The run happens in the May daemon, like every TUI turn.
+    let paths = may_agent::daemon::DaemonPaths::user()?;
+    let runtime_deps = runtime_deps.with_daemon(
+        may_agent::daemon::lifecycle::ensure_running(&paths, |line| {
+            let _ = writeln!(io::stderr(), "[may] {line}");
+        })
+        .await?,
+    );
 
     let mut output = OneShotOutput::new(io::stdout(), io::stderr());
     let mut worker: Option<AgentWorker> = None;
     let mut build = runtime_deps
         .begin_new_session(&mut app, &mut worker)
         .await?;
+    // Nobody answers permission prompts of a one-shot run; the daemon
+    // refuses them instead of asking.
+    if let Some(session) = app.session_manager.current() {
+        app.session_manager
+            .db()
+            .set_session_non_interactive(session.id.as_str())
+            .await?;
+    }
+    let mut answered_prompts = std::collections::HashSet::<String>::new();
     // Preparing the session's tool environments can ask for SSH consent, so
     // questions are answered while the worker is built.
     let completed = loop {
@@ -174,6 +196,8 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
         )
         .await?;
     let mut agent_handle = Some(handle);
+    // Prompt polls do not count as activity for the idle finish.
+    let mut last_agent_event = std::time::Instant::now();
 
     loop {
         if let Some(request) = runtime_deps.pending_permission(&app).await? {
@@ -187,17 +211,77 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
         let Some(handle) = agent_handle.as_ref() else {
             break;
         };
+        if let Some(request) = runtime_deps.pending_ask_user(&app).await?
+            && answered_prompts.insert(request.id.clone())
+        {
+            let questions = request
+                .questions
+                .iter()
+                .map(|question| may_agent::ask_user::Question {
+                    section: question.section.clone(),
+                    question: question.question.clone(),
+                    option: question.option.clone(),
+                    multi_select: question.multi_select,
+                })
+                .collect::<Vec<_>>();
+            let answers = prompt_oneshot_questions(&questions, output.stderr()?)?;
+            if !runtime_deps
+                .answer_open_question(&request.id, &answers)
+                .await?
+            {
+                writeln!(
+                    output.stderr()?,
+                    "[notice] the question is no longer open; this answer was not sent"
+                )?;
+            }
+            continue;
+        }
+        if let Some(request) = runtime_deps.pending_workspace(&app).await?
+            && answered_prompts.insert(request.id.clone())
+        {
+            let approved = prompt_oneshot_workspace(
+                &may_agent::workspace_request::RequestWorkspaceArgs {
+                    path: request.request.path.clone(),
+                    reason: request.request.reason.clone(),
+                },
+                output.stderr()?,
+            )?;
+            let session_id = app
+                .session_manager
+                .current()
+                .map(|session| session.id.clone())
+                .ok_or_else(|| anyhow::anyhow!("oneshot session missing"))?;
+            if !matches!(
+                runtime_deps
+                    .resolve_workspace_response(&session_id, &request.id, approved)
+                    .await?,
+                ResponseCommit::Committed
+            ) {
+                writeln!(
+                    output.stderr()?,
+                    "[notice] the workspace request is no longer open; this answer was not sent"
+                )?;
+            }
+            continue;
+        }
+
         let event_future = futures_lite::future::or(
             async { ask_user_queue.next().await.map(Event::AskUser) },
             futures_lite::future::or(
                 async { workspace_queue.next().await.map(Event::Workspace) },
-                async { handle.recv().await.map(Event::Agent) },
+                futures_lite::future::or(async { handle.recv().await.map(Event::Agent) }, async {
+                    async_io::Timer::after(DAEMON_PROMPT_POLL).await;
+                    Some(Event::Poll)
+                }),
             ),
         );
         let next = if assistant_response.text().is_empty() || !active_tool_calls.is_empty() {
             event_future.await
-        } else if let Ok(event) =
-            tokio::time::timeout(ONESHOT_IDLE_FINISH_TIMEOUT, event_future).await
+        } else if let Ok(event) = tokio::time::timeout(
+            ONESHOT_IDLE_FINISH_TIMEOUT.saturating_sub(last_agent_event.elapsed()),
+            event_future,
+        )
+        .await
         {
             event
         } else {
@@ -219,7 +303,11 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
         let Some(event) = next else {
             break;
         };
+        if matches!(event, Event::Agent(_)) {
+            last_agent_event = std::time::Instant::now();
+        }
         match event {
+            Event::Poll => {}
             Event::AskUser(request) => {
                 answer_oneshot_question(&runtime_deps, &app, request, &mut output).await?;
             }
@@ -325,7 +413,10 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                 return Ok(());
             }
             Event::Agent(
-                TuiEvent::Compacted(_) | TuiEvent::ContextReport(_) | TuiEvent::ContextDump(_),
+                TuiEvent::Compacted(_)
+                | TuiEvent::ContextReport(_)
+                | TuiEvent::ContextDump(_)
+                | TuiEvent::ContextDumpSaved { .. },
             ) => {}
             Event::Agent(TuiEvent::Error(error)) => {
                 writeln!(output.stderr()?, "[error] {error}")?;

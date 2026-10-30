@@ -264,6 +264,8 @@ pub struct App {
     pub subagent_runs: Option<aither_agent::specialized::SubagentRuns>,
     /// Model clone for `/btw` side questions (outside conversation history).
     pub btw_llm: Option<crate::agent::RequestParameterizedModel<aither_cloud::CloudProvider>>,
+    /// Daemon that answers `/btw` when the agent runs there.
+    pub btw_daemon: Option<crate::client::DaemonClient>,
     /// Latest job list shown in `AppMode::Jobs`
     pub jobs: Vec<aither_sandbox::JobInfo>,
     /// Selected row in `AppMode::Jobs`
@@ -520,6 +522,7 @@ impl App {
             job_registry: None,
             subagent_runs: None,
             btw_llm: None,
+            btw_daemon: None,
             jobs: Vec::new(),
             jobs_selected: 0,
             jobs_refreshed: None,
@@ -760,7 +763,7 @@ impl App {
 
     /// Open the `/btw` side-question overlay.
     pub fn open_btw(&mut self) {
-        if self.btw_llm.is_none() {
+        if self.btw_llm.is_none() && self.btw_daemon.is_none() {
             self.chat
                 .push_notice("No model available for /btw — start a session first");
             return;
@@ -771,7 +774,7 @@ impl App {
     /// Submit the question typed in the `/btw` overlay. Streams the answer
     /// back through [`AppEvent`]s; nothing touches the conversation history.
     pub fn submit_btw(&mut self) {
-        let (AppMode::Btw(state), Some(llm)) = (&self.mode, self.btw_llm.clone()) else {
+        let AppMode::Btw(state) = &self.mode else {
             return;
         };
         let question = state.input.trim().to_string();
@@ -780,32 +783,35 @@ impl App {
         }
         let messages = self.btw_messages(&question);
         let tx = self.event_tx.clone();
+        if let Some(llm) = self.btw_llm.clone() {
+            if let AppMode::Btw(state) = &mut self.mode {
+                state.loading = true;
+            }
+            spawn(stream_btw_answer(llm, messages, tx)).detach();
+            return;
+        }
+        let (Some(client), Some(session)) =
+            (self.btw_daemon.clone(), self.session_manager.current())
+        else {
+            return;
+        };
+        let path = crate::client::session_path(session.id.as_str(), "/btw");
         if let AppMode::Btw(state) = &mut self.mode {
             state.loading = true;
         }
         spawn(async move {
-            use aither_core::LanguageModel;
-            use futures_lite::StreamExt;
-            let request = aither_core::llm::LLMRequest::new(messages);
-            let mut stream = std::pin::pin!(llm.respond(request));
-            let mut failed = false;
-            while let Some(result) = stream.next().await {
-                match result {
-                    Ok(aither_core::llm::Event::Text(text)) => {
-                        if tx.send(AppEvent::BtwDelta(text)).await.is_err() {
-                            return;
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        failed = true;
-                        let _ = tx.send(AppEvent::BtwFailed(error.to_string())).await;
-                        break;
+            let answer: Result<crate::ui_server::BtwResponse, _> = client
+                .post(&path, &crate::ui_server::BtwRequest { messages })
+                .await;
+            match answer {
+                Ok(answer) => {
+                    if tx.send(AppEvent::BtwDelta(answer.answer)).await.is_ok() {
+                        let _ = tx.send(AppEvent::BtwFinished).await;
                     }
                 }
-            }
-            if !failed {
-                let _ = tx.send(AppEvent::BtwFinished).await;
+                Err(error) => {
+                    let _ = tx.send(AppEvent::BtwFailed(error.to_string())).await;
+                }
             }
         })
         .detach();
@@ -824,11 +830,10 @@ impl App {
 
     /// Build the `/btw` request: system contract, recent chat as context,
     /// then the question itself.
-    fn btw_messages(&self, question: &str) -> Vec<aither_core::llm::Message> {
+    fn btw_messages(&self, question: &str) -> Vec<crate::ui_server::BtwMessage> {
         use super::ui::chat::{ChatElement, ToolDisplay};
-        use aither_core::llm::Message;
 
-        let mut messages = vec![Message::system(Self::BTW_SYSTEM)];
+        let mut messages = vec![btw_message("system", Self::BTW_SYSTEM)];
         for element in self
             .chat
             .elements()
@@ -837,9 +842,9 @@ impl App {
             .take(Self::BTW_CONTEXT_ELEMENTS)
         {
             let message = match element {
-                ChatElement::UserMessage { content, .. } => Some(Message::user(content.as_str())),
+                ChatElement::UserMessage { content, .. } => Some(btw_message("user", content)),
                 ChatElement::AssistantText { content, .. } => {
-                    (!content.is_empty()).then(|| Message::assistant(content.as_str()))
+                    (!content.is_empty()).then(|| btw_message("assistant", content))
                 }
                 ChatElement::ToolCall { display, .. } => {
                     let summary = match display {
@@ -884,7 +889,7 @@ impl App {
                             format!("hosted tool {tool}: {detail}")
                         }
                     };
-                    Some(Message::assistant(summary))
+                    Some(btw_message("assistant", summary))
                 }
                 _ => None,
             };
@@ -896,7 +901,7 @@ impl App {
         let (system, history) = messages.split_first().expect("system message present");
         let mut ordered = vec![system.clone()];
         ordered.extend(history.iter().rev().cloned());
-        ordered.push(Message::user(question));
+        ordered.push(btw_message("user", question));
         ordered
     }
 
@@ -1377,6 +1382,61 @@ impl App {
         }
     }
 
+    /// Rebuilds the chat view from `messages`.
+    async fn render_history(&mut self, messages: &[ChatMessage]) {
+        self.chat = ChatStream::new();
+        for (history_index, msg) in messages.iter().enumerate() {
+            match msg.role {
+                MessageRole::User => {
+                    let restored = futures_util::future::join_all(msg.attachments.iter().map(
+                        |att| async move {
+                            super::runtime::tui_attachment_from_persisted(att.clone())
+                                .await
+                                .map_err(|error| (att.name.clone(), error))
+                        },
+                    ))
+                    .await;
+                    let mut attachments = Vec::with_capacity(restored.len());
+                    for result in restored {
+                        match result {
+                            Ok(attachment) => attachments.push(attachment),
+                            Err((name, error)) => {
+                                tracing::warn!("failed to restore attachment {name}: {error}");
+                                attachments.push(Attachment::FileReference {
+                                    path: PathBuf::from(&name),
+                                });
+                            }
+                        }
+                    }
+                    self.chat
+                        .push_user(&msg.content, attachments, history_index);
+                }
+                MessageRole::Assistant => {
+                    self.chat.push_text(&msg.content);
+                    self.chat.end_text();
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Re-reads the current session from the database and rebuilds the chat
+    /// view, keeping what the user is typing: a turn another client or the
+    /// daemon's queue ran wrote rows this view has not seen.
+    pub async fn reload_chat(&mut self) {
+        if let Err(error) = self.session_manager.refresh_history().await {
+            tracing::warn!(%error, "failed to reload the session history");
+            return;
+        }
+        let messages = self
+            .session_manager
+            .current()
+            .map(|session| session.history.messages().to_vec())
+            .unwrap_or_default();
+        self.render_history(&messages).await;
+        self.scroll = usize::MAX;
+    }
+
     /// Initialize for a session (sets up image manager and status).
     ///
     /// Takes the session ID and a slice of messages to avoid borrow conflicts
@@ -1424,40 +1484,7 @@ impl App {
         self.diff_preview_at = None;
 
         // Load chat history into display
-        self.chat = ChatStream::new();
-        for (history_index, msg) in messages.iter().enumerate() {
-            match msg.role {
-                MessageRole::User => {
-                    let restored = futures_util::future::join_all(msg.attachments.iter().map(
-                        |att| async move {
-                            super::runtime::tui_attachment_from_persisted(att.clone())
-                                .await
-                                .map_err(|error| (att.name.clone(), error))
-                        },
-                    ))
-                    .await;
-                    let mut attachments = Vec::with_capacity(restored.len());
-                    for result in restored {
-                        match result {
-                            Ok(attachment) => attachments.push(attachment),
-                            Err((name, error)) => {
-                                tracing::warn!("failed to restore attachment {name}: {error}");
-                                attachments.push(Attachment::FileReference {
-                                    path: PathBuf::from(&name),
-                                });
-                            }
-                        }
-                    }
-                    self.chat
-                        .push_user(&msg.content, attachments, history_index);
-                }
-                MessageRole::Assistant => {
-                    self.chat.push_text(&msg.content);
-                    self.chat.end_text();
-                }
-                _ => {}
-            }
-        }
+        self.render_history(messages).await;
 
         let session_dir = self.session_manager.current().map_or_else(
             || {
@@ -3231,8 +3258,9 @@ pub enum SendAction {
     RespondWorkspace {
         /// ID of the pending workspace request being answered.
         request_id: String,
-        /// The workspace request that was presented to the user.
-        request: crate::workspace_request::WorkspaceRequest,
+        /// The in-process request that was presented to the user; `None`
+        /// when the daemon holds it.
+        request: Option<crate::workspace_request::WorkspaceRequest>,
         /// Whether the user approved the request.
         approved: bool,
     },
@@ -3314,4 +3342,47 @@ mod tests {
         let buf = [b"ok".as_slice(), &[0xff], b"!", &emoji[..2]].concat();
         assert_eq!(utf8_complete_len(&buf), 4);
     }
+}
+
+fn btw_message(role: &str, content: impl Into<String>) -> crate::ui_server::BtwMessage {
+    crate::ui_server::BtwMessage {
+        role: role.to_string(),
+        content: content.into(),
+    }
+}
+
+/// Streams a `/btw` answer from the session's model into the overlay.
+async fn stream_btw_answer(
+    llm: crate::agent::RequestParameterizedModel<aither_cloud::CloudProvider>,
+    messages: Vec<crate::ui_server::BtwMessage>,
+    tx: EventSender,
+) {
+    use aither_core::LanguageModel;
+    use aither_core::llm::Message;
+    use futures_lite::StreamExt;
+    let messages = messages
+        .into_iter()
+        .map(|message| match message.role.as_str() {
+            "system" => Message::system(message.content),
+            "assistant" => Message::assistant(message.content),
+            _ => Message::user(message.content),
+        })
+        .collect::<Vec<_>>();
+    let request = aither_core::llm::LLMRequest::new(messages);
+    let mut stream = std::pin::pin!(llm.respond(request));
+    while let Some(result) = stream.next().await {
+        match result {
+            Ok(aither_core::llm::Event::Text(text)) => {
+                if tx.send(AppEvent::BtwDelta(text)).await.is_err() {
+                    return;
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                let _ = tx.send(AppEvent::BtwFailed(error.to_string())).await;
+                return;
+            }
+        }
+    }
+    let _ = tx.send(AppEvent::BtwFinished).await;
 }

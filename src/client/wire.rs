@@ -284,8 +284,12 @@ pub struct SessionAgentFrame {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionAgentBody {
-    /// A run started (its user message is in history).
-    Start,
+    /// A run started.
+    Start {
+        /// The user message the run answers, when it has one.
+        #[serde(default)]
+        content: Option<String>,
+    },
     /// An agent event of the run.
     Agent {
         /// The event.

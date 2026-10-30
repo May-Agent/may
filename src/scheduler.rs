@@ -13,8 +13,8 @@ use aither_core::llm::CommandOutcome;
 use aither_sandbox::{
     AnyContainerExec, BollardContainerExec, CompletedCommand, Configured, ContainerLaunchSpec,
     ContainerShellRuntime, JobStatus, OutputFormat, PermissionHandler, ShellRuntimeAvailability,
-    ShellSessionRegistry, TerminalArgs, TerminalExecutionMode,
-    TerminalMode, TerminalTool, ToolRegistryBuilder, permission::PermissionError,
+    ShellSessionRegistry, TerminalArgs, TerminalExecutionMode, TerminalMode, TerminalTool,
+    ToolRegistryBuilder, permission::PermissionError,
 };
 use arc_swap::ArcSwap;
 use askama::Template;

@@ -101,6 +101,21 @@ impl ChatDb {
         Ok(())
     }
 
+    /// Marks `id` as a session nobody answers prompts for.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] when the update fails.
+    pub async fn set_session_non_interactive(&self, id: &str) -> Result<(), ChatDbError> {
+        query!(
+            self.db,
+            "UPDATE sessions SET non_interactive = 1 WHERE id = ?",
+            id
+        )
+        .execute()
+        .await?;
+        Ok(())
+    }
+
     /// Get a session by ID.
     ///
     /// # Errors

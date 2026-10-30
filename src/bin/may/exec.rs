@@ -32,8 +32,6 @@ pub enum ExecError {
     InitializeSession(may_agent::session::SessionError),
     #[error("session '{0}' was not found")]
     SessionNotFound(String),
-    #[error("{0}")]
-    SessionLocked(#[from] may_agent::session::SessionOpenLockError),
     #[error("failed to load profile '{profile_id}': {source}")]
     LoadProfile {
         profile_id: String,
@@ -82,8 +80,6 @@ pub enum ExecError {
 struct ExecSessionContext {
     db: ChatDb,
     may_dir: std::path::PathBuf,
-    /// Held while the exec binds the session; released with the context.
-    _open_lock: may_agent::session::SessionOpenLock,
     session_id: SessionId,
     sandbox_dir: std::path::PathBuf,
     profile_environment: Option<ProfileEnvironment>,
@@ -288,17 +284,9 @@ async fn load_exec_session_context(session_id: &str) -> Result<ExecSessionContex
     )
     .await?;
 
-    let open_lock = may_agent::session::SessionOpenLock::acquire(
-        session_id,
-        store
-            .session_paths(session_id, profile_id.as_deref())
-            .root(),
-    )?;
-
     Ok(ExecSessionContext {
         db,
         may_dir,
-        _open_lock: open_lock,
         session_id: SessionId::from_string(session_id),
         sandbox_dir: store.sandbox_dir(session_id, profile_id.as_deref()),
         profile_environment,

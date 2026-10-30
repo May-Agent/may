@@ -151,18 +151,21 @@ trait ChatSink {
 struct HubSink {
     hub: Arc<hub::TurnHub>,
     session_id: String,
+    /// The user message of the run, shown by clients that did not send it.
+    content: Option<String>,
     seq: u64,
     turn_id: String,
 }
 
 impl HubSink {
-    fn new(state: &UiServerState, session_id: &str) -> Self {
+    fn new(state: &UiServerState, req: &ChatRequest) -> Self {
         // A turn moves the conversation past the idle agent's state.
-        state.parked_agents.evict(session_id);
-        state.turn_hub.begin_turn(session_id);
+        state.parked_agents.evict(&req.session_id);
+        state.turn_hub.begin_turn(&req.session_id);
         Self {
             hub: state.turn_hub.clone(),
-            session_id: session_id.to_string(),
+            session_id: req.session_id.clone(),
+            content: Some(req.content.clone()).filter(|content| !content.trim().is_empty()),
             seq: 1,
             turn_id: String::new(),
         }
@@ -265,7 +268,9 @@ impl ChatSink for HubSink {
                 assistant_id,
             },
         );
-        self.publish_agent(crate::client::SessionAgentBody::Start);
+        self.publish_agent(crate::client::SessionAgentBody::Start {
+            content: self.content.clone(),
+        });
         true
     }
 
@@ -1829,7 +1834,7 @@ async fn run_published_turn(
     req: ChatRequest,
     guard: SessionRunGuard,
 ) -> Result<(), crate::db::ChatDbError> {
-    let mut sink = HubSink::new(&state, &req.session_id);
+    let mut sink = HubSink::new(&state, &req);
     let result = run_agent_loop(&state, &req, &mut sink, &guard, true, true).await;
     let response_session_id = req.session_id.clone();
     match result {
@@ -1891,7 +1896,7 @@ async fn run_chat_collect_with_receiver(
     use_persisted_context_snapshot: bool,
     guard: &SessionRunGuard,
 ) -> Result<(), ChatCollectError> {
-    let mut sink = HubSink::new(&state, &req.session_id);
+    let mut sink = HubSink::new(&state, &req);
     let result = run_agent_loop(
         &state,
         &req,
@@ -2062,6 +2067,8 @@ struct SessionContext {
     sandbox_dir: std::path::PathBuf,
     /// Host directory the session works in.
     cwd: std::path::PathBuf,
+    /// Whether nobody answers this session's prompts.
+    non_interactive: bool,
     history_messages: Vec<LlmMessage>,
     context_snapshot: Option<crate::session::PersistedContextSnapshot>,
     hidden_context_xml: Option<String>,
@@ -2458,6 +2465,7 @@ async fn resolve_session_context(
         provider_candidate_count,
         sandbox_dir,
         cwd,
+        non_interactive: session.non_interactive,
         history_messages,
         context_snapshot,
         hidden_context_xml: (!hidden_context_parts.is_empty())
@@ -2832,11 +2840,16 @@ fn prepare_agent_for_request<'a>(
                 model: &ctx.current_model,
                 reasoning_effort: ctx.reasoning_effort,
                 profile_id: ctx.profile_id.clone(),
-                permission_approver: Some(
-                    state
+                permission_approver: Some({
+                    let approver = state
                         .permission_approver
-                        .for_session(ctx.session_id.as_str().to_string()),
-                ),
+                        .for_session(ctx.session_id.as_str().to_string());
+                    if ctx.non_interactive {
+                        approver.without_interactive_approval("restricted oneshot mode")
+                    } else {
+                        approver
+                    }
+                }),
                 profile_persona: ctx.profile_persona,
                 profile_memories: ctx.profile_memories,
                 plan_state: ctx.plan_state,

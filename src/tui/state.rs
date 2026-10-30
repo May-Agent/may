@@ -332,8 +332,13 @@ impl AskUserState {
 pub struct WorkspaceConfirmState {
     /// Persisted request id.
     pub request_id: String,
-    /// The request being confirmed.
-    pub request: WorkspaceRequest,
+    /// Directory the agent asks for.
+    pub path: String,
+    /// Why it asks.
+    pub reason: String,
+    /// The in-process request to answer; `None` when the agent runs in the
+    /// daemon, which holds the waiting request.
+    pub request: Option<WorkspaceRequest>,
 }
 
 /// Pending permission confirmation shown in the TUI.
