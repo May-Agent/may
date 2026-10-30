@@ -7,6 +7,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph},
 };
+use unicode_width::UnicodeWidthStr;
 
 use super::super::super::app::App;
 use super::super::super::state::{McpAddMode, SkillAddMode, SshAddMode};
@@ -170,6 +171,21 @@ pub(super) fn render_mcp_popup(frame: &mut Frame, area: Rect, app: &App) {
         .alignment(ratatui::layout::Alignment::Left);
 
     frame.render_widget(widget, popup_area);
+
+    // IME anchor on the `_` marker of the active `> {text}_` content row.
+    let caret = match app.mcp_add_mode {
+        McpAddMode::Name => Some((app.mcp_add_name.as_str(), 3)),
+        McpAddMode::Command => Some((app.mcp_add_command.as_str(), 5)),
+        McpAddMode::None => None,
+    };
+    if let Some((text, row)) = caret {
+        let caret_x =
+            popup_area.x + 3 + u16::try_from(UnicodeWidthStr::width(text)).unwrap_or(u16::MAX);
+        frame.set_cursor_position((
+            caret_x.min(popup_area.right().saturating_sub(2)),
+            popup_area.y + 1 + row,
+        ));
+    }
 }
 
 /// Render SSH server management popup.
@@ -290,6 +306,20 @@ pub(super) fn render_ssh_popup(frame: &mut Frame, area: Rect, app: &App) {
         .alignment(ratatui::layout::Alignment::Left);
 
     frame.render_widget(widget, popup_area);
+
+    let caret = match app.ssh_add_mode {
+        SshAddMode::Name => Some((app.ssh_add_name.as_str(), 3)),
+        SshAddMode::Target => Some((app.ssh_add_target.as_str(), 5)),
+        SshAddMode::None => None,
+    };
+    if let Some((text, row)) = caret {
+        let caret_x =
+            popup_area.x + 3 + u16::try_from(UnicodeWidthStr::width(text)).unwrap_or(u16::MAX);
+        frame.set_cursor_position((
+            caret_x.min(popup_area.right().saturating_sub(2)),
+            popup_area.y + 1 + row,
+        ));
+    }
 }
 
 /// Render the skill management popup.
@@ -338,6 +368,14 @@ pub(super) fn render_skill_popup(frame: &mut Frame, area: Rect, app: &App) {
                 ])
             };
             frame.render_widget(Paragraph::new(vec![search_line, Line::from("")]), chunks[0]);
+            let caret_x = chunks[0].x
+                + 8
+                + u16::try_from(UnicodeWidthStr::width(app.skill_search.as_str()))
+                    .unwrap_or(u16::MAX);
+            frame.set_cursor_position((
+                caret_x.min(chunks[0].right().saturating_sub(1)),
+                chunks[0].y,
+            ));
 
             // Render skill list
             let filtered = app.filtered_skills();
@@ -496,6 +534,14 @@ pub(super) fn render_skill_popup(frame: &mut Frame, area: Rect, app: &App) {
                 )),
             ];
             frame.render_widget(Paragraph::new(content), inner_area);
+            let caret_x = inner_area.x
+                + 2
+                + u16::try_from(UnicodeWidthStr::width(app.skill_github_input.as_str()))
+                    .unwrap_or(u16::MAX);
+            frame.set_cursor_position((
+                caret_x.min(inner_area.right().saturating_sub(1)),
+                inner_area.y + 3,
+            ));
         }
     }
 }
