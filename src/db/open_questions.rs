@@ -16,7 +16,7 @@ use crate::session::{PendingUserMessage, PersistedAskUserQuestion, PersistedAskU
 use super::common::{
     CommittedAnswerRow, CommittedDecisionRow, CommittedResponseLookup, CommittedSelectedOptionRow,
     PendingAskUserLookup, PendingAskUserQuestionOptionRow, PendingAskUserQuestionRow,
-    PendingAskUserRequestRow, PendingPermissionLookup, PendingWorkspaceLookup, overflow_error,
+    PendingAskUserRequestRow, PendingPermissionLookup, PendingWorkspaceLookup,
 };
 use super::{ChatDb, ChatDbError, query};
 
@@ -44,7 +44,7 @@ pub struct CommittedAskUserAnswer {
     pub delivered: bool,
 }
 
-fn history_questions(questions: &[PersistedAskUserQuestion]) -> Vec<Question> {
+pub(super) fn history_questions(questions: &[PersistedAskUserQuestion]) -> Vec<Question> {
     questions
         .iter()
         .map(|question| Question {
@@ -67,55 +67,22 @@ impl ChatDb {
         session_id: &str,
         request: &PersistedAskUserRequest,
     ) -> Result<(), ChatDbError> {
-        let now = jiff::Timestamp::now().to_string();
-        let mut tx = self.db.begin().await?;
-        query!(
-            tx,
-            "INSERT INTO session_pending_ask_user_requests_v2 (request_id, session_id, created_at, blocking) VALUES (?, ?, ?, 0)",
-            request.id.as_str(),
-            session_id,
-            now.as_str()
-        )
-        .execute()
-        .await?;
-        for (question_ordinal, question) in request.questions.iter().enumerate() {
-            let question_ordinal = i64::try_from(question_ordinal)
-                .map_err(|error| overflow_error("open question ordinal", &error))?;
-            query!(
-                tx,
-                "INSERT INTO session_pending_ask_user_questions_v2 (request_id, ordinal, section, question, multi_select) VALUES (?, ?, ?, ?, ?)",
-                request.id.as_str(),
-                question_ordinal,
-                question.section.as_str(),
-                question.question.as_str(),
-                question.multi_select
-            )
-            .execute()
-            .await?;
-            for (option_ordinal, option) in question.option.iter().enumerate() {
-                query!(
-                    tx,
-                    "INSERT INTO session_pending_ask_user_question_options_v2 (request_id, question_ordinal, option_ordinal, value) VALUES (?, ?, ?, ?)",
-                    request.id.as_str(),
-                    question_ordinal,
-                    i64::try_from(option_ordinal)
-                        .map_err(|error| overflow_error("open question option ordinal", &error))?,
-                    option.as_str()
-                )
-                .execute()
+        super::common::with_busy_retry(|| async {
+            let mut tx = self.db.begin().await?;
+            self.insert_pending_ask_user_in_tx(&mut tx, session_id, request, false)
                 .await?;
-            }
-        }
-        self.append_ask_user_request_message_in_tx(
-            &mut tx,
-            session_id,
-            request.id.as_str(),
-            &history_questions(&request.questions),
-            None,
-        )
-        .await?;
-        tx.commit().await?;
-        Ok(())
+            self.append_ask_user_request_message_in_tx(
+                &mut tx,
+                session_id,
+                request.id.as_str(),
+                &history_questions(&request.questions),
+                None,
+            )
+            .await?;
+            tx.commit().await?;
+            Ok(())
+        })
+        .await
     }
 
     /// Withdraw an open question of `session_id`. Returns whether it was
@@ -360,80 +327,83 @@ impl ChatDb {
         &self,
         request_id: &str,
         answers: &[QuestionAnswer],
-        delivery: Option<impl FnOnce(&PersistedAskUserRequest) -> PendingUserMessage>,
+        delivery: Option<impl Fn(&PersistedAskUserRequest) -> PendingUserMessage + Send + Sync>,
     ) -> Result<Option<CommittedAskUserAnswer>, ChatDbError> {
-        // The transaction opens with the delete so it takes the write lock
-        // up front rather than upgrading a read lock.
-        let mut tx = self.db.begin().await?;
-        let Some(pending) = query!(
-            tx,
-            "DELETE FROM session_pending_ask_user_requests_v2 WHERE request_id = ? RETURNING session_id, blocking",
-            request_id
-        )
-        .fetch_optional::<PendingAskUserLookup>()
-        .await?
-        else {
+        super::common::with_busy_retry(|| async {
+            // The transaction opens with the delete so it takes the write lock
+            // up front rather than upgrading a read lock.
+            let mut tx = self.db.begin().await?;
+            let Some(pending) = query!(
+                tx,
+                "DELETE FROM session_pending_ask_user_requests_v2 WHERE request_id = ? RETURNING session_id, blocking",
+                request_id
+            )
+            .fetch_optional::<PendingAskUserLookup>()
+            .await?
+            else {
+                tx.commit().await?;
+                return Ok(None);
+            };
+            let questions = query!(
+                tx,
+                "SELECT * FROM session_pending_ask_user_questions_v2 WHERE request_id = ? ORDER BY ordinal ASC",
+                request_id
+            )
+            .fetch_all::<PendingAskUserQuestionRow>()
+            .await?;
+            let options = query!(
+                tx,
+                "SELECT * FROM session_pending_ask_user_question_options_v2 WHERE request_id = ? ORDER BY question_ordinal ASC, option_ordinal ASC",
+                request_id
+            )
+            .fetch_all::<PendingAskUserQuestionOptionRow>()
+            .await?;
+            query!(
+                tx,
+                "DELETE FROM session_pending_ask_user_question_options_v2 WHERE request_id = ?",
+                request_id
+            )
+            .execute()
+            .await?;
+            query!(
+                tx,
+                "DELETE FROM session_pending_ask_user_questions_v2 WHERE request_id = ?",
+                request_id
+            )
+            .execute()
+            .await?;
+            let request = Self::persisted_ask_user_request_from_parts(
+                PendingAskUserRequestRow {
+                    request_id: request_id.to_string(),
+                },
+                questions,
+                options,
+            );
+            self.append_ask_user_response_message_in_tx(
+                &mut tx,
+                pending.session_id.as_str(),
+                request_id,
+                answers,
+                None,
+            )
+            .await?;
+            let delivered = if let Some(delivery) = &delivery {
+                let message = delivery(&request);
+                self.insert_pending_message_in_tx(&mut tx, pending.session_id.as_str(), &message)
+                    .await?;
+                true
+            } else {
+                false
+            };
             tx.commit().await?;
-            return Ok(None);
-        };
-        let questions = query!(
-            tx,
-            "SELECT * FROM session_pending_ask_user_questions_v2 WHERE request_id = ? ORDER BY ordinal ASC",
-            request_id
-        )
-        .fetch_all::<PendingAskUserQuestionRow>()
-        .await?;
-        let options = query!(
-            tx,
-            "SELECT * FROM session_pending_ask_user_question_options_v2 WHERE request_id = ? ORDER BY question_ordinal ASC, option_ordinal ASC",
-            request_id
-        )
-        .fetch_all::<PendingAskUserQuestionOptionRow>()
-        .await?;
-        query!(
-            tx,
-            "DELETE FROM session_pending_ask_user_question_options_v2 WHERE request_id = ?",
-            request_id
-        )
-        .execute()
-        .await?;
-        query!(
-            tx,
-            "DELETE FROM session_pending_ask_user_questions_v2 WHERE request_id = ?",
-            request_id
-        )
-        .execute()
-        .await?;
-        let request = Self::persisted_ask_user_request_from_parts(
-            PendingAskUserRequestRow {
-                request_id: request_id.to_string(),
-            },
-            questions,
-            options,
-        );
-        self.append_ask_user_response_message_in_tx(
-            &mut tx,
-            pending.session_id.as_str(),
-            request_id,
-            answers,
-            None,
-        )
-        .await?;
-        let delivered = if let Some(delivery) = delivery {
-            let message = delivery(&request);
-            self.insert_pending_message_in_tx(&mut tx, pending.session_id.as_str(), &message)
-                .await?;
-            true
-        } else {
-            false
-        };
-        tx.commit().await?;
-        Ok(Some(CommittedAskUserAnswer {
-            session_id: pending.session_id,
-            blocking: pending.blocking,
-            request,
-            delivered,
-        }))
+            Ok(Some(CommittedAskUserAnswer {
+                session_id: pending.session_id,
+                blocking: pending.blocking,
+                request,
+                delivered,
+            }))
+        })
+        .await
     }
 
     /// Delete every pending prompt and open question of `session_id`, and
