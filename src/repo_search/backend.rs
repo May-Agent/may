@@ -62,7 +62,11 @@ impl RepoSearchCollections {
 }
 
 impl CollectionBackend for RepoSearchCollections {
-    async fn upsert(&self, collection: &str, documents: Vec<Document>) -> Result<(), RepoSearchError> {
+    async fn upsert(
+        &self,
+        collection: &str,
+        documents: Vec<Document>,
+    ) -> Result<(), RepoSearchError> {
         if documents.is_empty() {
             return Ok(());
         }
@@ -91,7 +95,11 @@ impl CollectionBackend for RepoSearchCollections {
         }
     }
 
-    async fn search(&self, collection: &str, query: &str) -> Result<Vec<CollectionHit>, RepoSearchError> {
+    async fn search(
+        &self,
+        collection: &str,
+        query: &str,
+    ) -> Result<Vec<CollectionHit>, RepoSearchError> {
         let answer = match self
             .repo_search
             .client()
@@ -221,10 +229,7 @@ pub mod testing {
             collection: &str,
             query: &str,
         ) -> Result<Vec<CollectionHit>, RepoSearchError> {
-            let words: Vec<String> = query
-                .split_whitespace()
-                .map(str::to_lowercase)
-                .collect();
+            let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
             let collections = self.collections.lock().expect("collections lock");
             let Some(docs) = collections.get(collection) else {
                 return Ok(Vec::new());

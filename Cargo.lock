@@ -5436,6 +5436,7 @@ dependencies = [
  "shell-words",
  "similar",
  "skyzen",
+ "skyzen-core",
  "skyzen-services",
  "streamdown-parser",
  "syntect",

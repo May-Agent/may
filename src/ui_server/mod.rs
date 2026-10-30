@@ -27,8 +27,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::Mutex;
-
 use anyhow::{Context, anyhow};
 #[cfg(feature = "ui")]
 use skyzen::EmbeddedStaticDir;
@@ -48,6 +46,7 @@ use types::{
     RequestLogCacheSummary, RequestLogEntry, RequestLogsResponse,
 };
 
+pub use chat::{BtwMessage, BtwRequest, BtwResponse, CompactResponse, ContextDumpResponse};
 pub use types::DaemonHealth;
 
 #[cfg(feature = "ui")]
@@ -287,8 +286,10 @@ pub(crate) async fn start(mode: UiServerMode) -> anyhow::Result<StartedServer> {
         search_index_wake,
         search_index_status: crate::repo_search::indexer::IndexerStatus::default(),
         daemon_shutdown: Arc::new(tokio::sync::Notify::new()),
-        build_id: crate::daemon::current_build_id().context("failed to identify the running build")?,
-        session_open_locks: Mutex::new(std::collections::HashMap::new()),
+        build_id: crate::daemon::current_build_id()
+            .context("failed to identify the running build")?,
+        turn_hub: Arc::new(chat::TurnHub::default()),
+        parked_agents: chat::ParkedAgents::default(),
     });
 
     chat::resume_pending_follow_up_runs(state.clone())
@@ -328,7 +329,7 @@ fn api_routes() -> Route {
         browser_offer, browser_resize_viewport, browser_start, browser_status, browser_stop,
         browser_takeover_start, browser_takeover_stop,
     };
-    use chat::{chat_stream, enqueue_chat, remove_pending_message, stop_session_run};
+    use chat::{enqueue_chat, remove_pending_message, send_message, stop_session_run};
     use config::{
         add_mcp_server, add_ssh_server, copilot_logout, copilot_start, copilot_status,
         copilot_stream, delete_skill, get_memory, get_ui_config, install_skill, list_mcp_servers,
@@ -398,6 +399,14 @@ fn api_routes() -> Route {
                         "/artifacts/local-url-map".post(map_container_local_url),
                     )),
                     Route::new((
+                        "/messages".post(send_message),
+                        "/compact".post(chat::compact_session),
+                        "/context-report".at(chat::context_report),
+                        "/context-dump".post(chat::context_dump),
+                        "/btw".post(chat::btw),
+                        "/agent".delete(chat::release_agent),
+                    )),
+                    Route::new((
                         "/artifacts/runtime/preview".at(get_artifact_runtime_preview),
                         "/artifacts/stream".at(stream_session_artifacts),
                         "/artifacts/diagnostics".post(report_artifact_diagnostics),
@@ -425,10 +434,7 @@ fn api_routes() -> Route {
                 "/{id}".put(update_folder),
                 "/{id}".delete(delete_folder),
             ))),
-            "/chat".route(Route::new((
-                "/stream".post(chat_stream),
-                "/enqueue".post(enqueue_chat),
-            ))),
+            "/chat".route(Route::new(("/enqueue".post(enqueue_chat),))),
             "/permissions".route(Route::new(("/respond".post(respond_permission_request),))),
             "/workspace".route(Route::new(("/respond".post(respond_workspace_request),))),
             "/ask-user".route(Route::new(("/respond".post(respond_ask_user_request),))),

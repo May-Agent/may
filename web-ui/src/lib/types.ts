@@ -188,7 +188,7 @@ export interface ChatRequestPayload {
   deliveryMode?: PendingUserMessageMode;
 }
 
-// ── SSE events on /api/chat/stream ──────────────────────────
+// ── Turn events: `session_turn` frames on /api/events ───────
 
 export interface SseStart {
   kind: 'start';
@@ -292,6 +292,23 @@ export interface SseDone {
   assistant: ApiMessage;
 }
 
+/** The turn paused for a browser takeover; carries the partial reply. */
+export interface SsePaused {
+  kind: 'paused';
+  seq: number;
+  turnId: string;
+  sessionId: string;
+  assistant: ApiMessage;
+}
+
+/** Last event of every turn, however it ended. */
+export interface SseEnd {
+  kind: 'end';
+  seq: number;
+  turnId: string;
+  outcome: 'completed' | 'paused' | 'cancelled' | 'failed';
+}
+
 export interface SsePing {
   kind: 'ping';
   seq: number;
@@ -316,6 +333,8 @@ export type ChatStreamEvent =
   | SseTodoUpdate
   | SseError
   | SseDone
+  | SsePaused
+  | SseEnd
   | SsePing
   | SseSpeed;
 

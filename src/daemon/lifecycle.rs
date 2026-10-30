@@ -139,10 +139,16 @@ pub fn install(paths: &DaemonPaths) -> Result<PathBuf, LifecycleError> {
         .render()?;
         let domain = format!("gui/{}", uid()?);
         if path.exists() {
-            let _ = run("launchctl", &["bootout", &domain, &path.display().to_string()]);
+            let _ = run(
+                "launchctl",
+                &["bootout", &domain, &path.display().to_string()],
+            );
         }
         std::fs::write(&path, plist)?;
-        run("launchctl", &["bootstrap", &domain, &path.display().to_string()])?;
+        run(
+            "launchctl",
+            &["bootstrap", &domain, &path.display().to_string()],
+        )?;
         Ok(path)
     } else {
         let path = systemd_unit_path()?;
@@ -166,7 +172,10 @@ pub fn uninstall() -> Result<Option<PathBuf>, LifecycleError> {
             return Ok(None);
         }
         let domain = format!("gui/{}", uid()?);
-        let _ = run("launchctl", &["bootout", &domain, &path.display().to_string()]);
+        let _ = run(
+            "launchctl",
+            &["bootout", &domain, &path.display().to_string()],
+        );
         std::fs::remove_file(&path)?;
         Ok(Some(path))
     } else {

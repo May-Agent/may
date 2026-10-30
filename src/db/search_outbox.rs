@@ -124,9 +124,13 @@ impl ChatDb {
     /// # Errors
     /// Returns [`ChatDbError`] when the delete fails.
     pub async fn clear_search_outbox(&self, through_id: i64) -> Result<(), ChatDbError> {
-        query!(self.db, "DELETE FROM search_outbox WHERE id <= ?", through_id)
-            .execute()
-            .await?;
+        query!(
+            self.db,
+            "DELETE FROM search_outbox WHERE id <= ?",
+            through_id
+        )
+        .execute()
+        .await?;
         Ok(())
     }
 
@@ -135,12 +139,16 @@ impl ChatDb {
     ///
     /// # Errors
     /// Returns [`ChatDbError`] when the query fails.
-    pub async fn indexed_messages(&self, ids: &[i64]) -> Result<Vec<IndexedMessageRow>, ChatDbError> {
+    pub async fn indexed_messages(
+        &self,
+        ids: &[i64],
+    ) -> Result<Vec<IndexedMessageRow>, ChatDbError> {
         if ids.is_empty() {
             return Ok(Vec::new());
         }
-        let ids = serde_json::to_string(ids)
-            .map_err(|error| ChatDbError::Storage(super::db_custom_error("encode message ids: ", &error)))?;
+        let ids = serde_json::to_string(ids).map_err(|error| {
+            ChatDbError::Storage(super::db_custom_error("encode message ids: ", &error))
+        })?;
         Ok(query!(
             self.db,
             "SELECT m.id AS message_id, m.session_id, m.role, m.content, m.timestamp, \

@@ -15,11 +15,10 @@ use hyper::body::{Frame, Incoming};
 use hyper_util::rt::TokioIo;
 use skyzen::extract::PeerAddr;
 use skyzen::routing::Router;
-use skyzen::{BodyError, HttpError as _};
+use skyzen::BodyError;
 
-type ResponseBody = StreamBody<
-    futures_util::stream::MapOk<skyzen::Body, fn(bytes::Bytes) -> Frame<bytes::Bytes>>,
->;
+type ResponseBody =
+    StreamBody<futures_util::stream::MapOk<skyzen::Body, fn(bytes::Bytes) -> Frame<bytes::Bytes>>>;
 
 fn into_frame(bytes: bytes::Bytes) -> Frame<bytes::Bytes> {
     Frame::data(bytes)
@@ -43,20 +42,8 @@ async fn handle(
     let response = match router.go(request).await {
         Ok(response) => response,
         Err(error) => {
-            let status = error.status();
-            if status.is_server_error() {
-                tracing::error!(method = %method, %path, %status, error = %error, "request failed");
-            } else {
-                tracing::debug!(method = %method, %path, %status, error = %error, "request refused");
-            }
-            let message = if status.is_server_error() {
-                "Internal server error".to_string()
-            } else {
-                error.to_string()
-            };
-            let mut response = skyzen::Response::new(skyzen::Body::from(message));
-            *response.status_mut() = status;
-            response
+            skyzen_core::log_endpoint_error(&error, &method, path.as_str());
+            skyzen_core::error_response(&error)
         }
     };
     Ok(response.map(|body| StreamBody::new(body.map_ok(into_frame as fn(_) -> _))))
@@ -67,9 +54,8 @@ where
     IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        let service = hyper::service::service_fn(move |request| {
-            handle(router.clone(), peer, request)
-        });
+        let service =
+            hyper::service::service_fn(move |request| handle(router.clone(), peer, request));
         if let Err(error) = hyper::server::conn::http1::Builder::new()
             .serve_connection(TokioIo::new(io), service)
             .with_upgrades()

@@ -6,8 +6,10 @@
 //! local, so a connection costs microseconds.
 
 mod sse;
+mod wire;
 
 pub use sse::{ServerEvent, SseParser};
+pub use wire::{RunEnd, SessionAgentBody, SessionAgentFrame, WireAgentError, WireAgentEvent};
 
 use std::path::PathBuf;
 

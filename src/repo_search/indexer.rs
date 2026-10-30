@@ -187,7 +187,9 @@ pub struct IndexerStatus {
 }
 
 /// Point-in-time indexer state.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema,
+)]
 #[serde(rename_all = "camelCase")]
 pub struct IndexerSnapshot {
     /// Outbox entries not yet in repo-search.

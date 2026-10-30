@@ -1365,15 +1365,57 @@ struct TestSseEvent {
     data: String,
 }
 
-/// Drain a chat SSE response into `(event kind, parsed data)` pairs until the
-/// turn finishes (`done`/`paused`/`error`) or the server closes the stream.
+/// Starts a turn the way every client does: subscribes to the session's
+/// `session_turn` frames on `/api/events`, then `POST`s the message. Returns
+/// the event stream, or the refused `POST`'s response.
+async fn send_turn(
+    client: &reqwest::Client,
+    base_url: &str,
+    body: &Value,
+) -> reqwest::Result<reqwest::Response> {
+    let session_id = body
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .expect("turn body names its session")
+        .to_string();
+    let events = client
+        .get(format!("{base_url}/api/events"))
+        .query(&[
+            ("topics", "session_turn"),
+            ("sessionId", session_id.as_str()),
+        ])
+        .send()
+        .await?;
+    let sent = client
+        .post(format!("{base_url}/api/sessions/{session_id}/messages"))
+        .json(body)
+        .send()
+        .await?;
+    if sent.status().is_success() {
+        Ok(events)
+    } else {
+        Ok(sent)
+    }
+}
+
+/// Drain a session's `session_turn` frames into `(event kind, parsed data)`
+/// pairs until the turn finishes (`done`/`paused`/`error`/`end`) or the
+/// server closes the stream.
 async fn collect_sse_events(response: reqwest::Response) -> Vec<(String, Value)> {
     let mut reader = SseReader::new(response);
     let mut events = Vec::new();
     while let Some(event) = reader.next_event().await {
-        let data: Value = serde_json::from_str(&event.data).unwrap_or(Value::Null);
-        let kind = event.event;
-        let finished = matches!(kind.as_str(), "done" | "paused" | "error");
+        if event.event != "session_turn" {
+            continue;
+        }
+        let frame: Value = serde_json::from_str(&event.data).unwrap_or(Value::Null);
+        let kind = frame
+            .get("event")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let data = frame.get("data").cloned().unwrap_or(Value::Null);
+        let finished = matches!(kind.as_str(), "done" | "paused" | "error" | "end");
         events.push((kind, data));
         if finished {
             break;
@@ -2069,15 +2111,16 @@ async fn ui_chat_tasks_file_is_the_canonical_todo_document() {
     let sandbox_dir = SessionStore::new(MayHomePaths::new(harness.may_dir.clone()))
         .sandbox_dir(&session_id, Some(environment.profile_id()));
 
-    let response = client
-        .post(format!("{}/api/chat/stream", server.base_url))
-        .json(&serde_json::json!({
+    let response = send_turn(
+        &client,
+        &server.base_url,
+        &serde_json::json!({
             "sessionId": session_id,
             "content": "Plan the work in tasks.md."
-        }))
-        .send()
-        .await
-        .expect("chat stream request should succeed");
+        }),
+    )
+    .await
+    .expect("chat stream request should succeed");
     let response = expect_status(&server.log, response, StatusCode::OK).await;
     let events = collect_turn_events(response, "the first tasks turn", &server.log).await;
     assert!(
@@ -2145,15 +2188,16 @@ async fn ui_chat_tasks_file_is_the_canonical_todo_document() {
 
     // A follow-up turn proves the injection reads the file: the rewritten
     // content shows up in the next model request.
-    let response = client
-        .post(format!("{}/api/chat/stream", server.base_url))
-        .json(&serde_json::json!({
+    let response = send_turn(
+        &client,
+        &server.base_url,
+        &serde_json::json!({
             "sessionId": session_id,
             "content": "Continue."
-        }))
-        .send()
-        .await
-        .expect("second chat stream request should succeed");
+        }),
+    )
+    .await
+    .expect("second chat stream request should succeed");
     let response = expect_status(&server.log, response, StatusCode::OK).await;
     let events = collect_turn_events(response, "the follow-up tasks turn", &server.log).await;
     assert!(
@@ -2228,15 +2272,16 @@ async fn run_probe_turn(
     let sandbox_dir = SessionStore::new(MayHomePaths::new(harness.may_dir.clone()))
         .sandbox_dir(&session_id, Some(environment.profile_id()));
 
-    let response = client
-        .post(format!("{}/api/chat/stream", server.base_url))
-        .json(&serde_json::json!({
+    let response = send_turn(
+        &client,
+        &server.base_url,
+        &serde_json::json!({
             "sessionId": session_id,
             "content": content
-        }))
-        .send()
-        .await
-        .expect("chat stream request should succeed");
+        }),
+    )
+    .await
+    .expect("chat stream request should succeed");
     let response = expect_status(&server.log, response, StatusCode::OK).await;
     let events = collect_turn_events(response, "the subagent probe turn", &server.log).await;
     assert!(
@@ -2652,15 +2697,16 @@ async fn stream_stop_mid_response_persists_partial_assistant_text(environment: C
         let log = server.log.clone();
         let session_id = session_id.clone();
         async move {
-            let response = client
-                .post(format!("{base_url}/api/chat/stream"))
-                .json(&serde_json::json!({
+            let response = send_turn(
+                &client,
+                &base_url,
+                &serde_json::json!({
                     "sessionId": session_id,
                     "content": "Say several chunks slowly."
-                }))
-                .send()
-                .await
-                .expect("chat stream request should succeed");
+                }),
+            )
+            .await
+            .expect("chat stream request should succeed");
             let response = expect_status(&log, response, StatusCode::OK).await;
             collect_sse_events(response).await
         }
@@ -2761,15 +2807,16 @@ async fn terminal_and_terminal_input_round_trip(environment: ChatEnvironment) {
         let log = server.log.clone();
         let session_id = session_id.clone();
         async move {
-            let response = client
-                .post(format!("{base_url}/api/chat/stream"))
-                .json(&serde_json::json!({
+            let response = send_turn(
+                &client,
+                &base_url,
+                &serde_json::json!({
                     "sessionId": session_id,
                     "content": "Please ask the terminal for my name and answer with the result."
-                }))
-                .send()
-                .await
-                .expect("chat stream request should succeed");
+                }),
+            )
+            .await
+            .expect("chat stream request should succeed");
             let response = expect_status(&log, response, StatusCode::OK).await;
             collect_sse_events(response).await
         }
@@ -2921,15 +2968,16 @@ async fn chat_turns_on_one_session_prepare_tools_once(environment: ChatEnvironme
         ),
         ("Second turn.", Duration::from_secs(60)),
     ] {
-        let response = client
-            .post(format!("{}/api/chat/stream", server.base_url))
-            .json(&serde_json::json!({
+        let response = send_turn(
+            &client,
+            &server.base_url,
+            &serde_json::json!({
                 "sessionId": session_id,
                 "content": content
-            }))
-            .send()
-            .await
-            .expect("chat stream request should succeed");
+            }),
+        )
+        .await
+        .expect("chat stream request should succeed");
         let status = response.status();
         assert!(
             status == StatusCode::OK,
@@ -3189,15 +3237,16 @@ async fn ui_chat_reports_unreachable_provider_error() {
         .await;
     let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
 
-    let response = client
-        .post(format!("{}/api/chat/stream", server.base_url))
-        .json(&serde_json::json!({
+    let response = send_turn(
+        &client,
+        &server.base_url,
+        &serde_json::json!({
             "sessionId": session_id,
             "content": "Is anyone there?"
-        }))
-        .send()
-        .await
-        .expect("chat stream request should succeed");
+        }),
+    )
+    .await
+    .expect("chat stream request should succeed");
     assert_eq!(
         response.status(),
         StatusCode::OK,
@@ -3436,15 +3485,16 @@ async fn ask_user_after_the_run_ended_delivers_the_answer_to_a_new_run() {
         .await;
     let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
 
-    let response = client
-        .post(format!("{}/api/chat/stream", server.base_url))
-        .json(&serde_json::json!({
+    let response = send_turn(
+        &client,
+        &server.base_url,
+        &serde_json::json!({
             "sessionId": session_id,
             "content": "Pick a database."
-        }))
-        .send()
-        .await
-        .expect("chat stream request should succeed");
+        }),
+    )
+    .await
+    .expect("chat stream request should succeed");
     let response = expect_status(&server.log, response, StatusCode::OK).await;
     let events = collect_turn_events(response, "the asking turn", &server.log).await;
     assert!(
@@ -3525,15 +3575,16 @@ async fn ask_user_answered_mid_run_reaches_the_next_request_of_that_run() {
         .await;
     let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
 
-    let response = client
-        .post(format!("{}/api/chat/stream", server.base_url))
-        .json(&serde_json::json!({
+    let response = send_turn(
+        &client,
+        &server.base_url,
+        &serde_json::json!({
             "sessionId": session_id,
             "content": "Pick a database."
-        }))
-        .send()
-        .await
-        .expect("chat stream request should succeed");
+        }),
+    )
+    .await
+    .expect("chat stream request should succeed");
     let response = expect_status(&server.log, response, StatusCode::OK).await;
 
     tokio::time::timeout(Duration::from_secs(60), gate.arrived.notified())

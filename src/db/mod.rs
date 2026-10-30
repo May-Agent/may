@@ -35,12 +35,12 @@ pub use common::{
     StoredSessionContextSnapshot, UpdateProfileParams, UpdateScheduledTaskParams,
 };
 pub use context_snapshot::ContextDebugSnapshotWrite;
-pub use message::MessageMeta;
 pub use issue_search::IssueSearchDoc;
-pub use repo_usage::RepoUsage;
-pub use search_outbox::{IndexedMessageRow, SearchOutboxEntry};
+pub use message::MessageMeta;
 pub use open_questions::{CommittedAskUserAnswer, PendingAskUserQuestion};
+pub use repo_usage::RepoUsage;
 pub use run_lease::RunFence;
+pub use search_outbox::{IndexedMessageRow, SearchOutboxEntry};
 
 use common::{
     AskUserRequestMessageRow, AskUserRequestQuestionOptionRow, AskUserRequestQuestionRow,
@@ -106,6 +106,11 @@ impl ChatDb {
 
         if !existing.contains("reasoning_effort") {
             query!(db, "ALTER TABLE sessions ADD COLUMN reasoning_effort TEXT")
+                .execute()
+                .await?;
+        }
+        if !existing.contains("cwd") {
+            query!(db, "ALTER TABLE sessions ADD COLUMN cwd TEXT")
                 .execute()
                 .await?;
         }

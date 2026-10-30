@@ -19,8 +19,8 @@ use crate::agent::register_tool::{RegisterBroker, RegisterTool, Skills, Subagent
 use crate::agent::session_tool::SessionTool;
 use crate::agent::subagent_tracker::{SubagentTracker, TrackedSubagentTool, UsageObservedModel};
 use crate::agent::task_tool::{TaskBroker, TaskRuntimeKind, TaskTool};
-use crate::mcp::load_active_mcp_connections;
 use crate::issue::search::IssueSearch;
+use crate::mcp::load_active_mcp_connections;
 use crate::repo_search::indexer::SearchIndexer;
 use crate::repo_search::{CodeSearchTool, RepoSearch, RepoSearchCollections};
 use crate::workspace_request::{RequestWorkspaceTool, WorkspaceRequestBroker};

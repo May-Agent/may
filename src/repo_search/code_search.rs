@@ -169,9 +169,9 @@ impl CodeSearchTool {
             Final::Indexed { with_vector, total } => Ok(IndexedView { with_vector, total }
                 .render()
                 .map_err(render_error)?),
-            Final::Collection(_) | Final::Error(_) => {
-                Err(RepoSearchError::Client(ClientError::Protocol("unexpected answer")))
-            }
+            Final::Collection(_) | Final::Error(_) => Err(RepoSearchError::Client(
+                ClientError::Protocol("unexpected answer"),
+            )),
         }
     }
 }
@@ -265,7 +265,10 @@ mod tests {
     #[test]
     fn status_and_index_are_actions() {
         assert!(matches!(
-            request_for(&args(serde_json::json!({"query": "status"})), PathBuf::from("/r")),
+            request_for(
+                &args(serde_json::json!({"query": "status"})),
+                PathBuf::from("/r")
+            ),
             Request::Status { .. }
         ));
         assert!(matches!(

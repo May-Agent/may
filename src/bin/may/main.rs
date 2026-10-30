@@ -1918,6 +1918,11 @@ mod tests {
 
 /// `may ui`: make sure the daemon runs, then open its web UI.
 async fn open_web_ui() -> anyhow::Result<()> {
+    if !cfg!(feature = "ui") {
+        anyhow::bail!(
+            "`may ui` requires the `ui` cargo feature; use `may rest` for the REST API server"
+        );
+    }
     let paths = may_agent::daemon::DaemonPaths::user()?;
     may_agent::daemon::lifecycle::ensure_running(&paths, |line| eprintln!("{line}")).await?;
     let config = may_agent::config::MayConfig::load().await?;
@@ -1942,7 +1947,10 @@ async fn run_daemon_command(command: cli::DaemonCommand) -> anyhow::Result<()> {
         cli::DaemonCommand::Run => may_agent::daemon::run_daemon(DaemonOptions::new()).await,
         cli::DaemonCommand::Install => {
             let path = lifecycle::install(&paths)?;
-            eprintln!("Installed the May daemon as a login service: {}", path.display());
+            eprintln!(
+                "Installed the May daemon as a login service: {}",
+                path.display()
+            );
             Ok(())
         }
         cli::DaemonCommand::Uninstall => {
@@ -1967,7 +1975,11 @@ async fn run_daemon_command(command: cli::DaemonCommand) -> anyhow::Result<()> {
                     println!("May daemon running (pid {}).", health.pid);
                     println!(
                         "Login service: {}.",
-                        if lifecycle::installed() { "installed" } else { "not installed" }
+                        if lifecycle::installed() {
+                            "installed"
+                        } else {
+                            "not installed"
+                        }
                     );
                     println!(
                         "Search index: {} change(s) pending{}.",
