@@ -87,6 +87,9 @@ enum MockChatScenario {
 #[derive(Clone)]
 struct SubagentProbe {
     setup: &'static str,
+    /// Model selection flags on the launch line — `--model fast` picks the
+    /// tier outright; empty leaves the choice to the router request.
+    model_flags: &'static str,
     grant_flags: &'static str,
     child_script: &'static str,
     final_script: &'static str,
@@ -467,6 +470,16 @@ impl MockScenarioState {
                 self.request_index
             ));
         }
+        // A launch with no model flag asks the fast model which tier fits
+        // the prompt first; answer the routing request, then the launch
+        // continues on the routed model.
+        if is_routing_request(request) {
+            self.request_index += 1;
+            return Ok(MockHttpResponse::sse(text_stream_frames(
+                vec!["{\"model\": \"fast\"}".to_string()],
+                Duration::from_millis(10),
+            )));
+        }
         let is_child = is_subagent_request(request);
         if !is_child {
             verify_native_tool_surface(request)?;
@@ -505,8 +518,9 @@ impl MockScenarioState {
             match latest {
                 None => {
                     let launch = format!(
-                        "( {setup}\nprintf '{SUBAGENT_PROBE_MARKER}: run the probe.\\n' > prompt.md\nsubagent start explore prompt.md --model fast {flags} ) > sub.out 2>&1; touch sub.done",
+                        "( {setup}\nprintf '{SUBAGENT_PROBE_MARKER}: run the probe.\\n' > prompt.md\nsubagent start explore prompt.md{model_flags} {flags} ) > sub.out 2>&1; touch sub.done",
                         setup = probe.setup,
+                        model_flags = probe.model_flags,
                         flags = probe.grant_flags,
                     );
                     terminal_call("terminal_background", &id, &launch)
@@ -2237,6 +2251,25 @@ async fn run_probe_turn(
     (files, mock)
 }
 
+/// Whether a model request is the routing request a launch with no model
+/// flag sends first: the router's system prompt wrapped around the same
+/// prompt file the child will read, so it also carries the marker.
+fn is_routing_request(request: &Value) -> bool {
+    let routed = request
+        .get("messages")
+        .and_then(Value::as_array)
+        .is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message.get("role").and_then(Value::as_str) == Some("system")
+                    && message
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|content| content.contains("You route a subagent task"))
+            })
+        });
+    routed && is_subagent_request(request)
+}
+
 /// Whether a model request is the subagent's: its first user message is the
 /// prompt file, which carries [`SUBAGENT_PROBE_MARKER`]. Notices the main agent
 /// receives later may quote the marker, so only the first user message counts.
@@ -2385,6 +2418,7 @@ const CHILD_COMMIT: &str = "cd ../../wt && echo x > f.txt && echo WROTE_FILE && 
 async fn subagent_cannot_write_tasks_md_but_the_main_agent_can() {
     let (files, mock) = run_subagent_probe(SubagentProbe {
         setup: "printf -- '- [x] original\\n' > tasks.md",
+        model_flags: " --model fast",
         grant_flags: "",
         child_script: "printf -- '- [x] hacked\\n' >> ../../tasks.md; echo CHILD_RC=$?",
         final_script: "cp tasks.md tasks.before; printf -- '- [x] original\\n- [x] main wrote\\n' > tasks.md; echo MAIN_FINAL",
@@ -2414,6 +2448,7 @@ async fn subagent_cannot_write_tasks_md_but_the_main_agent_can() {
 async fn subagent_without_a_commit_grant_cannot_commit_in_a_worktree() {
     let (files, mock) = run_subagent_probe(SubagentProbe {
         setup: WORKTREE_SETUP,
+        model_flags: " --model fast",
         grant_flags: "--worktrees \"$PWD/wt\"",
         child_script: CHILD_COMMIT,
         final_script: WORKTREE_FINAL,
@@ -2442,11 +2477,47 @@ async fn subagent_without_a_commit_grant_cannot_commit_in_a_worktree() {
     );
 }
 
+/// A launch with no `--model` asks the fast model which tier fits before the
+/// child starts — the routed path is what overflows the tokio worker's
+/// default 512 KiB stack on macOS without a configured worker stack.
+#[tokio::test]
+#[serial]
+async fn subagent_without_a_model_flag_is_routed_then_runs() {
+    let (files, mock) = run_subagent_probe(SubagentProbe {
+        setup: ":",
+        model_flags: "",
+        grant_flags: "",
+        child_script: "echo CHILD_RC=0",
+        final_script: "echo MAIN_FINAL",
+    })
+    .await;
+
+    let requests = mock.agent_requests().await;
+    assert!(
+        requests.iter().any(is_routing_request),
+        "no routing request reached the mock: {requests:?}"
+    );
+    let outputs = child_probe_outputs(&mock).await;
+    assert_eq!(
+        child_exit_code(&outputs),
+        0,
+        "the routed subagent's probe must succeed: {outputs:?}"
+    );
+    assert!(
+        files
+            .get("sub.out")
+            .contains("Subagent 'explore' completed"),
+        "the routed launch must report completion: {}",
+        files.get("sub.out")
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn subagent_with_a_commit_grant_commits_and_the_main_agent_gets_the_listing() {
     let (files, mock) = run_subagent_probe(SubagentProbe {
         setup: WORKTREE_SETUP,
+        model_flags: " --model fast",
         grant_flags: "--commit-worktrees \"$PWD/wt\"",
         child_script: CHILD_COMMIT,
         final_script: WORKTREE_FINAL,
