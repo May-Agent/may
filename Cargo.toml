@@ -31,6 +31,11 @@ aither-mcp = { git = "https://github.com/lexoliu/aither", branch = "dev" }
 aither-browser = { git = "https://github.com/lexoliu/aither", branch = "dev" }
 aither-search = { git = "https://github.com/lexoliu/aither", branch = "dev" }
 
+# repo-search daemon client; its version must match the pinned daemon
+# release in `src/tools/host-programs.json`.
+repo-search-client = { version = "0.0.4", features = ["launcher"] }
+async-lock = "3"
+
 # Container runtime (Docker/OrbStack/Podman)
 bollard = "0.21"
 tar = "0.4"
