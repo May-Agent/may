@@ -675,6 +675,6 @@ mod tests {
         );
         // Inline images render as a link — no reserved rows, so no overlay
         // position is registered.
-        assert!(md.image_positions().is_empty());
+        assert_eq!(md.image_positions(), []);
     }
 }
