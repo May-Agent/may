@@ -739,7 +739,6 @@ where
                             .push_error(&format!("Context report failed: {err}"));
                     }
                     Some(TuiEvent::ContextDump(Ok(dump))) => {
-                        let block_count = dump.blocks.len();
                         let message_count = dump.messages.len();
                         let text = dump.render();
                         let dir = app.session_manager.current().map(|session| {
@@ -756,7 +755,7 @@ where
                                 match write {
                                     Ok(()) => {
                                         app.chat.push_notice(&format!(
-                                            "Context dump written to {} — {block_count} blocks, {message_count} messages",
+                                            "Context dump written to {} — {message_count} messages",
                                             path.display(),
                                         ));
                                         app.scroll = usize::MAX;
