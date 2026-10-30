@@ -48,6 +48,7 @@ struct EventSignatures {
     session_runtimes: String,
     profile_sessions: String,
     remote_access: String,
+    session_background: String,
 }
 
 pub(super) async fn stream_events(
@@ -323,6 +324,39 @@ async fn emit_topics_if_changed(
         && !emit_remote_access_if_changed(state, sender, &mut signatures.remote_access).await
     {
         return false;
+    }
+    if topics.contains(UiEventTopics::SESSION_BACKGROUND)
+        && !emit_session_background_if_changed(
+            state,
+            sender,
+            session_filter,
+            &mut signatures.session_background,
+        )
+        .await
+    {
+        return false;
+    }
+    true
+}
+
+/// The filtered session's background jobs and subagent runs.
+async fn emit_session_background_if_changed(
+    state: &Arc<UiServerState>,
+    sender: &skyzen::responder::sse::Sender,
+    session_filter: Option<&str>,
+    last_sig: &mut String,
+) -> bool {
+    let Some(session_id) = session_filter else {
+        return true;
+    };
+    let payload = state.session_background.snapshot(session_id).await;
+    if let Ok(sig) = serde_json::to_string(&payload)
+        && sig != *last_sig
+    {
+        if !send_event(sender, "session_background", &payload).await {
+            return false;
+        }
+        *last_sig = sig;
     }
     true
 }

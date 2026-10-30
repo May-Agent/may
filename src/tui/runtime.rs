@@ -1079,10 +1079,9 @@ impl RuntimeDeps {
     ) {
         app.set_current_model(build.model());
         app.worker_settings = build.settings().clone();
-        app.job_registry = new_worker.job_registry().cloned();
-        app.subagent_runs = new_worker.subagent_runs().cloned();
+        app.background = new_worker.background().cloned();
         app.btw_llm = new_worker.btw_llm().cloned();
-        app.subagent_tracker = new_worker.subagent_tracker().clone();
+        app.refresh_jobs();
         *worker = Some(new_worker);
     }
 
@@ -1334,6 +1333,7 @@ impl RuntimeDeps {
         let db = app.session_manager.db().clone();
         let cwd = app.cwd.display().to_string();
         let model_id = model.as_str().to_string();
+        let app_events = app.event_tx.clone();
         let task = spawn(async move {
             let effort = reasoning_effort.map(|effort| match effort {
                 ReasoningEffort::Low => "low",
@@ -1354,6 +1354,7 @@ impl RuntimeDeps {
             Ok(crate::tui::remote::spawn_remote_worker(
                 client,
                 session_id.as_str().to_string(),
+                app_events,
             ))
         });
         PendingWorkerBuild {
@@ -2014,6 +2015,7 @@ async fn build_worker_for_session(
             tool_distribution: deps.tool_distribution.clone(),
             tool_environments: deps.tool_environments.clone(),
             provider_attempt: 0,
+            subagents: None,
         },
     ))
     .await?;

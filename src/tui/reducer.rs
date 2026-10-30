@@ -32,20 +32,8 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
                 // output + file-diff previews.
                 app.poll_live_output();
             }
-            // Live-refresh the jobs list once per second while the panel is
-            // open — and while anything runs in the background so the status
-            // bar reflects it. Also refresh while the agent processes so
-            // live-output binding sees fresh jobs.
-            let jobs_wanted = matches!(app.mode, AppMode::Jobs | AppMode::JobDetail(_))
-                || app.processing
-                || app.has_running_background();
-            if jobs_wanted
-                && app
-                    .jobs_refreshed
-                    .is_none_or(|t| t.elapsed().as_secs() >= 1)
-            {
-                app.refresh_jobs();
-            }
+            // The jobs list and subagent runs arrive as `session_background`
+            // events while anything runs; nothing to poll for them here.
             // Same cadence for an open job/subagent detail view.
             if let AppMode::JobDetail(state) = &app.mode
                 && state.refreshed.is_none_or(|t| t.elapsed().as_secs() >= 1)
@@ -192,12 +180,17 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             Ok(None)
         }
 
-        AppEvent::JobsLoaded(jobs) => {
+        AppEvent::BackgroundLoaded { jobs, subagents } => {
             app.jobs = jobs;
+            app.subagents = subagents;
             let row_count = jobs_rows(app).len();
             if app.jobs_selected >= row_count && app.jobs_selected > 0 {
                 app.jobs_selected = row_count.saturating_sub(1);
             }
+            Ok(None)
+        }
+        AppEvent::Status(message) => {
+            app.set_status(message);
             Ok(None)
         }
         AppEvent::JobKilled { pid, ok } => {
@@ -343,9 +336,9 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
 /// (running before finished).
 pub fn jobs_rows(app: &App) -> Vec<JobRow> {
     let mut rows: Vec<JobRow> = app
-        .subagent_tracker
-        .running()
-        .into_iter()
+        .subagents
+        .iter()
+        .cloned()
         .map(JobRow::Subagent)
         .collect();
     let mut jobs: Vec<aither_sandbox::JobInfo> = app.jobs.clone();
