@@ -474,9 +474,12 @@ where
         }
 
         tracing::info!("=== LOOP START ===");
+        let mut phases = may_agent::tui::perf::LoopPhases::default();
 
         // First draw: updates content_height/view_height for accurate overflow calculation.
+        let draw_start = std::time::Instant::now();
         terminal.draw(|frame| ui::render(frame, app))?;
+        phases.draw = draw_start.elapsed();
         tracing::info!("after draw");
 
         // Check for model fetch results (non-blocking)
@@ -496,7 +499,7 @@ where
                 Ok(result) => {
                     app.clipboard_rx = None;
                     app.pending_attachment_jobs = app.pending_attachment_jobs.saturating_sub(1);
-                    app.enqueue_paste_result(result);
+                    app.enqueue_clipboard_result(result);
                 }
                 Err(TryRecvError::Closed) => {
                     app.clipboard_rx = None;
@@ -509,10 +512,13 @@ where
             }
         }
 
-        while let Some(result) = app.dequeue_paste_result() {
-            app.handle_paste_result(result).await?;
+        let step_start = std::time::Instant::now();
+        while let Some(paste) = app.dequeue_pending_paste() {
+            app.handle_pending_paste(paste).await?;
         }
+        phases.step("paste_results", step_start.elapsed());
 
+        let step_start = std::time::Instant::now();
         if matches!(app.mode, may_agent::tui::AppMode::Chat)
             && let Some(request) = runtime_deps.pending_permission(app).await?
         {
@@ -523,6 +529,7 @@ where
                 },
             );
         }
+        phases.step("pending_permission", step_start.elapsed());
 
         app.restore_parked_question();
 
@@ -530,6 +537,7 @@ where
         // `/questions` or Ctrl+Left; a fresh question (0 -> N) pops the
         // docked panel itself, notifies, and rings the terminal bell so the
         // dock icon bounces. Later additions only update the count.
+        let step_start = std::time::Instant::now();
         let open = runtime_deps.open_questions(app).await?;
         let had_none = app.open_question_count == 0;
         app.open_question_count = open.len();
@@ -566,6 +574,7 @@ where
         runtime_deps
             .listen_for_agent_messages(app, &agent_listeners, events.sender())
             .await?;
+        phases.step("questions+listeners", step_start.elapsed());
 
         // A saved change to the cache lifetime or compaction model replaces
         // the idle worker with one built from the saved config.
@@ -594,6 +603,7 @@ where
         if agent_handle.is_none()
             && let Some(w) = worker.as_ref()
         {
+            let step_start = std::time::Instant::now();
             match runtime_deps.begin_queued_run(app).await? {
                 QueuedRunStart::Started(msg) => {
                     busy_elsewhere_notified = false;
@@ -615,6 +625,7 @@ where
                 }
                 QueuedRunStart::Nothing => busy_elsewhere_notified = false,
             }
+            phases.step("begin_queued_run", step_start.elapsed());
         }
 
         // DIAGNOSTIC: Check channel states before entering select
@@ -704,6 +715,14 @@ where
         let Some(event) = event else {
             tracing::warn!("All channels closed, exiting");
             break;
+        };
+        let event_kind = match &event {
+            Event::Terminal(e) => e.kind(),
+            Event::AskUser(_) => "ask_user",
+            Event::Workspace(_) => "workspace",
+            Event::WorkerBuilt(_) => "worker_built",
+            Event::Agent(_) => "agent",
+            Event::Context(_) => "context",
         };
 
         match event {
@@ -798,7 +817,7 @@ where
                                 .await;
                         }
                     }
-                    TuiEvent::ContextReport(_) => {
+                    TuiEvent::ContextReport(_) | TuiEvent::ContextDump(_) => {
                         // Reports arrive on the context channel; the agent
                         // channel only carries them if the channels raced.
                     }
@@ -852,6 +871,40 @@ where
                     Some(TuiEvent::ContextReport(Err(err))) => {
                         app.chat
                             .push_error(&format!("Context report failed: {err}"));
+                    }
+                    Some(TuiEvent::ContextDump(Ok(dump))) => {
+                        let message_count = dump.messages.len();
+                        let text = dump.render();
+                        let dir = app.session_manager.current().map(|session| {
+                            may_agent::session::SessionPaths::new(session.sandbox_dir.clone())
+                                .outputs_dir()
+                        });
+                        match dir {
+                            Some(dir) => {
+                                let path = dir.join("context-dump.md");
+                                let write = match async_fs::create_dir_all(&dir).await {
+                                    Ok(()) => async_fs::write(&path, &text).await,
+                                    Err(error) => Err(error),
+                                };
+                                match write {
+                                    Ok(()) => {
+                                        app.chat.push_notice(&format!(
+                                            "Context dump written to {} — {message_count} messages",
+                                            path.display(),
+                                        ));
+                                        app.scroll = usize::MAX;
+                                    }
+                                    Err(error) => {
+                                        app.chat
+                                            .push_error(&format!("Context dump failed: {error}"));
+                                    }
+                                }
+                            }
+                            None => app.chat.push_error("No active session for context dump"),
+                        }
+                    }
+                    Some(TuiEvent::ContextDump(Err(err))) => {
+                        app.chat.push_error(&format!("Context dump failed: {err}"));
                     }
                     Some(TuiEvent::Error(err)) => app.chat.push_error(&err),
                     _ => {}
@@ -915,6 +968,7 @@ where
                 }
 
                 // Handle normal terminal events
+                let ev_start = std::time::Instant::now();
                 match app.handle_event(*terminal_event)? {
                     Some(SendAction::Quit) => break,
                     Some(SendAction::NewSession) => {
@@ -1114,6 +1168,16 @@ where
                         if let Some(w) = worker.as_ref() {
                             if context_handle.is_none() {
                                 context_handle = Some(w.context_report());
+                            }
+                        } else {
+                            app.chat
+                                .push_notice("Agent is still starting — try again in a moment");
+                        }
+                    }
+                    Some(SendAction::ContextDump) => {
+                        if let Some(w) = worker.as_ref() {
+                            if context_handle.is_none() {
+                                context_handle = Some(w.context_dump());
                             }
                         } else {
                             app.chat
@@ -1365,8 +1429,20 @@ where
                     }
                     None => {}
                 }
+                phases.event = ev_start.elapsed();
             }
         }
+
+        // Report a stall whenever one busy iteration exceeded the jank
+        // threshold; the log carries the render breakdown for repro.
+        may_agent::tui::perf::report(
+            &phases,
+            &app.frame_stats,
+            app.scroll,
+            app.rendered_plain_lines.len(),
+            events.backlog(),
+            event_kind,
+        );
     }
 
     Ok(())

@@ -37,6 +37,10 @@ pub static SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/compact", "Compact conversation history"),
     ("/context", "Show context window usage"),
     (
+        "/context dump",
+        "Dump the verbatim assembled context to a file",
+    ),
+    (
         "/rewind",
         "Rewind to an earlier prompt (conversation, optionally code too)",
     ),
