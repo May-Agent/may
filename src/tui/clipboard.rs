@@ -157,6 +157,12 @@ impl ClipboardPasteResult {
         (self.image, self.text)
     }
 
+    /// Rebuild a result from its parts.
+    #[must_use]
+    pub const fn from_parts(image: Option<ClipboardImage>, text: Option<String>) -> Self {
+        Self { image, text }
+    }
+
     /// Check whether the result is empty.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
