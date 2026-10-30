@@ -182,7 +182,9 @@ fn remove_legacy_search_index(may_dir: &Path) {
         match removed {
             Ok(()) => tracing::info!(path = %path.display(), "removed the legacy session index"),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => tracing::warn!(path = %path.display(), %error, "failed to remove the legacy session index"),
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "failed to remove the legacy session index")
+            }
         }
     }
 }
@@ -263,7 +265,10 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
     tokio::spawn(serve::serve_tcp(tcp_listener, router.clone()));
     tokio::spawn(serve::serve_unix(unix_listener, router.clone()));
     tracing::info!(%tcp, socket = %paths.socket().display(), "May daemon listening");
-    eprintln!("May daemon listening on http://{tcp} and {}", paths.socket().display());
+    eprintln!(
+        "May daemon listening on http://{tcp} and {}",
+        paths.socket().display()
+    );
 
     let mut extra = ExtraListeners {
         router: router.clone(),
@@ -291,7 +296,10 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
         state.db.clone(),
         RepoSearchCollections::new(repo_search.clone()),
     );
-    tokio::spawn(indexer.run(state.search_index_wake.clone(), state.search_index_status.clone()));
+    tokio::spawn(indexer.run(
+        state.search_index_wake.clone(),
+        state.search_index_status.clone(),
+    ));
     tokio::spawn(AutoIndexer::new(state.db.clone(), repo_search).run());
 
     wait_for_shutdown(&state.daemon_shutdown).await;

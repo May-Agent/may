@@ -163,7 +163,11 @@ mod tests {
             .expect("open db");
         let store = MayIssueStore::new(db.clone(), "repo".to_string());
         store
-            .create("Login token expires early", "Refresh happens too late.", &[])
+            .create(
+                "Login token expires early",
+                "Refresh happens too late.",
+                &[],
+            )
             .await
             .expect("create");
         let closed = store

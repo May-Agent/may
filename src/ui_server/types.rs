@@ -177,12 +177,6 @@ pub struct SseHeartbeat {
 
 /// Chat-stream ping emitted every 10 s so proxies and the browser's
 /// own idle detection don't close the connection during long tool phases.
-#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct SsePingEvent<'a> {
-    pub(crate) seq: u64,
-    pub(crate) turn_id: &'a str,
-}
 
 /// Live decode-speed sample emitted while model output streams.
 #[derive(Debug, serde::Serialize, skyzen::ToSchema)]
@@ -789,6 +783,9 @@ pub struct CreateSessionRequest {
     pub(crate) model: Option<String>,
     #[serde(default)]
     pub(crate) profile_id: Option<String>,
+    /// Host directory the session works in (the TUI's launch directory).
+    #[serde(default)]
+    pub(crate) cwd: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, skyzen::ToSchema)]

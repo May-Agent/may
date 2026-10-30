@@ -452,10 +452,10 @@ pub struct UiServerState {
     /// Build of the running executable; clients with another build replace
     /// the daemon.
     pub(crate) build_id: String,
-    /// Session open locks of sessions this server has bound for chat or
-    /// runs; a bound session stays locked for the server's lifetime.
-    pub(crate) session_open_locks:
-        Mutex<std::collections::HashMap<String, crate::session::SessionOpenLock>>,
+    /// Live turns fanned out to every client of their session.
+    pub(crate) turn_hub: Arc<super::chat::TurnHub>,
+    /// Each session's agent between turns.
+    pub(crate) parked_agents: super::chat::ParkedAgents,
 }
 
 impl UiServerState {

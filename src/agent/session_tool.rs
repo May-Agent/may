@@ -8,7 +8,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::db::{ChatDb, IndexedMessageRow};
-use crate::repo_search::indexer::{IndexerError, SESSIONS_COLLECTION, SearchIndexer, parse_message_doc_id};
+use crate::repo_search::indexer::{
+    IndexerError, SESSIONS_COLLECTION, SearchIndexer, parse_message_doc_id,
+};
 use crate::repo_search::{CollectionBackend, RepoSearchCollections};
 
 /// Session index as the `session` command queries it.
@@ -134,7 +136,9 @@ enum SessionToolError {
     MissingCommandPrompt { command_name: String },
     #[error("invalid session command: missing prompt after 'search'")]
     MissingSearchPrompt,
-    #[error("session search takes a description of what to find; use `session list` to list sessions by filters")]
+    #[error(
+        "session search takes a description of what to find; use `session list` to list sessions by filters"
+    )]
     WildcardQuery,
     #[error("session action '{action}' requires a session id")]
     MissingActionSessionId { action: &'static str },
@@ -307,7 +311,11 @@ async fn execute_search(
         .collect();
     let rows: Vec<SessionMatchRow> = ranked
         .into_iter()
-        .filter_map(|(id, score)| by_id.remove(&id).map(|row| SessionMatchRow::from_indexed(row, score)))
+        .filter_map(|(id, score)| {
+            by_id
+                .remove(&id)
+                .map(|row| SessionMatchRow::from_indexed(row, score))
+        })
         .filter(|row| row_matches_session_filters(row, &args))
         .collect();
 

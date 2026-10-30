@@ -35,6 +35,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   const cancel = useTurnStore((s) => s.cancel);
   const retry = useTurnStore((s) => s.retry);
   const dismissError = useTurnStore((s) => s.dismissError);
+  const watchTurns = useTurnStore((s) => s.watch);
   const config = useConfigStore((s) => s.config);
   const configLoaded = config !== null;
   const navigate = useNavigate();
@@ -47,6 +48,9 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   useEffect(() => {
     open(sessionId);
   }, [sessionId, open]);
+
+  // Turns of this session stream here whichever client started them.
+  useEffect(() => watchTurns(sessionId), [sessionId, watchTurns]);
 
   const handleScroll = useCallback(() => {
     const el = scrollerRef.current;

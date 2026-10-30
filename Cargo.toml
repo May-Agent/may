@@ -129,6 +129,8 @@ gstreamer-video = { version = "0.23", optional = true }
 
 # Web server for `may ui`
 skyzen = { version = "0.4", features = ["hyper"] }
+# The daemon serves the router itself and renders errors as skyzen does.
+skyzen-core = "0.2"
 utoipa = { version = "5.4", default-features = false, features = ["macros"] }
 skyzen-services = { version = "0.2", default-features = false, features = ["runtime-tokio-rustls", "sqlite"] }
 
