@@ -3,7 +3,49 @@ use std::sync::Arc;
 use aither_sandbox::{SshAuthorizationError, SshSessionAuthorizer};
 use askama::Template;
 
-use crate::ask_user::{AnswerValue, AskUserArgs, AskUserBroker, AskUserRequestPayload};
+use crate::ask_user::{
+    AnswerValue, AskUserArgs, AskUserBroker, AskUserRequestPayload, QuestionAnswer,
+};
+
+/// The choice a permission prompt offers: one allow option and a deny
+/// option. The live gate and the routing of a late answer both decide
+/// approval here, so they cannot disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PermissionChoice<'a> {
+    allow: &'a str,
+}
+
+impl<'a> PermissionChoice<'a> {
+    const DENY: &'static str = "Deny";
+
+    /// The choice that allows with the option labelled `allow`.
+    #[must_use]
+    pub const fn new(allow: &'a str) -> Self {
+        Self { allow }
+    }
+
+    /// Recover the choice from the options of a prompt built by
+    /// [`Self::options`].
+    #[must_use]
+    pub fn from_options(options: &'a [String]) -> Option<Self> {
+        options.first().map(|allow| Self::new(allow))
+    }
+
+    /// The options to show, allow first.
+    #[must_use]
+    pub fn options(&self) -> Vec<String> {
+        vec![self.allow.to_string(), Self::DENY.to_string()]
+    }
+
+    /// Whether `answers` select the allow option. Anything else, a typed
+    /// reply included, is not approval.
+    #[must_use]
+    pub fn allows(&self, answers: &[QuestionAnswer]) -> bool {
+        answers.iter().any(|answer| {
+            matches!(&answer.answer, AnswerValue::Selected(options) if options.iter().any(|option| option == self.allow))
+        })
+    }
+}
 
 #[derive(Template)]
 #[template(path = "ssh_connect_permission.txt", escape = "none")]
@@ -44,9 +86,10 @@ impl MaySshAuthorizer {
         let question = question
             .render()
             .map_err(|error| SshAuthorizationError::Prompt(error.to_string()))?;
+        let choice = PermissionChoice::new(allow_label);
         let args = AskUserArgs {
             question: Some(question),
-            option: vec![allow_label.to_string(), "Deny".to_string()],
+            option: choice.options(),
             multi_select: false,
             questions: Vec::new(),
         };
@@ -58,9 +101,7 @@ impl MaySshAuthorizer {
             })
             .await
             .map_err(|error| SshAuthorizationError::Prompt(error.to_string()))?;
-        Ok(response.iter().any(|a| {
-            matches!(&a.answer, AnswerValue::Selected(opts) if opts.iter().any(|o| o == allow_label))
-        }))
+        Ok(choice.allows(&response))
     }
 }
 

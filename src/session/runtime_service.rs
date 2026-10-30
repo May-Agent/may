@@ -475,6 +475,30 @@ impl SessionRuntimeService {
         Ok(Some(AskUserAnswer::Committed(committed)))
     }
 
+    /// The answers committed for the question `request_id`, or `None` when
+    /// none was committed.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] on storage failure.
+    pub async fn committed_ask_user_answers(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<Vec<crate::ask_user::QuestionAnswer>>, crate::db::ChatDbError> {
+        self.db.committed_ask_user_answers(request_id).await
+    }
+
+    /// The decision committed for the workspace request `request_id`, or
+    /// `None` when none was committed.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] on storage failure.
+    pub async fn committed_workspace_decision(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<bool>, crate::db::ChatDbError> {
+        self.db.committed_workspace_decision(request_id).await
+    }
+
     /// Queue the delivery of an answer whose live waiter was gone by the time
     /// it was woken.
     ///

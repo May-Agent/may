@@ -18,6 +18,29 @@ pub enum AskUserKey {
     Submit(Vec<QuestionAnswer>),
 }
 
+/// Show `prompt`, a prompt a run is blocked on. An open question being
+/// answered is parked in `parked` with its draft instead of being dropped.
+pub fn show_blocking_prompt(
+    mode: &mut AppMode,
+    parked: &mut Option<AskUserState>,
+    prompt: AppMode,
+) {
+    if let AppMode::AskUser(question) = std::mem::replace(mode, prompt)
+        && question.request.is_none()
+    {
+        *parked = Some(question);
+    }
+}
+
+/// Bring the parked open question back once nothing else holds the screen.
+pub fn restore_parked_question(mode: &mut AppMode, parked: &mut Option<AskUserState>) {
+    if matches!(mode, AppMode::Chat)
+        && let Some(question) = parked.take()
+    {
+        *mode = AppMode::AskUser(question);
+    }
+}
+
 pub fn handle_ask_user_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
     let AppMode::AskUser(state) = &mut app.mode else {
         return None;
@@ -348,5 +371,42 @@ mod tests {
             submitted(outcome),
             [Chose::Options(vec!["PostgreSQL", "SQLite"])]
         );
+    }
+
+    /// A blocking prompt that arrives while an open question is half
+    /// answered does not discard the draft: it comes back afterwards.
+    #[test]
+    fn a_blocking_prompt_keeps_the_open_question_draft() {
+        let mut mode = AppMode::AskUser(open_question(false));
+        let mut parked = None;
+        let AppMode::AskUser(state) = &mut mode else {
+            unreachable!("the mode was just set");
+        };
+        press(
+            state,
+            &[
+                KeyCode::Down,
+                KeyCode::Down,
+                KeyCode::Enter,
+                KeyCode::Char('M'),
+            ],
+        );
+
+        show_blocking_prompt(&mut mode, &mut parked, AppMode::Help);
+        assert!(matches!(mode, AppMode::Help), "the prompt is shown");
+        restore_parked_question(&mut mode, &mut parked);
+        assert!(
+            matches!(mode, AppMode::Help),
+            "the question waits while the prompt holds the screen"
+        );
+
+        mode = AppMode::Chat;
+        restore_parked_question(&mut mode, &mut parked);
+        let AppMode::AskUser(state) = mode else {
+            panic!("the open question comes back");
+        };
+        assert_eq!(state.request_id, "open-1");
+        assert!(state.question_states[0].custom_mode);
+        assert_eq!(state.question_states[0].custom_text, "M");
     }
 }

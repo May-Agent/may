@@ -885,12 +885,29 @@ fn resume_waiting_turn_reminder(
     crate::XmlBlock::parse(text).map_err(ChatMarkupError::Parse)
 }
 
-pub(super) async fn schedule_waiting_turn_resume(
-    state: &Arc<UiServerState>,
+/// How a resume after a decision was scheduled.
+pub(super) enum WaitingTurnResume {
+    /// The run is gone: this process took the session's lease and queued the
+    /// resume reminder, and the guard dispatches it.
+    Dispatch {
+        guard: SessionRunGuard,
+        runtime: crate::session::SessionRuntimeSummary,
+    },
+    /// A live run (possibly in another process) holds the lease. It was or
+    /// will be answered through its own prompt, so nothing was written: no
+    /// state change and no reminder that would reach the model after it.
+    RunLive(crate::session::SessionRuntimeSummary),
+}
+
+/// Take the lease of a session whose run is gone and queue the reminder for
+/// the decision it was waiting for. The lease is the gate: while a live run
+/// holds it, nothing about the session is written.
+pub(super) async fn queue_waiting_turn_resume(
+    runtime_service: &crate::session::SessionRuntimeService,
     session_id: &str,
     request_kind: ResumeRequestKind,
     resolution: ResumeResolution,
-) -> Result<crate::session::SessionRuntimeSummary, ScheduleWaitingTurnError> {
+) -> Result<WaitingTurnResume, ScheduleWaitingTurnError> {
     let pending = PendingUserMessage {
         content: String::new(),
         attachments: Vec::new(),
@@ -898,17 +915,48 @@ pub(super) async fn schedule_waiting_turn_resume(
         created_at: jiff::Timestamp::now().to_string(),
         delivery_mode: crate::session::PendingUserMessageMode::Steer,
     };
-    let runtime = state
-        .runtime_service
+    let guard = match runtime_service.runs().acquire(session_id).await {
+        Ok(guard) => guard,
+        Err(AcquireError::Busy(_)) => {
+            return runtime_service
+                .get(session_id)
+                .await
+                .map(WaitingTurnResume::RunLive)
+                .map_err(ScheduleWaitingTurnError::Lease);
+        }
+        Err(AcquireError::Storage(error)) => return Err(ScheduleWaitingTurnError::Lease(error)),
+    };
+    match runtime_service
         .enqueue(
             session_id,
             pending,
             crate::session::PendingUserMessageMode::Steer,
         )
         .await
-        .map_err(ScheduleWaitingTurnError::Enqueue)?;
-    spawn_follow_up_runs(state.clone(), session_id.to_string());
-    Ok(runtime)
+    {
+        Ok(runtime) => Ok(WaitingTurnResume::Dispatch { guard, runtime }),
+        Err(error) => {
+            finish_failed_run(guard).await;
+            Err(ScheduleWaitingTurnError::Enqueue(error))
+        }
+    }
+}
+
+pub(super) async fn schedule_waiting_turn_resume(
+    state: &Arc<UiServerState>,
+    session_id: &str,
+    request_kind: ResumeRequestKind,
+    resolution: ResumeResolution,
+) -> Result<crate::session::SessionRuntimeSummary, ScheduleWaitingTurnError> {
+    match queue_waiting_turn_resume(&state.runtime_service, session_id, request_kind, resolution)
+        .await?
+    {
+        WaitingTurnResume::Dispatch { guard, runtime } => {
+            spawn_continued_run(state.clone(), guard);
+            Ok(runtime)
+        }
+        WaitingTurnResume::RunLive(runtime) => Ok(runtime),
+    }
 }
 
 async fn schedule_browser_takeover_resume(
@@ -2140,6 +2188,8 @@ pub(super) enum ScheduleWaitingTurnError {
     Markup(#[from] ChatMarkupError),
     #[error("failed to enqueue waiting-turn resume message: {0}")]
     Enqueue(#[source] crate::db::ChatDbError),
+    #[error("failed to take the session run lease for the resume: {0}")]
+    Lease(#[source] crate::db::ChatDbError),
 }
 
 #[derive(Debug, thiserror::Error)]

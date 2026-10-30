@@ -15,6 +15,7 @@ use crate::agent::PermissionApprover;
 use crate::agent::browser_tool::{BrowserBroker, BrowserQueue};
 use crate::agent::register_tool::RegisterBroker;
 use crate::agent::register_tool::RegisterQueue;
+use crate::agent::ssh_authorizer::PermissionChoice;
 use crate::agent::task_tool::{TaskBroker, TaskQueue};
 use crate::ask_user::{AnswerValue, AskUserRequest, Question, QuestionAnswer};
 use crate::config::MayConfig;
@@ -571,16 +572,14 @@ pub struct AskUserResolved {
     pub outcome: AskUserOutcome,
 }
 
-/// Whether `answers` allow what an internal prompt asked for: nothing in
-/// them says "deny".
-fn answers_allow(answers: &[QuestionAnswer]) -> bool {
-    !answers.iter().any(|answer| match &answer.answer {
-        AnswerValue::Selected(values) => values
-            .iter()
-            .any(|value| value.eq_ignore_ascii_case("deny")),
-        AnswerValue::Custom(value) => value.eq_ignore_ascii_case("deny"),
-        AnswerValue::Skipped => unreachable!("a skipped answer is refused before it commits"),
-    })
+/// Whether `answers` select the allow option of the internal prompt
+/// `request`: the test the live gate applies.
+fn answers_allow(request: &PersistedAskUserRequest, answers: &[QuestionAnswer]) -> bool {
+    request
+        .questions
+        .first()
+        .and_then(|question| PermissionChoice::from_options(&question.option))
+        .is_some_and(|choice| choice.allows(answers))
 }
 
 #[derive(Debug, Clone)]
@@ -726,7 +725,7 @@ impl AskUserApprover {
             AskUserOutcome::Woke
         } else {
             AskUserOutcome::Resume {
-                approved: answers_allow(&answers),
+                approved: answers_allow(&committed.request, &answers),
             }
         };
         Ok(Some(AskUserResolved {

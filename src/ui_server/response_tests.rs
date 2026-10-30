@@ -497,6 +497,37 @@ async fn a_late_denial_resumes_the_session_as_denied() {
     assert_eq!(resolved.outcome, AskUserOutcome::Resume { approved: false });
 }
 
+/// Approval of a late answer to a blocking prompt means the allow option was
+/// selected, as the live gate decides: a typed reply, even one that reads as
+/// consent, is not approval.
+#[tokio::test]
+async fn only_selecting_the_allow_option_approves_a_late_answer() {
+    for typed in ["no", "yes", "allow"] {
+        let mut fixture = Fixture::new().await;
+        let prompt = Question::new(&fixture.runtime);
+        let (id, waiter) = start_waiter(&mut fixture, &prompt).await;
+        waiter.abort();
+        let _ = waiter.await;
+        let resolved = prompt
+            .0
+            .resolve(
+                &id,
+                vec![aither_agent::ask_user::QuestionAnswer {
+                    section: String::new(),
+                    answer: AnswerValue::Custom(typed.to_string()),
+                }],
+            )
+            .await
+            .expect("the answer commits")
+            .expect("the prompt was pending");
+        assert_eq!(
+            resolved.outcome,
+            AskUserOutcome::Resume { approved: false },
+            "a typed {typed:?} is not a selection of the allow option"
+        );
+    }
+}
+
 /// An answer to an open question joins the session queue as the agent's own
 /// question answered; a retry delivers nothing a second time and returns the
 /// committed state.
@@ -555,4 +586,108 @@ async fn an_answer_to_an_unknown_question_is_not_found() {
         .await
         .expect("an unknown id is not a failure");
     assert!(unknown.is_none());
+}
+
+/// A second process sharing the database: its own service over the same
+/// database file, with its own run registry.
+fn other_process(fixture: &Fixture) -> SessionRuntimeService {
+    SessionRuntimeService::new(fixture.runtime.db(), UiEventBus::new())
+}
+
+async fn resume_from(process: &SessionRuntimeService) -> super::chat::WaitingTurnResume {
+    super::chat::queue_waiting_turn_resume(
+        process,
+        "session",
+        super::chat::ResumeRequestKind::Authorization,
+        super::chat::ResumeResolution::Approved,
+    )
+    .await
+    .expect("the resume schedules")
+}
+
+/// The resume path of the process that won the commit must not touch the
+/// state of a session whose run is live in another process: that run owns
+/// the state.
+#[tokio::test]
+async fn a_resume_leaves_the_state_of_a_session_with_a_live_run_alone() {
+    init_executor();
+    let fixture = Fixture::new().await;
+    let holder = fixture
+        .runtime
+        .runs()
+        .acquire("session")
+        .await
+        .expect("the live run takes the lease");
+    let winner = other_process(&fixture);
+
+    let resumed = bounded("the resume", resume_from(&winner)).await;
+
+    assert!(
+        matches!(resumed, super::chat::WaitingTurnResume::RunLive(_)),
+        "a live run's lease blocks the resume"
+    );
+    assert_eq!(
+        winner.get("session").await.expect("runtime").state,
+        crate::session::SessionRuntimeState::Running,
+        "the resume rewrote the state of a session with a live run"
+    );
+    holder
+        .finish_idle(crate::session::RunOutcome::Completed)
+        .await
+        .expect("the live run ends");
+}
+
+/// The resume reminder is for a run that is gone. Queued behind a live run
+/// it would reach the model after that run, which was already answered
+/// through its own prompt: a second, stale delivery.
+#[tokio::test]
+async fn a_resume_queues_no_reminder_behind_a_live_run() {
+    init_executor();
+    let fixture = Fixture::new().await;
+    let holder = fixture
+        .runtime
+        .runs()
+        .acquire("session")
+        .await
+        .expect("the live run takes the lease");
+    let winner = other_process(&fixture);
+
+    let _ = bounded("the resume", resume_from(&winner)).await;
+
+    assert!(
+        !fixture
+            .runtime
+            .get("session")
+            .await
+            .expect("runtime")
+            .has_pending_messages(),
+        "a reminder was queued for a prompt the live run already answered"
+    );
+    holder
+        .finish_idle(crate::session::RunOutcome::Completed)
+        .await
+        .expect("the live run ends");
+}
+
+/// With no live run the resume takes the lease and queues the reminder.
+#[tokio::test]
+async fn a_resume_of_a_session_without_a_live_run_queues_the_reminder_under_the_lease() {
+    init_executor();
+    let fixture = Fixture::new().await;
+    let winner = other_process(&fixture);
+
+    let resumed = bounded("the resume", resume_from(&winner)).await;
+
+    let super::chat::WaitingTurnResume::Dispatch { guard, runtime } = resumed else {
+        panic!("a session without a live run must be resumed");
+    };
+    assert!(runtime.has_pending_messages(), "the reminder is queued");
+    assert!(
+        winner.runs().is_held("session").await.expect("lease read"),
+        "the resume holds the lease while it dispatches"
+    );
+    guard
+        .finish_idle(crate::session::RunOutcome::Completed)
+        .await
+        .expect("the resumed run ends");
 }
