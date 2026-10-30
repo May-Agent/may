@@ -2440,6 +2440,10 @@ impl App {
     pub async fn handle_pending_paste(&mut self, paste: PendingPaste) -> AppResult<()> {
         match paste {
             PendingPaste::Input(text) => {
+                // Clear the "Reading clipboard..." notice: attachment-bound
+                // pastes replace it with their own status, text into an
+                // input leaves none behind.
+                self.status = None;
                 self.handle_bracketed_paste(text);
                 Ok(())
             }
