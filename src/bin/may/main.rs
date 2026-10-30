@@ -134,7 +134,11 @@ async fn async_main() -> anyhow::Result<()> {
     ensure_rustls_provider();
 
     let cli_mode = parse_cli_mode_from_env();
-    let is_server_mode = matches!(cli_mode, CliMode::Ui(_) | CliMode::Rest(_));
+    // The daemon's stderr is its log file; its diagnostics go there too.
+    let is_server_mode = matches!(
+        cli_mode,
+        CliMode::Ui(_) | CliMode::Rest(_) | CliMode::Daemon(cli::DaemonCommand::Run)
+    );
 
     // Diagnostics live in a bounded in-memory ring; `/bug` and the panic
     // hook dump it on demand under ~/.may/bugs.
@@ -157,7 +161,11 @@ async fn async_main() -> anyhow::Result<()> {
     if is_server_mode {
         tracing_subscriber::registry()
             .with(fmt::layer().with_writer(log_writer).with_ansi(false))
-            .with(fmt::layer().with_writer(io::stderr).with_ansi(true))
+            .with(
+                fmt::layer()
+                    .with_writer(io::stderr)
+                    .with_ansi(std::io::IsTerminal::is_terminal(&io::stderr())),
+            )
             .with(env_filter)
             .init();
     } else {
