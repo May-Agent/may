@@ -179,4 +179,67 @@ mod tests {
         assert!(text.contains("[2] role: assistant\nhi there"));
         assert_eq!(dump.messages.len(), 3);
     }
+
+    #[test]
+    fn example_render() {
+        use aither_core::llm::{Attachment, ReasoningState, ToolCall};
+
+        let mut context = aither_agent::Context::default();
+        context.insert_system_text(
+            "base_system",
+            "You run in a terminal-first environment.\n\n<commands>\n- websearch <query>: search the web\n- browser <action>: drive the managed browser\n</commands>\n\n<skills>\n- pdf/ — read and write PDFs\n</skills>",
+        );
+        context.insert_system_text(
+            "persona",
+            "You are May. Be warm, lead with the point, prefer prose over lists.",
+        );
+        context.insert_system_text(
+            "permissions",
+            "Read access to the entire filesystem. Write access is restricted to the session sandbox and approved workdirs. Destructive or irreversible commands require approval.",
+        );
+        context.push(LlmMessage::user("为什么这个函数会 panic"));
+        context.push(LlmMessage::Assistant {
+            content: "先跑一下最小复现看看 panic 从哪来。".to_string(),
+            tool_calls: vec![ToolCall::new(
+                "terminal:1",
+                "terminal",
+                serde_json::json!({"command": "cargo test reproduce -- --nocapture", "timeout": 120}),
+            )],
+            reasoning: vec![ReasoningState::new("claude", "<opaque thinking payload>")],
+        });
+        context.push(LlmMessage::tool(
+            "terminal:1",
+            "thread 'reproduce' panicked at src/lib.rs:42:9:\nindex out of bounds: the len is 3 but the index is 5\nnote: run with `RUST_BACKTRACE=1`",
+        ));
+        context.push(
+            LlmMessage::user("附件里是出错时的堆栈").with_attachment(Attachment::new(
+                url::Url::parse("file:///Users/lexoliu/Coding/demo/backtrace.log").unwrap(),
+                "text/plain".parse::<mime::Mime>().unwrap(),
+            )),
+        );
+        context.push(LlmMessage::assistant("看到了——是第 42 行对空列表取 [5]。"));
+
+        let tail = [aither_agent::Block::new(
+            "tasks",
+            "<tasks>\n- [ ] fix index-out-of-bounds in src/lib.rs:42\n</tasks>",
+        )];
+        let snapshot = ContextWindowSnapshot {
+            phase: ContextWindowPhase::Stable,
+            metrics: test_metrics(),
+            messages: context.build_request(&tail),
+        };
+        let dump = ContextDump::assemble("swe-2-high", "custom", "mighty-pine-fjord", &snapshot);
+        let text = dump.render();
+
+        assert!(text.contains("[0] role: system\nYou run in a terminal-first environment."));
+        assert!(text.contains(
+            "[2] role: assistant\nreasoning: claude (25 bytes)\ntool_calls:\n  - name: terminal\n    arguments: {\"command\":\"cargo test reproduce -- --nocapture\",\"timeout\":120}"
+        ));
+        assert!(text.contains("[3] role: tool\ntool_call_id: terminal:1\nthread 'reproduce'"));
+        assert!(text.contains(
+            "[4] role: user\nattachments:\n  - file:///Users/lexoliu/Coding/demo/backtrace.log\n附件里是出错时的堆栈"
+        ));
+        assert!(text.contains("[6] role: system\n<tasks>"));
+        assert_eq!(dump.messages.len(), 7);
+    }
 }
