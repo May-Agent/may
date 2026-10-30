@@ -441,6 +441,17 @@ pub struct UiServerState {
     pub(crate) tool_environments: crate::agent::ToolEnvironmentCache,
     pub(crate) cwd: PathBuf,
     pub(crate) may_dir: PathBuf,
+    /// Wakes the search indexer after new messages land.
+    pub(crate) search_index_wake_tx: async_channel::Sender<()>,
+    /// The indexer's side of [`Self::search_index_wake_tx`].
+    pub(crate) search_index_wake: async_channel::Receiver<()>,
+    /// Latest outcome of the search indexer.
+    pub(crate) search_index_status: crate::repo_search::indexer::IndexerStatus,
+    /// Signalled by `POST /api/daemon/shutdown`.
+    pub(crate) daemon_shutdown: Arc<tokio::sync::Notify>,
+    /// Build of the running executable; clients with another build replace
+    /// the daemon.
+    pub(crate) build_id: String,
     /// Session open locks of sessions this server has bound for chat or
     /// runs; a bound session stays locked for the server's lifetime.
     pub(crate) session_open_locks:
