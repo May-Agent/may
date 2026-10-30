@@ -1016,8 +1016,8 @@ pub fn render_unified(
     chat: &ChatStream,
     scroll: usize,
     ctx: UnifiedRenderContext<'_>,
-) {
-    render_impl(frame, area, chat, scroll, ctx.into());
+) -> crate::tui::perf::ChatRenderStats {
+    render_impl(frame, area, chat, scroll, ctx.into())
 }
 
 /// Build plain wrapped lines for selection/copy from unified viewport
@@ -1659,10 +1659,11 @@ fn render_impl(
     chat: &ChatStream,
     scroll: usize,
     ctx: RenderContext<'_>,
-) {
+) -> crate::tui::perf::ChatRenderStats {
+    let mut stats = crate::tui::perf::ChatRenderStats::default();
     // Guard against zero-dimension areas to prevent overflow
     if area.width < 3 || area.height < 3 {
-        return;
+        return stats;
     }
 
     let RenderContext {
@@ -1679,7 +1680,9 @@ fn render_impl(
     let mut lines: Vec<Line> = Vec::new();
     let mut collected_image_positions: Vec<(String, usize)> = Vec::new();
 
+    let build_start = std::time::Instant::now();
     for elem in chat.active_elements() {
+        stats.elements += 1;
         match elem {
             ChatElement::UserMessage {
                 content,
@@ -1875,10 +1878,15 @@ fn render_impl(
         out.extend(collected_image_positions);
     }
 
+    stats.lines_build = build_start.elapsed();
+
     // Calculate dimensions using VISUAL line count (accounting for wrap)
     let view_height = area.height as usize;
     let render_width = area.width as usize;
+    let wrap_start = std::time::Instant::now();
     let visual_content_height = total_wrapped_lines(&lines, render_width);
+    stats.wrap_count = wrap_start.elapsed();
+    stats.content_height = visual_content_height;
 
     // Export dimensions for scroll normalization
     // Use visual height so scrolling works correctly with wrapped lines
@@ -1909,11 +1917,14 @@ fn render_impl(
         (u16::try_from(actual_scroll).unwrap_or(u16::MAX), lines)
     };
 
+    let widget_start = std::time::Instant::now();
     frame.render_widget(Clear, area);
     let paragraph = Paragraph::new(final_lines)
         .wrap(Wrap { trim: false })
         .scroll((scroll_y, 0));
     frame.render_widget(paragraph, area);
+    stats.widget = widget_start.elapsed();
+    stats
 }
 
 /// Convert a character index to a byte index in a string.
@@ -2785,6 +2796,55 @@ mod tests {
             output: None,
             diffs: Vec::new(),
             expanded: false,
+        }
+    }
+
+    /// A scroll step redraws the whole frame, so the diff written to the
+    /// backend must reproduce it exactly; a skipped cell stays visible as
+    /// a stray block. Mirrors what a real terminal shows after diffing.
+    #[test]
+    fn scroll_diff_leaves_no_stale_cells() {
+        use super::render;
+        use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, layout::Rect};
+
+        let mut chat = ChatStream::new();
+        chat.push_text("终端通道工作正常。要做更具体的测试吗？比如：\n\n- 并发/时序测试 — 比如先跑 `sleep 5` 再跑 `sleep 10`，验证顺序与完成回调\n- 后台任务测试 — `terminal_background` + `terminal_read` 增量读取\n- 文件写入测试 — 在 `artifacts/` 或 `data/` 里写文件并校验持久性\n- 特定命令 — 你直接给出要跑的命令，我执行后按你指定的格式回传（比如只回 `finished`）\n\n直接说要测什么就行。\n");
+        chat.push_user("你可以跑后台命令吗", Vec::new(), 0);
+        chat.push_text("可以，用 `terminal_background` 就行。我跑一个演示：\n");
+        chat.push_tool(
+            "call-1".to_string(),
+            ToolDisplay::Terminal {
+                command: "terminal_background {…}".to_string(),
+                mode: TerminalExecutionMode::Default,
+                status: ToolStatus::Done,
+                output: Some(
+                    super::TerminalCallInfo::new("terminal_background".to_string()).with_output(
+                        "tick 1 at 21:20:24\ntick 2 at 21:20:25\ntick 3 at 21:20:26".to_string(),
+                    ),
+                ),
+                diffs: Vec::new(),
+                expanded: false,
+            },
+        );
+        chat.push_text("后台任务运行正常，已输出到第 7 行（约每秒一行）。再等它跑完：\n");
+        chat.push_text("可用的后台操作还有：\n\n- `terminal_read` - 按字节偏移增量读取（不读已读部分）\n- `terminal_input` - 向后台任务的 stdin 写数据（适合交互式进程）\n- `terminal_kill` - 中途终止任务\n- `timeout` 参数控制后台任务最长存活时间（最多 7200 秒）\n\n要不要继续测某个具体场景？比如交互式 stdin、或者并发跑多个后台任务？\n");
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        let area = Rect::new(0, 0, 80, 30);
+
+        let mut truth = Buffer::empty(area);
+        for scroll in [usize::MAX, 9, 6, 3, 0, usize::MAX, 12] {
+            terminal
+                .draw(|frame| {
+                    render(frame, area, &chat, scroll);
+                    truth.clone_from(frame.buffer_mut());
+                })
+                .unwrap();
+            let shown = terminal.backend().buffer().clone();
+            assert_eq!(
+                &shown, &truth,
+                "scroll={scroll}: backend drifted from the rendered buffer"
+            );
         }
     }
 

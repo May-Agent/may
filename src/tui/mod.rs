@@ -16,6 +16,8 @@ pub mod event;
 pub mod file_diff;
 /// Persistent input history.
 pub mod history;
+/// Jank instrumentation (frame/loop timing for stall reports).
+pub mod perf;
 /// Pending message and attachment types.
 pub mod queue;
 /// Event reducers for non-chat modes.

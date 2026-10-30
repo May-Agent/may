@@ -237,6 +237,8 @@ pub struct App {
     pub render_top_padding: usize,
     /// Row spans of collapsible tool calls in `rendered_plain_lines` space
     pub collapse_regions: Vec<super::ui::chat::ClickRegion>,
+    /// Timing breakdown of the last rendered frame (jank reporting).
+    pub frame_stats: super::perf::FrameStats,
     /// When and where the last plain click finished; a second press at the
     /// same spot inside `DOUBLE_CLICK_WINDOW` selects the word under it.
     last_click: Option<(Instant, SelectionPoint)>,
@@ -494,6 +496,7 @@ impl App {
             selection: None,
             rendered_plain_lines: Vec::new(),
             render_top_padding: 0,
+            frame_stats: super::perf::FrameStats::default(),
             collapse_regions: Vec::new(),
             last_click: None,
             job_registry: None,
