@@ -90,6 +90,7 @@ impl AppMode {
             Self::Jobs => "jobs",
             Self::JobDetail(_) => "job-detail",
             Self::Btw(_) => "btw",
+            Self::ImageView(_) => "image-view",
         }
     }
 }
