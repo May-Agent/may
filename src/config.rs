@@ -651,12 +651,6 @@ pub struct ModelsConfig {
     /// Image generation models in priority order
     #[serde(default)]
     pub image_generation: Vec<ModelSelector>,
-    /// Global embedding model used for semantic search/indexing.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub embedding_model: Option<ModelSelector>,
-    /// Optional explicit embedding dimensions for providers that require it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub embedding_dimensions: Option<usize>,
     /// Model compaction runs on instead of the session model. Idle
     /// compaction is off while one is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -711,12 +705,6 @@ impl ModelsConfig {
         if !list.contains(&selector) {
             list.push(selector);
         }
-    }
-
-    /// Embedding model selector, if configured.
-    #[must_use]
-    pub const fn embedding_model(&self) -> Option<&ModelSelector> {
-        self.embedding_model.as_ref()
     }
 }
 
