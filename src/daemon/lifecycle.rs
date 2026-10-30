@@ -127,10 +127,10 @@ fn uid() -> Result<String, LifecycleError> {
 pub fn install(paths: &DaemonPaths) -> Result<PathBuf, LifecycleError> {
     let program = current_exe()?;
     let program = program.display().to_string();
-    std::fs::create_dir_all(paths.log().parent().unwrap_or(paths.root()))?;
+    std::fs::create_dir_all(paths.log().parent().unwrap_or_else(|| paths.root()))?;
     if cfg!(target_os = "macos") {
         let path = launchd_plist_path()?;
-        std::fs::create_dir_all(path.parent().unwrap_or(Path::new("/")))?;
+        std::fs::create_dir_all(path.parent().unwrap_or_else(|| Path::new("/")))?;
         let plist = LaunchdPlist {
             label: SERVICE_LABEL,
             program: &program,
@@ -152,7 +152,7 @@ pub fn install(paths: &DaemonPaths) -> Result<PathBuf, LifecycleError> {
         Ok(path)
     } else {
         let path = systemd_unit_path()?;
-        std::fs::create_dir_all(path.parent().unwrap_or(Path::new("/")))?;
+        std::fs::create_dir_all(path.parent().unwrap_or_else(|| Path::new("/")))?;
         std::fs::write(&path, SystemdUnit { program: &program }.render()?)?;
         run("systemctl", &["--user", "daemon-reload"])?;
         run("systemctl", &["--user", "enable", "--now", SYSTEMD_UNIT])?;

@@ -141,7 +141,7 @@ impl DaemonClient {
     ///
     /// # Errors
     /// Fails when the daemon is unreachable or refuses the request.
-    pub async fn post<B: Serialize, T: DeserializeOwned>(
+    pub async fn post<B: Serialize + Sync, T: DeserializeOwned>(
         &self,
         path: &str,
         body: &B,
@@ -154,7 +154,7 @@ impl DaemonClient {
     ///
     /// # Errors
     /// Fails when the daemon is unreachable or refuses the request.
-    pub async fn put<B: Serialize, T: DeserializeOwned>(
+    pub async fn put<B: Serialize + Sync, T: DeserializeOwned>(
         &self,
         path: &str,
         body: &B,

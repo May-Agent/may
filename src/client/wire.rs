@@ -214,7 +214,9 @@ impl WireAgentEvent {
     }
 
     /// The agent event this wire event stands for, stamped `at`.
-    #[must_use]
+    ///
+    /// # Errors
+    /// An `error` event becomes the agent error it reports.
     pub fn into_timed(self, at: jiff::Timestamp) -> Result<TimedEvent, AgentError> {
         let event = match self {
             Self::Text { text } => AgentEvent::Text(text),
