@@ -440,7 +440,7 @@ where
                 Ok(result) => {
                     app.clipboard_rx = None;
                     app.pending_attachment_jobs = app.pending_attachment_jobs.saturating_sub(1);
-                    app.enqueue_paste_result(result);
+                    app.enqueue_clipboard_result(result);
                 }
                 Err(TryRecvError::Closed) => {
                     app.clipboard_rx = None;
@@ -454,8 +454,8 @@ where
         }
 
         let step_start = std::time::Instant::now();
-        while let Some(result) = app.dequeue_paste_result() {
-            app.handle_paste_result(result).await?;
+        while let Some(paste) = app.dequeue_pending_paste() {
+            app.handle_pending_paste(paste).await?;
         }
         phases.step("paste_results", step_start.elapsed());
 
@@ -702,7 +702,7 @@ where
                                 .await;
                         }
                     }
-                    TuiEvent::ContextReport(_) => {
+                    TuiEvent::ContextReport(_) | TuiEvent::ContextDump(_) => {
                         // Reports arrive on the context channel; the agent
                         // channel only carries them if the channels raced.
                     }
@@ -756,6 +756,41 @@ where
                     Some(TuiEvent::ContextReport(Err(err))) => {
                         app.chat
                             .push_error(&format!("Context report failed: {err}"));
+                    }
+                    Some(TuiEvent::ContextDump(Ok(dump))) => {
+                        let block_count = dump.blocks.len();
+                        let message_count = dump.messages.len();
+                        let text = dump.render();
+                        let dir = app.session_manager.current().map(|session| {
+                            may_agent::session::SessionPaths::new(session.sandbox_dir.clone())
+                                .outputs_dir()
+                        });
+                        match dir {
+                            Some(dir) => {
+                                let path = dir.join("context-dump.md");
+                                let write = match async_fs::create_dir_all(&dir).await {
+                                    Ok(()) => async_fs::write(&path, &text).await,
+                                    Err(error) => Err(error),
+                                };
+                                match write {
+                                    Ok(()) => {
+                                        app.chat.push_notice(&format!(
+                                            "Context dump written to {} — {block_count} blocks, {message_count} messages",
+                                            path.display(),
+                                        ));
+                                        app.scroll = usize::MAX;
+                                    }
+                                    Err(error) => {
+                                        app.chat
+                                            .push_error(&format!("Context dump failed: {error}"));
+                                    }
+                                }
+                            }
+                            None => app.chat.push_error("No active session for context dump"),
+                        }
+                    }
+                    Some(TuiEvent::ContextDump(Err(err))) => {
+                        app.chat.push_error(&format!("Context dump failed: {err}"));
                     }
                     Some(TuiEvent::Error(err)) => app.chat.push_error(&err),
                     _ => {}
@@ -1011,6 +1046,16 @@ where
                         if let Some(w) = worker.as_ref() {
                             if context_handle.is_none() {
                                 context_handle = Some(w.context_report());
+                            }
+                        } else {
+                            app.chat
+                                .push_notice("Agent is still starting — try again in a moment");
+                        }
+                    }
+                    Some(SendAction::ContextDump) => {
+                        if let Some(w) = worker.as_ref() {
+                            if context_handle.is_none() {
+                                context_handle = Some(w.context_dump());
                             }
                         } else {
                             app.chat
