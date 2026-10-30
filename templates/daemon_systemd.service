@@ -1,0 +1,9 @@
+[Unit]
+Description=May daemon: agent loops, scheduled tasks and search indexing
+
+[Service]
+ExecStart={{ program }} daemon
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

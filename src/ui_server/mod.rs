@@ -34,7 +34,6 @@ use anyhow::{Context, anyhow};
 use skyzen::EmbeddedStaticDir;
 use skyzen::Result as SkyResult;
 use skyzen::routing::{CreateRouteNode, Route, Router};
-use skyzen::runtime::native;
 use skyzen::utils::{Json, State};
 
 use crate::config::MayConfig;
@@ -48,6 +47,8 @@ use types::{
     ApiHealth, ModelInfoItem, ModelsResponse, ProviderModelsItem, ProviderModelsResponse,
     RequestLogCacheSummary, RequestLogEntry, RequestLogsResponse,
 };
+
+pub use types::DaemonHealth;
 
 #[cfg(feature = "ui")]
 static WEB_UI_DIST: include_dir::Dir<'static> =
@@ -74,24 +75,42 @@ impl UiServerMode {
     }
 }
 
-/// Run the May HTTP server in either embedded-UI or REST-only mode.
+/// Parses `--host` / `--port` from `may ui` / `may rest` arguments.
 ///
 /// # Errors
-///
-/// Returns an error when the `ui` mode is selected without the `ui` cargo
-/// feature, or when binding or serving the HTTP listener fails.
-pub async fn run_server(mode: UiServerMode, args: &[String]) -> anyhow::Result<()> {
-    #[cfg(not(feature = "ui"))]
-    mode.ensure_supported()?;
-
+/// Fails when the pair does not form a socket address.
+pub fn parse_listen_args(args: &[String]) -> anyhow::Result<SocketAddr> {
     let host = helpers::parse_arg_value(args, "--host").unwrap_or_else(|| "127.0.0.1".to_string());
     let port = helpers::parse_arg_value(args, "--port")
         .and_then(|v| v.parse::<u16>().ok())
-        .unwrap_or(8787);
-
-    let addr: SocketAddr = format!("{host}:{port}")
+        .unwrap_or(DEFAULT_PORT);
+    format!("{host}:{port}")
         .parse()
-        .with_context(|| format!("Invalid host/port: {host}:{port}"))?;
+        .with_context(|| format!("Invalid host/port: {host}:{port}"))
+}
+
+/// TCP port the daemon serves the API and web UI on by default.
+pub const DEFAULT_PORT: u16 = 8787;
+
+/// A started server: shared state with its background work running, and
+/// the router that serves it.
+pub(crate) struct StartedServer {
+    /// Shared server state.
+    pub(crate) state: Arc<UiServerState>,
+    /// Router serving the API (and the web UI when embedded).
+    pub(crate) router: Router,
+}
+
+/// Builds the server state, starts its background work (scheduler, title
+/// worker, tool dispatchers, auto-archive, container auto-stop, remote
+/// access) and returns the router to serve.
+///
+/// # Errors
+/// Fails when configuration, persistence or a required service cannot be
+/// initialized.
+pub(crate) async fn start(mode: UiServerMode) -> anyhow::Result<StartedServer> {
+    #[cfg(not(feature = "ui"))]
+    mode.ensure_supported()?;
 
     let cwd = std::env::current_dir().context("Failed to get current working directory")?;
     let may_dir = MayConfig::may_dir().context("Failed to resolve ~/.may")?;
@@ -232,6 +251,7 @@ pub async fn run_server(mode: UiServerMode, args: &[String]) -> anyhow::Result<(
     }
     let task_runtime = Arc::new(task_runtime);
     let container_prepare = state::ContainerPrepareTracker::new(ui_event_bus.clone());
+    let (search_index_wake_tx, search_index_wake) = async_channel::bounded(1);
 
     let state = Arc::new(UiServerState {
         tokio_handle: tokio::runtime::Handle::current(),
@@ -263,6 +283,11 @@ pub async fn run_server(mode: UiServerMode, args: &[String]) -> anyhow::Result<(
         tool_environments: crate::agent::ToolEnvironmentCache::spawn(),
         cwd,
         may_dir,
+        search_index_wake_tx,
+        search_index_wake,
+        search_index_status: crate::repo_search::indexer::IndexerStatus::default(),
+        daemon_shutdown: Arc::new(tokio::sync::Notify::new()),
+        build_id: crate::daemon::current_build_id().context("failed to identify the running build")?,
         session_open_locks: Mutex::new(std::collections::HashMap::new()),
     });
 
@@ -287,28 +312,8 @@ pub async fn run_server(mode: UiServerMode, args: &[String]) -> anyhow::Result<(
         .await
         .context("failed to sync remote access state")?;
 
-    let state_for_server = state.clone();
-    tokio::task::spawn_blocking(move || {
-        native::init_logging();
-        native::launch(
-            native::LaunchOptions {
-                listen: Some(native::ListenOverride {
-                    addr,
-                    explicit: true,
-                }),
-                ..Default::default()
-            },
-            move || {
-                let state = state_for_server;
-                async move { (build_router(state, mode), ()) }
-            },
-            || async {},
-        );
-    })
-    .await
-    .context("HTTP server task failed")?;
-
-    Ok(())
+    let router = build_router(state.clone(), mode);
+    Ok(StartedServer { state, router })
 }
 
 fn api_routes() -> Route {
@@ -358,6 +363,7 @@ fn api_routes() -> Route {
     Route::new((
         Route::new((
             "/health".at(health),
+            "/daemon/shutdown".post(shutdown_daemon),
             "/artifact-runtime.js".at(get_artifact_runtime_bridge),
             "/bootstrap".at(get_bootstrap),
             "/models".route(Route::new((
@@ -519,8 +525,18 @@ fn build_router(state: Arc<UiServerState>, mode: UiServerMode) -> Router {
 
 // ── System / Meta handlers ────────────────────────────────
 
-async fn health() -> SkyResult<Json<ApiHealth>> {
-    Ok(Json(ApiHealth { ok: true }))
+async fn health(State(state): State<Arc<UiServerState>>) -> SkyResult<Json<types::DaemonHealth>> {
+    Ok(Json(types::DaemonHealth {
+        ok: true,
+        pid: std::process::id(),
+        build: state.build_id.clone(),
+        search_index: state.search_index_status.snapshot(),
+    }))
+}
+
+async fn shutdown_daemon(State(state): State<Arc<UiServerState>>) -> SkyResult<Json<ApiHealth>> {
+    state.daemon_shutdown.notify_one();
+    Ok(Json(types::API_OK))
 }
 
 async fn get_request_logs(

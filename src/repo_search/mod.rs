@@ -5,6 +5,7 @@
 //! request opens a fresh connection through the platform launcher, which
 //! starts or replaces the daemon when needed.
 
+pub mod auto_index;
 pub(crate) mod backend;
 mod code_search;
 pub mod indexer;

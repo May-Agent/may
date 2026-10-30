@@ -198,20 +198,15 @@ async fn async_main() -> anyhow::Result<()> {
             )?;
             return Ok(());
         }
-        CliMode::Ui(ui_args) => {
-            return may_agent::ui_server::run_server(
-                may_agent::ui_server::UiServerMode::Ui,
-                &ui_args,
-            )
-            .await;
-        }
+        CliMode::Ui(_) => return open_web_ui().await,
         CliMode::Rest(rest_args) => {
-            return may_agent::ui_server::run_server(
-                may_agent::ui_server::UiServerMode::Rest,
-                &rest_args,
-            )
+            return may_agent::daemon::run_daemon(may_agent::daemon::DaemonOptions {
+                mode: may_agent::ui_server::UiServerMode::Rest,
+                tcp: Some(may_agent::ui_server::parse_listen_args(&rest_args)?),
+            })
             .await;
         }
+        CliMode::Daemon(command) => return run_daemon_command(command).await,
         CliMode::Browser(args) => std::process::exit(run_browser(args).await?),
         CliMode::Exec(args) => std::process::exit(Box::pin(run_exec(args)).await?),
         CliMode::OneShot(args) => return run_oneshot(args).await,
@@ -1917,6 +1912,76 @@ mod tests {
             let mut attr = attr;
             libc::pthread_attr_destroy(&raw mut attr);
             size
+        }
+    }
+}
+
+/// `may ui`: make sure the daemon runs, then open its web UI.
+async fn open_web_ui() -> anyhow::Result<()> {
+    let paths = may_agent::daemon::DaemonPaths::user()?;
+    may_agent::daemon::lifecycle::ensure_running(&paths, |line| eprintln!("{line}")).await?;
+    let config = may_agent::config::MayConfig::load().await?;
+    let port = config
+        .daemon
+        .port
+        .unwrap_or(may_agent::ui_server::DEFAULT_PORT);
+    let url = format!("http://127.0.0.1:{port}");
+    eprintln!("May web UI: {url}");
+    if let Err(error) = open::that(&url) {
+        eprintln!("Open {url} in a browser ({error}).");
+    }
+    Ok(())
+}
+
+/// `may daemon [install|uninstall|status|stop]`.
+async fn run_daemon_command(command: cli::DaemonCommand) -> anyhow::Result<()> {
+    use may_agent::daemon::{DaemonOptions, DaemonPaths, lifecycle};
+
+    let paths = DaemonPaths::user()?;
+    match command {
+        cli::DaemonCommand::Run => may_agent::daemon::run_daemon(DaemonOptions::new()).await,
+        cli::DaemonCommand::Install => {
+            let path = lifecycle::install(&paths)?;
+            eprintln!("Installed the May daemon as a login service: {}", path.display());
+            Ok(())
+        }
+        cli::DaemonCommand::Uninstall => {
+            match lifecycle::uninstall()? {
+                Some(path) => eprintln!("Removed the May daemon login service: {}", path.display()),
+                None => eprintln!("The May daemon is not installed as a login service."),
+            }
+            Ok(())
+        }
+        cli::DaemonCommand::Stop => {
+            if lifecycle::stop(&paths).await? {
+                eprintln!("Stopped the May daemon.");
+            } else {
+                eprintln!("The May daemon is not running.");
+            }
+            Ok(())
+        }
+        cli::DaemonCommand::Status => {
+            let client = may_agent::client::DaemonClient::new(paths.socket());
+            match client.health().await {
+                Ok(health) => {
+                    println!("May daemon running (pid {}).", health.pid);
+                    println!(
+                        "Login service: {}.",
+                        if lifecycle::installed() { "installed" } else { "not installed" }
+                    );
+                    println!(
+                        "Search index: {} change(s) pending{}.",
+                        health.search_index.pending,
+                        health
+                            .search_index
+                            .last_error
+                            .map(|error| format!("; last error: {error}"))
+                            .unwrap_or_default()
+                    );
+                }
+                Err(_) => println!("May daemon not running."),
+            }
+            Ok(())
         }
     }
 }

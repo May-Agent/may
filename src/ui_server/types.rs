@@ -457,6 +457,20 @@ pub struct ApiHealth {
 
 pub const API_OK: ApiHealth = ApiHealth { ok: true };
 
+/// `GET /api/health`: the daemon is up, and which build it runs.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonHealth {
+    /// Always `true`.
+    pub ok: bool,
+    /// Daemon process id.
+    pub pid: u32,
+    /// Build id of the daemon executable.
+    pub build: String,
+    /// Search indexer state.
+    pub search_index: crate::repo_search::indexer::IndexerSnapshot,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RequestStats {
