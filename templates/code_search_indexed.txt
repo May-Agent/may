@@ -1,0 +1,1 @@
+Indexed: {{ with_vector }} of {{ total }} chunks embedded.

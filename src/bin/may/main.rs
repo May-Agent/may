@@ -134,7 +134,11 @@ async fn async_main() -> anyhow::Result<()> {
     ensure_rustls_provider();
 
     let cli_mode = parse_cli_mode_from_env();
-    let is_server_mode = matches!(cli_mode, CliMode::Ui(_) | CliMode::Rest(_));
+    // The daemon's stderr is its log file; its diagnostics go there too.
+    let is_server_mode = matches!(
+        cli_mode,
+        CliMode::Ui(_) | CliMode::Rest(_) | CliMode::Daemon(cli::DaemonCommand::Run)
+    );
 
     // Diagnostics live in a bounded in-memory ring; `/bug` and the panic
     // hook dump it on demand under ~/.may/bugs.
@@ -157,7 +161,11 @@ async fn async_main() -> anyhow::Result<()> {
     if is_server_mode {
         tracing_subscriber::registry()
             .with(fmt::layer().with_writer(log_writer).with_ansi(false))
-            .with(fmt::layer().with_writer(io::stderr).with_ansi(true))
+            .with(
+                fmt::layer()
+                    .with_writer(io::stderr)
+                    .with_ansi(std::io::IsTerminal::is_terminal(&io::stderr())),
+            )
             .with(env_filter)
             .init();
     } else {
@@ -198,20 +206,15 @@ async fn async_main() -> anyhow::Result<()> {
             )?;
             return Ok(());
         }
-        CliMode::Ui(ui_args) => {
-            return may_agent::ui_server::run_server(
-                may_agent::ui_server::UiServerMode::Ui,
-                &ui_args,
-            )
-            .await;
-        }
+        CliMode::Ui(_) => return open_web_ui().await,
         CliMode::Rest(rest_args) => {
-            return may_agent::ui_server::run_server(
-                may_agent::ui_server::UiServerMode::Rest,
-                &rest_args,
-            )
+            return may_agent::daemon::run_daemon(may_agent::daemon::DaemonOptions {
+                mode: may_agent::ui_server::UiServerMode::Rest,
+                tcp: Some(may_agent::ui_server::parse_listen_args(&rest_args)?),
+            })
             .await;
         }
+        CliMode::Daemon(command) => return run_daemon_command(command).await,
         CliMode::Browser(args) => std::process::exit(run_browser(args).await?),
         CliMode::Exec(args) => std::process::exit(Box::pin(run_exec(args)).await?),
         CliMode::OneShot(args) => return run_oneshot(args).await,
@@ -337,6 +340,22 @@ where
         tool_distribution,
         may_agent::agent::ToolEnvironmentCache::spawn(),
     );
+
+    // Agents run in the May daemon; the TUI is its client. Starting or
+    // replacing the daemon shows on the status line meanwhile.
+    app.set_status("Connecting to the May daemon…");
+    terminal.draw(|frame| ui::render(frame, &mut app))?;
+    let paths = may_agent::daemon::DaemonPaths::user()?;
+    let runtime_deps = match may_agent::daemon::lifecycle::ensure_running(&paths, |_| {}).await {
+        Ok(client) => {
+            app.status = None;
+            app.btw_daemon = Some(client.clone());
+            runtime_deps.with_daemon(client)
+        }
+        Err(error) => {
+            return Err(anyhow::anyhow!("the May daemon is unavailable: {error}"));
+        }
+    };
 
     // Only start a session if configuration is complete
     let mut worker_build = None;
@@ -478,6 +497,9 @@ where
     // The busy status shows once per episode of another run holding the session.
     let mut busy_elsewhere_notified = false;
     let mut assistant_response = AssistantReply::default();
+    // Daemon-held prompts already shown, so a prompt answered moments ago is
+    // not reopened before the daemon clears it.
+    let mut shown_prompts = std::collections::HashSet::<String>::new();
 
     // Sockets through which other main agents reach this TUI's session
     let agent_listeners =
@@ -489,6 +511,7 @@ where
             Workspace(may_agent::workspace_request::WorkspaceRequest),
             WorkerBuilt(Box<Result<AgentWorker, may_agent::tui::runtime::TuiRuntimeError>>),
             Agent(TuiEvent),
+            ForeignTurn(may_agent::agent::ForeignTurn),
             Context(Option<TuiEvent>),
             Terminal(Box<AppEvent>),
         }
@@ -548,6 +571,28 @@ where
                     request: request.request,
                 },
             );
+        }
+        // A daemon run waits on its prompts in the daemon; they show here
+        // from the session's runtime state and are answered over REST.
+        if runtime_deps.daemon().is_some() && matches!(app.mode, may_agent::tui::AppMode::Chat) {
+            if let Some(request) = runtime_deps.pending_ask_user(app).await?
+                && shown_prompts.insert(request.id.clone())
+            {
+                app.show_blocking_prompt(may_agent::tui::AppMode::AskUser(
+                    may_agent::tui::AskUserState::for_open_question(request),
+                ));
+            } else if let Some(request) = runtime_deps.pending_workspace(app).await?
+                && shown_prompts.insert(request.id.clone())
+            {
+                app.show_blocking_prompt(may_agent::tui::AppMode::WorkspaceConfirm(
+                    may_agent::tui::state::WorkspaceConfirmState {
+                        request_id: request.id,
+                        path: request.request.path,
+                        reason: request.request.reason,
+                        request: None,
+                    },
+                ));
+            }
         }
         phases.step("pending_permission", step_start.elapsed());
 
@@ -686,6 +731,10 @@ where
                                 let result = handle.recv().await;
                                 tracing::info!("agent handle.recv() RETURNED");
                                 result.map(Event::Agent)
+                            } else if let Some(worker) = worker.as_ref() {
+                                // A turn another client started, rendered
+                                // while this TUI has none of its own.
+                                worker.next_foreign_turn().await.map(Event::ForeignTurn)
                             } else {
                                 futures_lite::future::pending().await
                             }
@@ -726,6 +775,7 @@ where
                 Some(Event::Workspace(_)) => "Workspace",
                 Some(Event::WorkerBuilt(_)) => "WorkerBuilt",
                 Some(Event::Agent(_)) => "Agent",
+                Some(Event::ForeignTurn(_)) => "ForeignTurn",
                 Some(Event::Context(_)) => "Context",
                 Some(Event::Terminal(_)) => "Terminal",
                 None => "None",
@@ -742,6 +792,7 @@ where
             Event::Workspace(_) => "workspace",
             Event::WorkerBuilt(_) => "worker_built",
             Event::Agent(_) => "agent",
+            Event::ForeignTurn(_) => "foreign_turn",
             Event::Context(_) => "context",
         };
 
@@ -800,7 +851,9 @@ where
                         app.show_blocking_prompt(may_agent::tui::AppMode::WorkspaceConfirm(
                             may_agent::tui::state::WorkspaceConfirmState {
                                 request_id,
-                                request,
+                                path: request.args.request.path.clone(),
+                                reason: request.args.request.reason.clone(),
+                                request: Some(request),
                             },
                         ));
                     }
@@ -811,6 +864,24 @@ where
                         drop(request);
                     }
                 }
+            }
+
+            Event::ForeignTurn(turn) => {
+                let message = may_agent::tui::queue::PendingMessage {
+                    content: turn.content.clone().unwrap_or_default(),
+                    hidden_context_xml: None,
+                    attachments: Vec::new(),
+                    queued_at: jiff::Timestamp::now(),
+                    delivery_mode: may_agent::session::PendingUserMessageMode::Queue,
+                    display: turn.content.is_none().then(String::new),
+                };
+                if let Some(content) = turn.content {
+                    app.session_manager
+                        .record_unpersisted(may_agent::session::ChatMessage::user(content));
+                }
+                app.start_processing(&message);
+                assistant_response.clear();
+                agent_handle = Some(turn.handle);
             }
 
             Event::Agent(tui_event) => {
@@ -837,7 +908,9 @@ where
                                 .await;
                         }
                     }
-                    TuiEvent::ContextReport(_) | TuiEvent::ContextDump(_) => {
+                    TuiEvent::ContextReport(_)
+                    | TuiEvent::ContextDump(_)
+                    | TuiEvent::ContextDumpSaved { .. } => {
                         // Reports arrive on the context channel; the agent
                         // channel only carries them if the channels raced.
                     }
@@ -926,6 +999,15 @@ where
                     Some(TuiEvent::ContextDump(Err(err))) => {
                         app.chat.push_error(&format!("Context dump failed: {err}"));
                     }
+                    Some(TuiEvent::ContextDumpSaved {
+                        path,
+                        message_count,
+                    }) => {
+                        app.chat.push_notice(&format!(
+                            "Context dump written to {path} — {message_count} messages"
+                        ));
+                        app.scroll = usize::MAX;
+                    }
                     Some(TuiEvent::Error(err)) => app.chat.push_error(&err),
                     _ => {}
                 }
@@ -944,15 +1026,8 @@ where
                     let is_esc = *key_code == KeyCode::Esc;
                     // Esc while a subagent runs stops just that run; a second
                     // Esc (or Ctrl+C) still aborts the whole turn.
-                    if is_esc && let Some(runs) = &app.subagent_runs {
-                        let stopped = runs.cancel_all();
-                        if stopped > 0 {
-                            app.set_status(format!(
-                                "Stopped {stopped} subagent{} — Esc again to abort turn",
-                                if stopped == 1 { "" } else { "s" }
-                            ));
-                            continue;
-                        }
+                    if is_esc && app.cancel_all_subagents() {
+                        continue;
                     }
                     if is_ctrl_c || is_esc {
                         tracing::info!("Agent interrupted by user");
@@ -1308,14 +1383,24 @@ where
                             .await?
                         {
                             ResponseCommit::Committed => {
-                                request.respond(approved).unwrap_or_else(|_| {
-                                    panic!("{}", may_agent::tui::app::ERR_TOOL_RESPONSE_SEND.trim())
-                                });
+                                if let Some(request) = request {
+                                    request.respond(approved).unwrap_or_else(|_| {
+                                        panic!(
+                                            "{}",
+                                            may_agent::tui::app::ERR_TOOL_RESPONSE_SEND.trim()
+                                        )
+                                    });
+                                }
                             }
                             ResponseCommit::Lost(committed) => {
-                                request.respond(committed).unwrap_or_else(|_| {
-                                    panic!("{}", may_agent::tui::app::ERR_TOOL_RESPONSE_SEND.trim())
-                                });
+                                if let Some(request) = request {
+                                    request.respond(committed).unwrap_or_else(|_| {
+                                        panic!(
+                                            "{}",
+                                            may_agent::tui::app::ERR_TOOL_RESPONSE_SEND.trim()
+                                        )
+                                    });
+                                }
                                 app.chat.push_notice(
                                     "That request was already answered elsewhere; the run continues with that decision, not yours",
                                 );
@@ -1871,6 +1956,88 @@ where
     }
 
     Ok(())
+}
+
+/// `may ui`: make sure the daemon runs, then open its web UI.
+async fn open_web_ui() -> anyhow::Result<()> {
+    if !cfg!(feature = "ui") {
+        anyhow::bail!(
+            "`may ui` requires the `ui` cargo feature; use `may rest` for the REST API server"
+        );
+    }
+    let paths = may_agent::daemon::DaemonPaths::user()?;
+    may_agent::daemon::lifecycle::ensure_running(&paths, |line| eprintln!("{line}")).await?;
+    let config = may_agent::config::MayConfig::load().await?;
+    let port = config
+        .daemon
+        .port
+        .unwrap_or(may_agent::ui_server::DEFAULT_PORT);
+    let url = format!("http://127.0.0.1:{port}");
+    eprintln!("May web UI: {url}");
+    if let Err(error) = open::that(&url) {
+        eprintln!("Open {url} in a browser ({error}).");
+    }
+    Ok(())
+}
+
+/// `may daemon [install|uninstall|status|stop]`.
+async fn run_daemon_command(command: cli::DaemonCommand) -> anyhow::Result<()> {
+    use may_agent::daemon::{DaemonOptions, DaemonPaths, lifecycle};
+
+    let paths = DaemonPaths::user()?;
+    match command {
+        cli::DaemonCommand::Run => may_agent::daemon::run_daemon(DaemonOptions::new()).await,
+        cli::DaemonCommand::Install => {
+            let path = lifecycle::install(&paths)?;
+            eprintln!(
+                "Installed the May daemon as a login service: {}",
+                path.display()
+            );
+            Ok(())
+        }
+        cli::DaemonCommand::Uninstall => {
+            match lifecycle::uninstall()? {
+                Some(path) => eprintln!("Removed the May daemon login service: {}", path.display()),
+                None => eprintln!("The May daemon is not installed as a login service."),
+            }
+            Ok(())
+        }
+        cli::DaemonCommand::Stop => {
+            if lifecycle::stop(&paths).await? {
+                eprintln!("Stopped the May daemon.");
+            } else {
+                eprintln!("The May daemon is not running.");
+            }
+            Ok(())
+        }
+        cli::DaemonCommand::Status => {
+            let client = may_agent::client::DaemonClient::new(paths.socket());
+            match client.health().await {
+                Ok(health) => {
+                    println!("May daemon running (pid {}).", health.pid);
+                    println!(
+                        "Login service: {}.",
+                        if lifecycle::installed() {
+                            "installed"
+                        } else {
+                            "not installed"
+                        }
+                    );
+                    println!(
+                        "Search index: {} change(s) pending{}.",
+                        health.search_index.pending,
+                        health
+                            .search_index
+                            .last_error
+                            .map(|error| format!("; last error: {error}"))
+                            .unwrap_or_default()
+                    );
+                }
+                Err(_) => println!("May daemon not running."),
+            }
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]

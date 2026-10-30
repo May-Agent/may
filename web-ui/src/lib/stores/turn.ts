@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 import type { ApiMessage, ChatRequestPayload, ChatStreamEvent } from '../types';
-import { openChatStream, stopSession } from '../api/chat';
+import { openSessionTurns, sendMessage, stopSession } from '../api/chat';
 import {
   applyEvent,
   emptyTurn,
@@ -47,8 +47,6 @@ export interface SessionTurn {
   active: TurnState | null;
   /** Last turn kept for display even after stream ends. */
   last: TurnState | null;
-  /** Aborts the current stream. */
-  abort: (() => void) | null;
   /** Keeps the composer locked until the backend has fully settled a stop request. */
   stopping: boolean;
   /** Payload of the most recent send, used to retry after an error. */
@@ -58,19 +56,38 @@ export interface SessionTurn {
 const IDLE_TURN: SessionTurn = {
   active: null,
   last: null,
-  abort: null,
   stopping: false,
   lastPayload: null,
 };
+
+/** Wait before reopening a session's turn stream that dropped. */
+const RECONNECT_DELAY_MS = 1000;
 
 interface TurnSliceState {
   /** Turns keyed by the id of the session that owns them. */
   turns: Record<string, SessionTurn>;
 
+  /**
+   * Follow a session's turns, whichever client starts them. Returns the
+   * function that stops following.
+   */
+  watch: (sessionId: string) => () => void;
   send: (payload: ChatRequestPayload) => Promise<void>;
   cancel: (sessionId: string) => Promise<void>;
   retry: (sessionId: string) => Promise<void>;
   dismissError: (sessionId: string) => void;
+}
+
+function errorTurn(base: TurnState | null, sessionId: string, err: unknown): TurnState {
+  return {
+    ...(base ?? emptyTurn('', sessionId, '')),
+    error: {
+      code: 'internal_error',
+      message: err instanceof Error ? err.message : String(err),
+      retryable: true,
+    },
+    status: 'done',
+  };
 }
 
 export const useTurnStore = create<TurnSliceState>((set, get) => {
@@ -83,107 +100,111 @@ export const useTurnStore = create<TurnSliceState>((set, get) => {
       return { turns: { ...state.turns, [sessionId]: { ...prev, ...fn(prev) } } };
     });
 
+  /** Watchers by session id, counted so nested views share one stream. */
+  const watchers = new Map<string, { count: number; controller: AbortController }>();
+
+  const finishWithReply = (sessionId: string, assistant: ApiMessage) => {
+    const finalActive = turnOf(sessionId).active;
+    patch(sessionId, (prev) => ({ active: null, last: prev.active, stopping: false }));
+    const toolEvent = synthesizeToolEvent(finalActive?.tools ?? []);
+    const reasoning =
+      typeof assistant.thinking === 'string' && assistant.thinking.length > 0
+        ? assistant.thinking
+        : finalActive?.reasoning && finalActive.reasoning.length > 0
+          ? finalActive.reasoning
+          : assistant.thinking;
+    useSessionsStore.getState().appendMessage(sessionId, {
+      ...assistant,
+      toolEvent: toolEvent ?? assistant.toolEvent ?? null,
+      thinking: reasoning,
+    });
+  };
+
+  const handle = (sessionId: string, evt: ChatStreamEvent) => {
+    switch (evt.kind) {
+      case 'start':
+        patch(sessionId, (prev) => ({
+          active: applyEvent(prev.active ?? emptyTurn('', sessionId, ''), evt),
+          last: null,
+        }));
+        return;
+      case 'done':
+      case 'paused':
+        patch(sessionId, (prev) => (prev.active ? { active: applyEvent(prev.active, evt) } : {}));
+        finishWithReply(sessionId, evt.assistant);
+        return;
+      case 'end':
+        patch(sessionId, (prev) =>
+          prev.active
+            ? { active: null, last: applyEvent(prev.active, evt), stopping: false }
+            : { stopping: false },
+        );
+        return;
+      default:
+        patch(sessionId, (prev) => (prev.active ? { active: applyEvent(prev.active, evt) } : {}));
+    }
+  };
+
+  const follow = async (sessionId: string, signal: AbortSignal) => {
+    while (!signal.aborted) {
+      try {
+        const stream = await openSessionTurns(sessionId, signal);
+        for await (const evt of stream.events) handle(sessionId, evt);
+      } catch (err) {
+        if (signal.aborted) return;
+        console.warn('session turn stream dropped', err);
+      }
+      if (signal.aborted) return;
+      await new Promise((resolve) => setTimeout(resolve, RECONNECT_DELAY_MS));
+    }
+  };
+
+  const ensureWatched = (sessionId: string) => {
+    if (!watchers.has(sessionId)) get().watch(sessionId);
+  };
+
   return {
     turns: {},
 
+    watch(sessionId) {
+      const existing = watchers.get(sessionId);
+      if (existing) {
+        existing.count += 1;
+      } else {
+        const controller = new AbortController();
+        watchers.set(sessionId, { count: 1, controller });
+        void follow(sessionId, controller.signal);
+      }
+      return () => {
+        const watcher = watchers.get(sessionId);
+        if (!watcher) return;
+        watcher.count -= 1;
+        if (watcher.count <= 0) {
+          watcher.controller.abort();
+          watchers.delete(sessionId);
+        }
+      };
+    },
+
     async send(payload) {
       const sessionId = payload.sessionId;
-      await get().cancel(sessionId);
-
-      // Seed a placeholder turn so the UI paints immediately.
-      patch(sessionId, () => ({
-        active: emptyTurn('', sessionId, ''),
+      ensureWatched(sessionId);
+      // Seed a placeholder turn so the UI paints immediately; the `start`
+      // event of the turn replaces it.
+      patch(sessionId, (prev) => ({
+        active: prev.active ?? emptyTurn('', sessionId, ''),
         last: null,
-        abort: null,
         stopping: false,
         lastPayload: payload,
       }));
-
-      let handle;
       try {
-        handle = await openChatStream(payload);
+        await sendMessage(payload);
       } catch (err) {
-        patch(sessionId, () => ({
+        patch(sessionId, (prev) => ({
           active: null,
-          last: {
-            ...emptyTurn('', sessionId, ''),
-            error: {
-              code: 'internal_error',
-              message: err instanceof Error ? err.message : String(err),
-              retryable: true,
-            },
-            status: 'done',
-          },
+          last: errorTurn(prev.active, sessionId, err),
           stopping: false,
         }));
-        return;
-      }
-
-      patch(sessionId, () => ({ abort: handle.abort }));
-
-      let doneAssistant: ApiMessage | null = null;
-
-      try {
-        for await (const evt of handle.events as AsyncGenerator<ChatStreamEvent>) {
-          patch(sessionId, (prev) =>
-            prev.active ? { active: applyEvent(prev.active, evt) } : {},
-          );
-
-          if (evt.kind === 'done') {
-            doneAssistant = evt.assistant;
-          }
-        }
-      } catch (err) {
-        if (turnOf(sessionId).stopping) {
-          patch(sessionId, (prev) => ({
-            active: null,
-            last: prev.active ? { ...prev.active, status: 'done' } : prev.last,
-            abort: null,
-          }));
-          return;
-        }
-        patch(sessionId, (prev) => {
-          const base = prev.active ?? emptyTurn('', sessionId, '');
-          return {
-            active: null,
-            last: {
-              ...base,
-              error: {
-                code: 'internal_error',
-                message: err instanceof Error ? err.message : String(err),
-                retryable: true,
-              },
-              status: 'done',
-            },
-            abort: null,
-            stopping: false,
-          };
-        });
-        return;
-      }
-
-      const finalActive = turnOf(sessionId).active;
-      patch(sessionId, (prev) => ({
-        active: null,
-        last: prev.active,
-        abort: null,
-      }));
-
-      if (doneAssistant) {
-        const tools = finalActive?.tools ?? [];
-        const toolEvent = synthesizeToolEvent(tools);
-        const reasoning =
-          typeof doneAssistant.thinking === 'string' && doneAssistant.thinking.length > 0
-            ? doneAssistant.thinking
-            : finalActive?.reasoning && finalActive.reasoning.length > 0
-              ? finalActive.reasoning
-              : doneAssistant.thinking;
-        const merged: ApiMessage = {
-          ...doneAssistant,
-          toolEvent: toolEvent ?? doneAssistant.toolEvent ?? null,
-          thinking: reasoning,
-        };
-        useSessionsStore.getState().appendMessage(sessionId, merged);
       }
     },
 
@@ -194,8 +215,6 @@ export const useTurnStore = create<TurnSliceState>((set, get) => {
       patch(sessionId, () => ({ stopping: true }));
       try {
         await stopSession(sessionId);
-        turnOf(sessionId).abort?.();
-        patch(sessionId, () => ({ abort: null, stopping: false }));
       } catch (err) {
         patch(sessionId, (prev) => ({
           active: prev.active

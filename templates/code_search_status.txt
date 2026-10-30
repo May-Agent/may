@@ -1,0 +1,8 @@
+Worktree: {{ worktree }}
+{% match index -%}
+{% when Some with (index) -%}
+Index: {% if first_index %}first index in progress{% else %}maintained{% endif %}, {{ index.chunks_with_vector }} of {{ index.chunks_total }} chunks embedded, {{ index.in_flight }} in flight
+{% when None -%}
+Index: not built yet; the first search builds it.
+{% endmatch -%}
+Model: {{ model }}

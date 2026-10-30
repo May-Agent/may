@@ -22,6 +22,8 @@ pub mod perf;
 pub mod queue;
 /// Event reducers for non-chat modes.
 pub mod reducer;
+/// Agent worker over the May daemon.
+pub mod remote;
 /// Agent worker runtime glue for the TUI.
 pub mod runtime;
 /// UI mode and per-mode state types.

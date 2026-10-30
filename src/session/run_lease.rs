@@ -204,6 +204,12 @@ impl SessionRuns {
         });
     }
 
+    /// Number of runs this process currently holds.
+    #[must_use]
+    pub fn live_count(&self) -> usize {
+        self.live.load().len()
+    }
+
     /// Fence of the run this process currently holds on `session_id`.
     #[must_use]
     pub fn live_fence(&self, session_id: &str) -> Option<RunFence> {

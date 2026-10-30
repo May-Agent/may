@@ -275,6 +275,47 @@ impl ChatDb {
         self.issue_detail(row).await.map(Some)
     }
 
+    /// Issues of `repo_key` updated after `since` (any time when `None`),
+    /// oldest update first.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] when the query fails.
+    pub async fn issues_updated_since(
+        &self,
+        repo_key: &str,
+        since: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<IssueSummary>, ChatDbError> {
+        let Some(project_id) = self.find_issue_project(repo_key).await? else {
+            return Ok(Vec::new());
+        };
+        let rows = query!(
+            self.db,
+            "SELECT * FROM issues WHERE project_id = ? AND updated_at > ? ORDER BY updated_at, number LIMIT ?",
+            project_id,
+            since.unwrap_or(""),
+            limit
+        )
+        .fetch_all::<Model>()
+        .await?;
+        let mut summaries = Vec::with_capacity(rows.len());
+        for row in rows {
+            summaries.push(IssueSummary {
+                number: row.number,
+                title: row.title,
+                state: row.state.parse().map_err(|error: String| {
+                    storage_error(crate::db::common::db_custom_error(
+                        "invalid issue state: ",
+                        &error,
+                    ))
+                })?,
+                labels: self.issue_labels(row.id).await?,
+                updated_at: row.updated_at,
+            });
+        }
+        Ok(summaries)
+    }
+
     /// List issues in the project keyed by `repo_key`, newest first.
     ///
     /// `labels` filters to issues carrying every listed label.

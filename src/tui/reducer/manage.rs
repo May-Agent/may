@@ -73,7 +73,7 @@ pub fn handle_workspace_confirm_key(app: &mut App, code: KeyCode) -> Option<Send
         KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
             let mode = std::mem::replace(&mut app.mode, crate::tui::state::AppMode::Chat);
             if let crate::tui::state::AppMode::WorkspaceConfirm(state) = mode {
-                app.track_workspace_dir(std::path::Path::new(&state.request.args.request.path));
+                app.track_workspace_dir(std::path::Path::new(&state.path));
                 return Some(SendAction::RespondWorkspace {
                     request_id: state.request_id,
                     request: state.request,

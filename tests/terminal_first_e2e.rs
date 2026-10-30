@@ -75,7 +75,13 @@ enum MockChatScenario {
     /// The first request asks the user a question through the `ask_user`
     /// terminal command; every later request gets a plain text reply.
     AsksUser,
+    /// The first request starts [`BACKGROUND_JOB_SCRIPT`] as a background
+    /// terminal job; every later request gets a plain text reply.
+    StartsBackgroundJob,
 }
+
+/// The long-running script of [`MockChatScenario::StartsBackgroundJob`].
+const BACKGROUND_JOB_SCRIPT: &str = "sleep 120";
 
 /// A scripted main agent / subagent pair sharing one mock model.
 ///
@@ -108,7 +114,7 @@ const FORK_ANSWER: &str = "FORK-ANSWER-OK";
 /// launch that never finishes ends the test with a message instead of hanging.
 const SUBAGENT_PROBE_MAX_REQUESTS: usize = 40;
 
-/// Waits at most eight seconds (the foreground limit is ten) for the launch
+/// Waits at most eight seconds (the foreground wait is ten) for the launch
 /// job to finish, and prints what it wrote.
 const SUBAGENT_POLL_SCRIPT: &str = "i=0; while [ $i -lt 8 ]; do if [ -f sub.done ]; then echo POLL_DONE; cat sub.out; exit 0; fi; sleep 1; i=$((i+1)); done; echo POLL_PENDING";
 
@@ -279,15 +285,15 @@ impl MockScenarioState {
                 MockHttpResponse::sse(text_stream_frames(chunks.clone(), *delay))
             }
             MockChatScenario::TerminalRoundTrip => match self.request_index {
-                // The command blocks on `read`, so it runs as a background
-                // job: `terminal` foreground calls are killed at their bound,
-                // never promoted.
+                // The command blocks on `read`; it is started detached so the
+                // test drives its stdin as a background job.
                 0 => MockHttpResponse::sse(vec![
                     delayed_sse_frame(
                         tool_call_chunk(
                             "call-terminal",
-                            "terminal_background",
+                            "terminal",
                             &serde_json::json!({
+                                "background": true,
                                 "description": "Ask the terminal for the user's name",
                                 "script": "printf 'cwd=%s\\n' \"$(pwd -P)\"; printf 'name? '; read name; printf 'hello %s\\n' \"$name\"",
                                 "mode": "sandboxed",
@@ -411,6 +417,29 @@ impl MockScenarioState {
                     Duration::from_millis(10),
                 )),
             },
+            MockChatScenario::StartsBackgroundJob => match self.request_index {
+                0 => MockHttpResponse::sse(vec![
+                    delayed_sse_frame(
+                        tool_call_chunk(
+                            "call-background-job",
+                            "terminal",
+                            &serde_json::json!({
+                                "description": "Start a long job",
+                                "script": BACKGROUND_JOB_SCRIPT,
+                                "mode": "sandboxed",
+                                "background": true,
+                                "timeout": 600,
+                            }),
+                        ),
+                        Duration::from_millis(10),
+                    ),
+                    done_frame(Duration::from_millis(10)),
+                ]),
+                _ => MockHttpResponse::sse(text_stream_frames(
+                    vec!["started".to_string()],
+                    Duration::from_millis(10),
+                )),
+            },
             MockChatScenario::WritesTasksFile => {
                 // The run loop keeps the model going while `tasks.md` has
                 // unchecked items, and the model side sees the file once per
@@ -485,13 +514,14 @@ impl MockScenarioState {
             verify_native_tool_surface(request)?;
         }
         let latest = latest_tool_output(request);
-        let terminal_call = |name: &str, id: &str, script: &str| {
+        let terminal_call = |background: bool, id: &str, script: &str| {
             MockHttpResponse::sse(vec![
                 delayed_sse_frame(
                     tool_call_chunk(
                         id,
-                        name,
+                        "terminal",
                         &serde_json::json!({
+                            "background": background,
                             "description": "Run the subagent authority probe",
                             "script": script,
                             "mode": "sandboxed",
@@ -511,7 +541,7 @@ impl MockScenarioState {
         let id = format!("call-probe-{}", self.request_index);
         let response = if is_child {
             latest.map_or_else(
-                || terminal_call("terminal", &id, probe.child_script),
+                || terminal_call(false, &id, probe.child_script),
                 |output| text(format!("child probe output: {output}")),
             )
         } else {
@@ -523,13 +553,13 @@ impl MockScenarioState {
                         model_flags = probe.model_flags,
                         flags = probe.grant_flags,
                     );
-                    terminal_call("terminal_background", &id, &launch)
+                    terminal_call(true, &id, &launch)
                 }
                 Some(output) if output.contains("MAIN_FINAL") => text("probe complete".to_string()),
                 Some(output) if output.contains("POLL_DONE") => {
-                    terminal_call("terminal", &id, probe.final_script)
+                    terminal_call(false, &id, probe.final_script)
                 }
-                Some(_) => terminal_call("terminal", &id, SUBAGENT_POLL_SCRIPT),
+                Some(_) => terminal_call(false, &id, SUBAGENT_POLL_SCRIPT),
             }
         };
         self.request_index += 1;
@@ -543,13 +573,14 @@ impl MockScenarioState {
                 self.request_index
             ));
         }
-        let terminal_call = |name: &str, id: &str, script: &str| {
+        let terminal_call = |background: bool, id: &str, script: &str| {
             MockHttpResponse::sse(vec![
                 delayed_sse_frame(
                     tool_call_chunk(
                         id,
-                        name,
+                        "terminal",
                         &serde_json::json!({
+                            "background": background,
                             "description": "Run the fork probe",
                             "script": script,
                             "mode": "sandboxed",
@@ -574,18 +605,18 @@ impl MockScenarioState {
             text(FORK_ANSWER)
         } else {
             match latest_tool_output(request) {
-                None => terminal_call("terminal", &id, FORK_SECRET_SCRIPT),
+                None => terminal_call(false, &id, FORK_SECRET_SCRIPT),
                 Some(output) if output.contains("MAIN_FINAL") => text("fork probe complete"),
                 Some(output) if output.contains("POLL_DONE") => {
-                    terminal_call("terminal", &id, "echo MAIN_FINAL")
+                    terminal_call(false, &id, "echo MAIN_FINAL")
                 }
                 Some(output) if output.contains(FORK_SECRET) => {
                     let launch = format!(
                         "( printf '{FORK_TASK_MARKER}: report what you know.\\n' > prompt.md\nsubagent start fork prompt.md ) > sub.out 2>&1; touch sub.done"
                     );
-                    terminal_call("terminal_background", &id, &launch)
+                    terminal_call(true, &id, &launch)
                 }
-                Some(_) => terminal_call("terminal", &id, SUBAGENT_POLL_SCRIPT),
+                Some(_) => terminal_call(false, &id, SUBAGENT_POLL_SCRIPT),
             }
         };
         self.request_index += 1;
@@ -656,7 +687,6 @@ fn verify_native_tool_surface(request: &Value) -> Result<(), String> {
     if names
         != [
             "terminal",
-            "terminal_background",
             "terminal_input",
             "terminal_kill",
             "terminal_read",
@@ -1365,15 +1395,57 @@ struct TestSseEvent {
     data: String,
 }
 
-/// Drain a chat SSE response into `(event kind, parsed data)` pairs until the
-/// turn finishes (`done`/`paused`/`error`) or the server closes the stream.
+/// Starts a turn the way every client does: subscribes to the session's
+/// `session_turn` frames on `/api/events`, then `POST`s the message. Returns
+/// the event stream, or the refused `POST`'s response.
+async fn send_turn(
+    client: &reqwest::Client,
+    base_url: &str,
+    body: &Value,
+) -> reqwest::Result<reqwest::Response> {
+    let session_id = body
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .expect("turn body names its session")
+        .to_string();
+    let events = client
+        .get(format!("{base_url}/api/events"))
+        .query(&[
+            ("topics", "session_turn"),
+            ("sessionId", session_id.as_str()),
+        ])
+        .send()
+        .await?;
+    let sent = client
+        .post(format!("{base_url}/api/sessions/{session_id}/messages"))
+        .json(body)
+        .send()
+        .await?;
+    if sent.status().is_success() {
+        Ok(events)
+    } else {
+        Ok(sent)
+    }
+}
+
+/// Drain a session's `session_turn` frames into `(event kind, parsed data)`
+/// pairs until the turn finishes (`done`/`paused`/`error`/`end`) or the
+/// server closes the stream.
 async fn collect_sse_events(response: reqwest::Response) -> Vec<(String, Value)> {
     let mut reader = SseReader::new(response);
     let mut events = Vec::new();
     while let Some(event) = reader.next_event().await {
-        let data: Value = serde_json::from_str(&event.data).unwrap_or(Value::Null);
-        let kind = event.event;
-        let finished = matches!(kind.as_str(), "done" | "paused" | "error");
+        if event.event != "session_turn" {
+            continue;
+        }
+        let frame: Value = serde_json::from_str(&event.data).unwrap_or(Value::Null);
+        let kind = frame
+            .get("event")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let data = frame.get("data").cloned().unwrap_or(Value::Null);
+        let finished = matches!(kind.as_str(), "done" | "paused" | "error" | "end");
         events.push((kind, data));
         if finished {
             break;
@@ -2069,15 +2141,16 @@ async fn ui_chat_tasks_file_is_the_canonical_todo_document() {
     let sandbox_dir = SessionStore::new(MayHomePaths::new(harness.may_dir.clone()))
         .sandbox_dir(&session_id, Some(environment.profile_id()));
 
-    let response = client
-        .post(format!("{}/api/chat/stream", server.base_url))
-        .json(&serde_json::json!({
+    let response = send_turn(
+        &client,
+        &server.base_url,
+        &serde_json::json!({
             "sessionId": session_id,
             "content": "Plan the work in tasks.md."
-        }))
-        .send()
-        .await
-        .expect("chat stream request should succeed");
+        }),
+    )
+    .await
+    .expect("chat stream request should succeed");
     let response = expect_status(&server.log, response, StatusCode::OK).await;
     let events = collect_turn_events(response, "the first tasks turn", &server.log).await;
     assert!(
@@ -2145,15 +2218,16 @@ async fn ui_chat_tasks_file_is_the_canonical_todo_document() {
 
     // A follow-up turn proves the injection reads the file: the rewritten
     // content shows up in the next model request.
-    let response = client
-        .post(format!("{}/api/chat/stream", server.base_url))
-        .json(&serde_json::json!({
+    let response = send_turn(
+        &client,
+        &server.base_url,
+        &serde_json::json!({
             "sessionId": session_id,
             "content": "Continue."
-        }))
-        .send()
-        .await
-        .expect("second chat stream request should succeed");
+        }),
+    )
+    .await
+    .expect("second chat stream request should succeed");
     let response = expect_status(&server.log, response, StatusCode::OK).await;
     let events = collect_turn_events(response, "the follow-up tasks turn", &server.log).await;
     assert!(
@@ -2228,15 +2302,16 @@ async fn run_probe_turn(
     let sandbox_dir = SessionStore::new(MayHomePaths::new(harness.may_dir.clone()))
         .sandbox_dir(&session_id, Some(environment.profile_id()));
 
-    let response = client
-        .post(format!("{}/api/chat/stream", server.base_url))
-        .json(&serde_json::json!({
+    let response = send_turn(
+        &client,
+        &server.base_url,
+        &serde_json::json!({
             "sessionId": session_id,
             "content": content
-        }))
-        .send()
-        .await
-        .expect("chat stream request should succeed");
+        }),
+    )
+    .await
+    .expect("chat stream request should succeed");
     let response = expect_status(&server.log, response, StatusCode::OK).await;
     let events = collect_turn_events(response, "the subagent probe turn", &server.log).await;
     assert!(
@@ -2652,15 +2727,16 @@ async fn stream_stop_mid_response_persists_partial_assistant_text(environment: C
         let log = server.log.clone();
         let session_id = session_id.clone();
         async move {
-            let response = client
-                .post(format!("{base_url}/api/chat/stream"))
-                .json(&serde_json::json!({
+            let response = send_turn(
+                &client,
+                &base_url,
+                &serde_json::json!({
                     "sessionId": session_id,
                     "content": "Say several chunks slowly."
-                }))
-                .send()
-                .await
-                .expect("chat stream request should succeed");
+                }),
+            )
+            .await
+            .expect("chat stream request should succeed");
             let response = expect_status(&log, response, StatusCode::OK).await;
             collect_sse_events(response).await
         }
@@ -2761,15 +2837,16 @@ async fn terminal_and_terminal_input_round_trip(environment: ChatEnvironment) {
         let log = server.log.clone();
         let session_id = session_id.clone();
         async move {
-            let response = client
-                .post(format!("{base_url}/api/chat/stream"))
-                .json(&serde_json::json!({
+            let response = send_turn(
+                &client,
+                &base_url,
+                &serde_json::json!({
                     "sessionId": session_id,
                     "content": "Please ask the terminal for my name and answer with the result."
-                }))
-                .send()
-                .await
-                .expect("chat stream request should succeed");
+                }),
+            )
+            .await
+            .expect("chat stream request should succeed");
             let response = expect_status(&log, response, StatusCode::OK).await;
             collect_sse_events(response).await
         }
@@ -2921,15 +2998,16 @@ async fn chat_turns_on_one_session_prepare_tools_once(environment: ChatEnvironme
         ),
         ("Second turn.", Duration::from_secs(60)),
     ] {
-        let response = client
-            .post(format!("{}/api/chat/stream", server.base_url))
-            .json(&serde_json::json!({
+        let response = send_turn(
+            &client,
+            &server.base_url,
+            &serde_json::json!({
                 "sessionId": session_id,
                 "content": content
-            }))
-            .send()
-            .await
-            .expect("chat stream request should succeed");
+            }),
+        )
+        .await
+        .expect("chat stream request should succeed");
         let status = response.status();
         assert!(
             status == StatusCode::OK,
@@ -3189,15 +3267,16 @@ async fn ui_chat_reports_unreachable_provider_error() {
         .await;
     let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
 
-    let response = client
-        .post(format!("{}/api/chat/stream", server.base_url))
-        .json(&serde_json::json!({
+    let response = send_turn(
+        &client,
+        &server.base_url,
+        &serde_json::json!({
             "sessionId": session_id,
             "content": "Is anyone there?"
-        }))
-        .send()
-        .await
-        .expect("chat stream request should succeed");
+        }),
+    )
+    .await
+    .expect("chat stream request should succeed");
     assert_eq!(
         response.status(),
         StatusCode::OK,
@@ -3436,15 +3515,16 @@ async fn ask_user_after_the_run_ended_delivers_the_answer_to_a_new_run() {
         .await;
     let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
 
-    let response = client
-        .post(format!("{}/api/chat/stream", server.base_url))
-        .json(&serde_json::json!({
+    let response = send_turn(
+        &client,
+        &server.base_url,
+        &serde_json::json!({
             "sessionId": session_id,
             "content": "Pick a database."
-        }))
-        .send()
-        .await
-        .expect("chat stream request should succeed");
+        }),
+    )
+    .await
+    .expect("chat stream request should succeed");
     let response = expect_status(&server.log, response, StatusCode::OK).await;
     let events = collect_turn_events(response, "the asking turn", &server.log).await;
     assert!(
@@ -3525,15 +3605,16 @@ async fn ask_user_answered_mid_run_reaches_the_next_request_of_that_run() {
         .await;
     let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
 
-    let response = client
-        .post(format!("{}/api/chat/stream", server.base_url))
-        .json(&serde_json::json!({
+    let response = send_turn(
+        &client,
+        &server.base_url,
+        &serde_json::json!({
             "sessionId": session_id,
             "content": "Pick a database."
-        }))
-        .send()
-        .await
-        .expect("chat stream request should succeed");
+        }),
+    )
+    .await
+    .expect("chat stream request should succeed");
     let response = expect_status(&server.log, response, StatusCode::OK).await;
 
     tokio::time::timeout(Duration::from_secs(60), gate.arrived.notified())
@@ -3577,4 +3658,216 @@ async fn ask_user_answered_mid_run_reaches_the_next_request_of_that_run() {
     );
 
     server.stop().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn oneshot_run_starts_the_daemon_and_streams_its_turn() {
+    let mock = MockOpenAiServer::spawn(MockChatScenario::TextEveryTurn(
+        "hello from the daemon".into(),
+    ))
+    .await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    // A port of its own, so the daemon this run starts never meets another.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .expect("a free port should be found")
+        .port();
+    let config_path = harness.home_path().join(".may/config.toml");
+    let mut config: toml::Table = toml::from_str(
+        &tokio::fs::read_to_string(&config_path)
+            .await
+            .expect("test config should be readable"),
+    )
+    .expect("test config should parse");
+    let mut daemon = toml::Table::new();
+    daemon.insert("port".into(), toml::Value::Integer(i64::from(port)));
+    config.insert("daemon".into(), toml::Value::Table(daemon));
+    tokio::fs::write(
+        &config_path,
+        toml::to_string(&config).expect("test config should serialize"),
+    )
+    .await
+    .expect("test config should be written");
+
+    // One-shot runs use the default profile, a container one; this host may
+    // have no container runtime, so the profile runs locally instead.
+    let db = may_agent::db::ChatDb::open(&harness.home_path().join(".may/history.db"))
+        .await
+        .expect("test database should open");
+    let default_profile = db
+        .ensure_default_profiles()
+        .await
+        .expect("default profiles should exist");
+    db.update_profile(
+        &default_profile,
+        may_agent::db::UpdateProfileParams {
+            name: None,
+            icon: None,
+            environment: Some(may_agent::db::ProfileEnvironmentKind::Local),
+            container_image: None,
+            container_id: None,
+            sort_order: None,
+            persona: None,
+            preferences: None,
+            location_aware: None,
+        },
+    )
+    .await
+    .expect("default profile should switch to local");
+    drop(db);
+
+    let binary = may_binary_path();
+    let output = Command::new(&binary)
+        .arg("say hi")
+        .env("HOME", harness.home_path())
+        .env("HEEL_BIN", heel_bin())
+        .output()
+        .await
+        .expect("may one-shot should run");
+    let stop = Command::new(&binary)
+        .args(["daemon", "stop"])
+        .env("HOME", harness.home_path())
+        .output()
+        .await
+        .expect("may daemon stop should run");
+
+    assert!(
+        output.status.success(),
+        "one-shot run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("hello from the daemon"),
+        "stdout should carry the turn's text: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&stop.stderr).contains("Stopped"),
+        "the one-shot run should leave its daemon running: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+}
+
+/// The session's background work, as `GET /api/sessions/{id}/background`
+/// reports it.
+async fn background_of(
+    client: &reqwest::Client,
+    server: &RunningUiServer,
+    session_id: &str,
+) -> Value {
+    let response = client
+        .get(format!(
+            "{}/api/sessions/{session_id}/background",
+            server.base_url
+        ))
+        .send()
+        .await
+        .expect("background request should succeed");
+    expect_status(&server.log, response, StatusCode::OK)
+        .await
+        .json()
+        .await
+        .expect("background payload should be JSON")
+}
+
+fn background_job<'a>(background: &'a Value, script: &str) -> Option<&'a Value> {
+    background
+        .get("jobs")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|job| job.get("script").and_then(Value::as_str) == Some(script))
+}
+
+#[tokio::test]
+#[serial]
+async fn a_background_job_is_listed_pushed_and_killable_over_the_api() {
+    let mock = MockOpenAiServer::spawn(MockChatScenario::StartsBackgroundJob).await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    let server = RunningUiServer::spawn(harness.home_path(), &[]).await;
+    let client = reqwest::Client::new();
+    let environment = ChatEnvironment::Local
+        .prepare(&harness, &client, &server)
+        .await;
+    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+
+    // The turn stays open while its background job runs.
+    let turn = send_turn(
+        &client,
+        &server.base_url,
+        &serde_json::json!({ "sessionId": session_id, "content": "start the job" }),
+    )
+    .await
+    .expect("turn request should succeed");
+    let turn = expect_status(&server.log, turn, StatusCode::OK).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let background = background_of(&client, &server, &session_id).await;
+        if background_job(&background, BACKGROUND_JOB_SCRIPT)
+            .and_then(|job| job.pointer("/status/state"))
+            .and_then(Value::as_str)
+            == Some("running")
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the job should be listed as running: {background}; server logs:\n{}",
+            server.log.contents().await
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    // The event stream carries the same snapshot.
+    let events = client
+        .get(format!("{}/api/events", server.base_url))
+        .query(&[
+            ("topics", "session_background"),
+            ("sessionId", session_id.as_str()),
+        ])
+        .send()
+        .await
+        .expect("event stream should open");
+    let mut reader = SseReader::new(events);
+    let event = tokio::time::timeout(Duration::from_secs(10), reader.next_event())
+        .await
+        .expect("a session_background event should arrive")
+        .expect("the stream should stay open");
+    assert_eq!(event.event, "session_background");
+    let snapshot: Value = serde_json::from_str(&event.data).expect("snapshot JSON");
+    let pid = background_job(&snapshot, BACKGROUND_JOB_SCRIPT)
+        .and_then(|job| job.get("pid"))
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| panic!("the event should list the job: {snapshot}"));
+
+    let response = client
+        .post(format!(
+            "{}/api/sessions/{session_id}/jobs/{pid}/kill",
+            server.base_url
+        ))
+        .send()
+        .await
+        .expect("kill request should succeed");
+    let killed: Value = expect_status(&server.log, response, StatusCode::OK)
+        .await
+        .json()
+        .await
+        .expect("kill payload should be JSON");
+    assert_eq!(killed.get("ok"), Some(&Value::Bool(true)), "{killed}");
+
+    // With its job gone the turn finishes, and the job reads as killed.
+    let events = collect_turn_events(turn, "the background-job turn", &server.log).await;
+    assert!(
+        events.iter().any(|(kind, _)| kind == "done"),
+        "the turn should complete; events: {events:?}"
+    );
+    let background = background_of(&client, &server, &session_id).await;
+    assert_eq!(
+        background_job(&background, BACKGROUND_JOB_SCRIPT)
+            .and_then(|job| job.pointer("/status/state"))
+            .and_then(Value::as_str),
+        Some("killed"),
+        "{background}"
+    );
 }

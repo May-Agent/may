@@ -9,7 +9,7 @@ Message {{ message.message_id }} ({{ message.role }}{% if let Some(timestamp) = 
 {%- endmacro -%}
 
 {%- macro match_block(item) -%}
-Message {{ item.message_id }} ({{ item.role }}, {{ item.timestamp }}) in session {{ item.session_id }} "{{ item.title }}" (model: {{ item.model }}); score {{ item.score }}, matched by {% for mode in item.matched_by %}{{ mode.as_str() }}{% if !loop.last %}, {% endif %}{% endfor %}.
+Message {{ item.message_id }} ({{ item.role }}, {{ item.timestamp }}) in session {{ item.session_id }} "{{ item.title }}" (model: {{ item.model }}); score {{ item.score }}.
 Snippet: {{ item.snippet }}
 {%- if let Some(content) = item.content %}
 Content:

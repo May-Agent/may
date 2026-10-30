@@ -1,0 +1,12 @@
+{%- if hits.is_empty() -%}
+No {% if state != "all" %}{{ state }} {% endif %}issue matches "{{ query }}".
+{%- else -%}
+{{ hits.len() }} {% if state != "all" %}{{ state }} {% endif %}issue(s) matching "{{ query }}":
+{%- for hit in hits %}
+
+#{{ hit.number }} [{{ hit.state }}] {{ hit.title }}
+{%- if let Some(excerpt) = hit.excerpt %}
+{{ excerpt }}
+{%- endif %}
+{%- endfor %}
+{%- endif %}

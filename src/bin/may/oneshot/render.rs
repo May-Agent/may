@@ -26,7 +26,7 @@ struct StartedCall {
     label: String,
 }
 
-/// The arguments of `terminal` and `terminal_background` the start line reads.
+/// The arguments of `terminal` the start line reads.
 #[derive(Deserialize)]
 struct TerminalCall {
     #[serde(default)]
@@ -132,7 +132,7 @@ fn one_line(text: &str, limit: usize) -> String {
 
 /// Names a call by its tool and arguments.
 fn call_label(name: &str, arguments: &str) -> String {
-    if matches!(name, "terminal" | "terminal_background")
+    if name == "terminal"
         && let Ok(call) = serde_json::from_str::<TerminalCall>(arguments)
     {
         let description = one_line(&call.description, SUMMARY_LIMIT);

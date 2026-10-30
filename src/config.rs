@@ -651,12 +651,6 @@ pub struct ModelsConfig {
     /// Image generation models in priority order
     #[serde(default)]
     pub image_generation: Vec<ModelSelector>,
-    /// Global embedding model used for semantic search/indexing.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub embedding_model: Option<ModelSelector>,
-    /// Optional explicit embedding dimensions for providers that require it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub embedding_dimensions: Option<usize>,
     /// Model compaction runs on instead of the session model. Idle
     /// compaction is off while one is set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -711,12 +705,6 @@ impl ModelsConfig {
         if !list.contains(&selector) {
             list.push(selector);
         }
-    }
-
-    /// Embedding model selector, if configured.
-    #[must_use]
-    pub const fn embedding_model(&self) -> Option<&ModelSelector> {
-        self.embedding_model.as_ref()
     }
 }
 
@@ -965,37 +953,41 @@ impl BrowserConfig {
     }
 }
 
-/// Cloudflare-based remote access configuration for the May UI server.
+/// `tailscale` command run when no other binary is configured.
+pub const DEFAULT_TAILSCALE_BINARY: &str = "tailscale";
+
+/// Remote access to the May daemon over Tailscale: `tailscale serve` exposes
+/// the daemon's loopback listener on the tailnet over HTTPS.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteAccessConfig {
-    /// Whether the server should keep remote access enabled.
+    /// Whether the daemon keeps remote access enabled.
     #[serde(default)]
     pub enabled: bool,
-    /// Cloudflared executable path or command name.
-    #[serde(default = "default_cloudflared_binary")]
-    pub cloudflared_binary: String,
-    /// Remotely managed Cloudflare tunnel token.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tunnel_token: Option<String>,
-    /// Public HTTPS URL routed to this server.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub public_url: Option<String>,
+    /// Tailscale CLI path or command name.
+    #[serde(default = "default_tailscale_binary")]
+    pub tailscale_binary: String,
+    /// Tailnet HTTPS port the daemon is served on.
+    #[serde(default = "default_tailscale_https_port")]
+    pub https_port: u16,
     /// Whether local-environment profiles may be exposed remotely.
     #[serde(default)]
     pub allow_local_environment: bool,
 }
 
-fn default_cloudflared_binary() -> String {
-    "cloudflared".to_string()
+fn default_tailscale_binary() -> String {
+    DEFAULT_TAILSCALE_BINARY.to_string()
+}
+
+const fn default_tailscale_https_port() -> u16 {
+    443
 }
 
 impl Default for RemoteAccessConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            cloudflared_binary: default_cloudflared_binary(),
-            tunnel_token: None,
-            public_url: None,
+            tailscale_binary: default_tailscale_binary(),
+            https_port: default_tailscale_https_port(),
             allow_local_environment: false,
         }
     }
@@ -1081,12 +1073,28 @@ pub struct MayConfig {
     /// Remote access settings.
     #[serde(default)]
     pub remote_access: RemoteAccessConfig,
+    /// Daemon listener settings.
+    #[serde(default)]
+    pub daemon: DaemonConfig,
     /// Last model selected via /model command (used as default for new sessions).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_model: Option<ModelSelector>,
     /// Preconfigured SSH targets available to the agent.
     #[serde(default)]
     pub ssh_servers: Vec<SshServerConfig>,
+}
+
+/// Where the May daemon listens besides its unix socket.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct DaemonConfig {
+    /// TCP port on `127.0.0.1` for the web UI and API; `None` uses 8787.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    /// Further TCP addresses to serve on, such as a tailnet address
+    /// (`"100.101.102.103:8787"`). Requests on these are accepted from any
+    /// peer that can reach the address.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub listen: Vec<std::net::SocketAddr>,
 }
 
 const fn default_max_iterations() -> usize {
@@ -1104,6 +1112,7 @@ impl Default for MayConfig {
             appearance: Appearance::default(),
             browser: BrowserConfig::default(),
             remote_access: RemoteAccessConfig::default(),
+            daemon: DaemonConfig::default(),
             last_model: None,
             ssh_servers: Vec::new(),
         }

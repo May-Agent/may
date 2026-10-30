@@ -283,7 +283,6 @@ pub(super) async fn create_session_for_profile(
     db.create_session_in_profile(&id, None, Some(model), profile_id)
         .await
         .map_err(internal_error)?;
-    super::chat::ensure_session_open(state, &id).await?;
     super::chat::open_session_for_agents(state, &id, profile_id)
         .await
         .map_err(internal_error)?;
@@ -307,6 +306,21 @@ pub(super) async fn create_session(
         .clone()
         .or_else(|| Some(state.default_profile_id.clone()));
     let id = create_session_for_profile(&state, resolved_profile_id.as_deref(), &model).await?;
+    if let Some(cwd) = req
+        .cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|cwd| !cwd.is_empty())
+    {
+        state
+            .db()
+            .set_session_cwd(&id, cwd)
+            .await
+            .map_err(internal_error)?;
+        if let Some(worktree) = crate::repo_search::worktree_root(std::path::Path::new(cwd)) {
+            let _ = state.db().touch_repo_usage(&worktree).await;
+        }
+    }
 
     persist_last_model(&state, &model)
         .await
@@ -403,8 +417,8 @@ pub(super) async fn delete_session(
         .map_err(internal_error)?
         .and_then(|session| session.profile_id);
     db.delete_session(&id).await.map_err(internal_error)?;
+    state.parked_agents.evict(&id);
     state.agent_listeners.remove(&id);
-    state.session_open_locks.lock().await.remove(&id);
     state
         .tool_environments
         .evict(&crate::session::SessionId::from_string(id.as_str()));
@@ -425,7 +439,6 @@ pub(super) async fn delete_all_sessions(
     db.delete_all_sessions().await.map_err(internal_error)?;
     state.tool_environments.evict_all();
     state.agent_listeners.clear();
-    state.session_open_locks.lock().await.clear();
 
     // Clean up filesystem session directories
     let store = SessionStore::new(MayHomePaths::new(state.may_dir.clone()));

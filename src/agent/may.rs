@@ -37,7 +37,6 @@ use crate::agent::register_tool::RegisterBroker;
 use crate::agent::task_tool::TaskRuntimeKind;
 use crate::ask_user::AskUserBroker;
 use crate::config::MayConfig;
-use crate::embedding_provider::EmbeddingModelResolution;
 use crate::network_policy::CompiledNetworkPolicy;
 use crate::session::{SessionId, SessionPaths, SessionPlanState};
 use crate::terminal_commands::{
@@ -118,6 +117,8 @@ pub enum AgentEnvironment {
 /// Configuration for creating a `MayAgent`.
 #[derive(Debug)]
 pub struct MayAgentConfig {
+    /// The session's subagent handles; `None` starts fresh ones.
+    pub subagents: Option<crate::agent::subagent_tracker::SubagentHandles>,
     /// Trusted baseline tool distribution used by every configured backend.
     pub tool_distribution: Arc<aither_sandbox::ToolDistribution>,
     /// Prepared tool environments kept across rebuilds of a session's agent.
@@ -130,8 +131,6 @@ pub struct MayAgentConfig {
     pub model_id: String,
     /// Provider ID selected for this request.
     pub provider_id: String,
-    /// Optional embedding provider used for semantic retrieval tools.
-    pub search_embedder: EmbeddingModelResolution,
     /// Tier-resolved models for the `ask` terminal command.
     pub ask_models: super::provider::AskTierModels,
     /// Model compaction runs on; `None` compacts on the session model.
@@ -249,6 +248,8 @@ pub struct MayAgentSessionInput<'a> {
     pub tool_environments: ToolEnvironmentCache,
     /// Which provider candidate this build should try (retry counter).
     pub provider_attempt: usize,
+    /// The session's subagent handles; `None` starts fresh ones.
+    pub subagents: Option<crate::agent::subagent_tracker::SubagentHandles>,
 }
 
 type MayAgentInner = Agent<
@@ -333,7 +334,8 @@ impl MayAgent {
             .with_network_audit_log(network_audit)
             .with_process_priority(config.command_priority.process_priority());
         let job_registry = terminal_tool.job_registry();
-        let subagent_runs = aither_agent::specialized::SubagentRuns::default();
+        let subagents = config.subagents.clone().unwrap_or_default();
+        let subagent_runs = subagents.runs;
 
         let session_paths = SessionPaths::new(config.sandbox_dir.clone());
 
@@ -470,7 +472,7 @@ impl MayAgent {
         if let Some(compaction_llm) = config.compaction_llm.clone() {
             builder = builder.compaction_model(compaction_llm);
         }
-        let subagent_tracker = crate::agent::subagent_tracker::SubagentTracker::default();
+        let subagent_tracker = subagents.tracker;
         let shared_terminal_commands = register_shared_terminal_commands(
             builder.tool_registry_mut(),
             SharedTerminalCommandConfig {
@@ -482,7 +484,8 @@ impl MayAgent {
                 session_id: config.session_id.as_str().to_string(),
                 may_dir: config.may_dir.clone(),
                 sandbox_dir: config.sandbox_dir.clone(),
-                search_embedder: config.search_embedder.clone(),
+                cwd: config.cwd.clone(),
+                db: Some(config.db.clone()),
                 ask_user: hook_runtime.clone(),
                 imagine: Some(imagine_config),
                 task_runtime: match &config.environment {
@@ -626,6 +629,7 @@ impl MayAgent {
             tool_distribution,
             tool_environments,
             provider_attempt,
+            subagents,
         } = input;
         let selector = super::provider::parse_model_selector(model)?;
         let resolved_provider =
@@ -675,13 +679,13 @@ impl MayAgent {
         let secrets =
             crate::secrets::Secrets::load(&crate::secrets::SecretStore::new(&may_dir), may_config);
         Ok(MayAgentConfig {
+            subagents,
             tool_distribution,
             tool_environments,
             command_priority: may_config.sandbox.command_priority,
             llm,
             model_id: selector.model_id().to_string(),
             provider_id,
-            search_embedder: resolved_provider.search_embedder,
             ask_models,
             compaction_llm,
             cache_lifetime,

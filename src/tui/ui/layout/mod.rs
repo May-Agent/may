@@ -25,7 +25,6 @@ use super::super::state::{
     JobDetailTarget, RewindState,
 };
 use super::chat::{self, InputContext, QueueContext, StatusContext, UnifiedRenderContext};
-use crate::workspace_request::WorkspaceRequest;
 
 /// Convert character index to byte index for safe string slicing.
 pub(super) fn char_to_byte_idx(s: &str, char_idx: usize) -> usize {
@@ -62,7 +61,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             return;
         }
         AppMode::WorkspaceConfirm(state) => {
-            render_workspace_confirm(frame, area, &state.request);
+            render_workspace_confirm(frame, area, &state.path, &state.reason);
             return;
         }
         _ => {}
@@ -109,9 +108,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // Running background entries for the status bar: tracked subagents first,
     // then running terminal jobs.
     let mut background_items: Vec<chat::StatusBackgroundItem> = app
-        .subagent_tracker
-        .running()
-        .into_iter()
+        .subagents
+        .iter()
+        .cloned()
         .map(|run| chat::StatusBackgroundItem {
             elapsed_secs: run.elapsed_secs(),
             label: run.agent,
@@ -1420,7 +1419,7 @@ fn render_chatgpt_auth_screen(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// Render the workspace access confirmation dialog.
-fn render_workspace_confirm(frame: &mut Frame, area: Rect, request: &WorkspaceRequest) {
+fn render_workspace_confirm(frame: &mut Frame, area: Rect, path: &str, reason: &str) {
     // Clear background
     frame.render_widget(Clear, area);
     frame.render_widget(
@@ -1455,7 +1454,7 @@ fn render_workspace_confirm(frame: &mut Frame, area: Rect, request: &WorkspaceRe
         )),
         Line::from(""),
         Line::from(Span::styled(
-            format!("  {}", request.args.request.path.as_str()),
+            format!("  {path}"),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(ratatui::style::Modifier::BOLD),
@@ -1463,7 +1462,7 @@ fn render_workspace_confirm(frame: &mut Frame, area: Rect, request: &WorkspaceRe
         Line::from(""),
         Line::from(Span::styled("Reason:", Style::default().fg(Color::White))),
         Line::from(Span::styled(
-            format!("  {}", request.args.request.reason.as_str()),
+            format!("  {reason}"),
             Style::default().fg(Color::Yellow),
         )),
         Line::from(""),

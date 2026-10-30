@@ -19,7 +19,8 @@ const BASE_SYSTEM_TAG: &str = "base_system";
 
 /// A context-usage category, matching the rows Claude Code shows for
 /// `/context` with `Commands` added for May's terminal command index.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ContextCategory {
     /// Persistent system blocks (persona, runtime, workspace, the tool
     /// architecture portion of `base_system`, …).
@@ -59,7 +60,7 @@ impl ContextCategory {
 
 /// One usage row: estimated tokens for a category plus an optional item
 /// count detail (e.g. `12 tools`, `84 messages`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ContextCategoryRow {
     /// Which category this row describes.
     pub kind: ContextCategory,
@@ -70,7 +71,7 @@ pub struct ContextCategoryRow {
 }
 
 /// Estimated composition of the context window the next request would use.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ContextReport {
     /// Model identifier shown in the header.
     pub model_id: String,

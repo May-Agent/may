@@ -40,9 +40,6 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
       # The `ui` feature's build script builds and embeds web-ui with bun.
       - uses: oven-sh/setup-bun@v2
       - name: bun install
@@ -76,10 +73,6 @@ jobs:
       - name: Drop restored test scratch
         shell: bash
         run: rm -rf target/tmp
-      # lance-encoding's build script compiles protobuf definitions with protoc.
-      - uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Install heel runtime
         shell: bash
         run: |

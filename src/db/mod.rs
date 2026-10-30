@@ -6,13 +6,16 @@ mod common;
 mod context_snapshot;
 pub mod entity;
 mod issue;
+mod issue_search;
 mod logs;
 mod memory;
 mod message;
 mod notification;
 mod open_questions;
 mod profile;
+mod repo_usage;
 mod run_lease;
+mod search_outbox;
 mod session;
 mod sql;
 mod task;
@@ -32,9 +35,12 @@ pub use common::{
     StoredSessionContextSnapshot, UpdateProfileParams, UpdateScheduledTaskParams,
 };
 pub use context_snapshot::ContextDebugSnapshotWrite;
+pub use issue_search::IssueSearchDoc;
 pub use message::MessageMeta;
 pub use open_questions::{CommittedAskUserAnswer, PendingAskUserQuestion};
+pub use repo_usage::RepoUsage;
 pub use run_lease::RunFence;
+pub use search_outbox::{IndexedMessageRow, SearchOutboxEntry};
 
 use common::{
     AskUserRequestMessageRow, AskUserRequestQuestionOptionRow, AskUserRequestQuestionRow,
@@ -78,6 +84,7 @@ impl ChatDb {
         Self::ensure_session_run_lease_table(&db).await?;
         Self::migrate_legacy_remote_profiles(&db).await?;
         Self::migrate_removed_waiting_terminal_input(&db).await?;
+        Self::ensure_search_outbox(&db).await?;
         Ok(Self { db })
     }
 
@@ -101,6 +108,19 @@ impl ChatDb {
             query!(db, "ALTER TABLE sessions ADD COLUMN reasoning_effort TEXT")
                 .execute()
                 .await?;
+        }
+        if !existing.contains("cwd") {
+            query!(db, "ALTER TABLE sessions ADD COLUMN cwd TEXT")
+                .execute()
+                .await?;
+        }
+        if !existing.contains("non_interactive") {
+            query!(
+                db,
+                "ALTER TABLE sessions ADD COLUMN non_interactive BOOLEAN NOT NULL DEFAULT 0"
+            )
+            .execute()
+            .await?;
         }
         Ok(())
     }

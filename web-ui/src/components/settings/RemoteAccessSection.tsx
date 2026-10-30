@@ -114,12 +114,12 @@ export function RemoteAccessSection() {
                   </div>
                   <p className="mt-1 text-xs text-muted-foreground">
                     {status.state === 'running'
-                      ? 'Tunnel is live. Share the URL below to reach this instance.'
+                      ? 'Served on your tailnet. Devices signed in to it reach May at the URL below.'
                       : status.state === 'starting'
-                      ? 'Setting up a secure tunnel…'
+                      ? 'Asking Tailscale to serve May…'
                       : status.state === 'error'
-                      ? 'Something went wrong bringing the tunnel up.'
-                      : 'Start a tunnel to reach May from outside this machine.'}
+                      ? 'Tailscale could not serve May.'
+                      : 'Serve May over Tailscale to reach it from your other devices.'}
                   </p>
                 </div>
               </div>

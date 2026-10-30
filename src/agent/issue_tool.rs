@@ -8,10 +8,23 @@ use askama::Template;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+use crate::issue::search::{IssueHit, IssueSearch};
 use crate::issue::{
     IssueDetail, IssueError, IssueListState, IssueRelationKind, IssueState, IssueStore,
     IssueSummary,
 };
+use crate::repo_search::RepoSearchCollections;
+
+/// Issue search as the `issue` command runs it.
+pub type SessionIssueSearch = IssueSearch<RepoSearchCollections>;
+
+const fn default_search_limit() -> usize {
+    10
+}
+
+const fn default_search_state() -> IssueListState {
+    IssueListState::All
+}
 
 const fn default_list_limit() -> i64 {
     50
@@ -28,6 +41,8 @@ const fn default_list_state() -> IssueListState {
 /// - `issue create <title> [--body text] [--labels name ...]`
 /// - `issue view <number>`
 /// - `issue list [--state open|closed|all] [--labels name ...] [--limit n]`
+/// - `issue search <query> [--state open|closed|all] [--limit n]` — issues
+///   whose title, body or comments match the described topic
 /// - `issue edit <number> [--title t] [--body b] [--state open|closed]`
 /// - `issue comment <number> <body>`
 /// - `issue close <number>` (reopen with `edit --state open`)
@@ -66,6 +81,17 @@ pub enum IssueArgs {
         /// Maximum issues returned.
         #[serde(default = "default_list_limit")]
         limit: i64,
+    },
+    /// Find issues by what they are about, in natural language.
+    Search {
+        /// What the issues are about.
+        query: String,
+        /// State filter: `open`, `closed` or `all` (default).
+        #[serde(default = "default_search_state")]
+        state: IssueListState,
+        /// Maximum issues returned.
+        #[serde(default = "default_search_limit")]
+        limit: usize,
     },
     /// Edit an issue's title, body and/or state.
     Edit {
@@ -137,6 +163,7 @@ impl IssueArgs {
             Self::Create { .. } => "create",
             Self::View { .. } => "view",
             Self::List { .. } => "list",
+            Self::Search { .. } => "search",
             Self::Edit { .. } => "edit",
             Self::Comment { .. } => "comment",
             Self::Close { .. } => "close",
@@ -148,7 +175,10 @@ impl IssueArgs {
 
     /// Whether the subcommand changes the issue backend.
     const fn writes(&self) -> bool {
-        !matches!(self, Self::View { .. } | Self::List { .. })
+        !matches!(
+            self,
+            Self::View { .. } | Self::List { .. } | Self::Search { .. }
+        )
     }
 }
 
@@ -159,10 +189,20 @@ struct IssueReserved {
     subcommand: &'static str,
 }
 
+/// What the model reads for `issue search`.
+#[derive(Template)]
+#[template(path = "issue_search.txt", escape = "none")]
+struct IssueSearchText<'a> {
+    query: &'a str,
+    state: &'a str,
+    hits: &'a [IssueHit],
+}
+
 /// `issue` tool: unified issue tracker over the resolved backend.
 #[derive(Debug, Clone)]
 pub struct IssueTool<S> {
     store: S,
+    search: Option<SessionIssueSearch>,
 }
 
 /// The `issue` tool as a subagent sees it: the read subcommands work and every
@@ -170,13 +210,24 @@ pub struct IssueTool<S> {
 #[derive(Debug, Clone)]
 pub struct SubagentIssueTool<S> {
     store: S,
+    search: Option<SessionIssueSearch>,
 }
 
 impl<S: IssueStore> SubagentIssueTool<S> {
     /// Bind the read-only tool to the session's issue store.
     #[must_use]
     pub const fn new(store: S) -> Self {
-        Self { store }
+        Self {
+            store,
+            search: None,
+        }
+    }
+
+    /// Enable `issue search` through `search`.
+    #[must_use]
+    pub fn with_search(mut self, search: SessionIssueSearch) -> Self {
+        self.search = Some(search);
+        self
     }
 }
 
@@ -200,7 +251,9 @@ impl<S: IssueStore + Clone + 'static> Tool for SubagentIssueTool<S> {
             .render()?;
             return Err(IssueError::Reserved(refusal).into());
         }
-        execute(&self.store, arguments).await.map_err(Into::into)
+        execute(&self.store, self.search.as_ref(), arguments)
+            .await
+            .map_err(Into::into)
     }
 }
 
@@ -208,7 +261,17 @@ impl<S: IssueStore> IssueTool<S> {
     /// Bind the tool to the session's issue store.
     #[must_use]
     pub const fn new(store: S) -> Self {
-        Self { store }
+        Self {
+            store,
+            search: None,
+        }
+    }
+
+    /// Enable `issue search` through `search`.
+    #[must_use]
+    pub fn with_search(mut self, search: SessionIssueSearch) -> Self {
+        self.search = Some(search);
+        self
     }
 }
 
@@ -225,11 +288,17 @@ impl<S: IssueStore + Clone + 'static> Tool for IssueTool<S> {
         arguments: Self::Arguments,
         _cx: aither_core::llm::ToolContext,
     ) -> aither_core::Result<Self::Res> {
-        execute(&self.store, arguments).await.map_err(Into::into)
+        execute(&self.store, self.search.as_ref(), arguments)
+            .await
+            .map_err(Into::into)
     }
 }
 
-async fn execute<S: IssueStore>(backend: &S, args: IssueArgs) -> Result<ToolResult, IssueError> {
+async fn execute<S: IssueStore>(
+    backend: &S,
+    search: Option<&SessionIssueSearch>,
+    args: IssueArgs,
+) -> Result<ToolResult, IssueError> {
     match args {
         IssueArgs::Create {
             title,
@@ -257,6 +326,28 @@ async fn execute<S: IssueStore>(backend: &S, args: IssueArgs) -> Result<ToolResu
         } => {
             let summaries = backend.list(state, &labels, limit).await?;
             Ok(ToolResult::text(render_list(&summaries)))
+        }
+        IssueArgs::Search {
+            query,
+            state,
+            limit,
+        } => {
+            let Some(search) = search else {
+                return Err(IssueError::Search(
+                    "this session has no search index".to_string(),
+                ));
+            };
+            let hits = search
+                .search(backend, query.trim(), state, limit.clamp(1, 50))
+                .await?;
+            let text = IssueSearchText {
+                query: query.trim(),
+                state: state.as_str(),
+                hits: &hits,
+            }
+            .render()
+            .map_err(|error| IssueError::Search(error.to_string()))?;
+            Ok(ToolResult::text(text))
         }
         IssueArgs::Edit {
             number,

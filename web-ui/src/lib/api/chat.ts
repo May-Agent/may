@@ -2,51 +2,74 @@ import type { ChatRequestPayload, ChatStreamEvent } from '../types';
 import { ApiError, apiSseUrl } from './client';
 import { parseNamedSseStream } from '../stream/sse';
 
-export interface ChatStreamHandle {
+export interface TurnStreamHandle {
   events: AsyncGenerator<ChatStreamEvent, void, void>;
   abort: () => void;
 }
 
+interface SessionTurnFrame {
+  sessionId: string;
+  event: ChatStreamEvent['kind'];
+  data: Record<string, unknown>;
+}
+
 /**
- * Open a POST SSE stream to `/api/chat/stream`. The returned generator yields
- * typed {@link ChatStreamEvent}s until the server closes the connection.
+ * Follow every turn of one session: the `session_turn` frames of the
+ * multiplexed `/api/events` stream. Turns run in the daemon whichever client
+ * started them; a turn already in progress is replayed from its start.
  */
-export async function openChatStream(
-  payload: ChatRequestPayload,
+export async function openSessionTurns(
+  sessionId: string,
   abort?: AbortSignal,
-): Promise<ChatStreamHandle> {
+): Promise<TurnStreamHandle> {
   const controller = new AbortController();
   if (abort) {
     if (abort.aborted) controller.abort();
     else abort.addEventListener('abort', () => controller.abort(), { once: true });
   }
-
-  const res = await fetch(apiSseUrl('/chat/stream'), {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Accept: 'text/event-stream',
-    },
-    body: JSON.stringify(payload),
+  const params = new URLSearchParams({ topics: 'session_turn', sessionId });
+  const res = await fetch(apiSseUrl(`/events?${params.toString()}`), {
+    headers: { Accept: 'text/event-stream' },
     signal: controller.signal,
   });
-
   if (!res.ok) {
-    throw new ApiError('internal_error', `chat stream failed: ${res.status}`, res.status);
+    throw new ApiError('internal_error', `turn stream failed: ${res.status}`, res.status);
   }
-
   return {
-    events: mergeEventName(parseNamedSseStream<Record<string, unknown>>(res, controller.signal)),
+    events: turnEvents(
+      parseNamedSseStream<Record<string, unknown>>(res, controller.signal),
+      sessionId,
+    ),
     abort: () => controller.abort(),
   };
 }
 
-async function* mergeEventName(
+async function* turnEvents(
   source: AsyncGenerator<{ event: string; data: Record<string, unknown> }, void, void>,
+  sessionId: string,
 ): AsyncGenerator<ChatStreamEvent, void, void> {
   for await (const { event, data } of source) {
-    if (!data || typeof data !== 'object') continue;
-    yield { ...data, kind: event } as unknown as ChatStreamEvent;
+    if (event !== 'session_turn' || !data || typeof data !== 'object') continue;
+    const frame = data as unknown as SessionTurnFrame;
+    if (frame.sessionId !== sessionId || !frame.data) continue;
+    yield { ...frame.data, kind: frame.event } as unknown as ChatStreamEvent;
+  }
+}
+
+/** Start a turn; it streams through {@link openSessionTurns}. */
+export async function sendMessage(payload: ChatRequestPayload): Promise<void> {
+  const res = await fetch(`/api/sessions/${encodeURIComponent(payload.sessionId)}/messages`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const message = await res.text().catch(() => '');
+    throw new ApiError(
+      res.status === 409 ? 'bad_request' : 'internal_error',
+      message || `send failed: ${res.status}`,
+      res.status,
+    );
   }
 }
 

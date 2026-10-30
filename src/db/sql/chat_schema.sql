@@ -77,4 +77,6 @@ CREATE INDEX IF NOT EXISTS idx_issue_relations_issue ON issue_relations(issue_id
 CREATE INDEX IF NOT EXISTS idx_issue_relations_related ON issue_relations(related_issue_id, kind);
 CREATE TABLE IF NOT EXISTS profile_remote_servers (profile_id TEXT NOT NULL, ssh_server_name TEXT NOT NULL, sort_order INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, PRIMARY KEY (profile_id, ssh_server_name));
 CREATE INDEX IF NOT EXISTS idx_profile_remote_servers_profile ON profile_remote_servers(profile_id, sort_order);
+CREATE TABLE IF NOT EXISTS repo_usage (worktree TEXT PRIMARY KEY, last_used_at INTEGER NOT NULL, use_count INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS issue_search_docs (collection TEXT NOT NULL, number INTEGER NOT NULL, title TEXT NOT NULL, state TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY (collection, number));
 PRAGMA journal_mode=WAL;

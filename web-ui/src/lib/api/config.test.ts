@@ -35,8 +35,6 @@ function makeConfig(): UiFullConfig {
       balanced: [],
       fast: [],
       imageGeneration: [],
-      embeddingModel: null,
-      embeddingDimensions: null,
     },
     preferences: {
       warnOnModelChange: true,
@@ -63,9 +61,8 @@ function makeConfig(): UiFullConfig {
     },
     remoteAccess: {
       enabled: false,
-      cloudflaredBinary: 'cloudflared',
-      tunnelToken: null,
-      publicUrl: null,
+      tailscaleBinary: 'tailscale',
+      httpsPort: 443,
       allowLocalEnvironment: false,
     },
     sandbox: { commandPriority: 'low' },
