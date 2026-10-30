@@ -58,9 +58,21 @@ pub use aither_agent::{AgentError, AgentEvent, TimedEvent};
 
 use super::state::{
     ActiveTextInput, AppMode, AskUserState, ChatgptAuthStatus, ConfigEditMode, ConfigState,
-    CopilotAuthStatus, McpAddMode, PasteFilter, SelectionPoint, SkillAddMode, SshAddMode,
-    StatusNotice, TextSelection, detect_api_key_from_env,
+    CopilotAuthStatus, ImageViewState, McpAddMode, PasteFilter, SelectionPoint, SkillAddMode,
+    SshAddMode, StatusNotice, TextSelection, detect_api_key_from_env,
 };
+
+/// Screen rect an inline image was painted into last frame — hit-tested on
+/// clicks to open the zoom view.
+#[derive(Debug)]
+pub struct ImageRegion {
+    /// Absolute screen area the image occupies.
+    pub rect: ratatui::layout::Rect,
+    /// Key of the decoded image in `image_cache`.
+    pub key: String,
+    /// Path or URL shown under the zoomed image.
+    pub caption: String,
+}
 /// Application state (UI only - agent managed externally).
 #[derive(Debug)]
 pub struct App {
@@ -229,6 +241,10 @@ pub struct App {
     pub image_fetching: ahash::AHashSet<String>,
     /// Image keys that failed to fetch or decode (avoids retry loops)
     pub image_failed: ahash::AHashSet<String>,
+    /// Screen rects inline images were painted into last frame (click to zoom)
+    pub image_regions: Vec<ImageRegion>,
+    /// Image rect inside the zoom overlay — a click outside it closes the view
+    pub image_view_area: Option<ratatui::layout::Rect>,
     /// Mouse/text selection in rendered chat content
     pub selection: Option<TextSelection>,
     /// Plain text render cache used for selection copy
@@ -493,6 +509,8 @@ impl App {
             image_cache: ahash::AHashMap::new(),
             image_fetching: ahash::AHashSet::new(),
             image_failed: ahash::AHashSet::new(),
+            image_regions: Vec::new(),
+            image_view_area: None,
             selection: None,
             rendered_plain_lines: Vec::new(),
             render_top_padding: 0,
@@ -1165,6 +1183,7 @@ impl App {
                 Some(super::ui::chat::ToolCallImage {
                     key,
                     label: "image".to_string(),
+                    path: String::new(),
                 })
             }
             Kind::Stored { url, path } => {
@@ -1173,6 +1192,11 @@ impl App {
                     .and_then(|name| name.to_str())
                     .unwrap_or("image")
                     .to_string();
+                let caption_path = if path.is_empty() {
+                    url.clone()
+                } else {
+                    path.clone()
+                };
                 let mut targets = if url.is_empty() {
                     Vec::new()
                 } else {
@@ -1185,7 +1209,11 @@ impl App {
                     return None;
                 }
                 self.spawn_image_fetch(key.clone(), targets);
-                Some(super::ui::chat::ToolCallImage { key, label })
+                Some(super::ui::chat::ToolCallImage {
+                    key,
+                    label,
+                    path: caption_path,
+                })
             }
         }
     }
@@ -1426,6 +1454,18 @@ impl App {
         );
     }
 
+    /// Offer the open-question panel: it opens now when the chat is up,
+    /// parks behind whatever screen is open otherwise. Used when a new open
+    /// question arrives so the user sees it without the panel ripping a
+    /// different screen away.
+    pub fn offer_open_question(&mut self, state: AskUserState) {
+        if matches!(self.mode, AppMode::Chat) {
+            self.mode = AppMode::AskUser(state);
+        } else {
+            self.parked_question = Some(state);
+        }
+    }
+
     /// Bring back the parked open question once the screen is free.
     pub fn restore_parked_question(&mut self) {
         super::reducer::ask_user::restore_parked_question(
@@ -1657,6 +1697,7 @@ impl App {
                     self.handle_paste();
                     return Ok(None);
                 }
+                KeyCode::Left => return Ok(Some(SendAction::OpenQuestions)),
                 KeyCode::Char('n') => {
                     self.quit_pending = false;
                     self.status = None;
@@ -1725,6 +1766,9 @@ impl App {
                 self, code,
             )),
             AppMode::Btw(_) => Ok(super::reducer::navigation::handle_btw_key(self, code)),
+            AppMode::ImageView(_) => Ok(super::reducer::navigation::handle_image_view_key(
+                self, code,
+            )),
         }
     }
 
@@ -2123,8 +2167,22 @@ impl App {
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) -> AppResult<Option<SendAction>> {
         const SCROLL_STEP_LINES: usize = 3;
 
-        if !matches!(self.mode, AppMode::Chat) {
-            return Ok(None);
+        match &self.mode {
+            AppMode::Chat => {}
+            AppMode::ImageView(_) => {
+                // A click outside the displayed image closes the zoom view.
+                if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                    let inside = self.image_view_area.is_some_and(|rect| {
+                        rect.contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+                    });
+                    if !inside {
+                        self.mode = AppMode::Chat;
+                        self.image_view_area = None;
+                    }
+                }
+                return Ok(None);
+            }
+            _ => return Ok(None),
         }
 
         match mouse.kind {
@@ -2164,20 +2222,31 @@ impl App {
             MouseEventKind::Up(MouseButton::Left) => {
                 if self.selection.as_ref().is_some_and(TextSelection::is_empty) {
                     self.selection = None;
-                    // A press/release without a drag is a click: remember it
-                    // for double-click detection, then toggle the collapsed
+                    let point = ratatui::layout::Position::new(mouse.column, mouse.row);
+                    // A press/release without a drag is a click: open the
+                    // zoom view when it lands on an image; otherwise remember
+                    // it for double-click detection, then toggle the collapsed
                     // state of the tool call under the cursor.
-                    self.last_click = self
-                        .mouse_to_selection_point(mouse)
-                        .map(|point| (Instant::now(), point));
-                    if let Some(point) = self.mouse_to_selection_point(mouse)
-                        && let Some(region) = self
-                            .collapse_regions
-                            .iter()
-                            .find(|r| point.line >= r.start && point.line < r.end)
+                    if let Some(region) = self.image_regions.iter().find(|r| r.rect.contains(point))
                     {
-                        let id = region.element_id.clone();
-                        self.chat.toggle_expanded(&id);
+                        self.last_click = None;
+                        self.mode = AppMode::ImageView(ImageViewState {
+                            key: region.key.clone(),
+                            caption: region.caption.clone(),
+                        });
+                    } else {
+                        self.last_click = self
+                            .mouse_to_selection_point(mouse)
+                            .map(|point| (Instant::now(), point));
+                        if let Some(point) = self.mouse_to_selection_point(mouse)
+                            && let Some(region) = self
+                                .collapse_regions
+                                .iter()
+                                .find(|r| point.line >= r.start && point.line < r.end)
+                        {
+                            let id = region.element_id.clone();
+                            self.chat.toggle_expanded(&id);
+                        }
                     }
                 }
             }
@@ -2368,6 +2437,7 @@ impl App {
             "/compact" => Some(SendAction::Compact(None)),
             "/context" => Some(SendAction::ContextReport),
             "/context dump" => Some(SendAction::ContextDump),
+            "/bug" => Some(SendAction::BugReport),
             "/mcp" => {
                 self.mode = AppMode::McpManage;
                 None
@@ -2643,6 +2713,9 @@ impl App {
         }
         if trimmed == "/context dump" && attachments.is_empty() {
             return SendAction::ContextDump;
+        }
+        if trimmed == "/bug" && attachments.is_empty() {
+            return SendAction::BugReport;
         }
         if let Some(rest) = trimmed.strip_prefix("/compact")
             && attachments.is_empty()
@@ -3004,6 +3077,8 @@ pub enum SendAction {
     SwitchModel(String),
     /// Compact the conversation history with optional focus hint.
     Compact(Option<String>),
+    /// Write the recent-log snapshot to `~/.may/bugs`.
+    BugReport,
     /// Measure and display context-window usage.
     ContextReport,
     /// Dump the verbatim assembled context to the session's outputs dir.

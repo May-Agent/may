@@ -51,6 +51,48 @@ pub enum AppMode {
     JobDetail(JobDetailState),
     /// `/btw` side-question overlay: answered outside conversation history
     Btw(BtwState),
+    /// Zoomed image overlay (click an inline image to open)
+    ImageView(ImageViewState),
+}
+
+/// State for the zoomed image overlay.
+#[derive(Debug, Clone)]
+pub struct ImageViewState {
+    /// Key of the decoded image in `App::image_cache`.
+    pub key: String,
+    /// Path or URL shown under the image.
+    pub caption: String,
+}
+
+impl AppMode {
+    /// Stable name of the current mode for diagnostics.
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::SessionSelect => "session-select",
+            Self::FilePicker => "file-picker",
+            Self::Help => "help",
+            Self::ToolDetail => "tool-detail",
+            Self::Config => "config",
+            Self::ModelSelect => "model-select",
+            Self::TierModelPicker => "tier-model-picker",
+            Self::CopilotAuth => "copilot-auth",
+            Self::ChatgptAuth => "chatgpt-auth",
+            Self::PermissionConfirm(_) => "permission-confirm",
+            Self::WorkspaceConfirm(_) => "workspace-confirm",
+            Self::McpManage => "mcp-manage",
+            Self::SshManage => "ssh-manage",
+            Self::AskUser(_) => "ask-user",
+            Self::SkillManage => "skill-manage",
+            Self::ProfileSelect => "profile-select",
+            Self::Rewind(_) => "rewind",
+            Self::Jobs => "jobs",
+            Self::JobDetail(_) => "job-detail",
+            Self::Btw(_) => "btw",
+            Self::ImageView(_) => "image-view",
+        }
+    }
 }
 
 /// `/btw` overlay state: type a question, stream a one-off answer.

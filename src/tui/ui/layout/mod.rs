@@ -18,7 +18,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use ratatui::Frame;
 
-use super::super::app::App;
+use super::super::app::{App, ImageRegion};
 use super::super::completion::CompletionMode;
 use super::super::state::{
     AppMode, AskUserState, BtwState, ChatgptAuthStatus, CopilotAuthStatus, JobDetailState,
@@ -63,10 +63,6 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         }
         AppMode::WorkspaceConfirm(state) => {
             render_workspace_confirm(frame, area, &state.request);
-            return;
-        }
-        AppMode::AskUser(state) => {
-            render_ask_user(frame, area, state);
             return;
         }
         _ => {}
@@ -144,7 +140,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let cwd_label = app.cwd_label();
 
     // Collect image positions during rendering
-    let mut image_positions: Vec<(String, usize)> = Vec::new();
+    let mut image_positions: Vec<(String, usize, String)> = Vec::new();
 
     // Capture scroll value for image position calculations
     let scroll = app.scroll;
@@ -243,12 +239,18 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     }
 
     // Render images as overlays at their scroll-adjusted positions
+    app.image_regions.clear();
     if images_supported && !image_positions.is_empty() {
         render_inline_images(frame, chat_area, app, &image_positions, scroll);
     }
 
     // Render popups if in special modes
     match app.mode {
+        // The questions panel docks at the bottom over the still-rendered
+        // chat: opening it never hides the conversation behind it.
+        AppMode::AskUser(ref state) => {
+            render_ask_user(frame, area, state);
+        }
         AppMode::SessionSelect => {
             render_session_popup(frame, area, app);
         }
@@ -296,8 +298,62 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         render_completion_overlay(frame, area, app);
     }
 
+    // The zoomed image overlay sits above everything else.
+    if matches!(app.mode, AppMode::ImageView(_)) {
+        render_image_view(frame, area, app);
+    } else {
+        app.image_view_area = None;
+    }
+
     app.frame_stats.overlay = t.elapsed();
     app.frame_stats.total = render_start.elapsed();
+}
+
+/// Render the zoomed image overlay: the image fitted into a large centered
+/// popup with its path/URL caption underneath. Esc or a click outside the
+/// image closes it.
+fn render_image_view(frame: &mut Frame, area: Rect, app: &mut App) {
+    use ratatui_image::{Resize, StatefulImage};
+
+    let AppMode::ImageView(state) = &app.mode else {
+        return;
+    };
+    let (key, caption) = (state.key.clone(), state.caption.clone());
+    if !app.image_cache.contains_key(&key) {
+        app.mode = AppMode::Chat;
+        return;
+    }
+
+    let popup = centered_rect(80, 75, area);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" Image (Esc or click outside to close) ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let image_area = rows[0];
+    let state = app.image_cache.get_mut(&key).expect("checked above");
+    let fitted = state.protocol.size_for(Resize::Fit(None), image_area);
+    let draw_area = Rect::new(
+        image_area.x + image_area.width.saturating_sub(fitted.width) / 2,
+        image_area.y + image_area.height.saturating_sub(fitted.height) / 2,
+        fitted.width.min(image_area.width),
+        fitted.height.min(image_area.height),
+    );
+    app.image_view_area = Some(draw_area);
+    frame.render_stateful_widget(StatefulImage::default(), draw_area, &mut state.protocol);
+
+    let caption = Paragraph::new(caption)
+        .style(Style::default().fg(Color::DarkGray))
+        .alignment(Alignment::Center);
+    frame.render_widget(caption, rows[1]);
 }
 
 fn render_text_selection_overlay(frame: &mut Frame, area: Rect, app: &App) {
@@ -1782,15 +1838,17 @@ fn render_completion_overlay(frame: &mut Frame, area: Rect, app: &App) {
 
 /// Render images inline at their scroll-adjusted positions.
 /// Images appear within the content flow and scroll with the text.
+/// `image_positions` carries (key, visual row, caption) — the row is the
+/// wrapped line index the paragraph draws the reserved rows on.
 fn render_inline_images(
     frame: &mut Frame,
     chat_area: Rect,
     app: &mut App,
-    image_positions: &[(String, usize)],
+    image_positions: &[(String, usize, String)],
     _scroll: usize,
 ) {
     use super::streaming_markdown::IMAGE_HEIGHT;
-    use ratatui_image::StatefulImage;
+    use ratatui_image::{Resize, StatefulImage};
 
     // Early exit if image support was disabled during session
     if app.image_support.is_none() {
@@ -1815,75 +1873,29 @@ fn render_inline_images(
         (0, scroll_val)
     };
 
-    tracing::debug!(
-        "render_inline_images: {} positions, {} cached, padding={}, actual_scroll={}, content_height={}, view_height={}",
-        image_positions.len(),
-        app.image_cache.len(),
-        padding,
-        actual_scroll,
-        content_height,
-        view_height
-    );
-
-    for (url, line_index) in image_positions {
-        let is_cached = app.image_cache.contains_key(url);
-        tracing::debug!(
-            "Image at line {}: url={}, cached={}",
-            line_index,
-            url,
-            is_cached
-        );
-
-        // Calculate screen position accounting for both padding and scroll
-        // line_index is in the unpadded content coordinate system
-        // Screen position = padding + line_index - actual_scroll
-
-        // Skip if the image is scrolled above the visible area
-        if *line_index < actual_scroll {
-            // Image might be partially visible at top
-            let lines_hidden = actual_scroll - line_index;
-            if lines_hidden >= IMAGE_HEIGHT {
-                // Completely scrolled past
-                continue;
-            }
-            // Partial visibility at top - handled below
+    for (url, row, caption) in image_positions {
+        // Skip images scrolled (even partially) above the visible area: the
+        // overlay can't clip, and painting it over rows it doesn't own
+        // tramples the content that scrolls underneath.
+        if *row < actual_scroll {
+            continue;
         }
 
         // Screen line position (accounting for padding and scroll)
-        let screen_line = padding + line_index.saturating_sub(actual_scroll);
+        let screen_line = padding + row - actual_scroll;
 
         // Skip if completely below visible area
         if screen_line >= view_height {
             continue;
         }
 
-        // Get the cached image state
-        let Some(state) = app.image_cache.get_mut(url) else {
-            // Image not yet fetched
-            continue;
-        };
-
-        // Calculate visible portion of the image
-        // The image starts at line_index + 1 (skip the header line "🖼 Alt [loading...]")
-        // and spans IMAGE_HEIGHT - 1 lines
-        let image_content_line = screen_line + 1; // Skip header line
-
-        // Skip if header line is at or past the bottom
-        if image_content_line >= view_height {
-            continue;
-        }
-
-        let image_start_y = chat_area.y + u16::try_from(image_content_line).unwrap_or(u16::MAX);
+        let image_start_y = chat_area.y + u16::try_from(screen_line).unwrap_or(u16::MAX);
         let available_height = (chat_area.y + chat_area.height).saturating_sub(image_start_y);
-
-        // Skip if no space available
         if available_height == 0 {
             continue;
         }
 
-        // Calculate image area with proper bounds
-        // IMAGE_HEIGHT - 1 because we skip the header line
-        let image_height = u16::try_from(IMAGE_HEIGHT - 1)
+        let image_height = u16::try_from(IMAGE_HEIGHT)
             .unwrap_or(u16::MAX)
             .min(available_height);
         let indent = 2u16; // Indent from left edge
@@ -1895,24 +1907,33 @@ fn render_inline_images(
             image_height,
         );
 
-        tracing::debug!(
-            "Rendering image at area: x={}, y={}, w={}, h={} (screen_line={}, padding={}, line_index={})",
-            image_area.x,
-            image_area.y,
-            image_area.width,
-            image_area.height,
-            screen_line,
-            padding,
-            line_index
-        );
-
         // Skip if area is too small
         if image_area.width < 4 || image_area.height < 2 {
             continue;
         }
 
-        // Render the image
+        // Get the cached image state
+        let Some(state) = app.image_cache.get_mut(url) else {
+            // Image not yet fetched
+            continue;
+        };
+
+        // The fitted rect is what the image actually paints into — it is the
+        // click region for the zoom view.
+        let fitted = state.protocol.size_for(Resize::Fit(None), image_area);
+        let draw_area = Rect::new(
+            image_area.x,
+            image_area.y,
+            fitted.width.min(image_area.width),
+            fitted.height.min(image_area.height),
+        );
+
         let image_widget = StatefulImage::default();
         frame.render_stateful_widget(image_widget, image_area, &mut state.protocol);
+        app.image_regions.push(ImageRegion {
+            rect: draw_area,
+            key: url.clone(),
+            caption: caption.clone(),
+        });
     }
 }

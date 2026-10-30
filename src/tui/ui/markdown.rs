@@ -27,8 +27,8 @@ impl ImageSupport {
 pub struct MarkdownRenderResult {
     /// Rendered lines
     pub lines: Vec<Line<'static>>,
-    /// Image positions: (url, `line_index`) for each image
-    pub image_positions: Vec<(String, usize)>,
+    /// Image positions: (url, `line_index`, caption) for each image
+    pub image_positions: Vec<(String, usize, String)>,
 }
 
 /// Render markdown text to ratatui lines.

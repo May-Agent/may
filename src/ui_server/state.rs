@@ -441,6 +441,10 @@ pub struct UiServerState {
     pub(crate) tool_environments: crate::agent::ToolEnvironmentCache,
     pub(crate) cwd: PathBuf,
     pub(crate) may_dir: PathBuf,
+    /// Session open locks of sessions this server has bound for chat or
+    /// runs; a bound session stays locked for the server's lifetime.
+    pub(crate) session_open_locks:
+        Mutex<std::collections::HashMap<String, crate::session::SessionOpenLock>>,
 }
 
 impl UiServerState {
@@ -647,18 +651,10 @@ impl AskUserApprover {
                 questions: Self::persisted_questions(&questions),
             };
             if let Err(error) = runtime_service
-                .set_waiting_ask_user(session_id, Some(persisted_request))
+                .register_ask_user_request(session_id, &persisted_request)
                 .await
             {
-                tracing::warn!(session_id = %session_id, error = %error, "failed to persist ask-user runtime state");
-            }
-
-            if let Err(error) = runtime_service
-                .db()
-                .append_ask_user_request_message(session_id, request_id.as_str(), &questions, None)
-                .await
-            {
-                tracing::warn!(session_id, error = %error, "failed to append ask-user request history");
+                tracing::warn!(session_id = %session_id, error = %error, "failed to register ask-user request");
             }
         }
 

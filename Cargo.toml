@@ -135,7 +135,9 @@ ignore = "0.4"
 
 # Logging
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-appender = "0.2"
+
+# Per-session open lock (flock)
+fd-lock = "4.0.4"
 
 # Templating
 askama = "0.16"
