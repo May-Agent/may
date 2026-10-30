@@ -2,7 +2,7 @@ import { useSessionsStore } from '@/lib/stores/sessions';
 import { useRuntimeStore } from '@/lib/stores/runtime';
 import { PermissionModal } from './PermissionModal';
 import { WorkspaceModal } from './WorkspaceModal';
-import { AskUserModal } from './AskUserModal';
+import { AskUserModal, OpenQuestions } from './AskUserModal';
 
 export function InteractionLayer() {
   const active = useSessionsStore((s) => s.active);
@@ -15,6 +15,7 @@ export function InteractionLayer() {
       <PermissionModal request={runtime.waitingPermission ?? null} />
       <WorkspaceModal request={runtime.waitingWorkspace ?? null} />
       <AskUserModal request={runtime.waitingAskUser ?? null} />
+      <OpenQuestions requests={runtime.openQuestions ?? []} />
     </>
   );
 }

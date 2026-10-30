@@ -299,11 +299,37 @@ pub struct PendingPermissionLookup {
 #[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub struct PendingAskUserLookup {
     pub(crate) session_id: String,
+    /// Whether a run is waiting on the prompt, as opposed to an open question.
+    pub(crate) blocking: bool,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub struct PendingWorkspaceLookup {
     pub(crate) session_id: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
+pub(super) struct CommittedResponseLookup {
+    pub(super) message_id: i64,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
+pub(super) struct CommittedAnswerRow {
+    pub(super) ordinal: i64,
+    pub(super) section: String,
+    pub(super) answer_kind: String,
+    pub(super) custom_text: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
+pub(super) struct CommittedSelectedOptionRow {
+    pub(super) answer_ordinal: i64,
+    pub(super) value: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
+pub(super) struct CommittedDecisionRow {
+    pub(super) approved: bool,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]

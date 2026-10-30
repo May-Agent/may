@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use aither_agent::sandbox::builtin::AskCommand;
 use aither_agent::specialized::{SubagentFileMount, SubagentTool};
@@ -10,6 +11,7 @@ use aither_sandbox::ToolRegistryBuilder;
 use aither_search::{SearchEmbeddingResolution, SearchTool};
 
 use crate::agent::ImageGeneratorConfig;
+use crate::agent::ask_user_tool::{AskUserTool, WithdrawAskUserTool};
 use crate::agent::browser_tool::{BrowserBroker, BrowserTool};
 use crate::agent::imagine::ImagineTool;
 use crate::agent::issue_tool::{IssueTool, SubagentIssueTool};
@@ -18,7 +20,6 @@ use crate::agent::register_tool::{RegisterBroker, RegisterTool, Skills, Subagent
 use crate::agent::session_tool::SessionTool;
 use crate::agent::subagent_tracker::{SubagentTracker, TrackedSubagentTool, UsageObservedModel};
 use crate::agent::task_tool::{TaskBroker, TaskRuntimeKind, TaskTool};
-use crate::ask_user::{AskUserBroker, AskUserTool};
 use crate::embedding_provider::{EmbeddingModelResolution, MayEmbeddingModel};
 use crate::mcp::load_active_mcp_connections;
 use crate::workspace_request::{RequestWorkspaceTool, WorkspaceRequestBroker};
@@ -51,8 +52,9 @@ pub struct SharedTerminalCommandConfig<LLM> {
     pub sandbox_dir: PathBuf,
     /// Resolved embedding model for semantic search.
     pub search_embedder: EmbeddingModelResolution,
-    /// Broker for `ask_user` prompts, when interactive.
-    pub ask_user_broker: Option<AskUserBroker>,
+    /// Runtime that holds the session's open `ask_user` questions, when the
+    /// session has one.
+    pub ask_user: Option<Arc<crate::session::SessionRuntimeService>>,
     /// Image-generation config, when enabled.
     pub imagine: Option<ImagineCommandConfig>,
     /// Task runtime backing the `task` command.
@@ -150,10 +152,13 @@ where
         SubagentIssueTool::new(config.issue_store),
     );
 
-    if let Some(ask_user_broker) = config.ask_user_broker {
-        let ask_user = AskUserTool::new(config.session_id.clone(), ask_user_broker);
+    if let Some(runtime) = config.ask_user {
+        let ask_user = AskUserTool::new(runtime.clone(), config.session_id.clone());
         describe_tool(&mut descriptions, &ask_user);
         builder.main_only(|reserved| reserved.configure_tool(ask_user));
+        let withdraw = WithdrawAskUserTool::new(runtime, config.session_id.clone());
+        describe_tool(&mut descriptions, &withdraw);
+        builder.main_only(|reserved| reserved.configure_tool(withdraw));
     }
 
     if let Some(messaging) = config.agent_messaging {
@@ -331,7 +336,6 @@ mod tests {
     use futures_lite::Stream;
 
     use super::*;
-    use crate::ask_user;
 
     #[derive(Clone)]
     struct MockLlm;
@@ -370,6 +374,16 @@ mod tests {
         }
     }
 
+    async fn test_runtime(dir: &std::path::Path) -> Arc<crate::session::SessionRuntimeService> {
+        let db = crate::db::ChatDb::open(&dir.join("runtime.db"))
+            .await
+            .expect("chat db should open");
+        Arc::new(crate::session::SessionRuntimeService::new(
+            db,
+            crate::ui_event_bus::UiEventBus::new(),
+        ))
+    }
+
     async fn test_issue_store(dir: &std::path::Path) -> crate::issue::ResolvedIssueStore {
         let db = crate::db::ChatDb::open(&dir.join("history.db"))
             .await
@@ -385,7 +399,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let session_dir = temp.path().join("sessions/session-1");
         let artifacts_dir = session_dir.join("artifacts");
-        let (ask_user_broker, _ask_user_queue) = ask_user::channel();
+        let ask_user_runtime = test_runtime(temp.path()).await;
         let mut builder = ToolRegistryBuilder::new();
 
         let descriptions = register_shared_terminal_commands(
@@ -399,7 +413,7 @@ mod tests {
                 may_dir: temp.path().to_path_buf(),
                 sandbox_dir: session_dir.clone(),
                 search_embedder: EmbeddingModelResolution::Disabled,
-                ask_user_broker: Some(ask_user_broker),
+                ask_user: Some(ask_user_runtime),
                 imagine: Some(ImagineCommandConfig {
                     generator: None,
                     artifacts_dir,
@@ -454,7 +468,7 @@ mod tests {
                 may_dir: temp.path().to_path_buf(),
                 sandbox_dir: session_dir.clone(),
                 search_embedder: EmbeddingModelResolution::Disabled,
-                ask_user_broker: None,
+                ask_user: None,
                 imagine: None,
                 task_runtime: TaskRuntimeKind::Local,
                 task_broker: None,
@@ -510,7 +524,7 @@ mod tests {
                 may_dir: temp.path().to_path_buf(),
                 sandbox_dir: session_dir.clone(),
                 search_embedder: EmbeddingModelResolution::Disabled,
-                ask_user_broker: None,
+                ask_user: None,
                 imagine: None,
                 task_runtime: TaskRuntimeKind::Local,
                 task_broker: None,
@@ -541,7 +555,7 @@ mod tests {
     async fn a_subagent_registry_reads_issues_and_refuses_ask_user_and_issue_writes() {
         let temp = tempfile::tempdir().expect("tempdir");
         let session_dir = temp.path().join("sessions/session-1");
-        let (ask_user_broker, ask_user_queue) = ask_user::channel();
+        let ask_user_runtime = test_runtime(temp.path()).await;
         let mut builder = ToolRegistryBuilder::new();
         register_shared_terminal_commands(
             &mut builder,
@@ -554,7 +568,7 @@ mod tests {
                 may_dir: temp.path().to_path_buf(),
                 sandbox_dir: session_dir.clone(),
                 search_embedder: EmbeddingModelResolution::Disabled,
-                ask_user_broker: Some(ask_user_broker),
+                ask_user: Some(ask_user_runtime.clone()),
                 imagine: None,
                 task_runtime: TaskRuntimeKind::Local,
                 task_broker: None,
@@ -639,7 +653,12 @@ mod tests {
             "{refused:?}"
         );
         assert!(
-            ask_user_queue.is_empty(),
+            ask_user_runtime
+                .db()
+                .open_ask_user_questions("session-1")
+                .await
+                .expect("open questions load")
+                .is_empty(),
             "the refused call must not reach the user"
         );
     }
@@ -720,7 +739,7 @@ mod tests {
                 may_dir: temp.path().to_path_buf(),
                 sandbox_dir: session_dir.clone(),
                 search_embedder: EmbeddingModelResolution::Disabled,
-                ask_user_broker: None,
+                ask_user: None,
                 imagine: None,
                 task_runtime: TaskRuntimeKind::Local,
                 task_broker: None,
@@ -791,7 +810,7 @@ mod tests {
                 may_dir: temp.path().to_path_buf(),
                 sandbox_dir: session_dir.clone(),
                 search_embedder: EmbeddingModelResolution::Disabled,
-                ask_user_broker: None,
+                ask_user: None,
                 imagine: None,
                 task_runtime: TaskRuntimeKind::Local,
                 task_broker: None,
