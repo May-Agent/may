@@ -53,9 +53,21 @@ pub use aither_agent::{AgentError, AgentEvent, TimedEvent};
 
 use super::state::{
     ActiveTextInput, AppMode, AskUserState, ChatgptAuthStatus, ConfigEditMode, ConfigState,
-    CopilotAuthStatus, McpAddMode, PasteFilter, SelectionPoint, SkillAddMode, SshAddMode,
-    StatusNotice, TextSelection, detect_api_key_from_env,
+    CopilotAuthStatus, ImageViewState, McpAddMode, PasteFilter, SelectionPoint, SkillAddMode,
+    SshAddMode, StatusNotice, TextSelection, detect_api_key_from_env,
 };
+
+/// Screen rect an inline image was painted into last frame — hit-tested on
+/// clicks to open the zoom view.
+#[derive(Debug)]
+pub struct ImageRegion {
+    /// Absolute screen area the image occupies.
+    pub rect: ratatui::layout::Rect,
+    /// Key of the decoded image in `image_cache`.
+    pub key: String,
+    /// Path or URL shown under the zoomed image.
+    pub caption: String,
+}
 /// Application state (UI only - agent managed externally).
 #[derive(Debug)]
 pub struct App {
@@ -224,6 +236,10 @@ pub struct App {
     pub image_fetching: ahash::AHashSet<String>,
     /// Image keys that failed to fetch or decode (avoids retry loops)
     pub image_failed: ahash::AHashSet<String>,
+    /// Screen rects inline images were painted into last frame (click to zoom)
+    pub image_regions: Vec<ImageRegion>,
+    /// Image rect inside the zoom overlay — a click outside it closes the view
+    pub image_view_area: Option<ratatui::layout::Rect>,
     /// Mouse/text selection in rendered chat content
     pub selection: Option<TextSelection>,
     /// Plain text render cache used for selection copy
@@ -471,6 +487,8 @@ impl App {
             image_cache: ahash::AHashMap::new(),
             image_fetching: ahash::AHashSet::new(),
             image_failed: ahash::AHashSet::new(),
+            image_regions: Vec::new(),
+            image_view_area: None,
             selection: None,
             rendered_plain_lines: Vec::new(),
             render_top_padding: 0,
@@ -1141,6 +1159,7 @@ impl App {
                 Some(super::ui::chat::ToolCallImage {
                     key,
                     label: "image".to_string(),
+                    path: String::new(),
                 })
             }
             Kind::Stored { url, path } => {
@@ -1149,6 +1168,11 @@ impl App {
                     .and_then(|name| name.to_str())
                     .unwrap_or("image")
                     .to_string();
+                let caption_path = if path.is_empty() {
+                    url.clone()
+                } else {
+                    path.clone()
+                };
                 let mut targets = if url.is_empty() {
                     Vec::new()
                 } else {
@@ -1161,7 +1185,11 @@ impl App {
                     return None;
                 }
                 self.spawn_image_fetch(key.clone(), targets);
-                Some(super::ui::chat::ToolCallImage { key, label })
+                Some(super::ui::chat::ToolCallImage {
+                    key,
+                    label,
+                    path: caption_path,
+                })
             }
         }
     }
@@ -1682,6 +1710,9 @@ impl App {
                 self, code,
             )),
             AppMode::Btw(_) => Ok(super::reducer::navigation::handle_btw_key(self, code)),
+            AppMode::ImageView(_) => Ok(super::reducer::navigation::handle_image_view_key(
+                self, code,
+            )),
         }
     }
 
@@ -2086,8 +2117,22 @@ impl App {
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) -> AppResult<Option<SendAction>> {
         const SCROLL_STEP_LINES: usize = 3;
 
-        if !matches!(self.mode, AppMode::Chat) {
-            return Ok(None);
+        match &self.mode {
+            AppMode::Chat => {}
+            AppMode::ImageView(_) => {
+                // A click outside the displayed image closes the zoom view.
+                if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                    let inside = self.image_view_area.is_some_and(|rect| {
+                        rect.contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+                    });
+                    if !inside {
+                        self.mode = AppMode::Chat;
+                        self.image_view_area = None;
+                    }
+                }
+                return Ok(None);
+            }
+            _ => return Ok(None),
         }
 
         match mouse.kind {
@@ -2108,9 +2153,17 @@ impl App {
             MouseEventKind::Up(MouseButton::Left) => {
                 if self.selection.as_ref().is_some_and(TextSelection::is_empty) {
                     self.selection = None;
-                    // A press/release without a drag is a click: toggle the
+                    let point = ratatui::layout::Position::new(mouse.column, mouse.row);
+                    // A press/release without a drag is a click: open the
+                    // zoom view when it lands on an image, else toggle the
                     // collapsed state of the tool call under the cursor.
-                    if let Some(point) = self.mouse_to_selection_point(mouse)
+                    if let Some(region) = self.image_regions.iter().find(|r| r.rect.contains(point))
+                    {
+                        self.mode = AppMode::ImageView(ImageViewState {
+                            key: region.key.clone(),
+                            caption: region.caption.clone(),
+                        });
+                    } else if let Some(point) = self.mouse_to_selection_point(mouse)
                         && let Some(region) = self
                             .collapse_regions
                             .iter()
