@@ -27,7 +27,7 @@ use executor_core::{Executor, Task};
 use futures_lite::StreamExt;
 
 use crate::MayAgent;
-use crate::agent::{ContextReport, RequestParameterizedModel};
+use crate::agent::{ContextDump, ContextReport, RequestParameterizedModel};
 use crate::db::{ChatDb, RunFence};
 use crate::session::{RunOutcome, SessionRunGuard, SessionRuns};
 
@@ -40,6 +40,8 @@ pub enum TuiEvent {
     Compacted(Result<Option<CompactResult>, aither_agent::AgentError>),
     /// Context-window measurement for `/context` is ready.
     ContextReport(Result<ContextReport, aither_agent::AgentError>),
+    /// Assembled-context dump for `/context dump` is ready.
+    ContextDump(Result<ContextDump, aither_agent::AgentError>),
     /// Agent stream completed (ready for next prompt).
     Complete,
     /// Agent encountered a fatal error.
@@ -87,6 +89,8 @@ enum WorkerCommand {
     },
     /// Measure the context window for `/context`.
     ContextReport { event_tx: Sender<TuiEvent> },
+    /// Dump the assembled context for `/context dump`.
+    ContextDump { event_tx: Sender<TuiEvent> },
     /// Cancel current processing.
     Cancel,
     /// Shutdown the worker.
@@ -184,6 +188,29 @@ impl AgentWorker {
         let (event_tx, event_rx) = unbounded();
         self.command_tx
             .try_send(WorkerCommand::ContextReport { event_tx })
+            .unwrap_or_else(|_| panic!("{}", ERR_WORKER_CHANNEL_CLOSED.trim()));
+        AgentHandle {
+            event_rx,
+            command_tx: self.command_tx.clone(),
+        }
+    }
+
+    /// Request a verbatim context dump for `/context dump`.
+    ///
+    /// Issued while a turn is in flight, the dump is deferred by the worker
+    /// and captures the post-turn context once the turn ends.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the worker command channel is already closed — the worker
+    /// task has stopped unexpectedly.
+    #[must_use]
+    pub fn context_dump(&self) -> AgentHandle {
+        const ERR_WORKER_CHANNEL_CLOSED: &str =
+            include_str!("../texts/agent_worker_channel_closed.txt");
+        let (event_tx, event_rx) = unbounded();
+        self.command_tx
+            .try_send(WorkerCommand::ContextDump { event_tx })
             .unwrap_or_else(|_| panic!("{}", ERR_WORKER_CHANNEL_CLOSED.trim()));
         AgentHandle {
             event_rx,
@@ -374,6 +401,11 @@ async fn run_worker(
                 let _ = event_tx.send(TuiEvent::ContextReport(report)).await;
                 let _ = event_tx.send(TuiEvent::Complete).await;
             }
+            WorkerCommand::ContextDump { event_tx } => {
+                let dump = agent.context_dump().await;
+                let _ = event_tx.send(TuiEvent::ContextDump(dump)).await;
+                let _ = event_tx.send(TuiEvent::Complete).await;
+            }
             WorkerCommand::Cancel => {
                 // No active processing, ignore
             }
@@ -461,11 +493,12 @@ enum WorkOutcome<T> {
 /// Race `work` against the worker command channel.
 ///
 /// `Cancel` and `Shutdown` end the race early and drop `work` where it
-/// stands. A `ContextReport` received meanwhile is held and requeued once
-/// the race ends, so it is answered when the worker is idle again — the
-/// in-flight work borrows the agent, so a report cannot be measured
-/// mid-turn, and requeueing it during the race would hand it straight back
-/// to this loop. `Run` and `Compact` commands arriving mid-work are ignored.
+/// stands. A `ContextReport` or `ContextDump` received meanwhile is held
+/// and requeued once the race ends, so it is answered when the worker is
+/// idle again — the in-flight work borrows the agent, so a report cannot
+/// be measured mid-turn, and requeueing it during the race would hand it
+/// straight back to this loop. `Run` and `Compact` commands arriving
+/// mid-work are ignored.
 async fn race_against_commands<F: Future>(
     work: F,
     command_rx: &Receiver<WorkerCommand>,
@@ -481,14 +514,16 @@ async fn race_against_commands<F: Future>(
             match command {
                 WorkerCommand::Cancel => return WorkOutcome::Cancelled,
                 WorkerCommand::Shutdown => return WorkOutcome::Shutdown,
-                WorkerCommand::ContextReport { event_tx } => deferred.push(event_tx),
+                WorkerCommand::ContextReport { .. } | WorkerCommand::ContextDump { .. } => {
+                    deferred.push(command);
+                }
                 WorkerCommand::Run { .. } | WorkerCommand::Compact { .. } => {}
             }
         }
     })
     .await;
-    for event_tx in deferred {
-        let _ = command_tx.try_send(WorkerCommand::ContextReport { event_tx });
+    for command in deferred {
+        let _ = command_tx.try_send(command);
     }
     outcome
 }
