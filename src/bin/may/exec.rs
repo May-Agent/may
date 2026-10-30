@@ -9,7 +9,7 @@
 use std::io::{self, Write};
 use std::sync::Arc;
 
-use aither_core::llm::{CommandOutcome, CommandResult, Tool, ToolResult};
+use aither_core::llm::{CommandOutcome, CommandResult, ToolResult};
 use aither_sandbox::{
     ContainerShellRuntime, OutputFormat, ShellRuntimeAvailability, SshServer, TerminalArgs,
     TerminalExecutionMode, TerminalTool,
@@ -32,8 +32,6 @@ pub enum ExecError {
     InitializeSession(may_agent::session::SessionError),
     #[error("session '{0}' was not found")]
     SessionNotFound(String),
-    #[error("{0}")]
-    SessionLocked(#[from] may_agent::session::SessionOpenLockError),
     #[error("failed to load profile '{profile_id}': {source}")]
     LoadProfile {
         profile_id: String,
@@ -82,8 +80,6 @@ pub enum ExecError {
 struct ExecSessionContext {
     db: ChatDb,
     may_dir: std::path::PathBuf,
-    /// Held while the exec binds the session; released with the context.
-    _open_lock: may_agent::session::SessionOpenLock,
     session_id: SessionId,
     sandbox_dir: std::path::PathBuf,
     profile_environment: Option<ProfileEnvironment>,
@@ -146,36 +142,67 @@ pub async fn run_exec(args: ExecArgs) -> Result<i32, ExecError> {
         args.allow_runtime_install,
         tool_distribution,
     )
-    .await?
-    .with_foreground_limit(std::time::Duration::from_secs(args.timeout));
+    .await?;
 
-    let output = terminal_tool
-        .call(
-            TerminalArgs {
-                description: "execute the requested shell command".to_string(),
-                script: args.script,
-                mode: shell_mode,
-                ssh_server_id: args.ssh_server_id,
-                expect: OutputFormat::Text,
-                resolution: aither_sandbox::MediaResolution::Auto,
-                max_lines: args.max_lines,
-                raw: args.raw,
-            },
-            aither_core::llm::ToolContext::new(),
-        )
+    // `may exec` reports the final result, so the command runs detached
+    // under its `--timeout` kill bound and the call waits for completion.
+    let started = terminal_tool
+        .run_background(TerminalArgs {
+            description: "execute the requested shell command".to_string(),
+            script: args.script,
+            mode: shell_mode,
+            ssh_server_id: args.ssh_server_id,
+            expect: OutputFormat::Text,
+            resolution: aither_sandbox::MediaResolution::Auto,
+            max_lines: args.max_lines,
+            raw: args.raw,
+            timeout: args.timeout,
+            background: true,
+        })
         .await
         .map_err(ExecError::TerminalCall)?;
-
-    if output.is_error() {
+    if started.is_error() {
         return Err(ExecError::TerminalCall(anyhow::anyhow!(
-            output
+            started
                 .error_message()
                 .unwrap_or("terminal tool returned an error")
                 .to_string()
         )));
     }
-    let ToolResult::Command(result) = output else {
+    let ToolResult::Command(started) = started else {
         return Err(ExecError::NotACommandResult);
+    };
+    let result = match started.outcome.clone() {
+        CommandOutcome::Running { task_id, .. } => {
+            let receiver = terminal_tool.background_receiver();
+            let completed = loop {
+                let Some(completed) = receiver.recv().await else {
+                    return Err(ExecError::TerminalCall(anyhow::anyhow!(
+                        "the terminal job channel closed before the command finished"
+                    )));
+                };
+                if completed.task_id == task_id {
+                    break completed;
+                }
+            };
+            let killed = terminal_tool
+                .job_registry()
+                .get_by_task_id(&task_id)
+                .await
+                .is_some_and(|job| job.status == aither_sandbox::job_registry::JobStatus::Killed);
+            let mut result: CommandResult = completed
+                .result
+                .map_err(|error| ExecError::TerminalCall(anyhow::anyhow!(error.to_string())))?
+                .into();
+            if killed {
+                result.outcome = CommandOutcome::Killed {
+                    task_id,
+                    notice: format!("killed after its {}s timeout", args.timeout),
+                };
+            }
+            result
+        }
+        _ => *started,
     };
     render_exec_result(&result)?;
     Ok(exit_code(&result.outcome))
@@ -257,17 +284,9 @@ async fn load_exec_session_context(session_id: &str) -> Result<ExecSessionContex
     )
     .await?;
 
-    let open_lock = may_agent::session::SessionOpenLock::acquire(
-        session_id,
-        store
-            .session_paths(session_id, profile_id.as_deref())
-            .root(),
-    )?;
-
     Ok(ExecSessionContext {
         db,
         may_dir,
-        _open_lock: open_lock,
         session_id: SessionId::from_string(session_id),
         sandbox_dir: store.sandbox_dir(session_id, profile_id.as_deref()),
         profile_environment,
@@ -451,7 +470,6 @@ async fn build_exec_terminal_tool(
         context,
         may_config,
         resolved_provider.llm,
-        resolved_provider.search_embedder,
         &tool_dispatchers,
         environment,
     )
@@ -464,7 +482,6 @@ async fn build_exec_registry<LLM>(
     context: &ExecSessionContext,
     _may_config: &MayConfig,
     llm: LLM,
-    search_embedder: may_agent::embedding_provider::EmbeddingModelResolution,
     tool_dispatchers: &may_agent::tool_dispatch::ToolDispatchers,
     environment: &may_agent::AgentEnvironment,
 ) -> Result<Arc<aither_sandbox::ToolRegistry>, ExecError>
@@ -492,7 +509,8 @@ where
             session_id: context.session_id.as_str().to_string(),
             may_dir: context.may_dir.clone(),
             sandbox_dir: context.sandbox_dir.clone(),
-            search_embedder,
+            cwd: cwd.clone(),
+            db: Some(context.db.clone()),
             ask_user: None,
             imagine: None,
             task_runtime: match environment {

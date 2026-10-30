@@ -133,7 +133,7 @@ impl TerminalCallInfo {
 /// Display representation of a tool call.
 #[derive(Debug, Clone)]
 pub enum ToolDisplay {
-    /// A `terminal` or `terminal_background` script execution.
+    /// A `terminal` script execution, foreground or detached.
     Terminal {
         /// Model-provided summary shown as the headline; empty for `!`
         /// bash calls, which headline their command instead.
@@ -2801,18 +2801,18 @@ mod tests {
         use ratatui::{Terminal, backend::TestBackend, buffer::Buffer, layout::Rect};
 
         let mut chat = ChatStream::new();
-        chat.push_text("终端通道工作正常。要做更具体的测试吗？比如：\n\n- 并发/时序测试 — 比如先跑 `sleep 5` 再跑 `sleep 10`，验证顺序与完成回调\n- 后台任务测试 — `terminal_background` + `terminal_read` 增量读取\n- 文件写入测试 — 在 `artifacts/` 或 `data/` 里写文件并校验持久性\n- 特定命令 — 你直接给出要跑的命令，我执行后按你指定的格式回传（比如只回 `finished`）\n\n直接说要测什么就行。\n");
+        chat.push_text("终端通道工作正常。要做更具体的测试吗？比如：\n\n- 并发/时序测试 — 比如先跑 `sleep 5` 再跑 `sleep 10`，验证顺序与完成回调\n- 后台任务测试 — `terminal` 加 `background` + `terminal_read` 增量读取\n- 文件写入测试 — 在 `artifacts/` 或 `data/` 里写文件并校验持久性\n- 特定命令 — 你直接给出要跑的命令，我执行后按你指定的格式回传（比如只回 `finished`）\n\n直接说要测什么就行。\n");
         chat.push_user("你可以跑后台命令吗", Vec::new(), 0);
-        chat.push_text("可以，用 `terminal_background` 就行。我跑一个演示：\n");
+        chat.push_text("可以，用 `terminal` 加 `background` 就行。我跑一个演示：\n");
         chat.push_tool(
             "call-1".to_string(),
             ToolDisplay::Terminal {
                 description: String::new(),
-                command: "terminal_background {…}".to_string(),
+                command: "terminal {…}".to_string(),
                 mode: TerminalExecutionMode::Default,
                 status: ToolStatus::Done,
                 output: Some(
-                    super::TerminalCallInfo::new("terminal_background".to_string()).with_output(
+                    super::TerminalCallInfo::new("terminal".to_string()).with_output(
                         "tick 1 at 21:20:24\ntick 2 at 21:20:25\ntick 3 at 21:20:26".to_string(),
                     ),
                 ),

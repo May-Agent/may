@@ -131,6 +131,17 @@ impl Drop for RunGuard {
     }
 }
 
+/// The subagent handles one session keeps across agent rebuilds, so runs a
+/// turn started stay listed and cancellable after the next turn rebuilt the
+/// agent.
+#[derive(Debug, Default, Clone)]
+pub struct SubagentHandles {
+    /// Cancellation registry of the `subagent` command's runs.
+    pub runs: aither_agent::specialized::SubagentRuns,
+    /// Live snapshots of the same runs.
+    pub tracker: SubagentTracker,
+}
+
 /// Shared registry of in-flight `subagent` runs for one session.
 ///
 /// The session's worker holds one handle and the `subagent` IPC command holds

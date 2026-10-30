@@ -239,7 +239,8 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
         lastSeq: event.seq,
       };
 
-    case 'done': {
+    case 'done':
+    case 'paused': {
       const finalText = event.assistant.content || state.text;
       const hasTextSegment = state.segments.some((s) => s.kind === 'text');
       const segments =
@@ -254,6 +255,9 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
         lastSeq: event.seq,
       };
     }
+
+    case 'end':
+      return { ...state, status: 'done', lastSeq: event.seq };
 
     case 'ping':
       return { ...state, lastSeq: event.seq };

@@ -33,6 +33,9 @@ pub enum TuiRuntimeError {
     /// A turn was started without holding the session's run lease.
     #[error("no session run lease is held for this turn")]
     NoRunLease,
+    /// The May daemon refused or could not be reached.
+    #[error(transparent)]
+    Daemon(#[from] crate::client::DaemonClientError),
     /// History replay failed.
     #[error("history replay failed: {0}")]
     HistoryReplay(#[from] crate::session::HistoryReplayError),
@@ -548,6 +551,28 @@ impl LocalSessionRuntime {
     }
 }
 
+/// Answers as `POST /api/ask-user/respond` takes them.
+fn answers_json(answers: &[QuestionAnswer]) -> serde_json::Value {
+    use crate::ask_user::AnswerValue;
+    serde_json::Value::Array(
+        answers
+            .iter()
+            .filter_map(|answer| {
+                let value = match &answer.answer {
+                    AnswerValue::Selected(values) => {
+                        serde_json::json!({ "kind": "selected", "values": values })
+                    }
+                    AnswerValue::Custom(text) => {
+                        serde_json::json!({ "kind": "custom", "text": text })
+                    }
+                    AnswerValue::Skipped => return None,
+                };
+                Some(serde_json::json!({ "section": answer.section, "answer": value }))
+            })
+            .collect(),
+    )
+}
+
 fn pending_message_to_runtime(
     message: &PendingMessage,
 ) -> Result<crate::session::PendingUserMessage, TuiRuntimeError> {
@@ -740,6 +765,8 @@ pub struct RuntimeDeps {
     tool_environments: crate::agent::ToolEnvironmentCache,
     oneshot_model: Option<String>,
     oneshot_reasoning_effort: Option<ReasoningEffort>,
+    /// The May daemon that runs this TUI's agents, when it is a client.
+    daemon: Option<crate::client::DaemonClient>,
 }
 
 /// An agent worker under construction off the event loop.
@@ -813,7 +840,21 @@ impl RuntimeDeps {
             tool_environments,
             oneshot_model: None,
             oneshot_reasoning_effort: None,
+            daemon: None,
         }
+    }
+
+    /// Run every agent in the daemon behind `client` instead of in-process.
+    #[must_use]
+    pub fn with_daemon(mut self, client: crate::client::DaemonClient) -> Self {
+        self.daemon = Some(client);
+        self
+    }
+
+    /// The daemon this TUI is a client of, if any.
+    #[must_use]
+    pub const fn daemon(&self) -> Option<&crate::client::DaemonClient> {
+        self.daemon.as_ref()
     }
 
     /// Forgets the prepared tool environment of a deleted session.
@@ -1038,10 +1079,9 @@ impl RuntimeDeps {
     ) {
         app.set_current_model(build.model());
         app.worker_settings = build.settings().clone();
-        app.job_registry = Some(new_worker.job_registry().clone());
-        app.subagent_runs = Some(new_worker.subagent_runs().clone());
-        app.btw_llm = Some(new_worker.btw_llm().clone());
-        app.subagent_tracker = new_worker.subagent_tracker().clone();
+        app.background = new_worker.background().cloned();
+        app.btw_llm = new_worker.btw_llm().cloned();
+        app.refresh_jobs();
         *worker = Some(new_worker);
     }
 
@@ -1065,6 +1105,10 @@ impl RuntimeDeps {
             *title_gen = Some(TitleGenContext {
                 user_message: msg.content.clone(),
             });
+        }
+
+        if self.daemon.is_some() {
+            return Self::send_remote_turn(app, worker, msg);
         }
 
         let guard = app.run_guard.as_ref().ok_or(TuiRuntimeError::NoRunLease)?;
@@ -1106,6 +1150,36 @@ impl RuntimeDeps {
         ))
     }
 
+    /// Hands `msg` to the daemon. The daemon writes the turn's rows; the
+    /// in-memory history records the message now so the chat's history
+    /// positions stay aligned until the turn's end reloads them.
+    fn send_remote_turn(
+        app: &mut App,
+        worker: &AgentWorker,
+        msg: PendingMessage,
+    ) -> Result<AgentHandle, TuiRuntimeError> {
+        let attachments = msg
+            .attachments
+            .iter()
+            .map(persisted_attachment_from_tui)
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(hidden_context_xml) = msg.hidden_context_xml.as_ref() {
+            app.session_manager
+                .record_unpersisted(ChatMessage::hidden_context(hidden_context_xml.to_string()));
+        }
+        app.session_manager
+            .record_unpersisted(ChatMessage::user_with_attachments(
+                msg.content.clone(),
+                attachments.clone(),
+            ));
+        app.start_processing(&msg);
+        Ok(worker.send(crate::agent::RemoteTurn {
+            content: msg.content,
+            attachments,
+            hidden_context_xml: msg.hidden_context_xml.as_ref().map(ToString::to_string),
+        }))
+    }
+
     /// Settle the app after a run finishes: persist the assistant message, save
     /// the session, finish the run (which settles the session's runtime state
     /// and releases its lease), and kick off title generation.
@@ -1123,6 +1197,20 @@ impl RuntimeDeps {
             .map(|session| session.id.clone());
         *agent_handle = None;
         app.finish_processing();
+
+        if self.daemon.is_some() {
+            // The daemon persisted the turn and names the session.
+            if let Err(error) = app.session_manager.refresh_history().await {
+                tracing::warn!(%error, "failed to reload the session history");
+            }
+            title_gen.take();
+            if let Some(session_id) = session_id.as_ref()
+                && let Err(error) = self.local_runtime.sync_app_queue(app, session_id).await
+            {
+                tracing::warn!(session_id = %session_id, error = %error, "failed to refresh the pending queue");
+            }
+            return;
+        }
 
         if let Some(at) = assistant_response.at() {
             if let Some(fence) = app.run_guard.as_ref().map(|guard| guard.fence().clone()) {
@@ -1232,6 +1320,50 @@ impl RuntimeDeps {
         self.begin_worker_build(app, sandbox_dir, session_id, selected_model, None)
     }
 
+    /// A worker for `session_id` whose agent runs in the daemon. The model,
+    /// reasoning effort and working directory the daemon runs the session
+    /// with are recorded on the session first.
+    fn begin_remote_worker(
+        app: &App,
+        client: crate::client::DaemonClient,
+        session_id: SessionId,
+        model: SelectedModel,
+        reasoning_effort: Option<ReasoningEffort>,
+    ) -> PendingWorkerBuild {
+        let db = app.session_manager.db().clone();
+        let cwd = app.cwd.display().to_string();
+        let model_id = model.as_str().to_string();
+        let app_events = app.event_tx.clone();
+        let task = spawn(async move {
+            let effort = reasoning_effort.map(|effort| match effort {
+                ReasoningEffort::Low => "low",
+                ReasoningEffort::Medium => "medium",
+                _ => "high",
+            });
+            db.update_session(
+                session_id.as_str(),
+                None,
+                Some(model_id.as_str()),
+                effort.map(Some),
+            )
+            .await?;
+            db.set_session_cwd(session_id.as_str(), &cwd).await?;
+            if let Some(worktree) = crate::repo_search::worktree_root(std::path::Path::new(&cwd)) {
+                let _ = db.touch_repo_usage(&worktree).await;
+            }
+            Ok(crate::tui::remote::spawn_remote_worker(
+                client,
+                session_id.as_str().to_string(),
+                app_events,
+            ))
+        });
+        PendingWorkerBuild {
+            model: model.0,
+            settings: crate::agent::AgentLiveSettings::of(&app.config),
+            task: Box::pin(task),
+        }
+    }
+
     fn begin_worker_build(
         &self,
         app: &App,
@@ -1240,6 +1372,15 @@ impl RuntimeDeps {
         model: SelectedModel,
         reasoning_effort: Option<ReasoningEffort>,
     ) -> Result<PendingWorkerBuild, TuiRuntimeError> {
+        if let Some(client) = self.daemon.clone() {
+            return Ok(Self::begin_remote_worker(
+                app,
+                client,
+                session_id,
+                model,
+                reasoning_effort,
+            ));
+        }
         let current = app.session_manager.current();
         let history_messages = current
             .map(|session| session.history.to_aither_messages())
@@ -1280,6 +1421,23 @@ impl RuntimeDeps {
             .current()
             .map(|session| session.id.clone())
             .ok_or(TuiRuntimeError::NoActiveSession)?;
+        if let Some(client) = &self.daemon {
+            // The daemon dispatches queued and steering messages itself;
+            // the turns they start reach this TUI as foreign turns.
+            let body = serde_json::json!({
+                "sessionId": session_id.as_str(),
+                "content": message.content,
+                "attachments": message
+                    .attachments
+                    .iter()
+                    .map(persisted_attachment_from_tui)
+                    .collect::<Result<Vec<_>, _>>()?,
+                "hiddenContextXml": message.hidden_context_xml.as_ref().map(ToString::to_string),
+                "deliveryMode": message.delivery_mode,
+            });
+            let _: serde_json::Value = client.post("/api/chat/enqueue", &body).await?;
+            return self.local_runtime.sync_app_queue(app, &session_id).await;
+        }
         self.local_runtime
             .enqueue_pending_message(app, &session_id, message)
             .await
@@ -1297,6 +1455,10 @@ impl RuntimeDeps {
         listeners: &crate::agent_link::AgentListeners,
         wake: crate::tui::event::EventSender,
     ) -> Result<(), TuiRuntimeError> {
+        // The daemon makes every session discoverable itself.
+        if self.daemon.is_some() {
+            return Ok(());
+        }
         let Some(session) = app.session_manager.current() else {
             return Ok(());
         };
@@ -1329,6 +1491,10 @@ impl RuntimeDeps {
     /// # Errors
     /// Returns [`TuiRuntimeError`] on storage failure.
     pub async fn begin_queued_run(&self, app: &mut App) -> Result<QueuedRunStart, TuiRuntimeError> {
+        // The daemon dispatches the queue.
+        if self.daemon.is_some() {
+            return Ok(QueuedRunStart::Nothing);
+        }
         let Some(session_id) = app
             .session_manager
             .current()
@@ -1355,6 +1521,10 @@ impl RuntimeDeps {
     /// # Errors
     /// Returns [`TuiRuntimeError::NoActiveSession`] when no session is active, or [`TuiRuntimeError`] on storage failure.
     pub async fn begin_run(&self, app: &mut App) -> Result<bool, TuiRuntimeError> {
+        // The daemon takes the run lease when the turn starts there.
+        if self.daemon.is_some() {
+            return Ok(true);
+        }
         let session_id = app
             .session_manager
             .current()
@@ -1439,6 +1609,15 @@ impl RuntimeDeps {
         request_id: &str,
         answers: &[QuestionAnswer],
     ) -> Result<bool, TuiRuntimeError> {
+        if let Some(client) = &self.daemon {
+            return Ok(client
+                .post::<_, serde_json::Value>(
+                    "/api/ask-user/respond",
+                    &serde_json::json!({ "id": request_id, "answers": answers_json(answers) }),
+                )
+                .await
+                .is_ok());
+        }
         self.local_runtime
             .answer_open_question(request_id, answers)
             .await
@@ -1487,9 +1666,64 @@ impl RuntimeDeps {
         request_id: &str,
         approved: bool,
     ) -> Result<ResponseCommit<bool>, TuiRuntimeError> {
+        if let Some(client) = &self.daemon {
+            let _: serde_json::Value = client
+                .post(
+                    "/api/workspace/respond",
+                    &serde_json::json!({ "id": request_id, "approved": approved }),
+                )
+                .await?;
+            return Ok(ResponseCommit::Committed);
+        }
         self.local_runtime
             .resolve_workspace_response(session_id, request_id, approved)
             .await
+    }
+
+    /// The workspace request the session's run waits on, if any.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] on storage failure.
+    pub async fn pending_workspace(
+        &self,
+        app: &App,
+    ) -> Result<Option<crate::session::PersistedWorkspaceRequest>, TuiRuntimeError> {
+        let Some(session_id) = app
+            .session_manager
+            .current()
+            .map(|session| session.id.clone())
+        else {
+            return Ok(None);
+        };
+        Ok(self
+            .local_runtime
+            .runtime_service
+            .get(session_id.as_str())
+            .await?
+            .waiting_workspace)
+    }
+
+    /// The blocking question the session's run waits on, if any.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] on storage failure.
+    pub async fn pending_ask_user(
+        &self,
+        app: &App,
+    ) -> Result<Option<crate::session::PersistedAskUserRequest>, TuiRuntimeError> {
+        let Some(session_id) = app
+            .session_manager
+            .current()
+            .map(|session| session.id.clone())
+        else {
+            return Ok(None);
+        };
+        Ok(self
+            .local_runtime
+            .runtime_service
+            .get(session_id.as_str())
+            .await?
+            .waiting_ask_user)
     }
 
     /// Fetch the permission request blocking the session, if any.
@@ -1525,6 +1759,15 @@ impl RuntimeDeps {
             .current()
             .map(|session| session.id.clone())
             .ok_or(TuiRuntimeError::NoActiveSession)?;
+        if let Some(client) = &self.daemon {
+            let _: serde_json::Value = client
+                .post(
+                    "/api/permissions/respond",
+                    &serde_json::json!({ "id": request_id, "approved": approved }),
+                )
+                .await?;
+            return Ok(());
+        }
         self.local_runtime
             .resolve_permission_response(&session_id, request_id, approved)
             .await
@@ -1772,6 +2015,7 @@ async fn build_worker_for_session(
             tool_distribution: deps.tool_distribution.clone(),
             tool_environments: deps.tool_environments.clone(),
             provider_attempt: 0,
+            subagents: None,
         },
     ))
     .await?;

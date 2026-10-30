@@ -30,4 +30,12 @@ pub struct Model {
     /// Per-session reasoning/thinking depth override ("low" | "medium" | "high").
     /// NULL means "no override; provider/model default applies".
     pub reasoning_effort: Option<String>,
+    /// Host directory the session works in, when a client named one (the
+    /// TUI's launch directory); `None` uses the daemon's.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Whether nobody answers prompts for this session (a `may <prompt>`
+    /// one-shot run): permission requests are refused instead of asked.
+    #[serde(default)]
+    pub non_interactive: bool,
 }

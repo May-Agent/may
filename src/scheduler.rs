@@ -9,12 +9,12 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use aither_core::llm::{CommandOutcome, Tool};
+use aither_core::llm::CommandOutcome;
 use aither_sandbox::{
     AnyContainerExec, BollardContainerExec, CompletedCommand, Configured, ContainerLaunchSpec,
     ContainerShellRuntime, JobStatus, OutputFormat, PermissionHandler, ShellRuntimeAvailability,
-    ShellSessionRegistry, TerminalArgs, TerminalBackgroundArgs, TerminalExecutionMode,
-    TerminalMode, TerminalTool, ToolRegistryBuilder, permission::PermissionError,
+    ShellSessionRegistry, TerminalArgs, TerminalExecutionMode, TerminalMode, TerminalTool,
+    ToolRegistryBuilder, permission::PermissionError,
 };
 use arc_swap::ArcSwap;
 use askama::Template;
@@ -1546,7 +1546,7 @@ struct TaskTimeout(std::time::Duration);
 
 impl TaskTimeout {
     fn new(secs: u32) -> Result<Self, String> {
-        let cap = aither_sandbox::DEFAULT_BACKGROUND_TIMEOUT_CAP;
+        let cap = aither_sandbox::DEFAULT_TIMEOUT_CAP;
         let timeout = std::time::Duration::from_secs(u64::from(secs));
         if secs == 0 || timeout > cap {
             return Err(format!(
@@ -1568,8 +1568,8 @@ impl TaskTimeout {
     }
 }
 
-/// Runs `script` as a background terminal job bounded by `timeout` and waits
-/// for its final result; the foreground limit does not apply to it.
+/// Runs `script` as a detached terminal job bounded by `timeout` and waits
+/// for its final result; the foreground window does not apply to it.
 async fn run_terminal_command(
     terminal_tool: &TerminalTool<SchedulerPermissionHandler, DefaultExecutor, Configured>,
     mode: TerminalExecutionMode,
@@ -1578,23 +1578,18 @@ async fn run_terminal_command(
     timeout: TaskTimeout,
 ) -> Result<String, String> {
     let started = terminal_tool
-        .background_tool()
-        .call(
-            TerminalBackgroundArgs {
-                terminal: TerminalArgs {
-                    description: "run the scheduled task script".to_string(),
-                    script,
-                    mode,
-                    ssh_server_id,
-                    expect: OutputFormat::Text,
-                    resolution: aither_sandbox::MediaResolution::Auto,
-                    max_lines: 800,
-                    raw: false,
-                },
-                timeout: timeout.as_secs(),
-            },
-            aither_core::llm::ToolContext::new(),
-        )
+        .run_background(TerminalArgs {
+            description: "run the scheduled task script".to_string(),
+            script,
+            mode,
+            ssh_server_id,
+            expect: OutputFormat::Text,
+            resolution: aither_sandbox::MediaResolution::Auto,
+            max_lines: 800,
+            raw: false,
+            timeout: timeout.as_secs(),
+            background: true,
+        })
         .await
         .map_err(|error| prefixed_error("task terminal execution failed: ", &error))?;
     if started.is_error() {
@@ -1878,11 +1873,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task_runs_past_the_foreground_limit() {
+    async fn task_runs_past_the_foreground_wait() {
         let dir = tempdir().expect("temp dir should be created");
         let terminal = scheduler_test_terminal(dir.path()).await;
-        let runtime_secs = u32::try_from(aither_sandbox::DEFAULT_FOREGROUND_LIMIT.as_secs())
-            .expect("the foreground limit fits in u32 seconds")
+        let runtime_secs = u32::try_from(aither_sandbox::DEFAULT_FOREGROUND_WAIT.as_secs())
+            .expect("the foreground wait fits in u32 seconds")
             + 2;
 
         let output = run_terminal_command(
@@ -1893,7 +1888,7 @@ mod tests {
             TaskTimeout::new(runtime_secs + 60).expect("timeout is within the cap"),
         )
         .await
-        .expect("a task longer than the foreground limit should complete");
+        .expect("a task longer than the foreground wait should complete");
 
         assert!(output.contains("finished"), "unexpected output: {output}");
     }
@@ -1977,7 +1972,7 @@ mod tests {
     fn task_timeout_is_bounded_by_the_background_cap() {
         assert!(TaskTimeout::new(0).is_err());
         assert!(TaskTimeout::new(1).is_ok());
-        let cap = u32::try_from(aither_sandbox::DEFAULT_BACKGROUND_TIMEOUT_CAP.as_secs())
+        let cap = u32::try_from(aither_sandbox::DEFAULT_TIMEOUT_CAP.as_secs())
             .expect("the background cap fits in u32 seconds");
         assert!(TaskTimeout::new(cap).is_ok());
         assert!(TaskTimeout::new(cap + 1).is_err());

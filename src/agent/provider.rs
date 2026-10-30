@@ -27,7 +27,6 @@ use crate::config::{
     MayConfig, ModelTier, NativeToolsConfig, ProviderApi, ProviderInstance, ProviderType,
 };
 use crate::copilot::clear_copilot_credentials;
-use crate::embedding_provider::{EmbeddingModelResolution, resolve_embedding_model};
 use crate::model_selector::ModelSelector;
 
 const ERR_NO_MODELS: &str = include_str!("../texts/agent_err_no_models.txt");
@@ -220,8 +219,6 @@ pub struct ResolvedProviderRuntime {
     pub provider_id: String,
     /// Configured LLM client for the provider.
     pub llm: CloudProvider,
-    /// Embedding model resolution used by retrieval tools.
-    pub search_embedder: EmbeddingModelResolution,
 }
 
 /// Resolve a model selector against `may_config` into a usable provider
@@ -242,30 +239,7 @@ pub async fn resolve_provider_runtime(
         build_cloud_provider_from_instance(&provider_id, &provider_instance, selector.model_id())
             .await?;
 
-    let search_embedder =
-        EmbeddingModelResolution::from_result(resolve_embedding_model(may_config).await);
-    match &search_embedder {
-        EmbeddingModelResolution::Ready(resolved) => {
-            tracing::debug!(
-                embedding_model = resolved.model_id(),
-                provider_ids = %resolved.provider_ids().join(", "),
-                "resolved embedding provider for semantic search"
-            );
-        }
-        EmbeddingModelResolution::Disabled => {}
-        EmbeddingModelResolution::Failed(error) => {
-            tracing::debug!(
-                error = %error,
-                "semantic search embedder resolution failed"
-            );
-        }
-    }
-
-    Ok(ResolvedProviderRuntime {
-        provider_id,
-        llm,
-        search_embedder,
-    })
+    Ok(ResolvedProviderRuntime { provider_id, llm })
 }
 
 /// Tier-resolved models for the `ask` terminal command, each carrying the

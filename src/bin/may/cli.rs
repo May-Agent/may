@@ -14,6 +14,7 @@ pub enum CliMode {
     Tui,
     Ui(Vec<String>),
     Rest(Vec<String>),
+    Daemon(DaemonCommand),
     Exec(ExecArgs),
     Browser(BrowserCliArgs),
     OneShot(OneShotArgs),
@@ -26,6 +27,27 @@ pub struct OneShotArgs {
     pub prompt: String,
     pub model: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
+}
+
+/// Parsed `may daemon` invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonCommand {
+    /// Run the daemon in the foreground.
+    Run,
+    /// Install and start the login service.
+    Install,
+    /// Stop and remove the login service.
+    Uninstall,
+    /// Report whether a daemon runs and its state.
+    Status,
+    /// Stop the running daemon.
+    Stop,
+}
+
+impl DaemonCommand {
+    pub const fn help_text() -> &'static str {
+        "Usage: may daemon [install|uninstall|status|stop]\n\nWithout a subcommand, run the May daemon in the foreground. The daemon runs every agent loop, scheduled task and search index; the TUI and web UI are its clients and start it on demand. `install` keeps it running as a login service."
+    }
 }
 
 /// Parsed `may exec` invocation.
@@ -69,7 +91,7 @@ pub enum BrowserCliCommand {
 
 impl OneShotArgs {
     pub const fn help_text() -> &'static str {
-        "Usage: may [--model <id>] [--reasoning-effort <low|medium|high>] <prompt>\n       may ui [args...]\n       may rest [args...]\n\nOne-shot mode streams assistant text to stdout and process events to stderr."
+        "Usage: may [--model <id>] [--reasoning-effort <low|medium|high>] <prompt>\n       may ui [args...]\n       may rest [args...]\n       may daemon [install|uninstall|status|stop]\n\nOne-shot mode streams assistant text to stdout and process events to stderr."
     }
 }
 
@@ -77,7 +99,7 @@ pub struct UiArgs;
 
 impl UiArgs {
     pub const fn help_text() -> &'static str {
-        "Usage: may ui [--host <addr>] [--port <port>] [--open]\n\nRun the May web UI and API server."
+        "Usage: may ui\n\nStart the May daemon if it is not running and open its web UI in the browser."
     }
 }
 
@@ -85,7 +107,7 @@ pub struct RestArgs;
 
 impl RestArgs {
     pub const fn help_text() -> &'static str {
-        "Usage: may rest [--host <addr>] [--port <port>]\n\nRun the May REST API server without the embedded web UI."
+        "Usage: may rest [--host <addr>] [--port <port>]\n\nRun the May daemon in the foreground serving the REST API without the embedded web UI, on the given address."
     }
 }
 
@@ -112,6 +134,15 @@ pub fn parse_cli_mode(args: &[String]) -> CliMode {
         Some("rest") => match args.get(2).map(String::as_str) {
             Some("--help" | "-h") => CliMode::Help(RestArgs::help_text()),
             _ => CliMode::Rest(args[2..].to_vec()),
+        },
+        Some("daemon") => match args.get(2).map(String::as_str) {
+            None => CliMode::Daemon(DaemonCommand::Run),
+            Some("install") => CliMode::Daemon(DaemonCommand::Install),
+            Some("uninstall") => CliMode::Daemon(DaemonCommand::Uninstall),
+            Some("status") => CliMode::Daemon(DaemonCommand::Status),
+            Some("stop") => CliMode::Daemon(DaemonCommand::Stop),
+            // `--help`, `-h` and anything unknown.
+            Some(_) => CliMode::Help(DaemonCommand::help_text()),
         },
         Some("browser") => match args.get(2).map(String::as_str) {
             Some("--help" | "-h") => CliMode::Help(BrowserCliArgs::help_text()),

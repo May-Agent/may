@@ -175,15 +175,6 @@ pub struct SseHeartbeat {
     pub(crate) ok: bool,
 }
 
-/// Chat-stream ping emitted every 10 s so proxies and the browser's
-/// own idle detection don't close the connection during long tool phases.
-#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct SsePingEvent<'a> {
-    pub(crate) seq: u64,
-    pub(crate) turn_id: &'a str,
-}
-
 /// Live decode-speed sample emitted while model output streams.
 #[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -456,6 +447,20 @@ pub struct ApiHealth {
 }
 
 pub const API_OK: ApiHealth = ApiHealth { ok: true };
+
+/// `GET /api/health`: the daemon is up, and which build it runs.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DaemonHealth {
+    /// Always `true`.
+    pub ok: bool,
+    /// Daemon process id.
+    pub pid: u32,
+    /// Build id of the daemon executable.
+    pub build: String,
+    /// Search indexer state.
+    pub search_index: crate::repo_search::indexer::IndexerSnapshot,
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -775,6 +780,9 @@ pub struct CreateSessionRequest {
     pub(crate) model: Option<String>,
     #[serde(default)]
     pub(crate) profile_id: Option<String>,
+    /// Host directory the session works in (the TUI's launch directory).
+    #[serde(default)]
+    pub(crate) cwd: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
@@ -1306,8 +1314,6 @@ pub struct UiModelsConfig {
     pub(crate) balanced: Vec<String>,
     pub(crate) fast: Vec<String>,
     pub(crate) image_generation: Vec<String>,
-    pub(crate) embedding_model: Option<String>,
-    pub(crate) embedding_dimensions: Option<usize>,
     /// Model compaction runs on instead of the session model.
     #[serde(default)]
     pub(crate) compaction_model: Option<String>,
@@ -1359,9 +1365,8 @@ pub struct UiSystemProfileConfig {
 #[serde(rename_all = "camelCase")]
 pub struct UiRemoteAccessConfig {
     pub(crate) enabled: bool,
-    pub(crate) cloudflared_binary: String,
-    pub(crate) tunnel_token: Option<String>,
-    pub(crate) public_url: Option<String>,
+    pub(crate) tailscale_binary: String,
+    pub(crate) https_port: u16,
     pub(crate) allow_local_environment: bool,
 }
 
@@ -1369,9 +1374,8 @@ impl From<&RemoteAccessConfig> for UiRemoteAccessConfig {
     fn from(value: &RemoteAccessConfig) -> Self {
         Self {
             enabled: value.enabled,
-            cloudflared_binary: value.cloudflared_binary.clone(),
-            tunnel_token: value.tunnel_token.clone(),
-            public_url: value.public_url.clone(),
+            tailscale_binary: value.tailscale_binary.clone(),
+            https_port: value.https_port,
             allow_local_environment: value.allow_local_environment,
         }
     }

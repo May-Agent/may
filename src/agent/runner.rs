@@ -42,6 +42,13 @@ pub enum TuiEvent {
     ContextReport(Result<ContextReport, aither_agent::AgentError>),
     /// Assembled-context dump for `/context dump` is ready.
     ContextDump(Result<ContextDump, aither_agent::AgentError>),
+    /// The daemon wrote the `/context dump` to `path`.
+    ContextDumpSaved {
+        /// Where the dump was written.
+        path: String,
+        /// Messages in the dump.
+        message_count: usize,
+    },
     /// Agent stream completed (ready for next prompt).
     Complete,
     /// Agent encountered a fatal error.
@@ -72,8 +79,28 @@ impl RunLease {
     }
 }
 
+/// A turn handed to the daemon: the user's message as the TUI composed it.
+#[derive(Debug, Clone)]
+pub struct RemoteTurn {
+    /// Message text.
+    pub content: String,
+    /// Attachments, as the daemon's API records them.
+    pub attachments: Vec<crate::session::PersistedAttachment>,
+    /// Hidden context for the turn.
+    pub hidden_context_xml: Option<String>,
+}
+
+/// A turn of the session another client or the daemon's queue started.
+#[derive(Debug)]
+pub struct ForeignTurn {
+    /// Events of the turn.
+    pub handle: AgentHandle,
+    /// The user message the turn answers, when it has one.
+    pub content: Option<String>,
+}
+
 /// Command sent from main thread to agent worker.
-enum WorkerCommand {
+pub(crate) enum WorkerCommand {
     /// Run a prompt.
     Run {
         prompt: String,
@@ -91,6 +118,11 @@ enum WorkerCommand {
     ContextReport { event_tx: Sender<TuiEvent> },
     /// Dump the assembled context for `/context dump`.
     ContextDump { event_tx: Sender<TuiEvent> },
+    /// Run a turn in the daemon (remote workers only).
+    Send {
+        turn: RemoteTurn,
+        event_tx: Sender<TuiEvent>,
+    },
     /// Cancel current processing.
     Cancel,
     /// Shutdown the worker.
@@ -101,14 +133,22 @@ enum WorkerCommand {
 pub struct AgentWorker {
     /// Sender for commands to the worker.
     command_tx: Sender<WorkerCommand>,
-    /// Background-job registry shared with the session's terminal tool.
-    job_registry: aither_sandbox::JobRegistry,
-    /// Registry of in-flight `subagent` command runs.
-    subagent_runs: aither_agent::specialized::SubagentRuns,
-    /// Model clone for `/btw` side questions.
-    btw_llm: RequestParameterizedModel<aither_cloud::CloudProvider>,
+    /// Background-job registry shared with the session's terminal tool;
+    /// `None` when the agent runs in the daemon.
+    job_registry: Option<aither_sandbox::JobRegistry>,
+    /// Registry of in-flight `subagent` command runs; `None` when the agent
+    /// runs in the daemon.
+    subagent_runs: Option<aither_agent::specialized::SubagentRuns>,
+    /// Model clone for `/btw` side questions; `None` when the agent runs in
+    /// the daemon, which answers `/btw` itself.
+    btw_llm: Option<RequestParameterizedModel<aither_cloud::CloudProvider>>,
     /// Tracker shared with the session's `subagent` IPC command.
     subagent_tracker: crate::agent::SubagentTracker,
+    /// Turns of the session another client (or the daemon's queue) started,
+    /// for a worker whose agent runs in the daemon.
+    foreign_turns: Option<Receiver<ForeignTurn>>,
+    /// The session's background work in the daemon, for a remote worker.
+    background: Option<crate::client::background::RemoteBackground>,
 }
 
 impl std::fmt::Debug for AgentWorker {
@@ -218,6 +258,42 @@ impl AgentWorker {
         }
     }
 
+    /// Run `turn` in the daemon; only a worker from
+    /// [`crate::tui::remote::spawn_remote_worker`] accepts it.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the worker command channel is already closed — the worker
+    /// task has stopped unexpectedly.
+    #[must_use]
+    pub fn send(&self, turn: RemoteTurn) -> AgentHandle {
+        const ERR_WORKER_CHANNEL_CLOSED: &str =
+            include_str!("../texts/agent_worker_channel_closed.txt");
+        let (event_tx, event_rx) = unbounded();
+        self.command_tx
+            .try_send(WorkerCommand::Send { turn, event_tx })
+            .unwrap_or_else(|_| panic!("{}", ERR_WORKER_CHANNEL_CLOSED.trim()));
+        AgentHandle {
+            event_rx,
+            command_tx: self.command_tx.clone(),
+        }
+    }
+
+    /// Whether the agent runs in the daemon.
+    #[must_use]
+    pub const fn is_remote(&self) -> bool {
+        self.foreign_turns.is_some()
+    }
+
+    /// The next turn of the session this client did not start. Never
+    /// resolves for an in-process agent.
+    pub async fn next_foreign_turn(&self) -> Option<ForeignTurn> {
+        match &self.foreign_turns {
+            Some(turns) => turns.recv().await.ok(),
+            None => std::future::pending().await,
+        }
+    }
+
     /// Signal the worker task to shut down.
     pub fn shutdown(&self) {
         let _ = self.command_tx.try_send(WorkerCommand::Shutdown);
@@ -225,20 +301,44 @@ impl AgentWorker {
 
     /// Registry of background terminal jobs for this worker's session.
     #[must_use]
-    pub const fn job_registry(&self) -> &aither_sandbox::JobRegistry {
-        &self.job_registry
+    pub const fn job_registry(&self) -> Option<&aither_sandbox::JobRegistry> {
+        self.job_registry.as_ref()
     }
 
     /// Registry of in-flight subagent runs — list or cancel them.
     #[must_use]
-    pub const fn subagent_runs(&self) -> &aither_agent::specialized::SubagentRuns {
-        &self.subagent_runs
+    pub const fn subagent_runs(&self) -> Option<&aither_agent::specialized::SubagentRuns> {
+        self.subagent_runs.as_ref()
     }
 
     /// Model clone for `/btw` side questions.
     #[must_use]
-    pub const fn btw_llm(&self) -> &RequestParameterizedModel<aither_cloud::CloudProvider> {
-        &self.btw_llm
+    pub const fn btw_llm(&self) -> Option<&RequestParameterizedModel<aither_cloud::CloudProvider>> {
+        self.btw_llm.as_ref()
+    }
+
+    /// A worker over `command_tx` whose agent runs in the daemon.
+    pub(crate) fn remote(
+        command_tx: Sender<WorkerCommand>,
+        foreign_turns: Receiver<ForeignTurn>,
+        background: crate::client::background::RemoteBackground,
+    ) -> Self {
+        Self {
+            command_tx,
+            job_registry: None,
+            subagent_runs: None,
+            btw_llm: None,
+            subagent_tracker: crate::agent::SubagentTracker::default(),
+            foreign_turns: Some(foreign_turns),
+            background: Some(background),
+        }
+    }
+
+    /// The session's jobs and subagents in the daemon, for a worker whose
+    /// agent runs there.
+    #[must_use]
+    pub const fn background(&self) -> Option<&crate::client::background::RemoteBackground> {
+        self.background.as_ref()
     }
 
     /// Live tracker of this worker's `subagent` command invocations.
@@ -261,6 +361,19 @@ pub struct AgentHandle {
     event_rx: Receiver<TuiEvent>,
     /// Sender for commands (for cancel).
     command_tx: Sender<WorkerCommand>,
+}
+
+impl AgentHandle {
+    /// A handle reading `event_rx`, cancelled through `command_tx`.
+    pub(crate) const fn new(
+        event_rx: Receiver<TuiEvent>,
+        command_tx: Sender<WorkerCommand>,
+    ) -> Self {
+        Self {
+            event_rx,
+            command_tx,
+        }
+    }
 }
 
 impl AgentHandle {
@@ -310,10 +423,12 @@ pub fn spawn_worker<E: Executor + 'static>(
 
     AgentWorker {
         command_tx,
-        job_registry,
-        subagent_runs,
-        btw_llm,
+        job_registry: Some(job_registry),
+        subagent_runs: Some(subagent_runs),
+        btw_llm: Some(btw_llm),
         subagent_tracker,
+        foreign_turns: None,
+        background: None,
     }
 }
 
@@ -404,6 +519,14 @@ async fn run_worker(
             WorkerCommand::ContextDump { event_tx } => {
                 let dump = agent.context_dump().await;
                 let _ = event_tx.send(TuiEvent::ContextDump(dump)).await;
+                let _ = event_tx.send(TuiEvent::Complete).await;
+            }
+            WorkerCommand::Send { event_tx, .. } => {
+                let _ = event_tx
+                    .send(TuiEvent::Error(
+                        "this agent runs in-process; turns go through `run`".to_string(),
+                    ))
+                    .await;
                 let _ = event_tx.send(TuiEvent::Complete).await;
             }
             WorkerCommand::Cancel => {
@@ -517,7 +640,9 @@ async fn race_against_commands<F: Future>(
                 WorkerCommand::ContextReport { .. } | WorkerCommand::ContextDump { .. } => {
                     deferred.push(command);
                 }
-                WorkerCommand::Run { .. } | WorkerCommand::Compact { .. } => {}
+                WorkerCommand::Run { .. }
+                | WorkerCommand::Compact { .. }
+                | WorkerCommand::Send { .. } => {}
             }
         }
     })
