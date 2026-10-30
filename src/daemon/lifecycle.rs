@@ -35,6 +35,16 @@ pub enum LifecycleError {
         /// The daemon log.
         log: PathBuf,
     },
+    /// The daemon this client started exited before it answered.
+    #[error("the May daemon exited while starting ({status}): {reason}; see {}", .log.display())]
+    StartFailed {
+        /// How it exited.
+        status: std::process::ExitStatus,
+        /// The last line it logged.
+        reason: String,
+        /// The daemon log.
+        log: PathBuf,
+    },
     /// The old daemon did not stop.
     #[error("the running May daemon (pid {pid}) did not stop")]
     StopTimeout {
@@ -199,7 +209,7 @@ fn restart_service() -> Result<(), LifecycleError> {
     }
 }
 
-fn spawn(paths: &DaemonPaths) -> Result<(), LifecycleError> {
+fn spawn(paths: &DaemonPaths) -> Result<std::process::Child, LifecycleError> {
     use std::os::unix::process::CommandExt as _;
     use std::process::Stdio;
 
@@ -220,8 +230,28 @@ fn spawn(paths: &DaemonPaths) -> Result<(), LifecycleError> {
         // Its own process group: the daemon outlives the terminal that
         // started it, and a Ctrl+C there does not reach it.
         .process_group(0);
-    command.spawn()?;
-    Ok(())
+    Ok(command.spawn()?)
+}
+
+/// Why the daemon's last run failed, from its log: anyhow's `Error:` line
+/// and the first cause under it, or the log's last line.
+fn last_error_line(log: &Path) -> String {
+    let text = std::fs::read_to_string(log).unwrap_or_default();
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let Some(start) = lines.iter().rposition(|line| line.starts_with("Error:")) else {
+        return lines
+            .last()
+            .map_or_else(|| "no output".to_string(), |line| (*line).to_string());
+    };
+    let error = lines[start].trim_start_matches("Error:").trim();
+    match lines.get(start + 1..start + 3) {
+        Some(["Caused by:", cause]) => [error, cause].join(": "),
+        _ => error.to_string(),
+    }
 }
 
 async fn wait_until_gone(client: &DaemonClient, pid: u32) -> Result<(), LifecycleError> {
@@ -262,26 +292,28 @@ pub async fn ensure_running(
 ) -> Result<DaemonClient, LifecycleError> {
     let client = DaemonClient::new(paths.socket());
     let build = super::current_build_id()?;
-    if let Ok(health) = client.health().await {
+    let mut child = if let Ok(health) = client.health().await {
         if health.build == build {
             return Ok(client);
         }
         progress("Restarting the May daemon for this build…");
         if installed() {
             restart_service()?;
+            None
         } else {
             client.shutdown().await?;
             wait_until_gone(&client, health.pid).await?;
-            spawn(paths)?;
+            Some(spawn(paths)?)
         }
     } else {
         progress("Starting the May daemon…");
         if installed() {
             restart_service()?;
+            None
         } else {
-            spawn(paths)?;
+            Some(spawn(paths)?)
         }
-    }
+    };
     let deadline = Instant::now() + START_TIMEOUT;
     while Instant::now() < deadline {
         if let Ok(health) = client.health().await
@@ -289,7 +321,41 @@ pub async fn ensure_running(
         {
             return Ok(client);
         }
+        // A daemon that fails at startup (a held port, an unusable home
+        // directory) exits; there is nothing left to wait for.
+        if let Some(status) = child
+            .as_mut()
+            .and_then(|child| child.try_wait().ok().flatten())
+        {
+            return Err(LifecycleError::StartFailed {
+                status,
+                reason: last_error_line(&paths.log()),
+                log: paths.log(),
+            });
+        }
         async_io::Timer::after(Duration::from_millis(200)).await;
     }
     Err(LifecycleError::StartTimeout { log: paths.log() })
+}
+
+#[cfg(test)]
+mod start_failure_tests {
+    use super::last_error_line;
+
+    #[test]
+    fn reports_the_error_and_its_first_cause() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = dir.path().join("daemon.log");
+        std::fs::write(
+            &log,
+            "May daemon listening on x\nError: failed to open stored sessions\n\nCaused by:\n    socket path too long\n\nStack backtrace:\n   0: foo\n",
+        )
+        .expect("log written");
+        assert_eq!(
+            last_error_line(&log),
+            "failed to open stored sessions: socket path too long"
+        );
+        std::fs::write(&log, "just a line\n").expect("log written");
+        assert_eq!(last_error_line(&log), "just a line");
+    }
 }
