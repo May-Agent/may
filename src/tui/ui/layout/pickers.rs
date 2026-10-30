@@ -98,7 +98,6 @@ pub(super) fn render_session_popup(frame: &mut Frame, area: Rect, app: &App) {
         Line::from(vec![
             Span::styled("Search: ", Style::default().fg(Color::Cyan)),
             Span::styled(&app.session_search, Style::default().fg(Color::Yellow)),
-            Span::styled("_", Style::default().fg(Color::Yellow)),
         ])
     };
     frame.render_widget(Paragraph::new(vec![search_line, Line::from("")]), chunks[1]);
