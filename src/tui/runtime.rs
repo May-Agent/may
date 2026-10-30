@@ -321,15 +321,14 @@ impl LocalSessionRuntime {
     /// Returns [`TuiRuntimeError`] on storage failure.
     pub async fn register_ask_user_request(
         &self,
-        app: &mut App,
         session_id: &SessionId,
         questions: &[Question],
     ) -> Result<String, TuiRuntimeError> {
         let request_id = uuid::Uuid::new_v4().to_string();
         self.runtime_service
-            .set_waiting_ask_user(
+            .register_ask_user_request(
                 session_id.as_str(),
-                Some(crate::session::PersistedAskUserRequest {
+                &crate::session::PersistedAskUserRequest {
                     id: request_id.clone(),
                     questions: questions
                         .iter()
@@ -340,16 +339,7 @@ impl LocalSessionRuntime {
                             multi_select: question.multi_select,
                         })
                         .collect(),
-                }),
-            )
-            .await?;
-        app.session_manager
-            .db()
-            .append_ask_user_request_message(
-                session_id.as_str(),
-                request_id.as_str(),
-                questions,
-                None,
+                },
             )
             .await?;
         Ok(request_id)
@@ -1383,12 +1373,11 @@ impl RuntimeDeps {
     /// Returns [`TuiRuntimeError`] on storage failure.
     pub async fn register_ask_user_request(
         &self,
-        app: &mut App,
         session_id: &SessionId,
         questions: &[Question],
     ) -> Result<String, TuiRuntimeError> {
         self.local_runtime
-            .register_ask_user_request(app, session_id, questions)
+            .register_ask_user_request(session_id, questions)
             .await
     }
 
@@ -1408,6 +1397,34 @@ impl RuntimeDeps {
             return Ok(Vec::new());
         };
         self.local_runtime.open_questions(&session_id).await
+    }
+
+    /// Push-notify the user that a new open question arrived, through the
+    /// same `notify` dispatch path the `notify` command uses. Best effort:
+    /// a rejected or unroutable notification is logged, never fatal.
+    pub async fn notify_open_question(&self, session_id: &SessionId, question: &str) {
+        match self
+            .tool_dispatchers
+            .notify
+            .request(crate::agent::NotifyArgs {
+                title: "May has a question for you".to_string(),
+                body: question.to_string(),
+                session_id: Some(session_id.as_str().to_string()),
+                callback_context_xml: None,
+                callback_message: None,
+            })
+            .await
+        {
+            Ok(Ok(result)) => {
+                tracing::debug!(sent = result.sent, "open-question notification delivered");
+            }
+            Ok(Err(error)) => {
+                tracing::warn!(error = %error, "open-question notification was rejected");
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to send open-question notification");
+            }
+        }
     }
 
     /// Commit the user's answers to an open question; the answer joins the

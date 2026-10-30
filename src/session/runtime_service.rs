@@ -376,6 +376,24 @@ impl SessionRuntimeService {
         Ok(summary)
     }
 
+    /// Register `request` as the session's blocking ask-user prompt and
+    /// append it to the history, atomically.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] on storage failure.
+    pub async fn register_ask_user_request(
+        &self,
+        session_id: &str,
+        request: &PersistedAskUserRequest,
+    ) -> Result<SessionRuntimeSummary, crate::db::ChatDbError> {
+        let summary = self
+            .db
+            .register_ask_user_request(session_id, request)
+            .await?;
+        self.publish_ui(UiEventTopics::SESSION_RUNTIME | UiEventTopics::SESSION_RUNTIMES);
+        Ok(summary)
+    }
+
     /// Clear the ask-user prompt `request_id` by its id; a newer prompt of the
     /// session stays.
     ///

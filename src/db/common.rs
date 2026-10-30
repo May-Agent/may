@@ -685,6 +685,45 @@ pub(super) fn storage_error(message: impl Into<String>) -> ChatDbError {
     ChatDbError::Storage(message.into())
 }
 
+/// Extra attempts for a write that hits `SQLITE_BUSY`. The driver waits out
+/// its own busy timeout on each try; these retries ride out a writer that
+/// holds the lock just past it. `~/.may/history.db` is shared by every may
+/// process on the machine, so a busy write is transient contention, not a
+/// fatal error.
+const BUSY_RETRY_ATTEMPTS: u32 = 3;
+const BUSY_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Whether `error` is SQLite lock contention (`SQLITE_BUSY`), which the
+/// driver surfaces in the message of a [`ChatDbError::Storage`].
+pub(super) fn is_locked_error(error: &ChatDbError) -> bool {
+    match error {
+        ChatDbError::Storage(message) => {
+            message.contains("database is locked") || message.contains("database table is locked")
+        }
+        _ => false,
+    }
+}
+
+/// Run `attempt`, retrying [`is_locked_error`] failures a bounded number of
+/// times with a short delay.
+pub(super) async fn with_busy_retry<T, Fut>(
+    mut attempt: impl FnMut() -> Fut,
+) -> Result<T, ChatDbError>
+where
+    Fut: std::future::Future<Output = Result<T, ChatDbError>>,
+{
+    let mut retries = 0;
+    loop {
+        match attempt().await {
+            Err(error) if is_locked_error(&error) && retries < BUSY_RETRY_ATTEMPTS => {
+                retries += 1;
+                async_io::Timer::after(BUSY_RETRY_DELAY).await;
+            }
+            result => return result,
+        }
+    }
+}
+
 pub(super) fn conversion_error(field: &str, error: &impl std::fmt::Display) -> ChatDbError {
     storage_error(format!("{field} conversion failed: {error}"))
 }
@@ -786,4 +825,76 @@ pub(super) fn build_profile_preferences(
     container
         .is_some()
         .then_some(ProfilePreferences { container })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_locked_error, with_busy_retry};
+    use crate::db::ChatDbError;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn is_locked_error_matches_sqlite_busy_messages() {
+        assert!(is_locked_error(&ChatDbError::Storage(
+            "database is locked".to_string()
+        )));
+        assert!(is_locked_error(&ChatDbError::Storage(
+            "database table is locked".to_string()
+        )));
+        assert!(is_locked_error(&ChatDbError::Storage(
+            "error returned from database: (code: 5) database is locked".to_string()
+        )));
+    }
+
+    #[test]
+    fn is_locked_error_ignores_unrelated_errors() {
+        assert!(!is_locked_error(&ChatDbError::Storage(
+            "UNIQUE constraint failed".to_string()
+        )));
+        assert!(!is_locked_error(&ChatDbError::RowNotFound(
+            "Session not found".to_string()
+        )));
+    }
+
+    #[tokio::test]
+    async fn busy_retry_succeeds_once_contention_clears() {
+        let attempts = AtomicUsize::new(0);
+        let result = with_busy_retry(|| async {
+            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(ChatDbError::Storage("database is locked".to_string()))
+            } else {
+                Ok(7)
+            }
+        })
+        .await;
+        assert_eq!(result.expect("retry succeeds"), 7);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn busy_retry_stops_after_bounded_attempts() {
+        let attempts = AtomicUsize::new(0);
+        let result: Result<(), ChatDbError> = with_busy_retry(|| async {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Err(ChatDbError::Storage("database is locked".to_string()))
+        })
+        .await;
+        assert!(matches!(
+            result,
+            Err(ChatDbError::Storage(ref msg)) if msg == "database is locked"
+        ));
+        assert_eq!(attempts.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn busy_retry_never_retries_non_lock_errors() {
+        let attempts = AtomicUsize::new(0);
+        let result: Result<(), ChatDbError> = with_busy_retry(|| async {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Err(ChatDbError::Storage("disk full".to_string()))
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
 }
