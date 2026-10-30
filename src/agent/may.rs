@@ -37,7 +37,6 @@ use crate::agent::register_tool::RegisterBroker;
 use crate::agent::task_tool::TaskRuntimeKind;
 use crate::ask_user::AskUserBroker;
 use crate::config::MayConfig;
-use crate::embedding_provider::EmbeddingModelResolution;
 use crate::network_policy::CompiledNetworkPolicy;
 use crate::session::{SessionId, SessionPaths, SessionPlanState};
 use crate::terminal_commands::{
@@ -130,8 +129,6 @@ pub struct MayAgentConfig {
     pub model_id: String,
     /// Provider ID selected for this request.
     pub provider_id: String,
-    /// Optional embedding provider used for semantic retrieval tools.
-    pub search_embedder: EmbeddingModelResolution,
     /// Tier-resolved models for the `ask` terminal command.
     pub ask_models: super::provider::AskTierModels,
     /// Model compaction runs on; `None` compacts on the session model.
@@ -482,7 +479,6 @@ impl MayAgent {
                 session_id: config.session_id.as_str().to_string(),
                 may_dir: config.may_dir.clone(),
                 sandbox_dir: config.sandbox_dir.clone(),
-                search_embedder: config.search_embedder.clone(),
                 cwd: config.cwd.clone(),
                 db: Some(config.db.clone()),
                 ask_user: hook_runtime.clone(),
@@ -683,7 +679,6 @@ impl MayAgent {
             llm,
             model_id: selector.model_id().to_string(),
             provider_id,
-            search_embedder: resolved_provider.search_embedder,
             ask_models,
             compaction_llm,
             cache_lifetime,

@@ -1306,8 +1306,6 @@ pub struct UiModelsConfig {
     pub(crate) balanced: Vec<String>,
     pub(crate) fast: Vec<String>,
     pub(crate) image_generation: Vec<String>,
-    pub(crate) embedding_model: Option<String>,
-    pub(crate) embedding_dimensions: Option<usize>,
     /// Model compaction runs on instead of the session model.
     #[serde(default)]
     pub(crate) compaction_model: Option<String>,

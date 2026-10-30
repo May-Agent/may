@@ -6,6 +6,7 @@ mod common;
 mod context_snapshot;
 pub mod entity;
 mod issue;
+mod issue_search;
 mod logs;
 mod memory;
 mod message;
@@ -14,6 +15,7 @@ mod open_questions;
 mod profile;
 mod repo_usage;
 mod run_lease;
+mod search_outbox;
 mod session;
 mod sql;
 mod task;
@@ -34,7 +36,9 @@ pub use common::{
 };
 pub use context_snapshot::ContextDebugSnapshotWrite;
 pub use message::MessageMeta;
+pub use issue_search::IssueSearchDoc;
 pub use repo_usage::RepoUsage;
+pub use search_outbox::{IndexedMessageRow, SearchOutboxEntry};
 pub use open_questions::{CommittedAskUserAnswer, PendingAskUserQuestion};
 pub use run_lease::RunFence;
 
@@ -80,6 +84,7 @@ impl ChatDb {
         Self::ensure_session_run_lease_table(&db).await?;
         Self::migrate_legacy_remote_profiles(&db).await?;
         Self::migrate_removed_waiting_terminal_input(&db).await?;
+        Self::ensure_search_outbox(&db).await?;
         Ok(Self { db })
     }
 

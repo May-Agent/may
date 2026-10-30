@@ -35,8 +35,6 @@ function makeConfig(): UiFullConfig {
       balanced: [],
       fast: [],
       imageGeneration: [],
-      embeddingModel: null,
-      embeddingDimensions: null,
     },
     preferences: {
       warnOnModelChange: true,
