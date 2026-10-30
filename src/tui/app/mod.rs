@@ -2307,6 +2307,7 @@ impl App {
             "/quit" => Some(SendAction::Quit),
             "/compact" => Some(SendAction::Compact(None)),
             "/context" => Some(SendAction::ContextReport),
+            "/context dump" => Some(SendAction::ContextDump),
             "/mcp" => {
                 self.mode = AppMode::McpManage;
                 None
@@ -2539,6 +2540,9 @@ impl App {
         let trimmed = content.trim();
         if trimmed == "/context" && attachments.is_empty() {
             return SendAction::ContextReport;
+        }
+        if trimmed == "/context dump" && attachments.is_empty() {
+            return SendAction::ContextDump;
         }
         if let Some(rest) = trimmed.strip_prefix("/compact")
             && attachments.is_empty()
@@ -2902,6 +2906,8 @@ pub enum SendAction {
     Compact(Option<String>),
     /// Measure and display context-window usage.
     ContextReport,
+    /// Dump the verbatim assembled context to the session's outputs dir.
+    ContextDump,
     /// MCP server management actions.
     McpAdd {
         /// Name of the MCP server to add.

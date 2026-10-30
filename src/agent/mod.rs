@@ -4,6 +4,7 @@ pub(crate) mod ask_user_tool;
 pub(crate) mod browser_tool;
 #[cfg(test)]
 mod compaction_tests;
+mod context_dump;
 mod context_report;
 mod environment;
 mod hooks;
@@ -34,6 +35,7 @@ pub mod tool_environment_cache;
 pub use browser_tool::{
     BrowserArgs, BrowserBroker, BrowserRequest, BrowserResult, channel as browser_channel,
 };
+pub use context_dump::ContextDump;
 pub use context_report::{ContextCategory, ContextCategoryRow, ContextReport};
 pub use environment::{ResolveAgentEnvironmentError, resolve_agent_environment_for_session};
 pub use imagine::ImageGeneratorConfig;
