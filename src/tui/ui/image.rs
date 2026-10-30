@@ -223,7 +223,6 @@ async fn fetch_image_http(url: &str) -> Result<Vec<u8>, ImageFetchError> {
 pub fn render_placeholder(alt: &str, url: &str) -> Vec<Line<'static>> {
     vec![
         Line::from(vec![
-            Span::styled("🖼 ", Style::default()),
             Span::styled(
                 alt.to_string(),
                 Style::default()
