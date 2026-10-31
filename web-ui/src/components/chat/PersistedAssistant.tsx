@@ -4,6 +4,7 @@ import { MessageText } from './MessageText';
 import { ReasoningBlock } from './ReasoningBlock';
 import { ToolCard } from './ToolCard';
 import { ComputerCard } from './ComputerCard';
+import { MessageActions } from './MessageActions';
 import { groupBrowserRuns } from '@/lib/browser/activity';
 
 interface PersistedToolEvent {
@@ -57,7 +58,7 @@ export function PersistedAssistant({
   const tools = extractTools(message.toolEvent);
   const reasoning = typeof message.thinking === 'string' ? message.thinking : '';
   return (
-    <div className="space-y-2">
+    <div className="group/message space-y-2">
       {reasoning.length > 0 && <ReasoningBlock text={reasoning} />}
       {groupBrowserRuns(tools, (tool) => tool.variant === 'browser').map((group) =>
         group.kind === 'browser' ? (
@@ -67,6 +68,7 @@ export function PersistedAssistant({
         ),
       )}
       {message.content.length > 0 && <MessageText text={message.content} sessionId={sessionId} />}
+      <MessageActions text={message.content} className="-ml-1" />
     </div>
   );
 }

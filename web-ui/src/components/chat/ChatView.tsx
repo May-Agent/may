@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { Fragment, useCallback, useEffect, useRef, useState } from 'react';
 import { AlertCircle, AlertTriangle, ArrowDown, Loader2, RotateCw, X } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { useSessionsStore } from '@/lib/stores/sessions';
@@ -18,6 +18,7 @@ import type { ApiAttachment, ApiMessage } from '@/lib/types';
 import { enqueueMessage } from '@/lib/api/chat';
 import { isConfigUsable } from '@/lib/api/config';
 import { cn } from '@/lib/utils';
+import { formatGroupTime, startsGroup } from '@/lib/chat/time';
 
 const STICKY_BOTTOM_THRESHOLD_PX = 48;
 const NO_MESSAGES: ApiMessage[] = [];
@@ -27,6 +28,8 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   const messages = useSessionsStore((s) => s.messages[sessionId] ?? NO_MESSAGES);
   const active = useSessionsStore((s) => s.active);
   const appendMessage = useSessionsStore((s) => s.appendMessage);
+  // "Today" for the time labels between message groups.
+  const [now] = useState(() => new Date());
   const sessionTurn = useTurnStore((s) => s.turns[sessionId]);
   const activeTurn = sessionTurn?.active ?? null;
   const stopping = sessionTurn?.stopping ?? false;
@@ -133,6 +136,22 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     await send({ sessionId, content, attachments });
   };
 
+  const renderMessage = (msg: ApiMessage) => {
+    if (msg.role === 'user') {
+      return <UserMessage content={msg.content} attachments={msg.attachments} />;
+    }
+    if (lastTurnForActive && lastTurnForActive.assistantId === msg.id) {
+      return (
+        <AssistantTurn
+          turn={lastTurnForActive}
+          reasoningEnabled={reasoningEnabled}
+          showDecodeSpeed={showDecodeSpeed}
+        />
+      );
+    }
+    return <PersistedAssistant message={msg} sessionId={active.id} />;
+  };
+
   return (
     <div className="relative flex h-full flex-col">
       <SessionHeader session={active} />
@@ -148,23 +167,18 @@ export function ChatView({ sessionId }: { sessionId: string }) {
         aria-label={active.title || t('common.untitled')}
       >
         <div className="mx-auto w-full max-w-3xl space-y-6">
-          {messages.map((msg) => {
-            if (msg.role === 'user') {
-              return (
-                <UserMessage key={msg.id} content={msg.content} attachments={msg.attachments} />
-              );
-            }
-            if (lastTurnForActive && lastTurnForActive.assistantId === msg.id) {
-              return (
-                <AssistantTurn
-                  key={msg.id}
-                  turn={lastTurnForActive}
-                  reasoningEnabled={reasoningEnabled}
-                  showDecodeSpeed={showDecodeSpeed}
-                />
-              );
-            }
-            return <PersistedAssistant key={msg.id} message={msg} sessionId={active.id} />;
+          {messages.map((msg, i) => {
+            const stamp = startsGroup(messages[i - 1]?.timestamp, msg.timestamp) ? (
+              <p className="pt-2 text-center text-[11px] text-muted-foreground">
+                <time dateTime={msg.timestamp}>{formatGroupTime(msg.timestamp, now)}</time>
+              </p>
+            ) : null;
+            return (
+              <Fragment key={msg.id}>
+                {stamp}
+                {renderMessage(msg)}
+              </Fragment>
+            );
           })}
           {activeTurn && (
             <AssistantTurn
