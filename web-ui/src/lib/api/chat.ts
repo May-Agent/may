@@ -1,4 +1,5 @@
 import type { ChatRequestPayload, ChatStreamEvent } from '../types';
+import type { SessionBackground } from './background';
 import { ApiError, apiSseUrl } from './client';
 import { parseNamedSseStream } from '../stream/sse';
 
@@ -13,6 +14,14 @@ interface SessionTurnFrame {
   data: Record<string, unknown>;
 }
 
+export interface SessionTurnsOptions {
+  /**
+   * Also subscribe to the session's `session_background` frames (terminal
+   * jobs and subagent runs) on the same stream and hand each snapshot here.
+   */
+  onBackground?: (snapshot: SessionBackground) => void;
+}
+
 /**
  * Follow every turn of one session: the `session_turn` frames of the
  * multiplexed `/api/events` stream. Turns run in the daemon whichever client
@@ -21,13 +30,15 @@ interface SessionTurnFrame {
 export async function openSessionTurns(
   sessionId: string,
   abort?: AbortSignal,
+  options: SessionTurnsOptions = {},
 ): Promise<TurnStreamHandle> {
   const controller = new AbortController();
   if (abort) {
     if (abort.aborted) controller.abort();
     else abort.addEventListener('abort', () => controller.abort(), { once: true });
   }
-  const params = new URLSearchParams({ topics: 'session_turn', sessionId });
+  const topics = options.onBackground ? 'session_turn,session_background' : 'session_turn';
+  const params = new URLSearchParams({ topics, sessionId });
   const res = await fetch(apiSseUrl(`/events?${params.toString()}`), {
     headers: { Accept: 'text/event-stream' },
     signal: controller.signal,
@@ -39,6 +50,7 @@ export async function openSessionTurns(
     events: turnEvents(
       parseNamedSseStream<Record<string, unknown>>(res, controller.signal),
       sessionId,
+      options.onBackground,
     ),
     abort: () => controller.abort(),
   };
@@ -47,9 +59,16 @@ export async function openSessionTurns(
 async function* turnEvents(
   source: AsyncGenerator<{ event: string; data: Record<string, unknown> }, void, void>,
   sessionId: string,
+  onBackground?: (snapshot: SessionBackground) => void,
 ): AsyncGenerator<ChatStreamEvent, void, void> {
   for await (const { event, data } of source) {
-    if (event !== 'session_turn' || !data || typeof data !== 'object') continue;
+    if (!data || typeof data !== 'object') continue;
+    if (event === 'session_background') {
+      const snapshot = data as unknown as SessionBackground;
+      if (snapshot.sessionId === sessionId) onBackground?.(snapshot);
+      continue;
+    }
+    if (event !== 'session_turn') continue;
     const frame = data as unknown as SessionTurnFrame;
     if (frame.sessionId !== sessionId || !frame.data) continue;
     yield { ...frame.data, kind: frame.event } as unknown as ChatStreamEvent;
