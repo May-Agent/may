@@ -247,12 +247,9 @@ pub struct App {
     pub image_view_area: Option<ratatui::layout::Rect>,
     /// Mouse/text selection in rendered chat content
     pub selection: Option<TextSelection>,
-    /// Plain text render cache used for selection copy
-    pub rendered_plain_lines: Vec<String>,
-    /// Top padding rows added when viewport is taller than rendered content
-    pub render_top_padding: usize,
-    /// Row spans of collapsible tool calls in `rendered_plain_lines` space
-    pub collapse_regions: Vec<super::ui::chat::ClickRegion>,
+    /// Laid-out chat transcript: the render cache, and the plain-text
+    /// mirror (selection, copy, click hit-testing) of what was drawn.
+    pub chat_layout: super::ui::chat_layout::ChatLayout,
     /// Timing breakdown of the last rendered frame (jank reporting).
     pub frame_stats: super::perf::FrameStats,
     /// When and where the last plain click finished; a second press at the
@@ -516,10 +513,8 @@ impl App {
             image_regions: Vec::new(),
             image_view_area: None,
             selection: None,
-            rendered_plain_lines: Vec::new(),
-            render_top_padding: 0,
+            chat_layout: super::ui::chat_layout::ChatLayout::default(),
             frame_stats: super::perf::FrameStats::default(),
-            collapse_regions: Vec::new(),
             last_click: None,
             background: None,
             btw_llm: None,
@@ -1358,32 +1353,20 @@ impl App {
     /// user-message images — into the cache.
     pub fn scan_and_fetch_images(&mut self) {
         use super::ui::chat::ChatElement;
-        use super::ui::markdown::extract_images;
 
-        // Collect image URLs first to avoid borrow issues
+        // Markdown image references of the laid-out transcript (last
+        // frame's layout; a new reference is fetched one frame later). The
+        // layout already parsed them, so nothing is re-parsed here.
         let urls: Vec<String> = self
-            .chat
-            .active_elements()
-            .iter()
-            .flat_map(|elem| {
-                if let ChatElement::AssistantText { content, .. } = elem {
-                    extract_images(content.as_str())
-                        .into_iter()
-                        .map(|(_, url)| url)
-                        .collect::<Vec<_>>()
-                } else {
-                    Vec::new()
-                }
+            .chat_layout
+            .markdown_image_keys()
+            .filter(|key| {
+                !self.image_cache.contains_key(*key)
+                    && !self.image_failed.contains(*key)
+                    && !self.image_fetching.contains(*key)
             })
+            .map(str::to_string)
             .collect();
-
-        if !urls.is_empty() {
-            tracing::debug!(
-                "scan_and_fetch_images: found {} URLs: {:?}",
-                urls.len(),
-                urls
-            );
-        }
 
         for url in urls {
             self.request_image(&url);
@@ -1507,9 +1490,7 @@ impl App {
         self.content_height.store(0, Ordering::Relaxed);
         self.view_height.store(0, Ordering::Relaxed);
         self.selection = None;
-        self.rendered_plain_lines.clear();
-        self.render_top_padding = 0;
-        self.collapse_regions.clear();
+        self.chat_layout = super::ui::chat_layout::ChatLayout::default();
         self.jobs.clear();
         self.jobs_selected = 0;
         self.image_cache.clear();
@@ -2235,6 +2216,14 @@ impl App {
         None
     }
 
+    /// The scroll offset the last frame actually showed: the follow-bottom
+    /// sentinel resolved, and a stale offset clamped to content that has
+    /// since shrunk (resize, collapsed tool calls).
+    #[must_use]
+    pub fn effective_scroll(&self) -> usize {
+        self.scroll.min(self.max_chat_scroll())
+    }
+
     /// Largest scroll offset that still shows a full view of content.
     fn max_chat_scroll(&self) -> usize {
         self.content_height
@@ -2252,12 +2241,9 @@ impl App {
         if max_scroll == 0 {
             return;
         }
-        let base = if self.scroll == usize::MAX {
-            max_scroll
-        } else {
-            self.scroll
-        };
-        self.scroll = base.saturating_sub(lines);
+        // Clamp first: an offset left beyond the content (which shrank
+        // since) would otherwise swallow scroll steps without moving.
+        self.scroll = self.scroll.min(max_scroll).saturating_sub(lines);
     }
 
     /// Scroll the chat view down by `lines`, re-entering follow-bottom mode
@@ -2320,8 +2306,8 @@ impl App {
                     // the cursor instead of starting a point selection.
                     self.last_click = None;
                     self.selection = point.and_then(|p| {
-                        self.rendered_plain_lines
-                            .get(p.line)
+                        self.chat_layout
+                            .plain_line(p.line)
                             .and_then(|line| TextSelection::word_at(line, p))
                     });
                 } else {
@@ -2358,12 +2344,12 @@ impl App {
                             .map(|point| (Instant::now(), point));
                         if let Some(point) = self.mouse_to_selection_point(mouse)
                             && let Some(region) = self
-                                .collapse_regions
-                                .iter()
+                                .chat_layout
+                                .collapse_regions()
+                                .into_iter()
                                 .find(|r| point.line >= r.start && point.line < r.end)
                         {
-                            let id = region.element_id.clone();
-                            self.chat.toggle_expanded(&id);
+                            self.chat.toggle_expanded(&region.element_id);
                         }
                     }
                 }
@@ -2378,22 +2364,17 @@ impl App {
     }
 
     fn mouse_to_selection_point(&self, mouse: MouseEvent) -> Option<SelectionPoint> {
-        if self.rendered_plain_lines.is_empty() {
+        let rows = self.chat_layout.plain_len();
+        if rows == 0 {
             return None;
         }
 
-        let base_scroll = if self.scroll == usize::MAX {
-            let content_h = self.content_height.load(Ordering::Relaxed);
-            let view_h = self.view_height.load(Ordering::Relaxed);
-            content_h.saturating_sub(view_h)
-        } else {
-            self.scroll
-        };
+        let base_scroll = self.effective_scroll();
 
         let raw_line = base_scroll.saturating_add(mouse.row as usize);
-        let line = raw_line.saturating_sub(self.render_top_padding);
-        let line = line.min(self.rendered_plain_lines.len().saturating_sub(1));
-        let text = self.rendered_plain_lines.get(line)?;
+        let line = raw_line.saturating_sub(self.chat_layout.top_padding());
+        let line = line.min(rows.saturating_sub(1));
+        let text = self.chat_layout.plain_line(line)?;
         let column = clamp_column_by_width(text, mouse.column as usize);
         Some(SelectionPoint { line, column })
     }
@@ -2405,17 +2386,16 @@ impl App {
         }
         let (start, end) = sel.normalized();
 
-        if self.rendered_plain_lines.is_empty() || start.line >= self.rendered_plain_lines.len() {
+        let rows = self.chat_layout.plain_len();
+        if rows == 0 || start.line >= rows {
             return None;
         }
 
-        let end_line = end
-            .line
-            .min(self.rendered_plain_lines.len().saturating_sub(1));
+        let end_line = end.line.min(rows.saturating_sub(1));
         let mut out = String::new();
 
         for line_idx in start.line..=end_line {
-            let line = &self.rendered_plain_lines[line_idx];
+            let line = self.chat_layout.plain_line(line_idx).unwrap_or_default();
             let char_count = line.chars().count();
             let from = if line_idx == start.line {
                 start.column.min(char_count)
