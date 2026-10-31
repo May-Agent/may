@@ -209,6 +209,10 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             }
             Ok(None)
         }
+        AppEvent::SessionRuntime(event) => {
+            app.session_runtime = event.runtime;
+            Ok(None)
+        }
         AppEvent::HistoryStale => Ok(Some(SendAction::ReloadHistory)),
         AppEvent::Status(message) => {
             app.set_status(message);
