@@ -257,6 +257,8 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
         browser_lifecycle_tx,
         #[cfg(target_os = "macos")]
         session_displays: tokio::sync::Mutex::new(crate::computer::SessionDisplays::default()),
+        #[cfg(target_os = "macos")]
+        session_streams: tokio::sync::Mutex::new(crate::computer::SessionStreams::default()),
         remote_access_manager,
         notification_service: notification_service.clone(),
         memory_processor,
@@ -385,6 +387,12 @@ fn api_routes() -> Route {
                         "/outputs/preview".at(get_output_preview),
                         "/artifacts/local-url-map".post(map_container_local_url),
                     )),
+                    Route::new(("/computer".route(Route::new((
+                        "/status".at(super::computer::computer_status),
+                        "/start".post(super::computer::computer_start),
+                        "/stop".post(super::computer::computer_stop),
+                        "/offer".post(super::computer::computer_offer),
+                    ))),)),
                     Route::new((
                         "/messages".post(send_message),
                         "/compact".post(super::chat::compact_session),
