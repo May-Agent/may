@@ -128,44 +128,64 @@ pub fn handle_session_select_key(app: &mut App, code: KeyCode) -> Option<SendAct
                                 .is_some_and(|s| s.id.as_str() == deleted_id);
 
                             let tx = app.event_tx.clone();
-                            let db = app.session_manager.db().clone();
-                            let store = app.session_manager.store().clone();
+                            let fallback_profile = app.current_profile_id.clone();
+                            let client = app.btw_daemon.clone()?;
                             executor_core::spawn(async move {
-                                // Delete from both DB and filesystem
-                                let profile_id = match db.get_session(&deleted_id).await {
-                                    Ok(session) => session.and_then(|session| session.profile_id),
-                                    Err(error) => {
-                                        let _ = tx
-                                            .send(crate::tui::event::AppEvent::SessionDeleted {
-                                                deleted: None,
-                                                was_current,
-                                                result: Err(TuiError::from(error)),
-                                            })
-                                            .await;
-                                        return;
-                                    }
-                                };
-                                if let Err(e) = db.delete_session(&deleted_id).await {
+                                // The daemon removes the row and the session
+                                // directory.
+                                let profile_id = client
+                                    .get::<crate::client::WireSession>(&format!(
+                                        "/api/sessions/{deleted_id}"
+                                    ))
+                                    .await
+                                    .ok()
+                                    .and_then(|session| session.profile_id);
+                                if let Err(error) = client
+                                    .delete::<serde_json::Value>(&format!(
+                                        "/api/sessions/{deleted_id}"
+                                    ))
+                                    .await
+                                {
                                     let _ = tx
                                         .send(crate::tui::event::AppEvent::SessionDeleted {
                                             deleted: None,
                                             was_current,
-                                            result: Err(TuiError::from(e)),
+                                            result: Err(TuiError::from(error)),
                                         })
                                         .await;
                                     return;
                                 }
-                                let _ = store
-                                    .delete_session(&deleted_id, profile_id.as_deref())
-                                    .await;
-                                let result = crate::session::list_summaries_from_db(&db).await;
+                                let result = async {
+                                    let Some(pid) = profile_id.or(fallback_profile) else {
+                                        return Ok(Vec::new());
+                                    };
+                                    let sessions: crate::profile::ProfileSessions = client
+                                        .get(&format!("/api/profiles/{pid}/sessions"))
+                                        .await
+                                        .map_err(TuiError::from)?;
+                                    Ok(sessions
+                                        .pinned
+                                        .into_iter()
+                                        .flat_map(|item| match item {
+                                            crate::profile::PinnedItem::Session(summary) => {
+                                                vec![*summary]
+                                            }
+                                            crate::profile::PinnedItem::Folder {
+                                                sessions, ..
+                                            } => sessions,
+                                        })
+                                        .chain(sessions.regular)
+                                        .chain(sessions.archived)
+                                        .collect::<Vec<_>>())
+                                }
+                                .await;
                                 let _ = tx
                                     .send(crate::tui::event::AppEvent::SessionDeleted {
                                         deleted: Some(crate::session::SessionId::from_string(
                                             deleted_id,
                                         )),
                                         was_current,
-                                        result: result.map_err(TuiError::from),
+                                        result,
                                     })
                                     .await;
                             })
@@ -200,22 +220,28 @@ fn toggle_pin(app: &mut App) {
     let session_id = summary.id.as_str().to_string();
     let is_pinned = summary.pinned;
     let tx = app.event_tx.clone();
-    let db = app.session_manager.db().clone();
+    let Some(client) = app.btw_daemon.clone() else {
+        return;
+    };
     let profile_id = app.current_profile_id.clone();
 
     executor_core::spawn(async move {
-        let result = if is_pinned {
-            db.unpin_session(&session_id).await
-        } else {
-            db.pin_session(&session_id).await
-        };
-        if let Err(e) = result {
+        let action = if is_pinned { "unpin" } else { "pin" };
+        if let Err(e) = client
+            .post::<_, serde_json::Value>(
+                &format!("/api/sessions/{session_id}/{action}"),
+                &serde_json::json!({}),
+            )
+            .await
+        {
             tracing::warn!("Failed to toggle pin for session {}: {}", session_id, e);
             return;
         }
         // Reload profile sessions to reflect the change
         if let Some(pid) = profile_id {
-            let result = crate::profile::query_profile_sessions(&db, &pid).await;
+            let result = client
+                .get::<crate::profile::ProfileSessions>(&format!("/api/profiles/{pid}/sessions"))
+                .await;
             let _ = tx
                 .send(crate::tui::event::AppEvent::ProfileSessionsLoaded(
                     result.map_err(TuiError::from),
@@ -244,22 +270,28 @@ fn toggle_archive(app: &mut App) {
     let session_id = summary.id.as_str().to_string();
     let is_archived = summary.archived;
     let tx = app.event_tx.clone();
-    let db = app.session_manager.db().clone();
+    let Some(client) = app.btw_daemon.clone() else {
+        return;
+    };
     let profile_id = app.current_profile_id.clone();
 
     executor_core::spawn(async move {
-        let result = if is_archived {
-            db.unarchive_session(&session_id).await
-        } else {
-            db.archive_session(&session_id).await
-        };
-        if let Err(e) = result {
+        let action = if is_archived { "unarchive" } else { "archive" };
+        if let Err(e) = client
+            .post::<_, serde_json::Value>(
+                &format!("/api/sessions/{session_id}/{action}"),
+                &serde_json::json!({}),
+            )
+            .await
+        {
             tracing::warn!("Failed to toggle archive for session {}: {}", session_id, e);
             return;
         }
         // Reload profile sessions to reflect the change
         if let Some(pid) = profile_id {
-            let result = crate::profile::query_profile_sessions(&db, &pid).await;
+            let result = client
+                .get::<crate::profile::ProfileSessions>(&format!("/api/profiles/{pid}/sessions"))
+                .await;
             let _ = tx
                 .send(crate::tui::event::AppEvent::ProfileSessionsLoaded(
                     result.map_err(TuiError::from),

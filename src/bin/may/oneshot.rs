@@ -13,13 +13,9 @@ use aither_agent::{AgentEvent, TimedEvent};
 use jiff::Timestamp;
 
 use may_agent::agent::{AgentWorker, TuiEvent};
-use may_agent::ask_user;
 use may_agent::session::RunOutcome;
-use may_agent::tui::runtime::{
-    AssistantReply, LocalSessionRuntime, ResponseCommit, RuntimeDeps, TitleGenContext,
-};
+use may_agent::tui::runtime::{AssistantReply, ResponseCommit, RuntimeDeps, TitleGenContext};
 use may_agent::tui::{App, PendingMessage};
-use may_agent::workspace_request;
 
 use super::cli::OneShotArgs;
 
@@ -27,47 +23,51 @@ mod render;
 
 use render::OneShotOutput;
 
-/// Records a question for the current session, prompts on stderr and answers it.
-async fn answer_oneshot_question(
+/// The session's runtime snapshot as the daemon reports it; oneshot polls it
+/// for the prompts a remote run waits on.
+async fn session_runtime(
     runtime_deps: &RuntimeDeps,
-    app: &App,
-    request: may_agent::ask_user::AskUserRequest,
+    session_id: &may_agent::session::SessionId,
+) -> anyhow::Result<may_agent::client::SessionRuntimeSnapshot> {
+    Ok(runtime_deps
+        .daemon()
+        .ok_or_else(|| anyhow::anyhow!("the May daemon is not attached"))?
+        .get::<may_agent::client::SessionRuntimeSnapshot>(&format!(
+            "/api/sessions/{}/runtime",
+            session_id.as_str()
+        ))
+        .await?)
+}
+
+/// Prompt for the questions the daemon's run waits on and commit the answers.
+async fn answer_oneshot_questions(
+    runtime_deps: &RuntimeDeps,
+    session_id: &may_agent::session::SessionId,
+    request: &may_agent::session::PersistedAskUserRequest,
     output: &mut OneShotOutput<io::Stdout, io::Stderr>,
 ) -> anyhow::Result<()> {
-    let session_id = app
-        .session_manager
-        .current()
-        .map(|session| session.id.clone())
-        .ok_or_else(|| anyhow::anyhow!("oneshot session missing"))?;
-    let questions = request.args.request.clone().into_questions();
-    let request_id = match runtime_deps
-        .register_ask_user_request(&session_id, &questions)
-        .await
-    {
-        Ok(request_id) => request_id,
-        // A dropped request fails the tool call instead of the run.
-        Err(error) => {
-            tracing::warn!(error = %error, "failed to register ask-user request");
-            writeln!(
-                output.stderr()?,
-                "[error] failed to register the question: {error}"
-            )?;
-            drop(request);
-            return Ok(());
-        }
-    };
+    let questions = request
+        .questions
+        .iter()
+        .map(|question| may_agent::ask_user::Question {
+            section: question.section.clone(),
+            question: question.question.clone(),
+            option: question.option.clone(),
+            multi_select: question.multi_select,
+        })
+        .collect::<Vec<_>>();
     let answers = prompt_oneshot_questions(&questions, output.stderr()?)?;
     match runtime_deps
-        .resolve_ask_user_response(&session_id, &request_id, &answers)
+        .resolve_ask_user_response(session_id, &request.id, &answers)
         .await?
     {
-        ResponseCommit::Committed => request.respond(answers).map_err(anyhow::Error::from),
-        ResponseCommit::Lost(committed) => {
+        ResponseCommit::Committed => Ok(()),
+        ResponseCommit::Lost(_) => {
             writeln!(
                 output.stderr()?,
                 "[notice] the question was already answered elsewhere; the run continues with that answer, not yours"
             )?;
-            request.respond(committed).map_err(anyhow::Error::from)
+            Ok(())
         }
         ResponseCommit::Withdrawn => Err(anyhow::anyhow!(
             "the question was withdrawn; this answer was not sent"
@@ -77,8 +77,6 @@ async fn answer_oneshot_question(
 
 pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
     enum Event {
-        AskUser(may_agent::ask_user::AskUserRequest),
-        Workspace(may_agent::workspace_request::WorkspaceRequest),
         Agent(TuiEvent),
         /// Time to look for prompts the daemon's run waits on.
         Poll,
@@ -103,69 +101,63 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
         );
     }
 
-    let (workspace_broker, workspace_queue) = workspace_request::channel();
-    let (ask_user_broker, ask_user_queue) = ask_user::channel();
-    let mut local_runtime = LocalSessionRuntime::new(app.session_manager.db().clone());
-    local_runtime.enable_oneshot_restricted_mode();
-    let tool_distribution = std::sync::Arc::new(may_agent::tools::embedded_distribution()?);
-    let tool_dispatchers = may_agent::tool_dispatch::ToolDispatchers::spawn(
-        may_agent::tool_dispatch::ToolDispatchConfig {
-            may_dir: app.session_manager.may_dir().to_path_buf(),
-            cwd: app.cwd.clone(),
-            db: app.session_manager.db().clone(),
-            browser_config: app.config.browser.clone(),
-            network_policy: app.config.preferences.network_policy.clone(),
-            ask_user_broker: ask_user_broker.clone(),
-            tool_distribution: tool_distribution.clone(),
-        },
-    )
-    .await?;
-    let runtime_deps = RuntimeDeps::new(
-        local_runtime,
-        workspace_broker,
-        ask_user_broker,
-        tool_dispatchers,
-        std::sync::Arc::new(may_agent::location::LocationProvider::new()),
-        tool_distribution,
-        may_agent::agent::ToolEnvironmentCache::spawn(),
-    )
-    .with_oneshot_overrides(args.model.clone(), args.reasoning_effort);
+    let runtime_deps = RuntimeDeps::new(may_agent::agent::ToolEnvironmentCache::spawn())
+        .with_oneshot_overrides(args.model.clone(), args.reasoning_effort);
     // The run happens in the May daemon, like every TUI turn.
     let paths = may_agent::daemon::DaemonPaths::user()?;
-    let runtime_deps = runtime_deps.with_daemon(
-        may_agent::daemon::lifecycle::ensure_running(&paths, |line| {
-            let _ = writeln!(io::stderr(), "[may] {line}");
-        })
-        .await?,
-    );
+    let daemon_client = may_agent::daemon::lifecycle::ensure_running(&paths, |line| {
+        let _ = writeln!(io::stderr(), "[may] {line}");
+    })
+    .await?;
+    app.btw_daemon = Some(daemon_client.clone());
+    app.session_manager.attach_daemon(daemon_client.clone());
+    let runtime_deps = runtime_deps.with_daemon(daemon_client);
 
     let mut output = OneShotOutput::new(io::stdout(), io::stderr());
     let mut worker: Option<AgentWorker> = None;
     let mut build = runtime_deps
         .begin_new_session(&mut app, &mut worker)
         .await?;
+    let session_id = app
+        .session_manager
+        .current()
+        .map(|session| session.id.clone())
+        .ok_or_else(|| anyhow::anyhow!("oneshot session missing"))?;
     // Nobody answers permission prompts of a one-shot run; the daemon
     // refuses them instead of asking.
-    if let Some(session) = app.session_manager.current() {
-        app.session_manager
-            .db()
-            .set_session_non_interactive(session.id.as_str())
-            .await?;
-    }
+    runtime_deps
+        .daemon()
+        .ok_or_else(|| anyhow::anyhow!("the May daemon is not attached"))?
+        .put::<_, serde_json::Value>(
+            &format!("/api/sessions/{}", session_id.as_str()),
+            &may_agent::client::UpdateSessionRequest {
+                non_interactive: Some(true),
+                ..Default::default()
+            },
+        )
+        .await?;
     let mut answered_prompts = std::collections::HashSet::<String>::new();
-    // Preparing the session's tool environments can ask for SSH consent, so
-    // questions are answered while the worker is built.
+    // Preparing the session's tool environments can ask for SSH consent; the
+    // daemon registers the prompt and oneshot answers through the runtime
+    // snapshot while the worker is built.
     let completed = loop {
         let next = futures_lite::future::or(async { Ok(build.wait().await) }, async {
-            Err(ask_user_queue.next().await)
+            async_io::Timer::after(DAEMON_PROMPT_POLL).await;
+            Err(())
         })
         .await;
-        match next {
-            Ok(completed) => break completed?,
-            Err(Some(request)) => {
-                answer_oneshot_question(&runtime_deps, &app, request, &mut output).await?;
-            }
-            Err(None) => anyhow::bail!("ask-user channel closed while preparing the session"),
+        if let Ok(completed) = next {
+            break completed?;
+        }
+        let snapshot = session_runtime(&runtime_deps, &session_id).await?;
+        let pending = snapshot
+            .waiting_ask_user
+            .clone()
+            .or_else(|| snapshot.open_questions.first().cloned());
+        if let Some(request) = pending
+            && answered_prompts.insert(request.id.clone())
+        {
+            answer_oneshot_questions(&runtime_deps, &session_id, &request, &mut output).await?;
         }
     };
     RuntimeDeps::install_worker(&mut app, &mut worker, &build, completed);
@@ -176,81 +168,85 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
     let mut pending_title_gen: Option<TitleGenContext> = None;
     let mut assistant_response = AssistantReply::default();
     let mut active_tool_calls = std::collections::HashSet::<String>::new();
-    if !runtime_deps.begin_run(&mut app).await? {
+    if !runtime_deps.begin_run(&mut app)? {
         anyhow::bail!("the session is already running in another May process");
     }
     let prompt = build_oneshot_prompt_with_mentions(&app, &args.prompt).await?;
-    let handle = runtime_deps
-        .start_agent_task(
-            &mut app,
-            worker,
-            PendingMessage {
-                content: prompt.content,
-                hidden_context_xml: prompt.hidden_context_xml,
-                attachments: Vec::new(),
-                queued_at: Timestamp::now(),
-                delivery_mode: may_agent::session::PendingUserMessageMode::Steer,
-                display: None,
-            },
-            &mut pending_title_gen,
-        )
-        .await?;
+    let handle = runtime_deps.start_agent_task(
+        &mut app,
+        worker,
+        PendingMessage {
+            content: prompt.content,
+            hidden_context_xml: prompt.hidden_context_xml,
+            attachments: Vec::new(),
+            queued_at: Timestamp::now(),
+            delivery_mode: may_agent::session::PendingUserMessageMode::Steer,
+            display: None,
+        },
+        &mut pending_title_gen,
+    )?;
     let mut agent_handle = Some(handle);
     // Prompt polls do not count as activity for the idle finish.
     let mut last_agent_event = std::time::Instant::now();
 
-    loop {
-        if let Some(request) = runtime_deps.pending_permission(&app).await? {
+    while let Some(handle) = agent_handle.as_ref() {
+        let snapshot = session_runtime(&runtime_deps, &session_id).await?;
+        if let Some(request) = snapshot.waiting_permission
+            && answered_prompts.insert(request.id.clone())
+        {
             let approved = prompt_oneshot_permission(&request.request, output.stderr()?)?;
             runtime_deps
                 .resolve_permission_response(&app, &request.id, approved)
                 .await?;
             continue;
         }
-
-        let Some(handle) = agent_handle.as_ref() else {
-            break;
-        };
-        if let Some(request) = runtime_deps.pending_ask_user(&app).await?
+        let pending_ask = snapshot
+            .waiting_ask_user
+            .clone()
+            .or_else(|| snapshot.open_questions.first().cloned());
+        if let Some(request) = pending_ask
             && answered_prompts.insert(request.id.clone())
         {
-            let questions = request
-                .questions
-                .iter()
-                .map(|question| may_agent::ask_user::Question {
-                    section: question.section.clone(),
-                    question: question.question.clone(),
-                    option: question.option.clone(),
-                    multi_select: question.multi_select,
-                })
-                .collect::<Vec<_>>();
-            let answers = prompt_oneshot_questions(&questions, output.stderr()?)?;
-            if !runtime_deps
-                .answer_open_question(&request.id, &answers)
-                .await?
+            if snapshot
+                .waiting_ask_user
+                .as_ref()
+                .is_some_and(|w| w.id == request.id)
             {
-                writeln!(
-                    output.stderr()?,
-                    "[notice] the question is no longer open; this answer was not sent"
-                )?;
+                answer_oneshot_questions(&runtime_deps, &session_id, &request, &mut output).await?;
+            } else {
+                let questions = request
+                    .questions
+                    .iter()
+                    .map(|question| may_agent::ask_user::Question {
+                        section: question.section.clone(),
+                        question: question.question.clone(),
+                        option: question.option.clone(),
+                        multi_select: question.multi_select,
+                    })
+                    .collect::<Vec<_>>();
+                let answers = prompt_oneshot_questions(&questions, output.stderr()?)?;
+                if !runtime_deps
+                    .answer_open_question(&request.id, &answers)
+                    .await?
+                {
+                    writeln!(
+                        output.stderr()?,
+                        "[notice] the question is no longer open; this answer was not sent"
+                    )?;
+                }
             }
             continue;
         }
-        if let Some(request) = runtime_deps.pending_workspace(&app).await?
+        if let Some(request) = snapshot.waiting_workspace
             && answered_prompts.insert(request.id.clone())
         {
             let approved = prompt_oneshot_workspace(
                 &may_agent::workspace_request::RequestWorkspaceArgs {
-                    path: request.request.path.clone(),
-                    reason: request.request.reason.clone(),
+                    path: request.path.clone(),
+                    reason: request.reason.clone(),
                 },
                 output.stderr()?,
             )?;
-            let session_id = app
-                .session_manager
-                .current()
-                .map(|session| session.id.clone())
-                .ok_or_else(|| anyhow::anyhow!("oneshot session missing"))?;
             if !matches!(
                 runtime_deps
                     .resolve_workspace_response(&session_id, &request.id, approved)
@@ -265,16 +261,11 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
             continue;
         }
 
-        let event_future = futures_lite::future::or(
-            async { ask_user_queue.next().await.map(Event::AskUser) },
-            futures_lite::future::or(
-                async { workspace_queue.next().await.map(Event::Workspace) },
-                futures_lite::future::or(async { handle.recv().await.map(Event::Agent) }, async {
-                    async_io::Timer::after(DAEMON_PROMPT_POLL).await;
-                    Some(Event::Poll)
-                }),
-            ),
-        );
+        let event_future =
+            futures_lite::future::or(async { handle.recv().await.map(Event::Agent) }, async {
+                async_io::Timer::after(DAEMON_PROMPT_POLL).await;
+                Some(Event::Poll)
+            });
         let next = if assistant_response.text().is_empty() || !active_tool_calls.is_empty() {
             event_future.await
         } else if let Ok(event) = tokio::time::timeout(
@@ -307,50 +298,6 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
             last_agent_event = std::time::Instant::now();
         }
         match event {
-            Event::AskUser(request) => {
-                answer_oneshot_question(&runtime_deps, &app, request, &mut output).await?;
-            }
-            Event::Workspace(request) => {
-                let session_id = app
-                    .session_manager
-                    .current()
-                    .map(|session| session.id.clone())
-                    .ok_or_else(|| anyhow::anyhow!("oneshot session missing"))?;
-                let request_id = match runtime_deps
-                    .register_workspace_request(&mut app, &session_id, &request.args.request)
-                    .await
-                {
-                    Ok(request_id) => request_id,
-                    Err(error) => {
-                        tracing::warn!(error = %error, "failed to register workspace request");
-                        writeln!(
-                            output.stderr()?,
-                            "[error] failed to register the workspace request: {error}"
-                        )?;
-                        drop(request);
-                        continue;
-                    }
-                };
-                let approved = prompt_oneshot_workspace(&request.args.request, output.stderr()?)?;
-                match runtime_deps
-                    .resolve_workspace_response(&session_id, &request_id, approved)
-                    .await?
-                {
-                    ResponseCommit::Committed => {
-                        request.respond(approved).map_err(anyhow::Error::from)?;
-                    }
-                    ResponseCommit::Lost(committed) => {
-                        writeln!(
-                            output.stderr()?,
-                            "[notice] the workspace request was already answered elsewhere; the run continues with that decision, not yours"
-                        )?;
-                        request.respond(committed).map_err(anyhow::Error::from)?;
-                    }
-                    ResponseCommit::Withdrawn => anyhow::bail!(
-                        "the workspace request was withdrawn; this decision was not sent"
-                    ),
-                }
-            }
             Event::Agent(TuiEvent::Agent(result)) => {
                 if let Ok(TimedEvent {
                     event: AgentEvent::ToolCallStart { id, .. },
@@ -542,9 +489,9 @@ async fn build_oneshot_prompt_with_mentions(
         });
     };
 
-    let db = app.session_manager.db();
-    if let Ok(Some(session_mentions_xml)) =
-        may_agent::prompt_mentions::build_session_mentions(db, prompt).await
+    if let Some(client) = app.btw_daemon.as_ref()
+        && let Ok(Some(session_mentions_xml)) =
+            may_agent::prompt_mentions::build_session_mentions_remote(client, prompt).await
     {
         hidden_context_parts.push(session_mentions_xml);
     }
