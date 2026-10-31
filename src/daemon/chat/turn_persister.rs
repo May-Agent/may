@@ -122,11 +122,15 @@ mod tests {
         let tool_start_at: Timestamp = "2024-03-01T10:00:01.250Z".parse().expect("valid time");
         let tool_end_at: Timestamp = "2024-03-01T10:00:04.750Z".parse().expect("valid time");
         let answer_at: Timestamp = "2024-03-01T10:00:06.500Z".parse().expect("valid time");
-        let fence = db
-            .acquire_session_run_lease(session_id, "owner", 0, i64::MIN)
-            .await
-            .expect("lease acquisition should succeed")
-            .expect("the lease is free");
+        let fence = crate::db::RunFence {
+            session_id: session_id.to_string(),
+            run_id: "run-1".to_string(),
+        };
+        assert!(
+            db.claim_session_run(&fence)
+                .await
+                .expect("run claim should succeed")
+        );
         let mut persister = TurnPersister::new(fence);
         persister.push_tool_event("call_1".to_string(), "start".to_string(), tool_start_at);
         persister.push_tool_event("call_1".to_string(), "end".to_string(), tool_end_at);

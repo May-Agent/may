@@ -62,14 +62,7 @@ impl SessionRuntimeService {
     /// Create the service over `db`, publishing change events on `ui_event_bus`.
     #[must_use]
     pub fn new(db: ChatDb, ui_event_bus: UiEventBus) -> Self {
-        Self::with_run_ttl(db, ui_event_bus, super::DEFAULT_RUN_LEASE_TTL)
-    }
-
-    /// Create the service with run leases that expire after `ttl` without a
-    /// heartbeat.
-    #[must_use]
-    pub fn with_run_ttl(db: ChatDb, ui_event_bus: UiEventBus, ttl: std::time::Duration) -> Self {
-        let runs = SessionRuns::new(db.clone(), ui_event_bus.clone()).with_ttl(ttl);
+        let runs = SessionRuns::new(db.clone(), ui_event_bus.clone());
         Self {
             db,
             ui_event_bus,
@@ -78,9 +71,9 @@ impl SessionRuntimeService {
     }
 
     /// Spawn the background tasks of run leases with `spawner`; see
-    /// [`super::run_lease::Spawner`].
+    /// [`super::runs::Spawner`].
     #[must_use]
-    pub fn with_spawner(mut self, spawner: super::run_lease::Spawner) -> Self {
+    pub fn with_spawner(mut self, spawner: super::runs::Spawner) -> Self {
         self.runs = self.runs.with_spawner(spawner);
         self
     }
@@ -138,7 +131,7 @@ impl SessionRuntimeService {
     /// Persist a session's runtime state as the run holding `fence`.
     ///
     /// # Errors
-    /// Returns [`crate::db::ChatDbError::RunLeaseLost`] when the run no longer
+    /// Returns [`crate::db::ChatDbError::RunLost`] when the run no longer
     /// holds the lease, or [`crate::db::ChatDbError`] on storage failure.
     pub async fn set_state_as_run(
         &self,
@@ -244,7 +237,7 @@ impl SessionRuntimeService {
     ) -> Result<SessionRuntimeSummary, crate::db::ChatDbError> {
         loop {
             let runtime = self.get(session_id).await?;
-            if !self.runs.is_held(session_id).await? {
+            if !self.runs.is_held(session_id) {
                 if !runtime.state.is_active() || runtime.interactions.is_active() {
                     return Ok(runtime);
                 }

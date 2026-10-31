@@ -12,9 +12,9 @@ pub mod open_questions;
 mod open_questions_tests;
 pub(crate) mod persisted_message;
 mod plan;
-pub(crate) mod run_lease;
+pub(crate) mod runs;
 #[cfg(test)]
-mod run_lease_tests;
+mod runs_tests;
 pub mod runtime;
 mod runtime_service;
 mod store;
@@ -37,9 +37,7 @@ pub use manager::{
 };
 pub(crate) use persisted_message::{PersistedMessage, PersistedMessageError};
 pub use plan::SessionPlanState;
-pub use run_lease::{
-    AcquireError, DEFAULT_RUN_LEASE_TTL, RunOutcome, SessionBusy, SessionRunGuard, SessionRuns,
-};
+pub use runs::{AcquireError, RunOutcome, SessionBusy, SessionRunGuard, SessionRuns};
 pub use runtime::{
     AttachmentKind, BrowserInteractionState, PendingUserMessage, PendingUserMessageMode,
     PersistedAskUserQuestion, PersistedAskUserRequest, PersistedAttachment,

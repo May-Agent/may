@@ -15,6 +15,5 @@ pub mod scheduled_tasks;
 pub mod session_pending_permissions;
 pub mod session_pending_workspace;
 pub mod session_plans;
-pub mod session_run_leases;
 pub mod session_runtimes;
 pub mod sessions;

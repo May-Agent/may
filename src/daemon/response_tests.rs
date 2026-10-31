@@ -683,7 +683,7 @@ async fn a_resume_of_a_session_without_a_live_run_queues_the_reminder_under_the_
     };
     assert!(runtime.has_pending_messages(), "the reminder is queued");
     assert!(
-        winner.runs().is_held("session").await.expect("lease read"),
+        winner.runs().is_held("session"),
         "the resume holds the lease while it dispatches"
     );
     guard
