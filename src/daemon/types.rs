@@ -115,8 +115,8 @@ pub struct SseToolStartEvent<'a> {
     pub(crate) arguments: &'a str,
     /// Backend-projected summary fields. The frontend reads these directly
     /// for the summary chip; no client-side partial-JSON parsing required.
-    #[serde(skip_serializing_if = "crate::ui_server::tool_summary::ToolSummary::is_empty")]
-    pub(crate) summary: crate::ui_server::tool_summary::ToolSummary,
+    #[serde(skip_serializing_if = "crate::daemon::tool_summary::ToolSummary::is_empty")]
+    pub(crate) summary: crate::daemon::tool_summary::ToolSummary,
 }
 
 #[derive(Debug, serde::Serialize, skyzen::ToSchema)]
@@ -130,8 +130,8 @@ pub struct SseToolDeltaEvent<'a> {
     pub(crate) arguments_fragment: &'a str,
     /// Backend-projected summary fields, recomputed from the cumulative
     /// argument buffer at every delta.
-    #[serde(skip_serializing_if = "crate::ui_server::tool_summary::ToolSummary::is_empty")]
-    pub(crate) summary: crate::ui_server::tool_summary::ToolSummary,
+    #[serde(skip_serializing_if = "crate::daemon::tool_summary::ToolSummary::is_empty")]
+    pub(crate) summary: crate::daemon::tool_summary::ToolSummary,
 }
 
 #[derive(Debug, serde::Serialize, skyzen::ToSchema)]
@@ -147,8 +147,8 @@ pub struct SseToolEndEvent<'a> {
     #[schema(value_type = serde_json::Value)]
     #[serde(serialize_with = "crate::session::tool_result_wire::serialize")]
     pub(crate) result: &'a ToolResult,
-    #[serde(skip_serializing_if = "crate::ui_server::tool_summary::ToolSummary::is_empty")]
-    pub(crate) summary: crate::ui_server::tool_summary::ToolSummary,
+    #[serde(skip_serializing_if = "crate::daemon::tool_summary::ToolSummary::is_empty")]
+    pub(crate) summary: crate::daemon::tool_summary::ToolSummary,
 }
 
 #[derive(Debug, serde::Serialize, skyzen::ToSchema)]

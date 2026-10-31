@@ -19,10 +19,10 @@ use skyzen::utils::{Json, State};
 
 use crate::MayAgent;
 use crate::agent::{AgentWorker, TuiEvent, spawn_idle_worker};
-use crate::ui_server::error::{
+use crate::daemon::error::{
     bad_request_error, internal_error, internal_error_message, json_ok_response,
 };
-use crate::ui_server::state::UiServerState;
+use crate::daemon::state::DaemonState;
 
 /// Idle agents of the sessions the daemon ran.
 #[derive(Default)]
@@ -54,7 +54,7 @@ impl ParkedAgents {
     /// idle agent.
     pub(crate) fn park(
         &self,
-        state: &Arc<UiServerState>,
+        state: &Arc<DaemonState>,
         session_id: &str,
         agent: MayAgent,
         build_key: u64,
@@ -129,7 +129,7 @@ fn session_id_param(params: &Params) -> SkyResult<String> {
 
 /// The session's idle agent, built from its persisted context when the
 /// daemon has none (it restarted, or the session never ran here).
-async fn idle_agent(state: &Arc<UiServerState>, session_id: &str) -> SkyResult<Arc<AgentWorker>> {
+async fn idle_agent(state: &Arc<DaemonState>, session_id: &str) -> SkyResult<Arc<AgentWorker>> {
     if let Some(worker) = state.parked_agents.get(session_id) {
         return Ok(worker);
     }
@@ -209,7 +209,7 @@ pub struct CompactResponse {
 pub async fn compact_session(
     params: Params,
     Json(req): Json<CompactRequest>,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<CompactResponse>> {
     let session_id = session_id_param(&params)?;
     let worker = idle_agent(&state, &session_id).await?;
@@ -236,7 +236,7 @@ pub async fn compact_session(
 /// `GET /api/sessions/{id}/context-report`: a [`crate::agent::ContextReport`].
 pub async fn context_report(
     params: Params,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<skyzen::Response> {
     let session_id = session_id_param(&params)?;
     let worker = idle_agent(&state, &session_id).await?;
@@ -261,7 +261,7 @@ pub struct ContextDumpResponse {
 /// the session's `outputs/context-dump.md`.
 pub async fn context_dump(
     params: Params,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<ContextDumpResponse>> {
     let session_id = session_id_param(&params)?;
     let worker = idle_agent(&state, &session_id).await?;
@@ -271,7 +271,7 @@ pub async fn context_dump(
         _ => return Err(internal_error_message("the agent gave no context dump")),
     };
     let text = dump.render();
-    let paths = crate::ui_server::helpers::load_session_paths(&state, &session_id).await?;
+    let paths = crate::daemon::helpers::load_session_paths(&state, &session_id).await?;
     let dir = paths.outputs_dir();
     async_fs::create_dir_all(&dir)
         .await
@@ -315,7 +315,7 @@ pub struct BtwResponse {
 pub async fn btw(
     params: Params,
     Json(req): Json<BtwRequest>,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<BtwResponse>> {
     use aither_core::LanguageModel as _;
     use aither_core::llm::Message;
@@ -353,9 +353,9 @@ pub async fn btw(
 /// turn rebuilds it from history.
 pub async fn release_agent(
     params: Params,
-    State(state): State<Arc<UiServerState>>,
-) -> SkyResult<Json<crate::ui_server::types::ApiHealth>> {
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<crate::daemon::types::ApiHealth>> {
     let session_id = session_id_param(&params)?;
     state.parked_agents.evict(&session_id);
-    Ok(Json(crate::ui_server::types::API_OK))
+    Ok(Json(crate::daemon::types::API_OK))
 }

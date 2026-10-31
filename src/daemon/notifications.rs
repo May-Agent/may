@@ -9,7 +9,7 @@ use skyzen::utils::{Json, State};
 use crate::ui_event_bus::UiEventTopics;
 
 use super::error::{bad_request_error, internal_error};
-use super::state::UiServerState;
+use super::state::DaemonState;
 
 // ── Request/response types ──────────────────────────────
 
@@ -54,7 +54,7 @@ fn default_test_body() -> String {
 
 /// GET /api/push/vapid-key — return the VAPID public key for browser subscription.
 pub(super) async fn get_vapid_key(
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<VapidKeyResponse>> {
     Ok(Json(VapidKeyResponse {
         public_key: state.notification_service.public_key().to_string(),
@@ -64,7 +64,7 @@ pub(super) async fn get_vapid_key(
 /// POST /api/push/subscribe — register a browser push subscription.
 pub(super) async fn subscribe(
     Json(req): Json<SubscribeRequest>,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<super::types::ApiHealth>> {
     state
         .notification_service
@@ -78,7 +78,7 @@ pub(super) async fn subscribe(
 /// POST /api/push/unsubscribe — remove a browser push subscription.
 pub(super) async fn unsubscribe(
     Json(req): Json<UnsubscribeRequest>,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<super::types::ApiHealth>> {
     state
         .notification_service
@@ -92,7 +92,7 @@ pub(super) async fn unsubscribe(
 /// POST /api/push/test — send a test notification to all subscribers.
 pub(super) async fn test_notification(
     Json(req): Json<TestNotificationRequest>,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<super::types::NotificationSentResponse>> {
     let sent = state
         .notification_service
@@ -107,7 +107,7 @@ pub(super) async fn test_notification(
 }
 
 pub(super) async fn list_notification_mailbox(
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<super::types::NotificationMailboxResponse>> {
     let items = state
         .db()
@@ -122,7 +122,7 @@ pub(super) async fn list_notification_mailbox(
 
 pub(super) async fn consume_notification_callback(
     params: Params,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<super::types::NotificationCallbackResponse>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
     let callback = state
@@ -203,7 +203,7 @@ pub(super) async fn consume_notification_callback(
 }
 
 pub(super) async fn list_network_access_logs(
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<super::types::NetworkAccessLogsResponse>> {
     let items = state
         .db()

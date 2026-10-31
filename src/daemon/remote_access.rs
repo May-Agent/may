@@ -21,7 +21,7 @@ use crate::db::ChatDb;
 use crate::ui_event_bus::UiEventBus;
 
 use super::error::{bad_request_error, internal_error};
-use super::state::UiServerState;
+use super::state::DaemonState;
 use super::types::{ApiHealth, RemoteAccessState, RemoteAccessStatusResponse};
 
 const MAX_REMOTE_ACCESS_LOGS: usize = 48;
@@ -148,7 +148,7 @@ impl RemoteAccessManager {
 }
 
 pub async fn sync_remote_access_from_state(
-    state: &UiServerState,
+    state: &DaemonState,
 ) -> Result<(), crate::db::ChatDbError> {
     let config = state.config_snapshot().remote_access.clone();
     let db = state.db();
@@ -164,13 +164,13 @@ pub async fn sync_remote_access_from_state(
 }
 
 pub(super) async fn get_remote_access_status(
-    skyzen::utils::State(state): skyzen::utils::State<Arc<UiServerState>>,
+    skyzen::utils::State(state): skyzen::utils::State<Arc<DaemonState>>,
 ) -> skyzen::Result<skyzen::utils::Json<RemoteAccessStatusResponse>> {
     Ok(skyzen::utils::Json(state.remote_access_manager.snapshot()))
 }
 
 pub(super) async fn start_remote_access(
-    skyzen::utils::State(state): skyzen::utils::State<Arc<UiServerState>>,
+    skyzen::utils::State(state): skyzen::utils::State<Arc<DaemonState>>,
 ) -> skyzen::Result<skyzen::utils::Json<ApiHealth>> {
     sync_remote_access_from_state(&state)
         .await
@@ -189,7 +189,7 @@ pub(super) async fn start_remote_access(
 }
 
 pub(super) async fn stop_remote_access(
-    skyzen::utils::State(state): skyzen::utils::State<Arc<UiServerState>>,
+    skyzen::utils::State(state): skyzen::utils::State<Arc<DaemonState>>,
 ) -> skyzen::Result<skyzen::utils::Json<ApiHealth>> {
     state
         .remote_access_manager

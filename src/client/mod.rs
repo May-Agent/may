@@ -21,7 +21,7 @@ use hyper_util::rt::TokioIo;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::ui_server::DaemonHealth;
+use crate::daemon::DaemonHealth;
 
 /// Path of the session endpoint `tail` (such as `/stop`) under
 /// `/api/sessions/{session_id}`.

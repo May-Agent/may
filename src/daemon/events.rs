@@ -15,7 +15,7 @@ use crate::ui_event_bus::UiEventTopics;
 use super::config::build_ui_config_response;
 use super::error::bad_request_error;
 use super::helpers::send_event;
-use super::state::UiServerState;
+use super::state::DaemonState;
 use super::types::{
     BrowserStatusEventPayload, NetworkAccessLogEntryResponse, NetworkAccessLogsResponse,
     NotificationMailboxEntryResponse, NotificationMailboxResponse, ProfileSessionsEventPayload,
@@ -57,7 +57,7 @@ struct EventSignatures {
 
 pub(super) async fn stream_events(
     Query(query): Query<EventsQuery>,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Sse> {
     let session_id = query
         .session_id
@@ -285,7 +285,7 @@ async fn send_resync(sender: &skyzen::responder::sse::Sender, session_id: Option
 }
 
 async fn emit_topics_if_changed(
-    state: &Arc<UiServerState>,
+    state: &Arc<DaemonState>,
     sender: &skyzen::responder::sse::Sender,
     session_filter: Option<&str>,
     profile_filter: Option<&str>,
@@ -383,7 +383,7 @@ async fn emit_topics_if_changed(
 
 /// The filtered session's background jobs and subagent runs.
 async fn emit_session_background_if_changed(
-    state: &Arc<UiServerState>,
+    state: &Arc<DaemonState>,
     sender: &skyzen::responder::sse::Sender,
     session_filter: Option<&str>,
     last_sig: &mut String,
@@ -404,7 +404,7 @@ async fn emit_session_background_if_changed(
 }
 
 async fn emit_config_if_changed(
-    state: &Arc<UiServerState>,
+    state: &Arc<DaemonState>,
     sender: &skyzen::responder::sse::Sender,
     last_config_sig: &mut String,
 ) -> bool {
@@ -424,7 +424,7 @@ async fn emit_config_if_changed(
 }
 
 async fn emit_request_logs_if_changed(
-    state: &Arc<UiServerState>,
+    state: &Arc<DaemonState>,
     sender: &skyzen::responder::sse::Sender,
     last_logs_sig: &mut String,
 ) -> bool {
@@ -462,7 +462,7 @@ async fn emit_request_logs_if_changed(
 }
 
 async fn emit_browser_status_if_changed(
-    state: &Arc<UiServerState>,
+    state: &Arc<DaemonState>,
     sender: &skyzen::responder::sse::Sender,
     last_browser_status_sig: &mut String,
 ) -> bool {
@@ -504,7 +504,7 @@ async fn emit_browser_status_if_changed(
 }
 
 async fn emit_notification_mailbox_if_changed(
-    state: &Arc<UiServerState>,
+    state: &Arc<DaemonState>,
     sender: &skyzen::responder::sse::Sender,
     last_sig: &mut String,
 ) -> bool {
@@ -532,7 +532,7 @@ async fn emit_notification_mailbox_if_changed(
 }
 
 async fn emit_network_access_logs_if_changed(
-    state: &Arc<UiServerState>,
+    state: &Arc<DaemonState>,
     sender: &skyzen::responder::sse::Sender,
     last_sig: &mut String,
 ) -> bool {
@@ -559,7 +559,7 @@ async fn emit_network_access_logs_if_changed(
 }
 
 async fn emit_container_prepare_if_changed(
-    state: &Arc<UiServerState>,
+    state: &Arc<DaemonState>,
     sender: &skyzen::responder::sse::Sender,
     last_sig: &mut String,
 ) -> bool {
@@ -576,7 +576,7 @@ async fn emit_container_prepare_if_changed(
 }
 
 async fn emit_session_runtime_if_changed(
-    state: &Arc<UiServerState>,
+    state: &Arc<DaemonState>,
     sender: &skyzen::responder::sse::Sender,
     session_filter: Option<&str>,
     last_sig: &mut String,
@@ -607,7 +607,7 @@ async fn emit_session_runtime_if_changed(
 }
 
 async fn emit_session_runtimes_if_changed(
-    state: &Arc<UiServerState>,
+    state: &Arc<DaemonState>,
     sender: &skyzen::responder::sse::Sender,
     profile_filter: Option<&str>,
     last_sig: &mut String,
@@ -641,7 +641,7 @@ async fn emit_session_runtimes_if_changed(
 }
 
 async fn emit_remote_access_if_changed(
-    state: &Arc<UiServerState>,
+    state: &Arc<DaemonState>,
     sender: &skyzen::responder::sse::Sender,
     last_sig: &mut String,
 ) -> bool {
@@ -660,7 +660,7 @@ async fn emit_remote_access_if_changed(
 }
 
 async fn emit_profile_sessions_if_changed(
-    state: &Arc<UiServerState>,
+    state: &Arc<DaemonState>,
     sender: &skyzen::responder::sse::Sender,
     profile_filter: Option<&str>,
     last_sig: &mut String,
