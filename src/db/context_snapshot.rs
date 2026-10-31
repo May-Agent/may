@@ -6,7 +6,7 @@ use super::common::{
     ContextDebugSnapshotMessage, SessionContextSnapshotUpsert, StoredSessionContextSnapshot,
     StoredSessionContextSnapshotRow, overflow_error, storage_error,
 };
-use super::run_lease::RunFence;
+use super::session_run::RunFence;
 use super::{ChatDb, ChatDbError, query};
 
 /// Format version of the serialized [`aither_agent::AgentCheckpoint`] stored in
@@ -267,7 +267,7 @@ impl ChatDb {
     /// while the run's lease `fence` still holds.
     ///
     /// # Errors
-    /// Returns [`ChatDbError::RunLeaseLost`] when the lease was taken over or
+    /// Returns [`ChatDbError::RunLost`] when the lease was taken over or
     /// released, or [`ChatDbError`] on storage failure.
     pub async fn upsert_session_context_snapshot_as_run(
         &self,

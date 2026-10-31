@@ -32,7 +32,7 @@ pub enum ChatDbError {
     /// A run-scoped write was refused because the run's lease was taken over
     /// or released.
     #[error("The run lease of session {session_id} is no longer held by this run")]
-    RunLeaseLost {
+    RunLost {
         /// Session whose lease the run no longer holds.
         session_id: String,
     },

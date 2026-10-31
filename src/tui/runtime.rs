@@ -2158,13 +2158,8 @@ mod tests {
             panic!("an empty queue must start nothing");
         };
         assert!(
-            !local
-                .runtime_service
-                .runs()
-                .is_held("session")
-                .await
-                .expect("lease"),
-            "an empty queue must leave the lease released"
+            !local.runtime_service.runs().is_held("session"),
+            "an empty queue must leave the run released"
         );
     }
 
