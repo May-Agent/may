@@ -18,6 +18,7 @@ export default {
           DEFAULT: 'hsl(var(--sidebar))',
           foreground: 'hsl(var(--sidebar-foreground))',
         },
+        brand: 'hsl(var(--brand))',
         success: 'hsl(var(--success))',
         warning: 'hsl(var(--warning))',
         border: 'hsl(var(--border))',

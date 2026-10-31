@@ -197,7 +197,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
                 size="sm"
                 variant="secondary"
                 onClick={scrollToBottom}
-                className="gap-1 rounded-full border border-border/60 bg-background/80 px-3 shadow-md backdrop-blur-xl hover:bg-background"
+                className="gap-1 border border-border bg-background px-2.5 text-muted-foreground shadow-sm hover:bg-accent hover:text-foreground"
                 aria-label={t('chat.scrollToBottom')}
               >
                 <ArrowDown className="size-3.5" />
@@ -276,12 +276,12 @@ function ConfigGuardCard({ onOpenSettings }: ConfigGuardCardProps) {
     <button
       type="button"
       onClick={onOpenSettings}
-      className="flex w-full items-start gap-2 rounded-lg border border-amber-500/40 bg-amber-500/5 px-3 py-2.5 text-left text-sm text-amber-700 transition-colors hover:bg-amber-500/10 dark:text-amber-300"
+      className="flex w-full items-start gap-2 rounded-lg border border-border bg-background px-3 py-2.5 text-left text-[13px] transition-colors hover:bg-accent"
     >
-      <AlertTriangle className="mt-0.5 size-4 shrink-0" />
+      <AlertTriangle className="mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden />
       <div className="flex-1 min-w-0">
         <div className="font-medium">{t('chat.configGuard.title')}</div>
-        <div className="text-xs opacity-80">{t('chat.configGuard.body')}</div>
+        <div className="text-xs text-muted-foreground">{t('chat.configGuard.body')}</div>
       </div>
       <span className="shrink-0 text-xs font-medium underline-offset-4 hover:underline">
         {t('chat.configGuard.openSettings')}

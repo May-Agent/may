@@ -55,7 +55,7 @@ export function CommandPalette() {
         <DialogPrimitive.Content
           className={cn(
             'fixed left-1/2 top-[12vh] z-50 w-[calc(100%-2rem)] max-w-xl -translate-x-1/2',
-            'rounded-xl border border-border/60 bg-card/95 backdrop-blur-xl shadow-2xl',
+            'rounded-lg border border-border bg-popover shadow-2xl',
             'duration-200 ease-out',
             'data-[state=open]:animate-in data-[state=closed]:animate-out',
             'data-[state=open]:fade-in-0 data-[state=closed]:fade-out-0',

@@ -23,8 +23,8 @@ const MODE_ICON: Record<TerminalCommandMode, typeof Shield> = {
 
 const MODE_CLASS: Record<TerminalCommandMode, string> = {
   default: 'text-muted-foreground',
-  sandboxed: 'text-emerald-600 dark:text-emerald-400',
-  unsafe: 'text-amber-600 dark:text-amber-400',
+  sandboxed: 'text-muted-foreground',
+  unsafe: 'text-destructive',
   ssh: 'text-muted-foreground',
 };
 

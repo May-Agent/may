@@ -5,7 +5,6 @@ import {
   ChevronRight,
   Loader2,
   PanelLeftClose,
-  Pin,
   Plus,
   Search,
   Settings as SettingsIcon,
@@ -65,10 +64,10 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
         inSheet ? 'w-full' : 'w-64 border-r border-border',
       )}
     >
-      <div className="flex h-12 items-center gap-1 px-3 touch:h-14">
+      <div className="flex h-11 items-center gap-0.5 px-3 touch:h-14">
         <Link
           to="/"
-          className="mr-auto rounded-md px-1 text-[15px] font-semibold tracking-tight"
+          className="mr-auto rounded-md px-1 text-[13px] font-semibold"
         >
           {t('appName')}
         </Link>
@@ -111,7 +110,7 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
           <TooltipTrigger asChild>
             <Button
               variant="outline"
-              className="w-full justify-start gap-2 bg-background px-3 font-medium shadow-sm"
+              className="w-full justify-start gap-2 px-2 font-medium"
               onClick={() => void startNewChat()}
               disabled={!canCreate || creating}
               aria-busy={creating}
@@ -145,9 +144,9 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
               {t('sidebar.noSessionsInProfile')}
             </div>
           ) : (
-            <div className="space-y-4">
+            <div className="space-y-3">
               {pinned.length > 0 && (
-                <Section label={t('sidebar.pinned')} icon={<Pin className="size-3" aria-hidden />}>
+                <Section label={t('sidebar.pinned')}>
                   {pinned.map((item) =>
                     item.type === 'session' ? (
                       <SessionNode
@@ -198,7 +197,7 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
                   <button
                     type="button"
                     onClick={() => setArchiveOpen((v) => !v)}
-                    className="flex h-7 w-full items-center gap-1.5 rounded-md px-2 text-xs font-semibold text-muted-foreground hover:text-foreground touch:h-11"
+                    className="flex h-7 w-full items-center gap-1 rounded-md px-2 text-xs font-medium text-muted-foreground hover:text-foreground touch:h-11"
                     aria-expanded={archiveOpen}
                   >
                     {archiveOpen ? (
@@ -207,7 +206,7 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
                       <ChevronRight className="size-3.5" aria-hidden />
                     )}
                     <span>{t('sidebar.archived')}</span>
-                    <span className="font-normal">· {archived.length}</span>
+                    <span className="ml-auto font-normal tabular-nums">{archived.length}</span>
                   </button>
                   {archiveOpen && (
                     <ul className="mt-0.5 space-y-px">
@@ -235,11 +234,11 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
           to="/settings"
           aria-current={settingsActive ? 'page' : undefined}
           className={cn(
-            'flex h-8 items-center gap-2 rounded-md px-2 text-[13px] hover:bg-accent touch:h-11',
-            settingsActive && 'bg-accent font-medium',
+            'flex h-7 items-center gap-2 rounded-md px-2 text-[13px] font-medium text-muted-foreground hover:bg-accent hover:text-foreground touch:h-11',
+            settingsActive && 'bg-accent text-foreground',
           )}
         >
-          <SettingsIcon className="size-4 text-muted-foreground" aria-hidden />
+          <SettingsIcon className="size-4" strokeWidth={1.75} aria-hidden />
           {t('sidebar.settings')}
         </Link>
       </div>
@@ -251,17 +250,13 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
 
 interface SectionProps {
   label: string;
-  icon?: React.ReactNode;
   children: React.ReactNode;
 }
 
-function Section({ label, icon, children }: SectionProps) {
+function Section({ label, children }: SectionProps) {
   return (
     <section aria-label={label}>
-      <h3 className="flex h-6 items-center gap-1.5 px-2 text-xs font-semibold text-muted-foreground">
-        {icon}
-        <span>{label}</span>
-      </h3>
+      <h3 className="flex h-7 items-center px-2 text-xs font-medium text-muted-foreground">{label}</h3>
       <ul className="space-y-px">{children}</ul>
     </section>
   );

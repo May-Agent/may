@@ -112,7 +112,7 @@ export function Composer({
 
   return (
     <div
-      className="rounded-2xl border border-border/60 bg-background/70 shadow-lg backdrop-blur-xl backdrop-saturate-150"
+      className="rounded-lg border border-border bg-background shadow-[0_2px_8px_-2px_rgb(0_0_0/0.08)] dark:shadow-none"
       onDragOver={(e) => e.preventDefault()}
       onDrop={handleDrop}
     >
@@ -141,7 +141,7 @@ export function Composer({
       )}
       <textarea
         ref={textareaRef}
-        className="block w-full resize-none bg-transparent px-4 pt-3 pb-1 text-sm outline-none placeholder:text-muted-foreground min-h-[48px] max-h-[240px] scrollbar-thin"
+        className="block w-full resize-none bg-transparent px-3 pt-3 pb-1 text-sm outline-none placeholder:text-muted-foreground min-h-[48px] max-h-[240px] scrollbar-thin"
         placeholder={streaming ? t('composer.placeholderBusy') : t('composer.placeholder')}
         value={value}
         onChange={(e) => setValue(e.target.value)}
@@ -204,7 +204,7 @@ export function Composer({
               </TooltipContent>
             </Tooltip>
           )}
-          <div className="ml-1 h-5 w-px bg-border/60" />
+          <div className="mx-1 h-4 w-px bg-border" />
           <ModelPicker
             sessionId={sessionId}
             currentModel={currentModel}
