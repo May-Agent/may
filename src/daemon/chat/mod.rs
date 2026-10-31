@@ -1090,12 +1090,7 @@ pub(super) async fn stop_session_run(
         );
     }
 
-    let cancelled = state
-        .runtime_service
-        .runs()
-        .cancel(&session_id)
-        .await
-        .map_err(internal_error)?;
+    let cancelled = state.runtime_service.runs().cancel(&session_id);
     tracing::info!(session_id = %session_id, cancelled, "received session stop request");
 
     let runtime = state
@@ -1362,13 +1357,11 @@ fn run_agent_loop<'a>(
                     let next_event = tokio::select! {
                         biased;
                         cancel = guard.cancellation().recv() => {
-                            if cancel == Ok(()) && guard.is_lost() {
-                                cancellation_reason = Some("session run lease lost");
-                            } else if cancel == Ok(()) {
-                                cancellation_reason = Some("run cancelled by user");
+                            cancellation_reason = Some(if cancel == Ok(()) {
+                                "run cancelled by user"
                             } else {
-                                cancellation_reason = Some("run cancellation channel closed unexpectedly");
-                            }
+                                "run cancellation channel closed unexpectedly"
+                            });
                             None
                         }
                         next = stream.next() => next,

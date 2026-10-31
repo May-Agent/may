@@ -14,9 +14,9 @@ mod notification;
 mod open_questions;
 mod profile;
 mod repo_usage;
-mod run_lease;
 mod search_outbox;
 mod session;
+mod session_run;
 mod sql;
 mod task;
 
@@ -39,8 +39,8 @@ pub use issue_search::IssueSearchDoc;
 pub use message::MessageMeta;
 pub use open_questions::{CommittedAskUserAnswer, PendingAskUserQuestion};
 pub use repo_usage::RepoUsage;
-pub use run_lease::RunFence;
 pub use search_outbox::{IndexedMessageRow, SearchOutboxEntry};
+pub use session_run::RunFence;
 
 use common::{
     AskUserRequestMessageRow, AskUserRequestQuestionOptionRow, AskUserRequestQuestionRow,
@@ -81,7 +81,7 @@ impl ChatDb {
         Self::ensure_ask_user_blocking_column(&db).await?;
         Self::ensure_scheduled_task_columns(&db).await?;
         Self::ensure_session_context_snapshot_table(&db).await?;
-        Self::ensure_session_run_lease_table(&db).await?;
+        Self::ensure_session_run_layout(&db).await?;
         Self::migrate_legacy_remote_profiles(&db).await?;
         Self::migrate_removed_waiting_terminal_input(&db).await?;
         Self::ensure_search_outbox(&db).await?;
@@ -278,37 +278,20 @@ impl ChatDb {
         Ok(())
     }
 
-    /// Replace the boolean `active` lease table with the fenced layout.
-    ///
-    /// A lease is transient, so the legacy table is dropped rather than
-    /// converted: a run holding a legacy lease loses it, which only matters
-    /// to a process still running the previous build against this file.
-    async fn ensure_session_run_lease_table(db: &SkyDb) -> Result<(), ChatDbError> {
-        const EXPECTED_COLUMNS: [&str; 5] = [
-            "session_id",
-            "owner",
-            "generation",
-            "heartbeat_at",
-            "cancellation_requested",
-        ];
-        let columns = query!(db, db_sql::SESSION_RUN_LEASES_COLUMNS)
+    /// Drop the retired `session_run_leases` table and give
+    /// `session_runtimes` the `run_id` fencing column. Run ownership lived
+    /// there before it moved into the daemon's memory.
+    async fn ensure_session_run_layout(db: &SkyDb) -> Result<(), ChatDbError> {
+        query!(db, "DROP TABLE IF EXISTS session_run_leases")
+            .execute()
+            .await?;
+        let columns = query!(db, "SELECT name FROM pragma_table_info('session_runtimes')")
             .fetch_all::<SqliteTableInfoRow>()
             .await?;
-        let actual_columns = columns
-            .iter()
-            .map(|column| column.name.as_str())
-            .collect::<Vec<_>>();
-        if !actual_columns.is_empty() && actual_columns != EXPECTED_COLUMNS {
-            tracing::info!(
-                columns = ?actual_columns,
-                "session_run_leases has the legacy layout; recreating it with fenced leases"
-            );
-            query!(db, db_sql::SESSION_RUN_LEASES_DROP)
+        if !columns.iter().any(|column| column.name == "run_id") {
+            query!(db, "ALTER TABLE session_runtimes ADD COLUMN run_id TEXT")
                 .execute()
                 .await?;
-        }
-        for statement in db_sql::statements(db_sql::SESSION_RUN_LEASES_SCHEMA) {
-            query!(db, statement).execute().await?;
         }
         Ok(())
     }
@@ -578,7 +561,7 @@ mod tests {
     };
     use crate::task_trigger::PersistedTaskTrigger;
 
-    use super::{ChatDb, CreateProfileParams, CreateScheduledTaskParams};
+    use super::{ChatDb, CreateProfileParams, CreateScheduledTaskParams, RunFence};
 
     fn test_pending_message(content: &str, mode: PendingUserMessageMode) -> PendingUserMessage {
         PendingUserMessage {
@@ -1001,7 +984,7 @@ mod tests {
                 .expect("previous takeover owner should be cleared")
         );
 
-        db.recover_session_runtimes_after_restart(i64::MAX)
+        db.recover_session_runtimes_after_restart()
             .await
             .expect("runtime recovery should clear stale takeover ownership");
         assert_eq!(
@@ -1028,11 +1011,15 @@ mod tests {
         db.create_session(session_id, Some("Takeover race"), Some("test-model"))
             .await
             .expect("session should be created");
-        let fence = db
-            .acquire_session_run_lease(session_id, "owner", 0, i64::MIN)
-            .await
-            .expect("lease acquisition should succeed")
-            .expect("the lease is free");
+        let fence = RunFence {
+            session_id: session_id.to_string(),
+            run_id: "run-1".to_string(),
+        };
+        assert!(
+            db.claim_session_run(&fence)
+                .await
+                .expect("run claim should succeed")
+        );
         db.set_browser_takeover_owner(session_id)
             .await
             .expect("takeover should be active");
@@ -1366,7 +1353,7 @@ mod tests {
         .await
         .expect("waiting workspace should persist");
 
-        db.recover_session_runtimes_after_restart(i64::MAX)
+        db.recover_session_runtimes_after_restart()
             .await
             .expect("runtime recovery should succeed");
 

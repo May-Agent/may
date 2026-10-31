@@ -41,9 +41,6 @@ impl Hook for PendingSteerHook {
         let Some(service) = &self.runtime else {
             return TurnBoundaryAction::Continue;
         };
-        if service.runs().is_lost(&self.session_id) {
-            return TurnBoundaryAction::EndTurn;
-        }
         let Ok(runtime) = service.db().get_session_runtime(&self.session_id).await else {
             tracing::warn!(
                 session_id = %self.session_id,
