@@ -19,11 +19,11 @@ use crate::agent::ssh_authorizer::PermissionChoice;
 use crate::agent::task_tool::{TaskBroker, TaskQueue};
 use crate::ask_user::{AnswerValue, AskUserRequest, Question, QuestionAnswer};
 use crate::config::MayConfig;
+use crate::daemon::types::BrowserLifecycleEvent;
 use crate::live_response::LiveResponseRegistry;
 use crate::mcp::{MayMcpServerConfig, McpManager, McpServerInfo};
 use crate::session::{PersistedAskUserQuestion, PersistedAskUserRequest};
 use crate::ui_event_bus::{UiEventBus, UiEventTopics};
-use crate::daemon::types::BrowserLifecycleEvent;
 use crate::workspace_request::RequestWorkspaceArgs;
 
 #[derive(Debug, Clone, Copy, serde::Serialize, PartialEq, Eq, skyzen::ToSchema)]

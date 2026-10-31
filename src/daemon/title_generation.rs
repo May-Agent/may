@@ -5,7 +5,7 @@ use crate::session::SessionId;
 use crate::ui_event_bus::UiEventTopics;
 
 use super::helpers::truncate_preview;
-use super::state::{TitleGenerationTask, DaemonState};
+use super::state::{DaemonState, TitleGenerationTask};
 
 pub(super) fn enqueue(
     state: &Arc<DaemonState>,
