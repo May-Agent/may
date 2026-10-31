@@ -30,5 +30,7 @@ export function formatGroupTime(timestamp: string, now: Date, locale?: string): 
   if (days >= 0 && days < 6) {
     return new Intl.DateTimeFormat(locale, { weekday: 'short', ...time }).format(date);
   }
-  return new Intl.DateTimeFormat(locale, { month: 'short', day: 'numeric', ...time }).format(date);
+  const datePart = new Intl.DateTimeFormat(locale, { month: 'short', day: 'numeric' }).format(date);
+  const timePart = new Intl.DateTimeFormat(locale, time).format(date);
+  return `${datePart}, ${timePart}`;
 }
