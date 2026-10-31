@@ -427,11 +427,11 @@ pub struct DaemonState {
     /// Each session's virtual desktop, acquired on demand and released
     /// with its session — computer use.
     #[cfg(target_os = "macos")]
-    pub(crate) session_displays: Mutex<crate::computer::SessionDisplays>,
+    pub(crate) session_displays: Arc<Mutex<crate::computer::SessionDisplays>>,
     /// Each session's desktop stream — created with the first start,
     /// released with its session.
     #[cfg(target_os = "macos")]
-    pub(crate) session_streams: Mutex<crate::computer::SessionStreams>,
+    pub(crate) session_streams: Arc<Mutex<crate::computer::SessionStreams>>,
     pub(crate) remote_access_manager: Arc<super::remote_access::RemoteAccessManager>,
     pub(crate) notification_service: Arc<crate::notification::NotificationService>,
     pub(crate) memory_processor: Option<crate::memory::MemoryProcessor>,
