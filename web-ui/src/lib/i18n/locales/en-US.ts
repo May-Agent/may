@@ -236,6 +236,21 @@ export const enUS = {
     didRead: 'Read {page}',
     didOther: 'Used the browser',
   },
+  computer: {
+    title: 'Computer',
+    screenOf: '{name}\'s desktop',
+    caption: 'The session\'s virtual desktop',
+    asleep: 'Desktop is asleep',
+    wake: 'Start',
+    open: 'Open desktop',
+    minimize: 'Minimize',
+    mode: 'Control mode',
+    watching: 'Watching',
+    takeControl: 'Take control',
+    connecting: 'Connecting',
+    streamLost: 'Connection lost',
+  },
+
   modals: {
     permission: {
       title: 'May is asking for permission',
@@ -470,6 +485,7 @@ export const enUS = {
     tabDetails: 'Details',
     tabLibrary: 'Library',
     tabBrowser: 'Browser',
+    tabComputer: 'Computer',
     finished: 'Finished',
     jobDone: 'Done',
     libraryEmpty: 'No files yet. Files May creates appear here.',
