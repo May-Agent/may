@@ -217,6 +217,7 @@ impl SessionParts {
             cwd,
             session_id: self.session_id.clone(),
             workspace_request_broker: self.workspace_broker.clone(),
+            agent_messaging: None,
             ask_user_broker: self.ask_user_broker.clone(),
             db: self.db.clone(),
             model: "session::session-model",

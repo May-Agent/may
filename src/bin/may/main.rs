@@ -673,7 +673,6 @@ where
             app.mode = may_agent::tui::AppMode::Chat;
         }
 
-        runtime_deps.listen_for_agent_messages()?;
         phases.step("questions+listeners", step_start.elapsed());
 
         // A saved change to the cache lifetime or compaction model replaces

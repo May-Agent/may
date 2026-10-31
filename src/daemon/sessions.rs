@@ -398,9 +398,6 @@ pub(super) async fn create_session_for_profile(
     db.create_session_in_profile(&id, None, Some(model), profile_id)
         .await
         .map_err(internal_error)?;
-    super::chat::open_session_for_agents(state, &id, profile_id)
-        .await
-        .map_err(internal_error)?;
     Ok(id)
 }
 
@@ -555,7 +552,6 @@ pub(super) async fn delete_session(
         .and_then(|session| session.profile_id);
     db.delete_session(&id).await.map_err(internal_error)?;
     state.parked_agents.evict(&id);
-    state.agent_listeners.remove(&id);
     #[cfg(target_os = "macos")]
     state.session_displays.lock().await.release(&id);
     state
@@ -577,7 +573,6 @@ pub(super) async fn delete_all_sessions(
     let db = state.db();
     db.delete_all_sessions().await.map_err(internal_error)?;
     state.tool_environments.evict_all();
-    state.agent_listeners.clear();
     #[cfg(target_os = "macos")]
     state.session_displays.lock().await.clear();
 
