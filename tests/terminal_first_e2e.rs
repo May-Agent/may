@@ -1394,9 +1394,11 @@ impl SseReader {
     }
 }
 
+#[derive(Debug)]
 struct TestSseEvent {
     event: String,
     data: String,
+    id: Option<String>,
 }
 
 /// Starts a turn the way every client does: subscribes to the session's
@@ -1472,6 +1474,7 @@ fn split_sse_block(buffer: &str) -> Option<(TestSseEvent, String)> {
 
 fn parse_sse_block(block: &str) -> TestSseEvent {
     let mut event = String::new();
+    let mut id = None;
     let mut data_lines = Vec::new();
     for line in block.lines() {
         // Per the SSE spec, a single space after the field colon is optional.
@@ -1479,11 +1482,14 @@ fn parse_sse_block(block: &str) -> TestSseEvent {
             event = value.strip_prefix(' ').unwrap_or(value).to_string();
         } else if let Some(value) = line.strip_prefix("data:") {
             data_lines.push(value.strip_prefix(' ').unwrap_or(value).to_string());
+        } else if let Some(value) = line.strip_prefix("id:") {
+            id = Some(value.strip_prefix(' ').unwrap_or(value).to_string());
         }
     }
     TestSseEvent {
         event,
         data: data_lines.join("\n"),
+        id,
     }
 }
 
@@ -3947,4 +3953,109 @@ async fn a_background_job_finishing_after_its_turn_resumes_the_session() {
         resumed_request.contains(FINISHING_JOB_MARKER),
         "the model sees the job's output: {resumed_request}"
     );
+}
+
+/// Opens the session's `session_agent` stream, continuing after frame
+/// `after` when given.
+async fn agent_frames(
+    client: &reqwest::Client,
+    server: &RunningUiServer,
+    session_id: &str,
+    after: Option<u64>,
+) -> SseReader {
+    let mut query = vec![
+        ("topics", "session_agent".to_string()),
+        ("sessionId", session_id.to_string()),
+    ];
+    if let Some(after) = after {
+        query.push(("after", after.to_string()));
+    }
+    let response = client
+        .get(format!("{}/api/events", server.base_url))
+        .query(&query)
+        .send()
+        .await
+        .expect("event stream should open");
+    SseReader::new(response)
+}
+
+/// The next turn frame of `reader`, skipping heartbeats.
+async fn next_turn_frame(reader: &mut SseReader) -> TestSseEvent {
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(20), reader.next_event())
+            .await
+            .expect("a frame should arrive")
+            .expect("the stream should stay open");
+        if event.event != "heartbeat" {
+            return event;
+        }
+    }
+}
+
+fn frame_index(event: &TestSseEvent) -> u64 {
+    event
+        .id
+        .as_deref()
+        .and_then(|id| id.parse().ok())
+        .unwrap_or_else(|| panic!("turn frames carry their index: {event:?}"))
+}
+
+/// A client that reconnects mid-turn names the last frame it saw and gets
+/// only the frames after it; one that missed frames of a turn that already
+/// ended is told to reload the session.
+#[tokio::test]
+#[serial]
+async fn a_reconnecting_client_continues_after_the_last_frame_it_saw() {
+    let mock = MockOpenAiServer::spawn(MockChatScenario::SlowText {
+        chunks: (0..12).map(|index| format!("chunk-{index} ")).collect(),
+        delay: Duration::from_millis(150),
+    })
+    .await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    let server = RunningUiServer::spawn(harness.home_path(), &[]).await;
+    let client = reqwest::Client::new();
+    let environment = ChatEnvironment::Local
+        .prepare(&harness, &client, &server)
+        .await;
+    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+
+    let mut first = agent_frames(&client, &server, &session_id, None).await;
+    let turn = send_turn(
+        &client,
+        &server.base_url,
+        &serde_json::json!({ "sessionId": session_id, "content": "write slowly" }),
+    )
+    .await
+    .expect("turn request should succeed");
+    let turn = expect_status(&server.log, turn, StatusCode::OK).await;
+
+    // Read the start and a few chunks, then drop the stream mid-turn.
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        seen.push(next_turn_frame(&mut first).await);
+    }
+    assert!(seen[0].data.contains("\"start\""), "{:?}", seen[0]);
+    let last_seen = frame_index(seen.last().expect("frames were read"));
+    drop(first);
+
+    let mut reopened = agent_frames(&client, &server, &session_id, Some(last_seen)).await;
+    let next = next_turn_frame(&mut reopened).await;
+    // Indices count every turn frame; this stream asked for agent frames
+    // only, so the next one may skip the indices of the others.
+    assert!(
+        frame_index(&next) > last_seen,
+        "the reopened stream continues after the last frame seen: {next:?}"
+    );
+    assert!(
+        !next.data.contains("\"start\""),
+        "the turn is not replayed from its start: {next:?}"
+    );
+
+    let events = collect_turn_events(turn, "the slow turn", &server.log).await;
+    assert!(events.iter().any(|(kind, _)| kind == "done"), "{events:?}");
+
+    // The turn ended: frames after the first one are gone for good.
+    let mut stale = agent_frames(&client, &server, &session_id, Some(frame_index(&seen[0]))).await;
+    let resync = next_turn_frame(&mut stale).await;
+    assert_eq!(resync.event, "session_resync", "{resync:?}");
 }
