@@ -471,7 +471,7 @@ export const zhHant: Messages = {
     tabsLabel: '檢視器分頁',
     tabDetails: '詳細資料',
     tabLibrary: '檔案庫',
-    tabComputer: '瀏覽器',
+    tabBrowser: '瀏覽器',
     finished: '已結束',
     jobDone: '完成',
     libraryEmpty: '尚無檔案。May 建立的檔案會顯示在這裡。',
