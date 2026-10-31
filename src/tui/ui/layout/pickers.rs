@@ -10,11 +10,10 @@ use ratatui::{
 use unicode_width::UnicodeWidthStr;
 
 use super::super::super::app::App;
-use super::{centered_rect, centered_rect_exact};
 
 /// Render session selection popup with profile sections.
 pub(super) fn render_session_popup(frame: &mut Frame, area: Rect, app: &App) {
-    let popup_area = centered_rect(70, 60, area);
+    let popup_area = area;
     frame.render_widget(Clear, popup_area);
 
     let filtered = app.filtered_sessions();
@@ -419,12 +418,7 @@ pub(super) fn render_search_preview(
 
 /// Render profile selection popup.
 pub(super) fn render_profile_select_popup(frame: &mut Frame, area: Rect, app: &App) {
-    let popup_width = 50u16.min(area.width.saturating_sub(4));
-    let popup_height = u16::try_from(app.profiles.len())
-        .unwrap_or(u16::MAX)
-        .saturating_add(4)
-        .min(area.height.saturating_sub(4));
-    let popup_area = centered_rect_exact(popup_width, popup_height, area);
+    let popup_area = area;
     frame.render_widget(Clear, popup_area);
 
     let block = Block::default()
@@ -499,7 +493,7 @@ pub(super) fn render_profile_select_popup(frame: &mut Frame, area: Rect, app: &A
 
 /// Render file picker popup.
 pub(super) fn render_file_picker_popup(frame: &mut Frame, area: Rect, app: &App) {
-    let popup_area = centered_rect(70, 60, area);
+    let popup_area = area;
 
     // Clear background
     frame.render_widget(Clear, popup_area);

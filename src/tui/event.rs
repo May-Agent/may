@@ -68,6 +68,24 @@ pub enum AppEvent {
         state: Option<super::ui::image::ImageState>,
     },
 
+    // ─── Sidebar ─────────────────────────────────────────────────────
+    /// The session's `tasks.md`, as the daemon served it (`None`: no file).
+    SidebarTasks {
+        /// Session the document belongs to.
+        session_id: String,
+        /// Document content.
+        content: Option<String>,
+        /// Session title as stored (the daemon generates it).
+        title: Option<String>,
+    },
+    /// Lookups of issues the session's tasks link.
+    SidebarIssues {
+        /// Session the tasks belong to.
+        session_id: String,
+        /// The issues found.
+        issues: Vec<crate::tui::sidebar::IssueBrief>,
+    },
+
     // ─── Background jobs ─────────────────────────────────────────────
     /// The session's jobs and subagent runs, as the daemon reported them.
     BackgroundLoaded {
@@ -134,6 +152,8 @@ impl AppEvent {
             Self::ProfileSessionsLoaded(_) => "profile_sessions_loaded",
             Self::ConfigSaved(_) => "config_saved",
             Self::ImageDecoded { .. } => "image_decoded",
+            Self::SidebarTasks { .. } => "sidebar_tasks",
+            Self::SidebarIssues { .. } => "sidebar_issues",
             Self::BackgroundLoaded { .. } => "background_loaded",
             Self::Status(_) => "status",
             Self::JobKilled { .. } => "job_killed",
