@@ -17,7 +17,7 @@ use super::message_mapping::map_db_messages;
 use super::model_resolution::{
     persist_last_model, preferred_advanced_model, resolve_default_model,
 };
-use super::state::UiServerState;
+use super::state::DaemonState;
 use super::types::{
     ApiHealth, ApiSession, ContextDebugMessage, CreateSessionRequest, NullableStringPatch,
     SessionContextDebugResponse, SessionContextWindowMetricsResponse,
@@ -37,7 +37,7 @@ fn context_debug_not_found_error(session_id: &str) -> SkyError {
 }
 
 fn resolve_session_model(
-    state: &UiServerState,
+    state: &DaemonState,
     session_id: &str,
     model: Option<String>,
 ) -> Result<String, skyzen::Error> {
@@ -48,13 +48,13 @@ fn resolve_session_model(
 }
 
 pub(super) async fn list_sessions(
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<Vec<ApiSession>>> {
     Ok(Json(list_api_sessions(state.as_ref()).await?))
 }
 
 pub(super) async fn list_api_sessions(
-    state: &UiServerState,
+    state: &DaemonState,
 ) -> Result<Vec<ApiSession>, skyzen::Error> {
     let db = state.db();
     let summaries = list_summaries_from_db(&db).await.map_err(internal_error)?;
@@ -73,7 +73,7 @@ pub(super) async fn list_api_sessions(
 
 pub(super) async fn get_session(
     params: Params,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<ApiSession>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
@@ -100,7 +100,7 @@ pub(super) async fn get_session(
 
 pub(super) async fn get_session_context_debug(
     params: Params,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<SessionContextDebugResponse>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
@@ -140,7 +140,7 @@ pub(super) async fn get_session_context_debug(
 
 pub(super) async fn get_session_tasks(
     params: Params,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<SessionTasksPayload>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
     let paths = super::helpers::load_session_paths(&state, &id).await?;
@@ -167,7 +167,7 @@ pub(super) async fn get_session_tasks(
 pub(super) async fn set_session_plan_state(
     params: Params,
     Json(payload): Json<SessionPlanStateRequest>,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<SessionPlanStateResponse>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
     let runtime = state
@@ -183,7 +183,7 @@ pub(super) async fn set_session_plan_state(
 pub(super) async fn save_session_tasks(
     params: Params,
     Json(payload): Json<SessionTasksPayload>,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<SessionTasksPayload>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
     let paths = super::helpers::load_session_paths(&state, &id).await?;
@@ -249,7 +249,7 @@ const fn map_llm_role(role: LlmRole) -> &'static str {
 /// Shared by the regular create-session endpoint and notification callbacks,
 /// which open a fresh conversation in the originating profile.
 pub(super) async fn create_session_for_profile(
-    state: &Arc<UiServerState>,
+    state: &Arc<DaemonState>,
     profile_id: Option<&str>,
     model: &str,
 ) -> SkyResult<String> {
@@ -291,7 +291,7 @@ pub(super) async fn create_session_for_profile(
 
 pub(super) async fn create_session(
     Json(req): Json<CreateSessionRequest>,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<ApiSession>> {
     let requested_profile_id = req.profile_id.clone();
     let model = {
@@ -333,7 +333,7 @@ pub(super) async fn create_session(
 pub(super) async fn update_session(
     params: Params,
     Json(req): Json<UpdateSessionRequest>,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<ApiSession>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
     let db = state.db();
@@ -407,7 +407,7 @@ pub(super) async fn update_session(
 
 pub(super) async fn delete_session(
     params: Params,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<ApiHealth>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
     let db = state.db();
@@ -432,7 +432,7 @@ pub(super) async fn delete_session(
 }
 
 pub(super) async fn delete_all_sessions(
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<ApiHealth>> {
     // Delete all from DB
     let db = state.db();

@@ -13,7 +13,7 @@ use skyzen::{Result as SkyResult, StatusCode};
 use super::chat::spawn_follow_up_runs;
 use super::error::{internal_error, internal_error_message};
 use super::error_chain::error_chain_text;
-use super::state::UiServerState;
+use super::state::DaemonState;
 use super::types::BrowserTakeoverResponse;
 use crate::ui_event_bus::UiEventTopics;
 
@@ -85,7 +85,7 @@ pub(super) enum EnsureBrowserRuntimeError {
 }
 
 pub(super) async fn ensure_browser_runtime_started(
-    state: &UiServerState,
+    state: &DaemonState,
 ) -> Result<Arc<crate::container::browser::BrowserManager>, EnsureBrowserRuntimeError> {
     let browser_manager = state
         .browser_manager()
@@ -106,7 +106,7 @@ pub(super) async fn ensure_browser_runtime_started(
 }
 
 pub(super) async fn browser_status(
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<BrowserStatus>> {
     let enabled = state.config_snapshot().browser.enabled;
     let owner_session_id = state.browser_owner_session_id();
@@ -135,7 +135,7 @@ pub(super) async fn browser_status(
 }
 
 pub(super) async fn browser_start(
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<BrowserStatus>> {
     let tokio_handle = state.tokio_handle.clone();
     let response = tokio_handle
@@ -151,7 +151,7 @@ pub(super) async fn browser_start(
 }
 
 pub(super) async fn browser_stop(
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<BrowserStatus>> {
     let tokio_handle = state.tokio_handle.clone();
     let response = tokio_handle
@@ -172,7 +172,7 @@ pub(super) async fn browser_stop(
 /// Server responds with SDP answer containing ICE candidates.
 /// After this single round-trip, WebRTC media/data flows directly.
 pub(super) async fn browser_offer(
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
     Json(req): Json<WebRtcOfferRequest>,
 ) -> SkyResult<Json<WebRtcAnswerResponse>> {
     let tokio_handle = state.tokio_handle.clone();
@@ -188,7 +188,7 @@ pub(super) async fn browser_offer(
     Ok(Json(response))
 }
 
-async fn run_browser_start(state: Arc<UiServerState>) -> SkyResult<BrowserStatus> {
+async fn run_browser_start(state: Arc<DaemonState>) -> SkyResult<BrowserStatus> {
     let bm = ensure_browser_runtime_started(state.as_ref())
         .await
         .map_err(|error| {
@@ -214,7 +214,7 @@ async fn run_browser_start(state: Arc<UiServerState>) -> SkyResult<BrowserStatus
     })
 }
 
-async fn run_browser_stop(state: Arc<UiServerState>) -> SkyResult<BrowserStatus> {
+async fn run_browser_stop(state: Arc<DaemonState>) -> SkyResult<BrowserStatus> {
     let Some(bm) = state.browser_manager() else {
         return Err(skyzen::Error::msg("Browser automation is not enabled")
             .set_status(StatusCode::NOT_FOUND));
@@ -238,7 +238,7 @@ async fn run_browser_stop(state: Arc<UiServerState>) -> SkyResult<BrowserStatus>
 }
 
 async fn run_browser_offer(
-    state: Arc<UiServerState>,
+    state: Arc<DaemonState>,
     req: WebRtcOfferRequest,
 ) -> SkyResult<WebRtcAnswerResponse> {
     let Some(bm) = state.browser_manager() else {
@@ -264,7 +264,7 @@ async fn run_browser_offer(
 
 /// Resize the rendered viewport to follow the panel size on the client.
 pub(super) async fn browser_resize_viewport(
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
     Json(req): Json<BrowserResizeViewportRequest>,
 ) -> SkyResult<Json<BrowserResizeViewportResponse>> {
     let Some(bm) = state.browser_manager() else {
@@ -285,7 +285,7 @@ pub(super) async fn browser_resize_viewport(
 
 /// Mark that user has taken over browser control for a session.
 pub(super) async fn browser_takeover_start(
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
     Json(req): Json<BrowserTakeoverRequest>,
 ) -> SkyResult<Json<BrowserTakeoverResponse>> {
     let session_id = req.session_id.trim();
@@ -320,7 +320,7 @@ pub(super) async fn browser_takeover_start(
 
 /// Release browser takeover for a session and enqueue post-takeover alert.
 pub(super) async fn browser_takeover_stop(
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
     Json(req): Json<BrowserTakeoverRequest>,
 ) -> SkyResult<Json<BrowserTakeoverResponse>> {
     let session_id = req.session_id.trim();

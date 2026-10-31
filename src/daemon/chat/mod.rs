@@ -52,7 +52,7 @@ use super::error::internal_error;
 use super::error_chain::error_chain_text;
 use super::helpers::{RETRY_BACKOFF_MS, elapsed_ms_saturating, truncate_preview};
 use super::model_resolution::resolve_default_model;
-use super::state::{UiServerState, UiToolQueues};
+use super::state::{DaemonState, UiToolQueues};
 use super::terminal_parsing::update_terminal_snapshot_from_tool_event;
 use super::title_generation;
 use super::types::{
@@ -122,14 +122,14 @@ trait ChatSink {
         id: &str,
         name: &str,
         arguments_fragment: &str,
-        summary: crate::ui_server::tool_summary::ToolSummary,
+        summary: crate::daemon::tool_summary::ToolSummary,
     ) -> impl Future<Output = bool> + Send;
     fn on_tool_start(
         &mut self,
         id: &str,
         name: &str,
         arguments: &str,
-        summary: crate::ui_server::tool_summary::ToolSummary,
+        summary: crate::daemon::tool_summary::ToolSummary,
     ) -> impl Future<Output = bool> + Send;
     fn on_tool_end(
         &mut self,
@@ -137,7 +137,7 @@ trait ChatSink {
         name: &str,
         arguments: Option<&str>,
         result: &ToolResult,
-        summary: crate::ui_server::tool_summary::ToolSummary,
+        summary: crate::daemon::tool_summary::ToolSummary,
     ) -> impl Future<Output = bool> + Send;
     fn on_todo_update(
         &mut self,
@@ -165,7 +165,7 @@ struct HubSink {
 }
 
 impl HubSink {
-    fn new(state: &UiServerState, req: &ChatRequest) -> Self {
+    fn new(state: &DaemonState, req: &ChatRequest) -> Self {
         state.turn_hub.begin_turn(&req.session_id);
         Self {
             hub: state.turn_hub.clone(),
@@ -320,7 +320,7 @@ impl ChatSink for HubSink {
         id: &str,
         name: &str,
         arguments_fragment: &str,
-        summary: crate::ui_server::tool_summary::ToolSummary,
+        summary: crate::daemon::tool_summary::ToolSummary,
     ) -> bool {
         let seq = self.next_seq();
         self.publish_turn(
@@ -343,7 +343,7 @@ impl ChatSink for HubSink {
         id: &str,
         name: &str,
         arguments: &str,
-        summary: crate::ui_server::tool_summary::ToolSummary,
+        summary: crate::daemon::tool_summary::ToolSummary,
     ) -> bool {
         let seq = self.next_seq();
         self.publish_turn(
@@ -367,7 +367,7 @@ impl ChatSink for HubSink {
         name: &str,
         arguments: Option<&str>,
         result: &ToolResult,
-        summary: crate::ui_server::tool_summary::ToolSummary,
+        summary: crate::daemon::tool_summary::ToolSummary,
     ) -> bool {
         let seq = self.next_seq();
         self.publish_turn(
@@ -475,13 +475,13 @@ fn project_tool_summary_for_sink(
     id: &str,
     name: &str,
     fallback: Option<&str>,
-) -> crate::ui_server::tool_summary::ToolSummary {
+) -> crate::daemon::tool_summary::ToolSummary {
     let raw = pending_streams
         .get(id)
         .map(|p| p.buffered_arguments.as_str())
         .or(fallback)
         .unwrap_or("");
-    crate::ui_server::tool_summary::project_tool_summary(raw, ToolVariant::infer(name))
+    crate::daemon::tool_summary::project_tool_summary(raw, ToolVariant::infer(name))
 }
 
 fn normalize_tool_delta_for_sink(
@@ -733,7 +733,7 @@ pub fn api_attachments_from_persisted(
 
 /// Record that the run is executing again after a wait, as the lease holder.
 async fn mark_run_running(
-    state: &Arc<UiServerState>,
+    state: &Arc<DaemonState>,
     fence: &RunFence,
 ) -> Result<(), crate::db::ChatDbError> {
     state
@@ -743,7 +743,7 @@ async fn mark_run_running(
 }
 
 async fn set_terminal_runtime_state(
-    state: &Arc<UiServerState>,
+    state: &Arc<DaemonState>,
     session_id: &str,
     terminal: TerminalRuntimeState,
 ) -> Result<(), crate::db::ChatDbError> {
@@ -755,7 +755,7 @@ async fn set_terminal_runtime_state(
 }
 
 async fn clear_terminal_runtime_state(
-    state: &Arc<UiServerState>,
+    state: &Arc<DaemonState>,
     session_id: &str,
 ) -> Result<(), crate::db::ChatDbError> {
     state
@@ -765,7 +765,7 @@ async fn clear_terminal_runtime_state(
         .map(|_| ())
 }
 
-pub(super) fn spawn_follow_up_runs(state: Arc<UiServerState>, session_id: String) {
+pub(super) fn spawn_follow_up_runs(state: Arc<DaemonState>, session_id: String) {
     let tokio_handle = state.tokio_handle.clone();
     tokio_handle.spawn(async move {
         let guard = match state.runtime_service.runs().acquire(&session_id).await {
@@ -783,14 +783,14 @@ pub(super) fn spawn_follow_up_runs(state: Arc<UiServerState>, session_id: String
 }
 
 /// Continue a run that [`SessionRunGuard::finish`] re-acquired for pending work.
-fn spawn_continued_run(state: Arc<UiServerState>, guard: SessionRunGuard) {
+fn spawn_continued_run(state: Arc<DaemonState>, guard: SessionRunGuard) {
     let tokio_handle = state.tokio_handle.clone();
     tokio_handle.spawn(dispatch_follow_ups(state, guard));
 }
 
 /// Run the session's pending messages one after another under `guard`,
 /// until the queue is empty and finishing the guard finds no new work.
-async fn dispatch_follow_ups(state: Arc<UiServerState>, mut guard: SessionRunGuard) {
+async fn dispatch_follow_ups(state: Arc<DaemonState>, mut guard: SessionRunGuard) {
     let session_id = guard.session_id().to_string();
     loop {
         let next = match state.runtime_service.take_next_for_run(&session_id).await {
@@ -846,7 +846,7 @@ async fn finish_failed_run(guard: SessionRunGuard) {
 }
 
 pub(super) async fn resume_pending_follow_up_runs(
-    state: Arc<UiServerState>,
+    state: Arc<DaemonState>,
 ) -> Result<(), crate::db::ChatDbError> {
     let session_ids = state.db().sessions_requiring_pending_dispatch().await?;
     for session_id in session_ids {
@@ -957,7 +957,7 @@ pub(super) async fn queue_waiting_turn_resume(
 }
 
 pub(super) async fn schedule_waiting_turn_resume(
-    state: &Arc<UiServerState>,
+    state: &Arc<DaemonState>,
     session_id: &str,
     request_kind: ResumeRequestKind,
     resolution: ResumeResolution,
@@ -974,7 +974,7 @@ pub(super) async fn schedule_waiting_turn_resume(
 }
 
 async fn schedule_browser_takeover_resume(
-    state: &Arc<UiServerState>,
+    state: &Arc<DaemonState>,
     session_id: &str,
 ) -> Result<crate::session::SessionRuntimeSummary, crate::db::ChatDbError> {
     let pending = PendingUserMessage {
@@ -994,7 +994,7 @@ async fn schedule_browser_takeover_resume(
         .await
 }
 
-async fn record_request_log(state: &Arc<UiServerState>, entry: RequestLogEntry) {
+async fn record_request_log(state: &Arc<DaemonState>, entry: RequestLogEntry) {
     let db = state.db();
     if let Err(error) = db
         .append_request_log(crate::db::RequestLogParams {
@@ -1026,7 +1026,7 @@ async fn record_request_log(state: &Arc<UiServerState>, entry: RequestLogEntry) 
 
 pub(super) async fn enqueue_chat(
     Json(req): Json<ChatRequest>,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<SessionRuntimeResponse>> {
     let pending = pending_user_message_from_request(req.clone());
     let runtime = state
@@ -1044,7 +1044,7 @@ pub(super) async fn enqueue_chat(
 pub(super) async fn remove_pending_message(
     params: skyzen::routing::Params,
     Json(req): Json<RemovePendingMessageRequest>,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<SessionRuntimeResponse>> {
     let session_id = params
         .get("id")
@@ -1072,7 +1072,7 @@ pub(super) async fn remove_pending_message(
 
 pub(super) async fn stop_session_run(
     params: skyzen::routing::Params,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<SessionRuntimeResponse>> {
     let session_id = params
         .get("id")
@@ -1114,7 +1114,7 @@ pub(super) async fn stop_session_run(
 pub(super) async fn send_message(
     params: skyzen::routing::Params,
     Json(mut req): Json<ChatRequest>,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<SessionRuntimeResponse>> {
     let session_id = params
         .get("id")
@@ -1158,7 +1158,7 @@ pub(super) async fn send_message(
     Ok(Json(runtime.into()))
 }
 
-pub(super) fn spawn_shared_tool_dispatchers(state: Arc<UiServerState>, queues: UiToolQueues) {
+pub(super) fn spawn_shared_tool_dispatchers(state: Arc<DaemonState>, queues: UiToolQueues) {
     let UiToolQueues {
         task,
         notify,
@@ -1224,7 +1224,7 @@ pub(super) fn spawn_shared_tool_dispatchers(state: Arc<UiServerState>, queues: U
 /// boxed it itself would reserve room for it in its own poll frame, which a
 /// debug build keeps on the stack under every provider request.
 fn run_agent_loop<'a>(
-    state: &'a Arc<UiServerState>,
+    state: &'a Arc<DaemonState>,
     req: &'a ChatRequest,
     sink: &'a mut impl ChatSink,
     guard: &'a SessionRunGuard,
@@ -1887,7 +1887,7 @@ fn run_agent_loop<'a>(
 /// commands that need the model (`wake`). Nothing runs when the session is
 /// busy: the turn holding it continues with the same agent and sees them.
 pub(super) async fn start_background_turn(
-    state: &Arc<UiServerState>,
+    state: &Arc<DaemonState>,
     session_id: &str,
     wake: aither_agent::BackgroundWake,
 ) {
@@ -1922,7 +1922,7 @@ pub(super) async fn start_background_turn(
 }
 
 async fn run_published_turn(
-    state: Arc<UiServerState>,
+    state: Arc<DaemonState>,
     req: ChatRequest,
     guard: SessionRunGuard,
     kind: TurnKind,
@@ -1983,7 +1983,7 @@ async fn run_published_turn(
 /// suppresses network emission. The caller keeps the run's guard and settles
 /// it once the queue is drained.
 async fn run_chat_collect_with_receiver(
-    state: Arc<UiServerState>,
+    state: Arc<DaemonState>,
     req: ChatRequest,
     persist_user_message: bool,
     use_persisted_context_snapshot: bool,
@@ -2026,7 +2026,7 @@ async fn run_chat_collect_with_receiver(
     }
 }
 
-async fn schedule_profile_memory_processing(state: &Arc<UiServerState>, profile_id: Option<&str>) {
+async fn schedule_profile_memory_processing(state: &Arc<DaemonState>, profile_id: Option<&str>) {
     let Some(profile_id) = profile_id else {
         return;
     };
@@ -2037,7 +2037,7 @@ async fn schedule_profile_memory_processing(state: &Arc<UiServerState>, profile_
 }
 
 async fn persist_latest_assistant_stats(
-    state: &Arc<UiServerState>,
+    state: &Arc<DaemonState>,
     session_id: &SessionId,
     provider_id: &str,
     usage: &Usage,
@@ -2096,7 +2096,7 @@ fn map_context_debug_message(message: &LlmMessage) -> crate::db::ContextDebugSna
 }
 
 async fn persist_context_debug_snapshot(
-    state: &Arc<UiServerState>,
+    state: &Arc<DaemonState>,
     session_id: &SessionId,
     model: &str,
     provider_id: &str,
@@ -2128,7 +2128,7 @@ async fn persist_context_debug_snapshot(
 }
 
 fn enqueue_event_triggered_tasks(
-    state: &Arc<UiServerState>,
+    state: &Arc<DaemonState>,
     session_id: &SessionId,
     profile_id: Option<&str>,
 ) {
@@ -2373,7 +2373,7 @@ impl From<skyzen::Error> for ChatCollectError {
 // ── Agent preparation: decomposed steps ───────────────────
 
 async fn resolve_session_context(
-    state: &Arc<UiServerState>,
+    state: &Arc<DaemonState>,
     req: &ChatRequest,
     fence: &RunFence,
     persist_user_message: bool,
@@ -2601,7 +2601,7 @@ fn parse_reasoning_effort_token(token: &str) -> Option<aither_core::llm::model::
 }
 
 fn session_paths_for_session(
-    state: &UiServerState,
+    state: &DaemonState,
     profile_id: Option<&str>,
     session_id: &SessionId,
 ) -> SessionPaths {
@@ -2648,7 +2648,7 @@ async fn push_hidden_context_part(
 }
 
 async fn setup_agent_environment(
-    state: &Arc<UiServerState>,
+    state: &Arc<DaemonState>,
     ctx: &SessionContext,
 ) -> Result<
     (
@@ -2785,7 +2785,7 @@ async fn setup_agent_environment(
 }
 
 fn spawn_ask_user_forwarder(
-    state: &Arc<UiServerState>,
+    state: &Arc<DaemonState>,
     session_id: &SessionId,
 ) -> ask_user::AskUserBroker {
     let (ask_user_broker, ask_user_queue) = ask_user::channel();
@@ -2803,7 +2803,7 @@ fn spawn_ask_user_forwarder(
 }
 
 fn spawn_workspace_forwarder(
-    state: &Arc<UiServerState>,
+    state: &Arc<DaemonState>,
     session_id: &SessionId,
 ) -> crate::workspace_request::WorkspaceRequestBroker {
     let (workspace_broker, workspace_queue) = crate::workspace_request::channel();
@@ -2828,7 +2828,7 @@ fn spawn_workspace_forwarder(
     workspace_broker
 }
 
-fn build_tool_brokers(state: &Arc<UiServerState>, session_id: &SessionId) -> ToolBrokers {
+fn build_tool_brokers(state: &Arc<DaemonState>, session_id: &SessionId) -> ToolBrokers {
     ToolBrokers {
         workspace: spawn_workspace_forwarder(state, session_id),
         ask_user: spawn_ask_user_forwarder(state, session_id),
@@ -2840,7 +2840,7 @@ fn build_tool_brokers(state: &Arc<UiServerState>, session_id: &SessionId) -> Too
     }
 }
 
-fn session_host(state: &UiServerState) -> crate::agent_link::SessionHost {
+fn session_host(state: &DaemonState) -> crate::agent_link::SessionHost {
     crate::agent_link::SessionHost {
         may_dir: state.may_dir.clone(),
         cwd: state.cwd.clone(),
@@ -2849,7 +2849,7 @@ fn session_host(state: &UiServerState) -> crate::agent_link::SessionHost {
 }
 
 fn wake_by_follow_up_run(
-    state: &Arc<UiServerState>,
+    state: &Arc<DaemonState>,
     session_id: &str,
 ) -> impl Fn() + Send + Sync + 'static + use<> {
     let state = state.clone();
@@ -2860,7 +2860,7 @@ fn wake_by_follow_up_run(
 /// Makes a session the server can receive turns for discoverable by other main
 /// agents, whether or not it has run a turn yet.
 pub(super) async fn open_session_for_agents(
-    state: &Arc<UiServerState>,
+    state: &Arc<DaemonState>,
     session_id: &str,
     profile_id: Option<&str>,
 ) -> Result<(), crate::agent_link::AgentLinkError> {
@@ -2877,7 +2877,7 @@ pub(super) async fn open_session_for_agents(
 
 /// Makes every stored session that is not archived discoverable.
 pub(super) async fn open_all_sessions_for_agents(
-    state: &Arc<UiServerState>,
+    state: &Arc<DaemonState>,
 ) -> Result<(), crate::agent_link::AgentLinkError> {
     state
         .agent_listeners
@@ -2890,7 +2890,7 @@ pub(super) async fn open_all_sessions_for_agents(
 /// Makes the session discoverable by other main agents on this machine and
 /// dispatches the messages they store for it.
 async fn listen_for_agent_messages(
-    state: &Arc<UiServerState>,
+    state: &Arc<DaemonState>,
     session_id: &str,
     cwd: &std::path::Path,
     sandbox_dir: &std::path::Path,
@@ -2914,7 +2914,7 @@ async fn listen_for_agent_messages(
 ///
 /// Built on the heap for the reason given on [`run_agent_loop`].
 fn prepare_agent_for_request<'a>(
-    state: &'a Arc<UiServerState>,
+    state: &'a Arc<DaemonState>,
     req: &'a ChatRequest,
     fence: &'a RunFence,
     persist_user_message: bool,
@@ -3001,7 +3001,7 @@ fn prepare_agent_for_request<'a>(
 /// Builds the session's agent for `ctx` and restores its conversation, for a
 /// turn that has no idle agent to continue with.
 fn build_session_agent<'a>(
-    state: &'a Arc<UiServerState>,
+    state: &'a Arc<DaemonState>,
     config: &'a crate::config::MayConfig,
     ctx: &'a SessionContext,
     provider_attempt: usize,
@@ -3176,7 +3176,7 @@ async fn check_tasks_update(
     Some(checklist)
 }
 
-async fn is_takeover_active_for_session(state: &UiServerState, session_id: &SessionId) -> bool {
+async fn is_takeover_active_for_session(state: &DaemonState, session_id: &SessionId) -> bool {
     match state
         .runtime_service
         .has_browser_takeover(session_id.as_str())
@@ -3190,7 +3190,7 @@ async fn is_takeover_active_for_session(state: &UiServerState, session_id: &Sess
     }
 }
 
-async fn take_over_alert_pending(state: &UiServerState, session_id: &SessionId) -> bool {
+async fn take_over_alert_pending(state: &DaemonState, session_id: &SessionId) -> bool {
     match state
         .runtime_service
         .take_browser_takeover_alert_pending(session_id.as_str())

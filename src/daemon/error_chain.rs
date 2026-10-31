@@ -1,5 +1,5 @@
 //! Shared helper for formatting `std::error::Error` chains as a single
-//! colon-separated line. Kept next to its only callers in `ui_server`.
+//! colon-separated line. Kept next to its only callers in `daemon`.
 
 use std::error::Error;
 
@@ -8,7 +8,7 @@ use std::error::Error;
 ///
 /// Example: a `Foo` error that wraps a `Bar` error that wraps `io::Error`
 /// renders as `"foo: bar: io error"`. This is the format most of the
-/// HTTP/SSE error responses in `ui_server` want when returning a surfaced
+/// HTTP/SSE error responses in `daemon` want when returning a surfaced
 /// error string to the frontend.
 pub fn error_chain_text(error: &dyn Error) -> String {
     let mut chain = vec![error.to_string()];

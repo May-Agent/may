@@ -21,7 +21,7 @@ use crate::client::{
     DaemonClient, RunEnd, SessionAgentBody, SessionAgentFrame, WireAgentEvent, session_path,
 };
 use crate::tui::event::{AppEvent, EventSender};
-use crate::ui_server::{CompactResponse, ContextDumpResponse};
+use crate::daemon::{CompactResponse, ContextDumpResponse};
 
 /// Wait before reopening a dropped event stream.
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);

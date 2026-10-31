@@ -15,7 +15,7 @@ use skyzen::{Error as SkyError, Result as SkyResult, StatusCode};
 use crate::session::{MayHomePaths, SessionPaths};
 
 use super::error::{bad_request_error, internal_error};
-use super::state::UiServerState;
+use super::state::DaemonState;
 
 pub(super) async fn send_event<T: Serialize + Sync>(
     sender: &skyzen::responder::sse::Sender,
@@ -32,7 +32,7 @@ pub(super) async fn send_event<T: Serialize + Sync>(
 }
 
 pub(super) async fn load_session_paths(
-    state: &UiServerState,
+    state: &DaemonState,
     session_id: &str,
 ) -> SkyResult<SessionPaths> {
     let session = state
