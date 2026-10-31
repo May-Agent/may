@@ -21,6 +21,8 @@ import {
 } from '@/lib/api/tasks';
 import { useTranslation } from '@/lib/i18n';
 import { useSessionsStore } from '@/lib/stores/sessions';
+import { useInspectorStore } from '@/lib/stores/inspector';
+import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import type { SessionPlanState } from '@/lib/types';
 import { cn } from '@/lib/utils';
 
@@ -38,6 +40,8 @@ export function PlanBanner({ sessionId, planState }: PlanBannerProps) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState('');
   const [busy, setBusy] = useState(false);
+  const [discarding, setDiscarding] = useState(false);
+  const setInspectorTasks = useInspectorStore((s) => s.setTasks);
 
   useEffect(() => {
     let cancelled = false;
@@ -54,7 +58,9 @@ export function PlanBanner({ sessionId, planState }: PlanBannerProps) {
     };
   }, [sessionId, planState]);
 
-  if (planState === 'disabled' && !content) return null;
+  // The banner exists for the one decision only the user can make: approving
+  // a draft plan. An approved plan lives in the inspector.
+  if (planState !== 'draft' && !editing) return null;
   if (loading && !content) return null;
 
   const approved = planState === 'approved';
@@ -78,6 +84,7 @@ export function PlanBanner({ sessionId, planState }: PlanBannerProps) {
     try {
       const res = await putSessionTasks(sessionId, { content: draft, planState: 'draft' });
       setContent(res.content);
+      setInspectorTasks(sessionId, res.content, 'draft');
       updateRuntime(sessionId, { planState: 'draft' });
       setEditing(false);
     } catch (err) {
@@ -101,15 +108,25 @@ export function PlanBanner({ sessionId, planState }: PlanBannerProps) {
         'border-b border-border bg-gradient-to-b from-card/40 to-transparent',
       )}
     >
-      <div className="mx-auto w-full max-w-3xl px-6 py-3">
+      <ConfirmDialog
+        open={discarding}
+        onOpenChange={setDiscarding}
+        title={t('plan.discardTitle')}
+        description={t('plan.discardBody')}
+        confirmLabel={t('chat.discardPlan')}
+        destructive
+        onConfirm={() => transition('disabled')}
+      />
+      <div className="mx-auto w-full max-w-3xl px-4 py-3 sm:px-6">
         <div className="flex items-start gap-2">
           <button
             type="button"
             onClick={() => setExpanded((v) => !v)}
-            className="mt-0.5 text-muted-foreground transition-colors hover:text-foreground"
-            aria-label={expanded ? 'Collapse plan' : 'Expand plan'}
+            className="-m-1.5 flex size-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground touch:size-11"
+            aria-label={expanded ? t('plan.collapse') : t('plan.expand')}
+            aria-expanded={expanded}
           >
-            {expanded ? <ChevronDown className="size-3.5" /> : <ChevronRight className="size-3.5" />}
+            {expanded ? <ChevronDown className="size-4" /> : <ChevronRight className="size-4" />}
           </button>
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
@@ -138,7 +155,7 @@ export function PlanBanner({ sessionId, planState }: PlanBannerProps) {
             {expanded && !editing && (
               <div className="mt-2 max-h-64 overflow-y-auto rounded-md border border-border/60 bg-background/40 px-3 py-2 text-sm">
                 {content.trim().length === 0 ? (
-                  <div className="text-xs text-muted-foreground">No plan content yet.</div>
+                  <div className="text-xs text-muted-foreground">{t('plan.noContent')}</div>
                 ) : (
                   <div className="prose prose-sm dark:prose-invert max-w-none prose-headings:mb-1 prose-p:my-1 prose-ul:my-1">
                     <Streamdown>{content}</Streamdown>
@@ -166,22 +183,25 @@ export function PlanBanner({ sessionId, planState }: PlanBannerProps) {
                     {t('chat.approvePlan')}
                   </Button>
                 )}
-                {approved && (
-                  <Button size="sm" variant="outline" onClick={() => transition('draft')} disabled={busy}>
-                    Edit draft
-                  </Button>
-                )}
-                <Button size="icon" variant="ghost" onClick={beginEdit} aria-label="Edit plan">
-                  <Pencil className="size-3.5" />
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  onClick={beginEdit}
+                  aria-label={t('plan.edit')}
+                  title={t('plan.edit')}
+                >
+                  <Pencil />
                 </Button>
                 <Button
                   size="icon"
                   variant="ghost"
-                  onClick={() => transition('disabled')}
+                  className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+                  onClick={() => setDiscarding(true)}
                   disabled={busy}
                   aria-label={t('chat.discardPlan')}
+                  title={t('chat.discardPlan')}
                 >
-                  <Trash2 className="size-3.5" />
+                  <Trash2 />
                 </Button>
               </>
             ) : (
