@@ -105,12 +105,13 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
         .with_oneshot_overrides(args.model.clone(), args.reasoning_effort);
     // The run happens in the May daemon, like every TUI turn.
     let paths = may_agent::daemon::DaemonPaths::user()?;
-    let runtime_deps = runtime_deps.with_daemon(
-        may_agent::daemon::lifecycle::ensure_running(&paths, |line| {
-            let _ = writeln!(io::stderr(), "[may] {line}");
-        })
-        .await?,
-    );
+    let daemon_client = may_agent::daemon::lifecycle::ensure_running(&paths, |line| {
+        let _ = writeln!(io::stderr(), "[may] {line}");
+    })
+    .await?;
+    app.btw_daemon = Some(daemon_client.clone());
+    app.session_manager.attach_daemon(daemon_client.clone());
+    let runtime_deps = runtime_deps.with_daemon(daemon_client);
 
     let mut output = OneShotOutput::new(io::stdout(), io::stderr());
     let mut worker: Option<AgentWorker> = None;
