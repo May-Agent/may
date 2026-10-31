@@ -776,6 +776,9 @@ impl ApiSession {
 #[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateSessionRequest {
+    /// Session id the caller pre-generated; a fresh one is assigned otherwise.
+    #[serde(default)]
+    pub(crate) id: Option<String>,
     #[serde(default)]
     pub(crate) model: Option<String>,
     #[serde(default)]
@@ -783,6 +786,15 @@ pub struct CreateSessionRequest {
     /// Host directory the session works in (the TUI's launch directory).
     #[serde(default)]
     pub(crate) cwd: Option<String>,
+}
+
+/// Request to truncate a session's history at a stored row.
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RewindRequest {
+    /// Index into the session's stored message list where the cut starts;
+    /// it and every row after it are deleted.
+    pub(crate) index: usize,
 }
 
 #[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
@@ -798,6 +810,14 @@ pub struct UpdateSessionRequest {
     /// field present + string → `Some(NullableStringPatch::Set(s))` (set).
     #[serde(default, deserialize_with = "deserialize_present_patch")]
     pub(crate) reasoning_effort: Option<NullableStringPatch>,
+    /// Host directory the session works in; the worktree it belongs to is
+    /// touched for repo usage when set.
+    #[serde(default)]
+    pub(crate) cwd: Option<String>,
+    /// One-shot/non-interactive flag: set to refuse permission prompts
+    /// instead of asking.
+    #[serde(default)]
+    pub(crate) non_interactive: Option<bool>,
 }
 
 /// Deserialize a field that is present in the body, keeping an explicit `null`

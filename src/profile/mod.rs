@@ -100,7 +100,7 @@ impl core::str::FromStr for ContainerMountAccess {
 }
 
 /// A profile with its organized sessions.
-#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 pub struct ProfileSessions {
     /// The profile these sessions belong to.
     pub profile: ProfileInfo,
@@ -113,7 +113,7 @@ pub struct ProfileSessions {
 }
 
 /// Lightweight profile info (from DB model).
-#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ProfileInfo {
     /// Profile id.
@@ -184,7 +184,7 @@ impl ProfileInfo {
 ///
 /// Every profile owns exactly one home environment, and all session sandboxes
 /// and IPC-based terminal commands are rooted in that environment.
-#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(transparent)]
 pub struct HomeEnvironment(ProfileEnvironment);
 
@@ -227,7 +227,7 @@ impl AsRef<ProfileEnvironment> for HomeEnvironment {
 /// [`ProfileInfo::remote_attachments`]; agents reach them by invoking the
 /// `terminal` tool with `mode: "ssh"` and `ssh_server_id: <name>` rather than
 /// by treating the whole profile as remote.
-#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ProfileEnvironment {
     /// Run agents on the host.
@@ -253,7 +253,7 @@ impl ProfileEnvironment {
 }
 
 /// An item in the pinned section: either a bare session or a folder.
-#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum PinnedItem {
     /// A single pinned session (not grouped in a folder).
