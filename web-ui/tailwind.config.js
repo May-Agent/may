@@ -9,7 +9,18 @@ export default {
       screens: { '2xl': '1400px' },
     },
     extend: {
+      screens: {
+        // Touch-first devices: hit targets grow to the 44pt HIG minimum.
+        touch: { raw: '(pointer: coarse)' },
+      },
       colors: {
+        sidebar: {
+          DEFAULT: 'hsl(var(--sidebar))',
+          foreground: 'hsl(var(--sidebar-foreground))',
+        },
+        brand: 'hsl(var(--brand))',
+        success: 'hsl(var(--success))',
+        warning: 'hsl(var(--warning))',
         border: 'hsl(var(--border))',
         input: 'hsl(var(--input))',
         ring: 'hsl(var(--ring))',
@@ -50,8 +61,22 @@ export default {
         sm: 'calc(var(--radius) - 4px)',
       },
       fontFamily: {
-        sans: ['Inter', 'system-ui', '-apple-system', 'sans-serif'],
-        mono: ['"JetBrains Mono"', 'ui-monospace', 'SFMono-Regular', 'monospace'],
+        // The platform's system font: SF Pro on Apple platforms.
+        sans: [
+          '-apple-system',
+          'BlinkMacSystemFont',
+          '"SF Pro Text"',
+          '"SF Pro"',
+          'system-ui',
+          '"Segoe UI"',
+          'Roboto',
+          '"Helvetica Neue"',
+          'Arial',
+          'sans-serif',
+          '"Apple Color Emoji"',
+          '"Segoe UI Emoji"',
+        ],
+        mono: ['ui-monospace', '"SF Mono"', 'SFMono-Regular', 'Menlo', 'Consolas', 'monospace'],
       },
       keyframes: {
         shimmer: {

@@ -2,9 +2,13 @@
 //!
 //! After a turn, the session's agent stays in the daemon as an idle
 //! [`AgentWorker`]: it compacts the conversation when the provider's cache
-//! is about to expire, and answers `/compact`, `/context` and `/btw` without
-//! rebuilding. A new turn evicts it first, so an idle agent never acts on a
-//! conversation a turn has moved past.
+//! is about to expire, answers `/compact`, `/context` and `/btw` without
+//! rebuilding, and collects the background commands its turns detached.
+//! The next turn continues with the same agent ([`ParkedAgents::take`]), so
+//! the prompt cache stays warm and the commands keep running; it is rebuilt
+//! only when something the agent was built from changed. A detached command
+//! that finishes, or one blocked on stdin, starts a turn of its own
+//! ([`super::start_background_turn`]).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -14,7 +18,7 @@ use skyzen::routing::Params;
 use skyzen::utils::{Json, State};
 
 use crate::MayAgent;
-use crate::agent::{AgentWorker, TuiEvent, spawn_worker};
+use crate::agent::{AgentWorker, TuiEvent, spawn_idle_worker};
 use crate::ui_server::error::{
     bad_request_error, internal_error, internal_error_message, json_ok_response,
 };
@@ -23,7 +27,14 @@ use crate::ui_server::state::UiServerState;
 /// Idle agents of the sessions the daemon ran.
 #[derive(Default)]
 pub struct ParkedAgents {
-    workers: Mutex<HashMap<String, Arc<AgentWorker>>>,
+    workers: Mutex<HashMap<String, Parked>>,
+}
+
+/// One idle agent and what it was built from.
+struct Parked {
+    worker: Arc<AgentWorker>,
+    /// [`super::agent_build_key`] of the inputs the agent was built from.
+    build_key: u64,
 }
 
 impl std::fmt::Debug for ParkedAgents {
@@ -33,38 +44,82 @@ impl std::fmt::Debug for ParkedAgents {
 }
 
 impl ParkedAgents {
-    fn workers(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<AgentWorker>>> {
+    fn workers(&self) -> std::sync::MutexGuard<'_, HashMap<String, Parked>> {
         self.workers
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Keeps `agent` as `session_id`'s idle agent.
-    pub(crate) fn park(&self, state: &UiServerState, session_id: &str, agent: MayAgent) {
-        let worker = spawn_worker(
+    /// Keeps `agent`, built from inputs with `build_key`, as `session_id`'s
+    /// idle agent.
+    pub(crate) fn park(
+        &self,
+        state: &Arc<UiServerState>,
+        session_id: &str,
+        agent: MayAgent,
+        build_key: u64,
+    ) {
+        // One pending wake is enough: the agent's context holds every event
+        // a later wake would add, and the run it starts sees them all.
+        let (wakes, wake_rx) = async_channel::bounded(1);
+        let worker = spawn_idle_worker(
             executor_core::DefaultExecutor,
             agent,
             state.db(),
             state.runtime_service.runs().clone(),
+            Some(wakes),
         );
-        let previous = self
-            .workers()
-            .insert(session_id.to_string(), Arc::new(worker));
+        let previous = self.workers().insert(
+            session_id.to_string(),
+            Parked {
+                worker: Arc::new(worker),
+                build_key,
+            },
+        );
         if let Some(previous) = previous {
-            previous.shutdown();
+            previous.worker.shutdown();
         }
+        // Ends with the worker, which drops the sending half.
+        let wake_state = state.clone();
+        let session_id = session_id.to_string();
+        state.tokio_handle.spawn(async move {
+            while let Ok(wake) = wake_rx.recv().await {
+                super::start_background_turn(&wake_state, &session_id, wake).await;
+            }
+        });
     }
 
     /// Stops `session_id`'s idle agent, if any.
     pub(crate) fn evict(&self, session_id: &str) {
-        let worker = self.workers().remove(session_id);
-        if let Some(worker) = worker {
-            worker.shutdown();
+        let parked = self.workers().remove(session_id);
+        if let Some(parked) = parked {
+            parked.worker.shutdown();
         }
     }
 
+    /// Takes `session_id`'s idle agent for a turn. With `build_key`, an agent
+    /// built from other inputs is stopped instead and `None` returned, so the
+    /// turn builds a fresh one.
+    pub(crate) async fn take(&self, session_id: &str, build_key: Option<u64>) -> Option<MayAgent> {
+        let parked = self.workers().remove(session_id)?;
+        if build_key.is_some_and(|key| key != parked.build_key) {
+            parked.worker.shutdown();
+            return None;
+        }
+        let (reply, agent) = async_channel::bounded(1);
+        parked.worker.release(reply);
+        agent.recv().await.ok()
+    }
+
+    /// Whether `session_id` has an idle agent.
+    pub(crate) fn contains(&self, session_id: &str) -> bool {
+        self.workers().contains_key(session_id)
+    }
+
     fn get(&self, session_id: &str) -> Option<Arc<AgentWorker>> {
-        self.workers().get(session_id).cloned()
+        self.workers()
+            .get(session_id)
+            .map(|parked| parked.worker.clone())
     }
 }
 
@@ -91,16 +146,27 @@ async fn idle_agent(state: &Arc<UiServerState>, session_id: &str) -> SkyResult<A
         hidden_context_xml: None,
         delivery_mode: crate::session::PendingUserMessageMode::default(),
     };
-    let prepared = super::prepare_agent_for_request(state, &request, guard.fence(), false, true, 0)
-        .await
-        .map_err(internal_error);
+    let prepared = super::prepare_agent_for_request(
+        state,
+        &request,
+        guard.fence(),
+        false,
+        true,
+        0,
+        &super::TurnKind::Prompt,
+    )
+    .await
+    .map_err(internal_error);
     if let Err(error) = guard
         .finish_idle(crate::session::RunOutcome::Completed)
         .await
     {
         tracing::warn!(%session_id, %error, "failed to release the session after building its agent");
     }
-    state.parked_agents.park(state, session_id, prepared?.agent);
+    let prepared = prepared?;
+    state
+        .parked_agents
+        .park(state, session_id, prepared.agent, prepared.build_key);
     state
         .parked_agents
         .get(session_id)

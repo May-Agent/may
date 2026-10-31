@@ -26,6 +26,8 @@ pub mod reducer;
 pub mod remote;
 /// Agent worker runtime glue for the TUI.
 pub mod runtime;
+/// Right sidebar state: task tree, linked issues.
+pub mod sidebar;
 /// UI mode and per-mode state types.
 pub mod state;
 /// Rendering layer for the TUI.

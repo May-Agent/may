@@ -51,7 +51,7 @@ export function SlidevArtifact({ sessionId, path }: SlidevArtifactProps) {
   return (
     <section className="not-prose mt-3 overflow-hidden rounded-xl border border-border bg-card/40">
       <div className="flex items-center gap-3 border-b border-border px-4 py-3">
-        <div className="flex size-9 items-center justify-center rounded-lg bg-primary/10 text-primary">
+        <div className="flex size-9 items-center justify-center rounded-md bg-muted text-muted-foreground">
           <Presentation className="size-4.5" />
         </div>
         <div className="min-w-0 flex-1">

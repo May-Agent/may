@@ -22,6 +22,7 @@ import { useTranslation } from '@/lib/i18n';
 import type { ArtifactEntry } from '@/lib/types';
 import { cn } from '@/lib/utils';
 import { useArtifactValidation } from '@/lib/useArtifactValidation';
+import { formatBytes } from '@/lib/formatBytes';
 import { ArtifactValidationStatus } from './ArtifactValidationStatus';
 
 interface ArtifactsDrawerProps {
@@ -29,9 +30,11 @@ interface ArtifactsDrawerProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   initialCount?: number;
+  /** Open straight to this file's preview. */
+  initialPath?: string | null;
 }
 
-export function ArtifactsDrawer({ sessionId, open, onOpenChange }: ArtifactsDrawerProps) {
+export function ArtifactsDrawer({ sessionId, open, onOpenChange, initialPath = null }: ArtifactsDrawerProps) {
   const { t } = useTranslation();
   const [entries, setEntries] = useState<ArtifactEntry[]>([]);
   const [loading, setLoading] = useState(true);
@@ -40,12 +43,17 @@ export function ArtifactsDrawer({ sessionId, open, onOpenChange }: ArtifactsDraw
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
+    let selectedOnce = false;
     const load = async () => {
       try {
         const res = await listArtifacts(sessionId);
         if (!cancelled) {
           setEntries(res.artifacts);
           setLoading(false);
+          if (initialPath && !selectedOnce) {
+            selectedOnce = true;
+            setSelected(res.artifacts.find((a) => a.path === initialPath) ?? null);
+          }
         }
       } catch {
         if (!cancelled) setLoading(false);
@@ -72,7 +80,7 @@ export function ArtifactsDrawer({ sessionId, open, onOpenChange }: ArtifactsDraw
       cancelled = true;
       controller.abort();
     };
-  }, [sessionId, open]);
+  }, [sessionId, open, initialPath]);
 
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
@@ -363,9 +371,3 @@ const CODE_EXT = new Set([
 ]);
 const TEXT_EXT = new Set(['txt', 'log', 'csv', 'tsv', 'ini', 'conf', 'env']);
 
-function formatBytes(n: number): string {
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(1)} MB`;
-  return `${(n / (1024 * 1024 * 1024)).toFixed(1)} GB`;
-}

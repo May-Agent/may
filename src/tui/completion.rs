@@ -29,6 +29,7 @@ pub enum CompletionMode {
 
 /// Slash command definitions.
 pub static SLASH_COMMANDS: &[(&str, &str)] = &[
+    ("/help", "Show commands and shortcuts"),
     ("/session", "Switch or create sessions"),
     ("/new", "Start a new session"),
     ("/profile", "Switch profile (Ctrl+P)"),

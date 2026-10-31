@@ -21,7 +21,7 @@ export function ArtifactValidationStatus({
   }
   if (diagnostics.length === 0) {
     return (
-      <div className="flex items-center gap-2 px-4 py-3 text-xs text-emerald-600 dark:text-emerald-400">
+      <div className="flex items-center gap-2 px-4 py-3 text-xs text-muted-foreground">
         <CheckCircle2 className="size-3.5" />
         Artifact runtime validated successfully.
       </div>

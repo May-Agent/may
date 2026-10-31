@@ -2,12 +2,13 @@ import { cn } from '@/lib/utils';
 import type { SessionRuntimeState } from '@/lib/types';
 import { useTranslation } from '@/lib/i18n';
 
+// A small gray dot: filled while working, hollow while waiting on the user.
 const COLORS: Record<SessionRuntimeState, string> = {
   idle: 'bg-transparent',
-  running: 'bg-emerald-500 animate-pulse',
-  waiting_permission: 'bg-amber-500',
-  waiting_workspace: 'bg-amber-500',
-  waiting_ask_user: 'bg-sky-500',
+  running: 'bg-muted-foreground motion-safe:animate-pulse',
+  waiting_permission: 'border border-foreground',
+  waiting_workspace: 'border border-muted-foreground',
+  waiting_ask_user: 'border border-foreground',
 };
 
 const LABEL_KEYS: Record<SessionRuntimeState, string> = {
@@ -33,7 +34,7 @@ export function RuntimePhaseBadge({ state }: { state: SessionRuntimeState | unde
   const { t } = useTranslation();
   if (!state || state === 'idle') return null;
   return (
-    <span className="inline-flex items-center gap-1.5 rounded-full border border-border bg-card px-2 py-0.5 text-[11px] text-muted-foreground">
+    <span className="inline-flex items-center gap-1.5 text-xs text-muted-foreground">
       <span className={cn('inline-block size-1.5 rounded-full', COLORS[state])} />
       {t(LABEL_KEYS[state] as 'runtime.running')}
     </span>
