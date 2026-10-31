@@ -25,10 +25,12 @@ pub enum RawFrame {
     Jpeg(Vec<u8>),
     /// BGRA pixels copied out of a display surface, with the row stride
     /// the surface carried.
+    #[cfg(target_os = "macos")]
     Bgra(BgraFrame),
 }
 
 /// A captured display frame in BGRA order, as the display stream hands it over.
+#[cfg(target_os = "macos")]
 pub struct BgraFrame {
     pub data: Vec<u8>,
     /// Distance in bytes between two consecutive rows, which may exceed
@@ -38,6 +40,7 @@ pub struct BgraFrame {
     pub height: usize,
 }
 
+#[cfg(target_os = "macos")]
 impl BgraFrame {
     /// Drops the alpha byte and reorders to RGB, honouring the surface
     /// stride — the only conversion the display-capture source needs.
@@ -115,6 +118,7 @@ pub fn encode_loop(
                     }
                 }
             }
+            #[cfg(target_os = "macos")]
             RawFrame::Bgra(frame) => frame.to_rgb(),
         };
 
