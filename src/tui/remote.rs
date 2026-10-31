@@ -27,11 +27,6 @@ use crate::ui_server::{CompactResponse, ContextDumpResponse};
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 /// How long a send waits for the event stream to be attached.
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long a reopened stream waits for the replay of a turn that was in
-/// progress when the old stream dropped. The daemon writes the replay right
-/// after its initial snapshots, so silence this long means the turn ended
-/// while the TUI was disconnected.
-const RESUME_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Default)]
 struct Shared {
@@ -96,26 +91,28 @@ struct Forwarding {
 struct ForwardedTurn {
     events: Sender<TuiEvent>,
     saw_error: bool,
-    /// Daemon id of the turn.
-    turn_id: String,
-    /// Agent frames of the turn seen on the current stream.
-    seen: usize,
-    /// Agent frames already forwarded on an earlier stream: a reopened
-    /// stream replays the turn from its start, and those must not reach
-    /// the handle a second time (the TUI would render the reply twice).
-    already_forwarded: usize,
 }
 
 impl ForwardedTurn {
-    const fn new(events: Sender<TuiEvent>, turn_id: String) -> Self {
+    const fn new(events: Sender<TuiEvent>) -> Self {
         Self {
             events,
             saw_error: false,
-            turn_id,
-            seen: 0,
-            already_forwarded: 0,
         }
     }
+}
+
+/// The session's event query: a reopened stream names the last turn frame
+/// it saw (`after`), so the daemon sends only what came after it.
+fn events_query(session_id: &str, after: Option<&str>) -> String {
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    query
+        .append_pair("topics", "session_agent,session_turn,session_background")
+        .append_pair("sessionId", session_id);
+    if let Some(after) = after {
+        query.append_pair("after", after);
+    }
+    query.finish()
 }
 
 async fn follow_session(
@@ -124,60 +121,32 @@ async fn follow_session(
     shared: Arc<Shared>,
     forwarding: Forwarding,
 ) {
-    let query = url::form_urlencoded::Serializer::new(String::new())
-        .append_pair("topics", "session_agent,session_turn,session_background")
-        .append_pair("sessionId", &session_id)
-        .finish();
     let mut current: Option<ForwardedTurn> = None;
-    // A turn cut off by a dropped stream, waiting for its replay.
-    let mut suspended: Option<ForwardedTurn> = None;
+    // Index of the last turn frame received, for resuming a dropped stream.
+    let mut last_frame: Option<String> = None;
     while !shared.stopped.load(Ordering::Acquire) {
+        let query = events_query(&session_id, last_frame.as_deref());
         let mut stream = match client.events(&query).await {
             Ok(stream) => stream,
             Err(error) => {
                 tracing::debug!(%error, "session event stream unavailable");
-                // The daemon is unreachable: the interrupted turn ends here.
-                if let Some(turn) = suspended.take() {
-                    let _ = turn.events.send(TuiEvent::Complete).await;
-                }
                 tokio::time::sleep(RECONNECT_DELAY).await;
                 continue;
             }
         };
         shared.attached.store(true, Ordering::Release);
-        loop {
-            let next = if suspended.is_some() {
-                futures_lite::future::or(async { Some(stream.next().await) }, async {
-                    async_io::Timer::after(RESUME_WAIT).await;
-                    None
-                })
-                .await
-            } else {
-                Some(stream.next().await)
-            };
-            let event = match next {
-                Some(Ok(Some(event))) => event,
-                Some(_) => break,
-                None => {
-                    // No replay: the turn ended while disconnected; its rows
-                    // are in the session history.
-                    if let Some(turn) = suspended.take() {
-                        let _ = turn.events.send(TuiEvent::Complete).await;
-                    }
-                    continue;
-                }
-            };
+        while let Ok(Some(event)) = stream.next().await {
             if shared.stopped.load(Ordering::Acquire) {
                 return;
+            }
+            if let Some(id) = &event.id {
+                last_frame = Some(id.clone());
             }
             match event.kind.as_str() {
                 "session_agent" => {
                     let Ok(frame) = serde_json::from_str::<SessionAgentFrame>(&event.data) else {
                         continue;
                     };
-                    if resume_turn(&mut suspended, &mut current, &frame).await {
-                        continue;
-                    }
                     forward_agent_frame(
                         frame,
                         &mut current,
@@ -188,6 +157,15 @@ async fn follow_session(
                     .await;
                 }
                 "session_turn" => forward_turn_error(&event.data, &mut current).await,
+                // Frames this client missed are gone: the turn it followed
+                // ended unseen. The turn in progress, if any, follows from
+                // its start.
+                "session_resync" => {
+                    if let Some(turn) = current.take() {
+                        let _ = turn.events.send(TuiEvent::Complete).await;
+                    }
+                    let _ = forwarding.app_events.send(AppEvent::HistoryStale).await;
+                }
                 "session_background" => {
                     if let Ok(snapshot) =
                         serde_json::from_str::<SessionBackgroundSnapshot>(&event.data)
@@ -202,39 +180,11 @@ async fn follow_session(
                 _ => {}
             }
         }
+        // The turn in progress keeps its handle: the reopened stream
+        // continues it from the frame after the last one received.
         shared.attached.store(false, Ordering::Release);
-        // A turn cut off by the dropped stream resumes from its replay on
-        // the next stream, or ends there when no replay comes.
-        if let Some(turn) = current.take()
-            && let Some(stale) = suspended.replace(turn)
-        {
-            let _ = stale.events.send(TuiEvent::Complete).await;
-        }
         tokio::time::sleep(RECONNECT_DELAY).await;
     }
-}
-
-/// Settle a turn suspended by a dropped stream against the first
-/// `session_agent` frame of the reopened stream. The replay of the same turn
-/// resumes it on its existing handle (agent frames it already received are
-/// skipped by [`forward_agent_frame`]); any other frame means the turn ended
-/// while disconnected. Returns whether `frame` is fully handled.
-async fn resume_turn(
-    suspended: &mut Option<ForwardedTurn>,
-    current: &mut Option<ForwardedTurn>,
-    frame: &SessionAgentFrame,
-) -> bool {
-    let Some(mut turn) = suspended.take() else {
-        return false;
-    };
-    if turn.turn_id == frame.turn_id {
-        turn.already_forwarded = turn.seen;
-        turn.seen = 0;
-        *current = Some(turn);
-        return matches!(frame.body, SessionAgentBody::Start { .. });
-    }
-    let _ = turn.events.send(TuiEvent::Complete).await;
-    false
 }
 
 async fn forward_agent_frame(
@@ -246,6 +196,10 @@ async fn forward_agent_frame(
 ) {
     match frame.body {
         SessionAgentBody::Start { content } => {
+            // A turn whose end this client never saw is over.
+            if let Some(turn) = current.take() {
+                let _ = turn.events.send(TuiEvent::Complete).await;
+            }
             let events = shared.take_pending().unwrap_or_else(|| {
                 let (events, rx) = unbounded();
                 let _ = foreign_tx.try_send(ForeignTurn {
@@ -254,14 +208,10 @@ async fn forward_agent_frame(
                 });
                 events
             });
-            *current = Some(ForwardedTurn::new(events, frame.turn_id));
+            *current = Some(ForwardedTurn::new(events));
         }
         SessionAgentBody::Agent { event } => {
             if let Some(turn) = current.as_mut() {
-                turn.seen += 1;
-                if turn.seen <= turn.already_forwarded {
-                    return;
-                }
                 turn.saw_error |= matches!(event, WireAgentEvent::Error { .. });
                 let _ = turn
                     .events
@@ -475,21 +425,6 @@ mod tests {
         }
     }
 
-    /// Feed `frame` the way `follow_session` does.
-    async fn feed(
-        frame: SessionAgentFrame,
-        suspended: &mut Option<ForwardedTurn>,
-        current: &mut Option<ForwardedTurn>,
-        shared: &Shared,
-        foreign: &Sender<ForeignTurn>,
-        commands: &Sender<WorkerCommand>,
-    ) {
-        if resume_turn(suspended, current, &frame).await {
-            return;
-        }
-        forward_agent_frame(frame, current, shared, foreign, commands).await;
-    }
-
     fn drain_text(rx: &Receiver<TuiEvent>) -> (String, bool) {
         let mut out = String::new();
         let mut completed = false;
@@ -507,105 +442,40 @@ mod tests {
         (out, completed)
     }
 
-    /// A stream that drops mid-turn and reopens gets the turn replayed from
-    /// its start; the handle must see every chunk exactly once and the turn
-    /// must not end early. Before, the drop completed the turn and the
-    /// replay arrived as a foreign turn: the reply rendered twice.
-    #[tokio::test]
-    async fn reopened_stream_resumes_the_turn_without_duplicates() {
-        let shared = Shared::default();
-        let (events, rx) = unbounded();
-        shared.set_pending(events);
-        let (foreign_tx, foreign_rx) = unbounded();
-        let (commands, _command_rx) = unbounded();
-        let mut current = None;
-        let mut suspended = None;
-
-        for body in [
-            SessionAgentBody::Start { content: None },
-            text("Hel"),
-            text("lo"),
-        ] {
-            feed(
-                frame("t1", body),
-                &mut suspended,
-                &mut current,
-                &shared,
-                &foreign_tx,
-                &commands,
-            )
-            .await;
-        }
-        // The stream drops: the turn is suspended, not completed.
-        suspended = current.take();
-        // The reopened stream replays the turn, then continues live.
-        for body in [
-            SessionAgentBody::Start { content: None },
-            text("Hel"),
-            text("lo"),
-            text(", world"),
-            SessionAgentBody::End {
-                outcome: RunEnd::Completed,
-            },
-        ] {
-            feed(
-                frame("t1", body),
-                &mut suspended,
-                &mut current,
-                &shared,
-                &foreign_tx,
-                &commands,
-            )
-            .await;
-        }
-
-        assert_eq!(drain_text(&rx), ("Hello, world".to_string(), true));
-        assert!(
-            foreign_rx.try_recv().is_err(),
-            "replay became a foreign turn"
-        );
+    #[test]
+    fn a_reopened_stream_names_the_last_frame_it_saw() {
+        let first = events_query("s 1", None);
+        assert!(!first.contains("after="), "{first}");
+        let reopened = events_query("s 1", Some("42"));
+        assert!(reopened.ends_with("&after=42"), "{reopened}");
+        assert!(reopened.contains("sessionId=s+1"), "{reopened}");
     }
 
-    /// A turn that ended while disconnected completes when the reopened
-    /// stream starts a different turn.
+    /// A turn whose end the client missed completes when the next one
+    /// starts, which arrives as a foreign turn.
     #[tokio::test]
-    async fn suspended_turn_completes_when_another_turn_starts() {
+    async fn a_turn_without_a_seen_end_completes_when_the_next_starts() {
         let shared = Shared::default();
         let (events, rx) = unbounded();
         shared.set_pending(events);
         let (foreign_tx, foreign_rx) = unbounded();
         let (commands, _command_rx) = unbounded();
         let mut current = None;
-        let mut suspended = None;
 
-        feed(
-            frame("t1", SessionAgentBody::Start { content: None }),
-            &mut suspended,
-            &mut current,
-            &shared,
-            &foreign_tx,
-            &commands,
-        )
-        .await;
-        feed(
-            frame("t1", text("a")),
-            &mut suspended,
-            &mut current,
-            &shared,
-            &foreign_tx,
-            &commands,
-        )
-        .await;
-        suspended = current.take();
-        feed(
-            frame("t2", SessionAgentBody::Start { content: None }),
-            &mut suspended,
-            &mut current,
-            &shared,
-            &foreign_tx,
-            &commands,
-        )
-        .await;
+        for (turn, body) in [
+            ("t1", SessionAgentBody::Start { content: None }),
+            ("t1", text("a")),
+            ("t2", SessionAgentBody::Start { content: None }),
+        ] {
+            forward_agent_frame(
+                frame(turn, body),
+                &mut current,
+                &shared,
+                &foreign_tx,
+                &commands,
+            )
+            .await;
+        }
 
         assert_eq!(drain_text(&rx), ("a".to_string(), true));
         assert!(

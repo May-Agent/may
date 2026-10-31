@@ -188,13 +188,9 @@ impl HubSink {
             data,
         };
         match serde_json::to_string(&frame) {
-            Ok(json) => self.hub.publish(
-                &self.session_id,
-                hub::TurnFrame {
-                    kind: "session_turn",
-                    data: json.into(),
-                },
-            ),
+            Ok(json) => self
+                .hub
+                .publish(&self.session_id, "session_turn", json.into()),
             Err(error) => tracing::error!(%error, event, "failed to encode a turn frame"),
         }
     }
@@ -207,13 +203,9 @@ impl HubSink {
             body,
         };
         match serde_json::to_string(&frame) {
-            Ok(json) => self.hub.publish(
-                &self.session_id,
-                hub::TurnFrame {
-                    kind: "session_agent",
-                    data: json.into(),
-                },
-            ),
+            Ok(json) => self
+                .hub
+                .publish(&self.session_id, "session_agent", json.into()),
             Err(error) => tracing::error!(%error, "failed to encode an agent frame"),
         }
     }

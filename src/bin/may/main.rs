@@ -883,15 +883,25 @@ where
             }
 
             Event::ForeignTurn(turn) => {
+                // After a reload the turn's own message may already be the
+                // newest history row: it is not shown a second time.
+                let content = turn.content.filter(|content| {
+                    !app.session_manager.current().is_some_and(|session| {
+                        session.history.messages().last().is_some_and(|last| {
+                            last.role == may_agent::session::MessageRole::User
+                                && last.content == *content
+                        })
+                    })
+                });
                 let message = may_agent::tui::queue::PendingMessage {
-                    content: turn.content.clone().unwrap_or_default(),
+                    content: content.clone().unwrap_or_default(),
                     hidden_context_xml: None,
                     attachments: Vec::new(),
                     queued_at: jiff::Timestamp::now(),
                     delivery_mode: may_agent::session::PendingUserMessageMode::Queue,
-                    display: turn.content.is_none().then(String::new),
+                    display: content.is_none().then(String::new),
                 };
-                if let Some(content) = turn.content {
+                if let Some(content) = content {
                     app.session_manager
                         .record_unpersisted(may_agent::session::ChatMessage::user(content));
                 }
@@ -1199,6 +1209,9 @@ where
                                 "That question is no longer open; your answer was not sent",
                             );
                         }
+                    }
+                    Some(SendAction::ReloadHistory) => {
+                        app.reload_chat().await;
                     }
                     Some(SendAction::OpenQuestions) => {
                         let open = runtime_deps.open_questions(app).await?;
