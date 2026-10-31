@@ -6,6 +6,7 @@ import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { RenameDialog } from '@/components/ui/rename-dialog';
+import { ComputerPanel } from '../computer/ComputerPanel';
 import { BrowserPanel } from '@/components/browser/BrowserPanel';
 import { useTranslation } from '@/lib/i18n';
 import { EMPTY_INSPECTOR_ENTRY, useInspectorStore } from '@/lib/stores/inspector';
@@ -34,10 +35,11 @@ type PendingStop =
   | { kind: 'subagent'; run: SubagentRun }
   | null;
 
-const TABS: Array<{ id: InspectorTab; label: 'inspector.tabDetails' | 'inspector.tabLibrary' | 'inspector.tabBrowser' }> = [
+const TABS: Array<{ id: InspectorTab; label: 'inspector.tabDetails' | 'inspector.tabLibrary' | 'inspector.tabBrowser' | 'inspector.tabComputer' }> = [
   { id: 'details', label: 'inspector.tabDetails' },
   { id: 'library', label: 'inspector.tabLibrary' },
   { id: 'browser', label: 'inspector.tabBrowser' },
+  { id: 'computer', label: 'inspector.tabComputer' },
 ];
 
 /**
@@ -98,6 +100,7 @@ export function InspectorPane({ session, inSheet = false }: { session: ApiSessio
         {tab === 'details' && <DetailsPanel session={session} />}
         {tab === 'library' && <LibraryPanel sessionId={session.id} />}
         {tab === 'browser' && <BrowserPanel sessionId={session.id} visible />}
+        {tab === 'computer' && <ComputerPanel sessionId={session.id} visible />}
       </ScrollArea>
     </div>
   );

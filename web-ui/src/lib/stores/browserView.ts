@@ -1,7 +1,7 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 
-export type InspectorTab = 'details' | 'library' | 'browser';
+export type InspectorTab = 'details' | 'library' | 'browser' | 'computer';
 
 interface BrowserViewState {
   /** The full-screen browser viewer. */
