@@ -216,6 +216,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             // The sidebar shows the task tree; the inline block would repeat it.
             hide_todos: sidebar_area.is_some(),
             image_positions_out: Some(&mut image_positions),
+            spinner_frame: app.spinner_frame,
         },
     );
     // The plain mirror is read back from the cached layout on demand.
@@ -2046,6 +2047,7 @@ mod tests {
                         images_supported: true,
                         hide_todos: false,
                         image_positions_out: Some(&mut placements),
+                        spinner_frame: 0,
                     },
                 );
                 render_inline_images(frame, area, cache, &mut regions, &placements, &[]);
@@ -2150,6 +2152,7 @@ mod tests {
                         images_supported: true,
                         hide_todos: false,
                         image_positions_out: Some(&mut placements),
+                        spinner_frame: 0,
                     },
                 );
                 let occluder = Rect::new(0, 4, 50, 3);

@@ -1,4 +1,6 @@
-use aither_core::llm::{CommandResult, CommandStream, ToolResult, tool::ToolResultPart};
+use aither_core::llm::{
+    CommandOutcome, CommandResult, CommandStream, ToolResult, tool::ToolResultPart,
+};
 use aither_sandbox::builtin::{InputTerminalArgs, KillTerminalArgs, ReadTerminalDeltaArgs};
 use aither_sandbox::{TerminalArgs, TerminalExecutionMode};
 
@@ -82,6 +84,9 @@ pub struct ToolOutput {
     pub text: String,
     /// Image payload produced by the call, when present.
     pub image: Option<ToolImage>,
+    /// Why the command failed — a non-zero exit or a killed run; `None`
+    /// when the call succeeded.
+    pub failure: Option<String>,
 }
 
 /// Frontend-agnostic end event for a tool call.
@@ -190,6 +195,7 @@ pub fn parse_tool_end(result: &ToolResult) -> ToolEndKind {
         return ToolEndKind::Output(ToolOutput {
             text: output,
             image: Some(image),
+            failure: None,
         });
     }
 
@@ -200,6 +206,7 @@ pub fn parse_tool_end(result: &ToolResult) -> ToolEndKind {
     ToolEndKind::Output(ToolOutput {
         text: output,
         image: None,
+        failure: None,
     })
 }
 
@@ -228,10 +235,19 @@ fn binary_tool_image(result: &ToolResult) -> Option<ToolImage> {
 }
 
 fn extract_tool_output(result: &CommandResult) -> ToolOutput {
-    match &result.stdout {
+    // A command that ran to its end reports failure through its outcome —
+    // the same classification the daemon's terminal snapshot and the web
+    // UI's `hasError` apply.
+    let failure = match &result.outcome {
+        CommandOutcome::Exited { code } if *code != 0 => Some(format!("exit {code}")),
+        CommandOutcome::Killed { notice, .. } => Some(notice.clone()),
+        CommandOutcome::Exited { .. } | CommandOutcome::Running { .. } => None,
+    };
+    let mut output = match &result.stdout {
         CommandStream::Inline { text } => ToolOutput {
             text: text.clone(),
             image: None,
+            failure: None,
         },
         CommandStream::Image { file, .. } => ToolOutput {
             text: format!("[image] {}", file.path),
@@ -239,16 +255,21 @@ fn extract_tool_output(result: &CommandResult) -> ToolOutput {
                 url: file.url.clone(),
                 path: file.path.clone(),
             }),
+            failure: None,
         },
         CommandStream::Stored { file, preview, .. } if preview.is_empty() => ToolOutput {
             text: format!("[stored: {}]", file.url),
             image: None,
+            failure: None,
         },
         CommandStream::Stored { preview, .. } => ToolOutput {
             text: preview.clone(),
             image: None,
+            failure: None,
         },
-    }
+    };
+    output.failure = failure;
+    output
 }
 
 #[cfg(test)]
@@ -438,6 +459,42 @@ mod tests {
                 assert!(out.image.is_none());
             }
             ToolEndKind::Error(err) => panic!("unexpected error: {err}"),
+        }
+    }
+
+    #[test]
+    fn parse_tool_end_marks_command_failures() {
+        for (outcome, expected) in [
+            (CommandOutcome::Exited { code: 0 }, None),
+            (CommandOutcome::Exited { code: 2 }, Some("exit 2")),
+            (
+                CommandOutcome::Killed {
+                    task_id: "t".to_string(),
+                    notice: "killed at its timeout".to_string(),
+                },
+                Some("killed at its timeout"),
+            ),
+            (
+                CommandOutcome::Running {
+                    task_id: "t".to_string(),
+                    output: stored("outputs/log", "/tmp/log"),
+                },
+                None,
+            ),
+        ] {
+            let result = ToolResult::Command(Box::new(CommandResult {
+                stdout: CommandStream::Inline {
+                    text: String::new(),
+                },
+                stderr: None,
+                outcome,
+            }));
+            match parse_tool_end(&result) {
+                ToolEndKind::Output(out) => {
+                    assert_eq!(out.failure.as_deref(), expected);
+                }
+                ToolEndKind::Error(err) => panic!("unexpected error: {err}"),
+            }
         }
     }
 
