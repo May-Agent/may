@@ -133,6 +133,8 @@ pub struct App {
     pub selected_tool_index: usize,
     /// Scroll offset in tool detail view
     pub tool_detail_scroll: usize,
+    /// Rows the help sheet is scrolled.
+    pub help_scroll: u16,
     /// Unified configuration state (for Config mode)
     pub config_state: ConfigState,
     /// Selected index in model select popup
@@ -247,12 +249,9 @@ pub struct App {
     pub image_view_area: Option<ratatui::layout::Rect>,
     /// Mouse/text selection in rendered chat content
     pub selection: Option<TextSelection>,
-    /// Plain text render cache used for selection copy
-    pub rendered_plain_lines: Vec<String>,
-    /// Top padding rows added when viewport is taller than rendered content
-    pub render_top_padding: usize,
-    /// Row spans of collapsible tool calls in `rendered_plain_lines` space
-    pub collapse_regions: Vec<super::ui::chat::ClickRegion>,
+    /// Laid-out chat transcript: the render cache, and the plain-text
+    /// mirror (selection, copy, click hit-testing) of what was drawn.
+    pub chat_layout: super::ui::chat_layout::ChatLayout,
     /// Timing breakdown of the last rendered frame (jank reporting).
     pub frame_stats: super::perf::FrameStats,
     /// When and where the last plain click finished; a second press at the
@@ -265,6 +264,11 @@ pub struct App {
     pub btw_llm: Option<crate::agent::RequestParameterizedModel<aither_cloud::CloudProvider>>,
     /// Daemon that answers `/btw` when the agent runs there.
     pub btw_daemon: Option<crate::client::DaemonClient>,
+    /// Right sidebar: task tree, linked issues (background lists come
+    /// from `jobs` / `subagents`).
+    pub sidebar: super::sidebar::SidebarState,
+    /// Screen rect the chat column occupied last frame (mouse mapping).
+    pub chat_area: ratatui::layout::Rect,
     /// Latest job list shown in `AppMode::Jobs`
     pub jobs: Vec<aither_sandbox::JobInfo>,
     /// Selected row in `AppMode::Jobs`
@@ -459,6 +463,7 @@ impl App {
             selected_tool: None,
             selected_tool_index: 0,
             tool_detail_scroll: 0,
+            help_scroll: 0,
             config_state,
             model_select_index: 0,
             model_select_list: Vec::new(),
@@ -516,14 +521,14 @@ impl App {
             image_regions: Vec::new(),
             image_view_area: None,
             selection: None,
-            rendered_plain_lines: Vec::new(),
-            render_top_padding: 0,
+            chat_layout: super::ui::chat_layout::ChatLayout::default(),
             frame_stats: super::perf::FrameStats::default(),
-            collapse_regions: Vec::new(),
             last_click: None,
             background: None,
             btw_llm: None,
             btw_daemon: None,
+            sidebar: super::sidebar::SidebarState::default(),
+            chat_area: ratatui::layout::Rect::default(),
             jobs: Vec::new(),
             jobs_selected: 0,
             subagents: Vec::new(),
@@ -1358,32 +1363,20 @@ impl App {
     /// user-message images — into the cache.
     pub fn scan_and_fetch_images(&mut self) {
         use super::ui::chat::ChatElement;
-        use super::ui::markdown::extract_images;
 
-        // Collect image URLs first to avoid borrow issues
+        // Markdown image references of the laid-out transcript (last
+        // frame's layout; a new reference is fetched one frame later). The
+        // layout already parsed them, so nothing is re-parsed here.
         let urls: Vec<String> = self
-            .chat
-            .active_elements()
-            .iter()
-            .flat_map(|elem| {
-                if let ChatElement::AssistantText { content, .. } = elem {
-                    extract_images(content.as_str())
-                        .into_iter()
-                        .map(|(_, url)| url)
-                        .collect::<Vec<_>>()
-                } else {
-                    Vec::new()
-                }
+            .chat_layout
+            .markdown_image_keys()
+            .filter(|key| {
+                !self.image_cache.contains_key(*key)
+                    && !self.image_failed.contains(*key)
+                    && !self.image_fetching.contains(*key)
             })
+            .map(str::to_string)
             .collect();
-
-        if !urls.is_empty() {
-            tracing::debug!(
-                "scan_and_fetch_images: found {} URLs: {:?}",
-                urls.len(),
-                urls
-            );
-        }
 
         for url in urls {
             self.request_image(&url);
@@ -1507,9 +1500,7 @@ impl App {
         self.content_height.store(0, Ordering::Relaxed);
         self.view_height.store(0, Ordering::Relaxed);
         self.selection = None;
-        self.rendered_plain_lines.clear();
-        self.render_top_padding = 0;
-        self.collapse_regions.clear();
+        self.chat_layout = super::ui::chat_layout::ChatLayout::default();
         self.jobs.clear();
         self.jobs_selected = 0;
         self.image_cache.clear();
@@ -1816,6 +1807,11 @@ impl App {
                     return Ok(None);
                 }
                 KeyCode::Left => return Ok(Some(SendAction::OpenQuestions)),
+                // Ctrl+B shows/hides the right sidebar (wide terminals only).
+                KeyCode::Char('b') => {
+                    self.sidebar.enabled = !self.sidebar.enabled;
+                    return Ok(None);
+                }
                 KeyCode::Char('n') => {
                     self.quit_pending = false;
                     self.status = None;
@@ -2235,6 +2231,14 @@ impl App {
         None
     }
 
+    /// The scroll offset the last frame actually showed: the follow-bottom
+    /// sentinel resolved, and a stale offset clamped to content that has
+    /// since shrunk (resize, collapsed tool calls).
+    #[must_use]
+    pub fn effective_scroll(&self) -> usize {
+        self.scroll.min(self.max_chat_scroll())
+    }
+
     /// Largest scroll offset that still shows a full view of content.
     fn max_chat_scroll(&self) -> usize {
         self.content_height
@@ -2252,12 +2256,9 @@ impl App {
         if max_scroll == 0 {
             return;
         }
-        let base = if self.scroll == usize::MAX {
-            max_scroll
-        } else {
-            self.scroll
-        };
-        self.scroll = base.saturating_sub(lines);
+        // Clamp first: an offset left beyond the content (which shrank
+        // since) would otherwise swallow scroll steps without moving.
+        self.scroll = self.scroll.min(max_scroll).saturating_sub(lines);
     }
 
     /// Scroll the chat view down by `lines`, re-entering follow-bottom mode
@@ -2303,6 +2304,21 @@ impl App {
             _ => return Ok(None),
         }
 
+        // Clicks and drags outside the chat column (the sidebar) select
+        // nothing; the wheel scrolls the chat anywhere.
+        let in_chat = self.chat_area.is_empty()
+            || self
+                .chat_area
+                .contains(ratatui::layout::Position::new(mouse.column, mouse.row));
+        if !in_chat
+            && !matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            )
+        {
+            return Ok(None);
+        }
+
         match mouse.kind {
             MouseEventKind::ScrollUp => self.scroll_chat_up(SCROLL_STEP_LINES),
             MouseEventKind::ScrollDown => self.scroll_chat_down(SCROLL_STEP_LINES),
@@ -2320,8 +2336,8 @@ impl App {
                     // the cursor instead of starting a point selection.
                     self.last_click = None;
                     self.selection = point.and_then(|p| {
-                        self.rendered_plain_lines
-                            .get(p.line)
+                        self.chat_layout
+                            .plain_line(p.line)
                             .and_then(|line| TextSelection::word_at(line, p))
                     });
                 } else {
@@ -2358,12 +2374,12 @@ impl App {
                             .map(|point| (Instant::now(), point));
                         if let Some(point) = self.mouse_to_selection_point(mouse)
                             && let Some(region) = self
-                                .collapse_regions
-                                .iter()
+                                .chat_layout
+                                .collapse_regions()
+                                .into_iter()
                                 .find(|r| point.line >= r.start && point.line < r.end)
                         {
-                            let id = region.element_id.clone();
-                            self.chat.toggle_expanded(&id);
+                            self.chat.toggle_expanded(&region.element_id);
                         }
                     }
                 }
@@ -2378,22 +2394,17 @@ impl App {
     }
 
     fn mouse_to_selection_point(&self, mouse: MouseEvent) -> Option<SelectionPoint> {
-        if self.rendered_plain_lines.is_empty() {
+        let rows = self.chat_layout.plain_len();
+        if rows == 0 {
             return None;
         }
 
-        let base_scroll = if self.scroll == usize::MAX {
-            let content_h = self.content_height.load(Ordering::Relaxed);
-            let view_h = self.view_height.load(Ordering::Relaxed);
-            content_h.saturating_sub(view_h)
-        } else {
-            self.scroll
-        };
+        let base_scroll = self.effective_scroll();
 
         let raw_line = base_scroll.saturating_add(mouse.row as usize);
-        let line = raw_line.saturating_sub(self.render_top_padding);
-        let line = line.min(self.rendered_plain_lines.len().saturating_sub(1));
-        let text = self.rendered_plain_lines.get(line)?;
+        let line = raw_line.saturating_sub(self.chat_layout.top_padding());
+        let line = line.min(rows.saturating_sub(1));
+        let text = self.chat_layout.plain_line(line)?;
         let column = clamp_column_by_width(text, mouse.column as usize);
         Some(SelectionPoint { line, column })
     }
@@ -2405,17 +2416,16 @@ impl App {
         }
         let (start, end) = sel.normalized();
 
-        if self.rendered_plain_lines.is_empty() || start.line >= self.rendered_plain_lines.len() {
+        let rows = self.chat_layout.plain_len();
+        if rows == 0 || start.line >= rows {
             return None;
         }
 
-        let end_line = end
-            .line
-            .min(self.rendered_plain_lines.len().saturating_sub(1));
+        let end_line = end.line.min(rows.saturating_sub(1));
         let mut out = String::new();
 
         for line_idx in start.line..=end_line {
-            let line = &self.rendered_plain_lines[line_idx];
+            let line = self.chat_layout.plain_line(line_idx).unwrap_or_default();
             let char_count = line.chars().count();
             let from = if line_idx == start.line {
                 start.column.min(char_count)
@@ -2504,6 +2514,11 @@ impl App {
                             .spawn();
                     }
                 }
+                None
+            }
+            "/help" => {
+                self.help_scroll = 0;
+                self.mode = AppMode::Help;
                 None
             }
             "/config" => {
@@ -2918,8 +2933,10 @@ impl App {
     }
 
     /// Re-read the session's canonical `tasks.md` and refresh the todo
-    /// block. `async_fs` keeps the filesystem IO off the UI thread.
+    /// block. `async_fs` keeps the filesystem IO off the UI thread. The
+    /// sidebar's task tree is refetched from the daemon alongside.
     async fn refresh_todos(&mut self) {
+        self.request_sidebar_tasks();
         let Some(session) = self.session_manager.current() else {
             return;
         };
@@ -2938,6 +2955,119 @@ impl App {
                 tracing::warn!(error = %error, "failed to read session tasks.md");
             }
         }
+    }
+
+    /// Fetch the current session's `tasks.md` for the sidebar from the
+    /// daemon (`GET /api/sessions/{id}/tasks`); the answer arrives as
+    /// [`AppEvent::SidebarTasks`]. Without a daemon the session's file is
+    /// read directly.
+    pub fn request_sidebar_tasks(&mut self) {
+        let Some(session) = self.session_manager.current() else {
+            self.sidebar.reset();
+            return;
+        };
+        let session_id = session.id.as_str().to_string();
+        if self.sidebar.session_id.as_deref() != Some(session_id.as_str()) {
+            // A switched session never shows the previous one's tasks.
+            self.sidebar.reset();
+        }
+        let tx = self.event_tx.clone();
+        let daemon = self.btw_daemon.clone();
+        let db = self.session_manager.db().clone();
+        let paths = self
+            .session_manager
+            .store()
+            .session_paths(session.id.as_str(), session.profile_id.as_deref());
+        spawn(async move {
+            #[derive(serde::Deserialize)]
+            struct TasksPayload {
+                #[serde(default)]
+                content: String,
+            }
+            let content = match daemon {
+                Some(client) => match client
+                    .get::<TasksPayload>(&crate::client::session_path(&session_id, "/tasks"))
+                    .await
+                {
+                    Ok(payload) => Some(payload.content).filter(|content| !content.is_empty()),
+                    Err(error) => {
+                        tracing::debug!(%error, "sidebar: failed to fetch tasks.md");
+                        return;
+                    }
+                },
+                None => match paths.tasks_content().await {
+                    Ok(content) => content,
+                    Err(error) => {
+                        tracing::debug!(%error, "sidebar: failed to read tasks.md");
+                        return;
+                    }
+                },
+            };
+            let title = match db.get_session(&session_id).await {
+                Ok(row) => row.and_then(|row| row.title),
+                Err(error) => {
+                    tracing::debug!(%error, "sidebar: failed to read the session title");
+                    None
+                }
+            };
+            let _ = tx
+                .send(AppEvent::SidebarTasks {
+                    session_id,
+                    content,
+                    title,
+                })
+                .await;
+        })
+        .detach();
+    }
+
+    /// Look up the issues `numbers` in the session's issue store (its
+    /// backend is chosen by `workspace.toml`, as for the agent); the result
+    /// arrives as [`AppEvent::SidebarIssues`].
+    pub fn request_issue_lookups(&self, session_id: String, numbers: Vec<i64>) {
+        use crate::issue::IssueStore as _;
+
+        if numbers.is_empty() {
+            return;
+        }
+        let Some(session) = self.session_manager.current() else {
+            return;
+        };
+        let workspace_config =
+            crate::session::SessionPaths::new(session.sandbox_dir.clone()).workspace_config();
+        let cwd = self.cwd.clone();
+        let db = self.session_manager.db().clone();
+        let tx = self.event_tx.clone();
+        spawn(async move {
+            let store = match unblock(move || {
+                crate::issue::resolve_issue_store(&cwd, &workspace_config, db)
+            })
+            .await
+            {
+                Ok(store) => store,
+                Err(error) => {
+                    tracing::debug!(%error, "sidebar: no issue store");
+                    return;
+                }
+            };
+            let mut issues = Vec::with_capacity(numbers.len());
+            for number in numbers {
+                match store.get(number).await {
+                    Ok(detail) => issues.push(super::sidebar::IssueBrief {
+                        number,
+                        title: Some(detail.title),
+                        closed: matches!(detail.state, crate::issue::IssueState::Closed),
+                    }),
+                    Err(error) => {
+                        tracing::debug!(%error, number, "sidebar: issue lookup failed");
+                    }
+                }
+            }
+            let _ = tx
+                .send(AppEvent::SidebarIssues { session_id, issues })
+                .await;
+        })
+        .detach();
     }
 
     /// Handle an agent event. Returns true if stream ended.
@@ -3096,6 +3226,17 @@ impl App {
                         self.decode_meter.note_boundary();
                         self.chat.finish_builtin(&id, &tool, result);
                     }
+                    // A reply that ends without tool calls may be followed
+                    // by another in the same run (the harness re-prompting,
+                    // a background command finishing): it starts a block of
+                    // its own instead of being glued onto this one.
+                    AgentEvent::TurnComplete {
+                        has_tool_calls: false,
+                        ..
+                    } => {
+                        self.chat.end_text();
+                        self.decode_meter.note_boundary();
+                    }
                     AgentEvent::Complete { .. } => {
                         // Text was already streamed via AgentEvent::Text events
                         // Just finalize the message
@@ -3104,6 +3245,9 @@ impl App {
                         self.decode_meter.note_boundary();
                         self.scroll = usize::MAX;
                         self.input_visible = true;
+                        // The turn may have edited tasks.md without a tool
+                        // call ending after the edit (or in a foreign turn).
+                        self.refresh_todos().await;
                         // Signal that processing is complete
                         return true;
                     }

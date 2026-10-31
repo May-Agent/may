@@ -2016,6 +2016,7 @@ async fn build_worker_for_session(
             tool_environments: deps.tool_environments.clone(),
             provider_attempt: 0,
             subagents: None,
+            background_jobs: aither_agent::BackgroundJobPolicy::Await,
         },
     ))
     .await?;

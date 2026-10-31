@@ -17,7 +17,11 @@ import {
   Cloud,
   Network,
 } from 'lucide-react';
+import { ChevronLeft, ChevronRight } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { Button } from '@/components/ui/button';
+import { SidebarToggle } from '@/components/shell/SidebarToggle';
+import { SIDEBAR_COLUMN_QUERY, useMediaQuery } from '@/lib/useMediaQuery';
 import { useTranslation, type MessageKey } from '@/lib/i18n';
 import { AppearanceSection } from '@/components/settings/AppearanceSection';
 import { LanguageSection } from '@/components/settings/LanguageSection';
@@ -126,51 +130,84 @@ export function SettingsPage() {
     setParams(next, { replace: false });
   };
 
+  // Narrow screens navigate list → detail, like iOS Settings.
+  const wide = useMediaQuery(SIDEBAR_COLUMN_QUERY);
+  const showList = wide || !params.has('section');
+  const showDetail = wide || params.has('section');
+  const backToList = () => {
+    const next = new URLSearchParams(params);
+    next.delete('section');
+    setParams(next, { replace: false });
+  };
+
   return (
     <div className="flex h-full overflow-hidden">
-      <nav className="w-60 shrink-0 overflow-y-auto border-r border-border bg-card/30 px-2 py-4">
-        <div className="px-3 pb-4">
-          <div className="text-base font-semibold tracking-tight">{t('settings.title')}</div>
-          <div className="mt-0.5 text-xs text-muted-foreground">{t('settings.subtitle')}</div>
-        </div>
-        <div className="space-y-4">
-          {GROUPS.map((group) => (
-            <div key={group.id}>
-              <div className="px-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/70">
-                {group.label}
+      {showList && (
+        <nav
+          aria-label={t('settings.title')}
+          className={cn(
+            'shrink-0 overflow-y-auto bg-sidebar px-2 pb-4',
+            wide ? 'w-60 border-r border-border' : 'w-full',
+          )}
+        >
+          <div className="flex h-11 items-center gap-1 touch:h-14">
+            <SidebarToggle />
+          </div>
+          <div className="px-3 pb-4">
+            <h1 className="text-[15px] font-semibold tracking-tight">{t('settings.title')}</h1>
+            <p className="mt-0.5 text-xs text-muted-foreground">{t('settings.subtitle')}</p>
+          </div>
+          <div className="space-y-4">
+            {GROUPS.map((group) => (
+              <div key={group.id}>
+                <h2 className="px-3 pb-1 text-xs font-semibold text-muted-foreground">
+                  {group.label}
+                </h2>
+                <ul className="space-y-px">
+                  {group.items.map((s) => {
+                    const Icon = s.icon;
+                    const isActive = wide && s.id === active;
+                    return (
+                      <li key={s.id}>
+                        <button
+                          type="button"
+                          onClick={() => selectSection(s.id)}
+                          aria-current={isActive ? 'page' : undefined}
+                          className={cn(
+                            'flex h-8 w-full items-center gap-2 rounded-md px-3 text-[13px] transition-colors touch:h-11',
+                            isActive
+                              ? 'bg-accent font-medium text-foreground'
+                              : 'text-foreground hover:bg-accent/60',
+                          )}
+                        >
+                          <Icon className="size-4 text-muted-foreground" aria-hidden />
+                          <span className="flex-1 text-left">{t(s.labelKey)}</span>
+                          {!wide && <ChevronRight className="size-4 text-muted-foreground" aria-hidden />}
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ul>
               </div>
-              <ul className="space-y-0.5">
-                {group.items.map((s) => {
-                  const Icon = s.icon;
-                  const isActive = s.id === active;
-                  return (
-                    <li key={s.id}>
-                      <button
-                        type="button"
-                        onClick={() => selectSection(s.id)}
-                        className={cn(
-                          'flex w-full items-center gap-2 rounded-md px-3 py-1.5 text-sm transition-colors',
-                          isActive
-                            ? 'bg-accent font-medium text-foreground'
-                            : 'text-muted-foreground hover:bg-accent/60 hover:text-foreground',
-                        )}
-                      >
-                        <Icon className="size-3.5" />
-                        {t(s.labelKey)}
-                      </button>
-                    </li>
-                  );
-                })}
-              </ul>
+            ))}
+          </div>
+        </nav>
+      )}
+      {showDetail && (
+        <div className="min-w-0 flex-1 overflow-y-auto">
+          {!wide && (
+            <div className="sticky top-0 z-10 flex h-11 items-center border-b border-border bg-background/90 px-2 backdrop-blur touch:h-14">
+              <Button variant="ghost" className="gap-1 px-2 text-foreground" onClick={backToList}>
+                <ChevronLeft aria-hidden />
+                {t('settings.title')}
+              </Button>
             </div>
-          ))}
+          )}
+          <div className="mx-auto max-w-3xl px-4 py-6 sm:px-8 sm:py-8">
+            <ActiveComponent />
+          </div>
         </div>
-      </nav>
-      <div className="flex-1 overflow-y-auto">
-        <div className="mx-auto max-w-3xl px-8 py-8">
-          <ActiveComponent />
-        </div>
-      </div>
+      )}
     </div>
   );
 }

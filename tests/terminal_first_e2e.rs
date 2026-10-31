@@ -75,13 +75,17 @@ enum MockChatScenario {
     /// The first request asks the user a question through the `ask_user`
     /// terminal command; every later request gets a plain text reply.
     AsksUser,
-    /// The first request starts [`BACKGROUND_JOB_SCRIPT`] as a background
-    /// terminal job; every later request gets a plain text reply.
-    StartsBackgroundJob,
+    /// The first request starts the script as a background terminal job;
+    /// every later request gets a plain text reply.
+    StartsBackgroundJob(&'static str),
 }
 
-/// The long-running script of [`MockChatScenario::StartsBackgroundJob`].
+/// A background job that outlives every test turn.
 const BACKGROUND_JOB_SCRIPT: &str = "sleep 120";
+/// What [`FINISHING_JOB_SCRIPT`] prints once it is done.
+const FINISHING_JOB_MARKER: &str = "BG-DONE-7731";
+/// A background job that finishes a moment after its turn ended.
+const FINISHING_JOB_SCRIPT: &str = "sleep 2; echo BG-DONE-7731";
 
 /// A scripted main agent / subagent pair sharing one mock model.
 ///
@@ -417,7 +421,7 @@ impl MockScenarioState {
                     Duration::from_millis(10),
                 )),
             },
-            MockChatScenario::StartsBackgroundJob => match self.request_index {
+            MockChatScenario::StartsBackgroundJob(script) => match self.request_index {
                 0 => MockHttpResponse::sse(vec![
                     delayed_sse_frame(
                         tool_call_chunk(
@@ -425,7 +429,7 @@ impl MockScenarioState {
                             "terminal",
                             &serde_json::json!({
                                 "description": "Start a long job",
-                                "script": BACKGROUND_JOB_SCRIPT,
+                                "script": script,
                                 "mode": "sandboxed",
                                 "background": true,
                                 "timeout": 600,
@@ -1168,7 +1172,7 @@ fn may_binary_path() -> PathBuf {
 }
 
 /// Release of heel whose Linux binary the harness stages as the container heel.
-const CONTAINER_HEEL_RELEASE_TAG: &str = "heel-v0.5.0";
+const CONTAINER_HEEL_RELEASE_TAG: &str = "heel-v0.7.2";
 
 /// A pinned Linux heel release asset and the SHA-256 of its published bytes.
 struct PinnedHeelAsset {
@@ -1181,12 +1185,12 @@ struct PinnedHeelAsset {
 #[cfg(target_arch = "x86_64")]
 const CONTAINER_HEEL_ASSET: PinnedHeelAsset = PinnedHeelAsset {
     name: "heel-x86_64-unknown-linux-gnu",
-    sha256: "10ffff205170c4e6d9c54feb7448716e04e2ef1943ffa77bce75ee791598d50d",
+    sha256: "b2d4654805fef2e81f67ee935afe02334ea8f6c64afd42f911e6220a6e52936e",
 };
 #[cfg(target_arch = "aarch64")]
 const CONTAINER_HEEL_ASSET: PinnedHeelAsset = PinnedHeelAsset {
     name: "heel-aarch64-unknown-linux-gnu",
-    sha256: "0aa2ed4d91a85e312ff3608263da6da38831d0787b940bd2be23e92c6b5dd995",
+    sha256: "d1f301e814521a0f2efbfb18d580895f9391882e4c3c30f9ceb9ba51a5f9709b",
 };
 
 /// Stages the pinned container heel in the test home exactly as the product's
@@ -3047,13 +3051,11 @@ async fn chat_turns_on_one_session_prepare_tools_once(environment: ChatEnvironme
         .iter()
         .filter(|line| line.contains("outcome=\"prepared\""))
         .count();
-    let adopted = ready_lines
-        .iter()
-        .filter(|line| line.contains("outcome=\"adopted\""))
-        .count();
-    assert!(
-        prepared == 1 && adopted >= 1,
-        "only the first turn should prepare tools and later turns adopt them; readiness logs: {ready_lines:#?}"
+    // Later turns continue with the session's idle agent, or adopt the
+    // prepared tools when it had to be rebuilt.
+    assert_eq!(
+        prepared, 1,
+        "only the first turn should prepare tools; readiness logs: {ready_lines:#?}"
     );
 
     server.stop().await;
@@ -3782,7 +3784,8 @@ fn background_job<'a>(background: &'a Value, script: &str) -> Option<&'a Value> 
 #[tokio::test]
 #[serial]
 async fn a_background_job_is_listed_pushed_and_killable_over_the_api() {
-    let mock = MockOpenAiServer::spawn(MockChatScenario::StartsBackgroundJob).await;
+    let mock =
+        MockOpenAiServer::spawn(MockChatScenario::StartsBackgroundJob(BACKGROUND_JOB_SCRIPT)).await;
     let harness = TestHarness::new(&mock.base_url()).await;
     let server = RunningUiServer::spawn(harness.home_path(), &[]).await;
     let client = reqwest::Client::new();
@@ -3791,7 +3794,7 @@ async fn a_background_job_is_listed_pushed_and_killable_over_the_api() {
         .await;
     let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
 
-    // The turn stays open while its background job runs.
+    // The turn ends with the model's reply; its job keeps running.
     let turn = send_turn(
         &client,
         &server.base_url,
@@ -3800,24 +3803,20 @@ async fn a_background_job_is_listed_pushed_and_killable_over_the_api() {
     .await
     .expect("turn request should succeed");
     let turn = expect_status(&server.log, turn, StatusCode::OK).await;
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        let background = background_of(&client, &server, &session_id).await;
-        if background_job(&background, BACKGROUND_JOB_SCRIPT)
+    let events = collect_turn_events(turn, "the background-job turn", &server.log).await;
+    assert!(
+        events.iter().any(|(kind, _)| kind == "done"),
+        "the turn should end while its job runs; events: {events:?}"
+    );
+    let background = background_of(&client, &server, &session_id).await;
+    assert_eq!(
+        background_job(&background, BACKGROUND_JOB_SCRIPT)
             .and_then(|job| job.pointer("/status/state"))
-            .and_then(Value::as_str)
-            == Some("running")
-        {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the job should be listed as running: {background}; server logs:\n{}",
-            server.log.contents().await
-        );
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+            .and_then(Value::as_str),
+        Some("running"),
+        "the job outlives its turn: {background}; server logs:\n{}",
+        server.log.contents().await
+    );
 
     // The event stream carries the same snapshot.
     let events = client
@@ -3856,18 +3855,96 @@ async fn a_background_job_is_listed_pushed_and_killable_over_the_api() {
         .expect("kill payload should be JSON");
     assert_eq!(killed.get("ok"), Some(&Value::Bool(true)), "{killed}");
 
-    // With its job gone the turn finishes, and the job reads as killed.
-    let events = collect_turn_events(turn, "the background-job turn", &server.log).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let background = background_of(&client, &server, &session_id).await;
+        if background_job(&background, BACKGROUND_JOB_SCRIPT)
+            .and_then(|job| job.pointer("/status/state"))
+            .and_then(Value::as_str)
+            == Some("killed")
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the killed job should read as killed: {background}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// A background job that finishes after its turn ended starts a turn of its
+/// own, in which the model sees the job's output; meanwhile the session is
+/// idle, so the user is free to send messages.
+#[tokio::test]
+#[serial]
+async fn a_background_job_finishing_after_its_turn_resumes_the_session() {
+    let mock =
+        MockOpenAiServer::spawn(MockChatScenario::StartsBackgroundJob(FINISHING_JOB_SCRIPT)).await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    let server = RunningUiServer::spawn(harness.home_path(), &[]).await;
+    let client = reqwest::Client::new();
+    let environment = ChatEnvironment::Local
+        .prepare(&harness, &client, &server)
+        .await;
+    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+
+    let turn = send_turn(
+        &client,
+        &server.base_url,
+        &serde_json::json!({ "sessionId": session_id, "content": "start the job" }),
+    )
+    .await
+    .expect("turn request should succeed");
+    let turn = expect_status(&server.log, turn, StatusCode::OK).await;
+    let events = collect_turn_events(turn, "the turn starting the job", &server.log).await;
     assert!(
         events.iter().any(|(kind, _)| kind == "done"),
-        "the turn should complete; events: {events:?}"
+        "the turn should end while its job runs; events: {events:?}"
     );
-    let background = background_of(&client, &server, &session_id).await;
-    assert_eq!(
-        background_job(&background, BACKGROUND_JOB_SCRIPT)
-            .and_then(|job| job.pointer("/status/state"))
-            .and_then(Value::as_str),
-        Some("killed"),
-        "{background}"
+    let requests_after_first_turn = mock.agent_requests().await.len();
+
+    // The resumed turn shows up on the session's stream.
+    let stream = client
+        .get(format!("{}/api/events", server.base_url))
+        .query(&[
+            ("topics", "session_turn"),
+            ("sessionId", session_id.as_str()),
+        ])
+        .send()
+        .await
+        .expect("event stream should open");
+    let runtime: Value = client
+        .get(format!(
+            "{}/api/sessions/{session_id}/runtime",
+            server.base_url
+        ))
+        .send()
+        .await
+        .expect("runtime request should succeed")
+        .json()
+        .await
+        .expect("runtime JSON");
+    assert_ne!(
+        runtime.get("state").and_then(Value::as_str),
+        Some("running"),
+        "the session is idle while the job runs: {runtime}"
+    );
+    let resumed = collect_turn_events(stream, "the resumed turn", &server.log).await;
+    assert!(
+        resumed.iter().any(|(kind, _)| kind == "done"),
+        "the job's completion should resume the session; events: {resumed:?}; server logs:\n{}",
+        server.log.contents().await
+    );
+
+    let requests = mock.agent_requests().await;
+    assert!(
+        requests.len() > requests_after_first_turn,
+        "the resumed turn asked the model"
+    );
+    let resumed_request = requests.last().expect("a resumed request").to_string();
+    assert!(
+        resumed_request.contains(FINISHING_JOB_MARKER),
+        "the model sees the job's output: {resumed_request}"
     );
 }

@@ -11,10 +11,9 @@ use unicode_width::UnicodeWidthStr;
 
 use super::super::super::app::App;
 use super::super::super::state::{McpAddMode, SkillAddMode, SshAddMode};
-use super::centered_rect;
 
 pub(super) fn render_mcp_popup(frame: &mut Frame, area: Rect, app: &App) {
-    let popup_area = centered_rect(70, 60, area);
+    let popup_area = area;
 
     // Clear background
     frame.render_widget(Clear, popup_area);
@@ -190,7 +189,7 @@ pub(super) fn render_mcp_popup(frame: &mut Frame, area: Rect, app: &App) {
 
 /// Render SSH server management popup.
 pub(super) fn render_ssh_popup(frame: &mut Frame, area: Rect, app: &App) {
-    let popup_area = centered_rect(70, 60, area);
+    let popup_area = area;
     frame.render_widget(Clear, popup_area);
 
     let title = match app.ssh_add_mode {
@@ -324,7 +323,7 @@ pub(super) fn render_ssh_popup(frame: &mut Frame, area: Rect, app: &App) {
 
 /// Render the skill management popup.
 pub(super) fn render_skill_popup(frame: &mut Frame, area: Rect, app: &App) {
-    let popup_area = centered_rect(80, 70, area);
+    let popup_area = area;
 
     frame.render_widget(Clear, popup_area);
 

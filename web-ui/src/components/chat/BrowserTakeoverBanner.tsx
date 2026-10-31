@@ -1,17 +1,20 @@
-import { Globe2, LogOut } from 'lucide-react';
+import { useState } from 'react';
+import { Loader2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useTranslation } from '@/lib/i18n';
 import { stopTakeover } from '@/lib/api/browser';
+import { useBrowserViewStore } from '@/lib/stores/browserView';
 import type { ApiSession } from '@/lib/types';
-import { useState } from 'react';
 
+/** While you drive the agent's browser: one quiet line to hand it back. */
 export function BrowserTakeoverBanner({ session }: { session: ApiSession }) {
   const { t } = useTranslation();
+  const openViewer = useBrowserViewStore((s) => s.openViewer);
   const [busy, setBusy] = useState(false);
   const takeover = session.runtime.interactions?.browser;
   if (!takeover?.takeoverActive) return null;
 
-  const handleRelease = async () => {
+  const handBack = async () => {
     setBusy(true);
     try {
       await stopTakeover(session.id);
@@ -21,14 +24,14 @@ export function BrowserTakeoverBanner({ session }: { session: ApiSession }) {
   };
 
   return (
-    <div className="flex items-center justify-between gap-3 border-b border-amber-500/40 bg-amber-500/10 px-6 py-2 text-xs">
-      <div className="flex items-center gap-2">
-        <Globe2 className="size-4 text-amber-600 dark:text-amber-400" />
-        <span className="font-medium">{t('browserTakeover.active')}</span>
-      </div>
-      <Button size="sm" variant="outline" disabled={busy} onClick={handleRelease}>
-        <LogOut className="size-3.5" />
-        {t('browserTakeover.release')}
+    <div className="flex items-center gap-3 border-b border-border px-4 py-1.5 text-[13px] sm:px-6">
+      <span className="min-w-0 flex-1 truncate text-muted-foreground">{t('computer.youHaveControl')}</span>
+      <Button size="sm" variant="ghost" onClick={openViewer}>
+        {t('computer.open')}
+      </Button>
+      <Button size="sm" variant="outline" disabled={busy} onClick={() => void handBack()}>
+        {busy && <Loader2 className="animate-spin" aria-hidden />}
+        {t('computer.handBack')}
       </Button>
     </div>
   );
