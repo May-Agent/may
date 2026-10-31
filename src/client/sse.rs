@@ -7,6 +7,8 @@ pub struct ServerEvent {
     pub kind: String,
     /// The `data:` lines joined by newlines.
     pub data: String,
+    /// The `id:` field, when the frame has one.
+    pub id: Option<String>,
 }
 
 /// Buffers stream bytes and yields complete events.
@@ -30,18 +32,22 @@ impl SseParser {
             self.buffer.drain(..end.separator);
             let text = String::from_utf8_lossy(&frame);
             let mut kind = None;
+            let mut id = None;
             let mut data: Vec<&str> = Vec::new();
             for line in text.lines() {
                 if let Some(value) = line.strip_prefix("event:") {
                     kind = Some(value.trim_start().to_string());
                 } else if let Some(value) = line.strip_prefix("data:") {
                     data.push(value.strip_prefix(' ').unwrap_or(value));
+                } else if let Some(value) = line.strip_prefix("id:") {
+                    id = Some(value.trim_start().to_string());
                 }
             }
             if !data.is_empty() || kind.is_some() {
                 return Some(ServerEvent {
                     kind: kind.unwrap_or_else(|| "message".to_string()),
                     data: data.join("\n"),
+                    id,
                 });
             }
         }
@@ -88,6 +94,7 @@ mod tests {
             Some(ServerEvent {
                 kind: "session_turn".to_string(),
                 data: "{\"a\":1}".to_string(),
+                id: None,
             })
         );
         assert_eq!(
@@ -95,8 +102,19 @@ mod tests {
             Some(ServerEvent {
                 kind: "message".to_string(),
                 data: "x".to_string(),
+                id: None,
             })
         );
         assert_eq!(parser.next_event(), None);
+    }
+
+    #[test]
+    fn a_frame_keeps_its_id() {
+        let mut parser = SseParser::default();
+        parser.push(b"event: session_agent\nid: 17\ndata: {}\n\n");
+        assert_eq!(
+            parser.next_event().and_then(|event| event.id).as_deref(),
+            Some("17")
+        );
     }
 }

@@ -3368,6 +3368,9 @@ pub enum SendAction {
     EnqueuePending(PendingMessage),
     /// Show an open question of the session in the answer modal.
     OpenQuestions,
+    /// Reload the session's history, which turns this client missed
+    /// changed.
+    ReloadHistory,
     /// Submit an ask-user response.
     RespondAskUser {
         /// ID of the pending ask-user request being answered.
