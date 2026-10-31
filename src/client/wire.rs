@@ -137,6 +137,14 @@ pub enum WireAgentEvent {
         /// The usage.
         usage: Usage,
     },
+    /// A model response ended; `has_tool_calls` is false when the next
+    /// text, if any, is a separate reply rather than a continuation.
+    TurnComplete {
+        /// The turn number.
+        turn: usize,
+        /// Whether the response called tools.
+        has_tool_calls: bool,
+    },
     /// The agent finished the run.
     Complete {
         /// Full assistant text.
@@ -202,6 +210,13 @@ impl WireAgentEvent {
             AgentEvent::Usage(usage) => Self::Usage {
                 usage: usage.clone(),
             },
+            AgentEvent::TurnComplete {
+                turn,
+                has_tool_calls,
+            } => Self::TurnComplete {
+                turn: *turn,
+                has_tool_calls: *has_tool_calls,
+            },
             AgentEvent::Complete { final_text, turns } => Self::Complete {
                 final_text: final_text.clone(),
                 turns: *turns,
@@ -247,6 +262,13 @@ impl WireAgentEvent {
                 AgentEvent::BuiltInToolResult { id, tool, result }
             }
             Self::Usage { usage } => AgentEvent::Usage(usage),
+            Self::TurnComplete {
+                turn,
+                has_tool_calls,
+            } => AgentEvent::TurnComplete {
+                turn,
+                has_tool_calls,
+            },
             Self::Complete { final_text, turns } => AgentEvent::Complete { final_text, turns },
             Self::Error { error } => return Err(error.into()),
         };
