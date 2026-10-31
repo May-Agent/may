@@ -20,7 +20,7 @@ use super::error::{bad_request_error, internal_error, internal_error_message};
 use super::helpers::send_event;
 use super::message_mapping::map_skill;
 use super::model_resolution::persist_last_model;
-use super::state::UiServerState;
+use super::state::DaemonState;
 use super::types::{
     ApiHealth, CopilotAuthEvent, CopilotAuthStatus, CopilotStartResponse, CopilotStatusResponse,
     LastModelRequest, McpCreateRequest, MemoryPayload, MemorySaveRequest, SkillInfoDto,
@@ -42,7 +42,7 @@ pub(super) struct CopilotAuthStreamQuery {
     interval: u64,
 }
 
-fn scoped_skill_manager(state: &UiServerState, profile_id: &str) -> SkillManager {
+fn scoped_skill_manager(state: &DaemonState, profile_id: &str) -> SkillManager {
     let home_paths = MayHomePaths::new(state.may_dir.clone());
     SkillManager::from_profile_home(&home_paths.profile_home(profile_id))
 }
@@ -59,7 +59,7 @@ fn parse_selector_list(values: &[String]) -> Vec<ModelSelector> {
 }
 
 pub(super) async fn list_skills_for_profile(
-    state: &UiServerState,
+    state: &DaemonState,
     profile_id: &str,
 ) -> Result<Vec<SkillInfoDto>, skyzen::Error> {
     let skills = scoped_skill_manager(state, profile_id)
@@ -70,7 +70,7 @@ pub(super) async fn list_skills_for_profile(
 }
 
 pub(super) async fn get_ui_config(
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<UiConfigResponse>> {
     let config = state.config_snapshot();
     Ok(Json(build_ui_config_response(&config)))
@@ -158,7 +158,7 @@ pub(super) fn build_ui_full_config(config: &MayConfig) -> UiFullConfig {
             every_nth_frame: config.browser.every_nth_frame,
             stealth_enabled: config.browser.stealth_enabled,
             system_profile: config.browser.system_profile.as_ref().map(|sp| {
-                crate::ui_server::types::UiSystemProfileConfig {
+                crate::daemon::types::UiSystemProfileConfig {
                     path: sp.path.display().to_string(),
                     copy_on_first_use: sp.copy_on_first_use,
                 }
@@ -173,7 +173,7 @@ pub(super) fn build_ui_full_config(config: &MayConfig) -> UiFullConfig {
 
 pub(super) async fn save_full_config(
     Json(req): Json<UiFullConfig>,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<ApiHealth>> {
     let tokio_handle = state.tokio_handle.clone();
     let response = tokio_handle
@@ -218,10 +218,7 @@ fn provider_map_from_ui(
         .collect()
 }
 
-async fn run_save_full_config(
-    state: Arc<UiServerState>,
-    req: UiFullConfig,
-) -> SkyResult<ApiHealth> {
+async fn run_save_full_config(state: Arc<DaemonState>, req: UiFullConfig) -> SkyResult<ApiHealth> {
     let previous_browser_manager = state.browser_manager();
     let next_browser_manager = if req.browser.enabled {
         let next_browser_config = crate::config::BrowserConfig {
@@ -358,7 +355,7 @@ async fn run_save_full_config(
 
 pub(super) async fn set_last_model(
     Json(req): Json<LastModelRequest>,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<ApiHealth>> {
     let model = req.model.trim();
     if model.is_empty() {
@@ -372,7 +369,7 @@ pub(super) async fn set_last_model(
 }
 
 pub(super) async fn get_memory(
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<MemoryPayload>> {
     let content = state
         .db()
@@ -385,7 +382,7 @@ pub(super) async fn get_memory(
 
 pub(super) async fn save_memory(
     Json(payload): Json<MemorySaveRequest>,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<ApiHealth>> {
     if !payload.explicit_user_request {
         return Err(bad_request_error(
@@ -404,7 +401,7 @@ pub(super) async fn save_memory(
 
 pub(super) async fn add_ssh_server(
     Json(req): Json<SshServerRequest>,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<ApiHealth>> {
     let updated = state.update_config(|config| {
         config.upsert_ssh_server(SshServerConfig {
@@ -419,7 +416,7 @@ pub(super) async fn add_ssh_server(
 
 pub(super) async fn remove_ssh_server(
     params: Params,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<ApiHealth>> {
     let name = params.get("name").map_err(bad_request_error)?;
     let updated = state.update_config(|config| {
@@ -438,14 +435,14 @@ pub(super) async fn remove_ssh_server(
 // ── MCP ────────────────────────────────────────
 
 pub(super) async fn list_mcp_servers(
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<Vec<crate::mcp::McpServerInfo>>> {
     Ok(Json(state.mcp().server_info().await))
 }
 
 pub(super) async fn add_mcp_server(
     Json(req): Json<McpCreateRequest>,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<ApiHealth>> {
     let (name, config) = match req {
         McpCreateRequest::Process {
@@ -525,7 +522,7 @@ pub(super) async fn add_mcp_server(
 
 pub(super) async fn remove_mcp_server(
     params: Params,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<ApiHealth>> {
     let name = params.get("name").map_err(bad_request_error)?;
     state
@@ -538,7 +535,7 @@ pub(super) async fn remove_mcp_server(
 
 pub(super) async fn reconnect_mcp_server(
     params: Params,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<ApiHealth>> {
     let name = params.get("name").map_err(bad_request_error)?;
     state
@@ -553,7 +550,7 @@ pub(super) async fn reconnect_mcp_server(
 
 pub(super) async fn list_skills(
     Query(query): Query<SkillScopeQuery>,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<Vec<SkillInfoDto>>> {
     Ok(Json(
         list_skills_for_profile(state.as_ref(), query.profile_id.as_str()).await?,
@@ -563,7 +560,7 @@ pub(super) async fn list_skills(
 pub(super) async fn install_skill(
     Query(query): Query<SkillScopeQuery>,
     Json(req): Json<SkillInstallRequest>,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<Vec<SkillInfoDto>>> {
     let (owner, repo) = SkillManager::parse_github_repo(&req.repo).map_err(bad_request_error)?;
     let installed = scoped_skill_manager(&state, query.profile_id.as_str())
@@ -576,7 +573,7 @@ pub(super) async fn install_skill(
 pub(super) async fn delete_skill(
     params: Params,
     Query(query): Query<SkillScopeQuery>,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<ApiHealth>> {
     let dir = params.get("dir").map_err(bad_request_error)?;
     scoped_skill_manager(&state, query.profile_id.as_str())
@@ -608,7 +605,7 @@ pub(super) async fn copilot_start() -> SkyResult<Json<CopilotStartResponse>> {
 
 pub(super) async fn copilot_stream(
     Query(query): Query<CopilotAuthStreamQuery>,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Sse> {
     let device_code = query.device_code.trim().to_string();
     if device_code.is_empty() {

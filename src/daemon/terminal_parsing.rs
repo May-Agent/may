@@ -115,9 +115,7 @@ mod tests {
     use aither_core::llm::{CommandOutcome, CommandResult, CommandStream, ToolResult};
 
     use super::{terminal_status_from_result, update_terminal_snapshot_from_tool_event};
-    use crate::ui_server::types::{
-        TerminalExecutionStatus, TerminalStateSnapshot, ToolEventRecord,
-    };
+    use crate::daemon::types::{TerminalExecutionStatus, TerminalStateSnapshot, ToolEventRecord};
 
     fn command(outcome: CommandOutcome) -> ToolResult {
         ToolResult::Command(Box::new(CommandResult {

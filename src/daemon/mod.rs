@@ -9,6 +9,40 @@
 pub mod lifecycle;
 pub mod serve;
 
+mod artifacts;
+mod attachments;
+mod bootstrap;
+mod browser;
+mod chat;
+mod config;
+mod error;
+mod error_chain;
+mod events;
+mod helpers;
+mod interaction;
+mod local_url_mapper;
+mod message_mapping;
+mod model_resolution;
+mod notifications;
+mod profiles;
+mod remote_access;
+mod server;
+mod sessions;
+mod state;
+mod tasks;
+mod terminal_parsing;
+mod title_generation;
+mod tool_summary;
+mod types;
+
+#[cfg(test)]
+mod response_tests;
+
+pub use chat::{BtwMessage, BtwRequest, BtwResponse, CompactResponse, ContextDumpResponse};
+pub use server::{DEFAULT_PORT, DaemonMode, parse_listen_args};
+pub(crate) use server::{start, sync_remote_access};
+pub use types::DaemonHealth;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -23,7 +57,6 @@ use crate::repo_search::auto_index::AutoIndexer;
 use crate::repo_search::indexer::{IndexerStatus, SearchIndexer};
 use crate::repo_search::{RepoSearch, RepoSearchCollections};
 use crate::ui_event_bus::UiEventTopics;
-use crate::ui_server::{DEFAULT_PORT, UiServerMode};
 
 /// How long a shutdown waits for running turns before exiting anyway.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
@@ -107,7 +140,7 @@ pub fn current_build_id() -> std::io::Result<String> {
 #[derive(Debug, Clone)]
 pub struct DaemonOptions {
     /// Whether the embedded web UI is served next to the API.
-    pub mode: UiServerMode,
+    pub mode: DaemonMode,
     /// TCP address replacing `127.0.0.1:<[daemon] port>`.
     pub tcp: Option<SocketAddr>,
 }
@@ -119,9 +152,9 @@ impl DaemonOptions {
     pub const fn new() -> Self {
         Self {
             mode: if cfg!(feature = "ui") {
-                UiServerMode::Ui
+                DaemonMode::Ui
             } else {
-                UiServerMode::Rest
+                DaemonMode::Rest
             },
             tcp: None,
         }
@@ -250,7 +283,7 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
     let _instance = acquire_single_instance(&paths)?;
     remove_legacy_search_index(paths.root());
 
-    let started = crate::ui_server::start(options.mode).await?;
+    let started = crate::daemon::start(options.mode).await?;
     let state = started.state;
     let router = Arc::new(started.router);
 
@@ -268,7 +301,7 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
             .local_addr()
             .context("the daemon's TCP listener has no address")?,
     );
-    crate::ui_server::sync_remote_access(&state).await?;
+    crate::daemon::sync_remote_access(&state).await?;
     tokio::spawn(serve::serve_tcp(tcp_listener, router.clone()));
     tokio::spawn(serve::serve_unix(unix_listener, router.clone()));
     tracing::info!(%tcp, socket = %paths.socket().display(), "May daemon listening");

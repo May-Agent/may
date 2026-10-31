@@ -5,10 +5,10 @@ use crate::session::SessionId;
 use crate::ui_event_bus::UiEventTopics;
 
 use super::helpers::truncate_preview;
-use super::state::{TitleGenerationTask, UiServerState};
+use super::state::{DaemonState, TitleGenerationTask};
 
 pub(super) fn enqueue(
-    state: &Arc<UiServerState>,
+    state: &Arc<DaemonState>,
     session_id: &SessionId,
     user_message: String,
     assistant_response: String,
@@ -25,7 +25,7 @@ pub(super) fn enqueue(
 }
 
 pub(super) fn spawn_worker(
-    state: Arc<UiServerState>,
+    state: Arc<DaemonState>,
     mut queue: tokio::sync::mpsc::UnboundedReceiver<TitleGenerationTask>,
 ) {
     tokio::spawn(async move {
@@ -42,7 +42,7 @@ fn is_replaceable_session_title(current: Option<&str>, placeholder: &str) -> boo
     })
 }
 
-async fn process_task(state: Arc<UiServerState>, task: TitleGenerationTask) {
+async fn process_task(state: Arc<DaemonState>, task: TitleGenerationTask) {
     let session_id = SessionId::from_string(task.session_id);
     let placeholder = truncate_preview(&task.user_message);
     let db = state.db();

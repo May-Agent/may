@@ -1,27 +1,5 @@
-mod artifacts;
-mod attachments;
-mod bootstrap;
-mod browser;
-mod chat;
-mod config;
-mod error;
-mod error_chain;
-mod events;
-mod helpers;
-mod interaction;
-mod local_url_mapper;
-mod message_mapping;
-mod model_resolution;
-mod notifications;
-mod profiles;
-mod remote_access;
-mod sessions;
-mod state;
-mod tasks;
-mod terminal_parsing;
-mod title_generation;
-mod tool_summary;
-mod types;
+//! The daemon's API server: state construction, background workers, and
+//! the REST/SSE router every client (TUI, oneshot, web UI) talks to.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -39,22 +17,19 @@ use crate::mcp::McpManager;
 use crate::models::fetch_all_models;
 use aither_models::lookup as lookup_model_info;
 
-use error::internal_error;
-use state::{AskUserApprover, UiServerState, WorkspaceApprover, tool_dispatch_channels};
-use types::{
+use super::error::internal_error;
+use super::state::{AskUserApprover, DaemonState, WorkspaceApprover, tool_dispatch_channels};
+use super::types::{
     ApiHealth, ModelInfoItem, ModelsResponse, ProviderModelsItem, ProviderModelsResponse,
     RequestLogCacheSummary, RequestLogEntry, RequestLogsResponse,
 };
-
-pub use chat::{BtwMessage, BtwRequest, BtwResponse, CompactResponse, ContextDumpResponse};
-pub use types::DaemonHealth;
 
 /// Applies the configured remote access, once the daemon listens on TCP.
 ///
 /// # Errors
 /// Fails when the profiles cannot be read.
-pub(crate) async fn sync_remote_access(state: &UiServerState) -> anyhow::Result<()> {
-    remote_access::sync_remote_access_from_state(state)
+pub async fn sync_remote_access(state: &DaemonState) -> anyhow::Result<()> {
+    super::remote_access::sync_remote_access_from_state(state)
         .await
         .context("failed to sync remote access state")
 }
@@ -65,14 +40,14 @@ static WEB_UI_DIST: include_dir::Dir<'static> =
 
 /// HTTP server mode selected by the CLI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UiServerMode {
+pub enum DaemonMode {
     /// Serve the REST API plus the embedded web UI.
     Ui,
     /// Serve the REST API only.
     Rest,
 }
 
-impl UiServerMode {
+impl DaemonMode {
     #[cfg(not(feature = "ui"))]
     fn ensure_supported(self) -> anyhow::Result<()> {
         match self {
@@ -89,8 +64,9 @@ impl UiServerMode {
 /// # Errors
 /// Fails when the pair does not form a socket address.
 pub fn parse_listen_args(args: &[String]) -> anyhow::Result<SocketAddr> {
-    let host = helpers::parse_arg_value(args, "--host").unwrap_or_else(|| "127.0.0.1".to_string());
-    let port = helpers::parse_arg_value(args, "--port")
+    let host =
+        super::helpers::parse_arg_value(args, "--host").unwrap_or_else(|| "127.0.0.1".to_string());
+    let port = super::helpers::parse_arg_value(args, "--port")
         .and_then(|v| v.parse::<u16>().ok())
         .unwrap_or(DEFAULT_PORT);
     format!("{host}:{port}")
@@ -103,9 +79,9 @@ pub const DEFAULT_PORT: u16 = 8787;
 
 /// A started server: shared state with its background work running, and
 /// the router that serves it.
-pub(crate) struct StartedServer {
+pub struct StartedDaemon {
     /// Shared server state.
-    pub(crate) state: Arc<UiServerState>,
+    pub(crate) state: Arc<DaemonState>,
     /// Router serving the API (and the web UI when embedded).
     pub(crate) router: Router,
 }
@@ -117,7 +93,7 @@ pub(crate) struct StartedServer {
 /// # Errors
 /// Fails when configuration, persistence or a required service cannot be
 /// initialized.
-pub(crate) async fn start(mode: UiServerMode) -> anyhow::Result<StartedServer> {
+pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
     #[cfg(not(feature = "ui"))]
     mode.ensure_supported()?;
 
@@ -189,7 +165,7 @@ pub(crate) async fn start(mode: UiServerMode) -> anyhow::Result<StartedServer> {
     let (_session_store, db_for_archive, default_profile_id) =
         crate::session::initialize_session_persistence(&may_dir).await?;
     let (title_generation_queue, title_generation_rx) =
-        crate::ui_server::state::TitleGenerationQueue::new();
+        crate::daemon::state::TitleGenerationQueue::new();
     let ui_event_bus = crate::ui_event_bus::UiEventBus::new();
     // Request handlers acquire runs from outside the tokio runtime, so the
     // lease tasks are spawned on its handle.
@@ -205,7 +181,7 @@ pub(crate) async fn start(mode: UiServerMode) -> anyhow::Result<StartedServer> {
         .recover_after_restart()
         .await
         .context("failed to reconcile persisted session runtime state after restart")?;
-    let remote_access_manager = Arc::new(remote_access::RemoteAccessManager::new(
+    let remote_access_manager = Arc::new(super::remote_access::RemoteAccessManager::new(
         ui_event_bus.clone(),
     ));
     let permission_approver =
@@ -259,19 +235,19 @@ pub(crate) async fn start(mode: UiServerMode) -> anyhow::Result<StartedServer> {
         task_runtime = task_runtime.with_container_manager(manager.clone());
     }
     let task_runtime = Arc::new(task_runtime);
-    let container_prepare = state::ContainerPrepareTracker::new(ui_event_bus.clone());
+    let container_prepare = super::state::ContainerPrepareTracker::new(ui_event_bus.clone());
     let (search_index_wake_tx, search_index_wake) = async_channel::bounded(1);
 
-    let state = Arc::new(UiServerState {
+    let state = Arc::new(DaemonState {
         tokio_handle: tokio::runtime::Handle::current(),
         db: db_for_archive.clone(),
         default_profile_id,
-        mcp_service: state::McpService::spawn(mcp_manager),
+        mcp_service: super::state::McpService::spawn(mcp_manager),
         permission_approver,
         workspace_approver,
         ask_user_approver,
         tool_dispatchers,
-        fetched_models_cache: state::RefreshableCache::new(Duration::from_secs(20)),
+        fetched_models_cache: super::state::RefreshableCache::new(Duration::from_secs(20)),
         config: arc_swap::ArcSwap::from_pointee(config),
         ui_event_bus,
         container_prepare,
@@ -282,7 +258,7 @@ pub(crate) async fn start(mode: UiServerMode) -> anyhow::Result<StartedServer> {
         remote_access_manager,
         notification_service: notification_service.clone(),
         memory_processor,
-        local_url_port_mapper: Arc::new(local_url_mapper::LocalUrlPortMapper::new()),
+        local_url_port_mapper: Arc::new(super::local_url_mapper::LocalUrlPortMapper::new()),
         title_generation_queue,
         location_provider: crate::location::LocationProvider::new(),
         runtime_service,
@@ -298,16 +274,16 @@ pub(crate) async fn start(mode: UiServerMode) -> anyhow::Result<StartedServer> {
         daemon_shutdown: Arc::new(tokio::sync::Notify::new()),
         build_id: crate::daemon::current_build_id()
             .context("failed to identify the running build")?,
-        turn_hub: Arc::new(chat::TurnHub::default()),
-        parked_agents: chat::ParkedAgents::default(),
-        session_background: chat::SessionBackgrounds::default(),
+        turn_hub: Arc::new(super::chat::TurnHub::default()),
+        parked_agents: super::chat::ParkedAgents::default(),
+        session_background: super::chat::SessionBackgrounds::default(),
     });
 
-    chat::resume_pending_follow_up_runs(state.clone())
+    super::chat::resume_pending_follow_up_runs(state.clone())
         .await
         .context("failed to resume persisted pending session runs")?;
 
-    chat::open_all_sessions_for_agents(&state)
+    super::chat::open_all_sessions_for_agents(&state)
         .await
         .context("failed to open stored sessions to other agents")?;
 
@@ -316,55 +292,55 @@ pub(crate) async fn start(mode: UiServerMode) -> anyhow::Result<StartedServer> {
     if let Some(ref cm) = state.container_manager {
         let _auto_stop = cm.spawn_auto_stop_task();
     }
-    chat::spawn_shared_tool_dispatchers(state.clone(), tool_queues);
-    title_generation::spawn_worker(state.clone(), title_generation_rx);
-    chat::spawn_background_watcher(state.clone(), state.ui_event_bus.clone());
+    super::chat::spawn_shared_tool_dispatchers(state.clone(), tool_queues);
+    super::title_generation::spawn_worker(state.clone(), title_generation_rx);
+    super::chat::spawn_background_watcher(state.clone(), state.ui_event_bus.clone());
     let scheduler = crate::scheduler::TaskScheduler::new(task_runtime);
     let _scheduler = scheduler.spawn();
     let router = build_router(state.clone(), mode);
-    Ok(StartedServer { state, router })
+    Ok(StartedDaemon { state, router })
 }
 
 fn api_routes() -> Route {
-    use artifacts::{
+    use super::artifacts::{
         get_artifact_preview, get_artifact_runtime_bridge, get_artifact_runtime_preview,
         get_output_preview, get_session_runtime, get_slidev_static_asset, list_session_artifacts,
         map_container_local_url, prepare_slidev_preview, report_artifact_diagnostics,
         stream_session_artifacts,
     };
-    use bootstrap::get_bootstrap;
-    use browser::{
+    use super::bootstrap::get_bootstrap;
+    use super::browser::{
         browser_offer, browser_resize_viewport, browser_start, browser_status, browser_stop,
         browser_takeover_start, browser_takeover_stop,
     };
-    use chat::{enqueue_chat, remove_pending_message, send_message, stop_session_run};
-    use config::{
+    use super::chat::{enqueue_chat, remove_pending_message, send_message, stop_session_run};
+    use super::config::{
         add_mcp_server, add_ssh_server, copilot_logout, copilot_start, copilot_status,
         copilot_stream, delete_skill, get_memory, get_ui_config, install_skill, list_mcp_servers,
         list_skills, reconnect_mcp_server, remove_mcp_server, remove_ssh_server, save_full_config,
         save_memory, set_last_model,
     };
-    use events::stream_events;
-    use interaction::{
+    use super::events::stream_events;
+    use super::interaction::{
         respond_ask_user_request, respond_permission_request, respond_workspace_request,
     };
-    use notifications::{
+    use super::notifications::{
         consume_notification_callback, get_vapid_key, list_network_access_logs,
         list_notification_mailbox, subscribe, test_notification, unsubscribe,
     };
-    use profiles::{
+    use super::profiles::{
         archive_session, create_folder, create_profile, delete_folder, delete_profile,
         get_profile_remote_servers, get_profile_sessions, list_profiles, move_to_folder,
         pin_session, set_profile_remote_servers, unarchive_session, unpin_session, update_folder,
         update_profile,
     };
-    use remote_access::{get_remote_access_status, start_remote_access, stop_remote_access};
-    use sessions::{
+    use super::remote_access::{get_remote_access_status, start_remote_access, stop_remote_access};
+    use super::sessions::{
         create_session, delete_all_sessions, delete_session, get_session,
         get_session_context_debug, get_session_tasks, list_sessions, save_session_tasks,
         set_session_plan_state, update_session,
     };
-    use tasks::{
+    use super::tasks::{
         approve_task, create_task, delete_task, get_task, invoke_webhook_task, list_tasks,
         run_task, update_task,
     };
@@ -408,19 +384,19 @@ fn api_routes() -> Route {
                     )),
                     Route::new((
                         "/messages".post(send_message),
-                        "/compact".post(chat::compact_session),
-                        "/context-report".at(chat::context_report),
-                        "/context-dump".post(chat::context_dump),
-                        "/btw".post(chat::btw),
-                        "/agent".delete(chat::release_agent),
+                        "/compact".post(super::chat::compact_session),
+                        "/context-report".at(super::chat::context_report),
+                        "/context-dump".post(super::chat::context_dump),
+                        "/btw".post(super::chat::btw),
+                        "/agent".delete(super::chat::release_agent),
                     )),
                     Route::new((
-                        "/background".at(chat::get_background),
-                        "/jobs/read".at(chat::read_job),
-                        "/jobs/{pid}".at(chat::get_job),
-                        "/jobs/{pid}/kill".post(chat::kill_job),
-                        "/subagents".delete(chat::cancel_subagents),
-                        "/subagents/{runId}".delete(chat::cancel_subagent),
+                        "/background".at(super::chat::get_background),
+                        "/jobs/read".at(super::chat::read_job),
+                        "/jobs/{pid}".at(super::chat::get_job),
+                        "/jobs/{pid}/kill".post(super::chat::kill_job),
+                        "/subagents".delete(super::chat::cancel_subagents),
+                        "/subagents/{runId}".delete(super::chat::cancel_subagent),
                     )),
                     Route::new((
                         "/artifacts/runtime/preview".at(get_artifact_runtime_preview),
@@ -522,12 +498,12 @@ fn api_routes() -> Route {
     ))
 }
 
-fn build_router(state: Arc<UiServerState>, mode: UiServerMode) -> Router {
+fn build_router(state: Arc<DaemonState>, mode: DaemonMode) -> Router {
     let api = "/api".route(api_routes());
 
     match mode {
-        UiServerMode::Rest => Route::new((api,)).middleware(State(state)).build(),
-        UiServerMode::Ui => {
+        DaemonMode::Rest => Route::new((api,)).middleware(State(state)).build(),
+        DaemonMode::Ui => {
             #[cfg(feature = "ui")]
             {
                 Route::new((api, EmbeddedStaticDir::new("/", &WEB_UI_DIST).spa()))
@@ -547,8 +523,10 @@ fn build_router(state: Arc<UiServerState>, mode: UiServerMode) -> Router {
 
 // ── System / Meta handlers ────────────────────────────────
 
-async fn health(State(state): State<Arc<UiServerState>>) -> SkyResult<Json<types::DaemonHealth>> {
-    Ok(Json(types::DaemonHealth {
+async fn health(
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<super::types::DaemonHealth>> {
+    Ok(Json(super::types::DaemonHealth {
         ok: true,
         pid: std::process::id(),
         build: state.build_id.clone(),
@@ -556,13 +534,13 @@ async fn health(State(state): State<Arc<UiServerState>>) -> SkyResult<Json<types
     }))
 }
 
-async fn shutdown_daemon(State(state): State<Arc<UiServerState>>) -> SkyResult<Json<ApiHealth>> {
+async fn shutdown_daemon(State(state): State<Arc<DaemonState>>) -> SkyResult<Json<ApiHealth>> {
     state.daemon_shutdown.notify_one();
-    Ok(Json(types::API_OK))
+    Ok(Json(super::types::API_OK))
 }
 
 async fn get_request_logs(
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<RequestLogsResponse>> {
     let logs = state
         .db()
@@ -584,7 +562,7 @@ async fn get_request_logs(
     }))
 }
 
-async fn models(State(state): State<Arc<UiServerState>>) -> SkyResult<Json<ModelsResponse>> {
+async fn models(State(state): State<Arc<DaemonState>>) -> SkyResult<Json<ModelsResponse>> {
     let tokio_handle = state.tokio_handle.clone();
     let result = tokio_handle
         .spawn(async move {
@@ -688,7 +666,7 @@ fn build_models_response(
 }
 
 async fn models_by_provider(
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<ProviderModelsResponse>> {
     let tokio_handle = state.tokio_handle.clone();
     let result = tokio_handle
@@ -746,17 +724,14 @@ fn build_provider_models_response(
 }
 
 #[cfg(test)]
-mod response_tests;
-
-#[cfg(test)]
 mod tests {
     #[cfg(not(feature = "ui"))]
-    use super::UiServerMode;
+    use super::DaemonMode;
 
     #[cfg(not(feature = "ui"))]
     #[test]
     fn rest_mode_is_always_supported() {
-        UiServerMode::Rest
+        DaemonMode::Rest
             .ensure_supported()
             .expect("rest mode should always be available");
     }
@@ -764,7 +739,7 @@ mod tests {
     #[cfg(not(feature = "ui"))]
     #[test]
     fn ui_mode_requires_ui_feature() {
-        let error = UiServerMode::Ui
+        let error = DaemonMode::Ui
             .ensure_supported()
             .expect_err("ui mode should fail without the ui feature");
         assert_eq!(

@@ -19,11 +19,11 @@ use crate::agent::ssh_authorizer::PermissionChoice;
 use crate::agent::task_tool::{TaskBroker, TaskQueue};
 use crate::ask_user::{AnswerValue, AskUserRequest, Question, QuestionAnswer};
 use crate::config::MayConfig;
+use crate::daemon::types::BrowserLifecycleEvent;
 use crate::live_response::LiveResponseRegistry;
 use crate::mcp::{MayMcpServerConfig, McpManager, McpServerInfo};
 use crate::session::{PersistedAskUserQuestion, PersistedAskUserRequest};
 use crate::ui_event_bus::{UiEventBus, UiEventTopics};
-use crate::ui_server::types::BrowserLifecycleEvent;
 use crate::workspace_request::RequestWorkspaceArgs;
 
 #[derive(Debug, Clone, Copy, serde::Serialize, PartialEq, Eq, skyzen::ToSchema)]
@@ -405,7 +405,7 @@ impl McpService {
     }
 }
 
-pub struct UiServerState {
+pub struct DaemonState {
     pub(crate) tokio_handle: tokio::runtime::Handle,
     pub(crate) db: crate::db::ChatDb,
     pub(crate) default_profile_id: String,
@@ -460,7 +460,7 @@ pub struct UiServerState {
     pub(crate) session_background: super::chat::SessionBackgrounds,
 }
 
-impl UiServerState {
+impl DaemonState {
     pub(crate) fn mcp(&self) -> McpService {
         self.mcp_service.clone()
     }
@@ -846,7 +846,7 @@ impl WorkspaceApprover {
     }
 }
 
-impl UiServerState {
+impl DaemonState {
     pub(crate) fn notify_ui_events(&self, topics: UiEventTopics) {
         self.ui_event_bus.publish(topics);
     }

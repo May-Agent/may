@@ -13,7 +13,7 @@ use crate::session::AttachmentKind;
 
 use super::error::{bad_request_error, internal_error, internal_error_message};
 use super::helpers::{load_session_paths, parse_safe_relative_path};
-use super::state::UiServerState;
+use super::state::DaemonState;
 use super::types::{ApiAttachment, ChatRequest};
 
 pub(super) const INLINE_PASTED_TEXT_THRESHOLD: usize = 1200;
@@ -85,7 +85,7 @@ impl PromptSection {
 }
 
 pub(super) async fn build_prompt_and_attachments(
-    state: &UiServerState,
+    state: &DaemonState,
     req: &ChatRequest,
     model_id: &str,
 ) -> SkyResult<(String, Vec<LlmAttachment>)> {
@@ -245,7 +245,7 @@ struct NativeAttachmentSource {
 }
 
 async fn resolve_native_attachment_source(
-    state: &UiServerState,
+    state: &DaemonState,
     session_id: &str,
     raw: &str,
     canonical_session_root: &mut Option<PathBuf>,
@@ -287,7 +287,7 @@ async fn resolve_native_attachment_source(
 }
 
 async fn resolve_session_file_source(
-    state: &UiServerState,
+    state: &DaemonState,
     session_id: &str,
     path: PathBuf,
     canonical_session_root: &mut Option<PathBuf>,
@@ -321,7 +321,7 @@ async fn resolve_session_file_source(
 }
 
 async fn canonical_session_root_path(
-    state: &UiServerState,
+    state: &DaemonState,
     session_id: &str,
     cached: &mut Option<PathBuf>,
 ) -> SkyResult<PathBuf> {
@@ -492,7 +492,7 @@ fn build_offloaded_attachment(
 // ── Upload helpers ───────────────────────────────────────────
 
 async fn save_upload_data_url(
-    state: &UiServerState,
+    state: &DaemonState,
     session_id: &str,
     attachment: &ApiAttachment,
     data_url: &str,
@@ -532,7 +532,7 @@ async fn save_upload_data_url(
 }
 
 async fn save_large_pasted_text(
-    state: &UiServerState,
+    state: &DaemonState,
     session_id: &str,
     text: &str,
 ) -> SkyResult<(PathBuf, String)> {
@@ -553,7 +553,7 @@ async fn save_large_pasted_text(
     Ok((path, relative_path))
 }
 
-async fn generate_pasted_text_filename(state: &UiServerState, text: &str) -> String {
+async fn generate_pasted_text_filename(state: &DaemonState, text: &str) -> String {
     let config = state.config_snapshot();
     let snippet: String = text.chars().take(600).collect();
 
@@ -572,7 +572,7 @@ async fn generate_pasted_text_filename(state: &UiServerState, text: &str) -> Str
 }
 
 async fn allocate_upload_path(
-    state: &UiServerState,
+    state: &DaemonState,
     session_id: &str,
     base_name: &str,
     ext: &str,
