@@ -3203,9 +3203,13 @@ impl App {
                                 let image = out
                                     .image
                                     .or_else(|| self.imagine_result_image(&id, &out.text));
+                                let status = out.failure.map_or(
+                                    super::ui::chat::ToolStatus::Done,
+                                    super::ui::chat::ToolStatus::Failed,
+                                );
                                 self.chat.update_tool_with_output(
                                     &id,
-                                    super::ui::chat::ToolStatus::Done,
+                                    status,
                                     Some(out.text.as_str()),
                                 );
                                 if let Some(image) = image

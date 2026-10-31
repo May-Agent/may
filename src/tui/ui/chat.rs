@@ -1100,6 +1100,8 @@ pub struct UnifiedRenderContext<'a> {
     pub hide_todos: bool,
     /// Output: image blocks intersecting the view, for the overlay.
     pub image_positions_out: Option<&'a mut Vec<ImagePlacement>>,
+    /// Animation frame counter for running tool calls' status spinners.
+    pub spinner_frame: usize,
 }
 
 impl<'a> From<UnifiedRenderContext<'a>> for RenderContext<'a> {
@@ -1115,6 +1117,7 @@ impl<'a> From<UnifiedRenderContext<'a>> for RenderContext<'a> {
             images_supported: ctx.images_supported,
             hide_todos: ctx.hide_todos,
             image_positions_out: ctx.image_positions_out,
+            spinner_frame: ctx.spinner_frame,
         }
     }
 }
@@ -1149,7 +1152,15 @@ pub fn build_plain_wrapped_lines_unified(
         return Vec::new();
     }
     let mut layout = ChatLayout::default();
-    layout.sync(chat, width, images_supported, false, None, Instant::now());
+    layout.sync(
+        chat,
+        width,
+        images_supported,
+        false,
+        None,
+        0,
+        Instant::now(),
+    );
     let mut out: Vec<String> = (0..layout.element_rows())
         .map(|row| layout.plain_line(row).unwrap_or_default().to_string())
         .collect();
@@ -1337,36 +1348,6 @@ fn context_report_lines(report: &ContextReport) -> Vec<Line<'static>> {
     lines
 }
 
-/// The one-line headline a call renders: `▸`/`▾`-suffixed description,
-/// chip + summary, or the command itself when no description exists.
-fn tool_headline(display: &ToolDisplay) -> String {
-    match display {
-        ToolDisplay::Terminal {
-            description,
-            command,
-            mode,
-            ..
-        } => {
-            if description.is_empty() {
-                format!(
-                    "{}$ {}",
-                    terminal_mode_marker(*mode),
-                    command.lines().next().unwrap_or_default()
-                )
-            } else {
-                description.clone()
-            }
-        }
-        ToolDisplay::Action { chip, summary, .. } => {
-            let (label, rest) = action_headline(chip, summary);
-            format!("{label} {rest}").trim_end().to_string()
-        }
-        ToolDisplay::Builtin { tool, detail, .. } => {
-            format!("[{tool}] {detail}").trim_end().to_string()
-        }
-    }
-}
-
 /// Remove a background task id from a tool's result text, replacing its
 /// quoted and bare occurrences with a readable referent.
 fn scrub_task_id(text: &str, task_id: &str) -> String {
@@ -1437,6 +1418,8 @@ struct RenderContext<'a> {
     images_supported: bool,
     hide_todos: bool,
     image_positions_out: Option<&'a mut Vec<ImagePlacement>>,
+    /// Animation frame counter shared with the status-bar spinner.
+    spinner_frame: usize,
 }
 
 /// How one element renders this frame, beyond its own content.
@@ -1448,6 +1431,9 @@ pub(super) struct ElementState {
     pub open: bool,
     /// Todo blocks render nothing (the sidebar shows the task tree).
     pub hide_todos: bool,
+    /// Spinner frame for a running call's status icon; `0` for everything
+    /// else so only running calls re-lay-out as the frame advances.
+    pub spinner_frame: usize,
 }
 
 impl ElementState {
@@ -1456,6 +1442,7 @@ impl ElementState {
         elem: &ChatElement,
         selected_tool: Option<&str>,
         hide_todos: bool,
+        spinner_frame: usize,
         now: Instant,
     ) -> Self {
         match elem {
@@ -1463,11 +1450,17 @@ impl ElementState {
                 selected: selected_tool == Some(id.as_str()),
                 open: display.expandable() && display.body_open(now),
                 hide_todos,
+                spinner_frame: if matches!(display.status(), ToolStatus::Running) {
+                    spinner_frame
+                } else {
+                    0
+                },
             },
             _ => Self {
                 selected: false,
                 open: false,
                 hide_todos,
+                spinner_frame: 0,
             },
         }
     }
@@ -1592,6 +1585,7 @@ pub(super) fn element_lines(
                 images_supported,
                 &mut images,
                 state.open,
+                state.spinner_frame,
             );
             lines.extend(tool_lines.into_iter().map(line_into_static));
         }
@@ -1727,6 +1721,7 @@ fn render_impl(
         images_supported,
         hide_todos,
         image_positions_out,
+        spinner_frame,
     } = ctx;
 
     let build_start = std::time::Instant::now();
@@ -1736,6 +1731,7 @@ fn render_impl(
         images_supported,
         hide_todos,
         selected_tool,
+        spinner_frame,
         Instant::now(),
     );
     stats.elements = layout.rebuilt();
@@ -2200,9 +2196,27 @@ const fn terminal_mode_marker(mode: TerminalExecutionMode) -> &'static str {
     }
 }
 
-/// A tool call's styled headline: expand marker + chip/description +
-/// collapsed status suffix. Mirrors `plain_tool_lines`'s first line.
-fn tool_header_line(display: &ToolDisplay, selection_style: Style, open: bool) -> Line<'_> {
+/// The icon prefixing a call's headline — spinner while running, tick on
+/// success, cross on failure — and its style.
+fn status_icon(status: &ToolStatus, spinner_frame: usize) -> (char, Style) {
+    match status {
+        ToolStatus::Running => (
+            SPINNER_FRAMES[spinner_frame % SPINNER_FRAMES.len()],
+            Style::default().fg(Color::DarkGray),
+        ),
+        ToolStatus::Done => ('✓', Style::default().fg(Color::Green)),
+        ToolStatus::Failed(_) => ('✗', Style::default().fg(Color::Red)),
+    }
+}
+
+/// A tool call's styled headline: expand marker + status icon +
+/// chip/description + collapsed status suffix.
+fn tool_header_line(
+    display: &ToolDisplay,
+    selection_style: Style,
+    open: bool,
+    spinner_frame: usize,
+) -> Line<'_> {
     let marker = if !display.expandable() {
         "  "
     } else if open {
@@ -2211,10 +2225,38 @@ fn tool_header_line(display: &ToolDisplay, selection_style: Style, open: bool) -
         "▸ "
     };
     let dim = Style::default().fg(Color::DarkGray);
-    let mut spans = vec![Span::styled(marker, dim)];
+    let (icon, icon_style) = status_icon(display.status(), spinner_frame);
+    let mut spans = vec![
+        Span::styled(marker, dim),
+        Span::styled(format!("{icon} "), icon_style),
+    ];
     match display {
-        ToolDisplay::Terminal { .. } => {
-            spans.push(Span::styled(tool_headline(display), selection_style));
+        ToolDisplay::Terminal {
+            description,
+            command,
+            mode,
+            ..
+        } => {
+            if description.is_empty() {
+                // A `!` bash call headlines its command, highlighted like
+                // the expanded body.
+                spans.push(Span::styled(
+                    terminal_mode_marker(*mode),
+                    Style::default()
+                        .fg(Color::Red)
+                        .bold()
+                        .patch(selection_style),
+                ));
+                spans.push(Span::styled("$ ", dim.patch(selection_style)));
+                spans.extend(
+                    super::highlight::shell_spans(command.lines().next().unwrap_or_default())
+                        .into_iter()
+                        .flatten()
+                        .map(|span| Span::styled(span.content, span.style.patch(selection_style))),
+                );
+            } else {
+                spans.push(Span::styled(description.clone(), selection_style));
+            }
         }
         ToolDisplay::Action { chip, summary, .. } => {
             let (label, rest) = action_headline(chip, summary);
@@ -2247,7 +2289,7 @@ fn tool_header_line(display: &ToolDisplay, selection_style: Style, open: bool) -
 
 /// An `Action` headline as `(label, rest)`: known IPC command names get a
 /// semantic verb (`websearch` → `Searched "query"`), everything else keeps
-/// its `[chip]` label. `tool_headline` renders the same text plainly.
+/// its `[chip]` label.
 fn action_headline(chip: &str, summary: &str) -> (String, String) {
     match chip {
         "websearch" => ("Searched".to_string(), format!("\"{summary}\"")),
@@ -2282,6 +2324,7 @@ fn render_tool_inline<'a>(
         images_supported,
         image_positions,
         open,
+        0,
     );
 }
 
@@ -2293,6 +2336,7 @@ fn render_tool_inline_at<'a>(
     images_supported: bool,
     image_positions: &mut Vec<(String, usize, String)>,
     open: bool,
+    spinner_frame: usize,
 ) {
     let selection_style = if is_selected {
         Style::default().bg(Color::DarkGray)
@@ -2301,7 +2345,12 @@ fn render_tool_inline_at<'a>(
     };
     let dim = Style::default().fg(Color::DarkGray);
 
-    lines.push(tool_header_line(display, selection_style, open));
+    lines.push(tool_header_line(
+        display,
+        selection_style,
+        open,
+        spinner_frame,
+    ));
     if !open {
         return;
     }
@@ -2316,18 +2365,32 @@ fn render_tool_inline_at<'a>(
             ..
         } => {
             let mode_prefix = terminal_mode_marker(*mode);
-            let mut command_lines = command.lines();
-            if let Some(first) = command_lines.next() {
-                lines.push(Line::from(vec![
-                    Span::styled(mode_prefix, Style::default().fg(Color::Red).bold()),
-                    Span::styled("$ ", dim),
-                    Span::styled(first.to_string(), selection_style),
-                ]));
-                for line in command_lines {
-                    lines.push(Line::from(vec![
-                        Span::styled("│ ", dim),
-                        Span::styled(line.to_string(), selection_style),
-                    ]));
+            let mut command_rows = super::highlight::shell_spans(command).into_iter();
+            if let Some(first) = command_rows.next() {
+                let mut first_spans = vec![
+                    Span::styled(
+                        mode_prefix,
+                        Style::default()
+                            .fg(Color::Red)
+                            .bold()
+                            .patch(selection_style),
+                    ),
+                    Span::styled("$ ", dim.patch(selection_style)),
+                ];
+                first_spans.extend(
+                    first
+                        .into_iter()
+                        .map(|span| Span::styled(span.content, span.style.patch(selection_style))),
+                );
+                lines.push(Line::from(first_spans));
+                for row in command_rows {
+                    let mut row_spans = vec![Span::styled("│ ", dim.patch(selection_style))];
+                    row_spans.extend(
+                        row.into_iter().map(|span| {
+                            Span::styled(span.content, span.style.patch(selection_style))
+                        }),
+                    );
+                    lines.push(Line::from(row_spans));
                 }
             } else {
                 lines.push(Line::from(vec![
@@ -2734,7 +2797,7 @@ mod tests {
                 .iter()
                 .map(|span| span.content.as_ref())
                 .collect();
-            assert_eq!(rendered, format!("▸ {marker}$ echo hi"));
+            assert_eq!(rendered, format!("▸ ✓ {marker}$ echo hi"));
         }
     }
 
@@ -2855,6 +2918,7 @@ mod tests {
                         images_supported: true,
                         hide_todos: false,
                         image_positions_out: None,
+                        spinner_frame: 0,
                     },
                 );
                 truth = Some(frame.buffer_mut().clone());
@@ -3016,7 +3080,7 @@ mod tests {
             lines.extend(
                 super::element_lines(
                     elem,
-                    super::ElementState::of(elem, None, false, Instant::now()),
+                    super::ElementState::of(elem, None, false, 0, Instant::now()),
                     true,
                 )
                 .lines,
@@ -3051,7 +3115,7 @@ mod tests {
         chat.push_user("thanks", Vec::new(), 1);
 
         let mut layout = super::ChatLayout::default();
-        layout.sync(&chat, 60, true, false, None, Instant::now());
+        layout.sync(&chat, 60, true, false, None, 0, Instant::now());
         let images = layout.images_in(0, 1000);
         assert_eq!(images.len(), 1);
         let block_end = images[0].row + IMAGE_HEIGHT;
@@ -3123,7 +3187,7 @@ mod tests {
             render_tool_inline(&mut lines, &display, false, true, &mut positions);
             rendered_text(&lines)
         };
-        assert_eq!(text, vec!["▸ $ one".to_string()]);
+        assert_eq!(text, vec!["▸ ✓ $ one".to_string()]);
 
         // Just finished: still open, showing the whole command.
         let ToolDisplay::Terminal { finished_at, .. } = &mut display else {
@@ -3150,7 +3214,7 @@ mod tests {
             render_tool_inline(&mut lines, &display, false, true, &mut positions);
             rendered_text(&lines)
         };
-        assert_eq!(text, vec!["▸ $ one".to_string()]);
+        assert_eq!(text, vec!["▸ ✓ $ one".to_string()]);
     }
 
     #[test]
@@ -3175,7 +3239,7 @@ mod tests {
         let mut positions = Vec::new();
         render_tool_inline(&mut lines, &display, false, true, &mut positions);
         let text = rendered_text(&lines);
-        assert_eq!(text, vec!["▸ $ echo hi".to_string()]);
+        assert_eq!(text, vec!["▸ ✓ $ echo hi".to_string()]);
 
         // Expanded: command, diff summary and the capped diff body.
         let ToolDisplay::Terminal {
@@ -3192,9 +3256,60 @@ mod tests {
         let mut positions = Vec::new();
         render_tool_inline(&mut lines, &display, false, true, &mut positions);
         let text = rendered_text(&lines);
-        assert_eq!(text[0], "▾ $ echo hi");
+        assert_eq!(text[0], "▾ ✓ $ echo hi");
         assert!(text[2].contains("± 1 file (+12 −0)"));
         assert!(text[11].contains("4 more diff lines"));
+    }
+
+    /// The headline leads with the call's status: spinner while running,
+    /// tick once done, cross on failure.
+    #[test]
+    fn headline_icon_follows_status() {
+        use ratatui::style::Color;
+
+        for (status, icon, color) in [
+            (ToolStatus::Running, '⠋', Color::DarkGray),
+            (ToolStatus::Done, '✓', Color::Green),
+            (ToolStatus::Failed("exit 2".to_string()), '✗', Color::Red),
+        ] {
+            let mut display = terminal_display("echo hi");
+            let ToolDisplay::Terminal {
+                status: slot,
+                pinned,
+                ..
+            } = &mut display
+            else {
+                unreachable!()
+            };
+            *slot = status;
+            *pinned = Some(false); // collapsed, so only the headline renders
+            let mut lines: Vec<Line> = Vec::new();
+            let mut positions = Vec::new();
+            render_tool_inline(&mut lines, &display, false, true, &mut positions);
+            assert_eq!(lines.len(), 1);
+            let icon_span = &lines[0].spans[1];
+            assert_eq!(icon_span.content, format!("{icon} "));
+            assert_eq!(icon_span.style.fg, Some(color));
+        }
+    }
+
+    /// A command's `$` body is highlighted: at least one span carries a
+    /// colored foreground rather than the plain default.
+    #[test]
+    fn expanded_command_is_highlighted() {
+        let mut display = terminal_display("echo hi | grep h");
+        let ToolDisplay::Terminal { pinned, .. } = &mut display else {
+            unreachable!()
+        };
+        *pinned = Some(true);
+        let mut lines: Vec<Line> = Vec::new();
+        let mut positions = Vec::new();
+        render_tool_inline(&mut lines, &display, false, true, &mut positions);
+        let colored = lines[1]
+            .spans
+            .iter()
+            .any(|span| matches!(span.style.fg, Some(ratatui::style::Color::Rgb(..))));
+        assert!(colored, "command line has no syntax colors: {:?}", lines[1]);
     }
 
     #[test]
