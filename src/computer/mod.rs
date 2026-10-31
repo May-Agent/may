@@ -8,7 +8,9 @@
 #[cfg(target_os = "macos")]
 mod skylight;
 
+#[cfg(target_os = "macos")]
 use std::collections::HashMap;
+#[cfg(target_os = "macos")]
 use std::sync::Arc;
 
 /// A session's virtual display: created on demand, destroyed on drop —
