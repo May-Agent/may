@@ -65,6 +65,7 @@ impl TurnPersister {
 
         for msg in &messages {
             let chat_msg = ChatMessage {
+                id: None,
                 role: msg.role.clone(),
                 content: msg.content.clone(),
                 attachments: Vec::new(),

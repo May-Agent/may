@@ -34,6 +34,10 @@ pub(super) struct EventsQuery {
     profile_id: Option<String>,
     #[serde(default)]
     topics: Option<String>,
+    /// Index (SSE `id`) of the last turn frame the client saw: a client that
+    /// reconnects receives only the frames after it.
+    #[serde(default)]
+    after: Option<u64>,
 }
 
 #[derive(Default)]
@@ -84,7 +88,8 @@ pub(super) async fn stream_events(
     let mut lifecycle_rx = state.browser_lifecycle_subscribe();
     let lifecycle_subscribed = subscribed_topics.contains(UiEventTopics::BROWSER_LIFECYCLE);
     // Live turn frames of the filtered session, replayed from the turn's
-    // start for a client attaching mid-turn.
+    // start for a client attaching mid-turn, or from the frame after the
+    // last one it saw for a client reconnecting.
     let turn_kinds = TurnKinds {
         turn: subscribed_topics.contains(UiEventTopics::SESSION_TURN),
         agent: subscribed_topics.contains(UiEventTopics::SESSION_AGENT),
@@ -92,11 +97,16 @@ pub(super) async fn stream_events(
     let turns = session_id
         .as_deref()
         .filter(|_| turn_kinds.turn || turn_kinds.agent)
-        .map(|session_id| state.turn_hub.subscribe(session_id));
-    let (turn_replay, mut turn_rx) = match turns {
-        Some(subscription) => (subscription.replay, Some(subscription.live)),
-        None => (Vec::new(), None),
+        .map(|session_id| state.turn_hub.subscribe(session_id, query.after));
+    let (turn_replay, mut turn_rx, turn_gap) = match turns {
+        Some(subscription) => (
+            subscription.replay,
+            Some(subscription.live),
+            subscription.gap,
+        ),
+        None => (Vec::new(), None, false),
     };
+    let mut last_turn_index = query.after.unwrap_or(0);
 
     state.tokio_handle.spawn(async move {
         let mut signatures = EventSignatures::default();
@@ -116,7 +126,11 @@ pub(super) async fn stream_events(
         {
             return;
         }
+        if turn_gap && !send_resync(&sender, session_id.as_deref()).await {
+            return;
+        }
         for frame in &turn_replay {
+            last_turn_index = frame.index;
             if turn_kinds.wants(frame) && !send_frame(&sender, frame).await {
                 return;
             }
@@ -132,16 +146,32 @@ pub(super) async fn stream_events(
                 } => {
                     match frame {
                         Ok(frame) => {
+                            last_turn_index = frame.index;
                             if turn_kinds.wants(&frame) && !send_frame(&sender, &frame).await {
                                 break;
                             }
                         }
                         Err(RecvError::Lagged(skipped)) => {
-                            tracing::warn!(skipped, "turn stream lagged; asking the client to resync");
-                            let resync = SessionResync { session_id: session_id.as_deref().unwrap_or_default() };
-                            if !send_event(&sender, "session_resync", &resync).await {
+                            // Catch up from the turn in progress; only frames
+                            // of a turn that already ended are lost for good.
+                            let Some(session) = session_id.as_deref() else { break };
+                            let caught_up = state_cloned.turn_hub.subscribe(session, Some(last_turn_index));
+                            tracing::warn!(skipped, gap = caught_up.gap, "turn stream lagged; catching up");
+                            if caught_up.gap && !send_resync(&sender, Some(session)).await {
                                 break;
                             }
+                            let mut sent = true;
+                            for frame in &caught_up.replay {
+                                last_turn_index = frame.index;
+                                if turn_kinds.wants(frame) && !send_frame(&sender, frame).await {
+                                    sent = false;
+                                    break;
+                                }
+                            }
+                            if !sent {
+                                break;
+                            }
+                            turn_rx = Some(caught_up.live);
                         }
                         Err(RecvError::Closed) => turn_rx = None,
                     }
@@ -225,7 +255,8 @@ impl TurnKinds {
     }
 }
 
-/// Tells a client it missed live turn frames and must reload the session.
+/// Tells a client that turn frames it missed are gone and it must reload
+/// the session; the turn in progress follows from its start.
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SessionResync<'a> {
@@ -237,9 +268,20 @@ async fn send_frame(
     frame: &super::chat::TurnFrame,
 ) -> bool {
     sender
-        .send(skyzen::responder::sse::Event::data(&frame.data).event(frame.kind))
+        .send(
+            skyzen::responder::sse::Event::data(&frame.data)
+                .event(frame.kind)
+                .id(frame.index.to_string()),
+        )
         .await
         .is_ok()
+}
+
+async fn send_resync(sender: &skyzen::responder::sse::Sender, session_id: Option<&str>) -> bool {
+    let resync = SessionResync {
+        session_id: session_id.unwrap_or_default(),
+    };
+    send_event(sender, "session_resync", &resync).await
 }
 
 async fn emit_topics_if_changed(

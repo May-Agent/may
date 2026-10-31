@@ -96,6 +96,9 @@ pub enum AppEvent {
     },
     /// A background request finished with a message for the status line.
     Status(String),
+    /// The daemon dropped turn frames this client missed: the session's
+    /// history must be reloaded.
+    HistoryStale,
     /// A kill request finished; `true` when the job accepted it.
     JobKilled {
         /// Process ID the kill targeted.
@@ -156,6 +159,7 @@ impl AppEvent {
             Self::SidebarIssues { .. } => "sidebar_issues",
             Self::BackgroundLoaded { .. } => "background_loaded",
             Self::Status(_) => "status",
+            Self::HistoryStale => "history_stale",
             Self::JobKilled { .. } => "job_killed",
             Self::JobDetailLoaded { .. } => "job_detail_loaded",
             Self::TerminalOutputs(_) => "terminal_outputs",
