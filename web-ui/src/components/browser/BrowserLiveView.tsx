@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { ChevronsRight, Play, Power, Square } from 'lucide-react';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
-import { useTranslation } from '@/lib/i18n';
+import { translate, useTranslation } from '@/lib/i18n';
 import { cn } from '@/lib/utils';
 import { useRuntimeStore } from '@/lib/stores/runtime';
 import { useSessionsStore } from '@/lib/stores/sessions';
@@ -172,7 +172,7 @@ export function BrowserLiveView() {
         handleRef.current = handle;
       } catch (err) {
         if (!cancelled) {
-          toast.error(t('browserLive.streamLost'), {
+          toast.error(translate('browserLive.streamLost'), {
             description: err instanceof Error ? err.message : undefined,
           });
         }
@@ -185,7 +185,7 @@ export function BrowserLiveView() {
       if (video) video.srcObject = null;
       setConnectionState('new');
     };
-  }, [open, isRunning, sessionId, t]);
+  }, [open, isRunning, sessionId]);
 
   const sendInput = useCallback((msg: BrowserInputMessage) => {
     const dc = handleRef.current?.dc;
