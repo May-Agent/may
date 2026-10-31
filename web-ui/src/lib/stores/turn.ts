@@ -8,6 +8,7 @@ import {
   type TurnToolState,
 } from '../stream/reducer';
 import { useSessionsStore } from './sessions';
+import { useInspectorStore } from './inspector';
 
 /**
  * Build the persisted `tool_event` array from the in-memory turn state.
@@ -148,7 +149,9 @@ export const useTurnStore = create<TurnSliceState>((set, get) => {
   const follow = async (sessionId: string, signal: AbortSignal) => {
     while (!signal.aborted) {
       try {
-        const stream = await openSessionTurns(sessionId, signal);
+        const stream = await openSessionTurns(sessionId, signal, {
+          onBackground: (snapshot) => useInspectorStore.getState().applyBackground(snapshot),
+        });
         for await (const evt of stream.events) handle(sessionId, evt);
       } catch (err) {
         if (signal.aborted) return;
