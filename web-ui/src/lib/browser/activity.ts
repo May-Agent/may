@@ -90,7 +90,7 @@ export function hostOf(url: string): string {
 }
 
 /**
- * Consecutive browser calls form one stretch of computer use, shown as one
+ * Consecutive browser calls form one stretch of browser use, shown as one
  * card. Splits an ordered list into runs of browser tools and single items.
  */
 export function groupBrowserRuns<T>(

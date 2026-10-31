@@ -25,13 +25,13 @@ export function BrowserTakeoverBanner({ session }: { session: ApiSession }) {
 
   return (
     <div className="flex items-center gap-3 border-b border-border px-4 py-1.5 text-[13px] sm:px-6">
-      <span className="min-w-0 flex-1 truncate text-muted-foreground">{t('computer.youHaveControl')}</span>
+      <span className="min-w-0 flex-1 truncate text-muted-foreground">{t('browser.youHaveControl')}</span>
       <Button size="sm" variant="ghost" onClick={openViewer}>
-        {t('computer.open')}
+        {t('browser.open')}
       </Button>
       <Button size="sm" variant="outline" disabled={busy} onClick={() => void handBack()}>
         {busy && <Loader2 className="animate-spin" aria-hidden />}
-        {t('computer.handBack')}
+        {t('browser.handBack')}
       </Button>
     </div>
   );
