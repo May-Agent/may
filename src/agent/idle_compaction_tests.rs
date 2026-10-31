@@ -212,6 +212,8 @@ impl SessionParts {
         let cwd = self.dir.join("cwd");
         std::fs::create_dir_all(&cwd).expect("create cwd");
         MayAgentSessionInput {
+            #[cfg(target_os = "macos")]
+            computer: None,
             sandbox_dir: self.dir.join("sandbox"),
             may_dir: self.dir.join(".may"),
             cwd,

@@ -186,6 +186,10 @@ pub struct MayAgentConfig {
     pub notify_broker: Option<crate::agent::notify_tool::NotifyBroker>,
     /// Optional broker for `browser` command requests.
     pub browser_broker: Option<BrowserBroker>,
+    /// Daemon handles for the `computer` command — a session virtual
+    /// desktop exists only on macOS local environments.
+    #[cfg(target_os = "macos")]
+    pub computer: Option<crate::agent::computer_tool::ComputerHandles>,
     /// Optional broker for `register-skills` command requests.
     pub register_skills_broker: Option<RegisterBroker>,
     /// Optional broker for `register-subagents` command requests.
@@ -245,6 +249,9 @@ pub struct MayAgentSessionInput<'a> {
     pub notify_broker: Option<crate::agent::notify_tool::NotifyBroker>,
     /// Channel for browser requests.
     pub browser_broker: Option<BrowserBroker>,
+    /// Daemon handles for `computer` commands (macOS local only).
+    #[cfg(target_os = "macos")]
+    pub computer: Option<crate::agent::computer_tool::ComputerHandles>,
     /// Channel for register-skills requests.
     pub register_skills_broker: Option<RegisterBroker>,
     /// Channel for register-subagents requests.
@@ -525,6 +532,8 @@ impl MayAgent {
                 subagent_runs: subagent_runs.clone(),
                 issue_store: issue_store.clone(),
                 agent_messaging,
+                #[cfg(target_os = "macos")]
+                computer: config.computer.clone(),
             },
         )
         .await?;
@@ -646,6 +655,8 @@ impl MayAgent {
             task_broker,
             notify_broker,
             browser_broker,
+            #[cfg(target_os = "macos")]
+            computer,
             register_skills_broker,
             register_subagents_broker,
             environment,
@@ -741,6 +752,8 @@ impl MayAgent {
             task_broker,
             notify_broker,
             browser_broker,
+            #[cfg(target_os = "macos")]
+            computer,
             register_skills_broker,
             register_subagents_broker,
             native_voice_input: model_info

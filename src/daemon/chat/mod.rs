@@ -2978,6 +2978,15 @@ fn build_session_agent<'a>(
                 task_broker: Some(brokers.task),
                 notify_broker: Some(brokers.notify),
                 browser_broker: state.browser_manager().map(|_| brokers.browser),
+                #[cfg(target_os = "macos")]
+                computer: (!matches!(
+                    environment,
+                    crate::agent::AgentEnvironment::Container { .. }
+                ))
+                .then(|| crate::agent::computer_tool::ComputerHandles {
+                    displays: state.session_displays.clone(),
+                    streams: state.session_streams.clone(),
+                }),
                 register_skills_broker: Some(brokers.register_skills),
                 register_subagents_broker: Some(brokers.register_subagents),
                 environment,
