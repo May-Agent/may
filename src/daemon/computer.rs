@@ -91,7 +91,6 @@ pub(super) async fn computer_offer(
     Ok(Json(ComputerAnswerResponse { sdp }))
 }
 
-#[cfg_attr(not(target_os = "macos"), allow(clippy::unused_async))]
 /// The session's user takes the keyboard and mouse; an in-flight agent
 /// run is interrupted so it does not fight the human.
 pub(super) async fn computer_takeover_start(
@@ -125,6 +124,7 @@ pub(super) async fn computer_takeover_stop(
     }))
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(clippy::unused_async))]
 async fn run_computer_start(state: Arc<DaemonState>, id: String) -> SkyResult<bool> {
     #[cfg(target_os = "macos")]
     {
