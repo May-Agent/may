@@ -837,8 +837,8 @@ impl App {
             state.loading = true;
         }
         spawn(async move {
-            let answer: Result<crate::ui_server::BtwResponse, _> = client
-                .post(&path, &crate::ui_server::BtwRequest { messages })
+            let answer: Result<crate::daemon::BtwResponse, _> = client
+                .post(&path, &crate::daemon::BtwRequest { messages })
                 .await;
             match answer {
                 Ok(answer) => {
@@ -867,7 +867,7 @@ impl App {
 
     /// Build the `/btw` request: system contract, recent chat as context,
     /// then the question itself.
-    fn btw_messages(&self, question: &str) -> Vec<crate::ui_server::BtwMessage> {
+    fn btw_messages(&self, question: &str) -> Vec<crate::daemon::BtwMessage> {
         use super::ui::chat::{ChatElement, ToolDisplay};
 
         let mut messages = vec![btw_message("system", Self::BTW_SYSTEM)];
@@ -3497,8 +3497,8 @@ pub enum SendAction {
     },
 }
 
-fn btw_message(role: &str, content: impl Into<String>) -> crate::ui_server::BtwMessage {
-    crate::ui_server::BtwMessage {
+fn btw_message(role: &str, content: impl Into<String>) -> crate::daemon::BtwMessage {
+    crate::daemon::BtwMessage {
         role: role.to_string(),
         content: content.into(),
     }
@@ -3507,7 +3507,7 @@ fn btw_message(role: &str, content: impl Into<String>) -> crate::ui_server::BtwM
 /// Streams a `/btw` answer from the session's model into the overlay.
 async fn stream_btw_answer(
     llm: crate::agent::RequestParameterizedModel<aither_cloud::CloudProvider>,
-    messages: Vec<crate::ui_server::BtwMessage>,
+    messages: Vec<crate::daemon::BtwMessage>,
     tx: EventSender,
 ) {
     use aither_core::LanguageModel;

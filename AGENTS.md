@@ -101,18 +101,17 @@ May is a terminal-based AI assistant built as an application layer on the **aith
 **`src/agent/`** - MayAgent wrapper
 - `may.rs`: Wraps `aither_agent::Agent` with May-specific system prompt (via Askama template at `templates/system.md`), permission handling, and session context
 
-**`src/daemon/`** - The resident daemon
+**`src/daemon/`** - The resident daemon and its API
 - `mod.rs`: `run_daemon`, single-instance lock, listeners, auto-index
 - `serve.rs`: hyper accept loops (unix socket, TCP) calling skyzen's `Router::go`
 - `lifecycle.rs`: `ensure_running` (auto-spawn, build-id replacement), service install/uninstall, stop
-
-**`src/client/`** - `DaemonClient`: REST over the unix socket, and the `/api/events` SSE parser
-
-**`src/ui_server/`** - The daemon's API
+- `server.rs`: `start` builds `DaemonState`, the REST/SSE router and background workers
 - `chat/mod.rs`: the one turn runner (`run_agent_loop`); `chat/hub.rs` `TurnHub` fans a session's turn out as `session_turn` / `session_agent` events, with replay of the turn in progress for late subscribers
 - `chat/hosts.rs`: the session's idle agent between turns: the next turn continues with it unless what it was built from changed (`agent_build_key`), so the prompt cache stays warm and detached background commands keep running; it answers `/compact`, `/context`, `/btw`, and a detached command that finishes resumes the session (`start_background_turn`)
 - `chat/background.rs`: each session's terminal jobs and subagent runs across agent rebuilds; REST under `/api/sessions/{id}/background|jobs|subagents`, pushed as `session_background`
 - `remote_access.rs`: Tailscale serve
+
+**`src/client/`** - `DaemonClient`: REST over the unix socket, and the `/api/events` SSE parser
 
 **`src/repo_search/`** - Code, session and issue search through the repo-search daemon (`search` command, `may-sessions` / `may-issues-*` collections, the SQLite `search_outbox`, auto-indexing of frequently used repos)
 

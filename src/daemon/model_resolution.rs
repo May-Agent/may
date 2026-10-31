@@ -4,7 +4,7 @@ use crate::config::MayConfig;
 use crate::model_selector::ModelSelector;
 use crate::ui_event_bus::UiEventTopics;
 
-use super::state::UiServerState;
+use super::state::DaemonState;
 
 #[derive(Debug, thiserror::Error)]
 pub(super) enum PersistLastModelError {
@@ -29,7 +29,7 @@ pub(super) fn resolve_default_model(
 }
 
 pub(super) async fn persist_last_model(
-    state: &UiServerState,
+    state: &DaemonState,
     model: &str,
 ) -> Result<(), PersistLastModelError> {
     let snapshot = state.config_snapshot();

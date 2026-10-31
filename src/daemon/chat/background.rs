@@ -21,9 +21,9 @@ use crate::agent::SubagentHandles;
 use crate::client::background::{
     SessionBackgroundSnapshot, WireJob, WireJobDetail, WireSubagentRun, WireTerminalDelta,
 };
+use crate::daemon::error::bad_request_error;
+use crate::daemon::state::DaemonState;
 use crate::ui_event_bus::{UiEventBus, UiEventTopics};
-use crate::ui_server::error::bad_request_error;
-use crate::ui_server::state::UiServerState;
 
 /// How often running background work is checked for changes.
 const WATCH_INTERVAL: Duration = Duration::from_secs(1);
@@ -179,7 +179,7 @@ fn shape(snapshot: &SessionBackgroundSnapshot) -> Vec<(u64, String)> {
 
 /// Publishes `session_background` once a second while some session has
 /// background work, and once more when it changed.
-pub fn spawn_watcher(state: Arc<UiServerState>, bus: UiEventBus) {
+pub fn spawn_watcher(state: Arc<DaemonState>, bus: UiEventBus) {
     state.tokio_handle.clone().spawn(async move {
         let mut last: HashMap<String, Vec<(u64, String)>> = HashMap::new();
         loop {
@@ -219,7 +219,7 @@ fn pid_param(params: &Params) -> SkyResult<u32> {
 /// `GET /api/sessions/{id}/background`: the session's jobs and subagents.
 pub async fn get_background(
     params: Params,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<SessionBackgroundSnapshot>> {
     let session_id = session_id_param(&params)?;
     Ok(Json(state.session_background.snapshot(&session_id).await))
@@ -228,7 +228,7 @@ pub async fn get_background(
 /// `GET /api/sessions/{id}/jobs/{pid}`: one job and its buffered output.
 pub async fn get_job(
     params: Params,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<WireJobDetail>> {
     let session_id = session_id_param(&params)?;
     let pid = pid_param(&params)?;
@@ -264,7 +264,7 @@ pub struct KillJobResponse {
 /// `POST /api/sessions/{id}/jobs/{pid}/kill`.
 pub async fn kill_job(
     params: Params,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<KillJobResponse>> {
     let session_id = session_id_param(&params)?;
     let pid = pid_param(&params)?;
@@ -299,7 +299,7 @@ pub struct ReadJobQuery {
 pub async fn read_job(
     params: Params,
     Query(query): Query<ReadJobQuery>,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<WireTerminalDelta>> {
     let session_id = session_id_param(&params)?;
     let registry = state
@@ -333,7 +333,7 @@ pub struct CancelSubagentsResponse {
 /// with the same subagent and prompt is the same invocation.
 pub async fn cancel_subagent(
     params: Params,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<CancelSubagentsResponse>> {
     let session_id = session_id_param(&params)?;
     let run_id: u64 = params
@@ -361,7 +361,7 @@ pub async fn cancel_subagent(
 /// `DELETE /api/sessions/{id}/subagents`: stops every subagent run.
 pub async fn cancel_subagents(
     params: Params,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<CancelSubagentsResponse>> {
     let session_id = session_id_param(&params)?;
     let stopped = state

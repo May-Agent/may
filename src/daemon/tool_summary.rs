@@ -13,7 +13,7 @@
 use partial_json_fixer::fix_json;
 use serde_json::Value;
 
-use crate::ui_server::types::ToolVariant;
+use crate::daemon::types::ToolVariant;
 
 /// Per-variant subset of tool arguments shown in the UI summary chip.
 ///

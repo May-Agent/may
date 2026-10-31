@@ -17,7 +17,7 @@ use super::error::{
     bad_request_error, internal_error, internal_error_message, json_ok_response,
     typed_error_response,
 };
-use super::state::{ContainerPrepareStage, ContainerPrepareStatus, UiServerState};
+use super::state::{ContainerPrepareStage, ContainerPrepareStatus, DaemonState};
 use super::types::ApiErrorCode;
 
 // ── Request / Response types ────────────────────────────────
@@ -76,7 +76,7 @@ impl From<skyzen::Error> for ContainerPrepareError {
 /// spawned progress task, so it runs on the server's Tokio runtime whatever
 /// runtime the caller's handler is polled on.
 pub(super) async fn ensure_profile_environment_ready(
-    state: &Arc<UiServerState>,
+    state: &Arc<DaemonState>,
     profile_id: &str,
     allow_managed_podman_download: bool,
 ) -> Result<(), ContainerPrepareError> {
@@ -96,7 +96,7 @@ pub(super) async fn ensure_profile_environment_ready(
 }
 
 async fn prepare_profile_environment(
-    state: Arc<UiServerState>,
+    state: Arc<DaemonState>,
     profile_id: String,
     allow_managed_podman_download: bool,
 ) -> Result<(), ContainerPrepareError> {
@@ -320,7 +320,7 @@ pub(super) struct SetProfileRemoteServersRequest {
 // ── Profile endpoints ───────────────────────────────────────
 
 pub(super) async fn list_profiles(
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<Vec<ProfileInfo>>> {
     let db = state.db();
 
@@ -332,7 +332,7 @@ pub(super) async fn list_profiles(
 
 pub(super) async fn create_profile(
     Json(req): Json<CreateProfileRequest>,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<ProfileInfo>> {
     let db = state.db();
 
@@ -365,7 +365,7 @@ pub(super) async fn create_profile(
 pub(super) async fn update_profile(
     params: Params,
     Json(req): Json<UpdateProfileRequest>,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<ProfileInfo>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
@@ -406,7 +406,7 @@ pub(super) async fn update_profile(
 
 pub(super) async fn delete_profile(
     params: Params,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<super::types::ApiHealth>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
@@ -421,7 +421,7 @@ pub(super) async fn delete_profile(
 
 pub(super) async fn get_profile_remote_servers(
     params: Params,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<Vec<String>>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
     let db = state.db();
@@ -435,7 +435,7 @@ pub(super) async fn get_profile_remote_servers(
 pub(super) async fn set_profile_remote_servers(
     params: Params,
     Json(req): Json<SetProfileRemoteServersRequest>,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<skyzen::Response> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
     let db = state.db();
@@ -470,7 +470,7 @@ pub(super) async fn set_profile_remote_servers(
 pub(super) async fn get_profile_sessions(
     params: Params,
     Query(query): Query<ProfileSessionsQuery>,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<skyzen::Response> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
@@ -514,7 +514,7 @@ pub(super) struct FolderResponse {
 pub(super) async fn create_folder(
     params: Params,
     Json(req): Json<CreateFolderRequest>,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<FolderResponse>> {
     let profile_id = params.get("id").map_err(bad_request_error)?.to_string();
 
@@ -538,7 +538,7 @@ pub(super) async fn create_folder(
 pub(super) async fn update_folder(
     params: Params,
     Json(req): Json<UpdateFolderRequest>,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<super::types::ApiHealth>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
@@ -559,7 +559,7 @@ pub(super) async fn update_folder(
 
 pub(super) async fn delete_folder(
     params: Params,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<super::types::ApiHealth>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
@@ -574,7 +574,7 @@ pub(super) async fn delete_folder(
 
 pub(super) async fn pin_session(
     params: Params,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<super::types::ApiHealth>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
@@ -587,7 +587,7 @@ pub(super) async fn pin_session(
 
 pub(super) async fn unpin_session(
     params: Params,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<super::types::ApiHealth>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
@@ -600,7 +600,7 @@ pub(super) async fn unpin_session(
 
 pub(super) async fn archive_session(
     params: Params,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<super::types::ApiHealth>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
@@ -614,7 +614,7 @@ pub(super) async fn archive_session(
 
 pub(super) async fn unarchive_session(
     params: Params,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<super::types::ApiHealth>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
@@ -636,7 +636,7 @@ pub(super) async fn unarchive_session(
 pub(super) async fn move_to_folder(
     params: Params,
     Json(req): Json<MoveToFolderRequest>,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<super::types::ApiHealth>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
