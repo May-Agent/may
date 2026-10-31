@@ -26,7 +26,7 @@ use super::local_url_mapper::{
     LocalUrlProxyKey, LocalUrlProxyUpstream, mapped_url_from_target, parse_local_proxy_target,
     target_host_header,
 };
-use super::state::UiServerState;
+use super::state::DaemonState;
 use super::types::SseHeartbeat;
 use super::types::{
     ArtifactDiagnosticsRequest, ArtifactDiagnosticsResponse, ArtifactEntry, ArtifactPreviewQuery,
@@ -61,7 +61,7 @@ struct ResolvedSessionFile {
 
 pub(super) async fn get_session_runtime(
     params: Params,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<SessionRuntimeResponse>> {
     let session_id = params.get("id").map_err(bad_request_error)?.to_string();
     if session_id.is_empty() {
@@ -78,7 +78,7 @@ pub(super) async fn get_session_runtime(
 }
 
 async fn collect_session_artifacts(
-    state: &UiServerState,
+    state: &DaemonState,
     session_id: &str,
 ) -> SkyResult<Vec<ArtifactEntry>> {
     let artifacts_dir = load_session_paths(state, session_id).await?.artifacts_dir();
@@ -1044,7 +1044,7 @@ async fn write_slidev_build_diagnostics(
 
 pub(super) async fn list_session_artifacts(
     params: Params,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<SessionArtifactsResponse>> {
     let session_id = params.get("id").map_err(bad_request_error)?.to_string();
     if session_id.is_empty() {
@@ -1058,7 +1058,7 @@ pub(super) async fn list_session_artifacts(
 pub(super) async fn prepare_slidev_preview(
     params: Params,
     Query(query): Query<ArtifactPreviewQuery>,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<SlidevPreviewResponse>> {
     let session_id = params.get("id").map_err(bad_request_error)?.to_string();
     if session_id.is_empty() {
@@ -1260,7 +1260,7 @@ fn artifact_validation_id(
 pub(super) async fn report_artifact_diagnostics(
     params: Params,
     Json(request): Json<ArtifactDiagnosticsRequest>,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<ArtifactDiagnosticsResponse>> {
     let session_id = params.get("id").map_err(bad_request_error)?.to_string();
     if session_id.is_empty() {
@@ -1334,7 +1334,7 @@ pub(super) async fn report_artifact_diagnostics(
 
 pub(super) async fn get_slidev_static_asset(
     params: Params,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<skyzen::Response> {
     let session_id = params.get("id").map_err(bad_request_error)?.to_string();
     if session_id.is_empty() {
@@ -1373,7 +1373,7 @@ pub(super) async fn get_slidev_static_asset(
 
 pub(super) async fn stream_session_artifacts(
     params: Params,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Sse> {
     let session_id = params.get("id").map_err(bad_request_error)?.to_string();
     if session_id.is_empty() {
@@ -1453,7 +1453,7 @@ fn event_touches_artifacts(event: &NotifyEvent, artifacts_root: &Path) -> bool {
 }
 
 async fn emit_artifacts_if_changed(
-    state: &UiServerState,
+    state: &DaemonState,
     sender: &skyzen::responder::sse::Sender,
     session_id: &str,
     last_sig: &mut String,
@@ -1511,7 +1511,7 @@ struct ResolvedContainerProxyTarget {
 }
 
 async fn resolve_container_proxy_target(
-    state: &UiServerState,
+    state: &DaemonState,
     session_id: &str,
 ) -> Result<ResolvedContainerProxyTarget, skyzen::Error> {
     let container_manager = state
@@ -1591,7 +1591,7 @@ async fn resolve_container_proxy_target(
 pub(super) async fn map_container_local_url(
     params: Params,
     Json(payload): Json<LocalUrlMapRequest>,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<LocalUrlMapResponse>> {
     let session_id = params.get("id").map_err(bad_request_error)?.to_string();
     if session_id.is_empty() {
@@ -1643,7 +1643,7 @@ pub(super) async fn get_artifact_preview(
     params: Params,
     Query(query): Query<ArtifactPreviewQuery>,
     if_none_match: IfNoneMatchHeader,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<skyzen::Response> {
     let session_id = params.get("id").map_err(bad_request_error)?.to_string();
     if session_id.is_empty() {
@@ -1722,7 +1722,7 @@ pub(super) async fn get_artifact_runtime_preview(
     params: Params,
     Query(query): Query<ArtifactRuntimePreviewQuery>,
     if_none_match: IfNoneMatchHeader,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<skyzen::Response> {
     let session_id = params.get("id").map_err(bad_request_error)?.to_string();
     if session_id.is_empty() {
@@ -1807,7 +1807,7 @@ pub(super) async fn get_output_preview(
     params: Params,
     Query(query): Query<ArtifactPreviewQuery>,
     if_none_match: IfNoneMatchHeader,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<skyzen::Response> {
     let session_id = params.get("id").map_err(bad_request_error)?.to_string();
     if session_id.is_empty() {
@@ -1855,7 +1855,7 @@ mod tests {
         read_slidev_build_diagnostics, resolve_scoped_file, slidev_source_diagnostics,
         write_slidev_build_diagnostics,
     };
-    use crate::ui_server::types::{ArtifactDiagnosticsRequest, IfNoneMatchHeader};
+    use crate::daemon::types::{ArtifactDiagnosticsRequest, IfNoneMatchHeader};
     use std::path::PathBuf;
 
     #[test]

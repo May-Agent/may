@@ -8,11 +8,11 @@ use crate::profile::query_profile_sessions;
 use super::config::{build_ui_config_response, list_skills_for_profile};
 use super::profiles::{ContainerPrepareError, ensure_profile_environment_ready};
 use super::sessions::list_api_sessions;
-use super::state::UiServerState;
+use super::state::DaemonState;
 use super::types::{BootstrapProfileSessionsError, UiBootstrapResponse};
 
 pub(super) async fn get_bootstrap(
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<UiBootstrapResponse>> {
     let config = state.config_snapshot();
     let ui_config = build_ui_config_response(&config);
@@ -61,7 +61,7 @@ pub(super) async fn get_bootstrap(
 }
 
 async fn load_default_profile_sessions(
-    state: Arc<UiServerState>,
+    state: Arc<DaemonState>,
     profile_id: String,
 ) -> (
     Option<crate::profile::ProfileSessions>,

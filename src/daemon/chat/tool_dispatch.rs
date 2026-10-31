@@ -1,7 +1,7 @@
 //! Tool-dispatch request handlers used by the chat SSE loop.
 //!
 //! Each `handle_*_request` maps a typed tool-call from an agent into
-//! a concrete side effect against `UiServerState` (creating a task,
+//! a concrete side effect against `DaemonState` (creating a task,
 //! sending a notification, driving the managed browser, or registering
 //! skills/subagents after user approval). All helpers in this file are
 //! `pub(super)` so the chat module that wires the tool-dispatch loop
@@ -18,11 +18,11 @@ use crate::ui_event_bus::UiEventTopics;
 use super::super::browser::ensure_browser_runtime_started;
 use super::super::error_chain::error_chain_text;
 use super::super::helpers::load_session_paths;
-use super::super::state::UiServerState;
+use super::super::state::DaemonState;
 use crate::browser_service::persist_browser_page_capture;
 
 pub(super) async fn handle_task_request(
-    state: &Arc<UiServerState>,
+    state: &Arc<DaemonState>,
     request: crate::agent::task_tool::TaskCreateRequest,
 ) -> Result<crate::agent::task_tool::TaskCreateResult, String> {
     state
@@ -52,7 +52,7 @@ pub(super) async fn handle_notify_request(
 }
 
 pub(super) async fn handle_browser_request(
-    state: &Arc<UiServerState>,
+    state: &Arc<DaemonState>,
     request: crate::agent::browser_tool::BrowserRequest,
 ) -> Result<crate::agent::browser_tool::BrowserResult, BrowserToolError> {
     let session_id = request.session_id;
@@ -140,7 +140,7 @@ pub(super) async fn handle_browser_request(
 }
 
 pub(super) async fn handle_register_skills_request(
-    state: &Arc<UiServerState>,
+    state: &Arc<DaemonState>,
     request: crate::agent::register_tool::RegisterRequest,
 ) -> Result<crate::agent::register_tool::RegisterResult, String> {
     handle_register_request(
@@ -166,7 +166,7 @@ pub(super) async fn handle_register_skills_request(
 }
 
 pub(super) async fn handle_register_subagents_request(
-    state: &Arc<UiServerState>,
+    state: &Arc<DaemonState>,
     request: crate::agent::register_tool::RegisterRequest,
 ) -> Result<crate::agent::register_tool::RegisterResult, String> {
     handle_register_request(
@@ -192,7 +192,7 @@ pub(super) async fn handle_register_subagents_request(
 }
 
 async fn handle_register_request<F, Fut>(
-    state: &Arc<UiServerState>,
+    state: &Arc<DaemonState>,
     request: crate::agent::register_tool::RegisterRequest,
     source_label: &str,
     target_dir_name: &str,
@@ -230,7 +230,7 @@ fn build_registration_approval_message(
 }
 
 async fn resolve_session_root(
-    state: &UiServerState,
+    state: &DaemonState,
     session_id: &str,
 ) -> Result<std::path::PathBuf, String> {
     let session_root = load_session_paths(state, session_id)
@@ -258,7 +258,7 @@ async fn resolve_session_root(
 }
 
 async fn resolve_registration_source_path(
-    state: &UiServerState,
+    state: &DaemonState,
     raw_path: &str,
 ) -> Result<std::path::PathBuf, String> {
     let path = raw_path.trim();
@@ -296,7 +296,7 @@ async fn resolve_registration_source_path(
 }
 
 async fn request_registration_approval(
-    state: &UiServerState,
+    state: &DaemonState,
     session_id: &str,
     question: &str,
 ) -> Result<(), String> {

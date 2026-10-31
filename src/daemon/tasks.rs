@@ -19,7 +19,7 @@ use crate::task_trigger::{
 };
 
 use super::error::{bad_request_error, internal_error, internal_error_message};
-use super::state::UiServerState;
+use super::state::DaemonState;
 
 // ── Response type ──────────────────────────────────────────
 
@@ -230,7 +230,7 @@ fn validate_script_fields(script_path: Option<&str>, script_inline: Option<&str>
 // ── Endpoints ──────────────────────────────────────────────
 
 pub(super) async fn list_tasks(
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<Vec<ScheduledTaskResponse>>> {
     let tasks = state
         .db()
@@ -246,7 +246,7 @@ pub(super) async fn list_tasks(
 }
 
 async fn spawn_on_tokio<T>(
-    state: &Arc<UiServerState>,
+    state: &Arc<DaemonState>,
     operation: &'static str,
     future: impl Future<Output = SkyResult<T>> + Send + 'static,
 ) -> SkyResult<T>
@@ -267,7 +267,7 @@ where
 
 pub(super) async fn create_task(
     Json(req): Json<CreateTaskRequest>,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<ScheduledTaskResponse>> {
     let response = spawn_on_tokio(&state, "task create", {
         let state = state.clone();
@@ -278,7 +278,7 @@ pub(super) async fn create_task(
 }
 
 async fn run_create_task(
-    state: Arc<UiServerState>,
+    state: Arc<DaemonState>,
     req: CreateTaskRequest,
 ) -> SkyResult<ScheduledTaskResponse> {
     let id = uuid::Uuid::new_v4().to_string();
@@ -333,7 +333,7 @@ async fn run_create_task(
 
 pub(super) async fn get_task(
     params: Params,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<ScheduledTaskResponse>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
@@ -350,7 +350,7 @@ pub(super) async fn get_task(
 pub(super) async fn update_task(
     params: Params,
     Json(req): Json<UpdateTaskRequest>,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<ScheduledTaskResponse>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
     let response = spawn_on_tokio(&state, "task update", {
@@ -362,7 +362,7 @@ pub(super) async fn update_task(
 }
 
 async fn run_update_task(
-    state: Arc<UiServerState>,
+    state: Arc<DaemonState>,
     id: String,
     req: UpdateTaskRequest,
 ) -> SkyResult<ScheduledTaskResponse> {
@@ -480,7 +480,7 @@ async fn run_update_task(
 
 pub(super) async fn delete_task(
     params: Params,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<super::types::ApiHealth>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
     spawn_on_tokio(&state, "task delete", {
@@ -491,7 +491,7 @@ pub(super) async fn delete_task(
     Ok(Json(super::types::API_OK))
 }
 
-async fn run_delete_task(state: Arc<UiServerState>, id: String) -> SkyResult<()> {
+async fn run_delete_task(state: Arc<DaemonState>, id: String) -> SkyResult<()> {
     state
         .db()
         .delete_scheduled_task(&id)
@@ -507,7 +507,7 @@ async fn run_delete_task(state: Arc<UiServerState>, id: String) -> SkyResult<()>
 
 pub(super) async fn approve_task(
     params: Params,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<super::types::ApiHealth>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
     spawn_on_tokio(&state, "task approve", {
@@ -518,7 +518,7 @@ pub(super) async fn approve_task(
     Ok(Json(super::types::API_OK))
 }
 
-async fn run_approve_task(state: Arc<UiServerState>, id: String) -> SkyResult<()> {
+async fn run_approve_task(state: Arc<DaemonState>, id: String) -> SkyResult<()> {
     state
         .db()
         .approve_scheduled_task(&id)
@@ -534,7 +534,7 @@ async fn run_approve_task(state: Arc<UiServerState>, id: String) -> SkyResult<()
 
 pub(super) async fn run_task(
     params: Params,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<super::types::TaskTriggerResponse>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
     let response = spawn_on_tokio(&state, "task run", {
@@ -546,7 +546,7 @@ pub(super) async fn run_task(
 }
 
 async fn run_manual_task(
-    state: Arc<UiServerState>,
+    state: Arc<DaemonState>,
     id: String,
 ) -> SkyResult<super::types::TaskTriggerResponse> {
     let task = state
@@ -572,7 +572,7 @@ async fn run_manual_task(
 pub(super) async fn invoke_webhook_task(
     params: Params,
     webhook_request: WebhookInvocationRequest,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<super::types::TaskTriggerResponse>> {
     let token = params.get("token").map_err(bad_request_error)?.to_string();
     let response = spawn_on_tokio(&state, "task webhook", {
@@ -584,7 +584,7 @@ pub(super) async fn invoke_webhook_task(
 }
 
 async fn run_invoke_webhook_task(
-    state: Arc<UiServerState>,
+    state: Arc<DaemonState>,
     token: String,
     webhook_request: TaskWebhookRequest,
 ) -> SkyResult<super::types::TaskTriggerResponse> {
