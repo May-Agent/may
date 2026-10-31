@@ -188,14 +188,10 @@ export const useRuntimeStore = create<RuntimeState>((set, get) => ({
               set((prev) => ({
                 browserLifecycle: reduceLifecycle(prev.browserLifecycle, event),
               }));
-              // First time a peer attaches, gently nudge the panel open
-              // unless the user has explicitly closed it before.
-              if (event.kind === 'peerConnected' && event.count > 0) {
-                const view = useBrowserViewStore.getState();
-                if (!view.autoOpenedThisSession) {
-                  view.markAutoOpened();
-                  if (!view.open) view.setOpen(true);
-                }
+              // The first time the agent drives the browser, show its screen
+              // in the inspector's Computer tab (once per page load).
+              if (event.kind === 'navigating' || event.kind === 'ready') {
+                useBrowserViewStore.getState().revealComputerOnce();
               }
               break;
             }
