@@ -165,6 +165,9 @@ pub struct MayAgentConfig {
     pub ssh_servers: Vec<crate::config::SshServerConfig>,
     /// Optional web UI permission approver.
     pub permission_approver: Option<PermissionApprover>,
+    /// Discovery and messaging between main agents, when the daemon hosts
+    /// the session.
+    pub agent_messaging: Option<crate::agent_link::AgentMessaging>,
     /// Execution environment (local heel sandbox or container).
     pub environment: AgentEnvironment,
     /// Optional profile persona overlay injected into the agent context.
@@ -225,6 +228,9 @@ pub struct MayAgentSessionInput<'a> {
     pub profile_id: Option<String>,
     /// Optional permission approver handling interactive approval.
     pub permission_approver: Option<PermissionApprover>,
+    /// Discovery and messaging between main agents, when the daemon hosts
+    /// the session.
+    pub agent_messaging: Option<crate::agent_link::AgentMessaging>,
     /// Optional profile persona overlay injected into the agent context.
     pub profile_persona: Option<String>,
     /// Optional profile memories injected as read-only context.
@@ -445,16 +451,7 @@ impl MayAgent {
             generator: config.image_generator.clone(),
             artifacts_dir: session_paths.artifacts_dir(),
         };
-        let agent_messaging = config
-            .permission_approver
-            .as_ref()
-            .and_then(|approver| approver.runtime_service.clone())
-            .map(|runtime_service| crate::agent_link::AgentMessaging {
-                directory: crate::agent_link::AgentDirectory::new(
-                    crate::session::MayHomePaths::new(config.may_dir.clone()).agents_dir(),
-                ),
-                runtime_service,
-            });
+        let agent_messaging = config.agent_messaging.clone();
         let hook_runtime = config
             .permission_approver
             .as_ref()
@@ -641,6 +638,7 @@ impl MayAgent {
             reasoning_effort,
             profile_id,
             permission_approver,
+            agent_messaging,
             profile_persona,
             profile_memories,
             plan_state,
@@ -728,6 +726,7 @@ impl MayAgent {
             image_generator: resolve_image_generator_config(may_config),
             ssh_servers,
             permission_approver,
+            agent_messaging,
             environment,
             profile_persona,
             profile_memories,
