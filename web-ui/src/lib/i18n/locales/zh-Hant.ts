@@ -238,6 +238,21 @@ export const zhHant: Messages = {
     didRead: '已閱讀 {page}',
     didOther: '已使用瀏覽器',
   },
+  computer: {
+    title: '电脑',
+    screenOf: '{name} 的桌面',
+    caption: '会话的虚拟桌面',
+    asleep: '桌面已休眠',
+    wake: '启动',
+    open: '打开桌面',
+    minimize: '最小化',
+    mode: '控制模式',
+    watching: '观看中',
+    takeControl: '接管控制',
+    connecting: '连接中',
+    streamLost: '连接已断开',
+  },
+
   modals: {
     permission: {
       title: 'May 想徵求您的同意',
@@ -472,6 +487,7 @@ export const zhHant: Messages = {
     tabDetails: '詳細資料',
     tabLibrary: '檔案庫',
     tabBrowser: '瀏覽器',
+    tabComputer: '電腦',
     finished: '已結束',
     jobDone: '完成',
     libraryEmpty: '尚無檔案。May 建立的檔案會顯示在這裡。',
