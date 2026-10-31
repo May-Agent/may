@@ -3,7 +3,7 @@ import type { TurnState } from '@/lib/stream/reducer';
 import { MessageText } from './MessageText';
 import { ReasoningBlock } from './ReasoningBlock';
 import { ToolCard } from './ToolCard';
-import { ComputerCard } from './ComputerCard';
+import { BrowserCard } from './BrowserCard';
 import { MessageActions } from './MessageActions';
 import { groupBrowserRuns } from '@/lib/browser/activity';
 import { TodoBlock } from './TodoBlock';
@@ -53,7 +53,7 @@ export function AssistantTurn({
             const tool = segment.kind === 'tool' ? toolsById.get(segment.toolId) : undefined;
             return tool ? [tool] : [];
           });
-          return <ComputerCard key={`c-${group.items[0]!.idx}`} tools={tools} sessionId={turn.sessionId} />;
+          return <BrowserCard key={`c-${group.items[0]!.idx}`} tools={tools} sessionId={turn.sessionId} />;
         }
         const { segment, idx } = group.item;
         if (segment.kind === 'text') {

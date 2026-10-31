@@ -6,7 +6,7 @@ import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { RenameDialog } from '@/components/ui/rename-dialog';
-import { ComputerPanel } from '@/components/browser/ComputerPanel';
+import { BrowserPanel } from '@/components/browser/BrowserPanel';
 import { useTranslation } from '@/lib/i18n';
 import { EMPTY_INSPECTOR_ENTRY, useInspectorStore } from '@/lib/stores/inspector';
 import { useSessionsStore } from '@/lib/stores/sessions';
@@ -34,16 +34,16 @@ type PendingStop =
   | { kind: 'subagent'; run: SubagentRun }
   | null;
 
-const TABS: Array<{ id: InspectorTab; label: 'inspector.tabDetails' | 'inspector.tabLibrary' | 'inspector.tabComputer' }> = [
+const TABS: Array<{ id: InspectorTab; label: 'inspector.tabDetails' | 'inspector.tabLibrary' | 'inspector.tabBrowser' }> = [
   { id: 'details', label: 'inspector.tabDetails' },
   { id: 'library', label: 'inspector.tabLibrary' },
-  { id: 'computer', label: 'inspector.tabComputer' },
+  { id: 'browser', label: 'inspector.tabBrowser' },
 ];
 
 /**
  * The session inspector, in three tabs: Details (the chat's name, its
  * tasks.md task tree and linked issues, subagents and background jobs),
- * Library (files May made) and Computer (the agent's browser screen).
+ * Library (files May made) and Browser (the agent's browser screen).
  */
 export function InspectorPane({ session, inSheet = false }: { session: ApiSession; inSheet?: boolean }) {
   const { t } = useTranslation();
@@ -97,7 +97,7 @@ export function InspectorPane({ session, inSheet = false }: { session: ApiSessio
       >
         {tab === 'details' && <DetailsPanel session={session} />}
         {tab === 'library' && <LibraryPanel sessionId={session.id} />}
-        {tab === 'computer' && <ComputerPanel sessionId={session.id} visible />}
+        {tab === 'browser' && <BrowserPanel sessionId={session.id} visible />}
       </ScrollArea>
     </div>
   );

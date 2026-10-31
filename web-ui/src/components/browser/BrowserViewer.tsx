@@ -58,12 +58,12 @@ function mapToVideo(video: HTMLVideoElement, clientX: number, clientY: number) {
 }
 
 /**
- * The agent's computer, full screen: its browser centered on a dark
+ * The agent's browser, full screen: its viewport centered on a dark
  * window, a minimize control, and one Watching / Take control switch.
  * Taking control pauses the agent and sends your pointer and keys to the
  * browser; Watching hands it back.
  */
-export function ComputerViewer() {
+export function BrowserViewer() {
   const { t } = useTranslation();
   const open = useBrowserViewStore((s) => s.viewerOpen);
   const closeViewer = useBrowserViewStore((s) => s.closeViewer);
@@ -185,14 +185,14 @@ export function ComputerViewer() {
             if (takeover && document.activeElement === videoRef.current) e.preventDefault();
           }}
         >
-          <DialogPrimitive.Title className="sr-only">{t('computer.title')}</DialogPrimitive.Title>
+          <DialogPrimitive.Title className="sr-only">{t('browser.title')}</DialogPrimitive.Title>
           <div className="flex h-12 shrink-0 items-center gap-2 pl-5 pr-3 touch:h-14">
             <p className="min-w-0 flex-1 truncate text-xs text-white/45" title={caption ?? undefined}>
               {caption}
             </p>
             <DialogPrimitive.Close
-              aria-label={t('computer.minimize')}
-              title={t('computer.minimize')}
+              aria-label={t('browser.minimize')}
+              title={t('browser.minimize')}
               className="flex size-8 items-center justify-center rounded-md text-white/55 transition-colors hover:bg-white/10 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/40 touch:size-11"
             >
               <Minimize2 className="size-4" aria-hidden />
@@ -227,7 +227,7 @@ export function ComputerViewer() {
                   {!running ? (
                     <>
                       <MonitorOff className="size-5" strokeWidth={1.5} aria-hidden />
-                      {t('computer.asleep')}
+                      {t('browser.asleep')}
                       {browser?.enabled && (
                         <button
                           type="button"
@@ -235,16 +235,16 @@ export function ComputerViewer() {
                           onClick={() => void run(startBrowser)}
                           className="mt-1 h-7 rounded-md bg-white/10 px-3 text-xs font-medium text-white transition-colors hover:bg-white/15 disabled:opacity-50 touch:h-11"
                         >
-                          {t('computer.wake')}
+                          {t('browser.wake')}
                         </button>
                       )}
                     </>
                   ) : lost ? (
-                    t('computer.streamLost')
+                    t('browser.streamLost')
                   ) : (
                     <>
                       <Loader2 className="size-5 animate-spin" aria-hidden />
-                      {t('computer.connecting')}
+                      {t('browser.connecting')}
                     </>
                   )}
                 </div>
@@ -256,15 +256,15 @@ export function ComputerViewer() {
             <div className="pointer-events-none absolute inset-x-0 bottom-6 flex justify-center">
               <div
                 role="radiogroup"
-                aria-label={t('computer.mode')}
+                aria-label={t('browser.mode')}
                 className="pointer-events-auto flex items-center gap-0.5 rounded-full bg-white p-1 text-[13px] font-medium shadow-[0_8px_24px_rgb(0_0_0/0.35)]"
               >
                 <ModeSegment selected={!takeover} disabled={busy} onSelect={() => setMode(false)}>
                   <Eye className="size-4" aria-hidden />
-                  {t('computer.watching')}
+                  {t('browser.watching')}
                 </ModeSegment>
                 <ModeSegment selected={takeover} disabled={busy} onSelect={() => setMode(true)}>
-                  {t('computer.takeControl')}
+                  {t('browser.takeControl')}
                 </ModeSegment>
               </div>
             </div>

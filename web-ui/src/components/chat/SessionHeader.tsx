@@ -58,8 +58,8 @@ export function SessionHeader({ session }: { session: ApiSession }) {
           size="icon"
           variant="ghost"
           onClick={openViewer}
-          aria-label={t('computer.open')}
-          title={t('computer.open')}
+          aria-label={t('browser.open')}
+          title={t('browser.open')}
         >
           <Monitor />
         </Button>
