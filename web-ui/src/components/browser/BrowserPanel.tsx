@@ -12,10 +12,10 @@ import { BrowserLifecycleStatus } from './BrowserLifecycleStatus';
 import { LiveScreen } from './LiveScreen';
 
 /**
- * The inspector's Computer tab: a live thumbnail of the agent's browser
+ * The inspector's Browser tab: a live thumbnail of the agent's browser
  * that opens the full-screen viewer, or a quiet "asleep" state.
  */
-export function ComputerPanel({ sessionId, visible }: { sessionId: string; visible: boolean }) {
+export function BrowserPanel({ sessionId, visible }: { sessionId: string; visible: boolean }) {
   const { t } = useTranslation();
   const browser = useRuntimeStore((s) => s.browser);
   const lifecycle = useRuntimeStore((s) => s.browserLifecycle);
@@ -40,14 +40,14 @@ export function ComputerPanel({ sessionId, visible }: { sessionId: string; visib
     return (
       <div className="flex flex-col items-center justify-center gap-2 px-6 py-16 text-center">
         <MonitorOff className="size-5 text-muted-foreground" strokeWidth={1.5} aria-hidden />
-        <p className="text-[13px] text-muted-foreground">{t('computer.asleep')}</p>
+        <p className="text-[13px] text-muted-foreground">{t('browser.asleep')}</p>
         {browser?.enabled ? (
           <Button size="sm" variant="secondary" disabled={busy} onClick={() => void wake()}>
             {busy && <Loader2 className="animate-spin" aria-hidden />}
-            {t('computer.wake')}
+            {t('browser.wake')}
           </Button>
         ) : (
-          <p className="text-xs text-muted-foreground">{t('computer.off')}</p>
+          <p className="text-xs text-muted-foreground">{t('browser.off')}</p>
         )}
       </div>
     );
@@ -61,8 +61,8 @@ export function ComputerPanel({ sessionId, visible }: { sessionId: string; visib
       <button
         type="button"
         onClick={openViewer}
-        aria-label={t('computer.open')}
-        title={t('computer.open')}
+        aria-label={t('browser.open')}
+        title={t('browser.open')}
         className="group relative block aspect-[16/10] w-full overflow-hidden rounded-lg border border-border bg-muted"
       >
         <LiveScreen stream={stream} className="size-full object-contain" tabIndex={-1} />
@@ -72,11 +72,11 @@ export function ComputerPanel({ sessionId, visible }: { sessionId: string; visib
             className="absolute inset-0 flex items-center justify-center gap-2 text-xs text-muted-foreground"
           >
             {lost ? (
-              t('computer.streamLost')
+              t('browser.streamLost')
             ) : (
               <>
                 <Loader2 className="size-3.5 animate-spin" aria-hidden />
-                {t('computer.connecting')}
+                {t('browser.connecting')}
               </>
             )}
           </span>
@@ -86,7 +86,7 @@ export function ComputerPanel({ sessionId, visible }: { sessionId: string; visib
         </span>
       </button>
       <p className="mt-2 text-center text-xs text-muted-foreground">
-        {t('computer.screenOf', { name: agent })}
+        {t('browser.screenOf', { name: agent })}
       </p>
       <BrowserLifecycleStatus snapshot={lifecycle} className="mt-0.5 text-center" />
     </div>

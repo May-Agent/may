@@ -189,9 +189,9 @@ export const useRuntimeStore = create<RuntimeState>((set, get) => ({
                 browserLifecycle: reduceLifecycle(prev.browserLifecycle, event),
               }));
               // The first time the agent drives the browser, show its screen
-              // in the inspector's Computer tab (once per page load).
+              // in the inspector's Browser tab (once per page load).
               if (event.kind === 'navigating' || event.kind === 'ready') {
-                useBrowserViewStore.getState().revealComputerOnce();
+                useBrowserViewStore.getState().revealBrowserOnce();
               }
               break;
             }
