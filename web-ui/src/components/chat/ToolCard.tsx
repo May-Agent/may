@@ -23,7 +23,6 @@ import type { ToolVariant } from '@/lib/types';
 import { parsePartialJson, projectField } from '@/lib/stream/partialJson';
 import { useTranslation, type MessageKey } from '@/lib/i18n';
 import { useSessionsStore } from '@/lib/stores/sessions';
-import { useBrowserViewStore } from '@/lib/stores/browserView';
 import { outputsPreviewUrl } from '@/lib/api/artifacts';
 import { extractTerminalResult, type OutputStream } from '@/lib/terminalResult';
 
@@ -136,7 +135,7 @@ function statusIcon(status: TurnToolState['status'], result: unknown) {
   if (hasError(result)) {
     return <X className="size-3.5 text-destructive" />;
   }
-  return <Check className="size-3.5 text-emerald-500" />;
+  return <Check className="size-3.5 text-muted-foreground" />;
 }
 
 const shellHighlighterStyle: React.CSSProperties = {
@@ -186,7 +185,7 @@ function OutputBlock({
   return (
     <div className="space-y-0.5">
       {label && (
-        <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+        <div className="text-[11px] text-muted-foreground">
           {label}
         </div>
       )}
@@ -242,7 +241,7 @@ function TerminalDetails({
     <div className="space-y-2">
       {showScript && <ShellBlock script={script} />}
       {escalated && (
-        <div className="text-[11px] uppercase tracking-wider text-amber-600 dark:text-amber-400">
+        <div className="text-[11px] text-destructive">
           {t('tools.escalated')}
         </div>
       )}
@@ -346,20 +345,6 @@ export const ToolCard = memo(function ToolCard({ tool }: ToolCardProps) {
           {primary}
         </span>
         <span className="ml-auto flex items-center gap-1.5 shrink-0">
-          {tool.variant === 'browser' && (
-            <button
-              type="button"
-              className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] text-muted-foreground hover:bg-muted hover:text-foreground"
-              onClick={(e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                useBrowserViewStore.getState().setOpen(true);
-              }}
-            >
-              <ArrowUpRight className="size-3" />
-              {t('browserLive.openInToolCard')}
-            </button>
-          )}
           {statusIcon(tool.status, tool.result)}
           <ChevronRight className="size-3.5 text-muted-foreground transition-transform group-open:rotate-90" />
         </span>

@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Folder, Globe2, PanelRight } from 'lucide-react';
+import { Folder, Monitor, PanelRight } from 'lucide-react';
 import type { ApiSession } from '@/lib/types';
 import { Button } from '@/components/ui/button';
 import { RenameDialog } from '@/components/ui/rename-dialog';
@@ -23,8 +23,7 @@ export function SessionHeader({ session }: { session: ApiSession }) {
   const rename = useSessionsStore((s) => s.rename);
   const [renaming, setRenaming] = useState(false);
   const [artifactsOpen, setArtifactsOpen] = useState(false);
-  const browserViewOpen = useBrowserViewStore((s) => s.open);
-  const toggleBrowserView = useBrowserViewStore((s) => s.toggle);
+  const openViewer = useBrowserViewStore((s) => s.openViewer);
   const browserEnabled = useRuntimeStore((s) => s.browser?.enabled ?? false);
   const inspectorOpen = useUiStore((s) => s.inspectorOpen);
   const toggleInspector = useUiStore((s) => s.toggleInspector);
@@ -38,14 +37,14 @@ export function SessionHeader({ session }: { session: ApiSession }) {
   const inspectorLabel = inspectorShown ? t('shell.hideInspector') : t('shell.showInspector');
 
   return (
-    <header className="flex h-12 shrink-0 items-center gap-1 border-b border-border bg-background/80 px-2 backdrop-blur supports-[backdrop-filter]:bg-background/70 touch:h-14 sm:px-3">
+    <header className="flex h-11 shrink-0 items-center gap-0.5 border-b border-border bg-background px-2 touch:h-14 sm:px-3">
       <SidebarToggle />
       <h1 className="min-w-0 flex-1">
         <button
           type="button"
           onClick={() => setRenaming(true)}
           title={t('shell.renameTitle')}
-          className="max-w-full truncate rounded-md px-2 py-1 text-left text-[15px] font-semibold hover:bg-accent touch:min-h-11"
+          className="max-w-full truncate rounded-md px-2 py-1 text-left text-[13px] font-medium hover:bg-accent touch:min-h-11"
         >
           {title}
         </button>
@@ -57,13 +56,12 @@ export function SessionHeader({ session }: { session: ApiSession }) {
       {browserEnabled && (
         <Button
           size="icon"
-          variant={browserViewOpen ? 'secondary' : 'ghost'}
-          onClick={toggleBrowserView}
-          aria-pressed={browserViewOpen}
-          aria-label={browserViewOpen ? t('browserLive.close') : t('browserLive.open')}
-          title={browserViewOpen ? t('browserLive.close') : t('browserLive.open')}
+          variant="ghost"
+          onClick={openViewer}
+          aria-label={t('computer.open')}
+          title={t('computer.open')}
         >
-          <Globe2 />
+          <Monitor />
         </Button>
       )}
       <Button

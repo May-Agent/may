@@ -1,29 +1,18 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu';
-import {
-  Bot,
-  Loader2,
-  MoreHorizontal,
-  PanelRightClose,
-  Pencil,
-  Square,
-  SquareTerminal,
-  Trash2,
-  Undo2,
-  X,
-} from 'lucide-react';
+import { ChevronRight, Loader2, MoreHorizontal, PanelRightClose, Pencil, X } from 'lucide-react';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
-import { Badge } from '@/components/ui/badge';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { RenameDialog } from '@/components/ui/rename-dialog';
-import { RuntimePhaseBadge } from '@/components/shell/RuntimePhaseDot';
+import { ComputerPanel } from '@/components/browser/ComputerPanel';
 import { useTranslation } from '@/lib/i18n';
 import { EMPTY_INSPECTOR_ENTRY, useInspectorStore } from '@/lib/stores/inspector';
 import { useSessionsStore } from '@/lib/stores/sessions';
 import { useTurnStore } from '@/lib/stores/turn';
 import { useUiStore } from '@/lib/stores/ui';
+import { type InspectorTab, useBrowserViewStore } from '@/lib/stores/browserView';
 import { putSessionPlanState } from '@/lib/api/tasks';
 import {
   formatElapsed,
@@ -36,20 +25,85 @@ import type { BackgroundJob, SubagentRun } from '@/lib/api/background';
 import type { ApiSession, SessionPlanState } from '@/lib/types';
 import { shortcutAria, shortcutLabel } from '@/lib/shortcuts';
 import { cn } from '@/lib/utils';
-import { IssueChip, TaskTreeView } from './TaskTreeView';
+import { IssueLabel, TaskTreeView } from './TaskTreeView';
 import { PlanEditorSheet } from './PlanEditorSheet';
+import { LibraryPanel } from './LibraryPanel';
 
 type PendingStop =
   | { kind: 'job'; job: BackgroundJob }
   | { kind: 'subagent'; run: SubagentRun }
   | null;
 
+const TABS: Array<{ id: InspectorTab; label: 'inspector.tabDetails' | 'inspector.tabLibrary' | 'inspector.tabComputer' }> = [
+  { id: 'details', label: 'inspector.tabDetails' },
+  { id: 'library', label: 'inspector.tabLibrary' },
+  { id: 'computer', label: 'inspector.tabComputer' },
+];
+
 /**
- * The session inspector: name and state, the tasks.md task tree with its
- * linked issues, running subagents and background terminal jobs. Data comes
- * from the inspector store, which the session's event stream keeps current.
+ * The session inspector, in three tabs: Details (the chat's name, its
+ * tasks.md task tree and linked issues, subagents and background jobs),
+ * Library (files May made) and Computer (the agent's browser screen).
  */
 export function InspectorPane({ session, inSheet = false }: { session: ApiSession; inSheet?: boolean }) {
+  const { t } = useTranslation();
+  const tab = useBrowserViewStore((s) => s.inspectorTab);
+  const setTab = useBrowserViewStore((s) => s.setInspectorTab);
+  const toggleInspector = useUiStore((s) => s.toggleInspector);
+  const setInspectorSheetOpen = useUiStore((s) => s.setInspectorSheetOpen);
+  const close = () => (inSheet ? setInspectorSheetOpen(false) : toggleInspector());
+
+  return (
+    <div className="flex h-full min-h-0 flex-col bg-sidebar">
+      <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border pl-3 pr-2 touch:h-14">
+        <div role="tablist" aria-label={t('inspector.tabsLabel')} className="flex flex-1 items-center gap-0.5">
+          {TABS.map(({ id, label }) => (
+            <button
+              key={id}
+              type="button"
+              role="tab"
+              id={`inspector-tab-${id}`}
+              aria-selected={tab === id}
+              aria-controls={`inspector-panel-${id}`}
+              onClick={() => setTab(id)}
+              className={cn(
+                'h-7 rounded-md px-2.5 text-[13px] font-medium transition-colors touch:h-11 touch:px-3',
+                tab === id
+                  ? 'bg-accent text-foreground'
+                  : 'text-muted-foreground hover:text-foreground',
+              )}
+            >
+              {t(label)}
+            </button>
+          ))}
+        </div>
+        <Button
+          size="icon"
+          variant="ghost"
+          onClick={close}
+          aria-label={inSheet ? t('common.close') : t('shell.hideInspector')}
+          aria-keyshortcuts={inSheet ? undefined : shortcutAria('toggleInspector')}
+          title={inSheet ? t('common.close') : `${t('shell.hideInspector')} (${shortcutLabel('toggleInspector')})`}
+        >
+          {inSheet ? <X /> : <PanelRightClose />}
+        </Button>
+      </div>
+
+      <ScrollArea
+        className="min-h-0 flex-1"
+        role="tabpanel"
+        id={`inspector-panel-${tab}`}
+        aria-labelledby={`inspector-tab-${tab}`}
+      >
+        {tab === 'details' && <DetailsPanel session={session} />}
+        {tab === 'library' && <LibraryPanel sessionId={session.id} />}
+        {tab === 'computer' && <ComputerPanel sessionId={session.id} visible />}
+      </ScrollArea>
+    </div>
+  );
+}
+
+function DetailsPanel({ session }: { session: ApiSession }) {
   const { t } = useTranslation();
   const sessionId = session.id;
   const entry = useInspectorStore((s) => s.sessions[sessionId] ?? EMPTY_INSPECTOR_ENTRY);
@@ -58,14 +112,13 @@ export function InspectorPane({ session, inSheet = false }: { session: ApiSessio
   const killJob = useInspectorStore((s) => s.killJob);
   const stopSubagent = useInspectorStore((s) => s.stopSubagent);
   const rename = useSessionsStore((s) => s.rename);
-  const toggleInspector = useUiStore((s) => s.toggleInspector);
-  const setInspectorSheetOpen = useUiStore((s) => s.setInspectorSheetOpen);
   const todo = useTurnStore((s) => s.turns[sessionId]?.active?.todo ?? null);
   const turnActive = useTurnStore((s) => Boolean(s.turns[sessionId]?.active));
   const planState: SessionPlanState = session.runtime?.planState ?? 'disabled';
 
   const [renaming, setRenaming] = useState(false);
   const [pendingStop, setPendingStop] = useState<PendingStop>(null);
+  const [finishedOpen, setFinishedOpen] = useState(false);
 
   useEffect(() => {
     void loadBackground(sessionId);
@@ -79,10 +132,10 @@ export function InspectorPane({ session, inSheet = false }: { session: ApiSessio
 
   const tasks = entry.tasks;
   const jobs = useMemo(() => orderJobs(entry.background?.jobs ?? []), [entry.background]);
+  const runningJobs = jobs.filter(isJobRunning);
+  const finishedJobs = jobs.filter((job) => !isJobRunning(job));
   const subagents = entry.background?.subagents ?? [];
-  const runningJobs = jobs.filter(isJobRunning).length;
-
-  const close = () => (inSheet ? setInspectorSheetOpen(false) : toggleInspector());
+  const backgroundFailed = entry.backgroundError !== null && !entry.background;
 
   const confirmStop = async () => {
     if (!pendingStop) return;
@@ -97,170 +150,150 @@ export function InspectorPane({ session, inSheet = false }: { session: ApiSessio
     }
   };
 
+  const jobRow = (job: BackgroundJob) => {
+    const running = isJobRunning(job);
+    const stopping = entry.stopping.jobs.includes(job.pid);
+    const headline = scriptHeadline(job.script);
+    return (
+      <ListRow
+        key={job.pid}
+        title={<span className="font-mono text-xs">{headline}</span>}
+        titleText={job.script}
+        meta={<JobMeta job={job} stopping={stopping} />}
+        action={
+          running ? (
+            <StopButton
+              label={t('inspector.killJobNamed', { name: headline })}
+              stopping={stopping}
+              onClick={() => setPendingStop({ kind: 'job', job })}
+            />
+          ) : null
+        }
+      />
+    );
+  };
+
   return (
-    <div className="flex h-full min-h-0 flex-col bg-sidebar">
-      <div className="flex h-12 shrink-0 items-center gap-2 border-b border-border pl-4 pr-2 touch:h-14">
-        <h2 className="flex-1 text-[13px] font-semibold">{t('inspector.title')}</h2>
+    <div className="divide-y divide-border">
+      <section aria-label={t('inspector.session')} className="flex items-start gap-1 px-4 py-3">
+        <div className="min-w-0 flex-1">
+          <p className="break-words text-[13px] font-medium leading-5">
+            {session.title || t('common.untitled')}
+          </p>
+          <p className="truncate text-xs text-muted-foreground">{session.model}</p>
+        </div>
         <Button
           size="icon"
           variant="ghost"
-          onClick={close}
-          aria-label={inSheet ? t('common.close') : t('shell.hideInspector')}
-          aria-keyshortcuts={inSheet ? undefined : shortcutAria('toggleInspector')}
-          title={inSheet ? t('common.close') : `${t('shell.hideInspector')} (${shortcutLabel('toggleInspector')})`}
+          className="-mr-2 -mt-1.5 shrink-0"
+          onClick={() => setRenaming(true)}
+          aria-label={t('inspector.renameSession')}
+          title={t('inspector.renameSession')}
         >
-          {inSheet ? <X /> : <PanelRightClose />}
+          <Pencil />
         </Button>
-      </div>
+      </section>
 
-      <ScrollArea className="min-h-0 flex-1">
-        <div className="divide-y divide-border">
-          <Section title={t('inspector.session')}>
-            <div className="flex items-start gap-2">
-              <p className="min-w-0 flex-1 break-words text-[15px] font-semibold leading-5">
-                {session.title || t('common.untitled')}
+      <Section
+        title={t('inspector.tasks')}
+        meta={tasks && tasks.tree.total > 0 ? `${tasks.tree.completed}/${tasks.tree.total}` : undefined}
+        busy={entry.tasksLoading && tasks !== null}
+        accessory={
+          tasks && (tasks.content.trim().length > 0 || planState !== 'disabled') ? (
+            <PlanMenu sessionId={sessionId} planState={planState} content={tasks.content} />
+          ) : null
+        }
+      >
+        {tasks === null ? (
+          entry.tasksError ? (
+            <ErrorLine message={entry.tasksError} />
+          ) : (
+            <Waiting label={t('inspector.tasksLoading')} />
+          )
+        ) : (
+          <>
+            {tasks.tree.roots.length > 0 && (
+              <p className="mb-2 flex flex-wrap items-baseline gap-x-2 text-xs text-muted-foreground">
+                <span>{t('inspector.linkedIssues')}</span>
+                {tasks.tree.roots.map((issue) => (
+                  <IssueLabel key={issue.label} issue={issue} />
+                ))}
               </p>
-              <Button
-                size="icon"
-                variant="ghost"
-                className="-mr-1 -mt-1.5 shrink-0"
-                onClick={() => setRenaming(true)}
-                aria-label={t('inspector.renameSession')}
-                title={t('inspector.renameSession')}
-              >
-                <Pencil />
-              </Button>
-            </div>
-            <div className="mt-2 flex flex-wrap items-center gap-1.5">
-              <RuntimePhaseBadge state={session.runtime?.state} />
-              {planState !== 'disabled' && (
-                <Badge tone={planState === 'approved' ? 'positive' : 'info'}>
-                  {planState === 'approved' ? t('chat.planStateApproved') : t('chat.planStateDraft')}
-                </Badge>
-              )}
-              <span className="truncate text-xs text-muted-foreground">{session.model}</span>
-            </div>
-          </Section>
-
-          <Section
-            title={t('inspector.tasks')}
-            busy={entry.tasksLoading && tasks !== null}
-            accessory={
-              tasks && (tasks.content.trim().length > 0 || planState !== 'disabled') ? (
-                <PlanMenu
-                  sessionId={sessionId}
-                  planState={planState}
-                  content={tasks.content}
-                />
-              ) : null
-            }
-          >
-            {tasks === null ? (
-              entry.tasksError ? (
-                <ErrorLine message={entry.tasksError} />
-              ) : (
-                <Waiting label={t('inspector.tasksLoading')} />
-              )
-            ) : (
-              <>
-                {tasks.tree.roots.length > 0 && (
-                  <div className="mb-3">
-                    <h4 className="mb-1 text-xs font-semibold text-muted-foreground">
-                      {t('inspector.linkedIssues')}
-                    </h4>
-                    <div className="flex flex-wrap gap-1">
-                      {tasks.tree.roots.map((issue) => (
-                        <IssueChip key={issue.label} issue={issue} />
-                      ))}
-                    </div>
-                  </div>
-                )}
-                {tasks.tree.total === 0 ? (
-                  <Empty>{t('inspector.tasksEmpty')}</Empty>
-                ) : (
-                  <>
-                    <Progress completed={tasks.tree.completed} total={tasks.tree.total} />
-                    <TaskTreeView tree={tasks.tree} />
-                  </>
-                )}
-              </>
             )}
-          </Section>
-
-          <Section title={t('inspector.subagents')} count={subagents.length}>
-            {entry.backgroundError && !entry.background ? (
-              <ErrorLine message={entry.backgroundError} />
-            ) : subagents.length === 0 ? (
-              <Empty>{t('inspector.subagentsEmpty')}</Empty>
+            {tasks.tree.total === 0 ? (
+              <Empty>{t('inspector.tasksEmpty')}</Empty>
             ) : (
-              <ul className="space-y-2">
-                {subagents.map((run) => {
-                  const stopping = entry.stopping.subagents.includes(run.runId);
-                  return (
-                    <Row
-                      key={run.runId}
-                      icon={<Bot className="size-4 text-primary" aria-hidden />}
-                      title={run.agent}
-                      detail={run.prompt}
-                      meta={`${formatElapsed(run.elapsedMs)} · ${t('inspector.subagentTokens', {
-                        tokens: formatTokens(run.promptTokens + run.completionTokens),
-                        requests: run.requests,
-                      })}`}
-                      action={
-                        <StopButton
-                          label={t('inspector.stopSubagent', { agent: run.agent })}
-                          stopping={stopping}
-                          onClick={() => setPendingStop({ kind: 'subagent', run })}
-                        />
-                      }
-                    />
-                  );
+              <TaskTreeView tree={tasks.tree} />
+            )}
+          </>
+        )}
+      </Section>
+
+      <Section
+        title={t('inspector.subagents')}
+        meta={subagents.length > 0 ? String(subagents.length) : undefined}
+      >
+        {backgroundFailed ? (
+          <ErrorLine message={entry.backgroundError ?? ''} />
+        ) : subagents.length === 0 ? (
+          <Empty>{t('inspector.subagentsEmpty')}</Empty>
+        ) : (
+          <ul className="-mx-2">
+            {subagents.map((run) => (
+              <ListRow
+                key={run.runId}
+                title={run.agent}
+                detail={run.prompt}
+                meta={formatElapsed(run.elapsedMs)}
+                metaTitle={t('inspector.subagentTokens', {
+                  tokens: formatTokens(run.promptTokens + run.completionTokens),
+                  requests: run.requests,
                 })}
-              </ul>
-            )}
-          </Section>
+                action={
+                  <StopButton
+                    label={t('inspector.stopSubagent', { agent: run.agent })}
+                    stopping={entry.stopping.subagents.includes(run.runId)}
+                    onClick={() => setPendingStop({ kind: 'subagent', run })}
+                  />
+                }
+              />
+            ))}
+          </ul>
+        )}
+      </Section>
 
-          <Section title={t('inspector.jobs')} count={runningJobs}>
-            {entry.backgroundError && !entry.background ? (
-              <ErrorLine message={entry.backgroundError} />
-            ) : jobs.length === 0 ? (
-              <Empty>{t('inspector.jobsEmpty')}</Empty>
-            ) : (
-              <ul className="space-y-2">
-                {jobs.map((job) => {
-                  const running = isJobRunning(job);
-                  const stopping = entry.stopping.jobs.includes(job.pid);
-                  const headline = scriptHeadline(job.script);
-                  return (
-                    <Row
-                      key={job.pid}
-                      icon={<SquareTerminal className="size-4 text-muted-foreground" aria-hidden />}
-                      title={<code className="font-mono text-[12px]">{headline}</code>}
-                      titleText={job.script}
-                      meta={
-                        <span className="inline-flex items-center gap-1.5">
-                          <JobStatus job={job} stopping={stopping} />
-                          <span aria-hidden>·</span>
-                          {formatElapsed(job.elapsedMs)}
-                        </span>
-                      }
-                      action={
-                        running ? (
-                          <StopButton
-                            label={t('inspector.killJobNamed', { name: headline })}
-                            stopping={stopping}
-                            onClick={() => setPendingStop({ kind: 'job', job })}
-                          />
-                        ) : null
-                      }
-                    />
-                  );
-                })}
-              </ul>
+      <Section
+        title={t('inspector.jobs')}
+        meta={runningJobs.length > 0 ? String(runningJobs.length) : undefined}
+      >
+        {backgroundFailed ? (
+          <ErrorLine message={entry.backgroundError ?? ''} />
+        ) : jobs.length === 0 ? (
+          <Empty>{t('inspector.jobsEmpty')}</Empty>
+        ) : (
+          <>
+            {runningJobs.length > 0 && <ul className="-mx-2">{runningJobs.map(jobRow)}</ul>}
+            {finishedJobs.length > 0 && (
+              <div className={cn(runningJobs.length > 0 && 'mt-1')}>
+                <button
+                  type="button"
+                  onClick={() => setFinishedOpen((v) => !v)}
+                  aria-expanded={finishedOpen}
+                  className="-mx-2 flex h-7 items-center gap-1 rounded-md px-2 text-xs text-muted-foreground hover:text-foreground touch:h-11"
+                >
+                  <ChevronRight
+                    className={cn('size-3.5 transition-transform', finishedOpen && 'rotate-90')}
+                    aria-hidden
+                  />
+                  {t('inspector.finished')}
+                  <span className="tabular-nums">{finishedJobs.length}</span>
+                </button>
+                {finishedOpen && <ul className="-mx-2">{finishedJobs.map(jobRow)}</ul>}
+              </div>
             )}
-          </Section>
-        </div>
-      </ScrollArea>
+          </>
+        )}
+      </Section>
 
       <RenameDialog
         open={renaming}
@@ -285,23 +318,19 @@ export function InspectorPane({ session, inSheet = false }: { session: ApiSessio
 
 interface SectionProps {
   title: string;
-  count?: number;
+  meta?: string;
   busy?: boolean;
   accessory?: ReactNode;
   children: ReactNode;
 }
 
-function Section({ title, count, busy, accessory, children }: SectionProps) {
+function Section({ title, meta, busy, accessory, children }: SectionProps) {
   return (
-    <section aria-label={title} className="px-4 py-4">
-      <div className="mb-2 flex min-h-6 items-center gap-2">
-        <h3 className="text-xs font-semibold text-muted-foreground">{title}</h3>
-        {count !== undefined && count > 0 && (
-          <span className="rounded-full bg-primary/10 px-1.5 text-[11px] font-semibold tabular-nums text-primary">
-            {count}
-          </span>
-        )}
-        {busy && <Loader2 className="size-3.5 animate-spin text-muted-foreground" aria-hidden />}
+    <section aria-label={title} className="px-4 py-3">
+      <div className="mb-1.5 flex min-h-7 items-center gap-1.5">
+        <h3 className="text-xs font-medium text-muted-foreground">{title}</h3>
+        {meta && <span className="text-xs tabular-nums text-muted-foreground/80">{meta}</span>}
+        {busy && <Loader2 className="size-3 animate-spin text-muted-foreground" aria-hidden />}
         <div className="ml-auto">{accessory}</div>
       </div>
       {children}
@@ -309,49 +338,32 @@ function Section({ title, count, busy, accessory, children }: SectionProps) {
   );
 }
 
-function Progress({ completed, total }: { completed: number; total: number }) {
-  const { t } = useTranslation();
-  const label = t('inspector.tasksProgress', { completed, total });
-  return (
-    <div className="mb-3">
-      <div
-        role="progressbar"
-        aria-valuemin={0}
-        aria-valuemax={total}
-        aria-valuenow={completed}
-        aria-label={label}
-        className="h-1.5 overflow-hidden rounded-full bg-accent"
-      >
-        <div
-          className="h-full rounded-full bg-success transition-[width]"
-          style={{ width: `${total === 0 ? 0 : (completed / total) * 100}%` }}
-        />
-      </div>
-      <p className="mt-1 text-xs text-muted-foreground">{label}</p>
-    </div>
-  );
-}
-
-interface RowProps {
-  icon: ReactNode;
+interface ListRowProps {
   title: ReactNode;
   titleText?: string;
   detail?: string;
   meta: ReactNode;
+  metaTitle?: string;
   action: ReactNode;
 }
 
-function Row({ icon, title, titleText, detail, meta, action }: RowProps) {
+/** A Linear-style list row: title left, muted meta right, then an action. */
+function ListRow({ title, titleText, detail, meta, metaTitle, action }: ListRowProps) {
   return (
-    <li className="flex items-start gap-2 rounded-lg border border-border bg-background p-2.5">
-      <span className="mt-0.5 shrink-0">{icon}</span>
+    <li className="flex min-h-8 items-center gap-2 rounded-md px-2 py-1 hover:bg-accent/60 touch:min-h-11">
       <div className="min-w-0 flex-1">
-        <div className="truncate text-[13px] font-medium" title={titleText}>
+        <div className="truncate text-[13px]" title={titleText}>
           {title}
         </div>
-        {detail && <p className="mt-0.5 line-clamp-2 text-xs text-muted-foreground">{detail}</p>}
-        <div className="mt-1 text-xs text-muted-foreground">{meta}</div>
+        {detail && (
+          <p className="truncate text-xs text-muted-foreground" title={detail}>
+            {detail}
+          </p>
+        )}
       </div>
+      <span className="shrink-0 text-xs tabular-nums text-muted-foreground" title={metaTitle}>
+        {meta}
+      </span>
       {action && <div className="-my-1 -mr-1 shrink-0">{action}</div>}
     </li>
   );
@@ -360,36 +372,35 @@ function Row({ icon, title, titleText, detail, meta, action }: RowProps) {
 function StopButton({ label, stopping, onClick }: { label: string; stopping: boolean; onClick: () => void }) {
   const { t } = useTranslation();
   return (
-    <Button
-      size="icon"
-      variant="ghost"
-      className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+    <button
+      type="button"
       onClick={onClick}
       disabled={stopping}
       aria-label={stopping ? t('inspector.stopping') : label}
       title={stopping ? t('inspector.stopping') : label}
+      className="flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-60 touch:size-11"
     >
-      {stopping ? <Loader2 className="animate-spin" /> : <Square className="fill-current" />}
-    </Button>
+      {stopping ? (
+        <Loader2 className="size-3.5 animate-spin" aria-hidden />
+      ) : (
+        <span className="size-2.5 rounded-[2px] bg-current" aria-hidden />
+      )}
+    </button>
   );
 }
 
-function JobStatus({ job, stopping }: { job: BackgroundJob; stopping: boolean }) {
+function JobMeta({ job, stopping }: { job: BackgroundJob; stopping: boolean }) {
   const { t } = useTranslation();
-  if (stopping) return <span>{t('inspector.stopping')}</span>;
+  if (stopping) return <>{t('inspector.stopping')}</>;
+  const elapsed = formatElapsed(job.elapsedMs);
   switch (job.status.state) {
     case 'running':
-      return (
-        <span className="inline-flex items-center gap-1 text-success">
-          <span className="size-1.5 rounded-full bg-current motion-safe:animate-pulse" aria-hidden />
-          {t('inspector.jobRunning')}
-        </span>
-      );
+      return <>{elapsed}</>;
     case 'completed':
-      return (
-        <span className={cn(job.status.exit_code !== 0 && 'text-destructive')}>
-          {t('inspector.jobExited', { code: job.status.exit_code })}
-        </span>
+      return job.status.exit_code === 0 ? (
+        <>{elapsed}</>
+      ) : (
+        <span className="text-destructive">{t('inspector.jobExited', { code: job.status.exit_code })}</span>
       );
     case 'failed':
       return (
@@ -398,7 +409,7 @@ function JobStatus({ job, stopping }: { job: BackgroundJob; stopping: boolean })
         </span>
       );
     case 'killed':
-      return <span>{t('inspector.jobKilled')}</span>;
+      return <>{t('inspector.jobKilled')}</>;
   }
 }
 
@@ -429,7 +440,7 @@ function PlanMenu({
   };
 
   const itemClass =
-    'flex h-8 cursor-default select-none items-center gap-2 rounded-md px-2 text-[13px] outline-none data-[highlighted]:bg-accent touch:h-11';
+    'flex h-8 cursor-default select-none items-center rounded-md px-2 text-[13px] outline-none data-[highlighted]:bg-accent touch:h-11';
 
   return (
     <>
@@ -443,15 +454,13 @@ function PlanMenu({
           <DropdownMenu.Content
             align="end"
             sideOffset={4}
-            className="z-50 min-w-48 rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-lg"
+            className="z-50 min-w-44 rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-lg"
           >
             <DropdownMenu.Item className={itemClass} onSelect={() => setEditing(true)}>
-              <Pencil className="size-4" aria-hidden />
               {t('inspector.editTasks')}…
             </DropdownMenu.Item>
             {planState === 'approved' && (
               <DropdownMenu.Item className={itemClass} onSelect={() => void transition('draft').catch(() => undefined)}>
-                <Undo2 className="size-4" aria-hidden />
                 {t('inspector.reviseDraft')}
               </DropdownMenu.Item>
             )}
@@ -462,7 +471,6 @@ function PlanMenu({
                   className={cn(itemClass, 'text-destructive data-[highlighted]:bg-destructive/10')}
                   onSelect={() => setDiscarding(true)}
                 >
-                  <Trash2 className="size-4" aria-hidden />
                   {t('chat.discardPlan')}…
                 </DropdownMenu.Item>
               </>
@@ -487,7 +495,7 @@ function PlanMenu({
 function Waiting({ label }: { label: string }) {
   return (
     <div role="status" className="flex items-center gap-2 text-[13px] text-muted-foreground">
-      <Loader2 className="size-4 animate-spin" aria-hidden />
+      <Loader2 className="size-3.5 animate-spin" aria-hidden />
       {label}
     </div>
   );
