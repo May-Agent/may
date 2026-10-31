@@ -8,6 +8,8 @@
 #[cfg(target_os = "macos")]
 mod capture;
 #[cfg(target_os = "macos")]
+mod input;
+#[cfg(target_os = "macos")]
 mod skylight;
 #[cfg(target_os = "macos")]
 mod stream;

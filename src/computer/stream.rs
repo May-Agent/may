@@ -17,6 +17,8 @@ use tokio::sync::Mutex;
 use webrtc::api::APIBuilder;
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::{MIME_TYPE_H264, MediaEngine};
+use webrtc::data_channel::RTCDataChannel;
+use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::interceptor::registry::Registry;
 use webrtc::media::Sample;
@@ -29,6 +31,7 @@ use webrtc::track::track_local::TrackLocal;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
 use super::capture::{CapturedFrame, DisplayCapture};
+use super::input::{self, HeldButton, InputMessage};
 use super::{DisplayError, PlatformDisplay, SessionDisplay};
 use crate::video::{BgraFrame, EncodedSample, FRAME_QUEUE_CAPACITY, RawFrame, encode_loop};
 
@@ -44,6 +47,7 @@ const DESKTOP_BITRATE_KBPS: u32 = 8_000;
 /// desktop keeps its windows.
 pub struct SessionStream {
     runtime: Arc<Mutex<Option<StreamRuntime>>>,
+    takeover_active: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for SessionStream {
@@ -57,6 +61,11 @@ struct StreamRuntime {
     // the dispatch queue. The frame channel closes with it, which ends
     // the bridge, encoder and writer tasks.
     _capture: DisplayCapture,
+    // The display `DataChannel` input posts into.
+    display: Arc<PlatformDisplay>,
+    // Set while the session's user is driving the desktop; `DataChannel`
+    // input is dropped otherwise, as in the browser's takeover gate.
+    takeover_active: Arc<AtomicBool>,
     video_track: Arc<TrackLocalStaticSample>,
     webrtc_api: webrtc::api::API,
     peers: HashMap<String, Arc<RTCPeerConnection>>,
@@ -93,6 +102,7 @@ impl SessionStream {
     pub fn new() -> Self {
         Self {
             runtime: Arc::new(Mutex::new(None)),
+            takeover_active: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -199,6 +209,8 @@ impl SessionStream {
 
         *guard = Some(StreamRuntime {
             _capture: capture,
+            display,
+            takeover_active: self.takeover_active.clone(),
             video_track,
             webrtc_api,
             peers: HashMap::new(),
@@ -206,6 +218,18 @@ impl SessionStream {
             tasks: vec![bridge, encoder, writer],
         });
         Ok(())
+    }
+
+    /// Whether the session's user currently owns the desktop.
+    #[must_use]
+    pub fn takeover_active(&self) -> bool {
+        self.takeover_active.load(Ordering::Acquire)
+    }
+
+    /// Starts (`true`) or ends (`false`) user takeover: while set, the
+    /// stream's `DataChannel` input reaches the display.
+    pub fn set_takeover(&self, active: bool) {
+        self.takeover_active.store(active, Ordering::Release);
     }
 
     /// Stops capture, encoding and every peer. The display stays alive
@@ -288,6 +312,12 @@ impl SessionStream {
             })
         }));
 
+        setup_input_channel(
+            &peer,
+            runtime.display.clone(),
+            runtime.takeover_active.clone(),
+        );
+
         let offer = RTCSessionDescription::offer(offer_sdp)
             .map_err(|e| DisplayError(format!("parse offer: {e}")))?;
         peer.set_remote_description(offer)
@@ -313,4 +343,56 @@ impl SessionStream {
         runtime.peers.insert(peer_id, peer);
         Ok(local.sdp)
     }
+}
+
+/// Routes a peer's `DataChannel` input into the display while takeover
+/// is held. Each channel carries its own held-button state so drags
+/// survive across messages.
+fn setup_input_channel(
+    peer: &Arc<RTCPeerConnection>,
+    display: Arc<PlatformDisplay>,
+    takeover_active: Arc<AtomicBool>,
+) {
+    peer.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
+        let display = display.clone();
+        let takeover_active = takeover_active.clone();
+        Box::pin(async move {
+            // Held-button state is per channel and mutates across
+            // messages; `on_message` hands each message a copy, so the
+            // state lives behind a lock the callbacks share.
+            let held = std::sync::Arc::new(std::sync::Mutex::new(Option::<HeldButton>::None));
+            dc.on_message(Box::new(move |message: DataChannelMessage| {
+                let display = display.clone();
+                let takeover_active = takeover_active.clone();
+                let held = held.clone();
+                Box::pin(async move {
+                    if !takeover_active.load(Ordering::Acquire) {
+                        return;
+                    }
+                    let Ok(input) = serde_json::from_slice::<InputMessage>(&message.data) else {
+                        return;
+                    };
+                    let held_now = {
+                        let mut guard = held
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if let InputMessage::Mouse(mouse) = &input {
+                            match mouse.event_kind() {
+                                super::input::MousePhase::Pressed => {
+                                    *guard = mouse.held();
+                                }
+                                super::input::MousePhase::Released => *guard = None,
+                                super::input::MousePhase::Moved
+                                | super::input::MousePhase::Wheeled => {}
+                            }
+                        }
+                        *guard
+                    };
+                    if let Err(error) = input::post_input(display.display_id(), input, held_now) {
+                        tracing::debug!(%error, "computer input dropped");
+                    }
+                })
+            }));
+        })
+    }));
 }
