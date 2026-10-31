@@ -163,8 +163,6 @@ struct HubSink {
 
 impl HubSink {
     fn new(state: &UiServerState, req: &ChatRequest) -> Self {
-        // A turn moves the conversation past the idle agent's state.
-        state.parked_agents.evict(&req.session_id);
         state.turn_hub.begin_turn(&req.session_id);
         Self {
             hub: state.turn_hub.clone(),
@@ -1140,7 +1138,14 @@ pub(super) async fn send_message(
     let run_state = state.clone();
     tokio_handle.spawn(async move {
         let session_id = req.session_id.clone();
-        if let Err(error) = Box::pin(run_published_turn(run_state, req, run_guard)).await {
+        if let Err(error) = Box::pin(run_published_turn(
+            run_state,
+            req,
+            run_guard,
+            TurnKind::Prompt,
+        ))
+        .await
+        {
             tracing::error!(session_id = %session_id, error = %error, "failed to settle a turn");
         }
     });
@@ -1224,6 +1229,7 @@ fn run_agent_loop<'a>(
     guard: &'a SessionRunGuard,
     persist_user_message: bool,
     use_persisted_context_snapshot: bool,
+    kind: &'a TurnKind,
 ) -> Pin<Box<impl Future<Output = Result<AgentRunResult, AgentLoopError>> + 'a>> {
     Box::pin(async move {
         let mut attempt = 0usize;
@@ -1256,13 +1262,15 @@ fn run_agent_loop<'a>(
                 prompt,
                 attachments,
                 provider_candidate_count,
+                build_key,
             } = match prepare_agent_for_request(
                 state,
                 req,
                 guard.fence(),
-                persist_user_message && attempt == 0,
+                persist_user_message && attempt == 0 && !kind.is_resume(),
                 use_persisted_context_snapshot,
                 attempt,
+                kind,
             )
             .await
             {
@@ -1283,7 +1291,9 @@ fn run_agent_loop<'a>(
                 elapsed_ms = elapsed_ms_saturating(&started_at),
                 "chat agent prepared"
             );
-            if attempt == 0 {
+            // A resumed turn runs on the agent that collected its events; a
+            // provider retry would rebuild it without them.
+            if attempt == 0 && !kind.is_resume() {
                 max_retries = provider_candidate_count.saturating_sub(1);
             }
             if let Some(hidden_context_xml) = hidden_context_xml {
@@ -1323,11 +1333,21 @@ fn run_agent_loop<'a>(
             let mut first_text_seen = false;
             {
                 agent.sync_runtime_context().await;
-                let mut stream = agent.run_with_hidden_context(
-                    &prompt,
-                    turn_hidden_context_xml.as_deref(),
-                    attachments,
-                );
+                let mut stream = match kind {
+                    TurnKind::Prompt => {
+                        futures_util::future::Either::Left(agent.run_with_hidden_context(
+                            &prompt,
+                            turn_hidden_context_xml.as_deref(),
+                            attachments,
+                        ))
+                    }
+                    TurnKind::Resume(wake_events) => {
+                        futures_util::future::Either::Right(futures_lite::StreamExt::chain(
+                            futures_lite::stream::iter(wake_events.clone().into_iter().map(Ok)),
+                            agent.resume(),
+                        ))
+                    }
+                };
                 loop {
                     let next_event = tokio::select! {
                         biased;
@@ -1818,7 +1838,9 @@ fn run_agent_loop<'a>(
             // The turn's messages are in the search outbox now.
             let _ = state.search_index_wake_tx.try_send(());
             // The agent stays as the session's idle agent until the next turn.
-            state.parked_agents.park(state, session_id.as_str(), agent);
+            state
+                .parked_agents
+                .park(state, session_id.as_str(), agent, build_key);
 
             return Ok(AgentRunResult {
                 assistant_id,
@@ -1836,13 +1858,52 @@ fn run_agent_loop<'a>(
 
 /// Runs one turn under `guard`, publishing it to the session's clients, and
 /// settles the guard: a continued guard (more queued work) runs next.
+/// Starts a turn for `session_id` whose idle agent collected background
+/// commands that need the model (`wake`). Nothing runs when the session is
+/// busy: the turn holding it continues with the same agent and sees them.
+pub(super) async fn start_background_turn(
+    state: &Arc<UiServerState>,
+    session_id: &str,
+    wake: aither_agent::BackgroundWake,
+) {
+    if !state.parked_agents.contains(session_id) {
+        return;
+    }
+    let guard = match state.runtime_service.runs().acquire(session_id).await {
+        Ok(guard) => guard,
+        Err(error) => {
+            tracing::info!(%session_id, %error, "a running turn will see the background results");
+            return;
+        }
+    };
+    let req = ChatRequest {
+        session_id: session_id.to_string(),
+        content: String::new(),
+        attachments: Vec::new(),
+        hidden_context_xml: None,
+        delivery_mode: crate::session::PendingUserMessageMode::default(),
+    };
+    tracing::info!(%session_id, events = wake.events.len(), "background commands resume the session");
+    if let Err(error) = Box::pin(run_published_turn(
+        state.clone(),
+        req,
+        guard,
+        TurnKind::Resume(wake.events),
+    ))
+    .await
+    {
+        tracing::error!(%session_id, %error, "failed to settle a background turn");
+    }
+}
+
 async fn run_published_turn(
     state: Arc<UiServerState>,
     req: ChatRequest,
     guard: SessionRunGuard,
+    kind: TurnKind,
 ) -> Result<(), crate::db::ChatDbError> {
     let mut sink = HubSink::new(&state, &req);
-    let result = run_agent_loop(&state, &req, &mut sink, &guard, true, true).await;
+    let result = run_agent_loop(&state, &req, &mut sink, &guard, true, true, &kind).await;
     let response_session_id = req.session_id.clone();
     match result {
         Ok(result) => {
@@ -1911,6 +1972,7 @@ async fn run_chat_collect_with_receiver(
         guard,
         persist_user_message,
         use_persisted_context_snapshot,
+        &TurnKind::Prompt,
     )
     .await;
     match result {
@@ -2098,6 +2160,8 @@ struct PreparedAgent {
     prompt: String,
     attachments: Vec<LlmAttachment>,
     provider_candidate_count: usize,
+    /// [`agent_build_key`] of the inputs the agent was built from.
+    build_key: u64,
 }
 
 struct ToolBrokers {
@@ -2112,6 +2176,10 @@ struct ToolBrokers {
 
 #[derive(Debug, thiserror::Error)]
 enum UiChatPreparationError {
+    /// The idle agent whose background commands asked for a turn is gone:
+    /// a turn of the session took it first.
+    #[error("the session's idle agent was taken by another turn")]
+    NothingToResume,
     #[error("Browser takeover is active for this session; wait until user returns control")]
     BrowserTakeoverActive,
     #[error("Session {0} not found")]
@@ -2213,7 +2281,8 @@ impl UiChatPreparationError {
             | Self::BuildPrompt(_)
             | Self::PreviewRequest(_)
             | Self::PersistContextDebugSnapshot(_)
-            | Self::HistoryReplay(_) => ApiErrorCode::InternalError,
+            | Self::HistoryReplay(_)
+            | Self::NothingToResume => ApiErrorCode::InternalError,
         }
     }
 }
@@ -2817,6 +2886,7 @@ fn prepare_agent_for_request<'a>(
     persist_user_message: bool,
     use_persisted_context_snapshot: bool,
     provider_attempt: usize,
+    kind: &'a TurnKind,
 ) -> Pin<Box<impl Future<Output = Result<PreparedAgent, UiChatPreparationError>> + 'a>> {
     Box::pin(async move {
         let ctx = Box::pin(resolve_session_context(
@@ -2827,17 +2897,91 @@ fn prepare_agent_for_request<'a>(
             use_persisted_context_snapshot,
         ))
         .await?;
-        let (environment, location) = Box::pin(setup_agent_environment(state, &ctx)).await?;
+        let config = state.config_snapshot();
+        let build_key = agent_build_key(&config, &ctx);
+        // The session's idle agent continues the conversation when it was
+        // built from the same inputs; a resumed turn exists only for what
+        // that agent collected, so it takes the agent whatever changed.
+        let reused = if provider_attempt == 0 {
+            let fits = (!kind.is_resume()).then_some(build_key);
+            state
+                .parked_agents
+                .take(ctx.session_id.as_str(), fits)
+                .await
+        } else {
+            None
+        };
+        let mut agent = match reused {
+            Some(agent) => agent,
+            None if kind.is_resume() => return Err(UiChatPreparationError::NothingToResume),
+            None => Box::pin(build_session_agent(state, &config, &ctx, provider_attempt)).await?,
+        };
+
+        let provider_id = agent.provider_id().to_string();
+
+        let (prompt, attachments) = if kind.is_resume() {
+            (String::new(), Vec::new())
+        } else {
+            let (prompt, attachments) =
+                Box::pin(build_prompt_and_attachments(state, req, &ctx.current_model))
+                    .await
+                    .map_err(UiChatPreparationError::BuildPrompt)?;
+            let preview_messages = agent
+                .preview_request_messages_with_hidden_context(
+                    &prompt,
+                    ctx.hidden_context_xml.as_deref(),
+                    attachments.iter().cloned(),
+                )
+                .await
+                .map_err(UiChatPreparationError::PreviewRequest)?;
+            persist_context_debug_snapshot(
+                state,
+                &ctx.session_id,
+                &ctx.current_model,
+                &provider_id,
+                &prompt,
+                &attachments,
+                &preview_messages,
+            )
+            .await
+            .map_err(UiChatPreparationError::PersistContextDebugSnapshot)?;
+            (prompt, attachments)
+        };
+
+        Ok(PreparedAgent {
+            session_id: ctx.session_id,
+            agent,
+            current_model: ctx.current_model,
+            provider_id,
+            profile_id: ctx.profile_id,
+            hidden_context_xml: ctx.hidden_context_xml,
+            prompt,
+            attachments,
+            provider_candidate_count: ctx.provider_candidate_count,
+            build_key,
+        })
+    })
+}
+
+/// Builds the session's agent for `ctx` and restores its conversation, for a
+/// turn that has no idle agent to continue with.
+fn build_session_agent<'a>(
+    state: &'a Arc<UiServerState>,
+    config: &'a crate::config::MayConfig,
+    ctx: &'a SessionContext,
+    provider_attempt: usize,
+) -> Pin<Box<impl Future<Output = Result<MayAgent, UiChatPreparationError>> + 'a>> {
+    Box::pin(async move {
+        let (environment, location) = Box::pin(setup_agent_environment(state, ctx)).await?;
         let brokers = build_tool_brokers(state, &ctx.session_id);
         listen_for_agent_messages(state, ctx.session_id.as_str(), &ctx.cwd, &ctx.sandbox_dir)
             .await
             .map_err(UiChatPreparationError::AgentLink)?;
 
-        let config = state.config_snapshot();
         let mut agent = MayAgent::from_config_with_model_and_permissions(
-            &config,
+            config,
             crate::agent::MayAgentSessionInput {
-                sandbox_dir: ctx.sandbox_dir,
+                sandbox_dir: ctx.sandbox_dir.clone(),
                 may_dir: state.may_dir.clone(),
                 cwd: ctx.cwd.clone(),
                 session_id: ctx.session_id.clone(),
@@ -2857,8 +3001,8 @@ fn prepare_agent_for_request<'a>(
                         approver
                     }
                 }),
-                profile_persona: ctx.profile_persona,
-                profile_memories: ctx.profile_memories,
+                profile_persona: ctx.profile_persona.clone(),
+                profile_memories: ctx.profile_memories.clone(),
                 plan_state: ctx.plan_state,
                 location,
                 task_broker: Some(brokers.task),
@@ -2871,6 +3015,7 @@ fn prepare_agent_for_request<'a>(
                 tool_environments: state.tool_environments.clone(),
                 provider_attempt,
                 subagents: Some(state.session_background.subagents(ctx.session_id.as_str())),
+                background_jobs: aither_agent::BackgroundJobPolicy::Detach,
             },
         )
         .await
@@ -2914,49 +3059,54 @@ fn prepare_agent_for_request<'a>(
                 }
             }
         } else {
-            for message in ctx.history_messages {
-                agent.push_message(message);
+            for message in &ctx.history_messages {
+                agent.push_message(message.clone());
             }
         }
 
-        let provider_id = agent.provider_id().to_string();
-
-        let (prompt, attachments) =
-            Box::pin(build_prompt_and_attachments(state, req, &ctx.current_model))
-                .await
-                .map_err(UiChatPreparationError::BuildPrompt)?;
-        let preview_messages = agent
-            .preview_request_messages_with_hidden_context(
-                &prompt,
-                ctx.hidden_context_xml.as_deref(),
-                attachments.iter().cloned(),
-            )
-            .await
-            .map_err(UiChatPreparationError::PreviewRequest)?;
-        persist_context_debug_snapshot(
-            state,
-            &ctx.session_id,
-            &ctx.current_model,
-            &provider_id,
-            &prompt,
-            &attachments,
-            &preview_messages,
-        )
-        .await
-        .map_err(UiChatPreparationError::PersistContextDebugSnapshot)?;
-
-        Ok(PreparedAgent {
-            session_id: ctx.session_id,
-            agent,
-            current_model: ctx.current_model,
-            provider_id,
-            profile_id: ctx.profile_id,
-            hidden_context_xml: ctx.hidden_context_xml,
-            prompt,
-            attachments,
-            provider_candidate_count: ctx.provider_candidate_count,
-        })
+        Ok(agent)
     })
+}
+
+/// A fingerprint of everything `ctx`'s agent is built from, so a turn can
+/// tell whether the session's idle agent still fits: the configuration, the
+/// model and its reasoning effort, the profile, its persona and memories,
+/// the plan state and where the session works.
+fn agent_build_key(config: &crate::config::MayConfig, ctx: &SessionContext) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::hash::DefaultHasher::new();
+    serde_json::to_string(config)
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    ctx.current_model.hash(&mut hasher);
+    format!("{:?}", ctx.reasoning_effort).hash(&mut hasher);
+    ctx.profile_id.hash(&mut hasher);
+    format!("{:?}", ctx.profile_model).hash(&mut hasher);
+    format!("{:?}", ctx.profile_environment).hash(&mut hasher);
+    ctx.profile_persona.hash(&mut hasher);
+    format!("{:?}", ctx.profile_memories).hash(&mut hasher);
+    format!("{:?}", ctx.plan_state).hash(&mut hasher);
+    ctx.cwd.hash(&mut hasher);
+    ctx.non_interactive.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// What a turn starts from.
+#[derive(Debug, Default)]
+pub enum TurnKind {
+    /// A user message, or a queued one.
+    #[default]
+    Prompt,
+    /// The session's idle agent collected background commands that need the
+    /// model; their events open the turn.
+    Resume(Vec<aither_agent::TimedEvent>),
+}
+
+impl TurnKind {
+    const fn is_resume(&self) -> bool {
+        matches!(self, Self::Resume(_))
+    }
 }
 
 /// Read tasks.md and return the parsed checklist if its content changed since the last check.

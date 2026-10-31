@@ -125,6 +125,9 @@ pub(crate) enum WorkerCommand {
     },
     /// Cancel current processing.
     Cancel,
+    /// Hand the idle agent back and stop: the next turn of the session
+    /// continues with it.
+    Release { reply: Sender<MayAgent> },
     /// Shutdown the worker.
     Shutdown,
 }
@@ -294,6 +297,12 @@ impl AgentWorker {
         }
     }
 
+    /// Asks the worker to hand its idle agent back on `reply` and stop; a
+    /// worker busy with a run hands it back once the run is over.
+    pub(crate) fn release(&self, reply: Sender<MayAgent>) {
+        let _ = self.command_tx.try_send(WorkerCommand::Release { reply });
+    }
+
     /// Signal the worker task to shut down.
     pub fn shutdown(&self) {
         let _ = self.command_tx.try_send(WorkerCommand::Shutdown);
@@ -405,6 +414,19 @@ pub fn spawn_worker<E: Executor + 'static>(
     snapshot_db: ChatDb,
     runs: SessionRuns,
 ) -> AgentWorker {
+    spawn_idle_worker(executor, agent, snapshot_db, runs, None)
+}
+
+/// Spawns a worker like [`spawn_worker`] whose idle agent also waits on the
+/// background commands its earlier runs detached; each wake that needs the
+/// model is sent on `background_wakes`.
+pub fn spawn_idle_worker<E: Executor + 'static>(
+    executor: E,
+    agent: MayAgent,
+    snapshot_db: ChatDb,
+    runs: SessionRuns,
+    background_wakes: Option<Sender<aither_agent::BackgroundWake>>,
+) -> AgentWorker {
     let (command_tx, command_rx) = unbounded::<WorkerCommand>();
     let job_registry = agent.job_registry();
     let subagent_runs = agent.subagent_runs();
@@ -418,6 +440,7 @@ pub fn spawn_worker<E: Executor + 'static>(
             command_tx.clone(),
             snapshot_db,
             runs,
+            background_wakes,
         ))
         .detach();
 
@@ -439,10 +462,20 @@ async fn run_worker(
     command_tx: Sender<WorkerCommand>,
     snapshot_db: ChatDb,
     runs: SessionRuns,
+    background_wakes: Option<Sender<aither_agent::BackgroundWake>>,
 ) {
     loop {
-        // Wait for a command; an idle session is compacted on the way.
-        let Some(command) = next_command(&mut agent, &command_rx, &snapshot_db, &runs).await else {
+        // Wait for a command; an idle session is compacted on the way, and
+        // its detached background commands are collected.
+        let Some(command) = next_command(
+            &mut agent,
+            &command_rx,
+            &snapshot_db,
+            &runs,
+            background_wakes.as_ref(),
+        )
+        .await
+        else {
             // Channel closed, shutdown
             break;
         };
@@ -532,6 +565,10 @@ async fn run_worker(
             WorkerCommand::Cancel => {
                 // No active processing, ignore
             }
+            WorkerCommand::Release { reply } => {
+                let _ = reply.try_send(agent);
+                return;
+            }
             WorkerCommand::Shutdown => {
                 break;
             }
@@ -552,52 +589,107 @@ async fn next_command(
     command_rx: &Receiver<WorkerCommand>,
     snapshot_db: &ChatDb,
     runs: &SessionRuns,
+    background_wakes: Option<&Sender<aither_agent::BackgroundWake>>,
 ) -> Option<WorkerCommand> {
     loop {
-        let Some(due_in) = agent.idle_compaction_due_in() else {
-            return command_rx.recv().await.ok();
-        };
-        // `Some` is a command (or the closed channel), `None` the elapsed timer.
-        let command =
-            futures_lite::future::or(async { Some(command_rx.recv().await.ok()) }, async {
-                async_io::Timer::after(due_in).await;
-                None
-            })
-            .await;
-        if let Some(command) = command {
-            return command;
-        }
-        // The compaction rewrites the session's context, so it runs as a run
-        // of its own; a session another process is running is left alone.
-        let session_id = agent.session_id().as_str().to_string();
-        let guard = match runs.acquire(&session_id).await {
-            Ok(guard) => guard,
-            Err(error) => {
-                tracing::info!(%error, "skipping idle compaction");
-                return command_rx.recv().await.ok();
-            }
-        };
-        let compaction = futures_lite::future::or(
-            async { Ok(until_stopped(agent.compact_when_idle(), guard.cancellation()).await) },
-            async { Err(command_rx.recv().await.ok()) },
+        let compaction_due_in = agent.idle_compaction_due_in();
+        let step = futures_lite::future::or(
+            async { IdleStep::Command(command_rx.recv().await.ok()) },
+            futures_lite::future::or(
+                async {
+                    match compaction_due_in {
+                        Some(due_in) => {
+                            async_io::Timer::after(due_in).await;
+                            IdleStep::Compact
+                        }
+                        None => std::future::pending().await,
+                    }
+                },
+                async {
+                    match background_wakes {
+                        Some(_) => IdleStep::Background(agent.wait_background().await),
+                        None => std::future::pending().await,
+                    }
+                },
+            ),
         )
         .await;
-        match compaction {
-            Err(command) => {
-                finish_run(guard, RunOutcome::Cancelled).await;
-                return command;
+        match step {
+            IdleStep::Command(command) => return command,
+            IdleStep::Background(wake) => {
+                // The wake is recorded in the agent's context; a wake that
+                // needs the model asks the host for a run.
+                if wake.needs_model
+                    && let Some(wakes) = background_wakes
+                {
+                    let _ = wakes.try_send(wake);
+                }
             }
-            Ok(StopRace::Stopped) => finish_run(guard, RunOutcome::Cancelled).await,
-            Ok(StopRace::Done(Ok(None))) => finish_run(guard, RunOutcome::Completed).await,
-            Ok(StopRace::Done(Ok(Some(_)))) => {
-                persist_snapshot(snapshot_db, guard.fence(), agent).await;
-                finish_run(guard, RunOutcome::Completed).await;
+            IdleStep::Compact => {
+                if let Some(command) = compact_idle(agent, command_rx, snapshot_db, runs).await {
+                    return command;
+                }
             }
-            Ok(StopRace::Done(Err(error))) => {
-                tracing::error!(%error, "idle compaction failed");
-                finish_run(guard, RunOutcome::Failed).await;
-                return command_rx.recv().await.ok();
-            }
+        }
+    }
+}
+
+/// What ended one idle wait of the worker.
+enum IdleStep {
+    /// A command arrived, or `None` when the channel closed.
+    Command(Option<WorkerCommand>),
+    /// The idle compaction is due.
+    Compact,
+    /// A detached background command finished or raised an alert.
+    Background(aither_agent::BackgroundWake),
+}
+
+/// Compacts the idle session as a run of its own. `Some` is a command that
+/// arrived meanwhile (or `Some(None)`, the closed channel) and must be
+/// returned to the worker loop.
+async fn compact_idle(
+    agent: &mut MayAgent,
+    command_rx: &Receiver<WorkerCommand>,
+    snapshot_db: &ChatDb,
+    runs: &SessionRuns,
+) -> Option<Option<WorkerCommand>> {
+    // The compaction rewrites the session's context, so it runs as a run
+    // of its own; a session another process is running is left alone.
+    let session_id = agent.session_id().as_str().to_string();
+    let guard = match runs.acquire(&session_id).await {
+        Ok(guard) => guard,
+        Err(error) => {
+            tracing::info!(%error, "skipping idle compaction");
+            return Some(command_rx.recv().await.ok());
+        }
+    };
+    let compaction = futures_lite::future::or(
+        async { Ok(until_stopped(agent.compact_when_idle(), guard.cancellation()).await) },
+        async { Err(command_rx.recv().await.ok()) },
+    )
+    .await;
+    match compaction {
+        Err(command) => {
+            finish_run(guard, RunOutcome::Cancelled).await;
+            Some(command)
+        }
+        Ok(StopRace::Stopped) => {
+            finish_run(guard, RunOutcome::Cancelled).await;
+            None
+        }
+        Ok(StopRace::Done(Ok(None))) => {
+            finish_run(guard, RunOutcome::Completed).await;
+            None
+        }
+        Ok(StopRace::Done(Ok(Some(_)))) => {
+            persist_snapshot(snapshot_db, guard.fence(), agent).await;
+            finish_run(guard, RunOutcome::Completed).await;
+            None
+        }
+        Ok(StopRace::Done(Err(error))) => {
+            tracing::error!(%error, "idle compaction failed");
+            finish_run(guard, RunOutcome::Failed).await;
+            Some(command_rx.recv().await.ok())
         }
     }
 }
@@ -640,6 +732,8 @@ async fn race_against_commands<F: Future>(
                 WorkerCommand::ContextReport { .. } | WorkerCommand::ContextDump { .. } => {
                     deferred.push(command);
                 }
+                // The agent is busy: it is released once the work is over.
+                WorkerCommand::Release { .. } => deferred.push(command),
                 WorkerCommand::Run { .. }
                 | WorkerCommand::Compact { .. }
                 | WorkerCommand::Send { .. } => {}
