@@ -471,7 +471,7 @@ export const ja: Messages = {
     tabsLabel: 'インスペクタのセクション',
     tabDetails: '詳細',
     tabLibrary: 'ライブラリ',
-    tabComputer: 'ブラウザ',
+    tabBrowser: 'ブラウザ',
     finished: '終了',
     jobDone: '完了',
     libraryEmpty: 'ファイルはまだありません。May が作成したファイルがここに表示されます。',
