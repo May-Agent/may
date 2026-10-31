@@ -8,7 +8,9 @@
 #[cfg(target_os = "macos")]
 mod capture;
 #[cfg(target_os = "macos")]
-mod input;
+pub(crate) mod input;
+#[cfg(target_os = "macos")]
+pub(crate) mod screenshot;
 #[cfg(target_os = "macos")]
 mod skylight;
 #[cfg(target_os = "macos")]
@@ -133,6 +135,12 @@ impl SessionStreams {
             .entry(session_id.to_owned())
             .or_insert_with(|| Arc::new(SessionStream::new()))
             .clone()
+    }
+
+    /// The session's stream if it has one, without creating it.
+    #[must_use]
+    pub fn get(&self, session_id: &str) -> Option<Arc<SessionStream>> {
+        self.streams.get(session_id).cloned()
     }
 
     /// Ends the session's stream when its session ends.

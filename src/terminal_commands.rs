@@ -91,6 +91,10 @@ pub struct SharedTerminalCommandConfig<LLM> {
     /// Discovery and messaging between main agents, when the session has a
     /// persistent queue to deliver through.
     pub agent_messaging: Option<crate::agent_link::AgentMessaging>,
+    /// Daemon handles for the `computer` command — present when the
+    /// session may own a virtual desktop (macOS, local environment).
+    #[cfg(target_os = "macos")]
+    pub computer: Option<crate::agent::computer_tool::ComputerHandles>,
 }
 
 /// What [`register_shared_terminal_commands`] installed.
@@ -174,6 +178,15 @@ where
         let withdraw = WithdrawAskUserTool::new(runtime, config.session_id.clone());
         describe_tool(&mut descriptions, &withdraw);
         builder.main_only(|reserved| reserved.configure_tool(withdraw));
+    }
+
+    #[cfg(target_os = "macos")]
+    if let Some(handles) = config.computer {
+        register_tool_with_description(
+            builder,
+            &mut descriptions,
+            crate::agent::computer_tool::ComputerTool::new(config.session_id.clone(), handles),
+        );
     }
 
     if let Some(messaging) = config.agent_messaging {
@@ -408,6 +421,8 @@ mod tests {
         let descriptions = register_shared_terminal_commands(
             &mut builder,
             SharedTerminalCommandConfig {
+                #[cfg(target_os = "macos")]
+                computer: None,
                 llm: MockLlm,
                 ask_flagship: None,
                 ask_balanced: None,
@@ -464,6 +479,8 @@ mod tests {
         let descriptions = register_shared_terminal_commands(
             &mut builder,
             SharedTerminalCommandConfig {
+                #[cfg(target_os = "macos")]
+                computer: None,
                 llm: MockLlm,
                 ask_flagship: None,
                 ask_balanced: None,
@@ -521,6 +538,8 @@ mod tests {
         let descriptions = register_shared_terminal_commands(
             &mut builder,
             SharedTerminalCommandConfig {
+                #[cfg(target_os = "macos")]
+                computer: None,
                 llm: MockLlm,
                 ask_flagship: None,
                 ask_balanced: None,
@@ -566,6 +585,8 @@ mod tests {
         register_shared_terminal_commands(
             &mut builder,
             SharedTerminalCommandConfig {
+                #[cfg(target_os = "macos")]
+                computer: None,
                 llm: MockLlm,
                 ask_flagship: None,
                 ask_balanced: None,
@@ -726,6 +747,8 @@ mod tests {
         register_shared_terminal_commands(
             &mut builder,
             SharedTerminalCommandConfig {
+                #[cfg(target_os = "macos")]
+                computer: None,
                 llm: MockLlm,
                 ask_flagship: None,
                 ask_balanced: None,
@@ -798,6 +821,8 @@ mod tests {
         let descriptions = register_shared_terminal_commands(
             &mut builder,
             SharedTerminalCommandConfig {
+                #[cfg(target_os = "macos")]
+                computer: None,
                 llm: MockLlm,
                 ask_flagship: None,
                 ask_balanced: None,
