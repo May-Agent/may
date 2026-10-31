@@ -11,8 +11,9 @@ mod wire;
 
 pub use sse::{ServerEvent, SseParser};
 pub use wire::{
-    RunEnd, SessionAgentBody, SessionAgentFrame, SessionRuntimeEvent, SessionRuntimeSnapshot,
-    WireAgentError, WireAgentEvent,
+    CreateSessionRequest, RewindRequest, RunEnd, SessionAgentBody, SessionAgentFrame,
+    SessionRuntimeEvent, SessionRuntimeSnapshot, UpdateSessionRequest, WireAgentError,
+    WireAgentEvent, WireSession,
 };
 
 use std::path::PathBuf;
