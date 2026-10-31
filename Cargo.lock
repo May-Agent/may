@@ -5376,6 +5376,7 @@ dependencies = [
  "async-net",
  "async-stream",
  "base64 0.22.1",
+ "block2",
  "blocking",
  "bollard",
  "bytes",
