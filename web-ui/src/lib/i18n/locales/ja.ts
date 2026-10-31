@@ -238,6 +238,21 @@ export const ja: Messages = {
     didRead: '{page} を読みました',
     didOther: 'ブラウザを使用しました',
   },
+  computer: {
+    title: 'コンピュータ',
+    screenOf: '{name} のデスクトップ',
+    caption: 'セッションの仮想デスクトップ',
+    asleep: 'デスクトップはスリープ中',
+    wake: '起動',
+    open: 'デスクトップを開く',
+    minimize: '最小化',
+    mode: '操作モード',
+    watching: '視聴中',
+    takeControl: '操作を取る',
+    connecting: '接続中',
+    streamLost: '接続が切れました',
+  },
+
   modals: {
     permission: {
       title: 'May が許可を求めています',
@@ -472,6 +487,7 @@ export const ja: Messages = {
     tabDetails: '詳細',
     tabLibrary: 'ライブラリ',
     tabBrowser: 'ブラウザ',
+    tabComputer: 'コンピュータ',
     finished: '終了',
     jobDone: '完了',
     libraryEmpty: 'ファイルはまだありません。May が作成したファイルがここに表示されます。',

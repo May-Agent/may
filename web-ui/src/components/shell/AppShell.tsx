@@ -9,6 +9,7 @@ import { INSPECTOR_COLUMN_QUERY, SIDEBAR_COLUMN_QUERY, useMediaQuery } from '@/l
 import { useTranslation } from '@/lib/i18n';
 import { CommandPalette } from './CommandPalette';
 import { BrowserViewer } from '@/components/browser/BrowserViewer';
+import { ComputerViewer } from '@/components/computer/ComputerViewer';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import { InteractionLayer } from '@/components/interactions/InteractionLayer';
 import { useRuntimeStore } from '@/lib/stores/runtime';
@@ -110,6 +111,7 @@ export function AppShell() {
           <Outlet />
         </main>
         <BrowserViewer />
+        <ComputerViewer />
         <InteractionLayer />
         <CommandPalette />
         <Toaster theme={toasterTheme} closeButton position="top-right" />
