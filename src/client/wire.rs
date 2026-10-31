@@ -329,6 +329,132 @@ pub enum SessionAgentBody {
     },
 }
 
+/// One `session_runtime` event: the session's blocking-state snapshot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRuntimeEvent {
+    /// Session the snapshot belongs to.
+    pub session_id: String,
+    /// Its runtime summary.
+    pub runtime: SessionRuntimeSnapshot,
+}
+
+/// The session's blocking state, as `GET /api/sessions/{id}/runtime` and the
+/// `session_runtime` event report it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionRuntimeSnapshot {
+    /// Top-level runtime state.
+    pub state: crate::session::SessionRuntimeState,
+    /// Plan-mode state.
+    pub plan_state: crate::session::SessionPlanState,
+    /// Interactive-resource sub-state (browser, terminal).
+    pub interactions: SessionInteractionSnapshot,
+    /// Messages waiting to be processed.
+    pub queued_count: usize,
+    /// A message that must be dispatched before queued work.
+    #[serde(default)]
+    pub pending_immediate: Option<crate::session::PendingUserMessage>,
+    /// Messages queued for later dispatch.
+    #[serde(default)]
+    pub queued_messages: Vec<crate::session::PendingUserMessage>,
+    /// Permission request blocking the session, if any.
+    #[serde(default)]
+    pub waiting_permission: Option<PermissionPollItem>,
+    /// Workspace request blocking the session, if any.
+    #[serde(default)]
+    pub waiting_workspace: Option<WorkspacePollItem>,
+    /// Ask-user request blocking the session, if any.
+    #[serde(default)]
+    pub waiting_ask_user: Option<crate::session::PersistedAskUserRequest>,
+    /// Questions the agent asked that are neither answered nor withdrawn,
+    /// oldest first.
+    #[serde(default)]
+    pub open_questions: Vec<crate::session::PersistedAskUserRequest>,
+}
+
+impl Default for SessionRuntimeSnapshot {
+    fn default() -> Self {
+        Self {
+            state: crate::session::SessionRuntimeState::Idle,
+            plan_state: crate::session::SessionPlanState::Disabled,
+            interactions: SessionInteractionSnapshot::default(),
+            queued_count: 0,
+            pending_immediate: None,
+            queued_messages: Vec::new(),
+            waiting_permission: None,
+            waiting_workspace: None,
+            waiting_ask_user: None,
+            open_questions: Vec::new(),
+        }
+    }
+}
+
+/// Interactive-resource sub-state of a session.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionInteractionSnapshot {
+    /// Browser interaction sub-state.
+    #[serde(default)]
+    pub browser: BrowserInteractionSnapshot,
+    /// Terminal runtime sub-state.
+    #[serde(default)]
+    pub terminal: TerminalInteractionSnapshot,
+}
+
+/// Whether the browser is under user control.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserInteractionSnapshot {
+    /// The user holds the browser while the agent waits.
+    #[serde(default)]
+    pub takeover_active: bool,
+}
+
+/// The session's terminal, as the daemon reports it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalInteractionSnapshot {
+    /// Task currently attached, if any.
+    #[serde(default)]
+    pub task_id: Option<String>,
+    /// Terminal output file, if any.
+    #[serde(default)]
+    pub output_file: Option<String>,
+    /// Preview of its recent output, if any.
+    #[serde(default)]
+    pub output_preview: Option<String>,
+    /// Notice to show the user about pending input, if any.
+    #[serde(default)]
+    pub input_notice: Option<String>,
+}
+
+/// A permission request blocking a session, as polls report it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionPollItem {
+    /// Request id, the one `respond` answers.
+    pub id: String,
+    /// The request.
+    #[serde(flatten)]
+    pub request: crate::session::PersistedPermissionRequestPayload,
+}
+
+/// A workspace request blocking a session, as polls report it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspacePollItem {
+    /// Request id, the one `respond` answers.
+    pub id: String,
+    /// Path access is requested for.
+    pub path: String,
+    /// Why it is needed.
+    pub reason: String,
+    /// Session that asked, when it is not the connected one.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use aither_agent::{AgentError, AgentEvent};

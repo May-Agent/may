@@ -289,6 +289,9 @@ pub struct App {
     pub secrets: crate::secrets::Secrets,
     /// Questions the agent asked that nobody answered yet, for the status bar.
     pub open_question_count: usize,
+    /// The session's blocking state as the daemon last reported it on the
+    /// `session_runtime` stream.
+    pub session_runtime: crate::client::SessionRuntimeSnapshot,
     /// Which open question `/questions` shows next, so repeated use walks
     /// through all of them.
     pub question_cursor: usize,
@@ -538,6 +541,7 @@ impl App {
             diff_preview_at: None,
             secrets,
             open_question_count: 0,
+            session_runtime: Default::default(),
             question_cursor: 0,
             parked_question: None,
         })
