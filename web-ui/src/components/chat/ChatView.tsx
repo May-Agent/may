@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { AlertCircle, AlertTriangle, ArrowDown, RotateCw, X } from 'lucide-react';
+import { AlertCircle, AlertTriangle, ArrowDown, Loader2, RotateCw, X } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { useSessionsStore } from '@/lib/stores/sessions';
 import { useTurnStore } from '@/lib/stores/turn';
@@ -84,8 +84,12 @@ export function ChatView({ sessionId }: { sessionId: string }) {
 
   if (!active || active.id !== sessionId) {
     return (
-      <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
-        {t('common.loading')}
+      <div
+        role="status"
+        className="flex h-full items-center justify-center gap-2 text-sm text-muted-foreground"
+      >
+        <Loader2 className="size-4 animate-spin" aria-hidden />
+        {t('shell.loadingSession')}
       </div>
     );
   }
@@ -140,7 +144,8 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       <ScrollArea
         ref={scrollerRef}
         onScroll={handleScroll}
-        className="flex-1 px-6 pt-6 pb-48"
+        className="flex-1 px-4 pt-6 pb-48 sm:px-6"
+        aria-label={active.title || t('common.untitled')}
       >
         <div className="mx-auto w-full max-w-3xl space-y-6">
           {messages.map((msg) => {
@@ -182,7 +187,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
 
       <div
         className={cn(
-          'pointer-events-none absolute inset-x-0 bottom-0 flex justify-center px-6 pb-5',
+          'pointer-events-none absolute inset-x-0 bottom-0 flex justify-center px-4 pb-4 sm:px-6 sm:pb-5',
         )}
       >
         <div className="pointer-events-auto mx-auto w-full max-w-3xl space-y-2">
@@ -192,7 +197,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
                 size="sm"
                 variant="secondary"
                 onClick={scrollToBottom}
-                className="h-8 gap-1 rounded-full border border-border/60 bg-background/80 px-3 shadow-md backdrop-blur-xl hover:bg-background"
+                className="gap-1 rounded-full border border-border/60 bg-background/80 px-3 shadow-md backdrop-blur-xl hover:bg-background"
                 aria-label={t('chat.scrollToBottom')}
               >
                 <ArrowDown className="size-3.5" />
@@ -239,8 +244,8 @@ function TurnErrorCard({ code, message, retryable, onRetry, onDismiss }: TurnErr
       </div>
       <div className="flex items-center gap-1 shrink-0">
         {retryable && (
-          <Button size="sm" variant="outline" onClick={onRetry} className="h-7 gap-1 text-xs">
-            <RotateCw className="size-3" />
+          <Button size="sm" variant="outline" onClick={onRetry} className="gap-1">
+            <RotateCw className="size-3.5" />
             {t('common.retry')}
           </Button>
         )}
@@ -248,7 +253,6 @@ function TurnErrorCard({ code, message, retryable, onRetry, onDismiss }: TurnErr
           size="icon"
           variant="ghost"
           onClick={onDismiss}
-          className="size-7"
           aria-label={t('common.dismiss')}
         >
           <X className="size-3.5" />

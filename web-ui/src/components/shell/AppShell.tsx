@@ -1,7 +1,12 @@
 import { useEffect, useRef } from 'react';
-import { Outlet } from 'react-router-dom';
+import { Outlet, useLocation } from 'react-router-dom';
 import { Toaster } from 'sonner';
 import { Sidebar } from './Sidebar';
+import { Sheet, SheetContent, SheetTitle } from '@/components/ui/sheet';
+import { isMacPlatform, matchShortcut } from '@/lib/shortcuts';
+import { useNewChat } from '@/lib/useNewChat';
+import { INSPECTOR_COLUMN_QUERY, SIDEBAR_COLUMN_QUERY, useMediaQuery } from '@/lib/useMediaQuery';
+import { useTranslation } from '@/lib/i18n';
 import { CommandPalette } from './CommandPalette';
 import { BrowserLiveView } from '@/components/browser/BrowserLiveView';
 import { TooltipProvider } from '@/components/ui/tooltip';
@@ -24,12 +29,31 @@ export function AppShell() {
   const theme = useUiStore((s) => s.theme);
   const toasterTheme = theme === 'system' ? undefined : theme;
   const { profileId } = useActiveProfile();
+  const sidebarCollapsed = useUiStore((s) => s.sidebarCollapsed);
+  const sidebarSheetOpen = useUiStore((s) => s.sidebarSheetOpen);
+  const setSidebarSheetOpen = useUiStore((s) => s.setSidebarSheetOpen);
+  const sidebarColumn = useMediaQuery(SIDEBAR_COLUMN_QUERY);
+  const { t } = useTranslation();
+  const location = useLocation();
 
   const bootstrappedRef = useRef(false);
 
   useEffect(() => {
     applyTheme(theme);
+    if (theme !== 'system') return;
+    // Follow the system appearance live while the theme is "system".
+    const media = window.matchMedia('(prefers-color-scheme: dark)');
+    const onChange = () => applyTheme('system');
+    media.addEventListener('change', onChange);
+    return () => media.removeEventListener('change', onChange);
   }, [theme]);
+
+  // Navigating from the sidebar sheet dismisses it.
+  useEffect(() => {
+    setSidebarSheetOpen(false);
+  }, [location.pathname, setSidebarSheetOpen]);
+
+  useGlobalShortcuts(sidebarColumn);
 
   useEffect(() => {
     if (bootstrappedRef.current) return;
@@ -72,9 +96,17 @@ export function AppShell() {
 
   return (
     <TooltipProvider delayDuration={200}>
-      <div className="flex h-full w-full">
-        <Sidebar />
-        <main className="flex-1 overflow-hidden">
+      <div className="flex h-full w-full overflow-hidden">
+        {sidebarColumn && !sidebarCollapsed && <Sidebar />}
+        {!sidebarColumn && (
+          <Sheet open={sidebarSheetOpen} onOpenChange={setSidebarSheetOpen}>
+            <SheetContent side="left" className="w-[min(20rem,85vw)] max-w-none p-0" hideCloseButton aria-describedby={undefined}>
+              <SheetTitle className="sr-only">{t('sidebar.sessions')}</SheetTitle>
+              <Sidebar inSheet />
+            </SheetContent>
+          </Sheet>
+        )}
+        <main className="min-w-0 flex-1 overflow-hidden">
           <Outlet />
         </main>
         <BrowserLiveView />
@@ -84,4 +116,38 @@ export function AppShell() {
       </div>
     </TooltipProvider>
   );
+}
+
+/** Cmd/Ctrl+N, Cmd/Ctrl+K and the sidebar / inspector toggles. */
+function useGlobalShortcuts(sidebarColumn: boolean) {
+  const { start } = useNewChat();
+
+  useEffect(() => {
+    const mac = isMacPlatform();
+    const onKey = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || e.isComposing) return;
+      const id = matchShortcut(e, mac);
+      if (!id) return;
+      const ui = useUiStore.getState();
+      e.preventDefault();
+      switch (id) {
+        case 'newChat':
+          void start();
+          break;
+        case 'search':
+          ui.setCommandOpen(!ui.commandOpen);
+          break;
+        case 'toggleSidebar':
+          if (sidebarColumn) ui.toggleSidebar();
+          else ui.setSidebarSheetOpen(!ui.sidebarSheetOpen);
+          break;
+        case 'toggleInspector':
+          if (window.matchMedia(INSPECTOR_COLUMN_QUERY).matches) ui.toggleInspector();
+          else ui.setInspectorSheetOpen(!ui.inspectorSheetOpen);
+          break;
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [sidebarColumn, start]);
 }
