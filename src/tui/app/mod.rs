@@ -133,6 +133,8 @@ pub struct App {
     pub selected_tool_index: usize,
     /// Scroll offset in tool detail view
     pub tool_detail_scroll: usize,
+    /// Rows the help sheet is scrolled.
+    pub help_scroll: u16,
     /// Unified configuration state (for Config mode)
     pub config_state: ConfigState,
     /// Selected index in model select popup
@@ -262,6 +264,11 @@ pub struct App {
     pub btw_llm: Option<crate::agent::RequestParameterizedModel<aither_cloud::CloudProvider>>,
     /// Daemon that answers `/btw` when the agent runs there.
     pub btw_daemon: Option<crate::client::DaemonClient>,
+    /// Right sidebar: task tree, linked issues (background lists come
+    /// from `jobs` / `subagents`).
+    pub sidebar: super::sidebar::SidebarState,
+    /// Screen rect the chat column occupied last frame (mouse mapping).
+    pub chat_area: ratatui::layout::Rect,
     /// Latest job list shown in `AppMode::Jobs`
     pub jobs: Vec<aither_sandbox::JobInfo>,
     /// Selected row in `AppMode::Jobs`
@@ -456,6 +463,7 @@ impl App {
             selected_tool: None,
             selected_tool_index: 0,
             tool_detail_scroll: 0,
+            help_scroll: 0,
             config_state,
             model_select_index: 0,
             model_select_list: Vec::new(),
@@ -519,6 +527,8 @@ impl App {
             background: None,
             btw_llm: None,
             btw_daemon: None,
+            sidebar: super::sidebar::SidebarState::default(),
+            chat_area: ratatui::layout::Rect::default(),
             jobs: Vec::new(),
             jobs_selected: 0,
             subagents: Vec::new(),
@@ -1797,6 +1807,11 @@ impl App {
                     return Ok(None);
                 }
                 KeyCode::Left => return Ok(Some(SendAction::OpenQuestions)),
+                // Ctrl+B shows/hides the right sidebar (wide terminals only).
+                KeyCode::Char('b') => {
+                    self.sidebar.enabled = !self.sidebar.enabled;
+                    return Ok(None);
+                }
                 KeyCode::Char('n') => {
                     self.quit_pending = false;
                     self.status = None;
@@ -2289,6 +2304,21 @@ impl App {
             _ => return Ok(None),
         }
 
+        // Clicks and drags outside the chat column (the sidebar) select
+        // nothing; the wheel scrolls the chat anywhere.
+        let in_chat = self.chat_area.is_empty()
+            || self
+                .chat_area
+                .contains(ratatui::layout::Position::new(mouse.column, mouse.row));
+        if !in_chat
+            && !matches!(
+                mouse.kind,
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+            )
+        {
+            return Ok(None);
+        }
+
         match mouse.kind {
             MouseEventKind::ScrollUp => self.scroll_chat_up(SCROLL_STEP_LINES),
             MouseEventKind::ScrollDown => self.scroll_chat_down(SCROLL_STEP_LINES),
@@ -2484,6 +2514,11 @@ impl App {
                             .spawn();
                     }
                 }
+                None
+            }
+            "/help" => {
+                self.help_scroll = 0;
+                self.mode = AppMode::Help;
                 None
             }
             "/config" => {
@@ -2898,8 +2933,10 @@ impl App {
     }
 
     /// Re-read the session's canonical `tasks.md` and refresh the todo
-    /// block. `async_fs` keeps the filesystem IO off the UI thread.
+    /// block. `async_fs` keeps the filesystem IO off the UI thread. The
+    /// sidebar's task tree is refetched from the daemon alongside.
     async fn refresh_todos(&mut self) {
+        self.request_sidebar_tasks();
         let Some(session) = self.session_manager.current() else {
             return;
         };
@@ -2918,6 +2955,119 @@ impl App {
                 tracing::warn!(error = %error, "failed to read session tasks.md");
             }
         }
+    }
+
+    /// Fetch the current session's `tasks.md` for the sidebar from the
+    /// daemon (`GET /api/sessions/{id}/tasks`); the answer arrives as
+    /// [`AppEvent::SidebarTasks`]. Without a daemon the session's file is
+    /// read directly.
+    pub fn request_sidebar_tasks(&mut self) {
+        let Some(session) = self.session_manager.current() else {
+            self.sidebar.reset();
+            return;
+        };
+        let session_id = session.id.as_str().to_string();
+        if self.sidebar.session_id.as_deref() != Some(session_id.as_str()) {
+            // A switched session never shows the previous one's tasks.
+            self.sidebar.reset();
+        }
+        let tx = self.event_tx.clone();
+        let daemon = self.btw_daemon.clone();
+        let db = self.session_manager.db().clone();
+        let paths = self
+            .session_manager
+            .store()
+            .session_paths(session.id.as_str(), session.profile_id.as_deref());
+        spawn(async move {
+            #[derive(serde::Deserialize)]
+            struct TasksPayload {
+                #[serde(default)]
+                content: String,
+            }
+            let content = match daemon {
+                Some(client) => match client
+                    .get::<TasksPayload>(&crate::client::session_path(&session_id, "/tasks"))
+                    .await
+                {
+                    Ok(payload) => Some(payload.content).filter(|content| !content.is_empty()),
+                    Err(error) => {
+                        tracing::debug!(%error, "sidebar: failed to fetch tasks.md");
+                        return;
+                    }
+                },
+                None => match paths.tasks_content().await {
+                    Ok(content) => content,
+                    Err(error) => {
+                        tracing::debug!(%error, "sidebar: failed to read tasks.md");
+                        return;
+                    }
+                },
+            };
+            let title = match db.get_session(&session_id).await {
+                Ok(row) => row.and_then(|row| row.title),
+                Err(error) => {
+                    tracing::debug!(%error, "sidebar: failed to read the session title");
+                    None
+                }
+            };
+            let _ = tx
+                .send(AppEvent::SidebarTasks {
+                    session_id,
+                    content,
+                    title,
+                })
+                .await;
+        })
+        .detach();
+    }
+
+    /// Look up the issues `numbers` in the session's issue store (its
+    /// backend is chosen by `workspace.toml`, as for the agent); the result
+    /// arrives as [`AppEvent::SidebarIssues`].
+    pub fn request_issue_lookups(&self, session_id: String, numbers: Vec<i64>) {
+        use crate::issue::IssueStore as _;
+
+        if numbers.is_empty() {
+            return;
+        }
+        let Some(session) = self.session_manager.current() else {
+            return;
+        };
+        let workspace_config =
+            crate::session::SessionPaths::new(session.sandbox_dir.clone()).workspace_config();
+        let cwd = self.cwd.clone();
+        let db = self.session_manager.db().clone();
+        let tx = self.event_tx.clone();
+        spawn(async move {
+            let store = match unblock(move || {
+                crate::issue::resolve_issue_store(&cwd, &workspace_config, db)
+            })
+            .await
+            {
+                Ok(store) => store,
+                Err(error) => {
+                    tracing::debug!(%error, "sidebar: no issue store");
+                    return;
+                }
+            };
+            let mut issues = Vec::with_capacity(numbers.len());
+            for number in numbers {
+                match store.get(number).await {
+                    Ok(detail) => issues.push(super::sidebar::IssueBrief {
+                        number,
+                        title: Some(detail.title),
+                        closed: matches!(detail.state, crate::issue::IssueState::Closed),
+                    }),
+                    Err(error) => {
+                        tracing::debug!(%error, number, "sidebar: issue lookup failed");
+                    }
+                }
+            }
+            let _ = tx
+                .send(AppEvent::SidebarIssues { session_id, issues })
+                .await;
+        })
+        .detach();
     }
 
     /// Handle an agent event. Returns true if stream ended.
@@ -3084,6 +3234,9 @@ impl App {
                         self.decode_meter.note_boundary();
                         self.scroll = usize::MAX;
                         self.input_visible = true;
+                        // The turn may have edited tasks.md without a tool
+                        // call ending after the edit (or in a foreign turn).
+                        self.refresh_todos().await;
                         // Signal that processing is complete
                         return true;
                     }

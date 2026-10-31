@@ -13,6 +13,8 @@ SHORTCUTS
   Enter         Send message
   ! command     Run a bash command in may's environment
   Ctrl+v        Paste image
+  Ctrl+b        Show/hide the sidebar (tasks, issues,
+                subagents, jobs; terminals >= 120 cols)
   Ctrl+c        Quit
   Up/Down       History / Scroll chat
   Mouse wheel   Scroll chat
