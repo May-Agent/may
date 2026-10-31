@@ -83,6 +83,7 @@ pub(super) async fn computer_offer(
     Ok(Json(ComputerAnswerResponse { sdp }))
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(clippy::unused_async))]
 async fn run_computer_start(state: Arc<DaemonState>, id: String) -> SkyResult<bool> {
     #[cfg(target_os = "macos")]
     {
@@ -126,6 +127,7 @@ async fn is_running(state: &DaemonState, id: &str) -> bool {
 }
 
 #[cfg(not(target_os = "macos"))]
+#[allow(clippy::unused_async)]
 async fn is_running(_state: &DaemonState, _id: &str) -> bool {
     false
 }
@@ -136,6 +138,7 @@ async fn stop_stream(state: &DaemonState, id: &str) {
 }
 
 #[cfg(not(target_os = "macos"))]
+#[allow(clippy::unused_async)]
 async fn stop_stream(_state: &DaemonState, _id: &str) {}
 
 #[cfg(target_os = "macos")]
@@ -151,6 +154,7 @@ async fn answer_offer(state: &DaemonState, id: &str, offer_sdp: String) -> SkyRe
 }
 
 #[cfg(not(target_os = "macos"))]
+#[allow(clippy::unused_async)]
 async fn answer_offer(_state: &DaemonState, _id: &str, _offer_sdp: String) -> SkyResult<String> {
     Err(
         skyzen::Error::msg("session desktops are macOS-only for now")
