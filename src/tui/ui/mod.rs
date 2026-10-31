@@ -3,6 +3,7 @@
 pub mod chat;
 pub mod chat_layout;
 pub mod file_picker;
+pub(super) mod highlight;
 pub mod image;
 mod layout;
 pub mod markdown;

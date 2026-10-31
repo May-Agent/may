@@ -179,6 +179,7 @@ pub struct ChatLayout {
 impl ChatLayout {
     /// Bring the cache in line with `chat` at `width`. Only elements whose
     /// revision or render state changed are laid out again.
+    #[allow(clippy::too_many_arguments)]
     pub fn sync(
         &mut self,
         chat: &ChatStream,
@@ -186,6 +187,7 @@ impl ChatLayout {
         images_supported: bool,
         hide_todos: bool,
         selected_tool: Option<&str>,
+        spinner_frame: usize,
         now: Instant,
     ) {
         if width != self.width
@@ -208,7 +210,7 @@ impl ChatLayout {
         self.rebuilt = 0;
         for (index, elem) in elements.iter().enumerate() {
             let revision = chat.revision(index);
-            let state = ElementState::of(elem, selected_tool, hide_todos, now);
+            let state = ElementState::of(elem, selected_tool, hide_todos, spinner_frame, now);
             let end = old.len().min(cursor + REUSE_LOOKAHEAD);
             let found = (cursor..end).find(|&i| {
                 old[i]
