@@ -35,6 +35,15 @@ pub(super) struct UnsubscribeRequest {
 
 #[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
+pub(super) struct SendNotificationRequest {
+    pub title: String,
+    pub body: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct TestNotificationRequest {
     #[serde(default = "default_test_title")]
     pub title: String,
@@ -87,6 +96,31 @@ pub(super) async fn unsubscribe(
         .map_err(internal_error)?;
 
     Ok(Json(super::types::API_OK))
+}
+
+/// POST /api/notifications — dispatch a notification with an optional
+/// session association; clients use it for open-question nudges.
+pub(super) async fn send_notification(
+    Json(req): Json<SendNotificationRequest>,
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<super::types::NotificationSentResponse>> {
+    let sent = state
+        .notification_service
+        .send_payload(crate::notification::NotificationPayload {
+            notification_id: None,
+            title: req.title,
+            body: req.body,
+            session_id: req.session_id,
+            callback_context_xml: None,
+            callback_message: None,
+        })
+        .await
+        .map_err(internal_error)?;
+
+    Ok(Json(super::types::NotificationSentResponse {
+        ok: true,
+        sent,
+    }))
 }
 
 /// POST /api/push/test — send a test notification to all subscribers.
@@ -159,7 +193,8 @@ pub(super) async fn consume_notification_callback(
             .as_deref()
             .ok_or_else(|| bad_request_error("notification callback source model not found"))?;
         let new_session_id =
-            super::sessions::create_session_for_profile(&state, Some(profile_id), model).await?;
+            super::sessions::create_session_for_profile(&state, None, Some(profile_id), model)
+                .await?;
         let now = jiff::Timestamp::now().to_string();
         if let Some(context) = callback.callback_context_xml.as_deref() {
             state

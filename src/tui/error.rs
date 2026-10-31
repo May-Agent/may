@@ -13,6 +13,9 @@ pub enum TuiError {
     /// Database error.
     #[error("database error: {0}")]
     Database(#[from] crate::db::ChatDbError),
+    /// The May daemon refused or could not be reached.
+    #[error(transparent)]
+    Daemon(#[from] crate::client::DaemonClientError),
     /// Session storage error.
     #[error("session storage error: {0}")]
     Store(#[from] crate::session::StoreError),

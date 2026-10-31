@@ -289,6 +289,9 @@ pub struct App {
     pub secrets: crate::secrets::Secrets,
     /// Questions the agent asked that nobody answered yet, for the status bar.
     pub open_question_count: usize,
+    /// The session's blocking state as the daemon last reported it on the
+    /// `session_runtime` stream.
+    pub session_runtime: crate::client::SessionRuntimeSnapshot,
     /// Which open question `/questions` shows next, so repeated use walks
     /// through all of them.
     pub question_cursor: usize,
@@ -356,7 +359,7 @@ impl App {
         image_support: Option<super::ui::image::TerminalImageSupport>,
     ) -> AppResult<Self> {
         let mut config = MayConfig::load().await.map_err(TuiError::LoadConfig)?;
-        let mut session_manager = SessionManager::new().await?;
+        let session_manager = SessionManager::new().await?;
 
         // Auto-detect API keys from environment variables
         let mut env_providers_added = Vec::new();
@@ -397,14 +400,9 @@ impl App {
         let mut config_state = ConfigState::default();
         config_state.load_providers(&config);
 
-        // Load profiles from database
-        let profiles = crate::profile::list_profiles(session_manager.db())
-            .await
-            .unwrap_or_default();
-        let current_profile_id = profiles.first().map(|p| p.id.clone());
-        if let Some(ref profile_id) = current_profile_id {
-            session_manager.set_current_profile(profile_id.clone());
-        }
+        // Profiles load once the daemon is attached (`load_profiles`).
+        let profiles = Vec::new();
+        let current_profile_id = None;
 
         // Load input history
         let history = InputHistory::new(session_manager.may_dir());
@@ -538,6 +536,7 @@ impl App {
             diff_preview_at: None,
             secrets,
             open_question_count: 0,
+            session_runtime: crate::client::SessionRuntimeSnapshot::default(),
             question_cursor: 0,
             parked_question: None,
         })
@@ -1931,19 +1930,48 @@ impl App {
     /// Uses profile sessions when a profile is active, falls back to flat list.
     pub fn load_session_list(&mut self) {
         let tx = self.event_tx.clone();
-        let db = self.session_manager.db().clone();
+        let Some(client) = self.btw_daemon.clone() else {
+            return;
+        };
         let profile_id = self.current_profile_id.clone();
 
         spawn(async move {
             if let Some(pid) = profile_id {
-                let result = crate::profile::query_profile_sessions(&db, &pid).await;
+                let result = client
+                    .get::<crate::profile::ProfileSessions>(&format!(
+                        "/api/profiles/{pid}/sessions"
+                    ))
+                    .await;
                 let _ = tx
                     .send(AppEvent::ProfileSessionsLoaded(
                         result.map_err(TuiError::from),
                     ))
                     .await;
             } else {
-                let result = crate::session::list_summaries_from_db(&db).await;
+                let result = client
+                    .get::<Vec<crate::client::WireSession>>("/api/sessions")
+                    .await
+                    .map(|sessions| {
+                        sessions
+                            .into_iter()
+                            .map(|session| crate::session::SessionSummary {
+                                id: crate::session::SessionId::from_string(session.id),
+                                title: Some(session.title),
+                                model: Some(session.model),
+                                profile_id: session.profile_id,
+                                pinned: false,
+                                archived: false,
+                                folder_id: None,
+                                pin_sort_order: None,
+                                message_count: 0,
+                                created_at: None,
+                                updated_at: None,
+                                content_preview: String::new(),
+                                reasoning_effort: session.reasoning_effort,
+                                runtime: crate::session::SessionRuntimeSummary::default(),
+                            })
+                            .collect()
+                    });
                 let _ = tx
                     .send(AppEvent::SessionsLoaded(result.map_err(TuiError::from)))
                     .await;
@@ -1999,10 +2027,14 @@ impl App {
             return;
         };
         let tx = self.event_tx.clone();
-        let db = self.session_manager.db().clone();
+        let Some(client) = self.btw_daemon.clone() else {
+            return;
+        };
 
         spawn(async move {
-            let result = crate::profile::query_profile_sessions(&db, &pid).await;
+            let result = client
+                .get::<crate::profile::ProfileSessions>(&format!("/api/profiles/{pid}/sessions"))
+                .await;
             let _ = tx
                 .send(AppEvent::ProfileSessionsLoaded(
                     result.map_err(TuiError::from),
@@ -2976,7 +3008,6 @@ impl App {
         }
         let tx = self.event_tx.clone();
         let daemon = self.btw_daemon.clone();
-        let db = self.session_manager.db().clone();
         let paths = self
             .session_manager
             .store()
@@ -2987,7 +3018,7 @@ impl App {
                 #[serde(default)]
                 content: String,
             }
-            let content = match daemon {
+            let content = match &daemon {
                 Some(client) => match client
                     .get::<TasksPayload>(&crate::client::session_path(&session_id, "/tasks"))
                     .await
@@ -3006,12 +3037,13 @@ impl App {
                     }
                 },
             };
-            let title = match db.get_session(&session_id).await {
-                Ok(row) => row.and_then(|row| row.title),
-                Err(error) => {
-                    tracing::debug!(%error, "sidebar: failed to read the session title");
-                    None
-                }
+            let title = match &daemon {
+                Some(client) => client
+                    .get::<crate::client::WireSession>(&format!("/api/sessions/{session_id}"))
+                    .await
+                    .ok()
+                    .map(|session| session.title),
+                None => None,
             };
             let _ = tx
                 .send(AppEvent::SidebarTasks {
@@ -3028,44 +3060,27 @@ impl App {
     /// backend is chosen by `workspace.toml`, as for the agent); the result
     /// arrives as [`AppEvent::SidebarIssues`].
     pub fn request_issue_lookups(&self, session_id: String, numbers: Vec<i64>) {
-        use crate::issue::IssueStore as _;
-
         if numbers.is_empty() {
             return;
         }
-        let Some(session) = self.session_manager.current() else {
+        let Some(client) = self.btw_daemon.clone() else {
             return;
         };
-        let workspace_config =
-            crate::session::SessionPaths::new(session.sandbox_dir.clone()).workspace_config();
-        let cwd = self.cwd.clone();
-        let db = self.session_manager.db().clone();
         let tx = self.event_tx.clone();
         spawn(async move {
-            let store = match unblock(move || {
-                crate::issue::resolve_issue_store(&cwd, &workspace_config, db)
-            })
-            .await
+            let issues: Vec<super::sidebar::IssueBrief> = match client
+                .post::<_, Vec<super::sidebar::IssueBrief>>(
+                    &format!("/api/sessions/{session_id}/issues/lookup"),
+                    &serde_json::json!({ "numbers": numbers }),
+                )
+                .await
             {
-                Ok(store) => store,
+                Ok(issues) => issues,
                 Err(error) => {
-                    tracing::debug!(%error, "sidebar: no issue store");
-                    return;
+                    tracing::debug!(%error, "sidebar: issue lookup failed");
+                    Vec::new()
                 }
             };
-            let mut issues = Vec::with_capacity(numbers.len());
-            for number in numbers {
-                match store.get(number).await {
-                    Ok(detail) => issues.push(super::sidebar::IssueBrief {
-                        number,
-                        title: Some(detail.title),
-                        closed: matches!(detail.state, crate::issue::IssueState::Closed),
-                    }),
-                    Err(error) => {
-                        tracing::debug!(%error, number, "sidebar: issue lookup failed");
-                    }
-                }
-            }
             let _ = tx
                 .send(AppEvent::SidebarIssues { session_id, issues })
                 .await;
