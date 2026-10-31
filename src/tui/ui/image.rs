@@ -5,6 +5,9 @@
 //!
 //! The Picker must be initialized before entering raw mode and is stored in App state.
 
+use std::num::NonZeroU16;
+
+use ratatui::buffer::CellDiffOption;
 use ratatui::prelude::*;
 
 use ratatui::Frame;
@@ -99,9 +102,35 @@ pub fn decode_image_state(picker: &Picker, data: &[u8]) -> Option<ImageState> {
 }
 
 /// Render an image using the stateful protocol.
+///
+/// The protocols put the whole escape sequence of a row (kitty) or of the
+/// image (sixel, iTerm2) into one cell. Ratatui sizes a cell by its
+/// symbol's display width, and the printable bytes of the escape sequence
+/// (base64 data, CSI parameters) count: the buffer diff then skipped that
+/// many following cells — past the image, wrapping into the rows below —
+/// both when writing the image and on every later frame it stayed. Text
+/// under and after the image stopped updating (stale or doubled lines,
+/// leftover gray blocks) and kitty rows lost their placeholders. Pinning
+/// those cells to a width of one keeps the diff exact; the rest of the
+/// image area is already marked skip by the protocol.
 pub fn render_image(frame: &mut Frame, area: Rect, state: &mut ImageState) {
     let image_widget = StatefulImage::default();
     frame.render_stateful_widget(image_widget, area, &mut state.protocol);
+    pin_escape_cells(frame.buffer_mut(), area);
+}
+
+/// Give every cell of `area` holding an escape sequence a forced width of
+/// one (see [`render_image`]).
+pub fn pin_escape_cells(buf: &mut Buffer, area: Rect) {
+    let area = area.intersection(buf.area);
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let cell = &mut buf[(x, y)];
+            if cell.diff_option == CellDiffOption::None && cell.symbol().contains('\x1b') {
+                cell.set_diff_option(CellDiffOption::ForcedWidth(NonZeroU16::MIN));
+            }
+        }
+    }
 }
 
 /// Fetch an image from a URL or path asynchronously.
