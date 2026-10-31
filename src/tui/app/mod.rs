@@ -1867,6 +1867,9 @@ impl App {
             AppMode::WorkspaceConfirm(_) => Ok(
                 super::reducer::manage::handle_workspace_confirm_key(self, code),
             ),
+            AppMode::LaunchGrant(_) => {
+                Ok(super::reducer::manage::handle_launch_grant_key(self, code))
+            }
             AppMode::McpManage => Ok(super::reducer::manage::handle_mcp_key(self, code)),
             AppMode::SshManage => Ok(super::reducer::manage::handle_ssh_key(self, code)),
             AppMode::AskUser(_) => Ok(super::reducer::ask_user::handle_ask_user_key(self, code)),
@@ -3438,6 +3441,11 @@ pub enum SendAction {
     SshRemove {
         /// Name of the SSH server to remove.
         name: String,
+    },
+    /// Answer the startup launch-directory grant prompt.
+    RespondLaunchGrant {
+        /// Whether the user granted read/write access to the launch dir.
+        approved: bool,
     },
     /// Submit a workspace approval response.
     RespondWorkspace {
