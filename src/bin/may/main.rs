@@ -636,32 +636,32 @@ where
 
         let step_start = std::time::Instant::now();
         if matches!(app.mode, may_agent::tui::AppMode::Chat)
-            && let Some(request) = runtime_deps.pending_permission(app).await?
+            && let Some(request) = &app.session_runtime.waiting_permission
         {
             app.mode = may_agent::tui::AppMode::PermissionConfirm(
                 may_agent::tui::state::PermissionConfirmState {
-                    request_id: request.id,
-                    request: request.request,
+                    request_id: request.id.clone(),
+                    request: request.request.clone(),
                 },
             );
         }
         // A daemon run waits on its prompts in the daemon; they show here
         // from the session's runtime state and are answered over REST.
-        if runtime_deps.daemon().is_some() && matches!(app.mode, may_agent::tui::AppMode::Chat) {
-            if let Some(request) = runtime_deps.pending_ask_user(app).await?
+        if matches!(app.mode, may_agent::tui::AppMode::Chat) {
+            if let Some(request) = app.session_runtime.waiting_ask_user.clone()
                 && shown_prompts.insert(request.id.clone())
             {
                 app.show_blocking_prompt(may_agent::tui::AppMode::AskUser(
                     may_agent::tui::AskUserState::for_open_question(request),
                 ));
-            } else if let Some(request) = runtime_deps.pending_workspace(app).await?
+            } else if let Some(request) = &app.session_runtime.waiting_workspace
                 && shown_prompts.insert(request.id.clone())
             {
                 app.show_blocking_prompt(may_agent::tui::AppMode::WorkspaceConfirm(
                     may_agent::tui::state::WorkspaceConfirmState {
-                        request_id: request.id,
-                        path: request.request.path,
-                        reason: request.request.reason,
+                        request_id: request.id.clone(),
+                        path: request.path.clone(),
+                        reason: request.reason.clone(),
                         request: None,
                     },
                 ));
@@ -676,7 +676,7 @@ where
         // docked panel itself, notifies, and rings the terminal bell so the
         // dock icon bounces. Later additions only update the count.
         let step_start = std::time::Instant::now();
-        let open = runtime_deps.open_questions(app).await?;
+        let open = app.session_runtime.open_questions.clone();
         let had_none = app.open_question_count == 0;
         app.open_question_count = open.len();
         if had_none && let Some(first) = open.into_iter().next() {
@@ -1276,7 +1276,7 @@ where
                         app.reload_chat().await;
                     }
                     Some(SendAction::OpenQuestions) => {
-                        let open = runtime_deps.open_questions(app).await?;
+                        let open = app.session_runtime.open_questions.clone();
                         if open.is_empty() {
                             app.chat.push_notice("No open questions");
                         } else {

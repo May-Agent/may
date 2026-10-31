@@ -96,6 +96,9 @@ pub enum AppEvent {
     },
     /// A background request finished with a message for the status line.
     Status(String),
+    /// The session's blocking state, as the daemon reported it on the
+    /// `session_runtime` stream.
+    SessionRuntime(crate::client::SessionRuntimeEvent),
     /// The daemon dropped turn frames this client missed: the session's
     /// history must be reloaded.
     HistoryStale,
@@ -159,6 +162,7 @@ impl AppEvent {
             Self::SidebarIssues { .. } => "sidebar_issues",
             Self::BackgroundLoaded { .. } => "background_loaded",
             Self::Status(_) => "status",
+            Self::SessionRuntime(_) => "session_runtime",
             Self::HistoryStale => "history_stale",
             Self::JobKilled { .. } => "job_killed",
             Self::JobDetailLoaded { .. } => "job_detail_loaded",

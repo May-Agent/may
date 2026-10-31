@@ -1551,24 +1551,6 @@ impl RuntimeDeps {
             .await
     }
 
-    /// The open questions of the current session, oldest first.
-    ///
-    /// # Errors
-    /// Returns [`TuiRuntimeError`] on storage failure.
-    pub async fn open_questions(
-        &self,
-        app: &App,
-    ) -> Result<Vec<crate::session::PersistedAskUserRequest>, TuiRuntimeError> {
-        let Some(session_id) = app
-            .session_manager
-            .current()
-            .map(|session| session.id.clone())
-        else {
-            return Ok(Vec::new());
-        };
-        self.local_runtime.open_questions(&session_id).await
-    }
-
     /// Push-notify the user that a new open question arrived, through the
     /// same `notify` dispatch path the `notify` command uses. Best effort:
     /// a rejected or unroutable notification is logged, never fatal.
@@ -1678,70 +1660,6 @@ impl RuntimeDeps {
         self.local_runtime
             .resolve_workspace_response(session_id, request_id, approved)
             .await
-    }
-
-    /// The workspace request the session's run waits on, if any.
-    ///
-    /// # Errors
-    /// Returns [`TuiRuntimeError`] on storage failure.
-    pub async fn pending_workspace(
-        &self,
-        app: &App,
-    ) -> Result<Option<crate::session::PersistedWorkspaceRequest>, TuiRuntimeError> {
-        let Some(session_id) = app
-            .session_manager
-            .current()
-            .map(|session| session.id.clone())
-        else {
-            return Ok(None);
-        };
-        Ok(self
-            .local_runtime
-            .runtime_service
-            .get(session_id.as_str())
-            .await?
-            .waiting_workspace)
-    }
-
-    /// The blocking question the session's run waits on, if any.
-    ///
-    /// # Errors
-    /// Returns [`TuiRuntimeError`] on storage failure.
-    pub async fn pending_ask_user(
-        &self,
-        app: &App,
-    ) -> Result<Option<crate::session::PersistedAskUserRequest>, TuiRuntimeError> {
-        let Some(session_id) = app
-            .session_manager
-            .current()
-            .map(|session| session.id.clone())
-        else {
-            return Ok(None);
-        };
-        Ok(self
-            .local_runtime
-            .runtime_service
-            .get(session_id.as_str())
-            .await?
-            .waiting_ask_user)
-    }
-
-    /// Fetch the permission request blocking the session, if any.
-    ///
-    /// # Errors
-    /// Returns [`TuiRuntimeError`] on storage failure.
-    pub async fn pending_permission(
-        &self,
-        app: &App,
-    ) -> Result<Option<crate::session::PersistedPermissionRequest>, TuiRuntimeError> {
-        let Some(session_id) = app
-            .session_manager
-            .current()
-            .map(|session| session.id.clone())
-        else {
-            return Ok(None);
-        };
-        self.local_runtime.waiting_permission(&session_id).await
     }
 
     /// Record the permission decision and clear the pending request.
