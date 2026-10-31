@@ -1,7 +1,5 @@
 //! Main layout for the TUI.
 
-use std::sync::atomic::Ordering;
-
 mod config;
 mod pickers;
 mod popups;
@@ -138,17 +136,19 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // Working directory shown in the status bar (`~` for the user home).
     let cwd_label = app.cwd_label();
 
-    // Collect image positions during rendering
-    let mut image_positions: Vec<(String, usize, String)> = Vec::new();
+    // Image blocks intersecting the view, collected while rendering.
+    let mut image_positions: Vec<chat::ImagePlacement> = Vec::new();
 
-    // Capture scroll value for image position calculations
     let scroll = app.scroll;
+    let model_display = app.model_display();
+    let status_message = app.status_text().map(str::to_string);
 
     // Render everything in a single unified scrollable area
     app.frame_stats.chat = chat::render_unified(
         frame,
         chat_area,
         &app.chat,
+        &mut app.chat_layout,
         scroll,
         UnifiedRenderContext {
             selected_tool: app.selected_tool.as_deref(),
@@ -168,13 +168,13 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 })
             },
             status_ctx: Some(StatusContext {
-                model: &app.model_display(),
+                model: &model_display,
                 usage: usage_info,
                 queue_count: app.queue.len(),
                 open_questions: app.open_question_count,
                 background: &background_items,
                 decode_rate,
-                status_message: app.status_text(),
+                status_message: status_message.as_deref(),
                 cwd: cwd_label.as_str(),
                 activity: app.processing.then_some(chat::ActivityContext {
                     phase: app.activity_phase,
@@ -183,64 +183,40 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 spinner_frame: app.spinner_frame,
             }),
             images_supported,
+            hide_todos: false,
             image_positions_out: Some(&mut image_positions),
         },
     );
-
-    // Keep selection cache aligned with chat content and account for top padding.
-    let queue_ctx = if queue_messages.is_empty() {
-        None
-    } else {
-        Some(QueueContext {
-            messages: &queue_messages,
-        })
-    };
-    let status_ctx = StatusContext {
-        model: &app.model_display(),
-        usage: usage_info,
-        queue_count: app.queue.len(),
-        open_questions: app.open_question_count,
-        background: &background_items,
-        decode_rate,
-        status_message: app.status_text(),
-        cwd: cwd_label.as_str(),
-        activity: app.processing.then_some(chat::ActivityContext {
-            phase: app.activity_phase,
-            tokens: app.decode_meter.tokens(),
-        }),
-        spinner_frame: app.spinner_frame,
-    };
-    let mut collapse_regions = Vec::new();
-    let t = std::time::Instant::now();
-    let plain_all_lines = chat::build_plain_wrapped_lines_unified(
-        &app.chat,
-        chat_area.width,
-        queue_ctx.as_ref(),
-        Some(InputContext {
-            input: &app.input,
-            cursor: app.cursor,
-            attachments: &app.attachments,
-        }),
-        Some(&status_ctx),
-        Some(&mut collapse_regions),
-        images_supported,
-    );
-    app.frame_stats.plain_lines = t.elapsed();
-
-    let view_h = chat_area.height as usize;
-    app.render_top_padding = view_h.saturating_sub(plain_all_lines.len());
-    app.rendered_plain_lines = plain_all_lines;
-    app.collapse_regions = collapse_regions;
+    // The plain mirror is read back from the cached layout on demand.
+    app.frame_stats.plain_lines = std::time::Duration::ZERO;
 
     let t = std::time::Instant::now();
     if app.selection.is_some() {
         render_text_selection_overlay(frame, chat_area, app);
     }
 
-    // Render images as overlays at their scroll-adjusted positions
+    // Render images as overlays at their scroll-adjusted positions. Images
+    // never paint under a popup or the zoom view: a protocol image drawn
+    // and then overwritten in the same frame loses its one-time kitty
+    // transmission, and sixel/iTerm2 pixels would bleed through the popup.
     app.image_regions.clear();
-    if images_supported && !image_positions.is_empty() {
-        render_inline_images(frame, chat_area, app, &image_positions, scroll);
+    if images_supported
+        && app.image_support.is_some()
+        && !image_positions.is_empty()
+        && !matches!(app.mode, AppMode::ImageView(_))
+    {
+        let mut occluders: Vec<Rect> = Vec::new();
+        if let Some(rect) = completion_overlay_rect(app, area) {
+            occluders.push(rect);
+        }
+        render_inline_images(
+            frame,
+            chat_area,
+            &mut app.image_cache,
+            &mut app.image_regions,
+            &image_positions,
+            &occluders,
+        );
     }
 
     // Render popups if in special modes
@@ -312,7 +288,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 /// popup with its path/URL caption underneath. Esc or a click outside the
 /// image closes it.
 fn render_image_view(frame: &mut Frame, area: Rect, app: &mut App) {
-    use ratatui_image::{Resize, StatefulImage};
+    use ratatui_image::Resize;
 
     let AppMode::ImageView(state) = &app.mode else {
         return;
@@ -347,7 +323,7 @@ fn render_image_view(frame: &mut Frame, area: Rect, app: &mut App) {
         fitted.height.min(image_area.height),
     );
     app.image_view_area = Some(draw_area);
-    frame.render_stateful_widget(StatefulImage::default(), draw_area, &mut state.protocol);
+    super::image::render_image(frame, draw_area, state);
 
     let caption = Paragraph::new(caption)
         .style(Style::default().fg(Color::DarkGray))
@@ -359,28 +335,22 @@ fn render_text_selection_overlay(frame: &mut Frame, area: Rect, app: &App) {
     let Some(sel) = app.selection else {
         return;
     };
-    if sel.is_empty() || app.rendered_plain_lines.is_empty() {
+    let rows = app.chat_layout.plain_len();
+    if sel.is_empty() || rows == 0 {
         return;
     }
 
     let (start, end) = sel.normalized();
-    let start_line = start
-        .line
-        .min(app.rendered_plain_lines.len().saturating_sub(1));
-    let end_line = end
-        .line
-        .min(app.rendered_plain_lines.len().saturating_sub(1));
+    let start_line = start.line.min(rows.saturating_sub(1));
+    let end_line = end.line.min(rows.saturating_sub(1));
 
-    let base_scroll = if app.scroll == usize::MAX {
-        app.content_height
-            .load(Ordering::Relaxed)
-            .saturating_sub(app.view_height.load(Ordering::Relaxed))
-    } else {
-        app.scroll
-    };
-
-    for line_idx in start_line..=end_line {
-        let visual_line = app.render_top_padding.saturating_add(line_idx);
+    let base_scroll = app.effective_scroll();
+    let padding = app.chat_layout.top_padding();
+    // Only the selected rows inside the view are painted.
+    let first_visible = base_scroll.saturating_sub(padding);
+    let last_visible = (base_scroll + area.height as usize).saturating_sub(padding);
+    for line_idx in start_line.max(first_visible)..=end_line.min(last_visible) {
+        let visual_line = padding.saturating_add(line_idx);
         if visual_line < base_scroll {
             continue;
         }
@@ -390,7 +360,7 @@ fn render_text_selection_overlay(frame: &mut Frame, area: Rect, app: &App) {
             continue;
         }
 
-        let line = &app.rendered_plain_lines[line_idx];
+        let line = app.chat_layout.plain_line(line_idx).unwrap_or_default();
         let char_count = line.chars().count();
         let from = if line_idx == start_line {
             start.column.min(char_count)
@@ -1776,8 +1746,11 @@ fn render_ask_user(frame: &mut Frame, area: Rect, state: &AskUserState) {
 }
 
 /// Render completion overlay near bottom of screen.
+/// Rows the completion overlay lists at most.
+const COMPLETION_MAX_ITEMS: usize = 10;
+
 fn render_completion_overlay(frame: &mut Frame, area: Rect, app: &App) {
-    let max_items = 10;
+    let max_items = COMPLETION_MAX_ITEMS;
     let item_count = app.completion.len().min(max_items);
     let height = u16::try_from(item_count + 2).unwrap_or(u16::MAX); // +2 for borders
 
@@ -1834,84 +1807,79 @@ fn render_completion_overlay(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(list, overlay_area);
 }
 
-/// Render images inline at their scroll-adjusted positions.
-/// Images appear within the content flow and scroll with the text.
-/// `image_positions` carries (key, visual row, caption) — the row is the
-/// wrapped line index the paragraph draws the reserved rows on.
+/// Rect the completion overlay occupies this frame, if it is shown.
+fn completion_overlay_rect(app: &App, area: Rect) -> Option<Rect> {
+    if !app.completion.is_active() || app.completion.is_empty() {
+        return None;
+    }
+    let item_count = app.completion.len().min(COMPLETION_MAX_ITEMS);
+    let height = u16::try_from(item_count + 2).unwrap_or(u16::MAX); // +2 for borders
+    // Near the bottom, leaving 2 lines for input/status.
+    let y = area.y + area.height.saturating_sub(height + 2);
+    Some(Rect {
+        x: area.x,
+        y,
+        width: area.width,
+        height: height.min(area.height),
+    })
+}
+
+/// Paint the inline image blocks of the view.
+///
+/// Each block is drawn at its full reserved size or not at all: a block cut
+/// by the top or bottom edge used to be re-fitted into the visible rows,
+/// which re-encoded (and for kitty re-transmitted) the whole image on every
+/// scroll step and showed it squashed. A cut block shows a one-line caption
+/// in its visible rows instead. Blocks overlapping an `occluders` rect are
+/// skipped so a popup is never painted under.
 fn render_inline_images(
     frame: &mut Frame,
     chat_area: Rect,
-    app: &mut App,
-    image_positions: &[(String, usize, String)],
-    _scroll: usize,
+    image_cache: &mut ahash::AHashMap<String, super::image::ImageState>,
+    image_regions: &mut Vec<ImageRegion>,
+    placements: &[chat::ImagePlacement],
+    occluders: &[Rect],
 ) {
     use super::streaming_markdown::IMAGE_HEIGHT;
-    use ratatui_image::{Resize, StatefulImage};
+    use ratatui_image::Resize;
 
-    // Early exit if image support was disabled during session
-    if app.image_support.is_none() {
-        return;
-    }
-
-    let view_height = chat_area.height as usize;
-    let content_height = app.content_height.load(Ordering::Relaxed);
-
-    // Calculate offset the same way as render_impl does:
-    // When content doesn't fill the screen, it renders at the BOTTOM of the
-    // viewport area, so the y-offset equals the unused space above.
-    let (padding, actual_scroll) = if content_height < view_height {
-        (view_height - content_height, 0)
-    } else {
-        let max_scroll = content_height - view_height;
-        let scroll_val = if app.scroll == usize::MAX {
-            max_scroll
-        } else {
-            app.scroll.min(max_scroll)
-        };
-        (0, scroll_val)
-    };
-
-    for (url, row, caption) in image_positions {
-        // Skip images scrolled (even partially) above the visible area: the
-        // overlay can't clip, and painting it over rows it doesn't own
-        // tramples the content that scrolls underneath.
-        if *row < actual_scroll {
+    let view_height = i32::from(chat_area.height);
+    let block_height = i32::try_from(IMAGE_HEIGHT).unwrap_or(i32::MAX);
+    let indent = 2u16; // Indent from left edge
+    for placement in placements {
+        let top = placement.top;
+        let bottom = top.saturating_add(block_height);
+        if bottom <= 0 || top >= view_height {
             continue;
         }
-
-        // Screen line position (accounting for padding and scroll)
-        let screen_line = padding + row - actual_scroll;
-
-        // Skip if completely below visible area
-        if screen_line >= view_height {
+        let width = chat_area.width.saturating_sub(indent * 2);
+        if width < 4 {
             continue;
         }
-
-        let image_start_y = chat_area.y + u16::try_from(screen_line).unwrap_or(u16::MAX);
-        let available_height = (chat_area.y + chat_area.height).saturating_sub(image_start_y);
-        if available_height == 0 {
+        if top < 0 || bottom > view_height {
+            // Caption in the first visible reserved row.
+            let y = chat_area.y + u16::try_from(top.max(0)).unwrap_or(0);
+            frame.buffer_mut().set_stringn(
+                chat_area.x + indent,
+                y,
+                format!("▏image · {}", placement.caption),
+                usize::from(width),
+                Style::default().fg(Color::DarkGray),
+            );
             continue;
         }
-
-        let image_height = u16::try_from(IMAGE_HEIGHT)
-            .unwrap_or(u16::MAX)
-            .min(available_height);
-        let indent = 2u16; // Indent from left edge
-
         let image_area = Rect::new(
             chat_area.x + indent,
-            image_start_y,
-            chat_area.width.saturating_sub(indent * 2),
-            image_height,
+            chat_area.y + u16::try_from(top).unwrap_or(0),
+            width,
+            u16::try_from(IMAGE_HEIGHT).unwrap_or(u16::MAX),
         );
-
-        // Skip if area is too small
-        if image_area.width < 4 || image_area.height < 2 {
+        if occluders.iter().any(|rect| rect.intersects(image_area)) {
             continue;
         }
 
         // Get the cached image state
-        let Some(state) = app.image_cache.get_mut(url) else {
+        let Some(state) = image_cache.get_mut(&placement.key) else {
             // Image not yet fetched
             continue;
         };
@@ -1926,12 +1894,266 @@ fn render_inline_images(
             fitted.height.min(image_area.height),
         );
 
-        let image_widget = StatefulImage::default();
-        frame.render_stateful_widget(image_widget, image_area, &mut state.protocol);
-        app.image_regions.push(ImageRegion {
+        super::image::render_image(frame, image_area, state);
+        image_regions.push(ImageRegion {
             rect: draw_area,
-            key: url.clone(),
-            caption: caption.clone(),
+            key: placement.key.clone(),
+            caption: placement.caption.clone(),
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::chat::{ChatStream, ImagePlacement, UnifiedRenderContext, render_unified};
+    use super::super::chat_layout::ChatLayout;
+    use super::super::image::{ImageState, render_image};
+    use super::super::test_screen::{IMAGE_MARK, ScreenBackend, buffer_screen};
+    use super::render_inline_images;
+    use crate::tui::app::ImageRegion;
+    use ratatui::Terminal;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui_image::picker::{Picker, ProtocolType};
+
+    #[allow(deprecated)] // a fixed font size keeps the test off the real terminal
+    fn image_state(protocol: ProtocolType) -> ImageState {
+        let mut picker = Picker::from_fontsize((10, 20));
+        picker.set_protocol_type(protocol);
+        let image = image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            120,
+            100,
+            image::Rgb([200, 40, 40]),
+        ));
+        ImageState {
+            protocol: picker.new_resize_protocol(image),
+        }
+    }
+
+    /// Text drawn around an image must keep updating while the image stays
+    /// on screen. The protocols pack an escape sequence (base64 payload for
+    /// sixel/iTerm2) into one cell whose computed width made the buffer diff
+    /// skip up to thousands of following cells: the rows below the image
+    /// kept showing old text.
+    #[test]
+    fn text_around_an_image_keeps_updating() {
+        for protocol in [
+            ProtocolType::Kitty,
+            ProtocolType::Sixel,
+            ProtocolType::Iterm2,
+        ] {
+            let mut state = image_state(protocol);
+            let mut terminal = Terminal::new(ScreenBackend::new(40, 16)).unwrap();
+            let image_area = Rect::new(2, 2, 20, 6);
+            for fill in ['a', 'b', 'c'] {
+                let mut truth = Buffer::empty(Rect::new(0, 0, 40, 16));
+                terminal
+                    .draw(|frame| {
+                        let area = frame.area();
+                        let row: String = std::iter::repeat_n(fill, 40).collect();
+                        for y in 0..area.height {
+                            frame.buffer_mut().set_string(
+                                0,
+                                y,
+                                &row,
+                                ratatui::style::Style::default(),
+                            );
+                        }
+                        render_image(frame, image_area, &mut state);
+                        truth.clone_from(frame.buffer_mut());
+                    })
+                    .unwrap();
+                let shown = terminal.backend().screen();
+                let expected = buffer_screen(&truth);
+                for y in 0..16u16 {
+                    // Rows the image covers hold skip cells the terminal
+                    // paints itself; compare everything else.
+                    if (image_area.top()..image_area.bottom()).contains(&y) {
+                        let (shown_row, expected_row) =
+                            (&shown[usize::from(y)], &expected[usize::from(y)]);
+                        let right_shown: String = shown_row
+                            .chars()
+                            .skip(usize::from(image_area.right()))
+                            .collect();
+                        let right_expected: String = expected_row
+                            .chars()
+                            .skip(usize::from(image_area.right()))
+                            .collect();
+                        assert_eq!(
+                            right_shown, right_expected,
+                            "{protocol:?} fill={fill} row={y} right of image"
+                        );
+                        continue;
+                    }
+                    assert_eq!(
+                        shown[usize::from(y)],
+                        expected[usize::from(y)],
+                        "{protocol:?} fill={fill} row={y}"
+                    );
+                }
+                assert!(
+                    shown[usize::from(image_area.y)].contains(IMAGE_MARK),
+                    "{protocol:?}: image not drawn"
+                );
+            }
+        }
+    }
+
+    fn transcript() -> ChatStream {
+        use std::fmt::Write as _;
+        let mut chat = ChatStream::new();
+        chat.push_user("show me", Vec::new(), 0);
+        let mut reply = String::from("Here:\n\n![chart](chart.png)\n\n");
+        for index in 0..40 {
+            let _ = writeln!(reply, "line {index} after the image\n");
+        }
+        chat.push_text(&reply);
+        chat.end_text();
+        chat
+    }
+
+    /// Draw the transcript at `scroll` with the inline image overlay, as
+    /// `layout::render` does, asserting the terminal matches the frame.
+    fn draw(
+        terminal: &mut Terminal<ScreenBackend>,
+        chat: &ChatStream,
+        layout: &mut ChatLayout,
+        cache: &mut ahash::AHashMap<String, ImageState>,
+        scroll: usize,
+    ) -> (Vec<String>, Vec<ImageRegion>) {
+        let mut regions = Vec::new();
+        let mut truth = None;
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                let mut placements: Vec<ImagePlacement> = Vec::new();
+                render_unified(
+                    frame,
+                    area,
+                    chat,
+                    layout,
+                    scroll,
+                    UnifiedRenderContext {
+                        selected_tool: None,
+                        content_height_out: None,
+                        view_height_out: None,
+                        input_ctx: None,
+                        input_caret_active: false,
+                        queue_ctx: None,
+                        status_ctx: None,
+                        images_supported: true,
+                        hide_todos: false,
+                        image_positions_out: Some(&mut placements),
+                    },
+                );
+                render_inline_images(frame, area, cache, &mut regions, &placements, &[]);
+                truth = Some(frame.buffer_mut().clone());
+            })
+            .unwrap();
+        let shown = terminal.backend().screen();
+        let truth = buffer_screen(&truth.expect("drawn"));
+        // Skip cells inside an image are painted by the terminal itself.
+        for (y, (shown_row, truth_row)) in shown.iter().zip(&truth).enumerate() {
+            let y = u16::try_from(y).unwrap();
+            if regions
+                .iter()
+                .any(|r| (r.rect.top()..r.rect.bottom()).contains(&y))
+            {
+                continue;
+            }
+            assert_eq!(shown_row, truth_row, "scroll={scroll} row={y}");
+        }
+        (shown, regions)
+    }
+
+    /// Scrolling an image out of view leaves no image cell behind, and an
+    /// image cut by the view edge is not drawn squashed into what remains:
+    /// its visible rows show a caption.
+    #[test]
+    fn scrolled_out_image_leaves_no_cells() {
+        let chat = transcript();
+        let mut cache = ahash::AHashMap::new();
+        cache.insert("chart.png".to_string(), image_state(ProtocolType::Kitty));
+        let mut terminal = Terminal::new(ScreenBackend::new(50, 20)).unwrap();
+        let mut layout = ChatLayout::default();
+
+        let (shown, regions) = draw(&mut terminal, &chat, &mut layout, &mut cache, 0);
+        assert_eq!(regions.len(), 1, "image visible at the top");
+        assert!(shown.iter().any(|row| row.contains(IMAGE_MARK)));
+
+        // Cut by the top edge: caption only, no protocol cells.
+        let (shown, regions) = draw(&mut terminal, &chat, &mut layout, &mut cache, 5);
+        assert!(regions.is_empty());
+        assert!(
+            !shown.iter().any(|row| row.contains(IMAGE_MARK)),
+            "{shown:#?}"
+        );
+        assert!(shown[0].contains("image · chart.png"), "{shown:#?}");
+
+        // Fully out of view.
+        let (shown, regions) = draw(&mut terminal, &chat, &mut layout, &mut cache, 30);
+        assert!(regions.is_empty());
+        assert!(
+            !shown.iter().any(|row| row.contains(IMAGE_MARK)),
+            "{shown:#?}"
+        );
+
+        // Back in view.
+        let (shown, regions) = draw(&mut terminal, &chat, &mut layout, &mut cache, 0);
+        assert_eq!(regions.len(), 1);
+        assert!(shown.iter().any(|row| row.contains(IMAGE_MARK)));
+    }
+
+    /// An occluding rect (a sheet or overlay) keeps the image off-screen.
+    #[test]
+    fn occluded_image_is_not_drawn() {
+        let chat = transcript();
+        let mut cache = ahash::AHashMap::new();
+        cache.insert("chart.png".to_string(), image_state(ProtocolType::Kitty));
+        let mut layout = ChatLayout::default();
+        let mut terminal = Terminal::new(ScreenBackend::new(50, 20)).unwrap();
+        let mut regions = Vec::new();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                let mut placements = Vec::new();
+                render_unified(
+                    frame,
+                    area,
+                    &chat,
+                    &mut layout,
+                    0,
+                    UnifiedRenderContext {
+                        selected_tool: None,
+                        content_height_out: None,
+                        view_height_out: None,
+                        input_ctx: None,
+                        input_caret_active: false,
+                        queue_ctx: None,
+                        status_ctx: None,
+                        images_supported: true,
+                        hide_todos: false,
+                        image_positions_out: Some(&mut placements),
+                    },
+                );
+                let occluder = Rect::new(0, 4, 50, 3);
+                render_inline_images(
+                    frame,
+                    area,
+                    &mut cache,
+                    &mut regions,
+                    &placements,
+                    &[occluder],
+                );
+            })
+            .unwrap();
+        assert!(regions.is_empty());
+        assert!(
+            !terminal
+                .backend()
+                .screen()
+                .iter()
+                .any(|row| row.contains(IMAGE_MARK))
+        );
     }
 }

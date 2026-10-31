@@ -505,6 +505,13 @@ where
     let agent_listeners =
         may_agent::agent_link::AgentListeners::new(tokio::runtime::Handle::current());
 
+    // Frames are drawn when something changed: every event but the idle
+    // tick redraws. A tick redraws while a turn animates its spinner, and
+    // otherwise at most once a second so elapsed counters, auto-collapsing
+    // tool calls and expiring notices still advance.
+    let mut needs_draw = true;
+    let mut last_draw = std::time::Instant::now();
+
     loop {
         enum Event {
             AskUser(may_agent::ask_user::AskUserRequest),
@@ -520,10 +527,16 @@ where
         let mut phases = may_agent::tui::perf::LoopPhases::default();
 
         // First draw: updates content_height/view_height for accurate overflow calculation.
-        let draw_start = std::time::Instant::now();
-        terminal.draw(|frame| ui::render(frame, app))?;
-        phases.draw = draw_start.elapsed();
-        tracing::info!("after draw");
+        if needs_draw {
+            let draw_start = std::time::Instant::now();
+            terminal.draw(|frame| ui::render(frame, app))?;
+            phases.draw = draw_start.elapsed();
+            last_draw = draw_start;
+            tracing::info!("after draw");
+        }
+        // Any path back to the top of the loop redraws unless an idle tick
+        // below says otherwise.
+        needs_draw = true;
 
         // Check for model fetch results (non-blocking)
         if let Some(ref mut rx) = app.model_fetch_rx
@@ -786,6 +799,9 @@ where
             tracing::warn!("All channels closed, exiting");
             break;
         };
+        if matches!(&event, Event::Terminal(e) if matches!(**e, AppEvent::Tick)) {
+            needs_draw = app.processing || last_draw.elapsed() >= std::time::Duration::from_secs(1);
+        }
         let event_kind = match &event {
             Event::Terminal(e) => e.kind(),
             Event::AskUser(_) => "ask_user",
@@ -1544,7 +1560,7 @@ where
             &phases,
             &app.frame_stats,
             app.scroll,
-            app.rendered_plain_lines.len(),
+            app.chat_layout.plain_len(),
             events.backlog(),
             event_kind,
         );

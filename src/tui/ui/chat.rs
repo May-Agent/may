@@ -15,6 +15,7 @@ use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::super::queue::Attachment;
+use super::chat_layout::{self, ChatLayout};
 use super::markdown;
 use super::streaming_markdown::IMAGE_HEIGHT;
 use crate::agent::ContextReport;
@@ -352,6 +353,12 @@ impl ChatElement {}
 #[derive(Debug, Default)]
 pub struct ChatStream {
     elements: Vec<ChatElement>,
+    /// Revision of each element, parallel to `elements`. Every mutation of
+    /// an element stamps it with a fresh revision, unique across every
+    /// stream of the process (a rebuilt stream must never alias the
+    /// layout cache of the one it replaced), so the render cache
+    /// ([`ChatLayout`]) re-lays-out only what changed.
+    revisions: Vec<u64>,
     /// Counter generating thinking-block IDs.
     next_thinking_id: usize,
 }
@@ -363,10 +370,50 @@ impl ChatStream {
         Self::default()
     }
 
+    fn next_revision() -> u64 {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Append `element` with a fresh revision.
+    fn push_element(&mut self, element: ChatElement) {
+        let revision = Self::next_revision();
+        self.elements.push(element);
+        self.revisions.push(revision);
+    }
+
+    /// Mark the element at `index` changed.
+    fn touch(&mut self, index: usize) {
+        let revision = Self::next_revision();
+        if let Some(slot) = self.revisions.get_mut(index) {
+            *slot = revision;
+        }
+    }
+
+    /// Mark the last element changed.
+    fn touch_last(&mut self) {
+        if let Some(index) = self.elements.len().checked_sub(1) {
+            self.touch(index);
+        }
+    }
+
+    /// Index of the tool call `id`.
+    fn tool_index(&self, id: &str) -> Option<usize> {
+        self.elements.iter().position(
+            |elem| matches!(elem, ChatElement::ToolCall { id: tool_id, .. } if tool_id == id),
+        )
+    }
+
+    /// Revision of the element at `index` (see [`Self::revisions`]).
+    #[must_use]
+    pub fn revision(&self, index: usize) -> u64 {
+        self.revisions.get(index).copied().unwrap_or_default()
+    }
+
     /// Add a user message. `history_index` is the position of the
     /// persisted user row in session history.
     pub fn push_user(&mut self, content: &str, attachments: Vec<Attachment>, history_index: usize) {
-        self.elements.push(ChatElement::UserMessage {
+        self.push_element(ChatElement::UserMessage {
             content: content.to_string(),
             attachments,
             history_index,
@@ -375,7 +422,7 @@ impl ChatStream {
 
     /// Add an error message.
     pub fn push_error(&mut self, message: &str) {
-        self.elements.push(ChatElement::Error {
+        self.push_element(ChatElement::Error {
             message: message.to_string(),
         });
     }
@@ -383,7 +430,7 @@ impl ChatStream {
     /// Add a neutral system notice.
     pub fn push_notice(&mut self, message: &str) {
         self.end_text();
-        self.elements.push(ChatElement::Notice {
+        self.push_element(ChatElement::Notice {
             message: message.to_string(),
         });
     }
@@ -391,7 +438,7 @@ impl ChatStream {
     /// Add a `/context` usage report.
     pub fn push_context_report(&mut self, report: ContextReport) {
         self.end_text();
-        self.elements.push(ChatElement::ContextReport(report));
+        self.push_element(ChatElement::ContextReport(report));
     }
 
     /// User prompts that can be rewound to, oldest first, each carrying
@@ -471,6 +518,7 @@ impl ChatStream {
             return false;
         };
         self.elements.truncate(pos);
+        self.revisions.truncate(pos);
         true
     }
 
@@ -478,7 +526,7 @@ impl ChatStream {
     pub fn start_thinking(&mut self) {
         let id = self.next_thinking_id;
         self.next_thinking_id += 1;
-        self.elements.push(ChatElement::Thinking {
+        self.push_element(ChatElement::Thinking {
             id: format!("thinking-{id}"),
             content: String::new(),
             seconds: 0,
@@ -497,27 +545,34 @@ impl ChatStream {
         }
         if let Some(ChatElement::Thinking { content, .. }) = self.elements.last_mut() {
             content.push_str(chunk);
+            self.touch_last();
         }
     }
 
     /// Update thinking time.
     pub fn update_thinking(&mut self, seconds: u64) {
-        if let Some(ChatElement::Thinking { seconds: s, .. }) = self.elements.last_mut() {
+        if let Some(ChatElement::Thinking { seconds: s, .. }) = self.elements.last_mut()
+            && *s != seconds
+        {
             *s = seconds;
+            self.touch_last();
         }
     }
 
     /// Collapse the open thinking block (called when the reasoning burst
     /// ends or first text arrives). The block stays as a collapsed header.
     pub fn collapse_thinking(&mut self) {
-        if let Some(ChatElement::Thinking { expanded, .. }) = self.elements.last_mut() {
+        if let Some(ChatElement::Thinking { expanded, .. }) = self.elements.last_mut()
+            && *expanded
+        {
             *expanded = false;
+            self.touch_last();
         }
     }
 
     /// Start a new assistant text block.
     pub fn start_assistant(&mut self) {
-        self.elements.push(ChatElement::AssistantText {
+        self.push_element(ChatElement::AssistantText {
             content: String::new(),
             streaming: true,
         });
@@ -531,9 +586,10 @@ impl ChatStream {
         }) = self.elements.last_mut()
         {
             content.push_str(chunk);
+            self.touch_last();
         } else {
             // Create new streaming element
-            self.elements.push(ChatElement::AssistantText {
+            self.push_element(ChatElement::AssistantText {
                 content: chunk.to_string(),
                 streaming: true,
             });
@@ -542,8 +598,11 @@ impl ChatStream {
 
     /// Mark the current text element as done streaming.
     pub fn end_text(&mut self) {
-        if let Some(ChatElement::AssistantText { streaming, .. }) = self.elements.last_mut() {
+        if let Some(ChatElement::AssistantText { streaming, .. }) = self.elements.last_mut()
+            && *streaming
+        {
             *streaming = false;
+            self.touch_last();
         }
     }
 
@@ -551,13 +610,13 @@ impl ChatStream {
     pub fn push_tool(&mut self, id: String, display: ToolDisplay) {
         // End any current text block first
         self.end_text();
-        self.elements.push(ChatElement::ToolCall { id, display });
+        self.push_element(ChatElement::ToolCall { id, display });
     }
 
     /// Record a provider-hosted tool call the model just invoked.
     pub fn push_builtin(&mut self, id: String, tool: String, detail: String) {
         self.end_text();
-        self.elements.push(ChatElement::ToolCall {
+        self.push_element(ChatElement::ToolCall {
             id,
             display: ToolDisplay::Builtin {
                 tool,
@@ -573,9 +632,11 @@ impl ChatStream {
     /// Mark a provider-hosted call complete. Providers that emit a result
     /// without a matching call event get a completed entry appended instead.
     pub fn finish_builtin(&mut self, id: &str, tool: &str, result: String) {
-        for elem in &mut self.elements {
+        let found = self.elements.iter().position(|elem| {
+            matches!(elem, ChatElement::ToolCall { id: tool_id, display: ToolDisplay::Builtin { .. } } if tool_id == id)
+        });
+        if let Some(index) = found {
             if let ChatElement::ToolCall {
-                id: tool_id,
                 display:
                     ToolDisplay::Builtin {
                         status,
@@ -583,17 +644,18 @@ impl ChatStream {
                         finished_at,
                         ..
                     },
-            } = elem
-                && tool_id == id
+                ..
+            } = &mut self.elements[index]
             {
                 *status = ToolStatus::Done;
                 *output = Some(result);
                 *finished_at = Some(Instant::now());
-                return;
             }
+            self.touch(index);
+            return;
         }
         self.end_text();
-        self.elements.push(ChatElement::ToolCall {
+        self.push_element(ChatElement::ToolCall {
             id: id.to_string(),
             display: ToolDisplay::Builtin {
                 tool: tool.to_string(),
@@ -609,75 +671,71 @@ impl ChatStream {
     /// Update a tool's status and output by ID. A non-`Running` status stamps
     /// the call's finish time, which the automatic collapse counts from.
     pub fn update_tool_with_output(&mut self, id: &str, status: ToolStatus, output: Option<&str>) {
-        for elem in &mut self.elements {
-            if let ChatElement::ToolCall {
-                id: tool_id,
-                display,
-            } = elem
-                && tool_id == id
-            {
-                let finished = !matches!(status, ToolStatus::Running);
-                match display {
-                    ToolDisplay::Terminal {
-                        status: s,
-                        command,
-                        output: out,
-                        finished_at,
-                        ..
-                    } => {
-                        *s = status;
-                        if finished {
-                            *finished_at = Some(Instant::now());
-                        }
-                        if let Some(output_text) = output {
-                            *out = Some(TerminalCallInfo {
-                                command: command.clone(),
-                                output: output_text.to_string(),
-                                output_file: None,
-                                image: None,
-                            });
-                        }
+        let Some(index) = self.tool_index(id) else {
+            return;
+        };
+        self.touch(index);
+        if let ChatElement::ToolCall { display, .. } = &mut self.elements[index] {
+            let finished = !matches!(status, ToolStatus::Running);
+            match display {
+                ToolDisplay::Terminal {
+                    status: s,
+                    command,
+                    output: out,
+                    finished_at,
+                    ..
+                } => {
+                    *s = status;
+                    if finished {
+                        *finished_at = Some(Instant::now());
                     }
-                    ToolDisplay::Action {
-                        status: s,
-                        chip,
-                        task_id,
-                        output: out,
-                        finished_at,
-                        ..
-                    } => {
-                        *s = status;
-                        if finished {
-                            *finished_at = Some(Instant::now());
-                        }
-                        if let Some(output_text) = output {
-                            *out = Some(TerminalCallInfo {
-                                command: chip.clone(),
-                                output: task_id.as_ref().map_or_else(
-                                    || output_text.to_string(),
-                                    |id| scrub_task_id(output_text, id),
-                                ),
-                                output_file: None,
-                                image: None,
-                            });
-                        }
-                    }
-                    ToolDisplay::Builtin {
-                        status: s,
-                        output: out,
-                        finished_at,
-                        ..
-                    } => {
-                        *s = status;
-                        if finished {
-                            *finished_at = Some(Instant::now());
-                        }
-                        if let Some(output_text) = output {
-                            *out = Some(output_text.to_string());
-                        }
+                    if let Some(output_text) = output {
+                        *out = Some(TerminalCallInfo {
+                            command: command.clone(),
+                            output: output_text.to_string(),
+                            output_file: None,
+                            image: None,
+                        });
                     }
                 }
-                break;
+                ToolDisplay::Action {
+                    status: s,
+                    chip,
+                    task_id,
+                    output: out,
+                    finished_at,
+                    ..
+                } => {
+                    *s = status;
+                    if finished {
+                        *finished_at = Some(Instant::now());
+                    }
+                    if let Some(output_text) = output {
+                        *out = Some(TerminalCallInfo {
+                            command: chip.clone(),
+                            output: task_id.as_ref().map_or_else(
+                                || output_text.to_string(),
+                                |id| scrub_task_id(output_text, id),
+                            ),
+                            output_file: None,
+                            image: None,
+                        });
+                    }
+                }
+                ToolDisplay::Builtin {
+                    status: s,
+                    output: out,
+                    finished_at,
+                    ..
+                } => {
+                    *s = status;
+                    if finished {
+                        *finished_at = Some(Instant::now());
+                    }
+                    if let Some(output_text) = output {
+                        *out = Some(output_text.to_string());
+                    }
+                }
             }
         }
     }
@@ -686,7 +744,8 @@ impl ChatStream {
     /// block). For tool calls this sets the click pin: `Some(true)` pins the
     /// body open, `Some(false)` pins it shut, overriding the automatic rule.
     pub fn toggle_expanded(&mut self, id: &str) {
-        for elem in &mut self.elements {
+        let mut touched = None;
+        for (index, elem) in self.elements.iter_mut().enumerate() {
             match elem {
                 ChatElement::ToolCall {
                     id: tool_id,
@@ -698,6 +757,7 @@ impl ChatStream {
                         | ToolDisplay::Action { pinned, .. }
                         | ToolDisplay::Builtin { pinned, .. } => *pinned = Some(!open),
                     }
+                    touched = Some(index);
                     break;
                 }
                 ChatElement::Thinking {
@@ -706,16 +766,21 @@ impl ChatStream {
                     ..
                 } if think_id == id => {
                     *expanded = !*expanded;
+                    touched = Some(index);
                     break;
                 }
                 _ => {}
             }
         }
+        if let Some(index) = touched {
+            self.touch(index);
+        }
     }
 
     /// Attach file diffs to a terminal tool call.
     pub fn update_tool_diff(&mut self, id: &str, diffs: Vec<crate::file_tracker::RootDiff>) {
-        for elem in &mut self.elements {
+        let mut touched = None;
+        for (index, elem) in self.elements.iter_mut().enumerate() {
             if let ChatElement::ToolCall {
                 id: tool_id,
                 display: ToolDisplay::Terminal { diffs: slot, .. },
@@ -723,8 +788,12 @@ impl ChatStream {
                 && tool_id == id
             {
                 *slot = diffs;
+                touched = Some(index);
                 break;
             }
+        }
+        if let Some(index) = touched {
+            self.touch(index);
         }
     }
 
@@ -764,7 +833,8 @@ impl ChatStream {
     /// Attach an image to a tool call's terminal info (the latest call for
     /// subagent tasks).
     pub fn set_tool_image(&mut self, id: &str, image: ToolCallImage) {
-        for elem in &mut self.elements {
+        let mut touched = None;
+        for (index, elem) in self.elements.iter_mut().enumerate() {
             if let ChatElement::ToolCall {
                 id: tool_id,
                 display,
@@ -780,8 +850,12 @@ impl ChatStream {
                     // Provider-hosted calls carry no terminal info to attach.
                     ToolDisplay::Builtin { .. } => {}
                 }
+                touched = Some(index);
                 break;
             }
+        }
+        if let Some(index) = touched {
+            self.touch(index);
         }
     }
 
@@ -789,7 +863,8 @@ impl ChatStream {
     /// `TerminalCallInfo` on first chunk; the running renderer already shows
     /// `output` mid-run.
     pub fn append_tool_output(&mut self, id: &str, chunk: &str) {
-        for elem in &mut self.elements {
+        let mut touched = None;
+        for (index, elem) in self.elements.iter_mut().enumerate() {
             if let ChatElement::ToolCall {
                 id: tool_id,
                 display:
@@ -807,19 +882,30 @@ impl ChatStream {
                         );
                     }
                 }
+                touched = Some(index);
                 break;
             }
+        }
+        if let Some(index) = touched {
+            self.touch(index);
         }
     }
 
     /// Set the todo block (replaces previous).
     pub fn set_todos(&mut self, items: Vec<TodoChecklistItem>) {
         // Remove existing todo block
+        let mut kept_revisions = Vec::with_capacity(self.revisions.len());
+        for (elem, revision) in self.elements.iter().zip(&self.revisions) {
+            if !matches!(elem, ChatElement::TodoBlock { .. }) {
+                kept_revisions.push(*revision);
+            }
+        }
         self.elements
             .retain(|e| !matches!(e, ChatElement::TodoBlock { .. }));
+        self.revisions = kept_revisions;
         // Add new one at end
         if !items.is_empty() {
-            self.elements.push(ChatElement::TodoBlock { items });
+            self.push_element(ChatElement::TodoBlock { items });
         }
     }
 
@@ -964,9 +1050,30 @@ pub struct QueueContext<'a> {
     pub messages: &'a [String],
 }
 
-/// Render the chat stream.
+/// Render the chat stream with a throwaway layout cache.
+#[cfg(test)]
 pub fn render(frame: &mut Frame, area: Rect, chat: &ChatStream, scroll: usize) {
-    render_impl(frame, area, chat, scroll, RenderContext::default());
+    let mut layout = ChatLayout::default();
+    render_impl(
+        frame,
+        area,
+        chat,
+        &mut layout,
+        scroll,
+        RenderContext::default(),
+    );
+}
+
+/// One inline image block placed relative to the chat area.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImagePlacement {
+    /// Image cache key.
+    pub key: String,
+    /// Path or URL shown under the zoomed image.
+    pub caption: String,
+    /// First reserved row relative to the chat area's top edge; negative
+    /// when the block starts above the view.
+    pub top: i32,
 }
 
 /// Full-screen unified render context.
@@ -989,8 +1096,10 @@ pub struct UnifiedRenderContext<'a> {
     pub status_ctx: Option<StatusContext<'a>>,
     /// Whether terminal supports image rendering
     pub images_supported: bool,
-    /// Output: accumulated image positions (url, `line_index`, caption) for overlay rendering
-    pub image_positions_out: Option<&'a mut Vec<(String, usize, String)>>,
+    /// Todo blocks render nothing (the sidebar shows the task tree).
+    pub hide_todos: bool,
+    /// Output: image blocks intersecting the view, for the overlay.
+    pub image_positions_out: Option<&'a mut Vec<ImagePlacement>>,
 }
 
 impl<'a> From<UnifiedRenderContext<'a>> for RenderContext<'a> {
@@ -1004,6 +1113,7 @@ impl<'a> From<UnifiedRenderContext<'a>> for RenderContext<'a> {
             queue_ctx: ctx.queue_ctx,
             status_ctx: ctx.status_ctx,
             images_supported: ctx.images_supported,
+            hide_todos: ctx.hide_todos,
             image_positions_out: ctx.image_positions_out,
         }
     }
@@ -1014,15 +1124,17 @@ pub fn render_unified(
     frame: &mut Frame,
     area: Rect,
     chat: &ChatStream,
+    layout: &mut ChatLayout,
     scroll: usize,
     ctx: UnifiedRenderContext<'_>,
 ) -> crate::tui::perf::ChatRenderStats {
-    render_impl(frame, area, chat, scroll, ctx.into())
+    render_impl(frame, area, chat, layout, scroll, ctx.into())
 }
 
-/// Build plain wrapped lines for selection/copy from unified viewport
-/// content. When `regions_out` is given, it also reports the row span of
-/// every collapsible tool call for click hit-testing.
+/// Plain wrapped rows of the unified view (chat + queue + input + status),
+/// exactly as [`render_unified`] draws them. When `regions_out` is given,
+/// it also reports the row span of every collapsible element.
+#[cfg(test)]
 #[must_use]
 pub fn build_plain_wrapped_lines_unified(
     chat: &ChatStream,
@@ -1036,32 +1148,11 @@ pub fn build_plain_wrapped_lines_unified(
     if width == 0 {
         return Vec::new();
     }
-    let max_width = width as usize;
-    let mut out: Vec<String> = Vec::new();
-    let mut regions = Vec::new();
-
-    for elem in chat.active_elements() {
-        let start = out.len();
-        for line in plain_lines_for_element(elem, images_supported) {
-            out.append(&mut wrap_plain_line(&plain_text(&line), max_width));
-        }
-        let collapsible_id = match elem {
-            ChatElement::ToolCall { id, display } if display.expandable() => Some(id.clone()),
-            ChatElement::Thinking {
-                id,
-                expanded: false,
-                ..
-            } => Some(id.clone()),
-            _ => None,
-        };
-        if let Some(element_id) = collapsible_id {
-            regions.push(ClickRegion {
-                element_id,
-                start,
-                end: out.len(),
-            });
-        }
-    }
+    let mut layout = ChatLayout::default();
+    layout.sync(chat, width, images_supported, false, None, Instant::now());
+    let mut out: Vec<String> = (0..layout.element_rows())
+        .map(|row| layout.plain_line(row).unwrap_or_default().to_string())
+        .collect();
 
     let mut tail: Vec<Line<'static>> = Vec::new();
     if let Some(ctx) = queue_ctx
@@ -1073,24 +1164,18 @@ pub fn build_plain_wrapped_lines_unified(
         render_input_line(&mut tail, &ctx, images_supported, None);
     }
     if let Some(ctx) = status_ctx {
-        render_status_line(&mut tail, ctx, max_width);
+        render_status_line(&mut tail, ctx, width as usize);
     }
-    for line in tail {
-        out.append(&mut wrap_plain_line(&plain_text(&line), max_width));
-    }
+    let rows = tail
+        .iter()
+        .map(|line| chat_layout::line_rows(line, width))
+        .sum();
+    out.extend(chat_layout::plain_rows(&tail, width, rows));
 
     if let Some(slot) = regions_out {
-        *slot = regions;
+        *slot = layout.collapse_regions();
     }
     out
-}
-
-/// Plain text of a styled line (span contents concatenated).
-fn plain_text(line: &Line<'_>) -> String {
-    line.spans
-        .iter()
-        .map(|s| s.content.as_ref())
-        .collect::<String>()
 }
 
 /// Push `IMAGE_HEIGHT` blank rows reserved for the graphics overlay.
@@ -1252,95 +1337,6 @@ fn context_report_lines(report: &ContextReport) -> Vec<Line<'static>> {
     lines
 }
 
-/// Plain-text mirror of one chat element's styled rendering. Row count
-/// must track the styled output so selection rows and click regions
-/// align with what is on screen.
-fn plain_lines_for_element(elem: &ChatElement, images_supported: bool) -> Vec<Line<'static>> {
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    match elem {
-        ChatElement::UserMessage {
-            content,
-            attachments,
-            ..
-        } => {
-            for (i, line) in content.lines().enumerate() {
-                if i == 0 {
-                    lines.push(Line::from(format!("> {line}")));
-                } else {
-                    lines.push(Line::from(format!("  {line}")));
-                }
-            }
-            for att in attachments {
-                push_attachment_line(&mut lines, att, images_supported, None);
-            }
-            lines.push(Line::from(""));
-        }
-        ChatElement::AssistantText { content, .. } => {
-            let image_mode = if images_supported {
-                markdown::ImageSupport::Enabled
-            } else {
-                markdown::ImageSupport::Disabled
-            };
-            let mut md_lines = markdown::render_markdown_with_config(content, image_mode);
-            while md_lines.last().is_some_and(|l| l.spans.is_empty()) {
-                md_lines.pop();
-            }
-            lines.extend(md_lines);
-            lines.push(Line::from(""));
-        }
-        ChatElement::Error { message } => {
-            lines.push(Line::from(format!("✗ {message}")));
-            lines.push(Line::from(""));
-        }
-        ChatElement::ToolCall { display, .. } => {
-            plain_tool_lines(display, &mut lines, images_supported);
-        }
-        ChatElement::TodoBlock { items } => {
-            lines.push(Line::from("[todo] ────────────────────────────"));
-            for item in items {
-                let marker = if item.checked { "[x]" } else { "[ ]" };
-                lines.push(Line::from(format!("  {marker} {}", item.text)));
-            }
-            lines.push(Line::from("─────────────────────────────────────"));
-            lines.push(Line::from(""));
-        }
-        ChatElement::Notice { message } => {
-            lines.push(Line::from(message.clone()));
-            lines.push(Line::from(""));
-        }
-        ChatElement::ContextReport(report) => {
-            lines.extend(context_report_lines(report));
-        }
-        ChatElement::Thinking {
-            content,
-            seconds,
-            expanded,
-            ..
-        } => {
-            if *expanded {
-                let text = if *seconds == 0 {
-                    "◐ Thinking...".to_string()
-                } else {
-                    format!("◐ Thinking... ({seconds} sec)")
-                };
-                lines.push(Line::from(text));
-                for l in content.lines() {
-                    lines.push(Line::from(l.to_string()));
-                }
-            } else {
-                let text = if *seconds == 0 {
-                    "◐ Thought ▸".to_string()
-                } else {
-                    format!("◐ Thought for {seconds} sec ▸")
-                };
-                lines.push(Line::from(text));
-            }
-            lines.push(Line::from(""));
-        }
-    }
-    lines
-}
-
 /// The one-line headline a call renders: `▸`/`▾`-suffixed description,
 /// chip + summary, or the command itself when no description exists.
 fn tool_headline(display: &ToolDisplay) -> String {
@@ -1403,166 +1399,6 @@ fn collapsed_status_suffix(display: &ToolDisplay, open: bool) -> String {
     }
 }
 
-/// Plain-text mirror of `render_tool_inline` for one tool call.
-fn plain_tool_lines(display: &ToolDisplay, lines: &mut Vec<Line<'static>>, images_supported: bool) {
-    let expandable = display.expandable();
-    let open = expandable && display.body_open(Instant::now());
-    let marker = if !expandable {
-        "  "
-    } else if open {
-        "▾ "
-    } else {
-        "▸ "
-    };
-    lines.push(Line::from(format!(
-        "{marker}{}{}",
-        tool_headline(display),
-        collapsed_status_suffix(display, open)
-    )));
-    if !open {
-        return;
-    }
-    match display {
-        ToolDisplay::Terminal {
-            command,
-            mode,
-            status,
-            output,
-            diffs,
-            ..
-        } => {
-            let mode_prefix = terminal_mode_marker(*mode);
-            let mut command_lines = command.lines();
-            if let Some(first) = command_lines.next() {
-                lines.push(Line::from(format!("{mode_prefix}$ {first}")));
-                for line in command_lines {
-                    lines.push(Line::from(format!("│ {line}")));
-                }
-            } else {
-                lines.push(Line::from(format!("{mode_prefix}$")));
-            }
-            if let Some(status_text) = body_status_text(status) {
-                lines.push(Line::from(format!("↳ {status_text}")));
-            }
-            if let Some(info) = output
-                && !info.output.is_empty()
-            {
-                for line in info.output_preview(OUTPUT_PREVIEW_LINES).lines() {
-                    lines.push(Line::from(format!("│ {line}")));
-                }
-            }
-            if images_supported
-                && let Some(_) = output.as_ref().and_then(|info| info.image.as_ref())
-            {
-                push_image_rows(lines);
-            }
-            plain_diff_lines(diffs, lines);
-        }
-        ToolDisplay::Action {
-            detail,
-            status,
-            output,
-            ..
-        } => {
-            for line in detail.iter().take(DIFF_PREVIEW_LINES) {
-                lines.push(Line::from(format!("│ {line}")));
-            }
-            if detail.len() > DIFF_PREVIEW_LINES {
-                lines.push(Line::from(format!(
-                    "│ … {} more lines",
-                    detail.len() - DIFF_PREVIEW_LINES
-                )));
-            }
-            if let Some(status_text) = body_status_text(status) {
-                lines.push(Line::from(format!("↳ {status_text}")));
-            }
-            if let Some(info) = output
-                && !info.output.is_empty()
-            {
-                for line in info.output_preview(OUTPUT_PREVIEW_LINES).lines() {
-                    lines.push(Line::from(format!("│ {line}")));
-                }
-            }
-            if images_supported
-                && output
-                    .as_ref()
-                    .and_then(|info| info.image.as_ref())
-                    .is_some()
-            {
-                push_image_rows(lines);
-            }
-        }
-        ToolDisplay::Builtin { status, output, .. } => {
-            if let Some(status_text) = body_status_text(status) {
-                lines.push(Line::from(format!("↳ {status_text}")));
-            }
-            if let Some(text) = output {
-                for line in text.lines().take(OUTPUT_PREVIEW_LINES) {
-                    lines.push(Line::from(format!("│ {line}")));
-                }
-            }
-        }
-    }
-}
-
-/// Plain-text mirror of `render_diff_preview`.
-fn plain_diff_lines(diffs: &[crate::file_tracker::RootDiff], lines: &mut Vec<Line<'static>>) {
-    for (index, diff) in diffs.iter().enumerate() {
-        let summary = format!(
-            "± {} file{} (+{} −{})",
-            diff.files,
-            if diff.files == 1 { "" } else { "s" },
-            diff.additions,
-            diff.deletions,
-        );
-        if diffs.len() > 1 {
-            lines.push(Line::from(format!("{summary} in {}", diff.root.display())));
-        } else {
-            lines.push(Line::from(summary));
-        }
-        let count = diff.text.lines().count();
-        for line in diff.text.lines().take(DIFF_PREVIEW_LINES) {
-            lines.push(Line::from(format!("│ {line}")));
-        }
-        if count > DIFF_PREVIEW_LINES {
-            lines.push(Line::from(format!(
-                "│ … {} more diff lines",
-                count - DIFF_PREVIEW_LINES
-            )));
-        }
-        if index + 1 < diffs.len() {
-            lines.push(Line::from(""));
-        }
-    }
-}
-
-fn wrap_plain_line(line: &str, max_width: usize) -> Vec<String> {
-    if max_width == 0 {
-        return vec![String::new()];
-    }
-    if line.is_empty() {
-        return vec![String::new()];
-    }
-
-    let mut out = Vec::new();
-    let mut current = String::new();
-    let mut current_w = 0usize;
-
-    for ch in line.chars() {
-        let w = UnicodeWidthChar::width(ch).unwrap_or(1).max(1);
-        if current_w + w > max_width && !current.is_empty() {
-            out.push(current);
-            current = String::new();
-            current_w = 0;
-        }
-        current.push(ch);
-        current_w += w;
-    }
-
-    out.push(current);
-    out
-}
-
 /// Clamp a visual column in `line` to `target_col`, counting wide characters.
 #[must_use]
 pub fn clamp_column_by_width(line: &str, target_col: usize) -> usize {
@@ -1588,19 +1424,6 @@ fn safe_scroll(scroll: usize, content_height: usize, area_height: u16) -> u16 {
     u16::try_from(clamped).unwrap_or(u16::MAX)
 }
 
-/// Calculate actual visual row count using ratatui's own `Paragraph::line_count`.
-/// This is the only way to get an exact match with how Paragraph renders wrapped text,
-/// especially for CJK wide characters and word-boundary wrapping.
-fn total_wrapped_lines(lines: &[Line], width: usize) -> usize {
-    if width == 0 || lines.is_empty() {
-        return 0;
-    }
-    let w = u16::try_from(width).unwrap_or(u16::MAX);
-    Paragraph::new(lines.to_vec())
-        .wrap(Wrap { trim: false })
-        .line_count(w)
-}
-
 /// Internal render context with all optional parameters.
 #[derive(Default)]
 struct RenderContext<'a> {
@@ -1612,20 +1435,284 @@ struct RenderContext<'a> {
     queue_ctx: Option<QueueContext<'a>>,
     status_ctx: Option<StatusContext<'a>>,
     images_supported: bool,
-    image_positions_out: Option<&'a mut Vec<(String, usize, String)>>,
+    hide_todos: bool,
+    image_positions_out: Option<&'a mut Vec<ImagePlacement>>,
+}
+
+/// How one element renders this frame, beyond its own content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ElementState {
+    /// The element is the selected tool call.
+    pub selected: bool,
+    /// The element's body is open (tool calls: [`ToolDisplay::body_open`]).
+    pub open: bool,
+    /// Todo blocks render nothing (the sidebar shows the task tree).
+    pub hide_todos: bool,
+}
+
+impl ElementState {
+    /// State of `elem` at `now`.
+    pub(super) fn of(
+        elem: &ChatElement,
+        selected_tool: Option<&str>,
+        hide_todos: bool,
+        now: Instant,
+    ) -> Self {
+        match elem {
+            ChatElement::ToolCall { id, display } => Self {
+                selected: selected_tool == Some(id.as_str()),
+                open: display.expandable() && display.body_open(now),
+                hide_todos,
+            },
+            _ => Self {
+                selected: false,
+                open: false,
+                hide_todos,
+            },
+        }
+    }
+}
+
+/// Styled rows of one chat element plus the image anchors among them:
+/// `(cache key, line index, caption)`.
+#[derive(Debug, Default)]
+pub(super) struct ElementLines {
+    pub lines: Vec<Line<'static>>,
+    pub images: Vec<(String, usize, String)>,
+}
+
+/// Id a click on `elem` toggles, when it is collapsible.
+pub(super) fn collapsible_id(elem: &ChatElement) -> Option<&str> {
+    match elem {
+        ChatElement::ToolCall { id, display } if display.expandable() => Some(id.as_str()),
+        ChatElement::Thinking {
+            id,
+            expanded: false,
+            ..
+        } => Some(id.as_str()),
+        _ => None,
+    }
+}
+
+/// Lay out one element as styled lines (before wrapping).
+pub(super) fn element_lines(
+    elem: &ChatElement,
+    state: ElementState,
+    images_supported: bool,
+) -> ElementLines {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut images: Vec<(String, usize, String)> = Vec::new();
+    match elem {
+        ChatElement::UserMessage {
+            content,
+            attachments,
+            ..
+        } => {
+            // User message with > prefix
+            for (i, line) in content.lines().enumerate() {
+                if i == 0 {
+                    lines.push(Line::from(vec![
+                        Span::styled("> ", Style::default().fg(Color::Cyan)),
+                        Span::raw(line.to_string()),
+                    ]));
+                } else {
+                    lines.push(Line::from(format!("  {line}")));
+                }
+            }
+
+            // Attachments — images get a placeholder block the graphics
+            // overlay paints into; everything else is a one-line marker.
+            for att in attachments {
+                push_attachment_line(&mut lines, att, images_supported, Some(&mut images));
+            }
+
+            lines.push(Line::from(""));
+        }
+
+        ChatElement::AssistantText { content, streaming } => {
+            // Track current line offset before adding markdown
+            let line_offset = lines.len();
+
+            // Render markdown with position tracking
+            let image_mode = if images_supported {
+                markdown::ImageSupport::Enabled
+            } else {
+                markdown::ImageSupport::Disabled
+            };
+            let md_result = markdown::render_markdown_with_positions(content, image_mode);
+            let mut md_lines = md_result.lines;
+            // Strip trailing empties from the markdown renderer so a message
+            // does not end in a run of blank rows — but never into the rows
+            // reserved for an image: those are blank on purpose, and
+            // dropping them let the image overlay paint over whatever
+            // followed the message.
+            let reserved_end = md_result
+                .image_positions
+                .iter()
+                .map(|(_, pos, _)| pos + IMAGE_HEIGHT)
+                .max()
+                .unwrap_or(0);
+            while md_lines.len() > reserved_end
+                && md_lines.last().is_some_and(|l| l.spans.is_empty())
+            {
+                md_lines.pop();
+            }
+
+            // Collect image positions with offset adjustment
+            for (url, pos, caption) in md_result.image_positions {
+                images.push((url, line_offset + pos, caption));
+            }
+
+            if *streaming {
+                // Append cursor to the last line of text (inline)
+                if let Some(last_line) = md_lines.last_mut() {
+                    last_line
+                        .spans
+                        .push(Span::styled("_", Style::default().fg(Color::DarkGray)));
+                } else {
+                    // No content yet, show cursor on its own line
+                    md_lines.push(Line::from(Span::styled(
+                        "_",
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+            }
+
+            lines.extend(md_lines);
+            lines.push(Line::from(""));
+        }
+
+        ChatElement::ToolCall { id, display } => {
+            let _ = id;
+            let mut tool_lines = Vec::new();
+            render_tool_inline_at(
+                &mut tool_lines,
+                display,
+                state.selected,
+                images_supported,
+                &mut images,
+                state.open,
+            );
+            lines.extend(tool_lines.into_iter().map(line_into_static));
+        }
+
+        ChatElement::TodoBlock { .. } if state.hide_todos => {}
+        ChatElement::TodoBlock { items } => {
+            lines.push(Line::from(Span::styled(
+                "[todo] ────────────────────────────",
+                Style::default().fg(Color::Green),
+            )));
+
+            for item in items {
+                let (marker, style) = if item.checked {
+                    ("[x]", Style::default().fg(Color::DarkGray))
+                } else {
+                    ("[ ]", Style::default())
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {marker} "), style),
+                    Span::styled(item.text.clone(), style),
+                ]));
+            }
+
+            lines.push(Line::from(Span::styled(
+                "─────────────────────────────────────",
+                Style::default().fg(Color::Green),
+            )));
+            lines.push(Line::from(""));
+        }
+
+        ChatElement::Error { message } => {
+            // Error message with icon and red color
+            lines.push(Line::from(vec![
+                Span::styled("✗ ", Style::default().fg(Color::Red)),
+                Span::styled(message.clone(), Style::default().fg(Color::Red)),
+            ]));
+            lines.push(Line::from(""));
+        }
+
+        ChatElement::Notice { message } => {
+            lines.push(Line::from(vec![
+                Span::styled("◈ ", Style::default().fg(Color::Cyan)),
+                Span::styled(message.clone(), Style::default().fg(Color::DarkGray)),
+            ]));
+            lines.push(Line::from(""));
+        }
+
+        ChatElement::ContextReport(report) => {
+            lines.extend(context_report_lines(report));
+        }
+
+        ChatElement::Thinking {
+            content,
+            seconds,
+            expanded,
+            ..
+        } => {
+            let header = if *expanded {
+                if *seconds == 0 {
+                    "◐ Thinking...".to_string()
+                } else {
+                    format!("◐ Thinking... ({seconds} sec)")
+                }
+            } else if *seconds == 0 {
+                "◐ Thought ▸".to_string()
+            } else {
+                format!("◐ Thought for {seconds} sec ▸")
+            };
+            lines.push(Line::from(Span::styled(
+                header,
+                Style::default().fg(Color::Magenta),
+            )));
+            if *expanded {
+                for l in content.lines() {
+                    lines.push(Line::from(Span::styled(
+                        l.to_string(),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::ITALIC),
+                    )));
+                }
+            }
+            lines.push(Line::from(""));
+        }
+    }
+    ElementLines { lines, images }
+}
+
+/// Detach a line from the data it borrows.
+pub(super) fn line_into_static(line: Line<'_>) -> Line<'static> {
+    Line {
+        style: line.style,
+        alignment: line.alignment,
+        spans: line
+            .spans
+            .into_iter()
+            .map(|span| Span::styled(span.content.into_owned(), span.style))
+            .collect(),
+    }
 }
 
 /// Internal implementation for rendering chat stream.
+///
+/// Elements come from `layout`, which re-lays-out only what changed; the
+/// tail (queue, input, status) is rebuilt every frame since it is small and
+/// carries the spinner. Only the lines intersecting the view are handed to
+/// the paragraph, so a frame costs O(view), not O(history).
 fn render_impl(
     frame: &mut Frame,
     area: Rect,
     chat: &ChatStream,
+    layout: &mut ChatLayout,
     scroll: usize,
     ctx: RenderContext<'_>,
 ) -> crate::tui::perf::ChatRenderStats {
     let mut stats = crate::tui::perf::ChatRenderStats::default();
     // Guard against zero-dimension areas to prevent overflow
     if area.width < 3 || area.height < 3 {
+        if let Some(out) = ctx.image_positions_out {
+            out.clear();
+        }
         return stats;
     }
 
@@ -1638,190 +1725,29 @@ fn render_impl(
         queue_ctx,
         status_ctx,
         images_supported,
+        hide_todos,
         image_positions_out,
     } = ctx;
 
-    let mut lines: Vec<Line> = Vec::new();
-    let mut collected_image_positions: Vec<(String, usize, String)> = Vec::new();
-
     let build_start = std::time::Instant::now();
-    for elem in chat.active_elements() {
-        stats.elements += 1;
-        match elem {
-            ChatElement::UserMessage {
-                content,
-                attachments,
-                ..
-            } => {
-                // User message with > prefix
-                for (i, line) in content.lines().enumerate() {
-                    if i == 0 {
-                        lines.push(Line::from(vec![
-                            Span::styled("> ", Style::default().fg(Color::Cyan)),
-                            Span::raw(line.to_string()),
-                        ]));
-                    } else {
-                        lines.push(Line::from(format!("  {line}")));
-                    }
-                }
+    layout.sync(
+        chat,
+        area.width,
+        images_supported,
+        hide_todos,
+        selected_tool,
+        Instant::now(),
+    );
+    stats.elements = layout.rebuilt();
 
-                // Attachments — images get a placeholder block the graphics
-                // overlay paints into; everything else is a one-line marker.
-                for att in attachments {
-                    push_attachment_line(
-                        &mut lines,
-                        att,
-                        images_supported,
-                        Some(&mut collected_image_positions),
-                    );
-                }
-
-                lines.push(Line::from(""));
-            }
-
-            ChatElement::AssistantText { content, streaming } => {
-                // Track current line offset before adding markdown
-                let line_offset = lines.len();
-
-                // Render markdown with position tracking
-                let image_mode = if images_supported {
-                    markdown::ImageSupport::Enabled
-                } else {
-                    markdown::ImageSupport::Disabled
-                };
-                let md_result = markdown::render_markdown_with_positions(content, image_mode);
-                let mut md_lines = md_result.lines;
-                // Strip accidental trailing empties from markdown renderer so we don't inflate
-                // content height and trigger premature scrollback insertion.
-                while md_lines.last().is_some_and(|l| l.spans.is_empty()) {
-                    md_lines.pop();
-                }
-
-                // Collect image positions with offset adjustment
-                for (url, pos, caption) in md_result.image_positions {
-                    collected_image_positions.push((url, line_offset + pos, caption));
-                }
-
-                if *streaming {
-                    // Append cursor to the last line of text (inline)
-                    if let Some(last_line) = md_lines.last_mut() {
-                        last_line
-                            .spans
-                            .push(Span::styled("_", Style::default().fg(Color::DarkGray)));
-                    } else {
-                        // No content yet, show cursor on its own line
-                        md_lines.push(Line::from(Span::styled(
-                            "_",
-                            Style::default().fg(Color::DarkGray),
-                        )));
-                    }
-                }
-
-                lines.extend(md_lines);
-                lines.push(Line::from(""));
-            }
-
-            ChatElement::ToolCall { id, display } => {
-                let is_selected = selected_tool == Some(id.as_str());
-                render_tool_inline(
-                    &mut lines,
-                    display,
-                    is_selected,
-                    images_supported,
-                    &mut collected_image_positions,
-                );
-            }
-
-            ChatElement::TodoBlock { items } => {
-                lines.push(Line::from(Span::styled(
-                    "[todo] ────────────────────────────",
-                    Style::default().fg(Color::Green),
-                )));
-
-                for item in items {
-                    let (marker, style) = if item.checked {
-                        ("[x]", Style::default().fg(Color::DarkGray))
-                    } else {
-                        ("[ ]", Style::default())
-                    };
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("  {marker} "), style),
-                        Span::styled(&item.text, style),
-                    ]));
-                }
-
-                lines.push(Line::from(Span::styled(
-                    "─────────────────────────────────────",
-                    Style::default().fg(Color::Green),
-                )));
-                lines.push(Line::from(""));
-            }
-
-            ChatElement::Error { message } => {
-                // Error message with icon and red color
-                lines.push(Line::from(vec![
-                    Span::styled("✗ ", Style::default().fg(Color::Red)),
-                    Span::styled(message, Style::default().fg(Color::Red)),
-                ]));
-                lines.push(Line::from(""));
-            }
-
-            ChatElement::Notice { message } => {
-                lines.push(Line::from(vec![
-                    Span::styled("◈ ", Style::default().fg(Color::Cyan)),
-                    Span::styled(message, Style::default().fg(Color::DarkGray)),
-                ]));
-                lines.push(Line::from(""));
-            }
-
-            ChatElement::ContextReport(report) => {
-                lines.extend(context_report_lines(report));
-            }
-
-            ChatElement::Thinking {
-                content,
-                seconds,
-                expanded,
-                ..
-            } => {
-                let header = if *expanded {
-                    if *seconds == 0 {
-                        "◐ Thinking...".to_string()
-                    } else {
-                        format!("◐ Thinking... ({seconds} sec)")
-                    }
-                } else if *seconds == 0 {
-                    "◐ Thought ▸".to_string()
-                } else {
-                    format!("◐ Thought for {seconds} sec ▸")
-                };
-                lines.push(Line::from(Span::styled(
-                    header,
-                    Style::default().fg(Color::Magenta),
-                )));
-                if *expanded {
-                    for l in content.lines() {
-                        lines.push(Line::from(Span::styled(
-                            l.to_string(),
-                            Style::default()
-                                .fg(Color::DarkGray)
-                                .add_modifier(Modifier::ITALIC),
-                        )));
-                    }
-                }
-                lines.push(Line::from(""));
-            }
-        }
-    }
-
-    // Render queue messages if provided
+    // Tail: queue indicator, input line (with attachment previews), status.
+    let mut tail: Vec<Line<'_>> = Vec::new();
+    let mut tail_images: Vec<(String, usize, String)> = Vec::new();
     if let Some(ref ctx) = queue_ctx
         && !ctx.messages.is_empty()
     {
-        render_queue_lines(&mut lines, ctx, area.width);
+        render_queue_lines(&mut tail, ctx, area.width);
     }
-
-    // Render input line if provided (for full-screen scroll mode)
     let mut input_line_idx = None;
     let mut caret_line = None;
     if let Some(ctx) = input_ctx {
@@ -1829,98 +1755,117 @@ fn render_impl(
             caret_line = Some(input_caret_line(&ctx));
         }
         input_line_idx = Some(render_input_line(
-            &mut lines,
+            &mut tail,
             &ctx,
             images_supported,
-            Some(&mut collected_image_positions),
+            Some(&mut tail_images),
         ));
     }
-
-    // Render status bar if provided
     if let Some(ref ctx) = status_ctx {
-        render_status_line(&mut lines, ctx, area.width as usize);
+        render_status_line(&mut tail, ctx, area.width as usize);
     }
-
     stats.lines_build = build_start.elapsed();
 
-    // Calculate dimensions using VISUAL line count (accounting for wrap)
-    let view_height = area.height as usize;
-    let render_width = area.width as usize;
     let wrap_start = std::time::Instant::now();
-    let visual_content_height = total_wrapped_lines(&lines, render_width);
-    stats.wrap_count = wrap_start.elapsed();
-    stats.content_height = visual_content_height;
-
-    // Export collected image positions for overlay rendering, converting each
-    // logical line index to the visual row the paragraph actually draws it
-    // on: a wrapped line above pushes the image's reserved rows further down.
-    if let Some(out) = image_positions_out {
-        out.clear();
-        out.extend(
-            collected_image_positions
-                .into_iter()
-                .map(|(key, index, caption)| {
-                    let row = lines[..index.min(lines.len())]
-                        .iter()
-                        .map(|line| wrapped_line_rows(line, render_width))
-                        .sum();
-                    (key, row, caption)
-                }),
-        );
+    let mut tail_starts = Vec::with_capacity(tail.len());
+    let mut tail_rows = 0usize;
+    for line in &tail {
+        tail_starts.push(tail_rows);
+        tail_rows += chat_layout::line_rows(line, area.width);
     }
+    let element_rows = layout.element_rows();
+    let content_height = element_rows + tail_rows;
+    stats.wrap_count = wrap_start.elapsed();
+    stats.content_height = content_height;
 
-    // Export dimensions for scroll normalization
-    // Use visual height so scrolling works correctly with wrapped lines
+    let view_height = area.height as usize;
     if let Some(cell) = content_height_out {
-        cell.store(visual_content_height, Ordering::Relaxed);
+        cell.store(content_height, Ordering::Relaxed);
     }
     if let Some(cell) = view_height_out {
         cell.store(view_height, Ordering::Relaxed);
     }
 
-    // Keep input/composer anchored to the bottom when content underflows.
-    // Use explicit top padding lines to keep wrap + scroll behavior consistent.
-    let top_padding = view_height.saturating_sub(visual_content_height);
-    // Visual row where the input line starts (before padding is applied).
-    let input_top = input_line_idx.map(|idx| {
-        visual_content_height.saturating_sub(total_wrapped_lines(&lines[idx..], render_width))
-    });
-    let (scroll_y, final_lines) = if visual_content_height < view_height {
-        let mut padded = Vec::with_capacity(top_padding + lines.len());
-        for _ in 0..top_padding {
-            padded.push(Line::from(""));
-        }
-        padded.extend(lines);
-        (0u16, padded)
+    // Underflowing content sits at the bottom, above blank padding rows.
+    let top_padding = view_height.saturating_sub(content_height);
+    let top = if content_height <= view_height {
+        0
     } else {
-        let max_scroll = visual_content_height - view_height;
-        let actual_scroll = if scroll == usize::MAX {
-            max_scroll
-        } else {
-            scroll.min(max_scroll)
-        };
-        (u16::try_from(actual_scroll).unwrap_or(u16::MAX), lines)
+        scroll.min(content_height - view_height)
     };
+    layout.set_top_padding(top_padding);
+
+    // Lines intersecting the window [top, top + view_height).
+    let (mut lines, mut skip) = layout.visible_lines(top, view_height);
+    if top + view_height > element_rows {
+        if top >= element_rows {
+            // The window starts inside the tail.
+            let row = top - element_rows;
+            let first = tail_starts
+                .partition_point(|&start| start <= row)
+                .saturating_sub(1);
+            skip = row - tail_starts.get(first).copied().unwrap_or(0);
+            lines.extend(tail.iter().skip(first).cloned().map(line_into_static));
+        } else {
+            lines.extend(tail.iter().cloned().map(line_into_static));
+        }
+    }
+
+    if let Some(out) = image_positions_out {
+        out.clear();
+        let to_screen = |row: usize| {
+            i32::try_from(top_padding + row).unwrap_or(i32::MAX)
+                - i32::try_from(top).unwrap_or(i32::MAX)
+        };
+        for anchor in layout.images_in(top, view_height) {
+            out.push(ImagePlacement {
+                top: to_screen(anchor.row),
+                key: anchor.key,
+                caption: anchor.caption,
+            });
+        }
+        for (key, index, caption) in tail_images {
+            let row = element_rows + tail_starts.get(index).copied().unwrap_or(0);
+            if row < top + view_height && row + IMAGE_HEIGHT > top {
+                out.push(ImagePlacement {
+                    top: to_screen(row),
+                    key,
+                    caption,
+                });
+            }
+        }
+    }
 
     let widget_start = std::time::Instant::now();
     frame.render_widget(Clear, area);
-    let paragraph = Paragraph::new(final_lines)
+    let body = Rect {
+        y: area.y + u16::try_from(top_padding).unwrap_or(0),
+        height: area
+            .height
+            .saturating_sub(u16::try_from(top_padding).unwrap_or(0)),
+        ..area
+    };
+    Paragraph::new(lines)
         .wrap(Wrap { trim: false })
-        .scroll((scroll_y, 0));
-    frame.render_widget(paragraph, area);
+        .scroll((u16::try_from(skip).unwrap_or(u16::MAX), 0))
+        .render(body, frame.buffer_mut());
+
+    // Plain mirror of the tail, for selection.
+    layout.set_tail_plain(chat_layout::plain_rows(&tail, area.width, tail_rows));
 
     // Anchor the terminal cursor on the caret cell so IME composition and
     // its candidate window track the real insertion point.
-    if let (Some(caret_line), Some(input_top)) = (caret_line, input_top)
+    if let (Some(caret_line), Some(input_idx)) = (caret_line, input_line_idx)
         && let Some((cx, cy)) = wrapped_tail_cell(caret_line, area.width)
     {
-        let caret_row = top_padding + input_top + usize::from(cy);
-        if caret_row >= usize::from(scroll_y)
-            && caret_row - usize::from(scroll_y) < usize::from(area.height)
-        {
+        let caret_row = top_padding
+            + element_rows
+            + tail_starts.get(input_idx).copied().unwrap_or(0)
+            + usize::from(cy);
+        if caret_row >= top && caret_row - top < usize::from(area.height) {
             frame.set_cursor_position((
                 area.x + cx,
-                area.y + u16::try_from(caret_row - usize::from(scroll_y)).unwrap_or(u16::MAX),
+                area.y + u16::try_from(caret_row - top).unwrap_or(u16::MAX),
             ));
         }
     }
@@ -2321,6 +2266,7 @@ fn chip_style(chip: &str) -> Style {
     }
 }
 
+#[cfg(test)]
 fn render_tool_inline<'a>(
     lines: &mut Vec<Line<'a>>,
     display: &'a ToolDisplay,
@@ -2329,6 +2275,25 @@ fn render_tool_inline<'a>(
     image_positions: &mut Vec<(String, usize, String)>,
 ) {
     let open = display.expandable() && display.body_open(Instant::now());
+    render_tool_inline_at(
+        lines,
+        display,
+        is_selected,
+        images_supported,
+        image_positions,
+        open,
+    );
+}
+
+/// Inline rows of a tool call whose body is `open`.
+fn render_tool_inline_at<'a>(
+    lines: &mut Vec<Line<'a>>,
+    display: &'a ToolDisplay,
+    is_selected: bool,
+    images_supported: bool,
+    image_positions: &mut Vec<(String, usize, String)>,
+    open: bool,
+) {
     let selection_style = if is_selected {
         Style::default().bg(Color::DarkGray)
     } else {
@@ -2839,6 +2804,270 @@ mod tests {
             assert_eq!(
                 &shown, &truth,
                 "scroll={scroll}: backend drifted from the rendered buffer"
+            );
+        }
+    }
+
+    /// Render `chat` the way the TUI does (input + status tail) into
+    /// `terminal`, reusing `layout`; returns the rendered frame buffer and
+    /// asserts the backend (what a real terminal shows after diffing)
+    /// matches it.
+    fn draw_unified(
+        terminal: &mut ratatui::Terminal<crate::tui::ui::test_screen::ScreenBackend>,
+        chat: &ChatStream,
+        layout: &mut super::ChatLayout,
+        scroll: usize,
+    ) -> ratatui::buffer::Buffer {
+        use super::{StatusContext, UnifiedRenderContext, render_unified};
+        let mut truth = None;
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_unified(
+                    frame,
+                    area,
+                    chat,
+                    layout,
+                    scroll,
+                    UnifiedRenderContext {
+                        selected_tool: None,
+                        content_height_out: None,
+                        view_height_out: None,
+                        input_ctx: Some(InputContext {
+                            input: "draft",
+                            cursor: 5,
+                            attachments: &[],
+                        }),
+                        input_caret_active: true,
+                        queue_ctx: None,
+                        status_ctx: Some(StatusContext {
+                            model: "model",
+                            usage: None,
+                            queue_count: 0,
+                            open_questions: 0,
+                            background: &[],
+                            decode_rate: None,
+                            status_message: None,
+                            cwd: "~",
+                            activity: None,
+                            spinner_frame: 0,
+                        }),
+                        images_supported: true,
+                        hide_todos: false,
+                        image_positions_out: None,
+                    },
+                );
+                truth = Some(frame.buffer_mut().clone());
+            })
+            .unwrap();
+        let truth = truth.expect("frame drawn");
+        assert_eq!(
+            terminal.backend().screen(),
+            crate::tui::ui::test_screen::buffer_screen(&truth),
+            "the terminal shows something other than the rendered frame"
+        );
+        truth
+    }
+
+    const STREAMED_REPLY: &str = "Here is the plan:\n\n## Steps\n\n1. **Read** the `config.rs` file and check the provider list carefully before editing anything\n2. 修改终端渲染逻辑，确保宽字符换行正确，并且不会出现重复的文本行\n3. Run the tests\n\n```rust\nfn main() {\n    println!(\"hello\");\n}\n```\n\nDone — that's all for now, with a long closing sentence that wraps across several rows of the view.";
+
+    /// Streaming a reply in small chunks (with a frame after each) ends on
+    /// exactly the screen a one-shot render of the finished reply shows:
+    /// no row of an earlier, shorter wrap survives.
+    #[test]
+    fn streaming_in_chunks_matches_one_shot_render() {
+        use crate::tui::ui::test_screen::ScreenBackend as TestBackend;
+        use ratatui::Terminal;
+
+        let mut streamed = ChatStream::new();
+        streamed.push_user("plan it", Vec::new(), 0);
+        let mut terminal = Terminal::new(TestBackend::new(48, 30)).unwrap();
+        let mut layout = super::ChatLayout::default();
+        let mut rest = STREAMED_REPLY;
+        while !rest.is_empty() {
+            // Chunk on char boundaries, 7 chars at a time.
+            let split = rest.char_indices().nth(7).map_or(rest.len(), |(i, _)| i);
+            let (chunk, tail) = rest.split_at(split);
+            streamed.push_text(chunk);
+            draw_unified(&mut terminal, &streamed, &mut layout, usize::MAX);
+            rest = tail;
+        }
+        streamed.end_text();
+        let streamed_screen = draw_unified(&mut terminal, &streamed, &mut layout, usize::MAX);
+
+        let mut whole = ChatStream::new();
+        whole.push_user("plan it", Vec::new(), 0);
+        whole.push_text(STREAMED_REPLY);
+        whole.end_text();
+        let mut fresh = Terminal::new(TestBackend::new(48, 30)).unwrap();
+        let mut fresh_layout = super::ChatLayout::default();
+        let whole_screen = draw_unified(&mut fresh, &whole, &mut fresh_layout, usize::MAX);
+
+        assert_eq!(streamed_screen, whole_screen);
+    }
+
+    /// A width change re-wraps every element: the narrower screen equals a
+    /// fresh render at that width, with no row left from the wider wrap.
+    #[test]
+    fn resize_rewraps_without_duplicates() {
+        use crate::tui::ui::test_screen::ScreenBackend as TestBackend;
+        use ratatui::{Terminal, layout::Rect};
+
+        let mut chat = ChatStream::new();
+        chat.push_user("plan it", Vec::new(), 0);
+        chat.push_text(STREAMED_REPLY);
+        chat.end_text();
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        let mut layout = super::ChatLayout::default();
+        draw_unified(&mut terminal, &chat, &mut layout, usize::MAX);
+        terminal.backend_mut().resize(40, 30);
+        terminal.resize(Rect::new(0, 0, 40, 30)).unwrap();
+        let resized = draw_unified(&mut terminal, &chat, &mut layout, usize::MAX);
+
+        let mut fresh = Terminal::new(TestBackend::new(40, 30)).unwrap();
+        let mut fresh_layout = super::ChatLayout::default();
+        let expected = draw_unified(&mut fresh, &chat, &mut fresh_layout, usize::MAX);
+        assert_eq!(resized, expected);
+    }
+
+    /// Scrolling re-lays-out nothing: only the visible window is rendered
+    /// from the cache. A streamed chunk re-lays-out only the tail element.
+    #[test]
+    fn scroll_and_stream_relayout_only_what_changed() {
+        use crate::tui::ui::test_screen::ScreenBackend as TestBackend;
+        use ratatui::Terminal;
+
+        let mut chat = ChatStream::new();
+        for index in 0..40 {
+            chat.push_user(&format!("question {index}"), Vec::new(), index);
+            chat.push_text(STREAMED_REPLY);
+            chat.end_text();
+        }
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        let mut layout = super::ChatLayout::default();
+        draw_unified(&mut terminal, &chat, &mut layout, usize::MAX);
+        assert_eq!(layout.rebuilt(), 80);
+
+        for scroll in [0, 7, 300, 301, 302, 900] {
+            draw_unified(&mut terminal, &chat, &mut layout, scroll);
+            assert_eq!(layout.rebuilt(), 0, "scroll={scroll} re-laid-out elements");
+        }
+
+        chat.push_text("more");
+        draw_unified(&mut terminal, &chat, &mut layout, usize::MAX);
+        assert_eq!(layout.rebuilt(), 1);
+        chat.push_text(" text");
+        draw_unified(&mut terminal, &chat, &mut layout, usize::MAX);
+        assert_eq!(layout.rebuilt(), 1);
+    }
+
+    /// Every scroll offset of a long transcript shows exactly the rows a
+    /// whole-document render shows at that offset.
+    #[test]
+    fn windowed_render_matches_full_document() {
+        use crate::tui::ui::test_screen::ScreenBackend as TestBackend;
+        use ratatui::{
+            Terminal,
+            buffer::Buffer,
+            layout::Rect,
+            widgets::{Paragraph, Widget, Wrap},
+        };
+
+        let mut chat = ChatStream::new();
+        for index in 0..6 {
+            chat.push_user(&format!("question {index}"), Vec::new(), index);
+            chat.push_text(STREAMED_REPLY);
+            chat.end_text();
+        }
+        let (width, height) = (44u16, 12u16);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut layout = super::ChatLayout::default();
+        draw_unified(&mut terminal, &chat, &mut layout, 0);
+
+        // The plain mirror is the whole document, row for row.
+        let rows = layout.plain_len();
+        let doc: Vec<String> = (0..rows)
+            .map(|row| layout.plain_line(row).unwrap().to_string())
+            .collect();
+        for scroll in [0, 1, 5, 33, 64, rows - usize::from(height)] {
+            let screen = draw_unified(&mut terminal, &chat, &mut layout, scroll);
+            for y in 0..height {
+                let mut text = String::new();
+                let mut x = 0;
+                while x < width {
+                    let symbol = screen[(x, y)].symbol();
+                    text.push_str(symbol);
+                    x += u16::try_from(unicode_width::UnicodeWidthStr::width(symbol).max(1))
+                        .unwrap();
+                }
+                assert_eq!(
+                    text.trim_end(),
+                    doc[scroll + usize::from(y)],
+                    "scroll={scroll} row={y}"
+                );
+            }
+        }
+
+        // And the mirror itself matches a plain full-document paragraph.
+        let mut lines = Vec::new();
+        for (index, elem) in chat.active_elements().iter().enumerate() {
+            let _ = index;
+            lines.extend(
+                super::element_lines(
+                    elem,
+                    super::ElementState::of(elem, None, false, Instant::now()),
+                    true,
+                )
+                .lines,
+            );
+        }
+        let element_rows = layout.element_rows();
+        let area = Rect::new(0, 0, width, u16::try_from(element_rows).unwrap());
+        let mut buf = Buffer::empty(area);
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .render(area, &mut buf);
+        for (row, expected) in doc.iter().enumerate().take(element_rows) {
+            let y = u16::try_from(row).unwrap();
+            let mut text = String::new();
+            let mut x = 0;
+            while x < width {
+                let symbol = buf[(x, y)].symbol();
+                text.push_str(symbol);
+                x += u16::try_from(unicode_width::UnicodeWidthStr::width(symbol).max(1)).unwrap();
+            }
+            assert_eq!(&text.trim_end().to_string(), expected, "row={row}");
+        }
+    }
+
+    /// An image at the very end of a reply keeps its reserved rows: the
+    /// overlay block must not reach into the next element.
+    #[test]
+    fn trailing_image_keeps_its_reserved_rows() {
+        let mut chat = ChatStream::new();
+        chat.push_text("Here it is:\n\n![chart](https://example.com/chart.png)\n");
+        chat.end_text();
+        chat.push_user("thanks", Vec::new(), 1);
+
+        let mut layout = super::ChatLayout::default();
+        layout.sync(&chat, 60, true, false, None, Instant::now());
+        let images = layout.images_in(0, 1000);
+        assert_eq!(images.len(), 1);
+        let block_end = images[0].row + IMAGE_HEIGHT;
+        let user_row = (0..layout.element_rows())
+            .find(|&row| layout.plain_line(row) == Some("> thanks"))
+            .expect("user message row");
+        assert!(
+            block_end <= user_row,
+            "image block rows {}..{block_end} overlap the next message at {user_row}",
+            images[0].row
+        );
+        for row in images[0].row..block_end {
+            assert_eq!(
+                layout.plain_line(row),
+                Some(""),
+                "reserved row {row} not blank"
             );
         }
     }
