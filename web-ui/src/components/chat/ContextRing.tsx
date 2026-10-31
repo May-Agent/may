@@ -1,5 +1,4 @@
 import { useEffect, useState } from 'react';
-import { Gauge, Flame } from 'lucide-react';
 import {
   Popover,
   PopoverContent,
@@ -21,8 +20,8 @@ function formatTokens(n: number | null | undefined): string {
 
 function tone(fraction: number): { stroke: string; text: string } {
   if (fraction >= 0.9) return { stroke: 'stroke-destructive', text: 'text-destructive' };
-  if (fraction >= 0.7) return { stroke: 'stroke-amber-500', text: 'text-amber-600 dark:text-amber-400' };
-  return { stroke: 'stroke-primary', text: 'text-foreground' };
+  if (fraction >= 0.7) return { stroke: 'stroke-foreground', text: 'text-foreground' };
+  return { stroke: 'stroke-muted-foreground', text: 'text-muted-foreground' };
 }
 
 export function ContextRing({ sessionId }: { sessionId: string }) {
@@ -63,13 +62,13 @@ export function ContextRing({ sessionId }: { sessionId: string }) {
         <button
           type="button"
           className={cn(
-            'group inline-flex h-7 items-center gap-1.5 rounded-full border border-border bg-card/60 px-2 text-[11px] font-medium tabular-nums transition-colors hover:bg-accent touch:h-11 touch:px-3',
+            'group inline-flex h-8 items-center gap-1.5 rounded-md px-2 text-xs font-medium tabular-nums transition-colors hover:bg-accent hover:text-foreground touch:h-11 touch:px-3',
             text,
           )}
           aria-label={t('chat.context')}
         >
           <svg width="16" height="16" viewBox="0 0 18 18" aria-hidden>
-            <circle cx="9" cy="9" r={radius} fill="none" className="stroke-muted" strokeWidth="2" />
+            <circle cx="9" cy="9" r={radius} fill="none" className="stroke-border" strokeWidth="2" />
             <circle
               cx="9"
               cy="9"
@@ -83,15 +82,11 @@ export function ContextRing({ sessionId }: { sessionId: string }) {
               transform="rotate(-90 9 9)"
             />
           </svg>
-          {fraction >= 0.9 ? <Flame className="size-3" /> : null}
           <span>{pct}%</span>
         </button>
       </PopoverTrigger>
       <PopoverContent align="end" className="w-72 space-y-3">
-        <div className="flex items-center gap-2">
-          <Gauge className="size-3.5 text-muted-foreground" />
-          <div className="text-sm font-medium">{t('chat.context')}</div>
-        </div>
+        <div className="text-[13px] font-medium">{t('chat.context')}</div>
         {!metrics ? (
           <div className="text-xs text-muted-foreground">
             Context metrics will appear after May’s first reply.
@@ -104,7 +99,7 @@ export function ContextRing({ sessionId }: { sessionId: string }) {
                 total: totalWindow ? formatTokens(totalWindow) : '—',
               })}
             </div>
-            <div className="grid grid-cols-2 gap-2">
+            <div className="grid grid-cols-2 gap-x-4">
               <Stat label="Window" value={formatTokens(metrics.contextWindow)} />
               <Stat label="Estimated" value={formatTokens(metrics.estimatedTokens)} />
               <Stat label="Recent messages" value={metrics.recentMessageCount.toString()} />
@@ -123,9 +118,9 @@ export function ContextRing({ sessionId }: { sessionId: string }) {
 
 function Stat({ label, value }: { label: string; value: string }) {
   return (
-    <div className="rounded-md border border-border bg-card/40 px-2 py-1.5">
-      <div className="text-[10px] uppercase tracking-wide text-muted-foreground">{label}</div>
-      <div className="mt-0.5 font-mono text-xs">{value}</div>
+    <div className="flex items-baseline justify-between gap-2 border-b border-border py-1 text-xs">
+      <span className="text-muted-foreground">{label}</span>
+      <span className="tabular-nums">{value}</span>
     </div>
   );
 }

@@ -82,7 +82,7 @@ export function AskUserForm({ request }: { request: PersistedAskUserRequest }) {
                       className={cn(
                         'rounded-md border px-2.5 py-1 text-xs transition-colors',
                         selected
-                          ? 'border-primary bg-primary/10 text-foreground'
+                          ? 'border-foreground/60 bg-accent text-foreground'
                           : 'border-border hover:bg-accent',
                       )}
                     >

@@ -4,93 +4,98 @@
 
 @layer base {
   /*
-   * Semantic colors in the spirit of Apple's system colors. Every text /
-   * background pair used for reading meets WCAG AA (4.5:1): body and
-   * secondary text on every surface, white on the accent and destructive
-   * fills (light), dark text on the brighter dark-mode accent.
+   * A near-monochrome palette in the manner of Linear: grays for every
+   * surface and for text, one indigo accent kept for focus and links, red
+   * only for destructive actions and failures. Reading pairs meet WCAG AA
+   * (4.5:1): secondary text on every surface, text on the primary fill.
    */
   :root {
     color-scheme: light;
 
     --background: 0 0% 100%;
-    --foreground: 220 13% 10%;
+    --foreground: 240 6% 10%;
 
-    /* Source-list sidebar and inspector surfaces. */
-    --sidebar: 220 14% 97%;
-    --sidebar-foreground: 220 13% 10%;
+    /* Sidebar and inspector: one step off the canvas. */
+    --sidebar: 240 5% 98%;
+    --sidebar-foreground: 240 6% 10%;
 
     --card: 0 0% 100%;
-    --card-foreground: 220 13% 10%;
+    --card-foreground: 240 6% 10%;
 
     --popover: 0 0% 100%;
-    --popover-foreground: 220 13% 10%;
+    --popover-foreground: 240 6% 10%;
 
-    /* System blue, darkened to 5.1:1 against white. */
-    --primary: 211 100% 43%;
+    /* Primary actions are ink, not color. */
+    --primary: 240 6% 10%;
     --primary-foreground: 0 0% 100%;
 
-    --secondary: 220 14% 95%;
-    --secondary-foreground: 220 13% 10%;
+    --secondary: 240 5% 95%;
+    --secondary-foreground: 240 6% 10%;
 
-    --muted: 220 14% 96%;
-    /* 5.1:1 on the sidebar, 4.8:1 on a selected row. */
-    --muted-foreground: 220 9% 42%;
+    --muted: 240 5% 96%;
+    /* 4.8:1 on white, 4.6:1 on the sidebar. */
+    --muted-foreground: 240 4% 44%;
 
-    --accent: 220 14% 92%;
-    --accent-foreground: 220 13% 10%;
+    --accent: 240 5% 93%;
+    --accent-foreground: 240 6% 10%;
+
+    /* The one hue: focus rings and links. */
+    --brand: 235 47% 52%;
 
     --destructive: 0 72% 45%;
     --destructive-foreground: 0 0% 100%;
 
-    --success: 160 84% 30%;
-    --warning: 32 95% 38%;
+    /* Kept for compatibility; status reads as text, not color. */
+    --success: 240 6% 10%;
+    --warning: 240 6% 10%;
 
-    --border: 220 13% 88%;
-    --input: 220 13% 86%;
-    --ring: 211 100% 50%;
+    --border: 240 6% 91%;
+    --input: 240 5% 87%;
+    --ring: 235 47% 58%;
 
-    --radius: 0.625rem;
+    --radius: 0.5rem;
   }
 
   .dark {
     color-scheme: dark;
 
-    --background: 220 13% 9%;
-    --foreground: 220 14% 96%;
+    --background: 240 4% 9%;
+    --foreground: 240 5% 91%;
 
-    --sidebar: 220 12% 11%;
-    --sidebar-foreground: 220 14% 96%;
+    --sidebar: 240 4% 7%;
+    --sidebar-foreground: 240 5% 91%;
 
-    --card: 220 12% 12%;
-    --card-foreground: 220 14% 96%;
+    --card: 240 4% 11%;
+    --card-foreground: 240 5% 91%;
 
-    --popover: 220 12% 13%;
-    --popover-foreground: 220 14% 96%;
+    --popover: 240 4% 12%;
+    --popover-foreground: 240 5% 91%;
 
-    /* The brighter dark-mode blue carries dark text (6.3:1). */
-    --primary: 211 100% 62%;
-    --primary-foreground: 220 13% 9%;
+    --primary: 240 5% 91%;
+    --primary-foreground: 240 4% 9%;
 
-    --secondary: 220 12% 16%;
-    --secondary-foreground: 220 14% 96%;
+    --secondary: 240 4% 15%;
+    --secondary-foreground: 240 5% 91%;
 
-    --muted: 220 12% 15%;
-    /* 5.4:1 even on a selected row. */
-    --muted-foreground: 220 9% 64%;
+    --muted: 240 4% 13%;
+    /* 5.6:1 on the canvas, 5.0:1 on a hovered row. */
+    --muted-foreground: 240 4% 60%;
 
-    --accent: 220 12% 18%;
-    --accent-foreground: 220 14% 96%;
+    --accent: 240 4% 16%;
+    --accent-foreground: 240 5% 91%;
 
-    /* Readable as text on dark surfaces (5.7:1) and carries dark text. */
-    --destructive: 0 85% 66%;
-    --destructive-foreground: 220 13% 9%;
+    --brand: 235 70% 72%;
 
-    --success: 158 64% 52%;
-    --warning: 38 92% 60%;
+    /* Readable as text on dark surfaces (5.4:1). */
+    --destructive: 0 72% 64%;
+    --destructive-foreground: 240 4% 9%;
 
-    --border: 220 10% 20%;
-    --input: 220 10% 24%;
-    --ring: 211 100% 62%;
+    --success: 240 5% 91%;
+    --warning: 240 5% 91%;
+
+    --border: 240 4% 16%;
+    --input: 240 4% 21%;
+    --ring: 235 70% 72%;
   }
 
   * {
@@ -110,8 +115,9 @@
 
   body {
     @apply bg-background text-foreground font-sans antialiased;
-    font-size: 14px;
-    line-height: 1.45;
+    font-size: 13px;
+    line-height: 1.5;
+    font-feature-settings: 'cv11', 'ss01';
     -webkit-tap-highlight-color: transparent;
   }
 
@@ -135,6 +141,14 @@
       transition-duration: 0.01ms !important;
       scroll-behavior: auto !important;
     }
+  }
+}
+
+@layer components {
+  /* Markdown tables sit flat in the message: one hairline frame, no panel
+     around a bordered table. */
+  [data-streamdown='table-wrapper'] {
+    @apply !gap-1 !border-0 !bg-transparent !p-0;
   }
 }
 
