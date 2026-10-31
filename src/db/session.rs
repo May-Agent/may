@@ -3,7 +3,7 @@
 //!
 //! Every `impl ChatDb` method in this file either reads or mutates
 //! `sessions`, `session_runtimes`, `session_pending_permissions`,
-//! `session_pending_workspace`, `session_plans`, `session_run_leases`,
+//! `session_pending_workspace`, `session_plans`, `session_runtimes`,
 //! or the profile-memory dirty-job table. Split out of db/mod.rs so
 //! the session subsystem reads as one file instead of being buried in
 //! the 5k-line monolith.
@@ -1202,39 +1202,39 @@ impl ChatDb {
     /// Repair persisted runtime state after a server restart.
     ///
     /// Only durable state is repaired; live resources such as streams,
-    /// process handles, and SSH connections are rebuilt lazily. Leases whose
-    /// holder stopped renewing before `expired_before_ms` are freed, and
-    /// sessions no live lease covers get field-level fixes: a `running`
-    /// state becomes `idle` (waiting states are derived from the pending
-    /// request rows) with its terminal interaction cleared, and an active
-    /// browser takeover ends with its alert pending. A session whose lease a
-    /// live run still holds, a TUI process sharing this database for
-    /// instance, is left to that run.
+    /// process handles, and SSH connections are rebuilt lazily. Sessions a
+    /// run still owned when the daemon last stopped are settled: their
+    /// blocking waiting requests are deleted, an active browser takeover
+    /// ends with its alert pending, and the state settles to `idle` with its
+    /// terminal interaction cleared. Runs are held in the process's memory,
+    /// so anything still marked owned or running belongs to a process that
+    /// is gone.
     ///
     /// # Errors
     /// Returns [`ChatDbError`] on storage failure.
-    pub async fn recover_session_runtimes_after_restart(
-        &self,
-        expired_before_ms: i64,
-    ) -> Result<(), ChatDbError> {
+    pub async fn recover_session_runtimes_after_restart(&self) -> Result<(), ChatDbError> {
+        const STALE: &str = "(SELECT session_id FROM session_runtimes WHERE run_id IS NOT NULL OR state = 'running')";
         let mut tx = self.db.begin().await?;
+        for sql in [
+            "DELETE FROM session_pending_permissions WHERE session_id IN {STALE}",
+            "DELETE FROM session_pending_workspace WHERE session_id IN {STALE}",
+            "DELETE FROM session_pending_ask_user_question_options_v2 WHERE request_id IN (SELECT request_id FROM session_pending_ask_user_requests_v2 WHERE blocking = 1 AND session_id IN {STALE})",
+            "DELETE FROM session_pending_ask_user_questions_v2 WHERE request_id IN (SELECT request_id FROM session_pending_ask_user_requests_v2 WHERE blocking = 1 AND session_id IN {STALE})",
+            "DELETE FROM session_pending_ask_user_requests_v2 WHERE blocking = 1 AND session_id IN {STALE}",
+        ] {
+            let sql = sql.replace("{STALE}", STALE);
+            query!(tx, sql.as_str()).execute().await?;
+        }
         query!(
             tx,
-            "UPDATE session_run_leases SET owner = NULL, cancellation_requested = 0 WHERE owner IS NOT NULL AND heartbeat_at < ?",
-            expired_before_ms
-        )
-        .execute()
-        .await?;
-        query!(
-            tx,
-            "UPDATE session_runtimes SET browser_takeover_active = 0, browser_takeover_alert_pending = 1, updated_at = ? WHERE browser_takeover_active = 1 AND NOT EXISTS (SELECT 1 FROM session_run_leases AS lease WHERE lease.session_id = session_runtimes.session_id AND lease.owner IS NOT NULL)",
+            "UPDATE session_runtimes SET browser_takeover_active = 0, browser_takeover_alert_pending = 1, updated_at = ? WHERE browser_takeover_active = 1",
             jiff::Timestamp::now().to_string()
         )
         .execute()
         .await?;
         query!(
             tx,
-            "UPDATE session_runtimes SET state = 'idle', terminal_task_id = NULL, terminal_output_file = NULL, terminal_output_preview = NULL, terminal_input_notice = NULL, terminal_background_reason = NULL, updated_at = ? WHERE state = 'running' AND NOT EXISTS (SELECT 1 FROM session_run_leases AS lease WHERE lease.session_id = session_runtimes.session_id AND lease.owner IS NOT NULL)",
+            "UPDATE session_runtimes SET state = 'idle', run_id = NULL, terminal_task_id = NULL, terminal_output_file = NULL, terminal_output_preview = NULL, terminal_input_notice = NULL, terminal_background_reason = NULL, updated_at = ? WHERE run_id IS NOT NULL OR state = 'running'",
             jiff::Timestamp::now().to_string()
         )
         .execute()
