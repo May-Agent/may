@@ -11,6 +11,7 @@ use skyzen::routing::Params;
 use skyzen::utils::{Json, State};
 use skyzen::{Result as SkyResult, StatusCode};
 
+use super::chat::spawn_follow_up_runs;
 use super::error::{bad_request_error, internal_error_message};
 use super::state::DaemonState;
 use super::types::ApiHealth;
@@ -26,6 +27,13 @@ pub(super) struct ComputerStatus {
 #[serde(rename_all = "camelCase")]
 pub(super) struct ComputerOfferRequest {
     sdp: String,
+}
+
+#[derive(serde::Serialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ComputerTakeoverResponse {
+    ok: bool,
+    takeover: bool,
 }
 
 #[derive(serde::Serialize, skyzen::ToSchema)]
@@ -84,6 +92,39 @@ pub(super) async fn computer_offer(
 }
 
 #[cfg_attr(not(target_os = "macos"), allow(clippy::unused_async))]
+/// The session's user takes the keyboard and mouse; an in-flight agent
+/// run is interrupted so it does not fight the human.
+pub(super) async fn computer_takeover_start(
+    params: Params,
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<ComputerTakeoverResponse>> {
+    let id = params.get("id").map_err(bad_request_error)?.to_string();
+    set_takeover(&state, &id, true).await;
+    let _ = state.runtime_service.runs().cancel(id.as_str());
+    state.notify_ui_events(UiEventTopics::BROWSER_STATUS);
+    Ok(Json(ComputerTakeoverResponse {
+        ok: true,
+        takeover: true,
+    }))
+}
+
+/// Hands the desktop back to the agent and lets queued follow-ups run.
+pub(super) async fn computer_takeover_stop(
+    params: Params,
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<ComputerTakeoverResponse>> {
+    let id = params.get("id").map_err(bad_request_error)?.to_string();
+    set_takeover(&state, &id, false).await;
+    // Anything the model queued while the human drove runs now; the
+    // dispatch is a no-op when the session has no pending work.
+    spawn_follow_up_runs(state.clone(), id.clone());
+    state.notify_ui_events(UiEventTopics::BROWSER_STATUS);
+    Ok(Json(ComputerTakeoverResponse {
+        ok: true,
+        takeover: false,
+    }))
+}
+
 async fn run_computer_start(state: Arc<DaemonState>, id: String) -> SkyResult<bool> {
     #[cfg(target_os = "macos")]
     {
@@ -161,3 +202,17 @@ async fn answer_offer(_state: &DaemonState, _id: &str, _offer_sdp: String) -> Sk
             .set_status(StatusCode::NOT_FOUND),
     )
 }
+
+#[cfg(target_os = "macos")]
+async fn set_takeover(state: &DaemonState, id: &str, active: bool) {
+    state
+        .session_streams
+        .lock()
+        .await
+        .stream(id)
+        .set_takeover(active);
+}
+
+#[cfg(not(target_os = "macos"))]
+#[allow(clippy::unused_async)]
+async fn set_takeover(_state: &DaemonState, _id: &str, _active: bool) {}

@@ -392,6 +392,8 @@ fn api_routes() -> Route {
                         "/start".post(super::computer::computer_start),
                         "/stop".post(super::computer::computer_stop),
                         "/offer".post(super::computer::computer_offer),
+                        "/takeover/start".post(super::computer::computer_takeover_start),
+                        "/takeover/stop".post(super::computer::computer_takeover_stop),
                     ))),)),
                     Route::new((
                         "/messages".post(send_message),
