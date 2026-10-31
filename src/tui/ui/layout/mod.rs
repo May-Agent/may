@@ -332,6 +332,10 @@ fn sheet_height(app: &App, column: Rect) -> Option<u16> {
             rows(confirm_body_rows(&state.reason, column.width) + 9),
             pct(70),
         ),
+        AppMode::LaunchGrant(state) => (
+            rows(confirm_body_rows(&state.path.display().to_string(), column.width) + 9),
+            pct(70),
+        ),
         AppMode::Chat
         | AppMode::ImageView(_)
         | AppMode::Config
@@ -384,6 +388,7 @@ fn render_sheet(frame: &mut Frame, sheet: Rect, app: &App) {
         AppMode::WorkspaceConfirm(state) => {
             render_workspace_confirm(frame, sheet, &state.path, &state.reason);
         }
+        AppMode::LaunchGrant(state) => render_launch_grant(frame, sheet, state),
         _ => {}
     }
 }
@@ -1476,6 +1481,46 @@ fn render_workspace_confirm(frame: &mut Frame, area: Rect, path: &str, reason: &
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Yellow))
                 .title(" Workspace Access Request "),
+        )
+        .wrap(ratatui::widgets::Wrap { trim: false });
+
+    frame.render_widget(widget, area);
+}
+
+/// Render the launch-directory grant prompt as a bottom sheet.
+fn render_launch_grant(frame: &mut Frame, area: Rect, state: &crate::tui::state::LaunchGrantState) {
+    let content = vec![
+        Line::from(Span::styled(
+            "May was opened in this directory:",
+            Style::default().fg(Color::White),
+        )),
+        Line::from(Span::styled(
+            format!("  {}", state.path.display()),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Grant the agent read/write access to it?",
+            Style::default().fg(Color::White),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("[Y/Enter] ", Style::default().fg(Color::Green)),
+            Span::styled("Grant", Style::default().fg(Color::White)),
+            Span::raw("    "),
+            Span::styled("[N/Esc] ", Style::default().fg(Color::Red)),
+            Span::styled("Keep read-only", Style::default().fg(Color::White)),
+        ]),
+    ];
+
+    let widget = Paragraph::new(content)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow))
+                .title(" Workspace Access "),
         )
         .wrap(ratatui::widgets::Wrap { trim: false });
 

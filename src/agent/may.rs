@@ -325,6 +325,30 @@ impl MayAgent {
         .await
         .map_err(|e| MayAgentError::Sandbox(e.to_string()))?;
 
+        let session_paths = SessionPaths::new(config.sandbox_dir.clone());
+
+        // Create workspace with permissions (only used for local environment context)
+        let workspace = MayWorkspace::new(
+            config.sandbox_dir.clone(),
+            config.cwd.clone(),
+            session_paths.workspace_config(),
+        )?;
+
+        // Mount workspace grants into the terminal sandbox: read-only dirs
+        // become readable mounts, read-write dirs writable mounts.
+        let readable = workspace
+            .config
+            .workdirs
+            .iter()
+            .filter(|dir| dir.permission == crate::workspace::Permission::ReadOnly)
+            .map(|dir| dir.path.clone());
+        let writable = workspace
+            .config
+            .workdirs
+            .iter()
+            .filter(|dir| dir.permission == crate::workspace::Permission::ReadWrite)
+            .map(|dir| dir.path.clone());
+
         // Create the terminal command tool in the sandbox dir.
         let terminal_tool: TerminalTool<TerminalPermissionHandler, DefaultExecutor> =
             TerminalTool::new_exact(
@@ -339,12 +363,12 @@ impl MayAgent {
             .await
             .map_err(|e| MayAgentError::Sandbox(e.to_string()))?
             .with_network_audit_log(network_audit)
-            .with_process_priority(config.command_priority.process_priority());
+            .with_process_priority(config.command_priority.process_priority())
+            .with_readable_paths(readable)
+            .with_writable_paths(writable);
         let job_registry = terminal_tool.job_registry();
         let subagents = config.subagents.clone().unwrap_or_default();
         let subagent_runs = subagents.runs;
-
-        let session_paths = SessionPaths::new(config.sandbox_dir.clone());
 
         // Provision the session env file the shell sources for stored
         // secrets (`/secret`); refreshed in place on every build.
@@ -352,13 +376,6 @@ impl MayAgent {
         if let Err(error) = crate::secrets::write_env_file(&secrets_file, &config.secrets).await {
             tracing::warn!(%error, "failed to write session secrets env file");
         }
-
-        // Create workspace with permissions (only used for local environment context)
-        let workspace = MayWorkspace::new(
-            config.sandbox_dir.clone(),
-            config.cwd.clone(),
-            session_paths.workspace_config(),
-        )?;
 
         let ssh_servers: Vec<SshServer> = config
             .ssh_servers
