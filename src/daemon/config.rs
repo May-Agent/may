@@ -218,10 +218,7 @@ fn provider_map_from_ui(
         .collect()
 }
 
-async fn run_save_full_config(
-    state: Arc<DaemonState>,
-    req: UiFullConfig,
-) -> SkyResult<ApiHealth> {
+async fn run_save_full_config(state: Arc<DaemonState>, req: UiFullConfig) -> SkyResult<ApiHealth> {
     let previous_browser_manager = state.browser_manager();
     let next_browser_manager = if req.browser.enabled {
         let next_browser_config = crate::config::BrowserConfig {

@@ -21,9 +21,9 @@ use crate::agent::SubagentHandles;
 use crate::client::background::{
     SessionBackgroundSnapshot, WireJob, WireJobDetail, WireSubagentRun, WireTerminalDelta,
 };
-use crate::ui_event_bus::{UiEventBus, UiEventTopics};
 use crate::daemon::error::bad_request_error;
 use crate::daemon::state::DaemonState;
+use crate::ui_event_bus::{UiEventBus, UiEventTopics};
 
 /// How often running background work is checked for changes.
 const WATCH_INTERVAL: Duration = Duration::from_secs(1);

@@ -1856,11 +1856,7 @@ async fn profile_id_via_api(
         .to_string()
 }
 
-async fn get_runtime(
-    client: &reqwest::Client,
-    server: &RunningDaemon,
-    session_id: &str,
-) -> Value {
+async fn get_runtime(client: &reqwest::Client, server: &RunningDaemon, session_id: &str) -> Value {
     let response = client
         .get(format!(
             "{}/api/sessions/{session_id}/runtime",
