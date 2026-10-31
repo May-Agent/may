@@ -502,6 +502,8 @@ where
     register_shared_terminal_commands(
         &mut builder,
         SharedTerminalCommandConfig {
+            #[cfg(target_os = "macos")]
+            computer: None,
             llm,
             ask_flagship: None,
             ask_balanced: None,
