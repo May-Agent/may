@@ -92,6 +92,8 @@ pub mod tools;
 pub mod tui;
 /// Event bus publishing UI-facing state changes.
 pub mod ui_event_bus;
+
+pub(crate) mod video;
 /// HTTP/SSE server backing the web UI.
 /// Workspace request handling.
 pub mod workspace;
