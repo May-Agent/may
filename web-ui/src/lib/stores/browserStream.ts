@@ -9,7 +9,7 @@ import {
 
 /**
  * One WebRTC connection to the managed browser, shared by every view that
- * shows its screen (the Computer tab's thumbnail and the full-screen
+ * shows its screen (the Browser tab's thumbnail and the full-screen
  * viewer). Views ask for it with `useBrowserStream`; it opens with the first
  * and closes shortly after the last one goes away.
  */
