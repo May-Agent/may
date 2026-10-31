@@ -5416,6 +5416,7 @@ dependencies = [
  "mime_guess",
  "notify",
  "nucleo",
+ "objc2",
  "objc2-app-kit",
  "objc2-foundation",
  "open",

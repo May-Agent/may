@@ -21,6 +21,8 @@ pub mod chatgpt;
 pub mod client;
 /// Configuration loading and types.
 pub mod command_output;
+/// One virtual desktop per session — computer use.
+pub mod computer;
 pub mod config;
 /// Container runtime detection, images, and lifecycle.
 pub mod container;
