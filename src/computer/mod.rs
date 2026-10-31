@@ -6,7 +6,11 @@
 //! behind the same trait later.
 
 #[cfg(target_os = "macos")]
+mod capture;
+#[cfg(target_os = "macos")]
 mod skylight;
+#[cfg(target_os = "macos")]
+mod stream;
 
 #[cfg(target_os = "macos")]
 use std::collections::HashMap;
@@ -21,6 +25,9 @@ pub trait SessionDisplay: Send + Sync {
     /// `(width, height)` in points.
     fn size(&self) -> (u32, u32);
 }
+
+#[cfg(target_os = "macos")]
+pub use stream::SessionStream;
 
 /// The display a platform hands a session. `Error` is a plain message:
 /// virtual displays fail only one way — the platform refused.
@@ -95,5 +102,44 @@ impl SessionDisplays {
     /// Ends every display — the daemon's sessions are all gone.
     pub fn clear(&mut self) {
         self.displays.clear();
+    }
+}
+
+/// The daemon's live desktop streams, one per session that started
+/// one. Cheap holders are created on first ask; a stopped stream is
+/// the surface's asleep state.
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+pub struct SessionStreams {
+    streams: HashMap<String, Arc<SessionStream>>,
+}
+
+#[cfg(target_os = "macos")]
+impl std::fmt::Debug for SessionStreams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionStreams")
+            .field("streams", &self.streams.keys())
+            .finish()
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl SessionStreams {
+    /// The session's stream, creating the holder on first ask.
+    pub fn stream(&mut self, session_id: &str) -> Arc<SessionStream> {
+        self.streams
+            .entry(session_id.to_owned())
+            .or_insert_with(|| Arc::new(SessionStream::new()))
+            .clone()
+    }
+
+    /// Ends the session's stream when its session ends.
+    pub fn release(&mut self, session_id: &str) {
+        self.streams.remove(session_id);
+    }
+
+    /// Ends every stream — the daemon's sessions are all gone.
+    pub fn clear(&mut self) {
+        self.streams.clear();
     }
 }

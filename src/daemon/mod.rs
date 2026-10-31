@@ -14,6 +14,7 @@ mod attachments;
 mod bootstrap;
 mod browser;
 mod chat;
+mod computer;
 mod config;
 mod error;
 mod error_chain;

@@ -553,7 +553,11 @@ pub(super) async fn delete_session(
     db.delete_session(&id).await.map_err(internal_error)?;
     state.parked_agents.evict(&id);
     #[cfg(target_os = "macos")]
-    state.session_displays.lock().await.release(&id);
+    #[cfg(target_os = "macos")]
+    {
+        state.session_displays.lock().await.release(&id);
+        state.session_streams.lock().await.release(&id);
+    }
     state
         .tool_environments
         .evict(&crate::session::SessionId::from_string(id.as_str()));
@@ -574,7 +578,11 @@ pub(super) async fn delete_all_sessions(
     db.delete_all_sessions().await.map_err(internal_error)?;
     state.tool_environments.evict_all();
     #[cfg(target_os = "macos")]
-    state.session_displays.lock().await.clear();
+    #[cfg(target_os = "macos")]
+    {
+        state.session_displays.lock().await.clear();
+        state.session_streams.lock().await.clear();
+    }
 
     // Clean up filesystem session directories
     let store = SessionStore::new(MayHomePaths::new(state.may_dir.clone()));
