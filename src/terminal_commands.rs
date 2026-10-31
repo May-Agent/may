@@ -705,34 +705,22 @@ mod tests {
             db,
             crate::ui_event_bus::UiEventBus::new(),
         ));
+        // The peer is a second session the daemon sees; the wake callback
+        // stands in for the daemon dispatching its queued message.
+        let (woken_tx, woken) = async_channel::unbounded::<String>();
         let messaging = crate::agent_link::AgentMessaging {
-            directory: crate::agent_link::AgentDirectory::new(temp.path().join("agents")),
+            directory: crate::agent_link::AgentDirectory::new(
+                runtime_service.clone(),
+                temp.path().to_path_buf(),
+                temp.path().to_path_buf(),
+                move |session_id| {
+                    woken_tx
+                        .try_send(session_id.to_string())
+                        .expect("test keeps the receiver");
+                },
+            ),
             runtime_service: runtime_service.clone(),
         };
-
-        // The peer is a second main agent listening on the same machine.
-        let (woken_tx, woken) = async_channel::unbounded();
-        let peer_listeners =
-            crate::agent_link::AgentListeners::new(tokio::runtime::Handle::current());
-        for (id, wake_tx) in [("main", None), ("peer", Some(woken_tx))] {
-            peer_listeners
-                .ensure(
-                    &temp.path().join("agents"),
-                    crate::agent_link::AgentIdentity {
-                        session_id: id.to_string(),
-                        cwd: temp.path().to_path_buf(),
-                        sandbox_dir: temp.path().join(id),
-                    },
-                    runtime_service.clone(),
-                    move || {
-                        if let Some(wake_tx) = &wake_tx {
-                            wake_tx.try_send(()).expect("test keeps the receiver");
-                        }
-                    },
-                )
-                .await
-                .expect("agent listens");
-        }
 
         let mut builder = ToolRegistryBuilder::new();
         register_shared_terminal_commands(

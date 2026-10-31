@@ -607,7 +607,6 @@ pub(super) async fn archive_session(
     let db = state.db();
 
     db.archive_session(&id).await.map_err(internal_error)?;
-    state.agent_listeners.remove(&id);
     state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
     Ok(Json(super::types::API_OK))
 }
@@ -621,14 +620,6 @@ pub(super) async fn unarchive_session(
     let db = state.db();
 
     db.unarchive_session(&id).await.map_err(internal_error)?;
-    let profile_id = db
-        .get_session(&id)
-        .await
-        .map_err(internal_error)?
-        .and_then(|session| session.profile_id);
-    super::chat::open_session_for_agents(&state, &id, profile_id.as_deref())
-        .await
-        .map_err(internal_error)?;
     state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
     Ok(Json(super::types::API_OK))
 }
