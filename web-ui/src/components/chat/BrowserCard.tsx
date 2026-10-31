@@ -20,18 +20,18 @@ function pageName(a: BrowserActivity): string {
 function doingLabel(a: BrowserActivity, t: T): string {
   switch (a.action) {
     case 'open':
-      return t('computer.actionOpen');
+      return t('browser.actionOpen');
     case 'close':
-      return t('computer.actionClose');
+      return t('browser.actionClose');
     case 'status':
-      return t('computer.actionStatus');
+      return t('browser.actionStatus');
     case 'connect':
-      return t('computer.actionConnect');
+      return t('browser.actionConnect');
     case 'read':
-      if (a.screenshot) return t('computer.actionScreenshot');
-      return a.url ? t('computer.actionRead', { host: hostOf(a.url) }) : t('computer.actionOther');
+      if (a.screenshot) return t('browser.actionScreenshot');
+      return a.url ? t('browser.actionRead', { host: hostOf(a.url) }) : t('browser.actionOther');
     case 'other':
-      return t('computer.actionOther');
+      return t('browser.actionOther');
   }
 }
 
@@ -39,19 +39,19 @@ function doingLabel(a: BrowserActivity, t: T): string {
 function didLabel(a: BrowserActivity, t: T): string {
   switch (a.action) {
     case 'open':
-      return t('computer.didOpen');
+      return t('browser.didOpen');
     case 'close':
-      return t('computer.didClose');
+      return t('browser.didClose');
     case 'status':
-      return t('computer.didStatus');
+      return t('browser.didStatus');
     case 'connect':
-      return t('computer.didConnect');
+      return t('browser.didConnect');
     case 'read': {
       const page = pageName(a);
-      return page ? t('computer.didRead', { page }) : t('computer.didOther');
+      return page ? t('browser.didRead', { page }) : t('browser.didOther');
     }
     case 'other':
-      return t('computer.didOther');
+      return t('browser.didOther');
   }
 }
 
@@ -87,7 +87,7 @@ function Screenshots({ items, sessionId }: { items: BrowserActivity[]; sessionId
           >
             <img
               src={src}
-              alt={t('computer.screenshotOf', { page: pageName(a) || t('computer.title') })}
+              alt={t('browser.screenshotOf', { page: pageName(a) || t('browser.title') })}
               className="aspect-[16/10] w-full object-cover object-top"
               loading="lazy"
             />
@@ -101,9 +101,9 @@ function Screenshots({ items, sessionId }: { items: BrowserActivity[]; sessionId
 /**
  * One stretch of browser use in the chat. While the agent acts it is a
  * single muted line ("Taking a screenshot"); once it finishes it becomes a
- * quiet card with what was done, any screenshots, and Open computer.
+ * quiet card with what was done, any screenshots, and Open browser.
  */
-export const ComputerCard = memo(function ComputerCard({
+export const BrowserCard = memo(function BrowserCard({
   tools,
   sessionId,
 }: {
@@ -131,16 +131,16 @@ export const ComputerCard = memo(function ComputerCard({
   const failed = items.find((a) => a.status === 'failed');
   const steps = items.map((a) => didLabel(a, t));
   const summary = steps[steps.length - 1] ?? '';
-  const status = failed ? t('computer.failed') : t('computer.done');
+  const status = failed ? t('browser.failed') : t('browser.done');
 
   return (
     <section
-      aria-label={t('computer.title')}
+      aria-label={t('browser.title')}
       className="overflow-hidden rounded-lg border border-border bg-card"
     >
       <header className="flex items-center gap-2 border-b border-border px-3 py-2 text-[13px]">
         <Monitor className="size-4 shrink-0 text-muted-foreground" strokeWidth={1.75} aria-hidden />
-        <span className="font-medium">{t('computer.title')}</span>
+        <span className="font-medium">{t('browser.title')}</span>
         <span className="min-w-0 truncate text-muted-foreground" title={summary}>
           {status} · {summary}
         </span>
@@ -158,7 +158,7 @@ export const ComputerCard = memo(function ComputerCard({
         </div>
         <Button size="sm" variant="secondary" className="shrink-0 self-end" onClick={openViewer}>
           <Monitor className="size-3.5" strokeWidth={1.75} aria-hidden />
-          {t('computer.open')}
+          {t('browser.open')}
         </Button>
       </div>
     </section>
