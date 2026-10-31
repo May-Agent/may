@@ -333,6 +333,8 @@ async fn run_commands(
                 )
                 .await;
             }
+            // The agent is in the daemon; there is nothing to hand back.
+            WorkerCommand::Release { .. } => {}
             WorkerCommand::Shutdown => break,
         }
     }
