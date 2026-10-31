@@ -97,6 +97,9 @@ pub struct ForeignTurn {
     pub handle: AgentHandle,
     /// The user message the turn answers, when it has one.
     pub content: Option<String>,
+    /// Row id of that message in the session history, when the daemon
+    /// stored it.
+    pub message_id: Option<i32>,
 }
 
 /// Command sent from main thread to agent worker.

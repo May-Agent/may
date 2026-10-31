@@ -883,16 +883,18 @@ where
             }
 
             Event::ForeignTurn(turn) => {
-                // After a reload the turn's own message may already be the
-                // newest history row: it is not shown a second time.
-                let content = turn.content.filter(|content| {
-                    !app.session_manager.current().is_some_and(|session| {
-                        session.history.messages().last().is_some_and(|last| {
-                            last.role == may_agent::session::MessageRole::User
-                                && last.content == *content
-                        })
+                // After a reload the turn's own message is already in the
+                // history: it is not shown a second time.
+                let stored = turn.message_id.is_some_and(|id| {
+                    app.session_manager.current().is_some_and(|session| {
+                        session
+                            .history
+                            .messages()
+                            .iter()
+                            .any(|message| message.id == Some(id))
                     })
                 });
+                let content = turn.content.filter(|_| !stored);
                 let message = may_agent::tui::queue::PendingMessage {
                     content: content.clone().unwrap_or_default(),
                     hidden_context_xml: None,
