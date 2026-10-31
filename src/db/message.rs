@@ -16,7 +16,7 @@ use super::common::{
     to_i64_from_u64, to_u64, to_usize,
 };
 use super::entity::messages;
-use super::run_lease::RunFence;
+use super::session_run::RunFence;
 use super::{ChatDb, ChatDbError, query, truncate_preview};
 
 /// Optional columns carried by an appended message row.
@@ -533,7 +533,7 @@ impl ChatDb {
     /// the run's lease `fence` still holds.
     ///
     /// # Errors
-    /// Returns [`ChatDbError::RunLeaseLost`] when the lease was taken over or
+    /// Returns [`ChatDbError::RunLost`] when the lease was taken over or
     /// released, or [`ChatDbError`] on storage failure.
     pub async fn append_chat_message_as_run(
         &self,

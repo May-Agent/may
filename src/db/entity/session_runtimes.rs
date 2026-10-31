@@ -7,6 +7,8 @@ pub struct Model {
     pub session_id: String,
     /// Persisted runtime state string.
     pub state: String,
+    /// Run id of the run holding the session, `None` while it is free.
+    pub run_id: Option<String>,
     /// Whether a user peer currently owns browser input.
     pub browser_takeover_active: bool,
     /// Whether a takeover-ended alert still needs to surface.
