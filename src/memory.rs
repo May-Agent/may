@@ -305,7 +305,7 @@ impl MemoryProcessor {
 }
 
 /// Profile memories to inject into agent context (read-only).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ProfileMemories {
     /// Long-lived user preference memory, when present.
     pub preference: Option<String>,

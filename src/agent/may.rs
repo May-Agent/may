@@ -119,6 +119,9 @@ pub enum AgentEnvironment {
 pub struct MayAgentConfig {
     /// The session's subagent handles; `None` starts fresh ones.
     pub subagents: Option<crate::agent::subagent_tracker::SubagentHandles>,
+    /// What a run does with background commands still running when the
+    /// model ends its turn.
+    pub background_jobs: aither_agent::BackgroundJobPolicy,
     /// Trusted baseline tool distribution used by every configured backend.
     pub tool_distribution: Arc<aither_sandbox::ToolDistribution>,
     /// Prepared tool environments kept across rebuilds of a session's agent.
@@ -250,6 +253,10 @@ pub struct MayAgentSessionInput<'a> {
     pub provider_attempt: usize,
     /// The session's subagent handles; `None` starts fresh ones.
     pub subagents: Option<crate::agent::subagent_tracker::SubagentHandles>,
+    /// What a run does with background commands still running when the
+    /// model ends its turn: the daemon detaches them and resumes the
+    /// session when one finishes.
+    pub background_jobs: aither_agent::BackgroundJobPolicy,
 }
 
 type MayAgentInner = Agent<
@@ -459,7 +466,8 @@ impl MayAgent {
         let mut builder = TerminalAgentBuilder::new(llm, terminal_tool)
             .hook(context_snapshot_hook)
             .hook(pending_steer_hook)
-            .cache_lifetime(config.cache_lifetime.into());
+            .cache_lifetime(config.cache_lifetime.into())
+            .background_jobs(config.background_jobs);
         if let Some(runtime) = hook_runtime.clone() {
             builder = builder.context_source(super::ask_user_tool::OpenQuestionsContext::new(
                 runtime,
@@ -630,6 +638,7 @@ impl MayAgent {
             tool_environments,
             provider_attempt,
             subagents,
+            background_jobs,
         } = input;
         let selector = super::provider::parse_model_selector(model)?;
         let resolved_provider =
@@ -680,6 +689,7 @@ impl MayAgent {
             crate::secrets::Secrets::load(&crate::secrets::SecretStore::new(&may_dir), may_config);
         Ok(MayAgentConfig {
             subagents,
+            background_jobs,
             tool_distribution,
             tool_environments,
             command_priority: may_config.sandbox.command_priority,
@@ -755,6 +765,19 @@ impl MayAgent {
             self.inner.push_message(LlmMessage::system(hidden_context));
         }
         self.run(prompt, attachments)
+    }
+
+    /// Continues the conversation without a new user message, for the model
+    /// to act on what [`Self::wait_background`] recorded. Boxed like
+    /// [`Self::run`].
+    pub fn resume(&mut self) -> Pin<Box<impl Stream<Item = Result<TimedEvent, AgentError>> + '_>> {
+        Box::pin(self.inner.resume())
+    }
+
+    /// Waits, between runs, for a background command of an earlier run to
+    /// finish or raise an alert, and records it in the context. Cancel-safe.
+    pub async fn wait_background(&mut self) -> aither_agent::BackgroundWake {
+        self.inner.wait_background().await
     }
 
     /// One-shot query.
