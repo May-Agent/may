@@ -313,6 +313,9 @@ pub enum SessionAgentBody {
         /// The user message the run answers, when it has one.
         #[serde(default)]
         content: Option<String>,
+        /// Its row id in the session history, when the run stored it.
+        #[serde(default)]
+        message_id: Option<i32>,
     },
     /// An agent event of the run.
     Agent {

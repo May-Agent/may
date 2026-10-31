@@ -101,6 +101,9 @@ fn persist_stopped_terminal_calls(
 ///
 /// [`HubSink`] publishes them to every client of the session.
 trait ChatSink {
+    /// The run is prepared; `user_message_id` is the row of the user
+    /// message it answers, when it stored one.
+    fn on_prepared(&mut self, _user_message_id: Option<i32>) {}
     /// Every agent event of the run, as the agent emitted it.
     fn on_agent_event(
         &mut self,
@@ -265,10 +268,16 @@ impl ChatSink for HubSink {
                 assistant_id,
             },
         );
+        true
+    }
+
+    // The TUI's start frame waits for the stored message, so a client that
+    // reloaded its history can tell the turn's message is already there.
+    fn on_prepared(&mut self, user_message_id: Option<i32>) {
         self.publish_agent(crate::client::SessionAgentBody::Start {
             content: self.content.clone(),
+            message_id: user_message_id,
         });
-        true
     }
 
     fn on_agent_event(
@@ -1227,6 +1236,8 @@ fn run_agent_loop<'a>(
         let mut attempt = 0usize;
         let mut max_retries = 0usize;
         let mut turn_hidden_context_xml: Option<String> = None;
+        // The stored user message, from the first attempt.
+        let mut turn_user_message_id: Option<i32> = None;
 
         loop {
             let assistant_uuid = uuid::Uuid::new_v4().to_string();
@@ -1255,6 +1266,7 @@ fn run_agent_loop<'a>(
                 attachments,
                 provider_candidate_count,
                 build_key,
+                user_message_id,
             } = match prepare_agent_for_request(
                 state,
                 req,
@@ -1268,6 +1280,8 @@ fn run_agent_loop<'a>(
             {
                 Ok(prepared) => prepared,
                 Err(error) => {
+                    // Clients waiting for the run's start see it fail.
+                    sink.on_prepared(turn_user_message_id);
                     let _ = sink
                         .on_error(error.api_code(), &error.to_string(), false)
                         .await;
@@ -1288,6 +1302,10 @@ fn run_agent_loop<'a>(
             if attempt == 0 && !kind.is_resume() {
                 max_retries = provider_candidate_count.saturating_sub(1);
             }
+            if user_message_id.is_some() {
+                turn_user_message_id = user_message_id;
+            }
+            sink.on_prepared(turn_user_message_id);
             if let Some(hidden_context_xml) = hidden_context_xml {
                 turn_hidden_context_xml = Some(hidden_context_xml);
             }
@@ -2137,6 +2155,8 @@ fn enqueue_event_triggered_tasks(
 // ── Agent preparation: typed intermediate structs ─────────
 
 struct SessionContext {
+    /// Row id of the user message this turn stored, when it stored one.
+    user_message_id: Option<i32>,
     session_id: SessionId,
     current_model: String,
     provider_candidate_count: usize,
@@ -2169,6 +2189,8 @@ struct PreparedAgent {
     provider_candidate_count: usize,
     /// [`agent_build_key`] of the inputs the agent was built from.
     build_key: u64,
+    /// Row id of the user message this turn stored, when it stored one.
+    user_message_id: Option<i32>,
 }
 
 struct ToolBrokers {
@@ -2509,7 +2531,7 @@ async fn resolve_session_context(
         .map_err(UiChatPreparationError::PersistHiddenContext)?;
     }
 
-    if persist_user_message && request_has_visible_user_input(req) {
+    let user_message_id = if persist_user_message && request_has_visible_user_input(req) {
         let needs_title = session.title.is_none();
         if needs_title {
             let title = truncate_preview(&req.content);
@@ -2518,16 +2540,20 @@ async fn resolve_session_context(
                 .map_err(UiChatPreparationError::UpdateSessionTitle)?;
             state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
         }
-        db.append_chat_message_as_run(
-            fence,
-            &ChatMessage::user_with_attachments(
-                req.content.clone(),
-                persisted_attachments(req.attachments.clone()),
-            ),
-        )
-        .await
-        .map_err(UiChatPreparationError::AppendUserMessage)?;
-    }
+        let row = db
+            .append_chat_message_as_run(
+                fence,
+                &ChatMessage::user_with_attachments(
+                    req.content.clone(),
+                    persisted_attachments(req.attachments.clone()),
+                ),
+            )
+            .await
+            .map_err(UiChatPreparationError::AppendUserMessage)?;
+        Some(row.id)
+    } else {
+        None
+    };
 
     let sandbox_dir = SessionStore::new(MayHomePaths::new(state.may_dir.clone()))
         .sandbox_dir(session_id.as_str(), session.profile_id.as_deref());
@@ -2543,6 +2569,7 @@ async fn resolve_session_context(
         .map_or_else(|| state.cwd.clone(), std::path::PathBuf::from);
 
     Ok(SessionContext {
+        user_message_id,
         session_id,
         current_model,
         provider_candidate_count,
@@ -2966,6 +2993,7 @@ fn prepare_agent_for_request<'a>(
             attachments,
             provider_candidate_count: ctx.provider_candidate_count,
             build_key,
+            user_message_id: ctx.user_message_id,
         })
     })
 }

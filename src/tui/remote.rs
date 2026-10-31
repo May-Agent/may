@@ -195,7 +195,10 @@ async fn forward_agent_frame(
     command_tx: &Sender<WorkerCommand>,
 ) {
     match frame.body {
-        SessionAgentBody::Start { content } => {
+        SessionAgentBody::Start {
+            content,
+            message_id,
+        } => {
             // A turn whose end this client never saw is over.
             if let Some(turn) = current.take() {
                 let _ = turn.events.send(TuiEvent::Complete).await;
@@ -205,6 +208,7 @@ async fn forward_agent_frame(
                 let _ = foreign_tx.try_send(ForeignTurn {
                     handle: AgentHandle::new(rx, command_tx.clone()),
                     content,
+                    message_id,
                 });
                 events
             });
@@ -463,9 +467,21 @@ mod tests {
         let mut current = None;
 
         for (turn, body) in [
-            ("t1", SessionAgentBody::Start { content: None }),
+            (
+                "t1",
+                SessionAgentBody::Start {
+                    content: None,
+                    message_id: None,
+                },
+            ),
             ("t1", text("a")),
-            ("t2", SessionAgentBody::Start { content: None }),
+            (
+                "t2",
+                SessionAgentBody::Start {
+                    content: None,
+                    message_id: None,
+                },
+            ),
         ] {
             forward_agent_frame(
                 frame(turn, body),

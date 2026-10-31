@@ -239,6 +239,10 @@ impl core::str::FromStr for MessageRole {
 /// A single message in the chat history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
+    /// Row id in the session's stored history; `None` for a message not
+    /// stored yet.
+    #[serde(skip)]
+    pub id: Option<i32>,
     /// Message role.
     pub role: MessageRole,
     /// Message body (JSON payload for tool events).
@@ -275,6 +279,7 @@ impl ChatMessage {
         attachments: Vec<super::runtime::PersistedAttachment>,
     ) -> Self {
         Self {
+            id: None,
             role: MessageRole::User,
             content: content.into(),
             attachments,
@@ -289,6 +294,7 @@ impl ChatMessage {
     /// Create a new assistant message the agent emitted at `at`.
     pub fn assistant(content: impl Into<String>, at: Timestamp) -> Self {
         Self {
+            id: None,
             role: MessageRole::Assistant,
             content: content.into(),
             attachments: Vec::new(),
@@ -307,6 +313,7 @@ impl ChatMessage {
         at: Timestamp,
     ) -> Self {
         Self {
+            id: None,
             role: MessageRole::Assistant,
             content: content.into(),
             attachments: Vec::new(),
@@ -321,6 +328,7 @@ impl ChatMessage {
     /// Create a new system message.
     pub fn system(content: impl Into<String>) -> Self {
         Self {
+            id: None,
             role: MessageRole::System,
             content: content.into(),
             attachments: Vec::new(),
@@ -339,6 +347,7 @@ impl ChatMessage {
         at: Timestamp,
     ) -> Self {
         Self {
+            id: None,
             role: MessageRole::Tool,
             content: content.into(),
             attachments: Vec::new(),
@@ -356,6 +365,7 @@ impl ChatMessage {
     /// surfaced in chat history APIs.
     pub fn hidden_context(content: impl Into<String>) -> Self {
         Self {
+            id: None,
             role: MessageRole::HiddenContext,
             content: content.into(),
             attachments: Vec::new(),
