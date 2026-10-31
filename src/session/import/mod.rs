@@ -244,6 +244,7 @@ pub(super) fn tool_end(
         result,
     };
     ChatMessage {
+        id: None,
         role: MessageRole::Tool,
         content: serde_json::to_string(&record).unwrap_or_default(),
         attachments: Vec::new(),
@@ -263,6 +264,7 @@ pub(super) const fn assistant_turn(
     timestamp: Option<Timestamp>,
 ) -> ChatMessage {
     ChatMessage {
+        id: None,
         role: MessageRole::Assistant,
         content: text,
         attachments: Vec::new(),
@@ -281,6 +283,7 @@ pub(super) const fn user_text(
     timestamp: Option<Timestamp>,
 ) -> ChatMessage {
     ChatMessage {
+        id: None,
         role: MessageRole::User,
         content: text,
         attachments,
