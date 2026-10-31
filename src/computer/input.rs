@@ -103,24 +103,24 @@ pub enum InputMessage {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MouseInput {
-    event_type: MouseEventKind,
-    x: f64,
-    y: f64,
+    pub event_type: MouseEventKind,
+    pub x: f64,
+    pub y: f64,
     #[serde(default)]
-    button: Option<MouseButtonInput>,
+    pub button: Option<MouseButtonInput>,
     #[serde(default)]
-    click_count: Option<i32>,
+    pub click_count: Option<i32>,
     #[serde(default)]
-    delta_x: Option<f64>,
+    pub delta_x: Option<f64>,
     #[serde(default)]
-    delta_y: Option<f64>,
+    pub delta_y: Option<f64>,
     #[serde(default)]
-    modifiers: Option<u64>,
+    pub modifiers: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-enum MouseEventKind {
+pub enum MouseEventKind {
     #[serde(rename = "mousePressed")]
     Pressed,
     #[serde(rename = "mouseReleased")]
@@ -168,7 +168,7 @@ impl MouseInput {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "lowercase")]
-enum MouseButtonInput {
+pub enum MouseButtonInput {
     Left,
     Right,
     Middle,
@@ -177,18 +177,18 @@ enum MouseButtonInput {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KeyboardInput {
-    event_type: KeyboardEventKind,
+    pub event_type: KeyboardEventKind,
     #[serde(default)]
-    code: Option<String>,
+    pub code: Option<String>,
     #[serde(default)]
-    text: Option<String>,
+    pub text: Option<String>,
     #[serde(default)]
-    modifiers: Option<u64>,
+    pub modifiers: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-enum KeyboardEventKind {
+pub enum KeyboardEventKind {
     KeyDown,
     KeyUp,
 }
