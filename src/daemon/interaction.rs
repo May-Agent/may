@@ -6,7 +6,7 @@ use skyzen::utils::{Json, State};
 use crate::ask_user::QuestionAnswer;
 
 use super::error::{bad_request_error, internal_error};
-use super::state::{AskUserOutcome, AskUserRespondRequest, UiServerState};
+use super::state::{AskUserOutcome, AskUserRespondRequest, DaemonState};
 use super::types::{PermissionRespondRequest, SessionRuntimeResponse, WorkspaceRespondRequest};
 use crate::session::AnswerError;
 
@@ -15,7 +15,7 @@ use crate::session::AnswerError;
 /// that run is answered through its own prompt, and the resume takes the
 /// run lease before writing anything.
 async fn resume_after_decision(
-    state: &Arc<UiServerState>,
+    state: &Arc<DaemonState>,
     session_id: &str,
     request_kind: super::chat::ResumeRequestKind,
     approved: bool,
@@ -39,7 +39,7 @@ async fn resume_after_decision(
 /// resumed. A commit that fails is returned and wakes nothing.
 pub(super) async fn respond_permission_request(
     Json(req): Json<PermissionRespondRequest>,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<SessionRuntimeResponse>> {
     let resolved = state
         .permission_approver
@@ -69,7 +69,7 @@ pub(super) async fn respond_permission_request(
 
 pub(super) async fn respond_ask_user_request(
     Json(req): Json<AskUserRespondRequest>,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<SessionRuntimeResponse>> {
     let answers = req
         .answers
@@ -123,7 +123,7 @@ pub(super) async fn respond_ask_user_request(
 
 pub(super) async fn respond_workspace_request(
     Json(req): Json<WorkspaceRespondRequest>,
-    State(state): State<Arc<UiServerState>>,
+    State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<SessionRuntimeResponse>> {
     let resolved = state
         .workspace_approver

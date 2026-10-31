@@ -953,7 +953,7 @@ impl TestHarness {
     /// Tracing output a spawned server emitted, with ANSI styling stripped so
     /// assertions can match log content. May keeps diagnostics in an in-memory
     /// ring now; the captured stderr copy carries the same lines.
-    async fn server_logs(&self, server: &RunningUiServer) -> String {
+    async fn server_logs(&self, server: &RunningDaemon) -> String {
         strip_ansi_escapes(&server.log.contents().await)
     }
 
@@ -1015,7 +1015,7 @@ struct TestSession {
     sandbox_dir: PathBuf,
 }
 
-struct RunningUiServer {
+struct RunningDaemon {
     child: Child,
     base_url: String,
     log: ServerLog,
@@ -1057,7 +1057,7 @@ fn strip_ansi_escapes(text: &str) -> String {
     out
 }
 
-impl RunningUiServer {
+impl RunningDaemon {
     async fn spawn(home: &Path, extra_env: &[(&str, &str)]) -> Self {
         let port = reserve_tcp_port();
         let binary = may_binary_path();
@@ -1079,7 +1079,7 @@ impl RunningUiServer {
             // keeping failed assertions diagnosable from captured logs.
             .env(
                 "RUST_LOG",
-                "aither_openai::client=debug,may_agent::ui_server::chat=debug,may_agent::container=debug",
+                "aither_openai::client=debug,may_agent::daemon::chat=debug,may_agent::container=debug",
             )
             .stdin(Stdio::null())
             .stdout(StdStdio::from(log_file))
@@ -1346,7 +1346,7 @@ fn heel_bin() -> String {
     path
 }
 
-impl Drop for RunningUiServer {
+impl Drop for RunningDaemon {
     fn drop(&mut self) {
         let _ = self.child.start_kill();
     }
@@ -1515,7 +1515,7 @@ fn runtime_is_idle(runtime: &Value) -> bool {
 
 async fn wait_for_runtime_state_clear(
     client: &reqwest::Client,
-    server: &RunningUiServer,
+    server: &RunningDaemon,
     session_id: &str,
     timeout_duration: Duration,
 ) {
@@ -1538,7 +1538,7 @@ async fn wait_for_runtime_state_clear(
 
 async fn wait_for_runtime_condition<F>(
     client: &reqwest::Client,
-    server: &RunningUiServer,
+    server: &RunningDaemon,
     session_id: &str,
     timeout_duration: Duration,
     description: &str,
@@ -1648,7 +1648,7 @@ impl ChatEnvironment {
         self,
         harness: &TestHarness,
         client: &reqwest::Client,
-        server: &RunningUiServer,
+        server: &RunningDaemon,
     ) -> PreparedEnvironment {
         let profile_id = profile_id_via_api(client, server, self.profile_slug()).await;
         match self {
@@ -1810,7 +1810,7 @@ fn system_text(request: &Value) -> String {
 
 async fn create_session_via_api(
     client: &reqwest::Client,
-    server: &RunningUiServer,
+    server: &RunningDaemon,
     profile_id: &str,
 ) -> String {
     let response = client
@@ -1833,7 +1833,7 @@ async fn create_session_via_api(
 
 async fn profile_id_via_api(
     client: &reqwest::Client,
-    server: &RunningUiServer,
+    server: &RunningDaemon,
     slug: &str,
 ) -> String {
     let response = client
@@ -1858,7 +1858,7 @@ async fn profile_id_via_api(
 
 async fn get_runtime(
     client: &reqwest::Client,
-    server: &RunningUiServer,
+    server: &RunningDaemon,
     session_id: &str,
 ) -> Value {
     let response = client
@@ -2022,7 +2022,7 @@ async fn exec_large_output_is_previewed_and_saved_to_outputs_file() {
 async fn ui_session_crud_round_trip_matches_api_contract() {
     let harness = TestHarness::new("http://127.0.0.1:9/v1").await;
     let seeded_heel_state = harness.container_heel_state().await;
-    let server = RunningUiServer::spawn(harness.home_path(), &[]).await;
+    let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
     let client = reqwest::Client::new();
 
     let create_response = client
@@ -2142,7 +2142,7 @@ async fn ui_chat_tasks_file_is_the_canonical_todo_document() {
 
     let mock = MockOpenAiServer::spawn(MockChatScenario::WritesTasksFile).await;
     let harness = TestHarness::new(&mock.base_url()).await;
-    let server = RunningUiServer::spawn(harness.home_path(), &[]).await;
+    let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
     let client = reqwest::Client::new();
     let environment = ChatEnvironment::Local
         .prepare(&harness, &client, &server)
@@ -2303,7 +2303,7 @@ async fn run_probe_turn(
 ) -> (ProbeFiles, MockOpenAiServer) {
     let mock = MockOpenAiServer::spawn(scenario).await;
     let harness = TestHarness::new(&mock.base_url()).await;
-    let server = RunningUiServer::spawn(harness.home_path(), &[]).await;
+    let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
     let client = reqwest::Client::new();
     let environment = ChatEnvironment::Local
         .prepare(&harness, &client, &server)
@@ -2643,9 +2643,9 @@ async fn subagent_with_a_commit_grant_commits_and_the_main_agent_gets_the_listin
 /// underlying error.
 #[tokio::test]
 #[serial]
-async fn ui_server_error_logs_its_cause() {
+async fn daemon_error_logs_its_cause() {
     let harness = TestHarness::new("http://127.0.0.1:9/v1").await;
-    let server = RunningUiServer::spawn(harness.home_path(), &[]).await;
+    let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
     let client = reqwest::Client::new();
     let profile_id =
         profile_id_via_api(&client, &server, ChatEnvironment::Local.profile_slug()).await;
@@ -2726,7 +2726,7 @@ async fn stream_stop_mid_response_persists_partial_assistant_text(environment: C
     })
     .await;
     let harness = TestHarness::new(&mock.base_url()).await;
-    let server = RunningUiServer::spawn(harness.home_path(), &[]).await;
+    let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
     let client = reqwest::Client::new();
     let environment = environment.prepare(&harness, &client, &server).await;
     let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
@@ -2836,7 +2836,7 @@ async fn ui_chat_executes_terminal_and_terminal_input_round_trip_in_container() 
 async fn terminal_and_terminal_input_round_trip(environment: ChatEnvironment) {
     let mock = MockOpenAiServer::spawn(MockChatScenario::TerminalRoundTrip).await;
     let harness = TestHarness::new(&mock.base_url()).await;
-    let server = RunningUiServer::spawn(harness.home_path(), &[]).await;
+    let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
     let client = reqwest::Client::new();
     let environment = environment.prepare(&harness, &client, &server).await;
     let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
@@ -2996,7 +2996,7 @@ async fn chat_turns_on_one_session_prepare_tools_once(environment: ChatEnvironme
     let mock =
         MockOpenAiServer::spawn(MockChatScenario::TextEveryTurn("turn answered".to_string())).await;
     let harness = TestHarness::new(&mock.base_url()).await;
-    let server = RunningUiServer::spawn(harness.home_path(), &[]).await;
+    let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
     let client = reqwest::Client::new();
     let environment = environment.prepare(&harness, &client, &server).await;
     let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
@@ -3074,7 +3074,7 @@ async fn chat_turns_on_one_session_prepare_tools_once(environment: ChatEnvironme
 async fn ui_linux_runtime_has_heel_env_for_sandbox_stdin_detection() {
     let mock = MockOpenAiServer::spawn(MockChatScenario::TerminalRoundTrip).await;
     let harness = TestHarness::new(&mock.base_url()).await;
-    let server = RunningUiServer::spawn(harness.home_path(), &[]).await;
+    let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
 
     server.stop().await;
 }
@@ -3268,7 +3268,7 @@ async fn exec_applies_local_command_priority() {
 #[serial]
 async fn ui_chat_reports_unreachable_provider_error() {
     let harness = TestHarness::new("http://127.0.0.1:9/v1").await;
-    let mut server = RunningUiServer::spawn(harness.home_path(), &[]).await;
+    let mut server = RunningDaemon::spawn(harness.home_path(), &[]).await;
     let client = reqwest::Client::new();
     let environment = ChatEnvironment::Local
         .prepare(&harness, &client, &server)
@@ -3335,7 +3335,7 @@ enum TaskScriptSource {
 async fn container_task_reads_its_trigger_file(source: TaskScriptSource) {
     let mock = MockOpenAiServer::spawn(MockChatScenario::TextEveryTurn("unused".to_string())).await;
     let harness = TestHarness::new(&mock.base_url()).await;
-    let server = RunningUiServer::spawn(harness.home_path(), &[]).await;
+    let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
     let client = reqwest::Client::new();
     let environment = ChatEnvironment::Container
         .prepare(&harness, &client, &server)
@@ -3475,7 +3475,7 @@ async fn container_profile_script_file_task_reads_its_trigger_file() {
 /// Answers `request_id` through the API with `value` selected.
 async fn answer_open_question(
     client: &reqwest::Client,
-    server: &RunningUiServer,
+    server: &RunningDaemon,
     request_id: &str,
     value: &str,
 ) {
@@ -3516,7 +3516,7 @@ fn only_open_question_id(runtime: &Value) -> String {
 async fn ask_user_after_the_run_ended_delivers_the_answer_to_a_new_run() {
     let mock = MockOpenAiServer::spawn(MockChatScenario::AsksUser).await;
     let harness = TestHarness::new(&mock.base_url()).await;
-    let server = RunningUiServer::spawn(harness.home_path(), &[]).await;
+    let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
     let client = reqwest::Client::new();
     let environment = ChatEnvironment::Local
         .prepare(&harness, &client, &server)
@@ -3606,7 +3606,7 @@ async fn ask_user_answered_mid_run_reaches_the_next_request_of_that_run() {
     let gate = RequestGate::holding(1);
     let mock = MockOpenAiServer::spawn_gated(MockChatScenario::AsksUser, Some(gate.clone())).await;
     let harness = TestHarness::new(&mock.base_url()).await;
-    let server = RunningUiServer::spawn(harness.home_path(), &[]).await;
+    let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
     let client = reqwest::Client::new();
     let environment = ChatEnvironment::Local
         .prepare(&harness, &client, &server)
@@ -3761,7 +3761,7 @@ async fn oneshot_run_starts_the_daemon_and_streams_its_turn() {
 /// reports it.
 async fn background_of(
     client: &reqwest::Client,
-    server: &RunningUiServer,
+    server: &RunningDaemon,
     session_id: &str,
 ) -> Value {
     let response = client
@@ -3793,7 +3793,7 @@ async fn a_background_job_is_listed_pushed_and_killable_over_the_api() {
     let mock =
         MockOpenAiServer::spawn(MockChatScenario::StartsBackgroundJob(BACKGROUND_JOB_SCRIPT)).await;
     let harness = TestHarness::new(&mock.base_url()).await;
-    let server = RunningUiServer::spawn(harness.home_path(), &[]).await;
+    let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
     let client = reqwest::Client::new();
     let environment = ChatEnvironment::Local
         .prepare(&harness, &client, &server)
@@ -3888,7 +3888,7 @@ async fn a_background_job_finishing_after_its_turn_resumes_the_session() {
     let mock =
         MockOpenAiServer::spawn(MockChatScenario::StartsBackgroundJob(FINISHING_JOB_SCRIPT)).await;
     let harness = TestHarness::new(&mock.base_url()).await;
-    let server = RunningUiServer::spawn(harness.home_path(), &[]).await;
+    let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
     let client = reqwest::Client::new();
     let environment = ChatEnvironment::Local
         .prepare(&harness, &client, &server)
@@ -3959,7 +3959,7 @@ async fn a_background_job_finishing_after_its_turn_resumes_the_session() {
 /// `after` when given.
 async fn agent_frames(
     client: &reqwest::Client,
-    server: &RunningUiServer,
+    server: &RunningDaemon,
     session_id: &str,
     after: Option<u64>,
 ) -> SseReader {
@@ -4012,7 +4012,7 @@ async fn a_reconnecting_client_continues_after_the_last_frame_it_saw() {
     })
     .await;
     let harness = TestHarness::new(&mock.base_url()).await;
-    let server = RunningUiServer::spawn(harness.home_path(), &[]).await;
+    let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
     let client = reqwest::Client::new();
     let environment = ChatEnvironment::Local
         .prepare(&harness, &client, &server)

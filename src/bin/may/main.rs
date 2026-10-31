@@ -209,8 +209,8 @@ async fn async_main() -> anyhow::Result<()> {
         CliMode::Ui(_) => return open_web_ui().await,
         CliMode::Rest(rest_args) => {
             return may_agent::daemon::run_daemon(may_agent::daemon::DaemonOptions {
-                mode: may_agent::ui_server::UiServerMode::Rest,
-                tcp: Some(may_agent::ui_server::parse_listen_args(&rest_args)?),
+                mode: may_agent::daemon::DaemonMode::Rest,
+                tcp: Some(may_agent::daemon::parse_listen_args(&rest_args)?),
             })
             .await;
         }
@@ -2002,7 +2002,7 @@ async fn open_web_ui() -> anyhow::Result<()> {
     let port = config
         .daemon
         .port
-        .unwrap_or(may_agent::ui_server::DEFAULT_PORT);
+        .unwrap_or(may_agent::daemon::DEFAULT_PORT);
     let url = format!("http://127.0.0.1:{port}");
     eprintln!("May web UI: {url}");
     if let Err(error) = open::that(&url) {

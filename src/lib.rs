@@ -91,7 +91,6 @@ pub mod tui;
 /// Event bus publishing UI-facing state changes.
 pub mod ui_event_bus;
 /// HTTP/SSE server backing the web UI.
-pub mod ui_server;
 /// Workspace request handling.
 pub mod workspace;
 /// XML block serialization for prompt/context payloads.
