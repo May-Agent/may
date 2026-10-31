@@ -15,7 +15,7 @@ const SheetOverlay = forwardRef<
   <DialogPrimitive.Overlay
     ref={ref}
     className={cn(
-      'fixed inset-0 z-40 bg-background/50 backdrop-blur-sm',
+      'fixed inset-0 z-40 bg-black/30 backdrop-blur-[2px] dark:bg-black/50',
       'data-[state=open]:animate-in data-[state=open]:fade-in-0',
       'data-[state=closed]:animate-out data-[state=closed]:fade-out-0',
       className,
@@ -59,9 +59,9 @@ export const SheetContent = forwardRef<HTMLDivElement, SheetContentProps>(
         {!hideCloseButton && (
           <DialogPrimitive.Close
             aria-label="Close"
-            className="absolute right-3 top-3 rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            className="absolute right-3 top-3 flex size-8 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring touch:size-11"
           >
-            <X className="size-4" />
+            <X className="size-4" aria-hidden />
           </DialogPrimitive.Close>
         )}
       </DialogPrimitive.Content>

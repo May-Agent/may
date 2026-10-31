@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { AlertCircle, AlertTriangle, ArrowDown, RotateCw, X } from 'lucide-react';
+import { Fragment, useCallback, useEffect, useRef, useState } from 'react';
+import { AlertCircle, AlertTriangle, ArrowDown, Loader2, RotateCw, X } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { useSessionsStore } from '@/lib/stores/sessions';
 import { useTurnStore } from '@/lib/stores/turn';
@@ -18,6 +18,7 @@ import type { ApiAttachment, ApiMessage } from '@/lib/types';
 import { enqueueMessage } from '@/lib/api/chat';
 import { isConfigUsable } from '@/lib/api/config';
 import { cn } from '@/lib/utils';
+import { formatGroupTime, startsGroup } from '@/lib/chat/time';
 
 const STICKY_BOTTOM_THRESHOLD_PX = 48;
 const NO_MESSAGES: ApiMessage[] = [];
@@ -27,6 +28,8 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   const messages = useSessionsStore((s) => s.messages[sessionId] ?? NO_MESSAGES);
   const active = useSessionsStore((s) => s.active);
   const appendMessage = useSessionsStore((s) => s.appendMessage);
+  // "Today" for the time labels between message groups.
+  const [now] = useState(() => new Date());
   const sessionTurn = useTurnStore((s) => s.turns[sessionId]);
   const activeTurn = sessionTurn?.active ?? null;
   const stopping = sessionTurn?.stopping ?? false;
@@ -84,8 +87,12 @@ export function ChatView({ sessionId }: { sessionId: string }) {
 
   if (!active || active.id !== sessionId) {
     return (
-      <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
-        {t('common.loading')}
+      <div
+        role="status"
+        className="flex h-full items-center justify-center gap-2 text-sm text-muted-foreground"
+      >
+        <Loader2 className="size-4 animate-spin" aria-hidden />
+        {t('shell.loadingSession')}
       </div>
     );
   }
@@ -129,6 +136,22 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     await send({ sessionId, content, attachments });
   };
 
+  const renderMessage = (msg: ApiMessage) => {
+    if (msg.role === 'user') {
+      return <UserMessage content={msg.content} attachments={msg.attachments} />;
+    }
+    if (lastTurnForActive && lastTurnForActive.assistantId === msg.id) {
+      return (
+        <AssistantTurn
+          turn={lastTurnForActive}
+          reasoningEnabled={reasoningEnabled}
+          showDecodeSpeed={showDecodeSpeed}
+        />
+      );
+    }
+    return <PersistedAssistant message={msg} sessionId={active.id} />;
+  };
+
   return (
     <div className="relative flex h-full flex-col">
       <SessionHeader session={active} />
@@ -140,26 +163,22 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       <ScrollArea
         ref={scrollerRef}
         onScroll={handleScroll}
-        className="flex-1 px-6 pt-6 pb-48"
+        className="flex-1 px-4 pt-6 pb-48 sm:px-6"
+        aria-label={active.title || t('common.untitled')}
       >
         <div className="mx-auto w-full max-w-3xl space-y-6">
-          {messages.map((msg) => {
-            if (msg.role === 'user') {
-              return (
-                <UserMessage key={msg.id} content={msg.content} attachments={msg.attachments} />
-              );
-            }
-            if (lastTurnForActive && lastTurnForActive.assistantId === msg.id) {
-              return (
-                <AssistantTurn
-                  key={msg.id}
-                  turn={lastTurnForActive}
-                  reasoningEnabled={reasoningEnabled}
-                  showDecodeSpeed={showDecodeSpeed}
-                />
-              );
-            }
-            return <PersistedAssistant key={msg.id} message={msg} sessionId={active.id} />;
+          {messages.map((msg, i) => {
+            const stamp = startsGroup(messages[i - 1]?.timestamp, msg.timestamp) ? (
+              <p className="pt-2 text-center text-[11px] text-muted-foreground">
+                <time dateTime={msg.timestamp}>{formatGroupTime(msg.timestamp, now)}</time>
+              </p>
+            ) : null;
+            return (
+              <Fragment key={msg.id}>
+                {stamp}
+                {renderMessage(msg)}
+              </Fragment>
+            );
           })}
           {activeTurn && (
             <AssistantTurn
@@ -182,7 +201,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
 
       <div
         className={cn(
-          'pointer-events-none absolute inset-x-0 bottom-0 flex justify-center px-6 pb-5',
+          'pointer-events-none absolute inset-x-0 bottom-0 flex justify-center px-4 pb-4 sm:px-6 sm:pb-5',
         )}
       >
         <div className="pointer-events-auto mx-auto w-full max-w-3xl space-y-2">
@@ -192,7 +211,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
                 size="sm"
                 variant="secondary"
                 onClick={scrollToBottom}
-                className="h-8 gap-1 rounded-full border border-border/60 bg-background/80 px-3 shadow-md backdrop-blur-xl hover:bg-background"
+                className="gap-1 border border-border bg-background px-2.5 text-muted-foreground shadow-sm hover:bg-accent hover:text-foreground"
                 aria-label={t('chat.scrollToBottom')}
               >
                 <ArrowDown className="size-3.5" />
@@ -239,8 +258,8 @@ function TurnErrorCard({ code, message, retryable, onRetry, onDismiss }: TurnErr
       </div>
       <div className="flex items-center gap-1 shrink-0">
         {retryable && (
-          <Button size="sm" variant="outline" onClick={onRetry} className="h-7 gap-1 text-xs">
-            <RotateCw className="size-3" />
+          <Button size="sm" variant="outline" onClick={onRetry} className="gap-1">
+            <RotateCw className="size-3.5" />
             {t('common.retry')}
           </Button>
         )}
@@ -248,7 +267,6 @@ function TurnErrorCard({ code, message, retryable, onRetry, onDismiss }: TurnErr
           size="icon"
           variant="ghost"
           onClick={onDismiss}
-          className="size-7"
           aria-label={t('common.dismiss')}
         >
           <X className="size-3.5" />
@@ -272,12 +290,12 @@ function ConfigGuardCard({ onOpenSettings }: ConfigGuardCardProps) {
     <button
       type="button"
       onClick={onOpenSettings}
-      className="flex w-full items-start gap-2 rounded-lg border border-amber-500/40 bg-amber-500/5 px-3 py-2.5 text-left text-sm text-amber-700 transition-colors hover:bg-amber-500/10 dark:text-amber-300"
+      className="flex w-full items-start gap-2 rounded-lg border border-border bg-background px-3 py-2.5 text-left text-[13px] transition-colors hover:bg-accent"
     >
-      <AlertTriangle className="mt-0.5 size-4 shrink-0" />
+      <AlertTriangle className="mt-0.5 size-4 shrink-0 text-muted-foreground" aria-hidden />
       <div className="flex-1 min-w-0">
         <div className="font-medium">{t('chat.configGuard.title')}</div>
-        <div className="text-xs opacity-80">{t('chat.configGuard.body')}</div>
+        <div className="text-xs text-muted-foreground">{t('chat.configGuard.body')}</div>
       </div>
       <span className="shrink-0 text-xs font-medium underline-offset-4 hover:underline">
         {t('chat.configGuard.openSettings')}

@@ -180,6 +180,26 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             Ok(None)
         }
 
+        AppEvent::SidebarTasks {
+            session_id,
+            content,
+            title,
+        } => {
+            let current = app
+                .session_manager
+                .current()
+                .is_some_and(|session| session.id.as_str() == session_id);
+            if current {
+                let missing = app.sidebar.set_tasks(&session_id, content.as_deref());
+                app.sidebar.title = title;
+                app.request_issue_lookups(session_id, missing);
+            }
+            Ok(None)
+        }
+        AppEvent::SidebarIssues { session_id, issues } => {
+            app.sidebar.set_issues(&session_id, issues);
+            Ok(None)
+        }
         AppEvent::BackgroundLoaded { jobs, subagents } => {
             app.jobs = jobs;
             app.subagents = subagents;

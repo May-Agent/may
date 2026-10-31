@@ -16,13 +16,14 @@ pub const DEFAULT_JANK_THRESHOLD_MS: u64 = 20;
 /// [`crate::tui::ui::chat::render_unified`].
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ChatRenderStats {
-    /// Building styled `Line`s for every element (markdown re-parse).
+    /// Layout sync: re-laying-out changed elements (markdown parse + wrap)
+    /// and building the tail (queue, input, status).
     pub lines_build: Duration,
-    /// `total_wrapped_lines` — full-document wrap for the scroll map.
+    /// Wrapping the tail and computing the document height.
     pub wrap_count: Duration,
     /// `Clear` + `Paragraph` buffer write.
     pub widget: Duration,
-    /// Elements rendered this frame.
+    /// Elements re-laid-out this frame (0 while only scrolling).
     pub elements: usize,
     /// Wrapped visual height the render exported.
     pub content_height: usize,
@@ -38,7 +39,8 @@ pub struct FrameStats {
     pub image_scan: Duration,
     /// The `chat::render_unified` breakdown.
     pub chat: ChatRenderStats,
-    /// `build_plain_wrapped_lines_unified` — plain-text mirror build.
+    /// Plain-text mirror build (now read back lazily from the layout cache,
+    /// so this stays zero).
     pub plain_lines: Duration,
     /// Selection overlay, inline images, popups and completion overlay.
     pub overlay: Duration,
