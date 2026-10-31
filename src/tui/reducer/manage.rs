@@ -68,6 +68,20 @@ pub fn handle_chatgpt_auth_key(app: &mut App, code: KeyCode) -> Option<SendActio
     None
 }
 
+pub fn handle_launch_grant_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
+    match code {
+        KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
+            app.mode = crate::tui::state::AppMode::Chat;
+            Some(SendAction::RespondLaunchGrant { approved: true })
+        }
+        KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+            app.mode = crate::tui::state::AppMode::Chat;
+            Some(SendAction::RespondLaunchGrant { approved: false })
+        }
+        _ => None,
+    }
+}
+
 pub fn handle_workspace_confirm_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
     match code {
         KeyCode::Char('y' | 'Y') | KeyCode::Enter => {

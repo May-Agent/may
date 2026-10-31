@@ -357,9 +357,21 @@ where
         }
     };
 
-    // Only start a session if configuration is complete
+    // Only start a session if configuration is complete. When the launch
+    // directory is not already a workspace grant, the TUI asks first and the
+    // session starts once the prompt is answered.
     let mut worker_build = None;
-    if app.is_configured() {
+    let mut launch_grant = if app.is_configured() {
+        launch_grant_check(&app)?
+    } else {
+        None
+    };
+    if launch_grant.is_some() {
+        app.mode = may_agent::tui::AppMode::LaunchGrant(may_agent::tui::state::LaunchGrantState {
+            path: app.cwd.clone(),
+        });
+    }
+    if app.is_configured() && launch_grant.is_none() {
         match runtime_deps.begin_new_session(&mut app, &mut worker).await {
             Ok(build) => {
                 worker_build = Some(WorkerBuild {
@@ -383,8 +395,55 @@ where
         ask_user_queue,
         &mut mcp_manager,
         log_ring,
+        launch_grant.take(),
     )
     .await
+}
+
+/// A launch-directory grant the TUI offered before the session started.
+struct LaunchGrant {
+    /// The launch directory being offered.
+    dir: std::path::PathBuf,
+    /// `workspace.toml` the grant is written to on approval.
+    config_path: std::path::PathBuf,
+}
+
+/// Whether the launch directory needs the startup grant prompt: the current
+/// profile is local (workspace grants do not map into containers) and its
+/// `workspace.toml` does not already cover the directory read/write.
+fn launch_grant_check(
+    app: &App,
+) -> Result<Option<LaunchGrant>, may_agent::workspace::WorkspaceConfigError> {
+    use may_agent::session::MayHomePaths;
+
+    let home = MayHomePaths::new(app.session_manager.may_dir().to_path_buf());
+    let config_path = match app.session_manager.current_profile_id() {
+        Some(profile_id) => {
+            let container = app
+                .profiles
+                .iter()
+                .find(|profile| profile.id.as_str() == profile_id)
+                .is_some_and(|profile| {
+                    matches!(
+                        profile.environment.kind(),
+                        may_agent::profile::ProfileEnvironment::Container { .. }
+                    )
+                });
+            if container {
+                return Ok(None);
+            }
+            home.profile_home(profile_id).workspace_config()
+        }
+        None => home.workspace_config(),
+    };
+    let config = may_agent::workspace::WorkspaceConfig::load(&config_path)?;
+    if config.has_write_access(&app.cwd) {
+        return Ok(None);
+    }
+    Ok(Some(LaunchGrant {
+        dir: app.cwd.clone(),
+        config_path,
+    }))
 }
 
 /// Why the event loop is building an agent worker; decides how its outcome
@@ -482,6 +541,7 @@ async fn main_event_loop<B: Backend>(
     ask_user_queue: AskUserQueue,
     mcp_manager: &mut McpManager,
     log_ring: may_agent::log_ring::LogRingHandle,
+    mut launch_grant: Option<LaunchGrant>,
 ) -> anyhow::Result<()>
 where
     B::Error: Send + Sync + 'static,
@@ -1397,6 +1457,37 @@ where
                                     app.ssh_selected = app.config.ssh_servers.len() - 1;
                                 }
                             }
+                        }
+                    }
+                    Some(SendAction::RespondLaunchGrant { approved }) => {
+                        if let (Some(grant), true) = (launch_grant.take(), approved) {
+                            let result =
+                                may_agent::workspace::WorkspaceConfig::load(&grant.config_path)
+                                    .and_then(|mut config| {
+                                        config.add_workdir(
+                                            grant.dir.clone(),
+                                            Some("launch directory".to_string()),
+                                        );
+                                        config.save(&grant.config_path)
+                                    });
+                            match result {
+                                Ok(()) => app.track_workspace_dir(&grant.dir),
+                                Err(error) => app.chat.push_error(&format!(
+                                    "Could not grant workspace access to {}: {error}",
+                                    grant.dir.display()
+                                )),
+                            }
+                        }
+                        // The prompt this answered was the only thing holding
+                        // the startup session back.
+                        match runtime_deps.begin_new_session(app, worker).await {
+                            Ok(build) => {
+                                worker_build = Some(WorkerBuild {
+                                    purpose: WorkerBuildPurpose::Startup,
+                                    build,
+                                });
+                            }
+                            Err(e) => report_startup_failure(app, &e),
                         }
                     }
                     Some(SendAction::RespondWorkspace {
