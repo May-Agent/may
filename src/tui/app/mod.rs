@@ -3226,6 +3226,17 @@ impl App {
                         self.decode_meter.note_boundary();
                         self.chat.finish_builtin(&id, &tool, result);
                     }
+                    // A reply that ends without tool calls may be followed
+                    // by another in the same run (the harness re-prompting,
+                    // a background command finishing): it starts a block of
+                    // its own instead of being glued onto this one.
+                    AgentEvent::TurnComplete {
+                        has_tool_calls: false,
+                        ..
+                    } => {
+                        self.chat.end_text();
+                        self.decode_meter.note_boundary();
+                    }
                     AgentEvent::Complete { .. } => {
                         // Text was already streamed via AgentEvent::Text events
                         // Just finalize the message

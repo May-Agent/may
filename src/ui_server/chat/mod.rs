@@ -1654,6 +1654,21 @@ fn run_agent_loop<'a>(
                             )
                             .await?;
                         }
+                        // A reply without tool calls that the run follows
+                        // with another reply is stored as a message of its
+                        // own.
+                        Ok(aither_agent::AgentEvent::TurnComplete {
+                            has_tool_calls: false,
+                            ..
+                        }) => {
+                            if !segment_text.trim().is_empty() {
+                                turn_persister.push_assistant(
+                                    segment_text.clone(),
+                                    segment_emitted_at(segment_at),
+                                );
+                                segment_text.clear();
+                            }
+                        }
                         Ok(aither_agent::AgentEvent::BackgroundTaskCompleted { .. }) => {
                             saw_tool_activity = true;
                             clear_terminal_runtime_state(state, session_id.as_str()).await?;
