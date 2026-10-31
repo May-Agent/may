@@ -75,14 +75,14 @@ async fn racing_acquires_yield_exactly_one_holder() {
 
     for _ in 0..20 {
         let service = fixture.service.clone();
-        let mut racers = (0..RACERS)
+        let racers = (0..RACERS)
             .map(|_| {
                 let service = service.clone();
                 tokio::spawn(async move { service.runs().acquire("session").await })
             })
             .collect::<Vec<_>>();
         let mut winner = None;
-        for racer in racers.drain(..) {
+        for racer in racers {
             match racer.await.expect("racer task") {
                 Ok(guard) => {
                     assert!(winner.is_none(), "a second run was admitted");
