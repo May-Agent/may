@@ -147,10 +147,23 @@ export const useTurnStore = create<TurnSliceState>((set, get) => {
   };
 
   const follow = async (sessionId: string, signal: AbortSignal) => {
+    // Index of the last turn frame received: a reopened stream continues
+    // from the frame after it, so nothing replays twice.
+    let after: string | undefined;
     while (!signal.aborted) {
       try {
         const stream = await openSessionTurns(sessionId, signal, {
+          after,
+          onFrameId: (id) => {
+            after = id;
+          },
           onBackground: (snapshot) => useInspectorStore.getState().applyBackground(snapshot),
+          onResync: () => {
+            // Turn frames this client missed are gone: drop the turn it was
+            // following and reload the session's messages.
+            patch(sessionId, () => ({ active: null, stopping: false }));
+            void useSessionsStore.getState().refreshActive(sessionId);
+          },
         });
         for await (const evt of stream.events) handle(sessionId, evt);
       } catch (err) {

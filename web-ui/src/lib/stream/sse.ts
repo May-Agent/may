@@ -69,6 +69,8 @@ function parseEventBlock<T>(block: string): T | null {
 export interface NamedSseEvent<T> {
   event: string;
   data: T;
+  /** The `id:` field, when the frame has one. */
+  id?: string;
 }
 
 /**
@@ -116,18 +118,21 @@ export async function* parseNamedSseStream<T>(
 
 function parseNamedEventBlock<T>(block: string): NamedSseEvent<T> | null {
   let event = 'message';
+  let id: string | undefined;
   const dataLines: string[] = [];
   for (const line of block.split('\n')) {
     if (line.startsWith('event:')) {
       event = line.slice(6).trim();
     } else if (line.startsWith('data:')) {
       dataLines.push(line.slice(5).replace(/^ /, ''));
+    } else if (line.startsWith('id:')) {
+      id = line.slice(3).trim();
     }
   }
-  if (dataLines.length === 0) return { event, data: undefined as T };
+  if (dataLines.length === 0) return { event, data: undefined as T, id };
   const payload = dataLines.join('\n');
   try {
-    return { event, data: JSON.parse(payload) as T };
+    return { event, data: JSON.parse(payload) as T, id };
   } catch {
     return null;
   }

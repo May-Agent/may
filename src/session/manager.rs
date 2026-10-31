@@ -283,6 +283,7 @@ pub async fn load_history_from_db(
             .unwrap_or_default();
 
         history.push(ChatMessage {
+            id: Some(msg.id),
             role,
             content: msg.content,
             attachments,
