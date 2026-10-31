@@ -424,6 +424,10 @@ pub struct DaemonState {
     /// Sequential lifecycle facts emitted by the browser actor, fanned out
     /// to every active SSE client subscribed to `browser_lifecycle`.
     pub(crate) browser_lifecycle_tx: broadcast::Sender<BrowserLifecycleEvent>,
+    /// Each session's virtual desktop, acquired on demand and released
+    /// with its session — computer use.
+    #[cfg(target_os = "macos")]
+    pub(crate) session_displays: Mutex<crate::computer::SessionDisplays>,
     pub(crate) remote_access_manager: Arc<super::remote_access::RemoteAccessManager>,
     pub(crate) notification_service: Arc<crate::notification::NotificationService>,
     pub(crate) memory_processor: Option<crate::memory::MemoryProcessor>,
