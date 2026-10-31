@@ -2238,8 +2238,6 @@ enum UiChatPreparationError {
     AppendUserMessage(#[source] crate::db::ChatDbError),
     #[error("failed to persist hidden context: {0}")]
     PersistHiddenContext(#[source] crate::db::ChatDbError),
-    #[error("failed to listen for messages from other agents: {0}")]
-    AgentLink(#[source] crate::agent_link::AgentLinkError),
     #[error("container profile model is missing")]
     MissingContainerProfileModel,
     #[error("failed to reconcile container session layout: {0}")]
@@ -2297,7 +2295,6 @@ impl UiChatPreparationError {
             | Self::AppendUserMessage(_)
             | Self::PersistHiddenContext(_)
             | Self::ReconcileContainerLayout(_)
-            | Self::AgentLink(_)
             | Self::BuildAgent(_)
             | Self::RestoreCheckpoint(_)
             | Self::BuildPrompt(_)
@@ -2833,74 +2830,21 @@ fn build_tool_brokers(state: &Arc<DaemonState>, session_id: &SessionId) -> ToolB
     }
 }
 
-fn session_host(state: &DaemonState) -> crate::agent_link::SessionHost {
-    crate::agent_link::SessionHost {
-        may_dir: state.may_dir.clone(),
-        cwd: state.cwd.clone(),
+/// Agent-to-agent messaging as the daemon's sessions see it: `send` stores
+/// in the shared queue and `wake` dispatches a follow-up run in-process.
+fn agent_messaging(state: &Arc<DaemonState>) -> crate::agent_link::AgentMessaging {
+    crate::agent_link::AgentMessaging {
+        directory: crate::agent_link::AgentDirectory::new(
+            state.runtime_service.clone(),
+            state.may_dir.clone(),
+            state.cwd.clone(),
+            {
+                let state = state.clone();
+                move |session_id: &str| spawn_follow_up_runs(state.clone(), session_id.to_string())
+            },
+        ),
         runtime_service: state.runtime_service.clone(),
     }
-}
-
-fn wake_by_follow_up_run(
-    state: &Arc<DaemonState>,
-    session_id: &str,
-) -> impl Fn() + Send + Sync + 'static + use<> {
-    let state = state.clone();
-    let session_id = session_id.to_string();
-    move || spawn_follow_up_runs(state.clone(), session_id.clone())
-}
-
-/// Makes a session the server can receive turns for discoverable by other main
-/// agents, whether or not it has run a turn yet.
-pub(super) async fn open_session_for_agents(
-    state: &Arc<DaemonState>,
-    session_id: &str,
-    profile_id: Option<&str>,
-) -> Result<(), crate::agent_link::AgentLinkError> {
-    state
-        .agent_listeners
-        .open_session(
-            &session_host(state),
-            session_id,
-            profile_id,
-            wake_by_follow_up_run(state, session_id),
-        )
-        .await
-}
-
-/// Makes every stored session that is not archived discoverable.
-pub(super) async fn open_all_sessions_for_agents(
-    state: &Arc<DaemonState>,
-) -> Result<(), crate::agent_link::AgentLinkError> {
-    state
-        .agent_listeners
-        .open_stored_sessions(&session_host(state), |session_id| {
-            wake_by_follow_up_run(state, session_id)
-        })
-        .await
-}
-
-/// Makes the session discoverable by other main agents on this machine and
-/// dispatches the messages they store for it.
-async fn listen_for_agent_messages(
-    state: &Arc<DaemonState>,
-    session_id: &str,
-    cwd: &std::path::Path,
-    sandbox_dir: &std::path::Path,
-) -> Result<(), crate::agent_link::AgentLinkError> {
-    state
-        .agent_listeners
-        .ensure(
-            &crate::session::MayHomePaths::new(state.may_dir.clone()).agents_dir(),
-            crate::agent_link::AgentIdentity {
-                session_id: session_id.to_string(),
-                cwd: cwd.to_path_buf(),
-                sandbox_dir: sandbox_dir.to_path_buf(),
-            },
-            state.runtime_service.clone(),
-            wake_by_follow_up_run(state, session_id),
-        )
-        .await
 }
 
 /// Resolves the session context and builds the agent for one chat turn.
@@ -3002,9 +2946,6 @@ fn build_session_agent<'a>(
     Box::pin(async move {
         let (environment, location) = Box::pin(setup_agent_environment(state, ctx)).await?;
         let brokers = build_tool_brokers(state, &ctx.session_id);
-        listen_for_agent_messages(state, ctx.session_id.as_str(), &ctx.cwd, &ctx.sandbox_dir)
-            .await
-            .map_err(UiChatPreparationError::AgentLink)?;
 
         let mut agent = MayAgent::from_config_with_model_and_permissions(
             config,
@@ -3029,6 +2970,7 @@ fn build_session_agent<'a>(
                         approver
                     }
                 }),
+                agent_messaging: Some(agent_messaging(state)),
                 profile_persona: ctx.profile_persona.clone(),
                 profile_memories: ctx.profile_memories.clone(),
                 plan_state: ctx.plan_state,

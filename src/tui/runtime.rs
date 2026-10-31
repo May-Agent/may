@@ -74,9 +74,6 @@ pub enum TuiRuntimeError {
     /// An answer to an open question was refused.
     #[error("{0}")]
     Answer(#[from] crate::session::AnswerError),
-    /// Listening for messages from other agents failed.
-    #[error("failed to listen for messages from other agents: {0}")]
-    AgentLink(#[from] crate::agent_link::AgentLinkError),
     /// Selected model is empty.
     #[error("Selected model is empty")]
     EmptySelectedModel,
@@ -851,8 +848,6 @@ impl RuntimeDeps {
         Ok(())
     }
 
-    /// The daemon makes every session discoverable itself; listening is a
-    /// no-op for clients.
     ///
     /// # Errors
     /// Always succeeds.
