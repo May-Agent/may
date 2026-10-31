@@ -64,9 +64,10 @@ export function NotificationBell() {
         >
           <Bell className="size-4" />
           {pendingCount > 0 && (
-            <span className="absolute right-0.5 top-0.5 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-primary px-1 text-[9px] font-medium text-primary-foreground">
-              {pendingCount > 9 ? '9+' : pendingCount}
-            </span>
+            <span
+              className="absolute right-1.5 top-1.5 size-1.5 rounded-full bg-brand"
+              aria-label={String(pendingCount)}
+            />
           )}
         </Button>
       </PopoverTrigger>
@@ -100,7 +101,7 @@ export function NotificationBell() {
                   >
                     <div className="flex w-full items-center gap-2">
                       {entry.status === 'pending' && (
-                        <span className="size-1.5 shrink-0 rounded-full bg-primary" />
+                        <span className="size-1.5 shrink-0 rounded-full bg-brand" />
                       )}
                       <span className="flex-1 truncate text-sm font-medium">
                         {entry.title ?? t('sidebar.notifications.untitled')}

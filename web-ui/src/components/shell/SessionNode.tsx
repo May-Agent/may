@@ -6,9 +6,7 @@ import {
   ArchiveRestore,
   ChevronDown,
   ChevronRight,
-  Folder,
   FolderMinus,
-  MessageSquare,
   MoreHorizontal,
   Pencil,
   Pin,
@@ -62,12 +60,11 @@ export function SessionNode({
         to={href}
         aria-current={active ? 'page' : undefined}
         className={cn(
-          'flex h-8 items-center gap-2 rounded-md pl-2 pr-9 text-[13px] transition-colors hover:bg-accent touch:h-11 touch:pr-12',
-          active && 'bg-accent font-medium',
+          'flex h-7 items-center gap-2 rounded-md pl-2 pr-8 text-[13px] text-foreground/80 transition-colors hover:bg-accent hover:text-foreground touch:h-11 touch:pr-12',
+          active && 'bg-accent font-medium text-foreground',
           indent && 'pl-7',
         )}
       >
-        <MessageSquare className="size-4 shrink-0 text-muted-foreground" aria-hidden />
         <span className="flex-1 truncate">{title}</span>
         <RuntimePhaseDot state={runtime?.state} />
       </Link>
@@ -90,7 +87,7 @@ export function FolderNode({ id, name, children, defaultOpen = false }: FolderNo
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        className="flex h-8 w-full items-center gap-1.5 rounded-md px-2 text-[13px] text-muted-foreground hover:bg-accent touch:h-11"
+        className="flex h-7 w-full items-center gap-1 rounded-md px-2 text-[13px] font-medium text-muted-foreground hover:bg-accent hover:text-foreground touch:h-11"
         aria-expanded={open}
         aria-controls={`folder-${id}`}
       >
@@ -99,7 +96,6 @@ export function FolderNode({ id, name, children, defaultOpen = false }: FolderNo
         ) : (
           <ChevronRight className="size-3.5" aria-hidden />
         )}
-        <Folder className="size-4" aria-hidden />
         <span className="truncate">{name}</span>
       </button>
       {open && (

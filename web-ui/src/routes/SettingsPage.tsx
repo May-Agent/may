@@ -150,7 +150,7 @@ export function SettingsPage() {
             wide ? 'w-60 border-r border-border' : 'w-full',
           )}
         >
-          <div className="flex h-12 items-center gap-1 touch:h-14">
+          <div className="flex h-11 items-center gap-1 touch:h-14">
             <SidebarToggle />
           </div>
           <div className="px-3 pb-4">
@@ -196,8 +196,8 @@ export function SettingsPage() {
       {showDetail && (
         <div className="min-w-0 flex-1 overflow-y-auto">
           {!wide && (
-            <div className="sticky top-0 z-10 flex h-12 items-center border-b border-border bg-background/90 px-2 backdrop-blur touch:h-14">
-              <Button variant="ghost" className="gap-1 px-2 text-primary" onClick={backToList}>
+            <div className="sticky top-0 z-10 flex h-11 items-center border-b border-border bg-background/90 px-2 backdrop-blur touch:h-14">
+              <Button variant="ghost" className="gap-1 px-2 text-foreground" onClick={backToList}>
                 <ChevronLeft aria-hidden />
                 {t('settings.title')}
               </Button>
