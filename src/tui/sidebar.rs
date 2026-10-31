@@ -164,7 +164,7 @@ pub fn issue_refs(text: &str) -> Vec<i64> {
 }
 
 /// A linked issue as the sidebar shows it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct IssueBrief {
     /// Issue number.
     pub number: i64,

@@ -20,7 +20,7 @@ use super::model_resolution::{
 use super::state::DaemonState;
 use super::types::{
     ApiHealth, ApiSession, ContextDebugMessage, CreateSessionRequest, NullableStringPatch,
-    SessionContextDebugResponse, SessionContextWindowMetricsResponse,
+    RewindRequest, SessionContextDebugResponse, SessionContextWindowMetricsResponse,
     SessionContextWindowSnapshotResponse, SessionPlanStateRequest, SessionPlanStateResponse,
     SessionTasksPayload, UpdateSessionRequest,
 };
@@ -69,6 +69,120 @@ pub(super) async fn list_api_sessions(
     }
 
     Ok(sessions)
+}
+
+/// `GET /api/sessions/{id}/history` — the session's stored messages in the
+/// clients' own `ChatMessage` shape, so a reload replays history losslessly.
+pub(super) async fn get_session_history(
+    params: Params,
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<skyzen::Response> {
+    let id = params.get("id").map_err(bad_request_error)?.to_string();
+    let db = state.db();
+    let history = crate::session::load_history_from_db(&db, &id)
+        .await
+        .map_err(internal_error)?;
+    super::error::json_ok_response(&history.messages().to_vec())
+}
+
+/// `POST /api/sessions/{id}/history` — append stored messages in the
+/// clients' `ChatMessage` shape, for flows that inject history without a
+/// turn (transcript import).
+pub(super) async fn append_session_history(
+    params: Params,
+    Json(body): Json<serde_json::Value>,
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<i64>> {
+    let messages: Vec<crate::session::ChatMessage> =
+        serde_json::from_value(body).map_err(bad_request_error)?;
+    let id = params.get("id").map_err(bad_request_error)?.to_string();
+    let db = state.db();
+    let mut last = 0i64;
+    for message in &messages {
+        let row = db
+            .append_chat_message(&id, message)
+            .await
+            .map_err(internal_error)?;
+        last = i64::from(row.id);
+    }
+    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
+    Ok(Json(last))
+}
+
+/// `POST /api/sessions/{id}/rewind` — delete the session's stored history
+/// from the `index`-th stored row on, the truncation half of a client-side
+/// rewind. Clients index it because message row ids never cross the wire.
+pub(super) async fn rewind_session(
+    params: Params,
+    Json(req): Json<RewindRequest>,
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<i64>> {
+    let id = params.get("id").map_err(bad_request_error)?.to_string();
+    let db = state.db();
+    let rows = db.get_messages(&id).await.map_err(internal_error)?;
+    let Some(row) = rows.get(req.index) else {
+        return Err(bad_request_error("rewind index out of range"));
+    };
+    let cut_id = i64::from(row.id);
+    db.delete_messages_from(&id, cut_id)
+        .await
+        .map_err(internal_error)?;
+    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
+    Ok(Json(cut_id))
+}
+
+/// `POST /api/sessions/{id}/issues/lookup` — resolve the session's issue
+/// store and return a brief per requested number; misses yield `null`
+/// titles, matching the client's degraded rendering.
+pub(super) async fn lookup_issues(
+    params: Params,
+    Json(body): Json<serde_json::Value>,
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<skyzen::Response> {
+    use crate::issue::IssueStore as _;
+    #[derive(serde::Deserialize)]
+    struct LookupRequest {
+        numbers: Vec<i64>,
+    }
+    let req: LookupRequest = serde_json::from_value(body).map_err(bad_request_error)?;
+    let id = params.get("id").map_err(bad_request_error)?.to_string();
+    let db = state.db();
+    let session = db
+        .get_session(&id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| session_not_found_error(&id))?;
+    let cwd = session
+        .cwd
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| bad_request_error("session has no cwd"))?;
+    let store = SessionStore::new(MayHomePaths::new(state.may_dir.clone()));
+    let sandbox_dir = store.sandbox_dir(&id, session.profile_id.as_deref());
+    let workspace_config = crate::session::SessionPaths::new(sandbox_dir).workspace_config();
+    let issue_store =
+        blocking::unblock(move || crate::issue::resolve_issue_store(&cwd, &workspace_config, db))
+            .await
+            .map_err(internal_error)?;
+    let mut briefs = Vec::with_capacity(req.numbers.len());
+    for number in req.numbers {
+        let brief = match issue_store.get(number).await {
+            Ok(detail) => crate::tui::sidebar::IssueBrief {
+                number,
+                title: Some(detail.title),
+                closed: matches!(detail.state, crate::issue::IssueState::Closed),
+            },
+            Err(error) => {
+                tracing::debug!(%error, number, "issue lookup failed");
+                crate::tui::sidebar::IssueBrief {
+                    number,
+                    title: None,
+                    closed: false,
+                }
+            }
+        };
+        briefs.push(brief);
+    }
+    super::error::json_ok_response(&briefs)
 }
 
 pub(super) async fn get_session(
@@ -250,10 +364,11 @@ const fn map_llm_role(role: LlmRole) -> &'static str {
 /// which open a fresh conversation in the originating profile.
 pub(super) async fn create_session_for_profile(
     state: &Arc<DaemonState>,
+    id: Option<&str>,
     profile_id: Option<&str>,
     model: &str,
 ) -> SkyResult<String> {
-    let id = SessionId::new().to_string();
+    let id = id.map_or_else(|| SessionId::new().to_string(), str::to_string);
     let db = state.db();
     let layout = match profile_id {
         Some(profile_id) => {
@@ -305,7 +420,13 @@ pub(super) async fn create_session(
     let resolved_profile_id = requested_profile_id
         .clone()
         .or_else(|| Some(state.default_profile_id.clone()));
-    let id = create_session_for_profile(&state, resolved_profile_id.as_deref(), &model).await?;
+    let id = create_session_for_profile(
+        &state,
+        req.id.as_deref(),
+        resolved_profile_id.as_deref(),
+        &model,
+    )
+    .await?;
     if let Some(cwd) = req
         .cwd
         .as_deref()
@@ -377,6 +498,22 @@ pub(super) async fn update_session(
 
     if let Some(model) = model_to_persist {
         persist_last_model(&state, &model)
+            .await
+            .map_err(internal_error)?;
+    }
+    if let Some(cwd) = req
+        .cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|cwd| !cwd.is_empty())
+    {
+        db.set_session_cwd(&id, cwd).await.map_err(internal_error)?;
+        if let Some(worktree) = crate::repo_search::worktree_root(std::path::Path::new(cwd)) {
+            let _ = db.touch_repo_usage(&worktree).await;
+        }
+    }
+    if req.non_interactive == Some(true) {
+        db.set_session_non_interactive(&id)
             .await
             .map_err(internal_error)?;
     }

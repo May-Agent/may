@@ -50,14 +50,11 @@ use ratatui::backend::CrosstermBackend;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use may_agent::agent::{AgentHandle, AgentWorker, TuiEvent};
-use may_agent::ask_user::{self, AskUserQueue};
 use may_agent::session::RunOutcome;
 use may_agent::tui::runtime::{
-    AssistantReply, LocalSessionRuntime, QueuedRunStart, ResponseCommit, RuntimeDeps,
-    TitleGenContext,
+    AssistantReply, QueuedRunStart, ResponseCommit, RuntimeDeps, TitleGenContext,
 };
 use may_agent::tui::{App, AppEvent, EventHandler, SendAction, ui};
-use may_agent::workspace_request::{self, WorkspaceRequestQueue};
 use may_agent::{MayMcpServerConfig, McpManager, SkillManager};
 
 const PANIC_MESSAGE: &str = include_str!("../../texts/panic_message.txt");
@@ -284,14 +281,6 @@ where
     let mut app = App::new(events.sender(), image_support).await?;
     let mut worker: Option<AgentWorker> = None;
 
-    // Spawn background auto-archive task
-    let _auto_archive = may_agent::tasks::spawn_auto_archive(app.session_manager.db().clone());
-
-    // Create workspace request channel (runtime-agnostic)
-    let (workspace_broker, workspace_queue) = workspace_request::channel();
-
-    // Create ask user channel (runtime-agnostic)
-    let (ask_user_broker, ask_user_queue) = ask_user::channel();
     tracing::info!("=== MAY STARTUP - channels created ===");
 
     // Load MCP configuration and connect to servers
@@ -313,33 +302,7 @@ where
     // Update app's MCP server list
     app.mcp_servers = mcp_manager.server_info();
 
-    let local_runtime = LocalSessionRuntime::new(app.session_manager.db().clone());
-    let tool_distribution = std::sync::Arc::new(
-        may_agent::tools::embedded_distribution()
-            .context("embedded tool distribution is invalid")?,
-    );
-    let tool_dispatchers = may_agent::tool_dispatch::ToolDispatchers::spawn(
-        may_agent::tool_dispatch::ToolDispatchConfig {
-            may_dir: app.session_manager.may_dir().to_path_buf(),
-            cwd: app.cwd.clone(),
-            db: app.session_manager.db().clone(),
-            browser_config: app.config.browser.clone(),
-            network_policy: app.config.preferences.network_policy.clone(),
-            ask_user_broker: ask_user_broker.clone(),
-            tool_distribution: tool_distribution.clone(),
-        },
-    )
-    .await
-    .context("failed to initialize tool dispatch runtime")?;
-    let runtime_deps = RuntimeDeps::new(
-        local_runtime,
-        workspace_broker.clone(),
-        ask_user_broker.clone(),
-        tool_dispatchers,
-        std::sync::Arc::new(may_agent::location::LocationProvider::new()),
-        tool_distribution,
-        may_agent::agent::ToolEnvironmentCache::spawn(),
-    );
+    let runtime_deps = RuntimeDeps::new(may_agent::agent::ToolEnvironmentCache::spawn());
 
     // Agents run in the May daemon; the TUI is its client. Starting or
     // replacing the daemon shows on the status line meanwhile.
@@ -350,6 +313,17 @@ where
         Ok(client) => {
             app.status = None;
             app.btw_daemon = Some(client.clone());
+            app.session_manager.attach_daemon(client.clone());
+            if let Ok(profiles) = client
+                .get::<Vec<may_agent::profile::ProfileInfo>>("/api/profiles")
+                .await
+            {
+                app.current_profile_id = profiles.first().map(|p| p.id.clone());
+                if let Some(ref profile_id) = app.current_profile_id {
+                    app.session_manager.set_current_profile(profile_id.clone());
+                }
+                app.profiles = profiles;
+            }
             runtime_deps.with_daemon(client)
         }
         Err(error) => {
@@ -391,8 +365,6 @@ where
         &mut events,
         terminal,
         runtime_deps,
-        workspace_queue,
-        ask_user_queue,
         &mut mcp_manager,
         log_ring,
         launch_grant.take(),
@@ -537,8 +509,6 @@ async fn main_event_loop<B: Backend>(
     events: &mut EventHandler,
     terminal: &mut Terminal<B>,
     runtime_deps: RuntimeDeps,
-    workspace_queue: WorkspaceRequestQueue,
-    ask_user_queue: AskUserQueue,
     mcp_manager: &mut McpManager,
     log_ring: may_agent::log_ring::LogRingHandle,
     mut launch_grant: Option<LaunchGrant>,
@@ -561,10 +531,6 @@ where
     // not reopened before the daemon clears it.
     let mut shown_prompts = std::collections::HashSet::<String>::new();
 
-    // Sockets through which other main agents reach this TUI's session
-    let agent_listeners =
-        may_agent::agent_link::AgentListeners::new(tokio::runtime::Handle::current());
-
     // Frames are drawn when something changed: every event but the idle
     // tick redraws. A tick redraws while a turn animates its spinner, and
     // otherwise at most once a second so elapsed counters, auto-collapsing
@@ -574,8 +540,6 @@ where
 
     loop {
         enum Event {
-            AskUser(may_agent::ask_user::AskUserRequest),
-            Workspace(may_agent::workspace_request::WorkspaceRequest),
             WorkerBuilt(Box<Result<AgentWorker, may_agent::tui::runtime::TuiRuntimeError>>),
             Agent(TuiEvent),
             ForeignTurn(may_agent::agent::ForeignTurn),
@@ -709,9 +673,7 @@ where
             app.mode = may_agent::tui::AppMode::Chat;
         }
 
-        runtime_deps
-            .listen_for_agent_messages(app, &agent_listeners, events.sender())
-            .await?;
+        runtime_deps.listen_for_agent_messages()?;
         phases.step("questions+listeners", step_start.elapsed());
 
         // A saved change to the cache lifetime or compaction model replaces
@@ -742,14 +704,11 @@ where
             && let Some(w) = worker.as_ref()
         {
             let step_start = std::time::Instant::now();
-            match runtime_deps.begin_queued_run(app).await? {
+            match runtime_deps.begin_queued_run(app)? {
                 QueuedRunStart::Started(msg) => {
                     busy_elsewhere_notified = false;
-                    agent_handle = Some(
-                        runtime_deps
-                            .start_agent_task(app, w, msg, &mut pending_title_gen)
-                            .await?,
-                    );
+                    agent_handle =
+                        Some(runtime_deps.start_agent_task(app, w, msg, &mut pending_title_gen)?);
                     assistant_response.clear();
                     continue;
                 }
@@ -766,76 +725,52 @@ where
             phases.step("begin_queued_run", step_start.elapsed());
         }
 
-        // DIAGNOSTIC: Check channel states before entering select
-        tracing::info!(
-            ask_user_empty = ask_user_queue.is_empty(),
-            workspace_empty = workspace_queue.is_empty(),
-            has_agent_handle = agent_handle.is_some(),
-            "channel states before select"
-        );
-
         tracing::info!("entering select");
 
         // Use futures_lite::future::or chain
         let event = futures_lite::future::or(
             async {
-                let result = ask_user_queue.next().await;
-                tracing::info!("ask_user_queue.next() RETURNED: {:?}", result.is_some());
-                result.map(Event::AskUser)
+                match worker_build.as_mut() {
+                    Some(pending) => Some(Event::WorkerBuilt(Box::new(pending.build.wait().await))),
+                    None => futures_lite::future::pending().await,
+                }
             },
             futures_lite::future::or(
                 async {
-                    match worker_build.as_mut() {
-                        Some(pending) => {
-                            Some(Event::WorkerBuilt(Box::new(pending.build.wait().await)))
-                        }
-                        None => futures_lite::future::pending().await,
+                    if let Some(ref handle) = agent_handle {
+                        let result = handle.recv().await;
+                        tracing::info!("agent handle.recv() RETURNED");
+                        result.map(Event::Agent)
+                    } else if let Some(worker) = worker.as_ref() {
+                        // A turn another client started, rendered
+                        // while this TUI has none of its own.
+                        worker.next_foreign_turn().await.map(Event::ForeignTurn)
+                    } else {
+                        futures_lite::future::pending().await
                     }
                 },
                 futures_lite::future::or(
                     async {
-                        let result = workspace_queue.next().await;
-                        tracing::info!("workspace_queue.next() RETURNED");
-                        result.map(Event::Workspace)
+                        if let Some(ref handle) = context_handle {
+                            // None means the report channel closed —
+                            // surface it as an event so the handle is
+                            // cleared instead of quitting the loop.
+                            Some(Event::Context(handle.recv().await))
+                        } else {
+                            futures_lite::future::pending().await
+                        }
                     },
-                    futures_lite::future::or(
-                        async {
-                            if let Some(ref handle) = agent_handle {
-                                let result = handle.recv().await;
-                                tracing::info!("agent handle.recv() RETURNED");
-                                result.map(Event::Agent)
-                            } else if let Some(worker) = worker.as_ref() {
-                                // A turn another client started, rendered
-                                // while this TUI has none of its own.
-                                worker.next_foreign_turn().await.map(Event::ForeignTurn)
-                            } else {
-                                futures_lite::future::pending().await
-                            }
-                        },
-                        futures_lite::future::or(
-                            async {
-                                if let Some(ref handle) = context_handle {
-                                    // None means the report channel closed —
-                                    // surface it as an event so the handle is
-                                    // cleared instead of quitting the loop.
-                                    Some(Event::Context(handle.recv().await))
-                                } else {
-                                    futures_lite::future::pending().await
-                                }
-                            },
-                            async {
-                                let result = events.next().await;
-                                // Don't log ticks, too noisy
-                                if !matches!(result, Some(AppEvent::Tick)) {
-                                    tracing::info!(
-                                        "events.next() RETURNED: {:?}",
-                                        result.as_ref().map(|_| "event")
-                                    );
-                                }
-                                result.map(|event| Event::Terminal(Box::new(event)))
-                            },
-                        ),
-                    ),
+                    async {
+                        let result = events.next().await;
+                        // Don't log ticks, too noisy
+                        if !matches!(result, Some(AppEvent::Tick)) {
+                            tracing::info!(
+                                "events.next() RETURNED: {:?}",
+                                result.as_ref().map(|_| "event")
+                            );
+                        }
+                        result.map(|event| Event::Terminal(Box::new(event)))
+                    },
                 ),
             ),
         )
@@ -844,8 +779,6 @@ where
         tracing::info!(
             "select completed, event type: {}",
             match &event {
-                Some(Event::AskUser(_)) => "AskUser",
-                Some(Event::Workspace(_)) => "Workspace",
                 Some(Event::WorkerBuilt(_)) => "WorkerBuilt",
                 Some(Event::Agent(_)) => "Agent",
                 Some(Event::ForeignTurn(_)) => "ForeignTurn",
@@ -864,8 +797,6 @@ where
         }
         let event_kind = match &event {
             Event::Terminal(e) => e.kind(),
-            Event::AskUser(_) => "ask_user",
-            Event::Workspace(_) => "workspace",
             Event::WorkerBuilt(_) => "worker_built",
             Event::Agent(_) => "agent",
             Event::ForeignTurn(_) => "foreign_turn",
@@ -878,68 +809,6 @@ where
                     .take()
                     .expect("a built worker comes from the pending worker build");
                 finish_worker_build(app, worker, finished, *built).await?;
-            }
-
-            Event::AskUser(request) => {
-                let questions = request.args.request.clone().into_questions();
-                tracing::info!(question_count = questions.len(), "User question requested");
-                let session_id = app
-                    .session_manager
-                    .current()
-                    .map(|session| session.id.clone())
-                    .ok_or_else(|| anyhow::anyhow!("No active session"))?;
-                match runtime_deps
-                    .register_ask_user_request(&session_id, &questions)
-                    .await
-                {
-                    Ok(request_id) => {
-                        let state =
-                            may_agent::tui::AskUserState::new(request_id, request, questions);
-                        app.show_blocking_prompt(may_agent::tui::AppMode::AskUser(state));
-                    }
-                    // A dropped request fails the tool call instead of
-                    // taking the process down with it.
-                    Err(error) => {
-                        tracing::warn!(error = %error, "failed to register ask-user request");
-                        app.chat
-                            .push_error(&format!("Could not open the question: {error}"));
-                        drop(request);
-                    }
-                }
-            }
-
-            Event::Workspace(request) => {
-                tracing::info!(
-                    path = %request.args.request.path,
-                    reason = %request.args.request.reason,
-                    "Workspace access requested"
-                );
-                let session_id = app
-                    .session_manager
-                    .current()
-                    .map(|session| session.id.clone())
-                    .ok_or_else(|| anyhow::anyhow!("No active session"))?;
-                match runtime_deps
-                    .register_workspace_request(app, &session_id, &request.args.request)
-                    .await
-                {
-                    Ok(request_id) => {
-                        app.show_blocking_prompt(may_agent::tui::AppMode::WorkspaceConfirm(
-                            may_agent::tui::state::WorkspaceConfirmState {
-                                request_id,
-                                path: request.args.request.path.clone(),
-                                reason: request.args.request.reason.clone(),
-                                request: Some(request),
-                            },
-                        ));
-                    }
-                    Err(error) => {
-                        tracing::warn!(error = %error, "failed to register workspace request");
-                        app.chat
-                            .push_error(&format!("Could not open the workspace request: {error}"));
-                        drop(request);
-                    }
-                }
             }
 
             Event::ForeignTurn(turn) => {
@@ -1203,12 +1072,13 @@ where
                         if agent_handle.is_none()
                             && let Some(w) = worker.as_ref()
                         {
-                            if runtime_deps.begin_run(app).await? {
-                                agent_handle = Some(
-                                    runtime_deps
-                                        .start_agent_task(app, w, msg, &mut pending_title_gen)
-                                        .await?,
-                                );
+                            if runtime_deps.begin_run(app)? {
+                                agent_handle = Some(runtime_deps.start_agent_task(
+                                    app,
+                                    w,
+                                    msg,
+                                    &mut pending_title_gen,
+                                )?);
                                 assistant_response.clear();
                             } else {
                                 app.chat.push_notice(

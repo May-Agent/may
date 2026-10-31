@@ -328,7 +328,7 @@ fn api_routes() -> Route {
     };
     use super::notifications::{
         consume_notification_callback, get_vapid_key, list_network_access_logs,
-        list_notification_mailbox, subscribe, test_notification, unsubscribe,
+        list_notification_mailbox, send_notification, subscribe, test_notification, unsubscribe,
     };
     use super::profiles::{
         archive_session, create_folder, create_profile, delete_folder, delete_profile,
@@ -338,9 +338,9 @@ fn api_routes() -> Route {
     };
     use super::remote_access::{get_remote_access_status, start_remote_access, stop_remote_access};
     use super::sessions::{
-        create_session, delete_all_sessions, delete_session, get_session,
-        get_session_context_debug, get_session_tasks, list_sessions, save_session_tasks,
-        set_session_plan_state, update_session,
+        append_session_history, create_session, delete_all_sessions, delete_session, get_session,
+        get_session_context_debug, get_session_history, get_session_tasks, list_sessions,
+        lookup_issues, rewind_session, save_session_tasks, set_session_plan_state, update_session,
     };
     use super::tasks::{
         approve_task, create_task, delete_task, get_task, invoke_webhook_task, list_tasks,
@@ -368,6 +368,12 @@ fn api_routes() -> Route {
                         "".at(get_session),
                         "".put(update_session),
                         "".delete(delete_session),
+                        "/history".at(get_session_history),
+                        "/history".post(append_session_history),
+                        "/rewind".post(rewind_session),
+                        "/issues/lookup".post(lookup_issues),
+                    )),
+                    Route::new((
                         "/tasks".at(get_session_tasks),
                         "/tasks".put(save_session_tasks),
                         "/tasks/plan-state".put(set_session_plan_state),
@@ -492,6 +498,7 @@ fn api_routes() -> Route {
                 "/test".post(test_notification),
             ))),
             "/notifications".route(Route::new((
+                "".post(send_notification),
                 "/mailbox".at(list_notification_mailbox),
                 "/{id}/callback".post(consume_notification_callback),
                 "/network-access".at(list_network_access_logs),

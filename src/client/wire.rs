@@ -330,7 +330,7 @@ pub enum SessionAgentBody {
 }
 
 /// One `session_runtime` event: the session's blocking-state snapshot.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRuntimeEvent {
     /// Session the snapshot belongs to.
@@ -341,7 +341,7 @@ pub struct SessionRuntimeEvent {
 
 /// The session's blocking state, as `GET /api/sessions/{id}/runtime` and the
 /// `session_runtime` event report it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionRuntimeSnapshot {
     /// Top-level runtime state.
@@ -430,7 +430,7 @@ pub struct TerminalInteractionSnapshot {
 }
 
 /// A permission request blocking a session, as polls report it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PermissionPollItem {
     /// Request id, the one `respond` answers.
@@ -441,7 +441,7 @@ pub struct PermissionPollItem {
 }
 
 /// A workspace request blocking a session, as polls report it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspacePollItem {
     /// Request id, the one `respond` answers.
@@ -453,6 +453,72 @@ pub struct WorkspacePollItem {
     /// Session that asked, when it is not the connected one.
     #[serde(default)]
     pub session_id: Option<String>,
+}
+
+/// `POST /api/sessions` request body.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateSessionRequest {
+    /// Session id the client pre-generated; the daemon assigns one otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Model to bind.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Profile to create it under.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    /// Host directory the session works in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+
+/// `PUT /api/sessions/{id}` request body.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateSessionRequest {
+    /// New title.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// New model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Reasoning-effort override.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    /// Host directory the session works in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// One-shot/non-interactive flag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub non_interactive: Option<bool>,
+}
+
+/// `POST /api/sessions/{id}/rewind` request body.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RewindRequest {
+    /// Index into the session's stored message list where the cut starts.
+    pub index: usize,
+}
+
+/// One `GET /api/sessions/{id}` response, the fields a client session needs.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WireSession {
+    /// Session id.
+    pub id: String,
+    /// Title.
+    pub title: String,
+    /// Last-modified timestamp, RFC 3339.
+    pub last_modified: String,
+    /// Profile the session belongs to.
+    pub profile_id: Option<String>,
+    /// Model bound to the session.
+    pub model: String,
+    /// Reasoning effort override, if any.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 #[cfg(test)]

@@ -68,6 +68,74 @@ struct MentionCandidate {
 ///
 /// # Panics
 ///
+/// Like [`build_session_mentions`], but for daemon clients: session and
+/// history rows come from REST instead of a local `history.db` handle.
+///
+/// # Errors
+/// Returns [`PromptMentionError`] when a request fails.
+///
+/// Panics if the compiled template fails to render.
+pub async fn build_session_mentions_remote(
+    client: &crate::client::DaemonClient,
+    content: &str,
+) -> Result<Option<String>, PromptMentionError> {
+    let mention_ids = extract_session_mention_ids(content);
+    if mention_ids.is_empty() {
+        return Ok(None);
+    }
+
+    let mut entries = Vec::new();
+    for session_id in mention_ids {
+        if let Ok(session) = client
+            .get::<crate::client::WireSession>(&format!("/api/sessions/{session_id}"))
+            .await
+        {
+            let title = if session.title.is_empty() {
+                "Untitled".to_string()
+            } else {
+                session.title
+            };
+            let model = if session.model.is_empty() {
+                "unknown".to_string()
+            } else {
+                session.model
+            };
+            let recent_user_messages = client
+                .get::<Vec<crate::session::ChatMessage>>(&format!(
+                    "/api/sessions/{session_id}/history"
+                ))
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .rev()
+                .filter(|message| message.role == crate::session::MessageRole::User)
+                .take(4)
+                .map(|message| truncate_preview_with_limit(&message.content, 160))
+                .collect::<Vec<_>>();
+            entries.push(SessionMention {
+                id: session.id,
+                title,
+                model,
+                recent_user_messages,
+            });
+        }
+    }
+
+    if entries.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(
+        SessionMentions { sessions: entries }
+            .render()
+            .expect("session mentions template must render"),
+    ))
+}
+
+/// # Errors
+/// Returns [`PromptMentionError::SessionLookup`] when a session lookup fails.
+///
+/// # Panics
 /// Panics if the compiled template fails to render.
 pub async fn build_session_mentions(
     db: &ChatDb,
