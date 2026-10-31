@@ -107,7 +107,10 @@ impl ForwardedTurn {
 fn events_query(session_id: &str, after: Option<&str>) -> String {
     let mut query = url::form_urlencoded::Serializer::new(String::new());
     query
-        .append_pair("topics", "session_agent,session_turn,session_background")
+        .append_pair(
+            "topics",
+            "session_agent,session_turn,session_background,session_runtime",
+        )
         .append_pair("sessionId", session_id);
     if let Some(after) = after {
         query.append_pair("after", after);
@@ -157,6 +160,16 @@ async fn follow_session(
                     .await;
                 }
                 "session_turn" => forward_turn_error(&event.data, &mut current).await,
+                "session_runtime" => {
+                    if let Ok(snapshot) =
+                        serde_json::from_str::<crate::client::SessionRuntimeEvent>(&event.data)
+                    {
+                        let _ = forwarding
+                            .app_events
+                            .send(AppEvent::SessionRuntime(snapshot))
+                            .await;
+                    }
+                }
                 // Frames this client missed are gone: the turn it followed
                 // ended unseen. The turn in progress, if any, follows from
                 // its start.
