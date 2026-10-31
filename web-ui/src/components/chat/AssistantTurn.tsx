@@ -4,6 +4,7 @@ import { MessageText } from './MessageText';
 import { ReasoningBlock } from './ReasoningBlock';
 import { ToolCard } from './ToolCard';
 import { ComputerCard } from './ComputerCard';
+import { MessageActions } from './MessageActions';
 import { groupBrowserRuns } from '@/lib/browser/activity';
 import { TodoBlock } from './TodoBlock';
 import { useTranslation } from '@/lib/i18n';
@@ -38,7 +39,7 @@ export function AssistantTurn({
   const reasoningStreaming = streaming && !hasAnySegment;
 
   return (
-    <div className="space-y-2">
+    <div className="group/message space-y-2">
       {turn.reasoning.length > 0 && (
         <ReasoningBlock text={turn.reasoning} streaming={reasoningStreaming} />
       )}
@@ -72,6 +73,12 @@ export function AssistantTurn({
       })}
       {turn.todo && (
         <TodoBlock items={turn.todo.items} total={turn.todo.total} completed={turn.todo.completed} />
+      )}
+      {!streaming && (
+        <MessageActions
+          className="-ml-1"
+          text={turn.segments.flatMap((s) => (s.kind === 'text' ? [s.text] : [])).join('\n\n')}
+        />
       )}
       {showDecodeSpeed && turn.tokensPerSecond != null && (
         <div className="flex items-center gap-1.5 text-xs tabular-nums text-muted-foreground">
