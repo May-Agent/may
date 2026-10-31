@@ -32,6 +32,8 @@ pub enum AppMode {
     PermissionConfirm(PermissionConfirmState),
     /// Workspace access confirmation dialog
     WorkspaceConfirm(WorkspaceConfirmState),
+    /// Startup prompt offering read/write access to the launch directory
+    LaunchGrant(LaunchGrantState),
     /// MCP server management overlay
     McpManage,
     /// SSH server management overlay
@@ -81,6 +83,7 @@ impl AppMode {
             Self::ChatgptAuth => "chatgpt-auth",
             Self::PermissionConfirm(_) => "permission-confirm",
             Self::WorkspaceConfirm(_) => "workspace-confirm",
+            Self::LaunchGrant(_) => "launch-grant",
             Self::McpManage => "mcp-manage",
             Self::SshManage => "ssh-manage",
             Self::AskUser(_) => "ask-user",
@@ -325,6 +328,14 @@ impl AskUserState {
     pub const fn is_multi(&self) -> bool {
         self.questions.len() > 1
     }
+}
+
+/// Startup prompt offering to grant the agent read/write access to the
+/// directory May was launched in.
+#[derive(Debug)]
+pub struct LaunchGrantState {
+    /// The launch directory being offered.
+    pub path: std::path::PathBuf,
 }
 
 /// Pending workspace-access confirmation shown in the TUI.
