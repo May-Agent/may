@@ -1,3 +1,4 @@
+import { useCallback } from 'react';
 import i18next from 'i18next';
 import LanguageDetector from 'i18next-browser-languagedetector';
 import { initReactI18next, useTranslation as useReactI18nTranslation } from 'react-i18next';
@@ -94,8 +95,11 @@ export function useTranslation() {
   const { t: rawT } = useReactI18nTranslation();
   const locale = useLocaleStore((s) => s.locale);
   const setLocale = useLocaleStore((s) => s.setLocale);
-  const t = (key: MessageKey, vars?: Record<string, string | number>): string =>
-    rawT(key, vars as Record<string, unknown>) as string;
+  const t = useCallback(
+    (key: MessageKey, vars?: Record<string, string | number>): string =>
+      rawT(key, vars as Record<string, unknown>) as string,
+    [rawT],
+  );
   return { t, locale, setLocale };
 }
 
