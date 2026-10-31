@@ -63,7 +63,7 @@ export function ContextRing({ sessionId }: { sessionId: string }) {
         <button
           type="button"
           className={cn(
-            'group inline-flex items-center gap-1.5 rounded-full border border-border bg-card/60 px-2 py-0.5 text-[11px] font-medium tabular-nums transition-colors hover:bg-accent',
+            'group inline-flex h-7 items-center gap-1.5 rounded-full border border-border bg-card/60 px-2 text-[11px] font-medium tabular-nums transition-colors hover:bg-accent touch:h-11 touch:px-3',
             text,
           )}
           aria-label={t('chat.context')}
