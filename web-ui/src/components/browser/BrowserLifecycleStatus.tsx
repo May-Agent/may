@@ -1,76 +1,17 @@
-import {
-  AlertCircle,
-  CheckCircle2,
-  Compass,
-  Download,
-  Loader2,
-  PauseCircle,
-  Power,
-  Users,
-} from 'lucide-react';
 import type { BrowserLifecycleSnapshot } from '@/lib/stores/runtime';
 import { useTranslation } from '@/lib/i18n';
 import { cn } from '@/lib/utils';
+import { formatBytes } from '@/lib/formatBytes';
 
 interface Props {
   snapshot: BrowserLifecycleSnapshot;
   className?: string;
 }
 
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
+/** The browser's latest lifecycle step as one line of secondary text. */
 export function BrowserLifecycleStatus({ snapshot, className }: Props) {
   const { t } = useTranslation();
   const last = snapshot.last;
-
-  const tone = (
-    () => {
-      if (!last) return 'idle';
-      switch (last.kind) {
-        case 'error':
-        case 'encoderStalled':
-          return 'warn';
-        case 'ready':
-        case 'pageLoaded':
-          return 'ok';
-        case 'stopped':
-          return 'idle';
-        default:
-          return 'busy';
-      }
-    }
-  )();
-
-  const Icon = (() => {
-    if (!last) return PauseCircle;
-    switch (last.kind) {
-      case 'chromeFetching':
-        return Download;
-      case 'starting':
-        return Loader2;
-      case 'ready':
-        return CheckCircle2;
-      case 'navigating':
-        return Compass;
-      case 'pageLoaded':
-        return CheckCircle2;
-      case 'peerConnected':
-      case 'peerDisconnected':
-        return Users;
-      case 'takeoverChanged':
-        return Users;
-      case 'encoderStalled':
-        return AlertCircle;
-      case 'error':
-        return AlertCircle;
-      case 'stopped':
-        return Power;
-    }
-  })();
 
   const label = (() => {
     if (!last) return t('browserLive.lifecycle.idle');
@@ -89,7 +30,7 @@ export function BrowserLifecycleStatus({ snapshot, className }: Props) {
         return last.title ?? last.url;
       case 'peerConnected':
       case 'peerDisconnected':
-        return t('browserLive.viewerCount', { count: last.count });
+        return snapshot.pageTitle ?? snapshot.pageUrl ?? t('browserLive.lifecycle.ready');
       case 'takeoverChanged':
         return last.sessionId
           ? t('browserLive.lifecycle.takenOver')
@@ -103,27 +44,16 @@ export function BrowserLifecycleStatus({ snapshot, className }: Props) {
     }
   })();
 
+  const failed = last?.kind === 'error' || last?.kind === 'encoderStalled';
+
   return (
-    <div
-      className={cn(
-        'flex items-center gap-1.5 text-xs',
-        tone === 'ok' && 'text-emerald-600 dark:text-emerald-400',
-        tone === 'warn' && 'text-amber-600 dark:text-amber-400',
-        tone === 'busy' && 'text-muted-foreground',
-        tone === 'idle' && 'text-muted-foreground/60',
-        className,
-      )}
+    <p
+      className={cn('truncate text-xs', failed ? 'text-destructive' : 'text-muted-foreground', className)}
       role="status"
       aria-live="polite"
+      title={label}
     >
-      <Icon
-        className={cn(
-          'size-3.5 shrink-0',
-          last?.kind === 'starting' && 'animate-spin',
-          last?.kind === 'chromeFetching' && 'animate-pulse',
-        )}
-      />
-      <span className="truncate">{label}</span>
-    </div>
+      {label}
+    </p>
   );
 }

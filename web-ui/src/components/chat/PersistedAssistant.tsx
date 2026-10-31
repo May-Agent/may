@@ -3,6 +3,8 @@ import type { TurnToolState } from '@/lib/stream/reducer';
 import { MessageText } from './MessageText';
 import { ReasoningBlock } from './ReasoningBlock';
 import { ToolCard } from './ToolCard';
+import { ComputerCard } from './ComputerCard';
+import { groupBrowserRuns } from '@/lib/browser/activity';
 
 interface PersistedToolEvent {
   stage: 'start' | 'end';
@@ -57,9 +59,13 @@ export function PersistedAssistant({
   return (
     <div className="space-y-2">
       {reasoning.length > 0 && <ReasoningBlock text={reasoning} />}
-      {tools.map((tool) => (
-        <ToolCard key={tool.id} tool={tool} />
-      ))}
+      {groupBrowserRuns(tools, (tool) => tool.variant === 'browser').map((group) =>
+        group.kind === 'browser' ? (
+          <ComputerCard key={group.items[0]!.id} tools={group.items} sessionId={sessionId} />
+        ) : (
+          <ToolCard key={group.item.id} tool={group.item} />
+        ),
+      )}
       {message.content.length > 0 && <MessageText text={message.content} sessionId={sessionId} />}
     </div>
   );

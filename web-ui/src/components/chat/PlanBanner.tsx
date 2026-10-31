@@ -1,18 +1,8 @@
 import { useEffect, useState } from 'react';
 import { Streamdown } from 'streamdown';
-import {
-  CheckCircle2,
-  ChevronDown,
-  ChevronRight,
-  ClipboardList,
-  Pencil,
-  Save,
-  Trash2,
-  X,
-} from 'lucide-react';
+import { ChevronRight, Pencil, Trash2 } from 'lucide-react';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
-import { Badge } from '@/components/ui/badge';
 import { Textarea } from '@/components/ui/textarea';
 import {
   getSessionTasks,
@@ -58,9 +48,9 @@ export function PlanBanner({ sessionId, planState }: PlanBannerProps) {
     };
   }, [sessionId, planState]);
 
-  // The banner exists for the one decision only the user can make: approving
-  // a draft plan. An approved plan lives in the inspector.
-  if (planState !== 'draft' && !editing) return null;
+  // The plan's state lives here, with the plan, and nowhere else: a draft
+  // waits for the user's approval, an approved plan says so quietly.
+  if (planState === 'disabled' && !editing) return null;
   if (loading && !content) return null;
 
   const approved = planState === 'approved';
@@ -103,11 +93,7 @@ export function PlanBanner({ sessionId, planState }: PlanBannerProps) {
   };
 
   return (
-    <div
-      className={cn(
-        'border-b border-border bg-gradient-to-b from-card/40 to-transparent',
-      )}
-    >
+    <div className="border-b border-border">
       <ConfirmDialog
         open={discarding}
         onOpenChange={setDiscarding}
@@ -117,43 +103,33 @@ export function PlanBanner({ sessionId, planState }: PlanBannerProps) {
         destructive
         onConfirm={() => transition('disabled')}
       />
-      <div className="mx-auto w-full max-w-3xl px-4 py-3 sm:px-6">
+      <div className="mx-auto w-full max-w-3xl px-4 py-2 sm:px-6">
         <div className="flex items-start gap-2">
-          <button
-            type="button"
-            onClick={() => setExpanded((v) => !v)}
-            className="-m-1.5 flex size-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground touch:size-11"
-            aria-label={expanded ? t('plan.collapse') : t('plan.expand')}
-            aria-expanded={expanded}
-          >
-            {expanded ? <ChevronDown className="size-4" /> : <ChevronRight className="size-4" />}
-          </button>
           <div className="min-w-0 flex-1">
-            <div className="flex items-center gap-2">
-              <ClipboardList className="size-3.5 text-muted-foreground" />
-              <span className="text-xs font-medium text-foreground">
-                {t('chat.plan')}
+            <button
+              type="button"
+              onClick={() => setExpanded((v) => !v)}
+              className="-mx-1.5 flex h-7 max-w-full items-center gap-1.5 rounded-md px-1.5 text-[13px] hover:bg-accent touch:h-11"
+              aria-expanded={expanded}
+              title={expanded ? t('plan.collapse') : t('plan.expand')}
+            >
+              <ChevronRight
+                className={cn('size-3.5 shrink-0 text-muted-foreground transition-transform', expanded && 'rotate-90')}
+                aria-hidden
+              />
+              <span className="shrink-0 font-medium">{t('chat.plan')}</span>
+              <span className="shrink-0 text-muted-foreground">
+                {approved ? t('plan.approved') : t('plan.awaiting')}
               </span>
-              <Badge tone={approved ? 'positive' : 'info'}>
-                {approved ? (
-                  <>
-                    <CheckCircle2 className="size-2.5" />
-                    {t('chat.planStateApproved')}
-                  </>
-                ) : (
-                  t('chat.planStateDraft')
-                )}
-              </Badge>
-            </div>
-
-            {!expanded && content.length > 0 && (
-              <div className="mt-1 truncate text-[11px] text-muted-foreground">
-                {firstHeading(content) ?? content.slice(0, 120)}
-              </div>
-            )}
+              {!expanded && content.length > 0 && (
+                <span className="min-w-0 truncate text-muted-foreground/80">
+                  · {firstHeading(content) ?? content.slice(0, 120)}
+                </span>
+              )}
+            </button>
 
             {expanded && !editing && (
-              <div className="mt-2 max-h-64 overflow-y-auto rounded-md border border-border/60 bg-background/40 px-3 py-2 text-sm">
+              <div className="mt-1 mb-1 max-h-64 overflow-y-auto border-l border-border pl-3 text-[13px]">
                 {content.trim().length === 0 ? (
                   <div className="text-xs text-muted-foreground">{t('plan.noContent')}</div>
                 ) : (
@@ -175,14 +151,11 @@ export function PlanBanner({ sessionId, planState }: PlanBannerProps) {
           </div>
 
           <div className="flex shrink-0 items-center gap-1">
-            {!editing ? (
+            {approved && !editing ? null : !editing ? (
               <>
-                {!approved && (
-                  <Button size="sm" onClick={() => transition('approved')} disabled={busy}>
-                    <CheckCircle2 className="size-3.5" />
-                    {t('chat.approvePlan')}
-                  </Button>
-                )}
+                <Button size="sm" onClick={() => transition('approved')} disabled={busy}>
+                  {t('chat.approvePlan')}
+                </Button>
                 <Button
                   size="icon"
                   variant="ghost"
@@ -195,7 +168,7 @@ export function PlanBanner({ sessionId, planState }: PlanBannerProps) {
                 <Button
                   size="icon"
                   variant="ghost"
-                  className="text-destructive hover:bg-destructive/10 hover:text-destructive"
+                  className="hover:text-destructive"
                   onClick={() => setDiscarding(true)}
                   disabled={busy}
                   aria-label={t('chat.discardPlan')}
@@ -206,18 +179,11 @@ export function PlanBanner({ sessionId, planState }: PlanBannerProps) {
               </>
             ) : (
               <>
-                <Button size="sm" onClick={onSave} disabled={busy}>
-                  <Save className="size-3.5" />
-                  {t('common.save')}
+                <Button size="sm" variant="ghost" onClick={() => setEditing(false)} disabled={busy}>
+                  {t('common.cancel')}
                 </Button>
-                <Button
-                  size="icon"
-                  variant="ghost"
-                  onClick={() => setEditing(false)}
-                  disabled={busy}
-                  aria-label={t('common.cancel')}
-                >
-                  <X className="size-3.5" />
+                <Button size="sm" onClick={onSave} disabled={busy}>
+                  {t('common.save')}
                 </Button>
               </>
             )}

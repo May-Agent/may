@@ -8,7 +8,7 @@ import { useNewChat } from '@/lib/useNewChat';
 import { INSPECTOR_COLUMN_QUERY, SIDEBAR_COLUMN_QUERY, useMediaQuery } from '@/lib/useMediaQuery';
 import { useTranslation } from '@/lib/i18n';
 import { CommandPalette } from './CommandPalette';
-import { BrowserLiveView } from '@/components/browser/BrowserLiveView';
+import { ComputerViewer } from '@/components/browser/ComputerViewer';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import { InteractionLayer } from '@/components/interactions/InteractionLayer';
 import { useRuntimeStore } from '@/lib/stores/runtime';
@@ -109,10 +109,10 @@ export function AppShell() {
         <main className="min-w-0 flex-1 overflow-hidden">
           <Outlet />
         </main>
-        <BrowserLiveView />
+        <ComputerViewer />
         <InteractionLayer />
         <CommandPalette />
-        <Toaster theme={toasterTheme} richColors closeButton position="top-right" />
+        <Toaster theme={toasterTheme} closeButton position="top-right" />
       </div>
     </TooltipProvider>
   );
