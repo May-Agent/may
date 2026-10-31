@@ -64,7 +64,8 @@ impl DaemonMode {
 /// # Errors
 /// Fails when the pair does not form a socket address.
 pub fn parse_listen_args(args: &[String]) -> anyhow::Result<SocketAddr> {
-    let host = super::helpers::parse_arg_value(args, "--host").unwrap_or_else(|| "127.0.0.1".to_string());
+    let host =
+        super::helpers::parse_arg_value(args, "--host").unwrap_or_else(|| "127.0.0.1".to_string());
     let port = super::helpers::parse_arg_value(args, "--port")
         .and_then(|v| v.parse::<u16>().ok())
         .unwrap_or(DEFAULT_PORT);
@@ -522,7 +523,9 @@ fn build_router(state: Arc<DaemonState>, mode: DaemonMode) -> Router {
 
 // ── System / Meta handlers ────────────────────────────────
 
-async fn health(State(state): State<Arc<DaemonState>>) -> SkyResult<Json<super::types::DaemonHealth>> {
+async fn health(
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<super::types::DaemonHealth>> {
     Ok(Json(super::types::DaemonHealth {
         ok: true,
         pid: std::process::id(),
