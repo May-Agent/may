@@ -31,6 +31,7 @@ export function createSession(payload?: {
   title?: string;
   profileId?: string | null;
   model?: string;
+  repo?: string;
 }): Promise<ApiSession> {
   return apiPost<ApiSession>('/sessions', payload ?? {});
 }

@@ -86,7 +86,7 @@ interface SessionsState {
   load: () => Promise<void>;
   open: (id: string) => Promise<void>;
   refreshActive: (id: string) => Promise<void>;
-  createNew: (profileId?: string | null) => Promise<ApiSession>;
+  createNew: (profileId?: string | null, opts?: { repo?: string }) => Promise<ApiSession>;
   /**
    * Turn a draft into a real daemon session: `POST /api/sessions`, apply any
    * staged settings, rekey the stores from the draft id to the real id.
@@ -184,7 +184,7 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
     }
   },
 
-  async createNew(profileId) {
+  async createNew(profileId, opts) {
     activeRequestGeneration += 1;
     const draft: ApiSession = {
       id: `${DRAFT_PREFIX}${crypto.randomUUID()}`,
@@ -196,6 +196,7 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
       model: useConfigStore.getState().config?.fullConfig.lastModel ?? '',
       reasoningEffort: null,
       runtime: {},
+      repo: opts?.repo ?? null,
     };
     set((prev) => ({
       drafts: { ...prev.drafts, [draft.id]: { session: draft, planContent: null } },
@@ -211,6 +212,7 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
     let session = await createSession({
       profileId: record.session.profileId,
       model: record.session.model || undefined,
+      repo: record.session.repo ?? undefined,
     });
     const patch: UpdateSessionPatch = {};
     if (record.session.title !== 'New Chat') patch.title = record.session.title;
