@@ -20,7 +20,6 @@ use aither_core::llm::model::{Ability, Parameters};
 use askama::Template;
 
 use super::may::{AgentEnvironment, MayAgentConfig, MayAgentError};
-use crate::fs_utils::display_path;
 use crate::network_policy::{CompiledNetworkPolicy, NetworkPolicyMode};
 use crate::session::{SessionPaths, SessionPlanState};
 use crate::skill::SkillManager;
@@ -276,8 +275,8 @@ struct TerminalRuntimeContextTemplate {
     home_environment_kind: String,
     operating_system: String,
     shell_dialect: &'static str,
-    home_directory: String,
-    session_directory: String,
+    working_directory: String,
+    home_note: &'static str,
     host_launch_directory: Option<String>,
     home_layout: Vec<String>,
     session_layout: Vec<String>,
@@ -325,7 +324,7 @@ struct RepoCloneTemplateEntry {
 impl From<&MayWorkspaceDir> for WorkspaceDirEntry {
     fn from(value: &MayWorkspaceDir) -> Self {
         Self {
-            path: display_path(&value.path),
+            path: value.path.display().to_string(),
             description: value
                 .description
                 .clone()
@@ -425,14 +424,10 @@ pub fn build_terminal_runtime_context(
         home_environment_kind: home_environment_kind_label(&config.environment).to_string(),
         operating_system: operating_system_hint(&config.environment).to_string(),
         shell_dialect: "POSIX sh",
-        home_directory: display_path(&session_paths.home_root()),
-        session_directory: display_path(session_paths.root()),
+        working_directory: working_directory(&config.environment, session_paths),
+        home_note: home_note(&config.environment),
         host_launch_directory,
-        home_layout: vec![
-            "/sessions - per-session sandboxes under this home environment".to_string(),
-            "/skills, /subagents - profile-scoped, mounted read-only inside the session".to_string(),
-            "workspace.toml - May-managed workspace grants for this home environment".to_string(),
-        ],
+        home_layout: home_layout(&config.environment),
         session_layout: vec![
             "/tmp - disposable temporary files".to_string(),
             "/artifacts - durable user-facing outputs; put deliverables here".to_string(),
@@ -593,6 +588,42 @@ const fn home_environment_kind_label(environment: &AgentEnvironment) -> &'static
     match environment {
         AgentEnvironment::Local => "local",
         AgentEnvironment::Container { .. } => "container",
+    }
+}
+
+/// The working directory the terminal starts in, as the shell sees it.
+fn working_directory(environment: &AgentEnvironment, session_paths: &SessionPaths) -> String {
+    match environment {
+        AgentEnvironment::Local => session_paths.root().display().to_string(),
+        AgentEnvironment::Container { .. } => {
+            crate::container::lifecycle::CONTAINER_WORKSPACE.to_string()
+        }
+    }
+}
+
+/// What `~`/`$HOME` expands to inside the shell.
+const fn home_note(environment: &AgentEnvironment) -> &'static str {
+    match environment {
+        AgentEnvironment::Local => {
+            "`~` and `$HOME` expand to the current working directory in every terminal mode, unsafe escalations included; use absolute paths for host locations."
+        }
+        AgentEnvironment::Container { .. } => {
+            "`~` and `$HOME` expand to the current working directory; storage outside /workspace is ephemeral to the container."
+        }
+    }
+}
+
+/// Layout of the profile home environment, empty where it has no meaningful
+/// anchor inside the session (containers mount its pieces under /root/.may).
+fn home_layout(environment: &AgentEnvironment) -> Vec<String> {
+    match environment {
+        AgentEnvironment::Local => vec![
+            "/sessions - per-session sandboxes under this home environment".to_string(),
+            "/skills, /subagents - profile-scoped, mounted read-only inside the session"
+                .to_string(),
+            "workspace.toml - May-managed workspace grants for this home environment".to_string(),
+        ],
+        AgentEnvironment::Container { .. } => Vec::new(),
     }
 }
 
