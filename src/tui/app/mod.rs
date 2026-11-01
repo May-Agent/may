@@ -2841,7 +2841,7 @@ impl App {
             self.chat.push_notice(crate::secrets::SECRET_WARNING);
         }
 
-        let id = format!("bash-{}", uuid::Uuid::new_v4());
+        let id = format!("bash-{}", crate::id::new());
         self.chat.push_tool(
             id.clone(),
             ToolDisplay::Terminal {

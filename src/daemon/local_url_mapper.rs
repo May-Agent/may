@@ -119,7 +119,7 @@ struct LocalUrlProxySlot {
 impl LocalUrlProxySlot {
     fn new(upstream: LocalUrlProxyUpstream) -> Self {
         Self {
-            slot_id: uuid::Uuid::new_v4().to_string(),
+            slot_id: crate::id::new(),
             upstream,
             entry: OnceCell::new(),
         }

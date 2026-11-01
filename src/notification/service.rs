@@ -54,7 +54,7 @@ impl NotificationService {
         p256dh: &str,
         auth: &str,
     ) -> Result<(), crate::db::ChatDbError> {
-        let id = uuid::Uuid::new_v4().to_string();
+        let id = crate::id::new();
         self.db
             .add_push_subscription(&id, endpoint, p256dh, auth)
             .await?;
@@ -104,7 +104,7 @@ impl NotificationService {
         &self,
         mut payload: NotificationPayload,
     ) -> Result<usize, NotificationServiceError> {
-        let notification_id = uuid::Uuid::new_v4().to_string();
+        let notification_id = crate::id::new();
         payload.notification_id = Some(notification_id.clone());
         self.db
             .create_notification_mailbox_entry(&notification_id, &payload, MAILBOX_STATUS_PENDING)

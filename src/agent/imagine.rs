@@ -125,7 +125,7 @@ impl ImagineTool {
         }
 
         let image = latest.ok_or(ImagineToolError::EmptyResponse)?;
-        let mut filename = uuid::Uuid::new_v4().to_string();
+        let mut filename = crate::id::new();
         filename.push_str(".png");
         let path = self.artifacts_dir.join(&filename);
         async_fs::create_dir_all(&self.artifacts_dir)

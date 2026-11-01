@@ -39,6 +39,7 @@ pub mod decode_meter;
 mod file_tracker;
 mod fs_utils;
 mod heel;
+mod id;
 /// Issue tracking: may issues by default, GitHub when configured.
 pub mod issue;
 mod live_response;
