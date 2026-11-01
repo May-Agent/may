@@ -580,7 +580,7 @@ fn replay_user_message(
             AttachmentKind::File => {
                 let label = attachment_local_path(attachment).map_or_else(
                     |_| attachment.url.clone(),
-                    |path| path.display().to_string(),
+                    |path| crate::fs_utils::display_path(&path),
                 );
                 let _ = write!(content, "\n[File reference: {label}]");
             }

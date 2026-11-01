@@ -46,7 +46,7 @@ pub fn pasted_text_block(content: &str, saved_path: Option<&Path>) -> String {
         chars,
         shown_chars,
         truncated,
-        full_path: saved_path.map(|path| path.display().to_string()),
+        full_path: saved_path.map(crate::fs_utils::display_path),
     }
     .render()
     .expect("pasted text template must render")
