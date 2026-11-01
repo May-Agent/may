@@ -317,14 +317,7 @@ fn sheet_height(app: &App, column: Rect) -> Option<u16> {
             (pct(60).max(12), pct(70))
         }
         AppMode::ProfileSelect => (rows(app.profiles.len() + 2), pct(60)),
-        AppMode::Rewind(state) => (
-            if state.options_for.is_some() {
-                9
-            } else {
-                rows(state.targets.len() * 2 + 4).min(18)
-            },
-            pct(60),
-        ),
+        AppMode::Rewind(state) => (rows(state.targets.len() * 2 + 4).min(18), pct(60)),
         AppMode::ResumePicker(state) => (
             if state.loading {
                 8
@@ -990,16 +983,11 @@ fn render_effort_select_popup(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
-/// Render the rewind picker. Stage one lists the session's user prompts
-/// with the file changes the turn each started produced, plus a trailing
-/// `(current)` entry; choosing a prompt opens stage two, which picks the
-/// restoration scope (conversation only, or conversation and code).
+/// Render the rewind picker: the session's user prompts with the file
+/// changes the turn each started produced, plus a trailing `(current)`
+/// entry. Rewind is conversation-only — landed code is undone through a
+/// revert PR, never through the picker.
 fn render_rewind_popup(frame: &mut Frame, area: Rect, state: &RewindState) {
-    if let Some(prompt_index) = state.options_for {
-        render_rewind_scope_popup(frame, area, state, prompt_index);
-        return;
-    }
-
     let popup_area = area;
 
     let selected_style = Style::default()
@@ -1061,64 +1049,6 @@ fn prompt_preview(content: &str) -> String {
     } else {
         first.to_string()
     }
-}
-
-/// The two restoration scopes the rewind picker offers, with their hint line.
-const REWIND_SCOPE_OPTIONS: &[(&str, &str)] = &[
-    (
-        "Rewind conversation",
-        "messages only; keep the files as they are",
-    ),
-    (
-        "Rewind conversation and code",
-        "also restore tracked files to this prompt's checkpoint",
-    ),
-];
-
-/// Stage two of the rewind picker: how much of the turn to restore.
-fn render_rewind_scope_popup(
-    frame: &mut Frame,
-    area: Rect,
-    state: &RewindState,
-    prompt_index: usize,
-) {
-    let popup_area = area;
-
-    let items: Vec<ListItem> = REWIND_SCOPE_OPTIONS
-        .iter()
-        .enumerate()
-        .map(|(idx, (label, hint))| {
-            let selected = idx == state.option_selected;
-            ListItem::new(vec![
-                Line::from(Span::styled(
-                    format!("{}{}", if selected { "> " } else { "  " }, label),
-                    if selected {
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(Color::White)
-                    },
-                )),
-                Line::from(Span::styled(
-                    format!("    {hint}"),
-                    Style::default().fg(Color::DarkGray),
-                )),
-            ])
-        })
-        .collect();
-
-    let prompt = state
-        .targets
-        .get(prompt_index)
-        .map_or_else(String::new, |t| prompt_preview(&t.content));
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title(format!("{prompt} (Enter restore, Esc back)")),
-    );
-    frame.render_widget(list, popup_area);
 }
 
 /// Jobs panel: bottom-anchored drawer listing running subagents and

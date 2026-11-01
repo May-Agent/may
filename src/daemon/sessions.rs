@@ -127,6 +127,17 @@ pub(super) async fn rewind_session(
     db.delete_messages_from(&id, cut_id)
         .await
         .map_err(internal_error)?;
+    // The audit log is append-only: every PR this session opened keeps a
+    // `rewound` event so its history records that the conversation was
+    // cut back while the proposal itself still stands.
+    if let Ok(prs) = db.list_session_prs(&id).await {
+        let detail = format!("history rewound to message {cut_id}");
+        for pr in prs {
+            let _ = db
+                .add_pr_event(pr.id, "rewound", &id, "user", None, Some(&detail))
+                .await;
+        }
+    }
     state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
     Ok(Json(cut_id))
 }
