@@ -422,7 +422,8 @@ export type UiEvent =
   | { kind: 'remote_access'; payload: { status: RemoteAccessStatusResponse } }
   | { kind: 'request_logs'; payload: RequestLogsResponse }
   | { kind: 'notification_mailbox'; payload: unknown }
-  | { kind: 'network_access_logs'; payload: NetworkAccessLogsResponse };
+  | { kind: 'network_access_logs'; payload: NetworkAccessLogsResponse }
+  | { kind: 'session_artifacts'; payload: SessionArtifactsPayload };
 
 // ── Artifacts ──────────────────────────────────────────────
 
@@ -438,9 +439,9 @@ export interface SessionArtifactsResponse {
   artifacts: ArtifactEntry[];
 }
 
-export interface ArtifactStreamPayload {
-  count: number;
-  signature: string;
+export interface SessionArtifactsPayload {
+  sessionId: string;
+  artifacts: ArtifactEntry[];
 }
 
 export interface SlidevPreviewResponse {

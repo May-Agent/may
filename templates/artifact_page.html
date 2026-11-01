@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ name }}</title>
+<style>
+:root { color-scheme: light dark; }
+* { box-sizing: border-box; }
+body { margin: 0; font: 14px/1.55 system-ui, sans-serif; color: CanvasText; }
+header { position: sticky; top: 0; display: flex; align-items: center; gap: 12px; padding: 10px 16px; border-bottom: 1px solid color-mix(in srgb, CanvasText 15%, transparent); background: Canvas; }
+header .meta { min-width: 0; flex: 1; }
+header .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+header .path { font-size: 12px; opacity: .6; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+header .actions { display: flex; gap: 8px; }
+.btn { padding: 5px 12px; border: 1px solid color-mix(in srgb, CanvasText 20%, transparent); border-radius: 6px; color: inherit; text-decoration: none; font-size: 13px; }
+.btn:hover { background: color-mix(in srgb, CanvasText 7%, transparent); }
+main { padding: 0; }
+.markdown { max-width: 52rem; margin: 0 auto; padding: 24px 20px 48px; }
+.markdown img { max-width: 100%; }
+.markdown pre { overflow-x: auto; padding: 12px; border-radius: 8px; background: color-mix(in srgb, CanvasText 6%, transparent); }
+.markdown code { font-family: ui-monospace, monospace; font-size: .92em; }
+.markdown table { border-collapse: collapse; }
+.markdown th, .markdown td { border: 1px solid color-mix(in srgb, CanvasText 20%, transparent); padding: 4px 10px; }
+pre.text { margin: 0; padding: 20px; font: 12px/1.5 ui-monospace, monospace; overflow-x: auto; white-space: pre-wrap; word-break: break-word; }
+.frame { display: block; width: 100%; height: calc(100vh - 53px); border: 0; background: white; }
+img.media { display: block; max-width: 100%; max-height: calc(100vh - 53px); margin: 0 auto; }
+video.media { display: block; max-width: 100%; max-height: calc(100vh - 53px); margin: 0 auto; }
+audio { display: block; margin: 24px auto; width: min(480px, 90%); }
+.empty { padding: 64px 20px; text-align: center; opacity: .6; }
+</style>
+</head>
+<body>
+<header>
+  <div class="meta">
+    <div class="name">{{ name }}</div>
+    <div class="path">{{ rel_path }} · {{ size_label }}</div>
+  </div>
+  <nav class="actions">
+    <a class="btn" href="{{ raw_url }}">Source</a>
+    <a class="btn" href="{{ download_url }}">Download</a>
+  </nav>
+</header>
+<main>
+{% match kind %}
+{% when crate::daemon::artifact_pages::PreviewKind::Markdown %}
+<article class="markdown">{{ rendered_html|safe }}</article>
+{% when crate::daemon::artifact_pages::PreviewKind::Frame %}
+<iframe class="frame" src="{{ media_src }}" sandbox="allow-scripts"></iframe>
+{% when crate::daemon::artifact_pages::PreviewKind::Image %}
+<img class="media" src="{{ media_src }}" alt="{{ name }}">
+{% when crate::daemon::artifact_pages::PreviewKind::Video %}
+<video class="media" src="{{ media_src }}" controls></video>
+{% when crate::daemon::artifact_pages::PreviewKind::Audio %}
+<audio src="{{ media_src }}" controls></audio>
+{% when crate::daemon::artifact_pages::PreviewKind::Text %}
+<pre class="text">{{ text }}</pre>
+{% when crate::daemon::artifact_pages::PreviewKind::Binary %}
+<div class="empty">No preview for this file type — use Download to get the file.</div>
+{% endmatch %}
+</main>
+</body>
+</html>
