@@ -54,6 +54,7 @@ use may_agent::agent::{AgentHandle, AgentWorker, TuiEvent};
 use may_agent::session::RunOutcome;
 use may_agent::tui::runtime::{
     AssistantReply, QueuedRunStart, ResponseCommit, RuntimeDeps, TitleGenContext,
+    discard_ephemeral_session,
 };
 use may_agent::tui::{App, AppEvent, EventHandler, SendAction, ui};
 use may_agent::{MayMcpServerConfig, McpManager, SkillManager};
@@ -410,16 +411,10 @@ where
                 purpose: WorkerBuildPurpose::Session,
                 build,
             });
-        } else if app.is_configured() {
-            match runtime_deps.begin_new_session(&mut app, &mut worker).await {
-                Ok(build) => {
-                    worker_build = Some(WorkerBuild {
-                        purpose: WorkerBuildPurpose::Startup,
-                        build,
-                    });
-                }
-                Err(e) => report_startup_failure(&mut app, &e),
-            }
+        } else if app.is_configured()
+            && let Err(e) = runtime_deps.begin_new_session(&mut app, &mut worker).await
+        {
+            report_startup_failure(&mut app, &e);
         }
     }
 
@@ -511,9 +506,8 @@ fn launch_grant_check(
 /// is reported.
 #[derive(Debug, Clone, Copy)]
 enum WorkerBuildPurpose {
-    /// The session started with the TUI; failure leaves it unconfigured.
-    Startup,
-    /// A user-requested new or loaded session; failure ends the TUI.
+    /// A user-requested new, loaded or materialized session; failure ends the
+    /// TUI.
     Session,
     /// A user-requested model switch; failure keeps the current worker.
     SwitchModel,
@@ -555,10 +549,6 @@ async fn finish_worker_build(
             return Ok(());
         }
         (_, Ok(built)) => built,
-        (WorkerBuildPurpose::Startup, Err(error)) => {
-            report_startup_failure(app, &error);
-            return Ok(());
-        }
         (WorkerBuildPurpose::Session, Err(error)) => return Err(error.into()),
         (WorkerBuildPurpose::SwitchModel, Err(error)) => {
             app.chat
@@ -1149,10 +1139,7 @@ where
                         break;
                     }
                     Some(SendAction::NewSession) => {
-                        worker_build = Some(WorkerBuild {
-                            purpose: WorkerBuildPurpose::Session,
-                            build: runtime_deps.begin_new_session(app, worker).await?,
-                        });
+                        runtime_deps.begin_new_session(app, worker).await?;
                     }
                     Some(SendAction::LoadSession(id)) => {
                         worker_build = Some(WorkerBuild {
@@ -1194,6 +1181,15 @@ where
                         }
                     }
                     Some(SendAction::Send(msg)) => {
+                        // A not-yet-persisted session reaches the daemon on
+                        // this first send; the turn it starts arrives on the
+                        // worker's event stream as a foreign turn.
+                        if let Some(build) = runtime_deps.materialize_session(app).await? {
+                            worker_build = Some(WorkerBuild {
+                                purpose: WorkerBuildPurpose::Session,
+                                build,
+                            });
+                        }
                         if agent_handle.is_none()
                             && let Some(w) = worker.as_ref()
                         {
@@ -1218,6 +1214,12 @@ where
                         }
                     }
                     Some(SendAction::EnqueuePending(msg)) => {
+                        if let Some(build) = runtime_deps.materialize_session(app).await? {
+                            worker_build = Some(WorkerBuild {
+                                purpose: WorkerBuildPurpose::Session,
+                                build,
+                            });
+                        }
                         runtime_deps.enqueue_pending_message(app, msg).await?;
                     }
                     Some(SendAction::RespondAskUser {
@@ -1293,20 +1295,45 @@ where
                         run_chatgpt_auth(app, events, terminal).await?;
                     }
                     Some(SendAction::SwitchModel(model)) => {
-                        match runtime_deps.begin_switch_model(app, &model) {
-                            Ok(build) => {
-                                worker_build = Some(WorkerBuild {
-                                    purpose: WorkerBuildPurpose::SwitchModel,
-                                    build,
-                                });
+                        let persisted = app
+                            .session_manager
+                            .current()
+                            .is_some_and(|session| session.persisted);
+                        if persisted {
+                            match runtime_deps.begin_switch_model(app, &model) {
+                                Ok(build) => {
+                                    worker_build = Some(WorkerBuild {
+                                        purpose: WorkerBuildPurpose::SwitchModel,
+                                        build,
+                                    });
+                                }
+                                Err(e) => {
+                                    app.chat.push_error(&format!("Failed to switch model: {e}"));
+                                }
                             }
-                            Err(e) => {
-                                app.chat.push_error(&format!("Failed to switch model: {e}"));
+                        } else {
+                            // Ephemeral session: keep the pick in memory; the
+                            // materializing build resolves it.
+                            if let Some(session) = app.session_manager.current_mut() {
+                                session.model = Some(model.clone());
+                            }
+                            app.set_current_model(&model);
+                            app.config.last_model = model.parse().ok();
+                            if let Err(e) = app.config.clone().save().await {
+                                tracing::warn!("Failed to save config: {}", e);
                             }
                         }
                     }
                     Some(SendAction::SetEffort(effort)) => {
-                        if let (Some(client), Some(session_id)) = (
+                        if !app
+                            .session_manager
+                            .current()
+                            .is_some_and(|session| session.persisted)
+                        {
+                            // The session does not exist yet; the pick rides
+                            // along on the materializing PUT.
+                            app.current_effort = effort;
+                        } else if let (Some(client), Some(session_id)) = (
                             app.btw_daemon.clone(),
                             app.session_manager.current().map(|s| s.id.clone()),
                         ) {
@@ -1496,25 +1523,21 @@ where
                         // the startup session back — `may resume`'s session
                         // included.
                         let resumed = pending_resume.take();
-                        let build = match &resumed {
+                        match &resumed {
                             Some(session_id) => {
-                                resume_into_session(app, worker, &runtime_deps, session_id).await
-                            }
-                            None => runtime_deps.begin_new_session(app, worker).await,
-                        };
-                        match (resumed.is_some(), build) {
-                            (_, Ok(build)) => {
+                                let build =
+                                    resume_into_session(app, worker, &runtime_deps, session_id)
+                                        .await?;
                                 worker_build = Some(WorkerBuild {
-                                    purpose: if resumed.is_some() {
-                                        WorkerBuildPurpose::Session
-                                    } else {
-                                        WorkerBuildPurpose::Startup
-                                    },
+                                    purpose: WorkerBuildPurpose::Session,
                                     build,
                                 });
                             }
-                            (true, Err(e)) => return Err(e.into()),
-                            (false, Err(e)) => report_startup_failure(app, &e),
+                            None => {
+                                if let Err(e) = runtime_deps.begin_new_session(app, worker).await {
+                                    report_startup_failure(app, &e);
+                                }
+                            }
                         }
                     }
                     Some(SendAction::RespondWorkspace {
@@ -1648,6 +1671,7 @@ where
                         let sandbox_dir = app
                             .session_manager
                             .current()
+                            .filter(|session| session.persisted)
                             .map(|session| session.sandbox_dir.clone());
                         let config = app.config.clone();
                         spawn(async move {
@@ -1699,10 +1723,20 @@ where
         );
     }
 
-    Ok(app.session_manager.current().map(|session| ExitSummary {
-        session_id: session.id.as_str().to_string(),
-        agent_running: agent_left_running,
-    }))
+    let session = app.session_manager.current();
+    match session {
+        Some(session) if session.persisted => Ok(Some(ExitSummary {
+            session_id: session.id.as_str().to_string(),
+            agent_running: agent_left_running,
+        })),
+        Some(_) => {
+            // The session never reached the daemon: nothing to resume, and its
+            // scratch dirs go with it.
+            discard_ephemeral_session(app).await;
+            Ok(None)
+        }
+        None => Ok(None),
+    }
 }
 
 /// Run the GitHub Copilot OAuth device flow.

@@ -811,6 +811,12 @@ impl SessionManager {
         self.current.as_ref()
     }
 
+    /// Drop the in-memory current session without touching the daemon. The
+    /// caller removes any scratch directories it left behind.
+    pub const fn discard_current(&mut self) -> Option<Session> {
+        self.current.take()
+    }
+
     /// Get current session mutably.
     pub const fn current_mut(&mut self) -> Option<&mut Session> {
         self.current.as_mut()

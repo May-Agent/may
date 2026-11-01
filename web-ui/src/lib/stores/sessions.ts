@@ -1,5 +1,10 @@
 import { create } from 'zustand';
-import type { ApiMessage, ApiSession, SessionRuntimeSummary } from '../types';
+import type {
+  ApiMessage,
+  ApiSession,
+  SessionPlanState,
+  SessionRuntimeSummary,
+} from '../types';
 import {
   archiveSession,
   createSession,
@@ -9,7 +14,21 @@ import {
   updateSession,
   unarchiveSession,
   type ReasoningEffortPatch,
+  type UpdateSessionPatch,
 } from '../api/sessions';
+import { putSessionTasks } from '../api/tasks';
+import { useConfigStore } from './config';
+
+const DRAFT_PREFIX = 'draft_';
+
+/**
+ * Whether `id` names a client-side draft session — a "new chat" that has not
+ * sent its first message and does not exist on the daemon yet. Draft ids can
+ * never collide with daemon-issued petname ids (lowercase words + hyphens).
+ */
+export function isDraftSessionId(id: string): boolean {
+  return id.startsWith(DRAFT_PREFIX);
+}
 
 interface SessionSummary {
   id: string;
@@ -20,10 +39,23 @@ interface SessionSummary {
   runtime?: SessionRuntimeSummary;
 }
 
+/**
+ * A session that exists only on this client. Settings the user applies to it
+ * (title, model, effort, plan) are captured here and applied to the real
+ * session when the first message materializes it.
+ */
+interface DraftRecord {
+  session: ApiSession;
+  /** `tasks.md` content staged while the session was still a draft. */
+  planContent: string | null;
+}
+
 interface SessionsState {
   index: Record<string, SessionSummary>;
   order: string[];
   active: ApiSession | null;
+  /** Client-side new chats, keyed by their draft id. */
+  drafts: Record<string, DraftRecord>;
   /** Loaded messages keyed by the session that owns them. */
   messages: Record<string, ApiMessage[]>;
   loading: boolean;
@@ -33,6 +65,13 @@ interface SessionsState {
   open: (id: string) => Promise<void>;
   refreshActive: (id: string) => Promise<void>;
   createNew: (profileId?: string | null) => Promise<ApiSession>;
+  /**
+   * Turn a draft into a real daemon session: `POST /api/sessions`, apply any
+   * staged settings, rekey the stores from the draft id to the real id.
+   */
+  materialize: (id: string) => Promise<ApiSession>;
+  /** Stage a plan on a draft without touching the daemon. */
+  saveDraftPlan: (id: string, content: string, planState: SessionPlanState) => void;
   rename: (id: string, title: string) => Promise<void>;
   setModel: (id: string, model: string) => Promise<void>;
   setReasoningEffort: (id: string, effort: ReasoningEffortPatch) => Promise<void>;
@@ -50,6 +89,7 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
   index: {},
   order: [],
   active: null,
+  drafts: {},
   messages: {},
   loading: false,
   error: null,
@@ -71,6 +111,16 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
   },
 
   async open(id: string) {
+    const draft = get().drafts[id];
+    if (draft) {
+      activeRequestGeneration += 1;
+      set((prev) => ({
+        active: draft.session,
+        messages: { ...prev.messages, [id]: prev.messages[id] ?? [] },
+        loading: false,
+      }));
+      return;
+    }
     const generation = ++activeRequestGeneration;
     set({ loading: true, error: null });
     try {
@@ -88,6 +138,7 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
   },
 
   async refreshActive(id: string) {
+    if (isDraftSessionId(id)) return;
     const generation = ++activeRequestGeneration;
     try {
       const session = await getSession(id);
@@ -107,27 +158,99 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
 
   async createNew(profileId) {
     activeRequestGeneration += 1;
-    const created = await createSession({ profileId: profileId ?? null });
+    const draft: ApiSession = {
+      id: `${DRAFT_PREFIX}${crypto.randomUUID()}`,
+      title: 'New Chat',
+      lastModified: new Date().toISOString(),
+      preview: '',
+      messages: [],
+      profileId: profileId ?? null,
+      model: useConfigStore.getState().config?.fullConfig.lastModel ?? '',
+      reasoningEffort: null,
+      runtime: {},
+    };
     set((prev) => ({
-      index: {
-        ...prev.index,
-        [created.id]: {
-          id: created.id,
-          title: created.title,
-          lastModified: created.lastModified,
-          preview: created.preview,
-          profileId: created.profileId,
-          runtime: created.runtime,
-        },
-      },
-      order: [created.id, ...prev.order.filter((x) => x !== created.id)],
-      active: created,
-      messages: { ...prev.messages, [created.id]: created.messages ?? [] },
+      drafts: { ...prev.drafts, [draft.id]: { session: draft, planContent: null } },
+      active: draft,
+      messages: { ...prev.messages, [draft.id]: [] },
     }));
-    return created;
+    return draft;
+  },
+
+  async materialize(id) {
+    const record = get().drafts[id];
+    if (!record) throw new Error(`session ${id} is not a draft`);
+    let session = await createSession({
+      profileId: record.session.profileId,
+      model: record.session.model || undefined,
+    });
+    const patch: UpdateSessionPatch = {};
+    if (record.session.title !== 'New Chat') patch.title = record.session.title;
+    if (record.session.reasoningEffort != null)
+      patch.reasoningEffort = record.session.reasoningEffort as ReasoningEffortPatch;
+    if (patch.title !== undefined || patch.reasoningEffort !== undefined) {
+      session = await updateSession(session.id, patch);
+    }
+    const planState = record.session.runtime?.planState;
+    if (record.planContent != null || (planState != null && planState !== 'disabled')) {
+      await putSessionTasks(session.id, {
+        content: record.planContent ?? '',
+        planState: planState ?? 'draft',
+      });
+    }
+    activeRequestGeneration += 1;
+    set((prev) => {
+      const { [id]: _draft, ...drafts } = prev.drafts;
+      const messages = { ...prev.messages, [session.id]: prev.messages[id] ?? [] };
+      delete messages[id];
+      return {
+        drafts,
+        messages,
+        active: prev.active?.id === id ? session : prev.active,
+        index: {
+          ...prev.index,
+          [session.id]: {
+            id: session.id,
+            title: session.title,
+            lastModified: session.lastModified,
+            preview: session.preview,
+            profileId: session.profileId,
+            runtime: session.runtime,
+          },
+        },
+        order: [session.id, ...prev.order.filter((x) => x !== session.id)],
+      };
+    });
+    return session;
+  },
+
+  saveDraftPlan(id, content, planState) {
+    set((prev) => {
+      const draft = prev.drafts[id];
+      if (!draft) return prev;
+      const session = {
+        ...draft.session,
+        runtime: { ...draft.session.runtime, planState },
+      };
+      return {
+        drafts: { ...prev.drafts, [id]: { session, planContent: content } },
+        active: prev.active?.id === id ? session : prev.active,
+      };
+    });
   },
 
   async rename(id, title) {
+    const draft = get().drafts[id];
+    if (draft) {
+      set((prev) => ({
+        drafts: {
+          ...prev.drafts,
+          [id]: { ...draft, session: { ...draft.session, title } },
+        },
+        active: prev.active?.id === id ? { ...prev.active, title } : prev.active,
+      }));
+      return;
+    }
     await updateSession(id, { title });
     set((prev) => {
       const entry = prev.index[id];
@@ -140,6 +263,17 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
   },
 
   async setModel(id, model) {
+    const draft = get().drafts[id];
+    if (draft) {
+      set((prev) => ({
+        drafts: {
+          ...prev.drafts,
+          [id]: { ...draft, session: { ...draft.session, model } },
+        },
+        active: prev.active?.id === id ? { ...prev.active, model } : prev.active,
+      }));
+      return;
+    }
     const updated = await updateSession(id, { model });
     set((prev) => ({
       active: prev.active?.id === id ? { ...prev.active, model: updated.model } : prev.active,
@@ -147,6 +281,20 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
   },
 
   async setReasoningEffort(id, effort) {
+    const draft = get().drafts[id];
+    if (draft) {
+      set((prev) => ({
+        drafts: {
+          ...prev.drafts,
+          [id]: { ...draft, session: { ...draft.session, reasoningEffort: effort } },
+        },
+        active:
+          prev.active?.id === id
+            ? { ...prev.active, reasoningEffort: effort }
+            : prev.active,
+      }));
+      return;
+    }
     const updated = await updateSession(id, { reasoningEffort: effort });
     set((prev) => ({
       active:
@@ -157,6 +305,19 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
   },
 
   async remove(id) {
+    if (get().drafts[id]) {
+      activeRequestGeneration += 1;
+      set((prev) => {
+        const { [id]: _draft, ...drafts } = prev.drafts;
+        const { [id]: _messages, ...messages } = prev.messages;
+        return {
+          drafts,
+          messages,
+          active: prev.active?.id === id ? null : prev.active,
+        };
+      });
+      return;
+    }
     await deleteSession(id);
     activeRequestGeneration += 1;
     set((prev) => {
@@ -197,16 +358,31 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
 
   updateRuntime(id, patch) {
     set((prev) => {
+      const draft = prev.drafts[id];
       const entry = prev.index[id];
-      if (!entry) return prev;
-      const nextRuntime: SessionRuntimeSummary = { ...(entry.runtime ?? {}), ...patch };
-      const active =
-        prev.active?.id === id
-          ? { ...prev.active, runtime: { ...prev.active.runtime, ...patch } }
-          : prev.active;
       return {
-        index: { ...prev.index, [id]: { ...entry, runtime: nextRuntime } },
-        active,
+        drafts: draft
+          ? {
+              ...prev.drafts,
+              [id]: {
+                ...draft,
+                session: {
+                  ...draft.session,
+                  runtime: { ...draft.session.runtime, ...patch },
+                },
+              },
+            }
+          : prev.drafts,
+        index: entry
+          ? {
+              ...prev.index,
+              [id]: { ...entry, runtime: { ...(entry.runtime ?? {}), ...patch } },
+            }
+          : prev.index,
+        active:
+          prev.active?.id === id
+            ? { ...prev.active, runtime: { ...prev.active.runtime, ...patch } }
+            : prev.active,
       };
     });
   },

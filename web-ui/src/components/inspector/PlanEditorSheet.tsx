@@ -11,7 +11,7 @@ import {
   SheetTitle,
 } from '@/components/ui/sheet';
 import { putSessionTasks } from '@/lib/api/tasks';
-import { useSessionsStore } from '@/lib/stores/sessions';
+import { isDraftSessionId, useSessionsStore } from '@/lib/stores/sessions';
 import { useInspectorStore } from '@/lib/stores/inspector';
 import { useTranslation } from '@/lib/i18n';
 
@@ -41,9 +41,15 @@ function OpenPlanEditorSheet({ sessionId, open, onOpenChange, content }: PlanEdi
   const save = async () => {
     setBusy(true);
     try {
-      const res = await putSessionTasks(sessionId, { content: draft, planState: 'draft' });
-      setTasks(sessionId, res.content, 'draft');
-      updateRuntime(sessionId, { planState: 'draft' });
+      if (isDraftSessionId(sessionId)) {
+        // The session does not exist yet; the plan goes with its first send.
+        useSessionsStore.getState().saveDraftPlan(sessionId, draft, 'draft');
+        setTasks(sessionId, draft, 'draft');
+      } else {
+        const res = await putSessionTasks(sessionId, { content: draft, planState: 'draft' });
+        setTasks(sessionId, res.content, 'draft');
+        updateRuntime(sessionId, { planState: 'draft' });
+      }
       onOpenChange(false);
     } catch (err) {
       toast.error(t('errors.generic'), {
