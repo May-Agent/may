@@ -15,6 +15,8 @@ use super::error::{bad_request_error, internal_error, internal_error_message};
 use super::helpers::{load_session_paths, parse_safe_relative_path};
 use super::state::DaemonState;
 use super::types::{ApiAttachment, ChatRequest};
+use crate::config::{MayConfig, ProviderInstance, ProviderType};
+use crate::model_selector::ModelSelector;
 
 pub(super) const INLINE_PASTED_TEXT_THRESHOLD: usize = 1200;
 
@@ -89,7 +91,8 @@ pub(super) async fn build_prompt_and_attachments(
     req: &ChatRequest,
     model_id: &str,
 ) -> SkyResult<(String, Vec<LlmAttachment>)> {
-    let modality_support = ModelModalitySupport::for_model(model_id);
+    let config = state.config_snapshot();
+    let (modality_support, inline_images) = attachment_delivery(model_id, &config);
     let mut attachments = Vec::new();
     let mut prompt_sections = Vec::new();
     let mut xml_items = Vec::new();
@@ -163,7 +166,16 @@ pub(super) async fn build_prompt_and_attachments(
                     Some(saved_path.as_path()),
                     None,
                 )?;
-                let url = path_to_file_url(saved_path.as_path())?;
+                let url = match (modality, inline_images) {
+                    (AttachmentModality::Vision, true) => {
+                        let data_url =
+                            upload_data_url.expect("an uploaded attachment carried a data URL");
+                        url::Url::parse(data_url).map_err(|error| {
+                            bad_request_error(format!("invalid attachment data URL: {error}"))
+                        })?
+                    }
+                    _ => path_to_file_url(saved_path.as_path())?,
+                };
                 attachments.push(LlmAttachment::new(url, media_type));
             }
             continue;
@@ -204,7 +216,13 @@ pub(super) async fn build_prompt_and_attachments(
                 kind: attachment.attachment_type,
                 path: source.relative_path,
             });
-            attachments.push(LlmAttachment::new(source.url, media_type));
+            let url = match (modality, inline_images, source.local_path.as_deref()) {
+                (AttachmentModality::Vision, true, Some(path)) => {
+                    file_to_data_url(path, &media_type).await?
+                }
+                _ => source.url,
+            };
+            attachments.push(LlmAttachment::new(url, media_type));
             continue;
         }
 
@@ -440,25 +458,78 @@ struct ModelModalitySupport {
 }
 
 impl ModelModalitySupport {
-    fn for_model(model_id: &str) -> Self {
-        let Some(info) = lookup_model_info(model_id) else {
-            tracing::warn!(
-                model_id = %model_id,
-                "model metadata not found; treating advanced modalities as unsupported"
-            );
-            return Self {
-                vision: false,
-                audio: false,
-                video: false,
-                pdf: false,
-            };
-        };
+    const fn all() -> Self {
+        Self {
+            vision: true,
+            audio: true,
+            video: true,
+            pdf: true,
+        }
+    }
 
+    const fn none() -> Self {
+        Self {
+            vision: false,
+            audio: false,
+            video: false,
+            pdf: false,
+        }
+    }
+
+    fn from_entry(info: &aither_models::ModelEntry) -> Self {
         Self {
             vision: info.has_ability(Ability::Vision),
             audio: info.has_ability(Ability::Audio),
             video: info.has_ability(Ability::Video),
             pdf: info.has_ability(Ability::Pdf),
+        }
+    }
+
+    /// What the provider's wire protocol can deliver an attachment through,
+    /// independent of what the model accepts: the aither client each
+    /// provider type drives decides whether a modality reaches the backend.
+    fn wire(ptype: ProviderType, instance: &ProviderInstance, provider_id: &str) -> Self {
+        match ptype {
+            // Claude accepts base64 image and PDF document blocks.
+            ProviderType::Anthropic => Self {
+                vision: true,
+                pdf: true,
+                ..Self::none()
+            },
+            // Gemini inlines every modality it accepts.
+            ProviderType::Google => Self::all(),
+            // The Copilot chat-completions bridge inlines images only.
+            ProviderType::Copilot => Self {
+                vision: true,
+                ..Self::none()
+            },
+            // aither-codex does not serialize attachments — anything handed
+            // to it is dropped before it reaches the wire.
+            ProviderType::Chatgpt => Self::none(),
+            _ => {
+                // OpenAI-compatible wire: images ride `data:`/`http(s)` URLs
+                // or a Files API upload, audio falls back to inlined
+                // chat-completions input, and video has no input block. Only
+                // first-party OpenAI is guaranteed to host the Files API a
+                // PDF upload needs.
+                let files_api =
+                    ptype == ProviderType::OpenAI && !instance.is_generic_model_proxy(provider_id);
+                Self {
+                    vision: true,
+                    audio: true,
+                    video: false,
+                    pdf: files_api,
+                }
+            }
+        }
+    }
+
+    const fn intersect(self, other: Self) -> Self {
+        Self {
+            vision: self.vision && other.vision,
+            audio: self.audio && other.audio,
+            video: self.video && other.video,
+            pdf: self.pdf && other.pdf,
         }
     }
 
@@ -470,6 +541,78 @@ impl ModelModalitySupport {
             AttachmentModality::Pdf => self.pdf,
         }
     }
+}
+
+/// How attachments reach the model behind a `provider::model` selector: the
+/// modalities the conversation may carry, and whether image payloads are
+/// inlined as `data:` URLs instead of `file://` paths.
+fn attachment_delivery(selector_str: &str, config: &MayConfig) -> (ModelModalitySupport, bool) {
+    let selector = selector_str.parse::<ModelSelector>().ok();
+    let provider = selector
+        .as_ref()
+        .and_then(|s| config.provider.get(s.provider_id()).map(|i| (s, i)));
+
+    let wire = provider.map_or_else(ModelModalitySupport::none, |(s, instance)| {
+        ModelModalitySupport::wire(
+            instance.resolve_type(s.provider_id()),
+            instance,
+            s.provider_id(),
+        )
+    });
+    let inline_images = provider.is_some_and(|(s, instance)| {
+        should_inline_images(
+            instance.resolve_type(s.provider_id()),
+            instance,
+            s.provider_id(),
+        )
+    });
+
+    let model_id = selector
+        .as_ref()
+        .map_or(selector_str, ModelSelector::model_id);
+    let model = match lookup_model_info(model_id) {
+        Some(info) => ModelModalitySupport::from_entry(info),
+        None if provider.is_some_and(|(s, i)| i.is_generic_model_proxy(s.provider_id())) => {
+            // Generic proxies serve models the registry cannot index; the
+            // backend's own catalog decides what the model accepts.
+            ModelModalitySupport::all()
+        }
+        None => {
+            tracing::warn!(
+                model_id = %selector_str,
+                "model metadata not found; treating advanced modalities as unsupported"
+            );
+            ModelModalitySupport::none()
+        }
+    };
+    (model.intersect(wire), inline_images)
+}
+
+/// Whether image attachments reach this provider inline as `data:` URLs
+/// rather than as `file://` paths. On the Responses API a `file://` image is
+/// uploaded through the Files API, which only first-party `OpenAI` is
+/// guaranteed to serve — every other OpenAI-wire endpoint gets inline bytes.
+fn should_inline_images(
+    ptype: ProviderType,
+    instance: &ProviderInstance,
+    provider_id: &str,
+) -> bool {
+    let openai_wire = !matches!(
+        ptype,
+        ProviderType::Anthropic
+            | ProviderType::Google
+            | ProviderType::Copilot
+            | ProviderType::Chatgpt
+    );
+    openai_wire && (ptype != ProviderType::OpenAI || instance.is_generic_model_proxy(provider_id))
+}
+
+/// Read `path` and wrap it in a `data:` URL carrying `media_type`.
+async fn file_to_data_url(path: &Path, media_type: &mime::Mime) -> SkyResult<url::Url> {
+    let bytes = async_fs::read(path).await.map_err(internal_error)?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    url::Url::parse(&format!("data:{media_type};base64,{encoded}"))
+        .map_err(|error| internal_error_message(format!("invalid attachment data URL: {error}")))
 }
 
 // ── Prompt text rendering ────────────────────────────────────
