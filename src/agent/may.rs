@@ -347,23 +347,24 @@ impl MayAgent {
         )?;
 
         // Mount workspace grants into the terminal sandbox: read-only dirs
-        // become readable mounts, read-write dirs writable mounts.
+        // become readable mounts, read-write dirs writable mounts. The
+        // launch directory is readable by default — `readable_dirs` carries
+        // it — and the sandbox dir is the tool's own working directory, so
+        // it needs no grant entry of its own.
         let readable = workspace
-            .config
-            .workdirs
-            .iter()
-            .filter(|dir| dir.permission == crate::workspace::Permission::ReadOnly)
-            .map(|dir| dir.path.clone());
+            .readable_dirs()
+            .into_iter()
+            .filter(|path| path.as_path() != config.sandbox_dir.as_path())
+            .cloned();
         // `~/.may/memories` is linked into the session's `~/.may`; it must be
         // writable through the symlink, so it joins the grants.
         let memories_dir = crate::session::MayHomePaths::new(config.may_dir.clone()).memories_dir();
         async_fs::create_dir_all(&memories_dir).await.ok();
         let writable = workspace
-            .config
-            .workdirs
-            .iter()
-            .filter(|dir| dir.permission == crate::workspace::Permission::ReadWrite)
-            .map(|dir| dir.path.clone())
+            .writable_dirs()
+            .into_iter()
+            .filter(|path| path.as_path() != config.sandbox_dir.as_path())
+            .cloned()
             .chain(std::iter::once(memories_dir));
 
         // Create the terminal command tool in the sandbox dir.
@@ -449,14 +450,43 @@ impl MayAgent {
         if let Some(worktree) = crate::repo_search::worktree_root(&config.cwd)
             && let Ok(repo_key) = crate::issue::repository_identity(&worktree)
         {
-            match session_repos.ensure_local_clone(&worktree, &repo_key).await {
-                Ok(clone_path) => repo_clones.push(RepoCloneEntry {
+            // The first-contact trust decision picks the binding: GitHub
+            // trust clones the remote (cloud is the source of truth), local
+            // trust clones the checkout, undecided binds nothing yet — the
+            // question is posted once the session runtime exists below.
+            let trust = crate::trust::trust_for(&workspace.config, &repo_key, &worktree);
+            let clone = match trust {
+                Some(crate::trust::TrustLevel::Full | crate::trust::TrustLevel::PrsOnly) => {
+                    Some(match crate::trust::repo_kind(&worktree) {
+                        crate::trust::RepoKind::Github { owner_repo } => {
+                            match crate::trust::remote_url(&worktree) {
+                                Some(url) => {
+                                    session_repos.ensure_remote_clone(&url, &owner_repo).await
+                                }
+                                None => {
+                                    session_repos.ensure_local_clone(&worktree, &repo_key).await
+                                }
+                            }
+                        }
+                        crate::trust::RepoKind::Git => {
+                            session_repos.ensure_local_clone(&worktree, &repo_key).await
+                        }
+                    })
+                }
+                Some(crate::trust::TrustLevel::Local) => {
+                    Some(session_repos.ensure_local_clone(&worktree, &repo_key).await)
+                }
+                None => None,
+            };
+            match clone {
+                Some(Ok(clone_path)) => repo_clones.push(RepoCloneEntry {
                     clone_path,
                     source: crate::fs_utils::display_path(&worktree),
                 }),
-                Err(error) => {
+                Some(Err(error)) => {
                     tracing::warn!(%error, "failed to create session repo clone");
                 }
+                None => {}
             }
         }
         runtime_system_context =
@@ -517,6 +547,20 @@ impl MayAgent {
             .cache_lifetime(config.cache_lifetime.into())
             .background_jobs(config.background_jobs);
         if let Some(runtime) = hook_runtime.clone() {
+            // First-contact: an unknown repository asks once; the answer
+            // persists through `repo trust set` and later sessions reuse it.
+            if let Some(worktree) = crate::repo_search::worktree_root(&config.cwd)
+                && let Ok(repo_key) = crate::issue::repository_identity(&worktree)
+                && crate::trust::trust_for(&workspace.config, &repo_key, &worktree).is_none()
+            {
+                let kind = crate::trust::repo_kind(&worktree);
+                let _ = runtime
+                    .open_question(
+                        config.session_id.as_str(),
+                        &crate::trust::question_for(&kind, &worktree),
+                    )
+                    .await;
+            }
             builder = builder
                 .context_source(super::ask_user_tool::OpenQuestionsContext::new(
                     runtime.clone(),
