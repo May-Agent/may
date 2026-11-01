@@ -210,11 +210,9 @@ impl aither_agent::TaskBlockerResolver for AskUserBlockerResolver {
             .session_ask_user_request_exists(&self.session_id, mark)
             .await
         {
-            Ok(true) => db
-                .pending_ask_user_request(mark)
-                .await
-                .map(|pending| pending.is_some_and(|pending| pending.session_id == self.session_id))
-                .unwrap_or(false),
+            Ok(true) => db.pending_ask_user_request(mark).await.is_ok_and(
+                |pending| pending.is_some_and(|pending| pending.session_id == self.session_id),
+            ),
             Ok(false) => true,
             Err(error) => {
                 tracing::error!(session_id = %self.session_id, %error, "failed to resolve a BLOCKING mark");
