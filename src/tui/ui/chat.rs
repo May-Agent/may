@@ -1184,7 +1184,8 @@ pub struct ActivityContext {
 pub struct StatusContext<'a> {
     /// Model display string.
     pub model: &'a str,
-    /// Token usage info (`prompt_tokens`, `context_window`).
+    /// Token usage info (`prompt_tokens`, model `context_window`). The status
+    /// bar denominator is the auto-compact window derived from the latter.
     pub usage: Option<(u64, Option<u64>)>,
     /// Queued message count.
     pub queue_count: usize,
@@ -2019,6 +2020,12 @@ fn render_impl(
 
     // Plain mirror of the tail, for selection.
     layout.set_tail_plain(chat_layout::plain_rows(&tail, area.width, tail_rows));
+    layout.set_input_span(input_line_idx.map(|index| {
+        (
+            element_rows + tail_starts.get(index).copied().unwrap_or(0),
+            chat_layout::line_rows(&tail[index], area.width),
+        )
+    }));
 
     // Anchor the terminal cursor on the caret cell so IME composition and
     // its candidate window track the real insertion point.
@@ -2369,31 +2376,29 @@ fn render_status_line(lines: &mut Vec<Line<'_>>, ctx: &StatusContext<'_>, width:
         parts.push("↓ jobs".to_string());
     }
 
-    // Context usage pinned to the right edge: `4.8K/1M`.
-    let usage_text = ctx.usage.map(|(prompt_tokens, context_window)| {
-        let used = format_number(usize::try_from(prompt_tokens).unwrap_or(usize::MAX));
-        match context_window {
-            Some(window) => format!(
-                "{}/{}",
-                used,
-                format_number(usize::try_from(window).unwrap_or(usize::MAX))
-            ),
-            None => used,
-        }
-    });
+    // Context usage pinned to the right edge: `4.8K / 120.0K (4%)`.
+    let usage = ctx
+        .usage
+        .map(|(prompt_tokens, context_window)| format_status_usage(prompt_tokens, context_window));
 
     let status_text = parts.join(" · ");
     let status_style = Style::default().fg(Color::Cyan);
+    let warn_style = Style::default().fg(Color::Yellow);
 
-    if let Some(usage_text) = usage_text {
+    if let Some(usage) = usage {
         let pad = width
-            .saturating_sub(status_text.width() + usage_text.width())
+            .saturating_sub(status_text.width() + usage.width())
             .max(1);
-        lines.push(Line::from(vec![
+        let mut spans = vec![
             Span::styled(status_text, status_style),
             Span::raw(" ".repeat(pad)),
-            Span::styled(usage_text, status_style),
-        ]));
+            Span::styled(usage.usage, status_style),
+        ];
+        if let Some(warn) = usage.warn {
+            spans.push(Span::styled(" · ", status_style));
+            spans.push(Span::styled(warn, warn_style));
+        }
+        lines.push(Line::from(spans));
     } else {
         lines.push(Line::from(Span::styled(status_text, status_style)));
     }
@@ -2420,6 +2425,61 @@ pub(crate) fn format_number(n: usize) -> String {
     } else {
         n.to_string()
     }
+}
+
+/// Remaining percent of the auto-compact window below which the status bar
+/// warns that compaction is close.
+const AUTOCOMPACT_WARN_REMAINING_PCT: u8 = 10;
+
+/// Right-edge context usage for the status bar.
+struct StatusUsage {
+    /// `used / autocompact-window (percent%)`, or a bare count with no window.
+    usage: String,
+    /// Remaining-to-compact hint when headroom is under 10%.
+    warn: Option<String>,
+}
+
+impl StatusUsage {
+    fn width(&self) -> usize {
+        self.usage.width()
+            + self
+                .warn
+                .as_ref()
+                .map_or(0, |warn| " · ".width() + warn.width())
+    }
+}
+
+/// Format prompt-token usage against the auto-compact window.
+fn format_status_usage(prompt_tokens: u64, context_window: Option<u64>) -> StatusUsage {
+    let used = format_number(usize::try_from(prompt_tokens).unwrap_or(usize::MAX));
+    let Some(window) = context_window else {
+        return StatusUsage {
+            usage: used,
+            warn: None,
+        };
+    };
+    let compact =
+        crate::agent::autocompact_window_tokens(usize::try_from(window).unwrap_or(usize::MAX));
+    if compact == 0 {
+        return StatusUsage {
+            usage: used,
+            warn: None,
+        };
+    }
+    let used_n = usize::try_from(prompt_tokens).unwrap_or(usize::MAX);
+    #[allow(clippy::cast_precision_loss)]
+    let percent = used_n as f64 / compact as f64 * 100.0;
+    let usage = format!("{} / {} ({percent:.0}%)", used, format_number(compact));
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    let remaining_pct =
+        ((compact.saturating_sub(used_n) as f64 / compact as f64) * 100.0).round() as u8;
+    let warn = (remaining_pct < AUTOCOMPACT_WARN_REMAINING_PCT)
+        .then(|| format!("{remaining_pct}% to auto-compact"));
+    StatusUsage { usage, warn }
 }
 
 /// Render a tool call inline with optional selection highlight.
@@ -2891,8 +2951,8 @@ pub fn render_tool_fullscreen(frame: &mut Frame, area: Rect, display: &ToolDispl
 mod tests {
     use super::{
         ChatElement, ChatStream, InputContext, RECENT_EXPAND, ToolCallImage, ToolDisplay,
-        ToolStatus, build_plain_wrapped_lines_unified, render_input_line, render_tool_inline,
-        terminal_mode_marker,
+        ToolStatus, build_plain_wrapped_lines_unified, format_number, format_status_usage,
+        render_input_line, render_tool_inline, terminal_mode_marker,
     };
     use crate::tui::queue::Attachment;
     use crate::tui::ui::streaming_markdown::IMAGE_HEIGHT;
@@ -2901,6 +2961,58 @@ mod tests {
     use ratatui::text::Line;
     use std::path::PathBuf;
     use std::time::Instant;
+
+    #[test]
+    fn status_usage_is_used_over_autocompact_window() {
+        let window = 200_000_u64;
+        let compact = crate::agent::autocompact_window_tokens(usize::try_from(window).unwrap());
+        let used = compact / 4;
+        let line = format_status_usage(u64::try_from(used).unwrap(), Some(window));
+        #[allow(clippy::cast_precision_loss)]
+        let percent = used as f64 / compact as f64 * 100.0;
+        assert_eq!(
+            line.usage,
+            format!(
+                "{} / {} ({percent:.0}%)",
+                format_number(used),
+                format_number(compact)
+            )
+        );
+        assert!(line.warn.is_none());
+    }
+
+    #[test]
+    fn status_usage_warns_within_ten_percent_of_autocompact() {
+        let window = 200_000_u64;
+        let compact = crate::agent::autocompact_window_tokens(usize::try_from(window).unwrap());
+        let used = compact - compact / 20;
+        let line = format_status_usage(u64::try_from(used).unwrap(), Some(window));
+        assert_eq!(line.warn.as_deref(), Some("5% to auto-compact"));
+    }
+
+    #[test]
+    fn status_usage_omits_warn_at_ten_percent_remaining() {
+        let window = 200_000_u64;
+        let compact = crate::agent::autocompact_window_tokens(usize::try_from(window).unwrap());
+        let used = compact - compact / 10;
+        let line = format_status_usage(u64::try_from(used).unwrap(), Some(window));
+        assert!(line.warn.is_none());
+    }
+
+    #[test]
+    fn status_usage_warns_at_zero_headroom() {
+        let window = 200_000_u64;
+        let compact = crate::agent::autocompact_window_tokens(usize::try_from(window).unwrap());
+        let line = format_status_usage(u64::try_from(compact).unwrap(), Some(window));
+        assert_eq!(line.warn.as_deref(), Some("0% to auto-compact"));
+    }
+
+    #[test]
+    fn status_usage_falls_back_to_used_without_a_window() {
+        let line = format_status_usage(33_400, None);
+        assert_eq!(line.usage, "33.4K");
+        assert!(line.warn.is_none());
+    }
 
     #[test]
     fn live_output_appends_to_running_terminal_call() {
