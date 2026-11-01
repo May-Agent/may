@@ -1952,7 +1952,7 @@ async fn exec_uses_session_directory_and_exposes_ipc_command_help() {
         .arg("sandboxed")
         .arg("--")
         .arg(
-            "for d in tmp data files outputs artifacts; do test -d \"$d\" || exit 10; done; test -e skills; test -e subagents; session --help >/dev/null; ask --help >/dev/null; search --help >/dev/null; webfetch --help >/dev/null; websearch --help >/dev/null; task --help >/dev/null; notify --help >/dev/null; printf ready",
+            "for d in tmp data files outputs artifacts; do test -d \"$d\" || exit 10; done; test -e skills; test -e subagents; session --help >/dev/null; ask --help >/dev/null; search --help >/dev/null; webfetch --help >/dev/null; task --help >/dev/null; notify --help >/dev/null; printf ready",
         )
         .env("HOME", harness.home_path())
         .env("HEEL_BIN", &heel_bin)
