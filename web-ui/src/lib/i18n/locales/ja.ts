@@ -107,6 +107,9 @@ export const ja: Messages = {
     queued: 'キュー',
     queueHint: '現在のターン完了後に送信',
     immediateHint: '現在のターンを中断して送信',
+    bashMode: 'bash モード',
+    bashRunning: '!{command} を実行中…',
+    bashFailed: 'bash 失敗: {error}',
     modelPicker: {
       label: 'モデル',
       empty: '利用可能なモデルがありません',

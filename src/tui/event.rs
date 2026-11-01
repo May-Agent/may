@@ -177,23 +177,7 @@ impl AppEvent {
 }
 
 /// Masked result of a bash-mode command, ready for display and the agent.
-#[derive(Debug)]
-pub struct BashOutcome {
-    /// Chat element id (`bash-*`) showing the run.
-    pub call_id: String,
-    /// The raw command as typed (unmasked — the run already happened).
-    pub command: String,
-    /// Captured stdout (masked).
-    pub stdout: String,
-    /// Captured stderr (masked).
-    pub stderr: String,
-    /// Process exit code; `-1` when the signal had none.
-    pub exit_code: i32,
-    /// A secret was detected in the command or its output.
-    pub had_secret: bool,
-    /// Spawn/capture failure message, when the command never ran.
-    pub error: Option<String>,
-}
+pub use crate::bash::BashOutcome;
 
 /// One incremental output read bound to a running terminal tool call.
 #[derive(Debug)]
