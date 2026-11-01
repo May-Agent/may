@@ -3,6 +3,7 @@ import { Link, useLocation, useParams } from 'react-router-dom';
 import {
   ChevronDown,
   ChevronRight,
+  Github,
   Loader2,
   PanelLeftClose,
   Plus,
@@ -20,6 +21,8 @@ import { useActiveProfile } from '@/lib/profile/active';
 import { useNewChat } from '@/lib/useNewChat';
 import { shortcutAria, shortcutLabel } from '@/lib/shortcuts';
 import { FolderNode, SessionNode } from './SessionNode';
+import { repoLabel } from '@/lib/repo';
+import { NewChatRepoDialog } from './NewChatRepoDialog';
 import { ProfileSwitcher } from './ProfileSwitcher';
 import { NotificationBell } from './NotificationBell';
 import type { ProfileSessions } from '@/lib/types';
@@ -54,7 +57,50 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
   const loading = activeProfileId !== null && scoped === null;
 
   const [archiveOpen, setArchiveOpen] = useState(false);
+  const [repoDialogOpen, setRepoDialogOpen] = useState(false);
   const settingsActive = location.pathname.startsWith('/settings');
+
+  // GitHub repos already bound to sessions, offered as quick picks in the
+  // "new chat in repo" dialog.
+  const knownGithubRepos = useMemo(() => {
+    const seen = new Set<string>();
+    const collect = (repo: string | null | undefined) => {
+      if (repo?.startsWith('github:')) seen.add(repo.slice(7));
+    };
+    for (const item of [
+      ...(scoped?.pinned ?? []),
+      ...(scoped?.regular ?? []),
+      ...(scoped?.archived ?? []),
+    ]) {
+      if ('sessions' in item) {
+        for (const child of item.sessions) collect(child.repo);
+      } else {
+        collect(item.repo);
+      }
+    }
+    return [...seen].sort();
+  }, [scoped]);
+
+  // Sessions bound to a repository cluster under a collapsible group
+  // header; repo-less sessions stay flat above the groups.
+  const [regularNoRepo, repoGroups] = useMemo(() => {
+    const regular = scoped?.regular ?? [];
+    const flat: typeof regular = [];
+    const groups = new Map<string, typeof regular>();
+    for (const item of regular) {
+      if (item.repo) {
+        const list = groups.get(item.repo) ?? [];
+        list.push(item);
+        groups.set(item.repo, list);
+      } else {
+        flat.push(item);
+      }
+    }
+    const sorted = [...groups.entries()].sort(([a], [b]) =>
+      repoLabel(a).localeCompare(repoLabel(b)),
+    );
+    return [flat, sorted] as const;
+  }, [scoped]);
 
   return (
     <aside
@@ -105,7 +151,7 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
         )}
       </div>
 
-      <div className="px-3 pb-2">
+      <div className="flex gap-1 px-3 pb-2">
         <Tooltip>
           <TooltipTrigger asChild>
             <Button
@@ -127,7 +173,32 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
             {t('shell.newChatShortcut', { shortcut: shortcutLabel('newChat') })}
           </TooltipContent>
         </Tooltip>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              variant="outline"
+              size="icon"
+              className="shrink-0"
+              onClick={() => setRepoDialogOpen(true)}
+              disabled={!canCreate}
+              aria-label={t('sidebar.newChatRepo.title')}
+            >
+              <Github aria-hidden />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="right">{t('sidebar.newChatRepo.title')}</TooltipContent>
+        </Tooltip>
       </div>
+      <NewChatRepoDialog
+        open={repoDialogOpen}
+        onOpenChange={setRepoDialogOpen}
+        knownRepos={knownGithubRepos}
+        busy={creating}
+        onSubmit={(repo) => {
+          setRepoDialogOpen(false);
+          void startNewChat({ repo: `github:${repo}` });
+        }}
+      />
 
       <ScrollArea className="flex-1 px-2 pb-2">
         <nav aria-label={t('sidebar.sessions')}>
@@ -181,7 +252,7 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
 
               {regular.length > 0 && (
                 <Section label={t('sidebar.recent')}>
-                  {regular.map((item) => (
+                  {regularNoRepo.map((item) => (
                     <SessionNode
                       key={item.id}
                       id={item.id}
@@ -191,6 +262,21 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
                       active={item.id === sessionId}
                       repo={item.repo}
                     />
+                  ))}
+                  {repoGroups.map(([repo, items]) => (
+                    <RepoGroup key={repo} repo={repo} count={items.length}>
+                      {items.map((item) => (
+                        <SessionNode
+                          key={item.id}
+                          id={item.id}
+                          title={item.title || t('common.untitled')}
+                          runtime={item.runtime}
+                          kind="regular"
+                          active={item.id === sessionId}
+                          indent
+                        />
+                      ))}
+                    </RepoGroup>
                   ))}
                 </Section>
               )}
@@ -263,5 +349,37 @@ function Section({ label, children }: SectionProps) {
       <h3 className="flex h-7 items-center px-2 text-xs font-medium text-muted-foreground">{label}</h3>
       <ul className="space-y-px">{children}</ul>
     </section>
+  );
+}
+
+interface RepoGroupProps {
+  repo: string;
+  count: number;
+  children: React.ReactNode;
+}
+
+/** Collapsible header binding the sessions of one repository together. */
+function RepoGroup({ repo, count, children }: RepoGroupProps) {
+  const [open, setOpen] = useState(true);
+  return (
+    <li>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex h-7 w-full items-center gap-1 rounded-md px-2 text-xs font-medium text-muted-foreground hover:text-foreground touch:h-11"
+        aria-expanded={open}
+      >
+        {open ? (
+          <ChevronDown className="size-3.5" aria-hidden />
+        ) : (
+          <ChevronRight className="size-3.5" aria-hidden />
+        )}
+        <span className="truncate" title={repo}>
+          {repoLabel(repo)}
+        </span>
+        <span className="ml-auto font-normal tabular-nums">{count}</span>
+      </button>
+      {open && <ul className="space-y-px">{children}</ul>}
+    </li>
   );
 }
