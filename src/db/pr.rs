@@ -60,7 +60,8 @@ pub struct PrEventRow {
     /// Owning `prs` row.
     pub pr_id: i64,
     /// `opened`, `checks_pending`, `check_failed`, `rejected`, `queued`,
-    /// `merging`, `merged`, `closed`, `issue_linked`.
+    /// `merging`, `merged`, `closed`, `issue_linked`, `rewound`,
+    /// `orphaned`, `adopted`.
     pub kind: String,
     /// Session that caused the transition.
     pub session_id: String,
@@ -176,6 +177,24 @@ impl ChatDb {
         )
         .fetch_optional::<PrRow>()
         .await?)
+    }
+
+    /// Transfer a PR to another session — the manual orphan-recovery op.
+    ///
+    /// # Errors
+    /// Fails on database errors.
+    pub async fn adopt_pr(&self, pr_id: i64, session_id: &str) -> Result<(), ChatDbError> {
+        let now = jiff::Timestamp::now().to_string();
+        query!(
+            self.db,
+            "UPDATE prs SET session_id = ?, updated_at = ? WHERE id = ?",
+            session_id,
+            now,
+            pr_id
+        )
+        .execute()
+        .await?;
+        Ok(())
     }
 
     /// PRs for a project (or across all projects), newest first.
