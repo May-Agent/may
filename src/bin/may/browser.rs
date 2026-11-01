@@ -364,12 +364,6 @@ async fn run_browser_service(
             ),
             BrowserServiceRequest::EnsureStarted => match async {
                 if !browser_manager.is_running() {
-                    may_agent::container::browser::prepare_browser_runtime(
-                        &config.browser,
-                        &may_dir,
-                    )
-                    .await
-                    .map_err(|error| error.to_string())?;
                     browser_manager
                         .start()
                         .await
@@ -403,12 +397,6 @@ async fn run_browser_service(
             },
             BrowserServiceRequest::Read { url, options } => match async {
                 if !browser_manager.is_running() {
-                    may_agent::container::browser::prepare_browser_runtime(
-                        &config.browser,
-                        &may_dir,
-                    )
-                    .await
-                    .map_err(|error| error.to_string())?;
                     browser_manager
                         .start()
                         .await
