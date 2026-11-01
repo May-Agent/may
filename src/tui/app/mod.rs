@@ -61,8 +61,9 @@ pub use aither_agent::{AgentError, AgentEvent, TimedEvent};
 
 use super::state::{
     ActiveTextInput, AppMode, AskUserState, ChatgptAuthStatus, ConfigEditMode, ConfigState,
-    CopilotAuthStatus, ImageViewState, McpAddMode, PasteFilter, QuitConfirmState, SelectionPoint,
-    SkillAddMode, SshAddMode, StatusNotice, TextSelection, detect_api_key_from_env,
+    CopilotAuthStatus, ImageViewState, McpAddMode, PasteFilter, QuitConfirmState,
+    ResumePickerState, SelectionPoint, SkillAddMode, SshAddMode, StatusNotice, TextSelection,
+    detect_api_key_from_env,
 };
 
 /// Screen rect an inline image was painted into last frame — hit-tested on
@@ -1737,6 +1738,14 @@ impl App {
                     filter: PasteFilter::Any,
                 });
             }
+            AppMode::ResumePicker(_) => {
+                if let AppMode::ResumePicker(state) = &mut self.mode {
+                    return Some(ActiveTextInput::Simple {
+                        input: &mut state.search,
+                        filter: PasteFilter::Any,
+                    });
+                }
+            }
             AppMode::TierModelPicker => {
                 return Some(ActiveTextInput::Simple {
                     input: &mut self.tier_picker_query,
@@ -2016,6 +2025,9 @@ impl App {
                 self, code,
             )),
             AppMode::Rewind(_) => Ok(super::reducer::navigation::handle_rewind_key(self, code)),
+            AppMode::ResumePicker(_) => Ok(super::reducer::navigation::handle_resume_picker_key(
+                self, code,
+            )),
             AppMode::Jobs => Ok(super::reducer::navigation::handle_jobs_key(self, code)),
             AppMode::JobDetail(_) => Ok(super::reducer::navigation::handle_job_detail_key(
                 self, code,
@@ -2066,6 +2078,18 @@ impl App {
                 })
                 .collect()
         }
+    }
+
+    /// Open the Claude Code resume picker and list transcripts off the event loop.
+    fn open_resume_picker(&mut self) {
+        self.completion.cancel();
+        self.mode = AppMode::ResumePicker(ResumePickerState::loading());
+        let tx = self.event_tx.clone();
+        spawn(async move {
+            let sessions = unblock(crate::session::import::list_claude_sessions).await;
+            let _ = tx.send(AppEvent::ResumeSessionsLoaded(sessions)).await;
+        })
+        .detach();
     }
 
     /// Trigger async loading of session list for the session select popup.
@@ -2332,7 +2356,7 @@ impl App {
                 }
                 // Send as message (slash commands only work from menu selection)
                 if !self.input.is_empty() || !self.attachments.is_empty() {
-                    return Some(self.prepare_message(PendingUserMessageMode::Steer));
+                    return self.prepare_message(PendingUserMessageMode::Steer);
                 }
             }
             KeyCode::Backspace => {
@@ -2435,7 +2459,7 @@ impl App {
                         self.set_status("Waiting for attachments to finish...");
                         return None;
                     }
-                    return Some(self.prepare_message(PendingUserMessageMode::Queue));
+                    return self.prepare_message(PendingUserMessageMode::Queue);
                 }
             }
             KeyCode::Char(c) => {
@@ -2805,7 +2829,11 @@ impl App {
                 self.open_btw();
                 None
             }
-            "/resume-codex" | "/resume-claude" | "/secret" => {
+            "/resume-claude" => {
+                self.open_resume_picker();
+                None
+            }
+            "/resume-codex" | "/secret" => {
                 // These take arguments — leave the command in the input so
                 // the user can type them, rather than executing now.
                 self.input = format!("{cmd} ");
@@ -3086,7 +3114,7 @@ impl App {
     }
 
     /// Prepare a message for sending, returning the action.
-    fn prepare_message(&mut self, delivery_mode: PendingUserMessageMode) -> SendAction {
+    fn prepare_message(&mut self, delivery_mode: PendingUserMessageMode) -> Option<SendAction> {
         // Add to history before clearing (only if non-empty and not just whitespace)
         if !self.input.trim().is_empty() {
             self.history.push(self.input.clone());
@@ -3100,22 +3128,22 @@ impl App {
 
         let trimmed = content.trim();
         if trimmed == "/context" && attachments.is_empty() {
-            return SendAction::ContextReport;
+            return Some(SendAction::ContextReport);
         }
         if trimmed == "/context dump" && attachments.is_empty() {
-            return SendAction::ContextDump;
+            return Some(SendAction::ContextDump);
         }
         if trimmed == "/bug" && attachments.is_empty() {
-            return SendAction::BugReport;
+            return Some(SendAction::BugReport);
         }
         if let Some(rest) = trimmed.strip_prefix("/compact")
             && attachments.is_empty()
         {
             let focus = rest.trim();
             if focus.is_empty() {
-                return SendAction::Compact(None);
+                return Some(SendAction::Compact(None));
             }
-            return SendAction::Compact(Some(focus.to_string()));
+            return Some(SendAction::Compact(Some(focus.to_string())));
         }
         for (cmd, source) in [
             ("/resume-codex", crate::session::import::ForeignAgent::Codex),
@@ -3125,10 +3153,12 @@ impl App {
             ),
         ] {
             if trimmed == cmd || trimmed.starts_with(&format!("{cmd} ")) {
-                return SendAction::ResumeImport {
-                    source,
-                    query: trimmed[cmd.len()..].trim().to_string(),
-                };
+                let query = trimmed[cmd.len()..].trim().to_string();
+                if query.is_empty() && source == crate::session::import::ForeignAgent::Claude {
+                    self.open_resume_picker();
+                    return None;
+                }
+                return Some(SendAction::ResumeImport { source, query });
             }
         }
 
@@ -3142,9 +3172,9 @@ impl App {
         };
 
         if self.processing {
-            SendAction::EnqueuePending(msg)
+            Some(SendAction::EnqueuePending(msg))
         } else {
-            SendAction::Send(msg)
+            Some(SendAction::Send(msg))
         }
     }
 
