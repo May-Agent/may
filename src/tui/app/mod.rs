@@ -120,6 +120,10 @@ pub struct App {
     /// The last message handed to the agent, kept until the next send so
     /// an aborted-before-any-action turn can put it back into the input.
     last_sent_input: Option<String>,
+    /// Hidden context attached to the next send after a rewind: tells the
+    /// agent the conversation was cut back while the world — open and
+    /// merged PRs — stands as recorded.
+    pub rewind_notice: Option<crate::xml::XmlBlock>,
     /// File picker state (when in `FilePicker` mode)
     pub file_picker: Option<FilePicker>,
     /// Image manager for clipboard images
@@ -508,6 +512,7 @@ impl App {
             mode,
             turn_had_output: false,
             last_sent_input: None,
+            rewind_notice: None,
             queue: MessageQueue::new(),
             status,
             processing: false,
@@ -738,8 +743,6 @@ impl App {
             targets,
             // The trailing "(current)" entry is selected first.
             selected,
-            options_for: None,
-            option_selected: 0,
         });
         true
     }
@@ -3233,7 +3236,7 @@ impl App {
         self.last_sent_input = Some(content.clone());
         let msg = PendingMessage {
             content,
-            hidden_context_xml: None,
+            hidden_context_xml: self.rewind_notice.take(),
             attachments,
             queued_at: jiff::Timestamp::now(),
             delivery_mode,
