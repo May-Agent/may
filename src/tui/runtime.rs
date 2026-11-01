@@ -777,7 +777,8 @@ impl RuntimeDeps {
                 .map(|pr| format!("#{} {} ({})", pr.number, pr.title, pr.state))
                 .collect::<Vec<_>>()
                 .join(", ");
-            notice.push_str(&format!(" Session pull requests: {list}."));
+            use std::fmt::Write as _;
+            let _ = write!(notice, " Session pull requests: {list}.");
         }
         app.rewind_notice = crate::xml::XmlBlock::parse(notice).ok();
         app.chat.push_notice(&format!(
