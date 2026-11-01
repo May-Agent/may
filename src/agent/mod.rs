@@ -32,6 +32,7 @@ pub mod ssh_authorizer;
 pub mod subagent_tracker;
 pub(crate) mod task_tool;
 pub mod tool_environment_cache;
+pub(crate) mod tunnel_tool;
 
 pub use browser_tool::{
     BrowserArgs, BrowserBroker, BrowserRequest, BrowserResult, channel as browser_channel,

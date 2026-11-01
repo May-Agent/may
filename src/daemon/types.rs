@@ -1562,3 +1562,23 @@ mod tests {
         ));
     }
 }
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+pub struct TunnelRegisterRequest {
+    pub session_id: String,
+    pub url: String,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+pub struct TunnelRegisterResponse {
+    pub id: String,
+    pub url: String,
+    pub path: String,
+    pub local_url: String,
+}
+
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
+pub struct TunnelInfoResponse {
+    pub id: String,
+    pub target: String,
+}

@@ -110,6 +110,11 @@ impl RemoteAccessManager {
         self.local_addr.send_replace(Some(addr));
     }
 
+    /// The daemon's TCP address, once it listens.
+    pub(crate) fn local_addr(&self) -> Option<SocketAddr> {
+        *self.local_addr.borrow()
+    }
+
     pub(crate) fn snapshot(&self) -> RemoteAccessStatusResponse {
         self.status_rx.borrow().clone()
     }

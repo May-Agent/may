@@ -284,6 +284,7 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
         turn_hub: Arc::new(super::chat::TurnHub::default()),
         parked_agents: super::chat::ParkedAgents::default(),
         session_background: super::chat::SessionBackgrounds::default(),
+        tunnels: Arc::new(super::tunnel::TunnelRegistry::new()),
     });
 
     super::chat::resume_pending_follow_up_runs(state.clone())
@@ -486,6 +487,10 @@ fn api_routes() -> Route {
                 "/stream".at(copilot_stream),
                 "/logout".post(copilot_logout),
             ))),
+            "/tunnels".route(Route::new((
+                "".post(super::tunnel::register_tunnel),
+                "/{id}".at(super::tunnel::get_tunnel),
+            ))),
             "/browser".route(Route::new((
                 "/status".at(browser_status),
                 "/start".post(browser_start),
@@ -516,6 +521,14 @@ fn api_routes() -> Route {
     ))
 }
 
+fn tunnel_routes() -> Route {
+    Route::new((
+        "/tunnel/{id}".any(super::tunnel::tunnel_proxy),
+        "/tunnel/{id}/".any(super::tunnel::tunnel_proxy),
+        "/tunnel/{id}/{*path}".any(super::tunnel::tunnel_proxy),
+    ))
+}
+
 /// User-facing artifact pages: `/profile/{profileId}/session/{sessionId}/artifacts`
 /// browses a session's artifact directory with rendered previews for
 /// browsers and raw bytes for everything else.
@@ -529,22 +542,27 @@ fn artifact_page_routes() -> Route {
 
 fn build_router(state: Arc<DaemonState>, mode: DaemonMode) -> Router {
     let api = "/api".route(api_routes());
+    let tunnel = tunnel_routes();
     let artifact_pages = "/profile".route(artifact_page_routes());
+    let fallback = super::tunnel::TunnelRefererFallback::new(state.clone());
 
     match mode {
-        DaemonMode::Rest => Route::new((api, artifact_pages))
+        DaemonMode::Rest => Route::new((api, tunnel, artifact_pages))
             .middleware(State(state))
-            .build(),
+            .build()
+            .layer(fallback),
         DaemonMode::Ui => {
             #[cfg(feature = "ui")]
             {
                 Route::new((
                     api,
+                    tunnel,
                     artifact_pages,
                     EmbeddedStaticDir::new("/", &WEB_UI_DIST).spa(),
                 ))
                 .middleware(State(state))
                 .build()
+                .layer(fallback)
             }
 
             #[cfg(not(feature = "ui"))]

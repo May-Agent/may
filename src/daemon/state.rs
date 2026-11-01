@@ -196,6 +196,7 @@ pub struct UiToolDispatchers {
     pub(crate) browser: BrowserBroker,
     pub(crate) register_skills: RegisterBroker,
     pub(crate) register_subagents: RegisterBroker,
+    pub(crate) tunnel: crate::agent::tunnel_tool::TunnelBroker,
 }
 
 pub struct UiToolQueues {
@@ -204,6 +205,7 @@ pub struct UiToolQueues {
     pub(crate) browser: BrowserQueue,
     pub(crate) register_skills: RegisterQueue,
     pub(crate) register_subagents: RegisterQueue,
+    pub(crate) tunnel: crate::agent::tunnel_tool::TunnelQueue,
 }
 
 pub fn tool_dispatch_channels() -> (UiToolDispatchers, UiToolQueues) {
@@ -213,6 +215,7 @@ pub fn tool_dispatch_channels() -> (UiToolDispatchers, UiToolQueues) {
     let (register_skills, register_skills_queue) = crate::agent::register_tool::skills_channel();
     let (register_subagents, register_subagents_queue) =
         crate::agent::register_tool::subagents_channel();
+    let (tunnel, tunnel_queue) = crate::agent::tunnel_tool::channel();
 
     (
         UiToolDispatchers {
@@ -221,6 +224,7 @@ pub fn tool_dispatch_channels() -> (UiToolDispatchers, UiToolQueues) {
             browser,
             register_skills,
             register_subagents,
+            tunnel,
         },
         UiToolQueues {
             task: task_queue,
@@ -228,6 +232,7 @@ pub fn tool_dispatch_channels() -> (UiToolDispatchers, UiToolQueues) {
             browser: browser_queue,
             register_skills: register_skills_queue,
             register_subagents: register_subagents_queue,
+            tunnel: tunnel_queue,
         },
     )
 }
@@ -463,6 +468,7 @@ pub struct DaemonState {
     pub(crate) parked_agents: super::chat::ParkedAgents,
     /// Each session's background jobs and subagent runs, across turns.
     pub(crate) session_background: super::chat::SessionBackgrounds,
+    pub(crate) tunnels: Arc<super::tunnel::TunnelRegistry>,
 }
 
 impl DaemonState {

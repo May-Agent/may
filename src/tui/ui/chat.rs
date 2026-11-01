@@ -362,13 +362,43 @@ pub struct ChatStream {
     revisions: Vec<u64>,
     /// Counter generating thinking-block IDs.
     next_thinking_id: usize,
+    /// Base `http://host/tunnel` URL `<tunnel id>` tags resolve against.
+    tunnel_base: String,
+}
+
+/// Renders `<tunnel id="…"/>` control tags as daemon URLs so the terminal
+/// shows a link instead of the raw marker.
+fn resolve_tunnel_tags<'a>(content: &'a str, tunnel_base: &str) -> std::borrow::Cow<'a, str> {
+    static TAG: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = TAG.get_or_init(|| {
+        regex::Regex::new(r#"<tunnel\b[^>]*?\bid\s*=\s*["']([^"']+)["'][^>]*/>"#)
+            .expect("tunnel tag pattern must compile")
+    });
+    re.replace_all(content, |captures: &regex::Captures<'_>| {
+        format!("{tunnel_base}/{}/", &captures[1])
+    })
 }
 
 impl ChatStream {
     /// Create a new empty chat stream.
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            tunnel_base: format!("http://localhost:{}/tunnel", crate::daemon::DEFAULT_PORT),
+            ..Self::default()
+        }
+    }
+
+    /// Sets the daemon base URL `<tunnel id>` tags render against.
+    #[must_use]
+    pub fn with_tunnel_base(mut self, tunnel_base: String) -> Self {
+        self.tunnel_base = tunnel_base;
+        self
+    }
+
+    /// The base URL `<tunnel id>` tags resolve against.
+    pub(super) fn tunnel_base(&self) -> &str {
+        &self.tunnel_base
     }
 
     fn next_revision() -> u64 {
@@ -1588,6 +1618,7 @@ pub(super) fn element_lines(
     elem: &ChatElement,
     state: ElementState,
     images_supported: bool,
+    tunnel_base: &str,
 ) -> ElementLines {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut images: Vec<(String, usize, String)> = Vec::new();
@@ -1629,7 +1660,8 @@ pub(super) fn element_lines(
                 markdown::ImageSupport::Disabled
             };
             let display = artifact_tag_text(content);
-            let md_result = markdown::render_markdown_with_positions(&display, image_mode);
+            let content = resolve_tunnel_tags(&display, tunnel_base);
+            let md_result = markdown::render_markdown_with_positions(&content, image_mode);
             let mut md_lines = md_result.lines;
             // Strip trailing empties from the markdown renderer so a message
             // does not end in a run of blank rows — but never into the rows
@@ -3316,6 +3348,7 @@ mod tests {
                     elem,
                     super::ElementState::of(elem, None, false, 0, Instant::now()),
                     true,
+                    "http://localhost:8787/tunnel",
                 )
                 .lines,
             );
