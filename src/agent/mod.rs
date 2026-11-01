@@ -50,6 +50,7 @@ pub use permission::{
     PermissionApprover, PermissionHistoryMode, PermissionHistoryModeParseError, PermissionRequest,
     PermissionRequestMode, PermissionRequestModeParseError,
 };
+pub(crate) use provider::reasoning_text_requested;
 pub use provider::{
     RequestParameterizedModel, ResolvedProviderRuntime, build_fast_provider_chain,
     provider_candidate_count, resolve_provider_runtime,

@@ -79,7 +79,7 @@ async fn persist_browser_screenshot(
         .await
         .map_err(|source| BrowserCapturePersistError::CreateArtifactDirectory { source })?;
 
-    let filename = format!("snapshot-{}.{}", uuid::Uuid::new_v4(), extension);
+    let filename = format!("snapshot-{}.{}", crate::id::new(), extension);
     let relative_artifact_path = format!("browser/{filename}");
     let absolute_artifact_path = browser_artifacts_dir.join(&filename);
     let screenshot_bytes = base64::engine::general_purpose::STANDARD

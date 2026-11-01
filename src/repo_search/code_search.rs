@@ -133,7 +133,7 @@ impl CodeSearchTool {
         let dir = args.repo.clone().unwrap_or_else(|| self.cwd.clone());
         let Some(worktree) = worktree_root(&dir) else {
             return NotWorktree {
-                dir: &dir.display().to_string(),
+                dir: &crate::fs_utils::display_path(&dir),
             }
             .render()
             .map_err(render_error);
@@ -155,7 +155,7 @@ impl CodeSearchTool {
                     ModelStatus::Failed { message } => message.clone(),
                 };
                 Ok(StatusView {
-                    worktree: &report.worktree.display().to_string(),
+                    worktree: &crate::fs_utils::display_path(&report.worktree),
                     index: report.index.as_ref(),
                     first_index: report
                         .index

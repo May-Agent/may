@@ -68,7 +68,6 @@ partial-json-fixer = "0.5"
 
 # Utils
 jiff = { version = "0.2", features = ["serde"] }
-uuid = { version = "1.0", features = ["v4"] }
 petname = "2"
 hostname = "0.4"
 cron = "0.15"

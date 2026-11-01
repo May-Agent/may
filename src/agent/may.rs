@@ -429,7 +429,7 @@ impl MayAgent {
             &session_paths,
             aither_models::lookup(config.model_id.as_str()),
             config.ssh_servers.clone(),
-            (!is_container).then(|| config.cwd.display().to_string()),
+            (!is_container).then(|| crate::fs_utils::display_path(&config.cwd)),
         );
         runtime_system_context =
             runtime_system_context.with_terminal_runtime(terminal_runtime.clone());

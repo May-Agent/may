@@ -277,6 +277,7 @@ struct AgentSentText<'a> {
 
 struct ListedAgent {
     status: AgentStatus,
+    cwd: String,
     is_self: bool,
 }
 
@@ -441,6 +442,7 @@ impl Tool for AgentTool {
                     .await?
                     .into_iter()
                     .map(|status| ListedAgent {
+                        cwd: crate::fs_utils::display_path(&status.cwd),
                         is_self: status.session_id == self.session_id,
                         status,
                     })

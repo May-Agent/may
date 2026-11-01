@@ -2,7 +2,6 @@
 
 use async_fs;
 use jiff::Timestamp;
-use petname::{Generator, Petnames};
 use std::path::{Path, PathBuf};
 
 use super::{ChatHistory, ChatMessage, ChatMessageStats, MessageRole, SessionStore};
@@ -64,11 +63,7 @@ impl SessionId {
     /// Panics if the embedded petname dictionary cannot produce an id.
     #[must_use]
     pub fn new() -> Self {
-        let petnames = Petnames::default();
-        let id = petnames
-            .generate_one(4, "-")
-            .expect("Failed to generate session ID");
-        Self(id)
+        Self(crate::id::new_long())
     }
 
     /// Create from an existing string.

@@ -282,6 +282,23 @@ describe('reducer', () => {
     expect(t.segments[0]).toMatchObject({ kind: 'text', text: 'Hello world' });
   });
 
+  test('reasoning_end records the phase duration', () => {
+    const t = stream([
+      { kind: 'start', seq: 1, turnId: 't1', sessionId: 's1', assistantId: 'a1' },
+      { kind: 'reasoning_end', seq: 2, turnId: 't1', seconds: 7 },
+      { kind: 'text', seq: 3, turnId: 't1', chunk: 'answer' },
+    ]);
+    expect(t.reasoningMs).toBe(7000);
+    expect(t.reasoning).toBe('');
+    // A stale reasoning_end does not overwrite a newer measurement.
+    const t2 = stream([
+      { kind: 'start', seq: 1, turnId: 't1', sessionId: 's1', assistantId: 'a1' },
+      { kind: 'reasoning_end', seq: 5, turnId: 't1', seconds: 7 },
+      { kind: 'reasoning_end', seq: 3, turnId: 't1', seconds: 2 },
+    ]);
+    expect(t2.reasoningMs).toBe(7000);
+  });
+
   test('ping bumps seq but leaves state otherwise untouched', () => {
     const t = stream([
       { kind: 'start', seq: 1, turnId: 't1', sessionId: 's1', assistantId: 'a1' },

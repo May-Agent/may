@@ -2841,7 +2841,7 @@ impl App {
             self.chat.push_notice(crate::secrets::SECRET_WARNING);
         }
 
-        let id = format!("bash-{}", uuid::Uuid::new_v4());
+        let id = format!("bash-{}", crate::id::new());
         self.chat.push_tool(
             id.clone(),
             ToolDisplay::Terminal {
@@ -3246,6 +3246,14 @@ impl App {
                         self.chat.collapse_thinking();
                         self.chat.end_text();
                         self.thinking_start = None;
+                        // Args that never streamed as deltas still count as
+                        // decoded output.
+                        let streamed = self
+                            .pending_tool_calls
+                            .get(&id)
+                            .map_or(0, |pending| pending.arguments.len());
+                        self.decode_meter
+                            .note_output(arguments.len().saturating_sub(streamed));
                         self.decode_meter.note_boundary();
                         if let Some(pending) = self.pending_tool_calls.get_mut(&id) {
                             pending.started = true;

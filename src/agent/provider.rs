@@ -101,13 +101,42 @@ pub(super) fn session_request_parameters(
     session_id: &SessionId,
 ) -> Parameters {
     let provider_id = selector.provider_id();
-    request_parameters_for(
+    let provider_type = config
+        .provider
+        .get(provider_id)
+        .map(|instance| instance.resolve_type(provider_id));
+    let mut parameters = request_parameters_for(
         provider_id,
         config.provider.get(provider_id),
         selector.model_id(),
         reasoning_effort,
         session_id,
-    )
+    );
+    if reasoning_text_requested(provider_type, selector.model_id(), reasoning_effort) {
+        parameters = parameters.include_reasoning(true);
+    }
+    parameters
+}
+
+/// Whether a session's requests should ask the provider to stream its
+/// reasoning text, so the UI can show the thinking block.
+///
+/// An explicit effort asks for it on every provider. A model that reasons by
+/// default gets it too — except on Anthropic, where asking alone would turn
+/// adaptive thinking on for models whose default is off.
+pub fn reasoning_text_requested(
+    provider_type: Option<ProviderType>,
+    model_id: &str,
+    effort: Option<ReasoningEffort>,
+) -> bool {
+    if matches!(effort, Some(ReasoningEffort::None)) {
+        return false;
+    }
+    if effort.is_some() {
+        return true;
+    }
+    provider_type.is_some_and(|t| t != ProviderType::Anthropic)
+        && aither_models::lookup(model_id).is_some_and(|info| info.has_ability(Ability::Reasoning))
 }
 
 /// Computes the [`Parameters`] a model should run with: `reasoning_effort`
@@ -621,6 +650,41 @@ mod tests {
         assert!(!parameters.native_tools.claude.web_search);
         assert!(!parameters.native_tools.claude.web_fetch);
         assert_eq!(parameters.reasoning_effort, Some(ReasoningEffort::High));
+    }
+
+    #[test]
+    fn reasoning_text_requested_follows_effort_and_anthropic_guard() {
+        // Explicit effort asks for reasoning text on every provider.
+        assert!(reasoning_text_requested(
+            Some(ProviderType::Anthropic),
+            "claude-opus-4-5",
+            Some(ReasoningEffort::Low),
+        ));
+        // Effort "none" never asks — it exists to disable thinking.
+        assert!(!reasoning_text_requested(
+            Some(ProviderType::OpenAI),
+            "gpt-5",
+            Some(ReasoningEffort::None),
+        ));
+        // Without effort, a reasoning-by-default model gets its text on
+        // non-Anthropic providers; Anthropic stays silent so asking cannot
+        // turn thinking on for models whose default is off.
+        assert!(reasoning_text_requested(
+            Some(ProviderType::OpenAI),
+            "gpt-5",
+            None,
+        ));
+        assert!(!reasoning_text_requested(
+            Some(ProviderType::Anthropic),
+            "claude-opus-4-5",
+            None,
+        ));
+        // A model without reasoning ability is never asked.
+        assert!(!reasoning_text_requested(
+            Some(ProviderType::OpenAI),
+            "gpt-4o-mini",
+            None,
+        ));
     }
 
     #[test]

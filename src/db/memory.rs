@@ -128,7 +128,7 @@ impl ChatDb {
             .execute()
             .await?;
         } else {
-            let id = uuid::Uuid::new_v4().to_string();
+            let id = crate::id::new();
             query!(
                 self.db,
                 "INSERT INTO profile_memories (id, profile_id, memory_type, content, updated_at) VALUES (?, ?, ?, ?, ?)",

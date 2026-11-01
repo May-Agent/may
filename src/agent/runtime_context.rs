@@ -18,6 +18,7 @@ use aither_core::llm::model::{Ability, Parameters};
 use askama::Template;
 
 use super::may::{AgentEnvironment, MayAgentConfig, MayAgentError};
+use crate::fs_utils::display_path;
 use crate::network_policy::{CompiledNetworkPolicy, NetworkPolicyMode};
 use crate::session::{SessionPaths, SessionPlanState};
 use crate::skill::SkillManager;
@@ -298,7 +299,7 @@ struct WorkspaceDirEntry {
 impl From<&MayWorkspaceDir> for WorkspaceDirEntry {
     fn from(value: &MayWorkspaceDir) -> Self {
         Self {
-            path: value.path.display().to_string(),
+            path: display_path(&value.path),
             description: value
                 .description
                 .clone()
@@ -398,8 +399,8 @@ pub fn build_terminal_runtime_context(
         home_environment_kind: home_environment_kind_label(&config.environment).to_string(),
         operating_system: operating_system_hint(&config.environment).to_string(),
         shell_dialect: "POSIX sh",
-        home_directory: session_paths.home_root().display().to_string(),
-        session_directory: session_paths.root().display().to_string(),
+        home_directory: display_path(&session_paths.home_root()),
+        session_directory: display_path(session_paths.root()),
         host_launch_directory,
         home_layout: vec![
             "/sessions - per-session sandboxes under this home environment".to_string(),
@@ -420,6 +421,7 @@ pub fn build_terminal_runtime_context(
             "Commands run in the current session home environment unless you explicitly target another. IPC-backed commands only work inside this profile's home environment; if a system-reminder reports a call to a non-existent direct tool, retry it through `terminal` as the CLI command.".to_string(),
             "Read a selected skill completely before acting on it; the terminal call that reads the skill must finish before any task command that depends on it.".to_string(),
             "Inline command results are previews May may clean, fold, or compress; the filesystem is durable. After compaction, restart, or long runs, recover prior results from outputs/, data/, files/, artifacts/, or tasks.md - read the slice you need with `head`, `tail`, `rg`, `jq`, or `ask`.".to_string(),
+            "Ids surfaced by tool results and reminders — sessions, tasks, questions, runs, agents, requests — are internal handles: pass them to commands and reference them in tasks.md, but never quote them to the user.".to_string(),
         ],
         environment_rules: environment_runtime_rules(&config.environment),
         modality_support,
