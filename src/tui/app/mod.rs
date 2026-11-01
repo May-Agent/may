@@ -151,7 +151,13 @@ pub struct App {
     /// picker does not paint the configured-only list while a fetch lands
     pub model_catalog: Vec<FetchedModel>,
     /// Effort rungs offered by the `/effort` popup
-    pub effort_ladder: &'static [&'static str],
+    pub effort_ladder: Vec<&'static str>,
+    /// Effort rungs each fetched model family serves, keyed by
+    /// `(provider_id, family base)` — the `/effort` popup shows a family's
+    /// own ladder when the catalog reports one.
+    pub family_effort_rungs: std::collections::HashMap<(String, String), Vec<&'static str>>,
+    /// When the current turn began; `None` while idle.
+    pub turn_started_at: Option<std::time::Instant>,
     /// Selected index in the effort popup
     pub effort_index: usize,
     /// Session's stored reasoning effort as last reported by the daemon
@@ -514,7 +520,9 @@ impl App {
             model_select_list: Vec::new(),
             model_select_query: String::new(),
             model_catalog: Vec::new(),
-            effort_ladder: &[],
+            effort_ladder: Vec::new(),
+            family_effort_rungs: std::collections::HashMap::new(),
+            turn_started_at: None,
             effort_index: 0,
             current_effort: None,
             needs_setup,
@@ -609,8 +617,10 @@ impl App {
 
     /// Create or rebuild the file-diff worker for the current session.
     ///
-    /// The worker tracks the session sandbox plus every writable workspace
-    /// dir. Container-profile sessions are skipped: their writes land
+    /// The worker tracks the launch directory, every writable workspace
+    /// dir and the session's repo clones — the directories the session
+    /// actually works in; the session sandbox's own bookkeeping is never
+    /// tracked. Container-profile sessions are skipped: their writes land
     /// inside the container where host-side git cannot see them.
     fn ensure_file_diffs(&mut self) {
         // An ephemeral session has no dirs on disk yet; its filebase is
@@ -651,24 +661,25 @@ impl App {
         }
 
         let session_paths = crate::session::SessionPaths::new(session.sandbox_dir.clone());
-        let mut roots = vec![
-            crate::file_tracker::TrackedRootSpec::new(session.sandbox_dir.clone())
-                .exclude("filebase")
-                .exclude("tmp")
-                .exclude("outputs")
-                .exclude("skills")
-                .exclude("subagents"),
-        ];
-        if let Ok(config) =
-            crate::workspace::WorkspaceConfig::load(&session_paths.workspace_config())
-        {
-            roots.extend(
-                config
-                    .workdirs
-                    .iter()
-                    .filter(|dir| dir.permission == crate::workspace::Permission::ReadWrite)
-                    .map(|dir| crate::file_tracker::TrackedRootSpec::new(dir.path.clone())),
-            );
+        let mut roots = Self::repo_clone_specs(&session.sandbox_dir);
+        match crate::workspace::WorkspaceConfig::load(&session_paths.workspace_config()) {
+            Ok(config) => {
+                // The launch dir needs no root of its own when a grant
+                // already covers it.
+                if !config.has_write_access(&self.cwd) {
+                    roots.push(crate::file_tracker::TrackedRootSpec::new(self.cwd.clone()));
+                }
+                roots.extend(
+                    config
+                        .workdirs
+                        .iter()
+                        .filter(|dir| dir.permission == crate::workspace::Permission::ReadWrite)
+                        .map(|dir| crate::file_tracker::TrackedRootSpec::new(dir.path.clone())),
+                );
+            }
+            Err(_) => {
+                roots.push(crate::file_tracker::TrackedRootSpec::new(self.cwd.clone()));
+            }
         }
         self.file_status.clear();
         self.file_diffs =
@@ -768,8 +779,44 @@ impl App {
             }
         }
         if refresh_status && let Some(handle) = &self.file_diffs {
+            // Repo clones created since the last refresh join tracking;
+            // the worker dedupes roots it already covers.
+            if let Some(session) = self
+                .session_manager
+                .current()
+                .filter(|session| session.persisted)
+            {
+                for spec in Self::repo_clone_specs(&session.sandbox_dir) {
+                    handle.request_add_root(spec);
+                }
+            }
             handle.request_status();
         }
+    }
+
+    /// Tracked-root specs for the session's repo clones: every clone under
+    /// `<sandbox>/repos/` is an embedded repository whose working tree only
+    /// diffs against a shadow repo of its own, labeled by the repository
+    /// it serves.
+    fn repo_clone_specs(
+        sandbox_dir: &std::path::Path,
+    ) -> Vec<crate::file_tracker::TrackedRootSpec> {
+        let repos = crate::repo_clone::SessionRepos::new(sandbox_dir, "");
+        let Ok(clones) = repos.clones() else {
+            return Vec::new();
+        };
+        clones
+            .iter()
+            .map(|record| {
+                let label = if record.local {
+                    crate::fs_utils::display_path(std::path::Path::new(&record.source))
+                } else {
+                    record.source.clone()
+                };
+                crate::file_tracker::TrackedRootSpec::new(repos.root().join(&record.dir))
+                    .label(format!("{label} (clone)"))
+            })
+            .collect()
     }
 
     /// Show the result of a completed code rewind in the chat stream.
@@ -2818,7 +2865,7 @@ impl App {
                 None
             }
             "/effort" => {
-                self.effort_ladder = model_picker::effort_ladder_for(self.current_provider_type());
+                self.effort_ladder = self.effort_ladder_for_current();
                 self.effort_index = self.effort_ladder_index();
                 self.mode = AppMode::EffortSelect;
                 self.fetch_current_effort();
@@ -3090,7 +3137,6 @@ impl App {
                 output: None,
                 diffs: Vec::new(),
                 pinned: None,
-                finished_at: None,
             },
         );
         self.scroll = usize::MAX;
@@ -3194,6 +3240,7 @@ impl App {
     /// Called when starting to process a message.
     pub fn start_processing(&mut self, msg: &PendingMessage) {
         self.processing = true;
+        self.turn_started_at = Some(std::time::Instant::now());
         self.thinking_start = None;
         self.activity_phase = crate::tui::ui::chat::ActivityPhase::Thinking;
         self.decode_meter.reset();
@@ -3408,7 +3455,6 @@ impl App {
                 output: None,
                 diffs: Vec::new(),
                 pinned: None,
-                finished_at: None,
             },
             ToolStartKind::Stdin { task_id, input } => {
                 let mut detail: Vec<String> = Vec::new();
@@ -3426,7 +3472,6 @@ impl App {
                     status: super::ui::chat::ToolStatus::Running,
                     output: None,
                     pinned: None,
-                    finished_at: None,
                 }
             }
             ToolStartKind::JobControl { action, task_id } => ToolDisplay::Action {
@@ -3439,7 +3484,6 @@ impl App {
                 status: super::ui::chat::ToolStatus::Running,
                 output: None,
                 pinned: None,
-                finished_at: None,
             },
             ToolStartKind::Generic {
                 name,
@@ -3453,7 +3497,6 @@ impl App {
                 status: super::ui::chat::ToolStatus::Running,
                 output: None,
                 pinned: None,
-                finished_at: None,
             },
         }
     }
@@ -3665,6 +3708,24 @@ impl App {
         }
     }
 
+    /// Mirror the daemon's pending-message queue from the last
+    /// `session_runtime` snapshot, so an enqueued message keeps a
+    /// `[steer]`/`[queue]` preview until the turn it starts renders it.
+    pub fn sync_queue_from_runtime(&mut self) {
+        let runtime = &self.session_runtime;
+        self.queue.replace(
+            runtime
+                .pending_immediate
+                .as_ref()
+                .map(PendingMessage::from_wire),
+            runtime
+                .queued_messages
+                .iter()
+                .map(PendingMessage::from_wire)
+                .collect(),
+        );
+    }
+
     /// Get current session ID for display.
     pub fn session_id_display(&self) -> String {
         self.session_manager
@@ -3680,6 +3741,27 @@ impl App {
             .as_deref()
             .or(self.config.last_effort.as_deref())
             .unwrap_or("medium")
+    }
+
+    /// The effort rungs `/effort` offers for the current model: the
+    /// family's served rungs when the catalog reports them, else the
+    /// provider protocol's generic ladder.
+    pub fn effort_ladder_for_current(&self) -> Vec<&'static str> {
+        let family = self
+            .current_model
+            .as_deref()
+            .and_then(|model| model.parse::<crate::ModelSelector>().ok())
+            .map(|selector| {
+                (
+                    selector.provider_id().to_string(),
+                    crate::models::effort_family_base(selector.model_id()),
+                )
+            });
+        family
+            .and_then(|key| self.family_effort_rungs.get(&key).cloned())
+            .unwrap_or_else(|| {
+                model_picker::effort_ladder_for(self.current_provider_type()).to_vec()
+            })
     }
 
     /// The ladder index of [`Self::effective_effort`], falling back to the
