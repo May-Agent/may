@@ -10,6 +10,7 @@ use self::pickers::{render_file_picker_popup, render_profile_select_popup, rende
 use self::popups::{render_mcp_popup, render_skill_popup, render_ssh_popup};
 
 use ratatui::{
+    buffer::CellDiffOption,
     prelude::*,
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
@@ -398,10 +399,127 @@ fn render_sheet(frame: &mut Frame, sheet: Rect, app: &App) {
     }
 }
 
-/// Render the zoomed image overlay: the image fitted into a large centered
-/// popup with its path/URL caption underneath. Esc or a click outside the
-/// image closes it. It stays an overlay over the whole screen rather than a
-/// sheet: it exists to show the image as large as the terminal allows.
+/// Margin around the zoom overlay so click-outside still has a target and
+/// the dimmed chat shows as a ring.
+const IMAGE_VIEW_MARGIN: u16 = 2;
+/// Left + right border cells.
+const IMAGE_VIEW_H_CHROME: u16 = 2;
+/// Top + bottom border plus the caption row.
+const IMAGE_VIEW_V_CHROME: u16 = 3;
+const IMAGE_VIEW_TITLE: &str = " Image (Esc or click outside to close) ";
+/// Near-black veil painted over `Color::Reset` backgrounds.
+const IMAGE_VIEW_VEIL: Color = Color::Rgb(10, 10, 12);
+
+fn image_view_frame() -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(IMAGE_VIEW_TITLE)
+}
+
+/// Largest rect the image can occupy: the screen minus the overlay margin,
+/// the frame border, and the caption row.
+fn image_view_max_content(area: Rect) -> Rect {
+    let popup = area.inner(Margin {
+        horizontal: IMAGE_VIEW_MARGIN,
+        vertical: IMAGE_VIEW_MARGIN,
+    });
+    let inner = image_view_frame().inner(popup);
+    Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: inner.height.saturating_sub(1),
+    }
+}
+
+/// Frame sized to `image_width`×`image_height`, growing for the title if
+/// needed, clamped to the margin box and centered on `area`.
+fn image_view_popup(area: Rect, image_width: u16, image_height: u16) -> Rect {
+    let max = area.inner(Margin {
+        horizontal: IMAGE_VIEW_MARGIN,
+        vertical: IMAGE_VIEW_MARGIN,
+    });
+    let title_min = u16::try_from(UnicodeWidthStr::width(IMAGE_VIEW_TITLE))
+        .unwrap_or(u16::MAX)
+        .saturating_add(IMAGE_VIEW_H_CHROME);
+    let width = image_width
+        .saturating_add(IMAGE_VIEW_H_CHROME)
+        .max(title_min)
+        .min(max.width);
+    let height = image_height
+        .saturating_add(IMAGE_VIEW_V_CHROME)
+        .min(max.height);
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
+}
+
+/// Slightly darken every cell in `area`. Skip protocol cells — those hold
+/// kitty/sixel payloads the terminal paints itself.
+fn dim_area(buf: &mut Buffer, area: Rect) {
+    let area = area.intersection(buf.area);
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let cell = &mut buf[(x, y)];
+            if cell.diff_option == CellDiffOption::Skip {
+                continue;
+            }
+            cell.fg = dim_color(cell.fg);
+            cell.bg = dim_bg(cell.bg);
+            cell.modifier.insert(Modifier::DIM);
+        }
+    }
+}
+
+fn dim_bg(color: Color) -> Color {
+    match color {
+        Color::Reset => IMAGE_VIEW_VEIL,
+        other => dim_color(other),
+    }
+}
+
+fn dim_color(color: Color) -> Color {
+    match color {
+        Color::Rgb(r, g, b) => Color::Rgb(dim_channel(r), dim_channel(g), dim_channel(b)),
+        Color::White | Color::Gray => Color::DarkGray,
+        Color::LightRed => Color::Red,
+        Color::LightGreen => Color::Green,
+        Color::LightYellow => Color::Yellow,
+        Color::LightBlue => Color::Blue,
+        Color::LightMagenta => Color::Magenta,
+        Color::LightCyan => Color::Cyan,
+        Color::Indexed(index) => Color::Indexed(dim_indexed(index)),
+        other => other,
+    }
+}
+
+fn dim_channel(value: u8) -> u8 {
+    // 5/8 of the original: a slight wash, not a blackout.
+    u8::try_from(u16::from(value) * 5 / 8).unwrap_or(u8::MAX)
+}
+
+const fn dim_indexed(index: u8) -> u8 {
+    match index {
+        8..=15 => index - 8,
+        16..=231 => {
+            let n = index - 16;
+            let r = n / 36 * 5 / 8;
+            let g = (n % 36) / 6 * 5 / 8;
+            let b = n % 6 * 5 / 8;
+            16 + 36 * r + 6 * g + b
+        }
+        232..=255 => 232 + (index - 232) * 5 / 8,
+        _ => index,
+    }
+}
+
+/// Render the zoomed image overlay: the image fitted into a frame that hugs
+/// it, using nearly the full terminal. The chat behind is slightly dimmed.
+/// Esc or a click outside the image closes it.
 fn render_image_view(frame: &mut Frame, area: Rect, app: &mut App) {
     let AppMode::ImageView(state) = &app.mode else {
         return;
@@ -412,13 +530,27 @@ fn render_image_view(frame: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
-    let popup = centered_rect(80, 75, area);
-    frame.render_widget(Clear, popup);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(" Image (Esc or click outside to close) ");
+    dim_area(frame.buffer_mut(), area);
+
+    let max_content = image_view_max_content(area);
+    let fitted = app
+        .image_cache
+        .get(&key)
+        .expect("checked above")
+        .fitted(max_content);
+    let popup = image_view_popup(area, fitted.width, fitted.height);
+    if popup.width == 0 || popup.height == 0 {
+        app.image_view_area = None;
+        return;
+    }
+
+    let block = image_view_frame();
     let inner = block.inner(popup);
+    if inner.width == 0 || inner.height < 2 {
+        app.image_view_area = None;
+        return;
+    }
+    frame.render_widget(Clear, popup);
     frame.render_widget(block, popup);
 
     let rows = Layout::default()
@@ -2300,5 +2432,59 @@ mod tests {
                 .iter()
                 .any(|row| row.contains(IMAGE_MARK))
         );
+    }
+
+    #[test]
+    fn image_view_popup_hugs_the_image_and_leaves_a_margin() {
+        let area = Rect::new(0, 0, 100, 40);
+        let popup = super::image_view_popup(area, 90, 30);
+        assert_eq!(popup, Rect::new(4, 3, 92, 33));
+    }
+
+    #[test]
+    fn image_view_popup_grows_to_the_title_on_a_narrow_image() {
+        let area = Rect::new(0, 0, 80, 24);
+        let popup = super::image_view_popup(area, 10, 6);
+        let title_min = u16::try_from(unicode_width::UnicodeWidthStr::width(
+            super::IMAGE_VIEW_TITLE,
+        ))
+        .unwrap()
+            + super::IMAGE_VIEW_H_CHROME;
+        assert_eq!(popup.width, title_min);
+        assert_eq!(popup.height, 9);
+        assert_eq!(popup.x, (80 - title_min) / 2);
+        assert_eq!(popup.y, 7);
+    }
+
+    #[test]
+    fn image_view_popup_clamps_to_the_margin_box() {
+        let area = Rect::new(0, 0, 50, 20);
+        let popup = super::image_view_popup(area, 400, 400);
+        assert_eq!(popup, Rect::new(2, 2, 46, 16));
+    }
+
+    #[test]
+    fn image_view_popup_never_exceeds_a_tiny_margin_box() {
+        let area = Rect::new(0, 0, 8, 6);
+        let popup = super::image_view_popup(area, 400, 400);
+        assert_eq!(popup, Rect::new(2, 2, 4, 2));
+    }
+
+    #[test]
+    fn dim_area_darkens_rgb_and_veils_reset_background() {
+        use ratatui::style::{Color, Modifier};
+
+        let mut buf = Buffer::empty(Rect::new(0, 0, 3, 1));
+        buf[(0, 0)]
+            .set_fg(Color::Rgb(200, 100, 50))
+            .set_bg(Color::Rgb(80, 80, 80));
+        buf[(1, 0)].set_fg(Color::White).set_bg(Color::Reset);
+        super::dim_area(&mut buf, Rect::new(0, 0, 3, 1));
+        assert_eq!(buf[(0, 0)].fg, Color::Rgb(125, 62, 31));
+        assert_eq!(buf[(0, 0)].bg, Color::Rgb(50, 50, 50));
+        assert_eq!(buf[(1, 0)].fg, Color::DarkGray);
+        assert_eq!(buf[(1, 0)].bg, super::IMAGE_VIEW_VEIL);
+        assert!(buf[(0, 0)].modifier.contains(Modifier::DIM));
+        assert!(buf[(1, 0)].modifier.contains(Modifier::DIM));
     }
 }
