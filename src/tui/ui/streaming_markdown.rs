@@ -980,7 +980,7 @@ mod tests {
             .skip(1)
             .filter_map(|s| s.style.fg)
             .collect();
-        assert!(!colors.is_empty());
+        assert_ne!(colors, [] as [Color; 0]);
         assert!(
             colors.iter().all(|c| *c == colors[0]),
             "comment color broke across lines: {colors:?}"
