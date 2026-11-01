@@ -665,9 +665,11 @@ impl ChatDb {
     /// session does not exist, or [`ChatDbError`] when a query fails.
     pub async fn archive_session(&self, id: &str) -> Result<(), ChatDbError> {
         let runtime = self.load_session_runtime_summary(id).await?;
-        if runtime.is_active() {
-            let reason = if runtime.state.is_active() {
+        if runtime.blocks_auto_archive() {
+            let reason = if runtime.state.is_executing() {
                 format!("runtime state is {}", runtime.state.as_str())
+            } else if runtime.plan_state.blocks_auto_archive() {
+                format!("plan state is {}", runtime.plan_state.as_str())
             } else {
                 "pending follow-up work exists".to_string()
             };
