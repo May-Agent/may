@@ -341,8 +341,11 @@ pub enum ChatElement {
         content: String,
         /// Seconds spent thinking.
         seconds: u64,
-        /// Open while reasoning streams; click the collapsed header to reopen.
+        /// Open while reasoning streams, or after the user reopens a header.
         expanded: bool,
+        /// Still receiving the current burst. Live bodies are a 5-line tail
+        /// window; a user-reopened block (`expanded` without `live`) is full.
+        live: bool,
     },
     /// `/context` report — estimated context-window usage per category.
     ContextReport(ContextReport),
@@ -541,6 +544,11 @@ impl ChatStream {
         true
     }
 
+    fn pop_last(&mut self) {
+        self.elements.pop();
+        self.revisions.pop();
+    }
+
     /// Start thinking block.
     pub fn start_thinking(&mut self) {
         let id = self.next_thinking_id;
@@ -550,17 +558,33 @@ impl ChatStream {
             content: String::new(),
             seconds: 0,
             expanded: true,
+            live: true,
         });
     }
 
     /// Append streamed reasoning text to the open thinking block, starting a
-    /// new block when the previous burst already collapsed.
+    /// new block when the previous burst already collapsed. An empty 0-second
+    /// stub left by a premature phase close is reused instead of sitting in
+    /// front of the real burst.
     pub fn push_thinking(&mut self, chunk: &str) {
-        if !matches!(
-            self.elements.last(),
-            Some(ChatElement::Thinking { expanded: true, .. })
-        ) {
-            self.start_thinking();
+        if chunk.is_empty() {
+            return;
+        }
+        match self.elements.last() {
+            Some(ChatElement::Thinking { live: true, .. }) => {}
+            Some(ChatElement::Thinking {
+                content,
+                seconds: 0,
+                ..
+            }) if content.is_empty() => {
+                if let Some(ChatElement::Thinking { expanded, live, .. }) = self.elements.last_mut()
+                {
+                    *expanded = true;
+                    *live = true;
+                    self.touch_last();
+                }
+            }
+            _ => self.start_thinking(),
         }
         if let Some(ChatElement::Thinking { content, .. }) = self.elements.last_mut() {
             content.push_str(chunk);
@@ -581,38 +605,90 @@ impl ChatStream {
     /// Stamp the daemon-measured duration of a reasoning phase and collapse
     /// the block — the phase ended, nothing more can stream into it. A phase
     /// that produced no readable text leaves a collapsed, non-expandable
-    /// header.
+    /// header when `seconds > 0`. A 0-second empty close is dropped so it
+    /// cannot sit in front of the next burst as a bare `Thought`.
     pub fn finish_thinking(&mut self, seconds: u64) {
-        if let Some(ChatElement::Thinking {
-            seconds: s,
-            expanded,
-            ..
-        }) = self.elements.last_mut()
-            && *expanded
-        {
-            *s = seconds;
-            *expanded = false;
-            self.touch_last();
-        } else {
-            let id = self.next_thinking_id;
-            self.next_thinking_id += 1;
-            self.push_element(ChatElement::Thinking {
-                id: format!("thinking-{id}"),
-                content: String::new(),
-                seconds,
-                expanded: false,
-            });
+        enum Finish {
+            Stamp,
+            Pop,
+            Push,
+            None,
+        }
+        let action = match self.elements.last() {
+            Some(ChatElement::Thinking {
+                content,
+                expanded,
+                live,
+                ..
+            }) if *expanded || *live => {
+                if content.is_empty() && seconds == 0 {
+                    Finish::Pop
+                } else {
+                    Finish::Stamp
+                }
+            }
+            Some(ChatElement::Thinking { content, .. }) if content.is_empty() => {
+                if seconds == 0 {
+                    Finish::Pop
+                } else {
+                    Finish::Stamp
+                }
+            }
+            _ if seconds == 0 => Finish::None,
+            _ => Finish::Push,
+        };
+        match action {
+            Finish::Pop => self.pop_last(),
+            Finish::None => {}
+            Finish::Stamp => {
+                if let Some(ChatElement::Thinking {
+                    seconds: s,
+                    expanded,
+                    live,
+                    ..
+                }) = self.elements.last_mut()
+                {
+                    *s = seconds;
+                    *expanded = false;
+                    *live = false;
+                    self.touch_last();
+                }
+            }
+            Finish::Push => {
+                let id = self.next_thinking_id;
+                self.next_thinking_id += 1;
+                self.push_element(ChatElement::Thinking {
+                    id: format!("thinking-{id}"),
+                    content: String::new(),
+                    seconds,
+                    expanded: false,
+                    live: false,
+                });
+            }
         }
     }
 
     /// Collapse the open thinking block (called when the reasoning burst
-    /// ends or first text arrives). The block stays as a collapsed header.
+    /// ends or first text arrives). The block stays as a collapsed header,
+    /// unless it is an empty 0-second stub, which is dropped.
     pub fn collapse_thinking(&mut self) {
-        if let Some(ChatElement::Thinking { expanded, .. }) = self.elements.last_mut()
-            && *expanded
-        {
-            *expanded = false;
-            self.touch_last();
+        match self.elements.last() {
+            Some(ChatElement::Thinking {
+                content,
+                seconds: 0,
+                expanded,
+                live,
+                ..
+            }) if (*expanded || *live) && content.is_empty() => self.pop_last(),
+            Some(ChatElement::Thinking { expanded, live, .. }) if *expanded || *live => {
+                if let Some(ChatElement::Thinking { expanded, live, .. }) = self.elements.last_mut()
+                {
+                    *expanded = false;
+                    *live = false;
+                    self.touch_last();
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1651,12 +1727,69 @@ pub(super) fn collapsible_id(elem: &ChatElement) -> Option<&str> {
     }
 }
 
+/// Body rows shown while a thinking burst is still streaming.
+const THINKING_LIVE_LINES: usize = 5;
+
+/// Last `n` logical lines of `text`, matching [`str::lines`] (a trailing
+/// newline does not count as an extra empty line).
+fn last_lines(text: &str, n: usize) -> &str {
+    if n == 0 {
+        return "";
+    }
+    let text = text.strip_suffix('\n').unwrap_or(text);
+    let bytes = text.as_bytes();
+    let mut remaining = n;
+    let mut i = bytes.len();
+    while i > 0 {
+        i -= 1;
+        if bytes[i] == b'\n' {
+            remaining -= 1;
+            if remaining == 0 {
+                return &text[i + 1..];
+            }
+        }
+    }
+    text
+}
+
+/// Suffix of `text` whose display width is at most `max_width`.
+fn suffix_max_width(text: &str, max_width: usize) -> &str {
+    if max_width == 0 || text.is_empty() {
+        return "";
+    }
+    let mut width = 0usize;
+    let mut start = text.len();
+    for (i, ch) in text.char_indices().rev() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width.saturating_add(w) > max_width {
+            break;
+        }
+        width += w;
+        start = i;
+    }
+    &text[start..]
+}
+
+/// Tail of live thinking shown in the 5-line window: last `THINKING_LIVE_LINES`
+/// logical lines, clipped to about that many columns at `width` so a
+/// newline-less blob cannot fill the screen.
+fn live_thinking_body(content: &str, width: u16) -> &str {
+    let slice = last_lines(content, THINKING_LIVE_LINES);
+    let budget = usize::from(width.max(1)).saturating_mul(THINKING_LIVE_LINES);
+    if UnicodeWidthStr::width(slice) <= budget {
+        slice
+    } else {
+        suffix_max_width(slice, budget)
+    }
+}
+
 /// Lay out one element as styled lines (before wrapping).
 pub(super) fn element_lines(
     elem: &ChatElement,
     state: ElementState,
     images_supported: bool,
     tunnel_base: &str,
+    width: u16,
 ) -> ElementLines {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut images: Vec<(String, usize, String)> = Vec::new();
@@ -1808,6 +1941,7 @@ pub(super) fn element_lines(
             content,
             seconds,
             expanded,
+            live,
             ..
         } => {
             let header = if *expanded {
@@ -1830,7 +1964,12 @@ pub(super) fn element_lines(
                 Style::default().fg(Color::Magenta),
             )));
             if *expanded {
-                for l in content.lines() {
+                let body = if *live {
+                    live_thinking_body(content, width)
+                } else {
+                    content.as_str()
+                };
+                for l in body.lines() {
                     lines.push(Line::from(Span::styled(
                         l.to_string(),
                         Style::default()
@@ -3498,6 +3637,7 @@ mod tests {
                     super::ElementState::of(elem, None, false, 0, Instant::now()),
                     true,
                     "http://localhost:8787/tunnel",
+                    width,
                 )
                 .lines,
             );
@@ -3920,6 +4060,87 @@ mod tests {
         assert_eq!(regions[1].element_id, "t2");
         assert_eq!(regions[1].start, 1);
         assert_eq!(regions[1].end, 2);
+    }
+
+    #[test]
+    fn last_lines_skips_a_trailing_newline() {
+        assert_eq!(super::last_lines("a\nb\nc\n", 2), "b\nc");
+        assert_eq!(super::last_lines("a\nb\nc", 2), "b\nc");
+        assert_eq!(super::last_lines("only", 5), "only");
+        assert_eq!(super::last_lines("", 3), "");
+    }
+
+    #[test]
+    fn live_thinking_window_shows_last_five_lines_then_reopens_full() {
+        let mut chat = ChatStream::new();
+        chat.push_thinking("l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8");
+        let live = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
+        let body: Vec<&str> = live
+            .iter()
+            .skip(1)
+            .filter(|l| !l.is_empty())
+            .map(String::as_str)
+            .collect();
+        assert_eq!(body, ["l4", "l5", "l6", "l7", "l8"]);
+        assert!(live[0].contains("Thinking"));
+        assert!(!live.iter().any(|l| l.contains("l1")));
+
+        chat.collapse_thinking();
+        chat.toggle_expanded("thinking-0");
+        let reopened = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
+        let full: Vec<&str> = reopened
+            .iter()
+            .skip(1)
+            .filter(|l| !l.is_empty())
+            .map(String::as_str)
+            .collect();
+        assert_eq!(full, ["l1", "l2", "l3", "l4", "l5", "l6", "l7", "l8"]);
+    }
+
+    #[test]
+    fn empty_zero_second_thought_is_dropped() {
+        let mut chat = ChatStream::new();
+        chat.finish_thinking(0);
+        assert!(chat.elements().is_empty());
+
+        chat.start_thinking();
+        chat.collapse_thinking();
+        assert!(chat.elements().is_empty());
+    }
+
+    #[test]
+    fn premature_reasoning_end_does_not_leave_empty_thought_before_burst() {
+        let mut chat = ChatStream::new();
+        // Daemon closed a freshly re-armed phase at 0s (TurnComplete after
+        // tools), then the next burst streamed real reasoning.
+        chat.finish_thinking(0);
+        chat.push_thinking("step one");
+        chat.finish_thinking(9);
+        let lines = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
+        let headers: Vec<&str> = lines
+            .iter()
+            .filter(|l| l.contains("Thought") || l.contains("Thinking"))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(headers, ["◐ Thought for 9 sec ▸"]);
+        assert_eq!(
+            chat.elements()
+                .iter()
+                .filter(|e| matches!(e, ChatElement::Thinking { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn duration_only_header_stays_when_the_next_burst_starts() {
+        let mut chat = ChatStream::new();
+        chat.finish_thinking(4);
+        chat.push_thinking("next");
+        let lines = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
+        assert!(lines[0].contains("Thought for 4 sec"));
+        assert!(!lines[0].contains('▸'));
+        assert!(lines.iter().any(|l| l.contains("next")));
     }
 
     #[test]
