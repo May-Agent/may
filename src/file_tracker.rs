@@ -23,6 +23,9 @@ pub struct TrackedRootSpec {
     /// Additional entries for the shadow repo's `info/exclude`
     /// (paths relative to `worktree`).
     pub excludes: Vec<String>,
+    /// Display name for the root in diffs, when the tracked path itself is
+    /// uninformative (e.g. a session clone named `repos/<slug>`).
+    pub label: Option<String>,
 }
 
 impl TrackedRootSpec {
@@ -33,6 +36,7 @@ impl TrackedRootSpec {
         Self {
             worktree,
             excludes: Vec::new(),
+            label: None,
         }
     }
 
@@ -40,6 +44,13 @@ impl TrackedRootSpec {
     #[must_use]
     pub fn exclude(mut self, pattern: impl Into<String>) -> Self {
         self.excludes.push(pattern.into());
+        self
+    }
+
+    /// Name the root for display instead of its path.
+    #[must_use]
+    pub fn label(mut self, label: impl Into<String>) -> Self {
+        self.label = Some(label.into());
         self
     }
 }
@@ -61,6 +72,8 @@ pub struct FileStat {
 pub struct RootDiff {
     /// Tracked root the diff is relative to.
     pub root: PathBuf,
+    /// Display name of the root, when one was given in the spec.
+    pub label: Option<String>,
     /// Per-file line counts, in `git diff` path order.
     pub changes: Vec<FileStat>,
     /// Added lines across all files.
@@ -106,6 +119,7 @@ const CHECKPOINTS_FILE: &str = "checkpoints";
 #[derive(Debug)]
 struct TrackedRoot {
     worktree: PathBuf,
+    label: Option<String>,
     git_dir: PathBuf,
     tree: String,
     /// Tree the session's change list diffs against; set once, never moved.
@@ -139,7 +153,7 @@ impl FileChangeTracker {
         };
         for spec in roots {
             let worktree = spec.worktree.clone();
-            if let Err(error) = tracker.insert_root(spec) {
+            if let Err(error) = tracker.add_root(spec) {
                 tracing::warn!(
                     worktree = %worktree.display(),
                     %error,
@@ -147,6 +161,7 @@ impl FileChangeTracker {
                 );
             }
         }
+        tracker.prune_stale_shadow_repos()?;
         Ok(tracker)
     }
 
@@ -289,13 +304,33 @@ impl FileChangeTracker {
         diffs
     }
 
+    /// Remove shadow repositories under `state_dir` that no tracked root
+    /// owns — leftovers of a root set that changed since the session's
+    /// tracker state was written.
+    fn prune_stale_shadow_repos(&self) -> Result<(), TrackerError> {
+        let expected: std::collections::HashSet<PathBuf> = self
+            .roots
+            .iter()
+            .map(|root| root.git_dir.clone())
+            .collect();
+        for entry in std::fs::read_dir(&self.state_dir)? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|ext| ext == "git")
+                && path.is_dir()
+                && !expected.contains(&path)
+            {
+                std::fs::remove_dir_all(&path)?;
+            }
+        }
+        Ok(())
+    }
+
     fn insert_root(&mut self, spec: TrackedRootSpec) -> Result<(), TrackerError> {
         let spec = TrackedRootSpec {
             worktree: normalize_path(&spec.worktree),
             ..spec
         };
-        let index = self.roots.len();
-        let git_dir = self.state_dir.join(format!("{index}.git"));
+        let git_dir = self.state_dir.join(format!("{}.git", shadow_key(&spec.worktree)));
         if !git_dir.join("HEAD").exists() {
             init_bare(&git_dir).map_err(|stderr| TrackerError::Command {
                 args: format!("init --bare -b main {}", git_dir.display()),
@@ -323,12 +358,27 @@ impl FileChangeTracker {
         };
         self.roots.push(TrackedRoot {
             worktree: spec.worktree,
+            label: spec.label,
             git_dir,
             tree,
             session_base,
         });
         Ok(())
     }
+}
+
+/// Stable key for a root's shadow repository: the normalized worktree path
+/// hashed, so reordered or shrunken root sets cannot reattribute another
+/// root's baselines and checkpoints.
+fn shadow_key(worktree: &Path) -> String {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(worktree.as_os_str().as_encoded_bytes());
+    let mut key = String::with_capacity(16);
+    for byte in &digest[..8] {
+        use std::fmt::Write;
+        let _ = write!(key, "{byte:02x}");
+    }
+    key
 }
 
 /// Canonicalize `path` through its deepest existing ancestor, so paths that
@@ -481,6 +531,7 @@ fn numstat_diff(
     let deletions = changes.iter().map(|stat| stat.deletions).sum();
     Ok(Some(RootDiff {
         root: root.worktree.clone(),
+        label: root.label.clone(),
         changes,
         additions,
         deletions,
