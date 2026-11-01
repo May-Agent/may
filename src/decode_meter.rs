@@ -10,6 +10,12 @@ const BYTES_PER_TOKEN: u64 = 4;
 /// granularity dominates and produces meaningless spikes.
 const MIN_MEASUREMENT: Duration = Duration::from_millis(200);
 
+/// A gap between output chunks longer than this means the model was
+/// buffering server-side (for instance generating a large tool-call
+/// argument the provider does not stream), not decoding — the pause is not
+/// decode time and must not dilute the measured rate.
+const OUTPUT_GAP: Duration = Duration::from_secs(2);
+
 /// Measures output-token throughput while a model streams a response.
 ///
 /// Output events (text, reasoning, tool-call fragments) arrive in bursts: one
@@ -22,6 +28,8 @@ const MIN_MEASUREMENT: Duration = Duration::from_millis(200);
 pub struct DecodeMeter {
     /// Start of the current output burst; `None` between bursts.
     burst_start: Option<Instant>,
+    /// When the most recent output chunk arrived; `None` between bursts.
+    last_output_at: Option<Instant>,
     /// Decode time accumulated over completed bursts.
     elapsed: Duration,
     /// Exact completion tokens reported by `Usage` events.
@@ -37,11 +45,23 @@ impl DecodeMeter {
     }
 
     /// Record `bytes` of newly streamed model output.
+    ///
+    /// A chunk arriving after [`OUTPUT_GAP`] of silence closes the open
+    /// window at the previous chunk instead of letting the pause inflate
+    /// decode time.
     pub fn note_output(&mut self, bytes: usize) {
         if bytes == 0 {
             return;
         }
-        self.burst_start.get_or_insert_with(Instant::now);
+        let now = Instant::now();
+        if let Some(last) = self.last_output_at
+            && now.duration_since(last) > OUTPUT_GAP
+            && let Some(start) = self.burst_start.take()
+        {
+            self.elapsed += self.open_window_end(now).saturating_duration_since(start);
+        }
+        self.burst_start.get_or_insert(now);
+        self.last_output_at = Some(now);
         self.in_flight_bytes += bytes as u64;
     }
 
@@ -50,8 +70,19 @@ impl DecodeMeter {
     /// decode time.
     pub fn note_boundary(&mut self) {
         if let Some(start) = self.burst_start.take() {
-            self.elapsed += start.elapsed();
+            self.elapsed += self
+                .open_window_end(Instant::now())
+                .saturating_duration_since(start);
         }
+        self.last_output_at = None;
+    }
+
+    /// Instant up to which the open burst counts as decode time: the latest
+    /// chunk's arrival plus at most [`OUTPUT_GAP`]. Past that the window is
+    /// capped — silence after the last chunk is buffering, not decoding.
+    fn open_window_end(&self, now: Instant) -> Instant {
+        self.last_output_at
+            .map_or(now, |last| (last + OUTPUT_GAP).min(now))
     }
 
     /// Fold an exact completion-token report into the measurement, dropping
@@ -75,7 +106,9 @@ impl DecodeMeter {
         let tokens = self.tokens();
         let mut elapsed = self.elapsed;
         if let Some(start) = self.burst_start {
-            elapsed += start.elapsed();
+            elapsed += self
+                .open_window_end(Instant::now())
+                .saturating_duration_since(start);
         }
         let secs = elapsed.as_secs_f64();
         (tokens > 0 && secs >= MIN_MEASUREMENT.as_secs_f64()).then(|| {
@@ -131,6 +164,28 @@ mod tests {
         // 100 tokens over ~0.3s lands in the hundreds of tok/s.
         assert!(rate > 100.0, "rate {rate} implausibly low");
         assert!(rate < 10_000.0, "rate {rate} implausibly high");
+    }
+
+    #[test]
+    fn silent_gap_does_not_inflate_decode_time() {
+        let mut meter = DecodeMeter::default();
+        meter.note_output(400);
+        std::thread::sleep(MIN_MEASUREMENT + Duration::from_millis(100));
+        // A long pause with no output: the model was buffering server-side,
+        // not decoding at a crawling rate. The window caps at the last
+        // chunk + OUTPUT_GAP, so the rate freezes instead of collapsing.
+        std::thread::sleep(OUTPUT_GAP + Duration::from_secs(3));
+        let frozen = meter.rate().expect("rate during gap");
+        assert!(
+            frozen > 30.0,
+            "rate free-fell during silence: {frozen} tok/s"
+        );
+        // The next chunk closes the window at the same cap; the pause
+        // beyond OUTPUT_GAP never enters decode time.
+        meter.note_output(4);
+        std::thread::sleep(MIN_MEASUREMENT);
+        let resumed = meter.rate().expect("rate after resume");
+        assert!(resumed > 30.0, "gap leaked into decode time: {resumed}");
     }
 
     #[test]
