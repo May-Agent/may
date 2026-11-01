@@ -67,11 +67,8 @@ static LAND_LOCKS: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
 fn land_lock(repo_key: &str) -> Arc<Mutex<()>> {
     let mut locks = LAND_LOCKS
         .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    locks
-        .entry(repo_key.to_string())
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    locks.entry(repo_key.to_string()).or_default().clone()
 }
 
 /// The resolved clone a `pr` operates on.
@@ -244,14 +241,14 @@ impl PrStore {
             .await?;
         self.event(&pr, "checks_pending", None).await;
         // `[[projects]] checks` — the local check command runs in the clone.
-        if let Some(cmd) = self.check_command(&resolved.record) {
-            if let Err(err) = run_check(&resolved.dir, &cmd).await {
-                self.db()?
-                    .update_pr(pr.id, "failed", Some(&head_sha), None, None)
-                    .await?;
-                self.event(&pr, "check_failed", Some(&err)).await;
-                return Err(PrError::CheckFailed(err));
-            }
+        if let Some(cmd) = self.check_command(&resolved.record)
+            && let Err(err) = run_check(&resolved.dir, &cmd).await
+        {
+            self.db()?
+                .update_pr(pr.id, "failed", Some(&head_sha), None, None)
+                .await?;
+            self.event(&pr, "check_failed", Some(&err)).await;
+            return Err(PrError::CheckFailed(err));
         }
         // Serialized land: one in-flight merge per repository.
         let lock = land_lock(&resolved.record.repo_key);
@@ -261,7 +258,7 @@ impl PrStore {
             let session = self.context.session_id.clone();
             let clone = resolved.dir.clone();
             let number = pr.number;
-            move || land(&checkout, &clone, &session, number, lock)
+            move || land(&checkout, &clone, &session, number, &lock)
         })
         .await;
         let now = jiff::Timestamp::now().to_string();
@@ -319,18 +316,15 @@ impl PrStore {
     /// # Errors
     /// Fails on database errors.
     pub async fn list(&self, repo: Option<&str>, state: Option<&str>) -> Result<String, PrError> {
-        let key = match repo {
-            Some(name) => {
-                let resolved = self.resolve(Some(name)).await?;
-                Some(resolved.record.repo_key)
-            }
-            None => {
-                let clones = self.repos.clones()?;
-                if clones.len() == 1 {
-                    Some(clones[0].repo_key.clone())
-                } else {
-                    None
-                }
+        let key = if let Some(name) = repo {
+            let resolved = self.resolve(Some(name)).await?;
+            Some(resolved.record.repo_key)
+        } else {
+            let clones = self.repos.clones()?;
+            if clones.len() == 1 {
+                Some(clones[0].repo_key.clone())
+            } else {
+                None
             }
         };
         let rows = self.db()?.list_prs(key.as_deref(), state).await?;
@@ -404,8 +398,7 @@ impl PrStore {
             .iter()
             .find(|p| {
                 crate::issue::repository_identity(&p.path)
-                    .map(|k| k.to_string_lossy() == record.repo_key)
-                    .unwrap_or(false)
+                    .is_ok_and(|k| k.to_string_lossy() == record.repo_key)
             })
             .and_then(|p| p.checks.clone())
     }
@@ -454,7 +447,7 @@ fn land(
     clone: &Path,
     session: &str,
     number: i64,
-    lock: Arc<Mutex<()>>,
+    lock: &Mutex<()>,
 ) -> Result<String, String> {
     let _guard = lock.lock().map_err(|_| "land lock poisoned".to_string())?;
     let checkout_path = Path::new(checkout);
@@ -492,7 +485,7 @@ fn land(
     .map_err(|e| e.to_string())?
     .lines()
     .map(str::to_string)
-    .collect::<Vec<_>>();
+    .collect::<std::collections::HashSet<_>>();
     let overlap: Vec<String> = touched.into_iter().filter(|f| dirty.contains(f)).collect();
     if !overlap.is_empty() {
         return Err(format!(

@@ -808,6 +808,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store,
+                workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: Some(messaging),
             },
         )
