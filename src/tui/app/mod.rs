@@ -2862,26 +2862,7 @@ impl App {
                 self.mode = AppMode::Config;
                 None
             }
-            "/model" => {
-                self.model_select_list = self.collect_all_models();
-                // Seed with the catalog remembered from the last fetch so a
-                // warm open paints the full list at once; the in-flight
-                // refresh below re-merges whatever changed meanwhile.
-                let catalog = std::mem::take(&mut self.model_catalog);
-                self.merge_model_select_models(catalog);
-                self.model_select_query.clear();
-                self.model_select_rx = self.fetch_provider_models();
-                self.model_select_index = 0;
-                let fallback_model = self.config.last_model.as_ref().map(ToString::to_string);
-                let current = self.current_model.as_deref().or(fallback_model.as_deref());
-                if let Some(current) = current
-                    && let Some(idx) = self.model_select_position(current)
-                {
-                    self.model_select_index = idx;
-                }
-                self.mode = AppMode::ModelSelect;
-                None
-            }
+            "/model" => self.open_model_select(""),
             "/effort" => {
                 self.effort_ladder = self.effort_ladder_for_current();
                 self.effort_index = self.effort_ladder_index();
@@ -3238,6 +3219,14 @@ impl App {
                 }
                 return Some(SendAction::ResumeImport { source, query });
             }
+        }
+        // `/model` opens the picker and `/model <query>` searches it —
+        // either way the line is a command, never a message to the agent.
+        if attachments.is_empty()
+            && let Some(rest) = trimmed.strip_prefix("/model")
+            && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+        {
+            return self.open_model_select(rest.trim());
         }
 
         self.last_sent_input = Some(content.clone());
