@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::ChatDb;
+use crate::SkillManager;
 use crate::agent::browser_tool::BrowserToolError;
 use crate::agent::browser_tool::{BrowserBroker, BrowserRequest, BrowserResult};
 use crate::agent::notify_tool::{NotifyArgs, NotifyBroker, NotifyResult};
@@ -18,7 +19,6 @@ use crate::network_policy::NetworkPolicyConfig;
 use crate::notification::{NotificationManager, NotificationService};
 use crate::scheduler::TaskRuntime;
 use crate::session::{MayHomePaths, SessionStore};
-use crate::{SkillManager, SubagentManager};
 
 /// Failures while wiring the shared IPC command brokers.
 #[derive(Debug, thiserror::Error)]
@@ -45,8 +45,6 @@ pub struct ToolDispatchers {
     pub browser: Option<BrowserBroker>,
     /// Broker for skill registration.
     pub register_skills: RegisterBroker,
-    /// Broker for subagent registration.
-    pub register_subagents: RegisterBroker,
     /// Broker for the `tunnel` command.
     pub tunnel: crate::agent::tunnel_tool::TunnelBroker,
 }
@@ -171,22 +169,10 @@ impl ToolDispatchers {
 
         let (register_skills, register_skills_queue) =
             crate::agent::register_tool::skills_channel();
-        let registration_for_skills = registration.clone();
         tokio::spawn(async move {
             while let Some(request) = register_skills_queue.next().await {
                 let result =
-                    handle_register_skills_request(&registration_for_skills, request.args.clone())
-                        .await;
-                let _ = request.respond(result);
-            }
-        });
-
-        let (register_subagents, register_subagents_queue) =
-            crate::agent::register_tool::subagents_channel();
-        tokio::spawn(async move {
-            while let Some(request) = register_subagents_queue.next().await {
-                let result =
-                    handle_register_subagents_request(&registration, request.args.clone()).await;
+                    handle_register_skills_request(&registration, request.args.clone()).await;
                 let _ = request.respond(result);
             }
         });
@@ -206,7 +192,6 @@ impl ToolDispatchers {
             notify,
             browser,
             register_skills,
-            register_subagents,
             tunnel,
         })
     }
@@ -436,32 +421,6 @@ async fn handle_register_skills_request(
                     )
                 })?;
             Ok(vec![info.dir_name])
-        },
-    )
-    .await
-}
-
-async fn handle_register_subagents_request(
-    runtime: &RegistrationRuntime,
-    request: RegisterRequest,
-) -> Result<RegisterResult, String> {
-    handle_register_request(
-        runtime,
-        request,
-        "subagent definitions",
-        "subagents",
-        |subagents_dir, source| async move {
-            let manager = SubagentManager::from_subagents_dir(subagents_dir);
-            let infos = manager
-                .register_from_local_path(&source)
-                .await
-                .map_err(|error| {
-                    format!(
-                        "failed to register subagents from {}: {error}",
-                        source.display()
-                    )
-                })?;
-            Ok(infos.into_iter().map(|item| item.file_name).collect())
         },
     )
     .await

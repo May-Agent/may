@@ -528,7 +528,6 @@ where
             tunnel_broker: Some(tool_dispatchers.tunnel.clone()),
             browser_broker: tool_dispatchers.browser.clone(),
             register_skills_broker: None,
-            register_subagents_broker: None,
             workspace_request_broker: None,
             subagent_runs: aither_agent::specialized::SubagentRuns::default(),
             // exec runs scripts without a model turn, so no provider-hosted

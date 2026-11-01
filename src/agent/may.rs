@@ -193,8 +193,6 @@ pub struct MayAgentConfig {
     pub computer: Option<crate::agent::computer_tool::ComputerHandles>,
     /// Optional broker for `register-skills` command requests.
     pub register_skills_broker: Option<RegisterBroker>,
-    /// Optional broker for `register-subagents` command requests.
-    pub register_subagents_broker: Option<RegisterBroker>,
     /// Whether this model/runtime pair supports native voice input.
     pub native_voice_input: bool,
     /// Model context window resolved from provider metadata.
@@ -257,8 +255,6 @@ pub struct MayAgentSessionInput<'a> {
     pub computer: Option<crate::agent::computer_tool::ComputerHandles>,
     /// Channel for register-skills requests.
     pub register_skills_broker: Option<RegisterBroker>,
-    /// Channel for register-subagents requests.
-    pub register_subagents_broker: Option<RegisterBroker>,
     /// Execution environment (local heel sandbox or container).
     pub environment: AgentEnvironment,
     /// Trusted baseline tool distribution used by every configured backend.
@@ -529,13 +525,12 @@ impl MayAgent {
         let context_snapshot_hook =
             ContextSnapshotHook::new(hook_runtime.clone(), &config.session_id);
 
-        let (skills_dir, subagents_dir) = if let Some(profile_id) = config.profile_id.as_deref() {
-            let profile_home =
-                crate::session::MayHomePaths::new(config.may_dir.clone()).profile_home(profile_id);
-            (profile_home.skills_dir(), profile_home.subagents_dir())
+        let skills_dir = if let Some(profile_id) = config.profile_id.as_deref() {
+            crate::session::MayHomePaths::new(config.may_dir.clone())
+                .profile_home(profile_id)
+                .skills_dir()
         } else {
-            let home = crate::session::MayHomePaths::new(config.may_dir.clone());
-            (home.skills_dir(), home.subagents_dir())
+            crate::session::MayHomePaths::new(config.may_dir.clone()).skills_dir()
         };
 
         // Build the agent using a minimal base prompt + structured context blocks.
@@ -607,7 +602,6 @@ impl MayAgent {
                 tunnel_broker: config.tunnel_broker.clone(),
                 browser_broker: config.browser_broker.clone(),
                 register_skills_broker: config.register_skills_broker.clone(),
-                register_subagents_broker: config.register_subagents_broker.clone(),
                 request_parameters: config.request_parameters.clone(),
                 workspace_request_broker: (!is_container)
                     .then_some(config.workspace_request_broker.clone()),
@@ -626,10 +620,8 @@ impl MayAgent {
         builder = builder.fork_source(shared_terminal_commands.fork_source.clone());
         if is_container {
             builder = Box::pin(builder.with_skills_readable_only(&skills_dir)).await?;
-            builder = Box::pin(builder.with_subagents_readable_only(&subagents_dir)).await?;
         } else {
             builder = Box::pin(builder.with_skills(&skills_dir)).await?;
-            builder = Box::pin(builder.with_subagents(&subagents_dir)).await?;
         }
         // The builder's descriptions cover every shared command registered
         // above.
@@ -637,7 +629,6 @@ impl MayAgent {
             builder.tool_descriptions(),
             &config.request_parameters,
             &skills_dir,
-            &subagents_dir,
             &crate::issue::IssueStore::info(&issue_store),
         )
         .await?;
@@ -735,7 +726,6 @@ impl MayAgent {
             #[cfg(target_os = "macos")]
             computer,
             register_skills_broker,
-            register_subagents_broker,
             environment,
             tool_distribution,
             tool_environments,
@@ -833,7 +823,6 @@ impl MayAgent {
             #[cfg(target_os = "macos")]
             computer,
             register_skills_broker,
-            register_subagents_broker,
             native_voice_input: model_info
                 .is_some_and(|info| info.has_ability(aither_core::llm::model::Ability::Audio)),
             model_context_window: model_info.and_then(aither_models::ModelEntry::max_input_tokens),

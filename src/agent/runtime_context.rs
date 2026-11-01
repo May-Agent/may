@@ -16,7 +16,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use aither_agent::SubagentDefinition;
 use aither_core::llm::model::{Ability, Parameters};
 use askama::Template;
 use async_fs;
@@ -25,7 +24,6 @@ use super::may::{AgentEnvironment, MayAgentConfig, MayAgentError};
 use crate::network_policy::{CompiledNetworkPolicy, NetworkPolicyMode};
 use crate::session::{SessionPaths, SessionPlanState};
 use crate::skill::SkillManager;
-use crate::subagent::SubagentManager;
 use crate::workspace::{Workspace as MayWorkspace, WorkspaceDir as MayWorkspaceDir};
 
 const MEMORY_CONTEXT_HINT: &str = include_str!("../texts/memory_context_hint.txt");
@@ -600,7 +598,6 @@ pub async fn build_base_system_prompt(
     shared_terminal_commands: &[(String, String)],
     request_parameters: &Parameters,
     skills_dir: &std::path::Path,
-    subagents_dir: &std::path::Path,
     issue_backend: &crate::issue::IssueBackendInfo,
 ) -> Result<String, MayAgentError> {
     let mut commands = shared_terminal_commands
@@ -630,7 +627,17 @@ pub async fn build_base_system_prompt(
         })
         .collect::<Vec<_>>();
 
-    let mut subagents = load_prompt_subagents(subagents_dir).await?;
+    let mut subagents: Vec<BaseSystemSubagent> = aither_agent::builtin_subagents()
+        .into_iter()
+        .map(|def| BaseSystemSubagent {
+            id: def.id,
+            description: def.description,
+        })
+        .collect();
+    subagents.push(BaseSystemSubagent {
+        id: "fork".to_string(),
+        description: "Continues your own context on your model; use it for work that depends on what you have read and decided".to_string(),
+    });
     subagents.sort_by(|left, right| left.id.cmp(&right.id));
 
     let template = BaseSystemTemplate {
@@ -649,30 +656,6 @@ pub async fn build_base_system_prompt(
     template.render().map_err(|error| {
         MayAgentError::Sandbox(format!("failed to render base system prompt: {error}"))
     })
-}
-
-async fn load_prompt_subagents(
-    subagents_dir: &std::path::Path,
-) -> Result<Vec<BaseSystemSubagent>, MayAgentError> {
-    let manager = SubagentManager::from_subagents_dir(subagents_dir.to_path_buf());
-    let path = manager.subagents_dir();
-    if async_fs::metadata(path).await.is_err() {
-        return Ok(Vec::new());
-    }
-
-    let defs = SubagentDefinition::load_from_dir_async(path)
-        .await
-        .map_err(|error| {
-            MayAgentError::Sandbox(format!("failed to load subagent prompt metadata: {error}"))
-        })?;
-
-    Ok(defs
-        .into_iter()
-        .map(|def| BaseSystemSubagent {
-            id: def.id,
-            description: def.description,
-        })
-        .collect())
 }
 
 const fn home_environment_kind_label(environment: &AgentEnvironment) -> &'static str {
@@ -970,7 +953,6 @@ mod tests {
         tokio_test::block_on(build_base_system_prompt(
             commands,
             request_parameters,
-            dir.path(),
             dir.path(),
             issue_backend,
         ))

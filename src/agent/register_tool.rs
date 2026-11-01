@@ -1,8 +1,7 @@
 use std::borrow::Cow;
 
 use aither_agent::tool_request::{
-    ToolRequestBroker, ToolRequestQueue, bounded_channel as bounded_tool_request_channel,
-    channel as tool_request_channel,
+    ToolRequestBroker, ToolRequestQueue, channel as tool_request_channel,
 };
 use aither_core::llm::{Tool, ToolResult};
 use askama::Template;
@@ -38,8 +37,6 @@ struct RegisterDoneText<'a> {
 pub type RegisterBroker = ToolRequestBroker<RegisterRequest, Result<RegisterResult, String>>;
 pub type RegisterQueue = ToolRequestQueue<RegisterRequest, Result<RegisterResult, String>>;
 
-const SUBAGENT_QUEUE_CAPACITY: usize = 64;
-
 #[derive(Debug, thiserror::Error)]
 enum RegisterToolError {
     #[error("path must not be empty")]
@@ -55,11 +52,6 @@ pub fn skills_channel() -> (RegisterBroker, RegisterQueue) {
     tool_request_channel()
 }
 
-#[must_use]
-pub fn subagents_channel() -> (RegisterBroker, RegisterQueue) {
-    bounded_tool_request_channel(SUBAGENT_QUEUE_CAPACITY)
-}
-
 /// Marker trait for register tool variants.
 pub trait RegisterKind: Send + Sync + Clone + std::fmt::Debug + 'static {
     const TOOL_NAME: &'static str;
@@ -73,15 +65,6 @@ pub struct Skills;
 impl RegisterKind for Skills {
     const TOOL_NAME: &'static str = "register-skills";
     const DESCRIPTION: &'static str = "Register a local directory as a profile skill; pending user approval, it becomes available to sessions.";
-}
-
-/// Subagents register variant.
-#[derive(Debug, Clone)]
-pub struct Subagents;
-
-impl RegisterKind for Subagents {
-    const TOOL_NAME: &'static str = "register-subagents";
-    const DESCRIPTION: &'static str = "Register local subagent definitions; pending user approval, they become available to sessions.";
 }
 
 /// Unified register tool generic over the kind of registration.
