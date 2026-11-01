@@ -613,6 +613,39 @@ impl ChatStream {
         self.push_element(ChatElement::ToolCall { id, display });
     }
 
+    /// Insert a tool call, or replace its display when the element already
+    /// exists: a call materialized from streamed arguments gets its
+    /// canonical display once `ToolCallStart` lands, and a delta
+    /// projection refreshes it on every fragment. A finished call keeps
+    /// its display — a trailing event must not resurrect it — and the
+    /// user's expansion pin and any attached diffs carry over.
+    pub fn upsert_tool_display(&mut self, id: String, display: ToolDisplay) {
+        if let Some(index) = self.tool_index(&id) {
+            if let ChatElement::ToolCall { display: slot, .. } = &mut self.elements[index]
+                && !slot.is_complete()
+            {
+                let mut display = display;
+                let pinned = slot.pinned();
+                match &mut display {
+                    ToolDisplay::Terminal {
+                        pinned: pin, diffs, ..
+                    } => {
+                        *pin = pinned;
+                        if let ToolDisplay::Terminal { diffs: old, .. } = slot {
+                            *diffs = std::mem::take(old);
+                        }
+                    }
+                    ToolDisplay::Action { pinned: pin, .. }
+                    | ToolDisplay::Builtin { pinned: pin, .. } => *pin = pinned,
+                }
+                *slot = display;
+                self.touch(index);
+            }
+            return;
+        }
+        self.push_tool(id, display);
+    }
+
     /// Record a provider-hosted tool call the model just invoked.
     pub fn push_builtin(&mut self, id: String, tool: String, detail: String) {
         self.end_text();
@@ -2755,6 +2788,115 @@ mod tests {
         stream.update_tool_with_output("call-1", ToolStatus::Done, Some("hello\nworld\n"));
         assert_eq!(stream.running_terminal_calls(), Vec::new());
         assert!(!stream.is_tool_running("call-1"));
+    }
+
+    /// A delta-materialized call is replaced in place by its canonical
+    /// display — no duplicate element — and a finished call keeps its
+    /// terminal display when a trailing event arrives.
+    #[test]
+    fn upsert_tool_display_refreshes_then_ignores_late_events() {
+        fn terminal(command: &str) -> ToolDisplay {
+            ToolDisplay::Terminal {
+                description: String::new(),
+                command: command.to_string(),
+                mode: TerminalExecutionMode::Default,
+                status: ToolStatus::Running,
+                output: None,
+                diffs: Vec::new(),
+                pinned: None,
+                finished_at: None,
+            }
+        }
+
+        let mut stream = ChatStream::new();
+        stream.upsert_tool_display("call-1".to_string(), terminal("ech"));
+        stream.upsert_tool_display("call-1".to_string(), terminal("echo hi"));
+        assert_eq!(stream.elements.len(), 1);
+        let Some(ChatElement::ToolCall {
+            display: ToolDisplay::Terminal { command, .. },
+            ..
+        }) = stream.elements.first()
+        else {
+            panic!("tool call missing");
+        };
+        assert_eq!(command, "echo hi");
+
+        // Once finished, a stale delta/start cannot reopen the card.
+        stream.update_tool_with_output("call-1", ToolStatus::Done, Some("done"));
+        stream.upsert_tool_display("call-1".to_string(), terminal("ech"));
+        let Some(ChatElement::ToolCall {
+            display: ToolDisplay::Terminal {
+                command, status, ..
+            },
+            ..
+        }) = stream.elements.first()
+        else {
+            panic!("tool call missing");
+        };
+        assert_eq!(command, "echo hi");
+        assert!(matches!(status, ToolStatus::Done));
+    }
+
+    /// The user's expansion pin and any attached diffs survive a display
+    /// replacement.
+    #[test]
+    fn upsert_tool_display_carries_pin_and_diffs() {
+        let mut stream = ChatStream::new();
+        stream.upsert_tool_display(
+            "call-1".to_string(),
+            ToolDisplay::Terminal {
+                description: String::new(),
+                command: "ech".to_string(),
+                mode: TerminalExecutionMode::Default,
+                status: ToolStatus::Running,
+                output: None,
+                diffs: Vec::new(),
+                pinned: None,
+                finished_at: None,
+            },
+        );
+        stream.toggle_expanded("call-1");
+        stream.update_tool_diff(
+            "call-1",
+            vec![crate::file_tracker::RootDiff {
+                root: std::path::PathBuf::from("/repo"),
+                files: 1,
+                additions: 2,
+                deletions: 0,
+                text: "+line".to_string(),
+            }],
+        );
+
+        stream.upsert_tool_display(
+            "call-1".to_string(),
+            ToolDisplay::Terminal {
+                description: "greet".to_string(),
+                command: "echo hi".to_string(),
+                mode: TerminalExecutionMode::Default,
+                status: ToolStatus::Running,
+                output: None,
+                diffs: Vec::new(),
+                pinned: None,
+                finished_at: None,
+            },
+        );
+
+        let Some(ChatElement::ToolCall {
+            display:
+                ToolDisplay::Terminal {
+                    pinned,
+                    diffs,
+                    description,
+                    ..
+                },
+            ..
+        }) = stream.elements.first()
+        else {
+            panic!("tool call missing");
+        };
+        assert_eq!(*pinned, Some(false));
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(description, "greet");
     }
 
     #[test]
