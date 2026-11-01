@@ -449,10 +449,10 @@ impl App {
                 .iter()
                 .map(|(id, _)| id.as_str())
                 .collect();
-            Some(StatusNotice::persistent(format!(
-                "Auto-configured from env: {}",
-                names.join(", ")
-            )))
+            Some(StatusNotice::transient(
+                format!("Auto-configured from env: {}", names.join(", ")),
+                STATUS_NOTICE_TTL,
+            ))
         };
 
         let secrets = crate::secrets::Secrets::load(
@@ -1633,13 +1633,10 @@ impl App {
         );
     }
 
-    /// Show a status notice that stays until replaced or cleared.
+    /// Show a status notice that clears itself after [`STATUS_NOTICE_TTL`]
+    /// — or the moment the user presses a key. Notices are transient by
+    /// construction; nothing lingers on screen.
     pub fn set_status(&mut self, text: impl Into<String>) {
-        self.status = Some(StatusNotice::persistent(text));
-    }
-
-    /// Show a status notice that clears itself after [`STATUS_NOTICE_TTL`].
-    pub fn set_transient_status(&mut self, text: impl Into<String>) {
         self.status = Some(StatusNotice::transient(text, STATUS_NOTICE_TTL));
     }
 
@@ -1853,7 +1850,7 @@ impl App {
                 KeyCode::Char('c') => {
                     if self.copy_selection_to_clipboard()? {
                         self.quit_pending = false;
-                        self.set_transient_status("Copied selection");
+                        self.set_status("Copied selection");
                         return Ok(None);
                     }
 
@@ -2538,7 +2535,7 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Right) if self.copy_selection_to_clipboard()? => {
-                self.set_transient_status("Copied selection");
+                self.set_status("Copied selection");
             }
             _ => {}
         }
