@@ -1,22 +1,29 @@
-import { useParams } from 'react-router-dom';
+import { Navigate, useParams } from 'react-router-dom';
 import { ChatView } from '@/components/chat/ChatView';
 import { InspectorPane } from '@/components/inspector/InspectorPane';
 import { Sheet, SheetContent, SheetTitle } from '@/components/ui/sheet';
-import { useSessionsStore } from '@/lib/stores/sessions';
+import { isDraftSessionId, useSessionsStore } from '@/lib/stores/sessions';
+import { profilePath } from '@/lib/profile/active';
 import { useUiStore } from '@/lib/stores/ui';
 import { INSPECTOR_COLUMN_QUERY, useMediaQuery } from '@/lib/useMediaQuery';
 import { useTranslation } from '@/lib/i18n';
 
 /** Chat in the content area, the inspector beside it (or in a sheet when narrow). */
 export function SessionPage() {
-  const { sessionId } = useParams();
+  const { profileId, sessionId } = useParams();
   const active = useSessionsStore((s) => s.active);
+  const draftKnown = useSessionsStore((s) => sessionId != null && sessionId in s.drafts);
   const inspectorOpen = useUiStore((s) => s.inspectorOpen);
   const inspectorSheetOpen = useUiStore((s) => s.inspectorSheetOpen);
   const setInspectorSheetOpen = useUiStore((s) => s.setInspectorSheetOpen);
   const inspectorColumn = useMediaQuery(INSPECTOR_COLUMN_QUERY);
   const { t } = useTranslation();
   if (!sessionId) return null;
+  // A draft survives only in this tab's store; a reload of its URL has
+  // nothing to go back to — send the user home.
+  if (isDraftSessionId(sessionId) && !draftKnown) {
+    return <Navigate to={profileId ? profilePath(profileId) : '/'} replace />;
+  }
   const session = active && active.id === sessionId ? active : null;
 
   return (
