@@ -182,6 +182,7 @@ impl ChatDb {
                 })?,
                 script: row.script,
                 session_id: Some(row.session_id),
+                agent_id: row.agent_id,
             },
         })
     }
@@ -795,12 +796,13 @@ impl ChatDb {
         if let Some(request) = &request {
             query!(
                 tx,
-                "INSERT INTO session_pending_permissions (request_id, session_id, mode, script, created_at) VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO session_pending_permissions (request_id, session_id, mode, script, created_at, agent_id) VALUES (?, ?, ?, ?, ?, ?)",
                 request.id.as_str(),
                 session_id,
                 request.request.mode.as_str(),
                 request.request.script.as_str(),
-                now.as_str()
+                now.as_str(),
+                request.request.agent_id.as_deref()
             )
             .execute()
             .await?;
