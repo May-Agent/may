@@ -236,6 +236,7 @@ impl SessionParts {
             location: None,
             task_broker: None,
             notify_broker: None,
+            tunnel_broker: None,
             browser_broker: None,
             register_skills_broker: None,
             register_subagents_broker: None,

@@ -18,6 +18,11 @@ export default defineConfig({
         changeOrigin: true,
         ws: true,
       },
+      '/tunnel': {
+        target: apiTarget,
+        changeOrigin: true,
+        ws: true,
+      },
     },
   },
   build: {

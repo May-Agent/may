@@ -184,6 +184,8 @@ pub struct MayAgentConfig {
     pub task_broker: Option<crate::agent::task_tool::TaskBroker>,
     /// Optional broker for `notify` command requests.
     pub notify_broker: Option<crate::agent::notify_tool::NotifyBroker>,
+    /// Optional broker for `tunnel` command requests.
+    pub tunnel_broker: Option<crate::agent::tunnel_tool::TunnelBroker>,
     /// Optional broker for `browser` command requests.
     pub browser_broker: Option<BrowserBroker>,
     /// Daemon handles for the `computer` command — a session virtual
@@ -247,6 +249,8 @@ pub struct MayAgentSessionInput<'a> {
     pub task_broker: Option<crate::agent::task_tool::TaskBroker>,
     /// Channel for notification requests.
     pub notify_broker: Option<crate::agent::notify_tool::NotifyBroker>,
+    /// Channel for tunnel registrations.
+    pub tunnel_broker: Option<crate::agent::tunnel_tool::TunnelBroker>,
     /// Channel for browser requests.
     pub browser_broker: Option<BrowserBroker>,
     /// Daemon handles for `computer` commands (macOS local only).
@@ -523,6 +527,7 @@ impl MayAgent {
                 },
                 task_broker: config.task_broker.clone(),
                 notify_broker: config.notify_broker.clone(),
+                tunnel_broker: config.tunnel_broker.clone(),
                 browser_broker: config.browser_broker.clone(),
                 register_skills_broker: config.register_skills_broker.clone(),
                 register_subagents_broker: config.register_subagents_broker.clone(),
@@ -654,6 +659,7 @@ impl MayAgent {
             location,
             task_broker,
             notify_broker,
+            tunnel_broker,
             browser_broker,
             #[cfg(target_os = "macos")]
             computer,
@@ -751,6 +757,7 @@ impl MayAgent {
             location,
             task_broker,
             notify_broker,
+            tunnel_broker,
             browser_broker,
             #[cfg(target_os = "macos")]
             computer,
