@@ -1153,6 +1153,54 @@ pub(super) async fn send_message(
     Ok(Json(runtime.into()))
 }
 
+/// `POST /api/sessions/{id}/bash`: run a `!` command for the user.
+///
+/// Runs on the user's behalf in the session's cwd — keychain secrets
+/// injected, output masked — with the same runner the TUI's bash mode
+/// uses. The caller turns the masked outcome into the agent-facing
+/// transcript.
+pub(super) async fn run_bash(
+    params: skyzen::routing::Params,
+    Json(req): Json<crate::daemon::types::BashRequest>,
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<crate::daemon::types::BashResponse>> {
+    let session_id = params
+        .get("id")
+        .map_err(super::error::bad_request_error)?
+        .to_string();
+    let command = req.command.trim().to_string();
+    if command.is_empty() {
+        return Err(super::error::bad_request_error("empty bash command"));
+    }
+    let session = state
+        .db()
+        .get_session(&session_id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| super::error::bad_request_error("session not found"))?;
+    let cwd = session
+        .cwd
+        .map_or_else(|| state.cwd.clone(), std::path::PathBuf::from);
+    let secrets = crate::secrets::Secrets::load(
+        &crate::secrets::SecretStore::new(&state.may_dir),
+        state.config.load().as_ref(),
+    );
+    let run_secrets = secrets.clone();
+    let outcome =
+        blocking::unblock(move || crate::bash::run_bash_command(&command, &cwd, &run_secrets))
+            .await;
+    // The transcript returned to the client never carries the raw secret.
+    let (masked_command, _) = secrets.mask(&outcome.command);
+    Ok(Json(crate::daemon::types::BashResponse {
+        command: masked_command,
+        stdout: outcome.stdout,
+        stderr: outcome.stderr,
+        exit_code: outcome.exit_code,
+        had_secret: outcome.had_secret,
+        error: outcome.error,
+    }))
+}
+
 pub(super) fn spawn_shared_tool_dispatchers(state: Arc<DaemonState>, queues: UiToolQueues) {
     let UiToolQueues {
         task,
