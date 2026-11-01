@@ -1570,6 +1570,12 @@ fn run_agent_loop<'a>(
                                 "tool_start",
                             );
                             saw_tool_activity = true;
+                            // Args that never streamed as deltas still count
+                            // as decoded output.
+                            let streamed = pending_tool_streams
+                                .get(&id)
+                                .map_or(0, |pending| pending.buffered_arguments.len());
+                            decode_meter.note_output(arguments.len().saturating_sub(streamed));
                             decode_meter.note_boundary();
                             if matches!(
                                 name.as_str(),
