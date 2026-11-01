@@ -85,10 +85,10 @@ async fn resolve_session_artifacts_root(
         .await
         .map_err(internal_error)?
         .ok_or_else(not_found)?;
-    let profile_matches = match session.profile_id.as_deref() {
-        Some(actual) => profile_id == "-" || profile_id == actual,
-        None => profile_id == "-" || profile_id == "default",
-    };
+    let profile_matches = session.profile_id.as_deref().map_or_else(
+        || profile_id == "-" || profile_id == "default",
+        |actual| profile_id == "-" || profile_id == actual,
+    );
     if !profile_matches {
         return Err(not_found());
     }
@@ -129,14 +129,14 @@ pub(super) async fn serve_artifact(
             if relative_path.as_os_str().is_empty() {
                 // The directory itself may not exist yet; show an empty index
                 // rather than an error for the session root.
-                return index_page(&page_base, &relative_path, Vec::new()).await;
+                return index_page(&page_base, &relative_path, Vec::new());
             }
             return Err(error);
         }
     };
 
     if resolved.metadata.is_dir() {
-        return index_page(&page_base, &relative_path, collect_dir(&resolved).await?).await;
+        return index_page(&page_base, &relative_path, collect_dir(&resolved).await?);
     }
     if !resolved.metadata.is_file() {
         return Err(skyzen::Error::msg("artifact not found").set_status(StatusCode::NOT_FOUND));
@@ -163,12 +163,13 @@ fn artifact_url(base: &str, relative: &Path) -> String {
 }
 
 fn encode_path_segment(segment: &str) -> String {
+    use std::fmt::Write;
     let mut out = String::with_capacity(segment.len());
     for byte in segment.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
             out.push(char::from(byte));
         } else {
-            out.push_str(&format!("%{byte:02X}"));
+            let _ = write!(out, "%{byte:02X}");
         }
     }
     out
@@ -224,7 +225,7 @@ struct ArtifactIndexTemplate {
     parent_href: Option<String>,
 }
 
-async fn index_page(
+fn index_page(
     page_base: &str,
     relative_path: &Path,
     mut entries: Vec<DirEntry>,
@@ -236,22 +237,19 @@ async fn index_page(
             format!("{}/{}", artifact_url(page_base, relative_path), entry.href)
         };
     }
-    let title = relative_path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "artifacts".to_string());
+    let title = relative_path.file_name().map_or_else(
+        || "artifacts".to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    );
     let parent_href = if relative_path.as_os_str().is_empty() {
         None
     } else {
         Some(artifact_url(
             page_base,
-            &relative_path
-                .parent()
-                .unwrap_or(Path::new(""))
-                .to_path_buf(),
+            relative_path.parent().unwrap_or_else(|| Path::new("")),
         ))
     };
-    html_response(
+    Ok(html_response(
         ArtifactIndexTemplate {
             title,
             rel_path: relative_path.to_string_lossy().replace('\\', "/"),
@@ -260,7 +258,7 @@ async fn index_page(
         }
         .render()
         .map_err(internal_error)?,
-    )
+    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -361,7 +359,7 @@ async fn preview_page(
         _ => {}
     }
 
-    html_response(
+    Ok(html_response(
         ArtifactPageTemplate {
             name: &name,
             rel_path: &rel_path,
@@ -375,7 +373,7 @@ async fn preview_page(
         }
         .render()
         .map_err(internal_error)?,
-    )
+    ))
 }
 
 async fn raw_file_response(
@@ -397,11 +395,10 @@ async fn raw_file_response(
         PAGE_CACHE_CONTROL,
     );
     if download {
-        let name = resolved
-            .relative_path
-            .file_name()
-            .map(|value| value.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "artifact".to_string());
+        let name = resolved.relative_path.file_name().map_or_else(
+            || "artifact".to_string(),
+            |value| value.to_string_lossy().into_owned(),
+        );
         insert_header(
             &mut response,
             skyzen::header::CONTENT_DISPOSITION,
@@ -443,7 +440,7 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-fn html_response(html: String) -> SkyResult<skyzen::Response> {
+fn html_response(html: String) -> skyzen::Response {
     let mut response = skyzen::Response::new(skyzen::Body::from(html.into_bytes()));
     insert_header(
         &mut response,
@@ -465,5 +462,5 @@ fn html_response(html: String) -> SkyResult<skyzen::Response> {
         skyzen::header::X_CONTENT_TYPE_OPTIONS,
         "nosniff",
     );
-    Ok(response)
+    response
 }
