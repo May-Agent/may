@@ -364,10 +364,9 @@ async fn run_browser_service(
             ),
             BrowserServiceRequest::EnsureStarted => match async {
                 if !browser_manager.is_running() {
-                    browser_manager
-                        .start()
-                        .await
-                        .map_err(|error| error.to_string())?;
+                    browser_manager.start().await.map_err(|error| {
+                        may_agent::daemon::error_chain::error_chain_text(&error)
+                    })?;
                 }
                 Ok::<BrowserServiceResponse, String>(BrowserServiceResponse::Ok {
                     payload: BrowserServiceStatus {
@@ -383,10 +382,9 @@ async fn run_browser_service(
             },
             BrowserServiceRequest::Stop => match async {
                 if browser_manager.is_running() {
-                    browser_manager
-                        .stop()
-                        .await
-                        .map_err(|error| error.to_string())?;
+                    browser_manager.stop().await.map_err(|error| {
+                        may_agent::daemon::error_chain::error_chain_text(&error)
+                    })?;
                 }
                 Ok::<BrowserServiceResponse, String>(BrowserServiceResponse::Stopped)
             }
@@ -397,15 +395,14 @@ async fn run_browser_service(
             },
             BrowserServiceRequest::Read { url, options } => match async {
                 if !browser_manager.is_running() {
-                    browser_manager
-                        .start()
-                        .await
-                        .map_err(|error| error.to_string())?;
+                    browser_manager.start().await.map_err(|error| {
+                        may_agent::daemon::error_chain::error_chain_text(&error)
+                    })?;
                 }
                 let page = browser_manager
                     .read_page(url, options)
                     .await
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| may_agent::daemon::error_chain::error_chain_text(&error))?;
                 Ok::<BrowserServiceResponse, String>(BrowserServiceResponse::ReadOk {
                     payload: Box::new(page),
                 })

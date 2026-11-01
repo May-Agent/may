@@ -18,7 +18,7 @@ mod chat;
 mod computer;
 mod config;
 mod error;
-mod error_chain;
+pub mod error_chain;
 mod events;
 mod helpers;
 mod interaction;
