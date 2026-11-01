@@ -1226,17 +1226,6 @@ pub struct InputContext<'a> {
     pub attachments: &'a [Attachment],
 }
 
-/// One running background entry shown compactly in the status bar.
-#[derive(Debug)]
-pub struct StatusBackgroundItem {
-    /// Short label — subagent name or first command line.
-    pub label: String,
-    /// `true` for a `subagent` run, `false` for a terminal job.
-    pub subagent: bool,
-    /// Seconds since it started.
-    pub elapsed_secs: u64,
-}
-
 /// What the run is doing right now, for the activity line above the
 /// status bar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1278,8 +1267,10 @@ pub struct StatusContext<'a> {
     pub queue_count: usize,
     /// Questions the agent asked that wait for an answer.
     pub open_questions: usize,
-    /// Running background entries (subagents and jobs).
-    pub background: &'a [StatusBackgroundItem],
+    /// Running background terminal jobs (the sidebar lists each command).
+    pub shells: usize,
+    /// Running subagents (the sidebar lists each one).
+    pub subagents: usize,
     /// Live decode rate in tokens per second, when measurable.
     pub decode_rate: Option<f64>,
     /// Optional status message.
@@ -2617,20 +2608,8 @@ fn render_status_line(lines: &mut Vec<Line<'_>>, ctx: &StatusContext<'_>, width:
         parts.push(format!("? {} open · /questions", ctx.open_questions));
     }
 
-    for item in ctx.background.iter().take(3) {
-        let icon = if item.subagent { "◉" } else { "●" };
-        parts.push(format!(
-            "{icon} {} {}",
-            item.label,
-            format_elapsed(item.elapsed_secs)
-        ));
-    }
-    let hidden = ctx.background.len().saturating_sub(3);
-    if hidden > 0 {
-        parts.push(format!("+{hidden}"));
-    }
-    if !ctx.background.is_empty() {
-        parts.push("↓ jobs".to_string());
+    if let Some(background) = background_summary(ctx.shells, ctx.subagents) {
+        parts.push(background);
     }
 
     // Context usage pinned to the right edge: `4.8K / 120.0K (4%)`.
@@ -2671,6 +2650,29 @@ fn render_status_line(lines: &mut Vec<Line<'_>>, ctx: &StatusContext<'_>, width:
             spans.extend(bar);
         }
         lines.push(Line::from(spans));
+    }
+}
+
+/// Status-bar counts for running shells and subagents: `2 shells, 1 subagent ↓`.
+/// A class with count zero is omitted. `None` when nothing is running.
+fn background_summary(shells: usize, subagents: usize) -> Option<String> {
+    match (shells, subagents) {
+        (0, 0) => None,
+        (shells, 0) => Some(format!("{} ↓", counted(shells, "shell", "shells"))),
+        (0, subagents) => Some(format!("{} ↓", counted(subagents, "subagent", "subagents"))),
+        (shells, subagents) => Some(format!(
+            "{}, {} ↓",
+            counted(shells, "shell", "shells"),
+            counted(subagents, "subagent", "subagents")
+        )),
+    }
+}
+
+fn counted(n: usize, one: &str, many: &str) -> String {
+    if n == 1 {
+        format!("1 {one}")
+    } else {
+        format!("{n} {many}")
     }
 }
 
@@ -3247,8 +3249,8 @@ pub fn render_tool_fullscreen(frame: &mut Frame, area: Rect, display: &ToolDispl
 mod tests {
     use super::{
         ChatElement, ChatStream, InputContext, ToolCallImage, ToolDisplay, ToolStatus,
-        build_plain_wrapped_lines_unified, format_number, format_status_usage, index_bar,
-        render_input_line, render_tool_inline, terminal_mode_marker,
+        background_summary, build_plain_wrapped_lines_unified, format_number, format_status_usage,
+        index_bar, render_input_line, render_tool_inline, terminal_mode_marker,
     };
     use crate::tui::queue::Attachment;
     use crate::tui::ui::streaming_markdown::IMAGE_HEIGHT;
@@ -3342,6 +3344,18 @@ mod tests {
     fn index_bar_is_absent_at_full_coverage_or_with_nothing_to_index() {
         assert!(index_bar(&coverage(10, 10)).is_none());
         assert!(index_bar(&coverage(0, 0)).is_none());
+    }
+
+    #[test]
+    fn background_summary_counts_shells_and_subagents() {
+        assert_eq!(background_summary(0, 0), None);
+        assert_eq!(background_summary(1, 0).as_deref(), Some("1 shell ↓"));
+        assert_eq!(background_summary(2, 0).as_deref(), Some("2 shells ↓"));
+        assert_eq!(background_summary(0, 1).as_deref(), Some("1 subagent ↓"));
+        assert_eq!(
+            background_summary(2, 1).as_deref(),
+            Some("2 shells, 1 subagent ↓")
+        );
     }
 
     #[test]
@@ -3642,7 +3656,8 @@ mod tests {
                             usage: None,
                             queue_count: 0,
                             open_questions: 0,
-                            background: &[],
+                            shells: 0,
+                            subagents: 0,
                             decode_rate: None,
                             status_message: None,
                             cwd: "~",
