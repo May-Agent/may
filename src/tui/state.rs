@@ -536,37 +536,30 @@ fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
-/// A status-line notice. A notice with a deadline is transient and clears
-/// itself once the deadline passes; one without persists until replaced.
+/// A status-line notice. Notices are transient: they clear once the
+/// deadline passes or the user presses a key — nothing stays on screen
+/// indefinitely.
 #[derive(Debug, Clone)]
 pub struct StatusNotice {
     /// Text shown in the status line.
     pub text: String,
-    /// Deadline after which the notice clears; `None` means persistent.
-    pub expires_at: Option<std::time::Instant>,
+    /// Deadline after which the notice clears.
+    pub expires_at: std::time::Instant,
 }
 
 impl StatusNotice {
-    /// A notice that stays until something replaces or clears it.
-    pub fn persistent(text: impl Into<String>) -> Self {
-        Self {
-            text: text.into(),
-            expires_at: None,
-        }
-    }
-
     /// A notice that clears itself `lifetime` after creation.
     pub fn transient(text: impl Into<String>, lifetime: std::time::Duration) -> Self {
         Self {
             text: text.into(),
-            expires_at: Some(std::time::Instant::now() + lifetime),
+            expires_at: std::time::Instant::now() + lifetime,
         }
     }
 
     /// Whether the notice's deadline passed at `now`.
     #[must_use]
     pub fn expired(&self, now: std::time::Instant) -> bool {
-        self.expires_at.is_some_and(|deadline| now >= deadline)
+        now >= self.expires_at
     }
 
     /// Drop the notice in `slot` once its deadline has passed. Event-loop
@@ -898,10 +891,15 @@ mod tests {
     }
 
     #[test]
-    fn persistent_notice_does_not_expire() {
-        let mut status = Some(StatusNotice::persistent("^C Press Ctrl+C again to exit"));
+    fn every_notice_expires() {
+        // There is no persistent variant: a notice always carries a
+        // deadline and the sweep drops it once it passes.
+        let mut status = Some(StatusNotice::transient(
+            "^C Press Ctrl+C again to exit",
+            Duration::from_secs(2),
+        ));
 
         StatusNotice::clear_expired(&mut status, Instant::now() + Duration::from_secs(3600));
-        assert!(status.is_some());
+        assert!(status.is_none());
     }
 }
