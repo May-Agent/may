@@ -835,7 +835,8 @@ fn render_tier_model_picker(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(block, popup_area);
 }
 
-/// Render model select popup (anchored near input area).
+/// Render model select popup (anchored near input area). A catalog refresh
+/// in flight is named in the title so the list is never mistaken for final.
 fn render_model_select_popup(frame: &mut Frame, area: Rect, app: &App) {
     let popup_area = area;
 
@@ -849,6 +850,8 @@ fn render_model_select_popup(frame: &mut Frame, area: Rect, app: &App) {
         0
     };
 
+    let fallback_model = app.config.last_model.as_ref().map(ToString::to_string);
+    let current_model = app.current_model.as_deref().or(fallback_model.as_deref());
     let items: Vec<ListItem> = app
         .model_select_list
         .iter()
@@ -857,14 +860,8 @@ fn render_model_select_popup(frame: &mut Frame, area: Rect, app: &App) {
         .take(visible_height.max(1))
         .map(|(idx, model)| {
             let prefix = if idx == selected { "> " } else { "  " };
-            // The stored selector may carry an effort rung the list shows
-            // collapsed into its family (`swe-2-high` → `swe-2`).
-            let current = app.current_model.as_deref().is_some_and(|m| {
-                m == model
-                    || crate::models::effort_family_base(crate::model_selector::selector_model_id(
-                        m,
-                    )) == crate::model_selector::selector_model_id(model)
-            });
+            let current =
+                current_model.is_some_and(|m| crate::models::same_selectable_model(m, model));
             let suffix = if current { " (current)" } else { "" };
             let text = format!("{prefix}{model}{suffix}");
             let style = if idx == selected {
@@ -878,11 +875,16 @@ fn render_model_select_popup(frame: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
 
+    let title = if app.model_select_rx.is_some() {
+        "Select Model — fetching…"
+    } else {
+        "Select Model"
+    };
     let list = List::new(items).block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan))
-            .title("Select Model"),
+            .title(title),
     );
     frame.render_widget(list, popup_area);
 }
