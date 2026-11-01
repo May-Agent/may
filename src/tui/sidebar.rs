@@ -189,6 +189,8 @@ pub struct SidebarState {
     pub tasks: Option<TaskTree>,
     /// Linked issues with their lookups, in first-mention order.
     pub issues: Vec<IssueBrief>,
+    /// The session's PRs from the daemon's `/prs` endpoint, newest first.
+    pub prs: Vec<crate::client::WirePr>,
 }
 
 impl Default for SidebarState {
@@ -199,6 +201,7 @@ impl Default for SidebarState {
             title: None,
             tasks: None,
             issues: Vec::new(),
+            prs: Vec::new(),
         }
     }
 }
@@ -251,6 +254,13 @@ impl SidebarState {
         }
         self.issues = issues;
         missing
+    }
+
+    /// Store the session's PR list from the daemon.
+    pub fn set_prs(&mut self, session_id: &str, prs: Vec<crate::client::WirePr>) {
+        if self.session_id.as_deref() == Some(session_id) {
+            self.prs = prs;
+        }
     }
 
     /// Install issue lookups for `session_id`.

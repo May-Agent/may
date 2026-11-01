@@ -272,6 +272,20 @@ impl ChatDb {
         Ok(())
     }
 
+    /// Every PR a session opened, newest first — the session sidebar's PR list.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on query failure.
+    pub async fn list_session_prs(&self, session_id: &str) -> Result<Vec<PrRow>, ChatDbError> {
+        Ok(query!(
+            self.db,
+            "SELECT * FROM prs WHERE session_id = ? ORDER BY updated_at DESC",
+            session_id
+        )
+        .fetch_all::<PrRow>()
+        .await?)
+    }
+
     /// A PR's event history, oldest first.
     ///
     /// # Errors

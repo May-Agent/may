@@ -3175,6 +3175,7 @@ impl App {
     /// sidebar's task tree is refetched from the daemon alongside.
     async fn refresh_todos(&mut self) {
         self.request_sidebar_tasks();
+        self.request_sidebar_prs();
         let Some(session) = self
             .session_manager
             .current()
@@ -3197,6 +3198,36 @@ impl App {
                 tracing::warn!(error = %error, "failed to read session tasks.md");
             }
         }
+    }
+
+    /// Fetch the current session's PRs for the sidebar from the daemon
+    /// (`GET /api/sessions/{id}/prs`); the answer arrives as
+    /// [`AppEvent::SidebarPrs`].
+    pub fn request_sidebar_prs(&mut self) {
+        let Some(session_id) = self
+            .session_manager
+            .current()
+            .map(|session| session.id.as_str().to_string())
+        else {
+            return;
+        };
+        let Some(client) = self.btw_daemon.clone() else {
+            return;
+        };
+        let tx = self.event_tx.clone();
+        spawn(async move {
+            match client
+                .get::<Vec<crate::client::WirePr>>(&format!("/api/sessions/{session_id}/prs"))
+                .await
+            {
+                Ok(prs) => {
+                    let _ = tx.send(AppEvent::SidebarPrs { session_id, prs }).await;
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "sidebar: failed to fetch PRs");
+                }
+            }
+        });
     }
 
     /// Fetch the current session's `tasks.md` for the sidebar from the
