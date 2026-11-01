@@ -1993,7 +1993,7 @@ pub(super) fn element_lines(
             )));
             if *expanded {
                 for inner in elements {
-                    let sub = element_lines(inner, state, images_supported, tunnel_base);
+                    let sub = element_lines(inner, state, images_supported, tunnel_base, width);
                     let offset = lines.len();
                     lines.extend(sub.lines);
                     images.extend(
