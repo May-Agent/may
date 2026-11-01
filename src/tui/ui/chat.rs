@@ -2278,7 +2278,7 @@ fn render_status_line(lines: &mut Vec<Line<'_>>, ctx: &StatusContext<'_>, width:
         }
     });
 
-    let status_text = parts.join(" | ");
+    let status_text = parts.join(" · ");
     let status_style = Style::default().fg(Color::Cyan);
 
     if let Some(usage_text) = usage_text {
