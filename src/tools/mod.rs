@@ -28,7 +28,7 @@ const HOST_PROGRAMS: &[u8] = include_bytes!("host-programs.json");
 /// SHA-256 of `host-programs.json`, so an accidental edit fails a test.
 #[cfg(test)]
 const HOST_PROGRAMS_SHA256: &str =
-    "3a34e01a12c414156a56e382c734db19374b29d53d25bc00acdaec15f33b6a68";
+    "ede33d9912313fa042d452f6b3a88f10f0fb105958019acd9464e8a19d4a13fa";
 
 /// Loads May's hash-pinned host-program manifest.
 ///
