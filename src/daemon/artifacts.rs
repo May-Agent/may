@@ -1484,7 +1484,7 @@ async fn emit_artifacts_if_changed(
     true
 }
 
-fn is_container_local_proxy_host(host: &str) -> bool {
+pub(super) fn is_container_local_proxy_host(host: &str) -> bool {
     let normalized = host
         .trim()
         .trim_matches('[')
@@ -1505,12 +1505,12 @@ fn is_container_local_proxy_host(host: &str) -> bool {
 }
 
 #[derive(Debug)]
-struct ResolvedContainerProxyTarget {
-    container_id: String,
-    container_ip: String,
+pub(super) struct ResolvedContainerProxyTarget {
+    pub(crate) container_id: String,
+    pub(crate) container_ip: String,
 }
 
-async fn resolve_container_proxy_target(
+pub(super) async fn resolve_container_proxy_target(
     state: &DaemonState,
     session_id: &str,
 ) -> Result<ResolvedContainerProxyTarget, skyzen::Error> {

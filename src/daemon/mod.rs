@@ -34,7 +34,8 @@ mod tasks;
 mod terminal_parsing;
 mod title_generation;
 mod tool_summary;
-mod types;
+mod tunnel;
+pub(crate) mod types;
 
 #[cfg(test)]
 mod response_tests;

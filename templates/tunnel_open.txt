@@ -1,0 +1,3 @@
+"{{ url }}" is now tunneled as `{{ id }}`: the daemon proxies it under `{{ path }}` ({{ local_url }} on this machine).
+Emit the tag <tunnel id="{{ id }}" /> exactly where you want the link — it renders as a URL reachable however the user views May.
+The app is served under the path prefix `{{ path }}`; if it emits absolute paths and misbehaves, restart it with its base path set to `{{ path }}`.
