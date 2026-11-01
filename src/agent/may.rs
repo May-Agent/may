@@ -24,7 +24,7 @@ use super::permission::PermissionApprover;
 use super::provider::{RequestParameterizedModel, resolve_provider_runtime};
 use super::runtime_context::{
     RuntimeSystemContext, build_base_system_prompt, build_browser_context, build_location_context,
-    build_macos_host_automation_context, build_memory_context_content, build_native_voice_context,
+    build_memory_context_content, build_native_voice_context,
     build_network_restrictions_context, build_plan_mode_context, build_terminal_runtime_context,
     build_workspace_workdirs_context, tag,
 };
@@ -1219,10 +1219,6 @@ fn apply_runtime_context(
                 runtime_system_context =
                     runtime_system_context.with_workspace_workdirs(workdirs_context.clone());
                 builder = builder.system_text(tag::WORKSPACE_WORKDIRS, workdirs_context);
-            }
-            if let Some(macos_hint) = build_macos_host_automation_context() {
-                runtime_system_context = runtime_system_context.with_platform(macos_hint.clone());
-                builder = builder.system_text(tag::PLATFORM, macos_hint);
             }
         }
     }

@@ -26,7 +26,6 @@ use crate::subagent::SubagentManager;
 use crate::workspace::{Workspace as MayWorkspace, WorkspaceDir as MayWorkspaceDir};
 
 const MEMORY_CONTEXT_HINT: &str = include_str!("../texts/memory_context_hint.txt");
-const MACOS_HOST_AUTOMATION_HINT: &str = include_str!("../texts/macos_host_hint.txt");
 const NATIVE_VOICE_AVAILABLE_HINT: &str = "Native voice input is available in this session. You may treat spoken input as first-class user messages.";
 const PLAN_MODE_DRAFT_HINT: &str = include_str!("../texts/plan_mode_draft.txt");
 const PLAN_MODE_APPROVED_HINT: &str = include_str!("../texts/plan_mode_approved.txt");
@@ -72,7 +71,6 @@ pub struct RuntimeSystemContext {
     network_restrictions: Option<String>,
     location: Option<String>,
     native_voice_input: Option<String>,
-    platform: Option<String>,
 }
 
 impl RuntimeSystemContext {
@@ -89,7 +87,6 @@ impl RuntimeSystemContext {
             network_restrictions: None,
             location: None,
             native_voice_input: None,
-            platform: None,
         }
     }
 
@@ -138,11 +135,6 @@ impl RuntimeSystemContext {
         self
     }
 
-    pub(crate) fn with_platform(mut self, platform: String) -> Self {
-        self.platform = Some(platform);
-        self
-    }
-
     pub(crate) fn reconcile(&self, context: &mut aither_agent::Context) {
         reconcile_memory_block(
             context,
@@ -163,6 +155,9 @@ impl RuntimeSystemContext {
             self.workspace_workdirs.clone(),
         );
         reconcile_text_block(context, tag::CONTAINER_ENVIRONMENT_CONTEXT, None);
+        // The platform hint is gone; a context restored from an older
+        // snapshot may still carry it, so drop it unconditionally.
+        reconcile_text_block(context, tag::PLATFORM, None);
         reconcile_text_block(context, tag::BROWSER, self.browser.clone());
         reconcile_text_block(context, tag::PROFILE_PERSONA, self.profile_persona.clone());
         reconcile_text_block(
@@ -182,7 +177,6 @@ impl RuntimeSystemContext {
             tag::NATIVE_VOICE_INPUT,
             self.native_voice_input.clone(),
         );
-        reconcile_text_block(context, tag::PLATFORM, self.platform.clone());
     }
 
     pub(crate) async fn sync_memory_content(&mut self) {
@@ -622,58 +616,6 @@ pub fn build_network_restrictions_context(
         }
     }
     Some(out)
-}
-
-pub fn build_macos_host_automation_context() -> Option<String> {
-    if cfg!(target_os = "macos") && !is_running_in_container() {
-        return Some(MACOS_HOST_AUTOMATION_HINT.to_string());
-    }
-    None
-}
-
-fn is_running_in_container() -> bool {
-    detect_container_signal().is_some()
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ContainerSignalKind {
-    EnvVar,
-    DockerEnvFile,
-    ContainerEnvFile,
-    OverlayRootFs,
-}
-
-fn detect_container_signal() -> Option<ContainerSignalKind> {
-    if std::env::var_os("container").is_some() {
-        return Some(ContainerSignalKind::EnvVar);
-    }
-
-    if std::path::Path::new("/.dockerenv").exists() {
-        return Some(ContainerSignalKind::DockerEnvFile);
-    }
-
-    if std::path::Path::new("/run/.containerenv").exists() {
-        return Some(ContainerSignalKind::ContainerEnvFile);
-    }
-
-    proc_root_fs_type()
-        .filter(|fs_type| matches!(fs_type.as_str(), "overlay" | "aufs"))
-        .map(|_| ContainerSignalKind::OverlayRootFs)
-}
-
-fn proc_root_fs_type() -> Option<String> {
-    let mountinfo = std::fs::read_to_string("/proc/1/mountinfo").ok()?;
-    for line in mountinfo.lines() {
-        let (left, right) = line.split_once(" - ")?;
-        let mut left_fields = left.split_whitespace();
-        let mount_point = left_fields.nth(4)?;
-        if mount_point != "/" {
-            continue;
-        }
-        let fs_type = right.split_whitespace().next()?;
-        return Some(fs_type.to_string());
-    }
-    None
 }
 
 #[cfg(test)]
