@@ -595,7 +595,13 @@ impl App {
     /// dir. Container-profile sessions are skipped: their writes land
     /// inside the container where host-side git cannot see them.
     fn ensure_file_diffs(&mut self) {
-        let Some(session) = self.session_manager.current() else {
+        // An ephemeral session has no dirs on disk yet; its filebase is
+        // created when the session materializes.
+        let Some(session) = self
+            .session_manager
+            .current()
+            .filter(|session| session.persisted)
+        else {
             self.file_diffs = None;
             self.file_status.clear();
             return;
@@ -876,9 +882,12 @@ impl App {
             spawn(stream_btw_answer(llm, messages, tx)).detach();
             return;
         }
-        let (Some(client), Some(session)) =
-            (self.btw_daemon.clone(), self.session_manager.current())
-        else {
+        let (Some(client), Some(session)) = (
+            self.btw_daemon.clone(),
+            self.session_manager
+                .current()
+                .filter(|session| session.persisted),
+        ) else {
             return;
         };
         let path = crate::client::session_path(session.id.as_str(), "/btw");
@@ -2154,7 +2163,10 @@ impl App {
     fn fetch_current_effort(&self) {
         let (Some(client), Some(session_id)) = (
             self.btw_daemon.clone(),
-            self.session_manager.current().map(|s| s.id.clone()),
+            self.session_manager
+                .current()
+                .filter(|session| session.persisted)
+                .map(|s| s.id.clone()),
         ) else {
             return;
         };
@@ -3147,7 +3159,11 @@ impl App {
     /// sidebar's task tree is refetched from the daemon alongside.
     async fn refresh_todos(&mut self) {
         self.request_sidebar_tasks();
-        let Some(session) = self.session_manager.current() else {
+        let Some(session) = self
+            .session_manager
+            .current()
+            .filter(|session| session.persisted)
+        else {
             return;
         };
         let paths = self
@@ -3172,7 +3188,11 @@ impl App {
     /// [`AppEvent::SidebarTasks`]. Without a daemon the session's file is
     /// read directly.
     pub fn request_sidebar_tasks(&mut self) {
-        let Some(session) = self.session_manager.current() else {
+        let Some(session) = self
+            .session_manager
+            .current()
+            .filter(|session| session.persisted)
+        else {
             self.sidebar.reset();
             return;
         };
