@@ -32,7 +32,7 @@ pub struct ImageGeneratorConfig {
     pub model: String,
 }
 
-/// Arguments the agent supplies when invoking `imagine`.
+/// Generate an image from a text prompt and save it under `artifacts/`.
 #[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
 pub struct ImagineArgs {
     /// Prompt describing the image to generate.

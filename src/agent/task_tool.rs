@@ -36,6 +36,8 @@ impl std::fmt::Display for TaskRuntimeKind {
     }
 }
 
+/// Create a scheduled task that runs a script file or inline terminal command
+/// on a trigger, inside the session's task runtime.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct TaskArgs {
     /// Human-readable task name.

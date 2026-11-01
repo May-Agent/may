@@ -1,11 +1,9 @@
 Model: {{ model_id }}
-Home environment kind: {{ home_environment_kind }}
-Operating system hint: {{ operating_system }}
-Terminal shell dialect: {{ shell_dialect }}
-Home environment directory: {{ home_directory }}
-Session directory: {{ session_directory }}
-Current working directory: {{ current_working_directory }}
-
+Environment: {{ home_environment_kind }} ({{ operating_system }}, {{ shell_dialect }})
+Home directory: {{ home_directory }}
+Session directory (working directory, writable sandbox): {{ session_directory }}
+{% if let Some(dir) = host_launch_directory %}Host launch directory (read-only by default): {{ dir }}
+{% endif %}
 Home layout:
 {% for item in home_layout %}- {{ item }}
 {% endfor %}
@@ -14,10 +12,10 @@ Session layout:
 {% endfor %}
 Command rules:
 {% for item in command_rules %}- {{ item }}
-{% endfor %}
+{% endfor %}{% if !environment_rules.is_empty() %}
 Environment rules:
 {% for item in environment_rules %}- {{ item }}
-{% endfor %}
+{% endfor %}{% endif %}
 Modality support:
 {% for item in modality_support %}- {{ item }}
 {% endfor %}{% if !attached_remote_servers.is_empty() %}
