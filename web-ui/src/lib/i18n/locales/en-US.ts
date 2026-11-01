@@ -43,6 +43,13 @@ export const enUS = {
   },
   sidebar: {
     newChat: 'New chat',
+    newChatRepo: {
+      title: 'New chat in a GitHub repo',
+      description: 'Start a session bound to owner/repo — no local checkout needed.',
+      placeholder: 'owner/repo',
+      start: 'Start',
+      known: 'Repositories in use',
+    },
     sessions: 'Sessions',
     noSessions: 'No sessions yet',
     noSessionsInProfile: "This profile hasn't started any chats yet.",

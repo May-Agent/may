@@ -34,7 +34,7 @@ export type SessionNodeKind = 'pinned' | 'regular' | 'archived' | 'folder-child'
 
 /** Display label for a repo binding: `owner/repo` for github: specs, the
  * path basename for local: keys. */
-function repoLabel(repo: string): string {
+export function repoLabel(repo: string): string {
   if (repo.startsWith('github:')) {
     return repo.slice(7);
   }
