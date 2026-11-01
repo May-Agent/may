@@ -245,6 +245,10 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             app.sync_queue_from_runtime();
             Ok(None)
         }
+        AppEvent::IndexCoverage(index) => {
+            app.index_coverage = index;
+            Ok(None)
+        }
         AppEvent::TurnStarted { message_id } => {
             app.request_prompt_mark(i64::from(message_id));
             Ok(None)

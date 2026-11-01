@@ -345,6 +345,30 @@ pub struct SessionRuntimeEvent {
     pub runtime: SessionRuntimeSnapshot,
 }
 
+/// One `session_index` event: coverage of the session's worktree index in
+/// repo-search.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionIndexSnapshot {
+    /// Session the coverage belongs to.
+    pub session_id: String,
+    /// The worktree index's coverage; `None` when the session is not in a
+    /// git worktree or repo-search has not indexed it.
+    pub index: Option<IndexCoverage>,
+}
+
+/// How much of a worktree index carries a vector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexCoverage {
+    /// The index's phase.
+    pub phase: repo_search_client::protocol::WirePhase,
+    /// Chunks with a vector.
+    pub with_vector: u64,
+    /// Chunks in total.
+    pub total: u64,
+}
+
 /// The session's blocking state, as `GET /api/sessions/{id}/runtime` and the
 /// `session_runtime` event report it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
