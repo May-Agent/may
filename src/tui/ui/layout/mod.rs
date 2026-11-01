@@ -215,6 +215,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                     tokens: app.decode_meter.tokens(),
                 }),
                 spinner_frame: app.spinner_frame,
+                index_coverage: app.index_coverage.as_ref(),
             }),
             images_supported,
             // The sidebar shows the task tree; the inline block would repeat it.
