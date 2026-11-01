@@ -26,7 +26,10 @@ use chromiumoxide::cdp::browser_protocol::accessibility::{
     AxNode, AxProperty, AxValue, EnableParams as AccessibilityEnableParams,
     GetFullAxTreeParams as GetFullAccessibilityTreeParams,
 };
-use chromiumoxide::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams;
+use chromiumoxide::cdp::browser_protocol::emulation::{
+    SetDeviceMetricsOverrideParams, SetUserAgentOverrideParams, UserAgentBrandVersion,
+    UserAgentMetadata,
+};
 use chromiumoxide::cdp::browser_protocol::input::{
     DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams, DispatchMouseEventType,
     MouseButton,
@@ -36,6 +39,7 @@ use chromiumoxide::cdp::browser_protocol::page::{
     ScreencastFrameAckParams, StartScreencastFormat, StartScreencastParams,
 };
 use chromiumoxide::cdp::browser_protocol::target::{TargetId, TargetInfo};
+use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
 use chromiumoxide::error::CdpError;
 use chromiumoxide::page::Page;
 use chromiumoxide::page::ScreenshotParams;
@@ -340,9 +344,309 @@ struct BrowserSession {
     browser: Browser,
     page: Arc<Page>,
     backing: BrowserSessionBacking,
+    /// The host-screen identity the stealth emulation claims. Re-issued
+    /// with every device-metrics override, which replaces the whole
+    /// metric set per call.
+    screen_emulation: Option<ScreenEmulation>,
     handler: tokio::task::JoinHandle<()>,
     cdp_reader: tokio::task::JoinHandle<()>,
     sample_writer: tokio::task::JoinHandle<()>,
+}
+
+/// One consistent screen identity for the emulated session: the screen
+/// size, pixel ratio, viewport and window position a real machine of
+/// this platform would report.
+#[derive(Debug, Clone, Copy)]
+struct ScreenEmulation {
+    inner_width: i64,
+    inner_height: i64,
+    screen_width: i64,
+    screen_height: i64,
+    device_scale_factor: f64,
+    /// Y coordinate of the emulated window's top edge on the screen —
+    /// below the macOS menubar, at the edge elsewhere.
+    position_y: i64,
+}
+
+/// The screen identity a real desktop machine of `platform`
+/// (`navigator.userAgentData.platform`) would report. Headless has no
+/// real display to ask, so each platform carries the geometry of its
+/// most common machine: MacBook Pro 14" (1512x982 @2x) and a 1080p
+/// desktop (1920x1080 @1x) elsewhere.
+fn screen_emulation(platform: &str) -> ScreenEmulation {
+    let (screen_width, screen_height, dsf, top_inset, chrome_ui_height) = match platform {
+        "macOS" => (1512, 982, 2.0, 25, 87),
+        "Windows" => (1920, 1080, 1.0, 0, 79),
+        _ => (1920, 1080, 1.0, 0, 87),
+    };
+    let inner_width = 1440;
+    ScreenEmulation {
+        inner_width,
+        inner_height: screen_height - top_inset - chrome_ui_height,
+        screen_width,
+        screen_height,
+        device_scale_factor: dsf,
+        position_y: top_inset,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StealthIdentityProbe {
+    #[serde(default)]
+    languages: Vec<String>,
+    #[serde(default)]
+    navigator_platform: String,
+    ua_data: Option<UaDataProbe>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UaDataBrand {
+    brand: String,
+    version: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UaDataProbe {
+    #[serde(default)]
+    brands: Vec<UaDataBrand>,
+    #[serde(default)]
+    full_version_list: Vec<UaDataBrand>,
+    platform: String,
+    platform_version: String,
+    architecture: String,
+    bitness: String,
+    model: String,
+    mobile: bool,
+    wow64: bool,
+    ua_full_version: String,
+}
+
+/// Map `navigator.platform` to a `navigator.userAgentData.platform`
+/// value for targets where the client-hints API is unavailable.
+fn ua_platform(navigator_platform: &str) -> &'static str {
+    match navigator_platform {
+        "MacIntel" => "macOS",
+        platform if platform.starts_with("Win") => "Windows",
+        platform if platform.starts_with("Linux") => "Linux",
+        _ => "macOS",
+    }
+}
+
+/// Host CPU architecture as UA-CH reports it.
+fn ua_architecture() -> &'static str {
+    match std::env::consts::ARCH {
+        "aarch64" => "arm",
+        other => other,
+    }
+}
+
+/// Serialize the browser's language list into the `acceptLanguage`
+/// override value: bare comma-separated tags — CDP rejects q-weight
+/// suffixes and leaks them into `navigator.languages`. When the list is
+/// a lone regional tag ("en-US"), Chrome appends the bare subtag ("en").
+fn accept_language_header(languages: &[String]) -> Option<String> {
+    let primary = languages.first()?;
+    let mut parts = vec![primary.clone()];
+    if languages.len() == 1
+        && let Some((base, _)) = primary.split_once('-')
+    {
+        parts.push(base.to_string());
+    } else {
+        parts.extend(languages.iter().skip(1).cloned());
+    }
+    Some(parts.join(","))
+}
+
+/// Rebind the page's reported identity to a real desktop Chrome:
+/// user agent, UA client hints, `Accept-Language`, screen geometry and
+/// window position. Runs once at session start against the about:blank
+/// page so every later navigation carries the emulated values.
+///
+/// Returns the [`ScreenEmulation`] the session must keep re-issuing on
+/// every viewport resize.
+async fn apply_stealth_emulation(
+    browser: &Browser,
+    page: &Page,
+) -> Result<ScreenEmulation, BrowserError> {
+    // navigator.userAgentData only exists in secure contexts; the session
+    // page starts on about:blank which is not one. chrome://version is a
+    // local, always-available secure document to probe against.
+    page.goto("chrome://version")
+        .await
+        .map_err(|error| BrowserError::browser_operation("navigate stealth probe page", error))?;
+    let probe_response = page
+        .execute(
+            EvaluateParams::builder()
+                .expression(
+                    "(async () => { const d = navigator.userAgentData; let v = null; if (d) { v = { brands: d.brands || [], mobile: d.mobile === true, platform: d.platform || '', architecture: '', bitness: '', fullVersionList: [], model: '', platformVersion: '', uaFullVersion: '', wow64: false }; try { Object.assign(v, await d.getHighEntropyValues(['architecture','bitness','brands','fullVersionList','mobile','model','platform','platformVersion','uaFullVersion','wow64'])); } catch (_e) {} } return { languages: Array.from(navigator.languages || []), navigatorPlatform: navigator.platform || '', uaData: v }; })()",
+                )
+                .await_promise(true)
+                .return_by_value(true)
+                .build()
+                .map_err(|error| {
+                    BrowserError::browser_operation(
+                        "build stealth identity probe params",
+                        std::io::Error::other(error),
+                    )
+                })?,
+        )
+        .await
+        .map_err(|error| BrowserError::browser_operation("probe stealth identity", error))?;
+    let evaluate_returns = probe_response.result;
+    if let Some(exception) = evaluate_returns.exception_details {
+        return Err(BrowserError::browser_operation(
+            "probe stealth identity",
+            std::io::Error::other(format!("probe threw: {exception:?}")),
+        ));
+    }
+    let probe: StealthIdentityProbe =
+        serde_json::from_value(evaluate_returns.result.value.ok_or_else(|| {
+            BrowserError::browser_operation(
+                "decode stealth identity probe",
+                std::io::Error::other("probe returned no value"),
+            )
+        })?)
+        .map_err(|error| BrowserError::browser_operation("decode stealth identity probe", error))?;
+    let ua_data = probe.ua_data.ok_or_else(|| {
+        BrowserError::browser_operation(
+            "probe stealth identity",
+            std::io::Error::other("navigator.userAgentData is unavailable on this target"),
+        )
+    })?;
+
+    let version = browser
+        .version()
+        .await
+        .map_err(|error| BrowserError::browser_operation("fetch browser version", error))?;
+    let user_agent = version.user_agent.replace("HeadlessChrome", "Chrome");
+    let full_version = version
+        .product
+        .split('/')
+        .nth(1)
+        .map(str::to_string)
+        .filter(|version| !version.is_empty())
+        .unwrap_or_else(|| ua_data.ua_full_version.clone());
+    let major_version = full_version
+        .split('.')
+        .next()
+        .unwrap_or(full_version.as_str())
+        .to_string();
+    let platform = if ua_data.platform.is_empty() {
+        ua_platform(&probe.navigator_platform).to_string()
+    } else {
+        ua_data.platform.clone()
+    };
+    let architecture = if ua_data.architecture.is_empty() {
+        ua_architecture().to_string()
+    } else {
+        ua_data.architecture.clone()
+    };
+    let bitness = if ua_data.bitness.is_empty() {
+        "64".to_string()
+    } else {
+        ua_data.bitness.clone()
+    };
+
+    // Chrome for Testing reports only the Chromium brand; real Chrome adds
+    // "Google Chrome". Empty lists (no high-entropy answer) get the full
+    // real-Chrome set synthesized instead.
+    let google_chrome = |list: &[UaDataBrand], version: &str, full: bool| {
+        let mut brands: Vec<UserAgentBrandVersion> = if list.is_empty() {
+            vec![
+                UserAgentBrandVersion::new("Not:A-Brand", "8"),
+                UserAgentBrandVersion::new("Chromium", version.to_string()),
+            ]
+        } else {
+            list.iter()
+                .map(|brand| {
+                    let version =
+                        if full && (brand.brand == "Chromium" || brand.brand == "Google Chrome") {
+                            version.to_string()
+                        } else {
+                            brand.version.clone()
+                        };
+                    UserAgentBrandVersion::new(brand.brand.clone(), version)
+                })
+                .collect()
+        };
+        if !brands.iter().any(|brand| brand.brand == "Google Chrome") {
+            brands.push(UserAgentBrandVersion::new(
+                "Google Chrome",
+                version.to_string(),
+            ));
+        }
+        brands
+    };
+    let metadata = UserAgentMetadata::builder()
+        .brands(google_chrome(&ua_data.brands, &major_version, false))
+        .full_version_lists(google_chrome(
+            &ua_data.full_version_list,
+            &full_version,
+            true,
+        ))
+        .platform(platform.clone())
+        .platform_version(ua_data.platform_version.clone())
+        .architecture(architecture)
+        .model(ua_data.model.clone())
+        .mobile(ua_data.mobile)
+        .bitness(bitness)
+        .wow64(ua_data.wow64)
+        .build()
+        .map_err(|error| {
+            BrowserError::browser_operation(
+                "build user agent metadata",
+                std::io::Error::other(error),
+            )
+        })?;
+    let mut override_params = SetUserAgentOverrideParams::builder()
+        .user_agent(user_agent)
+        .user_agent_metadata(metadata);
+    if let Some(accept_language) = accept_language_header(&probe.languages) {
+        override_params = override_params.accept_language(accept_language);
+    }
+    page.execute(override_params.build().map_err(|error| {
+        BrowserError::browser_operation(
+            "build user agent override params",
+            std::io::Error::other(error),
+        )
+    })?)
+    .await
+    .map_err(|error| BrowserError::browser_operation("set user agent override", error))?;
+
+    let screen = screen_emulation(&platform);
+    page.execute(
+        SetDeviceMetricsOverrideParams::builder()
+            .width(screen.inner_width)
+            .height(screen.inner_height)
+            .device_scale_factor(screen.device_scale_factor)
+            .mobile(false)
+            .screen_width(screen.screen_width)
+            .screen_height(screen.screen_height)
+            .position_x(((screen.screen_width - screen.inner_width).max(0)) / 2)
+            .position_y(screen.position_y)
+            .build()
+            .map_err(|error| {
+                BrowserError::browser_operation(
+                    "build stealth device metrics override",
+                    std::io::Error::other(error),
+                )
+            })?,
+    )
+    .await
+    .map_err(|error| {
+        BrowserError::browser_operation("set stealth device metrics override", error)
+    })?;
+
+    // Leave the probe page behind: the session should idle on a blank
+    // document under the final identity, not on chrome://version.
+    page.goto("about:blank")
+        .await
+        .map_err(|error| BrowserError::browser_operation("restore blank page", error))?;
+
+    Ok(screen)
 }
 
 enum BrowserSessionBacking {
@@ -615,23 +919,32 @@ impl BrowserRuntime {
     ) -> Result<(), BrowserError> {
         let session = self.session.as_ref().ok_or(BrowserError::NotRunning)?;
         let page = session.page.clone();
+        let emulation = session.screen_emulation;
         let dpr = if device_scale_factor.is_finite() && device_scale_factor > 0.0 {
             device_scale_factor
         } else {
             1.0
         };
-        let params = SetDeviceMetricsOverrideParams::builder()
+        // Every metrics override replaces the whole set, so the claimed
+        // screen identity has to ride along with each panel-driven resize.
+        let mut params = SetDeviceMetricsOverrideParams::builder()
             .width(i64::from(width))
             .height(i64::from(height))
-            .device_scale_factor(dpr)
-            .mobile(false)
-            .build()
-            .map_err(|error| {
-                BrowserError::browser_operation(
-                    "build device metrics override params",
-                    std::io::Error::other(error),
-                )
-            })?;
+            .device_scale_factor(emulation.map_or(dpr, |e| e.device_scale_factor))
+            .mobile(false);
+        if let Some(e) = emulation {
+            params = params
+                .screen_width(e.screen_width)
+                .screen_height(e.screen_height)
+                .position_x(((e.screen_width - i64::from(width)).max(0)) / 2)
+                .position_y(e.position_y);
+        }
+        let params = params.build().map_err(|error| {
+            BrowserError::browser_operation(
+                "build device metrics override params",
+                std::io::Error::other(error),
+            )
+        })?;
         page.execute(params).await.map_err(|error| {
             BrowserError::browser_operation("set device metrics override", error)
         })?;
@@ -1230,6 +1543,7 @@ impl BrowserRuntime {
             BrowserSessionBacking::RemoteCdp => acquire_browser_page(&mut browser).await?,
         });
 
+        let mut screen_emulation = None;
         if config.stealth_enabled {
             // Page.addScriptToEvaluateOnNewDocument runs the shim before
             // any page script across every navigation, so each fresh
@@ -1246,6 +1560,7 @@ impl BrowserRuntime {
             page.execute(stealth_params)
                 .await
                 .map_err(|error| BrowserError::browser_operation("inject stealth shim", error))?;
+            screen_emulation = Some(apply_stealth_emulation(&browser, &page).await?);
         }
 
         let max_width = i64::from(config.screencast_max_width);
@@ -1294,6 +1609,7 @@ impl BrowserRuntime {
             browser,
             page,
             backing,
+            screen_emulation,
             handler: handler_task,
             cdp_reader,
             sample_writer,
