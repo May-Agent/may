@@ -727,6 +727,9 @@ pub struct ApiSession {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) reasoning_effort: Option<String>,
     pub(crate) runtime: SessionRuntimeResponse,
+    /// Repository the session is bound to, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) repo: Option<String>,
 }
 
 impl ApiSession {
@@ -754,6 +757,7 @@ impl ApiSession {
             model,
             reasoning_effort: summary.reasoning_effort.clone(),
             runtime: summary.runtime.clone().into(),
+            repo: summary.repo.clone(),
         }
     }
 
@@ -769,6 +773,7 @@ impl ApiSession {
             model,
             reasoning_effort: None,
             runtime: crate::session::SessionRuntimeSummary::default().into(),
+            repo: None,
         }
     }
 }
@@ -786,6 +791,10 @@ pub struct CreateSessionRequest {
     /// Host directory the session works in (the TUI's launch directory).
     #[serde(default)]
     pub(crate) cwd: Option<String>,
+    /// Repository to bind: `owner/repo`, a local path, or absent for a
+    /// repo-less chat.
+    #[serde(default)]
+    pub(crate) repo: Option<String>,
 }
 
 /// Request to truncate a session's history at a stored row.
@@ -814,6 +823,10 @@ pub struct UpdateSessionRequest {
     /// touched for repo usage when set.
     #[serde(default)]
     pub(crate) cwd: Option<String>,
+    /// Repository to bind: `owner/repo`, a local path, `null` clears the
+    /// binding; absent leaves it untouched.
+    #[serde(default, deserialize_with = "deserialize_present_patch")]
+    pub(crate) repo: Option<NullableStringPatch>,
     /// One-shot/non-interactive flag: set to refuse permission prompts
     /// instead of asking.
     #[serde(default)]

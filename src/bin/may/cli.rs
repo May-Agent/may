@@ -11,7 +11,7 @@ use may_agent::browser_service::{BrowserReadDetail, BrowserScreenshotMode};
 /// Top-level CLI mode the binary resolves from argv.
 #[derive(Debug, PartialEq, Eq)]
 pub enum CliMode {
-    Tui,
+    Tui(TuiArgs),
     Resume(ResumeArgs),
     Ui(Vec<String>),
     Rest(Vec<String>),
@@ -20,6 +20,13 @@ pub enum CliMode {
     Browser(BrowserCliArgs),
     OneShot(OneShotArgs),
     Help(&'static str),
+}
+
+/// Parsed `may` / `may chat` / `may --repo` TUI invocation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TuiArgs {
+    /// Repository the session binds to (`owner/repo` or a local path).
+    pub repo: Option<String>,
 }
 
 /// Parsed `may resume` invocation.
@@ -170,8 +177,12 @@ pub fn parse_cli_mode(args: &[String]) -> CliMode {
             Some("--help" | "-h") => CliMode::Help(ExecArgs::help_text()),
             _ => CliMode::Exec(parse_exec_args(&args[2..])),
         },
+        Some("chat") => CliMode::Tui(TuiArgs::default()),
+        Some("--repo") => CliMode::Tui(TuiArgs {
+            repo: args.get(2).cloned(),
+        }),
         Some(_) => CliMode::OneShot(parse_oneshot_args(&args[1..])),
-        None => CliMode::Tui,
+        None => CliMode::Tui(TuiArgs::default()),
     }
 }
 
@@ -452,7 +463,10 @@ mod tests {
 
     #[test]
     fn parse_cli_mode_defaults_to_tui() {
-        assert_eq!(parse_cli_mode(&args(&["may"])), CliMode::Tui);
+        assert_eq!(
+            parse_cli_mode(&args(&["may"])),
+            CliMode::Tui(TuiArgs::default())
+        );
     }
 
     #[test]
