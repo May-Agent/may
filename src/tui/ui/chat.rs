@@ -1283,6 +1283,9 @@ pub struct StatusContext<'a> {
     pub activity: Option<ActivityContext>,
     /// Animation frame counter for the activity spinner.
     pub spinner_frame: usize,
+    /// Coverage of the session's worktree index: a slim blue bar while the
+    /// index is incomplete, absent at full coverage or with nothing to index.
+    pub index_coverage: Option<&'a crate::client::IndexCoverage>,
 }
 
 /// Queued message context for rendering queue indicator.
@@ -2544,27 +2547,66 @@ fn render_status_line(lines: &mut Vec<Line<'_>>, ctx: &StatusContext<'_>, width:
         .usage
         .map(|(prompt_tokens, context_window)| format_status_usage(prompt_tokens, context_window));
 
+    // The worktree index's coverage, while incomplete: `index ▕██████░░░░▏ 62%`.
+    let index_bar = ctx.index_coverage.and_then(index_bar);
+
     let status_text = parts.join(" · ");
     let status_style = Style::default().fg(Color::Cyan);
     let warn_style = Style::default().fg(Color::Yellow);
 
+    let bar_width = index_bar.as_ref().map_or(0, |bar| {
+        bar.iter().map(Span::width).sum::<usize>() + " · ".width()
+    });
     if let Some(usage) = usage {
         let pad = width
-            .saturating_sub(status_text.width() + usage.width())
+            .saturating_sub(status_text.width() + bar_width + usage.width())
             .max(1);
-        let mut spans = vec![
-            Span::styled(status_text, status_style),
-            Span::raw(" ".repeat(pad)),
-            Span::styled(usage.usage, status_style),
-        ];
+        let mut spans = vec![Span::styled(status_text, status_style)];
+        if let Some(bar) = index_bar {
+            spans.push(Span::styled(" · ", status_style));
+            spans.extend(bar);
+        }
+        spans.push(Span::raw(" ".repeat(pad)));
+        spans.push(Span::styled(usage.usage, status_style));
         if let Some(warn) = usage.warn {
             spans.push(Span::styled(" · ", status_style));
             spans.push(Span::styled(warn, warn_style));
         }
         lines.push(Line::from(spans));
     } else {
-        lines.push(Line::from(Span::styled(status_text, status_style)));
+        let mut spans = vec![Span::styled(status_text, status_style)];
+        if let Some(bar) = index_bar {
+            spans.push(Span::styled(" · ", status_style));
+            spans.extend(bar);
+        }
+        lines.push(Line::from(spans));
     }
+}
+
+/// Cells in the status bar's index progress bar.
+const INDEX_BAR_CELLS: usize = 8;
+
+/// The status bar's index coverage segment while it is incomplete:
+/// `index ▕██████░░░░▏ 62%` in blue; `None` at full coverage or when there
+/// is nothing to index.
+fn index_bar(coverage: &crate::client::IndexCoverage) -> Option<Vec<Span<'static>>> {
+    let total = coverage.total;
+    if total == 0 || coverage.with_vector >= total {
+        return None;
+    }
+    let filled = usize::try_from(coverage.with_vector * INDEX_BAR_CELLS as u64 / total)
+        .expect("a share of at most the cell count");
+    let percent = coverage.with_vector * 100 / total;
+    let bar_style = Style::default().fg(Color::Blue);
+    Some(vec![
+        Span::styled("index ▕", bar_style),
+        Span::styled("█".repeat(filled), bar_style),
+        Span::styled(
+            "░".repeat(INDEX_BAR_CELLS - filled),
+            bar_style.add_modifier(Modifier::DIM),
+        ),
+        Span::styled(format!("▏ {percent}%"), bar_style),
+    ])
 }
 
 /// Format an elapsed duration compactly (`45s`, `2m05s`, `1h03m`).
@@ -3114,8 +3156,8 @@ pub fn render_tool_fullscreen(frame: &mut Frame, area: Rect, display: &ToolDispl
 mod tests {
     use super::{
         ChatElement, ChatStream, InputContext, ToolCallImage, ToolDisplay, ToolStatus,
-        build_plain_wrapped_lines_unified, format_number, format_status_usage, render_input_line,
-        render_tool_inline, terminal_mode_marker,
+        build_plain_wrapped_lines_unified, format_number, format_status_usage, index_bar,
+        render_input_line, render_tool_inline, terminal_mode_marker,
     };
     use crate::tui::queue::Attachment;
     use crate::tui::ui::streaming_markdown::IMAGE_HEIGHT;
@@ -3174,6 +3216,41 @@ mod tests {
         let line = format_status_usage(33_400, None);
         assert_eq!(line.usage, "33.4K");
         assert!(line.warn.is_none());
+    }
+
+    fn coverage(with_vector: u64, total: u64) -> crate::client::IndexCoverage {
+        crate::client::IndexCoverage {
+            phase: repo_search_client::protocol::WirePhase::FirstIndex,
+            with_vector,
+            total,
+        }
+    }
+
+    fn bar_text(coverage: &crate::client::IndexCoverage) -> Option<String> {
+        index_bar(coverage).map(|spans| {
+            spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+    }
+
+    #[test]
+    fn index_bar_shows_fill_and_percent_while_incomplete() {
+        assert_eq!(
+            bar_text(&coverage(6, 10)).as_deref(),
+            Some("index ▕████░░░░▏ 60%")
+        );
+        assert_eq!(
+            bar_text(&coverage(0, 5)).as_deref(),
+            Some("index ▕░░░░░░░░▏ 0%")
+        );
+    }
+
+    #[test]
+    fn index_bar_is_absent_at_full_coverage_or_with_nothing_to_index() {
+        assert!(index_bar(&coverage(10, 10)).is_none());
+        assert!(index_bar(&coverage(0, 0)).is_none());
     }
 
     #[test]
@@ -3480,6 +3557,7 @@ mod tests {
                             cwd: "~",
                             activity: None,
                             spinner_frame: 0,
+                            index_coverage: None,
                         }),
                         images_supported: true,
                         hide_todos: false,

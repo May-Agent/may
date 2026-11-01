@@ -317,6 +317,10 @@ pub struct App {
     /// The session's blocking state as the daemon last reported it on the
     /// `session_runtime` stream.
     pub session_runtime: crate::client::SessionRuntimeSnapshot,
+    /// Coverage of the session's worktree index, as the `session_index`
+    /// stream last reported it; `None` until the first report or when the
+    /// session is not in an indexed worktree.
+    pub index_coverage: Option<crate::client::IndexCoverage>,
     /// Which open question `/questions` shows next, so repeated use walks
     /// through all of them.
     pub question_cursor: usize,
@@ -593,6 +597,7 @@ impl App {
             secrets,
             open_question_count: 0,
             session_runtime: crate::client::SessionRuntimeSnapshot::default(),
+            index_coverage: None,
             question_cursor: 0,
             parked_question: None,
         })
@@ -1623,6 +1628,7 @@ impl App {
         self.jobs.clear();
         self.jobs_selected = 0;
         self.session_runtime = crate::client::SessionRuntimeSnapshot::default();
+        self.index_coverage = None;
         self.image_cache.clear();
         self.image_fetching.clear();
         self.image_failed.clear();
