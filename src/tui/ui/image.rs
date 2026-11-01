@@ -11,9 +11,15 @@ use ratatui::buffer::CellDiffOption;
 use ratatui::prelude::*;
 
 use ratatui::Frame;
-use ratatui_image::StatefulImage;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use base64::Engine as _;
+use ratatui_image::picker::cap_parser::Parser;
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
+use ratatui_image::{Resize, StatefulImage};
+
+use super::kitty_diacritics::diacritic;
 
 /// Terminal image support state.
 /// Created once at startup, before raw mode, and stored in App.
@@ -81,8 +87,8 @@ impl TerminalImageSupport {
 /// Image state for rendering.
 /// Created via `TerminalImageSupport`.
 pub struct ImageState {
-    /// The protocol state for rendering
-    pub protocol: StatefulProtocol,
+    /// The protocol state for rendering.
+    pub proto: ImageProtocol,
 }
 
 impl std::fmt::Debug for ImageState {
@@ -91,13 +97,160 @@ impl std::fmt::Debug for ImageState {
     }
 }
 
+/// Per-terminal render protocol.
+pub enum ImageProtocol {
+    /// Kitty graphics: the encoded image is transmitted once (`f=100`
+    /// PNG) and unicode placeholders scale it at every display size — no
+    /// per-size re-encode, no re-transmit.
+    Kitty(KittyImage),
+    /// iTerm2/Sixel/halfblocks: ratatui-image resizes+encodes per area.
+    Other(StatefulProtocol),
+}
+
+impl std::fmt::Debug for ImageProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImageProtocol").finish_non_exhaustive()
+    }
+}
+
+/// Kitty render state.
+///
+/// A prebuilt one-shot transmission plus the image identity placeholders
+/// reference. All costly work (encode + base64) is done on the decode
+/// worker; rendering only writes the payload once and placeholder cells
+/// afterwards.
+pub struct KittyImage {
+    /// The `f=100` chunked base64 transmission, emitted on first render.
+    transmit: String,
+    /// Flipped when the transmission has been written once.
+    transmitted: AtomicBool,
+    /// Foreground color escape encoding the image id.
+    id_color: String,
+    /// Third diacritic slot: the placement id's extra byte.
+    id_extra: u16,
+    /// Source pixel dimensions (for fit math).
+    width: u32,
+    height: u32,
+    /// Terminal cell size in pixels.
+    font: (u16, u16),
+}
+
+impl std::fmt::Debug for KittyImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KittyImage").finish_non_exhaustive()
+    }
+}
+
+impl KittyImage {
+    /// The rect the image paints into when fitted inside `area`,
+    /// preserving aspect ratio in whole cells.
+    #[must_use]
+    pub fn fit_rect(&self, area: Rect) -> Rect {
+        let (fw, fh) = (u32::from(self.font.0), u32::from(self.font.1));
+        let bw = u64::from(u32::from(area.width) * fw).min(u64::from(self.width));
+        let bh = u64::from(u32::from(area.height) * fh).min(u64::from(self.height));
+        let (img_w, img_h) = (u64::from(self.width), u64::from(self.height));
+        // Scale to the tighter axis, rounding like `round(img * ratio)` —
+        // `as` would truncate and never overflow here since img <= u32::MAX.
+        let (pw, ph) = if bw * img_h <= bh * img_w {
+            (bw, ((bw * img_h + img_w / 2) / img_w).max(1))
+        } else {
+            (((img_w * bh + img_h / 2) / img_h).max(1), bh)
+        };
+        Rect::new(
+            0,
+            0,
+            u16::try_from(pw.div_ceil(u64::from(fw))).unwrap_or(u16::MAX),
+            u16::try_from(ph.div_ceil(u64::from(fh))).unwrap_or(u16::MAX),
+        )
+    }
+}
+
+/// Build the kitty transmission string: `f=100` self-describing image
+/// bytes (PNG), chunked at 4 KB of base64 like the protocol requires.
+fn kitty_transmit(id: u32, is_tmux: bool, bytes: &[u8]) -> String {
+    use std::fmt::Write;
+
+    const CHARS_PER_CHUNK: usize = 4096;
+    const CHUNK_SIZE: usize = (CHARS_PER_CHUNK / 4) * 3;
+
+    let (start, escape, end) = Parser::escape_tmux(is_tmux);
+    let chunks = bytes.chunks(CHUNK_SIZE);
+    let chunk_count = chunks.len();
+    let mut data = String::with_capacity(
+        chunk_count * (11 + CHARS_PER_CHUNK + escape.len() * 2) + 46 + end.len(),
+    );
+    for (i, chunk) in chunks.enumerate() {
+        data.push_str(start);
+        write!(data, "{escape}_Gq=2,").unwrap();
+        if i == 0 {
+            write!(data, "i={id},a=T,U=1,f=100,").unwrap();
+        }
+        let more = u8::from(chunk_count > (i + 1));
+        write!(data, "m={more};").unwrap();
+        data.push_str(&base64::engine::general_purpose::STANDARD.encode(chunk));
+        write!(data, "{escape}\\").unwrap();
+        data.push_str(end);
+    }
+    data
+}
+
 /// Decode image bytes into an [`ImageState`] for `picker`. CPU-bound for
 /// large images — run on a worker thread, not the render loop.
 #[must_use]
 pub fn decode_image_state(picker: &Picker, data: &[u8]) -> Option<ImageState> {
+    if picker.protocol_type() == ProtocolType::Kitty {
+        return kitty_image_state(picker, data).map(|kitty| ImageState {
+            proto: ImageProtocol::Kitty(kitty),
+        });
+    }
     let image = image::load_from_memory(data).ok()?;
     Some(ImageState {
-        protocol: picker.new_resize_protocol(image),
+        proto: ImageProtocol::Other(picker.new_resize_protocol(image)),
+    })
+}
+
+/// Pass PNG bytes through unchanged when reasonable; anything else (or
+/// oversized) decodes and re-encodes to a bounded PNG on this worker —
+/// the encode never happens on the render path.
+fn kitty_image_state(picker: &Picker, data: &[u8]) -> Option<KittyImage> {
+    use std::fmt::Write;
+
+    const MAX_PASSTHROUGH: usize = 8 * 1024 * 1024;
+    const MAX_DIM: u32 = 4096;
+
+    let is_png = matches!(image::guess_format(data), Ok(image::ImageFormat::Png));
+    let (png, width, height) = if is_png && data.len() <= MAX_PASSTHROUGH {
+        let dims = image::ImageReader::new(std::io::Cursor::new(data))
+            .with_guessed_format()
+            .ok()?
+            .into_dimensions()
+            .ok()?;
+        (data.to_vec(), dims.0, dims.1)
+    } else {
+        let img = image::load_from_memory(data).ok()?;
+        let img = if img.width() > MAX_DIM || img.height() > MAX_DIM {
+            img.thumbnail(MAX_DIM, MAX_DIM)
+        } else {
+            img
+        };
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        img.write_to(&mut cursor, image::ImageFormat::Png).ok()?;
+        (cursor.into_inner(), img.width(), img.height())
+    };
+
+    let id = fastrand::u32(..);
+    let [id_extra, r, g, b] = id.to_be_bytes();
+    let mut id_color = String::new();
+    write!(id_color, "\x1b[38;2;{r};{g};{b}m").unwrap();
+    Some(KittyImage {
+        transmit: kitty_transmit(id, std::env::var_os("TMUX").is_some(), &png),
+        transmitted: AtomicBool::new(false),
+        id_color,
+        id_extra: u16::from(id_extra),
+        width,
+        height,
+        font: picker.font_size(),
     })
 }
 
@@ -114,9 +267,71 @@ pub fn decode_image_state(picker: &Picker, data: &[u8]) -> Option<ImageState> {
 /// those cells to a width of one keeps the diff exact; the rest of the
 /// image area is already marked skip by the protocol.
 pub fn render_image(frame: &mut Frame, area: Rect, state: &mut ImageState) {
-    let image_widget = StatefulImage::default();
-    frame.render_stateful_widget(image_widget, area, &mut state.protocol);
+    match &mut state.proto {
+        ImageProtocol::Kitty(kitty) => render_kitty(frame.buffer_mut(), area, kitty),
+        ImageProtocol::Other(protocol) => {
+            let image_widget = StatefulImage::default();
+            frame.render_stateful_widget(image_widget, area, protocol);
+        }
+    }
     pin_escape_cells(frame.buffer_mut(), area);
+}
+
+impl ImageState {
+    /// The rect the image paints into when fitted inside `area`.
+    /// Replaces `StatefulProtocol::size_for(Resize::Fit(None), area)`.
+    #[must_use]
+    pub fn fitted(&self, area: Rect) -> Rect {
+        match &self.proto {
+            ImageProtocol::Kitty(kitty) => kitty.fit_rect(area),
+            ImageProtocol::Other(protocol) => protocol.size_for(Resize::Fit(None), area),
+        }
+    }
+}
+
+/// Paint kitty unicode placeholders for `area`: the prebuilt transmission
+/// once, then placeholder cells only — no per-size encode or transmit.
+fn render_kitty(buf: &mut Buffer, area: Rect, kitty: &KittyImage) {
+    use std::fmt::Write;
+
+    let area = area.intersection(buf.area);
+    let fit = kitty.fit_rect(area);
+    let full_width = area.width.min(fit.width);
+    if full_width == 0 {
+        return;
+    }
+    let height = area.height.min(fit.height).min(297);
+
+    let first = !kitty.transmitted.swap(true, Ordering::SeqCst);
+    let row_diacritics: String =
+        std::iter::repeat_n('\u{10EEEE}', usize::from(full_width) - 1).collect();
+    let restore = format!("\x1b[u\x1b[{}C\x1b[{}B", area.width - 1, area.height - 1);
+    let mut symbol = String::new();
+    for y in 0..height {
+        symbol.clear();
+        if first && y == 0 {
+            symbol.push_str(&kitty.transmit);
+        }
+        write!(
+            symbol,
+            "\x1b[s{}\u{10EEEE}{}{}{}",
+            kitty.id_color,
+            diacritic(y),
+            diacritic(0),
+            diacritic(kitty.id_extra)
+        )
+        .unwrap();
+        symbol.push_str(&row_diacritics);
+        for x in 1..full_width {
+            if let Some(cell) = buf.cell_mut((area.left() + x, area.top() + y)) {
+                cell.set_diff_option(CellDiffOption::Skip);
+            }
+        }
+        symbol.push_str(&restore);
+        if let Some(cell) = buf.cell_mut((area.left(), area.top() + y)) {
+            cell.set_symbol(&symbol);
+        }
+    }
 }
 
 /// Give every cell of `area` holding an escape sequence a forced width of
@@ -279,5 +494,57 @@ mod tests {
     fn test_render_placeholder() {
         let lines = render_placeholder("Alt text", "https://example.com/image.png");
         assert_eq!(lines.len(), 2);
+    }
+
+    #[test]
+    fn kitty_transmit_carries_png_once_with_continuation_chunks() {
+        let bytes = vec![0xAB; 10_000];
+        let transmit = kitty_transmit(42, false, &bytes);
+
+        // First chunk carries the full action set; later chunks only `m=`.
+        assert!(transmit.starts_with("\x1b_Gq=2,i=42,a=T,U=1,f=100,m=1;"));
+        assert!(transmit.contains("\x1b\\\x1b_Gq=2,m="));
+        assert!(transmit.ends_with("\x1b\\"));
+        assert_eq!(transmit.matches("\x1b_G").count(), 4);
+        // Encoded payload is base64 of the raw bytes.
+        let payload: String = transmit
+            .split("\x1b_G")
+            .skip(1)
+            .map(|chunk| {
+                chunk
+                    .split(';')
+                    .nth(1)
+                    .unwrap_or_default()
+                    .replace("\x1b\\", "")
+            })
+            .collect();
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(payload)
+                .unwrap(),
+            bytes
+        );
+    }
+
+    #[test]
+    fn kitty_fit_rect_preserves_aspect_in_cells() {
+        let kitty = KittyImage {
+            transmit: String::new(),
+            transmitted: AtomicBool::new(false),
+            id_color: String::new(),
+            id_extra: 0,
+            width: 3248,
+            height: 1992,
+            font: (10, 20),
+        };
+        // 80x25 area of 10x20 cells = 800x500px: image fits at 800x491px -> 80x25 cells.
+        let fit = kitty.fit_rect(Rect::new(0, 0, 80, 25));
+        assert_eq!(fit, Rect::new(0, 0, 80, 25));
+        // A 10x10-cell area caps width at 100px: 100x61px -> 10x4 cells.
+        let fit = kitty.fit_rect(Rect::new(0, 0, 10, 10));
+        assert_eq!(fit.width, 10);
+        assert_eq!(fit.height, 4);
+        // Zero area renders nothing.
+        assert_eq!(kitty.fit_rect(Rect::new(0, 0, 0, 10)).width, 0);
     }
 }
