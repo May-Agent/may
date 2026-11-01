@@ -382,46 +382,79 @@ impl RuntimeDeps {
         self
     }
 
-    /// Creates and activates a new session and starts building its worker.
+    /// Creates and activates a new session in memory only.
     ///
-    /// The previous session's worker is dropped at once; messages sent before
-    /// the new worker is ready are queued for it.
+    /// Nothing reaches the daemon yet: the session row, its directories and
+    /// the agent worker are created by [`Self::materialize_session`] on the
+    /// first message sent.
     ///
     /// # Errors
-    /// Returns [`TuiRuntimeError`] when the session cannot be created or the worker build fails.
+    /// Returns [`TuiRuntimeError`] when no model can be resolved for display.
     pub async fn begin_new_session(
         &self,
         app: &mut App,
         worker: &mut Option<AgentWorker>,
-    ) -> Result<PendingWorkerBuild, TuiRuntimeError> {
+    ) -> Result<(), TuiRuntimeError> {
+        discard_ephemeral_session(app).await;
         let model = self
             .oneshot_model
             .clone()
             .or_else(|| app.config.last_model.as_ref().map(ToString::to_string));
-        let (sandbox_dir, session_id, messages) = {
+        let (session_id, messages) = {
             let session = app
                 .session_manager
                 .create_session_with_model(model.clone())?;
-            (
-                session.sandbox_dir.clone(),
-                session.id.clone(),
-                session.history.messages().to_vec(),
-            )
+            (session.id.clone(), session.history.messages().to_vec())
         };
 
-        app.session_manager.ensure_persisted().await?;
         app.init_session(&session_id, &messages, model.as_deref())
             .await;
         *worker = None;
 
         let selected_model = SelectedModel::resolve(&app.config, model.as_deref())?;
+        app.set_current_model(selected_model.as_str());
+        Ok(())
+    }
+
+    /// Persist the current session and start building its worker — the
+    /// transition a session's first message performs. `Ok(None)` when the
+    /// current session was already materialized or none is active.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] when the session cannot be persisted or
+    /// the worker build fails to start.
+    pub async fn materialize_session(
+        &self,
+        app: &mut App,
+    ) -> Result<Option<PendingWorkerBuild>, TuiRuntimeError> {
+        if app
+            .session_manager
+            .current()
+            .is_none_or(|session| session.persisted)
+        {
+            return Ok(None);
+        }
+        app.session_manager.ensure_persisted().await?;
+        let session = app
+            .session_manager
+            .current()
+            .ok_or(TuiRuntimeError::NoActiveSession)?;
+        let sandbox_dir = session.sandbox_dir.clone();
+        let session_id = session.id.clone();
+        let selected_model = SelectedModel::resolve(&app.config, session.model.as_deref())?;
+        let reasoning_effort = self.oneshot_reasoning_effort.or_else(|| {
+            app.current_effort
+                .as_deref()
+                .and_then(parse_reasoning_effort)
+        });
         self.begin_worker_build(
             app,
             sandbox_dir,
             session_id,
             selected_model,
-            self.oneshot_reasoning_effort,
+            reasoning_effort,
         )
+        .map(Some)
     }
 
     /// Activates a stored session and starts building its worker.
@@ -437,6 +470,7 @@ impl RuntimeDeps {
         worker: &mut Option<AgentWorker>,
         id: &SessionId,
     ) -> Result<PendingWorkerBuild, TuiRuntimeError> {
+        discard_ephemeral_session(app).await;
         let session = app.session_manager.load_session(id).await?;
 
         let sandbox_dir = session.sandbox_dir.clone();
@@ -468,6 +502,7 @@ impl RuntimeDeps {
         source: crate::session::import::ForeignAgent,
         query: &str,
     ) -> Result<PendingWorkerBuild, TuiRuntimeError> {
+        discard_ephemeral_session(app).await;
         let query_owned = query.to_string();
         let mut imported =
             blocking::unblock(move || crate::session::import::import(source, &query_owned)).await?;
@@ -1042,6 +1077,36 @@ impl AssistantReply {
     pub const fn at(&self) -> Option<jiff::Timestamp> {
         self.at
     }
+}
+
+/// Drop the current session when nothing ever persisted it, removing the
+/// scratch dirs (pasted attachments, the file-diff base) it may have left.
+pub async fn discard_ephemeral_session(app: &mut App) {
+    let Some(session) = app.session_manager.current() else {
+        return;
+    };
+    if session.persisted {
+        return;
+    }
+    let sandbox_dir = session.sandbox_dir.clone();
+    app.session_manager.discard_current();
+    if let Err(error) = async_fs::remove_dir_all(&sandbox_dir).await {
+        tracing::debug!(%error, "ephemeral session scratch dir cleanup failed");
+    }
+}
+
+/// Reasoning-effort strings as the effort ladder carries them.
+fn parse_reasoning_effort(value: &str) -> Option<ReasoningEffort> {
+    Some(match value {
+        "none" => ReasoningEffort::None,
+        "minimal" => ReasoningEffort::Minimal,
+        "low" => ReasoningEffort::Low,
+        "medium" => ReasoningEffort::Medium,
+        "high" => ReasoningEffort::High,
+        "xhigh" => ReasoningEffort::XHigh,
+        "max" => ReasoningEffort::Max,
+        _ => return None,
+    })
 }
 
 /// Context needed to generate a session title once a run finishes.

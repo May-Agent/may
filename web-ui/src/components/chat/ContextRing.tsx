@@ -5,6 +5,7 @@ import {
   PopoverTrigger,
 } from '@/components/ui/popover';
 import { getSessionContextDebug } from '@/lib/api/logs';
+import { isDraftSessionId } from '@/lib/stores/sessions';
 import { useTranslation } from '@/lib/i18n';
 import type { SessionContextDebugResponse } from '@/lib/types';
 import { cn } from '@/lib/utils';
@@ -29,6 +30,7 @@ export function ContextRing({ sessionId }: { sessionId: string }) {
   const [data, setData] = useState<SessionContextDebugResponse | null>(null);
 
   useEffect(() => {
+    if (isDraftSessionId(sessionId)) return;
     let cancelled = false;
     const load = async () => {
       try {

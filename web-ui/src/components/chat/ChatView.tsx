@@ -1,7 +1,9 @@
 import { Fragment, useCallback, useEffect, useRef, useState } from 'react';
 import { AlertCircle, AlertTriangle, ArrowDown, Loader2, RotateCw, X } from 'lucide-react';
-import { useNavigate } from 'react-router-dom';
-import { useSessionsStore } from '@/lib/stores/sessions';
+import { useNavigate, useParams } from 'react-router-dom';
+import { toast } from 'sonner';
+import { isDraftSessionId, useSessionsStore } from '@/lib/stores/sessions';
+import { profileSessionPath } from '@/lib/profile/active';
 import { useTurnStore } from '@/lib/stores/turn';
 import { useConfigStore } from '@/lib/stores/config';
 import { ScrollArea } from '@/components/ui/scroll-area';
@@ -52,12 +54,19 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     null,
   );
 
+  const { profileId } = useParams();
+  const isDraft = isDraftSessionId(sessionId);
+
   useEffect(() => {
     open(sessionId);
   }, [sessionId, open]);
 
-  // Turns of this session stream here whichever client started them.
-  useEffect(() => watchTurns(sessionId), [sessionId, watchTurns]);
+  // Turns of this session stream here whichever client started them. A draft
+  // has nothing to follow — it does not exist on the daemon yet.
+  useEffect(
+    () => (isDraft ? undefined : watchTurns(sessionId)),
+    [sessionId, isDraft, watchTurns],
+  );
 
   const handleScroll = useCallback(() => {
     const el = scrollerRef.current;
@@ -116,6 +125,23 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     attachments: ApiAttachment[],
     deliveryMode: 'steer' | 'queue',
   ) => {
+    // A draft materializes on this first send: the daemon session is created,
+    // the route swaps to its real id, then the message posts normally.
+    let sid = sessionId;
+    if (isDraft) {
+      let created;
+      try {
+        created = await useSessionsStore.getState().materialize(sessionId);
+      } catch (err) {
+        toast.error(t('errors.generic'), {
+          description: err instanceof Error ? err.message : String(err),
+        });
+        return;
+      }
+      sid = created.id;
+      const pid = profileId ?? created.profileId;
+      if (pid) navigate(profileSessionPath(pid, sid), { replace: true });
+    }
     // `!` prefix: bash mode — the daemon runs the command on the user's
     // behalf and returns a masked outcome; the transcript goes to the
     // agent as the next user message, like the TUI's bash mode.
@@ -125,9 +151,9 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       setBashStatus({ command });
       stickyBottomRef.current = true;
       try {
-        const outcome = await runBash(sessionId, command);
+        const outcome = await runBash(sid, command);
         const transcript = bashTranscript(outcome);
-        appendMessage(sessionId, {
+        appendMessage(sid, {
           id: `local-${Date.now()}`,
           role: 'user' as const,
           content: transcript,
@@ -135,9 +161,9 @@ export function ChatView({ sessionId }: { sessionId: string }) {
           attachments: [] as ApiAttachment[],
         });
         if (streaming) {
-          await enqueueMessage({ sessionId, content: transcript, attachments: [], deliveryMode });
+          await enqueueMessage({ sessionId: sid, content: transcript, attachments: [], deliveryMode });
         } else {
-          await send({ sessionId, content: transcript, attachments: [] });
+          await send({ sessionId: sid, content: transcript, attachments: [] });
         }
         setBashStatus(null);
       } catch (error) {
@@ -152,13 +178,13 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       timestamp: new Date().toISOString(),
       attachments,
     };
-    appendMessage(sessionId, userMessage);
+    appendMessage(sid, userMessage);
     // Sending a new message is an explicit user intent to follow the tail.
     stickyBottomRef.current = true;
 
     if (streaming) {
       await enqueueMessage({
-        sessionId,
+        sessionId: sid,
         content,
         attachments,
         deliveryMode,
@@ -166,7 +192,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       return;
     }
 
-    await send({ sessionId, content, attachments });
+    await send({ sessionId: sid, content, attachments });
   };
 
   const renderMessage = (msg: ApiMessage) => {

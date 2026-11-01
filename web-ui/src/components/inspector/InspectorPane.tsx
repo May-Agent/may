@@ -10,7 +10,7 @@ import { ComputerPanel } from '../computer/ComputerPanel';
 import { BrowserPanel } from '@/components/browser/BrowserPanel';
 import { useTranslation } from '@/lib/i18n';
 import { EMPTY_INSPECTOR_ENTRY, useInspectorStore } from '@/lib/stores/inspector';
-import { useSessionsStore } from '@/lib/stores/sessions';
+import { isDraftSessionId, useSessionsStore } from '@/lib/stores/sessions';
 import { useTurnStore } from '@/lib/stores/turn';
 import { useUiStore } from '@/lib/stores/ui';
 import { type InspectorTab, useBrowserViewStore } from '@/lib/stores/browserView';
@@ -432,8 +432,12 @@ function PlanMenu({
 
   const transition = async (next: SessionPlanState) => {
     try {
-      await putSessionPlanState(sessionId, next);
-      updateRuntime(sessionId, { planState: next });
+      if (isDraftSessionId(sessionId)) {
+        useSessionsStore.getState().saveDraftPlan(sessionId, content, next);
+      } else {
+        await putSessionPlanState(sessionId, next);
+        updateRuntime(sessionId, { planState: next });
+      }
     } catch (err) {
       toast.error(t('errors.generic'), {
         description: err instanceof Error ? err.message : undefined,
