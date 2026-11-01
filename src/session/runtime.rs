@@ -520,4 +520,8 @@ pub struct PersistedPermissionRequestPayload {
     /// Session the request belongs to, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Agent that raised the request: the session's own agent or one of its
+    /// subagents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
 }

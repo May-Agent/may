@@ -49,6 +49,9 @@ pub struct SessionRuntimeService {
     db: ChatDb,
     ui_event_bus: UiEventBus,
     runs: SessionRuns,
+    /// Agent id → owning session, for every agent the daemon has seen:
+    /// the address map agent-to-agent messaging routes through.
+    agents: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
 }
 
 impl std::fmt::Debug for SessionRuntimeService {
@@ -67,6 +70,7 @@ impl SessionRuntimeService {
             db,
             ui_event_bus,
             runs,
+            agents: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -88,6 +92,30 @@ impl SessionRuntimeService {
     #[must_use]
     pub fn db(&self) -> ChatDb {
         self.db.clone()
+    }
+
+    /// Record that `agent_id` belongs to `session_id`.
+    ///
+    /// # Panics
+    /// When the agents map's lock is poisoned.
+    pub fn register_agent(&self, agent_id: impl Into<String>, session_id: impl Into<String>) {
+        self.agents
+            .lock()
+            .expect("agents map is poisoned")
+            .insert(agent_id.into(), session_id.into());
+    }
+
+    /// The session an agent belongs to.
+    ///
+    /// # Panics
+    /// When the agents map's lock is poisoned.
+    #[must_use]
+    pub fn session_for_agent(&self, agent_id: &str) -> Option<String> {
+        self.agents
+            .lock()
+            .expect("agents map is poisoned")
+            .get(agent_id)
+            .cloned()
     }
 
     fn publish_ui(&self, topics: UiEventTopics) {
