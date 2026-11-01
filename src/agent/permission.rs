@@ -156,6 +156,10 @@ pub struct PermissionRequest {
     /// Session the request belongs to, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// Agent that raised the request: the session's own agent or one of its
+    /// subagents, each with an instance-unique `word-word-word` id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,6 +173,10 @@ enum ApprovalMode {
 pub struct PermissionApprover {
     live_responses: Arc<LiveResponseRegistry<bool>>,
     session_id: Option<String>,
+    /// The agent this approver speaks for: every agent in an instance — the
+    /// session's own agent and each of its subagents — gets a distinct
+    /// `word-word-word` id so requests stay attributable and addressable.
+    agent_id: String,
     pub(crate) runtime_service: Option<Arc<crate::session::SessionRuntimeService>>,
     approval_mode: ApprovalMode,
     timeout: std::time::Duration,
@@ -181,18 +189,26 @@ impl PermissionApprover {
         Self {
             live_responses: Arc::new(LiveResponseRegistry::new()),
             session_id: None,
+            agent_id: crate::id::new(),
             runtime_service: None,
             approval_mode: ApprovalMode::Interactive,
             timeout: MAIN_APPROVAL_TIMEOUT,
         }
     }
 
-    /// Return a copy bound to `session_id`.
+    /// Return a copy bound to `session_id`, speaking for a fresh agent id:
+    /// each session's main agent is its own agent.
     #[must_use]
     pub fn for_session(&self, session_id: impl Into<String>) -> Self {
+        let session_id = session_id.into();
+        let agent_id = crate::id::new();
+        if let Some(runtime_service) = &self.runtime_service {
+            runtime_service.register_agent(&agent_id, &session_id);
+        }
         Self {
             live_responses: self.live_responses.clone(),
-            session_id: Some(session_id.into()),
+            session_id: Some(session_id),
+            agent_id,
             runtime_service: self.runtime_service.clone(),
             approval_mode: self.approval_mode,
             timeout: self.timeout,
@@ -206,10 +222,22 @@ impl PermissionApprover {
         self
     }
 
-    /// The approval deadline used for requests raised by a subagent.
+    /// The approval deadline and fresh agent id for requests raised by a
+    /// subagent, registered against the parent's session.
     #[must_use]
-    pub const fn for_subagent(self) -> Self {
+    pub fn for_subagent(mut self) -> Self {
+        self.agent_id = crate::id::new();
+        if let (Some(runtime_service), Some(session_id)) = (&self.runtime_service, &self.session_id)
+        {
+            runtime_service.register_agent(&self.agent_id, session_id);
+        }
         self.with_approval_timeout(SUBAGENT_APPROVAL_TIMEOUT)
+    }
+
+    /// The agent this approver's requests are attributed to.
+    #[must_use]
+    pub fn agent_id(&self) -> &str {
+        &self.agent_id
     }
 
     /// Attach the runtime service used to persist/surface requests.
@@ -258,6 +286,7 @@ impl PermissionApprover {
                 mode: payload.mode,
                 script: payload.script,
                 session_id: payload.session_id,
+                agent_id: payload.agent_id,
             },
         }
     }
@@ -305,6 +334,7 @@ impl PermissionApprover {
             mode: mode.into(),
             script,
             session_id: Some(session_id.clone()),
+            agent_id: Some(self.agent_id.clone()),
         };
         let request_id = crate::id::new();
         let rx = self.live_responses.open(&request_id);
@@ -438,6 +468,26 @@ mod tests {
             SUBAGENT_APPROVAL_TIMEOUT
         );
         assert!(SUBAGENT_APPROVAL_TIMEOUT < MAIN_APPROVAL_TIMEOUT);
+    }
+
+    #[test]
+    fn every_agent_gets_a_distinct_id() {
+        let base = PermissionApprover::new();
+        let main_a = base.for_session("a");
+        let main_b = base.for_session("b");
+        let sub = main_a.clone().for_subagent();
+        for (left, right) in [
+            (main_a.agent_id(), main_b.agent_id()),
+            (main_a.agent_id(), sub.agent_id()),
+            (base.agent_id(), main_a.agent_id()),
+        ] {
+            assert_ne!(left, right, "agents must not share an id");
+            assert_eq!(
+                left.matches('-').count(),
+                2,
+                "agent id must be word-word-word: {left}"
+            );
+        }
     }
 
     #[test]

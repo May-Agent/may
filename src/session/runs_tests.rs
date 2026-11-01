@@ -160,6 +160,7 @@ async fn stop_in_each_waiting_state_ends_idle_with_the_run_released() {
                                 mode: PermissionRequestMode::Default,
                                 script: "echo hi".to_string(),
                                 session_id: Some("session".to_string()),
+                                agent_id: None,
                             },
                         }),
                     )
@@ -344,6 +345,7 @@ async fn recovery_settles_sessions_a_dead_run_left_owned() {
                     mode: PermissionRequestMode::Default,
                     script: "echo hi".to_string(),
                     session_id: Some("stale".to_string()),
+                    agent_id: None,
                 },
             }),
         )
