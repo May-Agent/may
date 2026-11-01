@@ -703,8 +703,7 @@ impl RuntimeDeps {
         history_index: usize,
         restore_code: bool,
     ) -> Result<PendingWorkerBuild, TuiRuntimeError> {
-        let Some((content, attachments, call_ids)) = app.chat.prompt_rewind_payload(history_index)
-        else {
+        let Some((content, attachments)) = app.chat.prompt_rewind_payload(history_index) else {
             return Err(crate::session::SessionError::NotFound(format!(
                 "no prompt at history position {history_index}"
             ))
@@ -721,7 +720,7 @@ impl RuntimeDeps {
         let model = session.model.clone();
 
         if restore_code {
-            app.request_prompt_rewind(point.user_message_id, call_ids);
+            app.request_prompt_rewind(point.user_message_id);
         }
 
         app.chat.truncate_prompt_at(history_index);
@@ -758,20 +757,25 @@ impl RuntimeDeps {
         let model_id = model.as_str().to_string();
         let app_events = app.event_tx.clone();
         let task = spawn(async move {
-            let effort = reasoning_effort.map(|effort| match effort {
-                ReasoningEffort::Low => "low",
-                ReasoningEffort::Medium => "medium",
-                _ => "high",
+            let mut body = serde_json::json!({
+                "model": model_id,
+                "cwd": cwd,
             });
+            // An absent reasoningEffort leaves the stored level untouched; a
+            // serialized null would read as "clear" on the daemon's tri-state.
+            if let Some(effort) = reasoning_effort {
+                body["reasoningEffort"] = serde_json::json!(match effort {
+                    ReasoningEffort::None => "none",
+                    ReasoningEffort::Minimal => "minimal",
+                    ReasoningEffort::Low => "low",
+                    ReasoningEffort::Medium => "medium",
+                    ReasoningEffort::High => "high",
+                    ReasoningEffort::XHigh => "xhigh",
+                    ReasoningEffort::Max => "max",
+                });
+            }
             let _: serde_json::Value = client
-                .put(
-                    &format!("/api/sessions/{}", session_id.as_str()),
-                    &serde_json::json!({
-                        "model": model_id,
-                        "reasoningEffort": effort,
-                        "cwd": cwd,
-                    }),
-                )
+                .put(&format!("/api/sessions/{}", session_id.as_str()), &body)
                 .await
                 .map_err(TuiRuntimeError::from)?;
             Ok(crate::tui::remote::spawn_remote_worker(

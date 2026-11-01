@@ -2728,9 +2728,13 @@ async fn resolve_session_context(
 fn parse_reasoning_effort_token(token: &str) -> Option<aither_core::llm::model::ReasoningEffort> {
     use aither_core::llm::model::ReasoningEffort;
     match token.trim().to_ascii_lowercase().as_str() {
+        "none" => Some(ReasoningEffort::None),
+        "minimal" => Some(ReasoningEffort::Minimal),
         "low" => Some(ReasoningEffort::Low),
         "medium" => Some(ReasoningEffort::Medium),
         "high" => Some(ReasoningEffort::High),
+        "xhigh" => Some(ReasoningEffort::XHigh),
+        "max" => Some(ReasoningEffort::Max),
         _ => None,
     }
 }

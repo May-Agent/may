@@ -46,6 +46,24 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
         AppEvent::Paste(text) => Ok(app.handle_bracketed_paste(text)),
         AppEvent::Mouse(mouse) => app.handle_mouse(mouse),
 
+        AppEvent::EffortLoaded(effort) => {
+            app.current_effort = effort;
+            if matches!(app.mode, AppMode::EffortSelect) {
+                app.effort_index = app
+                    .effort_ladder
+                    .iter()
+                    .position(|rung| *rung == app.current_effort.as_deref())
+                    .unwrap_or(0);
+            }
+            Ok(None)
+        }
+        AppEvent::EffortApplied(result) => {
+            match result {
+                Ok(effort) => app.current_effort = effort,
+                Err(e) => app.chat.push_error(&format!("Failed to set effort: {e}")),
+            }
+            Ok(None)
+        }
         AppEvent::SessionsLoaded(result) => {
             app.status = None;
             match result {
@@ -211,6 +229,10 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
         }
         AppEvent::SessionRuntime(event) => {
             app.session_runtime = event.runtime;
+            Ok(None)
+        }
+        AppEvent::TurnStarted { message_id } => {
+            app.request_prompt_mark(i64::from(message_id));
             Ok(None)
         }
         AppEvent::HistoryStale => Ok(Some(SendAction::ReloadHistory)),
