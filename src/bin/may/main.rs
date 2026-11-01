@@ -60,6 +60,7 @@ use may_agent::tui::{App, AppEvent, EventHandler, SendAction, ui};
 use may_agent::{MayMcpServerConfig, McpManager, SkillManager};
 
 const PANIC_MESSAGE: &str = include_str!("../../texts/panic_message.txt");
+const ERR_WORKER_BUSY: &str = include_str!("../../texts/agent_worker_busy.txt");
 
 /// Header of a `/bug` or panic snapshot, rendered ahead of the ring dump.
 #[derive(askama::Template)]
@@ -1226,9 +1227,10 @@ where
                                 );
                                 runtime_deps.enqueue_pending_message(app, msg).await?;
                             }
-                        } else if worker.is_none() && worker_build.is_some() {
-                            // The session's worker is still being prepared;
-                            // it picks the message up from the queue.
+                        } else {
+                            // A turn is in flight, or the session's worker is
+                            // still being prepared; the message waits on the
+                            // session queue, exactly like an enqueued one.
                             runtime_deps.enqueue_pending_message(app, msg).await?;
                         }
                     }
@@ -1407,7 +1409,7 @@ where
                                 agent_handle = Some(w.compact(focus));
                             }
                         } else {
-                            app.set_status("Agent is busy");
+                            app.chat.push_error(ERR_WORKER_BUSY.trim());
                         }
                     }
                     Some(SendAction::ContextReport) => {
