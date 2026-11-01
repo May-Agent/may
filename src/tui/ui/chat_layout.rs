@@ -17,7 +17,6 @@
 //! screen.
 
 use std::sync::OnceLock;
-use std::time::Instant;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -192,7 +191,6 @@ impl ChatLayout {
         hide_todos: bool,
         selected_tool: Option<&str>,
         spinner_frame: usize,
-        now: Instant,
     ) {
         if width != self.width
             || images_supported != self.images_supported
@@ -214,7 +212,7 @@ impl ChatLayout {
         self.rebuilt = 0;
         for (index, elem) in elements.iter().enumerate() {
             let revision = chat.revision(index);
-            let state = ElementState::of(elem, selected_tool, hide_todos, spinner_frame, now);
+            let state = ElementState::of(elem, selected_tool, hide_todos, spinner_frame);
             let end = old.len().min(cursor + REUSE_LOOKAHEAD);
             let found = (cursor..end).find(|&i| {
                 old[i]

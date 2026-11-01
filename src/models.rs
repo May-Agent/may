@@ -385,6 +385,16 @@ pub fn effort_family_base(model_id: &str) -> String {
     model_id.to_string()
 }
 
+/// Position of `rung` on the canonical effort order (`none` … `max`),
+/// for sorting a family's served rungs.
+#[must_use]
+pub fn effort_rung_rank(rung: &str) -> usize {
+    EFFORT_UID_TOKENS
+        .iter()
+        .position(|token| *token == rung)
+        .unwrap_or(usize::MAX)
+}
+
 /// The effort rung a catalog uid expresses, if it carries one
 /// (`o4-mini-high-lightning` → `high`).
 #[must_use]
@@ -403,4 +413,16 @@ pub fn effort_uid_token(model_id: &str) -> Option<&'static str> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::effort_rung_rank;
+
+    #[test]
+    fn effort_rung_rank_orders_the_ladder() {
+        let mut rungs = vec!["max", "medium", "high"];
+        rungs.sort_by_key(|rung| effort_rung_rank(rung));
+        assert_eq!(rungs, ["medium", "high", "max"]);
+    }
 }
