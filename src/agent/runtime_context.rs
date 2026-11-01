@@ -13,6 +13,8 @@
 //! only the [`tag::WORKSPACE_WORKDIRS`] block while the rest of the
 //! workspace prefix stays cached.
 
+use std::path::PathBuf;
+
 use aither_agent::SubagentDefinition;
 use aither_core::llm::model::{Ability, Parameters};
 use askama::Template;
@@ -40,6 +42,7 @@ pub mod tag {
     pub const TERMINAL_RUNTIME_CONTEXT: &str = "terminal_runtime_context";
     pub const WORKSPACE: &str = "workspace";
     pub const WORKSPACE_WORKDIRS: &str = "workspace_workdirs";
+    pub const REPO_CLONES: &str = "repo_clones";
     pub const CONTAINER_ENVIRONMENT_CONTEXT: &str = "container_environment_context";
     pub const BROWSER: &str = "browser";
     pub const PROFILE_PERSONA: &str = "profile_persona";
@@ -64,6 +67,7 @@ pub struct RuntimeSystemContext {
     last_memory_content: String,
     terminal_runtime: Option<String>,
     workspace_workdirs: Option<String>,
+    repo_clones: Option<String>,
     browser: Option<String>,
     profile_persona: Option<String>,
     profile_memories: Option<String>,
@@ -80,6 +84,7 @@ impl RuntimeSystemContext {
             last_memory_content: memory_content,
             terminal_runtime: None,
             workspace_workdirs: None,
+            repo_clones: None,
             browser: None,
             profile_persona: None,
             profile_memories: None,
@@ -97,6 +102,11 @@ impl RuntimeSystemContext {
 
     pub(crate) fn with_workspace_workdirs(mut self, workdirs: String) -> Self {
         self.workspace_workdirs = Some(workdirs);
+        self
+    }
+
+    pub(crate) fn with_repo_clones(mut self, repo_clones: Option<String>) -> Self {
+        self.repo_clones = repo_clones;
         self
     }
 
@@ -154,6 +164,7 @@ impl RuntimeSystemContext {
             tag::WORKSPACE_WORKDIRS,
             self.workspace_workdirs.clone(),
         );
+        reconcile_text_block(context, tag::REPO_CLONES, self.repo_clones.clone());
         reconcile_text_block(context, tag::CONTAINER_ENVIRONMENT_CONTEXT, None);
         // The platform hint is gone; a context restored from an older
         // snapshot may still carry it, so drop it unconditionally.
@@ -288,6 +299,27 @@ struct WorkspaceWorkdirsTemplate {
 struct WorkspaceDirEntry {
     path: String,
     description: String,
+}
+
+/// One session repository clone shown in runtime context.
+#[derive(Clone)]
+pub struct RepoCloneEntry {
+    /// Clone path inside the session sandbox.
+    pub clone_path: PathBuf,
+    /// Checkout or remote the clone came from.
+    pub source: String,
+}
+
+#[derive(Clone, Template)]
+#[template(path = "repo_clones.txt", escape = "none")]
+struct RepoClonesTemplate {
+    clones: Vec<RepoCloneTemplateEntry>,
+}
+
+#[derive(Clone)]
+struct RepoCloneTemplateEntry {
+    path: String,
+    source: String,
 }
 
 impl From<&MayWorkspaceDir> for WorkspaceDirEntry {
@@ -452,6 +484,29 @@ pub fn build_workspace_workdirs_context(workspace: &MayWorkspace) -> Option<Stri
         template
             .render()
             .unwrap_or_else(|error| panic!("failed to render workspace workdirs context: {error}")),
+    )
+}
+
+/// Builds the optional `repo_clones` block listing this session's private
+/// repository clones, kept as its own block so clone creation invalidates
+/// only it and not the stable prefix.
+pub fn build_repo_clones_context(clones: &[RepoCloneEntry]) -> Option<String> {
+    if clones.is_empty() {
+        return None;
+    }
+    let template = RepoClonesTemplate {
+        clones: clones
+            .iter()
+            .map(|c| RepoCloneTemplateEntry {
+                path: display_path(&c.clone_path),
+                source: c.source.clone(),
+            })
+            .collect(),
+    };
+    Some(
+        template
+            .render()
+            .unwrap_or_else(|error| panic!("failed to render repo clones context: {error}")),
     )
 }
 

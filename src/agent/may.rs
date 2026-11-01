@@ -23,9 +23,10 @@ use super::imagine::{ImageGeneratorConfig, resolve_image_generator_config};
 use super::permission::PermissionApprover;
 use super::provider::{RequestParameterizedModel, resolve_provider_runtime};
 use super::runtime_context::{
-    RuntimeSystemContext, build_base_system_prompt, build_browser_context, build_location_context,
-    build_memory_context_content, build_native_voice_context, build_network_restrictions_context,
-    build_plan_mode_context, build_terminal_runtime_context, build_workspace_workdirs_context, tag,
+    RepoCloneEntry, RuntimeSystemContext, build_base_system_prompt, build_browser_context,
+    build_location_context, build_memory_context_content, build_native_voice_context,
+    build_network_restrictions_context, build_plan_mode_context, build_repo_clones_context,
+    build_terminal_runtime_context, build_workspace_workdirs_context, tag,
 };
 use super::tool_environment_cache::{
     Acquired, HomeBackend, ToolEnvironmentCache, ToolEnvironmentCacheError, ToolEnvironmentKey,
@@ -436,6 +437,28 @@ impl MayAgent {
         );
         runtime_system_context =
             runtime_system_context.with_terminal_runtime(terminal_runtime.clone());
+
+        // Session repo clones: the writable working copy of each repository
+        // the session touches lives under the sandbox; checkouts stay read
+        // mounts. The launch directory's repo is cloned eagerly.
+        let session_repos =
+            crate::repo_clone::SessionRepos::new(session_paths.root(), config.session_id.as_str());
+        let mut repo_clones = Vec::new();
+        if let Some(worktree) = crate::repo_search::worktree_root(&config.cwd)
+            && let Ok(repo_key) = crate::issue::repository_identity(&worktree)
+        {
+            match session_repos.ensure_local_clone(&worktree, &repo_key).await {
+                Ok(clone_path) => repo_clones.push(RepoCloneEntry {
+                    clone_path,
+                    source: crate::fs_utils::display_path(&worktree),
+                }),
+                Err(error) => {
+                    tracing::warn!(%error, "failed to create session repo clone");
+                }
+            }
+        }
+        runtime_system_context =
+            runtime_system_context.with_repo_clones(build_repo_clones_context(&repo_clones));
 
         let llm =
             RequestParameterizedModel::new(config.llm.clone(), config.request_parameters.clone());
