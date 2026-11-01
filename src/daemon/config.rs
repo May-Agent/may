@@ -244,9 +244,6 @@ async fn run_save_full_config(state: Arc<DaemonState>, req: UiFullConfig) -> Sky
             }),
         };
         next_browser_config.validate().map_err(bad_request_error)?;
-        crate::container::browser::prepare_browser_runtime(&next_browser_config, &state.may_dir)
-            .await
-            .map_err(internal_error)?;
         Some(Arc::new(
             crate::container::browser::BrowserManager::new(
                 next_browser_config,
