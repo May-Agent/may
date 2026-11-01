@@ -278,6 +278,22 @@ impl EventHandler {
         self.rx.recv().await.ok()
     }
 
+    /// A queued key, paste, mouse, or resize, skipping coalesced ticks.
+    ///
+    /// The main loop takes this before waiting on a ready agent event so a
+    /// thinking stream cannot starve typing and Esc. Ticks are heartbeats;
+    /// dropping a backlog of them is correct.
+    #[must_use]
+    pub fn try_recv_input(&self) -> Option<AppEvent> {
+        loop {
+            match self.rx.try_recv() {
+                Ok(AppEvent::Tick) => {}
+                Ok(event) => return Some(event),
+                Err(_) => return None,
+            }
+        }
+    }
+
     /// Events queued behind the receiver — a growing backlog during a
     /// scroll burst means the loop cannot keep up with input.
     #[must_use]
@@ -289,5 +305,51 @@ impl EventHandler {
 impl Default for EventHandler {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pair() -> (EventHandler, EventSender) {
+        let (tx, rx) = async_channel::unbounded();
+        (EventHandler { rx, tx: tx.clone() }, tx)
+    }
+
+    #[test]
+    fn try_recv_input_skips_ticks_and_returns_a_key() {
+        let (handler, tx) = pair();
+        tx.send_blocking(AppEvent::Tick).unwrap();
+        tx.send_blocking(AppEvent::Tick).unwrap();
+        tx.send_blocking(AppEvent::Key(KeyCode::Char('a'), KeyModifiers::NONE))
+            .unwrap();
+        let event = handler.try_recv_input().expect("key");
+        assert!(matches!(event, AppEvent::Key(KeyCode::Char('a'), _)));
+        assert!(handler.try_recv_input().is_none());
+    }
+
+    #[test]
+    fn try_recv_input_is_none_when_only_ticks_are_queued() {
+        let (handler, tx) = pair();
+        tx.send_blocking(AppEvent::Tick).unwrap();
+        tx.send_blocking(AppEvent::Tick).unwrap();
+        assert!(handler.try_recv_input().is_none());
+    }
+
+    #[test]
+    fn try_recv_input_returns_paste_ahead_of_later_keys() {
+        let (handler, tx) = pair();
+        tx.send_blocking(AppEvent::Paste("hi".into())).unwrap();
+        tx.send_blocking(AppEvent::Key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert!(matches!(
+            handler.try_recv_input(),
+            Some(AppEvent::Paste(text)) if text == "hi"
+        ));
+        assert!(matches!(
+            handler.try_recv_input(),
+            Some(AppEvent::Key(KeyCode::Esc, _))
+        ));
     }
 }

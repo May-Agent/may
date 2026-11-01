@@ -822,54 +822,62 @@ where
 
         tracing::info!("entering select");
 
-        // Use futures_lite::future::or chain
-        let event = futures_lite::future::or(
-            async {
-                match worker_build.as_mut() {
-                    Some(pending) => Some(Event::WorkerBuilt(Box::new(pending.build.wait().await))),
-                    None => futures_lite::future::pending().await,
-                }
-            },
+        // A queued key/paste/mouse/resize beats a ready agent event: a
+        // thinking stream keeps `handle.recv()` ready, and `future::or`
+        // would otherwise never take the Terminal branch.
+        let event = if let Some(ev) = events.try_recv_input() {
+            Some(Event::Terminal(Box::new(ev)))
+        } else {
             futures_lite::future::or(
                 async {
-                    if let Some(ref handle) = agent_handle {
-                        let result = handle.recv().await;
-                        tracing::info!("agent handle.recv() RETURNED");
-                        result.map(Event::Agent)
-                    } else if let Some(worker) = worker.as_ref() {
-                        // A turn another client started, rendered
-                        // while this TUI has none of its own.
-                        worker.next_foreign_turn().await.map(Event::ForeignTurn)
-                    } else {
-                        futures_lite::future::pending().await
+                    match worker_build.as_mut() {
+                        Some(pending) => {
+                            Some(Event::WorkerBuilt(Box::new(pending.build.wait().await)))
+                        }
+                        None => futures_lite::future::pending().await,
                     }
                 },
                 futures_lite::future::or(
                     async {
-                        if let Some(ref handle) = context_handle {
-                            // None means the report channel closed —
-                            // surface it as an event so the handle is
-                            // cleared instead of quitting the loop.
-                            Some(Event::Context(handle.recv().await))
+                        if let Some(ref handle) = agent_handle {
+                            let result = handle.recv().await;
+                            tracing::info!("agent handle.recv() RETURNED");
+                            result.map(Event::Agent)
+                        } else if let Some(worker) = worker.as_ref() {
+                            // A turn another client started, rendered
+                            // while this TUI has none of its own.
+                            worker.next_foreign_turn().await.map(Event::ForeignTurn)
                         } else {
                             futures_lite::future::pending().await
                         }
                     },
-                    async {
-                        let result = events.next().await;
-                        // Don't log ticks, too noisy
-                        if !matches!(result, Some(AppEvent::Tick)) {
-                            tracing::info!(
-                                "events.next() RETURNED: {:?}",
-                                result.as_ref().map(|_| "event")
-                            );
-                        }
-                        result.map(|event| Event::Terminal(Box::new(event)))
-                    },
+                    futures_lite::future::or(
+                        async {
+                            if let Some(ref handle) = context_handle {
+                                // None means the report channel closed —
+                                // surface it as an event so the handle is
+                                // cleared instead of quitting the loop.
+                                Some(Event::Context(handle.recv().await))
+                            } else {
+                                futures_lite::future::pending().await
+                            }
+                        },
+                        async {
+                            let result = events.next().await;
+                            // Don't log ticks, too noisy
+                            if !matches!(result, Some(AppEvent::Tick)) {
+                                tracing::info!(
+                                    "events.next() RETURNED: {:?}",
+                                    result.as_ref().map(|_| "event")
+                                );
+                            }
+                            result.map(|event| Event::Terminal(Box::new(event)))
+                        },
+                    ),
                 ),
-            ),
-        )
-        .await;
+            )
+            .await
+        };
 
         tracing::info!(
             "select completed, event type: {}",
