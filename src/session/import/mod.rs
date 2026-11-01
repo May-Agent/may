@@ -89,6 +89,32 @@ pub enum ImportError {
     },
 }
 
+/// One foreign transcript as it appears in the resume picker.
+#[derive(Debug, Clone)]
+pub struct ForeignSessionSummary {
+    /// Foreign session id (Claude: jsonl file stem).
+    pub id: String,
+    /// Transcript path; passed back to [`import`] as the query.
+    pub path: PathBuf,
+    /// Working directory recorded in the transcript, when found.
+    pub cwd: Option<String>,
+    /// First real user prompt, truncated for the picker.
+    pub title: String,
+    /// File mtime, used to sort newest first.
+    pub modified: Option<Timestamp>,
+}
+
+/// List Claude Code transcripts under `~/.claude/projects`.
+///
+/// Only top-level `<project>/<id>.jsonl` files are included; nested
+/// subagent jsonl is skipped. Each file is peeked, not fully parsed.
+#[must_use]
+pub fn list_claude_sessions() -> Vec<ForeignSessionSummary> {
+    dirs::home_dir().map_or_else(Vec::new, |home| {
+        claude::list(&home.join(".claude/projects"))
+    })
+}
+
 /// A transcript translated into May's session format.
 #[derive(Debug)]
 pub struct ImportedTranscript {
@@ -302,19 +328,7 @@ pub(super) const fn user_text(
 pub(super) fn derive_title(source: ForeignAgent, messages: &[ChatMessage]) -> String {
     let first = messages
         .iter()
-        .find(|m| {
-            m.role == MessageRole::User
-                && ![
-                    "This session is being continued from a previous conversation",
-                    "<task-notification",
-                    "<local-command",
-                    "<command-name",
-                    "<command-message",
-                    "<command-args",
-                ]
-                .iter()
-                .any(|prefix| m.content.starts_with(prefix))
-        })
+        .find(|m| m.role == MessageRole::User && is_title_user_text(&m.content))
         .map_or("imported session", |m| m.content.as_str());
     let line = first.lines().next().unwrap_or(first).trim();
     let truncated: String = line.chars().take(60).collect();
@@ -324,4 +338,18 @@ pub(super) fn derive_title(source: ForeignAgent, messages: &[ChatMessage]) -> St
         truncated
     };
     format!("[{}] {truncated}", source.label())
+}
+
+/// User text that can title an imported session: skip compaction
+/// preambles and local-command XML the human never typed.
+pub(super) fn is_title_user_text(text: &str) -> bool {
+    const SKIP: &[&str] = &[
+        "This session is being continued from a previous conversation",
+        "<task-notification",
+        "<local-command",
+        "<command-name",
+        "<command-message",
+        "<command-args",
+    ];
+    !SKIP.iter().any(|prefix| text.starts_with(prefix))
 }

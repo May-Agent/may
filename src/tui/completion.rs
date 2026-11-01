@@ -58,7 +58,7 @@ pub static SLASH_COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/resume-claude",
-        "Import a Claude Code transcript into a new session",
+        "Import a Claude Code session (opens picker)",
     ),
     (
         "/secret",
