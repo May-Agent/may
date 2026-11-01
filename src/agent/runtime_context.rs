@@ -526,7 +526,7 @@ pub fn build_terminal_runtime_context(
             "/outputs - durable overflow and full command outputs".to_string(),
             "/data - durable session-owned state".to_string(),
             "/skills, /subagents - read-only profile mounts".to_string(),
-            "tasks.md - canonical task/plan document for long-running work; keep its checklist in sync with progress. An item waiting on an open ask_user question or on anything else the run cannot resolve is marked `BLOCKING <request_id or reason>` — it waits for what it names instead of holding the turn open".to_string(),
+            "tasks.md - canonical task/plan document for long-running work; keep its checklist in sync with progress. An item waiting on an open ask_user question or on anything else the run cannot resolve is marked `BLOCKING <request_id or reason>` — it waits for what it names instead of holding the turn open; a mark naming a request that is no longer open does not hold".to_string(),
         ],
         command_rules: vec![
             "Issue at most one tool call per assistant turn; compose multiple operations inside one terminal command with shell control flow, pipelines, or background jobs.".to_string(),
