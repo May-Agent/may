@@ -3130,6 +3130,7 @@ mod tests {
             "call-1",
             vec![crate::file_tracker::RootDiff {
                 root: std::path::PathBuf::from("/repo"),
+                label: None,
                 changes: vec![crate::file_tracker::FileStat {
                     path: std::path::PathBuf::from("a.txt"),
                     additions: 2,
@@ -3642,6 +3643,7 @@ mod tests {
             };
             *diffs = vec![crate::file_tracker::RootDiff {
                 root: std::path::PathBuf::from("/tmp/root"),
+                label: None,
                 changes: vec![crate::file_tracker::FileStat {
                     path: std::path::PathBuf::from("a.txt"),
                     additions: 12,
