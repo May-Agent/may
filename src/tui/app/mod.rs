@@ -60,8 +60,8 @@ pub use aither_agent::{AgentError, AgentEvent, TimedEvent};
 
 use super::state::{
     ActiveTextInput, AppMode, AskUserState, ChatgptAuthStatus, ConfigEditMode, ConfigState,
-    CopilotAuthStatus, ImageViewState, McpAddMode, PasteFilter, SelectionPoint, SkillAddMode,
-    SshAddMode, StatusNotice, TextSelection, detect_api_key_from_env,
+    CopilotAuthStatus, ImageViewState, McpAddMode, PasteFilter, QuitConfirmState, SelectionPoint,
+    SkillAddMode, SshAddMode, StatusNotice, TextSelection, detect_api_key_from_env,
 };
 
 /// Screen rect an inline image was painted into last frame — hit-tested on
@@ -1525,6 +1525,7 @@ impl App {
         self.chat_layout = super::ui::chat_layout::ChatLayout::default();
         self.jobs.clear();
         self.jobs_selected = 0;
+        self.session_runtime = crate::client::SessionRuntimeSnapshot::default();
         self.image_cache.clear();
         self.image_fetching.clear();
         self.image_failed.clear();
@@ -1614,6 +1615,29 @@ impl App {
     /// Show a status notice that clears itself after [`STATUS_NOTICE_TTL`].
     pub fn set_transient_status(&mut self, text: impl Into<String>) {
         self.status = Some(StatusNotice::transient(text, STATUS_NOTICE_TTL));
+    }
+
+    /// Whether an agent run is still in flight for the current session —
+    /// a turn this client follows or one the daemon reports.
+    #[must_use]
+    pub const fn agent_busy(&self) -> bool {
+        self.processing || !self.session_runtime.state.is_idle()
+    }
+
+    /// Answer a quit request: quits at once when no run is in flight, and
+    /// asks first what happens to a busy session's agent. A quit request
+    /// repeated while the dialog is up leaves the agent running.
+    fn request_quit(&mut self) -> Option<SendAction> {
+        if matches!(self.mode, AppMode::QuitConfirm(_)) || !self.agent_busy() {
+            return Some(SendAction::Quit);
+        }
+        self.quit_pending = false;
+        self.status = None;
+        let return_to = std::mem::replace(&mut self.mode, AppMode::Chat);
+        self.mode = AppMode::QuitConfirm(QuitConfirmState {
+            return_to: Box::new(return_to),
+        });
+        None
     }
 
     /// Text for the status line; `None` once a transient notice's deadline
@@ -1809,7 +1833,7 @@ impl App {
 
                     // Double-press Ctrl+C to quit
                     if self.quit_pending {
-                        return Ok(Some(SendAction::Quit));
+                        return Ok(self.request_quit());
                     }
                     // First Ctrl+C: clear input and show exit hint
                     self.quit_pending = true;
@@ -1821,7 +1845,7 @@ impl App {
                     self.set_status("^C Press Ctrl+C again to exit");
                     return Ok(None);
                 }
-                KeyCode::Char('q') => return Ok(Some(SendAction::Quit)),
+                KeyCode::Char('q') => return Ok(self.request_quit()),
                 // Ctrl+V pastes the system clipboard through the same path
                 // as a terminal paste; bound globally so every text input
                 // can use it.
@@ -1909,6 +1933,9 @@ impl App {
             AppMode::ImageView(_) => Ok(super::reducer::navigation::handle_image_view_key(
                 self, code,
             )),
+            AppMode::QuitConfirm(_) => {
+                Ok(super::reducer::manage::handle_quit_confirm_key(self, code))
+            }
         }
     }
 
@@ -2625,7 +2652,7 @@ impl App {
                 self.cursor = self.input_char_count;
                 None
             }
-            "/quit" => Some(SendAction::Quit),
+            "/quit" => self.request_quit(),
             "/compact" => Some(SendAction::Compact(None)),
             "/context" => Some(SendAction::ContextReport),
             "/context dump" => Some(SendAction::ContextDump),
@@ -3450,6 +3477,8 @@ fn pretty_arguments(arguments: &str) -> Vec<String> {
 pub enum SendAction {
     /// User wants to quit.
     Quit,
+    /// User wants the session's running agent stopped, then to quit.
+    StopAgentAndQuit,
     /// User wants to create a new session.
     NewSession,
     /// User wants to load an existing session.

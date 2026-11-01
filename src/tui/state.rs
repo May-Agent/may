@@ -55,6 +55,8 @@ pub enum AppMode {
     Btw(BtwState),
     /// Zoomed image overlay (click an inline image to open)
     ImageView(ImageViewState),
+    /// Quit confirmation shown while the session's agent still runs
+    QuitConfirm(QuitConfirmState),
 }
 
 /// State for the zoomed image overlay.
@@ -94,8 +96,17 @@ impl AppMode {
             Self::JobDetail(_) => "job-detail",
             Self::Btw(_) => "btw",
             Self::ImageView(_) => "image-view",
+            Self::QuitConfirm(_) => "quit-confirm",
         }
     }
+}
+
+/// State of the quit confirmation: the screen the user was on when they
+/// asked to quit, restored when they cancel it.
+#[derive(Debug)]
+pub struct QuitConfirmState {
+    /// Mode to go back to when the quit is cancelled.
+    pub return_to: Box<AppMode>,
 }
 
 /// `/btw` overlay state: type a question, stream a one-off answer.
