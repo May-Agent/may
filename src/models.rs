@@ -405,6 +405,16 @@ pub fn same_selectable_model(a: &str, b: &str) -> bool {
         && effort_family_base(a.model_id()) == effort_family_base(b.model_id())
 }
 
+/// Position of `rung` on the canonical effort order (`none` … `max`),
+/// for sorting a family's served rungs.
+#[must_use]
+pub fn effort_rung_rank(rung: &str) -> usize {
+    EFFORT_UID_TOKENS
+        .iter()
+        .position(|token| *token == rung)
+        .unwrap_or(usize::MAX)
+}
+
 /// The effort rung a catalog uid expresses, if it carries one
 /// (`o4-mini-high-lightning` → `high`).
 #[must_use]
@@ -427,7 +437,7 @@ pub fn effort_uid_token(model_id: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::same_selectable_model;
+    use super::{effort_rung_rank, same_selectable_model};
 
     #[test]
     fn same_model_matches_across_effort_rungs_on_one_provider() {
@@ -449,5 +459,12 @@ mod tests {
     fn unparseable_selectors_only_match_exactly() {
         assert!(same_selectable_model("o4-mini-high", "o4-mini-high"));
         assert!(!same_selectable_model("o4-mini-high", "o4-mini"));
+    }
+
+    #[test]
+    fn effort_rung_rank_orders_the_ladder() {
+        let mut rungs = vec!["max", "medium", "high"];
+        rungs.sort_by_key(|rung| effort_rung_rank(rung));
+        assert_eq!(rungs, ["medium", "high", "max"]);
     }
 }

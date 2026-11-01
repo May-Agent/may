@@ -63,6 +63,23 @@ pub struct PendingMessage {
     pub display: Option<String>,
 }
 
+impl PendingMessage {
+    /// A daemon-reported queued message as a display row: the preview
+    /// renders content and delivery mode; its attachments stay server-side
+    /// until the turn it starts writes them to history.
+    #[must_use]
+    pub fn from_wire(msg: &crate::session::PendingUserMessage) -> Self {
+        Self {
+            content: msg.content.clone(),
+            hidden_context_xml: msg.hidden_context_xml.clone(),
+            attachments: Vec::new(),
+            queued_at: msg.created_at.parse().unwrap_or_else(|_| Timestamp::now()),
+            delivery_mode: msg.delivery_mode,
+            display: None,
+        }
+    }
+}
+
 /// Message queue for concurrent user input.
 #[derive(Debug, Default)]
 pub struct MessageQueue {

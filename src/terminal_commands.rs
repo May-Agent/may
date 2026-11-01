@@ -134,6 +134,10 @@ where
     if !config.request_parameters.hosted_web_fetch() {
         register_tool_with_description(builder, &mut descriptions, WebFetchTool::new());
     }
+    let screen_llm = config
+        .ask_fast
+        .clone()
+        .unwrap_or_else(|| config.llm.clone());
     let ask_command = AskCommand::new(config.ask_fast.unwrap_or_else(|| config.llm.clone()))
         .with_flagship(config.ask_flagship.unwrap_or_else(|| config.llm.clone()))
         .with_balanced(config.ask_balanced.unwrap_or_else(|| config.llm.clone()));
@@ -176,12 +180,18 @@ where
     describe_tool(&mut descriptions, &issue_tool);
     builder.configure_role_tools(issue_tool, subagent_issue_tool);
 
+    let screen: Arc<crate::pr::ScreenFn> = Arc::new(move |title: &str, body: &str| {
+        let llm = screen_llm.clone();
+        let (title, body) = (title.to_string(), body.to_string());
+        Box::pin(async move { crate::pr::screen_with_llm(&llm, &title, &body).await })
+    });
     let pr_context = crate::pr::PrContext {
         db: config.db.clone(),
         session_id: config.session_id.clone(),
         session_root: config.sandbox_dir.clone(),
         cwd: config.cwd.clone(),
         workspace_config: config.workspace_config.clone(),
+        screen: Some(screen),
     };
     let pr_tool = PrTool::new(pr_context.clone());
     let subagent_pr_tool = SubagentPrTool::new(pr_context);

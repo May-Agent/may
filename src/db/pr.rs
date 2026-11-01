@@ -103,13 +103,14 @@ impl ChatDb {
         backend: &str,
         auto_merge: bool,
         issue_number: Option<i64>,
+        external_number: Option<i64>,
     ) -> Result<PrRow, ChatDbError> {
         let project_id = self.ensure_issue_project(repo_key).await?;
         let now = jiff::Timestamp::now().to_string();
         let mut tx = self.db.begin().await?;
         query!(
             tx,
-            "INSERT INTO prs (project_id, number, session_id, title, body, state, branch, base_sha, backend, auto_merge, issue_number, created_at, updated_at) SELECT ?, COALESCE(MAX(number), 0) + 1, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ? FROM prs WHERE project_id = ?",
+            "INSERT INTO prs (project_id, number, session_id, title, body, state, branch, base_sha, backend, external_number, auto_merge, issue_number, created_at, updated_at) SELECT ?, COALESCE(MAX(number), 0) + 1, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?, ? FROM prs WHERE project_id = ?",
             project_id,
             session_id,
             title,
@@ -117,6 +118,7 @@ impl ChatDb {
             branch,
             base_sha,
             backend,
+            external_number,
             auto_merge,
             issue_number,
             now.clone(),
