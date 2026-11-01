@@ -32,6 +32,16 @@ import { profilePath, profileSessionPath, useActiveProfile } from '@/lib/profile
 
 export type SessionNodeKind = 'pinned' | 'regular' | 'archived' | 'folder-child';
 
+/** Display label for a repo binding: `owner/repo` for github: specs, the
+ * path basename for local: keys. */
+function repoLabel(repo: string): string {
+  if (repo.startsWith('github:')) {
+    return repo.slice(7);
+  }
+  const rest = repo.startsWith('local:') ? repo.slice(6) : repo;
+  return rest.split('/').filter(Boolean).pop() ?? rest;
+}
+
 interface SessionNodeProps {
   id: string;
   title: string;
@@ -40,6 +50,7 @@ interface SessionNodeProps {
   active: boolean;
   inFolder?: boolean;
   indent?: boolean;
+  repo?: string | null;
 }
 
 /** One source-list row: the chat's title, its state, and an actions menu. */
@@ -51,6 +62,7 @@ export function SessionNode({
   active,
   inFolder,
   indent,
+  repo,
 }: SessionNodeProps) {
   const { profileId } = useActiveProfile();
   const href = profileId ? profileSessionPath(profileId, id) : `/s/${id}`;
@@ -66,6 +78,11 @@ export function SessionNode({
         )}
       >
         <span className="flex-1 truncate">{title}</span>
+        {repo && (
+          <span className="max-w-24 truncate text-[10px] text-muted-foreground/70" title={repo}>
+            {repoLabel(repo)}
+          </span>
+        )}
         <RuntimePhaseDot state={runtime?.state} />
       </Link>
       <SessionNodeMenu id={id} title={title} kind={kind} inFolder={inFolder ?? false} active={active} />
