@@ -477,6 +477,9 @@ pub struct CreateSessionRequest {
     /// Host directory the session works in.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// Repository to bind: `owner/repo`, a local path, or none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
 }
 
 /// `PUT /api/sessions/{id}` request body.
@@ -495,6 +498,9 @@ pub struct UpdateSessionRequest {
     /// Host directory the session works in.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// Repository to bind: `owner/repo`, a local path, or none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
     /// One-shot/non-interactive flag.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub non_interactive: Option<bool>,
@@ -525,6 +531,9 @@ pub struct WireSession {
     /// Reasoning effort override, if any.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// Repository binding, if any.
+    #[serde(default)]
+    pub repo: Option<String>,
 }
 
 #[cfg(test)]
