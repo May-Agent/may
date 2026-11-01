@@ -238,7 +238,7 @@ impl SessionRuntimeService {
         loop {
             let runtime = self.get(session_id).await?;
             if !self.runs.is_held(session_id) {
-                if !runtime.state.is_active() || runtime.interactions.is_active() {
+                if !runtime.state.is_executing() || runtime.interactions.is_active() {
                     return Ok(runtime);
                 }
                 match self.runs.acquire(session_id).await {
