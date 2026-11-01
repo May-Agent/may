@@ -71,6 +71,8 @@ pub mod repo_clone;
 pub mod repo_search;
 /// Scheduled task execution.
 pub mod scheduler;
+/// Repository trust: the first-contact decision, resolved per repo.
+pub mod trust;
 
 pub mod secrets;
 /// Session model, history, and on-disk layout.
