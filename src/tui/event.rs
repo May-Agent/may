@@ -83,6 +83,13 @@ pub enum AppEvent {
         /// Session title as stored (the daemon generates it).
         title: Option<String>,
     },
+    /// The session's PRs, as the daemon served them.
+    SidebarPrs {
+        /// Session the PRs belong to.
+        session_id: String,
+        /// PR list entries.
+        prs: Vec<crate::client::WirePr>,
+    },
     /// Lookups of issues the session's tasks link.
     SidebarIssues {
         /// Session the tasks belong to.
@@ -173,6 +180,7 @@ impl AppEvent {
             Self::EffortApplied(_) => "effort_applied",
             Self::ImageDecoded { .. } => "image_decoded",
             Self::SidebarTasks { .. } => "sidebar_tasks",
+            Self::SidebarPrs { .. } => "sidebar_prs",
             Self::SidebarIssues { .. } => "sidebar_issues",
             Self::BackgroundLoaded { .. } => "background_loaded",
             Self::Status(_) => "status",
