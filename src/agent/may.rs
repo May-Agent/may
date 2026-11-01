@@ -454,14 +454,43 @@ impl MayAgent {
         if let Some(worktree) = crate::repo_search::worktree_root(&config.cwd)
             && let Ok(repo_key) = crate::issue::repository_identity(&worktree)
         {
-            match session_repos.ensure_local_clone(&worktree, &repo_key).await {
-                Ok(clone_path) => repo_clones.push(RepoCloneEntry {
+            // The first-contact trust decision picks the binding: GitHub
+            // trust clones the remote (cloud is the source of truth), local
+            // trust clones the checkout, undecided binds nothing yet — the
+            // question is posted once the session runtime exists below.
+            let trust = crate::trust::trust_for(&workspace.config, &repo_key, &worktree);
+            let clone = match trust {
+                Some(crate::trust::TrustLevel::Full | crate::trust::TrustLevel::PrsOnly) => {
+                    Some(match crate::trust::repo_kind(&worktree) {
+                        crate::trust::RepoKind::Github { owner_repo } => {
+                            match crate::trust::remote_url(&worktree) {
+                                Some(url) => {
+                                    session_repos.ensure_remote_clone(&url, &owner_repo).await
+                                }
+                                None => {
+                                    session_repos.ensure_local_clone(&worktree, &repo_key).await
+                                }
+                            }
+                        }
+                        crate::trust::RepoKind::Git => {
+                            session_repos.ensure_local_clone(&worktree, &repo_key).await
+                        }
+                    })
+                }
+                Some(crate::trust::TrustLevel::Local) => {
+                    Some(session_repos.ensure_local_clone(&worktree, &repo_key).await)
+                }
+                None => None,
+            };
+            match clone {
+                Some(Ok(clone_path)) => repo_clones.push(RepoCloneEntry {
                     clone_path,
                     source: crate::fs_utils::display_path(&worktree),
                 }),
-                Err(error) => {
+                Some(Err(error)) => {
                     tracing::warn!(%error, "failed to create session repo clone");
                 }
+                None => {}
             }
         }
         runtime_system_context =
@@ -523,6 +552,20 @@ impl MayAgent {
             .cache_lifetime(config.cache_lifetime.into())
             .background_jobs(config.background_jobs);
         if let Some(runtime) = hook_runtime.clone() {
+            // First-contact: an unknown repository asks once; the answer
+            // persists through `repo trust set` and later sessions reuse it.
+            if let Some(worktree) = crate::repo_search::worktree_root(&config.cwd)
+                && let Ok(repo_key) = crate::issue::repository_identity(&worktree)
+                && crate::trust::trust_for(&workspace.config, &repo_key, &worktree).is_none()
+            {
+                let kind = crate::trust::repo_kind(&worktree);
+                let _ = runtime
+                    .open_question(
+                        config.session_id.as_str(),
+                        &crate::trust::question_for(&kind, &worktree),
+                    )
+                    .await;
+            }
             builder = builder
                 .context_source(super::ask_user_tool::OpenQuestionsContext::new(
                     runtime.clone(),

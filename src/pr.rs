@@ -187,6 +187,12 @@ impl PrStore {
         }
         let repo_key = crate::issue::repository_identity(&worktree)
             .map_err(|e| PrError::Resolve(format!("repository identity: {e}")))?;
+        // First-contact gate: no binding before a persisted trust decision.
+        if crate::trust::trust_for(&self.context.workspace_config, &repo_key, &worktree).is_none() {
+            return Err(PrError::Resolve(
+                "repository trust undecided — answer the repo-trust question, or run `repo trust set <full|prs-only|local>`".to_string(),
+            ));
+        }
         let dir = self.repos.ensure_local_clone(&worktree, &repo_key).await?;
         let record = self
             .repos

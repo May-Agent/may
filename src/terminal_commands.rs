@@ -17,6 +17,7 @@ use crate::agent::issue_tool::{IssueTool, SubagentIssueTool};
 use crate::agent::notify_tool::{NotifyBroker, NotifyTool};
 use crate::agent::pr_tool::{PrTool, SubagentPrTool};
 use crate::agent::register_tool::{RegisterBroker, RegisterTool, Skills, Subagents};
+use crate::agent::repo_tool::{RepoContext, RepoTool, SubagentRepoTool};
 use crate::agent::session_tool::SessionTool;
 use crate::agent::subagent_tracker::{SubagentTracker, TrackedSubagentTool, UsageObservedModel};
 use crate::agent::task_tool::{TaskBroker, TaskRuntimeKind, TaskTool};
@@ -197,6 +198,16 @@ where
     let subagent_pr_tool = SubagentPrTool::new(pr_context);
     describe_tool(&mut descriptions, &pr_tool);
     builder.configure_role_tools(pr_tool, subagent_pr_tool);
+
+    let repo_context = RepoContext {
+        cwd: config.cwd.clone(),
+        session_root: config.sandbox_dir.clone(),
+        workspace_config: config.workspace_config.clone(),
+    };
+    let repo_tool = RepoTool::new(repo_context.clone());
+    let subagent_repo_tool = SubagentRepoTool::new(repo_context);
+    describe_tool(&mut descriptions, &repo_tool);
+    builder.configure_role_tools(repo_tool, subagent_repo_tool);
 
     if let Some(runtime) = config.ask_user {
         let ask_user = AskUserTool::new(runtime.clone(), config.session_id.clone());
