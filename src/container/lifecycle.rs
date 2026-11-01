@@ -370,6 +370,13 @@ impl ContainerManager {
         let mut env = vec![
             "TERM=xterm-256color".to_string(),
             format!("MAY_HOST_GATEWAY={host_gateway}"),
+            // `~` is the mounted session workspace, matching a local session's
+            // HOME; churn-heavy caches stay on the container's own filesystem.
+            format!("HOME={CONTAINER_WORKSPACE}"),
+            format!("XDG_CONFIG_HOME={CONTAINER_WORKSPACE}/.config"),
+            "XDG_CACHE_HOME=/root/.cache".to_string(),
+            "BUN_INSTALL_CACHE_DIR=/root/.cache/bun".to_string(),
+            format!("PYTHONPATH={CONTAINER_WORKSPACE}/skills/python"),
         ];
         env.extend(spec.env.iter().cloned());
         env
