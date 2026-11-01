@@ -253,11 +253,6 @@ pub struct RewindState {
     /// Cursor position; `targets.len()` is the trailing `(current)` entry,
     /// which selects nothing and simply closes the picker.
     pub selected: usize,
-    /// Prompt the scope submenu is open for, if any.
-    pub options_for: Option<usize>,
-    /// Cursor position in the scope submenu (0 = conversation only,
-    /// 1 = conversation and code).
-    pub option_selected: usize,
 }
 
 /// Per-question interaction state.

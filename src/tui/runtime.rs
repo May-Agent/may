@@ -765,6 +765,24 @@ impl RuntimeDeps {
         app.input_char_count = app.input.chars().count();
         app.cursor = app.input_char_count;
         app.attachments = attachments;
+        // The next send carries a one-shot notice: the conversation rolled
+        // back while the world — open and merged PRs — stands. The audit
+        // log already recorded a `rewound` event per session PR.
+        let mut notice =
+            "The conversation was rewound to an earlier point. Nothing outside the conversation changed — repository state, open and merged pull requests, and issues still stand as recorded. Undo landed code through a revert PR, never by rewriting history.".to_string();
+        let prs = &app.sidebar.prs;
+        if !prs.is_empty() {
+            let list = prs
+                .iter()
+                .map(|pr| format!("#{} {} ({})", pr.number, pr.title, pr.state))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = std::fmt::Write::write_fmt(
+                &mut notice,
+                format_args!(" Session pull requests: {list}."),
+            );
+        }
+        app.rewind_notice = crate::xml::XmlBlock::parse(notice).ok();
         app.chat.push_notice(&format!(
             "⏪ rewound to before this prompt{}",
             if restore_code {
