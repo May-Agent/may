@@ -248,9 +248,29 @@ fn encode_png(img: &image::RgbaImage) -> Result<Vec<u8>, ImageError> {
     Ok(png_data)
 }
 
+/// macOS: POSIX path of a file URL on the pasteboard.
+///
+/// Finder copies of files (including iCloud Drive) put `public.file-url`
+/// plus often a `public.png` of the file *icon*. The icon must not win.
+#[cfg(target_os = "macos")]
+fn pasteboard_file_path() -> Option<PathBuf> {
+    use objc2_app_kit::NSPasteboard;
+    use objc2_foundation::{NSString, NSURL};
+
+    let pasteboard = NSPasteboard::generalPasteboard();
+    let data_type = NSString::from_str("public.file-url");
+    let url = pasteboard.stringForType(&data_type)?;
+    let nsurl = NSURL::URLWithString(&url)?;
+    let resolved = nsurl.filePathURL().unwrap_or(nsurl);
+    let path = resolved.path()?;
+    let path = PathBuf::from(path.to_string());
+    path.is_absolute().then_some(path)
+}
+
 /// macOS: read already-encoded image bytes straight off the pasteboard.
-/// Screenshots and copied files usually offer `public.png` or `public.jpeg`,
+/// Screenshots and in-app copies usually offer `public.png` or `public.jpeg`,
 /// which skips the decode → RGBA → re-encode round trip entirely.
+/// Finder file copies are handled by [`pasteboard_file_path`] instead.
 #[cfg(target_os = "macos")]
 fn pasteboard_image() -> Option<ClipboardImage> {
     use objc2_app_kit::NSPasteboard;
@@ -332,17 +352,51 @@ pub fn get_clipboard_text() -> Result<Option<String>, ImageError> {
     }
 }
 
+/// If `text` names an image file, read it; otherwise `None` (treat as text).
+/// A missing or unreadable path is text, not a clipboard error.
+fn image_from_clipboard_text(text: &str) -> Result<Option<ClipboardImage>, ImageError> {
+    let Some(path) = pasted_image_path_candidate(text) else {
+        return Ok(None);
+    };
+    match read_pasted_image_file(&path) {
+        Ok(image) => Ok(image),
+        Err(ImageError::Io(_)) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// Try to read from the clipboard, preferring images over text.
+///
+/// A Finder file copy is resolved from its file URL (the file's bytes), not
+/// from the pasteboard PNG — that PNG is often the document icon.
+/// Clipboard text that is a path to an image file is read the same way a
+/// terminal paste of that path is.
 ///
 /// # Errors
 ///
 /// Returns [`ImageError`] when reading the clipboard image or text fails.
 pub fn read_clipboard() -> Result<ClipboardPasteResult, ImageError> {
+    #[cfg(target_os = "macos")]
+    if let Some(path) = pasteboard_file_path() {
+        if let Ok(Some(image)) = read_pasted_image_file(&path) {
+            return Ok(ClipboardPasteResult::image(image));
+        }
+        // Not an image, or the file could not be read. Skip the icon PNG
+        // and surface the path as text.
+        if let Some(text) = get_clipboard_text()? {
+            return Ok(ClipboardPasteResult::text(text));
+        }
+        return Ok(ClipboardPasteResult::empty());
+    }
+
     if let Some(image) = get_clipboard_image()? {
         return Ok(ClipboardPasteResult::image(image));
     }
 
     if let Some(text) = get_clipboard_text()? {
+        if let Some(image) = image_from_clipboard_text(&text)? {
+            return Ok(ClipboardPasteResult::image(image));
+        }
         return Ok(ClipboardPasteResult::text(text));
     }
 
@@ -578,6 +632,29 @@ mod tests {
         assert_eq!(pasted_image_path_candidate("https://x/y.png"), None);
         assert_eq!(pasted_image_path_candidate("relative/dir"), None);
         assert_eq!(pasted_image_path_candidate("a\nb.png"), None);
+    }
+
+    #[test]
+    fn image_from_clipboard_text_reads_an_image_file() {
+        let png = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0];
+        let path = std::env::temp_dir().join("may-clipboard-text-png.png");
+        std::fs::write(&path, png).expect("write temp png");
+        let image = image_from_clipboard_text(path.to_str().expect("utf-8 path"))
+            .expect("read")
+            .expect("image");
+        assert_eq!(image.format, ImageFormat::Png);
+        assert_eq!(image.data, png);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn image_from_clipboard_text_ignores_plain_text_and_missing_files() {
+        assert!(image_from_clipboard_text("hello").unwrap().is_none());
+        assert!(
+            image_from_clipboard_text("/tmp/may-clipboard-missing-nope.png")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
