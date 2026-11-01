@@ -117,6 +117,8 @@ pub struct Session {
     pub updated_at: Timestamp,
     /// Whether this session has been persisted to disk.
     pub persisted: bool,
+    /// Repository the session is bound to, when one was named at launch.
+    pub repo: Option<String>,
 }
 
 /// Summary of a session for listing.
@@ -151,6 +153,10 @@ pub struct SessionSummary {
     /// Optional per-session reasoning/thinking override ("low"|"medium"|"high").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Repository binding: `github:owner/repo`, a local repository key, or
+    /// `None` for a repo-less chat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
     /// Persisted runtime summary for refresh-safe UI state.
     #[serde(
         default,
@@ -198,6 +204,7 @@ impl SessionSummary {
             updated_at,
             content_preview: s.preview.unwrap_or_default(),
             reasoning_effort: s.reasoning_effort,
+            repo: s.repo,
             runtime: SessionRuntimeSummary::default(),
         }
     }
@@ -427,6 +434,8 @@ pub struct SessionManager {
     current: Option<Session>,
     /// The currently active profile ID (sessions are created within this profile).
     current_profile_id: Option<String>,
+    /// Repository spec the next created session binds to; taken once.
+    pending_repo: Option<String>,
 }
 
 impl SessionManager {
@@ -447,8 +456,16 @@ impl SessionManager {
             daemon: None,
             current: None,
             current_profile_id: None,
+            pending_repo: None,
         };
         Ok(manager)
+    }
+
+    /// Bind the next created session to a repository spec
+    /// (`owner/repo` or a local path); consumed by the first session
+    /// created after the call.
+    pub fn set_pending_repo(&mut self, repo: Option<String>) {
+        self.pending_repo = repo;
     }
 
     /// Connect the manager to the daemon that owns session persistence.
@@ -516,6 +533,7 @@ impl SessionManager {
             created_at: now,
             updated_at: now,
             persisted: false,
+            repo: self.pending_repo.take(),
         };
 
         self.current = Some(session);
@@ -551,6 +569,7 @@ impl SessionManager {
                         model: model.clone(),
                         profile_id: profile_id.clone(),
                         cwd: None,
+                        repo: self.current.as_ref().and_then(|s| s.repo.clone()),
                     },
                 )
                 .await?;
@@ -633,6 +652,7 @@ impl SessionManager {
             created_at,
             updated_at,
             persisted: true,
+            repo: None,
         };
         *self.current.insert(session).history.messages_mut() = messages;
 
