@@ -756,13 +756,12 @@ impl AskUserApprover {
     /// cleared. Used when the daemon drains — no answer will ever arrive.
     pub(crate) async fn interrupt(&self, session_id: &str, request_id: &str) {
         self.live_responses.take(request_id);
-        if let Some(runtime) = &self.runtime_service {
-            if let Err(error) = runtime
+        if let Some(runtime) = &self.runtime_service
+            && let Err(error) = runtime
                 .clear_waiting_ask_user_request(session_id, request_id)
                 .await
-            {
-                tracing::warn!(%error, "failed to clear an interrupted ask-user request");
-            }
+        {
+            tracing::warn!(%error, "failed to clear an interrupted ask-user request");
         }
     }
 }
