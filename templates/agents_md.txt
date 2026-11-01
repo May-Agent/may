@@ -1,0 +1,13 @@
+{% if let Some(document) = root_document %}The launch directory's AGENTS.md{% if let Some(dir) = workdir %} ({{ dir }}){% endif %} is loaded below; its rules apply to all work on this project:
+{% if root_truncated %}(The file is truncated to fit the context budget — read it directly for the rest.)
+{% endif %}
+{{ document }}
+{% endif %}{% if !nested.is_empty() %}More AGENTS.md files exist under the launch directory, listed by relative path. They are not loaded here; each governs its own subtree. Before working under a listed path, read the AGENTS.md that covers it and follow its rules:
+{% for path in nested %}- {{ path }}
+{% endfor %}{% if extra_nested > 0 %}- … and {{ extra_nested }} more
+{% endif %}{% endif %}{% if !handoff_documents.is_empty() %}These AGENTS.md files were referenced by the compaction handoff and are loaded for you:
+{% for doc in handoff_documents %}{{ doc.path }}:
+{{ doc.content }}
+{% if doc.truncated %}(truncated — read the file for the rest)
+{% endif %}
+{% endfor %}{% endif %}When a compaction handoff is requested, reference every AGENTS.md the next turns still need as markdown links — the files are loaded from the handoff automatically.
