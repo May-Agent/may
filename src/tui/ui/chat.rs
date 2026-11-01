@@ -2975,8 +2975,8 @@ pub fn render_tool_fullscreen(frame: &mut Frame, area: Rect, display: &ToolDispl
 mod tests {
     use super::{
         ChatElement, ChatStream, InputContext, ToolCallImage, ToolDisplay, ToolStatus,
-        build_plain_wrapped_lines_unified, format_number, format_status_usage,
-        render_input_line, render_tool_inline, terminal_mode_marker,
+        build_plain_wrapped_lines_unified, format_number, format_status_usage, render_input_line,
+        render_tool_inline, terminal_mode_marker,
     };
     use crate::tui::queue::Attachment;
     use crate::tui::ui::streaming_markdown::IMAGE_HEIGHT;
