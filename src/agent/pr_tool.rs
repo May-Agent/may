@@ -18,6 +18,8 @@ use crate::pr::{PrContext, PrError, PrStore};
 /// - `pr list [--state open|merged|closed|all] [--repo key]`
 /// - `pr show <n> [--repo key]`
 /// - `pr close <n> [--repo key]`
+/// - `pr adopt <n> [--repo key]` — take over a PR whose session is gone
+///   (or still another's) so this session may merge or close it
 ///
 /// Writes are bound to this session's own PRs; reads are open.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -61,6 +63,13 @@ pub enum PrArgs {
         number: i64,
         /// Repo key or clone dir when several clones exist.
         #[serde(default)]
+        repo: Option<String>,
+    },
+    /// Take over a PR owned by a deleted (or other) session.
+    Adopt {
+        /// PR number.
+        number: i64,
+        /// `local:<path>` or `github:owner/repo`.
         repo: Option<String>,
     },
     /// Close an own, unmerged PR.
@@ -129,6 +138,7 @@ impl Tool for PrTool {
             }
             PrArgs::Show { number, repo } => self.store.show(number, repo.as_deref()).await,
             PrArgs::Close { number, repo } => self.store.close(number, repo.as_deref()).await,
+            PrArgs::Adopt { number, repo } => self.store.adopt(number, repo.as_deref()).await,
         };
         Ok(result.map_or_else(|e| ToolResult::text(e.to_string()), ToolResult::text))
     }
