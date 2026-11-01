@@ -115,10 +115,19 @@ impl SessionStore {
                 };
                 crate::bundle::Bundle::create_sandbox_home_symlinks(paths.root(), &symlink_root)
                     .await?;
+                let dot_may = paths.root().join(".may");
+                async_fs::create_dir_all(&dot_may).await?;
+                crate::bundle::Bundle::create_dir_symlink(
+                    &dot_may,
+                    &self.home_paths.memories_dir(),
+                    "memories",
+                )
+                .await?;
             }
             SandboxResourceLayout::ContainerMountPoints => {
                 Self::ensure_mount_point_dir(paths.root(), "skills").await?;
                 Self::ensure_mount_point_dir(paths.root(), "subagents").await?;
+                Self::ensure_mount_point_dir(paths.root(), ".may/memories").await?;
                 self.seed_session_scoped_resources(&paths, profile_id)
                     .await?;
             }
@@ -154,6 +163,7 @@ impl SessionStore {
         async_fs::create_dir_all(paths.artifacts_dir()).await?;
         Self::ensure_mount_point_dir(paths.root(), "skills").await?;
         Self::ensure_mount_point_dir(paths.root(), "subagents").await?;
+        Self::ensure_mount_point_dir(paths.root(), ".may/memories").await?;
         self.seed_session_scoped_resources(&paths, profile_id)
             .await?;
         Ok(())

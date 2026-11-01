@@ -358,12 +358,17 @@ impl MayAgent {
             .iter()
             .filter(|dir| dir.permission == crate::workspace::Permission::ReadOnly)
             .map(|dir| dir.path.clone());
+        // `~/.may/memories` is linked into the session's `~/.may`; it must be
+        // writable through the symlink, so it joins the grants.
+        let memories_dir = crate::session::MayHomePaths::new(config.may_dir.clone()).memories_dir();
+        async_fs::create_dir_all(&memories_dir).await.ok();
         let writable = workspace
             .config
             .workdirs
             .iter()
             .filter(|dir| dir.permission == crate::workspace::Permission::ReadWrite)
-            .map(|dir| dir.path.clone());
+            .map(|dir| dir.path.clone())
+            .chain(std::iter::once(memories_dir));
 
         // Create the terminal command tool in the sandbox dir.
         let terminal_tool: TerminalTool<TerminalPermissionHandler, DefaultExecutor> =
@@ -416,18 +421,19 @@ impl MayAgent {
             &ssh_servers,
         );
 
-        // Read global memory from the database.
-        let memory_content = config
-            .db
-            .get_global_memory()
+        // Read global memory from the memories directory sessions edit via
+        // the `~/.may/memories` link/mount.
+        let memory_file = crate::session::MayHomePaths::new(config.may_dir.clone()).memory_file();
+        let memory_content = async_fs::read_to_string(&memory_file)
             .await
             .unwrap_or_else(|error| {
-                tracing::error!(error = %error, "failed to load global memory from DB");
-                None
-            })
-            .unwrap_or_default();
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::error!(error = %error, "failed to load global memory file");
+                }
+                String::new()
+            });
         let mut runtime_system_context =
-            RuntimeSystemContext::new(config.db.clone(), memory_content.clone());
+            RuntimeSystemContext::new(memory_file, memory_content.clone());
         let terminal_runtime = build_terminal_runtime_context(
             &config,
             &session_paths,
@@ -1050,7 +1056,9 @@ impl MayAgent {
     }
 
     pub(crate) async fn sync_runtime_context(&mut self) {
-        self.runtime_system_context.sync_memory_content().await;
+        self.runtime_system_context
+            .sync_memory_content(self.inner.context_mut())
+            .await;
         self.runtime_system_context
             .reconcile(self.inner.context_mut());
     }
@@ -1128,7 +1136,7 @@ pub async fn test_agent(
     model_id: &str,
 ) -> (MayAgent, tempfile::TempDir) {
     let temp = tempfile::tempdir().expect("tempdir");
-    let db = crate::db::ChatDb::open(&temp.path().join("history.db"))
+    let _db = crate::db::ChatDb::open(&temp.path().join("history.db"))
         .await
         .expect("open test db");
     let session_id = SessionId::new();
@@ -1150,7 +1158,10 @@ pub async fn test_agent(
             model_id: model_id.to_string(),
             model_context_window: None,
             mcp_command_names: Vec::new(),
-            runtime_system_context: RuntimeSystemContext::new(db, String::new()),
+            runtime_system_context: RuntimeSystemContext::new(
+                temp.path().join("MEMORY.md"),
+                String::new(),
+            ),
             subagent_tracker: crate::agent::subagent_tracker::SubagentTracker::default(),
         },
         temp,
