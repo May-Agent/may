@@ -31,6 +31,13 @@ use crate::agent::{ContextDump, ContextReport, RequestParameterizedModel};
 use crate::db::{ChatDb, RunFence};
 use crate::session::{CancelReason, RunOutcome, SessionRunGuard, SessionRuns};
 
+/// The refusal a `Compact` gets when the agent is mid-work: the user sees it
+/// at once instead of waiting on the turn.
+const ERR_WORKER_BUSY: &str = include_str!("../texts/agent_worker_busy.txt");
+
+/// The refusal a `Send` gets on an in-process worker, idle or mid-work.
+const ERR_SEND_IN_PROCESS: &str = "this agent runs in-process; turns go through `run`";
+
 /// Events sent from the agent background task to the TUI.
 #[derive(Debug)]
 pub enum TuiEvent {
@@ -565,9 +572,7 @@ async fn run_worker(
             }
             WorkerCommand::Send { event_tx, .. } => {
                 let _ = event_tx
-                    .send(TuiEvent::Error(
-                        "this agent runs in-process; turns go through `run`".to_string(),
-                    ))
+                    .send(TuiEvent::Error(ERR_SEND_IN_PROCESS.to_string()))
                     .await;
                 let _ = event_tx.send(TuiEvent::Complete).await;
             }
@@ -717,12 +722,12 @@ enum WorkOutcome<T> {
 /// Race `work` against the worker command channel.
 ///
 /// `Cancel` and `Shutdown` end the race early and drop `work` where it
-/// stands. A `ContextReport` or `ContextDump` received meanwhile is held
-/// and requeued once the race ends, so it is answered when the worker is
-/// idle again — the in-flight work borrows the agent, so a report cannot
-/// be measured mid-turn, and requeueing it during the race would hand it
-/// straight back to this loop. `Run` and `Compact` commands arriving
-/// mid-work are ignored.
+/// stands. A `ContextReport`, `ContextDump`, `Release` or `Run` received
+/// meanwhile is held and requeued once the race ends, so it is served when
+/// the worker is idle again — the in-flight work borrows the agent, and
+/// requeueing it during the race would hand it straight back to this loop.
+/// A `Compact` or `Send` has no queued form: its `event_tx` is answered at
+/// once with a refusal and a `Complete`.
 async fn race_against_commands<F: Future>(
     work: F,
     command_rx: &Receiver<WorkerCommand>,
@@ -738,14 +743,25 @@ async fn race_against_commands<F: Future>(
             match command {
                 WorkerCommand::Cancel => return WorkOutcome::Cancelled,
                 WorkerCommand::Shutdown => return WorkOutcome::Shutdown,
-                WorkerCommand::ContextReport { .. } | WorkerCommand::ContextDump { .. } => {
-                    deferred.push(command);
-                }
-                // The agent is busy: it is released once the work is over.
-                WorkerCommand::Release { .. } => deferred.push(command),
+                // A run queues behind the in-flight work, exactly as an
+                // enqueued message does; the agent is released once the
+                // work is over; a report is measured against the idle agent.
                 WorkerCommand::Run { .. }
-                | WorkerCommand::Compact { .. }
-                | WorkerCommand::Send { .. } => {}
+                | WorkerCommand::Release { .. }
+                | WorkerCommand::ContextReport { .. }
+                | WorkerCommand::ContextDump { .. } => deferred.push(command),
+                WorkerCommand::Compact { event_tx, .. } => {
+                    let _ = event_tx
+                        .send(TuiEvent::Error(ERR_WORKER_BUSY.trim().to_string()))
+                        .await;
+                    let _ = event_tx.send(TuiEvent::Complete).await;
+                }
+                WorkerCommand::Send { event_tx, .. } => {
+                    let _ = event_tx
+                        .send(TuiEvent::Error(ERR_SEND_IN_PROCESS.to_string()))
+                        .await;
+                    let _ = event_tx.send(TuiEvent::Complete).await;
+                }
             }
         }
     })
@@ -1005,5 +1021,188 @@ mod tests {
         tokio::time::timeout(timeout, report)
             .await
             .expect("context report timed out — worker never became idle")
+    }
+
+    /// A `Run` sent while work is in flight is held, then requeued once the
+    /// race ends: it runs exactly once, after the in-flight work, exactly as
+    /// an enqueued message does.
+    #[tokio::test]
+    async fn a_run_sent_mid_work_is_deferred_until_the_work_ends() {
+        let (command_tx, command_rx) = unbounded::<WorkerCommand>();
+        let race_rx = command_rx.clone();
+        let (release_tx, release_rx) = unbounded::<()>();
+        let race = tokio::spawn({
+            let command_tx = command_tx.clone();
+            async move {
+                race_against_commands(
+                    async { release_rx.recv().await.is_ok() },
+                    &race_rx,
+                    &command_tx,
+                )
+                .await
+            }
+        });
+
+        let (event_tx, _event_rx) = unbounded();
+        let (_cancel_tx, cancellation) = unbounded();
+        command_tx
+            .send(WorkerCommand::Run {
+                prompt: "later".to_string(),
+                hidden_context: None,
+                attachments: Vec::new(),
+                lease: RunLease {
+                    cancellation,
+                    fence: RunFence {
+                        session_id: "session".to_string(),
+                        run_id: "run".to_string(),
+                    },
+                },
+                event_tx,
+            })
+            .await
+            .expect("the command channel is open");
+        // The race consumed the command but must not requeue it mid-work.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            command_rx.try_recv().is_err(),
+            "the deferred run must not be requeued mid-work"
+        );
+
+        release_tx.send(()).await.expect("release the work");
+        assert!(matches!(
+            race.await.expect("the race joins"),
+            WorkOutcome::Finished(true)
+        ));
+        match command_rx
+            .recv()
+            .await
+            .expect("the deferred run is requeued")
+        {
+            WorkerCommand::Run { prompt, .. } => assert_eq!(prompt, "later"),
+            _ => panic!("the requeued command is the run"),
+        }
+        assert!(
+            command_rx.try_recv().is_err(),
+            "the run is requeued exactly once"
+        );
+    }
+
+    /// A `Compact` sent while work is in flight is refused at once: an Error
+    /// then a Complete on its own event channel, and nothing is queued or run.
+    #[tokio::test]
+    async fn a_compact_sent_mid_work_is_refused_at_once() {
+        let (command_tx, command_rx) = unbounded::<WorkerCommand>();
+        let race_rx = command_rx.clone();
+        let (release_tx, release_rx) = unbounded::<()>();
+        let race = tokio::spawn({
+            let command_tx = command_tx.clone();
+            async move {
+                race_against_commands(
+                    async { release_rx.recv().await.is_ok() },
+                    &race_rx,
+                    &command_tx,
+                )
+                .await
+            }
+        });
+
+        let (event_tx, event_rx) = unbounded();
+        command_tx
+            .send(WorkerCommand::Compact {
+                focus: None,
+                event_tx,
+            })
+            .await
+            .expect("the command channel is open");
+        match event_rx.recv().await {
+            Ok(TuiEvent::Error(message)) => assert!(message.contains("busy")),
+            other => panic!("expected the busy error, got {other:?}"),
+        }
+        match event_rx.recv().await {
+            Ok(TuiEvent::Complete) => {}
+            other => panic!("expected Complete after the error, got {other:?}"),
+        }
+
+        release_tx.send(()).await.expect("release the work");
+        assert!(matches!(
+            race.await.expect("the race joins"),
+            WorkOutcome::Finished(true)
+        ));
+        assert!(
+            command_rx.try_recv().is_err(),
+            "the compact is answered, never queued"
+        );
+    }
+
+    /// A `Send` sent while work is in flight gets the same in-process refusal
+    /// the idle loop gives, at once.
+    #[tokio::test]
+    async fn a_send_sent_mid_work_is_refused_at_once() {
+        let (command_tx, command_rx) = unbounded::<WorkerCommand>();
+        let race_rx = command_rx.clone();
+        let (release_tx, release_rx) = unbounded::<()>();
+        let race = tokio::spawn({
+            let command_tx = command_tx.clone();
+            async move {
+                race_against_commands(
+                    async { release_rx.recv().await.is_ok() },
+                    &race_rx,
+                    &command_tx,
+                )
+                .await
+            }
+        });
+
+        let (event_tx, event_rx) = unbounded();
+        command_tx
+            .send(WorkerCommand::Send {
+                turn: RemoteTurn {
+                    content: "turn".to_string(),
+                    attachments: Vec::new(),
+                    hidden_context_xml: None,
+                },
+                event_tx,
+            })
+            .await
+            .expect("the command channel is open");
+        match event_rx.recv().await {
+            Ok(TuiEvent::Error(message)) => {
+                assert!(message.contains("runs in-process"));
+            }
+            other => panic!("expected the in-process error, got {other:?}"),
+        }
+        match event_rx.recv().await {
+            Ok(TuiEvent::Complete) => {}
+            other => panic!("expected Complete after the error, got {other:?}"),
+        }
+
+        release_tx.send(()).await.expect("release the work");
+        assert!(matches!(
+            race.await.expect("the race joins"),
+            WorkOutcome::Finished(true)
+        ));
+    }
+
+    /// `Shutdown` sent while work is in flight ends the race — the worker
+    /// loop breaks on it.
+    #[tokio::test]
+    async fn a_shutdown_sent_mid_work_stops_the_race() {
+        let (command_tx, command_rx) = unbounded::<WorkerCommand>();
+        let race_rx = command_rx.clone();
+        let race = tokio::spawn({
+            let command_tx = command_tx.clone();
+            async move {
+                race_against_commands(std::future::pending::<()>(), &race_rx, &command_tx).await
+            }
+        });
+
+        command_tx
+            .send(WorkerCommand::Shutdown)
+            .await
+            .expect("the command channel is open");
+        assert!(matches!(
+            race.await.expect("the race joins"),
+            WorkOutcome::Shutdown
+        ));
     }
 }

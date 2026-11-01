@@ -53,9 +53,9 @@ impl SessionRuntimeState {
         }
     }
 
-    /// Returns true when this state should prevent auto-archive.
+    /// Whether a run or a blocking interaction is in flight.
     #[must_use]
-    pub const fn is_active(self) -> bool {
+    pub const fn is_executing(self) -> bool {
         !matches!(self, Self::Idle)
     }
 
@@ -422,11 +422,44 @@ impl SessionRuntimeSummary {
 
     /// Whether the session should block auto-archive: running, pending messages, active plan, or live interaction.
     #[must_use]
-    pub const fn is_active(&self) -> bool {
-        self.state.is_active()
+    pub const fn blocks_auto_archive(&self) -> bool {
+        self.state.is_executing()
             || self.has_pending_messages()
             || self.plan_state.blocks_auto_archive()
             || self.interactions.is_active()
+    }
+
+    /// Whether the session admits a new request: not running, no pending
+    /// messages and no live interaction. A draft plan does not block
+    /// admission — it only keeps the session out of auto-archive.
+    #[must_use]
+    pub const fn admits_new_request(&self) -> bool {
+        !(self.state.is_executing() || self.has_pending_messages() || self.interactions.is_active())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SessionPlanState, SessionRuntimeState, SessionRuntimeSummary};
+
+    #[test]
+    fn an_idle_draft_session_admits_a_request_but_blocks_auto_archive() {
+        let summary = SessionRuntimeSummary {
+            plan_state: SessionPlanState::Draft,
+            ..SessionRuntimeSummary::default()
+        };
+        assert!(summary.admits_new_request());
+        assert!(summary.blocks_auto_archive());
+    }
+
+    #[test]
+    fn a_running_session_admits_no_request_and_blocks_auto_archive() {
+        let summary = SessionRuntimeSummary {
+            state: SessionRuntimeState::Running,
+            ..SessionRuntimeSummary::default()
+        };
+        assert!(!summary.admits_new_request());
+        assert!(summary.blocks_auto_archive());
     }
 }
 

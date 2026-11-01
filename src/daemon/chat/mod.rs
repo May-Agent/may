@@ -1162,7 +1162,7 @@ pub(super) async fn send_message(
         .get(&session_id)
         .await
         .map_err(internal_error)?;
-    if runtime.is_active() {
+    if !runtime.admits_new_request() {
         return Err(active_session_conflict_error());
     }
     let run_guard = state
