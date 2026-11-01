@@ -368,7 +368,7 @@ mod tests {
         assert_eq!(clone, again);
         // The checkout itself is untouched.
         let status = git(Some(&checkout), &["status", "--porcelain"]).unwrap();
-        assert!(status.trim().is_empty());
+        assert_eq!(status.trim(), "");
     }
 
     #[tokio::test]
@@ -394,7 +394,7 @@ mod tests {
         // The run's work is exactly its own commits on top of the parent base.
         let log = git(Some(&child), &["log", "--format=%s", "-1"]).unwrap();
         assert!(log.contains("sub work"));
-        assert!(uncommitted_changes(&parent).await.unwrap().is_empty());
+        assert_eq!(uncommitted_changes(&parent).await.unwrap().len(), 0);
     }
 
     #[tokio::test]
@@ -432,7 +432,7 @@ mod tests {
             &["for-each-ref", "refs/may", "--format=%(refname)"],
         )
         .unwrap();
-        assert!(refs.trim().is_empty());
-        assert!(repos.clones().unwrap().is_empty());
+        assert_eq!(refs.trim(), "");
+        assert_eq!(repos.clones().unwrap().len(), 0);
     }
 }
