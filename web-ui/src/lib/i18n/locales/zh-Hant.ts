@@ -107,6 +107,9 @@ export const zhHant: Messages = {
     queued: '排入佇列',
     queueHint: '待目前回合完成後再送出',
     immediateHint: '立即打斷目前回合送出此訊息',
+    bashMode: 'bash 模式',
+    bashRunning: '正在執行 !{command}…',
+    bashFailed: 'bash 失敗：{error}',
     modelPicker: {
       label: '模型',
       empty: '沒有可用的模型',
