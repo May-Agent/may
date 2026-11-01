@@ -1110,6 +1110,7 @@ impl From<crate::session::SessionRuntimeSummary> for SessionRuntimeResponse {
                         mode: request.request.mode,
                         script: request.request.script,
                         session_id: request.request.session_id,
+                        agent_id: request.request.agent_id,
                     },
                 }),
             waiting_workspace: summary.waiting_workspace.map(|request| WorkspacePollItem {

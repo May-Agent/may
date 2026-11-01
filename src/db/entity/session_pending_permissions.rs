@@ -13,4 +13,6 @@ pub struct Model {
     pub script: String,
     /// Request timestamp (ISO 8601).
     pub created_at: String,
+    /// Agent that raised the request, when recorded.
+    pub agent_id: Option<String>,
 }

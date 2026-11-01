@@ -158,6 +158,17 @@ impl PermissionHandler for TerminalPermissionHandler {
         allowed
     }
 
+    fn for_subagent(&self) -> Option<Self> {
+        self.approver.as_ref().map(|approver| Self {
+            approver: Some(approver.clone().for_subagent()),
+            runtime_service: self.runtime_service.clone(),
+            session_id: self.session_id.clone(),
+            network_policy: self.network_policy.clone(),
+            profile_id: self.profile_id.clone(),
+            source: self.source,
+        })
+    }
+
     async fn will_wait_for_approval(&self, mode: TerminalMode, script: &str) -> bool {
         match &self.approver {
             Some(approver) => approver.will_wait_for_approval(mode, script).await,
