@@ -145,6 +145,8 @@ pub struct App {
     pub model_select_index: usize,
     /// Available models for model select (cached)
     pub model_select_list: Vec<String>,
+    /// Search query in the model select popup
+    pub model_select_query: String,
     /// Last fetched provider catalog; seeds the next `/model` open so the
     /// picker does not paint the configured-only list while a fetch lands
     pub model_catalog: Vec<FetchedModel>,
@@ -510,6 +512,7 @@ impl App {
             config_state,
             model_select_index: 0,
             model_select_list: Vec::new(),
+            model_select_query: String::new(),
             model_catalog: Vec::new(),
             effort_ladder: &[],
             effort_index: 0,
@@ -2801,6 +2804,7 @@ impl App {
                 // refresh below re-merges whatever changed meanwhile.
                 let catalog = std::mem::take(&mut self.model_catalog);
                 self.merge_model_select_models(catalog);
+                self.model_select_query.clear();
                 self.model_select_rx = self.fetch_provider_models();
                 self.model_select_index = 0;
                 let fallback_model = self.config.last_model.as_ref().map(ToString::to_string);
