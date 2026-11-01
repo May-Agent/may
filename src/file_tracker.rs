@@ -11,7 +11,6 @@
 //! shadow repository, so reopening a session continues tracking from the
 //! state the last session left behind instead of re-attributing old changes.
 
-use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -45,15 +44,25 @@ impl TrackedRootSpec {
     }
 }
 
-/// A file diff attributed to one terminal call, in one tracked root.
+/// One file's line-change counts inside a [`RootDiff`].
+#[derive(Debug, Clone)]
+pub struct FileStat {
+    /// Path relative to the root, as `git diff --numstat` reports it.
+    pub path: PathBuf,
+    /// Lines added. `0` for binary files, which numstat marks `-`.
+    pub additions: usize,
+    /// Lines deleted. `0` for binary files.
+    pub deletions: usize,
+}
+
+/// File changes in one tracked root: attributed to one terminal call, or
+/// the accumulated session state against its starting tree.
 #[derive(Debug, Clone)]
 pub struct RootDiff {
     /// Tracked root the diff is relative to.
     pub root: PathBuf,
-    /// Unified `git diff` output between the previous and current trees.
-    pub text: String,
-    /// Number of files touched by this diff.
-    pub files: usize,
+    /// Per-file line counts, in `git diff` path order.
+    pub changes: Vec<FileStat>,
     /// Added lines across all files.
     pub additions: usize,
     /// Deleted lines across all files.
@@ -84,13 +93,14 @@ pub enum TrackerError {
 /// Name of the file inside each shadow `GIT_DIR` holding the last tree hash.
 const BASE_FILE: &str = "diff-base";
 
+/// Name of the file holding the tree the root started the session with —
+/// the fixed reference the session-wide change list diffs against.
+const SESSION_BASE_FILE: &str = "session-base";
+
 /// Name of the file listing rewind checkpoints: `<tree>\t<id>` per line.
-/// Entries are written by [`FileChangeTracker::snapshot`] — `id` is the
-/// tool call that produced the change and `tree` is the state the call
-/// started from — and by [`FileChangeTracker::mark_prompt`], where `id`
-/// is `prompt:<message row id>` and `tree` is the state when the user
-/// prompt was dispatched. Restoring either kind gives the code state at
-/// that point.
+/// Entries are written by [`FileChangeTracker::mark_prompt`], where `id`
+/// is `prompt:<message row id>` and `tree` is the state when the prompt's
+/// turn started. Restoring one gives the code state at that turn boundary.
 const CHECKPOINTS_FILE: &str = "checkpoints";
 
 #[derive(Debug)]
@@ -98,6 +108,8 @@ struct TrackedRoot {
     worktree: PathBuf,
     git_dir: PathBuf,
     tree: String,
+    /// Tree the session's change list diffs against; set once, never moved.
+    session_base: String,
 }
 
 /// Session-scoped tracker. Owns no background work itself — callers drive
@@ -186,17 +198,16 @@ impl FileChangeTracker {
     }
 
     /// Advance every root's baseline and return the diffs accumulated since
-    /// the previous snapshot, attributed to `tool_call_id`. Each change also
-    /// records a rewind checkpoint: the tree the call started from.
+    /// the previous snapshot, attributable to the call that just ended.
     ///
     /// Roots whose git operations fail are logged and skipped; their
     /// baselines stay put so the next snapshot still sees the accumulated
     /// change.
     #[must_use]
-    pub fn snapshot(&mut self, tool_call_id: &str) -> Vec<RootDiff> {
+    pub fn snapshot(&mut self) -> Vec<RootDiff> {
         let mut diffs = Vec::new();
         for root in &mut self.roots {
-            match snapshot_root(root, tool_call_id) {
+            match snapshot_root(root) {
                 Ok(Some(diff)) => diffs.push(diff),
                 Ok(None) => {}
                 Err(error) => {
@@ -204,6 +215,29 @@ impl FileChangeTracker {
                         worktree = %root.worktree.display(),
                         %error,
                         "file diff snapshot failed for root"
+                    );
+                }
+            }
+        }
+        diffs
+    }
+
+    /// Files changed across the session: every root's worktree diffed
+    /// against the tree it started with. Baselines and checkpoints are
+    /// untouched, so a per-call snapshot still attributes only its own
+    /// slice.
+    #[must_use]
+    pub fn status(&self) -> Vec<RootDiff> {
+        let mut diffs = Vec::new();
+        for root in &self.roots {
+            match status_root(root) {
+                Ok(Some(diff)) => diffs.push(diff),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        worktree = %root.worktree.display(),
+                        %error,
+                        "file status failed for root"
                     );
                 }
             }
@@ -230,21 +264,17 @@ impl FileChangeTracker {
     }
 
     /// Restore every root to the state it had at `mark_id`
-    /// (`prompt:<message row id>`). When a root holds no such mark — for
-    /// example a prompt written before marks existed — it falls back to
-    /// the earliest checkpoint attributed to any call id in
-    /// `fallback_call_ids` (the calls of the rewound turns, in log order),
-    /// which is the same pre-turn tree.
+    /// (`prompt:<message row id>`).
     ///
     /// Rewinding is point-in-time: later changes are undone too. Returns
-    /// the revert diff per affected root (empty when no checkpoint applies
-    /// or the root already matches it). The baseline moves to the restored
+    /// the revert diff per affected root (empty when no mark applies or
+    /// the root already matches it). The baseline moves to the restored
     /// tree so later diffs measure from the rewound state.
     #[must_use]
-    pub fn rewind(&mut self, mark_id: &str, fallback_call_ids: &HashSet<String>) -> Vec<RootDiff> {
+    pub fn rewind(&mut self, mark_id: &str) -> Vec<RootDiff> {
         let mut diffs = Vec::new();
         for root in &mut self.roots {
-            match rewind_root(root, mark_id, fallback_call_ids) {
+            match rewind_root(root, mark_id) {
                 Ok(Some(diff)) => diffs.push(diff),
                 Ok(None) => {}
                 Err(error) => {
@@ -283,10 +313,19 @@ impl FileChangeTracker {
             }
             Err(error) => return Err(TrackerError::Io(error)),
         };
+        let session_base = match std::fs::read_to_string(git_dir.join(SESSION_BASE_FILE)) {
+            Ok(saved) => saved.trim().to_string(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                std::fs::write(git_dir.join(SESSION_BASE_FILE), &tree)?;
+                tree.clone()
+            }
+            Err(error) => return Err(TrackerError::Io(error)),
+        };
         self.roots.push(TrackedRoot {
             worktree: spec.worktree,
             git_dir,
             tree,
+            session_base,
         });
         Ok(())
     }
@@ -385,18 +424,13 @@ fn write_excludes(git_dir: &Path, excludes: &[String]) -> Result<(), TrackerErro
 }
 
 /// Refresh `root`'s index and return the diff against its stored baseline,
-/// or `None` when the tree is unchanged. A changed tree records a rewind
-/// checkpoint for `tool_call_id` holding the pre-call tree.
-fn snapshot_root(
-    root: &mut TrackedRoot,
-    tool_call_id: &str,
-) -> Result<Option<RootDiff>, TrackerError> {
+/// or `None` when the tree is unchanged.
+fn snapshot_root(root: &mut TrackedRoot) -> Result<Option<RootDiff>, TrackerError> {
     let tree = write_tree(&root.git_dir, &root.worktree)?;
     if tree == root.tree {
         return Ok(None);
     }
-    let diff = baseline_diff(root, &tree)?;
-    record_checkpoint(root, &root.tree, tool_call_id)?;
+    let diff = numstat_diff(root, &root.tree.clone(), &tree)?;
     std::fs::write(root.git_dir.join(BASE_FILE), &tree)?;
     root.tree = tree;
     Ok(diff)
@@ -409,30 +443,45 @@ fn preview_root(root: &TrackedRoot) -> Result<Option<RootDiff>, TrackerError> {
     if tree == root.tree {
         return Ok(None);
     }
-    baseline_diff(root, &tree)
+    numstat_diff(root, &root.tree, &tree)
 }
 
-/// Diff `tree` against `root`'s stored baseline. `None` when the diff body is
-/// empty (e.g. mode-only churn the display cannot show).
-fn baseline_diff(root: &TrackedRoot, tree: &str) -> Result<Option<RootDiff>, TrackerError> {
-    let text =
-        run_git(&root.git_dir, &root.worktree, &["diff", &root.tree, tree]).map_err(|stderr| {
-            TrackerError::Command {
-                args: format!("diff {} {tree}", root.tree),
-                worktree: root.worktree.display().to_string(),
-                stderr,
-            }
-        })?;
-    if text.is_empty() {
-        // Tree hash changed without a visible diff (e.g. mode-only changes
-        // on filesystems that normalize them) — nothing to show.
+/// Refresh `root`'s index and diff the worktree against the tree the
+/// session started from.
+fn status_root(root: &TrackedRoot) -> Result<Option<RootDiff>, TrackerError> {
+    let tree = write_tree(&root.git_dir, &root.worktree)?;
+    if tree == root.session_base {
         return Ok(None);
     }
-    let (files, additions, deletions) = diff_stats(&text);
+    numstat_diff(root, &root.session_base, &tree)
+}
+
+/// Per-file change counts between two trees of `root`. `None` when nothing
+/// differs visibly (e.g. mode-only churn on normalizing filesystems).
+fn numstat_diff(
+    root: &TrackedRoot,
+    from: &str,
+    to: &str,
+) -> Result<Option<RootDiff>, TrackerError> {
+    let text = run_git(
+        &root.git_dir,
+        &root.worktree,
+        &["diff", "--numstat", "-z", "--no-renames", from, to],
+    )
+    .map_err(|stderr| TrackerError::Command {
+        args: format!("diff --numstat -z --no-renames {from} {to}"),
+        worktree: root.worktree.display().to_string(),
+        stderr,
+    })?;
+    let changes = parse_numstat(&text);
+    if changes.is_empty() {
+        return Ok(None);
+    }
+    let additions = changes.iter().map(|stat| stat.additions).sum();
+    let deletions = changes.iter().map(|stat| stat.deletions).sum();
     Ok(Some(RootDiff {
         root: root.worktree.clone(),
-        text,
-        files,
+        changes,
         additions,
         deletions,
     }))
@@ -447,7 +496,7 @@ fn mark_root(root: &TrackedRoot, mark_id: &str) -> Result<(), TrackerError> {
 }
 
 /// Append `<tree>\t<id>` to the root's checkpoint log. `tree` is the state
-/// before the call or prompt the id names — the tree a rewind restores.
+/// at the turn boundary the id names — the tree a rewind restores.
 fn record_checkpoint(
     root: &TrackedRoot,
     tree_before: &str,
@@ -476,24 +525,14 @@ fn read_checkpoints(root: &TrackedRoot) -> Result<Vec<(String, String)>, Tracker
         .collect())
 }
 
-/// Restore `root`'s worktree to the checkpoint recorded for `mark_id`, or
-/// to the earliest checkpoint attributed to a call in `fallback_call_ids`
-/// when the mark is absent. Returns the revert diff (current → restored),
-/// `None` when no checkpoint applies or nothing differs.
-fn rewind_root(
-    root: &mut TrackedRoot,
-    mark_id: &str,
-    fallback_call_ids: &HashSet<String>,
-) -> Result<Option<RootDiff>, TrackerError> {
+/// Restore `root`'s worktree to the checkpoint recorded for `mark_id`.
+/// Returns the revert diff (current → restored), `None` when no mark
+/// applies or nothing differs.
+fn rewind_root(root: &mut TrackedRoot, mark_id: &str) -> Result<Option<RootDiff>, TrackerError> {
     let checkpoints = read_checkpoints(root)?;
     let Some(target) = checkpoints
         .iter()
         .find(|(_, id)| id == mark_id)
-        .or_else(|| {
-            checkpoints
-                .iter()
-                .find(|(_, id)| fallback_call_ids.contains(id))
-        })
         .map(|(tree, _)| tree.clone())
     else {
         return Ok(None);
@@ -502,14 +541,7 @@ fn rewind_root(
     if current == target {
         return Ok(None);
     }
-    let text =
-        run_git(&root.git_dir, &root.worktree, &["diff", &current, &target]).map_err(|stderr| {
-            TrackerError::Command {
-                args: format!("diff {current} {target}"),
-                worktree: root.worktree.display().to_string(),
-                stderr,
-            }
-        })?;
+    let diff = numstat_diff(root, &current, &target)?;
     // Point-in-time restore: index ← target tree, write every tracked file,
     // then remove anything that is not in the index (files added after the
     // checkpoint). `clean` honors the shadow repo's info/exclude, so tracker
@@ -528,34 +560,28 @@ fn rewind_root(
     }
     std::fs::write(root.git_dir.join(BASE_FILE), &target)?;
     root.tree = target;
-    if text.is_empty() {
-        return Ok(None);
-    }
-    let (files, additions, deletions) = diff_stats(&text);
-    Ok(Some(RootDiff {
-        root: root.worktree.clone(),
-        text,
-        files,
-        additions,
-        deletions,
-    }))
+    Ok(diff)
 }
 
-/// Count files, added and removed lines in a unified diff body.
-fn diff_stats(text: &str) -> (usize, usize, usize) {
-    let mut files = 0;
-    let mut additions = 0;
-    let mut deletions = 0;
-    for line in text.lines() {
-        if line.starts_with("diff --git ") {
-            files += 1;
-        } else if line.starts_with('+') && !line.starts_with("+++") {
-            additions += 1;
-        } else if line.starts_with('-') && !line.starts_with("---") {
-            deletions += 1;
-        }
-    }
-    (files, additions, deletions)
+/// Parse `git diff --numstat -z --no-renames` output: one `adds\tdels\tpath`
+/// record per file, NUL-terminated; binary files carry `-` for both counts.
+fn parse_numstat(text: &str) -> Vec<FileStat> {
+    text.split('\0')
+        .filter(|record| !record.is_empty())
+        .filter_map(|record| {
+            let mut fields = record.splitn(3, '\t');
+            let parse =
+                |field: Option<&str>| field.and_then(|f| f.parse::<usize>().ok()).unwrap_or(0);
+            let additions = parse(fields.next());
+            let deletions = parse(fields.next());
+            let path = PathBuf::from(fields.next()?);
+            Some(FileStat {
+                path,
+                additions,
+                deletions,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -565,10 +591,6 @@ mod tests {
 
     fn spec(dir: &Path) -> TrackedRootSpec {
         TrackedRootSpec::new(dir.to_path_buf())
-    }
-
-    fn snap(tracker: &mut FileChangeTracker, id: &str) -> Vec<RootDiff> {
-        tracker.snapshot(id)
     }
 
     fn tracker() -> (tempfile::TempDir, PathBuf, FileChangeTracker) {
@@ -586,52 +608,50 @@ mod tests {
         let (_temp, worktree, mut tracker) = tracker();
         fs::write(worktree.join("hello.txt"), "world\n").expect("write");
 
-        let diffs = snap(&mut tracker, "call-1");
+        let diffs = tracker.snapshot();
 
         assert_eq!(diffs.len(), 1);
         let diff = &diffs[0];
-        assert_eq!(diff.files, 1);
+        assert_eq!(diff.changes.len(), 1);
         assert_eq!(diff.additions, 1);
         assert_eq!(diff.deletions, 0);
-        assert!(diff.text.contains("new file"));
-        assert!(diff.text.contains("+world"));
+        assert_eq!(diff.changes[0].path, PathBuf::from("hello.txt"));
     }
 
     #[test]
     fn modify_file_produces_diff() {
         let (_temp, worktree, mut tracker) = tracker();
         fs::write(worktree.join("a.txt"), "one\n").expect("write");
-        assert_eq!(snap(&mut tracker, "call-1").len(), 1);
+        assert_eq!(tracker.snapshot().len(), 1);
 
         fs::write(worktree.join("a.txt"), "one\ntwo\n").expect("rewrite");
-        let diffs = snap(&mut tracker, "call-1");
+        let diffs = tracker.snapshot();
 
         assert_eq!(diffs.len(), 1);
         assert_eq!(diffs[0].additions, 1);
         assert_eq!(diffs[0].deletions, 0);
-        assert!(diffs[0].text.contains("+two"));
+        assert_eq!(diffs[0].changes[0].path, PathBuf::from("a.txt"));
     }
 
     #[test]
     fn delete_file_produces_diff() {
         let (_temp, worktree, mut tracker) = tracker();
         fs::write(worktree.join("gone.txt"), "bye\n").expect("write");
-        assert_eq!(snap(&mut tracker, "call-1").len(), 1);
+        assert_eq!(tracker.snapshot().len(), 1);
 
         fs::remove_file(worktree.join("gone.txt")).expect("remove");
-        let diffs = snap(&mut tracker, "call-1");
+        let diffs = tracker.snapshot();
 
         assert_eq!(diffs.len(), 1);
         assert_eq!(diffs[0].deletions, 1);
-        assert!(diffs[0].text.contains("deleted file"));
-        assert!(diffs[0].text.contains("-bye"));
+        assert_eq!(diffs[0].changes[0].path, PathBuf::from("gone.txt"));
     }
 
     #[test]
     fn clean_tree_produces_no_diff() {
         let (_temp, _worktree, mut tracker) = tracker();
-        assert!(snap(&mut tracker, "call-1").is_empty());
-        assert!(snap(&mut tracker, "call-1").is_empty());
+        assert!(tracker.snapshot().is_empty());
+        assert!(tracker.snapshot().is_empty());
     }
 
     #[test]
@@ -644,7 +664,7 @@ mod tests {
         fs::write(worktree.join("a.txt"), "one\n").expect("write");
         let first = tracker.preview();
         assert_eq!(first.len(), 1);
-        assert_eq!(first[0].files, 1);
+        assert_eq!(first[0].changes.len(), 1);
         assert_eq!(first[0].additions, 1);
 
         // The baseline did not move: a second preview shows the same
@@ -657,33 +677,26 @@ mod tests {
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].additions, 2);
 
-        // The final snapshot attributes the whole diff to the call once —
-        // previews never recorded a checkpoint, so the call's own snapshot
-        // is still the rewind anchor.
-        let diffs = snap(&mut tracker, "call-1");
+        // The final snapshot attributes the whole diff to the call once.
+        let diffs = tracker.snapshot();
         assert_eq!(diffs.len(), 1);
         assert_eq!(diffs[0].additions, 2);
 
         // Baseline advanced now; nothing pending.
         assert!(tracker.preview().is_empty());
-
-        // Rewind restores the pre-call state even though previews ran.
-        let reverted = rewind_calls(&mut tracker, &["call-1"]);
-        assert_eq!(reverted.len(), 1);
-        assert!(!worktree.join("a.txt").exists());
     }
 
     #[test]
     fn gitignored_files_are_not_tracked() {
         let (_temp, worktree, mut tracker) = tracker();
         fs::write(worktree.join(".gitignore"), "ignored/\n").expect("gitignore");
-        assert_eq!(snap(&mut tracker, "call-1").len(), 1); // the .gitignore itself
+        assert_eq!(tracker.snapshot().len(), 1); // the .gitignore itself
 
         let ignored = worktree.join("ignored");
         fs::create_dir_all(&ignored).expect("ignored dir");
         fs::write(ignored.join("x.txt"), "nope\n").expect("write ignored");
 
-        assert!(snap(&mut tracker, "call-1").is_empty());
+        assert!(tracker.snapshot().is_empty());
     }
 
     #[test]
@@ -698,7 +711,7 @@ mod tests {
         assert_eq!(tracker.roots.len(), 2);
 
         fs::write(other.join("o.txt"), "data\n").expect("write other");
-        let diffs = snap(&mut tracker, "call-1");
+        let diffs = tracker.snapshot();
         assert_eq!(diffs.len(), 1);
         assert_eq!(diffs[0].root, normalize_path(&other));
     }
@@ -714,50 +727,70 @@ mod tests {
             let mut tracker =
                 FileChangeTracker::new(state_dir.clone(), vec![spec(&worktree)]).expect("init");
             fs::write(worktree.join("old.txt"), "changed\n").expect("rewrite");
-            assert_eq!(snap(&mut tracker, "call-1").len(), 1);
+            assert_eq!(tracker.snapshot().len(), 1);
         }
 
         // A new tracker must not re-report the change the first one saw.
         let mut tracker = FileChangeTracker::new(state_dir, vec![spec(&worktree)]).expect("reinit");
-        assert!(snap(&mut tracker, "call-1").is_empty());
+        assert!(tracker.snapshot().is_empty());
     }
 
-    fn rewind_calls(tracker: &mut FileChangeTracker, ids: &[&str]) -> Vec<RootDiff> {
-        tracker.rewind(
-            "prompt:no-such-mark",
-            &ids.iter().map(|id| (*id).to_string()).collect(),
-        )
+    #[test]
+    fn status_reports_cumulative_per_file_changes() {
+        let (_temp, worktree, mut tracker) = tracker();
+        assert!(tracker.status().is_empty());
+
+        fs::write(worktree.join("a.txt"), "one\n").expect("write");
+        fs::create_dir_all(worktree.join("dir")).expect("dir");
+        fs::write(worktree.join("dir/b.txt"), "x\ny\n").expect("write");
+        let diffs = tracker.status();
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].changes.len(), 2);
+        assert_eq!(diffs[0].additions, 3);
+
+        // A snapshot moves the call baseline, not the session base.
+        tracker.snapshot();
+        fs::write(worktree.join("a.txt"), "one\ntwo\n").expect("rewrite");
+        let diffs = tracker.status();
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].additions, 4);
+
+        // Net-zero churn leaves nothing behind.
+        fs::remove_file(worktree.join("a.txt")).expect("remove");
+        fs::remove_file(worktree.join("dir/b.txt")).expect("remove");
+        assert!(tracker.status().is_empty());
     }
 
     #[test]
     fn rewind_restores_modified_and_added_files() {
         let (_temp, worktree, mut tracker) = tracker();
         fs::write(worktree.join("a.txt"), "one\n").expect("write");
-        snap(&mut tracker, "call-1");
+        tracker.mark_prompt("prompt:1");
 
         fs::write(worktree.join("a.txt"), "one\ntwo\n").expect("rewrite");
         fs::write(worktree.join("new.txt"), "added\n").expect("add");
-        assert_eq!(snap(&mut tracker, "call-2").len(), 1);
+        assert_eq!(tracker.snapshot().len(), 1);
 
-        let reverted = rewind_calls(&mut tracker, &["call-2"]);
+        let reverted = tracker.rewind("prompt:1");
 
         assert_eq!(reverted.len(), 1);
         assert_eq!(fs::read_to_string(worktree.join("a.txt")).unwrap(), "one\n");
         assert!(!worktree.join("new.txt").exists());
         // Baseline moved back: the undo is not re-reported.
-        assert!(snap(&mut tracker, "call-3").is_empty());
+        assert!(tracker.snapshot().is_empty());
     }
 
     #[test]
     fn rewind_restores_deleted_files() {
         let (_temp, worktree, mut tracker) = tracker();
         fs::write(worktree.join("keep.txt"), "here\n").expect("write");
-        snap(&mut tracker, "call-1");
+        tracker.snapshot();
+        tracker.mark_prompt("prompt:1");
 
         fs::remove_file(worktree.join("keep.txt")).expect("remove");
-        assert_eq!(snap(&mut tracker, "call-2").len(), 1);
+        assert_eq!(tracker.snapshot().len(), 1);
 
-        let reverted = rewind_calls(&mut tracker, &["call-2"]);
+        let reverted = tracker.rewind("prompt:1");
 
         assert_eq!(reverted.len(), 1);
         assert_eq!(
@@ -767,12 +800,12 @@ mod tests {
     }
 
     #[test]
-    fn rewind_without_checkpoint_is_noop() {
+    fn rewind_without_mark_is_noop() {
         let (_temp, worktree, mut tracker) = tracker();
         fs::write(worktree.join("x.txt"), "data\n").expect("write");
-        snap(&mut tracker, "call-1");
+        tracker.snapshot();
 
-        assert!(rewind_calls(&mut tracker, &[]).is_empty());
+        assert!(tracker.rewind("prompt:no-such-mark").is_empty());
         assert_eq!(
             fs::read_to_string(worktree.join("x.txt")).unwrap(),
             "data\n"
@@ -780,59 +813,24 @@ mod tests {
     }
 
     #[test]
-    fn rewind_to_first_call_restores_initial_baseline() {
-        let (_temp, worktree, mut tracker) = tracker();
-        fs::write(worktree.join("seed.txt"), "original\n").expect("write");
-        snap(&mut tracker, "call-1");
-
-        fs::write(worktree.join("later.txt"), "later\n").expect("write");
-        snap(&mut tracker, "call-2");
-
-        // Rewinding to the first call restores the state at tracker init.
-        let reverted = rewind_calls(&mut tracker, &["call-1", "call-2"]);
-        assert_eq!(reverted.len(), 1);
-        assert!(!worktree.join("seed.txt").exists());
-        assert!(!worktree.join("later.txt").exists());
-    }
-
-    #[test]
-    fn prompt_mark_restores_state_at_dispatch() {
+    fn prompt_mark_restores_state_at_turn_start() {
         let (_temp, worktree, mut tracker) = tracker();
         fs::write(worktree.join("a.txt"), "one\n").expect("write");
-        snap(&mut tracker, "call-1");
+        tracker.snapshot();
 
-        // User prompt dispatched: mark the pre-turn tree.
+        // The turn's Start frame arrived: mark the pre-turn tree.
         tracker.mark_prompt("prompt:7");
 
         // Later changes — including ones no tool call is attributed.
         fs::write(worktree.join("a.txt"), "changed\n").expect("rewrite");
         fs::write(worktree.join("new.txt"), "added\n").expect("add");
 
-        let reverted = tracker.rewind("prompt:7", &HashSet::new());
+        let reverted = tracker.rewind("prompt:7");
 
         assert_eq!(reverted.len(), 1);
         assert_eq!(fs::read_to_string(worktree.join("a.txt")).unwrap(), "one\n");
         assert!(!worktree.join("new.txt").exists());
         // Baseline moved back: the undo is not re-reported.
-        assert!(snap(&mut tracker, "call-2").is_empty());
-    }
-
-    #[test]
-    fn prompt_mark_takes_precedence_over_call_fallback() {
-        let (_temp, worktree, mut tracker) = tracker();
-        fs::write(worktree.join("a.txt"), "one\n").expect("write");
-        snap(&mut tracker, "call-1");
-
-        tracker.mark_prompt("prompt:7");
-        fs::write(worktree.join("b.txt"), "two\n").expect("write");
-        snap(&mut tracker, "call-2");
-
-        // The mark wins over the call fallback: b.txt was written after the
-        // prompt was dispatched, so rewinding removes it.
-        let reverted = tracker.rewind("prompt:7", &HashSet::from(["call-2".to_string()]));
-
-        assert_eq!(reverted.len(), 1);
-        assert!(!worktree.join("b.txt").exists());
-        assert_eq!(fs::read_to_string(worktree.join("a.txt")).unwrap(), "one\n");
+        assert!(tracker.snapshot().is_empty());
     }
 }
