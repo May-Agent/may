@@ -428,6 +428,46 @@ pub struct SessionTasksPayload {
     pub(crate) plan_state: SessionPlanState,
 }
 
+/// One `prs` row over the wire — the session's PR list entry.
+#[derive(Debug, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiPr {
+    /// Per-repository PR number.
+    pub(crate) number: i64,
+    /// PR title.
+    pub(crate) title: String,
+    /// `open`, `checks_pending`, `failed`, `rejected`, `merging`, `merged`, `closed`.
+    pub(crate) state: String,
+    /// `may` or `github`.
+    pub(crate) backend: String,
+    /// External PR number, when the backend created one.
+    pub(crate) external_number: Option<i64>,
+    /// Associated issue number, when linked.
+    pub(crate) issue_number: Option<i64>,
+    /// Whether the PR merges itself once checks pass.
+    pub(crate) auto_merge: bool,
+    /// UTC timestamps.
+    pub(crate) created_at: String,
+    /// Latest update.
+    pub(crate) updated_at: String,
+    /// Merge timestamp, when merged.
+    pub(crate) merged_at: Option<String>,
+    /// Recent transition events, oldest first.
+    pub(crate) events: Vec<ApiPrEvent>,
+}
+
+/// One `pr_events` row over the wire.
+#[derive(Debug, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiPrEvent {
+    /// Transition kind (`opened`, `queued`, `merged`, ...).
+    pub(crate) kind: String,
+    /// Event payload (failure excerpt, merge sha, conflict list).
+    pub(crate) detail: Option<String>,
+    /// UTC time.
+    pub(crate) created_at: String,
+}
+
 #[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionPlanStateRequest {

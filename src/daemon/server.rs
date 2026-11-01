@@ -341,8 +341,9 @@ fn api_routes() -> Route {
     use super::remote_access::{get_remote_access_status, start_remote_access, stop_remote_access};
     use super::sessions::{
         append_session_history, create_session, delete_all_sessions, delete_session, get_session,
-        get_session_context_debug, get_session_history, get_session_tasks, list_sessions,
-        lookup_issues, rewind_session, save_session_tasks, set_session_plan_state, update_session,
+        get_session_context_debug, get_session_history, get_session_prs, get_session_tasks,
+        list_sessions, lookup_issues, rewind_session, save_session_tasks, set_session_plan_state,
+        update_session,
     };
     use super::tasks::{
         approve_task, create_task, delete_task, get_task, invoke_webhook_task, list_tasks,
@@ -377,6 +378,7 @@ fn api_routes() -> Route {
                     )),
                     Route::new((
                         "/tasks".at(get_session_tasks),
+                        "/prs".at(get_session_prs),
                         "/tasks".put(save_session_tasks),
                         "/tasks/plan-state".put(set_session_plan_state),
                         "/stop".post(stop_session_run),
