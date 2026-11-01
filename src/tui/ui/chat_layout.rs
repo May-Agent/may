@@ -348,7 +348,7 @@ impl ChatLayout {
 
     /// Record the composer input's doc-row span for click-to-caret hit
     /// testing; `None` when the frame drew no input.
-    pub fn set_input_span(&mut self, span: Option<(usize, usize)>) {
+    pub const fn set_input_span(&mut self, span: Option<(usize, usize)>) {
         self.input_span = span;
     }
 
