@@ -232,7 +232,7 @@ impl PrStore {
             return Err(PrError::State("no committed work in the clone".to_string()));
         }
         let base_sha = self.base_sha(&resolved).await?;
-        let (backend, github_repo) = self.backend_for(&resolved.record);
+        let (backend, github_repo) = Self::backend_for(&resolved.record);
         let branch = if resolved.record.local {
             format!("refs/may/{}", self.context.session_id)
         } else {
@@ -247,16 +247,17 @@ impl PrStore {
         }
         // GitHub-bound: push the session branch before recording, so the
         // row never points at a PR that failed to exist upstream.
-        let mut external_number = None;
-        if backend == "github" {
+        let external_number = if backend == "github" {
             let owner_repo = github_repo
                 .as_deref()
                 .ok_or_else(|| PrError::Resolve("github backend without a repo".to_string()))?;
-            external_number = Some(
+            Some(
                 self.push_and_create(&resolved, &branch, title, owner_repo)
                     .await?,
-            );
-        }
+            )
+        } else {
+            None
+        };
         let pr = self
             .db()?
             .create_pr(
@@ -478,14 +479,11 @@ impl PrStore {
     /// checkout through the may backend; remote clones publish through
     /// GitHub. `[[projects]] pr.backend = "may"` pins a remote clone to
     /// local landing — rejected, there is no checkout to land into.
-    fn backend_for(&self, record: &CloneRecord) -> (&'static str, Option<String>) {
+    fn backend_for(record: &CloneRecord) -> (&'static str, Option<String>) {
         if record.local {
             return ("may", None);
         }
-        match github_owner_repo(&record.source) {
-            Some(repo) => ("github", Some(repo)),
-            None => ("may", None),
-        }
+        github_owner_repo(&record.source).map_or(("may", None), |repo| ("github", Some(repo)))
     }
 
     /// The `[[projects]]` entry covering this record, by repository
@@ -493,9 +491,7 @@ impl PrStore {
     fn project_for_record(&self, record: &CloneRecord) -> Option<&crate::workspace::ProjectConfig> {
         self.context.workspace_config.projects.iter().find(|p| {
             if record.local {
-                crate::issue::repository_identity(&p.path)
-                    .map(|k| k == record.repo_key)
-                    .unwrap_or(false)
+                crate::issue::repository_identity(&p.path).is_ok_and(|k| k == record.repo_key)
             } else {
                 github_owner_repo(&record.source)
                     == p.github_repository()
@@ -507,11 +503,11 @@ impl PrStore {
     /// The `[[projects]]` entry covering a filesystem path.
     fn project_for_path(&self, path: &Path) -> Option<&crate::workspace::ProjectConfig> {
         let key = crate::issue::repository_identity(path).ok()?;
-        self.context.workspace_config.projects.iter().find(|p| {
-            crate::issue::repository_identity(&p.path)
-                .map(|k| k == key)
-                .unwrap_or(false)
-        })
+        self.context
+            .workspace_config
+            .projects
+            .iter()
+            .find(|p| crate::issue::repository_identity(&p.path).is_ok_and(|k| k == key))
     }
 
     /// Run the outbound screen when the project enables it. `Some(reason)`
@@ -601,7 +597,7 @@ impl PrStore {
             .external_number
             .ok_or_else(|| PrError::State("github PR missing its number".to_string()))?;
         let lock = land_lock(&resolved.record.repo_key);
-        self.event(&pr, "queued", None).await;
+        self.event(pr, "queued", None).await;
         // Serialized land: push + queue + watch run inside one blocking
         // call so the mutex guard never crosses an await.
         let state = blocking::unblock({
@@ -657,7 +653,7 @@ impl PrStore {
                 self.db()?
                     .update_pr(pr.id, "merged", Some(head_sha), None, Some(now.as_str()))
                     .await?;
-                self.event(&pr, "merged", Some(head_sha)).await;
+                self.event(pr, "merged", Some(head_sha)).await;
                 self.pull_sync(&owner_repo).await;
                 self.repos.delete_clone(&resolved.dir).await?;
                 Ok(format!("merged PR #{} upstream", pr.number))
@@ -666,14 +662,14 @@ impl PrStore {
                 self.db()?
                     .update_pr(pr.id, "closed", Some(head_sha), None, None)
                     .await?;
-                self.event(&pr, "closed", Some(other)).await;
+                self.event(pr, "closed", Some(other)).await;
                 Err(PrError::State(format!("upstream PR {other}")))
             }
             Err(reason) => {
                 self.db()?
                     .update_pr(pr.id, "failed", Some(head_sha), None, None)
                     .await?;
-                self.event(&pr, "check_failed", Some(&reason)).await;
+                self.event(pr, "check_failed", Some(reason)).await;
                 Err(PrError::Gh(reason.clone()))
             }
         }
@@ -865,6 +861,9 @@ fn github_owner_repo(url: &str) -> Option<String> {
 
 /// Screen published text through the fast model: `true` publishes. The
 /// registration site wraps this in the session's screen closure.
+///
+/// # Errors
+/// Returns the model's error as a string when the call fails.
 pub async fn screen_with_llm<LLM: aither_core::LanguageModel>(
     llm: &LLM,
     title: &str,

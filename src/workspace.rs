@@ -67,7 +67,7 @@ impl ProjectConfig {
     /// The GitHub repository this project is bound to, when its issue
     /// backend names one.
     #[must_use]
-    pub fn github_repository(&self) -> Option<&GitHubRepository> {
+    pub const fn github_repository(&self) -> Option<&GitHubRepository> {
         match &self.issues {
             ProjectIssues::Github { repository } => Some(repository),
             ProjectIssues::May => None,
