@@ -16,6 +16,7 @@ import { Button } from '@/components/ui/button';
 import { useTranslation } from '@/lib/i18n';
 import type { ApiAttachment, ApiMessage } from '@/lib/types';
 import { enqueueMessage } from '@/lib/api/chat';
+import { bashTranscript, runBash } from '@/lib/api/bash';
 import { isConfigUsable } from '@/lib/api/config';
 import { cn } from '@/lib/utils';
 import { formatGroupTime, startsGroup } from '@/lib/chat/time';
@@ -47,6 +48,9 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   const scrollerRef = useRef<HTMLDivElement>(null);
   const stickyBottomRef = useRef(true);
   const [showJumpButton, setShowJumpButton] = useState(false);
+  const [bashStatus, setBashStatus] = useState<{ command: string } | { error: string } | null>(
+    null,
+  );
 
   useEffect(() => {
     open(sessionId);
@@ -112,6 +116,35 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     attachments: ApiAttachment[],
     deliveryMode: 'steer' | 'queue',
   ) => {
+    // `!` prefix: bash mode — the daemon runs the command on the user's
+    // behalf and returns a masked outcome; the transcript goes to the
+    // agent as the next user message, like the TUI's bash mode.
+    if (content.startsWith('!')) {
+      const command = content.slice(1).trim();
+      if (!command) return;
+      setBashStatus({ command });
+      stickyBottomRef.current = true;
+      try {
+        const outcome = await runBash(sessionId, command);
+        const transcript = bashTranscript(outcome);
+        appendMessage(sessionId, {
+          id: `local-${Date.now()}`,
+          role: 'user' as const,
+          content: transcript,
+          timestamp: new Date().toISOString(),
+          attachments: [] as ApiAttachment[],
+        });
+        if (streaming) {
+          await enqueueMessage({ sessionId, content: transcript, attachments: [], deliveryMode });
+        } else {
+          await send({ sessionId, content: transcript, attachments: [] });
+        }
+        setBashStatus(null);
+      } catch (error) {
+        setBashStatus({ error: error instanceof Error ? error.message : String(error) });
+      }
+      return;
+    }
     const userMessage = {
       id: `local-${Date.now()}`,
       role: 'user' as const,
@@ -223,6 +256,20 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             <ConfigGuardCard
               onOpenSettings={() => navigate('/settings?section=providers')}
             />
+          )}
+          {bashStatus && (
+            <div
+              className={cn(
+                'rounded-lg border px-3 py-2 text-xs',
+                'command' in bashStatus
+                  ? 'border-border bg-muted/40 text-muted-foreground'
+                  : 'border-destructive/40 bg-destructive/5 text-destructive',
+              )}
+            >
+              {'command' in bashStatus
+                ? t('composer.bashRunning', { command: bashStatus.command })
+                : t('composer.bashFailed', { error: bashStatus.error })}
+            </div>
           )}
           <Composer
             disabled={!configUsable}

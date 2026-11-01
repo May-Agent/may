@@ -105,6 +105,9 @@ export const enUS = {
     queued: 'Queue',
     queueHint: 'Queue message until current turn finishes',
     immediateHint: 'Interrupt current turn with this message',
+    bashMode: 'bash mode',
+    bashRunning: 'Running !{command}…',
+    bashFailed: 'bash failed: {error}',
     modelPicker: {
       label: 'Model',
       empty: 'No models available',

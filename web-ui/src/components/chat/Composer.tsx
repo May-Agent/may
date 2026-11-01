@@ -139,6 +139,12 @@ export function Composer({
           ))}
         </div>
       )}
+      {value.startsWith('!') && (
+        <div className="flex items-center gap-2 border-b border-border px-3 py-1.5 text-[11px] text-muted-foreground">
+          <span>({t('composer.bashMode')})</span>
+          <span className="h-px flex-1 bg-border" aria-hidden />
+        </div>
+      )}
       <textarea
         ref={textareaRef}
         className="block w-full resize-none bg-transparent px-3 pt-3 pb-1 text-sm outline-none placeholder:text-muted-foreground min-h-[48px] max-h-[240px] scrollbar-thin"

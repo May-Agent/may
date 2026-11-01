@@ -1476,7 +1476,7 @@ where
                         let cwd = app.cwd.clone();
                         spawn(async move {
                             let mut outcome = blocking::unblock(move || {
-                                run_bash_command(&command, &cwd, &secrets)
+                                may_agent::bash::run_bash_command(&command, &cwd, &secrets)
                             })
                             .await;
                             outcome.call_id = call_id;
@@ -1542,65 +1542,6 @@ where
     }
 
     Ok(())
-}
-
-/// Cap a captured output stream at `MAX` bytes on a char boundary.
-fn cap_stream(bytes: &[u8]) -> String {
-    const MAX: usize = 64 * 1024;
-    let text = String::from_utf8_lossy(bytes);
-    if text.len() <= MAX {
-        return text.into_owned();
-    }
-    let end = text
-        .char_indices()
-        .nth(MAX)
-        .map_or(text.len(), |(index, _)| index);
-    format!("{}\n… (output truncated)", &text[..end])
-}
-
-/// Run a bash-mode (`!`) command in may's environment: the launch cwd plus
-/// keychain secrets injected as environment variables. Output is masked
-/// before it returns to the TUI or the transcript.
-fn run_bash_command(
-    command: &str,
-    cwd: &std::path::Path,
-    secrets: &may_agent::secrets::Secrets,
-) -> may_agent::tui::event::BashOutcome {
-    let (_, command_secret) = secrets.mask(command);
-    let spawn = || {
-        std::process::Command::new("bash")
-            .arg("-c")
-            .arg(command)
-            .current_dir(cwd)
-            .envs(secrets.env_pairs())
-            .output()
-    };
-    match spawn() {
-        Err(error) => may_agent::tui::event::BashOutcome {
-            call_id: String::new(),
-            command: command.to_string(),
-            stdout: String::new(),
-            stderr: String::new(),
-            exit_code: -1,
-            had_secret: command_secret,
-            error: Some(format!("failed to run bash: {error}")),
-        },
-        Ok(output) => {
-            let (stdout, out_secret) = secrets.mask(&cap_stream(&output.stdout));
-            let (stderr, err_secret) = secrets.mask(&cap_stream(&output.stderr));
-            // `had_secret` tracks output only — a command-side hit already
-            // warned at submit time.
-            may_agent::tui::event::BashOutcome {
-                call_id: String::new(),
-                command: command.to_string(),
-                stdout,
-                stderr,
-                exit_code: output.status.code().unwrap_or(-1),
-                had_secret: out_secret || err_secret,
-                error: None,
-            }
-        }
-    }
 }
 
 /// Run the GitHub Copilot OAuth device flow.
