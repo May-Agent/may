@@ -111,6 +111,22 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
     .await?;
     app.btw_daemon = Some(daemon_client.clone());
     app.session_manager.attach_daemon(daemon_client.clone());
+    // One-shot runs land on the built-in Build profile, like the TUI.
+    if let Ok(profiles) = daemon_client
+        .get::<Vec<may_agent::profile::ProfileInfo>>("/api/profiles")
+        .await
+    {
+        let profile_id = profiles
+            .iter()
+            .find(|profile| profile.slug.as_deref() == Some(may_agent::profile::BUILD_PROFILE_SLUG))
+            .or_else(|| profiles.first())
+            .map(|profile| profile.id.clone());
+        if let Some(profile_id) = &profile_id {
+            app.session_manager.set_current_profile(profile_id.clone());
+        }
+        app.current_profile_id = profile_id;
+        app.profiles = profiles;
+    }
     let runtime_deps = runtime_deps.with_daemon(daemon_client);
 
     let mut output = OneShotOutput::new(io::stdout(), io::stderr());

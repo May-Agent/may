@@ -1748,14 +1748,10 @@ mod tests {
         let db = ChatDb::open(&dir.path().join("history.db"))
             .await
             .expect("db should initialize");
-        db.ensure_default_profiles()
+        let local_profile_id = db
+            .ensure_default_profiles()
             .await
             .expect("default profiles should exist");
-        let local_profile = db
-            .get_profile_by_slug("local")
-            .await
-            .expect("profile lookup should succeed")
-            .expect("local profile should exist");
 
         for (task_id, session_id, approved) in [
             ("task-match", Some("session-a"), true),
@@ -1767,7 +1763,7 @@ mod tests {
             };
             db.create_scheduled_task(CreateScheduledTaskParams {
                 id: task_id,
-                profile_id: local_profile.id.as_str(),
+                profile_id: local_profile_id.as_str(),
                 session_id,
                 name: task_id,
                 trigger: &trigger,
@@ -1798,7 +1794,7 @@ mod tests {
         let triggered = runtime
             .dispatch_event(
                 "chat.turn.completed",
-                Some(local_profile.id.as_str()),
+                Some(local_profile_id.as_str()),
                 Some("session-a"),
             )
             .await
