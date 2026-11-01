@@ -47,7 +47,7 @@ impl std::fmt::Debug for RepoTool {
 impl RepoTool {
     /// Build the command for one session.
     #[must_use]
-    pub fn new(context: RepoContext) -> Self {
+    pub const fn new(context: RepoContext) -> Self {
         Self { context }
     }
 }
@@ -72,6 +72,7 @@ impl Tool for RepoTool {
     type Arguments = RepoArgs;
     type Res = ToolResult;
 
+    #[allow(clippy::unused_async_trait_impl)]
     async fn call(
         &self,
         args: Self::Arguments,
@@ -83,29 +84,33 @@ impl Tool for RepoTool {
                     Ok(v) => v,
                     Err(e) => return Ok(ToolResult::text(e)),
                 };
-                match set {
-                    None => match trust::trust_for(&self.context.workspace_config, &key, &worktree)
-                    {
-                        Some(level) => format!("trust: {}", level.as_str()),
-                        None => "trust undecided — answer the repo-trust question".to_string(),
+                set.map_or_else(
+                    || {
+                        trust::trust_for(&self.context.workspace_config, &key, &worktree)
+                            .map_or_else(
+                                || "trust undecided — answer the repo-trust question".to_string(),
+                                |level| format!("trust: {}", level.as_str()),
+                            )
                     },
-                    Some(value) => match TrustLevel::parse(&value) {
-                        None => "level must be full, prs-only or local".to_string(),
-                        Some(level) => {
-                            let kind = trust::repo_kind(&worktree);
-                            match trust::persist(
-                                &self.context.workspace_config,
-                                &config_path(&self.context),
-                                &worktree,
-                                Some(&kind),
-                                level,
-                            ) {
-                                Ok(()) => format!("trust set: {}", level.as_str()),
-                                Err(e) => format!("failed to persist: {e}"),
-                            }
-                        }
+                    |value| {
+                        TrustLevel::parse(&value).map_or_else(
+                            || "level must be full, prs-only or local".to_string(),
+                            |level| {
+                                let kind = trust::repo_kind(&worktree);
+                                match trust::persist(
+                                    &self.context.workspace_config,
+                                    &config_path(&self.context),
+                                    &worktree,
+                                    Some(&kind),
+                                    level,
+                                ) {
+                                    Ok(()) => format!("trust set: {}", level.as_str()),
+                                    Err(e) => format!("failed to persist: {e}"),
+                                }
+                            },
+                        )
                     },
-                }
+                )
             }
         }))
     }
@@ -125,7 +130,7 @@ impl std::fmt::Debug for SubagentRepoTool {
 impl SubagentRepoTool {
     /// Build the read-only command for one session.
     #[must_use]
-    pub fn new(context: RepoContext) -> Self {
+    pub const fn new(context: RepoContext) -> Self {
         Self { context }
     }
 }
@@ -138,6 +143,7 @@ impl Tool for SubagentRepoTool {
     type Arguments = RepoArgs;
     type Res = ToolResult;
 
+    #[allow(clippy::unused_async_trait_impl)]
     async fn call(
         &self,
         args: Self::Arguments,
@@ -150,10 +156,10 @@ impl Tool for SubagentRepoTool {
                     Ok(v) => v,
                     Err(e) => return Ok(ToolResult::text(e)),
                 };
-                match trust::trust_for(&self.context.workspace_config, &key, &worktree) {
-                    Some(level) => format!("trust: {}", level.as_str()),
-                    None => "trust undecided — answer the repo-trust question".to_string(),
-                }
+                trust::trust_for(&self.context.workspace_config, &key, &worktree).map_or_else(
+                    || "trust undecided — answer the repo-trust question".to_string(),
+                    |level| format!("trust: {}", level.as_str()),
+                )
             }
         }))
     }
