@@ -13,14 +13,15 @@
 //! only the [`tag::WORKSPACE_WORKDIRS`] block while the rest of the
 //! workspace prefix stays cached.
 
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use aither_agent::SubagentDefinition;
 use aither_core::llm::model::{Ability, Parameters};
 use askama::Template;
+use async_fs;
 
 use super::may::{AgentEnvironment, MayAgentConfig, MayAgentError};
-use crate::fs_utils::display_path;
 use crate::network_policy::{CompiledNetworkPolicy, NetworkPolicyMode};
 use crate::session::{SessionPaths, SessionPlanState};
 use crate::skill::SkillManager;
@@ -63,7 +64,10 @@ pub mod tag {
 /// additional templating cost and no XML wrapping.
 #[derive(Clone)]
 pub struct RuntimeSystemContext {
-    memory_db: crate::db::ChatDb,
+    memory_path: PathBuf,
+    /// Snapshot of every file under the memories directory; `None` until the
+    /// first scan establishes a silent baseline.
+    memories_snapshot: Option<HashMap<String, String>>,
     last_memory_content: String,
     terminal_runtime: Option<String>,
     workspace_workdirs: Option<String>,
@@ -78,9 +82,10 @@ pub struct RuntimeSystemContext {
 }
 
 impl RuntimeSystemContext {
-    pub(crate) const fn new(memory_db: crate::db::ChatDb, memory_content: String) -> Self {
+    pub(crate) const fn new(memory_path: PathBuf, memory_content: String) -> Self {
         Self {
-            memory_db,
+            memory_path,
+            memories_snapshot: None,
             last_memory_content: memory_content,
             terminal_runtime: None,
             workspace_workdirs: None,
@@ -190,14 +195,92 @@ impl RuntimeSystemContext {
         );
     }
 
-    pub(crate) async fn sync_memory_content(&mut self) {
-        match self.memory_db.get_global_memory().await {
-            Ok(Some(content)) => self.last_memory_content = content,
-            Ok(None) => self.last_memory_content = String::new(),
+    /// Re-read the memory index and watch the whole memories directory,
+    /// alerting on changes to files this session has actually seen.
+    pub(crate) async fn sync_memory_content(&mut self, context: &mut aither_agent::Context) {
+        match async_fs::read_to_string(&self.memory_path).await {
+            Ok(index_content) => self.last_memory_content = index_content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.last_memory_content = String::new();
+            }
             Err(error) => {
-                tracing::error!(error = %error, "failed to read global memory from DB");
+                tracing::error!(error = %error, "failed to read global memory file");
             }
         }
+
+        let Some(memories_dir) = self.memory_path.parent() else {
+            return;
+        };
+        let mut next = HashMap::new();
+        scan_memories_dir(memories_dir, memories_dir, &mut next);
+        let Some(snapshot) = self.memories_snapshot.replace(next.clone()) else {
+            // First scan is a silent baseline: nothing counts as changed.
+            return;
+        };
+
+        // A file counts as read only if a memory path reached the
+        // conversation — changes to never-surfaced files stay silent.
+        let mut seen = HashSet::new();
+        for message in context.conversation_messages() {
+            collect_memory_paths(message.content(), &mut seen);
+        }
+
+        let mut changes = Vec::new();
+        for (rel, content) in &next {
+            if rel == "MEMORY.md" || !seen.contains(rel) {
+                continue;
+            }
+            if snapshot.get(rel) != Some(content) {
+                changes.push(format!("{rel} (modified)"));
+            }
+        }
+        for rel in snapshot.keys() {
+            if rel != "MEMORY.md" && !next.contains_key(rel) && seen.contains(rel) {
+                changes.push(format!("{rel} (deleted)"));
+            }
+        }
+        if !changes.is_empty() {
+            changes.sort();
+            context.push_alert(&MemoriesChanges { files: changes });
+        }
+    }
+}
+
+fn scan_memories_dir(root: &Path, dir: &Path, out: &mut HashMap<String, String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            scan_memories_dir(root, &path, out);
+        } else if let Ok(content) = std::fs::read_to_string(&path) {
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            out.insert(rel, content);
+        }
+    }
+}
+
+/// Collect `memories/<relative>` path mentions out of a text.
+fn collect_memory_paths(text: &str, out: &mut HashSet<String>) {
+    let mut rest = text;
+    while let Some(index) = rest.find("memories/") {
+        let tail = &rest[index + "memories/".len()..];
+        let end = tail
+            .find(|c: char| !(c.is_alphanumeric() || matches!(c, '/' | '.' | '-' | '_')))
+            .unwrap_or(tail.len());
+        let rel = tail[..end].trim_end_matches(['.', '/']).to_string();
+        if !rel.is_empty() && rel != "." {
+            out.insert(rel);
+        }
+        rest = &tail[end..];
     }
 }
 
@@ -217,6 +300,13 @@ fn reconcile_text_block(
 #[template(path = "alert_memory_update.txt", escape = "none")]
 struct MemoryUpdate {
     diff: String,
+}
+
+/// Durable alert listing which files under `~/.may/memories/` changed.
+#[derive(Template)]
+#[template(path = "alert_memories_changes.txt", escape = "none")]
+struct MemoriesChanges {
+    files: Vec<String>,
 }
 
 /// Reconciles the MEMORY block without invalidating the KV-cache prefix.
@@ -276,8 +366,8 @@ struct TerminalRuntimeContextTemplate {
     home_environment_kind: String,
     operating_system: String,
     shell_dialect: &'static str,
-    home_directory: String,
-    session_directory: String,
+    working_directory: String,
+    home_note: &'static str,
     host_launch_directory: Option<String>,
     home_layout: Vec<String>,
     session_layout: Vec<String>,
@@ -325,7 +415,7 @@ struct RepoCloneTemplateEntry {
 impl From<&MayWorkspaceDir> for WorkspaceDirEntry {
     fn from(value: &MayWorkspaceDir) -> Self {
         Self {
-            path: display_path(&value.path),
+            path: value.path.display().to_string(),
             description: value
                 .description
                 .clone()
@@ -425,14 +515,10 @@ pub fn build_terminal_runtime_context(
         home_environment_kind: home_environment_kind_label(&config.environment).to_string(),
         operating_system: operating_system_hint(&config.environment).to_string(),
         shell_dialect: "POSIX sh",
-        home_directory: display_path(&session_paths.home_root()),
-        session_directory: display_path(session_paths.root()),
+        working_directory: working_directory(&config.environment, session_paths),
+        home_note: home_note(&config.environment),
         host_launch_directory,
-        home_layout: vec![
-            "/sessions - per-session sandboxes under this home environment".to_string(),
-            "/skills, /subagents - profile-scoped, mounted read-only inside the session".to_string(),
-            "workspace.toml - May-managed workspace grants for this home environment".to_string(),
-        ],
+        home_layout: home_layout(&config.environment),
         session_layout: vec![
             "/tmp - disposable temporary files".to_string(),
             "/artifacts - durable user-facing outputs; put deliverables here".to_string(),
@@ -498,7 +584,7 @@ pub fn build_repo_clones_context(clones: &[RepoCloneEntry]) -> Option<String> {
         clones: clones
             .iter()
             .map(|c| RepoCloneTemplateEntry {
-                path: display_path(&c.clone_path),
+                path: c.clone_path.display().to_string(),
                 source: c.source.clone(),
             })
             .collect(),
@@ -596,6 +682,42 @@ const fn home_environment_kind_label(environment: &AgentEnvironment) -> &'static
     }
 }
 
+/// The working directory the terminal starts in, as the shell sees it.
+fn working_directory(environment: &AgentEnvironment, session_paths: &SessionPaths) -> String {
+    match environment {
+        AgentEnvironment::Local => session_paths.root().display().to_string(),
+        AgentEnvironment::Container { .. } => {
+            crate::container::lifecycle::CONTAINER_WORKSPACE.to_string()
+        }
+    }
+}
+
+/// What `~`/`$HOME` expands to inside the shell.
+const fn home_note(environment: &AgentEnvironment) -> &'static str {
+    match environment {
+        AgentEnvironment::Local => {
+            "`~` and `$HOME` expand to the current working directory in every terminal mode, unsafe escalations included; use absolute paths for host locations."
+        }
+        AgentEnvironment::Container { .. } => {
+            "`~` and `$HOME` expand to the current working directory; storage outside /workspace is ephemeral to the container."
+        }
+    }
+}
+
+/// Layout of the profile home environment, empty where it has no meaningful
+/// anchor inside the session (containers mount its pieces under /root/.may).
+fn home_layout(environment: &AgentEnvironment) -> Vec<String> {
+    match environment {
+        AgentEnvironment::Local => vec![
+            "/sessions - per-session sandboxes under this home environment".to_string(),
+            "/skills, /subagents - profile-scoped, mounted read-only inside the session"
+                .to_string(),
+            "workspace.toml - May-managed workspace grants for this home environment".to_string(),
+        ],
+        AgentEnvironment::Container { .. } => Vec::new(),
+    }
+}
+
 fn operating_system_hint(environment: &AgentEnvironment) -> &'static str {
     match environment {
         AgentEnvironment::Local => host_operating_system_label(),
@@ -683,13 +805,10 @@ mod tests {
         RuntimeSystemContext, build_base_system_prompt, build_memory_context_content, tag,
     };
 
-    fn test_db() -> crate::db::ChatDb {
+    fn test_memory_file() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempdir().expect("temp dir should be created");
-        let db_path = dir.path().join("test.db");
-        // Leak the tempdir so the DB file persists for the test duration
-        let dir = Box::leak(Box::new(dir));
-        let _ = dir;
-        tokio_test::block_on(crate::db::ChatDb::open(&db_path)).expect("test db should open")
+        let path = dir.path().join("MEMORY.md");
+        (dir, path)
     }
 
     /// Durable system alerts pushed with `Context::push_alert`.
@@ -708,8 +827,8 @@ mod tests {
 
     #[test]
     fn runtime_system_context_reinstates_memory_and_prunes_absent_blocks() {
-        let db = test_db();
-        let runtime_context = RuntimeSystemContext::new(db, "remember this".to_string());
+        let (_dir, memory_path) = test_memory_file();
+        let runtime_context = RuntimeSystemContext::new(memory_path, "remember this".to_string());
         let mut context = aither_agent::Context::default();
         context.insert_system_text(tag::PROFILE_PERSONA, "stale persona");
         context.insert_system_text(tag::WORKSPACE, "stale workspace");
@@ -728,15 +847,16 @@ mod tests {
 
     #[test]
     fn runtime_system_context_stages_memory_updates_with_diff_alert() {
-        let db = test_db();
-        tokio_test::block_on(db.set_global_memory("before")).expect("write initial memory");
+        let (_dir, memory_path) = test_memory_file();
+        std::fs::write(&memory_path, "before").expect("write initial memory");
 
-        let mut runtime_context = RuntimeSystemContext::new(db.clone(), "before".to_string());
+        let mut runtime_context =
+            RuntimeSystemContext::new(memory_path.clone(), "before".to_string());
         let mut context = aither_agent::Context::default();
         runtime_context.reconcile(&mut context);
 
-        tokio_test::block_on(db.set_global_memory("after")).expect("update memory");
-        tokio_test::block_on(runtime_context.sync_memory_content());
+        std::fs::write(&memory_path, "after").expect("update memory");
+        tokio_test::block_on(runtime_context.sync_memory_content(&mut context));
         runtime_context.reconcile(&mut context);
 
         // Cache-friendly: the live block still holds the old content; the
@@ -782,8 +902,8 @@ mod tests {
 
     #[test]
     fn terminal_runtime_context_is_reconciled_as_system_block() {
-        let db = test_db();
-        let runtime_context = RuntimeSystemContext::new(db, "remember this".to_string())
+        let (_dir, memory_path) = test_memory_file();
+        let runtime_context = RuntimeSystemContext::new(memory_path, "remember this".to_string())
             .with_terminal_runtime("Model: demo-model\nHome environment kind: local".to_string());
         let mut context = aither_agent::Context::default();
         runtime_context.reconcile(&mut context);
@@ -804,8 +924,8 @@ mod tests {
 
     #[test]
     fn workspace_and_workdirs_are_reconciled_independently() {
-        let db = test_db();
-        let mut runtime_context = RuntimeSystemContext::new(db, String::new())
+        let (_dir, memory_path) = test_memory_file();
+        let mut runtime_context = RuntimeSystemContext::new(memory_path, String::new())
             .with_terminal_runtime("Model: demo-model".to_string());
         let mut context = aither_agent::Context::default();
         context.insert_system_text(tag::WORKSPACE, "stale workspace");
