@@ -21,6 +21,7 @@ use hyper_util::rt::TokioIo;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use may_agent::config::CommandPriority;
 use may_agent::config::{ProviderInstance, ProviderType};
+use may_agent::db::{CreateProfileParams, ProfileEnvironmentKind};
 use may_agent::model_selector::ModelSelector;
 use may_agent::session::{
     SandboxResourceLayout, SessionId, SessionStore, initialize_session_persistence,
@@ -1650,7 +1651,7 @@ impl ChatEnvironment {
                 PreparedEnvironment::Local { profile_id }
             }
             Self::Container => {
-                let profile_id = create_container_profile_via_api(client, server).await;
+                let profile_id = create_container_profile(harness).await;
                 let runtime = may_agent::container::ContainerRuntime::detect()
                     .await
                     .unwrap_or_else(|error| {
@@ -1836,31 +1837,34 @@ async fn create_session_via_api(
         .to_string()
 }
 
-/// Creates a container-environment profile through the REST API, the way the
-/// web UI's profile settings do, and returns its id.
-async fn create_container_profile_via_api(
-    client: &reqwest::Client,
-    server: &RunningDaemon,
-) -> String {
-    let response = client
-        .post(format!("{}/api/profiles", server.base_url))
-        .json(&serde_json::json!({
-            "name": "e2e-container",
-            "environment": "container",
-            "locationAware": false,
-        }))
-        .send()
+/// Creates the container-environment profile container tests run in, and
+/// returns its id. The id stays short on purpose: it becomes part of the
+/// session container's name, which Linux caps as a hostname at 63 bytes.
+async fn create_container_profile(harness: &TestHarness) -> String {
+    let (_store, db, _default_profile_id) = initialize_session_persistence(&harness.may_dir)
         .await
-        .expect("create profile request should succeed");
-    let response = expect_status(&server.log, response, StatusCode::OK).await;
-    response
-        .json::<Value>()
+        .expect("session persistence should initialize");
+    if let Some(existing) = db
+        .get_profile("e2e-container")
         .await
-        .expect("create profile response should be valid JSON")
-        .get("id")
-        .and_then(Value::as_str)
-        .expect("create profile response should include id")
-        .to_string()
+        .expect("profile lookup should succeed")
+    {
+        return existing.id;
+    }
+    db.create_profile(CreateProfileParams {
+        id: "e2e-container",
+        name: "e2e-container",
+        environment: ProfileEnvironmentKind::Container,
+        container_image: None,
+        slug: None,
+        icon: None,
+        persona: None,
+        preferences: None,
+        location_aware: false,
+    })
+    .await
+    .expect("container profile should be created")
+    .id
 }
 
 async fn profile_id_via_api(
