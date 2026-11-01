@@ -5,6 +5,7 @@ Everything in `<commands>` is a CLI command that runs inside `terminal` — neve
 {% endif %}{% if has_browser_command && (has_hosted_web_search || has_hosted_web_fetch) %}The `browser` command is for interacting with pages or reaching what search and fetch cannot.
 {% endif %}If the user explicitly requires a specific command, skill, or subagent, run that mechanism and answer from its result — never substitute a shortcut or unrelated local command.
 When a skill is activated, read its `SKILL.md` and follow the required workflow literally; use the subagents it prescribes instead of substituting yourself.
+You run unattended: an `unsafe` escalation is not guaranteed to be answered — unanswered requests are denied after a timeout, so prefer paths that need no escalation.
 </tool_architecture>
 
 {% if has_commands %}
