@@ -8,7 +8,6 @@ use async_fs;
 use base64::Engine;
 use image::ImageFormat as ImgFormat;
 use url::Url;
-use zenwave::ResponseExt;
 
 use crate::session::SessionPaths;
 
@@ -452,12 +451,18 @@ pub async fn download_image(url: &Url) -> Result<ClipboardImage, ImageError> {
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default()
-        .to_string();
+        .to_lowercase();
 
-    let data = response
-        .into_bytes()
-        .await
-        .map_err(|e| ImageError::Download(e.to_string()))?;
+    // A declared non-image type never reaches the body; an image or an
+    // opaque type (absent, octet-stream) still needs the bytes probed.
+    let declared_image = content_type.starts_with("image/");
+    if !content_type.is_empty() && !declared_image && !content_type.contains("octet-stream") {
+        return Err(ImageError::NotImage(format!(
+            "response content-type '{content_type}' is not an image type"
+        )));
+    }
+
+    let data = read_image_body(response.into_body(), declared_image).await?;
 
     let format_from_header = ImageFormat::from_content_type(&content_type);
     let format_from_bytes = ImageFormat::from_magic_bytes(data.as_ref());
@@ -480,10 +485,45 @@ pub async fn download_image(url: &Url) -> Result<ClipboardImage, ImageError> {
         }
     };
 
-    Ok(ClipboardImage {
-        data: data.to_vec(),
-        format,
-    })
+    Ok(ClipboardImage { data, format })
+}
+
+/// Read a response body as image bytes, bounded and probed: when the
+/// content type did not vouch for an image, the first chunk's magic bytes
+/// must — a non-image body aborts there instead of being pulled whole.
+async fn read_image_body(body: zenwave::Body, declared_image: bool) -> Result<Vec<u8>, ImageError> {
+    use futures_lite::AsyncReadExt;
+
+    const MAX_BODY: usize = 64 * 1024 * 1024;
+
+    let mut reader = body.into_reader();
+    let mut data = Vec::new();
+    let mut chunk = vec![0u8; 16 * 1024];
+    let mut first = true;
+    loop {
+        let n = reader
+            .read(&mut chunk)
+            .await
+            .map_err(|e| ImageError::Download(e.to_string()))?;
+        if n == 0 {
+            break;
+        }
+        data.extend_from_slice(&chunk[..n]);
+        if first {
+            first = false;
+            if !declared_image && ImageFormat::from_magic_bytes(&data).is_none() {
+                return Err(ImageError::NotImage(
+                    "response body is not a supported image format".to_string(),
+                ));
+            }
+        }
+        if data.len() > MAX_BODY {
+            return Err(ImageError::Download(format!(
+                "image exceeds {MAX_BODY} bytes"
+            )));
+        }
+    }
+    Ok(data)
 }
 
 #[cfg(test)]
