@@ -467,7 +467,7 @@ impl ChatStream {
                     ..
                 } => {
                     if let Some(target) = targets.last_mut() {
-                        target.files += diffs.iter().map(|d| d.files).sum::<usize>();
+                        target.files += diffs.iter().map(|d| d.changes.len()).sum::<usize>();
                         target.additions += diffs.iter().map(|d| d.additions).sum::<usize>();
                         target.deletions += diffs.iter().map(|d| d.deletions).sum::<usize>();
                     }
@@ -480,14 +480,9 @@ impl ChatStream {
 
     /// Everything a prompt-level rewind needs from the stream: the
     /// prompt's own content and attachments (restored into the input for
-    /// editing) plus the ids of tool calls at or after it (file-restore
-    /// fallback when no prompt checkpoint exists). `None` when no user
-    /// message carries `history_index`.
+    /// editing). `None` when no user message carries `history_index`.
     #[must_use]
-    pub fn prompt_rewind_payload(
-        &self,
-        history_index: usize,
-    ) -> Option<(String, Vec<Attachment>, Vec<String>)> {
+    pub fn prompt_rewind_payload(&self, history_index: usize) -> Option<(String, Vec<Attachment>)> {
         let pos = self.elements.iter().position(|elem| {
             matches!(elem, ChatElement::UserMessage { history_index: idx, .. } if *idx == history_index)
         })?;
@@ -499,14 +494,7 @@ impl ChatStream {
         else {
             return None;
         };
-        let call_ids = self.elements[pos..]
-            .iter()
-            .filter_map(|elem| match elem {
-                ChatElement::ToolCall { id, .. } => Some(id.clone()),
-                _ => None,
-            })
-            .collect();
-        Some((content.clone(), attachments.clone(), call_ids))
+        Some((content.clone(), attachments.clone()))
     }
 
     /// Drop the user message at `history_index` and every element after
@@ -2385,6 +2373,7 @@ fn tool_header_line(
             description,
             command,
             mode,
+            diffs,
             ..
         } => {
             if description.is_empty() {
@@ -2406,6 +2395,28 @@ fn tool_header_line(
                 );
             } else {
                 spans.push(Span::styled(description.clone(), selection_style));
+            }
+            // File changes the call caused, as a compact badge: which
+            // files and how many lines, never the patch itself — the
+            // command text already carries anything the model wrote.
+            if !diffs.is_empty() {
+                let files: usize = diffs.iter().map(|d| d.changes.len()).sum();
+                let additions: usize = diffs.iter().map(|d| d.additions).sum();
+                let deletions: usize = diffs.iter().map(|d| d.deletions).sum();
+                let yellow = Style::default().fg(Color::Yellow);
+                spans.push(Span::styled(
+                    format!("  ± {files} file{} (", if files == 1 { "" } else { "s" }),
+                    yellow,
+                ));
+                spans.push(Span::styled(
+                    format!("+{additions}"),
+                    Style::default().fg(Color::Green),
+                ));
+                spans.push(Span::styled(
+                    format!(" −{deletions}"),
+                    Style::default().fg(Color::Red),
+                ));
+                spans.push(Span::styled(")", yellow));
             }
         }
         ToolDisplay::Action { chip, summary, .. } => {
@@ -2511,7 +2522,6 @@ fn render_tool_inline_at<'a>(
             mode,
             status,
             output,
-            diffs,
             ..
         } => {
             let mode_prefix = terminal_mode_marker(*mode);
@@ -2562,7 +2572,6 @@ fn render_tool_inline_at<'a>(
                 }
             }
             push_tool_call_image(lines, output.as_ref(), images_supported, image_positions);
-            render_diff_preview(lines, diffs);
         }
         ToolDisplay::Action {
             detail,
@@ -2606,63 +2615,6 @@ fn render_tool_inline_at<'a>(
                     lines.push(Line::from(Span::styled(format!("│ {line}"), dim)));
                 }
             }
-        }
-    }
-}
-
-/// Style one unified-diff line by its leading marker.
-fn diff_line_style(line: &str) -> Style {
-    if line.starts_with("+++") || line.starts_with("---") {
-        Style::default().fg(Color::DarkGray).bold()
-    } else if line.starts_with('+') {
-        Style::default().fg(Color::Green)
-    } else if line.starts_with('-') {
-        Style::default().fg(Color::Red)
-    } else if line.starts_with("@@") {
-        Style::default().fg(Color::Cyan)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    }
-}
-
-/// Render a compact per-root diff summary plus a capped tinted preview
-/// inside an expanded terminal tool body.
-fn render_diff_preview<'a>(lines: &mut Vec<Line<'a>>, diffs: &'a [crate::file_tracker::RootDiff]) {
-    for (index, diff) in diffs.iter().enumerate() {
-        let summary = format!(
-            "± {} file{} (+{} −{})",
-            diff.files,
-            if diff.files == 1 { "" } else { "s" },
-            diff.additions,
-            diff.deletions,
-        );
-        lines.push(Line::from(Span::styled(
-            if diffs.len() > 1 {
-                format!("{summary} in {}", diff.root.display())
-            } else {
-                summary
-            },
-            Style::default().fg(Color::Yellow),
-        )));
-
-        let total = diff.text.lines().count();
-        for line in diff.text.lines().take(DIFF_PREVIEW_LINES) {
-            lines.push(Line::from(vec![
-                Span::styled("│ ", Style::default().fg(Color::DarkGray)),
-                Span::styled(line.to_string(), diff_line_style(line)),
-            ]));
-        }
-        if total > DIFF_PREVIEW_LINES {
-            lines.push(Line::from(vec![
-                Span::styled("│ ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    format!("… {} more diff lines", total - DIFF_PREVIEW_LINES),
-                    Style::default().fg(Color::DarkGray).italic(),
-                ),
-            ]));
-        }
-        if index + 1 < diffs.len() {
-            lines.push(Line::from(""));
         }
     }
 }
@@ -2793,34 +2745,6 @@ pub fn render_tool_fullscreen(frame: &mut Frame, area: Rect, display: &ToolDispl
             }
 
             lines.push(Line::from(""));
-        }
-    }
-
-    // File changes attributed to this call
-    if let ToolDisplay::Terminal { diffs, .. } = display
-        && !diffs.is_empty()
-    {
-        for (index, diff) in diffs.iter().enumerate() {
-            lines.push(Line::from(Span::styled(
-                format!(
-                    "─── Changes in {} ({} file{}, +{} −{}) ───",
-                    diff.root.display(),
-                    diff.files,
-                    if diff.files == 1 { "" } else { "s" },
-                    diff.additions,
-                    diff.deletions,
-                ),
-                Style::default().fg(Color::Blue),
-            )));
-            for line in diff.text.lines() {
-                lines.push(Line::from(Span::styled(
-                    line.to_string(),
-                    diff_line_style(line),
-                )));
-            }
-            if index + 1 < diffs.len() {
-                lines.push(Line::from(""));
-            }
         }
     }
 
@@ -2978,10 +2902,13 @@ mod tests {
             "call-1",
             vec![crate::file_tracker::RootDiff {
                 root: std::path::PathBuf::from("/repo"),
-                files: 1,
+                changes: vec![crate::file_tracker::FileStat {
+                    path: std::path::PathBuf::from("a.txt"),
+                    additions: 2,
+                    deletions: 0,
+                }],
                 additions: 2,
                 deletions: 0,
-                text: "+line".to_string(),
             }],
         );
 
@@ -3478,8 +3405,7 @@ mod tests {
     }
 
     #[test]
-    fn expanded_shows_diff_body() {
-        let body = "+line\n".repeat(12);
+    fn headline_shows_diff_badge() {
         let mut display = terminal_display("echo hi");
         {
             let ToolDisplay::Terminal { diffs, .. } = &mut display else {
@@ -3487,21 +3413,25 @@ mod tests {
             };
             *diffs = vec![crate::file_tracker::RootDiff {
                 root: std::path::PathBuf::from("/tmp/root"),
-                text: body,
-                files: 1,
+                changes: vec![crate::file_tracker::FileStat {
+                    path: std::path::PathBuf::from("a.txt"),
+                    additions: 12,
+                    deletions: 0,
+                }],
                 additions: 12,
                 deletions: 0,
             }];
         }
 
-        // Collapsed: only the headline, no diff information.
+        // Collapsed: the headline carries the badge; no patch lines
+        // render anywhere.
         let mut lines: Vec<Line> = Vec::new();
         let mut positions = Vec::new();
         render_tool_inline(&mut lines, &display, false, true, &mut positions);
         let text = rendered_text(&lines);
-        assert_eq!(text, vec!["▸ ✓ $ echo hi".to_string()]);
+        assert_eq!(text, vec!["▸ ✓ $ echo hi  ± 1 file (+12 −0)".to_string()]);
 
-        // Expanded: command, diff summary and the capped diff body.
+        // Expanded: command body, still no diff block.
         let ToolDisplay::Terminal {
             pinned,
             finished_at,
@@ -3516,9 +3446,8 @@ mod tests {
         let mut positions = Vec::new();
         render_tool_inline(&mut lines, &display, false, true, &mut positions);
         let text = rendered_text(&lines);
-        assert_eq!(text[0], "▾ ✓ $ echo hi");
-        assert!(text[2].contains("± 1 file (+12 −0)"));
-        assert!(text[11].contains("4 more diff lines"));
+        assert_eq!(text[0], "▾ ✓ $ echo hi  ± 1 file (+12 −0)");
+        assert!(text.iter().all(|line| !line.contains("+line")));
     }
 
     /// The headline leads with the call's status: spinner while running,
