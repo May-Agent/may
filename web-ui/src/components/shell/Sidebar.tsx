@@ -156,6 +156,7 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
                         runtime={item.runtime}
                         kind="pinned"
                         active={item.id === sessionId}
+                        repo={item.repo}
                       />
                     ) : (
                       <FolderNode key={item.id} id={item.id} name={item.name} defaultOpen>
@@ -169,6 +170,7 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
                             active={child.id === sessionId}
                             inFolder
                             indent
+                            repo={child.repo}
                           />
                         ))}
                       </FolderNode>
@@ -187,6 +189,7 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
                       runtime={item.runtime}
                       kind="regular"
                       active={item.id === sessionId}
+                      repo={item.repo}
                     />
                   ))}
                 </Section>
@@ -218,6 +221,7 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
                           runtime={item.runtime}
                           kind="archived"
                           active={item.id === sessionId}
+                          repo={item.repo}
                         />
                       ))}
                     </ul>
