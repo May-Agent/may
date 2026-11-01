@@ -279,6 +279,7 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
         search_index_wake,
         search_index_status: crate::repo_search::indexer::IndexerStatus::default(),
         daemon_shutdown: Arc::new(tokio::sync::Notify::new()),
+        draining: std::sync::atomic::AtomicBool::new(false),
         build_id: crate::daemon::current_build_id()
             .context("failed to identify the running build")?,
         turn_hub: Arc::new(super::chat::TurnHub::default()),
@@ -554,6 +555,9 @@ async fn health(
 }
 
 async fn shutdown_daemon(State(state): State<Arc<DaemonState>>) -> SkyResult<Json<ApiHealth>> {
+    state
+        .draining
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     state.daemon_shutdown.notify_one();
     Ok(Json(super::types::API_OK))
 }
