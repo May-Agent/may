@@ -376,6 +376,18 @@ async fn run_commands(
                     Err(error) => fail(&event_tx, error.to_string()).await,
                 }
             }
+            WorkerCommand::UsageReport { event_tx } => {
+                match client
+                    .get::<crate::agent::SessionUsageReport>(&session_path(&session_id, "/usage"))
+                    .await
+                {
+                    Ok(report) => {
+                        let _ = event_tx.send(TuiEvent::UsageReport(report)).await;
+                        let _ = event_tx.send(TuiEvent::Complete).await;
+                    }
+                    Err(error) => fail(&event_tx, error.to_string()).await,
+                }
+            }
             WorkerCommand::ContextDump { event_tx } => {
                 let result: Result<ContextDumpResponse, _> = client
                     .post(
