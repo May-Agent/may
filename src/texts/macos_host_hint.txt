@@ -1,1 +1,0 @@
-Host automation: prefer `osascript -l JavaScript` (JXA) over AppleScript; use `mdfind` for Spotlight search; request unsafe escalation explicitly when a host-level operation needs elevated sandbox permissions.
