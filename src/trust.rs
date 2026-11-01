@@ -8,7 +8,7 @@
 //! - `prs_only` — GitHub PRs, may issues; every published text is screened
 //! - `local` — may PR + may issue; nothing leaves the machine
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::session::{PersistedAskUserQuestion, PersistedAskUserRequest};
 use crate::workspace::{
@@ -109,9 +109,7 @@ pub fn trust_for(
     _worktree: &Path,
 ) -> Option<TrustLevel> {
     let project = config.projects.iter().find(|p| {
-        crate::issue::repository_identity(&p.path)
-            .map(|k| k.as_path() == repo_key)
-            .unwrap_or(false)
+        crate::issue::repository_identity(&p.path).is_ok_and(|k| k.as_path() == repo_key)
     })?;
     Some(match (project.pr.backend.as_deref(), &project.issues) {
         (Some("github"), ProjectIssues::Github { .. }) => TrustLevel::Full,
@@ -165,9 +163,9 @@ pub fn persist(
     config.save(config_path)
 }
 
-/// The first-contact ask_user request for one repository.
+/// The first-contact `ask_user` request for one repository.
 #[must_use]
-pub fn question_for(kind: &RepoKind, worktree: &PathBuf) -> PersistedAskUserRequest {
+pub fn question_for(kind: &RepoKind, worktree: &Path) -> PersistedAskUserRequest {
     let (question, options) = match kind {
         RepoKind::Github { owner_repo } => (
             format!(
