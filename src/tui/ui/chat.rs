@@ -1015,6 +1015,52 @@ impl ChatStream {
     }
 }
 
+/// Quoted `url` attribute of an `<artifact …>` control tag.
+fn artifact_tag_url(tag: &str) -> Option<&str> {
+    let tail = tag
+        .split("url")
+        .nth(1)?
+        .trim_start()
+        .strip_prefix('=')?
+        .trim_start();
+    let quote = *tail.as_bytes().first()?;
+    if quote != b'"' && quote != b'\'' {
+        return None;
+    }
+    let inner = &tail[1..];
+    let end = inner.find(quote as char)?;
+    let path = &inner[..end];
+    (!path.is_empty()).then_some(path)
+}
+
+/// Replaces `<artifact url="path" … />` control tags with a readable
+/// markdown line; a malformed or still-streaming tag is left alone.
+fn artifact_tag_text(content: &str) -> std::borrow::Cow<'_, str> {
+    if !content.contains("<artifact") {
+        return std::borrow::Cow::Borrowed(content);
+    }
+    let mut out = String::with_capacity(content.len());
+    let mut rest = content;
+    while let Some(start) = rest.find("<artifact") {
+        let after = &rest[start..];
+        let Some(end) = after.find("/>") else {
+            break;
+        };
+        let Some(path) = artifact_tag_url(&after[..end]) else {
+            out.push_str(&rest[..start + "<artifact".len()]);
+            rest = &after["<artifact".len()..];
+            continue;
+        };
+        out.push_str(&rest[..start]);
+        out.push_str("**artifact:** `");
+        out.push_str(path);
+        out.push('`');
+        rest = &after[end + 2..];
+    }
+    out.push_str(rest);
+    std::borrow::Cow::Owned(out)
+}
+
 /// Input rendering context for combined view.
 #[derive(Debug)]
 pub struct InputContext<'a> {
@@ -1582,7 +1628,8 @@ pub(super) fn element_lines(
             } else {
                 markdown::ImageSupport::Disabled
             };
-            let md_result = markdown::render_markdown_with_positions(content, image_mode);
+            let display = artifact_tag_text(content);
+            let md_result = markdown::render_markdown_with_positions(&display, image_mode);
             let mut md_lines = md_result.lines;
             // Strip trailing empties from the markdown renderer so a message
             // does not end in a run of blank rows — but never into the rows
