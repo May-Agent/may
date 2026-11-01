@@ -39,9 +39,9 @@ use crate::ask_user;
 use crate::db::RunFence;
 use crate::prompt_mentions;
 use crate::session::{
-    AcquireError, ChatHistory, ChatMessage, ChatMessageStats, MayHomePaths, MessageRole,
-    PendingUserMessage, PersistedAttachment, RunOutcome, SessionId, SessionPaths, SessionRunGuard,
-    SessionRuntimeState, SessionStore, TerminalRuntimeState,
+    AcquireError, CancelReason, ChatHistory, ChatMessage, ChatMessageStats, MayHomePaths,
+    MessageRole, PendingUserMessage, PersistedAttachment, RunOutcome, SessionId, SessionPaths,
+    SessionRunGuard, SessionRuntimeState, SessionStore, TerminalRuntimeState,
 };
 use crate::task_trigger::EVENT_CHAT_TURN_COMPLETED;
 use crate::ui_event_bus::UiEventTopics;
@@ -715,6 +715,11 @@ fn active_session_conflict_error() -> skyzen::Error {
         .set_status(skyzen::StatusCode::CONFLICT)
 }
 
+fn draining_error() -> skyzen::Error {
+    skyzen::Error::msg("the daemon is shutting down; the next daemon takes over")
+        .set_status(skyzen::StatusCode::CONFLICT)
+}
+
 fn persisted_attachments(
     attachments: Vec<super::types::ApiAttachment>,
 ) -> Vec<PersistedAttachment> {
@@ -1120,7 +1125,10 @@ pub(super) async fn stop_session_run(
         );
     }
 
-    let cancelled = state.runtime_service.runs().cancel(&session_id);
+    let cancelled = state
+        .runtime_service
+        .runs()
+        .cancel(&session_id, CancelReason::User);
     tracing::info!(session_id = %session_id, cancelled, "received session stop request");
 
     let runtime = state
@@ -1146,6 +1154,9 @@ pub(super) async fn send_message(
         .map_err(super::error::bad_request_error)?
         .to_string();
     req.session_id.clone_from(&session_id);
+    if state.draining.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(draining_error());
+    }
     let runtime = state
         .runtime_service
         .get(&session_id)
@@ -1461,10 +1472,12 @@ fn run_agent_loop<'a>(
                     let next_event = tokio::select! {
                         biased;
                         cancel = guard.cancellation().recv() => {
-                            cancellation_reason = Some(if cancel == Ok(()) {
-                                "run cancelled by user"
-                            } else {
-                                "run cancellation channel closed unexpectedly"
+                            cancellation_reason = Some(match cancel {
+                                Ok(CancelReason::User) => "run cancelled by user",
+                                Ok(CancelReason::DaemonRestarting) => {
+                                    "run interrupted: the daemon is restarting"
+                                }
+                                Err(_) => "run cancellation channel closed unexpectedly",
                             });
                             None
                         }

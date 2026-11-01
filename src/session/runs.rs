@@ -46,6 +46,15 @@ pub enum RunOutcome {
     Cancelled,
 }
 
+/// Who asked a run to stop, carried to the run so it can say why it ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelReason {
+    /// The user stopped the run (the session stop endpoint).
+    User,
+    /// The daemon is shutting down and draining its turns.
+    DaemonRestarting,
+}
+
 /// Starts a detached background task: the settling of a dropped guard.
 ///
 /// The default spawns on the global executor, which only works from a thread
@@ -61,7 +70,7 @@ fn global_spawner() -> Spawner {
 /// Process-local view of a live guard.
 struct LiveRun {
     fence: RunFence,
-    cancel_tx: Sender<()>,
+    cancel_tx: Sender<CancelReason>,
 }
 
 /// Acquires, cancels and inspects session runs.
@@ -189,10 +198,16 @@ impl SessionRuns {
 
     /// Stop the run holding `session_id`. Returns whether one was signalled.
     #[must_use]
-    pub fn cancel(&self, session_id: &str) -> bool {
+    pub fn cancel(&self, session_id: &str, reason: CancelReason) -> bool {
         self.live_runs()
             .get(session_id)
-            .is_some_and(|run| run.cancel_tx.try_send(()).is_ok())
+            .is_some_and(|run| run.cancel_tx.try_send(reason).is_ok())
+    }
+
+    /// Sessions currently held by a live run.
+    #[must_use]
+    pub fn live_session_ids(&self) -> Vec<String> {
+        self.live_runs().keys().cloned().collect()
     }
 
     /// Whether a live run holds the session.
@@ -221,7 +236,7 @@ impl SessionRuns {
 pub struct SessionRunGuard {
     runs: SessionRuns,
     fence: RunFence,
-    cancel_rx: Receiver<()>,
+    cancel_rx: Receiver<CancelReason>,
     settled: bool,
 }
 
@@ -249,7 +264,7 @@ impl SessionRunGuard {
     /// Receives a message when the run must stop. The run drops its work and
     /// finishes the guard.
     #[must_use]
-    pub const fn cancellation(&self) -> &Receiver<()> {
+    pub const fn cancellation(&self) -> &Receiver<CancelReason> {
         &self.cancel_rx
     }
 
