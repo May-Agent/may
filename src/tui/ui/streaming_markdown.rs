@@ -5,10 +5,24 @@
 
 use ratatui::prelude::*;
 use streamdown_parser::{InlineElement, InlineParser, ParseEvent, Parser};
+use syntect::easy::HighlightLines;
 use unicode_width::UnicodeWidthStr;
 
 /// Height reserved for inline images (in terminal lines).
 pub const IMAGE_HEIGHT: usize = 8;
+
+/// Background every code-block line is painted with.
+const CODE_BG: Color = Color::Rgb(30, 30, 30);
+
+/// `HighlightLines` carries no `Debug`; this wrapper lets the renderer
+/// keep its `#[derive(Debug)]` while recording only that a block is open.
+struct CodeHighlighter(HighlightLines<'static>);
+
+impl std::fmt::Debug for CodeHighlighter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CodeHighlighter(..)")
+    }
+}
 
 /// Streaming markdown renderer with incremental parsing.
 #[derive(Debug)]
@@ -47,6 +61,10 @@ pub struct StreamingMarkdown {
     table_header_rows: usize,
     /// Whether `TableSeparator` has arrived for the open table.
     table_has_separator: bool,
+    /// Highlighter of the open fenced code block; `None` for a fence with
+    /// no language or one syntect doesn't know. Holds parse state across
+    /// streamed `CodeBlockLine`s.
+    code_highlighter: Option<CodeHighlighter>,
 }
 
 impl Default for StreamingMarkdown {
@@ -76,6 +94,7 @@ impl StreamingMarkdown {
             table_rows: Vec::new(),
             table_header_rows: 0,
             table_has_separator: false,
+            code_highlighter: None,
         }
     }
 
@@ -98,6 +117,7 @@ impl StreamingMarkdown {
             table_rows: Vec::new(),
             table_header_rows: 0,
             table_has_separator: false,
+            code_highlighter: None,
         }
     }
 
@@ -187,6 +207,7 @@ impl StreamingMarkdown {
         self.table_rows.clear();
         self.table_header_rows = 0;
         self.table_has_separator = false;
+        self.code_highlighter = None;
     }
 
     /// Get the current raw content.
@@ -357,32 +378,37 @@ impl StreamingMarkdown {
             }
             ParseEvent::CodeBlockStart { language, .. } => {
                 self.end_inline_line();
-                if let Some(lang) = language {
-                    self.rendered.push(Line::from(vec![
-                        Span::styled("│ ", Style::default().fg(Color::DarkGray)),
-                        Span::styled(
-                            lang,
-                            Style::default()
-                                .fg(Color::Yellow)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                    ]));
-                }
+                self.code_highlighter = language
+                    .as_deref()
+                    .and_then(super::highlight::highlighter)
+                    .map(CodeHighlighter);
             }
             ParseEvent::CodeBlockLine(line) => {
                 self.end_inline_line();
-                self.rendered.push(Line::from(vec![
-                    Span::styled("│ ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(
+                let mut spans = vec![Span::styled("│ ", Style::default().fg(Color::DarkGray))];
+                if let Some(highlighter) = &mut self.code_highlighter {
+                    spans.extend(
+                        super::highlight::line_spans(&mut highlighter.0, &line)
+                            .into_iter()
+                            .map(|span| {
+                                let style = span.style.patch(Style::default().bg(CODE_BG));
+                                span.style(style)
+                            }),
+                    );
+                } else {
+                    spans.push(Span::styled(
                         line,
-                        Style::default().fg(Color::White).bg(Color::Rgb(30, 30, 30)),
-                    ),
-                ]));
+                        Style::default().fg(Color::White).bg(CODE_BG),
+                    ));
+                }
+                self.rendered.push(Line::from(spans));
             }
-            ParseEvent::CodeBlockEnd
-            | ParseEvent::ListEnd
-            | ParseEvent::BlockquoteEnd
-            | ParseEvent::EmptyLine => {
+            ParseEvent::CodeBlockEnd => {
+                self.end_inline_line();
+                self.code_highlighter = None;
+                self.rendered.push(Line::from(""));
+            }
+            ParseEvent::ListEnd | ParseEvent::BlockquoteEnd | ParseEvent::EmptyLine => {
                 self.end_inline_line();
                 self.rendered.push(Line::from(""));
             }
@@ -907,6 +933,59 @@ mod tests {
             has_modifier(lines, Modifier::BOLD),
             "no BOLD span in: {lines:?}"
         );
+    }
+
+    #[test]
+    fn test_code_block_highlighted() {
+        let mut md = StreamingMarkdown::new();
+        md.push("```rust\nlet x = 1;\n```\n");
+        md.flush();
+        let lines = md.lines();
+        let code = &lines[0];
+        // Gutter plus more than one styled region: keywords got colored.
+        assert!(code.spans.len() > 2, "not highlighted: {code:?}");
+        assert!(
+            code.spans
+                .iter()
+                .all(|s| s.style.bg == Some(CODE_BG) || s.content.as_ref() == "│ "),
+            "code span lost its background: {code:?}"
+        );
+        // The `rust` fence name is not rendered as a label line.
+        let text = flattened_text(lines);
+        assert!(!text.contains("rust"), "language label leaked: {text}");
+    }
+
+    #[test]
+    fn test_code_block_unknown_language_plain() {
+        let mut md = StreamingMarkdown::new();
+        md.push("```notalang\nlet x = 1;\n```\n");
+        md.flush();
+        let code = &md.lines()[0];
+        assert_eq!(code.spans.len(), 2, "expected gutter + one span: {code:?}");
+        assert_eq!(code.spans[1].style.bg, Some(CODE_BG));
+    }
+
+    #[test]
+    fn test_code_block_highlight_state_across_lines() {
+        // A comment opened on one line stays open into the next: the
+        // second line's code spans all carry the comment color, which
+        // differs from the default white of an unhighlighted block.
+        let mut md = StreamingMarkdown::new();
+        md.push("```rust\n/* start\nend */\n```\n");
+        md.flush();
+        let lines = md.lines();
+        let colors: Vec<Color> = lines[1]
+            .spans
+            .iter()
+            .skip(1)
+            .filter_map(|s| s.style.fg)
+            .collect();
+        assert_ne!(colors, [] as [Color; 0]);
+        assert!(
+            colors.iter().all(|c| *c == colors[0]),
+            "comment color broke across lines: {colors:?}"
+        );
+        assert_ne!(colors[0], Color::White);
     }
 
     #[test]
