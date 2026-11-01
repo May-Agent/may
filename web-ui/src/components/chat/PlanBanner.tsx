@@ -10,7 +10,7 @@ import {
   putSessionTasks,
 } from '@/lib/api/tasks';
 import { useTranslation } from '@/lib/i18n';
-import { useSessionsStore } from '@/lib/stores/sessions';
+import { isDraftSessionId, useSessionsStore } from '@/lib/stores/sessions';
 import { useInspectorStore } from '@/lib/stores/inspector';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import type { SessionPlanState } from '@/lib/types';
@@ -24,8 +24,10 @@ interface PlanBannerProps {
 export function PlanBanner({ sessionId, planState }: PlanBannerProps) {
   const { t } = useTranslation();
   const updateRuntime = useSessionsStore((s) => s.updateRuntime);
-  const [content, setContent] = useState<string>('');
-  const [loading, setLoading] = useState(true);
+  const isDraft = isDraftSessionId(sessionId);
+  const draftPlan = useSessionsStore((s) => s.drafts[sessionId]?.planContent);
+  const [fetchedContent, setFetchedContent] = useState<string>('');
+  const [fetching, setFetching] = useState(true);
   const [expanded, setExpanded] = useState(false);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState('');
@@ -34,19 +36,24 @@ export function PlanBanner({ sessionId, planState }: PlanBannerProps) {
   const setInspectorTasks = useInspectorStore((s) => s.setTasks);
 
   useEffect(() => {
+    // A draft's plan lives in the draft record — nothing to fetch.
+    if (isDraft) return;
     let cancelled = false;
     void (async () => {
       try {
         const res = await getSessionTasks(sessionId);
-        if (!cancelled) setContent(res.content);
+        if (!cancelled) setFetchedContent(res.content);
       } finally {
-        if (!cancelled) setLoading(false);
+        if (!cancelled) setFetching(false);
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, [sessionId, planState]);
+  }, [sessionId, planState, isDraft]);
+
+  const content = isDraft ? (draftPlan ?? '') : fetchedContent;
+  const loading = !isDraft && fetching;
 
   // The plan's state lives here, with the plan, and nowhere else: a draft
   // waits for the user's approval, an approved plan says so quietly.
@@ -58,8 +65,12 @@ export function PlanBanner({ sessionId, planState }: PlanBannerProps) {
   const transition = async (next: SessionPlanState) => {
     setBusy(true);
     try {
-      await putSessionPlanState(sessionId, next);
-      updateRuntime(sessionId, { planState: next });
+      if (isDraft) {
+        useSessionsStore.getState().saveDraftPlan(sessionId, content, next);
+      } else {
+        await putSessionPlanState(sessionId, next);
+        updateRuntime(sessionId, { planState: next });
+      }
     } catch (err) {
       toast.error(t('errors.generic'), {
         description: err instanceof Error ? err.message : undefined,
@@ -72,10 +83,15 @@ export function PlanBanner({ sessionId, planState }: PlanBannerProps) {
   const onSave = async () => {
     setBusy(true);
     try {
-      const res = await putSessionTasks(sessionId, { content: draft, planState: 'draft' });
-      setContent(res.content);
-      setInspectorTasks(sessionId, res.content, 'draft');
-      updateRuntime(sessionId, { planState: 'draft' });
+      if (isDraft) {
+        useSessionsStore.getState().saveDraftPlan(sessionId, draft, 'draft');
+        setInspectorTasks(sessionId, draft, 'draft');
+      } else {
+        const res = await putSessionTasks(sessionId, { content: draft, planState: 'draft' });
+        setFetchedContent(res.content);
+        setInspectorTasks(sessionId, res.content, 'draft');
+        updateRuntime(sessionId, { planState: 'draft' });
+      }
       setEditing(false);
     } catch (err) {
       toast.error(t('errors.generic'), {

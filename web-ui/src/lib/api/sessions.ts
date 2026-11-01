@@ -27,7 +27,11 @@ export function getSessionMessages(id: string): Promise<SessionMessagesResponse>
   return apiGet<SessionMessagesResponse>(`/sessions/${encodeURIComponent(id)}/messages`);
 }
 
-export function createSession(payload?: { title?: string; profileId?: string | null }): Promise<ApiSession> {
+export function createSession(payload?: {
+  title?: string;
+  profileId?: string | null;
+  model?: string;
+}): Promise<ApiSession> {
   return apiPost<ApiSession>('/sessions', payload ?? {});
 }
 

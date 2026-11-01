@@ -115,9 +115,14 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
 
     let mut output = OneShotOutput::new(io::stdout(), io::stderr());
     let mut worker: Option<AgentWorker> = None;
-    let mut build = runtime_deps
+    runtime_deps
         .begin_new_session(&mut app, &mut worker)
         .await?;
+    // A one-shot's prompt is the first message: the session materializes at once.
+    let mut build = runtime_deps
+        .materialize_session(&mut app)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("oneshot session already persisted"))?;
     let session_id = app
         .session_manager
         .current()
