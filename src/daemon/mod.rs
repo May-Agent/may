@@ -9,6 +9,7 @@
 pub mod lifecycle;
 pub mod serve;
 
+mod artifact_pages;
 mod artifacts;
 mod attachments;
 mod bootstrap;

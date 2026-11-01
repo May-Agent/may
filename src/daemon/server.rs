@@ -300,6 +300,7 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
     super::chat::spawn_background_watcher(state.clone(), state.ui_event_bus.clone());
     let scheduler = crate::scheduler::TaskScheduler::new(task_runtime);
     let _scheduler = scheduler.spawn();
+    super::artifacts::spawn_artifact_watcher(&state);
     let router = build_router(state.clone(), mode);
     Ok(StartedDaemon { state, router })
 }
@@ -309,7 +310,6 @@ fn api_routes() -> Route {
         get_artifact_preview, get_artifact_runtime_bridge, get_artifact_runtime_preview,
         get_output_preview, get_session_runtime, get_slidev_static_asset, list_session_artifacts,
         map_container_local_url, prepare_slidev_preview, report_artifact_diagnostics,
-        stream_session_artifacts,
     };
     use super::bootstrap::get_bootstrap;
     use super::browser::{
@@ -418,7 +418,6 @@ fn api_routes() -> Route {
                     )),
                     Route::new((
                         "/artifacts/runtime/preview".at(get_artifact_runtime_preview),
-                        "/artifacts/stream".at(stream_session_artifacts),
                         "/artifacts/diagnostics".post(report_artifact_diagnostics),
                         "/pin".post(pin_session),
                         "/unpin".post(unpin_session),
@@ -517,17 +516,35 @@ fn api_routes() -> Route {
     ))
 }
 
+/// User-facing artifact pages: `/profile/{profileId}/session/{sessionId}/artifacts`
+/// browses a session's artifact directory with rendered previews for
+/// browsers and raw bytes for everything else.
+fn artifact_page_routes() -> Route {
+    use super::artifact_pages::serve_artifact;
+    Route::new((
+        "/{profileId}/session/{sessionId}/artifacts".at(serve_artifact),
+        "/{profileId}/session/{sessionId}/artifacts/{*path}".at(serve_artifact),
+    ))
+}
+
 fn build_router(state: Arc<DaemonState>, mode: DaemonMode) -> Router {
     let api = "/api".route(api_routes());
+    let artifact_pages = "/profile".route(artifact_page_routes());
 
     match mode {
-        DaemonMode::Rest => Route::new((api,)).middleware(State(state)).build(),
+        DaemonMode::Rest => Route::new((api, artifact_pages))
+            .middleware(State(state))
+            .build(),
         DaemonMode::Ui => {
             #[cfg(feature = "ui")]
             {
-                Route::new((api, EmbeddedStaticDir::new("/", &WEB_UI_DIST).spa()))
-                    .middleware(State(state))
-                    .build()
+                Route::new((
+                    api,
+                    artifact_pages,
+                    EmbeddedStaticDir::new("/", &WEB_UI_DIST).spa(),
+                ))
+                .middleware(State(state))
+                .build()
             }
 
             #[cfg(not(feature = "ui"))]

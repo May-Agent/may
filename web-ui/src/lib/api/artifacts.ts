@@ -1,11 +1,9 @@
-import { apiGet, apiPost, apiSseUrl } from './client';
+import { apiGet, apiPost } from './client';
 import type {
   ArtifactDiagnosticsResponse,
-  ArtifactStreamPayload,
   SessionArtifactsResponse,
   SlidevPreviewResponse,
 } from '../types';
-import { parseNamedSseStream } from '../stream/sse';
 
 export function listArtifacts(sessionId: string): Promise<SessionArtifactsResponse> {
   return apiGet<SessionArtifactsResponse>(
@@ -54,41 +52,20 @@ export function reportArtifactDiagnostics(
   );
 }
 
-export type ArtifactStreamEvent =
-  | { kind: 'artifacts'; payload: ArtifactStreamPayload }
-  | { kind: 'heartbeat' };
-
-export interface ArtifactStreamHandle {
-  events: AsyncGenerator<ArtifactStreamEvent, void, void>;
-  abort: () => void;
+/**
+ * User-facing artifact page on the daemon. Browsers get the rendered
+ * preview page; other clients get the raw file. `profileId` may be `-`
+ * when the caller does not know the session's profile.
+ */
+export function artifactPageUrl(sessionId: string, path: string, profileId = '-'): string {
+  const rel = path
+    .replace(/^\.?\/?artifacts\//, '')
+    .split('/')
+    .map(encodeURIComponent)
+    .join('/');
+  return `/profile/${encodeURIComponent(profileId)}/session/${encodeURIComponent(sessionId)}/artifacts${rel ? `/${rel}` : ''}`;
 }
 
-export async function openArtifactStream(
-  sessionId: string,
-  abort?: AbortSignal,
-): Promise<ArtifactStreamHandle> {
-  const controller = new AbortController();
-  if (abort) {
-    if (abort.aborted) controller.abort();
-    else abort.addEventListener('abort', () => controller.abort(), { once: true });
-  }
-  const res = await fetch(
-    apiSseUrl(`/sessions/${encodeURIComponent(sessionId)}/artifacts/stream`),
-    { headers: { Accept: 'text/event-stream' }, signal: controller.signal },
-  );
-  if (!res.ok) throw new Error(`artifacts stream failed: ${res.status}`);
-
-  const raw = parseNamedSseStream<ArtifactStreamPayload>(res, controller.signal);
-
-  async function* translate(): AsyncGenerator<ArtifactStreamEvent, void, void> {
-    for await (const evt of raw) {
-      if (evt.event === 'artifacts' && evt.data) {
-        yield { kind: 'artifacts', payload: evt.data };
-      } else if (evt.event === 'heartbeat') {
-        yield { kind: 'heartbeat' };
-      }
-    }
-  }
-
-  return { events: translate(), abort: () => controller.abort() };
+export function artifactDownloadUrl(sessionId: string, path: string, profileId = '-'): string {
+  return `${artifactPageUrl(sessionId, path, profileId)}?download`;
 }
