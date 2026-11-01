@@ -522,10 +522,15 @@ impl MayAgent {
             .cache_lifetime(config.cache_lifetime.into())
             .background_jobs(config.background_jobs);
         if let Some(runtime) = hook_runtime.clone() {
-            builder = builder.context_source(super::ask_user_tool::OpenQuestionsContext::new(
-                runtime,
-                config.session_id.as_str(),
-            ));
+            builder = builder
+                .context_source(super::ask_user_tool::OpenQuestionsContext::new(
+                    runtime.clone(),
+                    config.session_id.as_str(),
+                ))
+                .blocker_resolver(super::ask_user_tool::AskUserBlockerResolver::new(
+                    runtime,
+                    config.session_id.as_str(),
+                ));
         }
         if let Some(clock) = config.clock.clone() {
             builder = builder.clock(clock);
