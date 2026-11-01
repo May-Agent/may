@@ -3,13 +3,13 @@
   "host_programs": [
     {
       "tool": "repo_search",
-      "version": "0.0.8",
+      "version": "0.0.9",
       "target": {
         "os": "macos",
         "arch": "aarch64"
       },
-      "url": "https://github.com/May-Agent/repo-search/releases/download/v0.0.8/repo-search-aarch64-apple-darwin.tar.xz",
-      "sha256": "b3590d93850153bb4c80b9497dedc2067b6a8367476b328fabbe7dc5bfc9a4f6",
+      "url": "https://github.com/May-Agent/repo-search/releases/download/v0.0.9/repo-search-aarch64-apple-darwin.tar.xz",
+      "sha256": "443089a0af366e328f7908c35e81bfb62cacbba035abd2bda05687c8b26644f1",
       "encoding": {
         "format": "tar_xz",
         "executable": "repo-search-aarch64-apple-darwin/search"
@@ -17,13 +17,13 @@
     },
     {
       "tool": "repo_search",
-      "version": "0.0.8",
+      "version": "0.0.9",
       "target": {
         "os": "linux",
         "arch": "aarch64"
       },
-      "url": "https://github.com/May-Agent/repo-search/releases/download/v0.0.8/repo-search-aarch64-unknown-linux-gnu.tar.xz",
-      "sha256": "981346573615b3a09131b1443766b7c8a0bc826f7c25c2a996127cd671775524",
+      "url": "https://github.com/May-Agent/repo-search/releases/download/v0.0.9/repo-search-aarch64-unknown-linux-gnu.tar.xz",
+      "sha256": "36860d45420436f7fef27f1e9eca4e2e8e61d1cc8a1836660f4ef269621cf1aa",
       "encoding": {
         "format": "tar_xz",
         "executable": "repo-search-aarch64-unknown-linux-gnu/search"
@@ -31,13 +31,13 @@
     },
     {
       "tool": "repo_search",
-      "version": "0.0.8",
+      "version": "0.0.9",
       "target": {
         "os": "linux",
         "arch": "x86_64"
       },
-      "url": "https://github.com/May-Agent/repo-search/releases/download/v0.0.8/repo-search-x86_64-unknown-linux-gnu.tar.xz",
-      "sha256": "632260ebc39c36b05bc20b61a252543e8e5b0b57ffcb88b0cf9a51966cdb99f9",
+      "url": "https://github.com/May-Agent/repo-search/releases/download/v0.0.9/repo-search-x86_64-unknown-linux-gnu.tar.xz",
+      "sha256": "26646d3a32d21f64386c4d3edd1b0e47ce1589c7124f429924a87a9502a22592",
       "encoding": {
         "format": "tar_xz",
         "executable": "repo-search-x86_64-unknown-linux-gnu/search"
