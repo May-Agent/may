@@ -16,8 +16,8 @@ import {
   artifactPreviewUrl,
   artifactRuntimePreviewUrl,
   listArtifacts,
-  openArtifactStream,
 } from '@/lib/api/artifacts';
+import { openUiEventStream } from '@/lib/api/events';
 import { useTranslation } from '@/lib/i18n';
 import type { ArtifactEntry } from '@/lib/types';
 import { cn } from '@/lib/utils';
@@ -64,11 +64,15 @@ export function ArtifactsDrawer({ sessionId, open, onOpenChange, initialPath = n
     const controller = new AbortController();
     (async () => {
       try {
-        const handle = await openArtifactStream(sessionId, controller.signal);
+        const handle = await openUiEventStream(['session_artifacts'], {
+          sessionId,
+          abort: controller.signal,
+        });
         for await (const evt of handle.events) {
           if (cancelled) break;
-          if (evt.kind === 'artifacts') {
-            void load();
+          if (evt.kind === 'session_artifacts') {
+            setEntries(evt.payload.artifacts);
+            setLoading(false);
           }
         }
       } catch {

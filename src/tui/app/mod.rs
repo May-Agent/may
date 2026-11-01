@@ -23,8 +23,9 @@ use super::agent_event_adapter::{
     ToolEndKind, ToolStartKind, parse_tool_end, parse_tool_start, parse_tool_start_partial,
 };
 use super::clipboard::{
-    ClipboardPasteResult, ImageManager, TextManager, download_image, is_image_url, read_clipboard,
-    set_clipboard_html, set_clipboard_text,
+    ClipboardPasteResult, ImageManager, TextManager, download_image, is_image_url,
+    pasted_image_path_candidate, read_clipboard, read_pasted_image_file, set_clipboard_html,
+    set_clipboard_text,
 };
 use super::completion::{Completion, CompletionMode};
 use super::error::{AppResult, TuiError};
@@ -178,8 +179,13 @@ pub struct App {
     pub tier_picker_loading: bool,
     /// Receiver for fetched models (oneshot)
     pub model_fetch_rx: Option<Receiver<Vec<FetchedModel>>>,
+    /// Receiver for provider catalogs merged into the model-select popup
+    pub model_select_rx: Option<Receiver<Vec<FetchedModel>>>,
     /// Per-session file-diff worker (rebuilt on session switch)
     pub file_diffs: Option<FileDiffHandle>,
+    /// Per-root session file changes shown in the sidebar's Changes
+    /// section; refreshed from the diff worker's status outcomes.
+    pub file_status: Vec<crate::file_tracker::RootDiff>,
     /// Receiver for clipboard paste resolution (oneshot)
     pub clipboard_rx: Option<Receiver<Result<ClipboardPasteResult, TuiError>>>,
     /// Pending paste results waiting to be handled
@@ -456,10 +462,10 @@ impl App {
                 .iter()
                 .map(|(id, _)| id.as_str())
                 .collect();
-            Some(StatusNotice::persistent(format!(
-                "Auto-configured from env: {}",
-                names.join(", ")
-            )))
+            Some(StatusNotice::transient(
+                format!("Auto-configured from env: {}", names.join(", ")),
+                STATUS_NOTICE_TTL,
+            ))
         };
 
         let secrets = crate::secrets::Secrets::load(
@@ -517,7 +523,9 @@ impl App {
             tier_picker_query: String::new(),
             tier_picker_loading: false,
             model_fetch_rx: None,
+            model_select_rx: None,
             file_diffs: None,
+            file_status: Vec::new(),
             clipboard_rx: None,
             pending_paste_results: std::collections::VecDeque::new(),
             pending_attachment_jobs: 0,
@@ -599,6 +607,7 @@ impl App {
     fn ensure_file_diffs(&mut self) {
         let Some(session) = self.session_manager.current() else {
             self.file_diffs = None;
+            self.file_status.clear();
             return;
         };
         let session_id = session.id.as_str().to_string();
@@ -623,6 +632,7 @@ impl App {
             });
         if is_container {
             self.file_diffs = None;
+            self.file_status.clear();
             return;
         }
 
@@ -646,8 +656,12 @@ impl App {
                     .map(|dir| crate::file_tracker::TrackedRootSpec::new(dir.path.clone())),
             );
         }
+        self.file_status.clear();
         self.file_diffs =
             FileDiffHandle::start(session_id, session_paths.root().join("filebase"), roots);
+        if let Some(handle) = &self.file_diffs {
+            handle.request_status();
+        }
     }
 
     /// Ask the diff worker to attribute pending file changes to
@@ -670,13 +684,11 @@ impl App {
     }
 
     /// Ask the diff worker to restore every tracked root to the tree
-    /// recorded at prompt dispatch. `fallback_call_ids` are the tool
-    /// calls of the rewound turns; the earliest of their checkpoints
-    /// applies when the prompt mark does not exist.
-    pub fn request_prompt_rewind(&mut self, message_db_id: i64, fallback_call_ids: Vec<String>) {
+    /// recorded when the prompt's turn started — turn-granular rewind.
+    pub fn request_prompt_rewind(&mut self, message_db_id: i64) {
         self.ensure_file_diffs();
         if let Some(handle) = &self.file_diffs {
-            handle.request_rewind(&format!("prompt:{message_db_id}"), fallback_call_ids);
+            handle.request_rewind(&format!("prompt:{message_db_id}"));
         }
     }
 
@@ -717,6 +729,7 @@ impl App {
             Some(handle) => handle.drain(),
             None => return,
         };
+        let mut refresh_status = false;
         for outcome in outcomes {
             match outcome {
                 super::file_diff::Outcome::Diff {
@@ -729,11 +742,19 @@ impl App {
                     if final_snapshot || self.chat.is_tool_running(&tool_call_id) {
                         self.chat.update_tool_diff(&tool_call_id, diffs);
                     }
+                    refresh_status = true;
                 }
                 super::file_diff::Outcome::Rewound { diffs, .. } => {
                     self.apply_rewind_result(&diffs);
+                    refresh_status = true;
+                }
+                super::file_diff::Outcome::Status { diffs } => {
+                    self.file_status = diffs;
                 }
             }
+        }
+        if refresh_status && let Some(handle) = &self.file_diffs {
+            handle.request_status();
         }
     }
 
@@ -745,7 +766,7 @@ impl App {
             );
             return;
         }
-        let files: usize = diffs.iter().map(|d| d.files).sum();
+        let files: usize = diffs.iter().map(|d| d.changes.len()).sum();
         let additions: usize = diffs.iter().map(|d| d.additions).sum();
         let deletions: usize = diffs.iter().map(|d| d.deletions).sum();
         self.chat.push_notice(&format!(
@@ -1626,13 +1647,10 @@ impl App {
         );
     }
 
-    /// Show a status notice that stays until replaced or cleared.
+    /// Show a status notice that clears itself after [`STATUS_NOTICE_TTL`]
+    /// — or the moment the user presses a key. Notices are transient by
+    /// construction; nothing lingers on screen.
     pub fn set_status(&mut self, text: impl Into<String>) {
-        self.status = Some(StatusNotice::persistent(text));
-    }
-
-    /// Show a status notice that clears itself after [`STATUS_NOTICE_TTL`].
-    pub fn set_transient_status(&mut self, text: impl Into<String>) {
         self.status = Some(StatusNotice::transient(text, STATUS_NOTICE_TTL));
     }
 
@@ -1780,6 +1798,42 @@ impl App {
         None
     }
 
+    /// Terminal paste (bracketed paste). When the payload resolves to a
+    /// filesystem path — how terminals that materialize pasted images as
+    /// files deliver them (iTerm2, cmux-style temp-file bridges, dragged
+    /// files, Finder copies) — the path is read on a worker and an image
+    /// attaches; anything else pastes as text unchanged.
+    pub(super) fn handle_paste_event(&mut self, text: String) -> Option<SendAction> {
+        if matches!(self.mode, AppMode::Chat)
+            && self.clipboard_rx.is_none()
+            && pasted_image_path_candidate(&text).is_some()
+        {
+            self.spawn_image_path_attach(text);
+            return None;
+        }
+        self.handle_bracketed_paste(text)
+    }
+
+    /// Read a pasted file reference on a worker thread: an image attaches,
+    /// anything else pastes as the original text through the channel.
+    fn spawn_image_path_attach(&mut self, pasted: String) {
+        let Some(path) = pasted_image_path_candidate(&pasted) else {
+            return;
+        };
+        let (tx, rx) = async_channel::bounded(1);
+        self.clipboard_rx = Some(rx);
+        self.pending_attachment_jobs = self.pending_attachment_jobs.saturating_add(1);
+        spawn(async move {
+            let result = match unblock(move || read_pasted_image_file(&path)).await {
+                Ok(Some(image)) => Ok(ClipboardPasteResult::image(image)),
+                Ok(None) => Ok(ClipboardPasteResult::text(pasted)),
+                Err(e) => Err(TuiError::from(e)),
+            };
+            let _ = tx.send(result).await;
+        })
+        .detach();
+    }
+
     /// Route pasted text — a terminal paste event or a Ctrl+V clipboard
     /// read — into the focused input, or an attachment when it is large.
     pub(super) fn handle_bracketed_paste(&mut self, text: String) -> Option<SendAction> {
@@ -1846,7 +1900,7 @@ impl App {
                 KeyCode::Char('c') => {
                     if self.copy_selection_to_clipboard()? {
                         self.quit_pending = false;
-                        self.set_transient_status("Copied selection");
+                        self.set_status("Copied selection");
                         return Ok(None);
                     }
 
@@ -1902,6 +1956,14 @@ impl App {
                 }
                 _ => {}
             }
+        }
+
+        // Cmd+V (super+V): terminals forwarding super-modified keys via the
+        // kitty keyboard protocol deliver it here; the same paste path as
+        // Ctrl+V.
+        if modifiers.contains(KeyModifiers::SUPER) && matches!(code, KeyCode::Char('v' | 'V')) {
+            self.handle_paste();
+            return Ok(None);
         }
 
         // Reset quit confirmation on any other input
@@ -2531,7 +2593,7 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Right) if self.copy_selection_to_clipboard()? => {
-                self.set_transient_status("Copied selection");
+                self.set_status("Copied selection");
             }
             _ => {}
         }
@@ -2675,6 +2737,7 @@ impl App {
             }
             "/model" => {
                 self.model_select_list = self.collect_all_models();
+                self.model_select_rx = self.fetch_provider_models();
                 self.model_select_index = 0;
                 let fallback_model = self.config.last_model.as_ref().map(ToString::to_string);
                 let current = self.current_model.as_deref().or(fallback_model.as_deref());

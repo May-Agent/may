@@ -156,6 +156,7 @@ async fn follow_session(
                         &shared,
                         &forwarding.foreign_tx,
                         &forwarding.command_tx,
+                        &forwarding.app_events,
                     )
                     .await;
                 }
@@ -206,6 +207,7 @@ async fn forward_agent_frame(
     shared: &Shared,
     foreign_tx: &Sender<ForeignTurn>,
     command_tx: &Sender<WorkerCommand>,
+    app_events: &EventSender,
 ) {
     match frame.body {
         SessionAgentBody::Start {
@@ -215,6 +217,11 @@ async fn forward_agent_frame(
             // A turn whose end this client never saw is over.
             if let Some(turn) = current.take() {
                 let _ = turn.events.send(TuiEvent::Complete).await;
+            }
+            // Turn boundary: the file tracker marks the pre-turn tree
+            // under the prompt's row id, whoever started the turn.
+            if let Some(message_id) = message_id {
+                let _ = app_events.try_send(AppEvent::TurnStarted { message_id });
             }
             let events = shared.take_pending().unwrap_or_else(|| {
                 let (events, rx) = unbounded();
@@ -483,6 +490,7 @@ mod tests {
         let (foreign_tx, foreign_rx) = unbounded();
         let (commands, _command_rx) = unbounded();
         let mut current = None;
+        let (app_events, _app_rx) = unbounded();
 
         for (turn, body) in [
             (
@@ -507,6 +515,7 @@ mod tests {
                 &shared,
                 &foreign_tx,
                 &commands,
+                &app_events,
             )
             .await;
         }

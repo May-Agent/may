@@ -36,7 +36,8 @@ use async_channel::TryRecvError;
 use crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        KeyCode, KeyModifiers,
+        KeyCode, KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute,
     style::{Color, Print, ResetColor, SetForegroundColor},
@@ -231,7 +232,8 @@ async fn async_main() -> anyhow::Result<()> {
             io::stdout(),
             LeaveAlternateScreen,
             DisableBracketedPaste,
-            DisableMouseCapture
+            DisableMouseCapture,
+            PopKeyboardEnhancementFlags
         );
         let _ = execute!(
             io::stderr(),
@@ -252,7 +254,8 @@ async fn async_main() -> anyhow::Result<()> {
         stdout,
         EnterAlternateScreen,
         EnableBracketedPaste,
-        EnableMouseCapture
+        EnableMouseCapture,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -266,7 +269,8 @@ async fn async_main() -> anyhow::Result<()> {
         terminal.backend_mut(),
         LeaveAlternateScreen,
         DisableBracketedPaste,
-        DisableMouseCapture
+        DisableMouseCapture,
+        PopKeyboardEnhancementFlags
     )?;
     terminal.show_cursor()?;
 
@@ -657,6 +661,14 @@ where
         {
             app.handle_fetched_models(models);
             app.model_fetch_rx = None;
+        }
+
+        // Check for provider catalog results for the model-select popup
+        if let Some(ref mut rx) = app.model_select_rx
+            && let Ok(models) = rx.try_recv()
+        {
+            app.merge_model_select_models(models);
+            app.model_select_rx = None;
         }
 
         // Apply finished file diffs to their tool-call blocks (non-blocking)

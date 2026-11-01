@@ -1200,9 +1200,9 @@ pub struct SessionArtifactsResponse {
 
 #[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct ArtifactStreamPayload {
-    pub(crate) count: usize,
-    pub(crate) signature: String,
+pub struct SessionArtifactsEventPayload {
+    pub(crate) session_id: String,
+    pub(crate) artifacts: Vec<ArtifactEntry>,
 }
 
 #[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
