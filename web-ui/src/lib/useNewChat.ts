@@ -21,11 +21,11 @@ export function useNewChat() {
   const navigate = useNavigate();
   const { profileId } = useActiveProfile();
 
-  const start = useCallback(async () => {
+  const start = useCallback(async (opts?: { repo?: string }) => {
     if (!profileId || useNewChatStore.getState().creating) return;
     useNewChatStore.setState({ creating: true });
     try {
-      const session = await createNew(profileId);
+      const session = await createNew(profileId, opts);
       useUiStore.getState().setSidebarSheetOpen(false);
       navigate(profileSessionPath(profileId, session.id));
     } catch (err) {
