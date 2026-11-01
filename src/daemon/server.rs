@@ -402,6 +402,7 @@ fn api_routes() -> Route {
                         "/bash".post(super::chat::run_bash),
                         "/compact".post(super::chat::compact_session),
                         "/context-report".at(super::chat::context_report),
+                        "/usage".at(super::chat::usage_report),
                         "/context-dump".post(super::chat::context_dump),
                         "/btw".post(super::chat::btw),
                         "/agent".delete(super::chat::release_agent),

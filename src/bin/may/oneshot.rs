@@ -350,6 +350,9 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                     return Ok(());
                 }
             }
+            Event::Agent(TuiEvent::UsageReport(_)) => {
+                // One-shot runs never ask for `/usage`; ignore a report.
+            }
             Event::Agent(TuiEvent::ReasoningEnd { seconds }) => {
                 app.chat.finish_thinking(seconds);
                 writeln!(output.stderr()?, "[thought for {seconds}s]")?;
