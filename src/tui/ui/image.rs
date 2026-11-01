@@ -11,7 +11,7 @@ use ratatui::buffer::CellDiffOption;
 use ratatui::prelude::*;
 
 use ratatui::Frame;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use base64::Engine as _;
 use ratatui_image::picker::cap_parser::Parser;
@@ -100,8 +100,9 @@ impl std::fmt::Debug for ImageState {
 /// Per-terminal render protocol.
 pub enum ImageProtocol {
     /// Kitty graphics: the encoded image is transmitted once (`f=100`
-    /// PNG) and unicode placeholders scale it at every display size — no
-    /// per-size re-encode, no re-transmit.
+    /// PNG) and unicode placeholders scale it at every display size — a
+    /// size change only re-puts the virtual placement's grid (`a=p`),
+    /// never the image bytes.
     Kitty(KittyImage),
     /// iTerm2/Sixel/halfblocks: ratatui-image resizes+encodes per area.
     Other(StatefulProtocol),
@@ -124,10 +125,17 @@ pub struct KittyImage {
     transmit: String,
     /// Flipped when the transmission has been written once.
     transmitted: AtomicBool,
+    /// The placeholder grid the virtual placement was last put on,
+    /// packed as `cols << 16 | rows`; 0 while none has been sent.
+    placed: AtomicU32,
+    /// The image id the transmission and placements refer to.
+    id: u32,
     /// Foreground color escape encoding the image id.
     id_color: String,
-    /// Third diacritic slot: the placement id's extra byte.
+    /// Third diacritic slot: the image id's most significant byte.
     id_extra: u16,
+    /// Whether graphics commands must be wrapped for tmux passthrough.
+    is_tmux: bool,
     /// Source pixel dimensions (for fit math).
     width: u32,
     height: u32,
@@ -166,6 +174,22 @@ impl KittyImage {
     }
 }
 
+/// The placement id the image's single virtual placement is put under.
+/// Fixed so a re-`put` replaces the previous grid in place instead of
+/// accumulating placements (kitty and ghostty both update on the same
+/// `(image id, placement id)` key).
+const PLACEMENT_ID: u32 = 1;
+
+/// Build the `a=p` command that (re)creates the image's virtual
+/// placement on a `cols`x`rows` grid. The grid is what scales the image:
+/// a placement without `c`/`r` falls back to the image's natural size in
+/// cells, so drawing fewer placeholder cells than that shows only the
+/// top-left part of the image.
+fn kitty_place(id: u32, is_tmux: bool, cols: u16, rows: u16) -> String {
+    let (start, escape, end) = Parser::escape_tmux(is_tmux);
+    format!("{start}{escape}_Gq=2,a=p,U=1,i={id},p={PLACEMENT_ID},c={cols},r={rows}{escape}\\{end}")
+}
+
 /// Build the kitty transmission string: `f=100` self-describing image
 /// bytes (PNG), chunked at 4 KB of base64 like the protocol requires.
 fn kitty_transmit(id: u32, is_tmux: bool, bytes: &[u8]) -> String {
@@ -184,7 +208,7 @@ fn kitty_transmit(id: u32, is_tmux: bool, bytes: &[u8]) -> String {
         data.push_str(start);
         write!(data, "{escape}_Gq=2,").unwrap();
         if i == 0 {
-            write!(data, "i={id},a=T,U=1,f=100,").unwrap();
+            write!(data, "i={id},a=t,f=100,").unwrap();
         }
         let more = u8::from(chunk_count > (i + 1));
         write!(data, "m={more};").unwrap();
@@ -240,14 +264,18 @@ fn kitty_image_state(picker: &Picker, data: &[u8]) -> Option<KittyImage> {
     };
 
     let id = fastrand::u32(..);
+    let is_tmux = std::env::var_os("TMUX").is_some();
     let [id_extra, r, g, b] = id.to_be_bytes();
     let mut id_color = String::new();
     write!(id_color, "\x1b[38;2;{r};{g};{b}m").unwrap();
     Some(KittyImage {
-        transmit: kitty_transmit(id, std::env::var_os("TMUX").is_some(), &png),
+        transmit: kitty_transmit(id, is_tmux, &png),
         transmitted: AtomicBool::new(false),
+        placed: AtomicU32::new(0),
+        id,
         id_color,
         id_extra: u16::from(id_extra),
+        is_tmux,
         width,
         height,
         font: picker.font_size(),
@@ -297,10 +325,18 @@ fn render_kitty(buf: &mut Buffer, area: Rect, kitty: &KittyImage) {
     let area = area.intersection(buf.area);
     let fit = kitty.fit_rect(area);
     let full_width = area.width.min(fit.width);
-    if full_width == 0 {
+    let height = area.height.min(fit.height).min(297);
+    if full_width == 0 || height == 0 {
         return;
     }
-    let height = area.height.min(fit.height).min(297);
+
+    // Re-put the virtual placement whenever the drawn grid changes. The
+    // put replaces the placement under the fixed placement id, so it is
+    // flicker-free and costs only a short escape — no image data is
+    // re-sent.
+    let grid = u32::from(full_width) << 16 | u32::from(height);
+    let place = (kitty.placed.swap(grid, Ordering::SeqCst) != grid)
+        .then(|| kitty_place(kitty.id, kitty.is_tmux, full_width, height));
 
     let first = !kitty.transmitted.swap(true, Ordering::SeqCst);
     let row_diacritics: String =
@@ -309,8 +345,16 @@ fn render_kitty(buf: &mut Buffer, area: Rect, kitty: &KittyImage) {
     let mut symbol = String::new();
     for y in 0..height {
         symbol.clear();
-        if first && y == 0 {
-            symbol.push_str(&kitty.transmit);
+        if y == 0 {
+            if first {
+                symbol.push_str(&kitty.transmit);
+            }
+            // The placement must exist before the placeholder cells it
+            // scales and come after the transmission that creates the
+            // image — both hold inside this symbol.
+            if let Some(place) = &place {
+                symbol.push_str(place);
+            }
         }
         write!(
             symbol,
@@ -502,7 +546,7 @@ mod tests {
         let transmit = kitty_transmit(42, false, &bytes);
 
         // First chunk carries the full action set; later chunks only `m=`.
-        assert!(transmit.starts_with("\x1b_Gq=2,i=42,a=T,U=1,f=100,m=1;"));
+        assert!(transmit.starts_with("\x1b_Gq=2,i=42,a=t,f=100,m=1;"));
         assert!(transmit.contains("\x1b\\\x1b_Gq=2,m="));
         assert!(transmit.ends_with("\x1b\\"));
         assert_eq!(transmit.matches("\x1b_G").count(), 4);
@@ -527,12 +571,21 @@ mod tests {
     }
 
     #[test]
+    fn kitty_place_targets_the_drawn_grid() {
+        let place = kitty_place(42, false, 40, 12);
+        assert_eq!(place, "\x1b_Gq=2,a=p,U=1,i=42,p=1,c=40,r=12\x1b\\");
+    }
+
+    #[test]
     fn kitty_fit_rect_preserves_aspect_in_cells() {
         let kitty = KittyImage {
             transmit: String::new(),
             transmitted: AtomicBool::new(false),
+            placed: AtomicU32::new(0),
+            id: 0,
             id_color: String::new(),
             id_extra: 0,
+            is_tmux: false,
             width: 3248,
             height: 1992,
             font: (10, 20),
