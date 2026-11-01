@@ -121,6 +121,27 @@ struct BaseSystemCarve {
     subagent_count: usize,
 }
 
+/// Usage fraction of the calibrated window at which auto-compaction forks.
+#[must_use]
+pub fn autocompact_trigger() -> f32 {
+    ContextPolicy::default().compact_at
+}
+
+/// Token count at which auto-compaction forks, floored from
+/// [`autocompact_trigger`] × `window`.
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn autocompact_window_tokens(window: usize) -> usize {
+    let trigger = f64::from(autocompact_trigger());
+    (trigger * window as f64) as usize
+}
+
+/// Tokens reserved above the auto-compaction trigger.
+#[must_use]
+pub fn autocompact_buffer_tokens(window: usize) -> usize {
+    window.saturating_sub(autocompact_window_tokens(window))
+}
+
 impl ContextReport {
     /// Assemble a report from the agent's live context and a
     /// [`ContextWindowMetrics`] measured on the same state.
@@ -222,12 +243,9 @@ impl ContextReport {
         let window = usize::try_from(metrics.context_window).expect("a u32 window fits usize");
         // May keeps aither's default context policy: a compaction is forked at
         // `compact_at`, so everything above it is the autocompact buffer from
-        // the user's perspective. `trigger` is a fraction in [0, 1]; flooring
-        // the product is the intended bucket.
-        let trigger = ContextPolicy::default().compact_at;
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let autocompact_buffer =
-            window.saturating_sub((f64::from(trigger) * window as f64) as usize);
+        // the user's perspective.
+        let trigger = autocompact_trigger();
+        let autocompact_buffer = autocompact_buffer_tokens(window);
 
         Self {
             model_id: model_id.to_string(),
@@ -477,6 +495,11 @@ mod tests {
         assert_eq!(
             report.autocompact_buffer_tokens,
             report.window_tokens * 2 / 5
+        );
+        assert_eq!(autocompact_window_tokens(200_000), 120_000);
+        assert_eq!(
+            autocompact_window_tokens(200_000) + autocompact_buffer_tokens(200_000),
+            200_000
         );
     }
 }
