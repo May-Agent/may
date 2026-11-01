@@ -2932,6 +2932,15 @@ impl App {
         }
 
         if let Some(text) = text {
+            // Small single-line pastes insert into the input like a
+            // terminal paste; only large or multiline text needs an
+            // attachment (and its file).
+            if !matches!(self.mode, AppMode::Chat)
+                || (!text.contains('\n') && text.len() <= LARGE_PASTE_THRESHOLD)
+            {
+                self.handle_bracketed_paste(text);
+                return Ok(());
+            }
             let saved_path = if text.len() > LARGE_PASTE_THRESHOLD {
                 let manager = self
                     .text_manager
