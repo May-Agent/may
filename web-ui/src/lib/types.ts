@@ -178,6 +178,7 @@ export interface ApiSession {
   model: string;
   reasoningEffort?: string | null;
   runtime: SessionRuntimeSummary;
+  repo?: string | null;
 }
 
 export interface ChatRequestPayload {
@@ -382,6 +383,7 @@ export interface ProfileSessionSummary {
   runtime: SessionRuntimeSummary;
   updated_at?: string | null;
   profile_id?: string | null;
+  repo?: string | null;
 }
 
 export type ProfileSessionsPayload = {

@@ -18,7 +18,8 @@ use crate::agent::runner::WorkerCommand;
 use crate::agent::{AgentHandle, AgentWorker, ForeignTurn, RemoteTurn, TuiEvent};
 use crate::client::background::{RemoteBackground, SessionBackgroundSnapshot};
 use crate::client::{
-    DaemonClient, RunEnd, SessionAgentBody, SessionAgentFrame, WireAgentEvent, session_path,
+    DaemonClient, RunEnd, SessionAgentBody, SessionAgentFrame, SessionIndexSnapshot,
+    WireAgentEvent, session_path,
 };
 use crate::daemon::{CompactResponse, ContextDumpResponse};
 use crate::tui::event::{AppEvent, EventSender};
@@ -109,7 +110,7 @@ fn events_query(session_id: &str, after: Option<&str>) -> String {
     query
         .append_pair(
             "topics",
-            "session_agent,session_turn,session_background,session_runtime",
+            "session_agent,session_turn,session_background,session_runtime,session_index",
         )
         .append_pair("sessionId", session_id);
     if let Some(after) = after {
@@ -188,6 +189,15 @@ async fn follow_session(
                         let _ = forwarding
                             .app_events
                             .send(AppEvent::BackgroundLoaded { jobs, subagents })
+                            .await;
+                    }
+                }
+                "session_index" => {
+                    if let Ok(snapshot) = serde_json::from_str::<SessionIndexSnapshot>(&event.data)
+                    {
+                        let _ = forwarding
+                            .app_events
+                            .send(AppEvent::IndexCoverage(snapshot.index))
                             .await;
                     }
                 }

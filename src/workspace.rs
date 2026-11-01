@@ -321,3 +321,62 @@ impl Workspace {
         dirs
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_launch_directory_is_readable_but_not_writable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = Workspace::new(
+            dir.path().join("sandbox"),
+            dir.path().join("launch"),
+            dir.path().join("workspace.toml"),
+        )
+        .expect("workspace");
+
+        assert!(
+            workspace
+                .readable_dirs()
+                .iter()
+                .any(|dir| dir.as_path() == workspace.cwd.as_path()),
+            "the directory the session was launched from must be readable"
+        );
+        assert!(
+            !workspace
+                .writable_dirs()
+                .iter()
+                .any(|dir| dir.as_path() == workspace.cwd.as_path()),
+            "the launch directory stays read-only by default"
+        );
+    }
+
+    #[test]
+    fn approved_workdirs_are_readable_and_writable_per_permission() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("work")).expect("workdir");
+        let mut config = WorkspaceConfig::default();
+        config.add_workdir(dir.path().join("work"), None);
+        let workspace = Workspace {
+            sandbox: dir.path().join("sandbox"),
+            cwd: dir.path().join("launch"),
+            config,
+            config_path: dir.path().join("workspace.toml"),
+        };
+
+        let work = dir.path().join("work").canonicalize().expect("canonical");
+        assert!(
+            workspace
+                .readable_dirs()
+                .iter()
+                .any(|dir| dir.as_path() == work.as_path())
+        );
+        assert!(
+            workspace
+                .writable_dirs()
+                .iter()
+                .any(|dir| dir.as_path() == work.as_path())
+        );
+    }
+}
