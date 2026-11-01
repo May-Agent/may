@@ -24,9 +24,8 @@ use super::permission::PermissionApprover;
 use super::provider::{RequestParameterizedModel, resolve_provider_runtime};
 use super::runtime_context::{
     RuntimeSystemContext, build_base_system_prompt, build_browser_context, build_location_context,
-    build_memory_context_content, build_native_voice_context,
-    build_network_restrictions_context, build_plan_mode_context, build_terminal_runtime_context,
-    build_workspace_workdirs_context, tag,
+    build_memory_context_content, build_native_voice_context, build_network_restrictions_context,
+    build_plan_mode_context, build_terminal_runtime_context, build_workspace_workdirs_context, tag,
 };
 use super::tool_environment_cache::{
     Acquired, HomeBackend, ToolEnvironmentCache, ToolEnvironmentCacheError, ToolEnvironmentKey,
