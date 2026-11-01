@@ -37,6 +37,8 @@ pub enum AppMode {
     WorkspaceConfirm(WorkspaceConfirmState),
     /// Startup prompt offering read/write access to the launch directory
     LaunchGrant(LaunchGrantState),
+    /// Startup prompt deciding the launch repository's trust level
+    RepoTrust(RepoTrustState),
     /// MCP server management overlay
     McpManage,
     /// SSH server management overlay
@@ -92,6 +94,7 @@ impl AppMode {
             Self::PermissionConfirm(_) => "permission-confirm",
             Self::WorkspaceConfirm(_) => "workspace-confirm",
             Self::LaunchGrant(_) => "launch-grant",
+            Self::RepoTrust(_) => "repo-trust",
             Self::McpManage => "mcp-manage",
             Self::SshManage => "ssh-manage",
             Self::AskUser(_) => "ask-user",
@@ -397,6 +400,15 @@ impl AskUserState {
 pub struct LaunchGrantState {
     /// The launch directory being offered.
     pub path: std::path::PathBuf,
+}
+
+/// Startup prompt deciding the launch repository's trust level. The
+/// option list renders through the `ask_user` sheet; the answer is
+/// persisted by the client and never reaches the agent.
+#[derive(Debug)]
+pub struct RepoTrustState {
+    /// The option-list sheet state.
+    pub ask: AskUserState,
 }
 
 /// Pending workspace-access confirmation shown in the TUI.

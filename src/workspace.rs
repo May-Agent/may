@@ -218,21 +218,41 @@ impl WorkspaceConfig {
         Ok(())
     }
 
-    /// Add a working directory with read/write access.
+    /// Add a working directory with read/write access, upgrading an
+    /// existing entry — a recorded read-only decision becomes writable.
     pub fn add_workdir(&mut self, path: PathBuf, description: Option<String>) {
-        // Canonicalize the path
-        let canonical = path.canonicalize().unwrap_or(path);
+        self.record_workdir(path, Permission::ReadWrite, description);
+    }
 
-        // Check if already exists
-        if self.workdirs.iter().any(|d| d.path == canonical) {
+    /// Record an access decision for a directory: the entry is created or
+    /// its permission replaced.
+    pub fn record_workdir(
+        &mut self,
+        path: PathBuf,
+        permission: Permission,
+        description: Option<String>,
+    ) {
+        let canonical = path.canonicalize().unwrap_or(path);
+        if let Some(entry) = self.workdirs.iter_mut().find(|d| d.path == canonical) {
+            entry.permission = permission;
+            if let Some(description) = description {
+                entry.description = Some(description);
+            }
             return;
         }
-
         self.workdirs.push(WorkspaceDir {
             path: canonical,
-            permission: Permission::ReadWrite,
+            permission,
             description,
         });
+    }
+
+    /// Whether a workdir entry covers `path` at any permission — the
+    /// directory's access was decided, grant or denial.
+    #[must_use]
+    pub fn covers(&self, path: &Path) -> bool {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        self.workdirs.iter().any(|d| canonical.starts_with(&d.path))
     }
 
     /// Remove a working directory.
@@ -378,5 +398,27 @@ mod tests {
                 .iter()
                 .any(|dir| dir.as_path() == work.as_path())
         );
+    }
+
+    #[test]
+    fn a_denied_workdir_is_decided_and_an_approval_upgrades_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut config = WorkspaceConfig::default();
+        // Denial persists as read-only — a decided directory, not a grant.
+        config.record_workdir(
+            dir.path().to_path_buf(),
+            Permission::ReadOnly,
+            Some("launch directory".to_string()),
+        );
+        assert!(config.covers(dir.path()));
+        assert!(!config.has_write_access(dir.path()));
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).expect("subdir");
+        assert!(config.covers(&sub));
+
+        // A later approval upgrades the recorded denial to read/write.
+        config.add_workdir(dir.path().to_path_buf(), None);
+        assert_eq!(config.workdirs.len(), 1);
+        assert!(config.has_write_access(dir.path()));
     }
 }

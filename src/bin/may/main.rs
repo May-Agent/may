@@ -393,22 +393,34 @@ where
         app.set_status("No session to resume; starting a new one");
     }
 
-    // Only start a session if configuration is complete. When the launch
-    // directory is not already a workspace grant, the TUI asks first and the
-    // session starts once the prompt is answered. A resumed session loads
-    // regardless: it carries its own model.
+    // Only start a session if configuration is complete. The launch
+    // directory's first-contact decision — repo trust inside a worktree,
+    // the write-grant outside one — is asked before the session starts,
+    // and the session starts once the prompt is answered. A resumed
+    // session loads regardless: it carries its own model.
     let mut worker_build = None;
-    let mut launch_grant = if app.is_configured() {
-        launch_grant_check(&app)?
+    let mut startup_gate = if app.is_configured() {
+        startup_gate_check(&app)?
     } else {
         None
     };
-    if launch_grant.is_some() {
-        app.mode = may_agent::tui::AppMode::LaunchGrant(may_agent::tui::state::LaunchGrantState {
-            path: app.cwd.clone(),
-        });
+    match &startup_gate {
+        Some(StartupGate::RepoTrust(trust)) => {
+            app.mode = may_agent::tui::AppMode::RepoTrust(may_agent::tui::state::RepoTrustState {
+                ask: may_agent::tui::AskUserState::for_open_question(
+                    may_agent::trust::question_for(&trust.kind, &trust.worktree),
+                ),
+            });
+        }
+        Some(StartupGate::LaunchGrant(_)) => {
+            app.mode =
+                may_agent::tui::AppMode::LaunchGrant(may_agent::tui::state::LaunchGrantState {
+                    path: app.cwd.clone(),
+                });
+        }
+        None => {}
     }
-    if launch_grant.is_none() {
+    if startup_gate.is_none() {
         if let Some(session_id) = pending_resume.take() {
             let build = resume_into_session(&mut app, &mut worker, &runtime_deps, &session_id)
                 .await
@@ -434,10 +446,30 @@ where
         runtime_deps,
         &mut mcp_manager,
         log_ring,
-        launch_grant.take(),
+        startup_gate.take(),
         pending_resume,
     )
     .await
+}
+
+/// Start the session the startup gate held back — `may resume`'s session
+/// when one was named, a fresh one otherwise.
+async fn start_deferred_session(
+    app: &mut App,
+    worker: &mut Option<AgentWorker>,
+    runtime_deps: &RuntimeDeps,
+    pending_resume: Option<may_agent::SessionId>,
+) -> anyhow::Result<Option<WorkerBuild>> {
+    let Some(session_id) = pending_resume else {
+        if let Err(e) = runtime_deps.begin_new_session(app, worker).await {
+            report_startup_failure(app, &e);
+        }
+        return Ok(None);
+    };
+    Ok(Some(WorkerBuild {
+        purpose: WorkerBuildPurpose::Session,
+        build: resume_into_session(app, worker, runtime_deps, &session_id).await?,
+    }))
 }
 
 /// Load `session_id` as the TUI's session and adopt its profile, so session
@@ -460,6 +492,57 @@ async fn resume_into_session(
         app.current_profile_id = Some(profile_id);
     }
     Ok(build)
+}
+
+/// The first-contact decision the TUI asks before the session starts.
+enum StartupGate {
+    /// The launch directory is a repository with undecided trust.
+    RepoTrust(RepoTrust),
+    /// The launch directory is not a repository and has no access decision.
+    LaunchGrant(LaunchGrant),
+}
+
+/// A launch repository whose trust is undecided.
+struct RepoTrust {
+    /// The launch repository's worktree root.
+    worktree: std::path::PathBuf,
+    /// Whether the remote is GitHub-backed — picks the option set.
+    kind: may_agent::trust::RepoKind,
+    /// `workspace.toml` the decision is written to on approval.
+    config_path: std::path::PathBuf,
+}
+
+/// The launch gate: a repository launch asks for its trust level, any
+/// other launch asks for the write-grant.
+fn startup_gate_check(
+    app: &App,
+) -> Result<Option<StartupGate>, may_agent::workspace::WorkspaceConfigError> {
+    if let Some(trust) = repo_trust_check(app)? {
+        return Ok(Some(StartupGate::RepoTrust(trust)));
+    }
+    Ok(launch_grant_check(app)?.map(StartupGate::LaunchGrant))
+}
+
+/// Whether the launch directory's repository has no persisted trust level.
+/// Repositories are decided here — never through the write-grant, since
+/// the session works in a clone and the checkout stays a read mount.
+fn repo_trust_check(
+    app: &App,
+) -> Result<Option<RepoTrust>, may_agent::workspace::WorkspaceConfigError> {
+    use may_agent::session::MayHomePaths;
+
+    let home = MayHomePaths::new(app.session_manager.may_dir().to_path_buf());
+    let config_path = app.session_manager.current_profile_id().map_or_else(
+        || home.workspace_config(),
+        |profile_id| home.profile_home(profile_id).workspace_config(),
+    );
+    Ok(
+        may_agent::trust::pending_decision(&app.cwd, &config_path)?.map(|pending| RepoTrust {
+            worktree: pending.worktree,
+            kind: pending.kind,
+            config_path,
+        }),
+    )
 }
 
 /// A launch-directory grant the TUI offered before the session started.
@@ -498,8 +581,16 @@ fn launch_grant_check(
         }
         None => home.workspace_config(),
     };
+    // A repository's first-contact decision is the repo-trust gate, never
+    // this write-grant — the session works in a clone and the checkout
+    // stays a read mount.
+    if may_agent::repo_search::worktree_root(&app.cwd).is_some() {
+        return Ok(None);
+    }
     let config = may_agent::workspace::WorkspaceConfig::load(&config_path)?;
-    if config.has_write_access(&app.cwd) {
+    // A covering entry of any permission is a decided directory — a
+    // recorded denial is as final as a grant.
+    if config.covers(&app.cwd) {
         return Ok(None);
     }
     Ok(Some(LaunchGrant {
@@ -596,7 +687,7 @@ async fn main_event_loop<B: Backend>(
     runtime_deps: RuntimeDeps,
     mcp_manager: &mut McpManager,
     log_ring: may_agent::log_ring::LogRingHandle,
-    mut launch_grant: Option<LaunchGrant>,
+    mut startup_gate: Option<StartupGate>,
     mut pending_resume: Option<may_agent::SessionId>,
 ) -> anyhow::Result<Option<ExitSummary>>
 where
@@ -1532,20 +1623,31 @@ where
                         }
                     }
                     Some(SendAction::RespondLaunchGrant { approved }) => {
-                        if let (Some(grant), true) = (launch_grant.take(), approved) {
+                        if let Some(StartupGate::LaunchGrant(grant)) = startup_gate.take() {
+                            // Grant or denial, the decision is recorded: a
+                            // covered directory is never asked again.
                             let result =
                                 may_agent::workspace::WorkspaceConfig::load(&grant.config_path)
                                     .and_then(|mut config| {
-                                        config.add_workdir(
+                                        config.record_workdir(
                                             grant.dir.clone(),
+                                            if approved {
+                                                may_agent::workspace::Permission::ReadWrite
+                                            } else {
+                                                may_agent::workspace::Permission::ReadOnly
+                                            },
                                             Some("launch directory".to_string()),
                                         );
                                         config.save(&grant.config_path)
                                     });
                             match result {
-                                Ok(()) => app.track_workspace_dir(&grant.dir),
+                                Ok(()) => {
+                                    if approved {
+                                        app.track_workspace_dir(&grant.dir);
+                                    }
+                                }
                                 Err(error) => app.chat.push_error(&format!(
-                                    "Could not grant workspace access to {}: {error}",
+                                    "Could not record workspace access for {}: {error}",
                                     grant.dir.display()
                                 )),
                             }
@@ -1553,23 +1655,42 @@ where
                         // The prompt this answered was the only thing holding
                         // the startup session back — `may resume`'s session
                         // included.
-                        let resumed = pending_resume.take();
-                        match &resumed {
-                            Some(session_id) => {
-                                let build =
-                                    resume_into_session(app, worker, &runtime_deps, session_id)
-                                        .await?;
-                                worker_build = Some(WorkerBuild {
-                                    purpose: WorkerBuildPurpose::Session,
-                                    build,
-                                });
-                            }
-                            None => {
-                                if let Err(e) = runtime_deps.begin_new_session(app, worker).await {
-                                    report_startup_failure(app, &e);
-                                }
+                        worker_build = start_deferred_session(
+                            app,
+                            worker,
+                            &runtime_deps,
+                            pending_resume.take(),
+                        )
+                        .await?;
+                    }
+                    Some(SendAction::RespondRepoTrust { level }) => {
+                        if let (Some(StartupGate::RepoTrust(trust)), Some(level)) =
+                            (startup_gate.take(), level)
+                        {
+                            let result =
+                                may_agent::workspace::WorkspaceConfig::load(&trust.config_path)
+                                    .and_then(|config| {
+                                        may_agent::trust::persist(
+                                            &config,
+                                            &trust.config_path,
+                                            &trust.worktree,
+                                            Some(&trust.kind),
+                                            level,
+                                        )
+                                    });
+                            if let Err(error) = result {
+                                app.chat.push_error(&format!(
+                                    "Could not persist repository trust: {error}"
+                                ));
                             }
                         }
+                        worker_build = start_deferred_session(
+                            app,
+                            worker,
+                            &runtime_deps,
+                            pending_resume.take(),
+                        )
+                        .await?;
                     }
                     Some(SendAction::RespondWorkspace {
                         request_id,

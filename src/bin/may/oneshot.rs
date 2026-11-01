@@ -75,6 +75,60 @@ async fn answer_oneshot_questions(
     }
 }
 
+/// The launch repository's first-contact trust decision: an interactive
+/// stdin gets the prompt before the run starts and the answer persists to
+/// the session profile's `workspace.toml`; non-interactive stdin leaves
+/// the repository unbound.
+async fn answer_oneshot_repo_trust(
+    app: &App,
+    session_id: &may_agent::session::SessionId,
+    output: &mut OneShotOutput<io::Stdout, io::Stderr>,
+) -> anyhow::Result<()> {
+    use std::io::IsTerminal as _;
+
+    if !io::stdin().is_terminal() {
+        return Ok(());
+    }
+    let Some(client) = app.btw_daemon.clone() else {
+        return Ok(());
+    };
+    let session: may_agent::client::WireSession = client
+        .get(&format!("/api/sessions/{}", session_id.as_str()))
+        .await?;
+    let home = may_agent::session::MayHomePaths::new(app.session_manager.may_dir().to_path_buf());
+    let config_path = session.profile_id.as_deref().map_or_else(
+        || home.workspace_config(),
+        |id| home.profile_home(id).workspace_config(),
+    );
+    let Some(pending) = may_agent::trust::pending_decision(&app.cwd, &config_path)? else {
+        return Ok(());
+    };
+    let request = may_agent::trust::question_for(&pending.kind, &pending.worktree);
+    let questions = request
+        .questions
+        .iter()
+        .map(|question| may_agent::ask_user::Question {
+            section: question.section.clone(),
+            question: question.question.clone(),
+            option: question.option.clone(),
+            multi_select: question.multi_select,
+        })
+        .collect::<Vec<_>>();
+    let answers = prompt_oneshot_questions(&questions, output.stderr()?)?;
+    let Some(level) = answers.first().and_then(may_agent::trust::level_for_answer) else {
+        return Ok(());
+    };
+    let config = may_agent::workspace::WorkspaceConfig::load(&config_path)?;
+    may_agent::trust::persist(
+        &config,
+        &config_path,
+        &pending.worktree,
+        Some(&pending.kind),
+        level,
+    )?;
+    Ok(())
+}
+
 pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
     enum Event {
         Agent(TuiEvent),
@@ -169,6 +223,11 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
     let worker = worker
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("oneshot worker was not initialized"))?;
+
+    // The launch repository's first-contact trust is a pre-run decision:
+    // an interactive stdin gets the prompt now; a non-interactive run
+    // proceeds unbound.
+    answer_oneshot_repo_trust(&app, &session_id, &mut output).await?;
 
     let mut pending_title_gen: Option<TitleGenContext> = None;
     let mut assistant_response = AssistantReply::default();
