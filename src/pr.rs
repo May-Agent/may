@@ -309,7 +309,7 @@ impl PrStore {
             .ok_or_else(|| PrError::State(format!("no PR #{number}")))?;
         if pr.session_id != self.context.session_id {
             return Err(PrError::Ownership(format!(
-                "PR #{number} belongs to another session"
+                "PR #{number} belongs to another session — adopt it with `pr adopt {number}`"
             )));
         }
         match pr.state.as_str() {
@@ -390,7 +390,7 @@ impl PrStore {
             .ok_or_else(|| PrError::State(format!("no PR #{number}")))?;
         if pr.session_id != self.context.session_id {
             return Err(PrError::Ownership(format!(
-                "PR #{number} belongs to another session"
+                "PR #{number} belongs to another session — adopt it with `pr adopt {number}`"
             )));
         }
         self.db()?
@@ -398,6 +398,26 @@ impl PrStore {
             .await?;
         self.event(&pr, "closed", None).await;
         Ok(format!("closed PR #{number}"))
+    }
+
+    /// Take over a PR whose owning session is gone — or still another's.
+    /// Adoption transfers `session_id` so this session may merge or close
+    /// it, and the event log records the handover.
+    pub async fn adopt(&self, number: i64, repo: Option<&str>) -> Result<String, PrError> {
+        let resolved = self.resolve(repo).await?;
+        let pr = self
+            .db()?
+            .get_pr(&resolved.record.repo_key, number)
+            .await?
+            .ok_or_else(|| PrError::State(format!("no PR #{number}")))?;
+        if pr.session_id == self.context.session_id {
+            return Ok(format!("PR #{number} is already this session's"));
+        }
+        let previous = pr.session_id.clone();
+        self.db()?.adopt_pr(pr.id, &self.context.session_id).await?;
+        let detail = format!("from session {previous}");
+        self.event(&pr, "adopted", Some(&detail)).await;
+        Ok(format!("adopted PR #{number} (was session {previous})"))
     }
 
     /// `pr list` — every PR on the repo (or all repos with `--repo all`-less
@@ -421,12 +441,23 @@ impl PrStore {
         if rows.is_empty() {
             return Ok("no PRs".to_string());
         }
+        // A PR whose owning session was deleted shows an `orphaned` marker —
+        // another session adopts it with `pr adopt` before merging.
+        let mut dead = std::collections::HashSet::<&str>::new();
+        for pr in &rows {
+            if dead.contains(pr.session_id.as_str()) {
+                continue;
+            }
+            if self.db()?.get_session(&pr.session_id).await?.is_none() {
+                dead.insert(&pr.session_id);
+            }
+        }
         let mut out = String::new();
         for pr in &rows {
             let _ = std::fmt::Write::write_fmt(
                 &mut out,
                 format_args!(
-                    "PR #{} [{}] {}{} (session {})\n",
+                    "PR #{} [{}] {}{}{} (session {})\n",
                     pr.number,
                     pr.state,
                     pr.title,
@@ -434,6 +465,11 @@ impl PrStore {
                         .as_deref()
                         .map(|s| format!(" → {s}"))
                         .unwrap_or_default(),
+                    if dead.contains(pr.session_id.as_str()) {
+                        " — orphaned"
+                    } else {
+                        ""
+                    },
                     pr.session_id
                 ),
             );
@@ -453,12 +489,14 @@ impl PrStore {
             .await?
             .ok_or_else(|| PrError::State(format!("no PR #{number}")))?;
         let events = self.db()?.pr_events(pr.id).await?;
+        let orphaned = self.db()?.get_session(&pr.session_id).await?.is_none();
         let mut out = format!(
-            "PR #{} [{}] {}\nsession {} · backend {} · base {} · head {}",
+            "PR #{} [{}] {}\nsession {}{} · backend {} · base {} · head {}",
             pr.number,
             pr.state,
             pr.title,
             pr.session_id,
+            if orphaned { " (orphaned)" } else { "" },
             pr.backend,
             pr.base_sha,
             pr.head_sha.as_deref().unwrap_or("-")
