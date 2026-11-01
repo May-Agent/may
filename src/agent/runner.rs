@@ -47,6 +47,8 @@ pub enum TuiEvent {
     Compacted(Result<Option<CompactResult>, aither_agent::AgentError>),
     /// Context-window measurement for `/context` is ready.
     ContextReport(Result<ContextReport, aither_agent::AgentError>),
+    /// Provider-usage aggregation for `/usage` is ready.
+    UsageReport(crate::agent::SessionUsageReport),
     /// Assembled-context dump for `/context dump` is ready.
     ContextDump(Result<ContextDump, aither_agent::AgentError>),
     /// The daemon wrote the `/context dump` to `path`.
@@ -132,6 +134,8 @@ pub(crate) enum WorkerCommand {
     },
     /// Measure the context window for `/context`.
     ContextReport { event_tx: Sender<TuiEvent> },
+    /// Aggregate the session's provider usage for `/usage`.
+    UsageReport { event_tx: Sender<TuiEvent> },
     /// Dump the assembled context for `/context dump`.
     ContextDump { event_tx: Sender<TuiEvent> },
     /// Run a turn in the daemon (remote workers only).
@@ -247,6 +251,26 @@ impl AgentWorker {
         let (event_tx, event_rx) = unbounded();
         self.command_tx
             .try_send(WorkerCommand::ContextReport { event_tx })
+            .unwrap_or_else(|_| panic!("{}", ERR_WORKER_CHANNEL_CLOSED.trim()));
+        AgentHandle {
+            event_rx,
+            command_tx: self.command_tx.clone(),
+        }
+    }
+
+    /// Ask for the session's provider-usage aggregation for `/usage`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the worker command channel is already closed — the worker
+    /// task has stopped unexpectedly.
+    #[must_use]
+    pub fn usage_report(&self) -> AgentHandle {
+        const ERR_WORKER_CHANNEL_CLOSED: &str =
+            include_str!("../texts/agent_worker_channel_closed.txt");
+        let (event_tx, event_rx) = unbounded();
+        self.command_tx
+            .try_send(WorkerCommand::UsageReport { event_tx })
             .unwrap_or_else(|_| panic!("{}", ERR_WORKER_CHANNEL_CLOSED.trim()));
         AgentHandle {
             event_rx,
@@ -560,6 +584,13 @@ async fn run_worker(
                     }
                 }
             }
+            WorkerCommand::UsageReport { event_tx } => {
+                let _ = event_tx
+                    .send(TuiEvent::Error(
+                        "usage reports are served by the daemon".to_string(),
+                    ))
+                    .await;
+            }
             WorkerCommand::ContextReport { event_tx } => {
                 let report = agent.context_report().await;
                 let _ = event_tx.send(TuiEvent::ContextReport(report)).await;
@@ -722,12 +753,12 @@ enum WorkOutcome<T> {
 /// Race `work` against the worker command channel.
 ///
 /// `Cancel` and `Shutdown` end the race early and drop `work` where it
-/// stands. A `ContextReport`, `ContextDump`, `Release` or `Run` received
-/// meanwhile is held and requeued once the race ends, so it is served when
-/// the worker is idle again — the in-flight work borrows the agent, and
-/// requeueing it during the race would hand it straight back to this loop.
-/// A `Compact` or `Send` has no queued form: its `event_tx` is answered at
-/// once with a refusal and a `Complete`.
+/// stands. A `ContextReport`, `UsageReport`, `ContextDump`, `Release` or
+/// `Run` received meanwhile is held and requeued once the race ends, so it
+/// is served when the worker is idle again — the in-flight work borrows
+/// the agent, and requeueing it during the race would hand it straight
+/// back to this loop. A `Compact` or `Send` has no queued form: its
+/// `event_tx` is answered at once with a refusal and a `Complete`.
 async fn race_against_commands<F: Future>(
     work: F,
     command_rx: &Receiver<WorkerCommand>,
@@ -749,6 +780,7 @@ async fn race_against_commands<F: Future>(
                 WorkerCommand::Run { .. }
                 | WorkerCommand::Release { .. }
                 | WorkerCommand::ContextReport { .. }
+                | WorkerCommand::UsageReport { .. }
                 | WorkerCommand::ContextDump { .. } => deferred.push(command),
                 WorkerCommand::Compact { event_tx, .. } => {
                     let _ = event_tx

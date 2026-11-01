@@ -81,6 +81,7 @@ impl ChatDb {
         Self::ensure_session_columns(&db).await?;
         Self::ensure_message_columns(&db).await?;
         Self::ensure_ask_user_blocking_column(&db).await?;
+        Self::ensure_pending_permission_agent_id_column(&db).await?;
         Self::ensure_scheduled_task_columns(&db).await?;
         Self::ensure_session_context_snapshot_table(&db).await?;
         Self::ensure_session_run_layout(&db).await?;
@@ -145,6 +146,24 @@ impl ChatDb {
             query!(
                 db,
                 "ALTER TABLE session_pending_ask_user_requests_v2 ADD COLUMN blocking BOOLEAN NOT NULL DEFAULT 1"
+            )
+            .execute()
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_pending_permission_agent_id_column(db: &SkyDb) -> Result<(), ChatDbError> {
+        let columns = query!(
+            db,
+            "SELECT name FROM pragma_table_info('session_pending_permissions')"
+        )
+        .fetch_all::<SqliteTableInfoRow>()
+        .await?;
+        if !columns.iter().any(|column| column.name == "agent_id") {
+            query!(
+                db,
+                "ALTER TABLE session_pending_permissions ADD COLUMN agent_id TEXT"
             )
             .execute()
             .await?;
@@ -1327,6 +1346,7 @@ mod tests {
                     mode: PermissionRequestMode::Default,
                     script: "echo hi".to_string(),
                     session_id: Some(session_id.to_string()),
+                    agent_id: None,
                 },
             }),
         )
@@ -1451,6 +1471,7 @@ mod tests {
                     mode: PermissionRequestMode::Default,
                     script: "echo hi".to_string(),
                     session_id: Some(session_id.to_string()),
+                    agent_id: None,
                 },
             }),
         )
