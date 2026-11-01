@@ -12,6 +12,7 @@ use may_agent::browser_service::{BrowserReadDetail, BrowserScreenshotMode};
 #[derive(Debug, PartialEq, Eq)]
 pub enum CliMode {
     Tui,
+    Resume(ResumeArgs),
     Ui(Vec<String>),
     Rest(Vec<String>),
     Daemon(DaemonCommand),
@@ -19,6 +20,13 @@ pub enum CliMode {
     Browser(BrowserCliArgs),
     OneShot(OneShotArgs),
     Help(&'static str),
+}
+
+/// Parsed `may resume` invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeArgs {
+    /// Session to reopen in the TUI; `None` resumes the most recent one.
+    pub session: Option<String>,
 }
 
 /// Parsed `--model` / `--reasoning-effort` / prompt for one-shot runs.
@@ -91,7 +99,13 @@ pub enum BrowserCliCommand {
 
 impl OneShotArgs {
     pub const fn help_text() -> &'static str {
-        "Usage: may [--model <id>] [--reasoning-effort <low|medium|high>] <prompt>\n       may ui [args...]\n       may rest [args...]\n       may daemon [install|uninstall|status|stop]\n\nOne-shot mode streams assistant text to stdout and process events to stderr."
+        "Usage: may [--model <id>] [--reasoning-effort <low|medium|high>] <prompt>\n       may resume [session-id]\n       may ui [args...]\n       may rest [args...]\n       may daemon [install|uninstall|status|stop]\n\nOne-shot mode streams assistant text to stdout and process events to stderr."
+    }
+}
+
+impl ResumeArgs {
+    pub const fn help_text() -> &'static str {
+        "Usage: may resume [session-id]\n\nOpen the TUI on an existing session. Without a session id, the most recently active session resumes."
     }
 }
 
@@ -143,6 +157,10 @@ pub fn parse_cli_mode(args: &[String]) -> CliMode {
             Some("stop") => CliMode::Daemon(DaemonCommand::Stop),
             // `--help`, `-h` and anything unknown.
             Some(_) => CliMode::Help(DaemonCommand::help_text()),
+        },
+        Some("resume") => match args.get(2).map(String::as_str) {
+            Some("--help" | "-h") => CliMode::Help(ResumeArgs::help_text()),
+            _ => CliMode::Resume(parse_resume_args(&args[2..])),
         },
         Some("browser") => match args.get(2).map(String::as_str) {
             Some("--help" | "-h") => CliMode::Help(BrowserCliArgs::help_text()),
@@ -248,6 +266,15 @@ fn parse_browser_args(args: &[String]) -> BrowserCliArgs {
         panic!("may browser accepts exactly one subcommand");
     }
     BrowserCliArgs { command }
+}
+
+fn parse_resume_args(args: &[String]) -> ResumeArgs {
+    let session = match args {
+        [] => None,
+        [id] => Some(id.clone()),
+        _ => panic!("{}", ResumeArgs::help_text()),
+    };
+    ResumeArgs { session }
 }
 
 pub fn parse_cli_mode_from_env() -> CliMode {
@@ -426,6 +453,20 @@ mod tests {
     #[test]
     fn parse_cli_mode_defaults_to_tui() {
         assert_eq!(parse_cli_mode(&args(&["may"])), CliMode::Tui);
+    }
+
+    #[test]
+    fn parse_cli_mode_detects_resume_subcommand() {
+        assert_eq!(
+            parse_cli_mode(&args(&["may", "resume"])),
+            CliMode::Resume(super::ResumeArgs { session: None })
+        );
+        assert_eq!(
+            parse_cli_mode(&args(&["may", "resume", "calm-river-stone-lake"])),
+            CliMode::Resume(super::ResumeArgs {
+                session: Some("calm-river-stone-lake".to_string()),
+            })
+        );
     }
 
     #[test]
