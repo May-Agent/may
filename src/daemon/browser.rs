@@ -72,11 +72,6 @@ pub(super) struct BrowserResizeViewportResponse {
 pub(super) enum EnsureBrowserRuntimeError {
     #[error("browser automation is not enabled")]
     Unavailable,
-    #[error("failed to prepare browser runtime")]
-    Prepare {
-        #[source]
-        source: crate::container::browser::BrowserError,
-    },
     #[error("failed to start browser runtime")]
     Start {
         #[source]
@@ -93,11 +88,6 @@ pub(super) async fn ensure_browser_runtime_started(
     if browser_manager.is_running() {
         return Ok(browser_manager);
     }
-
-    let config = state.config_snapshot();
-    crate::container::browser::prepare_browser_runtime(&config.browser, state.may_dir.as_path())
-        .await
-        .map_err(|source| EnsureBrowserRuntimeError::Prepare { source })?;
     browser_manager
         .start()
         .await
@@ -194,8 +184,7 @@ async fn run_browser_start(state: Arc<DaemonState>) -> SkyResult<BrowserStatus> 
         .map_err(|error| {
             let status = match error {
                 EnsureBrowserRuntimeError::Unavailable => StatusCode::NOT_FOUND,
-                EnsureBrowserRuntimeError::Prepare { .. }
-                | EnsureBrowserRuntimeError::Start { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+                EnsureBrowserRuntimeError::Start { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             };
             skyzen::Error::msg(error_chain_text(&error)).set_status(status)
         })?;
