@@ -284,6 +284,9 @@ impl ExtraListeners {
 pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
     let paths = DaemonPaths::user()?;
     let _instance = acquire_single_instance(&paths)?;
+    // heel executes the sandboxed commands this process runs; configure the
+    // managed binary before any spawned task can reach a sandbox.
+    crate::configure_heel_binary().await;
     remove_legacy_search_index(paths.root());
 
     let started = crate::daemon::start(options.mode).await?;

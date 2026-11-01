@@ -192,7 +192,6 @@ async fn async_main() -> anyhow::Result<()> {
 
     if !matches!(cli_mode, CliMode::Help(_)) {
         may_agent::startup::validate_configuration().await?;
-        may_agent::configure_heel_binary().await;
     }
 
     let resume = match &cli_mode {
