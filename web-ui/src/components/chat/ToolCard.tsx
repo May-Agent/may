@@ -92,7 +92,7 @@ function pickPrimaryLabel(tool: TurnToolState, fallback: string): string {
       return fallback;
     }
     case 'web_search':
-      return s.query ? `“${s.query}”` : fallback;
+      return s.query ? `Searched "${s.query}"` : fallback;
     case 'web_fetch':
       return s.url ?? fallback;
     case 'browser': {

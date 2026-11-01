@@ -172,30 +172,26 @@ pub(super) fn request_parameters_for(
         aither_models::lookup(model_id).is_some_and(|info| info.has_ability(Ability::WebSearch));
     match provider_type {
         Some(ProviderType::Anthropic) => {
-            request_parameters.native_tools.claude.web_search =
-                native.web_search && model_has_web_search;
+            request_parameters.native_tools.claude.web_search = model_has_web_search;
             request_parameters.native_tools.claude.web_fetch = native.web_fetch;
         }
         Some(ProviderType::Google) => {
-            request_parameters.websearch = native.web_search && model_has_web_search;
+            request_parameters.websearch = model_has_web_search;
             request_parameters.native_tools.gemini.url_context = native.web_fetch;
         }
         Some(ProviderType::OpenAI) => {
-            request_parameters.websearch = native.web_search && model_has_web_search;
+            request_parameters.websearch = model_has_web_search;
         }
         Some(ProviderType::Chatgpt) => {
-            // Hosted search is included in the subscription (no per-call
-            // billing), so default it on unless native_tools was configured
-            // explicitly. The backend's own catalog decides support — the
-            // aither-models db has no entries for codex slugs, so the
-            // Ability::WebSearch gate would always read false here.
-            request_parameters.websearch = native.web_search || native.is_empty();
+            // Hosted search is included in the subscription. Codex slugs are
+            // absent from aither-models, so the Ability::WebSearch gate would
+            // always read false here.
+            request_parameters.websearch = true;
         }
         Some(ProviderType::Custom) => {
-            // Like ChatGPT, a custom endpoint's support is decided by the
-            // backend — config validation already guarantees `native_tools`
-            // only reaches this arm when the provider speaks the Responses
-            // API.
+            // A custom endpoint's support is decided by the backend — config
+            // validation already guarantees this arm only when the provider
+            // speaks the Responses API.
             request_parameters.websearch = native.web_search;
         }
         _ => {}
@@ -694,7 +690,6 @@ mod tests {
             request_parameters_for("chatgpt", Some(&instance), "gpt-5", None, &SessionId::new());
         assert!(parameters.websearch);
 
-        // An explicitly configured `native_tools` section drops the default.
         let mut fetch_only = ProviderInstance::new(ProviderType::Chatgpt);
         fetch_only.native_tools.web_fetch = true;
         let parameters = request_parameters_for(
@@ -704,7 +699,7 @@ mod tests {
             None,
             &SessionId::new(),
         );
-        assert!(!parameters.websearch);
+        assert!(parameters.websearch);
     }
 
     #[test]
@@ -776,7 +771,6 @@ mod tests {
     #[test]
     fn request_parameters_for_anthropic_gates_on_model_ability() {
         let mut instance = ProviderInstance::new(ProviderType::Anthropic).with_api_key("key");
-        instance.native_tools.web_search = true;
         instance.native_tools.web_fetch = true;
 
         let parameters = request_parameters_for(
@@ -790,8 +784,7 @@ mod tests {
         assert!(parameters.native_tools.claude.web_fetch);
         assert!(!parameters.websearch);
 
-        // A model without the WebSearch ability keeps the flag off even when
-        // the provider instance enables it.
+        // A model without the WebSearch ability keeps the flag off.
         let parameters = request_parameters_for(
             "anthropic",
             Some(&instance),
@@ -806,8 +799,7 @@ mod tests {
     #[test]
     fn session_selector_enables_native_web_search() {
         let mut config = MayConfig::default();
-        let mut instance = ProviderInstance::new(ProviderType::Google).with_api_key("key");
-        instance.native_tools.web_search = true;
+        let instance = ProviderInstance::new(ProviderType::Google).with_api_key("key");
         config.provider.insert("google".to_string(), instance);
 
         let selector = parse_model_selector("google::gemini-3-flash-preview").unwrap();
