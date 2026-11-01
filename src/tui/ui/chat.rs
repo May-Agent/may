@@ -2617,7 +2617,7 @@ fn render_status_line(lines: &mut Vec<Line<'_>>, ctx: &StatusContext<'_>, width:
         .usage
         .map(|(prompt_tokens, context_window)| format_status_usage(prompt_tokens, context_window));
 
-    // The worktree index's coverage, while incomplete: `index ▕██████░░░░▏ 62%`.
+    // The worktree index: fill bar while incomplete, `index ✓` once full.
     let index_bar = ctx.index_coverage.and_then(index_bar);
 
     let status_text = parts.join(" · ");
@@ -2679,18 +2679,20 @@ fn counted(n: usize, one: &str, many: &str) -> String {
 /// Cells in the status bar's index progress bar.
 const INDEX_BAR_CELLS: usize = 8;
 
-/// The status bar's index coverage segment while it is incomplete:
-/// `index ▕██████░░░░▏ 62%` in blue; `None` at full coverage or when there
-/// is nothing to index.
+/// The status bar's index coverage segment: `index ▕██████░░░░▏ 62%` while
+/// incomplete, `index ✓` once full; `None` when there is nothing to index.
 fn index_bar(coverage: &crate::client::IndexCoverage) -> Option<Vec<Span<'static>>> {
     let total = coverage.total;
-    if total == 0 || coverage.with_vector >= total {
+    if total == 0 {
         return None;
+    }
+    let bar_style = Style::default().fg(Color::Blue);
+    if coverage.with_vector >= total {
+        return Some(vec![Span::styled("index ✓", bar_style)]);
     }
     let filled = usize::try_from(coverage.with_vector * INDEX_BAR_CELLS as u64 / total)
         .expect("a share of at most the cell count");
     let percent = coverage.with_vector * 100 / total;
-    let bar_style = Style::default().fg(Color::Blue);
     Some(vec![
         Span::styled("index ▕", bar_style),
         Span::styled("█".repeat(filled), bar_style),
@@ -3341,8 +3343,13 @@ mod tests {
     }
 
     #[test]
-    fn index_bar_is_absent_at_full_coverage_or_with_nothing_to_index() {
-        assert!(index_bar(&coverage(10, 10)).is_none());
+    fn index_bar_shows_checkmark_at_full_coverage() {
+        assert_eq!(bar_text(&coverage(10, 10)).as_deref(), Some("index ✓"));
+        assert_eq!(bar_text(&coverage(12, 10)).as_deref(), Some("index ✓"));
+    }
+
+    #[test]
+    fn index_bar_is_absent_with_nothing_to_index() {
         assert!(index_bar(&coverage(0, 0)).is_none());
     }
 
