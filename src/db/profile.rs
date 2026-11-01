@@ -390,7 +390,7 @@ impl ChatDb {
         Ok(())
     }
 
-    /// Get a profile by its well-known slug ("daily", "work", "local").
+    /// Get a profile by its well-known slug ("daily", "build", "work").
     ///
     /// # Errors
     ///
@@ -406,9 +406,11 @@ impl ChatDb {
         )
     }
 
-    /// Ensure the three default profiles (daily, work, local) exist.
+    /// Ensure the built-in profiles (daily, build, work) exist.
     ///
-    /// Returns the ID of the first profile (daily).
+    /// All built-in profiles run on the local machine. Returns the ID of the
+    /// Build profile: the profile sessions created without one fall back to —
+    /// the TUI's and one-shot runs' default.
     ///
     /// # Errors
     ///
@@ -416,38 +418,34 @@ impl ChatDb {
     ///
     /// # Panics
     ///
-    /// Panics if no default profile ID exists after all defaults have been ensured.
+    /// Panics if the Build profile does not exist after all defaults have been
+    /// ensured.
     pub async fn ensure_default_profiles(&self) -> Result<String, ChatDbError> {
-        let local_hostname = hostname::get().map_or_else(
-            |_| "local".to_string(),
-            |h| h.to_string_lossy().into_owned(),
-        );
-
         let defaults = [
             DefaultProfile {
-                slug: "daily",
+                slug: crate::profile::DAILY_PROFILE_SLUG,
                 name: "Daily",
                 icon: "\u{1F305}", // 🌅
-                environment: "container",
+                environment: "local",
                 location_aware: true,
             },
             DefaultProfile {
-                slug: "work",
-                name: "Work",
-                icon: "\u{1F4BC}", // 💼
-                environment: "container",
+                slug: crate::profile::BUILD_PROFILE_SLUG,
+                name: "Build",
+                icon: "\u{1F528}", // 🔨
+                environment: "local",
                 location_aware: false,
             },
             DefaultProfile {
-                slug: "local",
-                name: &local_hostname,
-                icon: "\u{1F5A5}\u{FE0F}", // 🖥️
+                slug: crate::profile::WORK_PROFILE_SLUG,
+                name: "Work",
+                icon: "\u{1F4BC}", // 💼
                 environment: "local",
                 location_aware: false,
             },
         ];
 
-        let mut first_id = None;
+        let mut fallback_id = None;
         for def in &defaults {
             let ensured = if let Some(existing) = self.get_profile_by_slug(def.slug).await? {
                 existing
@@ -468,13 +466,13 @@ impl ChatDb {
                 .await?
             };
 
-            if first_id.is_none() {
-                first_id = Some(ensured.id.clone());
+            if def.slug == crate::profile::BUILD_PROFILE_SLUG {
+                fallback_id = Some(ensured.id.clone());
             }
         }
 
-        // first_id is always set because we iterate at least one default profile
-        Ok(first_id.expect("at least one default profile must be created"))
+        // BUILD_PROFILE_SLUG is always in `defaults`, so fallback_id is set.
+        Ok(fallback_id.expect("the build profile must be ensured"))
     }
 
     async fn max_profile_sort_order(&self) -> Result<i32, ChatDbError> {
