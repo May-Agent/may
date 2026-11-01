@@ -387,6 +387,7 @@ pub fn effort_family_base(model_id: &str) -> String {
 
 /// Position of `rung` on the canonical effort order (`none` … `max`),
 /// for sorting a family's served rungs.
+#[must_use]
 pub fn effort_rung_rank(rung: &str) -> usize {
     EFFORT_UID_TOKENS
         .iter()
