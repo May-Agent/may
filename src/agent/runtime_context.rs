@@ -1188,10 +1188,9 @@ mod tests {
     }
 
     #[test]
-    fn base_system_prompt_keeps_web_commands_when_hosted_tools_off() {
+    fn base_system_prompt_keeps_webfetch_when_hosted_fetch_off() {
         let commands = vec![
             ("browser".to_string(), "Drive the browser".to_string()),
-            ("websearch".to_string(), "Search the web".to_string()),
             ("webfetch".to_string(), "Fetch a URL".to_string()),
         ];
 
@@ -1207,7 +1206,7 @@ mod tests {
             .and_then(|rest| rest.split("</commands>").next())
             .expect("commands section should render");
         assert!(
-            commands_section.contains("- websearch: Search the web"),
+            !commands_section.contains("websearch"),
             "{commands_section}"
         );
         assert!(

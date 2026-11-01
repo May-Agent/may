@@ -409,8 +409,9 @@ pub enum ApiFormat {
 /// Provider-native hosted tool toggles.
 ///
 /// These enable server-side tools the provider executes instead of the
-/// harness. When a hosted equivalent is active for the resolved provider, the
-/// matching `websearch` / `webfetch` terminal command is not registered.
+/// harness. Hosted web search is turned on from the model's abilities;
+/// `web_search` here still gates custom Responses endpoints. Hosted fetch
+/// suppresses the matching `webfetch` terminal command.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NativeToolsConfig {
     /// Hosted web search (`OpenAI` `web_search`, Claude `web_search`, Gemini

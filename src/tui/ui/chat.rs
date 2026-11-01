@@ -2892,19 +2892,17 @@ fn tool_header_line(
             }
         }
         ToolDisplay::Action { chip, summary, .. } => {
-            let (label, rest) = action_headline(chip, summary);
+            let (label, rest) = semantic_headline(chip, summary);
             spans.push(Span::styled(label, chip_style(chip)));
             if !rest.is_empty() {
                 spans.push(Span::styled(format!(" {rest}"), selection_style));
             }
         }
         ToolDisplay::Builtin { tool, detail, .. } => {
-            spans.push(Span::styled(
-                format!("[{tool}]"),
-                Style::default().fg(Color::Magenta),
-            ));
-            if !detail.is_empty() {
-                spans.push(Span::styled(format!(" {detail}"), selection_style));
+            let (label, rest) = semantic_headline(tool, detail);
+            spans.push(Span::styled(label, chip_style(tool)));
+            if !rest.is_empty() {
+                spans.push(Span::styled(format!(" {rest}"), selection_style));
             }
         }
     }
@@ -2920,23 +2918,32 @@ fn tool_header_line(
     Line::from(spans)
 }
 
-/// An `Action` headline as `(label, rest)`: known IPC command names get a
-/// semantic verb (`websearch` → `Searched "query"`), everything else keeps
-/// its `[chip]` label.
-fn action_headline(chip: &str, summary: &str) -> (String, String) {
-    match chip {
-        "websearch" => ("Searched".to_string(), format!("\"{summary}\"")),
-        "webfetch" => ("Fetched".to_string(), summary.to_string()),
-        _ => (format!("[{chip}]"), summary.to_string()),
+/// A tool headline as `(label, rest)`: hosted and IPC search names become
+/// `Searched "query"`, fetch becomes `Fetched url`, everything else keeps
+/// its `[name]` label.
+fn semantic_headline(name: &str, summary: &str) -> (String, String) {
+    match name {
+        "websearch" | "web_search" | "google_search" => (
+            "Searched".to_string(),
+            if summary.is_empty() {
+                String::new()
+            } else {
+                format!("\"{summary}\"")
+            },
+        ),
+        "webfetch" | "web_fetch" => ("Fetched".to_string(), summary.to_string()),
+        _ => (format!("[{name}]"), summary.to_string()),
     }
 }
 
-/// Color for an `Action` chip label.
+/// Color for an Action or Builtin chip label.
 fn chip_style(chip: &str) -> Style {
     match chip {
         "kill" => Style::default().fg(Color::Red),
         "stdin" => Style::default().fg(Color::Yellow),
-        "websearch" | "webfetch" => Style::default().fg(Color::Blue),
+        "websearch" | "web_search" | "google_search" | "webfetch" | "web_fetch" => {
+            Style::default().fg(Color::Blue)
+        }
         _ => Style::default().fg(Color::Cyan),
     }
 }
@@ -3115,11 +3122,12 @@ pub fn render_tool_fullscreen(frame: &mut Frame, area: Rect, display: &ToolDispl
             }
         }
         ToolDisplay::Action { chip, summary, .. } => {
-            let (label, rest) = action_headline(chip, summary);
+            let (label, rest) = semantic_headline(chip, summary);
             format!("{label} {rest}").trim_end().to_string()
         }
         ToolDisplay::Builtin { tool, detail, .. } => {
-            format!("{tool}: {detail}")
+            let (label, rest) = semantic_headline(tool, detail);
+            format!("{label} {rest}").trim_end().to_string()
         }
     };
 
@@ -3910,6 +3918,43 @@ mod tests {
             pinned: None,
         };
         assert!(!builtin.expandable());
+    }
+
+    #[test]
+    fn hosted_web_search_headlines_as_searched() {
+        let display = ToolDisplay::Builtin {
+            tool: "web_search".to_string(),
+            detail: "may agent".to_string(),
+            status: ToolStatus::Done,
+            output: None,
+            pinned: None,
+        };
+        let text = {
+            let mut lines: Vec<Line> = Vec::new();
+            let mut positions = Vec::new();
+            render_tool_inline(&mut lines, &display, false, true, &mut positions);
+            rendered_text(&lines)
+        };
+        assert!(
+            text.iter()
+                .any(|line| line.contains("Searched \"may agent\"")),
+            "{text:?}"
+        );
+
+        let gemini = ToolDisplay::Builtin {
+            tool: "google_search".to_string(),
+            detail: "rust async".to_string(),
+            status: ToolStatus::Running,
+            output: None,
+            pinned: None,
+        };
+        let text = {
+            let mut lines: Vec<Line> = Vec::new();
+            let mut positions = Vec::new();
+            render_tool_inline(&mut lines, &gemini, false, true, &mut positions);
+            rendered_text(&lines)
+        };
+        assert!(text[0].contains("Searched \"rust async\""), "{text:?}");
     }
 
     #[test]

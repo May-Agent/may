@@ -111,7 +111,7 @@ fn map_call(id: &str, name: &str, input: &Value) -> ToolCall {
             &format!("glob {}", s("pattern")),
             &format!("rg --files {} --glob {}", shq(s("path")), shq(s("pattern"))),
         ),
-        "WebSearch" => call("websearch", &format!("websearch {}", shq(s("query")))),
+        "WebSearch" => comment_call(id.to_string(), "WebSearch", input),
         "WebFetch" => call("webfetch", &format!("webfetch {}", shq(s("url")))),
         _ => comment_call(id.to_string(), name, input),
     }
