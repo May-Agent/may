@@ -440,12 +440,53 @@ pub(super) async fn create_session(
         }
     }
 
+    if let Some(repo) = resolve_repo_binding(req.repo.as_deref()).map_err(bad_request_error)? {
+        state
+            .db()
+            .set_session_repo(&id, Some(repo.as_str()))
+            .await
+            .map_err(internal_error)?;
+    }
+
     persist_last_model(&state, &model)
         .await
         .map_err(internal_error)?;
     state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS | UiEventTopics::SESSION_RUNTIMES);
 
-    Ok(Json(ApiSession::new_empty(id, model, resolved_profile_id)))
+    let mut session = ApiSession::new_empty(id, model, resolved_profile_id);
+    session.repo = resolve_repo_binding(req.repo.as_deref()).ok().flatten();
+    Ok(Json(session))
+}
+
+/// Normalize a repo spec into a stored binding: `owner/repo` or a
+/// `github:owner/repo` spec binds the GitHub repository itself; an
+/// existing path binds that repository's local identity; anything else
+/// fails.
+fn resolve_repo_binding(spec: Option<&str>) -> Result<Option<String>, String> {
+    let Some(spec) = spec.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let github = spec.strip_prefix("github:").unwrap_or(spec);
+    let looks_like_github = {
+        let mut parts = github.split('/');
+        matches!(
+            (parts.next(), parts.next(), parts.next()),
+            (Some(o), Some(r), None) if !o.is_empty() && !r.is_empty() && !o.contains(' ') && !r.contains(' ')
+        )
+    };
+    // An existing filesystem path binds the local repository identity.
+    let path = std::path::Path::new(spec);
+    if let Some(worktree) = crate::repo_search::worktree_root(path)
+        && !spec.starts_with("github:")
+    {
+        let key = crate::issue::repository_identity(&worktree)
+            .map_err(|e| format!("repository identity: {e}"))?;
+        return Ok(Some(format!("local:{}", key.display())));
+    }
+    if looks_like_github {
+        return Ok(Some(format!("github:{github}")));
+    }
+    Err(format!("invalid repo spec '{spec}'"))
 }
 
 pub(super) async fn update_session(
@@ -514,6 +555,18 @@ pub(super) async fn update_session(
             let _ = db.touch_repo_usage(&worktree).await;
         }
     }
+    let mut next_repo = session.repo.clone();
+    if let Some(patch) = req.repo.clone() {
+        next_repo = match patch {
+            crate::daemon::types::NullableStringPatch::Null => None,
+            crate::daemon::types::NullableStringPatch::Set(spec) => {
+                resolve_repo_binding(Some(spec.as_str())).map_err(bad_request_error)?
+            }
+        };
+        db.set_session_repo(&id, next_repo.as_deref())
+            .await
+            .map_err(internal_error)?;
+    }
     if req.non_interactive == Some(true) {
         db.set_session_non_interactive(&id)
             .await
@@ -541,6 +594,7 @@ pub(super) async fn update_session(
         model,
         reasoning_effort: next_effort,
         runtime: runtime.into(),
+        repo: next_repo,
     }))
 }
 
