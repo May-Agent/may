@@ -57,7 +57,7 @@ const DEFAULT_AUTO_STOP_MINUTES: u64 = 30;
 
 #[derive(Debug, Clone)]
 struct SharedHostPaths {
-    memory_file: PathBuf,
+    memories_dir: PathBuf,
     tools_mount: aither_sandbox::MountSpec,
 }
 
@@ -289,13 +289,13 @@ impl ContainerManager {
         spec: &ContainerLaunchSpec,
     ) -> Result<SharedHostPaths, ContainerError> {
         let home_paths = MayHomePaths::new(self.may_dir.clone());
-        let (tools_mount, memory_file) = futures_lite::future::try_zip(
+        let (tools_mount, memories_dir) = futures_lite::future::try_zip(
             self.prepare_tools_mount(spec, &home_paths),
-            Self::ensure_memory_file(&home_paths),
+            Self::ensure_memories_dir(&home_paths),
         )
         .await?;
         Ok(SharedHostPaths {
-            memory_file,
+            memories_dir,
             tools_mount,
         })
     }
@@ -338,8 +338,11 @@ impl ContainerManager {
         Ok(tools_mount)
     }
 
-    /// Ensures the global memory file exists and returns its canonical path.
-    async fn ensure_memory_file(home_paths: &MayHomePaths) -> Result<PathBuf, ContainerError> {
+    /// Ensures the global memories directory and its index exist, returning
+    /// the directory's canonical path.
+    async fn ensure_memories_dir(home_paths: &MayHomePaths) -> Result<PathBuf, ContainerError> {
+        let memories_dir = home_paths.memories_dir();
+        tokio::fs::create_dir_all(&memories_dir).await?;
         let memory_file = home_paths.memory_file();
         if tokio::fs::metadata(&memory_file).await.is_err() {
             tokio::fs::write(&memory_file, "").await?;
@@ -353,12 +356,12 @@ impl ContainerManager {
                     home_paths.root().display()
                 ))
             })?;
-        let canonical = tokio::fs::canonicalize(&memory_file)
+        let canonical = tokio::fs::canonicalize(&memories_dir)
             .await
             .map_err(|error| {
                 ContainerError::Bootstrap(format!(
-                    "failed to canonicalize global memory file {}: {error}",
-                    memory_file.display()
+                    "failed to canonicalize global memories dir {}: {error}",
+                    memories_dir.display()
                 ))
             })?;
         // Windows canonical paths carry the `\\?\` verbatim prefix, which container
@@ -370,6 +373,13 @@ impl ContainerManager {
         let mut env = vec![
             "TERM=xterm-256color".to_string(),
             format!("MAY_HOST_GATEWAY={host_gateway}"),
+            // `~` is the mounted session workspace, matching a local session's
+            // HOME; churn-heavy caches stay on the container's own filesystem.
+            format!("HOME={CONTAINER_WORKSPACE}"),
+            format!("XDG_CONFIG_HOME={CONTAINER_WORKSPACE}/.config"),
+            "XDG_CACHE_HOME=/root/.cache".to_string(),
+            "BUN_INSTALL_CACHE_DIR=/root/.cache/bun".to_string(),
+            format!("PYTHONPATH={CONTAINER_WORKSPACE}/skills/python"),
         ];
         env.extend(spec.env.iter().cloned());
         env
@@ -385,10 +395,11 @@ impl ContainerManager {
                 read_only: Some(false),
                 ..Default::default()
             },
-            // Global memory file is shared across sessions.
+            // Global memories directory is shared across sessions; the
+            // container's HOME is the workspace, so `~/.may/memories` lands here.
             Mount {
-                target: Some("/root/.may/MEMORY.md".to_string()),
-                source: Some(shared_paths.memory_file.display().to_string()),
+                target: Some(format!("{CONTAINER_WORKSPACE}/.may/memories")),
+                source: Some(shared_paths.memories_dir.display().to_string()),
                 typ: Some(MountType::BIND),
                 read_only: Some(false),
                 ..Default::default()
@@ -615,7 +626,7 @@ mod tests {
 
     fn shared_paths() -> SharedHostPaths {
         SharedHostPaths {
-            memory_file: "/managed/MEMORY.md".into(),
+            memories_dir: "/managed/memories".into(),
             tools_mount: aither_sandbox::MountSpec::read_only(
                 "/managed/tools/bundle",
                 ContainerPath::new("/opt/aither/tools/bundle").unwrap(),

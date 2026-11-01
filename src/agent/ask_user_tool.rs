@@ -181,6 +181,50 @@ impl Tool for WithdrawAskUserTool {
     }
 }
 
+/// Resolves `BLOCKING <what>` payloads in `tasks.md` against the session's
+/// `ask_user` history: a mark naming a still-pending question holds; one
+/// naming a request the session issued that is answered or withdrawn does
+/// not — the item is runnable work again. A payload naming no request the
+/// session issued is free text and trusted.
+#[derive(Clone)]
+pub struct AskUserBlockerResolver {
+    runtime: Arc<SessionRuntimeService>,
+    session_id: String,
+}
+
+impl AskUserBlockerResolver {
+    /// The resolver for `session_id`, reading through `runtime`.
+    #[must_use]
+    pub fn new(runtime: Arc<SessionRuntimeService>, session_id: impl Into<String>) -> Self {
+        Self {
+            runtime,
+            session_id: session_id.into(),
+        }
+    }
+}
+
+impl aither_agent::TaskBlockerResolver for AskUserBlockerResolver {
+    async fn is_open(&self, mark: &str) -> bool {
+        let db = self.runtime.db();
+        match db
+            .session_ask_user_request_exists(&self.session_id, mark)
+            .await
+        {
+            Ok(true) => db
+                .pending_ask_user_request(mark)
+                .await
+                .is_ok_and(|pending| {
+                    pending.is_some_and(|pending| pending.session_id == self.session_id)
+                }),
+            Ok(false) => true,
+            Err(error) => {
+                tracing::error!(session_id = %self.session_id, %error, "failed to resolve a BLOCKING mark");
+                false
+            }
+        }
+    }
+}
+
 /// Lists the session's open questions in every request, so they are present
 /// after compaction like `tasks.md`: this is session state, rebuilt from the
 /// database each time rather than raised once as an alert.

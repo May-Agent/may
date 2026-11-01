@@ -16,6 +16,14 @@ use aither_sandbox::{
 
 use crate::live_response::LiveResponseRegistry;
 
+/// How long an escalation from the main agent stays pending before it
+/// resolves as denied. The operator is not assumed to be at the screen.
+pub const MAIN_APPROVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(30);
+
+/// The same deadline for escalations raised by a subagent: they should
+/// not hold a run nearly as long.
+pub const SUBAGENT_APPROVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(3);
+
 /// Error returned when parsing an unknown [`PermissionRequestMode`] value.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("unknown permission request mode: {value}")]
@@ -163,6 +171,7 @@ pub struct PermissionApprover {
     session_id: Option<String>,
     pub(crate) runtime_service: Option<Arc<crate::session::SessionRuntimeService>>,
     approval_mode: ApprovalMode,
+    timeout: std::time::Duration,
 }
 
 impl PermissionApprover {
@@ -174,6 +183,7 @@ impl PermissionApprover {
             session_id: None,
             runtime_service: None,
             approval_mode: ApprovalMode::Interactive,
+            timeout: MAIN_APPROVAL_TIMEOUT,
         }
     }
 
@@ -185,7 +195,21 @@ impl PermissionApprover {
             session_id: Some(session_id.into()),
             runtime_service: self.runtime_service.clone(),
             approval_mode: self.approval_mode,
+            timeout: self.timeout,
         }
+    }
+
+    /// Return a copy whose pending requests auto-deny after `timeout`.
+    #[must_use]
+    pub const fn with_approval_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// The approval deadline used for requests raised by a subagent.
+    #[must_use]
+    pub const fn for_subagent(self) -> Self {
+        self.with_approval_timeout(SUBAGENT_APPROVAL_TIMEOUT)
     }
 
     /// Attach the runtime service used to persist/surface requests.
@@ -299,7 +323,26 @@ impl PermissionApprover {
                 .await?;
         }
 
-        rx.recv().await.map_err(|_| PermissionError::Interrupted)
+        if let Ok(decision) = tokio::time::timeout(self.timeout, rx.recv()).await {
+            return decision.map_err(|_| PermissionError::Interrupted);
+        }
+        // The operator never answered: resolve the pending request as
+        // denied so it stops blocking the UI and the history records the
+        // decision, then refuse the escalation. The waiter is this run
+        // itself — there is nothing to wake.
+        self.live_responses.take(&request_id);
+        if let Some(runtime_service) = &self.runtime_service
+            && let Err(error) = runtime_service
+                .commit_permission_response(&request_id, false)
+                .await
+        {
+            tracing::warn!(%error, "failed to persist a timed-out permission denial");
+        }
+        Err(PermissionError::Denied(format!(
+            "{} mode approval was not answered within {} minutes and was denied",
+            mode.description(),
+            self.timeout.as_secs() / 60
+        )))
     }
 
     /// Resolve the pending request `request_id`: the decision is committed
@@ -376,5 +419,66 @@ impl PermissionHandler for PermissionApprover {
             !matches!(self.approval_mode, ApprovalMode::Unavailable { .. })
                 && matches!(mode, TerminalMode::Unsafe),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_timeout_is_thirty_minutes() {
+        assert_eq!(PermissionApprover::new().timeout, MAIN_APPROVAL_TIMEOUT);
+    }
+
+    #[test]
+    fn subagent_approver_uses_the_shorter_deadline() {
+        assert_eq!(
+            PermissionApprover::new().for_subagent().timeout,
+            SUBAGENT_APPROVAL_TIMEOUT
+        );
+        assert!(SUBAGENT_APPROVAL_TIMEOUT < MAIN_APPROVAL_TIMEOUT);
+    }
+
+    #[test]
+    fn for_session_preserves_the_timeout() {
+        let approver = PermissionApprover::new()
+            .with_approval_timeout(std::time::Duration::from_secs(5))
+            .for_session("session-1");
+        assert_eq!(approver.timeout, std::time::Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_request_times_out_denied() {
+        let approver = PermissionApprover::new()
+            .with_approval_timeout(std::time::Duration::from_millis(50))
+            .for_session("session-1");
+        let error = approver
+            .request_and_wait(TerminalMode::Unsafe, "cargo build".to_string())
+            .await
+            .expect_err("an unanswered request must not succeed");
+        let PermissionError::Denied(message) = error else {
+            panic!("expected a denial, got {error:?}");
+        };
+        assert!(message.contains("denied"), "unexpected message: {message}");
+    }
+
+    #[tokio::test]
+    async fn an_answered_request_returns_the_decision() {
+        let approver = PermissionApprover::new()
+            .with_approval_timeout(std::time::Duration::from_secs(30))
+            .for_session("session-1");
+        let responder = approver.clone();
+        let wait = tokio::spawn(async move {
+            approver
+                .request_and_wait(TerminalMode::Unsafe, "cargo build".to_string())
+                .await
+        });
+        // The request id is internal; approve whatever is pending.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let pending = responder.live_responses.pending_ids();
+        assert_eq!(pending.len(), 1);
+        assert!(responder.respond(&pending[0], true));
+        assert!(wait.await.expect("join").expect("answered"));
     }
 }

@@ -8,14 +8,18 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
+use std::fs::File;
+use std::io::Read;
 use std::path::Path;
+use std::time::SystemTime;
 
 use aither_core::llm::{ReasoningState, ToolCall, ToolResult};
+use jiff::Timestamp;
 use serde_json::Value;
 
 use super::{
-    ForeignAgent, ImportError, ImportedTranscript, assistant_turn, comment_call, derive_title,
-    parse_ts, terminal_call, tool_end, user_text,
+    ForeignAgent, ForeignSessionSummary, ImportError, ImportedTranscript, assistant_turn,
+    comment_call, derive_title, is_title_user_text, parse_ts, terminal_call, tool_end, user_text,
 };
 use crate::session::ChatMessage;
 
@@ -374,10 +378,193 @@ pub(super) fn parse(path: &Path) -> Result<ImportedTranscript, ImportError> {
     })
 }
 
+/// Bytes of a transcript to read when building a picker row. Enough for
+/// cwd + the first user prompt; the rest of a large jsonl is ignored.
+const LIST_PEEK_BYTES: u64 = 64 * 1024;
+
+/// Top-level `<project>/<id>.jsonl` transcripts under `projects_root`,
+/// newest mtime first. Nested `subagents/` jsonl is skipped.
+pub(super) fn list(projects_root: &Path) -> Vec<ForeignSessionSummary> {
+    let mut out = Vec::new();
+    let Ok(projects) = std::fs::read_dir(projects_root) else {
+        return out;
+    };
+    for project in projects.flatten() {
+        let project_path = project.path();
+        if !project_path.is_dir() {
+            continue;
+        }
+        let slug = project.file_name().to_string_lossy().into_owned();
+        let Ok(entries) = std::fs::read_dir(&project_path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            if let Some(summary) = summarize(&path, &slug) {
+                out.push(summary);
+            }
+        }
+    }
+    out.sort_by_key(|a| std::cmp::Reverse(a.modified));
+    out
+}
+
+fn summarize(path: &Path, project_slug: &str) -> Option<ForeignSessionSummary> {
+    let id = path.file_stem()?.to_str()?.to_string();
+    let modified = std::fs::metadata(path)
+        .ok()
+        .and_then(|meta| meta.modified().ok())
+        .and_then(system_time_to_ts);
+    let peeked = peek_records(path);
+    let mut cwd = peeked.cwd;
+    if cwd.is_none() {
+        cwd = Some(decode_project_slug(project_slug));
+    }
+    let title = peeked
+        .title
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| "untitled".to_string());
+    Some(ForeignSessionSummary {
+        id,
+        path: path.to_path_buf(),
+        cwd,
+        title,
+        modified,
+    })
+}
+
+fn system_time_to_ts(time: SystemTime) -> Option<Timestamp> {
+    Timestamp::try_from(time).ok()
+}
+
+/// Claude encodes a cwd as a directory name by replacing `/` with `-`.
+fn decode_project_slug(slug: &str) -> String {
+    slug.strip_prefix('-').map_or_else(
+        || slug.replace('-', "/"),
+        |rest| format!("/{path}", path = rest.replace('-', "/")),
+    )
+}
+
+struct Peeked {
+    cwd: Option<String>,
+    title: Option<String>,
+}
+
+fn peek_records(path: &Path) -> Peeked {
+    let mut peeked = Peeked {
+        cwd: None,
+        title: None,
+    };
+    let Ok(file) = File::open(path) else {
+        return peeked;
+    };
+    let mut buf = Vec::new();
+    let Ok(n) = file.take(LIST_PEEK_BYTES).read_to_end(&mut buf) else {
+        return peeked;
+    };
+    let mut text = String::from_utf8_lossy(&buf).into_owned();
+    if u64::try_from(n).unwrap_or(0) == LIST_PEEK_BYTES
+        && let Some(cut) = text.rfind('\n')
+    {
+        text.truncate(cut);
+    }
+    let mut fallback_title = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if peeked.cwd.is_none()
+            && let Some(cwd) = record.get("cwd").and_then(Value::as_str)
+            && !cwd.is_empty()
+        {
+            peeked.cwd = Some(cwd.to_string());
+        }
+        if peeked.title.is_some() {
+            continue;
+        }
+        let Some(text) = user_prompt_text(&record) else {
+            continue;
+        };
+        if !is_title_user_text(&text) {
+            continue;
+        }
+        let preview = first_line_preview(&text);
+        if preview.is_empty() {
+            continue;
+        }
+        if preview.starts_with('/') {
+            if fallback_title.is_none() {
+                fallback_title = Some(preview);
+            }
+            continue;
+        }
+        peeked.title = Some(preview);
+    }
+    if peeked.title.is_none() {
+        peeked.title = fallback_title;
+    }
+    peeked
+}
+
+fn user_prompt_text(record: &Value) -> Option<String> {
+    if record.get("type").and_then(Value::as_str) != Some("user") {
+        return None;
+    }
+    if record
+        .get("isSidechain")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || record
+            .get("isMeta")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        return None;
+    }
+    match &record["message"]["content"] {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(blocks) => {
+            let mut parts = Vec::new();
+            for block in blocks {
+                if block.get("type").and_then(Value::as_str) == Some("text")
+                    && let Some(t) = block.get("text").and_then(Value::as_str)
+                    && !t.is_empty()
+                {
+                    parts.push(t);
+                }
+            }
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("\n"))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn first_line_preview(text: &str) -> String {
+    let line = text.lines().next().unwrap_or(text).trim();
+    let truncated: String = line.chars().take(60).collect();
+    if line.chars().count() > 60 {
+        format!("{truncated}…")
+    } else {
+        truncated
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::session::MessageRole;
+    use std::path::Path;
 
     #[test]
     fn walks_live_branch_and_skips_sidechains_and_meta() {
@@ -421,5 +608,92 @@ mod tests {
         assert_eq!(end.tool_call_id.as_deref(), Some("tu_1"));
         let record: Value = serde_json::from_str(&end.content).unwrap();
         assert_eq!(record["stage"], "end");
+    }
+
+    fn write_jsonl(path: &Path, body: &str) {
+        std::fs::write(path, body).unwrap();
+    }
+
+    fn set_mtime(path: &Path, secs: u64) {
+        let time = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(false)
+            .open(path)
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+    }
+
+    #[test]
+    fn list_skips_subagents_and_sorts_newest_first() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("-Users-lexoliu-Coding-may");
+        std::fs::create_dir_all(project.join("subagents")).unwrap();
+
+        let older = project.join("aaaa.jsonl");
+        let newer = project.join("bbbb.jsonl");
+        let nested = project.join("subagents").join("cccc.jsonl");
+        write_jsonl(
+            &older,
+            r#"{"type":"user","cwd":"/Users/lexoliu/Coding/may","message":{"role":"user","content":"older prompt"}}"#,
+        );
+        write_jsonl(
+            &newer,
+            r#"{"type":"user","cwd":"/Users/lexoliu/Coding/may","message":{"role":"user","content":"newer prompt"}}"#,
+        );
+        write_jsonl(
+            &nested,
+            r#"{"type":"user","cwd":"/x","message":{"role":"user","content":"subagent"}}"#,
+        );
+        set_mtime(&older, 1_700_000_000);
+        set_mtime(&newer, 1_700_000_100);
+        set_mtime(&nested, 1_700_000_200);
+
+        let listed = list(root.path());
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].id, "bbbb");
+        assert_eq!(listed[0].title, "newer prompt");
+        assert_eq!(listed[1].id, "aaaa");
+        assert_eq!(listed[1].title, "older prompt");
+        assert_eq!(listed[0].cwd.as_deref(), Some("/Users/lexoliu/Coding/may"));
+    }
+
+    #[test]
+    fn list_prefers_real_prompt_over_slash_and_decodes_slug_cwd() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("-tmp-work");
+        std::fs::create_dir_all(&project).unwrap();
+        write_jsonl(
+            &project.join("s1.jsonl"),
+            concat!(
+                r#"{"type":"user","isMeta":true,"message":{"role":"user","content":"<local-command/>"}}"#,
+                "\n",
+                r#"{"type":"user","message":{"role":"user","content":"/help"}}"#,
+                "\n",
+                r#"{"type":"user","message":{"role":"user","content":"real question"}}"#,
+                "\n",
+            ),
+        );
+
+        let listed = list(root.path());
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].title, "real question");
+        assert_eq!(listed[0].cwd.as_deref(), Some("/tmp/work"));
+    }
+
+    #[test]
+    fn list_falls_back_to_slash_title_when_that_is_all() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        write_jsonl(
+            &project.join("s2.jsonl"),
+            r#"{"type":"user","message":{"role":"user","content":"/compact"}}"#,
+        );
+
+        let listed = list(root.path());
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].title, "/compact");
     }
 }

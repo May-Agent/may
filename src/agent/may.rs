@@ -195,8 +195,6 @@ pub struct MayAgentConfig {
     pub computer: Option<crate::agent::computer_tool::ComputerHandles>,
     /// Optional broker for `register-skills` command requests.
     pub register_skills_broker: Option<RegisterBroker>,
-    /// Optional broker for `register-subagents` command requests.
-    pub register_subagents_broker: Option<RegisterBroker>,
     /// Whether this model/runtime pair supports native voice input.
     pub native_voice_input: bool,
     /// Model context window resolved from provider metadata.
@@ -259,8 +257,6 @@ pub struct MayAgentSessionInput<'a> {
     pub computer: Option<crate::agent::computer_tool::ComputerHandles>,
     /// Channel for register-skills requests.
     pub register_skills_broker: Option<RegisterBroker>,
-    /// Channel for register-subagents requests.
-    pub register_subagents_broker: Option<RegisterBroker>,
     /// Execution environment (local heel sandbox or container).
     pub environment: AgentEnvironment,
     /// Trusted baseline tool distribution used by every configured backend.
@@ -353,19 +349,25 @@ impl MayAgent {
         )?;
 
         // Mount workspace grants into the terminal sandbox: read-only dirs
-        // become readable mounts, read-write dirs writable mounts.
+        // become readable mounts, read-write dirs writable mounts. The
+        // launch directory is readable by default — `readable_dirs` carries
+        // it — and the sandbox dir is the tool's own working directory, so
+        // it needs no grant entry of its own.
         let readable = workspace
-            .config
-            .workdirs
-            .iter()
-            .filter(|dir| dir.permission == crate::workspace::Permission::ReadOnly)
-            .map(|dir| dir.path.clone());
+            .readable_dirs()
+            .into_iter()
+            .filter(|path| path.as_path() != config.sandbox_dir.as_path())
+            .cloned();
+        // `~/.may/memories` is linked into the session's `~/.may`; it must be
+        // writable through the symlink, so it joins the grants.
+        let memories_dir = crate::session::MayHomePaths::new(config.may_dir.clone()).memories_dir();
+        async_fs::create_dir_all(&memories_dir).await.ok();
         let writable = workspace
-            .config
-            .workdirs
-            .iter()
-            .filter(|dir| dir.permission == crate::workspace::Permission::ReadWrite)
-            .map(|dir| dir.path.clone());
+            .writable_dirs()
+            .into_iter()
+            .filter(|path| path.as_path() != config.sandbox_dir.as_path())
+            .cloned()
+            .chain(std::iter::once(memories_dir));
 
         // Create the terminal command tool in the sandbox dir.
         let terminal_tool: TerminalTool<TerminalPermissionHandler, DefaultExecutor> =
@@ -418,24 +420,25 @@ impl MayAgent {
             &ssh_servers,
         );
 
-        // Read global memory from the database.
-        let memory_content = config
-            .db
-            .get_global_memory()
+        // Read global memory from the memories directory sessions edit via
+        // the `~/.may/memories` link/mount.
+        let memory_file = crate::session::MayHomePaths::new(config.may_dir.clone()).memory_file();
+        let memory_content = async_fs::read_to_string(&memory_file)
             .await
             .unwrap_or_else(|error| {
-                tracing::error!(error = %error, "failed to load global memory from DB");
-                None
-            })
-            .unwrap_or_default();
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::error!(error = %error, "failed to load global memory file");
+                }
+                String::new()
+            });
         let mut runtime_system_context =
-            RuntimeSystemContext::new(config.db.clone(), memory_content.clone());
+            RuntimeSystemContext::new(memory_file, memory_content.clone());
         let terminal_runtime = build_terminal_runtime_context(
             &config,
             &session_paths,
             aither_models::lookup(config.model_id.as_str()),
             config.ssh_servers.clone(),
-            (!is_container).then(|| crate::fs_utils::display_path(&config.cwd)),
+            (!is_container).then(|| config.cwd.display().to_string()),
         );
         runtime_system_context =
             runtime_system_context.with_terminal_runtime(terminal_runtime.clone());
@@ -449,14 +452,43 @@ impl MayAgent {
         if let Some(worktree) = crate::repo_search::worktree_root(&config.cwd)
             && let Ok(repo_key) = crate::issue::repository_identity(&worktree)
         {
-            match session_repos.ensure_local_clone(&worktree, &repo_key).await {
-                Ok(clone_path) => repo_clones.push(RepoCloneEntry {
+            // The first-contact trust decision picks the binding: GitHub
+            // trust clones the remote (cloud is the source of truth), local
+            // trust clones the checkout, undecided binds nothing yet — the
+            // question is posted once the session runtime exists below.
+            let trust = crate::trust::trust_for(&workspace.config, &repo_key, &worktree);
+            let clone = match trust {
+                Some(crate::trust::TrustLevel::Full | crate::trust::TrustLevel::PrsOnly) => {
+                    Some(match crate::trust::repo_kind(&worktree) {
+                        crate::trust::RepoKind::Github { owner_repo } => {
+                            match crate::trust::remote_url(&worktree) {
+                                Some(url) => {
+                                    session_repos.ensure_remote_clone(&url, &owner_repo).await
+                                }
+                                None => {
+                                    session_repos.ensure_local_clone(&worktree, &repo_key).await
+                                }
+                            }
+                        }
+                        crate::trust::RepoKind::Git => {
+                            session_repos.ensure_local_clone(&worktree, &repo_key).await
+                        }
+                    })
+                }
+                Some(crate::trust::TrustLevel::Local) => {
+                    Some(session_repos.ensure_local_clone(&worktree, &repo_key).await)
+                }
+                None => None,
+            };
+            match clone {
+                Some(Ok(clone_path)) => repo_clones.push(RepoCloneEntry {
                     clone_path,
                     source: crate::fs_utils::display_path(&worktree),
                 }),
-                Err(error) => {
+                Some(Err(error)) => {
                     tracing::warn!(%error, "failed to create session repo clone");
                 }
+                None => {}
             }
         }
         runtime_system_context =
@@ -504,13 +536,12 @@ impl MayAgent {
         let context_snapshot_hook =
             ContextSnapshotHook::new(hook_runtime.clone(), &config.session_id);
 
-        let (skills_dir, subagents_dir) = if let Some(profile_id) = config.profile_id.as_deref() {
-            let profile_home =
-                crate::session::MayHomePaths::new(config.may_dir.clone()).profile_home(profile_id);
-            (profile_home.skills_dir(), profile_home.subagents_dir())
+        let skills_dir = if let Some(profile_id) = config.profile_id.as_deref() {
+            crate::session::MayHomePaths::new(config.may_dir.clone())
+                .profile_home(profile_id)
+                .skills_dir()
         } else {
-            let home = crate::session::MayHomePaths::new(config.may_dir.clone());
-            (home.skills_dir(), home.subagents_dir())
+            crate::session::MayHomePaths::new(config.may_dir.clone()).skills_dir()
         };
 
         // Build the agent using a minimal base prompt + structured context blocks.
@@ -527,10 +558,29 @@ impl MayAgent {
             .cache_lifetime(config.cache_lifetime.into())
             .background_jobs(config.background_jobs);
         if let Some(runtime) = hook_runtime.clone() {
-            builder = builder.context_source(super::ask_user_tool::OpenQuestionsContext::new(
-                runtime,
-                config.session_id.as_str(),
-            ));
+            // First-contact: an unknown repository asks once; the answer
+            // persists through `repo trust set` and later sessions reuse it.
+            if let Some(worktree) = crate::repo_search::worktree_root(&config.cwd)
+                && let Ok(repo_key) = crate::issue::repository_identity(&worktree)
+                && crate::trust::trust_for(&workspace.config, &repo_key, &worktree).is_none()
+            {
+                let kind = crate::trust::repo_kind(&worktree);
+                let _ = runtime
+                    .open_question(
+                        config.session_id.as_str(),
+                        &crate::trust::question_for(&kind, &worktree),
+                    )
+                    .await;
+            }
+            builder = builder
+                .context_source(super::ask_user_tool::OpenQuestionsContext::new(
+                    runtime.clone(),
+                    config.session_id.as_str(),
+                ))
+                .blocker_resolver(super::ask_user_tool::AskUserBlockerResolver::new(
+                    runtime,
+                    config.session_id.as_str(),
+                ));
         }
         if let Some(clock) = config.clock.clone() {
             builder = builder.clock(clock);
@@ -563,12 +613,12 @@ impl MayAgent {
                 tunnel_broker: config.tunnel_broker.clone(),
                 browser_broker: config.browser_broker.clone(),
                 register_skills_broker: config.register_skills_broker.clone(),
-                register_subagents_broker: config.register_subagents_broker.clone(),
                 request_parameters: config.request_parameters.clone(),
                 workspace_request_broker: (!is_container)
                     .then_some(config.workspace_request_broker.clone()),
                 subagent_runs: subagent_runs.clone(),
                 issue_store: issue_store.clone(),
+                workspace_config: workspace.config.clone(),
                 agent_messaging,
                 #[cfg(target_os = "macos")]
                 computer: config.computer.clone(),
@@ -581,10 +631,8 @@ impl MayAgent {
         builder = builder.fork_source(shared_terminal_commands.fork_source.clone());
         if is_container {
             builder = Box::pin(builder.with_skills_readable_only(&skills_dir)).await?;
-            builder = Box::pin(builder.with_subagents_readable_only(&subagents_dir)).await?;
         } else {
             builder = Box::pin(builder.with_skills(&skills_dir)).await?;
-            builder = Box::pin(builder.with_subagents(&subagents_dir)).await?;
         }
         // The builder's descriptions cover every shared command registered
         // above.
@@ -592,7 +640,6 @@ impl MayAgent {
             builder.tool_descriptions(),
             &config.request_parameters,
             &skills_dir,
-            &subagents_dir,
             &crate::issue::IssueStore::info(&issue_store),
         )
         .await?;
@@ -690,7 +737,6 @@ impl MayAgent {
             #[cfg(target_os = "macos")]
             computer,
             register_skills_broker,
-            register_subagents_broker,
             environment,
             tool_distribution,
             tool_environments,
@@ -788,7 +834,6 @@ impl MayAgent {
             #[cfg(target_os = "macos")]
             computer,
             register_skills_broker,
-            register_subagents_broker,
             native_voice_input: model_info
                 .is_some_and(|info| info.has_ability(aither_core::llm::model::Ability::Audio)),
             model_context_window: model_info.and_then(aither_models::ModelEntry::max_input_tokens),
@@ -1061,7 +1106,9 @@ impl MayAgent {
     }
 
     pub(crate) async fn sync_runtime_context(&mut self) {
-        self.runtime_system_context.sync_memory_content().await;
+        self.runtime_system_context
+            .sync_memory_content(self.inner.context_mut())
+            .await;
         let handoff = handoff_markdown(self.inner.context());
         self.runtime_system_context
             .sync_agents_md(handoff.as_deref())
@@ -1152,7 +1199,7 @@ pub async fn test_agent(
     model_id: &str,
 ) -> (MayAgent, tempfile::TempDir) {
     let temp = tempfile::tempdir().expect("tempdir");
-    let db = crate::db::ChatDb::open(&temp.path().join("history.db"))
+    let _db = crate::db::ChatDb::open(&temp.path().join("history.db"))
         .await
         .expect("open test db");
     let session_id = SessionId::new();
@@ -1174,7 +1221,10 @@ pub async fn test_agent(
             model_id: model_id.to_string(),
             model_context_window: None,
             mcp_command_names: Vec::new(),
-            runtime_system_context: RuntimeSystemContext::new(db, String::new()),
+            runtime_system_context: RuntimeSystemContext::new(
+                temp.path().join("MEMORY.md"),
+                String::new(),
+            ),
             subagent_tracker: crate::agent::subagent_tracker::SubagentTracker::default(),
         },
         temp,

@@ -1,13 +1,12 @@
 Model: {{ model_id }}
 Environment: {{ home_environment_kind }} ({{ operating_system }}, {{ shell_dialect }})
-Home directory: {{ home_directory }}
-Session directory (working directory, writable sandbox): {{ session_directory }}
+Current working directory (writable sandbox): {{ working_directory }}
+{{ home_note }}
 {% if let Some(dir) = host_launch_directory %}Host launch directory (the checkout this session clones from — the session's writable copies are its repository clones, never this directory): {{ dir }}
-{% endif %}
-Home layout:
+{% endif %}{% if !home_layout.is_empty() %}Home layout (`~/../..`):
 {% for item in home_layout %}- {{ item }}
 {% endfor %}
-Session layout:
+{% endif %}Session layout:
 {% for item in session_layout %}- {{ item }}
 {% endfor %}
 Command rules:

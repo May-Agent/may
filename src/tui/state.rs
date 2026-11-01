@@ -3,6 +3,7 @@
 use crate::MayConfig;
 use crate::ask_user::{AskUserRequest, Question};
 use crate::config::ProviderType;
+use crate::session::import::ForeignSessionSummary;
 use crate::workspace_request::WorkspaceRequest;
 
 /// Application mode.
@@ -49,6 +50,8 @@ pub enum AppMode {
     /// Rewind picker: restore the conversation (and optionally the code)
     /// to the point before a user prompt
     Rewind(RewindState),
+    /// `/resume-claude` picker over Claude Code transcripts
+    ResumePicker(ResumePickerState),
     /// Background jobs and running subagents viewer
     Jobs,
     /// Detail view of one background job or subagent run
@@ -95,6 +98,7 @@ impl AppMode {
             Self::SkillManage => "skill-manage",
             Self::ProfileSelect => "profile-select",
             Self::Rewind(_) => "rewind",
+            Self::ResumePicker(_) => "resume-picker",
             Self::Jobs => "jobs",
             Self::JobDetail(_) => "job-detail",
             Self::Btw(_) => "btw",
@@ -193,6 +197,54 @@ pub struct RewindPrompt {
     pub deletions: usize,
 }
 
+/// Searchable Claude Code session picker opened by `/resume-claude`.
+#[derive(Debug)]
+pub struct ResumePickerState {
+    /// Transcripts, newest mtime first.
+    pub sessions: Vec<ForeignSessionSummary>,
+    /// Cursor in the filtered list.
+    pub selected: usize,
+    /// Filter over title, cwd, and id.
+    pub search: String,
+    /// Listing is still running off the event loop.
+    pub loading: bool,
+}
+
+impl ResumePickerState {
+    /// Empty picker shown while transcripts are listed.
+    #[must_use]
+    pub const fn loading() -> Self {
+        Self {
+            sessions: Vec::new(),
+            selected: 0,
+            search: String::new(),
+            loading: true,
+        }
+    }
+
+    /// Indices into `sessions` matching `search` (title, cwd, id).
+    #[must_use]
+    pub fn filtered(&self) -> Vec<usize> {
+        if self.search.is_empty() {
+            return (0..self.sessions.len()).collect();
+        }
+        let query = self.search.to_lowercase();
+        self.sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, session)| {
+                session.title.to_lowercase().contains(&query)
+                    || session.id.to_lowercase().contains(&query)
+                    || session
+                        .cwd
+                        .as_ref()
+                        .is_some_and(|cwd| cwd.to_lowercase().contains(&query))
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+}
+
 /// Rewind picker state: first pick a prompt, then the restoration scope.
 #[derive(Debug)]
 pub struct RewindState {
@@ -201,11 +253,6 @@ pub struct RewindState {
     /// Cursor position; `targets.len()` is the trailing `(current)` entry,
     /// which selects nothing and simply closes the picker.
     pub selected: usize,
-    /// Prompt the scope submenu is open for, if any.
-    pub options_for: Option<usize>,
-    /// Cursor position in the scope submenu (0 = conversation only,
-    /// 1 = conversation and code).
-    pub option_selected: usize,
 }
 
 /// Per-question interaction state.
@@ -824,7 +871,7 @@ pub fn detect_api_key_from_env(provider: ProviderType) -> Option<(String, &'stat
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{SelectionPoint, StatusNotice, TextSelection};
+    use super::{ResumePickerState, SelectionPoint, StatusNotice, TextSelection};
 
     fn point(line: usize, column: usize) -> SelectionPoint {
         SelectionPoint { line, column }
@@ -872,6 +919,35 @@ mod tests {
         // Wide chars take two cells but one char index each.
         let sel = TextSelection::word_at("你好 world", point(0, 3)).unwrap();
         assert_eq!(sel.normalized(), (point(0, 3), point(0, 8)));
+    }
+
+    #[test]
+    fn resume_picker_filters_title_cwd_and_id() {
+        use std::path::PathBuf;
+
+        use crate::session::import::ForeignSessionSummary;
+
+        let summary = |id: &str, title: &str, cwd: &str| ForeignSessionSummary {
+            id: id.to_string(),
+            path: PathBuf::from(id),
+            cwd: Some(cwd.to_string()),
+            title: title.to_string(),
+            modified: None,
+        };
+        let sessions = vec![
+            summary("aaaa-1111", "fix the picker", "/Users/lexoliu/Coding/may"),
+            summary("bbbb-2222", "unrelated", "/tmp/other"),
+        ];
+        let picker = |search: &str| ResumePickerState {
+            sessions: sessions.clone(),
+            selected: 0,
+            search: search.to_string(),
+            loading: false,
+        };
+        assert_eq!(picker("").filtered(), vec![0, 1]);
+        assert_eq!(picker("picker").filtered(), vec![0]);
+        assert_eq!(picker("coding/may").filtered(), vec![0]);
+        assert_eq!(picker("bbbb").filtered(), vec![1]);
     }
 
     #[test]

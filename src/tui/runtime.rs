@@ -709,6 +709,8 @@ impl RuntimeDeps {
             .map(|session| session.id.clone());
         *agent_handle = None;
         app.finish_processing();
+        app.chat
+            .fold_turn_work(app.turn_started_at.map_or(0, |at| at.elapsed().as_secs()));
 
         // The daemon persisted the turn and names the session.
         if let Err(error) = app.session_manager.refresh_history().await {
@@ -763,6 +765,24 @@ impl RuntimeDeps {
         app.input_char_count = app.input.chars().count();
         app.cursor = app.input_char_count;
         app.attachments = attachments;
+        // The next send carries a one-shot notice: the conversation rolled
+        // back while the world — open and merged PRs — stands. The audit
+        // log already recorded a `rewound` event per session PR.
+        let mut notice =
+            "The conversation was rewound to an earlier point. Nothing outside the conversation changed — repository state, open and merged pull requests, and issues still stand as recorded. Undo landed code through a revert PR, never by rewriting history.".to_string();
+        let prs = &app.sidebar.prs;
+        if !prs.is_empty() {
+            let list = prs
+                .iter()
+                .map(|pr| format!("#{} {} ({})", pr.number, pr.title, pr.state))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = std::fmt::Write::write_fmt(
+                &mut notice,
+                format_args!(" Session pull requests: {list}."),
+            );
+        }
+        app.rewind_notice = crate::xml::XmlBlock::parse(notice).ok();
         app.chat.push_notice(&format!(
             "⏪ rewound to before this prompt{}",
             if restore_code {
@@ -870,7 +890,10 @@ impl RuntimeDeps {
             .ok_or(TuiRuntimeError::NoActiveSession)?;
         if let Some(client) = &self.daemon {
             // The daemon dispatches queued and steering messages itself;
-            // the turns they start reach this TUI as foreign turns.
+            // the turns they start reach this TUI as foreign turns. The
+            // local queue mirrors the message for display until then, and
+            // the next `session_runtime` snapshot makes it authoritative.
+            app.queue.enqueue(message.clone());
             let body = serde_json::json!({
                 "sessionId": session_id.as_str(),
                 "content": message.content,
@@ -882,7 +905,13 @@ impl RuntimeDeps {
                 "hiddenContextXml": message.hidden_context_xml.as_ref().map(ToString::to_string),
                 "deliveryMode": message.delivery_mode,
             });
-            let _: serde_json::Value = client.post("/api/chat/enqueue", &body).await?;
+            if let Err(error) = client
+                .post::<_, serde_json::Value>("/api/chat/enqueue", &body)
+                .await
+            {
+                app.sync_queue_from_runtime();
+                return Err(error.into());
+            }
         }
         Ok(())
     }

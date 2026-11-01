@@ -29,6 +29,7 @@ use may_agent::{MayConfig, MayHomePaths};
 use serde_json::Value;
 use serial_test::serial;
 use tempfile::TempDir;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::process::{Child, Command};
 use tokio::time::{Instant, sleep};
@@ -3730,11 +3731,26 @@ async fn oneshot_run_starts_the_daemon_and_streams_its_turn() {
     drop(db);
 
     let binary = may_binary_path();
-    let output = Command::new(&binary)
+    let mut oneshot = Command::new(&binary)
         .arg("say hi")
         .env("HOME", harness.home_path())
         .env("HEEL_BIN", heel_bin())
-        .output()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("may one-shot should spawn");
+    // The first-contact repo-trust question precedes the turn; answer
+    // "local" so the session works without external publishing.
+    oneshot
+        .stdin
+        .as_mut()
+        .expect("oneshot stdin is piped")
+        .write_all(b"3\n")
+        .await
+        .expect("trust answer should write");
+    let output = oneshot
+        .wait_with_output()
         .await
         .expect("may one-shot should run");
     let stop = Command::new(&binary)
