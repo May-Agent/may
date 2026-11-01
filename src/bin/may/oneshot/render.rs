@@ -130,6 +130,22 @@ fn one_line(text: &str, limit: usize) -> String {
     }
 }
 
+/// Hosted search/fetch as a verb headline; other hosted tools keep `[name]`.
+fn hosted_headline(tool: &str, detail: &str) -> (String, String) {
+    match tool {
+        "websearch" | "web_search" | "google_search" => (
+            "Searched".to_string(),
+            if detail.is_empty() {
+                String::new()
+            } else {
+                format!("\"{detail}\"")
+            },
+        ),
+        "webfetch" | "web_fetch" => ("Fetched".to_string(), detail.to_string()),
+        _ => (tool.to_string(), detail.to_string()),
+    }
+}
+
 /// Names a call by its tool and arguments.
 fn call_label(name: &str, arguments: &str) -> String {
     if name == "terminal"
@@ -244,11 +260,12 @@ impl<O: Write, E: Write> OneShotOutput<O, E> {
             }
             AgentEvent::BuiltInToolCall { tool, detail, .. } => {
                 let detail = one_line(detail, SUMMARY_LIMIT);
+                let (label, rest) = hosted_headline(tool, &detail);
                 self.write_line(
                     at,
                     LineKind::BuiltInTool {
-                        tool,
-                        detail: &detail,
+                        tool: &label,
+                        detail: &rest,
                     },
                 )
             }

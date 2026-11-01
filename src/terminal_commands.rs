@@ -4,7 +4,6 @@ use std::sync::Arc;
 use aither_agent::sandbox::builtin::AskCommand;
 use aither_agent::specialized::{SubagentFileMount, SubagentTool};
 use aither_agent::webfetch::WebFetchTool;
-use aither_agent::websearch::WebSearchTool;
 use aither_core::LanguageModel;
 use aither_core::llm::{Tool, model::Parameters, tool::ToolDefinition};
 use aither_sandbox::ToolRegistryBuilder;
@@ -79,10 +78,10 @@ pub struct SharedTerminalCommandConfig<LLM> {
     /// Registry the `subagent` command reports in-flight runs to;
     /// cloneable handle the host uses to list or cancel them.
     pub subagent_runs: aither_agent::specialized::SubagentRuns,
-    /// Request parameters the agent will run with. Provider-hosted web tools
-    /// (`Parameters::hosted_web_search` / `hosted_web_fetch`) suppress the
-    /// redundant `websearch` / `webfetch` commands so the model has a single
-    /// search path.
+    /// Request parameters the agent will run with. Provider-hosted URL fetch
+    /// (`Parameters::hosted_web_fetch`) suppresses the redundant `webfetch`
+    /// command. Search is always provider-hosted; there is no `websearch`
+    /// command.
     pub request_parameters: Parameters,
     /// Tracker the `subagent` command reports each invocation to — the host
     /// UI reads live per-run stats off it.
@@ -127,9 +126,6 @@ where
 {
     let mut descriptions = Vec::new();
 
-    if !config.request_parameters.hosted_web_search() {
-        register_tool_with_description(builder, &mut descriptions, WebSearchTool::default());
-    }
     if !config.request_parameters.hosted_web_fetch() {
         register_tool_with_description(builder, &mut descriptions, WebFetchTool::new());
     }
@@ -560,13 +556,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn web_commands_are_suppressed_when_hosted_tools_are_enabled() {
+    async fn websearch_is_never_registered_as_an_ipc_command() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_dir = temp.path().join("sessions/session-1");
+        let mut builder = ToolRegistryBuilder::new();
+
+        let descriptions = register_shared_terminal_commands(
+            &mut builder,
+            SharedTerminalCommandConfig {
+                #[cfg(target_os = "macos")]
+                computer: None,
+                llm: MockLlm,
+                ask_flagship: None,
+                ask_balanced: None,
+                ask_fast: None,
+                session_id: "session-1".to_string(),
+                may_dir: temp.path().to_path_buf(),
+                sandbox_dir: session_dir.clone(),
+                cwd: PathBuf::from("."),
+                db: None,
+                ask_user: None,
+                imagine: None,
+                task_runtime: TaskRuntimeKind::Local,
+                task_broker: None,
+                notify_broker: None,
+                tunnel_broker: None,
+                browser_broker: None,
+                register_skills_broker: None,
+                workspace_request_broker: None,
+                subagent_runs: aither_agent::specialized::SubagentRuns::default(),
+                subagent_tracker: SubagentTracker::default(),
+                request_parameters: Parameters::default(),
+                issue_store: test_issue_store(temp.path()).await,
+                workspace_config: crate::workspace::WorkspaceConfig::default(),
+                agent_messaging: None,
+            },
+        )
+        .await
+        .expect("commands should register")
+        .descriptions;
+
+        let registry = builder.build(session_dir.join("outputs"));
+        assert!(!registry.is_tool_configured("websearch"));
+        assert!(!descriptions.iter().any(|(name, _)| name == "websearch"));
+        assert!(registry.is_tool_configured("webfetch"));
+    }
+
+    #[tokio::test]
+    async fn webfetch_is_suppressed_when_hosted_fetch_is_enabled() {
         let temp = tempfile::tempdir().expect("tempdir");
         let session_dir = temp.path().join("sessions/session-1");
         let mut builder = ToolRegistryBuilder::new();
 
         let mut request_parameters = Parameters::default();
-        request_parameters.native_tools.claude.web_search = true;
         request_parameters.native_tools.claude.web_fetch = true;
 
         let descriptions = register_shared_terminal_commands(
@@ -605,9 +647,7 @@ mod tests {
         .descriptions;
 
         let registry = builder.build(session_dir.join("outputs"));
-        assert!(!registry.is_tool_configured("websearch"));
         assert!(!registry.is_tool_configured("webfetch"));
-        assert!(!descriptions.iter().any(|(name, _)| name == "websearch"));
         assert!(!descriptions.iter().any(|(name, _)| name == "webfetch"));
     }
 
@@ -891,9 +931,9 @@ mod tests {
         .descriptions;
 
         let registry = builder.build(session_dir.join("outputs"));
-        assert!(registry.is_tool_configured("websearch"));
+        assert!(!registry.is_tool_configured("websearch"));
         assert!(registry.is_tool_configured("webfetch"));
-        assert!(descriptions.iter().any(|(name, _)| name == "websearch"));
+        assert!(!descriptions.iter().any(|(name, _)| name == "websearch"));
         assert!(descriptions.iter().any(|(name, _)| name == "webfetch"));
     }
 }
