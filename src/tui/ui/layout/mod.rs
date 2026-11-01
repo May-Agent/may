@@ -307,6 +307,7 @@ fn sheet_height(app: &App, column: Rect) -> Option<u16> {
         AppMode::Help => (rows(HELP_TEXT.lines().count() + 2), pct(70)),
         AppMode::ToolDetail => (full, pct(80)),
         AppMode::ModelSelect => (rows(app.model_select_list.len() + 2).min(12), pct(60)),
+        AppMode::EffortSelect => (rows(4), pct(70)),
         AppMode::McpManage | AppMode::SshManage | AppMode::SkillManage => {
             (pct(60).max(12), pct(70))
         }
@@ -378,6 +379,7 @@ fn render_sheet(frame: &mut Frame, sheet: Rect, app: &App) {
         AppMode::Help => render_help_popup(frame, sheet, app.help_scroll),
         AppMode::ToolDetail => render_tool_detail_popup(frame, sheet, app),
         AppMode::ModelSelect => render_model_select_popup(frame, sheet, app),
+        AppMode::EffortSelect => render_effort_select_popup(frame, sheet, app),
         AppMode::McpManage => render_mcp_popup(frame, sheet, app),
         AppMode::SshManage => render_ssh_popup(frame, sheet, app),
         AppMode::SkillManage => render_skill_popup(frame, sheet, app),
@@ -727,6 +729,32 @@ fn render_model_select_popup(frame: &mut Frame, area: Rect, app: &App) {
             .title("Select Model"),
     );
     frame.render_widget(list, popup_area);
+}
+
+/// Render the effort select popup: a single horizontal ladder, ←/→ steps
+/// the highlighted rung and applies immediately.
+fn render_effort_select_popup(frame: &mut Frame, area: Rect, app: &App) {
+    let mut spans = Vec::with_capacity(app.effort_ladder.len() + 2);
+    spans.push(Span::styled("◀ ", Style::default().fg(Color::DarkGray)));
+    for (idx, rung) in app.effort_ladder.iter().enumerate() {
+        let label = rung.unwrap_or("default");
+        let style = if idx == app.effort_index {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        spans.push(Span::styled(format!(" {label} "), style));
+    }
+    spans.push(Span::styled(" ▶", Style::default().fg(Color::DarkGray)));
+    let paragraph = Paragraph::new(Line::from(spans)).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title("Reasoning effort"),
+    );
+    frame.render_widget(paragraph, area);
 }
 
 /// Render the rewind picker. Stage one lists the session's user prompts
