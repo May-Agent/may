@@ -58,6 +58,42 @@ pub struct ProjectConfig {
     /// merge, e.g. `checks = "cargo test"`.
     #[serde(default)]
     pub checks: Option<String>,
+    /// PR backend and landing policy for this project.
+    #[serde(default)]
+    pub pr: ProjectPr,
+}
+
+impl ProjectConfig {
+    /// The GitHub repository this project is bound to, when its issue
+    /// backend names one.
+    #[must_use]
+    pub fn github_repository(&self) -> Option<&GitHubRepository> {
+        match &self.issues {
+            ProjectIssues::Github { repository } => Some(repository),
+            ProjectIssues::May => None,
+        }
+    }
+}
+
+/// `pr` settings for a project.
+///
+/// `backend` overrides detection (`"may"` or `"github"`); `screen` runs
+/// every published text through the outbound screen before it reaches
+/// GitHub — the "PRs only" trust mode's guard.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProjectPr {
+    /// `"may"` or `"github"`; absent detects GitHub remotes automatically.
+    #[serde(default)]
+    pub backend: Option<String>,
+    /// Screen published text (PR title/body) before it leaves the machine.
+    #[serde(default)]
+    pub screen: Option<bool>,
+    /// Default `--hold` when false: the PR opens but never merges itself.
+    #[serde(default)]
+    pub auto_merge: Option<bool>,
+    /// Merge waits for an explicit user approval (#322 wires the UI).
+    #[serde(default)]
+    pub require_review: Option<bool>,
 }
 
 /// Issue backend selected for a project.
