@@ -659,6 +659,14 @@ where
             app.model_fetch_rx = None;
         }
 
+        // Check for provider catalog results for the model-select popup
+        if let Some(ref mut rx) = app.model_select_rx
+            && let Ok(models) = rx.try_recv()
+        {
+            app.merge_model_select_models(models);
+            app.model_select_rx = None;
+        }
+
         // Apply finished file diffs to their tool-call blocks (non-blocking)
         app.poll_file_diffs();
 
