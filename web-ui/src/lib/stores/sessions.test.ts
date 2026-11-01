@@ -55,7 +55,7 @@ describe('draft sessions', () => {
       calls.methods.push(init?.method ?? 'GET');
       if (init?.body) calls.bodies.push(String(init.body));
       return Promise.resolve(json(apiSession('real-session-id')));
-    }) as typeof fetch;
+    }) as unknown as typeof fetch;
   });
 
   afterEach(() => {
