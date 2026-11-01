@@ -6,6 +6,7 @@ import {
   type SessionBackground,
 } from '../api/background';
 import { getSessionTasks } from '../api/tasks';
+import { isDraftSessionId, useSessionsStore } from './sessions';
 import { parseTaskTree, type TaskTree } from '../tasks/taskTree';
 import {
   NO_STOP_REQUESTS,
@@ -79,6 +80,18 @@ export const useInspectorStore = create<InspectorState>((set, get) => {
     sessions: {},
 
     async loadTasks(sessionId) {
+      // A draft has no daemon-side tasks.md; its plan lives in the draft record.
+      if (isDraftSessionId(sessionId)) {
+        const record = useSessionsStore.getState().drafts[sessionId];
+        patch(sessionId, () => ({
+          tasks: tasksOf(
+            record?.planContent ?? '',
+            record?.session.runtime?.planState ?? 'disabled',
+          ),
+          tasksError: null,
+        }));
+        return;
+      }
       const running = inflight.get(sessionId);
       if (running) {
         running.again = true;
@@ -111,6 +124,7 @@ export const useInspectorStore = create<InspectorState>((set, get) => {
     },
 
     async loadBackground(sessionId) {
+      if (isDraftSessionId(sessionId)) return;
       try {
         const snapshot = await getSessionBackground(sessionId);
         get().applyBackground({ ...snapshot, sessionId: snapshot.sessionId ?? sessionId });

@@ -19,6 +19,7 @@ import {
   openArtifactStream,
 } from '@/lib/api/artifacts';
 import { useTranslation } from '@/lib/i18n';
+import { isDraftSessionId } from '@/lib/stores/sessions';
 import type { ArtifactEntry } from '@/lib/types';
 import { cn } from '@/lib/utils';
 import { useArtifactValidation } from '@/lib/useArtifactValidation';
@@ -41,7 +42,7 @@ export function ArtifactsDrawer({ sessionId, open, onOpenChange, initialPath = n
   const [selected, setSelected] = useState<ArtifactEntry | null>(null);
 
   useEffect(() => {
-    if (!open) return;
+    if (!open || isDraftSessionId(sessionId)) return;
     let cancelled = false;
     let selectedOnce = false;
     const load = async () => {
