@@ -6,6 +6,15 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 const SELECTOR_SEPARATOR: &str = "::";
 
+/// The model id of a `provider::model` selector string, or the whole string
+/// when it carries no provider prefix.
+#[must_use]
+pub fn selector_model_id(selector: &str) -> &str {
+    selector
+        .split_once(SELECTOR_SEPARATOR)
+        .map_or(selector, |(_, model_id)| model_id)
+}
+
 /// A `provider::model` pair identifying a concrete model.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ModelSelector {
