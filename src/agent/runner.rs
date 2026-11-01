@@ -29,7 +29,7 @@ use futures_lite::StreamExt;
 use crate::MayAgent;
 use crate::agent::{ContextDump, ContextReport, RequestParameterizedModel};
 use crate::db::{ChatDb, RunFence};
-use crate::session::{RunOutcome, SessionRunGuard, SessionRuns};
+use crate::session::{CancelReason, RunOutcome, SessionRunGuard, SessionRuns};
 
 /// Events sent from the agent background task to the TUI.
 #[derive(Debug)]
@@ -69,7 +69,7 @@ pub enum TuiEvent {
 pub struct RunLease {
     /// Receives a message when the run must stop: a stop request or loss of
     /// the lease.
-    pub cancellation: Receiver<()>,
+    pub cancellation: Receiver<CancelReason>,
     /// Fence the run's database commits verify.
     pub fence: RunFence,
 }
@@ -766,7 +766,10 @@ enum StopRace<T> {
 
 /// Race `work` against `cancellation`, dropping the work where it stands when
 /// the run must stop.
-async fn until_stopped<F: Future>(work: F, cancellation: &Receiver<()>) -> StopRace<F::Output> {
+async fn until_stopped<F: Future>(
+    work: F,
+    cancellation: &Receiver<CancelReason>,
+) -> StopRace<F::Output> {
     futures_lite::future::or(async { StopRace::Done(work.await) }, async {
         let _ = cancellation.recv().await;
         StopRace::Stopped
