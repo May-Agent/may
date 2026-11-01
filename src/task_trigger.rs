@@ -435,7 +435,7 @@ pub enum TaskTriggerResponse {
 /// Generate a fresh random webhook token.
 #[must_use]
 pub fn new_webhook_token() -> String {
-    uuid::Uuid::new_v4().to_string()
+    crate::id::new_long()
 }
 
 /// URL path a webhook trigger with `token` listens on.

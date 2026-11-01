@@ -289,7 +289,7 @@ impl SessionStream {
             }
         });
 
-        let peer_id = uuid::Uuid::new_v4().to_string();
+        let peer_id = crate::id::new();
         let state_for_peer = self.runtime.clone();
         let gone_id = peer_id.clone();
         peer.on_peer_connection_state_change(Box::new(move |state| {
