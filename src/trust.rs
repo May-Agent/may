@@ -54,7 +54,10 @@ impl TrustLevel {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RepoKind {
     /// Has a GitHub remote — the four-option dialog.
-    Github { owner_repo: String },
+    Github {
+        /// `owner/repo` of the GitHub repository.
+        owner_repo: String,
+    },
     /// Any other git repository — the two-option dialog.
     Git,
 }
