@@ -57,12 +57,6 @@ impl MayHomePaths {
         self.root.join("skills")
     }
 
-    /// Directory holding registered subagents.
-    #[must_use]
-    pub fn subagents_dir(&self) -> PathBuf {
-        self.root.join("subagents")
-    }
-
     /// Global memories directory shared by every session.
     #[must_use]
     pub fn memories_dir(&self) -> PathBuf {
@@ -159,12 +153,6 @@ impl ProfileHomePaths {
         self.root.join("skills")
     }
 
-    /// Subagents directory under the profile root.
-    #[must_use]
-    pub fn subagents_dir(&self) -> PathBuf {
-        self.root.join("subagents")
-    }
-
     /// Workspace config under the profile root.
     #[must_use]
     pub fn workspace_config(&self) -> PathBuf {
@@ -248,12 +236,6 @@ impl SessionPaths {
     #[must_use]
     pub fn skills_dir(&self) -> PathBuf {
         self.root.join("skills")
-    }
-
-    /// Mounted subagents directory exposed to the agent sandbox.
-    #[must_use]
-    pub fn subagents_dir(&self) -> PathBuf {
-        self.root.join("subagents")
     }
 
     /// Optional task document path for long-running plans.

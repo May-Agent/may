@@ -16,7 +16,7 @@ use crate::agent::imagine::ImagineTool;
 use crate::agent::issue_tool::{IssueTool, SubagentIssueTool};
 use crate::agent::notify_tool::{NotifyBroker, NotifyTool};
 use crate::agent::pr_tool::{PrTool, SubagentPrTool};
-use crate::agent::register_tool::{RegisterBroker, RegisterTool, Skills, Subagents};
+use crate::agent::register_tool::{RegisterBroker, RegisterTool, Skills};
 use crate::agent::session_tool::SessionTool;
 use crate::agent::subagent_tracker::{SubagentTracker, TrackedSubagentTool, UsageObservedModel};
 use crate::agent::task_tool::{TaskBroker, TaskRuntimeKind, TaskTool};
@@ -73,8 +73,6 @@ pub struct SharedTerminalCommandConfig<LLM> {
     pub browser_broker: Option<BrowserBroker>,
     /// Broker for skill registration.
     pub register_skills_broker: Option<RegisterBroker>,
-    /// Broker for subagent registration.
-    pub register_subagents_broker: Option<RegisterBroker>,
     /// Broker for workspace-access requests.
     pub workspace_request_broker: Option<WorkspaceRequestBroker>,
     /// Registry the `subagent` command reports in-flight runs to;
@@ -286,17 +284,6 @@ where
         );
     }
 
-    if let Some(register_subagents_broker) = config.register_subagents_broker {
-        register_tool_with_description(
-            builder,
-            &mut descriptions,
-            RegisterTool::<Subagents>::new(
-                config.session_id.clone(),
-                Some(register_subagents_broker),
-            ),
-        );
-    }
-
     if let Some(workspace_request_broker) = config.workspace_request_broker {
         register_tool_with_description(
             builder,
@@ -311,10 +298,6 @@ where
         .with_base_dir(&config.sandbox_dir)
         .with_file_mounts([
             SubagentFileMount::new(PathBuf::from("."), config.sandbox_dir.clone()),
-            SubagentFileMount::new(
-                PathBuf::from("subagents"),
-                config.sandbox_dir.join("subagents"),
-            ),
             SubagentFileMount::new(PathBuf::from("skills"), config.sandbox_dir.join("skills")),
         ]);
     let subagent_tracker = config.subagent_tracker;
@@ -481,7 +464,6 @@ mod tests {
                 tunnel_broker: None,
                 browser_broker: None,
                 register_skills_broker: None,
-                register_subagents_broker: None,
                 workspace_request_broker: None,
                 subagent_runs: aither_agent::specialized::SubagentRuns::default(),
                 subagent_tracker: SubagentTracker::default(),
@@ -538,7 +520,6 @@ mod tests {
                 tunnel_broker: None,
                 browser_broker: None,
                 register_skills_broker: None,
-                register_subagents_broker: None,
                 workspace_request_broker: None,
                 subagent_runs: aither_agent::specialized::SubagentRuns::default(),
                 subagent_tracker: SubagentTracker::default(),
@@ -599,7 +580,6 @@ mod tests {
                 tunnel_broker: None,
                 browser_broker: None,
                 register_skills_broker: None,
-                register_subagents_broker: None,
                 workspace_request_broker: None,
                 subagent_runs: aither_agent::specialized::SubagentRuns::default(),
                 subagent_tracker: SubagentTracker::default(),
@@ -648,7 +628,6 @@ mod tests {
                 tunnel_broker: None,
                 browser_broker: None,
                 register_skills_broker: None,
-                register_subagents_broker: None,
                 workspace_request_broker: None,
                 subagent_runs: aither_agent::specialized::SubagentRuns::default(),
                 subagent_tracker: SubagentTracker::default(),
@@ -812,7 +791,6 @@ mod tests {
                 tunnel_broker: None,
                 browser_broker: None,
                 register_skills_broker: None,
-                register_subagents_broker: None,
                 workspace_request_broker: None,
                 subagent_runs: aither_agent::specialized::SubagentRuns::default(),
                 subagent_tracker: SubagentTracker::default(),
@@ -888,7 +866,6 @@ mod tests {
                 tunnel_broker: None,
                 browser_broker: None,
                 register_skills_broker: None,
-                register_subagents_broker: None,
                 workspace_request_broker: None,
                 subagent_runs: aither_agent::specialized::SubagentRuns::default(),
                 subagent_tracker: SubagentTracker::default(),

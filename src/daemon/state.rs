@@ -195,7 +195,6 @@ pub struct UiToolDispatchers {
     pub(crate) notify: crate::agent::notify_tool::NotifyBroker,
     pub(crate) browser: BrowserBroker,
     pub(crate) register_skills: RegisterBroker,
-    pub(crate) register_subagents: RegisterBroker,
     pub(crate) tunnel: crate::agent::tunnel_tool::TunnelBroker,
 }
 
@@ -204,7 +203,6 @@ pub struct UiToolQueues {
     pub(crate) notify: crate::agent::notify_tool::NotifyQueue,
     pub(crate) browser: BrowserQueue,
     pub(crate) register_skills: RegisterQueue,
-    pub(crate) register_subagents: RegisterQueue,
     pub(crate) tunnel: crate::agent::tunnel_tool::TunnelQueue,
 }
 
@@ -213,8 +211,6 @@ pub fn tool_dispatch_channels() -> (UiToolDispatchers, UiToolQueues) {
     let (notify, notify_queue) = crate::agent::notify_tool::channel();
     let (browser, browser_queue) = crate::agent::browser_tool::channel();
     let (register_skills, register_skills_queue) = crate::agent::register_tool::skills_channel();
-    let (register_subagents, register_subagents_queue) =
-        crate::agent::register_tool::subagents_channel();
     let (tunnel, tunnel_queue) = crate::agent::tunnel_tool::channel();
 
     (
@@ -223,7 +219,6 @@ pub fn tool_dispatch_channels() -> (UiToolDispatchers, UiToolQueues) {
             notify,
             browser,
             register_skills,
-            register_subagents,
             tunnel,
         },
         UiToolQueues {
@@ -231,7 +226,6 @@ pub fn tool_dispatch_channels() -> (UiToolDispatchers, UiToolQueues) {
             notify: notify_queue,
             browser: browser_queue,
             register_skills: register_skills_queue,
-            register_subagents: register_subagents_queue,
             tunnel: tunnel_queue,
         },
     )

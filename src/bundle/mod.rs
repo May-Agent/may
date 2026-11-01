@@ -1,6 +1,6 @@
 //! Bundled resources extraction.
 //!
-//! Skills and subagents are embedded in the binary and extracted
+//! Skills are embedded in the binary and extracted
 //! to the canonical May home on first run.
 //! Local/heel session sandboxes get symlinks pointing to their home-scoped resources.
 //! Container sessions use mount points managed by container lifecycle code.
@@ -13,9 +13,8 @@ use include_dir::{Dir, include_dir};
 
 use crate::session::SessionPaths;
 
-// Embed the skills and subagents directories at compile time
+// Embed the skills directory at compile time
 static SKILLS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/skills");
-static SUBAGENTS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/src/bundle/subagents");
 
 // Embed container build context managed by May.
 static CONTAINER_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/container");
@@ -34,7 +33,7 @@ pub struct Bundle;
 
 impl Bundle {
     /// Extract bundled resources to ~/.may/ if not already present.
-    /// Creates ~/.may/skills/, ~/.may/subagents/, and ~/.may/container/ directories.
+    /// Creates ~/.may/skills/ and ~/.may/container/ directories.
     ///
     /// # Errors
     ///
@@ -42,23 +41,19 @@ impl Bundle {
     /// cannot be extracted under `may_dir`.
     pub async fn ensure_extracted(may_dir: &Path) -> Result<(), BundleError> {
         let skills_dir = may_dir.join("skills");
-        let subagents_dir = may_dir.join("subagents");
         let container_dir = may_dir.join("container");
         let heel_dir = container_dir.join("heel");
         let heel_bin_dir = heel_dir.join("bin");
 
         Self::ensure_materialized_dir(&skills_dir).await?;
-        Self::ensure_materialized_dir(&subagents_dir).await?;
         Self::ensure_materialized_dir(&container_dir).await?;
         Self::ensure_materialized_dir(&heel_dir).await?;
         Self::remove_legacy_heel_source_tree(&heel_dir).await?;
         async_fs::create_dir_all(&heel_bin_dir).await?;
 
         // Built-in resources must stay in lockstep with the running binary.
-        // Always overwrite bundled content to avoid stale skills/subagents after upgrades.
+        // Always overwrite bundled content to avoid stale skills after upgrades.
         Self::extract_dir_overwrite(&SKILLS_DIR, &skills_dir).await?;
-
-        Self::extract_dir_overwrite(&SUBAGENTS_DIR, &subagents_dir).await?;
 
         // Extract container build context. Managed files are always overwritten since they
         // are owned by the running May binary rather than user content.
@@ -84,10 +79,8 @@ impl Bundle {
         home_root: &Path,
     ) -> Result<(), BundleError> {
         let session_paths = SessionPaths::new(sandbox_dir.to_path_buf());
-        let subagents_target = home_root.join("subagents");
         let skills_target = home_root.join("skills");
 
-        Self::create_dir_symlink(sandbox_dir, &subagents_target, "subagents").await?;
         Self::create_dir_symlink(sandbox_dir, &skills_target, "skills").await?;
 
         async_fs::create_dir_all(session_paths.tmp_dir()).await?;
