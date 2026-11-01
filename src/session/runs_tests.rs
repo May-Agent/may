@@ -8,7 +8,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 use super::{
-    AcquireError, PendingUserMessage, PendingUserMessageMode, PersistedAskUserQuestion,
+    AcquireError, CancelReason, PendingUserMessage, PendingUserMessageMode, PersistedAskUserQuestion,
     PersistedAskUserRequest, PersistedPermissionRequest, PersistedPermissionRequestPayload,
     PersistedWorkspaceRequest, PersistedWorkspaceRequestPayload, RunOutcome, SessionRuntimeService,
     SessionRuntimeState,
@@ -208,7 +208,7 @@ async fn stop_in_each_waiting_state_ends_idle_with_the_run_released() {
 
         // The stop reaches the run, which ends and settles the session.
         assert!(
-            service.runs().cancel("session"),
+            service.runs().cancel("session", CancelReason::User),
             "{waiting:?}: the stop must reach the run"
         );
         bounded(
