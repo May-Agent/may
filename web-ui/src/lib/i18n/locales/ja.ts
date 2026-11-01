@@ -45,6 +45,13 @@ export const ja: Messages = {
   },
   sidebar: {
     newChat: '新しいチャット',
+    newChatRepo: {
+      title: 'GitHub リポジトリで新規チャット',
+      description: 'owner/repo に紐付いたセッションを開始 — ローカル checkout は不要です。',
+      placeholder: 'owner/repo',
+      start: '開始',
+      known: '使用中のリポジトリ',
+    },
     sessions: 'セッション',
     noSessions: 'セッションはまだありません',
     noSessionsInProfile: 'このプロファイルではまだチャットが始まっていません。',
