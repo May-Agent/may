@@ -1346,6 +1346,7 @@ mod tests {
                     mode: PermissionRequestMode::Default,
                     script: "echo hi".to_string(),
                     session_id: Some(session_id.to_string()),
+                    agent_id: None,
                 },
             }),
         )
@@ -1470,6 +1471,7 @@ mod tests {
                     mode: PermissionRequestMode::Default,
                     script: "echo hi".to_string(),
                     session_id: Some(session_id.to_string()),
+                    agent_id: None,
                 },
             }),
         )

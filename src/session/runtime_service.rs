@@ -95,6 +95,9 @@ impl SessionRuntimeService {
     }
 
     /// Record that `agent_id` belongs to `session_id`.
+    ///
+    /// # Panics
+    /// When the agents map's lock is poisoned.
     pub fn register_agent(&self, agent_id: impl Into<String>, session_id: impl Into<String>) {
         self.agents
             .lock()
@@ -103,6 +106,9 @@ impl SessionRuntimeService {
     }
 
     /// The session an agent belongs to.
+    ///
+    /// # Panics
+    /// When the agents map's lock is poisoned.
     #[must_use]
     pub fn session_for_agent(&self, agent_id: &str) -> Option<String> {
         self.agents
