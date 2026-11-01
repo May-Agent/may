@@ -50,6 +50,8 @@ pub enum ExecError {
     CurrentDir(std::io::Error),
     #[error("failed to resolve the session issue backend: {0}")]
     ResolveIssueBackend(may_agent::issue::IssueError),
+    #[error("failed to load workspace config: {0}")]
+    WorkspaceConfig(may_agent::workspace::WorkspaceConfigError),
     #[error("failed to resolve provider runtime: {0}")]
     ResolveProviderRuntime(may_agent::agent::MayAgentError),
     #[error("failed to load May config: {0}")]
@@ -533,6 +535,10 @@ where
             // exec has no UI reader; the tracker still records harmlessly.
             subagent_tracker: may_agent::agent::SubagentTracker::default(),
             issue_store,
+            workspace_config: may_agent::workspace::WorkspaceConfig::load(
+                &session_paths.workspace_config(),
+            )
+            .map_err(ExecError::WorkspaceConfig)?,
             // exec is no main agent: it has no turn boundary to deliver at.
             agent_messaging: None,
         },

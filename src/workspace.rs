@@ -54,6 +54,10 @@ pub struct ProjectConfig {
     /// Issue backend for this project; absent means local may issues.
     #[serde(default)]
     pub issues: ProjectIssues,
+    /// Local check command run inside the session clone before a `pr`
+    /// merge, e.g. `checks = "cargo test"`.
+    #[serde(default)]
+    pub checks: Option<String>,
 }
 
 /// Issue backend selected for a project.

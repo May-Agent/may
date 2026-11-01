@@ -59,6 +59,8 @@ pub use aither_sandbox::network_policy;
 pub mod notification;
 /// Large pasted text rendered for the model.
 pub mod pasted_text;
+/// `pr` — the session's landing object: numbered, session-owned PRs.
+pub mod pr;
 /// Profile model and environment resolution.
 pub mod profile;
 /// `@`-mention extraction and prompt text building.
