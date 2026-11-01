@@ -99,6 +99,13 @@ pub enum AppEvent {
     /// The session's blocking state, as the daemon reported it on the
     /// `session_runtime` stream.
     SessionRuntime(crate::client::SessionRuntimeEvent),
+    /// A turn started in the daemon (this client's or another's), carrying
+    /// the stored user-message row id — the prompt-mark key file rewind
+    /// checkpoints hang on.
+    TurnStarted {
+        /// Row id of the user message the turn answers.
+        message_id: i32,
+    },
     /// The daemon dropped turn frames this client missed: the session's
     /// history must be reloaded.
     HistoryStale,
@@ -163,6 +170,7 @@ impl AppEvent {
             Self::BackgroundLoaded { .. } => "background_loaded",
             Self::Status(_) => "status",
             Self::SessionRuntime(_) => "session_runtime",
+            Self::TurnStarted { .. } => "turn_started",
             Self::HistoryStale => "history_stale",
             Self::JobKilled { .. } => "job_killed",
             Self::JobDetailLoaded { .. } => "job_detail_loaded",
