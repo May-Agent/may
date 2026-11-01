@@ -582,3 +582,48 @@ pub fn handle_job_detail_key(app: &mut App, code: KeyCode) -> Option<SendAction>
     }
     None
 }
+
+/// `/resume-claude` picker: type to filter, arrows to move, Enter to import.
+pub fn handle_resume_picker_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
+    let AppMode::ResumePicker(state) = &mut app.mode else {
+        return None;
+    };
+    match code {
+        KeyCode::Esc => {
+            app.mode = AppMode::Chat;
+        }
+        KeyCode::Up => {
+            state.selected = state.selected.saturating_sub(1);
+        }
+        KeyCode::Down => {
+            let len = state.filtered().len();
+            if state.selected + 1 < len {
+                state.selected += 1;
+            }
+        }
+        KeyCode::Enter => {
+            if state.loading {
+                return None;
+            }
+            let filtered = state.filtered();
+            let &index = filtered.get(state.selected)?;
+            let session = state.sessions.get(index)?;
+            let query = session.path.display().to_string();
+            app.mode = AppMode::Chat;
+            return Some(SendAction::ResumeImport {
+                source: crate::session::import::ForeignAgent::Claude,
+                query,
+            });
+        }
+        KeyCode::Backspace => {
+            state.search.pop();
+            state.selected = 0;
+        }
+        KeyCode::Char(c) => {
+            state.search.push(c);
+            state.selected = 0;
+        }
+        _ => {}
+    }
+    None
+}
