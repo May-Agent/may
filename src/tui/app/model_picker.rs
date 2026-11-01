@@ -99,6 +99,33 @@ impl App {
         Some(rx)
     }
 
+    /// Kick off a live fetch of every configured provider's model catalog.
+    ///
+    /// Returns a receiver to poll for the result; `None` is never produced —
+    /// the fetch task always sends, an empty list on total failure.
+    pub fn fetch_provider_models(&self) -> Option<Receiver<Vec<FetchedModel>>> {
+        let (tx, rx) = async_channel::bounded(1);
+        let config = self.config.clone();
+        spawn(async move {
+            let models = crate::models::fetch_all_models(&config).await;
+            let _ = tx.send(models).await;
+        })
+        .detach();
+        Some(rx)
+    }
+
+    /// Merge live-fetched provider catalogs into the model-select list:
+    /// configured tier selectors keep their lead positions, and every model
+    /// a provider actually serves is appended as `provider::model`.
+    pub fn merge_model_select_models(&mut self, models: Vec<FetchedModel>) {
+        for model in models {
+            let selector = crate::ModelSelector::new(&model.provider_id, &model.id).to_string();
+            if !self.model_select_list.contains(&selector) {
+                self.model_select_list.push(selector);
+            }
+        }
+    }
+
     /// Handle fetched models from async task.
     pub fn handle_fetched_models(&mut self, mut models: Vec<FetchedModel>) {
         // Sort by tier relevance:
