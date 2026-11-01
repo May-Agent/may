@@ -749,7 +749,7 @@ mod tests {
         assert_eq!(diffs[0].additions, 3);
 
         // A snapshot moves the call baseline, not the session base.
-        tracker.snapshot();
+        let _ = tracker.snapshot();
         fs::write(worktree.join("a.txt"), "one\ntwo\n").expect("rewrite");
         let diffs = tracker.status();
         assert_eq!(diffs.len(), 1);
@@ -784,7 +784,7 @@ mod tests {
     fn rewind_restores_deleted_files() {
         let (_temp, worktree, mut tracker) = tracker();
         fs::write(worktree.join("keep.txt"), "here\n").expect("write");
-        tracker.snapshot();
+        let _ = tracker.snapshot();
         tracker.mark_prompt("prompt:1");
 
         fs::remove_file(worktree.join("keep.txt")).expect("remove");
@@ -803,7 +803,7 @@ mod tests {
     fn rewind_without_mark_is_noop() {
         let (_temp, worktree, mut tracker) = tracker();
         fs::write(worktree.join("x.txt"), "data\n").expect("write");
-        tracker.snapshot();
+        let _ = tracker.snapshot();
 
         assert!(tracker.rewind("prompt:no-such-mark").is_empty());
         assert_eq!(
@@ -816,7 +816,7 @@ mod tests {
     fn prompt_mark_restores_state_at_turn_start() {
         let (_temp, worktree, mut tracker) = tracker();
         fs::write(worktree.join("a.txt"), "one\n").expect("write");
-        tracker.snapshot();
+        let _ = tracker.snapshot();
 
         // The turn's Start frame arrived: mark the pre-turn tree.
         tracker.mark_prompt("prompt:7");
