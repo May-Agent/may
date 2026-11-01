@@ -36,11 +36,12 @@ use chromiumoxide::cdp::browser_protocol::input::{
 };
 use chromiumoxide::cdp::browser_protocol::page::{
     AddScriptToEvaluateOnNewDocumentParams, CaptureScreenshotFormat, EventScreencastFrame,
-    ScreencastFrameAckParams, StartScreencastFormat, StartScreencastParams,
+    NavigateParams, ScreencastFrameAckParams, StartScreencastFormat, StartScreencastParams,
 };
 use chromiumoxide::cdp::browser_protocol::target::{TargetId, TargetInfo};
 use chromiumoxide::cdp::js_protocol::runtime::EvaluateParams;
 use chromiumoxide::error::CdpError;
+use chromiumoxide::handler::HandlerConfig;
 use chromiumoxide::page::Page;
 use chromiumoxide::page::ScreenshotParams;
 use chromiumoxide_fetcher::{
@@ -1514,9 +1515,15 @@ impl BrowserRuntime {
                 let endpoint = config.remote_cdp_endpoint().map_err(|error| {
                     BrowserError::browser_operation("resolve remote cdp endpoint", error)
                 })?;
-                let (browser, handler) = Browser::connect(endpoint).await.map_err(|error| {
-                    BrowserError::browser_operation("connect to remote cdp endpoint", error)
-                })?;
+                let browser_config = HandlerConfig {
+                    request_timeout: cdp_request_timeout(),
+                    ..HandlerConfig::default()
+                };
+                let (browser, handler) = Browser::connect_with_config(endpoint, browser_config)
+                    .await
+                    .map_err(|error| {
+                        BrowserError::browser_operation("connect to remote cdp endpoint", error)
+                    })?;
                 (browser, handler, BrowserSessionBacking::RemoteCdp)
             }
         };
@@ -1543,8 +1550,14 @@ impl BrowserRuntime {
             BrowserSessionBacking::RemoteCdp => acquire_browser_page(&mut browser).await?,
         });
 
+        // Stealth emulation exists to correct what headless Chrome gets
+        // wrong. A remote_cdp target is a real user browser: its UA,
+        // client hints and window metrics are authentic already, and
+        // overriding them measurably trips defenders (PerimeterX
+        // challenges the emulated target while the same profile's
+        // untouched tabs pass).
         let mut screen_emulation = None;
-        if config.stealth_enabled {
+        if config.stealth_enabled && matches!(backing, BrowserSessionBacking::Managed { .. }) {
             // Page.addScriptToEvaluateOnNewDocument runs the shim before
             // any page script across every navigation, so each fresh
             // document boots with the patched fingerprints in place.
@@ -1859,6 +1872,19 @@ const fn browser_initial_page_timeout() -> Duration {
     Duration::from_secs(3)
 }
 
+/// Cap on waiting for a navigation's load event during a page read.
+/// Content is read regardless once this elapses.
+const fn read_nav_load_wait() -> Duration {
+    Duration::from_secs(20)
+}
+
+/// Per-command CDP patience. chromiumoxide's 30 s default is tuned for
+/// synthetic pages; real ad-heavy documents can take longer to commit a
+/// navigation, and an expired request wedges the session for good.
+const fn cdp_request_timeout() -> Duration {
+    Duration::from_secs(120)
+}
+
 fn managed_browser_start_timeout_error(
     browser: &mut Browser,
     owns_process: bool,
@@ -1910,6 +1936,7 @@ fn build_managed_browser_launch_config(
 ) -> Result<BrowserConfig, BrowserError> {
     let mut builder = BrowserConfig::builder()
         .new_headless_mode()
+        .request_timeout(cdp_request_timeout())
         .port(port)
         .arg("--remote-allow-origins=*")
         .arg("--remote-debugging-address=0.0.0.0")
@@ -2084,9 +2111,22 @@ async fn read_page_capture(
 
     let limits = capture_limits(options.detail);
 
-    page.goto(trimmed_url)
-        .await
-        .map_err(|error| BrowserError::browser_operation("navigate page for read", error))?;
+    page.execute(
+        NavigateParams::builder()
+            .url(trimmed_url.to_string())
+            .build()
+            .map_err(|error| {
+                BrowserError::browser_operation(
+                    "build navigate params for read",
+                    std::io::Error::other(error),
+                )
+            })?,
+    )
+    .await
+    .map_err(|error| BrowserError::browser_operation("navigate page for read", error))?;
+    // Ad-heavy pages defer the load event far past usable content; cap the
+    // wait and read whatever rendered instead of failing the whole read.
+    let _ = tokio::time::timeout(read_nav_load_wait(), page.wait_for_navigation()).await;
     tokio::time::sleep(limits.settle_delay).await;
 
     let page_summary = read_page_summary(page.as_ref(), limits).await?;

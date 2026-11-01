@@ -1,5 +1,6 @@
 //! Shared helper for formatting `std::error::Error` chains as a single
-//! colon-separated line. Kept next to its only callers in `daemon`.
+//! colon-separated line. Used by `daemon` HTTP/SSE responses and the
+//! `may browser` service when surfacing error strings to clients.
 
 use std::error::Error;
 
