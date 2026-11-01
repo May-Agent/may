@@ -18,6 +18,10 @@ export default defineConfig({
         changeOrigin: true,
         ws: true,
       },
+      '/profile': {
+        target: apiTarget,
+        changeOrigin: true,
+      },
     },
   },
   build: {

@@ -9,6 +9,20 @@ describe('parseArtifactTags', () => {
     });
   });
 
+  test('extracts a file artifact tag', () => {
+    expect(parseArtifactTags('Here you go.\n\n<artifact url="report.md" />')).toEqual({
+      visibleText: 'Here you go.',
+      artifacts: [{ path: 'report.md', type: 'file' }],
+    });
+  });
+
+  test('accepts a slidev type attribute', () => {
+    expect(parseArtifactTags('<artifact url="deck.md" type="slidev" />')).toEqual({
+      visibleText: '',
+      artifacts: [{ path: 'deck.md', type: 'slidev' }],
+    });
+  });
+
   test('normalizes a session-relative artifacts prefix', () => {
     expect(parseArtifactTags('<artifact url="artifacts/deck/slides.md" slidev />')).toEqual({
       visibleText: '',
@@ -16,9 +30,9 @@ describe('parseArtifactTags', () => {
     });
   });
 
-  test('preserves unsupported artifact markup as prose', () => {
-    expect(parseArtifactTags('<artifact url="report.md" document />')).toEqual({
-      visibleText: '<artifact url="report.md" document />',
+  test('preserves artifact markup without a url as prose', () => {
+    expect(parseArtifactTags('<artifact name="report.md" />')).toEqual({
+      visibleText: '<artifact name="report.md" />',
       artifacts: [],
     });
   });

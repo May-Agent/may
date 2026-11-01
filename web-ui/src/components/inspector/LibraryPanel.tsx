@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { Loader2 } from 'lucide-react';
-import { listArtifacts } from '@/lib/api/artifacts';
+import { openUiEventStream } from '@/lib/api/events';
 import { useTranslation } from '@/lib/i18n';
 import type { ArtifactEntry } from '@/lib/types';
 import { ArtifactsDrawer } from '@/components/chat/ArtifactsDrawer';
@@ -14,11 +14,24 @@ export function LibraryPanel({ sessionId }: { sessionId: string }) {
 
   useEffect(() => {
     let cancelled = false;
-    listArtifacts(sessionId)
-      .then((res) => !cancelled && setEntries(res.artifacts))
-      .catch(() => !cancelled && setEntries([]));
+    const controller = new AbortController();
+    (async () => {
+      try {
+        const handle = await openUiEventStream(['session_artifacts'], {
+          sessionId,
+          abort: controller.signal,
+        });
+        for await (const evt of handle.events) {
+          if (cancelled) break;
+          if (evt.kind === 'session_artifacts') setEntries(evt.payload.artifacts);
+        }
+      } catch {
+        if (!cancelled) setEntries([]);
+      }
+    })();
     return () => {
       cancelled = true;
+      controller.abort();
     };
   }, [sessionId]);
 
