@@ -2290,8 +2290,10 @@ impl App {
     fn handle_chat_key(&mut self, code: KeyCode) -> Option<SendAction> {
         match code {
             KeyCode::Enter => {
-                // Handle completion if active
-                if self.completion.is_active() {
+                // Accept a palette item when one is selected. An empty
+                // palette (slash command plus arguments) must fall through
+                // so `/resume-claude <id>` submits.
+                if self.completion.has_matches() {
                     let mode = self.completion.mode;
                     if let Some(item) = self.completion.complete() {
                         let cmd = item.insert.clone();
@@ -2307,11 +2309,11 @@ impl App {
 
                         // For file completion, insert into input
                         self.accept_completion(&cmd);
-                    } else {
-                        // No item to select, just cancel completion
-                        self.completion.cancel();
                     }
                     return None;
+                }
+                if self.completion.is_active() {
+                    self.completion.cancel();
                 }
                 if self.has_pending_attachments() {
                     self.set_status("Waiting for attachments to finish...");
@@ -2363,7 +2365,7 @@ impl App {
                 self.cursor = (self.cursor + 1).min(self.input_char_count);
             }
             KeyCode::Up => {
-                if self.completion.is_active() {
+                if self.completion.has_matches() {
                     self.completion.prev();
                 } else if let Some(entry) = self.history.prev(&self.input) {
                     self.input = entry.to_string();
@@ -2372,7 +2374,7 @@ impl App {
                 }
             }
             KeyCode::Down => {
-                if self.completion.is_active() {
+                if self.completion.has_matches() {
                     self.completion.next();
                 } else if let Some(entry) = self.history.next_entry() {
                     self.input = entry.to_string();
@@ -2401,7 +2403,7 @@ impl App {
                 self.cursor = self.input_char_count;
             }
             KeyCode::Esc => {
-                if self.completion.is_active() {
+                if self.completion.has_matches() {
                     self.completion.cancel();
                     self.last_esc_at = Some(std::time::Instant::now());
                 } else if self
@@ -2422,7 +2424,7 @@ impl App {
                 }
             }
             KeyCode::Tab => {
-                if self.completion.is_active()
+                if self.completion.has_matches()
                     && let Some(item) = self.completion.complete()
                 {
                     self.accept_completion(&item.insert.clone());
