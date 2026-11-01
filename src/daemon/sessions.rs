@@ -662,6 +662,27 @@ pub(super) async fn delete_session(
         .await
         .map_err(internal_error)?
         .and_then(|session| session.profile_id);
+    // Live PRs of the dying session stay on record — the audit log marks
+    // them `orphaned` so a later session knows to `pr adopt` before merge.
+    if let Ok(prs) = db.list_session_prs(&id).await {
+        for pr in prs {
+            if matches!(
+                pr.state.as_str(),
+                "open" | "checks_pending" | "failed" | "rejected" | "merging"
+            ) {
+                let _ = db
+                    .add_pr_event(
+                        pr.id,
+                        "orphaned",
+                        &id,
+                        "user",
+                        None,
+                        Some("session deleted"),
+                    )
+                    .await;
+            }
+        }
+    }
     db.delete_session(&id).await.map_err(internal_error)?;
     state.parked_agents.evict(&id);
     state.tunnels.remove_session(&id);
@@ -689,6 +710,21 @@ pub(super) async fn delete_all_sessions(
     // Delete all from DB
     let db = state.db();
     state.tunnels.remove_all();
+    // Every live PR outlives its session — mark them `orphaned` first.
+    if let Ok(prs) = db.list_prs(None, Some("open")).await {
+        for pr in prs {
+            let _ = db
+                .add_pr_event(
+                    pr.id,
+                    "orphaned",
+                    &pr.session_id,
+                    "user",
+                    None,
+                    Some("session deleted"),
+                )
+                .await;
+        }
+    }
     db.delete_all_sessions().await.map_err(internal_error)?;
     state.tool_environments.evict_all();
     #[cfg(target_os = "macos")]
