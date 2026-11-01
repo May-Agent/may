@@ -116,7 +116,8 @@ impl App {
 
     /// Merge live-fetched provider catalogs into the model-select list:
     /// configured tier selectors keep their lead positions, and every model
-    /// a provider actually serves is appended as `provider::model`.
+    /// a provider actually serves is appended as `provider::model`. The
+    /// catalog is remembered so the next `/model` open seeds a full list.
     pub fn merge_model_select_models(&mut self, models: Vec<FetchedModel>) {
         // Families whose catalog offers 2+ effort-suffixed variants collapse
         // to the family base: the rung is chosen on the effort ladder, not
@@ -161,13 +162,37 @@ impl App {
         let mut seen = std::collections::HashSet::new();
         self.model_select_list
             .retain(|entry| seen.insert(entry.clone()));
-        for model in models {
-            let id = family_base_of(&model.provider_id, &model.id).unwrap_or(model.id);
+        for model in &models {
+            let id =
+                family_base_of(&model.provider_id, &model.id).unwrap_or_else(|| model.id.clone());
             let selector = crate::ModelSelector::new(&model.provider_id, &id).to_string();
             if !self.model_select_list.contains(&selector) {
                 self.model_select_list.push(selector);
             }
         }
+        // A failed fetch returns an empty list: keep the previous catalog
+        // then, or the next open falls back to the configured-only seed.
+        if !models.is_empty() {
+            self.model_catalog = models;
+        }
+        if self.model_select_index >= self.filtered_model_select().len() {
+            self.model_select_index = 0;
+        }
+    }
+
+    /// The select list narrowed by `model_select_query` as
+    /// `(list_index, selector)` pairs, mirroring `filtered_sessions`.
+    pub fn filtered_model_select(&self) -> Vec<(usize, &String)> {
+        filter_model_list(&self.model_select_list, &self.model_select_query)
+    }
+
+    /// Position of `current` in the select list, matching the renderer's
+    /// `(current)` marker: an effort-suffixed selector highlights its
+    /// collapsed family entry on the same provider.
+    pub(super) fn model_select_position(&self, current: &str) -> Option<usize> {
+        self.model_select_list
+            .iter()
+            .position(|entry| crate::models::same_selectable_model(entry, current))
     }
 
     /// Handle fetched models from async task.
@@ -211,25 +236,57 @@ impl App {
         self.tier_picker_loading = false;
     }
 
-    /// Handle key in model select popup.
+    /// Handle key in model select popup. Typing narrows the list; `j`/`k`
+    /// navigate only while the query is empty, like the session picker.
     pub(super) fn handle_model_select_key(&mut self, code: KeyCode) -> Option<SendAction> {
+        let filtered_len = self.filtered_model_select().len();
         match code {
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Esc => {
+                if self.model_select_query.is_empty() {
+                    self.mode = AppMode::Chat;
+                } else {
+                    self.model_select_query.clear();
+                    self.model_select_index = 0;
+                }
+            }
+            KeyCode::Up => {
                 self.model_select_index = self.model_select_index.saturating_sub(1);
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if self.model_select_index + 1 < self.model_select_list.len() {
+            KeyCode::Down => {
+                if self.model_select_index + 1 < filtered_len {
                     self.model_select_index += 1;
                 }
             }
             KeyCode::Enter => {
-                if let Some(model) = self.model_select_list.get(self.model_select_index).cloned() {
+                if let Some(&(idx, _)) = self.filtered_model_select().get(self.model_select_index)
+                    && let Some(model) = self.model_select_list.get(idx).cloned()
+                {
                     self.mode = AppMode::Chat;
                     return Some(SendAction::SwitchModel(model));
                 }
             }
-            KeyCode::Esc => {
-                self.mode = AppMode::Chat;
+            KeyCode::Backspace => {
+                self.model_select_query.pop();
+                self.model_select_index = 0;
+            }
+            KeyCode::Char(c) => {
+                if self.model_select_query.is_empty() {
+                    match c {
+                        'k' => {
+                            self.model_select_index = self.model_select_index.saturating_sub(1);
+                            return None;
+                        }
+                        'j' => {
+                            if self.model_select_index + 1 < filtered_len {
+                                self.model_select_index += 1;
+                            }
+                            return None;
+                        }
+                        _ => {}
+                    }
+                }
+                self.model_select_query.push(c);
+                self.model_select_index = 0;
             }
             _ => {}
         }
@@ -290,6 +347,20 @@ impl App {
     }
 }
 
+/// `list` narrowed by `query` — a case-insensitive substring on the
+/// `provider::model` selector, so a query can hit either side — returned as
+/// `(list_index, selector)` pairs. An empty query keeps every entry.
+fn filter_model_list<'a>(list: &'a [String], query: &str) -> Vec<(usize, &'a String)> {
+    if query.is_empty() {
+        return list.iter().enumerate().collect();
+    }
+    let query = query.to_lowercase();
+    list.iter()
+        .enumerate()
+        .filter(|(_, model)| model.to_lowercase().contains(&query))
+        .collect()
+}
+
 /// The reasoning-effort ladder a provider's wire protocol expresses. Every
 /// rung is concrete — the session's effort is the one it last selected, and
 /// "default" before any selection means medium, not a provider-decided
@@ -306,5 +377,33 @@ pub(super) const fn effort_ladder_for(
         Some(ProviderType::Anthropic) => CLAUDE,
         Some(ProviderType::Google) => GEMINI,
         _ => OPENAI,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::filter_model_list;
+
+    #[test]
+    fn filter_keeps_every_entry_on_an_empty_query() {
+        let list = vec!["swe2::swe-2".to_string(), "google::aqa".to_string()];
+        assert_eq!(filter_model_list(&list, "").len(), 2);
+    }
+
+    #[test]
+    fn filter_matches_provider_or_model_case_insensitively() {
+        let list = vec![
+            "swe2::swe-2".to_string(),
+            "google::aqa".to_string(),
+            "swe2::claude-opus-4-6".to_string(),
+        ];
+        // Pairs carry the original list index so Enter resolves the real entry.
+        let by_provider = filter_model_list(&list, "GOOGLE");
+        assert_eq!(by_provider.len(), 1);
+        assert_eq!(by_provider[0].0, 1);
+        assert_eq!(by_provider[0].1, "google::aqa");
+        let by_model = filter_model_list(&list, "opus");
+        assert_eq!(by_model.len(), 1);
+        assert_eq!(by_model[0].0, 2);
     }
 }

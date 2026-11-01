@@ -385,6 +385,26 @@ pub fn effort_family_base(model_id: &str) -> String {
     model_id.to_string()
 }
 
+/// Whether two selector strings address the same selectable model.
+///
+/// The provider ids must match and the model ids must collapse to the same
+/// effort family (`swe2::swe-2-high` and `swe2::swe-2` are one picker entry).
+/// Strings that fail to parse only match exactly.
+#[must_use]
+pub fn same_selectable_model(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let (Ok(a), Ok(b)) = (
+        a.parse::<crate::ModelSelector>(),
+        b.parse::<crate::ModelSelector>(),
+    ) else {
+        return false;
+    };
+    a.provider_id() == b.provider_id()
+        && effort_family_base(a.model_id()) == effort_family_base(b.model_id())
+}
+
 /// Position of `rung` on the canonical effort order (`none` … `max`),
 /// for sorting a family's served rungs.
 #[must_use]
@@ -417,7 +437,29 @@ pub fn effort_uid_token(model_id: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::effort_rung_rank;
+    use super::{effort_rung_rank, same_selectable_model};
+
+    #[test]
+    fn same_model_matches_across_effort_rungs_on_one_provider() {
+        assert!(same_selectable_model("swe2::swe-2-high", "swe2::swe-2"));
+        assert!(same_selectable_model("swe2::swe-2", "swe2::swe-2-max"));
+        assert!(same_selectable_model(
+            "swe2::swe-2-high-lightning",
+            "swe2::swe-2-lightning"
+        ));
+    }
+
+    #[test]
+    fn same_model_requires_the_same_provider_and_family() {
+        assert!(!same_selectable_model("google::swe-2", "swe2::swe-2"));
+        assert!(!same_selectable_model("swe2::swe-2-high", "swe2::swe-3"));
+    }
+
+    #[test]
+    fn unparseable_selectors_only_match_exactly() {
+        assert!(same_selectable_model("swe-2-high", "swe-2-high"));
+        assert!(!same_selectable_model("swe-2-high", "swe-2"));
+    }
 
     #[test]
     fn effort_rung_rank_orders_the_ladder() {
