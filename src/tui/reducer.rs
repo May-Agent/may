@@ -231,6 +231,10 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             app.session_runtime = event.runtime;
             Ok(None)
         }
+        AppEvent::TurnStarted { message_id } => {
+            app.request_prompt_mark(i64::from(message_id));
+            Ok(None)
+        }
         AppEvent::HistoryStale => Ok(Some(SendAction::ReloadHistory)),
         AppEvent::Status(message) => {
             app.set_status(message);
