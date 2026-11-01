@@ -22,6 +22,8 @@ pub enum AppMode {
     Config,
     /// Quick model selector popup (anchored near input)
     ModelSelect,
+    /// Reasoning-effort selector popup (`/effort`)
+    EffortSelect,
     /// Model picker for tier configuration in Config screen
     TierModelPicker,
     /// GitHub Copilot OAuth authentication
@@ -78,6 +80,7 @@ impl AppMode {
             Self::ToolDetail => "tool-detail",
             Self::Config => "config",
             Self::ModelSelect => "model-select",
+            Self::EffortSelect => "effort-select",
             Self::TierModelPicker => "tier-model-picker",
             Self::CopilotAuth => "copilot-auth",
             Self::ChatgptAuth => "chatgpt-auth",

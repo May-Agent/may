@@ -34,6 +34,7 @@ pub static SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/new", "Start a new session"),
     ("/profile", "Switch profile (Ctrl+P)"),
     ("/model", "Switch model for this session"),
+    ("/effort", "Adjust reasoning effort for this session"),
     ("/sandbox", "Open sandbox folder in Finder"),
     ("/compact", "Compact conversation history"),
     ("/context", "Show context window usage"),
