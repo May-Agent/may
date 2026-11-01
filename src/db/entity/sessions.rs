@@ -34,6 +34,10 @@ pub struct Model {
     /// TUI's launch directory); `None` uses the daemon's.
     #[serde(default)]
     pub cwd: Option<String>,
+    /// Repository the session is bound to: `github:owner/repo`, a local
+    /// repository identity, or `None` for a repo-less chat.
+    #[serde(default)]
+    pub repo: Option<String>,
     /// Whether nobody answers prompts for this session (a `may <prompt>`
     /// one-shot run): permission requests are refused instead of asked.
     #[serde(default)]

@@ -14,9 +14,12 @@ use super::{
     AnswerError, AskUserAnswer, PendingUserMessageMode, SessionRuntimeService, SessionRuntimeState,
 };
 use super::{PersistedAskUserQuestion, PersistedAskUserRequest};
-use crate::agent::ask_user_tool::{AskUserTool, WithdrawAskUserArgs, WithdrawAskUserTool};
+use crate::agent::ask_user_tool::{
+    AskUserBlockerResolver, AskUserTool, WithdrawAskUserArgs, WithdrawAskUserTool,
+};
 use crate::db::ChatDb;
 use crate::ui_event_bus::UiEventBus;
+use aither_agent::TaskBlockerResolver;
 
 /// Upper bound on any single wait in this module.
 const WAIT_BOUND: Duration = Duration::from_secs(20);
@@ -119,6 +122,38 @@ fn selected(section: &str, value: &str) -> QuestionAnswer {
         section: section.to_string(),
         answer: AnswerValue::Selected(vec![value.to_string()]),
     }
+}
+
+/// A `BLOCKING` mark holds while its question is open; one naming an
+/// answered, withdrawn or fabricated request does not — while a payload
+/// naming no request the session issued is free text and trusted.
+#[tokio::test]
+async fn blocker_marks_hold_only_while_their_question_is_open() {
+    let fixture = Fixture::new().await;
+    let service = fixture.service().await;
+    let resolver = AskUserBlockerResolver::new(service.clone(), "session");
+    let open = ask(&service, which_database()).await;
+    let answered = ask(&service, which_database()).await;
+    service
+        .answer_ask_user(&answered, &[selected("", "SQLite")])
+        .await
+        .expect("the answer commits");
+    let withdrawn = ask(&service, which_database()).await;
+    WithdrawAskUserTool::new(service.clone(), "session")
+        .call(
+            WithdrawAskUserArgs {
+                request_id: withdrawn.clone(),
+            },
+            ToolContext::new(),
+        )
+        .await
+        .expect("the open question is withdrawn");
+
+    assert!(resolver.is_open(&open).await);
+    assert!(!resolver.is_open(&answered).await);
+    assert!(!resolver.is_open(&withdrawn).await);
+    assert!(resolver.is_open("waiting on the user").await);
+    assert!(resolver.is_open("never-issued-words").await);
 }
 
 /// `ask_user` persists the question and returns its request id with the
