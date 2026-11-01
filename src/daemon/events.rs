@@ -53,6 +53,7 @@ struct EventSignatures {
     profile_sessions: String,
     remote_access: String,
     session_background: String,
+    session_artifacts: String,
 }
 
 pub(super) async fn stream_events(
@@ -377,6 +378,48 @@ async fn emit_topics_if_changed(
         .await
     {
         return false;
+    }
+    if topics.contains(UiEventTopics::SESSION_ARTIFACTS)
+        && !emit_session_artifacts_if_changed(
+            state,
+            sender,
+            session_filter,
+            &mut signatures.session_artifacts,
+        )
+        .await
+    {
+        return false;
+    }
+    true
+}
+
+/// The filtered session's `artifacts/` directory listing.
+async fn emit_session_artifacts_if_changed(
+    state: &Arc<DaemonState>,
+    sender: &skyzen::responder::sse::Sender,
+    session_filter: Option<&str>,
+    last_sig: &mut String,
+) -> bool {
+    let Some(session_id) = session_filter else {
+        return true;
+    };
+    let artifacts = match super::artifacts::collect_session_artifacts(state, session_id).await {
+        Ok(artifacts) => artifacts,
+        Err(error) => {
+            tracing::warn!(session_id, error = %error, "failed to collect session artifacts");
+            return true;
+        }
+    };
+    let sig = super::artifacts::artifacts_signature(&artifacts);
+    if sig != *last_sig {
+        let payload = super::types::SessionArtifactsEventPayload {
+            session_id: session_id.to_string(),
+            artifacts,
+        };
+        if !send_event(sender, "session_artifacts", &payload).await {
+            return false;
+        }
+        *last_sig = sig;
     }
     true
 }

@@ -37,6 +37,8 @@ pub enum UiEventTopic {
     SessionAgent = 1 << 12,
     /// A session's background jobs or subagent runs changed.
     SessionBackground = 1 << 13,
+    /// A session's artifacts directory changed.
+    SessionArtifacts = 1 << 14,
 }
 
 impl UiEventTopic {
@@ -62,6 +64,7 @@ impl UiEventTopic {
             Self::SessionTurn => "session_turn",
             Self::SessionAgent => "session_agent",
             Self::SessionBackground => "session_background",
+            Self::SessionArtifacts => "session_artifacts",
         }
     }
 }
@@ -85,6 +88,7 @@ impl FromStr for UiEventTopic {
             "session_turn" => Ok(Self::SessionTurn),
             "session_agent" => Ok(Self::SessionAgent),
             "session_background" => Ok(Self::SessionBackground),
+            "session_artifacts" => Ok(Self::SessionArtifacts),
             _ => Err(UnknownUiEventTopic(value.to_string())),
         }
     }
@@ -125,6 +129,8 @@ impl UiEventTopics {
     pub const SESSION_AGENT: Self = Self(UiEventTopic::SessionAgent.bit());
     /// `session_background` topic.
     pub const SESSION_BACKGROUND: Self = Self(UiEventTopic::SessionBackground.bit());
+    /// `session_artifacts` topic.
+    pub const SESSION_ARTIFACTS: Self = Self(UiEventTopic::SessionArtifacts.bit());
     /// Every topic.
     pub const ALL: Self = Self(
         Self::CONFIG.0
@@ -138,7 +144,9 @@ impl UiEventTopics {
             | Self::PROFILE_SESSIONS.0
             | Self::REMOTE_ACCESS.0
             | Self::BROWSER_LIFECYCLE.0
-            | Self::SESSION_TURN.0,
+            | Self::SESSION_TURN.0
+            | Self::SESSION_BACKGROUND.0
+            | Self::SESSION_ARTIFACTS.0,
     );
 
     /// Whether no topics are set.
