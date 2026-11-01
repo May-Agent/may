@@ -1182,6 +1182,25 @@ where
                             }
                         }
                     }
+                    Some(SendAction::SetEffort(effort)) => {
+                        if let (Some(client), Some(session_id)) = (
+                            app.btw_daemon.clone(),
+                            app.session_manager.current().map(|s| s.id.clone()),
+                        ) {
+                            let tx = app.event_tx.clone();
+                            spawn(async move {
+                                let result = client
+                                    .put::<_, serde_json::Value>(
+                                        &format!("/api/sessions/{}", session_id.as_str()),
+                                        &serde_json::json!({"reasoningEffort": effort}),
+                                    )
+                                    .await
+                                    .map(|_| effort)
+                                    .map_err(may_agent::tui::error::TuiError::from);
+                                let _ = tx.send(AppEvent::EffortApplied(result)).await;
+                            });
+                        }
+                    }
                     Some(SendAction::OpenChatgptAuthUrl { url, code }) => {
                         if !code.is_empty()
                             && let Ok(mut clipboard) = arboard::Clipboard::new()

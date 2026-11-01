@@ -58,6 +58,11 @@ pub enum AppEvent {
     /// Background config save completed.
     ConfigSaved(Result<(), TuiError>),
 
+    /// The session's stored reasoning effort arrived from the daemon.
+    EffortLoaded(Option<String>),
+    /// A `/effort` update finished; Ok carries the applied token.
+    EffortApplied(Result<Option<String>, TuiError>),
+
     // ─── Image loading ────────────────────────────────────────────────
     /// Image bytes decoded into a renderable state on a worker thread.
     /// `state=None` means fetch or decode failed for `key`.
@@ -157,6 +162,8 @@ impl AppEvent {
             Self::ProfilesLoaded(_) => "profiles_loaded",
             Self::ProfileSessionsLoaded(_) => "profile_sessions_loaded",
             Self::ConfigSaved(_) => "config_saved",
+            Self::EffortLoaded(_) => "effort_loaded",
+            Self::EffortApplied(_) => "effort_applied",
             Self::ImageDecoded { .. } => "image_decoded",
             Self::SidebarTasks { .. } => "sidebar_tasks",
             Self::SidebarIssues { .. } => "sidebar_issues",
