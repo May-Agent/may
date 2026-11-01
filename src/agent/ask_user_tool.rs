@@ -121,7 +121,7 @@ impl Tool for AskUserTool {
     }
 }
 
-/// Arguments of `withdraw_ask_user`.
+/// Withdraw an open `ask_user` question by its `request_id`.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct WithdrawAskUserArgs {
     /// The request id `ask_user` returned.
