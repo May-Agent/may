@@ -219,6 +219,10 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             app.sidebar.set_issues(&session_id, issues);
             Ok(None)
         }
+        AppEvent::SidebarPrs { session_id, prs } => {
+            app.sidebar.set_prs(&session_id, prs);
+            Ok(None)
+        }
         AppEvent::BackgroundLoaded { jobs, subagents } => {
             app.jobs = jobs;
             app.subagents = subagents;

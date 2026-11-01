@@ -353,6 +353,13 @@ pub(super) fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
             tasks.push(dim("No tasks yet".to_string()));
         }
     }
+    if !app.sidebar.prs.is_empty() {
+        tasks.push(Line::from(""));
+        tasks.push(heading("Pull requests".to_string()));
+        for pr in &app.sidebar.prs {
+            tasks.push(dim(format!("  #{} {} — {}", pr.number, pr.title, pr.state)));
+        }
+    }
 
     let height = usize::from(inner.height);
     let budget = height

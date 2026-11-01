@@ -19,10 +19,10 @@ use super::model_resolution::{
 };
 use super::state::DaemonState;
 use super::types::{
-    ApiHealth, ApiSession, ContextDebugMessage, CreateSessionRequest, NullableStringPatch,
-    RewindRequest, SessionContextDebugResponse, SessionContextWindowMetricsResponse,
-    SessionContextWindowSnapshotResponse, SessionPlanStateRequest, SessionPlanStateResponse,
-    SessionTasksPayload, UpdateSessionRequest,
+    ApiHealth, ApiPr, ApiPrEvent, ApiSession, ContextDebugMessage, CreateSessionRequest,
+    NullableStringPatch, RewindRequest, SessionContextDebugResponse,
+    SessionContextWindowMetricsResponse, SessionContextWindowSnapshotResponse,
+    SessionPlanStateRequest, SessionPlanStateResponse, SessionTasksPayload, UpdateSessionRequest,
 };
 
 fn session_not_found_error(session_id: &str) -> SkyError {
@@ -272,6 +272,48 @@ pub(super) async fn get_session_tasks(
         content,
         plan_state: runtime.plan_state,
     }))
+}
+
+/// The session's PRs with their transition events — the sidebar's list.
+pub(super) async fn get_session_prs(
+    params: Params,
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<Vec<ApiPr>>> {
+    let id = params.get("id").map_err(bad_request_error)?.to_string();
+    let rows = state
+        .db()
+        .list_session_prs(&id)
+        .await
+        .map_err(internal_error)?;
+    let mut prs = Vec::with_capacity(rows.len());
+    for row in rows {
+        let events = state
+            .db()
+            .pr_events(row.id)
+            .await
+            .map_err(internal_error)?
+            .into_iter()
+            .map(|e| ApiPrEvent {
+                kind: e.kind,
+                detail: e.detail,
+                created_at: e.created_at,
+            })
+            .collect();
+        prs.push(ApiPr {
+            number: row.number,
+            title: row.title,
+            state: row.state,
+            backend: row.backend,
+            external_number: row.external_number,
+            issue_number: row.issue_number,
+            auto_merge: row.auto_merge,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            merged_at: row.merged_at,
+            events,
+        });
+    }
+    Ok(Json(prs))
 }
 
 /// Atomically set the plan state for a session without touching task content.
