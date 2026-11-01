@@ -20,6 +20,28 @@ import { putSessionTasks } from '../api/tasks';
 import { useConfigStore } from './config';
 
 const DRAFT_PREFIX = 'draft_';
+const LOCAL_PREFIX = 'local-';
+
+/**
+ * `fetched` with this client's not-yet-persisted sends re-appended: a
+ * refresh that ran before the daemon committed a just-sent message must
+ * not drop its optimistic copy. A fetched user message with equal content
+ * consumes one pending echo.
+ */
+function mergePendingLocal(fetched: ApiMessage[], current: ApiMessage[]): ApiMessage[] {
+  const echoes = new Map<string, number>();
+  for (const msg of fetched) {
+    if (msg.role === 'user') echoes.set(msg.content, (echoes.get(msg.content) ?? 0) + 1);
+  }
+  const pending: ApiMessage[] = [];
+  for (const msg of current) {
+    if (!msg.id.startsWith(LOCAL_PREFIX) || msg.role !== 'user') continue;
+    const seen = echoes.get(msg.content) ?? 0;
+    if (seen > 0) echoes.set(msg.content, seen - 1);
+    else pending.push(msg);
+  }
+  return pending.length === 0 ? fetched : [...fetched, ...pending];
+}
 
 /**
  * Whether `id` names a client-side draft session — a "new chat" that has not
@@ -128,7 +150,10 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
       if (generation !== activeRequestGeneration) return;
       set({
         active: session,
-        messages: { ...get().messages, [id]: session.messages ?? [] },
+        messages: {
+          ...get().messages,
+          [id]: mergePendingLocal(session.messages ?? [], get().messages[id] ?? []),
+        },
         loading: false,
       });
     } catch (err) {
@@ -147,7 +172,10 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
         if (prev.active?.id !== id) return prev;
         return {
           active: session,
-          messages: { ...prev.messages, [id]: session.messages ?? [] },
+          messages: {
+            ...prev.messages,
+            [id]: mergePendingLocal(session.messages ?? [], prev.messages[id] ?? []),
+          },
         };
       });
     } catch (err) {

@@ -3,7 +3,6 @@
 use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
 
 use aither_agent::ContextWindowPhase;
 use aither_sandbox::TerminalExecutionMode;
@@ -152,8 +151,6 @@ pub enum ToolDisplay {
         diffs: Vec<crate::file_tracker::RootDiff>,
         /// Expansion pinned by a click; `None` follows the automatic rule.
         pinned: Option<bool>,
-        /// When the call finished; drives automatic collapse.
-        finished_at: Option<Instant>,
     },
     /// A labelled action: a terminal control call (`terminal_input`,
     /// `terminal_read`, `terminal_kill`) or any other tool invocation.
@@ -174,8 +171,6 @@ pub enum ToolDisplay {
         output: Option<TerminalCallInfo>,
         /// Expansion pinned by a click; `None` follows the automatic rule.
         pinned: Option<bool>,
-        /// When the call finished; drives automatic collapse.
-        finished_at: Option<Instant>,
     },
     /// Provider-hosted (server-side) tool call — the provider executes it,
     /// the harness only observes start and result events.
@@ -190,14 +185,9 @@ pub enum ToolDisplay {
         output: Option<String>,
         /// Expansion pinned by a click; `None` follows the automatic rule.
         pinned: Option<bool>,
-        /// When the call finished; drives automatic collapse.
-        finished_at: Option<Instant>,
     },
 }
 
-/// A finished call keeps its body open this long before it auto-collapses
-/// to its headline.
-const RECENT_EXPAND: std::time::Duration = std::time::Duration::from_secs(15);
 /// Output lines previewed inside an expanded body.
 const OUTPUT_PREVIEW_LINES: usize = 3;
 /// Diff lines previewed per root inside an expanded body.
@@ -240,27 +230,12 @@ impl ToolDisplay {
         }
     }
 
-    /// When the call finished, shared by every variant.
+    /// Whether the body renders open: a click pin wins; otherwise the body
+    /// is open while the call runs and folds to its headline when it ends.
     #[must_use]
-    const fn finished_at(&self) -> Option<Instant> {
-        match self {
-            Self::Terminal { finished_at, .. }
-            | Self::Action { finished_at, .. }
-            | Self::Builtin { finished_at, .. } => *finished_at,
-        }
-    }
-
-    /// Whether the body renders open at `now`: a click pin wins; otherwise
-    /// the body is open while the call runs and for [`RECENT_EXPAND`]
-    /// after it finishes.
-    #[must_use]
-    pub fn body_open(&self, now: Instant) -> bool {
-        self.pinned().unwrap_or_else(|| {
-            matches!(self.status(), ToolStatus::Running)
-                || self
-                    .finished_at()
-                    .is_some_and(|at| now.duration_since(at) < RECENT_EXPAND)
-        })
+    pub fn body_open(&self) -> bool {
+        self.pinned()
+            .unwrap_or_else(|| matches!(self.status(), ToolStatus::Running))
     }
 
     /// Get all terminal calls for this tool.
@@ -347,6 +322,19 @@ pub enum ChatElement {
         /// window; a user-reopened block (`expanded` without `live`) is full.
         live: bool,
     },
+    /// A finished turn's work — thinking bursts, tool calls and the
+    /// intermediate messages between them — folded into one row when the
+    /// turn ends. A click expands the whole group; a second folds it shut.
+    WorkedFor {
+        /// Stable ID for click hit-testing.
+        id: String,
+        /// Wall-clock seconds the turn ran.
+        seconds: u64,
+        /// The folded elements.
+        elements: Vec<Self>,
+        /// Open after a click; folded by default.
+        expanded: bool,
+    },
     /// `/context` report — estimated context-window usage per category.
     ContextReport(ContextReport),
 }
@@ -365,6 +353,11 @@ pub struct ChatStream {
     revisions: Vec<u64>,
     /// Counter generating thinking-block IDs.
     next_thinking_id: usize,
+    /// Counter generating worked-for row IDs.
+    next_worked_id: usize,
+    /// Elements before this index belong to already-folded turns and are
+    /// never folded again.
+    fold_cursor: usize,
     /// Base `http://host/tunnel` URL `<tunnel id>` tags resolve against.
     tunnel_base: String,
 }
@@ -696,7 +689,6 @@ impl ChatStream {
     /// without reporting their completion, so holding their bodies open
     /// would be wrong. They collapse once the recent window lapses.
     pub fn finish_running_calls(&mut self) {
-        let now = Instant::now();
         for index in 0..self.elements.len() {
             let Some(ChatElement::ToolCall { display, .. }) = self.elements.get_mut(index) else {
                 continue;
@@ -705,27 +697,51 @@ impl ChatStream {
                 continue;
             }
             match display {
-                ToolDisplay::Terminal {
-                    status,
-                    finished_at,
-                    ..
-                }
-                | ToolDisplay::Action {
-                    status,
-                    finished_at,
-                    ..
-                }
-                | ToolDisplay::Builtin {
-                    status,
-                    finished_at,
-                    ..
-                } => {
+                ToolDisplay::Terminal { status, .. }
+                | ToolDisplay::Action { status, .. }
+                | ToolDisplay::Builtin { status, .. } => {
                     *status = ToolStatus::Failed("interrupted".to_string());
-                    *finished_at = Some(now);
                 }
             }
             self.touch(index);
         }
+    }
+
+    /// Fold the finished turn's work — thinking bursts, tool calls and the
+    /// intermediate messages between them — into a single "Worked for" row.
+    /// The turn's final reply stays visible, as do notices and reports.
+    pub fn fold_turn_work(&mut self, seconds: u64) {
+        self.fold_cursor = self.fold_cursor.min(self.elements.len());
+        let start = self
+            .elements
+            .iter()
+            .rposition(|e| matches!(e, ChatElement::UserMessage { .. }))
+            .map_or(self.fold_cursor, |i| (i + 1).max(self.fold_cursor));
+        // The reply ends the turn: everything before its last block is work.
+        let end = self
+            .elements
+            .iter()
+            .rposition(|e| matches!(e, ChatElement::AssistantText { .. }))
+            .filter(|index| *index > start)
+            .unwrap_or(self.elements.len());
+        if end <= start {
+            return;
+        }
+        let folded: Vec<ChatElement> = self.elements.splice(start..end, []).collect();
+        self.revisions.splice(start..end, []);
+        let id = self.next_worked_id;
+        self.next_worked_id += 1;
+        self.elements.insert(
+            start,
+            ChatElement::WorkedFor {
+                id: format!("work-{id}"),
+                seconds,
+                elements: folded,
+                expanded: false,
+            },
+        );
+        self.revisions.insert(start, Self::next_revision());
+        self.fold_cursor = start + 1;
     }
 
     /// Start a new assistant text block.
@@ -815,7 +831,6 @@ impl ChatStream {
                 status: ToolStatus::Running,
                 output: None,
                 pinned: None,
-                finished_at: None,
             },
         });
     }
@@ -828,19 +843,12 @@ impl ChatStream {
         });
         if let Some(index) = found {
             if let ChatElement::ToolCall {
-                display:
-                    ToolDisplay::Builtin {
-                        status,
-                        output,
-                        finished_at,
-                        ..
-                    },
+                display: ToolDisplay::Builtin { status, output, .. },
                 ..
             } = &mut self.elements[index]
             {
                 *status = ToolStatus::Done;
                 *output = Some(result);
-                *finished_at = Some(Instant::now());
             }
             self.touch(index);
             return;
@@ -854,7 +862,6 @@ impl ChatStream {
                 status: ToolStatus::Done,
                 output: Some(result),
                 pinned: None,
-                finished_at: Some(Instant::now()),
             },
         });
     }
@@ -867,19 +874,14 @@ impl ChatStream {
         };
         self.touch(index);
         if let ChatElement::ToolCall { display, .. } = &mut self.elements[index] {
-            let finished = !matches!(status, ToolStatus::Running);
             match display {
                 ToolDisplay::Terminal {
                     status: s,
                     command,
                     output: out,
-                    finished_at,
                     ..
                 } => {
                     *s = status;
-                    if finished {
-                        *finished_at = Some(Instant::now());
-                    }
                     if let Some(output_text) = output {
                         *out = Some(TerminalCallInfo {
                             command: command.clone(),
@@ -894,13 +896,9 @@ impl ChatStream {
                     chip,
                     task_id,
                     output: out,
-                    finished_at,
                     ..
                 } => {
                     *s = status;
-                    if finished {
-                        *finished_at = Some(Instant::now());
-                    }
                     if let Some(output_text) = output {
                         *out = Some(TerminalCallInfo {
                             command: chip.clone(),
@@ -916,13 +914,9 @@ impl ChatStream {
                 ToolDisplay::Builtin {
                     status: s,
                     output: out,
-                    finished_at,
                     ..
                 } => {
                     *s = status;
-                    if finished {
-                        *finished_at = Some(Instant::now());
-                    }
                     if let Some(output_text) = output {
                         *out = Some(output_text.to_string());
                     }
@@ -942,7 +936,7 @@ impl ChatStream {
                     id: tool_id,
                     display,
                 } if tool_id == id && display.expandable() => {
-                    let open = display.body_open(Instant::now());
+                    let open = display.body_open();
                     match display {
                         ToolDisplay::Terminal { pinned, .. }
                         | ToolDisplay::Action { pinned, .. }
@@ -957,6 +951,15 @@ impl ChatStream {
                     content,
                     ..
                 } if think_id == id && !content.is_empty() => {
+                    *expanded = !*expanded;
+                    touched = Some(index);
+                    break;
+                }
+                ChatElement::WorkedFor {
+                    id: work_id,
+                    expanded,
+                    ..
+                } if work_id == id => {
                     *expanded = !*expanded;
                     touched = Some(index);
                     break;
@@ -1391,15 +1394,7 @@ pub fn build_plain_wrapped_lines_unified(
         return Vec::new();
     }
     let mut layout = ChatLayout::default();
-    layout.sync(
-        chat,
-        width,
-        images_supported,
-        false,
-        None,
-        0,
-        Instant::now(),
-    );
+    layout.sync(chat, width, images_supported, false, None, 0);
     let mut out: Vec<String> = (0..layout.element_rows())
         .map(|row| layout.plain_line(row).unwrap_or_default().to_string())
         .collect();
@@ -1676,18 +1671,17 @@ pub(super) struct ElementState {
 }
 
 impl ElementState {
-    /// State of `elem` at `now`.
+    /// State of `elem`.
     pub(super) fn of(
         elem: &ChatElement,
         selected_tool: Option<&str>,
         hide_todos: bool,
         spinner_frame: usize,
-        now: Instant,
     ) -> Self {
         match elem {
             ChatElement::ToolCall { id, display } => Self {
                 selected: selected_tool == Some(id.as_str()),
-                open: display.expandable() && display.body_open(now),
+                open: display.expandable() && display.body_open(),
                 hide_todos,
                 spinner_frame: if matches!(display.status(), ToolStatus::Running) {
                     spinner_frame
@@ -1713,16 +1707,21 @@ pub(super) struct ElementLines {
     pub images: Vec<(String, usize, String)>,
 }
 
+/// `52s`, `1m27s` — the worked-for row's compact duration.
+fn compact_seconds(seconds: u64) -> String {
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else {
+        format!("{}m{}s", seconds / 60, seconds % 60)
+    }
+}
+
 /// Id a click on `elem` toggles, when it is collapsible.
 pub(super) fn collapsible_id(elem: &ChatElement) -> Option<&str> {
     match elem {
         ChatElement::ToolCall { id, display } if display.expandable() => Some(id.as_str()),
-        ChatElement::Thinking {
-            id,
-            expanded: false,
-            content,
-            ..
-        } if !content.is_empty() => Some(id.as_str()),
+        ChatElement::Thinking { id, content, .. } if !content.is_empty() => Some(id.as_str()),
+        ChatElement::WorkedFor { id, .. } => Some(id.as_str()),
         _ => None,
     }
 }
@@ -1961,7 +1960,7 @@ pub(super) fn element_lines(
             };
             lines.push(Line::from(Span::styled(
                 header,
-                Style::default().fg(Color::Magenta),
+                Style::default().fg(Color::DarkGray),
             )));
             if *expanded {
                 let body = if *live {
@@ -1976,6 +1975,32 @@ pub(super) fn element_lines(
                             .fg(Color::DarkGray)
                             .add_modifier(Modifier::ITALIC),
                     )));
+                }
+            }
+            lines.push(Line::from(""));
+        }
+
+        ChatElement::WorkedFor {
+            seconds,
+            elements,
+            expanded,
+            ..
+        } => {
+            let arrow = if *expanded { " ▾" } else { " ▸" };
+            lines.push(Line::from(Span::styled(
+                format!("✦ Worked for {}{arrow}", compact_seconds(*seconds)),
+                Style::default().fg(Color::DarkGray),
+            )));
+            if *expanded {
+                for inner in elements {
+                    let sub = element_lines(inner, state, images_supported, tunnel_base);
+                    let offset = lines.len();
+                    lines.extend(sub.lines);
+                    images.extend(
+                        sub.images
+                            .into_iter()
+                            .map(|(url, row, mime)| (url, offset + row, mime)),
+                    );
                 }
             }
             lines.push(Line::from(""));
@@ -2042,7 +2067,6 @@ fn render_impl(
         hide_todos,
         selected_tool,
         spinner_frame,
-        Instant::now(),
     );
     stats.elements = layout.rebuilt();
 
@@ -2792,7 +2816,7 @@ fn render_tool_inline<'a>(
     images_supported: bool,
     image_positions: &mut Vec<(String, usize, String)>,
 ) {
-    let open = display.expandable() && display.body_open(Instant::now());
+    let open = display.expandable() && display.body_open();
     render_tool_inline_at(
         lines,
         display,
@@ -3089,9 +3113,9 @@ pub fn render_tool_fullscreen(frame: &mut Frame, area: Rect, display: &ToolDispl
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatElement, ChatStream, InputContext, RECENT_EXPAND, ToolCallImage, ToolDisplay,
-        ToolStatus, build_plain_wrapped_lines_unified, format_number, format_status_usage,
-        render_input_line, render_tool_inline, terminal_mode_marker,
+        ChatElement, ChatStream, InputContext, ToolCallImage, ToolDisplay, ToolStatus,
+        build_plain_wrapped_lines_unified, format_number, format_status_usage, render_input_line,
+        render_tool_inline, terminal_mode_marker,
     };
     use crate::tui::queue::Attachment;
     use crate::tui::ui::streaming_markdown::IMAGE_HEIGHT;
@@ -3099,7 +3123,6 @@ mod tests {
     use ratatui::style::Color;
     use ratatui::text::Line;
     use std::path::PathBuf;
-    use std::time::Instant;
 
     #[test]
     fn status_usage_is_used_over_autocompact_window() {
@@ -3166,7 +3189,6 @@ mod tests {
                 output: None,
                 diffs: Vec::new(),
                 pinned: None,
-                finished_at: None,
             },
         );
 
@@ -3213,7 +3235,6 @@ mod tests {
                 output: None,
                 diffs: Vec::new(),
                 pinned: None,
-                finished_at: None,
             }
         }
 
@@ -3261,7 +3282,6 @@ mod tests {
                 output: None,
                 diffs: Vec::new(),
                 pinned: None,
-                finished_at: None,
             },
         );
         stream.toggle_expanded("call-1");
@@ -3269,6 +3289,7 @@ mod tests {
             "call-1",
             vec![crate::file_tracker::RootDiff {
                 root: std::path::PathBuf::from("/repo"),
+                label: None,
                 changes: vec![crate::file_tracker::FileStat {
                     path: std::path::PathBuf::from("a.txt"),
                     additions: 2,
@@ -3289,7 +3310,6 @@ mod tests {
                 output: None,
                 diffs: Vec::new(),
                 pinned: None,
-                finished_at: None,
             },
         );
 
@@ -3340,7 +3360,6 @@ mod tests {
                 output: None,
                 diffs: Vec::new(),
                 pinned: None,
-                finished_at: None,
             };
             let mut lines: Vec<Line> = Vec::new();
             let mut positions = Vec::new();
@@ -3355,8 +3374,7 @@ mod tests {
         }
     }
 
-    /// A call that finished long ago — outside [`RECENT_EXPAND`], so the
-    /// automatic rule renders it collapsed.
+    /// A call that finished — the automatic rule renders it collapsed.
     fn terminal_display(command: &str) -> ToolDisplay {
         ToolDisplay::Terminal {
             description: String::new(),
@@ -3366,11 +3384,6 @@ mod tests {
             output: None,
             diffs: Vec::new(),
             pinned: None,
-            finished_at: Some(
-                Instant::now()
-                    .checked_sub(RECENT_EXPAND * 2)
-                    .expect("test clock precedes twice the expand window"),
-            ),
         }
     }
 
@@ -3400,7 +3413,6 @@ mod tests {
                 ),
                 diffs: Vec::new(),
                 pinned: None,
-                finished_at: None,
             },
         );
         chat.push_text("后台任务运行正常，已输出到第 7 行（约每秒一行）。再等它跑完：\n");
@@ -3634,7 +3646,7 @@ mod tests {
             lines.extend(
                 super::element_lines(
                     elem,
-                    super::ElementState::of(elem, None, false, 0, Instant::now()),
+                    super::ElementState::of(elem, None, false, 0),
                     true,
                     "http://localhost:8787/tunnel",
                     width,
@@ -3671,7 +3683,7 @@ mod tests {
         chat.push_user("thanks", Vec::new(), 1);
 
         let mut layout = super::ChatLayout::default();
-        layout.sync(&chat, 60, true, false, None, 0, Instant::now());
+        layout.sync(&chat, 60, true, false, None, 0);
         let images = layout.images_in(0, 1000);
         assert_eq!(images.len(), 1);
         let block_end = images[0].row + IMAGE_HEIGHT;
@@ -3719,7 +3731,6 @@ mod tests {
             status: ToolStatus::Done,
             output: None,
             pinned: None,
-            finished_at: None,
         };
         assert!(!bare.expandable());
         let builtin = ToolDisplay::Builtin {
@@ -3728,7 +3739,6 @@ mod tests {
             status: ToolStatus::Done,
             output: None,
             pinned: None,
-            finished_at: None,
         };
         assert!(!builtin.expandable());
     }
@@ -3745,11 +3755,11 @@ mod tests {
         };
         assert_eq!(text, vec!["▸ ✓ $ one".to_string()]);
 
-        // Just finished: still open, showing the whole command.
-        let ToolDisplay::Terminal { finished_at, .. } = &mut display else {
+        // A click pins it open, showing the whole command.
+        let ToolDisplay::Terminal { pinned, .. } = &mut display else {
             unreachable!()
         };
-        *finished_at = Some(Instant::now());
+        *pinned = Some(true);
         let text = {
             let mut lines: Vec<Line> = Vec::new();
             let mut positions = Vec::new();
@@ -3759,7 +3769,7 @@ mod tests {
         assert_eq!(text.len(), 6); // headline + 5 command lines
         assert_eq!(text[5], "│ five");
 
-        // A click pins it shut regardless of the recent-expansion window.
+        // A second click pins it shut.
         let ToolDisplay::Terminal { pinned, .. } = &mut display else {
             unreachable!()
         };
@@ -3782,6 +3792,7 @@ mod tests {
             };
             *diffs = vec![crate::file_tracker::RootDiff {
                 root: std::path::PathBuf::from("/tmp/root"),
+                label: None,
                 changes: vec![crate::file_tracker::FileStat {
                     path: std::path::PathBuf::from("a.txt"),
                     additions: 12,
@@ -3801,16 +3812,10 @@ mod tests {
         assert_eq!(text, vec!["▸ ✓ $ echo hi  ± 1 file (+12 −0)".to_string()]);
 
         // Expanded: command body, still no diff block.
-        let ToolDisplay::Terminal {
-            pinned,
-            finished_at,
-            ..
-        } = &mut display
-        else {
+        let ToolDisplay::Terminal { pinned, .. } = &mut display else {
             unreachable!()
         };
         *pinned = Some(true);
-        *finished_at = Some(Instant::now());
         let mut lines: Vec<Line> = Vec::new();
         let mut positions = Vec::new();
         render_tool_inline(&mut lines, &display, false, true, &mut positions);
@@ -4242,7 +4247,6 @@ mod tests {
                 status: ToolStatus::Running,
                 output: None,
                 pinned: None,
-                finished_at: None,
             },
         );
         chat.finish_running_calls();
@@ -4250,7 +4254,6 @@ mod tests {
             panic!("the call stays in the stream");
         };
         assert!(matches!(display.status(), ToolStatus::Failed(_)));
-        assert!(display.finished_at().is_some());
     }
 
     /// A tasks.md document parsed into a checklist feeds the todo block —
@@ -4284,5 +4287,70 @@ mod tests {
                 .all(|element| !matches!(element, ChatElement::TodoBlock { .. })),
             "an empty checklist should remove the todo block"
         );
+    }
+
+    /// A finished turn folds its work — thinking, calls and the messages
+    /// between them — behind one "Worked for" row that clicks open and
+    /// shut again.
+    #[test]
+    fn worked_for_folds_turn_and_toggles() {
+        let mut chat = ChatStream::new();
+        chat.push_user("hi", Vec::new(), 0);
+        chat.push_thinking("draft reply");
+        chat.push_tool(
+            "t1".to_string(),
+            ToolDisplay::Terminal {
+                description: String::new(),
+                command: "echo hi".to_string(),
+                mode: TerminalExecutionMode::Default,
+                status: ToolStatus::Done,
+                output: None,
+                diffs: Vec::new(),
+                pinned: None,
+            },
+        );
+        chat.push_text("done");
+        chat.fold_turn_work(52);
+
+        // user message + folded work + the reply, which stays visible.
+        assert!(matches!(
+            chat.elements.last(),
+            Some(ChatElement::AssistantText { .. })
+        ));
+        let Some(ChatElement::WorkedFor { elements, .. }) = chat.elements.get(1) else {
+            panic!("the turn's work folds into one row");
+        };
+        assert_eq!(elements.len(), 2);
+
+        let collapsed = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
+        assert!(collapsed.iter().any(|line| line.contains("Worked for 52s")));
+        assert!(!collapsed.iter().any(|line| line.contains("draft reply")));
+
+        chat.toggle_expanded("work-0");
+        let open = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
+        assert!(open.iter().any(|line| line.contains("draft reply")));
+
+        chat.toggle_expanded("work-0");
+        let closed = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
+        assert!(!closed.iter().any(|line| line.contains("draft reply")));
+    }
+
+    /// An expanded thinking block stays clickable — a click folds it back.
+    #[test]
+    fn expanded_thinking_has_click_region() {
+        let mut chat = ChatStream::new();
+        chat.push_thinking("step one");
+        let mut regions = Vec::new();
+        let _ = build_plain_wrapped_lines_unified(
+            &chat,
+            80,
+            None,
+            None,
+            None,
+            Some(&mut regions),
+            false,
+        );
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].element_id, "thinking-0");
     }
 }

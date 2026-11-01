@@ -298,6 +298,12 @@ pub async fn ensure_running(
         }
         progress("Restarting the May daemon for this build…");
         if installed() {
+            // Drain first: a service restart alone hard-kills every in-flight
+            // turn. `restart_service` below doubles as the forced kill when
+            // the daemon does not stop in time.
+            if client.shutdown().await.is_ok() {
+                let _ = wait_until_gone(&client, health.pid).await;
+            }
             restart_service()?;
             None
         } else {

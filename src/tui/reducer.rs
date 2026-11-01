@@ -242,6 +242,7 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
         }
         AppEvent::SessionRuntime(event) => {
             app.session_runtime = event.runtime;
+            app.sync_queue_from_runtime();
             Ok(None)
         }
         AppEvent::TurnStarted { message_id } => {
