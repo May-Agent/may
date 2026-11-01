@@ -15,6 +15,7 @@ use crate::agent::browser_tool::{BrowserBroker, BrowserTool};
 use crate::agent::imagine::ImagineTool;
 use crate::agent::issue_tool::{IssueTool, SubagentIssueTool};
 use crate::agent::notify_tool::{NotifyBroker, NotifyTool};
+use crate::agent::pr_tool::{PrTool, SubagentPrTool};
 use crate::agent::register_tool::{RegisterBroker, RegisterTool, Skills, Subagents};
 use crate::agent::session_tool::SessionTool;
 use crate::agent::subagent_tracker::{SubagentTracker, TrackedSubagentTool, UsageObservedModel};
@@ -90,6 +91,8 @@ pub struct SharedTerminalCommandConfig<LLM> {
     /// Issue store for the `issue` command, resolved from the session
     /// workspace and its per-project configuration.
     pub issue_store: crate::issue::ResolvedIssueStore,
+    /// Per-project workspace config — `pr` reads `[[projects]] checks` off it.
+    pub workspace_config: crate::workspace::WorkspaceConfig,
     /// Discovery and messaging between main agents, when the session has a
     /// persistent queue to deliver through.
     pub agent_messaging: Option<crate::agent_link::AgentMessaging>,
@@ -172,6 +175,18 @@ where
     }
     describe_tool(&mut descriptions, &issue_tool);
     builder.configure_role_tools(issue_tool, subagent_issue_tool);
+
+    let pr_context = crate::pr::PrContext {
+        db: config.db.clone(),
+        session_id: config.session_id.clone(),
+        session_root: config.sandbox_dir.clone(),
+        cwd: config.cwd.clone(),
+        workspace_config: config.workspace_config.clone(),
+    };
+    let pr_tool = PrTool::new(pr_context.clone());
+    let subagent_pr_tool = SubagentPrTool::new(pr_context);
+    describe_tool(&mut descriptions, &pr_tool);
+    builder.configure_role_tools(pr_tool, subagent_pr_tool);
 
     if let Some(runtime) = config.ask_user {
         let ask_user = AskUserTool::new(runtime.clone(), config.session_id.clone());
@@ -462,6 +477,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
+                workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
             },
         )
@@ -518,6 +534,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
+                workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
             },
         )
@@ -578,6 +595,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters,
                 issue_store: test_issue_store(temp.path()).await,
+                workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
             },
         )
@@ -626,6 +644,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
+                workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
             },
         )
@@ -789,6 +808,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store,
+                workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: Some(messaging),
             },
         )
@@ -864,6 +884,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
+                workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
             },
         )

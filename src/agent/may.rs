@@ -569,6 +569,7 @@ impl MayAgent {
                     .then_some(config.workspace_request_broker.clone()),
                 subagent_runs: subagent_runs.clone(),
                 issue_store: issue_store.clone(),
+                workspace_config: workspace.config.clone(),
                 agent_messaging,
                 #[cfg(target_os = "macos")]
                 computer: config.computer.clone(),
