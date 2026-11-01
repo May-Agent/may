@@ -271,7 +271,7 @@ pub async fn usage_report(
                 .created_at
                 .parse::<jiff::Timestamp>()
                 .ok()
-                .map(|ts| ts.as_millisecond())
+                .map(jiff::Timestamp::as_millisecond)
         });
     let now_ms = jiff::Timestamp::now().as_millisecond();
     json_ok_response(&crate::agent::assemble_usage_report(
