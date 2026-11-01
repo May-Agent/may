@@ -116,7 +116,8 @@ impl App {
 
     /// Merge live-fetched provider catalogs into the model-select list:
     /// configured tier selectors keep their lead positions, and every model
-    /// a provider actually serves is appended as `provider::model`.
+    /// a provider actually serves is appended as `provider::model`. The
+    /// catalog is remembered so the next `/model` open seeds a full list.
     pub fn merge_model_select_models(&mut self, models: Vec<FetchedModel>) {
         // Families whose catalog offers 2+ effort-suffixed variants collapse
         // to the family base: the rung is chosen on the effort ladder, not
@@ -151,13 +152,31 @@ impl App {
         let mut seen = std::collections::HashSet::new();
         self.model_select_list
             .retain(|entry| seen.insert(entry.clone()));
-        for model in models {
-            let id = family_base_of(&model.provider_id, &model.id).unwrap_or(model.id);
+        for model in &models {
+            let id =
+                family_base_of(&model.provider_id, &model.id).unwrap_or_else(|| model.id.clone());
             let selector = crate::ModelSelector::new(&model.provider_id, &id).to_string();
             if !self.model_select_list.contains(&selector) {
                 self.model_select_list.push(selector);
             }
         }
+        // A failed fetch returns an empty list: keep the previous catalog
+        // then, or the next open falls back to the configured-only seed.
+        if !models.is_empty() {
+            self.model_catalog = models;
+        }
+        if self.model_select_index >= self.model_select_list.len() {
+            self.model_select_index = 0;
+        }
+    }
+
+    /// Position of `current` in the select list, matching the renderer's
+    /// `(current)` marker: an effort-suffixed selector highlights its
+    /// collapsed family entry on the same provider.
+    pub(super) fn model_select_position(&self, current: &str) -> Option<usize> {
+        self.model_select_list
+            .iter()
+            .position(|entry| crate::models::same_selectable_model(entry, current))
     }
 
     /// Handle fetched models from async task.
