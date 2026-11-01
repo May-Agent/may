@@ -14,7 +14,7 @@ mod turn_persister;
 
 use self::tool_dispatch::{
     handle_browser_request, handle_notify_request, handle_register_skills_request,
-    handle_register_subagents_request, handle_task_request,
+    handle_task_request,
 };
 
 use std::future::Future;
@@ -1248,7 +1248,6 @@ pub(super) fn spawn_shared_tool_dispatchers(state: Arc<DaemonState>, queues: UiT
         notify,
         browser,
         register_skills,
-        register_subagents,
         tunnel,
     } = queues;
 
@@ -1290,20 +1289,12 @@ pub(super) fn spawn_shared_tool_dispatchers(state: Arc<DaemonState>, queues: UiT
         }
     });
 
-    let tunnel_state = state.clone();
-    let tokio_handle = state.tokio_handle.clone();
+    let tunnel_state = state;
+    let tokio_handle = tunnel_state.tokio_handle.clone();
     tokio_handle.spawn(async move {
         while let Some(request) = tunnel.next().await {
             let result =
                 super::tunnel::handle_tunnel_request(&tunnel_state, request.args.clone()).await;
-            let _ = request.respond(result);
-        }
-    });
-
-    let tokio_handle = state.tokio_handle.clone();
-    tokio_handle.spawn(async move {
-        while let Some(request) = register_subagents.next().await {
-            let result = handle_register_subagents_request(&state, request.args.clone()).await;
             let _ = request.respond(result);
         }
     });
@@ -2371,7 +2362,6 @@ struct ToolBrokers {
     notify: crate::agent::notify_tool::NotifyBroker,
     browser: crate::agent::browser_tool::BrowserBroker,
     register_skills: crate::agent::register_tool::RegisterBroker,
-    register_subagents: crate::agent::register_tool::RegisterBroker,
     tunnel: crate::agent::tunnel_tool::TunnelBroker,
 }
 
@@ -3017,7 +3007,6 @@ fn build_tool_brokers(state: &Arc<DaemonState>, session_id: &SessionId) -> ToolB
         notify: state.tool_dispatchers.notify.clone(),
         browser: state.tool_dispatchers.browser.clone(),
         register_skills: state.tool_dispatchers.register_skills.clone(),
-        register_subagents: state.tool_dispatchers.register_subagents.clone(),
         tunnel: state.tool_dispatchers.tunnel.clone(),
     }
 }
@@ -3182,7 +3171,6 @@ fn build_session_agent<'a>(
                     streams: state.session_streams.clone(),
                 }),
                 register_skills_broker: Some(brokers.register_skills),
-                register_subagents_broker: Some(brokers.register_subagents),
                 environment,
                 tool_distribution: state.tool_distribution.clone(),
                 tool_environments: state.tool_environments.clone(),

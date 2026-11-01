@@ -107,7 +107,6 @@ impl SessionStore {
                         let profile_home = self.home_paths.profile_home(profile_id);
                         async_fs::create_dir_all(profile_home.root()).await?;
                         async_fs::create_dir_all(profile_home.skills_dir()).await?;
-                        async_fs::create_dir_all(profile_home.subagents_dir()).await?;
                         self.seed_profile_scoped_resources(profile_id).await?;
                         profile_home.root().to_path_buf()
                     }
@@ -126,7 +125,6 @@ impl SessionStore {
             }
             SandboxResourceLayout::ContainerMountPoints => {
                 Self::ensure_mount_point_dir(paths.root(), "skills").await?;
-                Self::ensure_mount_point_dir(paths.root(), "subagents").await?;
                 Self::ensure_mount_point_dir(paths.root(), ".may/memories").await?;
                 self.seed_session_scoped_resources(&paths, profile_id)
                     .await?;
@@ -137,13 +135,13 @@ impl SessionStore {
     }
 
     /// Bring an existing session's sandbox up to the container mount-point
-    /// layout: create the standard directories, replace the skills/subagents
-    /// entries with mount-point directories, and seed session resources.
+    /// layout: create the standard directories, replace the skills
+    /// entry with mount-point directories, and seed session resources.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError`] when a directory cannot be created or an existing
-    /// skills/subagents entry is neither a directory nor removable.
+    /// skills entry is neither a directory nor removable.
     pub async fn reconcile_container_mount_points(
         &self,
         id: &str,
@@ -162,7 +160,6 @@ impl SessionStore {
         async_fs::create_dir_all(paths.outputs_dir()).await?;
         async_fs::create_dir_all(paths.artifacts_dir()).await?;
         Self::ensure_mount_point_dir(paths.root(), "skills").await?;
-        Self::ensure_mount_point_dir(paths.root(), "subagents").await?;
         Self::ensure_mount_point_dir(paths.root(), ".may/memories").await?;
         self.seed_session_scoped_resources(&paths, profile_id)
             .await?;
@@ -250,15 +247,10 @@ impl SessionStore {
     async fn seed_profile_scoped_resources(&self, profile_id: &str) -> Result<(), StoreError> {
         let profile_home = self.home_paths.profile_home(profile_id);
         Self::sync_dir_contents(&self.home_paths.skills_dir(), &profile_home.skills_dir()).await?;
-        Self::sync_dir_contents(
-            &self.home_paths.subagents_dir(),
-            &profile_home.subagents_dir(),
-        )
-        .await?;
         Ok(())
     }
 
-    /// Seed a profile's skills and subagents directories from the shared home.
+    /// Seed a profile's skills directory from the shared home.
     ///
     /// # Errors
     ///
@@ -272,19 +264,14 @@ impl SessionStore {
         paths: &SessionPaths,
         profile_id: Option<&str>,
     ) -> Result<(), StoreError> {
-        let (skills_dir, subagents_dir) = match profile_id {
+        let skills_dir = match profile_id {
             Some(profile_id) => {
                 self.seed_profile_scoped_resources(profile_id).await?;
-                let profile_home = self.home_paths.profile_home(profile_id);
-                (profile_home.skills_dir(), profile_home.subagents_dir())
+                self.home_paths.profile_home(profile_id).skills_dir()
             }
-            None => (
-                self.home_paths.skills_dir(),
-                self.home_paths.subagents_dir(),
-            ),
+            None => self.home_paths.skills_dir(),
         };
         Self::sync_dir_contents(&skills_dir, &paths.skills_dir()).await?;
-        Self::sync_dir_contents(&subagents_dir, &paths.subagents_dir()).await?;
         Ok(())
     }
 

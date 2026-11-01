@@ -239,7 +239,6 @@ impl SessionParts {
             tunnel_broker: None,
             browser_broker: None,
             register_skills_broker: None,
-            register_subagents_broker: None,
             environment: AgentEnvironment::Local,
             tool_distribution: Arc::new(
                 crate::tools::embedded_distribution().expect("embedded distribution validates"),
