@@ -33,7 +33,7 @@ struct LabelIdRow {
 
 impl ChatDb {
     /// Fetch (creating if needed) the project row for `repo_key`.
-    async fn ensure_issue_project(&self, repo_key: &str) -> Result<i64, ChatDbError> {
+    pub(crate) async fn ensure_issue_project(&self, repo_key: &str) -> Result<i64, ChatDbError> {
         let now = jiff::Timestamp::now().to_string();
         query!(
             self.db,

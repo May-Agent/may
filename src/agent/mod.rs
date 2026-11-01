@@ -20,6 +20,7 @@ pub(crate) mod notify_tool;
 #[cfg(test)]
 mod open_questions_tests;
 mod permission;
+pub(crate) mod pr_tool;
 mod provider;
 pub(crate) mod register_tool;
 pub mod runner;
