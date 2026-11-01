@@ -114,6 +114,8 @@ pub enum AppEvent {
     /// The session's blocking state, as the daemon reported it on the
     /// `session_runtime` stream.
     SessionRuntime(crate::client::SessionRuntimeEvent),
+    /// The session's worktree index coverage, from the `session_index` stream.
+    IndexCoverage(Option<crate::client::IndexCoverage>),
     /// A turn started in the daemon (this client's or another's), carrying
     /// the stored user-message row id — the prompt-mark key file rewind
     /// checkpoints hang on.
@@ -189,6 +191,7 @@ impl AppEvent {
             Self::BackgroundLoaded { .. } => "background_loaded",
             Self::Status(_) => "status",
             Self::SessionRuntime(_) => "session_runtime",
+            Self::IndexCoverage(_) => "index_coverage",
             Self::TurnStarted { .. } => "turn_started",
             Self::HistoryStale => "history_stale",
             Self::JobKilled { .. } => "job_killed",
