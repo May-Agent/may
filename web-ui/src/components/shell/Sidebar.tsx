@@ -20,7 +20,8 @@ import { useRuntimeStore } from '@/lib/stores/runtime';
 import { useActiveProfile } from '@/lib/profile/active';
 import { useNewChat } from '@/lib/useNewChat';
 import { shortcutAria, shortcutLabel } from '@/lib/shortcuts';
-import { FolderNode, SessionNode, repoLabel } from './SessionNode';
+import { FolderNode, SessionNode } from './SessionNode';
+import { repoLabel } from '@/lib/repo';
 import { NewChatRepoDialog } from './NewChatRepoDialog';
 import { ProfileSwitcher } from './ProfileSwitcher';
 import { NotificationBell } from './NotificationBell';
@@ -63,16 +64,27 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
   // "new chat in repo" dialog.
   const knownGithubRepos = useMemo(() => {
     const seen = new Set<string>();
-    for (const item of [...pinned, ...regular, ...archived]) {
-      const repo = item.type === 'session' ? item.repo : null;
+    const collect = (repo: string | null | undefined) => {
       if (repo?.startsWith('github:')) seen.add(repo.slice(7));
+    };
+    for (const item of [
+      ...(scoped?.pinned ?? []),
+      ...(scoped?.regular ?? []),
+      ...(scoped?.archived ?? []),
+    ]) {
+      if ('sessions' in item) {
+        for (const child of item.sessions) collect(child.repo);
+      } else {
+        collect(item.repo);
+      }
     }
     return [...seen].sort();
-  }, [pinned, regular, archived]);
+  }, [scoped]);
 
   // Sessions bound to a repository cluster under a collapsible group
   // header; repo-less sessions stay flat above the groups.
   const [regularNoRepo, repoGroups] = useMemo(() => {
+    const regular = scoped?.regular ?? [];
     const flat: typeof regular = [];
     const groups = new Map<string, typeof regular>();
     for (const item of regular) {
@@ -88,7 +100,7 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
       repoLabel(a).localeCompare(repoLabel(b)),
     );
     return [flat, sorted] as const;
-  }, [regular]);
+  }, [scoped]);
 
   return (
     <aside
