@@ -385,6 +385,26 @@ pub fn effort_family_base(model_id: &str) -> String {
     model_id.to_string()
 }
 
+/// Whether two selector strings address the same selectable model.
+///
+/// The provider ids must match and the model ids must collapse to the same
+/// effort family (`relay::o4-mini-high` and `relay::o4-mini` are one picker entry).
+/// Strings that fail to parse only match exactly.
+#[must_use]
+pub fn same_selectable_model(a: &str, b: &str) -> bool {
+    if a == b {
+        return true;
+    }
+    let (Ok(a), Ok(b)) = (
+        a.parse::<crate::ModelSelector>(),
+        b.parse::<crate::ModelSelector>(),
+    ) else {
+        return false;
+    };
+    a.provider_id() == b.provider_id()
+        && effort_family_base(a.model_id()) == effort_family_base(b.model_id())
+}
+
 /// The effort rung a catalog uid expresses, if it carries one
 /// (`o4-mini-high-lightning` → `high`).
 #[must_use]
@@ -403,4 +423,31 @@ pub fn effort_uid_token(model_id: &str) -> Option<&'static str> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_selectable_model;
+
+    #[test]
+    fn same_model_matches_across_effort_rungs_on_one_provider() {
+        assert!(same_selectable_model("relay::o4-mini-high", "relay::o4-mini"));
+        assert!(same_selectable_model("relay::o4-mini", "relay::o4-mini-max"));
+        assert!(same_selectable_model(
+            "relay::o4-mini-high-lightning",
+            "relay::o4-mini-lightning"
+        ));
+    }
+
+    #[test]
+    fn same_model_requires_the_same_provider_and_family() {
+        assert!(!same_selectable_model("google::o4-mini", "relay::o4-mini"));
+        assert!(!same_selectable_model("relay::o4-mini-high", "relay::o5-mini"));
+    }
+
+    #[test]
+    fn unparseable_selectors_only_match_exactly() {
+        assert!(same_selectable_model("o4-mini-high", "o4-mini-high"));
+        assert!(!same_selectable_model("o4-mini-high", "o4-mini"));
+    }
 }
