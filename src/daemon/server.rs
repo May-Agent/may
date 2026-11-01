@@ -267,6 +267,7 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
         tool_distribution,
         tool_environments: crate::agent::ToolEnvironmentCache::spawn(),
         cwd,
+        repo_search: crate::repo_search::RepoSearch::global(&may_dir),
         may_dir,
         search_index_wake_tx,
         search_index_wake,
