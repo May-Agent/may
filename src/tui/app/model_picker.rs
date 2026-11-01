@@ -124,12 +124,22 @@ impl App {
         let mut families: std::collections::HashMap<(String, String), usize> =
             std::collections::HashMap::new();
         for model in &models {
+            let base = crate::models::effort_family_base(&model.id);
             *families
-                .entry((
-                    model.provider_id.clone(),
-                    crate::models::effort_family_base(&model.id),
-                ))
+                .entry((model.provider_id.clone(), base.clone()))
                 .or_default() += 1;
+            if let Some(rung) = crate::models::effort_uid_token(&model.id) {
+                let rungs = self
+                    .family_effort_rungs
+                    .entry((model.provider_id.clone(), base))
+                    .or_default();
+                if !rungs.contains(&rung) {
+                    rungs.push(rung);
+                }
+            }
+        }
+        for rungs in self.family_effort_rungs.values_mut() {
+            rungs.sort_by_key(|rung| crate::models::effort_rung_rank(rung));
         }
         let family_base_of = |provider_id: &str, model_id: &str| {
             let base = crate::models::effort_family_base(model_id);
