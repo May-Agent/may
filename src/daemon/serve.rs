@@ -48,6 +48,13 @@ async fn handle(
     if let Some(peer) = peer {
         request.extensions_mut().insert(PeerAddr(peer));
     }
+    // WebSocket upgrade extraction needs the runtime executor skyzen's own
+    // launcher inserts per request.
+    request
+        .extensions_mut()
+        .insert(std::sync::Arc::new(executor_core::AnyExecutor::new(
+            executor_core::tokio::TokioGlobal,
+        )));
     let response = match router.go(request).await {
         Ok(response) => response,
         Err(error) => {

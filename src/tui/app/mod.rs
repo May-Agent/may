@@ -377,6 +377,15 @@ pub(super) fn utf8_complete_len(buf: &[u8]) -> usize {
 /// How often live terminal output is read from the daemon while calls run.
 const LIVE_OUTPUT_READ_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
+/// Base URL `<tunnel id>` tags resolve against in the TUI: the daemon's
+/// loopback listener.
+fn tunnel_base(config: &MayConfig) -> String {
+    format!(
+        "http://localhost:{}/tunnel",
+        config.daemon.port.unwrap_or(crate::daemon::DEFAULT_PORT)
+    )
+}
+
 impl App {
     /// Create a new application.
     /// `image_support` should be detected before entering raw mode using `TerminalImageSupport::detect()`.
@@ -424,6 +433,7 @@ impl App {
         }
 
         let needs_setup = !config.is_configured();
+        let tunnel_base = tunnel_base(&config);
         // Always start in Chat mode - show inline message if not configured
         let mode = AppMode::Chat;
 
@@ -471,7 +481,7 @@ impl App {
             cursor: 0,
             input_char_count: 0,
             attachments: Vec::new(),
-            chat: ChatStream::new(),
+            chat: ChatStream::new().with_tunnel_base(tunnel_base),
             scroll: usize::MAX, // Follow bottom by default
             input_visible: true,
             content_height: AtomicUsize::new(0),
@@ -1476,7 +1486,7 @@ impl App {
 
     /// Rebuilds the chat view from `messages`.
     async fn render_history(&mut self, messages: &[ChatMessage]) {
-        self.chat = ChatStream::new();
+        self.chat = ChatStream::new().with_tunnel_base(tunnel_base(&self.config));
         for (history_index, msg) in messages.iter().enumerate() {
             match msg.role {
                 MessageRole::User => {

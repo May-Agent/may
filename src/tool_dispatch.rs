@@ -47,6 +47,8 @@ pub struct ToolDispatchers {
     pub register_skills: RegisterBroker,
     /// Broker for subagent registration.
     pub register_subagents: RegisterBroker,
+    /// Broker for the `tunnel` command.
+    pub tunnel: crate::agent::tunnel_tool::TunnelBroker,
 }
 
 /// Dependencies needed to construct the shared IPC brokers.
@@ -127,6 +129,7 @@ impl ToolDispatchers {
             db: config.db.clone(),
             ask_user_broker: config.ask_user_broker,
         };
+        let daemon_socket = crate::daemon::DaemonPaths::new(config.may_dir.clone()).socket();
 
         let (task, task_queue) = crate::agent::task_channel();
         tokio::spawn(async move {
@@ -188,14 +191,52 @@ impl ToolDispatchers {
             }
         });
 
+        // Exec mode has no in-process daemon, so tunnel registrations go
+        // through the running daemon's REST API over its unix socket.
+        let (tunnel, tunnel_queue) = crate::agent::tunnel_tool::channel();
+        tokio::spawn(async move {
+            while let Some(request) = tunnel_queue.next().await {
+                let result = handle_exec_tunnel_request(&daemon_socket, request.args.clone()).await;
+                let _ = request.respond(result);
+            }
+        });
+
         Ok(Self {
             task,
             notify,
             browser,
             register_skills,
             register_subagents,
+            tunnel,
         })
     }
+}
+
+/// Forwards a `tunnel` command request to the running daemon's REST API;
+/// `may exec` has no in-process daemon to register with.
+async fn handle_exec_tunnel_request(
+    socket_path: &Path,
+    args: crate::agent::tunnel_tool::TunnelRequest,
+) -> Result<crate::agent::tunnel_tool::TunnelResult, String> {
+    let client = crate::client::DaemonClient::new(socket_path.to_path_buf());
+    let response: crate::daemon::types::TunnelRegisterResponse = client
+        .post(
+            "/api/tunnels",
+            &crate::daemon::types::TunnelRegisterRequest {
+                session_id: args.session_id,
+                url: args.url,
+            },
+        )
+        .await
+        .map_err(|error| {
+            format!("tunnel needs the running May daemon ({error}); start it with `may daemon`")
+        })?;
+    Ok(crate::agent::tunnel_tool::TunnelResult {
+        id: response.id,
+        url: response.url,
+        path: response.path,
+        local_url: response.local_url,
+    })
 }
 
 async fn handle_notify_request(
