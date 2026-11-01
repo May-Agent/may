@@ -970,6 +970,7 @@ where
                         }
                     }
                     TuiEvent::ContextReport(_)
+                    | TuiEvent::UsageReport(_)
                     | TuiEvent::ContextDump(_)
                     | TuiEvent::ContextDumpSaved { .. } => {
                         // Reports arrive on the context channel; the agent
@@ -1028,6 +1029,10 @@ where
                     Some(TuiEvent::ContextReport(Err(err))) => {
                         app.chat
                             .push_error(&format!("Context report failed: {err}"));
+                    }
+                    Some(TuiEvent::UsageReport(report)) => {
+                        app.chat.push_usage_report(report);
+                        app.scroll = usize::MAX;
                     }
                     Some(TuiEvent::ContextDump(Ok(dump))) => {
                         let message_count = dump.messages.len();
@@ -1408,6 +1413,16 @@ where
                         if let Some(w) = worker.as_ref() {
                             if context_handle.is_none() {
                                 context_handle = Some(w.context_report());
+                            }
+                        } else {
+                            app.chat
+                                .push_notice("Agent is still starting — try again in a moment");
+                        }
+                    }
+                    Some(SendAction::UsageReport) => {
+                        if let Some(w) = worker.as_ref() {
+                            if context_handle.is_none() {
+                                context_handle = Some(w.usage_report());
                             }
                         } else {
                             app.chat

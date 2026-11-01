@@ -7,7 +7,9 @@ pub use background::{
     cancel_subagent, cancel_subagents, get_background, get_job, kill_job, read_job,
 };
 pub use hosts::{BtwMessage, BtwRequest, BtwResponse, CompactResponse, ContextDumpResponse};
-pub use hosts::{ParkedAgents, btw, compact_session, context_dump, context_report, release_agent};
+pub use hosts::{
+    ParkedAgents, btw, compact_session, context_dump, context_report, release_agent, usage_report,
+};
 pub use hub::{TurnFrame, TurnHub};
 mod tool_dispatch;
 mod turn_persister;

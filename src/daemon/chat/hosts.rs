@@ -247,6 +247,41 @@ pub async fn context_report(
     }
 }
 
+/// Answer of `GET /api/sessions/{id}/usage`: the session's provider usage
+/// aggregated out of its request log, no agent needed.
+pub async fn usage_report(
+    params: Params,
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<skyzen::Response> {
+    let session_id = session_id_param(&params)?;
+    let rows = state
+        .runtime_service
+        .db()
+        .request_logs_for_session(&session_id)
+        .await
+        .map_err(internal_error)?;
+    let created_at_ms = state
+        .runtime_service
+        .db()
+        .get_session(&session_id)
+        .await
+        .map_err(internal_error)?
+        .and_then(|session| {
+            session
+                .created_at
+                .parse::<jiff::Timestamp>()
+                .ok()
+                .map(|ts| ts.as_millisecond())
+        });
+    let now_ms = jiff::Timestamp::now().as_millisecond();
+    json_ok_response(&crate::agent::assemble_usage_report(
+        &session_id,
+        &rows,
+        created_at_ms,
+        now_ms,
+    ))
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 /// Answer of `POST /api/sessions/{id}/context-dump`.

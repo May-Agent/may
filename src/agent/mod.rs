@@ -35,6 +35,7 @@ pub mod subagent_tracker;
 pub(crate) mod task_tool;
 pub mod tool_environment_cache;
 pub(crate) mod tunnel_tool;
+mod usage;
 
 pub use browser_tool::{
     BrowserArgs, BrowserBroker, BrowserRequest, BrowserResult, channel as browser_channel,
@@ -72,3 +73,4 @@ pub use task_tool::{
 pub use tool_environment_cache::{
     HomeBackend, ToolEnvironmentCache, ToolEnvironmentCacheError, ToolEnvironmentKey,
 };
+pub use usage::{ModelUsageRow, SessionUsageReport, assemble_usage_report};
