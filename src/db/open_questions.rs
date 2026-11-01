@@ -277,6 +277,27 @@ impl ChatDb {
         .map(|row| row.approved))
     }
 
+    /// Whether `request_id` was issued as an `ask_user` request of
+    /// `session_id`, whatever became of it — open, answered or withdrawn.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn session_ask_user_request_exists(
+        &self,
+        session_id: &str,
+        request_id: &str,
+    ) -> Result<bool, ChatDbError> {
+        Ok(query!(
+            self.db,
+            "SELECT m.session_id AS session_id FROM message_ask_user_requests r JOIN messages m ON m.id = r.message_id WHERE r.request_id = ? AND m.session_id = ? LIMIT 1",
+            request_id,
+            session_id
+        )
+        .fetch_optional::<PendingPermissionLookup>()
+        .await?
+        .is_some())
+    }
+
     /// The pending question `request_id` and the session it belongs to, or
     /// `None` when it is not pending: answered, withdrawn or never asked.
     ///
