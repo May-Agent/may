@@ -2,7 +2,7 @@ Model: {{ model_id }}
 Environment: {{ home_environment_kind }} ({{ operating_system }}, {{ shell_dialect }})
 Home directory: {{ home_directory }}
 Session directory (working directory, writable sandbox): {{ session_directory }}
-{% if let Some(dir) = host_launch_directory %}Host launch directory (read-only by default): {{ dir }}
+{% if let Some(dir) = host_launch_directory %}Host launch directory (the checkout this session clones from — the session's writable copies are its repository clones, never this directory): {{ dir }}
 {% endif %}
 Home layout:
 {% for item in home_layout %}- {{ item }}
