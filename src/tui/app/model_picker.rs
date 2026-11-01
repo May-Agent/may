@@ -165,6 +165,40 @@ impl App {
         None
     }
 
+    /// Handle key in the effort select popup: ←/→ steps the ladder and
+    /// applies at once, Enter/Esc closes.
+    pub(super) fn handle_effort_select_key(&mut self, code: KeyCode) -> Option<SendAction> {
+        match code {
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.effort_index = self.effort_index.saturating_sub(1);
+                return self.selected_effort();
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                if self.effort_index + 1 < self.effort_ladder.len() {
+                    self.effort_index += 1;
+                }
+                return self.selected_effort();
+            }
+            KeyCode::Enter | KeyCode::Esc => {
+                self.mode = AppMode::Chat;
+            }
+            _ => {}
+        }
+        None
+    }
+
+    /// The effort token at the highlighted rung (`None` = provider default).
+    fn selected_effort(&self) -> Option<SendAction> {
+        self.effort_ladder
+            .get(self.effort_index)
+            .copied()
+            .flatten()
+            .map_or_else(
+                || Some(SendAction::SetEffort(None)),
+                |token| Some(SendAction::SetEffort(Some(token.to_string()))),
+            )
+    }
+
     /// Collect all unique models from config for model select.
     pub(super) fn collect_all_models(&self) -> Vec<String> {
         let mut models = Vec::new();
@@ -187,5 +221,46 @@ impl App {
             }
         }
         models
+    }
+}
+
+/// The reasoning-effort ladder a provider's wire protocol expresses, first
+/// rung `None` meaning "provider default" — no override stored. Families
+/// outside a ladder still take it: vendors map what they can on their own
+/// API-compat layer and reject what a model does not have.
+pub(super) const fn effort_ladder_for(
+    provider_type: Option<crate::config::ProviderType>,
+) -> &'static [Option<&'static str>] {
+    use crate::config::ProviderType;
+    const OPENAI: &[Option<&str>] = &[
+        None,
+        Some("none"),
+        Some("minimal"),
+        Some("low"),
+        Some("medium"),
+        Some("high"),
+        Some("xhigh"),
+        Some("max"),
+    ];
+    const CLAUDE: &[Option<&str>] = &[
+        None,
+        Some("none"),
+        Some("low"),
+        Some("medium"),
+        Some("high"),
+        Some("xhigh"),
+        Some("max"),
+    ];
+    const GEMINI: &[Option<&str>] = &[
+        None,
+        Some("minimal"),
+        Some("low"),
+        Some("medium"),
+        Some("high"),
+    ];
+    match provider_type {
+        Some(ProviderType::Anthropic) => CLAUDE,
+        Some(ProviderType::Google) => GEMINI,
+        _ => OPENAI,
     }
 }
