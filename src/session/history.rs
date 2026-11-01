@@ -599,11 +599,19 @@ fn replay_user_message(
 }
 
 /// Resolve the URL to hand the provider for a binary attachment. The
-/// recorded `file://` URL wins while the file still exists; otherwise the
-/// inline `data:` URL is used when one was stored.
+/// inline `data:` bytes recorded at send time win: they deliver on every
+/// provider without depending on the file still existing or on a Files API
+/// the endpoint may not serve. Otherwise the recorded URL is used.
 fn attachment_url(
     attachment: &super::runtime::PersistedAttachment,
 ) -> Result<url::Url, HistoryReplayError> {
+    if let Some(url) = attachment
+        .upload_data_url
+        .as_deref()
+        .and_then(|raw| url::Url::parse(raw).ok())
+    {
+        return Ok(url);
+    }
     let url = url::Url::parse(&attachment.url)
         .map_err(|error| invalid_attachment(attachment, format!("invalid url: {error}")))?;
     let file_gone = url.to_file_path().is_ok_and(|path| !path.exists());
