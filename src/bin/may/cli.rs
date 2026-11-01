@@ -177,12 +177,11 @@ pub fn parse_cli_mode(args: &[String]) -> CliMode {
             Some("--help" | "-h") => CliMode::Help(ExecArgs::help_text()),
             _ => CliMode::Exec(parse_exec_args(&args[2..])),
         },
-        Some("chat") => CliMode::Tui(TuiArgs::default()),
+        Some("chat") | None => CliMode::Tui(TuiArgs::default()),
         Some("--repo") => CliMode::Tui(TuiArgs {
             repo: args.get(2).cloned(),
         }),
         Some(_) => CliMode::OneShot(parse_oneshot_args(&args[1..])),
-        None => CliMode::Tui(TuiArgs::default()),
     }
 }
 
@@ -452,7 +451,7 @@ fn parse_terminal_execution_mode(value: &str) -> TerminalExecutionMode {
 mod tests {
     use super::{
         BrowserCliArgs, BrowserCliCommand, CliMode, ExecArgs, OneShotArgs, TerminalExecutionMode,
-        parse_cli_mode, parse_reasoning_effort,
+        TuiArgs, parse_cli_mode, parse_reasoning_effort,
     };
     use aither_core::llm::model::ReasoningEffort;
     use may_agent::browser_service::{BrowserReadDetail, BrowserScreenshotMode};
