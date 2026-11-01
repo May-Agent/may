@@ -308,11 +308,8 @@ impl FileChangeTracker {
     /// owns — leftovers of a root set that changed since the session's
     /// tracker state was written.
     fn prune_stale_shadow_repos(&self) -> Result<(), TrackerError> {
-        let expected: std::collections::HashSet<PathBuf> = self
-            .roots
-            .iter()
-            .map(|root| root.git_dir.clone())
-            .collect();
+        let expected: std::collections::HashSet<PathBuf> =
+            self.roots.iter().map(|root| root.git_dir.clone()).collect();
         for entry in std::fs::read_dir(&self.state_dir)? {
             let path = entry?.path();
             if path.extension().is_some_and(|ext| ext == "git")
@@ -330,7 +327,9 @@ impl FileChangeTracker {
             worktree: normalize_path(&spec.worktree),
             ..spec
         };
-        let git_dir = self.state_dir.join(format!("{}.git", shadow_key(&spec.worktree)));
+        let git_dir = self
+            .state_dir
+            .join(format!("{}.git", shadow_key(&spec.worktree)));
         if !git_dir.join("HEAD").exists() {
             init_bare(&git_dir).map_err(|stderr| TrackerError::Command {
                 args: format!("init --bare -b main {}", git_dir.display()),
