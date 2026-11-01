@@ -536,6 +536,31 @@ pub struct WireSession {
     pub repo: Option<String>,
 }
 
+/// One session PR over the wire, mirroring the daemon's `ApiPr`.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WirePr {
+    /// Per-repository PR number.
+    pub number: i64,
+    /// PR title.
+    pub title: String,
+    /// Lifecycle state.
+    pub state: String,
+    /// `may` or `github`.
+    pub backend: String,
+    /// External PR number, when the backend created one.
+    #[serde(default)]
+    pub external_number: Option<i64>,
+    /// Associated issue number, when linked.
+    #[serde(default)]
+    pub issue_number: Option<i64>,
+    /// Whether the PR merges itself once checks pass.
+    #[serde(default)]
+    pub auto_merge: bool,
+    /// Latest update timestamp.
+    pub updated_at: String,
+}
+
 #[cfg(test)]
 mod tests {
     use aither_agent::{AgentError, AgentEvent};
