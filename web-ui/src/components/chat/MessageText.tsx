@@ -13,7 +13,9 @@ import css from 'react-syntax-highlighter/dist/esm/languages/prism/css';
 import markdown from 'react-syntax-highlighter/dist/esm/languages/prism/markdown';
 import oneLight from 'react-syntax-highlighter/dist/esm/styles/prism/one-light';
 import { parseArtifactTags } from '@/lib/artifactTags';
+import { parseTunnelTags } from '@/lib/tunnelTags';
 import { SlidevArtifact } from './SlidevArtifact';
+import { TunnelLink } from './TunnelLink';
 
 for (const [name, lang] of Object.entries({
   bash,
@@ -131,13 +133,22 @@ export const MessageText = memo(function MessageText({
   // and the PlanBanner renders the canonical document. Do not expose the raw
   // XML marker as assistant prose.
   const withoutTasks = text.replace(/<tasks\s*\/>/gi, '');
-  const { visibleText, artifacts } = parseArtifactTags(withoutTasks);
-  if (visibleText.length === 0 && artifacts.length === 0 && !streaming) return null;
+  const { visibleText: withoutArtifacts, artifacts } = parseArtifactTags(withoutTasks);
+  const { visibleText, tunnels } = parseTunnelTags(withoutArtifacts);
+  if (visibleText.length === 0 && artifacts.length === 0 && tunnels.length === 0 && !streaming)
+    return null;
   return (
     <div>
       {visibleText.length > 0 && (
         <div className="prose prose-sm dark:prose-invert max-w-none">
           <Streamdown components={streamdownComponents}>{visibleText}</Streamdown>
+        </div>
+      )}
+      {tunnels.length > 0 && (
+        <div className="flex flex-wrap items-center gap-2 py-1">
+          {tunnels.map((id) => (
+            <TunnelLink key={id} id={id} />
+          ))}
         </div>
       )}
       {sessionId &&

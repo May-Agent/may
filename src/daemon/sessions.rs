@@ -552,6 +552,7 @@ pub(super) async fn delete_session(
         .and_then(|session| session.profile_id);
     db.delete_session(&id).await.map_err(internal_error)?;
     state.parked_agents.evict(&id);
+    state.tunnels.remove_session(&id);
     #[cfg(target_os = "macos")]
     #[cfg(target_os = "macos")]
     {
@@ -575,6 +576,7 @@ pub(super) async fn delete_all_sessions(
 ) -> SkyResult<Json<ApiHealth>> {
     // Delete all from DB
     let db = state.db();
+    state.tunnels.remove_all();
     db.delete_all_sessions().await.map_err(internal_error)?;
     state.tool_environments.evict_all();
     #[cfg(target_os = "macos")]

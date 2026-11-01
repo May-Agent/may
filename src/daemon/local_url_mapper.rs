@@ -53,14 +53,14 @@ pub enum ProxyScheme {
 }
 
 impl ProxyScheme {
-    pub(crate) const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Http => "http",
             Self::Https => "https",
         }
     }
 
-    pub(crate) fn from_str(value: &str) -> Option<Self> {
+    pub fn from_str(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
             "http" => Some(Self::Http),
             "https" => Some(Self::Https),
@@ -71,18 +71,18 @@ impl ProxyScheme {
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct LocalUrlProxyUpstream {
-    pub(crate) scheme: ProxyScheme,
-    pub(crate) container_ip: String,
-    pub(crate) target_port: u16,
-    pub(crate) host_header: String,
+    pub scheme: ProxyScheme,
+    pub container_ip: String,
+    pub target_port: u16,
+    pub host_header: String,
 }
 
 #[derive(Debug, Clone, Eq)]
 pub struct LocalUrlProxyKey {
-    pub(crate) session_id: String,
-    pub(crate) scheme: ProxyScheme,
-    pub(crate) requested_host: String,
-    pub(crate) target_port: u16,
+    pub session_id: String,
+    pub scheme: ProxyScheme,
+    pub requested_host: String,
+    pub target_port: u16,
 }
 
 impl PartialEq for LocalUrlProxyKey {
@@ -188,14 +188,14 @@ impl std::fmt::Debug for LocalUrlPortMapper {
 }
 
 impl LocalUrlPortMapper {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
         let actor_tx = command_tx.clone();
         tokio::spawn(run_local_url_proxy_actor(command_rx, actor_tx));
         Self { command_tx }
     }
 
-    pub(crate) async fn ensure_port(
+    pub async fn ensure_port(
         self: &Arc<Self>,
         key: LocalUrlProxyKey,
         upstream: LocalUrlProxyUpstream,
@@ -398,7 +398,7 @@ async fn proxy_http_request_impl(
     Ok(response)
 }
 
-fn to_zenwave_method(method: &Method) -> Result<zenwave::Method, LocalUrlProxyError> {
+pub fn to_zenwave_method(method: &Method) -> Result<zenwave::Method, LocalUrlProxyError> {
     method
         .as_str()
         .parse::<zenwave::Method>()
@@ -408,7 +408,7 @@ fn to_zenwave_method(method: &Method) -> Result<zenwave::Method, LocalUrlProxyEr
         })
 }
 
-fn should_skip_request_header(name: &HeaderName) -> bool {
+pub fn should_skip_request_header(name: &HeaderName) -> bool {
     let lowered = name.as_str().to_ascii_lowercase();
     lowered == "connection"
         || lowered == "keep-alive"
@@ -421,7 +421,7 @@ fn should_skip_request_header(name: &HeaderName) -> bool {
         || lowered == "host"
 }
 
-fn should_skip_response_header(name: &HeaderName) -> bool {
+pub fn should_skip_response_header(name: &HeaderName) -> bool {
     let lowered = name.as_str().to_ascii_lowercase();
     lowered == "connection"
         || lowered == "keep-alive"
