@@ -145,6 +145,11 @@ pub struct App {
     pub model_select_index: usize,
     /// Available models for model select (cached)
     pub model_select_list: Vec<String>,
+    /// Search query in the model select popup
+    pub model_select_query: String,
+    /// Last fetched provider catalog; seeds the next `/model` open so the
+    /// picker does not paint the configured-only list while a fetch lands
+    pub model_catalog: Vec<FetchedModel>,
     /// Effort rungs offered by the `/effort` popup
     pub effort_ladder: Vec<&'static str>,
     /// Effort rungs each fetched model family serves, keyed by
@@ -513,6 +518,8 @@ impl App {
             config_state,
             model_select_index: 0,
             model_select_list: Vec::new(),
+            model_select_query: String::new(),
+            model_catalog: Vec::new(),
             effort_ladder: Vec::new(),
             family_effort_rungs: std::collections::HashMap::new(),
             turn_started_at: None,
@@ -2839,12 +2846,18 @@ impl App {
             }
             "/model" => {
                 self.model_select_list = self.collect_all_models();
+                // Seed with the catalog remembered from the last fetch so a
+                // warm open paints the full list at once; the in-flight
+                // refresh below re-merges whatever changed meanwhile.
+                let catalog = std::mem::take(&mut self.model_catalog);
+                self.merge_model_select_models(catalog);
+                self.model_select_query.clear();
                 self.model_select_rx = self.fetch_provider_models();
                 self.model_select_index = 0;
                 let fallback_model = self.config.last_model.as_ref().map(ToString::to_string);
                 let current = self.current_model.as_deref().or(fallback_model.as_deref());
                 if let Some(current) = current
-                    && let Some(idx) = self.model_select_list.iter().position(|m| m == current)
+                    && let Some(idx) = self.model_select_position(current)
                 {
                     self.model_select_index = idx;
                 }

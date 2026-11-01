@@ -310,7 +310,7 @@ fn sheet_height(app: &App, column: Rect) -> Option<u16> {
         ),
         AppMode::Help => (rows(HELP_TEXT.lines().count() + 2), pct(70)),
         AppMode::ToolDetail => (full, pct(80)),
-        AppMode::ModelSelect => (rows(app.model_select_list.len() + 2).min(12), pct(60)),
+        AppMode::ModelSelect => (rows(app.filtered_model_select().len() + 6).min(16), pct(60)),
         AppMode::EffortSelect => (rows(4), pct(70)),
         AppMode::McpManage | AppMode::SshManage | AppMode::SkillManage => {
             (pct(60).max(12), pct(70))
@@ -835,13 +835,68 @@ fn render_tier_model_picker(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(block, popup_area);
 }
 
-/// Render model select popup (anchored near input area).
+/// Render model select popup (anchored near input area): a search line, the
+/// filtered selector list and a hint footer. A catalog refresh in flight is
+/// named in the title so the list is never mistaken for final.
 fn render_model_select_popup(frame: &mut Frame, area: Rect, app: &App) {
     let popup_area = area;
 
+    let filtered = app.filtered_model_select();
+    let filtered_len = filtered.len();
+    let title = if app.model_select_query.is_empty() {
+        format!("Select Model ({})", app.model_select_list.len())
+    } else {
+        format!(
+            "Select Model ({filtered_len}/{})",
+            app.model_select_list.len()
+        )
+    };
+    let title = if app.model_select_rx.is_some() {
+        format!("{title} — fetching…")
+    } else {
+        title
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(title);
+    let inner_area = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2), // Search input
+            Constraint::Min(1),    // Model list
+            Constraint::Length(2), // Footer hints
+        ])
+        .split(inner_area);
+
+    let search_line = if app.model_select_query.is_empty() {
+        Line::from(Span::styled(
+            "Type to search...",
+            Style::default().fg(Color::DarkGray),
+        ))
+    } else {
+        Line::from(vec![
+            Span::styled("Search: ", Style::default().fg(Color::Cyan)),
+            Span::styled(&app.model_select_query, Style::default().fg(Color::Yellow)),
+        ])
+    };
+    frame.render_widget(Paragraph::new(vec![search_line, Line::from("")]), chunks[0]);
+    let caret_x = chunks[0].x
+        + 8
+        + u16::try_from(UnicodeWidthStr::width(app.model_select_query.as_str()))
+            .unwrap_or(u16::MAX);
+    frame.set_cursor_position((
+        caret_x.min(chunks[0].right().saturating_sub(1)),
+        chunks[0].y,
+    ));
+
     // Keep the highlighted row inside the visible window as the selection
     // moves past either edge of the sheet.
-    let visible_height = popup_area.height.saturating_sub(2) as usize;
+    let visible_height = chunks[1].height as usize;
     let selected = app.model_select_index;
     let scroll_offset = if selected >= visible_height {
         selected - visible_height + 1
@@ -849,25 +904,20 @@ fn render_model_select_popup(frame: &mut Frame, area: Rect, app: &App) {
         0
     };
 
-    let items: Vec<ListItem> = app
-        .model_select_list
+    let fallback_model = app.config.last_model.as_ref().map(ToString::to_string);
+    let current_model = app.current_model.as_deref().or(fallback_model.as_deref());
+    let mut items: Vec<ListItem> = filtered
         .iter()
         .enumerate()
         .skip(scroll_offset)
         .take(visible_height.max(1))
-        .map(|(idx, model)| {
-            let prefix = if idx == selected { "> " } else { "  " };
-            // The stored selector may carry an effort rung the list shows
-            // collapsed into its family (`o4-mini-high` → `o4-mini`).
-            let current = app.current_model.as_deref().is_some_and(|m| {
-                m == model
-                    || crate::models::effort_family_base(crate::model_selector::selector_model_id(
-                        m,
-                    )) == crate::model_selector::selector_model_id(model)
-            });
+        .map(|(display_idx, &(_, model))| {
+            let prefix = if display_idx == selected { "> " } else { "  " };
+            let current =
+                current_model.is_some_and(|m| crate::models::same_selectable_model(m, model));
             let suffix = if current { " (current)" } else { "" };
             let text = format!("{prefix}{model}{suffix}");
-            let style = if idx == selected {
+            let style = if display_idx == selected {
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(ratatui::style::Modifier::BOLD)
@@ -877,14 +927,41 @@ fn render_model_select_popup(frame: &mut Frame, area: Rect, app: &App) {
             ListItem::new(text).style(style)
         })
         .collect();
+    if filtered_len == 0 {
+        items.push(ListItem::new(Span::styled(
+            "  No matching models.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    frame.render_widget(List::new(items), chunks[1]);
 
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title("Select Model"),
-    );
-    frame.render_widget(list, popup_area);
+    let footer_line = if app.model_select_query.is_empty() {
+        Line::from(vec![
+            Span::styled("[jk] ", Style::default().fg(Color::Cyan)),
+            Span::styled("Nav", Style::default().fg(Color::White)),
+            Span::raw("  "),
+            Span::styled("[Type] ", Style::default().fg(Color::Cyan)),
+            Span::styled("Search", Style::default().fg(Color::White)),
+            Span::raw("  "),
+            Span::styled("[Enter] ", Style::default().fg(Color::Cyan)),
+            Span::styled("Select", Style::default().fg(Color::White)),
+            Span::raw("  "),
+            Span::styled("[Esc] ", Style::default().fg(Color::Cyan)),
+            Span::styled("Close", Style::default().fg(Color::White)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("[↑↓] ", Style::default().fg(Color::Cyan)),
+            Span::styled("Navigate", Style::default().fg(Color::White)),
+            Span::raw("  "),
+            Span::styled("[Enter] ", Style::default().fg(Color::Cyan)),
+            Span::styled("Select", Style::default().fg(Color::White)),
+            Span::raw("  "),
+            Span::styled("[Esc] ", Style::default().fg(Color::Cyan)),
+            Span::styled("Clear search", Style::default().fg(Color::White)),
+        ])
+    };
+    frame.render_widget(Paragraph::new(vec![Line::from(""), footer_line]), chunks[2]);
 }
 
 /// Render the effort select popup: a single horizontal ladder, ←/→ steps
