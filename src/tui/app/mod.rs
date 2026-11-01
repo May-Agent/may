@@ -23,8 +23,9 @@ use super::agent_event_adapter::{
     ToolEndKind, ToolStartKind, parse_tool_end, parse_tool_start, parse_tool_start_partial,
 };
 use super::clipboard::{
-    ClipboardPasteResult, ImageManager, TextManager, download_image, is_image_url, read_clipboard,
-    set_clipboard_html, set_clipboard_text,
+    ClipboardPasteResult, ImageManager, TextManager, download_image, is_image_url,
+    pasted_image_path_candidate, read_clipboard, read_pasted_image_file, set_clipboard_html,
+    set_clipboard_text,
 };
 use super::completion::{Completion, CompletionMode};
 use super::error::{AppResult, TuiError};
@@ -1787,6 +1788,42 @@ impl App {
         None
     }
 
+    /// Terminal paste (bracketed paste). When the payload resolves to a
+    /// filesystem path — how terminals that materialize pasted images as
+    /// files deliver them (iTerm2, cmux-style temp-file bridges, dragged
+    /// files, Finder copies) — the path is read on a worker and an image
+    /// attaches; anything else pastes as text unchanged.
+    pub(super) fn handle_paste_event(&mut self, text: String) -> Option<SendAction> {
+        if matches!(self.mode, AppMode::Chat)
+            && self.clipboard_rx.is_none()
+            && pasted_image_path_candidate(&text).is_some()
+        {
+            self.spawn_image_path_attach(text);
+            return None;
+        }
+        self.handle_bracketed_paste(text)
+    }
+
+    /// Read a pasted file reference on a worker thread: an image attaches,
+    /// anything else pastes as the original text through the channel.
+    fn spawn_image_path_attach(&mut self, pasted: String) {
+        let Some(path) = pasted_image_path_candidate(&pasted) else {
+            return;
+        };
+        let (tx, rx) = async_channel::bounded(1);
+        self.clipboard_rx = Some(rx);
+        self.pending_attachment_jobs = self.pending_attachment_jobs.saturating_add(1);
+        spawn(async move {
+            let result = match unblock(move || read_pasted_image_file(&path)).await {
+                Ok(Some(image)) => Ok(ClipboardPasteResult::image(image)),
+                Ok(None) => Ok(ClipboardPasteResult::text(pasted)),
+                Err(e) => Err(TuiError::from(e)),
+            };
+            let _ = tx.send(result).await;
+        })
+        .detach();
+    }
+
     /// Route pasted text — a terminal paste event or a Ctrl+V clipboard
     /// read — into the focused input, or an attachment when it is large.
     pub(super) fn handle_bracketed_paste(&mut self, text: String) -> Option<SendAction> {
@@ -1909,6 +1946,14 @@ impl App {
                 }
                 _ => {}
             }
+        }
+
+        // Cmd+V (super+V): terminals forwarding super-modified keys via the
+        // kitty keyboard protocol deliver it here; the same paste path as
+        // Ctrl+V.
+        if modifiers.contains(KeyModifiers::SUPER) && matches!(code, KeyCode::Char('v' | 'V')) {
+            self.handle_paste();
+            return Ok(None);
         }
 
         // Reset quit confirmation on any other input

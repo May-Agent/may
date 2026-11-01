@@ -43,7 +43,7 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             Ok(None)
         }
         AppEvent::Resize(_, _) => Ok(None),
-        AppEvent::Paste(text) => Ok(app.handle_bracketed_paste(text)),
+        AppEvent::Paste(text) => Ok(app.handle_paste_event(text)),
         AppEvent::Mouse(mouse) => app.handle_mouse(mouse),
 
         AppEvent::EffortLoaded(effort) => {
