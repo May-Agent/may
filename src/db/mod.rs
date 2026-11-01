@@ -582,8 +582,8 @@ mod tests {
     use crate::session::{
         PendingUserMessage, PendingUserMessageMode, PersistedAskUserQuestion,
         PersistedAskUserRequest, PersistedPermissionRequest, PersistedPermissionRequestPayload,
-        PersistedWorkspaceRequest, PersistedWorkspaceRequestPayload, SessionRuntimeState,
-        TerminalRuntimeState,
+        PersistedWorkspaceRequest, PersistedWorkspaceRequestPayload, SessionPlanState,
+        SessionRuntimeState, TerminalRuntimeState,
     };
     use crate::task_trigger::PersistedTaskTrigger;
 
@@ -1655,5 +1655,42 @@ mod tests {
         for task in tasks {
             task.await.expect("take task should not panic");
         }
+    }
+
+    /// A session whose plan is still a draft accepts a new request but is not
+    /// archived: the draft only blocks auto-archive, not admission.
+    #[tokio::test]
+    async fn a_draft_session_admits_requests_but_is_not_archived() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db should initialize successfully");
+        db.create_session("session", Some("Session"), Some("test-model"))
+            .await
+            .expect("session should be created");
+
+        let runtime = db
+            .set_session_plan_state("session", SessionPlanState::Draft)
+            .await
+            .expect("plan state should be set");
+        assert!(runtime.admits_new_request());
+        assert!(runtime.blocks_auto_archive());
+
+        let error = db
+            .archive_session("session")
+            .await
+            .expect_err("a draft plan must block archiving");
+        assert!(
+            format!("{error}").contains("draft"),
+            "the refusal should name the draft plan: {error}"
+        );
+        assert!(
+            !db.get_session("session")
+                .await
+                .expect("session lookup")
+                .expect("session exists")
+                .archived,
+            "the auto-archive pass must leave the draft session open"
+        );
     }
 }
