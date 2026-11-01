@@ -25,12 +25,17 @@ pub(super) async fn get_bootstrap(
 
     let (sessions, profiles) = tokio::join!(sessions_fut, profiles_fut);
     let profiles = profiles.map_err(super::error::internal_error)?;
-    let default_profile_id = profiles.first().map_or_else(
+    // The web UI lands on the built-in Daily profile by default.
+    let default_profile = profiles
+        .iter()
+        .find(|profile| profile.slug.as_deref() == Some(crate::profile::DAILY_PROFILE_SLUG))
+        .or_else(|| profiles.first());
+    let default_profile_id = default_profile.map_or_else(
         || state.default_profile_id.clone(),
         |profile| profile.id.clone(),
     );
     let (default_profile_sessions, default_profile_sessions_error, default_profile_skills) =
-        if let Some(default_profile) = profiles.first() {
+        if let Some(default_profile) = default_profile {
             let default_profile_id = default_profile.id.clone();
             let default_profile_sessions_fut =
                 load_default_profile_sessions(state.clone(), default_profile_id.clone());

@@ -958,11 +958,11 @@ impl TestHarness {
         strip_ansi_escapes(&server.log.contents().await)
     }
 
-    /// Session in the local profile. Terminal-first contract tests use this so
-    /// they exercise Leash, the session filesystem, and IPC independently of
-    /// an optional host container runtime.
+    /// Session in a local-environment profile. Terminal-first contract tests
+    /// use this so they exercise Leash, the session filesystem, and IPC
+    /// independently of an optional host container runtime.
     async fn create_session(&self) -> TestSession {
-        self.create_session_in_profile("local").await
+        self.create_session_in_profile("build").await
     }
 
     async fn create_session_in_profile(&self, profile_slug: &str) -> TestSession {
@@ -1614,11 +1614,11 @@ async fn expect_status(
 /// The profile environment a chat round-trip test runs its session in.
 #[derive(Debug, Clone, Copy)]
 enum ChatEnvironment {
-    /// The `local` profile: commands run on the host under heel.
+    /// The `build` profile: commands run on the host under heel.
     Local,
-    /// The `work` profile: commands run inside the May workspace container.
-    /// It is container-backed like `daily` but not location-aware, so a turn
-    /// never performs a geolocation lookup.
+    /// A container profile the test creates on demand: commands run inside
+    /// the May workspace container. The profile is not location-aware, so a
+    /// turn never performs a geolocation lookup.
     ///
     /// Its tests expect a container runtime on Linux (Docker on the CI
     /// runners), where a missing runtime fails them; elsewhere they are
@@ -1636,13 +1636,6 @@ const CONTAINER_IMAGE_BUILD_TIMEOUT: Duration = Duration::from_mins(20);
 const CONTAINER_FIRST_TURN_ALLOWANCE: Duration = Duration::from_secs(120);
 
 impl ChatEnvironment {
-    const fn profile_slug(self) -> &'static str {
-        match self {
-            Self::Local => "local",
-            Self::Container => "work",
-        }
-    }
-
     /// Resolves the environment's profile on `server` and makes it ready for
     /// chat the way the web UI does before opening a profile.
     async fn prepare(
@@ -1651,10 +1644,13 @@ impl ChatEnvironment {
         client: &reqwest::Client,
         server: &RunningDaemon,
     ) -> PreparedEnvironment {
-        let profile_id = profile_id_via_api(client, server, self.profile_slug()).await;
         match self {
-            Self::Local => PreparedEnvironment::Local { profile_id },
+            Self::Local => {
+                let profile_id = profile_id_via_api(client, server, "build").await;
+                PreparedEnvironment::Local { profile_id }
+            }
             Self::Container => {
+                let profile_id = create_container_profile_via_api(client, server).await;
                 let runtime = may_agent::container::ContainerRuntime::detect()
                     .await
                     .unwrap_or_else(|error| {
@@ -1837,6 +1833,33 @@ async fn create_session_via_api(
         .get("id")
         .and_then(Value::as_str)
         .expect("create session response should include id")
+        .to_string()
+}
+
+/// Creates a container-environment profile through the REST API, the way the
+/// web UI's profile settings do, and returns its id.
+async fn create_container_profile_via_api(
+    client: &reqwest::Client,
+    server: &RunningDaemon,
+) -> String {
+    let response = client
+        .post(format!("{}/api/profiles", server.base_url))
+        .json(&serde_json::json!({
+            "name": "e2e-container",
+            "environment": "container",
+            "locationAware": false,
+        }))
+        .send()
+        .await
+        .expect("create profile request should succeed");
+    let response = expect_status(&server.log, response, StatusCode::OK).await;
+    response
+        .json::<Value>()
+        .await
+        .expect("create profile response should be valid JSON")
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("create profile response should include id")
         .to_string()
 }
 
@@ -2037,12 +2060,13 @@ async fn ui_session_crud_round_trip_matches_api_contract() {
         .await
         .expect("create session request should succeed");
     let create_response = expect_status(&server.log, create_response, StatusCode::OK).await;
-    // Any release-API check rewrites the state's timestamp; an untouched
-    // state proves the default container profile took the seeded fast path.
+    // A profile-less session lands in the local-environment fallback
+    // profile; any release-API check would rewrite the state's timestamp,
+    // so an untouched state proves nothing reached for container assets.
     assert_eq!(
         harness.container_heel_state().await,
         seeded_heel_state,
-        "session creation must reuse the seeded container heel without a release check"
+        "local session creation must not touch the container heel state"
     );
     let created: Value = create_response
         .json()
@@ -2652,8 +2676,7 @@ async fn daemon_error_logs_its_cause() {
     let harness = TestHarness::new("http://127.0.0.1:9/v1").await;
     let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
     let client = reqwest::Client::new();
-    let profile_id =
-        profile_id_via_api(&client, &server, ChatEnvironment::Local.profile_slug()).await;
+    let profile_id = profile_id_via_api(&client, &server, "build").await;
 
     // A regular file where the profile's sessions directory belongs makes
     // session directory creation fail with an I/O error.
