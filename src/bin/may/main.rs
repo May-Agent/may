@@ -870,6 +870,9 @@ where
                         // Reports arrive on the context channel; the agent
                         // channel only carries them if the channels raced.
                     }
+                    TuiEvent::ReasoningEnd { seconds } => {
+                        app.chat.finish_thinking(seconds);
+                    }
                     TuiEvent::Compacted(result) => match result {
                         Ok(Some(stats)) => {
                             app.set_status(format!(

@@ -213,6 +213,18 @@ export interface SseReasoning {
 }
 
 /**
+ * Closes a reasoning phase: `seconds` is how long the model spent on it,
+ * whether or not the provider returned readable reasoning text. Emitted
+ * just before the first visible output that follows the phase.
+ */
+export interface SseReasoningEnd {
+  kind: 'reasoning_end';
+  seq: number;
+  turnId: string;
+  seconds: number;
+}
+
+/**
  * Backend-projected summary fields. Populated server-side from cumulative
  * argument JSON via `partial-json-fixer`. The frontend reads these directly
  * for the summary chip — no client-side partial-JSON parsing.
@@ -327,6 +339,7 @@ export type ChatStreamEvent =
   | SseStart
   | SseText
   | SseReasoning
+  | SseReasoningEnd
   | SseToolStart
   | SseToolDelta
   | SseToolEnd

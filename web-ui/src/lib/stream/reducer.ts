@@ -41,6 +41,12 @@ export interface TurnState {
   assistantId: string;
   text: string;
   reasoning: string;
+  /**
+   * Duration the backend measured for the last reasoning phase, in
+   * milliseconds. Non-null even when `reasoning` stayed empty — an empty
+   * phase renders as a non-expandable "thought for Ns" header.
+   */
+  reasoningMs: number | null;
   tools: TurnToolState[];
   /**
    * Chronological segments, preserving the order in which text chunks and
@@ -68,6 +74,7 @@ export function emptyTurn(
     assistantId,
     text: '',
     reasoning: '',
+    reasoningMs: null,
     tools: [],
     segments: [],
     todo: null,
@@ -131,6 +138,9 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
 
     case 'reasoning':
       return { ...state, reasoning: state.reasoning + event.chunk, lastSeq: event.seq };
+
+    case 'reasoning_end':
+      return { ...state, reasoningMs: event.seconds * 1000, lastSeq: event.seq };
 
     case 'tool_start': {
       const tools = upsertTool(
