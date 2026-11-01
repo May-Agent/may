@@ -2705,10 +2705,17 @@ async fn resolve_session_context(
     let sandbox_dir = SessionStore::new(MayHomePaths::new(state.may_dir.clone()))
         .sandbox_dir(session_id.as_str(), session.profile_id.as_deref());
 
+    // Effective effort: the rung the session selected, else the last rung
+    // selected anywhere, else medium — "default" is the last selection, not
+    // a provider-decided level.
+    let config = state.config_snapshot();
     let reasoning_effort = session
         .reasoning_effort
         .as_deref()
-        .and_then(parse_reasoning_effort_token);
+        .or_else(|| config.last_effort.as_deref())
+        .unwrap_or("medium")
+        .to_string();
+    let reasoning_effort = parse_reasoning_effort_token(&reasoning_effort);
 
     let cwd = session
         .cwd

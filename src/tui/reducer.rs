@@ -54,11 +54,7 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
         AppEvent::EffortLoaded(effort) => {
             app.current_effort = effort;
             if matches!(app.mode, AppMode::EffortSelect) {
-                app.effort_index = app
-                    .effort_ladder
-                    .iter()
-                    .position(|rung| *rung == app.current_effort.as_deref())
-                    .unwrap_or(0);
+                app.effort_index = app.effort_ladder_index();
             }
             Ok(None)
         }

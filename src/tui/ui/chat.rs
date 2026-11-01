@@ -578,19 +578,20 @@ impl ChatStream {
         }
     }
 
-    /// Stamp the daemon-measured duration of a reasoning phase. An open
-    /// block keeps its place and takes the server clock; a phase that
-    /// produced no readable text leaves a collapsed, non-expandable header.
+    /// Stamp the daemon-measured duration of a reasoning phase and collapse
+    /// the block — the phase ended, nothing more can stream into it. A phase
+    /// that produced no readable text leaves a collapsed, non-expandable
+    /// header.
     pub fn finish_thinking(&mut self, seconds: u64) {
         if let Some(ChatElement::Thinking {
             seconds: s,
-            expanded: true,
+            expanded,
             ..
         }) = self.elements.last_mut()
+            && *expanded
         {
-            if *s != seconds {
-                *s = seconds;
-            }
+            *s = seconds;
+            *expanded = false;
             self.touch_last();
         } else {
             let id = self.next_thinking_id;
@@ -612,6 +613,42 @@ impl ChatStream {
         {
             *expanded = false;
             self.touch_last();
+        }
+    }
+
+    /// Mark every call still marked running as interrupted — the run ended
+    /// without reporting their completion, so holding their bodies open
+    /// would be wrong. They collapse once the recent window lapses.
+    pub fn finish_running_calls(&mut self) {
+        let now = Instant::now();
+        for index in 0..self.elements.len() {
+            let Some(ChatElement::ToolCall { display, .. }) = self.elements.get_mut(index) else {
+                continue;
+            };
+            if !matches!(display.status(), ToolStatus::Running) {
+                continue;
+            }
+            match display {
+                ToolDisplay::Terminal {
+                    status,
+                    finished_at,
+                    ..
+                }
+                | ToolDisplay::Action {
+                    status,
+                    finished_at,
+                    ..
+                }
+                | ToolDisplay::Builtin {
+                    status,
+                    finished_at,
+                    ..
+                } => {
+                    *status = ToolStatus::Failed("interrupted".to_string());
+                    *finished_at = Some(now);
+                }
+            }
+            self.touch(index);
         }
     }
 
@@ -3847,16 +3884,40 @@ mod tests {
     }
 
     #[test]
-    fn finish_thinking_stamps_the_open_block() {
+    fn finish_thinking_collapses_the_phase() {
         let mut chat = ChatStream::new();
         chat.push_thinking("chunk");
         chat.finish_thinking(6);
+        // The phase ended: the block collapses to its header at once, it does
+        // not wait for the next element to arrive.
         let lines = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
-        assert!(lines[0].contains("Thinking... (6 sec)"));
+        assert!(lines[0].contains("Thought for 6 sec ▸"));
 
         chat.collapse_thinking();
         let collapsed = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
         assert!(collapsed[0].contains("Thought for 6 sec ▸"));
+    }
+
+    #[test]
+    fn finish_running_calls_marks_orphans_interrupted() {
+        let mut chat = ChatStream::new();
+        chat.push_tool(
+            "call-1".to_string(),
+            ToolDisplay::Builtin {
+                tool: "search".to_string(),
+                detail: String::new(),
+                status: ToolStatus::Running,
+                output: None,
+                pinned: None,
+                finished_at: None,
+            },
+        );
+        chat.finish_running_calls();
+        let Some(ChatElement::ToolCall { display, .. }) = chat.elements.last() else {
+            panic!("the call stays in the stream");
+        };
+        assert!(matches!(display.status(), ToolStatus::Failed(_)));
+        assert!(display.finished_at().is_some());
     }
 
     /// A tasks.md document parsed into a checklist feeds the todo block —

@@ -15,7 +15,7 @@ use aither_core::llm::{Message as LlmMessage, Role as LlmRole};
 use super::error::{bad_request_error, internal_error, internal_error_message};
 use super::message_mapping::map_db_messages;
 use super::model_resolution::{
-    persist_last_model, preferred_advanced_model, resolve_default_model,
+    persist_last_effort, persist_last_model, preferred_advanced_model, resolve_default_model,
 };
 use super::state::DaemonState;
 use super::types::{
@@ -495,6 +495,11 @@ pub(super) async fn update_session(
 
     if let Some(model) = model_to_persist {
         persist_last_model(&state, &model)
+            .await
+            .map_err(internal_error)?;
+    }
+    if let Some(NullableStringPatch::Set(effort)) = requested_effort_patch.as_ref() {
+        persist_last_effort(&state, effort)
             .await
             .map_err(internal_error)?;
     }
