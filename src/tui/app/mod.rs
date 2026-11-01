@@ -179,6 +179,8 @@ pub struct App {
     pub tier_picker_loading: bool,
     /// Receiver for fetched models (oneshot)
     pub model_fetch_rx: Option<Receiver<Vec<FetchedModel>>>,
+    /// Receiver for provider catalogs merged into the model-select popup
+    pub model_select_rx: Option<Receiver<Vec<FetchedModel>>>,
     /// Per-session file-diff worker (rebuilt on session switch)
     pub file_diffs: Option<FileDiffHandle>,
     /// Per-root session file changes shown in the sidebar's Changes
@@ -511,6 +513,7 @@ impl App {
             tier_picker_query: String::new(),
             tier_picker_loading: false,
             model_fetch_rx: None,
+            model_select_rx: None,
             file_diffs: None,
             file_status: Vec::new(),
             clipboard_rx: None,
@@ -2724,6 +2727,7 @@ impl App {
             }
             "/model" => {
                 self.model_select_list = self.collect_all_models();
+                self.model_select_rx = self.fetch_provider_models();
                 self.model_select_index = 0;
                 let fallback_model = self.config.last_model.as_ref().map(ToString::to_string);
                 let current = self.current_model.as_deref().or(fallback_model.as_deref());
