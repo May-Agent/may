@@ -24,7 +24,7 @@ const NESTED_LIST_CAP: usize = 64;
 const HANDOFF_DOC_CAP: usize = 8;
 
 /// An `AGENTS.md` loaded because a compaction handoff linked to it.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HandoffAgentDoc {
     /// Resolved path shown in the block.
     pub path: String,
@@ -279,7 +279,7 @@ mod tests {
         let index = discover(dir.path()).await;
 
         assert!(index.root_document.is_none());
-        assert!(index.nested.is_empty());
+        assert_eq!(index.nested, [] as [String; 0]);
         assert_eq!(index.extra_nested, 0);
     }
 
@@ -294,7 +294,7 @@ mod tests {
                 ".github/AGENTS.md".to_string(),
             ]
         );
-        assert!(referenced_agents_paths("no links here").is_empty());
+        assert_eq!(referenced_agents_paths("no links here"), [] as [String; 0]);
     }
 
     #[tokio::test]
@@ -315,6 +315,9 @@ mod tests {
         assert!(docs[0].path.ends_with("crates/foo/AGENTS.md"));
 
         // Relative links need a base; without one they are skipped.
-        assert!(load_referenced("[x](sub/AGENTS.md)", None).await.is_empty());
+        assert_eq!(
+            load_referenced("[x](sub/AGENTS.md)", None).await,
+            [] as [HandoffAgentDoc; 0]
+        );
     }
 }
