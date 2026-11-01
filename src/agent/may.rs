@@ -23,11 +23,10 @@ use super::imagine::{ImageGeneratorConfig, resolve_image_generator_config};
 use super::permission::PermissionApprover;
 use super::provider::{RequestParameterizedModel, resolve_provider_runtime};
 use super::runtime_context::{
-    RuntimeSystemContext, build_base_system_prompt, build_browser_context,
-    build_container_environment_context, build_location_context,
+    RuntimeSystemContext, build_base_system_prompt, build_browser_context, build_location_context,
     build_macos_host_automation_context, build_memory_context_content, build_native_voice_context,
     build_network_restrictions_context, build_plan_mode_context, build_terminal_runtime_context,
-    build_workspace_context, build_workspace_workdirs_context, tag,
+    build_workspace_workdirs_context, tag,
 };
 use super::tool_environment_cache::{
     Acquired, HomeBackend, ToolEnvironmentCache, ToolEnvironmentCacheError, ToolEnvironmentKey,
@@ -430,6 +429,7 @@ impl MayAgent {
             &session_paths,
             aither_models::lookup(config.model_id.as_str()),
             config.ssh_servers.clone(),
+            (!is_container).then(|| crate::fs_utils::display_path(&config.cwd)),
         );
         runtime_system_context =
             runtime_system_context.with_terminal_runtime(terminal_runtime.clone());
@@ -549,11 +549,9 @@ impl MayAgent {
             builder = Box::pin(builder.with_subagents(&subagents_dir)).await?;
         }
         // The builder's descriptions cover every shared command registered
-        // above; the native tool surface comes from the same builder.
-        let native_tool_definitions = builder.native_tool_definitions();
+        // above.
         let base_system_prompt = build_base_system_prompt(
             builder.tool_descriptions(),
-            &native_tool_definitions,
             &config.request_parameters,
             &skills_dir,
             &subagents_dir,
@@ -576,13 +574,8 @@ impl MayAgent {
             .system_text(tag::TERMINAL_RUNTIME_CONTEXT, terminal_runtime)
             .max_iterations(effective_max_iterations);
 
-        let (builder, runtime_system_context) = apply_runtime_context(
-            builder,
-            runtime_system_context,
-            &config,
-            &session_paths,
-            &workspace,
-        );
+        let (builder, runtime_system_context) =
+            apply_runtime_context(builder, runtime_system_context, &config, &workspace);
 
         // Get the actual working directory before building
         let actual_sandbox_dir = PathBuf::from(builder.sandbox_dir().as_ref());
@@ -1141,7 +1134,6 @@ fn apply_runtime_context(
     mut builder: MayBuilder,
     mut runtime_system_context: RuntimeSystemContext,
     config: &MayAgentConfig,
-    session_paths: &SessionPaths,
     workspace: &MayWorkspace,
 ) -> (MayBuilder, RuntimeSystemContext) {
     if let Some(voice_hint) = build_native_voice_context(config.native_voice_input) {
@@ -1207,10 +1199,6 @@ fn apply_runtime_context(
                 container_exec.clone(),
                 cdp_endpoint.clone(),
             );
-            let container_context = build_container_environment_context(session_paths.root());
-            runtime_system_context =
-                runtime_system_context.with_container_environment(container_context.clone());
-            builder = builder.system_text(tag::CONTAINER_ENVIRONMENT_CONTEXT, container_context);
             builder = builder.container_runtime(
                 ContainerShellRuntime::new(container_id, container_ipc_route, container_exec)
                     .with_workspace_mount(crate::container::lifecycle::workspace_mount(
@@ -1220,10 +1208,6 @@ fn apply_runtime_context(
             browser_cdp_endpoint = cdp_endpoint;
         }
         AgentEnvironment::Local => {
-            let workspace_context = build_workspace_context(workspace);
-            runtime_system_context =
-                runtime_system_context.with_workspace(workspace_context.clone());
-            builder = builder.system_text(tag::WORKSPACE, workspace_context);
             if let Some(workdirs_context) = build_workspace_workdirs_context(workspace) {
                 runtime_system_context =
                     runtime_system_context.with_workspace_workdirs(workdirs_context.clone());
