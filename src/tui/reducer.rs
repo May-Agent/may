@@ -17,7 +17,12 @@ use super::state::{AppMode, StatusNotice};
 /// handler fails — e.g. a database write for a UI action errors.
 pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendAction>> {
     match event {
-        AppEvent::Key(code, modifiers) => app.handle_key(code, modifiers),
+        AppEvent::Key(code, modifiers) => {
+            // Any key press dismisses the current notice; the key still
+            // dispatches normally.
+            app.status = None;
+            app.handle_key(code, modifiers)
+        }
         AppEvent::Tick => {
             // Sweep a transient status notice whose deadline passed; the tick
             // cadence bounds how long an expired notice can linger.
