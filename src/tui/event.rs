@@ -8,6 +8,7 @@ use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseEvent};
 use executor_core::spawn;
 
 use crate::profile::{ProfileInfo, ProfileSessions};
+use crate::session::import::ForeignSessionSummary;
 use crate::{SessionSummary, SkillInfo};
 
 use super::error::TuiError;
@@ -31,6 +32,8 @@ pub enum AppEvent {
     // ─── Async operation results ───────────────────────────────────────
     /// Session list loaded from background task
     SessionsLoaded(Result<Vec<SessionSummary>, TuiError>),
+    /// Claude Code transcripts listed for the `/resume-claude` picker
+    ResumeSessionsLoaded(Vec<ForeignSessionSummary>),
     /// Session deleted from background task (includes refreshed list)
     SessionDeleted {
         /// The session removed from the database, when deletion got that far.
@@ -83,6 +86,13 @@ pub enum AppEvent {
         /// Session title as stored (the daemon generates it).
         title: Option<String>,
     },
+    /// The session's PRs, as the daemon served them.
+    SidebarPrs {
+        /// Session the PRs belong to.
+        session_id: String,
+        /// PR list entries.
+        prs: Vec<crate::client::WirePr>,
+    },
     /// Lookups of issues the session's tasks link.
     SidebarIssues {
         /// Session the tasks belong to.
@@ -104,6 +114,8 @@ pub enum AppEvent {
     /// The session's blocking state, as the daemon reported it on the
     /// `session_runtime` stream.
     SessionRuntime(crate::client::SessionRuntimeEvent),
+    /// The session's worktree index coverage, from the `session_index` stream.
+    IndexCoverage(Option<crate::client::IndexCoverage>),
     /// A turn started in the daemon (this client's or another's), carrying
     /// the stored user-message row id — the prompt-mark key file rewind
     /// checkpoints hang on.
@@ -162,6 +174,7 @@ impl AppEvent {
             Self::Paste(_) => "paste",
             Self::Mouse(_) => "mouse",
             Self::SessionsLoaded(_) => "sessions_loaded",
+            Self::ResumeSessionsLoaded(_) => "resume_sessions_loaded",
             Self::SessionDeleted { .. } => "session_deleted",
             Self::SkillsLoaded(_) => "skills_loaded",
             Self::SkillInstalled(_) => "skill_installed",
@@ -173,10 +186,12 @@ impl AppEvent {
             Self::EffortApplied(_) => "effort_applied",
             Self::ImageDecoded { .. } => "image_decoded",
             Self::SidebarTasks { .. } => "sidebar_tasks",
+            Self::SidebarPrs { .. } => "sidebar_prs",
             Self::SidebarIssues { .. } => "sidebar_issues",
             Self::BackgroundLoaded { .. } => "background_loaded",
             Self::Status(_) => "status",
             Self::SessionRuntime(_) => "session_runtime",
+            Self::IndexCoverage(_) => "index_coverage",
             Self::TurnStarted { .. } => "turn_started",
             Self::HistoryStale => "history_stale",
             Self::JobKilled { .. } => "job_killed",
@@ -270,6 +285,22 @@ impl EventHandler {
         self.rx.recv().await.ok()
     }
 
+    /// A queued key, paste, mouse, or resize, skipping coalesced ticks.
+    ///
+    /// The main loop takes this before waiting on a ready agent event so a
+    /// thinking stream cannot starve typing and Esc. Ticks are heartbeats;
+    /// dropping a backlog of them is correct.
+    #[must_use]
+    pub fn try_recv_input(&self) -> Option<AppEvent> {
+        loop {
+            match self.rx.try_recv() {
+                Ok(AppEvent::Tick) => {}
+                Ok(event) => return Some(event),
+                Err(_) => return None,
+            }
+        }
+    }
+
     /// Events queued behind the receiver — a growing backlog during a
     /// scroll burst means the loop cannot keep up with input.
     #[must_use]
@@ -281,5 +312,51 @@ impl EventHandler {
 impl Default for EventHandler {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pair() -> (EventHandler, EventSender) {
+        let (tx, rx) = async_channel::unbounded();
+        (EventHandler { rx, tx: tx.clone() }, tx)
+    }
+
+    #[test]
+    fn try_recv_input_skips_ticks_and_returns_a_key() {
+        let (handler, tx) = pair();
+        tx.send_blocking(AppEvent::Tick).unwrap();
+        tx.send_blocking(AppEvent::Tick).unwrap();
+        tx.send_blocking(AppEvent::Key(KeyCode::Char('a'), KeyModifiers::NONE))
+            .unwrap();
+        let event = handler.try_recv_input().expect("key");
+        assert!(matches!(event, AppEvent::Key(KeyCode::Char('a'), _)));
+        assert!(handler.try_recv_input().is_none());
+    }
+
+    #[test]
+    fn try_recv_input_is_none_when_only_ticks_are_queued() {
+        let (handler, tx) = pair();
+        tx.send_blocking(AppEvent::Tick).unwrap();
+        tx.send_blocking(AppEvent::Tick).unwrap();
+        assert!(handler.try_recv_input().is_none());
+    }
+
+    #[test]
+    fn try_recv_input_returns_paste_ahead_of_later_keys() {
+        let (handler, tx) = pair();
+        tx.send_blocking(AppEvent::Paste("hi".into())).unwrap();
+        tx.send_blocking(AppEvent::Key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert!(matches!(
+            handler.try_recv_input(),
+            Some(AppEvent::Paste(text)) if text == "hi"
+        ));
+        assert!(matches!(
+            handler.try_recv_input(),
+            Some(AppEvent::Key(KeyCode::Esc, _))
+        ));
     }
 }

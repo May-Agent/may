@@ -165,32 +165,6 @@ pub(super) async fn handle_register_skills_request(
     .await
 }
 
-pub(super) async fn handle_register_subagents_request(
-    state: &Arc<DaemonState>,
-    request: crate::agent::register_tool::RegisterRequest,
-) -> Result<crate::agent::register_tool::RegisterResult, String> {
-    handle_register_request(
-        state,
-        request,
-        "subagent definitions",
-        "subagents",
-        |subagents_dir, source| async move {
-            let manager = crate::subagent::SubagentManager::from_subagents_dir(subagents_dir);
-            let infos = manager
-                .register_from_local_path(&source)
-                .await
-                .map_err(|error| {
-                    format!(
-                        "failed to register subagents from {}: {error}",
-                        source.display()
-                    )
-                })?;
-            Ok(infos.into_iter().map(|item| item.file_name).collect())
-        },
-    )
-    .await
-}
-
 async fn handle_register_request<F, Fut>(
     state: &Arc<DaemonState>,
     request: crate::agent::register_tool::RegisterRequest,

@@ -9,7 +9,10 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
+use jiff::Timestamp;
+
 use super::super::super::app::App;
+use crate::tui::state::ResumePickerState;
 
 /// Render session selection popup with profile sections.
 pub(super) fn render_session_popup(frame: &mut Frame, area: Rect, app: &App) {
@@ -565,4 +568,178 @@ pub(super) fn render_file_picker_popup(frame: &mut Frame, area: Rect, app: &App)
     );
 
     frame.render_widget(list, chunks[1]);
+}
+
+/// Render the `/resume-claude` session picker.
+pub(super) fn render_resume_picker(frame: &mut Frame, area: Rect, state: &ResumePickerState) {
+    frame.render_widget(Clear, area);
+
+    let filtered = state.filtered();
+    let title = if state.loading {
+        "Claude sessions".to_string()
+    } else if state.search.is_empty() {
+        format!("Claude sessions ({})", state.sessions.len())
+    } else {
+        format!(
+            "Claude sessions ({}/{})",
+            filtered.len(),
+            state.sessions.len()
+        )
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(title)
+        .title_alignment(ratatui::layout::Alignment::Left);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(2),
+        ])
+        .split(inner);
+
+    let search_line = if state.search.is_empty() {
+        Line::from(Span::styled(
+            "Type to search...",
+            Style::default().fg(Color::DarkGray),
+        ))
+    } else {
+        Line::from(vec![
+            Span::styled("Search: ", Style::default().fg(Color::Cyan)),
+            Span::styled(&state.search, Style::default().fg(Color::Yellow)),
+        ])
+    };
+    frame.render_widget(Paragraph::new(vec![search_line, Line::from("")]), chunks[0]);
+    let caret_col = if state.search.is_empty() {
+        0
+    } else {
+        8 + UnicodeWidthStr::width(state.search.as_str())
+    };
+    let caret_x = chunks[0].x + u16::try_from(caret_col).unwrap_or(u16::MAX);
+    frame.set_cursor_position((
+        caret_x.min(chunks[0].right().saturating_sub(1)),
+        chunks[0].y,
+    ));
+
+    let mut lines = Vec::new();
+    if state.loading {
+        lines.push(Line::from(Span::styled(
+            "Loading Claude sessions...",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else if filtered.is_empty() {
+        let message = if state.sessions.is_empty() {
+            "No Claude Code sessions found."
+        } else {
+            "No matching sessions."
+        };
+        lines.push(Line::from(Span::styled(
+            message,
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        let list_height = chunks[1].height as usize;
+        let visible = (list_height / 2).max(1);
+        let scroll = state.selected.saturating_sub(visible.saturating_sub(1));
+        if scroll > 0 {
+            lines.push(Line::from(Span::styled(
+                format!("  {scroll} more above"),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        for (display_idx, &index) in filtered.iter().enumerate().skip(scroll).take(visible) {
+            let Some(session) = state.sessions.get(index) else {
+                continue;
+            };
+            let selected = display_idx == state.selected;
+            let prefix = if selected { "> " } else { "  " };
+            let name_style = if selected {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(ratatui::style::Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let meta_style = Style::default().fg(Color::DarkGray);
+            let cwd = session.cwd.as_deref().map(display_cwd).unwrap_or_default();
+            let id_short: String = session.id.chars().take(8).collect();
+            let age = session.modified.map(relative_age).unwrap_or_default();
+            lines.push(Line::from(vec![
+                Span::styled(
+                    prefix,
+                    if selected {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default()
+                    },
+                ),
+                Span::styled(&session.title, name_style),
+            ]));
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(cwd, meta_style),
+                Span::styled("  ", meta_style),
+                Span::styled(id_short, meta_style),
+                Span::styled("  ", meta_style),
+                Span::styled(age, meta_style),
+            ]));
+        }
+        let shown_end = scroll + visible;
+        if shown_end < filtered.len() {
+            lines.push(Line::from(Span::styled(
+                format!("  {} more below", filtered.len() - shown_end),
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), chunks[1]);
+
+    let footer = Line::from(vec![
+        Span::styled("[↑↓] ", Style::default().fg(Color::Cyan)),
+        Span::styled("Navigate", Style::default().fg(Color::White)),
+        Span::raw("  "),
+        Span::styled("[Enter] ", Style::default().fg(Color::Cyan)),
+        Span::styled("Import", Style::default().fg(Color::White)),
+        Span::raw("  "),
+        Span::styled("[Esc] ", Style::default().fg(Color::Cyan)),
+        Span::styled("Close", Style::default().fg(Color::White)),
+    ]);
+    frame.render_widget(Paragraph::new(vec![Line::from(""), footer]), chunks[2]);
+}
+
+fn display_cwd(cwd: &str) -> String {
+    if let Some(home) = dirs::home_dir() {
+        let home = home.to_string_lossy();
+        if let Some(rest) = cwd.strip_prefix(home.as_ref()) {
+            return format!("~{rest}");
+        }
+    }
+    cwd.to_string()
+}
+
+fn relative_age(ts: Timestamp) -> String {
+    let Ok(span) = Timestamp::now().since(ts) else {
+        return ts.strftime("%Y-%m-%d").to_string();
+    };
+    let Ok(secs) = span.total(jiff::Unit::Second) else {
+        return ts.strftime("%Y-%m-%d").to_string();
+    };
+    if !(0.0..2_592_000.0).contains(&secs) {
+        return ts.strftime("%Y-%m-%d").to_string();
+    }
+    if secs < 60.0 {
+        format!("{}s", secs.round())
+    } else if secs < 3600.0 {
+        format!("{}m", (secs / 60.0).round())
+    } else if secs < 86_400.0 {
+        format!("{}h", (secs / 3600.0).round())
+    } else {
+        format!("{}d", (secs / 86_400.0).round())
+    }
 }

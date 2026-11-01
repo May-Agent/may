@@ -54,6 +54,46 @@ pub struct ProjectConfig {
     /// Issue backend for this project; absent means local may issues.
     #[serde(default)]
     pub issues: ProjectIssues,
+    /// Local check command run inside the session clone before a `pr`
+    /// merge, e.g. `checks = "cargo test"`.
+    #[serde(default)]
+    pub checks: Option<String>,
+    /// PR backend and landing policy for this project.
+    #[serde(default)]
+    pub pr: ProjectPr,
+}
+
+impl ProjectConfig {
+    /// The GitHub repository this project is bound to, when its issue
+    /// backend names one.
+    #[must_use]
+    pub const fn github_repository(&self) -> Option<&GitHubRepository> {
+        match &self.issues {
+            ProjectIssues::Github { repository } => Some(repository),
+            ProjectIssues::May => None,
+        }
+    }
+}
+
+/// `pr` settings for a project.
+///
+/// `backend` overrides detection (`"may"` or `"github"`); `screen` runs
+/// every published text through the outbound screen before it reaches
+/// GitHub — the "PRs only" trust mode's guard.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProjectPr {
+    /// `"may"` or `"github"`; absent detects GitHub remotes automatically.
+    #[serde(default)]
+    pub backend: Option<String>,
+    /// Screen published text (PR title/body) before it leaves the machine.
+    #[serde(default)]
+    pub screen: Option<bool>,
+    /// Default `--hold` when false: the PR opens but never merges itself.
+    #[serde(default)]
+    pub auto_merge: Option<bool>,
+    /// Merge waits for an explicit user approval (#322 wires the UI).
+    #[serde(default)]
+    pub require_review: Option<bool>,
 }
 
 /// Issue backend selected for a project.
@@ -279,5 +319,64 @@ impl Workspace {
             }
         }
         dirs
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_launch_directory_is_readable_but_not_writable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let workspace = Workspace::new(
+            dir.path().join("sandbox"),
+            dir.path().join("launch"),
+            dir.path().join("workspace.toml"),
+        )
+        .expect("workspace");
+
+        assert!(
+            workspace
+                .readable_dirs()
+                .iter()
+                .any(|dir| dir.as_path() == workspace.cwd.as_path()),
+            "the directory the session was launched from must be readable"
+        );
+        assert!(
+            !workspace
+                .writable_dirs()
+                .iter()
+                .any(|dir| dir.as_path() == workspace.cwd.as_path()),
+            "the launch directory stays read-only by default"
+        );
+    }
+
+    #[test]
+    fn approved_workdirs_are_readable_and_writable_per_permission() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join("work")).expect("workdir");
+        let mut config = WorkspaceConfig::default();
+        config.add_workdir(dir.path().join("work"), None);
+        let workspace = Workspace {
+            sandbox: dir.path().join("sandbox"),
+            cwd: dir.path().join("launch"),
+            config,
+            config_path: dir.path().join("workspace.toml"),
+        };
+
+        let work = dir.path().join("work").canonicalize().expect("canonical");
+        assert!(
+            workspace
+                .readable_dirs()
+                .iter()
+                .any(|dir| dir.as_path() == work.as_path())
+        );
+        assert!(
+            workspace
+                .writable_dirs()
+                .iter()
+                .any(|dir| dir.as_path() == work.as_path())
+        );
     }
 }

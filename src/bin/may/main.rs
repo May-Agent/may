@@ -192,11 +192,14 @@ async fn async_main() -> anyhow::Result<()> {
 
     if !matches!(cli_mode, CliMode::Help(_)) {
         may_agent::startup::validate_configuration().await?;
-        may_agent::configure_heel_binary().await;
     }
 
     let resume = match &cli_mode {
         CliMode::Resume(args) => Some(args.clone()),
+        _ => None,
+    };
+    let tui_repo = match &cli_mode {
+        CliMode::Tui(args) => args.repo.clone(),
         _ => None,
     };
     match cli_mode {
@@ -221,7 +224,7 @@ async fn async_main() -> anyhow::Result<()> {
         CliMode::Browser(args) => std::process::exit(run_browser(args).await?),
         CliMode::Exec(args) => std::process::exit(Box::pin(run_exec(args)).await?),
         CliMode::OneShot(args) => return run_oneshot(args).await,
-        CliMode::Tui | CliMode::Resume(_) => {}
+        CliMode::Tui(_) | CliMode::Resume(_) => {}
     }
 
     // Set up panic hook to restore terminal state before panicking
@@ -262,7 +265,7 @@ async fn async_main() -> anyhow::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Create app and run
-    let result = run_app(&mut terminal, image_support, log_ring, resume).await;
+    let result = run_app(&mut terminal, image_support, log_ring, resume, tui_repo).await;
 
     // Cleanup terminal
     disable_raw_mode()?;
@@ -308,12 +311,14 @@ async fn run_app<B: Backend>(
     image_support: Option<may_agent::tui::ui::image::TerminalImageSupport>,
     log_ring: may_agent::log_ring::LogRingHandle,
     resume: Option<cli::ResumeArgs>,
+    tui_repo: Option<String>,
 ) -> anyhow::Result<Option<ExitSummary>>
 where
     B::Error: Send + Sync + 'static,
 {
     let mut events = EventHandler::new();
     let mut app = App::new(events.sender(), image_support).await?;
+    app.session_manager.set_pending_repo(tui_repo);
     let mut worker: Option<AgentWorker> = None;
 
     tracing::info!("=== MAY STARTUP - channels created ===");
@@ -817,54 +822,62 @@ where
 
         tracing::info!("entering select");
 
-        // Use futures_lite::future::or chain
-        let event = futures_lite::future::or(
-            async {
-                match worker_build.as_mut() {
-                    Some(pending) => Some(Event::WorkerBuilt(Box::new(pending.build.wait().await))),
-                    None => futures_lite::future::pending().await,
-                }
-            },
+        // A queued key/paste/mouse/resize beats a ready agent event: a
+        // thinking stream keeps `handle.recv()` ready, and `future::or`
+        // would otherwise never take the Terminal branch.
+        let event = if let Some(ev) = events.try_recv_input() {
+            Some(Event::Terminal(Box::new(ev)))
+        } else {
             futures_lite::future::or(
                 async {
-                    if let Some(ref handle) = agent_handle {
-                        let result = handle.recv().await;
-                        tracing::info!("agent handle.recv() RETURNED");
-                        result.map(Event::Agent)
-                    } else if let Some(worker) = worker.as_ref() {
-                        // A turn another client started, rendered
-                        // while this TUI has none of its own.
-                        worker.next_foreign_turn().await.map(Event::ForeignTurn)
-                    } else {
-                        futures_lite::future::pending().await
+                    match worker_build.as_mut() {
+                        Some(pending) => {
+                            Some(Event::WorkerBuilt(Box::new(pending.build.wait().await)))
+                        }
+                        None => futures_lite::future::pending().await,
                     }
                 },
                 futures_lite::future::or(
                     async {
-                        if let Some(ref handle) = context_handle {
-                            // None means the report channel closed —
-                            // surface it as an event so the handle is
-                            // cleared instead of quitting the loop.
-                            Some(Event::Context(handle.recv().await))
+                        if let Some(ref handle) = agent_handle {
+                            let result = handle.recv().await;
+                            tracing::info!("agent handle.recv() RETURNED");
+                            result.map(Event::Agent)
+                        } else if let Some(worker) = worker.as_ref() {
+                            // A turn another client started, rendered
+                            // while this TUI has none of its own.
+                            worker.next_foreign_turn().await.map(Event::ForeignTurn)
                         } else {
                             futures_lite::future::pending().await
                         }
                     },
-                    async {
-                        let result = events.next().await;
-                        // Don't log ticks, too noisy
-                        if !matches!(result, Some(AppEvent::Tick)) {
-                            tracing::info!(
-                                "events.next() RETURNED: {:?}",
-                                result.as_ref().map(|_| "event")
-                            );
-                        }
-                        result.map(|event| Event::Terminal(Box::new(event)))
-                    },
+                    futures_lite::future::or(
+                        async {
+                            if let Some(ref handle) = context_handle {
+                                // None means the report channel closed —
+                                // surface it as an event so the handle is
+                                // cleared instead of quitting the loop.
+                                Some(Event::Context(handle.recv().await))
+                            } else {
+                                futures_lite::future::pending().await
+                            }
+                        },
+                        async {
+                            let result = events.next().await;
+                            // Don't log ticks, too noisy
+                            if !matches!(result, Some(AppEvent::Tick)) {
+                                tracing::info!(
+                                    "events.next() RETURNED: {:?}",
+                                    result.as_ref().map(|_| "event")
+                                );
+                            }
+                            result.map(|event| Event::Terminal(Box::new(event)))
+                        },
+                    ),
                 ),
-            ),
-        )
-        .await;
+            )
+            .await
+        };
 
         tracing::info!(
             "select completed, event type: {}",
@@ -1086,6 +1099,7 @@ where
                         if let Some(handle) = agent_handle.take() {
                             handle.cancel();
                         }
+                        app.restore_aborted_draft();
                         app.status = None;
                         // Clean up loading/streaming state before adding interrupt message
                         app.chat.collapse_thinking();

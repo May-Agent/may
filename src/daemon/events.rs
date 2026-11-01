@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use repo_search_client::protocol::{Final, Request};
 use serde::Deserialize;
 use skyzen::Result as SkyResult;
 use skyzen::extract::Query;
@@ -24,6 +25,8 @@ use super::types::{
 };
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+/// How often an attached client's session index coverage is re-polled.
+const INDEX_POLL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Deserialize, Default, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -54,6 +57,7 @@ struct EventSignatures {
     remote_access: String,
     session_background: String,
     session_artifacts: String,
+    session_index: String,
 }
 
 pub(super) async fn stream_events(
@@ -88,6 +92,7 @@ pub(super) async fn stream_events(
     // a distinct event kind, per AGENTS.md.
     let mut lifecycle_rx = state.browser_lifecycle_subscribe();
     let lifecycle_subscribed = subscribed_topics.contains(UiEventTopics::BROWSER_LIFECYCLE);
+    let index_subscribed = subscribed_topics.contains(UiEventTopics::SESSION_INDEX);
     // Live turn frames of the filtered session, replayed from the turn's
     // start for a client attaching mid-turn, or from the frame after the
     // last one it saw for a client reconnecting.
@@ -114,6 +119,8 @@ pub(super) async fn stream_events(
         let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let _ = heartbeat.tick().await;
+        let mut index_tick = tokio::time::interval(INDEX_POLL);
+        index_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         if !emit_topics_if_changed(
             &state_cloned,
@@ -225,6 +232,16 @@ pub(super) async fn stream_events(
                             tracing::warn!(skipped, "browser lifecycle stream lagged; dropping events");
                         }
                         Err(RecvError::Closed) => {}
+                    }
+                }
+                _ = index_tick.tick(), if index_subscribed => {
+                    if !emit_session_index_if_changed(
+                        &state_cloned,
+                        &sender,
+                        session_id.as_deref(),
+                        &mut signatures.session_index,
+                    ).await {
+                        break;
                     }
                 }
                 _ = heartbeat.tick() => {
@@ -444,6 +461,69 @@ async fn emit_session_background_if_changed(
         *last_sig = sig;
     }
     true
+}
+
+/// The filtered session's worktree index coverage, re-polled every
+/// [`INDEX_POLL`] while a `session_index` subscriber is attached.
+async fn emit_session_index_if_changed(
+    state: &Arc<DaemonState>,
+    sender: &skyzen::responder::sse::Sender,
+    session_filter: Option<&str>,
+    last_sig: &mut String,
+) -> bool {
+    let Some(session_id) = session_filter else {
+        return true;
+    };
+    let payload = crate::client::SessionIndexSnapshot {
+        session_id: session_id.to_string(),
+        index: index_coverage(state, session_id).await,
+    };
+    if let Ok(sig) = serde_json::to_string(&payload)
+        && sig != *last_sig
+    {
+        if !send_event(sender, "session_index", &payload).await {
+            return false;
+        }
+        *last_sig = sig;
+    }
+    true
+}
+
+/// The session's worktree index coverage, when the session is in a git
+/// worktree and repo-search answers its status.
+async fn index_coverage(
+    state: &Arc<DaemonState>,
+    session_id: &str,
+) -> Option<crate::client::IndexCoverage> {
+    let session = state.db().get_session(session_id).await.ok()??;
+    let worktree = crate::repo_search::worktree_root(std::path::Path::new(session.cwd?.as_str()))?;
+    let status = async {
+        let client = state
+            .repo_search
+            .client()
+            .await
+            .map_err(|e| e.to_string())?;
+        client
+            .request(Request::Status { worktree })
+            .await
+            .map_err(|e| e.to_string())?
+            .finish()
+            .await
+            .map_err(|e| e.to_string())
+    }
+    .await;
+    match status {
+        Ok(Final::Status(report)) => report.index.map(|index| crate::client::IndexCoverage {
+            phase: index.phase,
+            with_vector: index.chunks_with_vector,
+            total: index.chunks_total,
+        }),
+        Ok(_) => None,
+        Err(error) => {
+            tracing::debug!(session_id, %error, "index coverage poll failed");
+            None
+        }
+    }
 }
 
 async fn emit_config_if_changed(

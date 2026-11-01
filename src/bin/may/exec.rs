@@ -50,6 +50,8 @@ pub enum ExecError {
     CurrentDir(std::io::Error),
     #[error("failed to resolve the session issue backend: {0}")]
     ResolveIssueBackend(may_agent::issue::IssueError),
+    #[error("failed to load workspace config: {0}")]
+    WorkspaceConfig(may_agent::workspace::WorkspaceConfigError),
     #[error("failed to resolve provider runtime: {0}")]
     ResolveProviderRuntime(may_agent::agent::MayAgentError),
     #[error("failed to load May config: {0}")]
@@ -112,6 +114,8 @@ impl aither_sandbox::SshSessionAuthorizer for ExecSshAuthorizer {
 }
 
 pub async fn run_exec(args: ExecArgs) -> Result<i32, ExecError> {
+    // `exec` runs a sandbox in-process; the daemon configures its own heel.
+    may_agent::configure_heel_binary().await;
     let context = load_exec_session_context(&args.session_id).await?;
     let config_path = context.may_dir.join("config.toml");
     let may_config = MayConfig::load_from(&config_path)
@@ -524,7 +528,6 @@ where
             tunnel_broker: Some(tool_dispatchers.tunnel.clone()),
             browser_broker: tool_dispatchers.browser.clone(),
             register_skills_broker: None,
-            register_subagents_broker: None,
             workspace_request_broker: None,
             subagent_runs: aither_agent::specialized::SubagentRuns::default(),
             // exec runs scripts without a model turn, so no provider-hosted
@@ -533,6 +536,10 @@ where
             // exec has no UI reader; the tracker still records harmlessly.
             subagent_tracker: may_agent::agent::SubagentTracker::default(),
             issue_store,
+            workspace_config: may_agent::workspace::WorkspaceConfig::load(
+                &session_paths.workspace_config(),
+            )
+            .map_err(ExecError::WorkspaceConfig)?,
             // exec is no main agent: it has no turn boundary to deliver at.
             agent_messaging: None,
         },

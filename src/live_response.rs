@@ -51,4 +51,9 @@ impl<Response> LiveResponseRegistry<Response> {
         self.take(request_id)
             .is_some_and(|tx| tx.try_send(response).is_ok())
     }
+
+    #[cfg(test)]
+    pub(crate) fn pending_ids(&self) -> Vec<String> {
+        self.senders.load().keys().cloned().collect()
+    }
 }

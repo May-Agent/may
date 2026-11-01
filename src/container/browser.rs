@@ -1127,6 +1127,7 @@ impl BrowserRuntime {
     ) -> Result<(), BrowserError> {
         let (mut browser, mut handler, backing) = match config.backend {
             BrowserBackendKind::Managed => {
+                prepare_browser_runtime(config, may_dir).await?;
                 let paths =
                     ManagedBrowserPaths::discover(may_dir).ok_or(BrowserError::NotProvisioned)?;
                 match inspect_managed_browser_listener_state(config.port, &paths).await? {

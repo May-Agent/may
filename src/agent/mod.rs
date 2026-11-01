@@ -21,8 +21,10 @@ pub(crate) mod notify_tool;
 #[cfg(test)]
 mod open_questions_tests;
 mod permission;
+pub(crate) mod pr_tool;
 mod provider;
 pub(crate) mod register_tool;
+pub(crate) mod repo_tool;
 pub mod runner;
 mod runtime_context;
 /// Session tool registration for the agent.
@@ -39,6 +41,7 @@ pub use browser_tool::{
     BrowserArgs, BrowserBroker, BrowserRequest, BrowserResult, channel as browser_channel,
 };
 pub use context_dump::ContextDump;
+pub(crate) use context_report::autocompact_window_tokens;
 pub use context_report::{ContextCategory, ContextCategoryRow, ContextReport};
 pub use environment::{ResolveAgentEnvironmentError, resolve_agent_environment_for_session};
 pub use imagine::ImageGeneratorConfig;

@@ -17,7 +17,6 @@
 //! screen.
 
 use std::sync::OnceLock;
-use std::time::Instant;
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -106,7 +105,7 @@ impl Entry {
         images_supported: bool,
         tunnel_base: &str,
     ) -> Self {
-        let laid = element_lines(elem, state, images_supported, tunnel_base);
+        let laid = element_lines(elem, state, images_supported, tunnel_base, width);
         let mut line_starts = Vec::with_capacity(laid.lines.len());
         let mut rows = 0usize;
         for line in &laid.lines {
@@ -171,6 +170,9 @@ pub struct ChatLayout {
     element_rows: usize,
     /// Plain rows of the tail (queue, input, status) drawn last frame.
     tail_plain: Vec<String>,
+    /// Doc-row span of the composer input last frame — click-to-caret
+    /// hit testing. `None` when no input was drawn.
+    input_span: Option<(usize, usize)>,
     /// Blank rows drawn above the content when it underflows the view.
     top_padding: usize,
     /// Elements re-laid-out by the last [`ChatLayout::sync`].
@@ -189,7 +191,6 @@ impl ChatLayout {
         hide_todos: bool,
         selected_tool: Option<&str>,
         spinner_frame: usize,
-        now: Instant,
     ) {
         if width != self.width
             || images_supported != self.images_supported
@@ -211,7 +212,7 @@ impl ChatLayout {
         self.rebuilt = 0;
         for (index, elem) in elements.iter().enumerate() {
             let revision = chat.revision(index);
-            let state = ElementState::of(elem, selected_tool, hide_todos, spinner_frame, now);
+            let state = ElementState::of(elem, selected_tool, hide_todos, spinner_frame);
             let end = old.len().min(cursor + REUSE_LOOKAHEAD);
             let found = (cursor..end).find(|&i| {
                 old[i]
@@ -341,6 +342,18 @@ impl ChatLayout {
     #[must_use]
     pub const fn top_padding(&self) -> usize {
         self.top_padding
+    }
+
+    /// Record the composer input's doc-row span for click-to-caret hit
+    /// testing; `None` when the frame drew no input.
+    pub const fn set_input_span(&mut self, span: Option<(usize, usize)>) {
+        self.input_span = span;
+    }
+
+    /// The composer input's doc-row span `(start, rows)` last frame.
+    #[must_use]
+    pub const fn input_span(&self) -> Option<(usize, usize)> {
+        self.input_span
     }
 
     /// Rows of the plain-text mirror: elements, then the tail.

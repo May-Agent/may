@@ -6,10 +6,14 @@ mod popups;
 mod sidebar;
 
 use self::config::render_config_screen;
-use self::pickers::{render_file_picker_popup, render_profile_select_popup, render_session_popup};
+use self::pickers::{
+    render_file_picker_popup, render_profile_select_popup, render_resume_picker,
+    render_session_popup,
+};
 use self::popups::{render_mcp_popup, render_skill_popup, render_ssh_popup};
 
 use ratatui::{
+    buffer::CellDiffOption,
     prelude::*,
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
@@ -211,6 +215,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                     tokens: app.decode_meter.tokens(),
                 }),
                 spinner_frame: app.spinner_frame,
+                index_coverage: app.index_coverage.as_ref(),
             }),
             images_supported,
             // The sidebar shows the task tree; the inline block would repeat it.
@@ -306,19 +311,20 @@ fn sheet_height(app: &App, column: Rect) -> Option<u16> {
         ),
         AppMode::Help => (rows(HELP_TEXT.lines().count() + 2), pct(70)),
         AppMode::ToolDetail => (full, pct(80)),
-        AppMode::ModelSelect => (rows(app.model_select_list.len() + 2).min(12), pct(60)),
+        AppMode::ModelSelect => (rows(app.filtered_model_select().len() + 6).min(16), pct(60)),
         AppMode::EffortSelect => (rows(4), pct(70)),
         AppMode::McpManage | AppMode::SshManage | AppMode::SkillManage => {
             (pct(60).max(12), pct(70))
         }
         AppMode::ProfileSelect => (rows(app.profiles.len() + 2), pct(60)),
-        AppMode::Rewind(state) => (
-            if state.options_for.is_some() {
-                9
+        AppMode::Rewind(state) => (rows(state.targets.len() * 2 + 4).min(18), pct(60)),
+        AppMode::ResumePicker(state) => (
+            if state.loading {
+                8
             } else {
-                rows(state.targets.len() * 2 + 4).min(18)
+                rows(state.filtered().len() * 2 + 8).max(12)
             },
-            pct(60),
+            pct(70),
         ),
         AppMode::Jobs => (
             rows(crate::tui::reducer::jobs_rows(app).len() * 2 + 3).max(6),
@@ -385,6 +391,7 @@ fn render_sheet(frame: &mut Frame, sheet: Rect, app: &App) {
         AppMode::SkillManage => render_skill_popup(frame, sheet, app),
         AppMode::ProfileSelect => render_profile_select_popup(frame, sheet, app),
         AppMode::Rewind(state) => render_rewind_popup(frame, sheet, state),
+        AppMode::ResumePicker(state) => render_resume_picker(frame, sheet, state),
         AppMode::Jobs => render_jobs_panel(frame, sheet, app),
         AppMode::JobDetail(state) => render_job_detail(frame, sheet, state),
         AppMode::Btw(state) => render_btw_popup(frame, sheet, state),
@@ -398,10 +405,127 @@ fn render_sheet(frame: &mut Frame, sheet: Rect, app: &App) {
     }
 }
 
-/// Render the zoomed image overlay: the image fitted into a large centered
-/// popup with its path/URL caption underneath. Esc or a click outside the
-/// image closes it. It stays an overlay over the whole screen rather than a
-/// sheet: it exists to show the image as large as the terminal allows.
+/// Margin around the zoom overlay so click-outside still has a target and
+/// the dimmed chat shows as a ring.
+const IMAGE_VIEW_MARGIN: u16 = 2;
+/// Left + right border cells.
+const IMAGE_VIEW_H_CHROME: u16 = 2;
+/// Top + bottom border plus the caption row.
+const IMAGE_VIEW_V_CHROME: u16 = 3;
+const IMAGE_VIEW_TITLE: &str = " Image (Esc or click outside to close) ";
+/// Near-black veil painted over `Color::Reset` backgrounds.
+const IMAGE_VIEW_VEIL: Color = Color::Rgb(10, 10, 12);
+
+fn image_view_frame() -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(IMAGE_VIEW_TITLE)
+}
+
+/// Largest rect the image can occupy: the screen minus the overlay margin,
+/// the frame border, and the caption row.
+fn image_view_max_content(area: Rect) -> Rect {
+    let popup = area.inner(Margin {
+        horizontal: IMAGE_VIEW_MARGIN,
+        vertical: IMAGE_VIEW_MARGIN,
+    });
+    let inner = image_view_frame().inner(popup);
+    Rect {
+        x: inner.x,
+        y: inner.y,
+        width: inner.width,
+        height: inner.height.saturating_sub(1),
+    }
+}
+
+/// Frame sized to `image_width`×`image_height`, growing for the title if
+/// needed, clamped to the margin box and centered on `area`.
+fn image_view_popup(area: Rect, image_width: u16, image_height: u16) -> Rect {
+    let max = area.inner(Margin {
+        horizontal: IMAGE_VIEW_MARGIN,
+        vertical: IMAGE_VIEW_MARGIN,
+    });
+    let title_min = u16::try_from(UnicodeWidthStr::width(IMAGE_VIEW_TITLE))
+        .unwrap_or(u16::MAX)
+        .saturating_add(IMAGE_VIEW_H_CHROME);
+    let width = image_width
+        .saturating_add(IMAGE_VIEW_H_CHROME)
+        .max(title_min)
+        .min(max.width);
+    let height = image_height
+        .saturating_add(IMAGE_VIEW_V_CHROME)
+        .min(max.height);
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
+}
+
+/// Slightly darken every cell in `area`. Skip protocol cells — those hold
+/// kitty/sixel payloads the terminal paints itself.
+fn dim_area(buf: &mut Buffer, area: Rect) {
+    let area = area.intersection(buf.area);
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            let cell = &mut buf[(x, y)];
+            if cell.diff_option == CellDiffOption::Skip {
+                continue;
+            }
+            cell.fg = dim_color(cell.fg);
+            cell.bg = dim_bg(cell.bg);
+            cell.modifier.insert(Modifier::DIM);
+        }
+    }
+}
+
+fn dim_bg(color: Color) -> Color {
+    match color {
+        Color::Reset => IMAGE_VIEW_VEIL,
+        other => dim_color(other),
+    }
+}
+
+fn dim_color(color: Color) -> Color {
+    match color {
+        Color::Rgb(r, g, b) => Color::Rgb(dim_channel(r), dim_channel(g), dim_channel(b)),
+        Color::White | Color::Gray => Color::DarkGray,
+        Color::LightRed => Color::Red,
+        Color::LightGreen => Color::Green,
+        Color::LightYellow => Color::Yellow,
+        Color::LightBlue => Color::Blue,
+        Color::LightMagenta => Color::Magenta,
+        Color::LightCyan => Color::Cyan,
+        Color::Indexed(index) => Color::Indexed(dim_indexed(index)),
+        other => other,
+    }
+}
+
+fn dim_channel(value: u8) -> u8 {
+    // 5/8 of the original: a slight wash, not a blackout.
+    u8::try_from(u16::from(value) * 5 / 8).unwrap_or(u8::MAX)
+}
+
+const fn dim_indexed(index: u8) -> u8 {
+    match index {
+        8..=15 => index - 8,
+        16..=231 => {
+            let n = index - 16;
+            let r = n / 36 * 5 / 8;
+            let g = (n % 36) / 6 * 5 / 8;
+            let b = n % 6 * 5 / 8;
+            16 + 36 * r + 6 * g + b
+        }
+        232..=255 => 232 + (index - 232) * 5 / 8,
+        _ => index,
+    }
+}
+
+/// Render the zoomed image overlay: the image fitted into a frame that hugs
+/// it, using nearly the full terminal. The chat behind is slightly dimmed.
+/// Esc or a click outside the image closes it.
 fn render_image_view(frame: &mut Frame, area: Rect, app: &mut App) {
     let AppMode::ImageView(state) = &app.mode else {
         return;
@@ -412,13 +536,27 @@ fn render_image_view(frame: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
-    let popup = centered_rect(80, 75, area);
-    frame.render_widget(Clear, popup);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(" Image (Esc or click outside to close) ");
+    dim_area(frame.buffer_mut(), area);
+
+    let max_content = image_view_max_content(area);
+    let fitted = app
+        .image_cache
+        .get(&key)
+        .expect("checked above")
+        .fitted(max_content);
+    let popup = image_view_popup(area, fitted.width, fitted.height);
+    if popup.width == 0 || popup.height == 0 {
+        app.image_view_area = None;
+        return;
+    }
+
+    let block = image_view_frame();
     let inner = block.inner(popup);
+    if inner.width == 0 || inner.height < 2 {
+        app.image_view_area = None;
+        return;
+    }
+    frame.render_widget(Clear, popup);
     frame.render_widget(block, popup);
 
     let rows = Layout::default()
@@ -691,13 +829,68 @@ fn render_tier_model_picker(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(block, popup_area);
 }
 
-/// Render model select popup (anchored near input area).
+/// Render model select popup (anchored near input area): a search line, the
+/// filtered selector list and a hint footer. A catalog refresh in flight is
+/// named in the title so the list is never mistaken for final.
 fn render_model_select_popup(frame: &mut Frame, area: Rect, app: &App) {
     let popup_area = area;
 
+    let filtered = app.filtered_model_select();
+    let filtered_len = filtered.len();
+    let title = if app.model_select_query.is_empty() {
+        format!("Select Model ({})", app.model_select_list.len())
+    } else {
+        format!(
+            "Select Model ({filtered_len}/{})",
+            app.model_select_list.len()
+        )
+    };
+    let title = if app.model_select_rx.is_some() {
+        format!("{title} — fetching…")
+    } else {
+        title
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(title);
+    let inner_area = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2), // Search input
+            Constraint::Min(1),    // Model list
+            Constraint::Length(2), // Footer hints
+        ])
+        .split(inner_area);
+
+    let search_line = if app.model_select_query.is_empty() {
+        Line::from(Span::styled(
+            "Type to search...",
+            Style::default().fg(Color::DarkGray),
+        ))
+    } else {
+        Line::from(vec![
+            Span::styled("Search: ", Style::default().fg(Color::Cyan)),
+            Span::styled(&app.model_select_query, Style::default().fg(Color::Yellow)),
+        ])
+    };
+    frame.render_widget(Paragraph::new(vec![search_line, Line::from("")]), chunks[0]);
+    let caret_x = chunks[0].x
+        + 8
+        + u16::try_from(UnicodeWidthStr::width(app.model_select_query.as_str()))
+            .unwrap_or(u16::MAX);
+    frame.set_cursor_position((
+        caret_x.min(chunks[0].right().saturating_sub(1)),
+        chunks[0].y,
+    ));
+
     // Keep the highlighted row inside the visible window as the selection
     // moves past either edge of the sheet.
-    let visible_height = popup_area.height.saturating_sub(2) as usize;
+    let visible_height = chunks[1].height as usize;
     let selected = app.model_select_index;
     let scroll_offset = if selected >= visible_height {
         selected - visible_height + 1
@@ -705,25 +898,20 @@ fn render_model_select_popup(frame: &mut Frame, area: Rect, app: &App) {
         0
     };
 
-    let items: Vec<ListItem> = app
-        .model_select_list
+    let fallback_model = app.config.last_model.as_ref().map(ToString::to_string);
+    let current_model = app.current_model.as_deref().or(fallback_model.as_deref());
+    let mut items: Vec<ListItem> = filtered
         .iter()
         .enumerate()
         .skip(scroll_offset)
         .take(visible_height.max(1))
-        .map(|(idx, model)| {
-            let prefix = if idx == selected { "> " } else { "  " };
-            // The stored selector may carry an effort rung the list shows
-            // collapsed into its family (`o4-mini-high` → `o4-mini`).
-            let current = app.current_model.as_deref().is_some_and(|m| {
-                m == model
-                    || crate::models::effort_family_base(crate::model_selector::selector_model_id(
-                        m,
-                    )) == crate::model_selector::selector_model_id(model)
-            });
+        .map(|(display_idx, &(_, model))| {
+            let prefix = if display_idx == selected { "> " } else { "  " };
+            let current =
+                current_model.is_some_and(|m| crate::models::same_selectable_model(m, model));
             let suffix = if current { " (current)" } else { "" };
             let text = format!("{prefix}{model}{suffix}");
-            let style = if idx == selected {
+            let style = if display_idx == selected {
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(ratatui::style::Modifier::BOLD)
@@ -733,14 +921,41 @@ fn render_model_select_popup(frame: &mut Frame, area: Rect, app: &App) {
             ListItem::new(text).style(style)
         })
         .collect();
+    if filtered_len == 0 {
+        items.push(ListItem::new(Span::styled(
+            "  No matching models.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    frame.render_widget(List::new(items), chunks[1]);
 
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title("Select Model"),
-    );
-    frame.render_widget(list, popup_area);
+    let footer_line = if app.model_select_query.is_empty() {
+        Line::from(vec![
+            Span::styled("[jk] ", Style::default().fg(Color::Cyan)),
+            Span::styled("Nav", Style::default().fg(Color::White)),
+            Span::raw("  "),
+            Span::styled("[Type] ", Style::default().fg(Color::Cyan)),
+            Span::styled("Search", Style::default().fg(Color::White)),
+            Span::raw("  "),
+            Span::styled("[Enter] ", Style::default().fg(Color::Cyan)),
+            Span::styled("Select", Style::default().fg(Color::White)),
+            Span::raw("  "),
+            Span::styled("[Esc] ", Style::default().fg(Color::Cyan)),
+            Span::styled("Close", Style::default().fg(Color::White)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("[↑↓] ", Style::default().fg(Color::Cyan)),
+            Span::styled("Navigate", Style::default().fg(Color::White)),
+            Span::raw("  "),
+            Span::styled("[Enter] ", Style::default().fg(Color::Cyan)),
+            Span::styled("Select", Style::default().fg(Color::White)),
+            Span::raw("  "),
+            Span::styled("[Esc] ", Style::default().fg(Color::Cyan)),
+            Span::styled("Clear search", Style::default().fg(Color::White)),
+        ])
+    };
+    frame.render_widget(Paragraph::new(vec![Line::from(""), footer_line]), chunks[2]);
 }
 
 /// Render the effort select popup: a single horizontal ladder, ←/→ steps
@@ -768,16 +983,11 @@ fn render_effort_select_popup(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(paragraph, area);
 }
 
-/// Render the rewind picker. Stage one lists the session's user prompts
-/// with the file changes the turn each started produced, plus a trailing
-/// `(current)` entry; choosing a prompt opens stage two, which picks the
-/// restoration scope (conversation only, or conversation and code).
+/// Render the rewind picker: the session's user prompts with the file
+/// changes the turn each started produced, plus a trailing `(current)`
+/// entry. Rewind is conversation-only — landed code is undone through a
+/// revert PR, never through the picker.
 fn render_rewind_popup(frame: &mut Frame, area: Rect, state: &RewindState) {
-    if let Some(prompt_index) = state.options_for {
-        render_rewind_scope_popup(frame, area, state, prompt_index);
-        return;
-    }
-
     let popup_area = area;
 
     let selected_style = Style::default()
@@ -839,64 +1049,6 @@ fn prompt_preview(content: &str) -> String {
     } else {
         first.to_string()
     }
-}
-
-/// The two restoration scopes the rewind picker offers, with their hint line.
-const REWIND_SCOPE_OPTIONS: &[(&str, &str)] = &[
-    (
-        "Rewind conversation",
-        "messages only; keep the files as they are",
-    ),
-    (
-        "Rewind conversation and code",
-        "also restore tracked files to this prompt's checkpoint",
-    ),
-];
-
-/// Stage two of the rewind picker: how much of the turn to restore.
-fn render_rewind_scope_popup(
-    frame: &mut Frame,
-    area: Rect,
-    state: &RewindState,
-    prompt_index: usize,
-) {
-    let popup_area = area;
-
-    let items: Vec<ListItem> = REWIND_SCOPE_OPTIONS
-        .iter()
-        .enumerate()
-        .map(|(idx, (label, hint))| {
-            let selected = idx == state.option_selected;
-            ListItem::new(vec![
-                Line::from(Span::styled(
-                    format!("{}{}", if selected { "> " } else { "  " }, label),
-                    if selected {
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(Color::White)
-                    },
-                )),
-                Line::from(Span::styled(
-                    format!("    {hint}"),
-                    Style::default().fg(Color::DarkGray),
-                )),
-            ])
-        })
-        .collect();
-
-    let prompt = state
-        .targets
-        .get(prompt_index)
-        .map_or_else(String::new, |t| prompt_preview(&t.content));
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title(format!("{prompt} (Enter restore, Esc back)")),
-    );
-    frame.render_widget(list, popup_area);
 }
 
 /// Jobs panel: bottom-anchored drawer listing running subagents and
@@ -2300,5 +2452,59 @@ mod tests {
                 .iter()
                 .any(|row| row.contains(IMAGE_MARK))
         );
+    }
+
+    #[test]
+    fn image_view_popup_hugs_the_image_and_leaves_a_margin() {
+        let area = Rect::new(0, 0, 100, 40);
+        let popup = super::image_view_popup(area, 90, 30);
+        assert_eq!(popup, Rect::new(4, 3, 92, 33));
+    }
+
+    #[test]
+    fn image_view_popup_grows_to_the_title_on_a_narrow_image() {
+        let area = Rect::new(0, 0, 80, 24);
+        let popup = super::image_view_popup(area, 10, 6);
+        let title_min = u16::try_from(unicode_width::UnicodeWidthStr::width(
+            super::IMAGE_VIEW_TITLE,
+        ))
+        .unwrap()
+            + super::IMAGE_VIEW_H_CHROME;
+        assert_eq!(popup.width, title_min);
+        assert_eq!(popup.height, 9);
+        assert_eq!(popup.x, (80 - title_min) / 2);
+        assert_eq!(popup.y, 7);
+    }
+
+    #[test]
+    fn image_view_popup_clamps_to_the_margin_box() {
+        let area = Rect::new(0, 0, 50, 20);
+        let popup = super::image_view_popup(area, 400, 400);
+        assert_eq!(popup, Rect::new(2, 2, 46, 16));
+    }
+
+    #[test]
+    fn image_view_popup_never_exceeds_a_tiny_margin_box() {
+        let area = Rect::new(0, 0, 8, 6);
+        let popup = super::image_view_popup(area, 400, 400);
+        assert_eq!(popup, Rect::new(2, 2, 4, 2));
+    }
+
+    #[test]
+    fn dim_area_darkens_rgb_and_veils_reset_background() {
+        use ratatui::style::{Color, Modifier};
+
+        let mut buf = Buffer::empty(Rect::new(0, 0, 3, 1));
+        buf[(0, 0)]
+            .set_fg(Color::Rgb(200, 100, 50))
+            .set_bg(Color::Rgb(80, 80, 80));
+        buf[(1, 0)].set_fg(Color::White).set_bg(Color::Reset);
+        super::dim_area(&mut buf, Rect::new(0, 0, 3, 1));
+        assert_eq!(buf[(0, 0)].fg, Color::Rgb(125, 62, 31));
+        assert_eq!(buf[(0, 0)].bg, Color::Rgb(50, 50, 50));
+        assert_eq!(buf[(1, 0)].fg, Color::DarkGray);
+        assert_eq!(buf[(1, 0)].bg, super::IMAGE_VIEW_VEIL);
+        assert!(buf[(0, 0)].modifier.contains(Modifier::DIM));
+        assert!(buf[(1, 0)].modifier.contains(Modifier::DIM));
     }
 }
