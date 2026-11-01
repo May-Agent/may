@@ -191,7 +191,7 @@ impl PrStore {
         match crate::trust::trust_for(&self.context.workspace_config, &repo_key, &worktree) {
             None => {
                 return Err(PrError::Resolve(
-                    "repository trust undecided — answer the repo-trust question, or run `repo trust set <full|prs-only|local-branch|local>`".to_string(),
+                    "repository trust undecided — the launch gate asks on startup, or run `repo trust set <full|prs-only|local-branch|local>`".to_string(),
                 ));
             }
             Some(level) if !level.clones_work() => {
