@@ -225,10 +225,7 @@ pub(super) fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
                 hidden += root.changes.len();
                 continue;
             }
-            let root_name = root
-                .label
-                .clone()
-                .unwrap_or_else(|| home_label(&root.root));
+            let root_name = root.label.clone().unwrap_or_else(|| home_label(&root.root));
             background.push(dim(format!(
                 " {}",
                 truncate(&root_name, width.saturating_sub(1))
