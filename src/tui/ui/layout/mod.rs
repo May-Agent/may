@@ -337,6 +337,7 @@ fn sheet_height(app: &App, column: Rect) -> Option<u16> {
             rows(confirm_body_rows(&state.path.display().to_string(), column.width) + 9),
             pct(70),
         ),
+        AppMode::QuitConfirm(_) => (9, pct(70)),
         AppMode::Chat
         | AppMode::ImageView(_)
         | AppMode::Config
@@ -390,6 +391,7 @@ fn render_sheet(frame: &mut Frame, sheet: Rect, app: &App) {
             render_workspace_confirm(frame, sheet, &state.path, &state.reason);
         }
         AppMode::LaunchGrant(state) => render_launch_grant(frame, sheet, state),
+        AppMode::QuitConfirm(_) => render_quit_confirm(frame, sheet),
         _ => {}
     }
 }
@@ -1522,6 +1524,47 @@ fn render_launch_grant(frame: &mut Frame, area: Rect, state: &crate::tui::state:
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Yellow))
                 .title(" Workspace Access "),
+        )
+        .wrap(ratatui::widgets::Wrap { trim: false });
+
+    frame.render_widget(widget, area);
+}
+
+/// Render the quit confirmation for a session whose agent still runs.
+fn render_quit_confirm(frame: &mut Frame, area: Rect) {
+    let content = vec![
+        Line::from(Span::styled(
+            "The agent is still running in this session.",
+            Style::default().fg(Color::White),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("[Enter/L] ", Style::default().fg(Color::Green)),
+            Span::styled(
+                "Keep it running in the background",
+                Style::default().fg(Color::White),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("[S] ", Style::default().fg(Color::Green)),
+            Span::styled(
+                "Stop the agent, then quit",
+                Style::default().fg(Color::White),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("[Esc] ", Style::default().fg(Color::Red)),
+            Span::styled("Cancel", Style::default().fg(Color::White)),
+        ]),
+    ];
+
+    let widget = Paragraph::new(content)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow))
+                .title(" Quit "),
         )
         .wrap(ratatui::widgets::Wrap { trim: false });
 
