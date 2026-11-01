@@ -118,8 +118,42 @@ impl App {
     /// configured tier selectors keep their lead positions, and every model
     /// a provider actually serves is appended as `provider::model`.
     pub fn merge_model_select_models(&mut self, models: Vec<FetchedModel>) {
+        // Families whose catalog offers 2+ effort-suffixed variants collapse
+        // to the family base: the rung is chosen on the effort ladder, not
+        // by picking a suffixed model entry.
+        let mut families: std::collections::HashMap<(String, String), usize> =
+            std::collections::HashMap::new();
+        for model in &models {
+            *families
+                .entry((
+                    model.provider_id.clone(),
+                    crate::models::effort_family_base(&model.id),
+                ))
+                .or_default() += 1;
+        }
+        let family_base_of = |provider_id: &str, model_id: &str| {
+            let base = crate::models::effort_family_base(model_id);
+            families
+                .get(&(provider_id.to_string(), base.clone()))
+                .is_some_and(|count| *count >= 2)
+                .then_some(base)
+        };
+        // Configured selectors pointing at a suffixed variant of a collapsed
+        // family resolve to the family base too.
+        for entry in &mut self.model_select_list {
+            let Ok(selector) = entry.parse::<crate::ModelSelector>() else {
+                continue;
+            };
+            if let Some(base) = family_base_of(selector.provider_id(), selector.model_id()) {
+                *entry = crate::ModelSelector::new(selector.provider_id(), &base).to_string();
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        self.model_select_list
+            .retain(|entry| seen.insert(entry.clone()));
         for model in models {
-            let selector = crate::ModelSelector::new(&model.provider_id, &model.id).to_string();
+            let id = family_base_of(&model.provider_id, &model.id).unwrap_or(model.id);
+            let selector = crate::ModelSelector::new(&model.provider_id, &id).to_string();
             if !self.model_select_list.contains(&selector) {
                 self.model_select_list.push(selector);
             }
@@ -214,16 +248,11 @@ impl App {
         None
     }
 
-    /// The effort token at the highlighted rung (`None` = provider default).
+    /// The effort token at the highlighted rung.
     fn selected_effort(&self) -> Option<SendAction> {
         self.effort_ladder
             .get(self.effort_index)
-            .copied()
-            .flatten()
-            .map_or_else(
-                || Some(SendAction::SetEffort(None)),
-                |token| Some(SendAction::SetEffort(Some(token.to_string()))),
-            )
+            .map(|token| SendAction::SetEffort(Some((*token).to_string())))
     }
 
     /// Collect all unique models from config for model select.
@@ -251,40 +280,18 @@ impl App {
     }
 }
 
-/// The reasoning-effort ladder a provider's wire protocol expresses, first
-/// rung `None` meaning "provider default" — no override stored. Families
-/// outside a ladder still take it: vendors map what they can on their own
-/// API-compat layer and reject what a model does not have.
+/// The reasoning-effort ladder a provider's wire protocol expresses. Every
+/// rung is concrete — the session's effort is the one it last selected, and
+/// "default" before any selection means medium, not a provider-decided
+/// level. Families outside a ladder still take it: vendors map what they can
+/// on their own API-compat layer and reject what a model does not have.
 pub(super) const fn effort_ladder_for(
     provider_type: Option<crate::config::ProviderType>,
-) -> &'static [Option<&'static str>] {
+) -> &'static [&'static str] {
     use crate::config::ProviderType;
-    const OPENAI: &[Option<&str>] = &[
-        None,
-        Some("none"),
-        Some("minimal"),
-        Some("low"),
-        Some("medium"),
-        Some("high"),
-        Some("xhigh"),
-        Some("max"),
-    ];
-    const CLAUDE: &[Option<&str>] = &[
-        None,
-        Some("none"),
-        Some("low"),
-        Some("medium"),
-        Some("high"),
-        Some("xhigh"),
-        Some("max"),
-    ];
-    const GEMINI: &[Option<&str>] = &[
-        None,
-        Some("minimal"),
-        Some("low"),
-        Some("medium"),
-        Some("high"),
-    ];
+    const OPENAI: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+    const CLAUDE: &[&str] = &["none", "low", "medium", "high", "xhigh", "max"];
+    const GEMINI: &[&str] = &["minimal", "low", "medium", "high"];
     match provider_type {
         Some(ProviderType::Anthropic) => CLAUDE,
         Some(ProviderType::Google) => GEMINI,
