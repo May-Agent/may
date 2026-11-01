@@ -63,10 +63,16 @@ impl MayHomePaths {
         self.root.join("subagents")
     }
 
-    /// Global memory file.
+    /// Global memories directory shared by every session.
+    #[must_use]
+    pub fn memories_dir(&self) -> PathBuf {
+        self.root.join("memories")
+    }
+
+    /// Global memory index file inside [`Self::memories_dir`].
     #[must_use]
     pub fn memory_file(&self) -> PathBuf {
-        self.root.join("MEMORY.md")
+        self.memories_dir().join("MEMORY.md")
     }
 
     /// Workspace config file.
