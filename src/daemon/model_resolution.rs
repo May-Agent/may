@@ -52,3 +52,21 @@ pub(super) async fn persist_last_model(
     state.notify_ui_events(UiEventTopics::CONFIG);
     Ok(())
 }
+
+/// Persist the reasoning effort a session last chose — it becomes the
+/// effective effort of sessions that never selected one ("default" is the
+/// last selection, medium before the first).
+pub(super) async fn persist_last_effort(
+    state: &DaemonState,
+    effort: &str,
+) -> Result<(), PersistLastModelError> {
+    if state.config_snapshot().last_effort.as_deref() == Some(effort) {
+        return Ok(());
+    }
+    let updated = state.update_config(|config| {
+        config.last_effort = Some(effort.to_string());
+    });
+    updated.save().await?;
+    state.notify_ui_events(UiEventTopics::CONFIG);
+    Ok(())
+}

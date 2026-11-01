@@ -1079,6 +1079,10 @@ pub struct MayConfig {
     /// Last model selected via /model command (used as default for new sessions).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_model: Option<ModelSelector>,
+    /// Last reasoning effort selected via /effort (the effective effort of
+    /// sessions that never chose one; medium before the first selection).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_effort: Option<String>,
     /// Preconfigured SSH targets available to the agent.
     #[serde(default)]
     pub ssh_servers: Vec<SshServerConfig>,
@@ -1114,6 +1118,7 @@ impl Default for MayConfig {
             remote_access: RemoteAccessConfig::default(),
             daemon: DaemonConfig::default(),
             last_model: None,
+            last_effort: None,
             ssh_servers: Vec::new(),
         }
     }

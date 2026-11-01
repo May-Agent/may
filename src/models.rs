@@ -350,3 +350,57 @@ pub fn ability_to_label(ability: Ability) -> String {
         _ => panic!("unsupported ability variant: {ability:?}"),
     }
 }
+
+/// Trailing tokens a provider catalog uses to encode a reasoning-effort rung
+/// inside the model uid (`swe-2-high`, `claude-opus-5-5-low`).
+const EFFORT_UID_TOKENS: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/// Speed markers that may follow the effort rung in a uid
+/// (`claude-opus-5-5-low-fast`, `swe-2-high-lightning`). The marker belongs to
+/// the family, the effort rung does not.
+const EFFORT_UID_TAGS: &[&str] = &["-fast", "-lightning"];
+
+/// The family a catalog uid belongs to once its effort rung is stripped.
+///
+/// `swe-2-high` and `swe-2-max` share the `swe-2` family, and a trailing
+/// speed marker stays with the family (`swe-2-high-lightning` →
+/// `swe-2-lightning`). Providers whose catalog encodes effort in the uid
+/// pick the rung through the reasoning-effort ladder rather than a suffixed
+/// model.
+#[must_use]
+pub fn effort_family_base(model_id: &str) -> String {
+    for tag in EFFORT_UID_TAGS.iter().chain([&""]) {
+        let Some(core) = model_id.strip_suffix(tag) else {
+            continue;
+        };
+        for token in EFFORT_UID_TOKENS {
+            let suffix = format!("-{token}");
+            if let Some(base) = core.strip_suffix(&suffix)
+                && !base.is_empty()
+            {
+                return format!("{base}{tag}");
+            }
+        }
+    }
+    model_id.to_string()
+}
+
+/// The effort rung a catalog uid expresses, if it carries one
+/// (`swe-2-high-lightning` → `high`).
+#[must_use]
+pub fn effort_uid_token(model_id: &str) -> Option<&'static str> {
+    for tag in EFFORT_UID_TAGS.iter().chain([&""]) {
+        let Some(core) = model_id.strip_suffix(tag) else {
+            continue;
+        };
+        for token in EFFORT_UID_TOKENS {
+            if core
+                .strip_suffix(&format!("-{token}"))
+                .is_some_and(|base| !base.is_empty())
+            {
+                return Some(token);
+            }
+        }
+    }
+    None
+}

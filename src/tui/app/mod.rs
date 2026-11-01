@@ -144,8 +144,8 @@ pub struct App {
     pub model_select_index: usize,
     /// Available models for model select (cached)
     pub model_select_list: Vec<String>,
-    /// Effort rungs offered by the `/effort` popup (`None` rung = provider default)
-    pub effort_ladder: &'static [Option<&'static str>],
+    /// Effort rungs offered by the `/effort` popup
+    pub effort_ladder: &'static [&'static str],
     /// Selected index in the effort popup
     pub effort_index: usize,
     /// Session's stored reasoning effort as last reported by the daemon
@@ -2763,11 +2763,7 @@ impl App {
             }
             "/effort" => {
                 self.effort_ladder = model_picker::effort_ladder_for(self.current_provider_type());
-                self.effort_index = self
-                    .effort_ladder
-                    .iter()
-                    .position(|rung| *rung == self.current_effort.as_deref())
-                    .unwrap_or(0);
+                self.effort_index = self.effort_ladder_index();
                 self.mode = AppMode::EffortSelect;
                 self.fetch_current_effort();
                 None
@@ -3512,6 +3508,7 @@ impl App {
                         // Text was already streamed via AgentEvent::Text events
                         // Just finalize the message
                         self.chat.collapse_thinking();
+                        self.chat.finish_running_calls();
                         self.chat.end_text();
                         self.decode_meter.note_boundary();
                         self.pending_tool_calls.clear();
@@ -3543,6 +3540,7 @@ impl App {
                 self.pending_tool_calls.clear();
                 // Display error to user
                 self.chat.collapse_thinking();
+                self.chat.finish_running_calls();
                 self.chat.push_error(&format!("{e}"));
                 self.scroll = usize::MAX;
                 self.input_visible = true;
@@ -3572,6 +3570,26 @@ impl App {
             .map_or_else(|| "none".to_string(), |s| s.id.to_string())
     }
 
+    /// The session's effective reasoning effort: the rung it selected, the
+    /// last rung selected anywhere (`config.last_effort`), or medium before
+    /// any selection — "default" is never a provider-decided level.
+    pub fn effective_effort(&self) -> &str {
+        self.current_effort
+            .as_deref()
+            .or(self.config.last_effort.as_deref())
+            .unwrap_or("medium")
+    }
+
+    /// The ladder index of [`Self::effective_effort`], falling back to the
+    /// medium rung when the effective level is not on this provider's ladder.
+    pub fn effort_ladder_index(&self) -> usize {
+        self.effort_ladder
+            .iter()
+            .position(|rung| *rung == self.effective_effort())
+            .or_else(|| self.effort_ladder.iter().position(|rung| *rung == "medium"))
+            .unwrap_or(0)
+    }
+
     /// Get model name for display.
     pub fn model_display(&self) -> String {
         // Show the actual model being used - no fallback
@@ -3580,7 +3598,7 @@ impl App {
             |model| {
                 model.parse::<crate::ModelSelector>().map_or_else(
                     |_| model.clone(),
-                    |selector| selector.model_id().to_string(),
+                    |selector| crate::models::effort_family_base(selector.model_id()),
                 )
             },
         )
@@ -3592,7 +3610,7 @@ impl App {
         // Also update context window from model info
         let lookup_model = model.parse::<crate::ModelSelector>().map_or_else(
             |_| model.to_string(),
-            |selector| selector.model_id().to_string(),
+            |selector| crate::models::effort_family_base(selector.model_id()),
         );
         if let Some(info) = aither_models::lookup(&lookup_model) {
             self.context_window = info.max_input_tokens();
