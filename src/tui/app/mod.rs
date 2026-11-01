@@ -2478,7 +2478,7 @@ impl App {
                     self.cursor = self.input_char_count;
                 } else if self.background.is_some() {
                     // ↓ past the newest history entry opens the background
-                    // jobs/subagents panel (status bar hint: "↓ jobs").
+                    // jobs/subagents panel (status bar hint: `N shells ↓`).
                     self.open_jobs();
                 }
             }

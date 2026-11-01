@@ -137,35 +137,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     };
     app.chat_area = chat_area;
 
-    // Running background entries for the status bar: tracked subagents first,
-    // then running terminal jobs.
-    let mut background_items: Vec<chat::StatusBackgroundItem> = app
-        .subagents
+    let running_shells = app
+        .jobs
         .iter()
-        .cloned()
-        .map(|run| chat::StatusBackgroundItem {
-            elapsed_secs: run.elapsed_secs(),
-            label: run.agent,
-            subagent: true,
-        })
-        .collect();
-    background_items.extend(
-        app.jobs
-            .iter()
-            .filter(|job| matches!(job.status, aither_sandbox::JobStatus::Running))
-            .map(|job| chat::StatusBackgroundItem {
-                label: job
-                    .script
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-                    .chars()
-                    .take(24)
-                    .collect(),
-                subagent: false,
-                elapsed_secs: job.started_at.elapsed().as_secs(),
-            }),
-    );
+        .filter(|job| matches!(job.status, aither_sandbox::JobStatus::Running))
+        .count();
 
     // Working directory shown in the status bar (`~` for the user home).
     let cwd_label = app.cwd_label();
@@ -206,7 +182,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 usage: usage_info,
                 queue_count: app.queue.len(),
                 open_questions: app.open_question_count,
-                background: &background_items,
+                shells: running_shells,
+                subagents: app.subagents.len(),
                 decode_rate,
                 status_message: status_message.as_deref(),
                 cwd: cwd_label.as_str(),
