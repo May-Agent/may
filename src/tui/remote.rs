@@ -168,7 +168,7 @@ async fn follow_session(
                     {
                         let _ = forwarding
                             .app_events
-                            .send(AppEvent::SessionRuntime(snapshot))
+                            .send(AppEvent::SessionRuntime(Box::new(snapshot)))
                             .await;
                     }
                 }
@@ -371,6 +371,18 @@ async fn run_commands(
                 {
                     Ok(report) => {
                         let _ = event_tx.send(TuiEvent::ContextReport(Ok(report))).await;
+                        let _ = event_tx.send(TuiEvent::Complete).await;
+                    }
+                    Err(error) => fail(&event_tx, error.to_string()).await,
+                }
+            }
+            WorkerCommand::UsageReport { event_tx } => {
+                match client
+                    .get::<crate::agent::SessionUsageReport>(&session_path(&session_id, "/usage"))
+                    .await
+                {
+                    Ok(report) => {
+                        let _ = event_tx.send(TuiEvent::UsageReport(report)).await;
                         let _ = event_tx.send(TuiEvent::Complete).await;
                     }
                     Err(error) => fail(&event_tx, error.to_string()).await,

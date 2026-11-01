@@ -95,6 +95,22 @@ impl ChatDb {
             .await?)
     }
 
+    /// Every request log of one session, oldest first.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn request_logs_for_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<request_logs::Model>, ChatDbError> {
+        Ok(self
+            .db
+            .query("SELECT * FROM request_logs WHERE session_id = ? ORDER BY timestamp ASC")
+            .bind(session_id.to_string())
+            .fetch_all::<request_logs::Model>()
+            .await?)
+    }
+
     /// Append one network-access log entry.
     ///
     /// # Errors
