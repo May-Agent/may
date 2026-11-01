@@ -403,6 +403,9 @@ impl PrStore {
     /// Take over a PR whose owning session is gone — or still another's.
     /// Adoption transfers `session_id` so this session may merge or close
     /// it, and the event log records the handover.
+    ///
+    /// # Errors
+    /// Fails when the PR does not exist.
     pub async fn adopt(&self, number: i64, repo: Option<&str>) -> Result<String, PrError> {
         let resolved = self.resolve(repo).await?;
         let pr = self
