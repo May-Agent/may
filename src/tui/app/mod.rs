@@ -145,7 +145,13 @@ pub struct App {
     /// Available models for model select (cached)
     pub model_select_list: Vec<String>,
     /// Effort rungs offered by the `/effort` popup
-    pub effort_ladder: &'static [&'static str],
+    pub effort_ladder: Vec<&'static str>,
+    /// Effort rungs each fetched model family serves, keyed by
+    /// `(provider_id, family base)` — the `/effort` popup shows a family's
+    /// own ladder when the catalog reports one.
+    pub family_effort_rungs: std::collections::HashMap<(String, String), Vec<&'static str>>,
+    /// When the current turn began; `None` while idle.
+    pub turn_started_at: Option<std::time::Instant>,
     /// Selected index in the effort popup
     pub effort_index: usize,
     /// Session's stored reasoning effort as last reported by the daemon
@@ -506,7 +512,9 @@ impl App {
             config_state,
             model_select_index: 0,
             model_select_list: Vec::new(),
-            effort_ladder: &[],
+            effort_ladder: Vec::new(),
+            family_effort_rungs: std::collections::HashMap::new(),
+            turn_started_at: None,
             effort_index: 0,
             current_effort: None,
             needs_setup,
@@ -2781,7 +2789,7 @@ impl App {
                 None
             }
             "/effort" => {
-                self.effort_ladder = model_picker::effort_ladder_for(self.current_provider_type());
+                self.effort_ladder = self.effort_ladder_for_current();
                 self.effort_index = self.effort_ladder_index();
                 self.mode = AppMode::EffortSelect;
                 self.fetch_current_effort();
@@ -3049,7 +3057,6 @@ impl App {
                 output: None,
                 diffs: Vec::new(),
                 pinned: None,
-                finished_at: None,
             },
         );
         self.scroll = usize::MAX;
@@ -3151,6 +3158,7 @@ impl App {
     /// Called when starting to process a message.
     pub fn start_processing(&mut self, msg: &PendingMessage) {
         self.processing = true;
+        self.turn_started_at = Some(std::time::Instant::now());
         self.thinking_start = None;
         self.activity_phase = crate::tui::ui::chat::ActivityPhase::Thinking;
         self.decode_meter.reset();
@@ -3365,7 +3373,6 @@ impl App {
                 output: None,
                 diffs: Vec::new(),
                 pinned: None,
-                finished_at: None,
             },
             ToolStartKind::Stdin { task_id, input } => {
                 let mut detail: Vec<String> = Vec::new();
@@ -3383,7 +3390,6 @@ impl App {
                     status: super::ui::chat::ToolStatus::Running,
                     output: None,
                     pinned: None,
-                    finished_at: None,
                 }
             }
             ToolStartKind::JobControl { action, task_id } => ToolDisplay::Action {
@@ -3396,7 +3402,6 @@ impl App {
                 status: super::ui::chat::ToolStatus::Running,
                 output: None,
                 pinned: None,
-                finished_at: None,
             },
             ToolStartKind::Generic {
                 name,
@@ -3410,7 +3415,6 @@ impl App {
                 status: super::ui::chat::ToolStatus::Running,
                 output: None,
                 pinned: None,
-                finished_at: None,
             },
         }
     }
@@ -3637,6 +3641,27 @@ impl App {
             .as_deref()
             .or(self.config.last_effort.as_deref())
             .unwrap_or("medium")
+    }
+
+    /// The effort rungs `/effort` offers for the current model: the
+    /// family's served rungs when the catalog reports them, else the
+    /// provider protocol's generic ladder.
+    pub fn effort_ladder_for_current(&self) -> Vec<&'static str> {
+        let family = self
+            .current_model
+            .as_deref()
+            .and_then(|model| model.parse::<crate::ModelSelector>().ok())
+            .map(|selector| {
+                (
+                    selector.provider_id().to_string(),
+                    crate::models::effort_family_base(selector.model_id()),
+                )
+            });
+        family
+            .and_then(|key| self.family_effort_rungs.get(&key).cloned())
+            .unwrap_or_else(|| {
+                model_picker::effort_ladder_for(self.current_provider_type()).to_vec()
+            })
     }
 
     /// The ladder index of [`Self::effective_effort`], falling back to the

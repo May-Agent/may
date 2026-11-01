@@ -709,6 +709,8 @@ impl RuntimeDeps {
             .map(|session| session.id.clone());
         *agent_handle = None;
         app.finish_processing();
+        app.chat
+            .fold_turn_work(app.turn_started_at.map_or(0, |at| at.elapsed().as_secs()));
 
         // The daemon persisted the turn and names the session.
         if let Err(error) = app.session_manager.refresh_history().await {
