@@ -153,7 +153,7 @@ fn answers_json(answers: &[QuestionAnswer]) -> serde_json::Value {
 fn persisted_attachment_from_tui(
     attachment: &Attachment,
 ) -> Result<crate::session::PersistedAttachment, TuiRuntimeError> {
-    let id = uuid::Uuid::new_v4().to_string();
+    let id = crate::id::new();
     match attachment {
         Attachment::Image { path, data } => Ok(crate::session::PersistedAttachment {
             id,

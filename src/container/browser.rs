@@ -1404,7 +1404,7 @@ impl BrowserRuntime {
             self.takeover_owner.clone(),
         );
 
-        let peer_id = uuid::Uuid::new_v4().to_string();
+        let peer_id = crate::id::new();
         setup_peer_connection_lifecycle(&peer_connection, peer_id.clone(), peer_events);
 
         let offer = RTCSessionDescription::offer(offer_sdp)

@@ -104,7 +104,7 @@ impl Tool for AskUserTool {
             return Err(AskUserToolError::NoQuestion.into());
         }
         let request = PersistedAskUserRequest {
-            id: uuid::Uuid::new_v4().to_string(),
+            id: crate::id::new(),
             questions: persisted_questions(questions),
         };
         self.runtime

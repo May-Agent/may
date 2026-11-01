@@ -281,7 +281,16 @@ async fn run_create_task(
     state: Arc<DaemonState>,
     req: CreateTaskRequest,
 ) -> SkyResult<ScheduledTaskResponse> {
-    let id = uuid::Uuid::new_v4().to_string();
+    let mut id = crate::id::new();
+    while state
+        .db()
+        .get_scheduled_task(&id)
+        .await
+        .map_err(internal_error)?
+        .is_some()
+    {
+        id = crate::id::new();
+    }
     let trigger = normalize_create_trigger(&req)?;
     let normalized_script_path = req
         .script_path
