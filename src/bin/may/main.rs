@@ -193,6 +193,10 @@ async fn async_main() -> anyhow::Result<()> {
         may_agent::configure_heel_binary().await;
     }
 
+    let resume = match &cli_mode {
+        CliMode::Resume(args) => Some(args.clone()),
+        _ => None,
+    };
     match cli_mode {
         CliMode::Help(help_text) => {
             use std::io::Write as _;
@@ -215,7 +219,7 @@ async fn async_main() -> anyhow::Result<()> {
         CliMode::Browser(args) => std::process::exit(run_browser(args).await?),
         CliMode::Exec(args) => std::process::exit(Box::pin(run_exec(args)).await?),
         CliMode::OneShot(args) => return run_oneshot(args).await,
-        CliMode::Tui => {}
+        CliMode::Tui | CliMode::Resume(_) => {}
     }
 
     // Set up panic hook to restore terminal state before panicking
@@ -254,7 +258,7 @@ async fn async_main() -> anyhow::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Create app and run
-    let result = run_app(&mut terminal, image_support, log_ring).await;
+    let result = run_app(&mut terminal, image_support, log_ring, resume).await;
 
     // Cleanup terminal
     disable_raw_mode()?;
@@ -266,14 +270,40 @@ async fn async_main() -> anyhow::Result<()> {
     )?;
     terminal.show_cursor()?;
 
-    result
+    match result {
+        Ok(Some(exit)) => {
+            let mut stdout = io::stdout();
+            if exit.agent_running {
+                writeln!(
+                    stdout,
+                    "The agent keeps running in the daemon for this session."
+                )?;
+            }
+            writeln!(
+                stdout,
+                "Resume this session with: may resume {}",
+                exit.session_id
+            )?;
+            Ok(())
+        }
+        Ok(None) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// What the exited TUI leaves the user at the shell: the session to resume
+/// and whether its agent is still running in the daemon.
+struct ExitSummary {
+    session_id: String,
+    agent_running: bool,
 }
 
 async fn run_app<B: Backend>(
     terminal: &mut Terminal<B>,
     image_support: Option<may_agent::tui::ui::image::TerminalImageSupport>,
     log_ring: may_agent::log_ring::LogRingHandle,
-) -> anyhow::Result<()>
+    resume: Option<cli::ResumeArgs>,
+) -> anyhow::Result<Option<ExitSummary>>
 where
     B::Error: Send + Sync + 'static,
 {
@@ -331,9 +361,31 @@ where
         }
     };
 
+    // The session `may resume` names, or the most recently active one when
+    // `may resume` stands alone. It survives a pending launch-grant prompt
+    // and loads once the prompt is answered.
+    let mut pending_resume: Option<may_agent::SessionId> = match &resume {
+        Some(cli::ResumeArgs { session: Some(id) }) => {
+            Some(may_agent::SessionId::from_string(id.clone()))
+        }
+        Some(cli::ResumeArgs { session: None }) => app
+            .session_manager
+            .list_sessions()
+            .await?
+            .into_iter()
+            .filter(|session| !session.archived)
+            .max_by_key(|session| session.updated_at)
+            .map(|session| session.id),
+        None => None,
+    };
+    if resume.is_some() && pending_resume.is_none() {
+        app.set_status("No session to resume; starting a new one");
+    }
+
     // Only start a session if configuration is complete. When the launch
     // directory is not already a workspace grant, the TUI asks first and the
-    // session starts once the prompt is answered.
+    // session starts once the prompt is answered. A resumed session loads
+    // regardless: it carries its own model.
     let mut worker_build = None;
     let mut launch_grant = if app.is_configured() {
         launch_grant_check(&app)?
@@ -345,15 +397,25 @@ where
             path: app.cwd.clone(),
         });
     }
-    if app.is_configured() && launch_grant.is_none() {
-        match runtime_deps.begin_new_session(&mut app, &mut worker).await {
-            Ok(build) => {
-                worker_build = Some(WorkerBuild {
-                    purpose: WorkerBuildPurpose::Startup,
-                    build,
-                });
+    if launch_grant.is_none() {
+        if let Some(session_id) = pending_resume.take() {
+            let build = resume_into_session(&mut app, &mut worker, &runtime_deps, &session_id)
+                .await
+                .with_context(|| format!("cannot resume session {}", session_id.as_str()))?;
+            worker_build = Some(WorkerBuild {
+                purpose: WorkerBuildPurpose::Session,
+                build,
+            });
+        } else if app.is_configured() {
+            match runtime_deps.begin_new_session(&mut app, &mut worker).await {
+                Ok(build) => {
+                    worker_build = Some(WorkerBuild {
+                        purpose: WorkerBuildPurpose::Startup,
+                        build,
+                    });
+                }
+                Err(e) => report_startup_failure(&mut app, &e),
             }
-            Err(e) => report_startup_failure(&mut app, &e),
         }
     }
 
@@ -368,8 +430,31 @@ where
         &mut mcp_manager,
         log_ring,
         launch_grant.take(),
+        pending_resume,
     )
     .await
+}
+
+/// Load `session_id` as the TUI's session and adopt its profile, so session
+/// pickers and profile-scoped lookups agree with what is open.
+async fn resume_into_session(
+    app: &mut App,
+    worker: &mut Option<AgentWorker>,
+    runtime_deps: &RuntimeDeps,
+    session_id: &may_agent::SessionId,
+) -> Result<may_agent::tui::runtime::PendingWorkerBuild, may_agent::tui::runtime::TuiRuntimeError> {
+    let build = runtime_deps
+        .begin_load_session(app, worker, session_id)
+        .await?;
+    if let Some(profile_id) = app
+        .session_manager
+        .current()
+        .and_then(|session| session.profile_id.clone())
+    {
+        app.session_manager.set_current_profile(profile_id.clone());
+        app.current_profile_id = Some(profile_id);
+    }
+    Ok(build)
 }
 
 /// A launch-directory grant the TUI offered before the session started.
@@ -512,12 +597,16 @@ async fn main_event_loop<B: Backend>(
     mcp_manager: &mut McpManager,
     log_ring: may_agent::log_ring::LogRingHandle,
     mut launch_grant: Option<LaunchGrant>,
-) -> anyhow::Result<()>
+    mut pending_resume: Option<may_agent::SessionId>,
+) -> anyhow::Result<Option<ExitSummary>>
 where
     B::Error: Send + Sync + 'static,
 {
     // Handle to a running agent task (if any)
     let mut agent_handle: Option<AgentHandle> = None;
+
+    // Whether a run is left in flight in the daemon when the loop exits.
+    let mut agent_left_running = false;
 
     // Handle to a `/context` measurement (deferred behind any running turn)
     let mut context_handle: Option<AgentHandle> = None;
@@ -789,6 +878,7 @@ where
 
         let Some(event) = event else {
             tracing::warn!("All channels closed, exiting");
+            agent_left_running = agent_handle.is_some() || app.agent_busy();
             break;
         };
         if matches!(&event, Event::Terminal(e) if matches!(**e, AppEvent::Tick)) {
@@ -1024,7 +1114,28 @@ where
                 // Handle normal terminal events
                 let ev_start = std::time::Instant::now();
                 match app.handle_event(*terminal_event)? {
-                    Some(SendAction::Quit) => break,
+                    Some(SendAction::Quit) => {
+                        agent_left_running = agent_handle.is_some() || app.agent_busy();
+                        break;
+                    }
+                    Some(SendAction::StopAgentAndQuit) => {
+                        if let (Some(client), Some(session)) =
+                            (runtime_deps.daemon(), app.session_manager.current())
+                        {
+                            let stopped: Result<serde_json::Value, _> = client
+                                .post(
+                                    &may_agent::client::session_path(session.id.as_str(), "/stop"),
+                                    &serde_json::json!({}),
+                                )
+                                .await;
+                            if let Err(error) = stopped {
+                                tracing::warn!(%error, "failed to stop the session's run before quitting");
+                            }
+                        } else if let Some(handle) = agent_handle.take() {
+                            handle.cancel();
+                        }
+                        break;
+                    }
                     Some(SendAction::NewSession) => {
                         worker_build = Some(WorkerBuild {
                             purpose: WorkerBuildPurpose::Session,
@@ -1351,15 +1462,28 @@ where
                             }
                         }
                         // The prompt this answered was the only thing holding
-                        // the startup session back.
-                        match runtime_deps.begin_new_session(app, worker).await {
-                            Ok(build) => {
+                        // the startup session back — `may resume`'s session
+                        // included.
+                        let resumed = pending_resume.take();
+                        let build = match &resumed {
+                            Some(session_id) => {
+                                resume_into_session(app, worker, &runtime_deps, session_id).await
+                            }
+                            None => runtime_deps.begin_new_session(app, worker).await,
+                        };
+                        match (resumed.is_some(), build) {
+                            (_, Ok(build)) => {
                                 worker_build = Some(WorkerBuild {
-                                    purpose: WorkerBuildPurpose::Startup,
+                                    purpose: if resumed.is_some() {
+                                        WorkerBuildPurpose::Session
+                                    } else {
+                                        WorkerBuildPurpose::Startup
+                                    },
                                     build,
                                 });
                             }
-                            Err(e) => report_startup_failure(app, &e),
+                            (true, Err(e)) => return Err(e.into()),
+                            (false, Err(e)) => report_startup_failure(app, &e),
                         }
                     }
                     Some(SendAction::RespondWorkspace {
@@ -1544,7 +1668,10 @@ where
         );
     }
 
-    Ok(())
+    Ok(app.session_manager.current().map(|session| ExitSummary {
+        session_id: session.id.as_str().to_string(),
+        agent_running: agent_left_running,
+    }))
 }
 
 /// Run the GitHub Copilot OAuth device flow.

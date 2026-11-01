@@ -110,6 +110,27 @@ pub fn handle_workspace_confirm_key(app: &mut App, code: KeyCode) -> Option<Send
     None
 }
 
+pub fn handle_quit_confirm_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
+    match code {
+        KeyCode::Char('s' | 'S') => {
+            app.mode = crate::tui::state::AppMode::Chat;
+            Some(SendAction::StopAgentAndQuit)
+        }
+        KeyCode::Enter | KeyCode::Char('l' | 'L') => {
+            app.mode = crate::tui::state::AppMode::Chat;
+            Some(SendAction::Quit)
+        }
+        KeyCode::Esc => {
+            let mode = std::mem::replace(&mut app.mode, crate::tui::state::AppMode::Chat);
+            if let crate::tui::state::AppMode::QuitConfirm(state) = mode {
+                app.mode = *state.return_to;
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 pub fn handle_permission_confirm_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
     match code {
         KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
