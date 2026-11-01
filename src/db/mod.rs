@@ -114,6 +114,11 @@ impl ChatDb {
                 .execute()
                 .await?;
         }
+        if !existing.contains("repo") {
+            query!(db, "ALTER TABLE sessions ADD COLUMN repo TEXT")
+                .execute()
+                .await?;
+        }
         if !existing.contains("non_interactive") {
             query!(
                 db,

@@ -101,6 +101,23 @@ impl ChatDb {
         Ok(())
     }
 
+    /// Bind `id` to a repository identity (`github:owner/repo` or a local
+    /// repository key), or clear the binding with `None`.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] when the update fails.
+    pub async fn set_session_repo(&self, id: &str, repo: Option<&str>) -> Result<(), ChatDbError> {
+        query!(
+            self.db,
+            "UPDATE sessions SET repo = ? WHERE id = ?",
+            repo,
+            id
+        )
+        .execute()
+        .await?;
+        Ok(())
+    }
+
     /// Marks `id` as a session nobody answers prompts for.
     ///
     /// # Errors

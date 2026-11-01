@@ -2110,6 +2110,7 @@ impl App {
                                 updated_at: None,
                                 content_preview: String::new(),
                                 reasoning_effort: session.reasoning_effort,
+                                repo: session.repo,
                                 runtime: crate::session::SessionRuntimeSummary::default(),
                             })
                             .collect()

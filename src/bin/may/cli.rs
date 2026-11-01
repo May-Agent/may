@@ -11,7 +11,7 @@ use may_agent::browser_service::{BrowserReadDetail, BrowserScreenshotMode};
 /// Top-level CLI mode the binary resolves from argv.
 #[derive(Debug, PartialEq, Eq)]
 pub enum CliMode {
-    Tui,
+    Tui(TuiArgs),
     Resume(ResumeArgs),
     Ui(Vec<String>),
     Rest(Vec<String>),
@@ -20,6 +20,13 @@ pub enum CliMode {
     Browser(BrowserCliArgs),
     OneShot(OneShotArgs),
     Help(&'static str),
+}
+
+/// Parsed `may` / `may chat` / `may --repo` TUI invocation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TuiArgs {
+    /// Repository the session binds to (`owner/repo` or a local path).
+    pub repo: Option<String>,
 }
 
 /// Parsed `may resume` invocation.
@@ -170,8 +177,11 @@ pub fn parse_cli_mode(args: &[String]) -> CliMode {
             Some("--help" | "-h") => CliMode::Help(ExecArgs::help_text()),
             _ => CliMode::Exec(parse_exec_args(&args[2..])),
         },
+        Some("chat") | None => CliMode::Tui(TuiArgs::default()),
+        Some("--repo") => CliMode::Tui(TuiArgs {
+            repo: args.get(2).cloned(),
+        }),
         Some(_) => CliMode::OneShot(parse_oneshot_args(&args[1..])),
-        None => CliMode::Tui,
     }
 }
 
@@ -441,7 +451,7 @@ fn parse_terminal_execution_mode(value: &str) -> TerminalExecutionMode {
 mod tests {
     use super::{
         BrowserCliArgs, BrowserCliCommand, CliMode, ExecArgs, OneShotArgs, TerminalExecutionMode,
-        parse_cli_mode, parse_reasoning_effort,
+        TuiArgs, parse_cli_mode, parse_reasoning_effort,
     };
     use aither_core::llm::model::ReasoningEffort;
     use may_agent::browser_service::{BrowserReadDetail, BrowserScreenshotMode};
@@ -452,7 +462,10 @@ mod tests {
 
     #[test]
     fn parse_cli_mode_defaults_to_tui() {
-        assert_eq!(parse_cli_mode(&args(&["may"])), CliMode::Tui);
+        assert_eq!(
+            parse_cli_mode(&args(&["may"])),
+            CliMode::Tui(TuiArgs::default())
+        );
     }
 
     #[test]
