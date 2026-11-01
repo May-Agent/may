@@ -130,7 +130,6 @@ dependencies = [
  "aither-sandbox",
  "aither-skills",
  "aither-webfetch",
- "aither-websearch",
  "anyhow",
  "arc-swap",
  "askama 0.16.1",
@@ -466,24 +465,6 @@ dependencies = [
  "schemars",
  "serde",
  "thiserror 2.0.21",
- "tracing",
- "url",
- "zenwave",
-]
-
-[[package]]
-name = "aither-websearch"
-version = "0.11.0"
-source = "git+https://github.com/lexoliu/aither?branch=dev#ebf4d5987e10fe47f68a2313e91b638f21db4e1b"
-dependencies = [
- "aither-core",
- "anyhow",
- "askama 0.16.1",
- "async-io 2.6.0",
- "rustls",
- "schemars",
- "serde",
- "serde_json",
  "tracing",
  "url",
  "zenwave",
