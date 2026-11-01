@@ -40,8 +40,12 @@ export function AssistantTurn({
 
   return (
     <div className="group/message space-y-2">
-      {turn.reasoning.length > 0 && (
-        <ReasoningBlock text={turn.reasoning} streaming={reasoningStreaming} />
+      {(turn.reasoning.length > 0 || turn.reasoningMs != null) && (
+        <ReasoningBlock
+          text={turn.reasoning}
+          seconds={turn.reasoningMs != null ? Math.round(turn.reasoningMs / 1000) : undefined}
+          streaming={reasoningStreaming}
+        />
       )}
       {groupBrowserRuns(
         turn.segments.map((segment, idx) => ({ segment, idx })),

@@ -322,6 +322,12 @@ pub enum SessionAgentBody {
         /// The event.
         event: WireAgentEvent,
     },
+    /// A reasoning phase of the run closed; `seconds` is how long the model
+    /// spent on it, whether or not the provider returned readable text.
+    ReasoningEnd {
+        /// Seconds the phase lasted.
+        seconds: u64,
+    },
     /// The run ended.
     End {
         /// How it ended.
