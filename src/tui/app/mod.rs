@@ -3695,6 +3695,24 @@ impl App {
         }
     }
 
+    /// Mirror the daemon's pending-message queue from the last
+    /// `session_runtime` snapshot, so an enqueued message keeps a
+    /// `[steer]`/`[queue]` preview until the turn it starts renders it.
+    pub fn sync_queue_from_runtime(&mut self) {
+        let runtime = &self.session_runtime;
+        self.queue.replace(
+            runtime
+                .pending_immediate
+                .as_ref()
+                .map(PendingMessage::from_wire),
+            runtime
+                .queued_messages
+                .iter()
+                .map(PendingMessage::from_wire)
+                .collect(),
+        );
+    }
+
     /// Get current session ID for display.
     pub fn session_id_display(&self) -> String {
         self.session_manager

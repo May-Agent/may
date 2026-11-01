@@ -872,7 +872,10 @@ impl RuntimeDeps {
             .ok_or(TuiRuntimeError::NoActiveSession)?;
         if let Some(client) = &self.daemon {
             // The daemon dispatches queued and steering messages itself;
-            // the turns they start reach this TUI as foreign turns.
+            // the turns they start reach this TUI as foreign turns. The
+            // local queue mirrors the message for display until then, and
+            // the next `session_runtime` snapshot makes it authoritative.
+            app.queue.enqueue(message.clone());
             let body = serde_json::json!({
                 "sessionId": session_id.as_str(),
                 "content": message.content,
@@ -884,7 +887,13 @@ impl RuntimeDeps {
                 "hiddenContextXml": message.hidden_context_xml.as_ref().map(ToString::to_string),
                 "deliveryMode": message.delivery_mode,
             });
-            let _: serde_json::Value = client.post("/api/chat/enqueue", &body).await?;
+            if let Err(error) = client
+                .post::<_, serde_json::Value>("/api/chat/enqueue", &body)
+                .await
+            {
+                app.sync_queue_from_runtime();
+                return Err(error.into());
+            }
         }
         Ok(())
     }

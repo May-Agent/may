@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
-import type { ApiSession } from '../types';
+import type { ApiMessage, ApiSession } from '../types';
 import { isDraftSessionId, useSessionsStore } from './sessions';
 
 const originalFetch = globalThis.fetch;
@@ -136,5 +136,50 @@ describe('draft sessions', () => {
     expect(useSessionsStore.getState().drafts[draft.id]).toBeUndefined();
     expect(useSessionsStore.getState().active).toBeNull();
     expect(calls.urls).toEqual([]);
+  });
+});
+
+describe('optimistic sends', () => {
+  const message = (id: string, content: string): ApiMessage => ({
+    id,
+    role: 'user',
+    content,
+    timestamp: '2026-01-01T00:00:00Z',
+    attachments: [],
+  });
+
+  function serve(messages: ApiMessage[]) {
+    globalThis.fetch = mock(() =>
+      Promise.resolve(json(apiSession('s1', { messages }))),
+    ) as unknown as typeof fetch;
+  }
+
+  beforeEach(reset);
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  test('refreshActive keeps a sent message the daemon has not committed', async () => {
+    useSessionsStore.setState({
+      active: apiSession('s1'),
+      messages: { s1: [message('local-1', 'hello')] },
+    });
+    serve([]);
+
+    await useSessionsStore.getState().refreshActive('s1');
+
+    expect(useSessionsStore.getState().messages.s1?.map((m) => m.id)).toEqual(['local-1']);
+  });
+
+  test('refreshActive drops the local echo once its row is persisted', async () => {
+    useSessionsStore.setState({
+      active: apiSession('s1'),
+      messages: { s1: [message('local-1', 'hello')] },
+    });
+    serve([message('m1', 'hello')]);
+
+    await useSessionsStore.getState().refreshActive('s1');
+
+    expect(useSessionsStore.getState().messages.s1?.map((m) => m.id)).toEqual(['m1']);
   });
 });

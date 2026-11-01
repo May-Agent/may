@@ -2692,14 +2692,6 @@ async fn resolve_session_context(
     }
 
     let user_message_id = if persist_user_message && request_has_visible_user_input(req) {
-        let needs_title = session.title.is_none();
-        if needs_title {
-            let title = truncate_preview(&req.content);
-            db.update_session(session_id.as_str(), Some(title.as_str()), None, None)
-                .await
-                .map_err(UiChatPreparationError::UpdateSessionTitle)?;
-            state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
-        }
         let row = db
             .append_chat_message_as_run(
                 fence,
@@ -2710,6 +2702,15 @@ async fn resolve_session_context(
             )
             .await
             .map_err(UiChatPreparationError::AppendUserMessage)?;
+        if session.title.is_none() {
+            // The prompt row lands first: a client reloading history on the
+            // title's `updated_at` drift already sees the message.
+            let title = truncate_preview(&req.content);
+            db.update_session(session_id.as_str(), Some(title.as_str()), None, None)
+                .await
+                .map_err(UiChatPreparationError::UpdateSessionTitle)?;
+            state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
+        }
         Some(row.id)
     } else {
         None
