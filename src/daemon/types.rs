@@ -858,6 +858,26 @@ pub struct ChatRequest {
     pub(crate) delivery_mode: PendingUserMessageMode,
 }
 
+/// `POST /api/sessions/{id}/bash` payload.
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BashRequest {
+    /// The `!` command line to run on the user's behalf.
+    pub(crate) command: String,
+}
+
+/// `POST /api/sessions/{id}/bash` response — the masked run outcome.
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BashResponse {
+    pub(crate) command: String,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
+    pub(crate) exit_code: i32,
+    pub(crate) had_secret: bool,
+    pub(crate) error: Option<String>,
+}
+
 #[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RemovePendingMessageRequest {

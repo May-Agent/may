@@ -9,6 +9,8 @@ pub mod agent;
 pub mod agent_link;
 /// Persistent storage for OAuth credentials.
 pub mod auth_store;
+
+pub mod bash;
 /// Managed browser sessions backing the browser tool.
 pub mod browser_service;
 /// Bundled resources shipped with the binary.
