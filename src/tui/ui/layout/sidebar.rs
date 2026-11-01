@@ -225,9 +225,13 @@ pub(super) fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
                 hidden += root.changes.len();
                 continue;
             }
+            let root_name = root
+                .label
+                .clone()
+                .unwrap_or_else(|| home_label(&root.root));
             background.push(dim(format!(
                 " {}",
-                truncate(&home_label(&root.root), width.saturating_sub(1))
+                truncate(&root_name, width.saturating_sub(1))
             )));
             for stat in &root.changes {
                 if rows_left == 0 {

@@ -601,8 +601,10 @@ impl App {
 
     /// Create or rebuild the file-diff worker for the current session.
     ///
-    /// The worker tracks the session sandbox plus every writable workspace
-    /// dir. Container-profile sessions are skipped: their writes land
+    /// The worker tracks the launch directory, every writable workspace
+    /// dir and the session's repo clones — the directories the session
+    /// actually works in; the session sandbox's own bookkeeping is never
+    /// tracked. Container-profile sessions are skipped: their writes land
     /// inside the container where host-side git cannot see them.
     fn ensure_file_diffs(&mut self) {
         // An ephemeral session has no dirs on disk yet; its filebase is
@@ -643,24 +645,25 @@ impl App {
         }
 
         let session_paths = crate::session::SessionPaths::new(session.sandbox_dir.clone());
-        let mut roots = vec![
-            crate::file_tracker::TrackedRootSpec::new(session.sandbox_dir.clone())
-                .exclude("filebase")
-                .exclude("tmp")
-                .exclude("outputs")
-                .exclude("skills")
-                .exclude("subagents"),
-        ];
-        if let Ok(config) =
-            crate::workspace::WorkspaceConfig::load(&session_paths.workspace_config())
-        {
-            roots.extend(
-                config
-                    .workdirs
-                    .iter()
-                    .filter(|dir| dir.permission == crate::workspace::Permission::ReadWrite)
-                    .map(|dir| crate::file_tracker::TrackedRootSpec::new(dir.path.clone())),
-            );
+        let mut roots = Self::repo_clone_specs(&session.sandbox_dir);
+        match crate::workspace::WorkspaceConfig::load(&session_paths.workspace_config()) {
+            Ok(config) => {
+                // The launch dir needs no root of its own when a grant
+                // already covers it.
+                if !config.has_write_access(&self.cwd) {
+                    roots.push(crate::file_tracker::TrackedRootSpec::new(self.cwd.clone()));
+                }
+                roots.extend(
+                    config
+                        .workdirs
+                        .iter()
+                        .filter(|dir| dir.permission == crate::workspace::Permission::ReadWrite)
+                        .map(|dir| crate::file_tracker::TrackedRootSpec::new(dir.path.clone())),
+                );
+            }
+            Err(_) => {
+                roots.push(crate::file_tracker::TrackedRootSpec::new(self.cwd.clone()));
+            }
         }
         self.file_status.clear();
         self.file_diffs =
@@ -760,8 +763,44 @@ impl App {
             }
         }
         if refresh_status && let Some(handle) = &self.file_diffs {
+            // Repo clones created since the last refresh join tracking;
+            // the worker dedupes roots it already covers.
+            if let Some(session) = self
+                .session_manager
+                .current()
+                .filter(|session| session.persisted)
+            {
+                for spec in Self::repo_clone_specs(&session.sandbox_dir) {
+                    handle.request_add_root(spec);
+                }
+            }
             handle.request_status();
         }
+    }
+
+    /// Tracked-root specs for the session's repo clones: every clone under
+    /// `<sandbox>/repos/` is an embedded repository whose working tree only
+    /// diffs against a shadow repo of its own, labeled by the repository
+    /// it serves.
+    fn repo_clone_specs(
+        sandbox_dir: &std::path::Path,
+    ) -> Vec<crate::file_tracker::TrackedRootSpec> {
+        let repos = crate::repo_clone::SessionRepos::new(sandbox_dir, "");
+        let Ok(clones) = repos.clones() else {
+            return Vec::new();
+        };
+        clones
+            .iter()
+            .map(|record| {
+                let label = if record.local {
+                    crate::fs_utils::display_path(std::path::Path::new(&record.source))
+                } else {
+                    record.source.clone()
+                };
+                crate::file_tracker::TrackedRootSpec::new(repos.root().join(&record.dir))
+                    .label(format!("{label} (clone)"))
+            })
+            .collect()
     }
 
     /// Show the result of a completed code rewind in the chat stream.
