@@ -2020,6 +2020,12 @@ fn render_impl(
 
     // Plain mirror of the tail, for selection.
     layout.set_tail_plain(chat_layout::plain_rows(&tail, area.width, tail_rows));
+    layout.set_input_span(input_line_idx.map(|index| {
+        (
+            element_rows + tail_starts.get(index).copied().unwrap_or(0),
+            chat_layout::line_rows(&tail[index], area.width),
+        )
+    }));
 
     // Anchor the terminal cursor on the caret cell so IME composition and
     // its candidate window track the real insertion point.

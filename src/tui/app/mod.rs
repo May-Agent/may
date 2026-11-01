@@ -2545,6 +2545,22 @@ impl App {
             MouseEventKind::ScrollDown => self.scroll_chat_down(SCROLL_STEP_LINES),
             MouseEventKind::Down(MouseButton::Left) => {
                 let point = self.mouse_to_selection_point(mouse);
+                // A click inside the composer moves the input caret to the
+                // hit cell instead of starting a text selection.
+                if let Some(p) = point
+                    && let Some((start, rows)) = self.chat_layout.input_span()
+                    && (start..start + rows).contains(&p.line)
+                {
+                    let mut cursor = 0usize;
+                    for row in start..p.line {
+                        if let Some(text) = self.chat_layout.plain_line(row) {
+                            cursor += text.chars().count();
+                        }
+                    }
+                    self.cursor = (cursor + p.column).min(self.input_char_count);
+                    self.selection = None;
+                    return Ok(None);
+                }
                 let double_click = point.is_some_and(|p| {
                     self.last_click.is_some_and(|(at, last)| {
                         at.elapsed() <= DOUBLE_CLICK_WINDOW
