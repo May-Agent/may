@@ -104,8 +104,9 @@ impl Entry {
         state: ElementState,
         width: u16,
         images_supported: bool,
+        tunnel_base: &str,
     ) -> Self {
-        let laid = element_lines(elem, state, images_supported);
+        let laid = element_lines(elem, state, images_supported, tunnel_base);
         let mut line_starts = Vec::with_capacity(laid.lines.len());
         let mut rows = 0usize;
         for line in &laid.lines {
@@ -223,7 +224,14 @@ impl ChatLayout {
             });
             let entry = reused.unwrap_or_else(|| {
                 self.rebuilt += 1;
-                Entry::build(elem, revision, state, width, images_supported)
+                Entry::build(
+                    elem,
+                    revision,
+                    state,
+                    width,
+                    images_supported,
+                    chat.tunnel_base(),
+                )
             });
             entries.push(entry);
         }

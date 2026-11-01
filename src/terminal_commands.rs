@@ -66,6 +66,8 @@ pub struct SharedTerminalCommandConfig<LLM> {
     pub task_broker: Option<TaskBroker>,
     /// Broker for `notify` notifications.
     pub notify_broker: Option<NotifyBroker>,
+    /// Broker for `tunnel` registrations.
+    pub tunnel_broker: Option<crate::agent::tunnel_tool::TunnelBroker>,
     /// Broker for `browser` commands.
     pub browser_broker: Option<BrowserBroker>,
     /// Broker for skill registration.
@@ -229,6 +231,17 @@ where
             builder,
             &mut descriptions,
             NotifyTool::new(Some(notify_broker)).for_session(config.session_id.clone()),
+        );
+    }
+
+    if let Some(tunnel_broker) = config.tunnel_broker {
+        register_tool_with_description(
+            builder,
+            &mut descriptions,
+            crate::agent::tunnel_tool::TunnelTool::new(
+                config.session_id.clone(),
+                Some(tunnel_broker),
+            ),
         );
     }
 
@@ -440,6 +453,7 @@ mod tests {
                 task_runtime: TaskRuntimeKind::Local,
                 task_broker: None,
                 notify_broker: None,
+                tunnel_broker: None,
                 browser_broker: None,
                 register_skills_broker: None,
                 register_subagents_broker: None,
@@ -495,6 +509,7 @@ mod tests {
                 task_runtime: TaskRuntimeKind::Local,
                 task_broker: None,
                 notify_broker: None,
+                tunnel_broker: None,
                 browser_broker: None,
                 register_skills_broker: None,
                 register_subagents_broker: None,
@@ -554,6 +569,7 @@ mod tests {
                 task_runtime: TaskRuntimeKind::Local,
                 task_broker: None,
                 notify_broker: None,
+                tunnel_broker: None,
                 browser_broker: None,
                 register_skills_broker: None,
                 register_subagents_broker: None,
@@ -601,6 +617,7 @@ mod tests {
                 task_runtime: TaskRuntimeKind::Local,
                 task_broker: None,
                 notify_broker: None,
+                tunnel_broker: None,
                 browser_broker: None,
                 register_skills_broker: None,
                 register_subagents_broker: None,
@@ -763,6 +780,7 @@ mod tests {
                 task_runtime: TaskRuntimeKind::Local,
                 task_broker: None,
                 notify_broker: None,
+                tunnel_broker: None,
                 browser_broker: None,
                 register_skills_broker: None,
                 register_subagents_broker: None,
@@ -837,6 +855,7 @@ mod tests {
                 task_runtime: TaskRuntimeKind::Local,
                 task_broker: None,
                 notify_broker: None,
+                tunnel_broker: None,
                 browser_broker: None,
                 register_skills_broker: None,
                 register_subagents_broker: None,

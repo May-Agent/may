@@ -1238,6 +1238,7 @@ pub(super) fn spawn_shared_tool_dispatchers(state: Arc<DaemonState>, queues: UiT
         browser,
         register_skills,
         register_subagents,
+        tunnel,
     } = queues;
 
     let task_state = state.clone();
@@ -1274,6 +1275,16 @@ pub(super) fn spawn_shared_tool_dispatchers(state: Arc<DaemonState>, queues: UiT
         while let Some(request) = register_skills.next().await {
             let result =
                 handle_register_skills_request(&register_skills_state, request.args.clone()).await;
+            let _ = request.respond(result);
+        }
+    });
+
+    let tunnel_state = state.clone();
+    let tokio_handle = state.tokio_handle.clone();
+    tokio_handle.spawn(async move {
+        while let Some(request) = tunnel.next().await {
+            let result =
+                super::tunnel::handle_tunnel_request(&tunnel_state, request.args.clone()).await;
             let _ = request.respond(result);
         }
     });
@@ -2339,6 +2350,7 @@ struct ToolBrokers {
     browser: crate::agent::browser_tool::BrowserBroker,
     register_skills: crate::agent::register_tool::RegisterBroker,
     register_subagents: crate::agent::register_tool::RegisterBroker,
+    tunnel: crate::agent::tunnel_tool::TunnelBroker,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -2976,6 +2988,7 @@ fn build_tool_brokers(state: &Arc<DaemonState>, session_id: &SessionId) -> ToolB
         browser: state.tool_dispatchers.browser.clone(),
         register_skills: state.tool_dispatchers.register_skills.clone(),
         register_subagents: state.tool_dispatchers.register_subagents.clone(),
+        tunnel: state.tool_dispatchers.tunnel.clone(),
     }
 }
 
@@ -3127,6 +3140,7 @@ fn build_session_agent<'a>(
                 location,
                 task_broker: Some(brokers.task),
                 notify_broker: Some(brokers.notify),
+                tunnel_broker: Some(brokers.tunnel),
                 browser_broker: state.browser_manager().map(|_| brokers.browser),
                 #[cfg(target_os = "macos")]
                 computer: (!matches!(
