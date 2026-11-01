@@ -174,7 +174,7 @@ impl Bundle {
     }
 
     /// Create directory symlink from parent/name to target.
-    async fn create_dir_symlink(
+    pub(crate) async fn create_dir_symlink(
         parent: &Path,
         target: &Path,
         name: &str,

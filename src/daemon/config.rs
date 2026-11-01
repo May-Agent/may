@@ -371,11 +371,9 @@ pub(super) async fn set_last_model(
 pub(super) async fn get_memory(
     State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<MemoryPayload>> {
-    let content = state
-        .db()
-        .get_global_memory()
+    let memory_file = MayHomePaths::new(state.may_dir.clone()).memory_file();
+    let content = async_fs::read_to_string(&memory_file)
         .await
-        .map_err(internal_error)?
         .unwrap_or_default();
     Ok(Json(MemoryPayload { content }))
 }
@@ -389,9 +387,8 @@ pub(super) async fn save_memory(
             "memory updates require explicit user request confirmation",
         ));
     }
-    state
-        .db()
-        .set_global_memory(&payload.content)
+    let memory_file = MayHomePaths::new(state.may_dir.clone()).memory_file();
+    async_fs::write(&memory_file, &payload.content)
         .await
         .map_err(internal_error)?;
     Ok(Json(ApiHealth { ok: true }))
