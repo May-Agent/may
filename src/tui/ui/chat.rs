@@ -2287,27 +2287,37 @@ pub(crate) fn format_number(n: usize) -> String {
 }
 
 /// Render a tool call inline with optional selection highlight.
-/// Marker prefix shown before a terminal command for its execution backend.
+/// Marker prefix shown before a terminal command for its execution
+/// backend. A host-run (`unsafe`) command is marked by the red status
+/// icon instead — see [`status_icon`].
 const fn terminal_mode_marker(mode: TerminalExecutionMode) -> &'static str {
     match mode {
-        TerminalExecutionMode::Default => "",
+        TerminalExecutionMode::Default | TerminalExecutionMode::Unsafe => "",
         TerminalExecutionMode::Sandboxed => "[sandbox] ",
-        TerminalExecutionMode::Unsafe => "[unsafe] ",
         TerminalExecutionMode::Ssh => "[ssh] ",
     }
 }
 
 /// The icon prefixing a call's headline — spinner while running, tick on
-/// success, cross on failure — and its style.
-fn status_icon(status: &ToolStatus, spinner_frame: usize) -> (char, Style) {
-    match status {
-        ToolStatus::Running => (
-            SPINNER_FRAMES[spinner_frame % SPINNER_FRAMES.len()],
-            Style::default().fg(Color::DarkGray),
-        ),
-        ToolStatus::Done => ('✓', Style::default().fg(Color::Green)),
-        ToolStatus::Failed(_) => ('✗', Style::default().fg(Color::Red)),
-    }
+/// success, cross on failure — and its style. An `unsafe` (host-run)
+/// command is red in every state so it stands out from sandboxed calls
+/// at a glance.
+fn status_icon(status: &ToolStatus, spinner_frame: usize, unsafe_exec: bool) -> (char, Style) {
+    let state_color = if unsafe_exec {
+        Color::Red
+    } else {
+        match status {
+            ToolStatus::Running => Color::DarkGray,
+            ToolStatus::Done => Color::Green,
+            ToolStatus::Failed(_) => Color::Red,
+        }
+    };
+    let icon = match status {
+        ToolStatus::Running => SPINNER_FRAMES[spinner_frame % SPINNER_FRAMES.len()],
+        ToolStatus::Done => '✓',
+        ToolStatus::Failed(_) => '✗',
+    };
+    (icon, Style::default().fg(state_color))
 }
 
 /// A tool call's styled headline: expand marker + status icon +
@@ -2326,7 +2336,14 @@ fn tool_header_line(
         "▸ "
     };
     let dim = Style::default().fg(Color::DarkGray);
-    let (icon, icon_style) = status_icon(display.status(), spinner_frame);
+    let unsafe_exec = matches!(
+        display,
+        ToolDisplay::Terminal {
+            mode: TerminalExecutionMode::Unsafe,
+            ..
+        }
+    );
+    let (icon, icon_style) = status_icon(display.status(), spinner_frame, unsafe_exec);
     let mut spans = vec![
         Span::styled(marker, dim),
         Span::styled(format!("{icon} "), icon_style),
@@ -2975,20 +2992,19 @@ mod tests {
             terminal_mode_marker(TerminalExecutionMode::Sandboxed),
             "[sandbox] "
         );
-        assert_eq!(
-            terminal_mode_marker(TerminalExecutionMode::Unsafe),
-            "[unsafe] "
-        );
+        // Unsafe carries no text marker — the red status icon marks it.
+        assert_eq!(terminal_mode_marker(TerminalExecutionMode::Unsafe), "");
         assert_eq!(terminal_mode_marker(TerminalExecutionMode::Ssh), "[ssh] ");
     }
 
     #[test]
     fn inline_terminal_renders_mode_marker() {
-        for (mode, marker) in [
-            (TerminalExecutionMode::Default, ""),
-            (TerminalExecutionMode::Sandboxed, "[sandbox] "),
-            (TerminalExecutionMode::Unsafe, "[unsafe] "),
-            (TerminalExecutionMode::Ssh, "[ssh] "),
+        for (mode, marker, icon_fg) in [
+            (TerminalExecutionMode::Default, "", Color::Green),
+            (TerminalExecutionMode::Sandboxed, "[sandbox] ", Color::Green),
+            // Unsafe: no text marker — the status icon turns red instead.
+            (TerminalExecutionMode::Unsafe, "", Color::Red),
+            (TerminalExecutionMode::Ssh, "[ssh] ", Color::Green),
         ] {
             let display = ToolDisplay::Terminal {
                 description: String::new(),
@@ -3009,6 +3025,7 @@ mod tests {
                 .map(|span| span.content.as_ref())
                 .collect();
             assert_eq!(rendered, format!("▸ ✓ {marker}$ echo hi"));
+            assert_eq!(lines[0].spans[1].style.fg, Some(icon_fg));
         }
     }
 

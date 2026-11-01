@@ -2847,7 +2847,7 @@ impl App {
             ToolDisplay::Terminal {
                 description: String::new(),
                 command: format!("! {masked}"),
-                mode: aither_sandbox::TerminalExecutionMode::Default,
+                mode: aither_sandbox::TerminalExecutionMode::Unsafe,
                 status: super::ui::chat::ToolStatus::Running,
                 output: None,
                 diffs: Vec::new(),
