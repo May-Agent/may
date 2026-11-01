@@ -1,5 +1,6 @@
 //! Chat stream display with inline tools and todos.
 
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
@@ -1205,7 +1206,7 @@ pub fn build_plain_wrapped_lines_unified(
         render_queue_lines(&mut tail, ctx, width);
     }
     if let Some(ctx) = input_ctx {
-        render_input_line(&mut tail, &ctx, images_supported, None);
+        render_input_line(&mut tail, &ctx, width, images_supported, None);
     }
     if let Some(ctx) = status_ctx {
         render_status_line(&mut tail, ctx, width as usize);
@@ -1786,6 +1787,7 @@ fn render_impl(
         input_line_idx = Some(render_input_line(
             &mut tail,
             &ctx,
+            area.width,
             images_supported,
             Some(&mut tail_images),
         ));
@@ -1920,6 +1922,49 @@ fn wrapped_line_rows(line: &Line<'_>, width: usize) -> usize {
         .line_count(w)
 }
 
+/// Style of the leading `!` chip while the composer is in bash mode.
+const BANG_STYLE: Style = Style::new()
+    .fg(Color::Black)
+    .bg(Color::Yellow)
+    .add_modifier(Modifier::BOLD);
+
+/// `true` when the composer input is a bash-mode (`!`) command — the same
+/// gate `submit_bash` uses.
+fn bash_mode(input: &str) -> bool {
+    input.starts_with('!')
+}
+
+/// The composer's visible text: `/secret KEY VALUE` renders the value as
+/// `•`s so a secret never sits on screen; every other input shows
+/// verbatim. Masking is char-for-char so caret indexing stays aligned
+/// with `input`.
+fn composer_display(input: &str) -> Cow<'_, str> {
+    let Some(rest) = input.trim_start().strip_prefix("/secret") else {
+        return Cow::Borrowed(input);
+    };
+    if !rest.starts_with(char::is_whitespace) {
+        return Cow::Borrowed(input);
+    }
+    let rest = rest.trim_start();
+    let Some(key_end) = rest.find(char::is_whitespace) else {
+        return Cow::Borrowed(input);
+    };
+    let value = rest[key_end..].trim_start();
+    if value.is_empty() {
+        return Cow::Borrowed(input);
+    }
+    // `value` is a suffix of `input`, so the visible prefix ends where it
+    // begins.
+    let mut masked = String::with_capacity(input.len());
+    masked.push_str(&input[..input.len() - value.len()]);
+    masked.extend(
+        value
+            .chars()
+            .map(|c| if c.is_whitespace() { c } else { '•' }),
+    );
+    Cow::Owned(masked)
+}
+
 /// The input `Line` up to and including the caret marker: prompt,
 /// attachment chips and the text before the caret. The caret marker's
 /// cell is where the terminal cursor — and therefore IME composition —
@@ -1962,8 +2007,14 @@ fn input_caret_line(ctx: &InputContext<'_>) -> Line<'static> {
         }
     }
 
-    let byte_idx = char_to_byte_index(ctx.input, ctx.cursor);
-    spans.push(Span::raw(ctx.input[..byte_idx].to_string()));
+    let display = composer_display(ctx.input);
+    let byte_idx = char_to_byte_index(&display, ctx.cursor);
+    if bash_mode(&display) && byte_idx > 0 {
+        spans.push(Span::styled("!", BANG_STYLE));
+        spans.push(Span::raw(display[1..byte_idx].to_string()));
+    } else {
+        spans.push(Span::raw(display[..byte_idx].to_string()));
+    }
     spans.push(Span::styled("│", Style::default().fg(Color::Yellow)));
     Line::from(spans)
 }
@@ -2003,6 +2054,7 @@ fn wrapped_tail_cell(line: Line<'static>, width: u16) -> Option<(u16, u16)> {
 fn render_input_line(
     lines: &mut Vec<Line<'_>>,
     ctx: &InputContext<'_>,
+    width: u16,
     images_supported: bool,
     mut image_positions: Option<&mut Vec<(String, usize, String)>>,
 ) -> usize {
@@ -2024,9 +2076,25 @@ fn render_input_line(
     // scratch anchor used for cursor placement.
     let mut line = input_caret_line(ctx);
     line.spans.pop();
-    let byte_idx = char_to_byte_index(ctx.input, ctx.cursor);
-    line.spans
-        .push(Span::raw(ctx.input[byte_idx..].to_string()));
+    let display = composer_display(ctx.input);
+    let byte_idx = char_to_byte_index(&display, ctx.cursor);
+    if bash_mode(&display) && byte_idx == 0 {
+        line.spans.push(Span::styled("!", BANG_STYLE));
+        line.spans.push(Span::raw(display[1..].to_string()));
+    } else {
+        line.spans.push(Span::raw(display[byte_idx..].to_string()));
+    }
+
+    // The bash-mode affordance hugs the input line, below any attachment
+    // previews.
+    if bash_mode(&display) {
+        const LABEL: &str = " (bash mode) ";
+        let fill = usize::from(width).saturating_sub(UnicodeWidthStr::width(LABEL));
+        lines.push(Line::from(Span::styled(
+            format!("{LABEL}{}", "─".repeat(fill)),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
 
     let index = lines.len();
     lines.push(line);
@@ -2740,6 +2808,7 @@ mod tests {
     use crate::tui::queue::Attachment;
     use crate::tui::ui::streaming_markdown::IMAGE_HEIGHT;
     use aither_sandbox::TerminalExecutionMode;
+    use ratatui::style::Color;
     use ratatui::text::Line;
     use std::path::PathBuf;
     use std::time::Instant;
@@ -3505,7 +3574,7 @@ mod tests {
         };
         let mut lines: Vec<Line> = Vec::new();
         let mut positions = Vec::new();
-        render_input_line(&mut lines, &ctx, true, Some(&mut positions));
+        render_input_line(&mut lines, &ctx, 80, true, Some(&mut positions));
 
         assert_eq!(lines.len(), IMAGE_HEIGHT + 1);
         assert!(
@@ -3527,7 +3596,7 @@ mod tests {
             attachments: &attachments,
         };
         let mut lines: Vec<Line> = Vec::new();
-        render_input_line(&mut lines, &ctx, false, None);
+        render_input_line(&mut lines, &ctx, 80, false, None);
 
         assert_eq!(lines.len(), 1);
         let rendered: String = lines[0]
@@ -3536,6 +3605,49 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect();
         assert!(rendered.contains("[image]"));
+    }
+
+    #[test]
+    fn bash_input_shows_mode_hint_and_styled_bang() {
+        let ctx = InputContext {
+            input: "!ls -la",
+            cursor: 7,
+            attachments: &[],
+        };
+        let mut lines: Vec<Line> = Vec::new();
+        let index = render_input_line(&mut lines, &ctx, 80, false, None);
+
+        assert_eq!(index, 1);
+        let hint: String = lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(hint.starts_with(" (bash mode) ───"));
+        let prompt = &lines[1];
+        assert_eq!(prompt.spans[0].content, "> ");
+        assert_eq!(prompt.spans[1].content, "!");
+        assert_eq!(prompt.spans[1].style.bg, Some(Color::Yellow));
+        assert_eq!(prompt.spans[2].content, "ls -la");
+    }
+
+    #[test]
+    fn secret_input_masks_value() {
+        let ctx = InputContext {
+            input: "/secret KEY hunter2",
+            cursor: 19,
+            attachments: &[],
+        };
+        let mut lines: Vec<Line> = Vec::new();
+        render_input_line(&mut lines, &ctx, 80, false, None);
+
+        let rendered: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect();
+        assert!(rendered.contains("/secret KEY "));
+        assert!(!rendered.contains("hunter2"));
+        assert!(rendered.contains("•••••••"));
     }
 
     #[test]
