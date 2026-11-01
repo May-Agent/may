@@ -19,7 +19,9 @@ use crate::profile::{PinnedItem, ProfileInfo, ProfileSessions};
 use crate::session::PendingUserMessageMode;
 use crate::{ChatMessage, MayConfig, MessageRole, SessionId, SessionManager, SessionSummary};
 
-use super::agent_event_adapter::{ToolEndKind, ToolStartKind, parse_tool_end, parse_tool_start};
+use super::agent_event_adapter::{
+    ToolEndKind, ToolStartKind, parse_tool_end, parse_tool_start, parse_tool_start_partial,
+};
 use super::clipboard::{
     ClipboardPasteResult, ImageManager, TextManager, download_image, is_image_url, read_clipboard,
     set_clipboard_html, set_clipboard_text,
@@ -283,6 +285,10 @@ pub struct App {
     pub run_guard: Option<crate::session::SessionRunGuard>,
     /// Running terminal calls bound to registry jobs for live output.
     pub live_reads: std::collections::HashMap<String, LiveRead>,
+    /// Tool calls still streaming their arguments, keyed by call id: the
+    /// cumulative JSON `ToolCallDelta` fragments assembled so far, so the
+    /// call's element can render before the canonical `ToolCallStart`.
+    pub pending_tool_calls: std::collections::HashMap<String, PendingToolCall>,
     /// Last time file-diff previews were requested for running calls.
     pub diff_preview_at: Option<std::time::Instant>,
     /// Loaded secret values for bash-mode masking and env injection.
@@ -323,6 +329,19 @@ pub struct LiveRead {
     /// Trailing bytes of an incomplete multi-byte UTF-8 sequence, held for
     /// the next chunk so the live preview never shows mojibake.
     pub pending: Vec<u8>,
+}
+
+/// A tool call whose arguments are still streaming in.
+#[derive(Debug, Default)]
+pub struct PendingToolCall {
+    /// Tool name; empty until the first named fragment arrives.
+    pub name: String,
+    /// Cumulative arguments JSON — fragments concatenate into the call's
+    /// full payload.
+    pub arguments: String,
+    /// The canonical `ToolCallStart` landed; later deltas are stale and
+    /// must not regress the fully-parsed display.
+    pub started: bool,
 }
 
 /// Length of `buf`'s longest prefix that ends on a UTF-8 boundary —
@@ -533,6 +552,7 @@ impl App {
             live_output_read_at: None,
             run_guard: None,
             live_reads: std::collections::HashMap::new(),
+            pending_tool_calls: std::collections::HashMap::new(),
             diff_preview_at: None,
             secrets,
             open_question_count: 0,
@@ -1290,6 +1310,9 @@ impl App {
     /// that named it. The id itself is never surfaced.
     fn resolve_task_label(&self, task_id: &str) -> Option<String> {
         use super::ui::chat::ChatElement;
+        if task_id.is_empty() {
+            return None;
+        }
         if let Some(job) = self.jobs.iter().find(|job| job.task_id == task_id) {
             return job.script.lines().next().map(str::to_string);
         }
@@ -1509,6 +1532,7 @@ impl App {
         self.subagents.clear();
         self.live_output_read_at = None;
         self.live_reads.clear();
+        self.pending_tool_calls.clear();
         self.diff_preview_at = None;
 
         // Load chat history into display
@@ -3088,6 +3112,73 @@ impl App {
         .detach();
     }
 
+    /// Map a parsed tool-call start into its stream display. Shared by the
+    /// canonical `ToolCallStart` path and the progressive `ToolCallDelta`
+    /// projection — a partial parse only differs in fields still empty.
+    fn tool_start_display(&self, kind: ToolStartKind) -> ToolDisplay {
+        match kind {
+            ToolStartKind::Terminal {
+                description,
+                script,
+                mode,
+            } => ToolDisplay::Terminal {
+                description,
+                command: script,
+                mode,
+                status: super::ui::chat::ToolStatus::Running,
+                output: None,
+                diffs: Vec::new(),
+                pinned: None,
+                finished_at: None,
+            },
+            ToolStartKind::Stdin { task_id, input } => {
+                let mut detail: Vec<String> = Vec::new();
+                if let Some(target) = self.resolve_task_label(&task_id) {
+                    detail.push(format!("→ {target}"));
+                }
+                if input.lines().count() > 1 {
+                    detail.extend(input.lines().map(str::to_string));
+                }
+                ToolDisplay::Action {
+                    chip: "stdin".to_string(),
+                    task_id: Some(task_id),
+                    summary: input.lines().next().unwrap_or_default().to_string(),
+                    detail,
+                    status: super::ui::chat::ToolStatus::Running,
+                    output: None,
+                    pinned: None,
+                    finished_at: None,
+                }
+            }
+            ToolStartKind::JobControl { action, task_id } => ToolDisplay::Action {
+                chip: action.chip().to_string(),
+                task_id: Some(task_id.clone()),
+                summary: self
+                    .resolve_task_label(&task_id)
+                    .unwrap_or_else(|| "background task".to_string()),
+                detail: Vec::new(),
+                status: super::ui::chat::ToolStatus::Running,
+                output: None,
+                pinned: None,
+                finished_at: None,
+            },
+            ToolStartKind::Generic {
+                name,
+                summary,
+                arguments,
+            } => ToolDisplay::Action {
+                chip: name,
+                task_id: None,
+                summary,
+                detail: pretty_arguments(&arguments),
+                status: super::ui::chat::ToolStatus::Running,
+                output: None,
+                pinned: None,
+                finished_at: None,
+            },
+        }
+    }
+
     /// Handle an agent event. Returns true if stream ended.
     pub async fn handle_agent_event(&mut self, result: Result<TimedEvent, AgentError>) -> bool {
         match result {
@@ -3116,10 +3207,35 @@ impl App {
                         }
                     }
                     AgentEvent::ToolCallDelta {
-                        arguments_fragment, ..
+                        id,
+                        name,
+                        arguments_fragment,
                     } => {
                         self.activity_phase = crate::tui::ui::chat::ActivityPhase::Working;
                         self.decode_meter.note_output(arguments_fragment.len());
+                        let kind = {
+                            let pending = self.pending_tool_calls.entry(id.clone()).or_default();
+                            if !name.is_empty() {
+                                pending.name.clone_from(&name);
+                            }
+                            pending.arguments.push_str(&arguments_fragment);
+                            if pending.started || pending.name.is_empty() {
+                                None
+                            } else {
+                                Some(parse_tool_start_partial(&pending.name, &pending.arguments))
+                            }
+                        };
+                        if let Some(kind) = kind {
+                            // Materialize the call the moment its name is
+                            // known and grow its display as arguments
+                            // stream in; the canonical start re-parses
+                            // and replaces it below.
+                            self.chat.collapse_thinking();
+                            self.chat.end_text();
+                            self.thinking_start = None;
+                            let display = self.tool_start_display(kind);
+                            self.chat.upsert_tool_display(id, display);
+                        }
                     }
                     AgentEvent::ToolCallStart {
                         id,
@@ -3131,68 +3247,11 @@ impl App {
                         self.chat.end_text();
                         self.thinking_start = None;
                         self.decode_meter.note_boundary();
-                        let display = match parse_tool_start(&name, &arguments) {
-                            ToolStartKind::Terminal {
-                                description,
-                                script,
-                                mode,
-                            } => ToolDisplay::Terminal {
-                                description,
-                                command: script,
-                                mode,
-                                status: super::ui::chat::ToolStatus::Running,
-                                output: None,
-                                diffs: Vec::new(),
-                                pinned: None,
-                                finished_at: None,
-                            },
-                            ToolStartKind::Stdin { task_id, input } => {
-                                let mut detail: Vec<String> = Vec::new();
-                                if let Some(target) = self.resolve_task_label(&task_id) {
-                                    detail.push(format!("→ {target}"));
-                                }
-                                if input.lines().count() > 1 {
-                                    detail.extend(input.lines().map(str::to_string));
-                                }
-                                ToolDisplay::Action {
-                                    chip: "stdin".to_string(),
-                                    task_id: Some(task_id),
-                                    summary: input.lines().next().unwrap_or_default().to_string(),
-                                    detail,
-                                    status: super::ui::chat::ToolStatus::Running,
-                                    output: None,
-                                    pinned: None,
-                                    finished_at: None,
-                                }
-                            }
-                            ToolStartKind::JobControl { action, task_id } => ToolDisplay::Action {
-                                chip: action.chip().to_string(),
-                                task_id: Some(task_id.clone()),
-                                summary: self
-                                    .resolve_task_label(&task_id)
-                                    .unwrap_or_else(|| "background task".to_string()),
-                                detail: Vec::new(),
-                                status: super::ui::chat::ToolStatus::Running,
-                                output: None,
-                                pinned: None,
-                                finished_at: None,
-                            },
-                            ToolStartKind::Generic {
-                                name,
-                                summary,
-                                arguments,
-                            } => ToolDisplay::Action {
-                                chip: name,
-                                task_id: None,
-                                summary,
-                                detail: pretty_arguments(&arguments),
-                                status: super::ui::chat::ToolStatus::Running,
-                                output: None,
-                                pinned: None,
-                                finished_at: None,
-                            },
-                        };
-                        self.chat.push_tool(id, display);
+                        if let Some(pending) = self.pending_tool_calls.get_mut(&id) {
+                            pending.started = true;
+                        }
+                        let display = self.tool_start_display(parse_tool_start(&name, &arguments));
+                        self.chat.upsert_tool_display(id, display);
                     }
                     AgentEvent::ToolCallEnd { id, result, .. } => {
                         // Back to waiting on the model for the next burst.
@@ -3227,6 +3286,7 @@ impl App {
                             }
                         }
                         self.live_reads.remove(&id);
+                        self.pending_tool_calls.remove(&id);
                         self.request_file_diff(&id);
                         self.refresh_todos().await;
                     }
@@ -3265,6 +3325,7 @@ impl App {
                         self.chat.collapse_thinking();
                         self.chat.end_text();
                         self.decode_meter.note_boundary();
+                        self.pending_tool_calls.clear();
                         self.scroll = usize::MAX;
                         self.input_visible = true;
                         // The turn may have edited tasks.md without a tool
@@ -3290,6 +3351,7 @@ impl App {
             Err(e) => {
                 tracing::error!("Agent error: {}", e);
                 self.decode_meter.note_boundary();
+                self.pending_tool_calls.clear();
                 // Display error to user
                 self.chat.collapse_thinking();
                 self.chat.push_error(&format!("{e}"));

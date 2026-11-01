@@ -3,6 +3,7 @@ use aither_core::llm::{
 };
 use aither_sandbox::builtin::{InputTerminalArgs, KillTerminalArgs, ReadTerminalDeltaArgs};
 use aither_sandbox::{TerminalArgs, TerminalExecutionMode};
+use partial_json_fixer::fix_json;
 
 /// Frontend-agnostic start event for a tool call.
 #[derive(Debug, Clone)]
@@ -149,6 +150,57 @@ pub fn parse_tool_start(name: &str, arguments: &str) -> ToolStartKind {
     }
 }
 
+/// Parse still-streaming tool-call arguments into a best-effort start
+/// event for progressive rendering.
+///
+/// `arguments` is the fragment assembled so far — almost never complete
+/// JSON. `partial-json-fixer` repairs it textually, fields that have not
+/// streamed in yet come back empty, and unreadable values fall back to
+/// defaults; nothing panics. The canonical `ToolCallStart` re-parses
+/// with [`parse_tool_start`] and replaces this projection.
+#[must_use]
+pub fn parse_tool_start_partial(name: &str, arguments: &str) -> ToolStartKind {
+    let repaired = fix_json(arguments.trim());
+    let value: serde_json::Value = serde_json::from_str(&repaired).unwrap_or_default();
+    match name {
+        "terminal" => ToolStartKind::Terminal {
+            description: pick(&value, "description"),
+            script: pick(&value, "script"),
+            mode: value
+                .get("mode")
+                .and_then(|mode| serde_json::from_value(mode.clone()).ok())
+                .unwrap_or_default(),
+        },
+        "terminal_input" => ToolStartKind::Stdin {
+            task_id: pick(&value, "task_id"),
+            input: pick(&value, "input"),
+        },
+        "terminal_kill" => ToolStartKind::JobControl {
+            action: JobControlAction::Kill,
+            task_id: pick(&value, "task_id"),
+        },
+        "terminal_read" => ToolStartKind::JobControl {
+            action: JobControlAction::Read,
+            task_id: pick(&value, "task_id"),
+        },
+        _ => ToolStartKind::Generic {
+            name: name.to_string(),
+            summary: generic_summary(&repaired),
+            arguments: repaired,
+        },
+    }
+}
+
+/// String field `key` of a repaired arguments object, empty when it has
+/// not streamed in yet.
+fn pick(value: &serde_json::Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
 /// Argument keys inspected for a one-line summary of an unknown tool call,
 /// in priority order. Covers the shared command surface (`description`,
 /// `query`, `prompt`, ...) plus free-form MCP payloads.
@@ -274,7 +326,10 @@ fn extract_tool_output(result: &CommandResult) -> ToolOutput {
 
 #[cfg(test)]
 mod tests {
-    use super::{ToolEndKind, ToolImage, ToolStartKind, parse_tool_end, parse_tool_start};
+    use super::{
+        ToolEndKind, ToolImage, ToolStartKind, parse_tool_end, parse_tool_start,
+        parse_tool_start_partial,
+    };
     use aither_core::llm::{
         CommandOutcome, CommandResult, CommandStream, StoredFile, ToolResult, tool::ToolResultPart,
     };
@@ -380,6 +435,104 @@ mod tests {
             ToolStartKind::Generic { summary, .. } => assert_eq!(summary, ""),
             _ => panic!("expected generic start event"),
         }
+    }
+
+    #[test]
+    fn parse_tool_start_partial_grows_terminal_fields() {
+        // Arguments stream in order; each projection surfaces whatever is
+        // readable so far, never panics on the truncated JSON.
+        let frames = [
+            "",
+            "{\"",
+            "{\"description\":\"Get cur",
+            "{\"description\":\"Get current time\",\"script\":\"date",
+            "{\"description\":\"Get current time\",\"script\":\"date +%s\"}",
+        ];
+        let mut previous = String::new();
+        for frame in frames {
+            let ToolStartKind::Terminal {
+                description,
+                script,
+                mode,
+            } = parse_tool_start_partial("terminal", frame)
+            else {
+                panic!("expected terminal start kind");
+            };
+            assert_eq!(mode, TerminalExecutionMode::Default);
+            assert!(description.starts_with(previous.as_str()));
+            previous = description;
+            let _ = script;
+        }
+        assert_eq!(previous, "Get current time");
+    }
+
+    #[test]
+    fn parse_tool_start_partial_reads_partial_mode() {
+        let ToolStartKind::Terminal { mode, .. } = parse_tool_start_partial(
+            "terminal",
+            r#"{"description":"x","script":"rm -rf /","mode":"unsa"}"#,
+        ) else {
+            panic!("expected terminal start kind");
+        };
+        // Truncated enum text is unreadable — falls back to the default.
+        assert_eq!(mode, TerminalExecutionMode::Default);
+
+        let ToolStartKind::Terminal { mode, .. } = parse_tool_start_partial(
+            "terminal",
+            r#"{"description":"x","script":"rm -rf /","mode":"unsafe"}"#,
+        ) else {
+            panic!("expected terminal start kind");
+        };
+        assert_eq!(mode, TerminalExecutionMode::Unsafe);
+    }
+
+    #[test]
+    fn parse_tool_start_partial_covers_terminal_family() {
+        let ToolStartKind::Stdin { task_id, input } =
+            parse_tool_start_partial("terminal_input", r#"{"task_id":"finch-comet","input":"Fri"#)
+        else {
+            panic!("expected stdin start kind");
+        };
+        assert_eq!(task_id, "finch-comet");
+        assert_eq!(input, "Fri");
+
+        let ToolStartKind::JobControl { action, task_id } =
+            parse_tool_start_partial("terminal_kill", "{\"task_id\":\"finch-com")
+        else {
+            panic!("expected job-control start kind");
+        };
+        assert_eq!(action, super::JobControlAction::Kill);
+        assert_eq!(task_id, "finch-com");
+
+        let ToolStartKind::JobControl { action, .. } =
+            parse_tool_start_partial("terminal_read", "{}")
+        else {
+            panic!("expected job-control start kind");
+        };
+        assert_eq!(action, super::JobControlAction::Read);
+    }
+
+    #[test]
+    fn parse_tool_start_partial_generic_and_garbage() {
+        let ToolStartKind::Generic {
+            name,
+            summary,
+            arguments,
+        } = parse_tool_start_partial("websearch", r#"{"query":"may ag"#)
+        else {
+            panic!("expected generic start kind");
+        };
+        assert_eq!(name, "websearch");
+        assert_eq!(summary, "may ag");
+        assert!(serde_json::from_str::<serde_json::Value>(&arguments).is_ok());
+
+        // Garbage in, empty projection out — no panic.
+        let ToolStartKind::Generic { summary, .. } =
+            parse_tool_start_partial("mystery", "not json at all")
+        else {
+            panic!("expected generic start kind");
+        };
+        assert_eq!(summary, "");
     }
 
     fn terminal_result(stdout: CommandStream) -> ToolResult {
