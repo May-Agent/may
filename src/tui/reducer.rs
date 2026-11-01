@@ -82,6 +82,14 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             }
             Ok(None)
         }
+        AppEvent::ResumeSessionsLoaded(sessions) => {
+            if let AppMode::ResumePicker(state) = &mut app.mode {
+                state.sessions = sessions;
+                state.loading = false;
+                state.selected = 0;
+            }
+            Ok(None)
+        }
         AppEvent::SessionDeleted {
             deleted: _,
             was_current,
