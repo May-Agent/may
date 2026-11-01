@@ -99,7 +99,10 @@ pub(super) async fn computer_takeover_start(
 ) -> SkyResult<Json<ComputerTakeoverResponse>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
     set_takeover(&state, &id, true).await;
-    let _ = state.runtime_service.runs().cancel(id.as_str());
+    let _ = state
+        .runtime_service
+        .runs()
+        .cancel(id.as_str(), crate::session::CancelReason::User);
     state.notify_ui_events(UiEventTopics::BROWSER_STATUS);
     Ok(Json(ComputerTakeoverResponse {
         ok: true,
