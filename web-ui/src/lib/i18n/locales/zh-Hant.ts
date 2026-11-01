@@ -45,6 +45,13 @@ export const zhHant: Messages = {
   },
   sidebar: {
     newChat: '新對話',
+    newChatRepo: {
+      title: '在 GitHub repo 開始新對話',
+      description: '建立綁定 owner/repo 的 session — 不需要本地 checkout。',
+      placeholder: 'owner/repo',
+      start: '開始',
+      known: '使用中的 repo',
+    },
     sessions: '會話',
     noSessions: '尚無會話',
     noSessionsInProfile: '這個 Profile 還沒有任何對話。',
