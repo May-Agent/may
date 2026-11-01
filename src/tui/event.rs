@@ -8,6 +8,7 @@ use crossterm::event::{self, Event, KeyCode, KeyModifiers, MouseEvent};
 use executor_core::spawn;
 
 use crate::profile::{ProfileInfo, ProfileSessions};
+use crate::session::import::ForeignSessionSummary;
 use crate::{SessionSummary, SkillInfo};
 
 use super::error::TuiError;
@@ -31,6 +32,8 @@ pub enum AppEvent {
     // ─── Async operation results ───────────────────────────────────────
     /// Session list loaded from background task
     SessionsLoaded(Result<Vec<SessionSummary>, TuiError>),
+    /// Claude Code transcripts listed for the `/resume-claude` picker
+    ResumeSessionsLoaded(Vec<ForeignSessionSummary>),
     /// Session deleted from background task (includes refreshed list)
     SessionDeleted {
         /// The session removed from the database, when deletion got that far.
@@ -169,6 +172,7 @@ impl AppEvent {
             Self::Paste(_) => "paste",
             Self::Mouse(_) => "mouse",
             Self::SessionsLoaded(_) => "sessions_loaded",
+            Self::ResumeSessionsLoaded(_) => "resume_sessions_loaded",
             Self::SessionDeleted { .. } => "session_deleted",
             Self::SkillsLoaded(_) => "skills_loaded",
             Self::SkillInstalled(_) => "skill_installed",
