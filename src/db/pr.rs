@@ -91,6 +91,7 @@ impl ChatDb {
     ///
     /// # Errors
     /// Fails on database errors.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_pr(
         &self,
         repo_key: &str,
