@@ -113,7 +113,7 @@ pub enum AppEvent {
     Status(String),
     /// The session's blocking state, as the daemon reported it on the
     /// `session_runtime` stream.
-    SessionRuntime(crate::client::SessionRuntimeEvent),
+    SessionRuntime(Box<crate::client::SessionRuntimeEvent>),
     /// The session's worktree index coverage, from the `session_index` stream.
     IndexCoverage(Option<crate::client::IndexCoverage>),
     /// A turn started in the daemon (this client's or another's), carrying

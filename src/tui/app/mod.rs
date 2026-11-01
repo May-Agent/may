@@ -2922,6 +2922,7 @@ impl App {
             "/quit" => self.request_quit(),
             "/compact" => Some(SendAction::Compact(None)),
             "/context" => Some(SendAction::ContextReport),
+            "/usage" => Some(SendAction::UsageReport),
             "/context dump" => Some(SendAction::ContextDump),
             "/bug" => Some(SendAction::BugReport),
             "/mcp" => {
@@ -3917,6 +3918,8 @@ pub enum SendAction {
     BugReport,
     /// Measure and display context-window usage.
     ContextReport,
+    /// Aggregate and display provider usage and cost for `/usage`.
+    UsageReport,
     /// Dump the verbatim assembled context to the session's outputs dir.
     ContextDump,
     /// MCP server management actions.

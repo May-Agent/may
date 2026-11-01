@@ -337,6 +337,8 @@ pub enum ChatElement {
     },
     /// `/context` report — estimated context-window usage per category.
     ContextReport(ContextReport),
+    /// A `/usage` provider-usage report block.
+    UsageReport(crate::agent::SessionUsageReport),
 }
 
 impl ChatElement {}
@@ -466,6 +468,12 @@ impl ChatStream {
     pub fn push_context_report(&mut self, report: ContextReport) {
         self.end_text();
         self.push_element(ChatElement::ContextReport(report));
+    }
+
+    /// Add a `/usage` provider-usage report.
+    pub fn push_usage_report(&mut self, report: crate::agent::SessionUsageReport) {
+        self.end_text();
+        self.push_element(ChatElement::UsageReport(report));
     }
 
     /// User prompts that can be rewound to, oldest first, each carrying
@@ -1496,6 +1504,85 @@ fn push_tool_call_image(
     }
 }
 
+/// Milliseconds as `1d 2h 3m` or `4m 5s`, biggest unit first.
+fn usage_duration(ms: u64) -> String {
+    const MIN: u64 = 60_000;
+    const HOUR: u64 = 60 * MIN;
+    const DAY: u64 = 24 * HOUR;
+    let (days, rem) = (ms / DAY, ms % DAY);
+    let (hours, rem) = (rem / HOUR, rem % HOUR);
+    let (mins, secs) = (rem / MIN, rem % MIN);
+    let mut parts = Vec::new();
+    if days > 0 {
+        parts.push(format!("{days}d"));
+    }
+    if hours > 0 {
+        parts.push(format!("{hours}h"));
+    }
+    if mins > 0 || parts.is_empty() {
+        parts.push(format!("{mins}m"));
+    }
+    if parts.len() < 2 && secs > 0 {
+        parts.push(format!("{}s", secs / 1000));
+    }
+    parts.join(" ")
+}
+
+/// Styled lines for a `/usage` report block: session totals, then one row
+/// per model with its cache and cost breakdown.
+fn usage_report_lines(report: &crate::agent::SessionUsageReport) -> Vec<Line<'static>> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let value = Style::default().fg(Color::Cyan);
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("API time   ", dim),
+            Span::styled(usage_duration(report.api_ms), value),
+        ]),
+        Line::from(vec![
+            Span::styled("Wall clock ", dim),
+            Span::styled(usage_duration(report.wall_ms), value),
+        ]),
+    ];
+    if let Some(cost) = report.total_cost_usd {
+        lines.push(Line::from(vec![
+            Span::styled("Total cost ", dim),
+            Span::styled(format!("${cost:.2}"), value),
+        ]));
+    }
+    for model in &report.models {
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled(model.model.clone(), value),
+            Span::styled(format!("  {} requests", model.requests), dim),
+        ]));
+        let cost_suffix = model
+            .cost_usd
+            .map_or_else(String::new, |cost| format!("  ${cost:.2}"));
+        lines.push(Line::styled(
+            format!(
+                "    out {}  cache read {}  write {}  hit {:.0}%{cost_suffix}",
+                compact_count(model.completion_tokens),
+                compact_count(model.cache_read_tokens),
+                compact_count(model.cache_write_tokens),
+                model.cache_hit_rate * 100.0,
+            ),
+            dim,
+        ));
+    }
+    lines
+}
+
+/// `1234567` as `1.2m`, `12345` as `12.3k`.
+fn compact_count(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}m", n as f64 / 1e6)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1e3)
+    } else {
+        n.to_string()
+    }
+}
+
 /// Styled lines for a `/context` report block, shared by the rendered
 /// chat and its plain-text mirror so row counts stay aligned.
 fn context_report_lines(report: &ContextReport) -> Vec<Line<'static>> {
@@ -1937,6 +2024,10 @@ pub(super) fn element_lines(
 
         ChatElement::ContextReport(report) => {
             lines.extend(context_report_lines(report));
+        }
+
+        ChatElement::UsageReport(report) => {
+            lines.extend(usage_report_lines(report));
         }
 
         ChatElement::Thinking {
