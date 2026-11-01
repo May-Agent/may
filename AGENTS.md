@@ -139,14 +139,14 @@ May is a terminal-based AI assistant built as an application layer on the **aith
 - Workdirs: User-approved directories with read/write (stored in `~/.may/workspace.toml`)
 
 **`src/bundle/`** - Embedded resources
-- Subagents (`explore.md`, `research.md`, `plan.md`) bundled via `include_str!`
-- Extracted to `~/.may/.bundle/` with symlinks at `~/.may/subagents/` and `~/.may/skills/`
+- Skills bundled via `include_str!`; subagent types (`explore`, `plan`, `research`, `fork`) are aither built-ins, not files
+- Extracted with symlinks at `~/.may/skills/`
 
 ### Session Storage Format
 
 Session conversation state is stored in the SQLite database at `~/.may/history.db`.
 That includes message history, runtime state, context snapshots, and other session metadata.
-Session directories only hold sandbox-visible artifacts such as `tmp/`, `files/`, `outputs/`, `artifacts/`, `data/`, `skills/`, `subagents/`, and optional `tasks.md`.
+Session directories only hold sandbox-visible artifacts such as `tmp/`, `files/`, `outputs/`, `artifacts/`, `data/`, `skills/`, and optional `tasks.md`.
 Do not treat `.txt` or `.md` files as the canonical session persistence layer.
 
 ### Event Loop Architecture

@@ -81,8 +81,6 @@ pub mod session;
 pub mod skill;
 /// Startup validation of configuration files.
 pub mod startup;
-/// Subagent registration and dispatch.
-pub mod subagent;
 /// Scheduled-task trigger definitions.
 pub mod task_trigger;
 /// Background task types and execution.
@@ -128,7 +126,6 @@ pub use session::{
     SessionManager, SessionMetadata, SessionPlanState, SessionStore, SessionSummary,
 };
 pub use skill::{SkillInfo, SkillManager, SkillSource};
-pub use subagent::{SubagentInfo, SubagentManager};
 pub use terminal_commands::{SharedTerminalCommandConfig, register_shared_terminal_commands};
 pub use terminal_permission_handler::TerminalPermissionHandler;
 pub use workspace::{Workspace, WorkspaceConfig};
