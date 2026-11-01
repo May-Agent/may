@@ -143,6 +143,12 @@ pub struct App {
     pub model_select_index: usize,
     /// Available models for model select (cached)
     pub model_select_list: Vec<String>,
+    /// Effort rungs offered by the `/effort` popup (`None` rung = provider default)
+    pub effort_ladder: &'static [Option<&'static str>],
+    /// Selected index in the effort popup
+    pub effort_index: usize,
+    /// Session's stored reasoning effort as last reported by the daemon
+    pub current_effort: Option<String>,
     /// Whether we need to run setup (config incomplete)
     pub needs_setup: bool,
     /// Current working directory (where May was launched)
@@ -174,6 +180,9 @@ pub struct App {
     pub model_fetch_rx: Option<Receiver<Vec<FetchedModel>>>,
     /// Per-session file-diff worker (rebuilt on session switch)
     pub file_diffs: Option<FileDiffHandle>,
+    /// Per-root session file changes shown in the sidebar's Changes
+    /// section; refreshed from the diff worker's status outcomes.
+    pub file_status: Vec<crate::file_tracker::RootDiff>,
     /// Receiver for clipboard paste resolution (oneshot)
     pub clipboard_rx: Option<Receiver<Result<ClipboardPasteResult, TuiError>>>,
     /// Pending paste results waiting to be handled
@@ -484,6 +493,9 @@ impl App {
             config_state,
             model_select_index: 0,
             model_select_list: Vec::new(),
+            effort_ladder: &[],
+            effort_index: 0,
+            current_effort: None,
             needs_setup,
             cwd,
             quit_pending: false,
@@ -499,6 +511,7 @@ impl App {
             tier_picker_loading: false,
             model_fetch_rx: None,
             file_diffs: None,
+            file_status: Vec::new(),
             clipboard_rx: None,
             pending_paste_results: std::collections::VecDeque::new(),
             pending_attachment_jobs: 0,
@@ -580,6 +593,7 @@ impl App {
     fn ensure_file_diffs(&mut self) {
         let Some(session) = self.session_manager.current() else {
             self.file_diffs = None;
+            self.file_status.clear();
             return;
         };
         let session_id = session.id.as_str().to_string();
@@ -604,6 +618,7 @@ impl App {
             });
         if is_container {
             self.file_diffs = None;
+            self.file_status.clear();
             return;
         }
 
@@ -627,8 +642,12 @@ impl App {
                     .map(|dir| crate::file_tracker::TrackedRootSpec::new(dir.path.clone())),
             );
         }
+        self.file_status.clear();
         self.file_diffs =
             FileDiffHandle::start(session_id, session_paths.root().join("filebase"), roots);
+        if let Some(handle) = &self.file_diffs {
+            handle.request_status();
+        }
     }
 
     /// Ask the diff worker to attribute pending file changes to
@@ -651,13 +670,11 @@ impl App {
     }
 
     /// Ask the diff worker to restore every tracked root to the tree
-    /// recorded at prompt dispatch. `fallback_call_ids` are the tool
-    /// calls of the rewound turns; the earliest of their checkpoints
-    /// applies when the prompt mark does not exist.
-    pub fn request_prompt_rewind(&mut self, message_db_id: i64, fallback_call_ids: Vec<String>) {
+    /// recorded when the prompt's turn started — turn-granular rewind.
+    pub fn request_prompt_rewind(&mut self, message_db_id: i64) {
         self.ensure_file_diffs();
         if let Some(handle) = &self.file_diffs {
-            handle.request_rewind(&format!("prompt:{message_db_id}"), fallback_call_ids);
+            handle.request_rewind(&format!("prompt:{message_db_id}"));
         }
     }
 
@@ -698,6 +715,7 @@ impl App {
             Some(handle) => handle.drain(),
             None => return,
         };
+        let mut refresh_status = false;
         for outcome in outcomes {
             match outcome {
                 super::file_diff::Outcome::Diff {
@@ -710,11 +728,19 @@ impl App {
                     if final_snapshot || self.chat.is_tool_running(&tool_call_id) {
                         self.chat.update_tool_diff(&tool_call_id, diffs);
                     }
+                    refresh_status = true;
                 }
                 super::file_diff::Outcome::Rewound { diffs, .. } => {
                     self.apply_rewind_result(&diffs);
+                    refresh_status = true;
+                }
+                super::file_diff::Outcome::Status { diffs } => {
+                    self.file_status = diffs;
                 }
             }
+        }
+        if refresh_status && let Some(handle) = &self.file_diffs {
+            handle.request_status();
         }
     }
 
@@ -726,7 +752,7 @@ impl App {
             );
             return;
         }
-        let files: usize = diffs.iter().map(|d| d.files).sum();
+        let files: usize = diffs.iter().map(|d| d.changes.len()).sum();
         let additions: usize = diffs.iter().map(|d| d.additions).sum();
         let deletions: usize = diffs.iter().map(|d| d.deletions).sum();
         self.chat.push_notice(&format!(
@@ -1905,6 +1931,7 @@ impl App {
             )),
             AppMode::Config => Ok(self.handle_config_key(code, modifiers)),
             AppMode::ModelSelect => Ok(self.handle_model_select_key(code)),
+            AppMode::EffortSelect => Ok(self.handle_effort_select_key(code)),
             AppMode::TierModelPicker => Ok(self.handle_tier_model_picker_key(code)),
             AppMode::CopilotAuth => Ok(super::reducer::manage::handle_copilot_auth_key(self, code)),
             AppMode::ChatgptAuth => Ok(super::reducer::manage::handle_chatgpt_auth_key(self, code)),
@@ -2061,6 +2088,46 @@ impl App {
         }
 
         self.session_list = list;
+    }
+
+    /// The provider type serving the session's current model; picks the
+    /// effort ladder's vocabulary.
+    fn current_provider_type(&self) -> Option<crate::config::ProviderType> {
+        let model = self
+            .current_model
+            .clone()
+            .or_else(|| self.config.last_model.as_ref().map(ToString::to_string))?;
+        let selector = model.parse::<crate::ModelSelector>().ok()?;
+        self.config
+            .provider
+            .get(selector.provider_id())
+            .map(|instance| instance.resolve_type(selector.provider_id()))
+    }
+
+    /// Fetch the session's stored reasoning effort so the popup highlights
+    /// the level other clients may have set.
+    fn fetch_current_effort(&self) {
+        let (Some(client), Some(session_id)) = (
+            self.btw_daemon.clone(),
+            self.session_manager.current().map(|s| s.id.clone()),
+        ) else {
+            return;
+        };
+        let tx = self.event_tx.clone();
+        spawn(async move {
+            if let Ok(session) = client
+                .get::<crate::client::WireSession>(&format!(
+                    "/api/sessions/{}",
+                    session_id.as_str()
+                ))
+                .await
+            {
+                let _ = tx
+                    .send(AppEvent::EffortLoaded(session.reasoning_effort))
+                    .await;
+            }
+        })
+        .detach();
     }
 
     /// Get the current profile name for display.
@@ -2624,6 +2691,17 @@ impl App {
                     self.model_select_index = idx;
                 }
                 self.mode = AppMode::ModelSelect;
+                None
+            }
+            "/effort" => {
+                self.effort_ladder = model_picker::effort_ladder_for(self.current_provider_type());
+                self.effort_index = self
+                    .effort_ladder
+                    .iter()
+                    .position(|rung| *rung == self.current_effort.as_deref())
+                    .unwrap_or(0);
+                self.mode = AppMode::EffortSelect;
+                self.fetch_current_effort();
                 None
             }
             "/rewind" => {
@@ -3521,6 +3599,8 @@ pub enum SendAction {
     },
     /// Switch to a different model for this session.
     SwitchModel(String),
+    /// Set the session's reasoning effort (`None` clears to provider default).
+    SetEffort(Option<String>),
     /// Compact the conversation history with optional focus hint.
     Compact(Option<String>),
     /// Write the recent-log snapshot to `~/.may/bugs`.

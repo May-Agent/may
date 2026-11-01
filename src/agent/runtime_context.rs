@@ -15,7 +15,6 @@
 
 use aither_agent::SubagentDefinition;
 use aither_core::llm::model::{Ability, Parameters};
-use aither_core::llm::tool::ToolDefinition;
 use askama::Template;
 
 use super::may::{AgentEnvironment, MayAgentConfig, MayAgentError};
@@ -65,9 +64,7 @@ pub struct RuntimeSystemContext {
     memory_db: crate::db::ChatDb,
     last_memory_content: String,
     terminal_runtime: Option<String>,
-    workspace: Option<String>,
     workspace_workdirs: Option<String>,
-    container_environment: Option<String>,
     browser: Option<String>,
     profile_persona: Option<String>,
     profile_memories: Option<String>,
@@ -84,9 +81,7 @@ impl RuntimeSystemContext {
             memory_db,
             last_memory_content: memory_content,
             terminal_runtime: None,
-            workspace: None,
             workspace_workdirs: None,
-            container_environment: None,
             browser: None,
             profile_persona: None,
             profile_memories: None,
@@ -103,18 +98,8 @@ impl RuntimeSystemContext {
         self
     }
 
-    pub(crate) fn with_workspace(mut self, workspace: String) -> Self {
-        self.workspace = Some(workspace);
-        self
-    }
-
     pub(crate) fn with_workspace_workdirs(mut self, workdirs: String) -> Self {
         self.workspace_workdirs = Some(workdirs);
-        self
-    }
-
-    pub(crate) fn with_container_environment(mut self, container_environment: String) -> Self {
-        self.container_environment = Some(container_environment);
         self
     }
 
@@ -168,17 +153,16 @@ impl RuntimeSystemContext {
             tag::TERMINAL_RUNTIME_CONTEXT,
             self.terminal_runtime.clone(),
         );
-        reconcile_text_block(context, tag::WORKSPACE, self.workspace.clone());
+        // The workspace and container-environment blocks were folded into the
+        // terminal-runtime block; a context restored from an older snapshot may
+        // still carry them, so drop them unconditionally.
+        reconcile_text_block(context, tag::WORKSPACE, None);
         reconcile_text_block(
             context,
             tag::WORKSPACE_WORKDIRS,
             self.workspace_workdirs.clone(),
         );
-        reconcile_text_block(
-            context,
-            tag::CONTAINER_ENVIRONMENT_CONTEXT,
-            self.container_environment.clone(),
-        );
+        reconcile_text_block(context, tag::CONTAINER_ENVIRONMENT_CONTEXT, None);
         reconcile_text_block(context, tag::BROWSER, self.browser.clone());
         reconcile_text_block(context, tag::PROFILE_PERSONA, self.profile_persona.clone());
         reconcile_text_block(
@@ -289,7 +273,7 @@ struct TerminalRuntimeContextTemplate {
     shell_dialect: &'static str,
     home_directory: String,
     session_directory: String,
-    current_working_directory: String,
+    host_launch_directory: Option<String>,
     home_layout: Vec<String>,
     session_layout: Vec<String>,
     command_rules: Vec<String>,
@@ -298,14 +282,6 @@ struct TerminalRuntimeContextTemplate {
     attached_remote_servers: Vec<crate::config::SshServerConfig>,
     secret_names: Vec<String>,
     secrets_file: String,
-}
-
-#[derive(Clone, Template)]
-#[template(path = "workspace_context.txt", escape = "none")]
-struct WorkspaceTemplate {
-    operating_system: String,
-    sandbox: String,
-    cwd: String,
 }
 
 #[derive(Clone, Template)]
@@ -332,21 +308,8 @@ impl From<&MayWorkspaceDir> for WorkspaceDirEntry {
     }
 }
 
-#[derive(Clone, Template)]
-#[template(path = "container_environment_context.txt", escape = "none")]
-struct ContainerEnvironmentContextTemplate {
-    operating_system: String,
-    cwd: String,
-}
-
 #[derive(Clone)]
 struct BaseSystemCommand {
-    name: String,
-    description: String,
-}
-
-#[derive(Clone)]
-struct BaseSystemNativeTool {
     name: String,
     description: String,
 }
@@ -367,7 +330,6 @@ struct BaseSystemSubagent {
 #[derive(Clone, Template)]
 #[template(path = "base_system.md", escape = "none")]
 struct BaseSystemTemplate {
-    native_tools: Vec<BaseSystemNativeTool>,
     has_hosted_web_search: bool,
     has_hosted_web_fetch: bool,
     has_browser_command: bool,
@@ -401,10 +363,10 @@ pub fn build_terminal_runtime_context(
     session_paths: &SessionPaths,
     model_info: Option<&aither_models::ModelEntry>,
     attached_remote_servers: Vec<crate::config::SshServerConfig>,
+    host_launch_directory: Option<String>,
 ) -> String {
     let mut modality_support = Vec::new();
     if let Some(info) = model_info {
-        modality_support.push(resolved_model_capability(info.id()));
         if info.has_ability(Ability::Vision) {
             modality_support.push("Image input is supported natively.".to_string());
         }
@@ -439,41 +401,27 @@ pub fn build_terminal_runtime_context(
         shell_dialect: "POSIX sh",
         home_directory: display_path(&session_paths.home_root()),
         session_directory: display_path(session_paths.root()),
-        current_working_directory: display_path(session_paths.root()),
+        host_launch_directory,
         home_layout: vec![
             "/sessions - per-session sandboxes under this home environment".to_string(),
-            "/skills - profile/home-scoped skills, exposed read-only inside the session"
-                .to_string(),
-            "/subagents - profile/home-scoped subagents, exposed read-only inside the session"
-                .to_string(),
+            "/skills, /subagents - profile-scoped, mounted read-only inside the session".to_string(),
             "workspace.toml - May-managed workspace grants for this home environment".to_string(),
         ],
         session_layout: vec![
             "/tmp - disposable temporary files".to_string(),
-            "/artifacts - durable user-facing outputs; put deliverables here instead of tmp/"
-                .to_string(),
+            "/artifacts - durable user-facing outputs; put deliverables here".to_string(),
             "/files - durable uploaded or recalled files".to_string(),
             "/outputs - durable overflow and full command outputs".to_string(),
             "/data - durable session-owned state".to_string(),
-            "/skills - read-only profile skills mounted into this session".to_string(),
-            "/subagents - read-only profile subagents mounted into this session".to_string(),
+            "/skills, /subagents - read-only profile mounts".to_string(),
             "tasks.md - canonical task/plan document for long-running work".to_string(),
         ],
         command_rules: vec![
-            "The native tools are `terminal`, which executes commands, and `terminal_kill`, `terminal_input`, and `terminal_read`, which manage its background jobs. Higher-level capabilities are terminal CLI commands exposed through the IPC bridge rather than extra native tools; rely on runtime tool descriptions and command `--help` output instead of assuming a static command list.".to_string(),
-            "Issue at most one tool call per assistant turn. If you need multiple operations or parallel work, compose them inside one terminal command with shell control flow, pipelines, or background jobs instead of emitting multiple tool calls in the same response.".to_string(),
-            "Read a selected skill completely before acting on it. The terminal call that reads the skill must finish before any task command that depends on those instructions.".to_string(),
-            "IPC-backed commands are only valid when executed inside this profile's home environment. If you get a system-reminder because you tried to call a non-existent direct tool, immediately retry through `terminal` with the corresponding CLI command.".to_string(),
-            "Commands run in the current session home environment by default unless you explicitly target another environment. Treat the home environment as the place where profile-scoped state, IPC commands, and durable session directories live.".to_string(),
-            "Every terminal call must set timeout: the seconds after which the command and its processes are killed (1 to 7200). The call waits up to 10 seconds for the command; one still running then continues as a background task and the call returns its task id. Set background=true to return the task id at once.".to_string(),
-            "Inline command results are previews, not guaranteed byte-for-byte raw output. May may clean, fold, summarize, or structurally compress large outputs before putting them in context.".to_string(),
-            "Treat context as memory and the filesystem as disk. After compaction, restart, or long runs, recover prior tool results from outputs/, data/, files/, artifacts/, or tasks.md instead of assuming the inline preview was complete.".to_string(),
-            "For large saved outputs, use normal shell tools such as `head`, `tail`, `sed`, `rg`, `jq`, or the `ask` command against files to recall only the relevant slice.".to_string(),
-            "Background tasks persist output to files. Use terminal_read for incremental reads, terminal_input for stdin when the process needs user input, and terminal_kill to stop them.".to_string(),
-            "For image-producing commands, set expect=image and optionally resolution=auto|low|medium|high|native. If omitted, May picks a preview resolution from the source media.".to_string(),
-            "For browser work, use the terminal `browser` command with this exact lifecycle: `browser open`, `browser read <url> --detail <brief|standard|full> --screenshot <off|viewport|full-page>`, `browser cdp-endpoint` only when CDP is required, and `browser close` when finished so the live browser sidebar closes and resources are released.".to_string(),
-            "When you create a user-facing file, write it under artifacts/ and surface it with an artifact control tag on its own line: `<artifact url=\"path/inside/artifacts\" />`; a Slidev deck adds the `slidev` attribute. The UI renders the tag as the artifact's preview card.".to_string(),
-            "Use tasks.md as the canonical working document for multi-step work; it should stay accurate enough to resume after context loss.".to_string(),
+            "Issue at most one tool call per assistant turn; compose multiple operations inside one terminal command with shell control flow, pipelines, or background jobs.".to_string(),
+            "Commands run in the current session home environment unless you explicitly target another. IPC-backed commands only work inside this profile's home environment; if a system-reminder reports a call to a non-existent direct tool, retry it through `terminal` as the CLI command.".to_string(),
+            "Read a selected skill completely before acting on it; the terminal call that reads the skill must finish before any task command that depends on it.".to_string(),
+            "Inline command results are previews May may clean, fold, or compress; the filesystem is durable. After compaction, restart, or long runs, recover prior results from outputs/, data/, files/, artifacts/, or tasks.md - read the slice you need with `head`, `tail`, `rg`, `jq`, or `ask`.".to_string(),
+            "Surface a user-facing file by writing it under artifacts/ and emitting an artifact tag on its own line: `<artifact url=\"path/inside/artifacts\" />`; a Slidev deck adds the `slidev` attribute.".to_string(),
             "Ids surfaced by tool results and reminders — sessions, tasks, questions, runs, agents, requests — are internal handles: pass them to commands and reference them in tasks.md, but never quote them to the user.".to_string(),
         ],
         environment_rules: environment_runtime_rules(&config.environment),
@@ -492,28 +440,9 @@ pub fn build_terminal_runtime_context(
         .unwrap_or_else(|error| panic!("failed to render terminal runtime context: {error}"))
 }
 
-fn resolved_model_capability(model_id: &str) -> String {
-    let mut text = String::with_capacity(model_id.len() + 16);
-    text.push_str("Resolved model: ");
-    text.push_str(model_id);
-    text
-}
-
-pub fn build_workspace_context(workspace: &MayWorkspace) -> String {
-    let template = WorkspaceTemplate {
-        operating_system: operating_system_hint(&AgentEnvironment::Local).to_string(),
-        sandbox: display_path(&workspace.sandbox),
-        cwd: display_path(&workspace.cwd),
-    };
-    template
-        .render()
-        .unwrap_or_else(|error| panic!("failed to render workspace context: {error}"))
-}
-
 /// Builds the optional `workspace_workdirs` block from currently approved
-/// workspace grants. Split from [`build_workspace_context`] so that runtime
-/// workdir approvals can invalidate only this block and leave the stable
-/// workspace prefix cached.
+/// workspace grants. Kept as its own block so that runtime workdir approvals
+/// can invalidate only this block and leave the stable prefix cached.
 pub fn build_workspace_workdirs_context(workspace: &MayWorkspace) -> Option<String> {
     let workdirs: Vec<WorkspaceDirEntry> = workspace
         .config
@@ -532,19 +461,8 @@ pub fn build_workspace_workdirs_context(workspace: &MayWorkspace) -> Option<Stri
     )
 }
 
-pub fn build_container_environment_context(cwd: &std::path::Path) -> String {
-    let template = ContainerEnvironmentContextTemplate {
-        operating_system: "linux (managed container runtime)".to_string(),
-        cwd: display_path(cwd),
-    };
-    template
-        .render()
-        .unwrap_or_else(|error| panic!("failed to render container environment context: {error}"))
-}
-
 pub async fn build_base_system_prompt(
     shared_terminal_commands: &[(String, String)],
-    native_tool_definitions: &[ToolDefinition],
     request_parameters: &Parameters,
     skills_dir: &std::path::Path,
     subagents_dir: &std::path::Path,
@@ -559,27 +477,8 @@ pub async fn build_base_system_prompt(
         .collect::<Vec<_>>();
     commands.sort_by(|left, right| left.name.cmp(&right.name));
 
-    let mut native_tools = native_tool_definitions
-        .iter()
-        .map(|definition| BaseSystemNativeTool {
-            name: definition.name().to_string(),
-            description: crate::terminal_commands::short_description(definition.description()),
-        })
-        .collect::<Vec<_>>();
     let has_hosted_web_search = request_parameters.hosted_web_search();
     let has_hosted_web_fetch = request_parameters.hosted_web_fetch();
-    if has_hosted_web_search {
-        native_tools.push(BaseSystemNativeTool {
-            name: "web_search".to_string(),
-            description: "Provider-hosted web search".to_string(),
-        });
-    }
-    if has_hosted_web_fetch {
-        native_tools.push(BaseSystemNativeTool {
-            name: "web_fetch".to_string(),
-            description: "Provider-hosted URL fetch".to_string(),
-        });
-    }
     let has_browser_command = commands.iter().any(|command| command.name == "browser");
 
     let skills = SkillManager::from_skills_dir(skills_dir.to_path_buf())
@@ -600,7 +499,6 @@ pub async fn build_base_system_prompt(
     subagents.sort_by(|left, right| left.id.cmp(&right.id));
 
     let template = BaseSystemTemplate {
-        native_tools,
         has_hosted_web_search,
         has_hosted_web_fetch,
         has_browser_command,
@@ -668,14 +566,11 @@ fn host_operating_system_label() -> &'static str {
 fn environment_runtime_rules(environment: &AgentEnvironment) -> Vec<String> {
     match environment {
         AgentEnvironment::Local => vec![
-            "This home environment runs on the user's local machine. Default to the session sandbox and approved workspace roots for writes.".to_string(),
-            "Outside approved writable paths, treat the host as read-mostly and request approval before side effects.".to_string(),
-            "Host automation must respect the local operating system and user presence.".to_string(),
+            "This home environment is the user's real machine: prefer inspection over mutation outside the sandbox and approved workdirs, and request approval before destructive or irreversible commands.".to_string(),
         ],
         AgentEnvironment::Container { .. } => vec![
-            "This home environment runs inside a managed container. Prefer direct terminal usage and assume the filesystem is writable unless a command says otherwise.".to_string(),
-            "Container state outside the durable session directories may be ephemeral, so persist anything important into session files.".to_string(),
-            "The container is isolated from the user's host machine, but you should still avoid needless destructive commands inside it.".to_string(),
+            "This home environment is a managed container isolated from the user's host machine; the filesystem is writable unless a command says otherwise, but avoid needless destructive commands.".to_string(),
+            "Container-global state may be ephemeral; persist anything important into durable session directories (data/, outputs/, files/, artifacts/). Host-specific and desktop automation tools do not exist inside the container unless verified.".to_string(),
         ],
     }
 }
@@ -786,42 +681,10 @@ mod tests {
     use tempfile::tempdir;
 
     use aither_core::llm::model::Parameters;
-    use aither_core::llm::tool::ToolDefinition;
 
     use super::{
         RuntimeSystemContext, build_base_system_prompt, build_memory_context_content, tag,
     };
-
-    fn native_tool_definitions() -> Vec<ToolDefinition> {
-        [
-            (
-                "terminal",
-                "Execute terminal commands in a sandboxed environment.",
-            ),
-            (
-                "terminal_kill",
-                "Terminate a background terminal task by its task id.",
-            ),
-            (
-                "terminal_input",
-                "Send input to a background terminal task that is waiting on stdin.",
-            ),
-            (
-                "terminal_read",
-                "Read incremental output from a background terminal task.",
-            ),
-        ]
-        .into_iter()
-        .map(|(name, description)| {
-            ToolDefinition::from_parts(
-                name.into(),
-                description.into(),
-                serde_json::json!({"type": "object", "properties": {}}),
-            )
-            .expect("tool definition schema should be valid")
-        })
-        .collect()
-    }
 
     fn test_db() -> crate::db::ChatDb {
         let dir = tempdir().expect("temp dir should be created");
@@ -946,8 +809,10 @@ mod tests {
     fn workspace_and_workdirs_are_reconciled_independently() {
         let db = test_db();
         let mut runtime_context = RuntimeSystemContext::new(db, String::new())
-            .with_workspace("Workspace: local".to_string());
+            .with_terminal_runtime("Model: demo-model".to_string());
         let mut context = aither_agent::Context::default();
+        context.insert_system_text(tag::WORKSPACE, "stale workspace");
+        context.insert_system_text(tag::CONTAINER_ENVIRONMENT_CONTEXT, "stale container");
         runtime_context.reconcile(&mut context);
         let without_workdirs_fingerprint = context.stable_prefix_fingerprint();
 
@@ -955,7 +820,8 @@ mod tests {
             .with_workspace_workdirs("Approved workspace directories:\n- /foo".to_string());
         runtime_context.reconcile(&mut context);
 
-        assert!(context.has_system_block(tag::WORKSPACE));
+        assert!(!context.has_system_block(tag::WORKSPACE));
+        assert!(!context.has_system_block(tag::CONTAINER_ENVIRONMENT_CONTEXT));
         assert!(context.has_system_block(tag::WORKSPACE_WORKDIRS));
         assert_ne!(
             without_workdirs_fingerprint,
@@ -986,7 +852,6 @@ mod tests {
         let dir = tempdir().expect("temp dir should be created");
         tokio_test::block_on(build_base_system_prompt(
             commands,
-            &native_tool_definitions(),
             request_parameters,
             dir.path(),
             dir.path(),
@@ -1015,25 +880,11 @@ mod tests {
     }
 
     #[test]
-    fn base_system_prompt_lists_native_tools() {
+    fn base_system_prompt_has_no_native_tool_listing() {
+        // Native tool usage lives in the injected tool schemas; the system
+        // prompt only names CLI commands, skills and subagents.
         let prompt = render_base_system_prompt(&[], &Parameters::default());
-
-        let native_section = prompt
-            .split("<native_tools>")
-            .nth(1)
-            .and_then(|rest| rest.split("</native_tools>").next())
-            .expect("native tools section should render");
-        for name in [
-            "terminal",
-            "terminal_kill",
-            "terminal_input",
-            "terminal_read",
-        ] {
-            assert!(
-                native_section.contains(&format!("- {name}:")),
-                "native tool '{name}' missing: {native_section}"
-            );
-        }
+        assert!(!prompt.contains("<native_tools>"), "{prompt}");
     }
 
     #[test]
@@ -1045,13 +896,6 @@ mod tests {
 
         let prompt = render_base_system_prompt(&commands, &parameters);
 
-        let native_section = prompt
-            .split("<native_tools>")
-            .nth(1)
-            .and_then(|rest| rest.split("</native_tools>").next())
-            .expect("native tools section should render");
-        assert!(native_section.contains("- web_search:"), "{native_section}");
-        assert!(native_section.contains("- web_fetch:"), "{native_section}");
         assert!(prompt.contains("Use `web_search` to look up current information"));
         assert!(prompt.contains("Use `web_fetch` to read a known URL"));
         assert!(prompt.contains(
@@ -1069,13 +913,7 @@ mod tests {
 
         let prompt = render_base_system_prompt(&commands, &Parameters::default());
 
-        let native_section = prompt
-            .split("<native_tools>")
-            .nth(1)
-            .and_then(|rest| rest.split("</native_tools>").next())
-            .expect("native tools section should render");
-        assert!(!native_section.contains("web_search"), "{native_section}");
-        assert!(!native_section.contains("web_fetch"), "{native_section}");
+        assert!(!prompt.contains("web_search"), "{prompt}");
         assert!(!prompt.contains("look up current information"));
         let commands_section = prompt
             // The tool architecture mentions `<commands>` inline, so match the

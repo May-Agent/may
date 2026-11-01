@@ -1,1 +1,1 @@
-You are on the user's real macOS machine (not a container) under heel isolation. Prefer `osascript -l JavaScript` (JXA) over AppleScript for app automation. Use `mdfind` for Spotlight search. Request unsafe escalation explicitly when host-level operations need elevated sandbox permissions.
+Host automation: prefer `osascript -l JavaScript` (JXA) over AppleScript; use `mdfind` for Spotlight search; request unsafe escalation explicitly when a host-level operation needs elevated sandbox permissions.
