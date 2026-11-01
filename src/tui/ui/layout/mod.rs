@@ -695,21 +695,35 @@ fn render_tier_model_picker(frame: &mut Frame, area: Rect, app: &App) {
 fn render_model_select_popup(frame: &mut Frame, area: Rect, app: &App) {
     let popup_area = area;
 
+    // Keep the highlighted row inside the visible window as the selection
+    // moves past either edge of the sheet.
+    let visible_height = popup_area.height.saturating_sub(2) as usize;
+    let selected = app.model_select_index;
+    let scroll_offset = if selected >= visible_height {
+        selected - visible_height + 1
+    } else {
+        0
+    };
+
     let items: Vec<ListItem> = app
         .model_select_list
         .iter()
         .enumerate()
+        .skip(scroll_offset)
+        .take(visible_height.max(1))
         .map(|(idx, model)| {
-            let prefix = if idx == app.model_select_index {
-                "> "
-            } else {
-                "  "
-            };
-            // Check if this is current model
-            let current = app.current_model.as_deref().is_some_and(|m| m == model);
+            let prefix = if idx == selected { "> " } else { "  " };
+            // The stored selector may carry an effort rung the list shows
+            // collapsed into its family (`swe-2-high` → `swe-2`).
+            let current = app.current_model.as_deref().is_some_and(|m| {
+                m == model
+                    || crate::models::effort_family_base(crate::model_selector::selector_model_id(
+                        m,
+                    )) == crate::model_selector::selector_model_id(model)
+            });
             let suffix = if current { " (current)" } else { "" };
             let text = format!("{prefix}{model}{suffix}");
-            let style = if idx == app.model_select_index {
+            let style = if idx == selected {
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(ratatui::style::Modifier::BOLD)
@@ -735,7 +749,6 @@ fn render_effort_select_popup(frame: &mut Frame, area: Rect, app: &App) {
     let mut spans = Vec::with_capacity(app.effort_ladder.len() + 2);
     spans.push(Span::styled("◀ ", Style::default().fg(Color::DarkGray)));
     for (idx, rung) in app.effort_ladder.iter().enumerate() {
-        let label = rung.unwrap_or("default");
         let style = if idx == app.effort_index {
             Style::default()
                 .fg(Color::Yellow)
@@ -743,7 +756,7 @@ fn render_effort_select_popup(frame: &mut Frame, area: Rect, app: &App) {
         } else {
             Style::default().fg(Color::White)
         };
-        spans.push(Span::styled(format!(" {label} "), style));
+        spans.push(Span::styled(format!(" {rung} "), style));
     }
     spans.push(Span::styled(" ▶", Style::default().fg(Color::DarkGray)));
     let paragraph = Paragraph::new(Line::from(spans)).block(
