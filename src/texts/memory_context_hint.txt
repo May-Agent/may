@@ -1,2 +1,3 @@
-Your persistent memory file: ~/.may/MEMORY.md (current content follows below).
-When the user asks you to remember, forget, or update memory, edit this file directly via terminal commands.
+Your persistent memory directory: ~/.may/memories/ (index file MEMORY.md; its current content follows below).
+When the user asks you to remember, forget, or update memory, edit files under this directory directly via terminal commands.
+MEMORY.md is a strict index: every item states its last updated date, a summary, and detail; a detail's links may only point to other files under ~/.may/memories/ (a subdirectory's MEMORY.md included).
