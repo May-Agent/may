@@ -560,6 +560,32 @@ impl ChatStream {
         }
     }
 
+    /// Stamp the daemon-measured duration of a reasoning phase. An open
+    /// block keeps its place and takes the server clock; a phase that
+    /// produced no readable text leaves a collapsed, non-expandable header.
+    pub fn finish_thinking(&mut self, seconds: u64) {
+        if let Some(ChatElement::Thinking {
+            seconds: s,
+            expanded: true,
+            ..
+        }) = self.elements.last_mut()
+        {
+            if *s != seconds {
+                *s = seconds;
+            }
+            self.touch_last();
+        } else {
+            let id = self.next_thinking_id;
+            self.next_thinking_id += 1;
+            self.push_element(ChatElement::Thinking {
+                id: format!("thinking-{id}"),
+                content: String::new(),
+                seconds,
+                expanded: false,
+            });
+        }
+    }
+
     /// Collapse the open thinking block (called when the reasoning burst
     /// ends or first text arrives). The block stays as a collapsed header.
     pub fn collapse_thinking(&mut self) {
@@ -797,8 +823,9 @@ impl ChatStream {
                 ChatElement::Thinking {
                     id: think_id,
                     expanded,
+                    content,
                     ..
-                } if think_id == id => {
+                } if think_id == id && !content.is_empty() => {
                     *expanded = !*expanded;
                     touched = Some(index);
                     break;
@@ -1515,8 +1542,9 @@ pub(super) fn collapsible_id(elem: &ChatElement) -> Option<&str> {
         ChatElement::Thinking {
             id,
             expanded: false,
+            content,
             ..
-        } => Some(id.as_str()),
+        } if !content.is_empty() => Some(id.as_str()),
         _ => None,
     }
 }
@@ -1683,10 +1711,14 @@ pub(super) fn element_lines(
                 } else {
                     format!("◐ Thinking... ({seconds} sec)")
                 }
-            } else if *seconds == 0 {
-                "◐ Thought ▸".to_string()
             } else {
-                format!("◐ Thought for {seconds} sec ▸")
+                // An empty block is a timing marker only: no expand affordance.
+                let arrow = if content.is_empty() { "" } else { " ▸" };
+                if *seconds == 0 {
+                    format!("◐ Thought{arrow}")
+                } else {
+                    format!("◐ Thought for {seconds} sec{arrow}")
+                }
             };
             lines.push(Line::from(Span::styled(
                 header,
@@ -3760,6 +3792,45 @@ mod tests {
         let lines = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
         assert!(lines[0].contains("Thought")); // first burst collapsed
         assert!(lines.iter().any(|l| l.contains("second")));
+    }
+
+    #[test]
+    fn empty_thinking_block_is_not_collapsible() {
+        let mut chat = ChatStream::new();
+        // A reasoning phase that produced no readable text: only a duration.
+        chat.finish_thinking(4);
+        let mut regions = Vec::new();
+        let lines = build_plain_wrapped_lines_unified(
+            &chat,
+            80,
+            None,
+            None,
+            None,
+            Some(&mut regions),
+            false,
+        );
+        assert_eq!(lines.len(), 2); // header + trailing blank
+        assert!(lines[0].contains("Thought for 4 sec"));
+        assert!(!lines[0].contains('▸'));
+        assert!(regions.is_empty());
+
+        // Toggling by id is a no-op on an empty block.
+        chat.toggle_expanded("thinking-0");
+        let lines = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
+        assert_eq!(lines.len(), 2);
+    }
+
+    #[test]
+    fn finish_thinking_stamps_the_open_block() {
+        let mut chat = ChatStream::new();
+        chat.push_thinking("chunk");
+        chat.finish_thinking(6);
+        let lines = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
+        assert!(lines[0].contains("Thinking... (6 sec)"));
+
+        chat.collapse_thinking();
+        let collapsed = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
+        assert!(collapsed[0].contains("Thought for 6 sec ▸"));
     }
 
     /// A tasks.md document parsed into a checklist feeds the todo block —

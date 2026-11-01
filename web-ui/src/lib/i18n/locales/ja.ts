@@ -128,6 +128,7 @@ export const ja: Messages = {
     responding: '応答中',
     scrollToBottom: '最新へ戻る',
     thought: '思考過程',
+    thoughtFor: '{seconds} 秒間思考',
     plan: 'プラン',
     assistantStreaming: 'May が応答中',
     artifacts: 'ファイル',

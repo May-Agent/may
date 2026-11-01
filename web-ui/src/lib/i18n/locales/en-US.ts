@@ -126,6 +126,7 @@ export const enUS = {
     responding: 'Responding',
     scrollToBottom: 'Jump to latest',
     thought: 'Thought',
+    thoughtFor: 'Thought for {seconds}s',
     plan: 'Plan',
     assistantStreaming: 'May is responding',
     artifacts: 'Files',

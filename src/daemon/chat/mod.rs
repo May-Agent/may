@@ -117,6 +117,12 @@ trait ChatSink {
     ) -> impl Future<Output = bool> + Send;
     fn on_text(&mut self, chunk: &str) -> impl Future<Output = bool> + Send;
     fn on_reasoning(&mut self, chunk: &str) -> impl Future<Output = bool> + Send;
+    /// A reasoning phase closed after `seconds`, whether or not it produced
+    /// readable text. Emitted just before the first visible output that
+    /// follows the phase.
+    fn on_reasoning_end(&mut self, _seconds: u64) -> impl Future<Output = bool> + Send {
+        async { true }
+    }
     fn on_tool_delta(
         &mut self,
         id: &str,
@@ -233,6 +239,16 @@ impl HubSink {
     }
 }
 
+/// `session_turn` frame closing a reasoning phase: `seconds` is its length
+/// whether or not the provider returned readable reasoning text.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReasoningEndEvent<'a> {
+    seq: u64,
+    turn_id: &'a str,
+    seconds: u64,
+}
+
 /// The last `session_turn` event of every turn, however it ended.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -312,6 +328,20 @@ impl ChatSink for HubSink {
                 chunk,
             },
         );
+        true
+    }
+
+    async fn on_reasoning_end(&mut self, seconds: u64) -> bool {
+        let seq = self.next_seq();
+        self.publish_turn(
+            "reasoning_end",
+            &ReasoningEndEvent {
+                seq,
+                turn_id: &self.turn_id,
+                seconds,
+            },
+        );
+        self.publish_agent(crate::client::SessionAgentBody::ReasoningEnd { seconds });
         true
     }
 
@@ -1262,6 +1292,7 @@ fn run_agent_loop<'a>(
                 provider_candidate_count,
                 build_key,
                 user_message_id,
+                reasoning_effort,
             } = match prepare_agent_for_request(
                 state,
                 req,
@@ -1336,6 +1367,21 @@ fn run_agent_loop<'a>(
             let mut first_agent_event_seen = false;
             let mut first_visible_tool_seen = false;
             let mut first_text_seen = false;
+            // `Some` while a model call is in its reasoning phase: the instant
+            // the phase began, measured as user-perceived wait. Armed only
+            // when the request asked the provider for reasoning text, and
+            // re-armed at every tool-result boundary.
+            let reasoning_display = crate::agent::reasoning_text_requested(
+                state
+                    .config
+                    .load()
+                    .provider
+                    .get(&provider_id)
+                    .map(|instance| instance.resolve_type(&provider_id)),
+                &current_model,
+                reasoning_effort,
+            );
+            let mut reasoning_phase = reasoning_display.then_some(started_at);
             {
                 agent.sync_runtime_context().await;
                 let mut stream = match kind {
@@ -1374,6 +1420,18 @@ fn run_agent_loop<'a>(
                         (timed.at, timed.event)
                     });
                     let event_at = event.as_ref().ok().map(|(at, _)| *at);
+                    // The first visible output of a call closes the pending
+                    // reasoning phase; its marker goes out before the event.
+                    if reasoning_phase.is_some()
+                        && event
+                            .as_ref()
+                            .map_or(true, |(_, event)| closes_reasoning_phase(event))
+                        && let Some(started) = reasoning_phase.take()
+                        && !sink.on_reasoning_end(started.elapsed().as_secs()).await
+                    {
+                        cancellation_reason = Some("client disconnected during reasoning end");
+                        break;
+                    }
                     sink.on_agent_event(event.as_ref().map(|(_, event)| event));
                     match event.map(|(_, event)| event) {
                         Ok(aither_agent::AgentEvent::Reasoning(text)) => {
@@ -1638,6 +1696,9 @@ fn run_agent_loop<'a>(
                                     Some("client disconnected during todo update");
                                 break;
                             }
+                            // A tool result is the boundary after which the
+                            // next call may reason again.
+                            reasoning_phase = reasoning_display.then(Instant::now);
                         }
                         Ok(aither_agent::AgentEvent::BackgroundTaskStarted {
                             task_id,
@@ -1660,6 +1721,14 @@ fn run_agent_loop<'a>(
                         // A reply without tool calls that the run follows
                         // with another reply is stored as a message of its
                         // own.
+                        Ok(
+                            aither_agent::AgentEvent::BuiltInToolResult { .. }
+                            | aither_agent::AgentEvent::RunResumed { .. },
+                        ) => {
+                            // Delivered tool output / a resumed run arms the
+                            // next call's reasoning phase.
+                            reasoning_phase = reasoning_display.then(Instant::now);
+                        }
                         Ok(aither_agent::AgentEvent::TurnComplete {
                             has_tool_calls: false,
                             ..
@@ -1674,6 +1743,7 @@ fn run_agent_loop<'a>(
                         }
                         Ok(aither_agent::AgentEvent::BackgroundTaskCompleted { .. }) => {
                             saw_tool_activity = true;
+                            reasoning_phase = reasoning_display.then(Instant::now);
                             clear_terminal_runtime_state(state, session_id.as_str()).await?;
                             mark_run_running(state, guard.fence()).await?;
                         }
@@ -1689,6 +1759,11 @@ fn run_agent_loop<'a>(
                         break;
                     }
                 }
+            }
+
+            // A stream that ended mid-phase still reports the reasoning wait.
+            if let Some(started) = reasoning_phase.take() {
+                let _ = sink.on_reasoning_end(started.elapsed().as_secs()).await;
             }
 
             decode_meter.note_boundary();
@@ -1872,6 +1947,21 @@ fn run_agent_loop<'a>(
             });
         }
     })
+}
+
+/// Whether an agent event is the first visible output that ends a pending
+/// reasoning phase. `Complete` is excluded: an armed phase that reaches
+/// stream end without output is closed once, after the loop.
+const fn closes_reasoning_phase(event: &aither_agent::AgentEvent) -> bool {
+    matches!(
+        event,
+        aither_agent::AgentEvent::Text(_)
+            | aither_agent::AgentEvent::ToolCallDelta { .. }
+            | aither_agent::AgentEvent::ToolCallStart { .. }
+            | aither_agent::AgentEvent::BuiltInToolCall { .. }
+            | aither_agent::AgentEvent::TurnComplete { .. }
+            | aither_agent::AgentEvent::Error(_)
+    )
 }
 
 /// Runs one turn under `guard`, publishing it to the session's clients, and
@@ -2184,6 +2274,8 @@ struct PreparedAgent {
     build_key: u64,
     /// Row id of the user message this turn stored, when it stored one.
     user_message_id: Option<i32>,
+    /// Reasoning effort resolved for this turn's requests.
+    reasoning_effort: Option<aither_core::llm::model::ReasoningEffort>,
 }
 
 struct ToolBrokers {
@@ -2931,6 +3023,7 @@ fn prepare_agent_for_request<'a>(
             provider_candidate_count: ctx.provider_candidate_count,
             build_key,
             user_message_id: ctx.user_message_id,
+            reasoning_effort: ctx.reasoning_effort,
         })
     })
 }

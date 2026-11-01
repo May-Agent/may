@@ -49,6 +49,12 @@ pub enum TuiEvent {
         /// Messages in the dump.
         message_count: usize,
     },
+    /// A reasoning phase closed after `seconds`, whether or not it produced
+    /// readable text. Emitted just before the output that follows it.
+    ReasoningEnd {
+        /// Seconds the phase lasted.
+        seconds: u64,
+    },
     /// Agent stream completed (ready for next prompt).
     Complete,
     /// Agent encountered a fatal error.
