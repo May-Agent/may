@@ -180,6 +180,9 @@ pub struct App {
     pub model_fetch_rx: Option<Receiver<Vec<FetchedModel>>>,
     /// Per-session file-diff worker (rebuilt on session switch)
     pub file_diffs: Option<FileDiffHandle>,
+    /// Per-root session file changes shown in the sidebar's Changes
+    /// section; refreshed from the diff worker's status outcomes.
+    pub file_status: Vec<crate::file_tracker::RootDiff>,
     /// Receiver for clipboard paste resolution (oneshot)
     pub clipboard_rx: Option<Receiver<Result<ClipboardPasteResult, TuiError>>>,
     /// Pending paste results waiting to be handled
@@ -508,6 +511,7 @@ impl App {
             tier_picker_loading: false,
             model_fetch_rx: None,
             file_diffs: None,
+            file_status: Vec::new(),
             clipboard_rx: None,
             pending_paste_results: std::collections::VecDeque::new(),
             pending_attachment_jobs: 0,
@@ -589,6 +593,7 @@ impl App {
     fn ensure_file_diffs(&mut self) {
         let Some(session) = self.session_manager.current() else {
             self.file_diffs = None;
+            self.file_status.clear();
             return;
         };
         let session_id = session.id.as_str().to_string();
@@ -613,6 +618,7 @@ impl App {
             });
         if is_container {
             self.file_diffs = None;
+            self.file_status.clear();
             return;
         }
 
@@ -636,8 +642,12 @@ impl App {
                     .map(|dir| crate::file_tracker::TrackedRootSpec::new(dir.path.clone())),
             );
         }
+        self.file_status.clear();
         self.file_diffs =
             FileDiffHandle::start(session_id, session_paths.root().join("filebase"), roots);
+        if let Some(handle) = &self.file_diffs {
+            handle.request_status();
+        }
     }
 
     /// Ask the diff worker to attribute pending file changes to
@@ -660,13 +670,11 @@ impl App {
     }
 
     /// Ask the diff worker to restore every tracked root to the tree
-    /// recorded at prompt dispatch. `fallback_call_ids` are the tool
-    /// calls of the rewound turns; the earliest of their checkpoints
-    /// applies when the prompt mark does not exist.
-    pub fn request_prompt_rewind(&mut self, message_db_id: i64, fallback_call_ids: Vec<String>) {
+    /// recorded when the prompt's turn started — turn-granular rewind.
+    pub fn request_prompt_rewind(&mut self, message_db_id: i64) {
         self.ensure_file_diffs();
         if let Some(handle) = &self.file_diffs {
-            handle.request_rewind(&format!("prompt:{message_db_id}"), fallback_call_ids);
+            handle.request_rewind(&format!("prompt:{message_db_id}"));
         }
     }
 
@@ -707,6 +715,7 @@ impl App {
             Some(handle) => handle.drain(),
             None => return,
         };
+        let mut refresh_status = false;
         for outcome in outcomes {
             match outcome {
                 super::file_diff::Outcome::Diff {
@@ -719,11 +728,19 @@ impl App {
                     if final_snapshot || self.chat.is_tool_running(&tool_call_id) {
                         self.chat.update_tool_diff(&tool_call_id, diffs);
                     }
+                    refresh_status = true;
                 }
                 super::file_diff::Outcome::Rewound { diffs, .. } => {
                     self.apply_rewind_result(&diffs);
+                    refresh_status = true;
+                }
+                super::file_diff::Outcome::Status { diffs } => {
+                    self.file_status = diffs;
                 }
             }
+        }
+        if refresh_status && let Some(handle) = &self.file_diffs {
+            handle.request_status();
         }
     }
 
@@ -735,7 +752,7 @@ impl App {
             );
             return;
         }
-        let files: usize = diffs.iter().map(|d| d.files).sum();
+        let files: usize = diffs.iter().map(|d| d.changes.len()).sum();
         let additions: usize = diffs.iter().map(|d| d.additions).sum();
         let deletions: usize = diffs.iter().map(|d| d.deletions).sum();
         self.chat.push_notice(&format!(
