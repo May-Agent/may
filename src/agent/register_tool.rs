@@ -72,8 +72,7 @@ pub struct Skills;
 
 impl RegisterKind for Skills {
     const TOOL_NAME: &'static str = "register-skills";
-    const DESCRIPTION: &'static str =
-        "Register a local directory as a profile skill; pending user approval, it becomes available to sessions.";
+    const DESCRIPTION: &'static str = "Register a local directory as a profile skill; pending user approval, it becomes available to sessions.";
 }
 
 /// Subagents register variant.
@@ -82,8 +81,7 @@ pub struct Subagents;
 
 impl RegisterKind for Subagents {
     const TOOL_NAME: &'static str = "register-subagents";
-    const DESCRIPTION: &'static str =
-        "Register local subagent definitions; pending user approval, they become available to sessions.";
+    const DESCRIPTION: &'static str = "Register local subagent definitions; pending user approval, they become available to sessions.";
 }
 
 /// Unified register tool generic over the kind of registration.

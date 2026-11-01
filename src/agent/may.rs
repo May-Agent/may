@@ -574,12 +574,8 @@ impl MayAgent {
             .system_text(tag::TERMINAL_RUNTIME_CONTEXT, terminal_runtime)
             .max_iterations(effective_max_iterations);
 
-        let (builder, runtime_system_context) = apply_runtime_context(
-            builder,
-            runtime_system_context,
-            &config,
-            &workspace,
-        );
+        let (builder, runtime_system_context) =
+            apply_runtime_context(builder, runtime_system_context, &config, &workspace);
 
         // Get the actual working directory before building
         let actual_sandbox_dir = PathBuf::from(builder.sandbox_dir().as_ref());
