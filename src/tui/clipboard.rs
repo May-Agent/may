@@ -350,6 +350,57 @@ pub fn read_clipboard() -> Result<ClipboardPasteResult, ImageError> {
     Ok(ClipboardPasteResult::empty())
 }
 
+/// A pasted single-line payload that resolves to a filesystem path.
+///
+/// Accepts a `file://` URL, a `~`-relative or absolute path, quoted or
+/// shell-escaped. `None` means "treat the payload as text"; existence and
+/// content checks happen on the worker in [`read_pasted_image_file`].
+#[must_use]
+pub fn pasted_image_path_candidate(pasted: &str) -> Option<PathBuf> {
+    let text = pasted.trim();
+    if text.is_empty() || text.contains('\n') {
+        return None;
+    }
+    if let Ok(url) = Url::parse(text) {
+        return (url.scheme() == "file")
+            .then(|| url.to_file_path().ok())
+            .flatten();
+    }
+    let unescaped = text
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .or_else(|| text.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
+        .map(str::to_string)
+        .or_else(|| {
+            shell_words::split(text)
+                .ok()
+                .filter(|words| words.len() == 1)
+                .and_then(|mut words| words.pop())
+        })?;
+    let path = match unescaped.strip_prefix("~/") {
+        Some(rest) => dirs::home_dir()?.join(rest),
+        None => PathBuf::from(unescaped),
+    };
+    path.is_absolute().then_some(path)
+}
+
+/// Read a pasted file reference as an image: `None` when it is not a
+/// regular file, exceeds the size cap, or carries no supported image
+/// magic bytes.
+///
+/// # Errors
+///
+/// Returns [`ImageError::Io`] when the file cannot be stat'ed or read.
+pub fn read_pasted_image_file(path: &Path) -> Result<Option<ClipboardImage>, ImageError> {
+    const MAX_BYTES: u64 = 64 * 1024 * 1024;
+    let meta = std::fs::metadata(path)?;
+    if !meta.is_file() || meta.len() > MAX_BYTES {
+        return Ok(None);
+    }
+    let data = std::fs::read(path)?;
+    Ok(ImageFormat::from_magic_bytes(&data).map(|format| ClipboardImage { data, format }))
+}
+
 /// Copy text to the system clipboard.
 ///
 /// # Errors
@@ -459,6 +510,34 @@ mod tests {
             ImageFormat::from_url_path(&asset_url),
             Some(ImageFormat::Png)
         );
+    }
+
+    #[test]
+    fn pasted_image_path_candidate_accepts_path_shapes() {
+        assert_eq!(
+            pasted_image_path_candidate("/tmp/a b.png"),
+            None,
+            "unescaped space is two words"
+        );
+        assert_eq!(
+            pasted_image_path_candidate("/tmp/a\\ b.png"),
+            Some(PathBuf::from("/tmp/a b.png"))
+        );
+        assert_eq!(
+            pasted_image_path_candidate("file:///tmp/a%20b.png"),
+            Some(PathBuf::from("/tmp/a b.png"))
+        );
+        assert_eq!(
+            pasted_image_path_candidate("\"/tmp/a b.png\""),
+            Some(PathBuf::from("/tmp/a b.png"))
+        );
+        assert_eq!(
+            pasted_image_path_candidate("~/shot.png"),
+            dirs::home_dir().map(|h| h.join("shot.png"))
+        );
+        assert_eq!(pasted_image_path_candidate("https://x/y.png"), None);
+        assert_eq!(pasted_image_path_candidate("relative/dir"), None);
+        assert_eq!(pasted_image_path_candidate("a\nb.png"), None);
     }
 
     #[test]

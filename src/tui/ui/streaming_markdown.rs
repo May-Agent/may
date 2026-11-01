@@ -5,9 +5,24 @@
 
 use ratatui::prelude::*;
 use streamdown_parser::{InlineElement, InlineParser, ParseEvent, Parser};
+use syntect::easy::HighlightLines;
+use unicode_width::UnicodeWidthStr;
 
 /// Height reserved for inline images (in terminal lines).
 pub const IMAGE_HEIGHT: usize = 8;
+
+/// Background every code-block line is painted with.
+const CODE_BG: Color = Color::Rgb(30, 30, 30);
+
+/// `HighlightLines` carries no `Debug`; this wrapper lets the renderer
+/// keep its `#[derive(Debug)]` while recording only that a block is open.
+struct CodeHighlighter(HighlightLines<'static>);
+
+impl std::fmt::Debug for CodeHighlighter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CodeHighlighter(..)")
+    }
+}
 
 /// Streaming markdown renderer with incremental parsing.
 #[derive(Debug)]
@@ -33,6 +48,23 @@ pub struct StreamingMarkdown {
     inline_open: bool,
     /// Whether terminal supports image rendering
     images_supported: bool,
+    /// Index in `rendered` where the open table's first line sits; `None`
+    /// when the block parser is not inside a table.
+    table_start: Option<usize>,
+    /// Lines the open table currently occupies in `rendered`.
+    table_line_count: usize,
+    /// Rendered cell spans of every row of the open table, header rows
+    /// first, so a wider row streaming in later can re-align the rows
+    /// already emitted.
+    table_rows: Vec<Vec<Vec<Span<'static>>>>,
+    /// Leading rows of `table_rows` emitted as `TableHeader`.
+    table_header_rows: usize,
+    /// Whether `TableSeparator` has arrived for the open table.
+    table_has_separator: bool,
+    /// Highlighter of the open fenced code block; `None` for a fence with
+    /// no language or one syntect doesn't know. Holds parse state across
+    /// streamed `CodeBlockLine`s.
+    code_highlighter: Option<CodeHighlighter>,
 }
 
 impl Default for StreamingMarkdown {
@@ -57,6 +89,12 @@ impl StreamingMarkdown {
             pending_line: String::new(),
             inline_open: false,
             images_supported: false,
+            table_start: None,
+            table_line_count: 0,
+            table_rows: Vec::new(),
+            table_header_rows: 0,
+            table_has_separator: false,
+            code_highlighter: None,
         }
     }
 
@@ -74,6 +112,12 @@ impl StreamingMarkdown {
             pending_line: String::new(),
             inline_open: false,
             images_supported,
+            table_start: None,
+            table_line_count: 0,
+            table_rows: Vec::new(),
+            table_header_rows: 0,
+            table_has_separator: false,
+            code_highlighter: None,
         }
     }
 
@@ -103,9 +147,48 @@ impl StreamingMarkdown {
 
     /// Parse a single line and render its events.
     fn parse_line(&mut self, line: &str) {
+        let normalized = self.normalize_table_line(line);
+        let line = normalized.as_deref().unwrap_or(line);
         for event in self.parser.parse_line(line) {
             self.render_event(event);
         }
+    }
+
+    /// streamdown-parser requires both outer pipes on a table row; GFM
+    /// makes them optional and models drop the trailing one constantly.
+    /// Add the missing pipes when the line is unambiguously part of a
+    /// table — a pipe-bearing line inside an open table, or a pipe-led
+    /// line the next unparsed line proves to be a header. Anything else
+    /// passes through so it can still end the table.
+    fn normalize_table_line(&self, line: &str) -> Option<String> {
+        let trimmed = line.trim_end();
+        let starts = trimmed.trim_start().starts_with('|');
+        let ends = trimmed.ends_with('|') && trimmed.len() > 1;
+        if trimmed.is_empty() || (starts && ends) {
+            return None;
+        }
+        if self.table_start.is_some() {
+            if !trimmed.contains('|') {
+                return None;
+            }
+        } else {
+            if !starts {
+                return None;
+            }
+            let next = self.pending_line.lines().next().unwrap_or("");
+            if !is_table_separator_line(next) {
+                return None;
+            }
+        }
+        let mut out = String::with_capacity(trimmed.len() + 4);
+        if !starts {
+            out.push_str("| ");
+        }
+        out.push_str(trimmed);
+        if !ends {
+            out.push_str(" |");
+        }
+        Some(out)
     }
 
     /// Clear all content and reset parser state.
@@ -119,6 +202,12 @@ impl StreamingMarkdown {
         self.image_positions.clear();
         self.pending_line.clear();
         self.inline_open = false;
+        self.table_start = None;
+        self.table_line_count = 0;
+        self.table_rows.clear();
+        self.table_header_rows = 0;
+        self.table_has_separator = false;
+        self.code_highlighter = None;
     }
 
     /// Get the current raw content.
@@ -289,34 +378,47 @@ impl StreamingMarkdown {
             }
             ParseEvent::CodeBlockStart { language, .. } => {
                 self.end_inline_line();
-                if let Some(lang) = language {
-                    self.rendered.push(Line::from(vec![
-                        Span::styled("│ ", Style::default().fg(Color::DarkGray)),
-                        Span::styled(
-                            lang,
-                            Style::default()
-                                .fg(Color::Yellow)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                    ]));
-                }
+                self.code_highlighter = language
+                    .as_deref()
+                    .and_then(super::highlight::highlighter)
+                    .map(CodeHighlighter);
             }
             ParseEvent::CodeBlockLine(line) => {
                 self.end_inline_line();
-                self.rendered.push(Line::from(vec![
-                    Span::styled("│ ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(
+                let mut spans = vec![Span::styled("│ ", Style::default().fg(Color::DarkGray))];
+                if let Some(highlighter) = &mut self.code_highlighter {
+                    spans.extend(
+                        super::highlight::line_spans(&mut highlighter.0, &line)
+                            .into_iter()
+                            .map(|span| {
+                                let style = span.style.patch(Style::default().bg(CODE_BG));
+                                span.style(style)
+                            }),
+                    );
+                } else {
+                    spans.push(Span::styled(
                         line,
-                        Style::default().fg(Color::White).bg(Color::Rgb(30, 30, 30)),
-                    ),
-                ]));
+                        Style::default().fg(Color::White).bg(CODE_BG),
+                    ));
+                }
+                self.rendered.push(Line::from(spans));
             }
-            ParseEvent::CodeBlockEnd
-            | ParseEvent::ListEnd
-            | ParseEvent::BlockquoteEnd
-            | ParseEvent::TableEnd
-            | ParseEvent::EmptyLine => {
+            ParseEvent::CodeBlockEnd => {
                 self.end_inline_line();
+                self.code_highlighter = None;
+                self.rendered.push(Line::from(""));
+            }
+            ParseEvent::ListEnd | ParseEvent::BlockquoteEnd | ParseEvent::EmptyLine => {
+                self.end_inline_line();
+                self.rendered.push(Line::from(""));
+            }
+            ParseEvent::TableEnd => {
+                self.end_inline_line();
+                self.table_start = None;
+                self.table_line_count = 0;
+                self.table_rows.clear();
+                self.table_header_rows = 0;
+                self.table_has_separator = false;
                 self.rendered.push(Line::from(""));
             }
             ParseEvent::ListItem {
@@ -362,31 +464,32 @@ impl StreamingMarkdown {
             }
             ParseEvent::TableHeader(cells) => {
                 self.end_inline_line();
-                let style = Style::default().add_modifier(Modifier::BOLD);
-                let mut spans = Vec::new();
-                for cell in cells {
-                    spans.push(Span::styled("│ ", style));
-                    spans.extend(self.block_inline_spans(&cell, style));
-                    spans.push(Span::styled(" ", style));
+                if self.table_start.is_none() {
+                    self.table_start = Some(self.rendered.len());
+                    self.table_line_count = 0;
                 }
-                self.rendered.push(Line::from(spans));
+                let style = Style::default().add_modifier(Modifier::BOLD);
+                let row = cells
+                    .iter()
+                    .map(|cell| self.block_inline_spans(cell, style))
+                    .collect();
+                self.table_rows.push(row);
+                self.table_header_rows += 1;
+                self.rebuild_table();
             }
             ParseEvent::TableSeparator => {
                 self.end_inline_line();
-                self.rendered.push(Line::from(Span::styled(
-                    "├────────────────────────────────────────┤",
-                    Style::default().fg(Color::DarkGray),
-                )));
+                self.table_has_separator = true;
+                self.rebuild_table();
             }
             ParseEvent::TableRow(cells) => {
                 self.end_inline_line();
-                let mut spans = Vec::new();
-                for cell in cells {
-                    spans.push(Span::raw("│ "));
-                    spans.extend(self.block_inline_spans(&cell, Style::default()));
-                    spans.push(Span::raw(" "));
-                }
-                self.rendered.push(Line::from(spans));
+                let row = cells
+                    .iter()
+                    .map(|cell| self.block_inline_spans(cell, Style::default()))
+                    .collect();
+                self.table_rows.push(row);
+                self.rebuild_table();
             }
             ParseEvent::Newline => {
                 // Newline terminates the current logical line; it should not add
@@ -420,6 +523,89 @@ impl StreamingMarkdown {
             self.rendered.push(Line::from(""));
         }
     }
+
+    /// Re-render the open table's lines in place: every column is padded
+    /// to the widest cell seen so far, so a wider row arriving later
+    /// re-aligns the rows already emitted.
+    fn rebuild_table(&mut self) {
+        let Some(start) = self.table_start else {
+            return;
+        };
+        let col_count = self.table_rows.iter().map(Vec::len).max().unwrap_or(0);
+        let mut widths = vec![0usize; col_count];
+        for row in &self.table_rows {
+            for (col, cell) in row.iter().enumerate() {
+                widths[col] = widths[col].max(cell_width(cell));
+            }
+        }
+
+        let mut lines = Vec::with_capacity(self.table_rows.len() + 1);
+        for (index, row) in self.table_rows.iter().enumerate() {
+            if self.table_has_separator && index == self.table_header_rows {
+                lines.push(table_separator_line(&widths));
+            }
+            lines.push(table_row_line(row, &widths));
+        }
+        if self.table_has_separator && self.table_rows.len() == self.table_header_rows {
+            lines.push(table_separator_line(&widths));
+        }
+
+        let old_count = self.table_line_count;
+        self.table_line_count = lines.len();
+        self.rendered.splice(start..start + old_count, lines);
+    }
+}
+
+/// Display width of a rendered cell.
+fn cell_width(cell: &[Span<'static>]) -> usize {
+    cell.iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum()
+}
+
+/// One table row line: `│ cell │ cell │`, cells padded to `widths`.
+fn table_row_line(cells: &[Vec<Span<'static>>], widths: &[usize]) -> Line<'static> {
+    let border = Style::default().fg(Color::DarkGray);
+    let mut spans = vec![Span::styled("│ ", border)];
+    for (col, width) in widths.iter().enumerate() {
+        if col > 0 {
+            spans.push(Span::styled(" │ ", border));
+        }
+        let filled = cells.get(col).map_or(0, |cell| {
+            spans.extend(cell.iter().cloned());
+            cell_width(cell)
+        });
+        if filled < *width {
+            spans.push(Span::raw(" ".repeat(width - filled)));
+        }
+    }
+    spans.push(Span::styled(" │", border));
+    Line::from(spans)
+}
+
+/// The separator under the header, spanning the full table width:
+/// `├──┼──┤`.
+fn table_separator_line(widths: &[usize]) -> Line<'static> {
+    let mut text = String::from("├");
+    for (col, width) in widths.iter().enumerate() {
+        if col > 0 {
+            text.push('┼');
+        }
+        text.push_str(&"─".repeat(width + 2));
+    }
+    text.push('┤');
+    Line::from(Span::styled(text, Style::default().fg(Color::DarkGray)))
+}
+
+/// Whether `line` is a table delimiter row (`|---|---|`), pipes optional.
+fn is_table_separator_line(line: &str) -> bool {
+    let inner = line.trim();
+    let inner = inner.strip_prefix('|').unwrap_or(inner);
+    let inner = inner.strip_suffix('|').unwrap_or(inner);
+    inner.contains('-')
+        && inner
+            .chars()
+            .all(|c| matches!(c, '-' | ':' | '|' | ' ' | '\t'))
 }
 
 /// Render an inline element to a Span.
@@ -647,6 +833,94 @@ mod tests {
     }
 
     #[test]
+    fn test_table_columns_aligned() {
+        let mut md = StreamingMarkdown::new();
+        md.push("| aa | b |\n|---|---|\n| c | dddd |\n");
+        md.flush();
+        let lines = md.lines();
+        let rows: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        assert_eq!(rows, ["│ aa │ b    │", "├────┼──────┤", "│ c  │ dddd │",]);
+    }
+
+    #[test]
+    fn test_table_cjk_columns_aligned() {
+        let mut md = StreamingMarkdown::new();
+        md.push("| 子 issue | 状态 |\n|---|---|\n| #18 登录 | ❌ 无 |\n");
+        md.flush();
+        let widths: Vec<usize> = md
+            .lines()
+            .iter()
+            .map(|l| {
+                UnicodeWidthStr::width(
+                    l.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                        .as_str(),
+                )
+            })
+            .collect();
+        assert!(
+            widths[..3].windows(2).all(|w| w[0] == w[1]),
+            "table rows misaligned: {widths:?}"
+        );
+    }
+
+    #[test]
+    fn test_table_missing_trailing_pipes() {
+        // GFM makes outer pipes optional; models drop the trailing one.
+        let mut md = StreamingMarkdown::new();
+        md.push("| a | b\n|---|---\n| c | d\n");
+        md.flush();
+        let text = flattened_text(md.lines());
+        assert!(!text.contains("| a | b"), "unparsed table line in: {text}");
+        let rows: Vec<String> = md
+            .lines()
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        assert_eq!(rows[0], "│ a │ b │");
+        assert_eq!(rows[1], "├───┼───┤");
+        assert_eq!(rows[2], "│ c │ d │");
+    }
+
+    #[test]
+    fn test_table_late_wide_row_realigns() {
+        // A wider row streaming in later re-pads the rows already drawn.
+        let mut md = StreamingMarkdown::new();
+        md.push("| a | b |\n|---|---|\n| c | d |\n");
+        md.push("| much longer | x |\n");
+        md.flush();
+        let rows: Vec<String> = md
+            .lines()
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        assert_eq!(rows[0], "│ a           │ b │");
+        assert_eq!(rows[1], "├─────────────┼───┤");
+        assert_eq!(rows[2], "│ c           │ d │");
+        assert_eq!(rows[3], "│ much longer │ x │");
+    }
+
+    #[test]
+    fn test_table_pipe_line_below_is_not_absorbed() {
+        // A pipe-less paragraph after a table ends it instead of joining.
+        let mut md = StreamingMarkdown::new();
+        md.push("| a |\n|---|\n| b |\ntext after\n");
+        md.flush();
+        let rows: Vec<String> = md
+            .lines()
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.to_string()).collect())
+            .collect();
+        assert_eq!(rows[3], "");
+        assert_eq!(rows[4], "text after");
+    }
+
+    #[test]
     fn test_heading_inline_markdown() {
         let mut md = StreamingMarkdown::new();
         md.push("## **Title** rest\n");
@@ -659,6 +933,59 @@ mod tests {
             has_modifier(lines, Modifier::BOLD),
             "no BOLD span in: {lines:?}"
         );
+    }
+
+    #[test]
+    fn test_code_block_highlighted() {
+        let mut md = StreamingMarkdown::new();
+        md.push("```rust\nlet x = 1;\n```\n");
+        md.flush();
+        let lines = md.lines();
+        let code = &lines[0];
+        // Gutter plus more than one styled region: keywords got colored.
+        assert!(code.spans.len() > 2, "not highlighted: {code:?}");
+        assert!(
+            code.spans
+                .iter()
+                .all(|s| s.style.bg == Some(CODE_BG) || s.content.as_ref() == "│ "),
+            "code span lost its background: {code:?}"
+        );
+        // The `rust` fence name is not rendered as a label line.
+        let text = flattened_text(lines);
+        assert!(!text.contains("rust"), "language label leaked: {text}");
+    }
+
+    #[test]
+    fn test_code_block_unknown_language_plain() {
+        let mut md = StreamingMarkdown::new();
+        md.push("```notalang\nlet x = 1;\n```\n");
+        md.flush();
+        let code = &md.lines()[0];
+        assert_eq!(code.spans.len(), 2, "expected gutter + one span: {code:?}");
+        assert_eq!(code.spans[1].style.bg, Some(CODE_BG));
+    }
+
+    #[test]
+    fn test_code_block_highlight_state_across_lines() {
+        // A comment opened on one line stays open into the next: the
+        // second line's code spans all carry the comment color, which
+        // differs from the default white of an unhighlighted block.
+        let mut md = StreamingMarkdown::new();
+        md.push("```rust\n/* start\nend */\n```\n");
+        md.flush();
+        let lines = md.lines();
+        let colors: Vec<Color> = lines[1]
+            .spans
+            .iter()
+            .skip(1)
+            .filter_map(|s| s.style.fg)
+            .collect();
+        assert_ne!(colors, [] as [Color; 0]);
+        assert!(
+            colors.iter().all(|c| *c == colors[0]),
+            "comment color broke across lines: {colors:?}"
+        );
+        assert_ne!(colors[0], Color::White);
     }
 
     #[test]

@@ -13,7 +13,6 @@ use notify::{
     Config as NotifyConfig, Event as NotifyEvent, RecommendedWatcher, RecursiveMode, Watcher,
 };
 use skyzen::extract::Query;
-use skyzen::responder::Sse;
 use skyzen::routing::Params;
 use skyzen::utils::{Json, State};
 use skyzen::{Result as SkyResult, StatusCode};
@@ -21,17 +20,16 @@ use tokio::process::Command;
 
 use super::chat::spawn_follow_up_runs;
 use super::error::{bad_request_error, internal_error, internal_error_message};
-use super::helpers::{load_session_paths, parse_safe_relative_path, send_event};
+use super::helpers::{load_session_paths, parse_safe_relative_path};
 use super::local_url_mapper::{
     LocalUrlProxyKey, LocalUrlProxyUpstream, mapped_url_from_target, parse_local_proxy_target,
     target_host_header,
 };
 use super::state::DaemonState;
-use super::types::SseHeartbeat;
 use super::types::{
     ArtifactDiagnosticsRequest, ArtifactDiagnosticsResponse, ArtifactEntry, ArtifactPreviewQuery,
-    ArtifactRuntimePreviewQuery, ArtifactStreamPayload, IfNoneMatchHeader, LocalUrlMapRequest,
-    LocalUrlMapResponse, SessionArtifactsResponse, SessionRuntimeResponse, SlidevPreviewResponse,
+    ArtifactRuntimePreviewQuery, IfNoneMatchHeader, LocalUrlMapRequest, LocalUrlMapResponse,
+    SessionArtifactsResponse, SessionRuntimeResponse, SlidevPreviewResponse,
 };
 
 const PREVIEW_CACHE_CONTROL: &str = "private, no-cache";
@@ -53,10 +51,10 @@ struct ArtifactRuntimeBridgeTemplate<'a> {
     validation_profile: &'a str,
 }
 
-struct ResolvedSessionFile {
-    canonical_path: PathBuf,
-    relative_path: PathBuf,
-    metadata: std::fs::Metadata,
+pub(super) struct ResolvedSessionFile {
+    pub(super) canonical_path: PathBuf,
+    pub(super) relative_path: PathBuf,
+    pub(super) metadata: std::fs::Metadata,
 }
 
 pub(super) async fn get_session_runtime(
@@ -77,7 +75,7 @@ pub(super) async fn get_session_runtime(
     Ok(Json(runtime.into()))
 }
 
-async fn collect_session_artifacts(
+pub(super) async fn collect_session_artifacts(
     state: &DaemonState,
     session_id: &str,
 ) -> SkyResult<Vec<ArtifactEntry>> {
@@ -136,7 +134,7 @@ async fn collect_session_artifacts(
     Ok(entries)
 }
 
-fn artifacts_signature(entries: &[ArtifactEntry]) -> String {
+pub(super) fn artifacts_signature(entries: &[ArtifactEntry]) -> String {
     entries
         .iter()
         .map(|e| format!("{}:{}:{}", e.path, e.fingerprint, e.is_html))
@@ -144,19 +142,21 @@ fn artifacts_signature(entries: &[ArtifactEntry]) -> String {
         .join("|")
 }
 
-async fn resolve_scoped_file(
+pub(super) async fn resolve_scoped_path(
     scope_root: &Path,
     relative_path: PathBuf,
-    not_found_message: &str,
-    traversal_message: &str,
+    not_found_message: &'static str,
+    traversal_message: &'static str,
+    not_found_status: StatusCode,
 ) -> Result<ResolvedSessionFile, skyzen::Error> {
+    let not_found = || skyzen::Error::msg(not_found_message).set_status(not_found_status);
     let full_path = scope_root.join(&relative_path);
     let canonical_scope_root = async_fs::canonicalize(scope_root)
         .await
-        .map_err(|_| bad_request_error(not_found_message))?;
+        .map_err(|_| not_found())?;
     let canonical_path = async_fs::canonicalize(&full_path)
         .await
-        .map_err(|_| bad_request_error(not_found_message))?;
+        .map_err(|_| not_found())?;
     if !canonical_path.starts_with(&canonical_scope_root) {
         return Err(bad_request_error(traversal_message));
     }
@@ -164,15 +164,32 @@ async fn resolve_scoped_file(
     let metadata = async_fs::metadata(&canonical_path)
         .await
         .map_err(internal_error)?;
-    if !metadata.is_file() {
-        return Err(bad_request_error(not_found_message));
-    }
 
     Ok(ResolvedSessionFile {
         canonical_path,
         relative_path,
         metadata,
     })
+}
+
+async fn resolve_scoped_file(
+    scope_root: &Path,
+    relative_path: PathBuf,
+    not_found_message: &'static str,
+    traversal_message: &'static str,
+) -> Result<ResolvedSessionFile, skyzen::Error> {
+    let resolved = resolve_scoped_path(
+        scope_root,
+        relative_path,
+        not_found_message,
+        traversal_message,
+        StatusCode::BAD_REQUEST,
+    )
+    .await?;
+    if !resolved.metadata.is_file() {
+        return Err(bad_request_error(not_found_message));
+    }
+    Ok(resolved)
 }
 
 fn output_relative_path(raw: &str) -> Result<PathBuf, skyzen::Error> {
@@ -192,7 +209,7 @@ fn output_relative_path(raw: &str) -> Result<PathBuf, skyzen::Error> {
     Ok(scoped.to_path_buf())
 }
 
-fn metadata_modified_nanos(metadata: &std::fs::Metadata) -> u128 {
+pub(super) fn metadata_modified_nanos(metadata: &std::fs::Metadata) -> u128 {
     metadata
         .modified()
         .ok()
@@ -200,7 +217,7 @@ fn metadata_modified_nanos(metadata: &std::fs::Metadata) -> u128 {
         .map_or(0, |duration| duration.as_nanos())
 }
 
-fn etag_value(metadata: &std::fs::Metadata) -> String {
+pub(super) fn etag_value(metadata: &std::fs::Metadata) -> String {
     let mut value = String::new();
     value.push('"');
     value.push_str(metadata.len().to_string().as_str());
@@ -210,7 +227,7 @@ fn etag_value(metadata: &std::fs::Metadata) -> String {
     value
 }
 
-fn etag_matches(if_none_match: &IfNoneMatchHeader, etag: &str) -> bool {
+pub(super) fn etag_matches(if_none_match: &IfNoneMatchHeader, etag: &str) -> bool {
     let current = etag.trim_start_matches("W/").trim_matches('"');
     if_none_match
         .0
@@ -220,13 +237,17 @@ fn etag_matches(if_none_match: &IfNoneMatchHeader, etag: &str) -> bool {
         .is_some_and(|value| value == "*" || value == current)
 }
 
-fn insert_header(response: &mut skyzen::Response, header: skyzen::header::HeaderName, value: &str) {
+pub(super) fn insert_header(
+    response: &mut skyzen::Response,
+    header: skyzen::header::HeaderName,
+    value: &str,
+) {
     if let Ok(header_value) = skyzen::header::HeaderValue::from_str(value) {
         response.headers_mut().insert(header, header_value);
     }
 }
 
-fn not_modified_response(etag: &str, cache_control: &str) -> skyzen::Response {
+pub(super) fn not_modified_response(etag: &str, cache_control: &str) -> skyzen::Response {
     let mut response = skyzen::Response::new(skyzen::Body::empty());
     *response.status_mut() = StatusCode::NOT_MODIFIED;
     insert_header(&mut response, skyzen::header::ETAG, etag);
@@ -255,7 +276,7 @@ fn insert_artifact_security_headers(response: &mut skyzen::Response, content_typ
     }
 }
 
-fn file_response(
+pub(super) fn file_response(
     bytes: Vec<u8>,
     content_type: &str,
     etag: &str,
@@ -277,7 +298,7 @@ fn mime_requires_utf8(mime: &str) -> bool {
         )
 }
 
-fn content_type_for_path(path: &Path) -> String {
+pub(super) fn content_type_for_path(path: &Path) -> String {
     let mime = mime_guess::from_path(path).first_or_octet_stream();
     let essence = mime.essence_str();
     if mime_requires_utf8(essence) {
@@ -1371,117 +1392,80 @@ pub(super) async fn get_slidev_static_asset(
     ))
 }
 
-pub(super) async fn stream_session_artifacts(
-    params: Params,
-    State(state): State<Arc<DaemonState>>,
-) -> SkyResult<Sse> {
-    let session_id = params.get("id").map_err(bad_request_error)?.to_string();
-    if session_id.is_empty() {
-        return Err(bad_request_error("session id is required"));
-    }
+/// How long the artifacts watcher waits for filesystem-quiet before one
+/// `session_artifacts` topic notification covers a burst of writes.
+const ARTIFACT_WATCH_DEBOUNCE: Duration = Duration::from_millis(300);
 
-    let (sender, sse) = Sse::channel();
-    let state_cloned = state.clone();
-    let session_paths = load_session_paths(&state, &session_id).await?;
-    let artifacts_root = session_paths.artifacts_dir();
+/// Whether `path` lies under a session's `artifacts/` directory, in either
+/// layout (`~/.may/sessions/<id>` or `~/.may/profiles/<pid>/sessions/<id>`).
+fn is_session_artifacts_path(path: &Path) -> bool {
+    let components: Vec<_> = path.components().collect();
+    components
+        .windows(3)
+        .any(|window| window[0].as_os_str() == "sessions" && window[2].as_os_str() == "artifacts")
+}
 
-    async_fs::create_dir_all(&artifacts_root)
-        .await
-        .map_err(internal_error)?;
-
-    let (watch_tx, mut watch_rx) =
-        tokio::sync::mpsc::unbounded_channel::<notify::Result<NotifyEvent>>();
-    let mut watcher = RecommendedWatcher::new(
-        move |event| {
-            let _ = watch_tx.send(event);
-        },
-        NotifyConfig::default(),
-    )
-    .map_err(internal_error)?;
-    watcher
-        .watch(&artifacts_root, RecursiveMode::Recursive)
-        .map_err(internal_error)?;
-
+/// Watches the session roots and publishes `session_artifacts` on the UI
+/// event bus when any session's `artifacts/` directory changes. SSE
+/// subscribers compute their own session's payload from the filesystem,
+/// so the notification carries no per-session data.
+pub(super) fn spawn_artifact_watcher(state: &Arc<DaemonState>) {
+    let home = crate::session::MayHomePaths::new(state.may_dir.clone());
+    let bus = state.ui_event_bus.clone();
     state.tokio_handle.spawn(async move {
-        let _watcher = watcher;
-        let mut last_sig = String::new();
-        let mut heartbeat_tick = tokio::time::interval(Duration::from_secs(15));
+        let sessions_root = home.sessions_dir();
+        let profiles_root = home.profiles_dir();
+        let _ = async_fs::create_dir_all(&sessions_root).await;
+        let _ = async_fs::create_dir_all(&profiles_root).await;
 
-        if !send_event(&sender, "heartbeat", &SseHeartbeat { ok: true }).await {
-            return;
+        let (watch_tx, mut watch_rx) =
+            tokio::sync::mpsc::unbounded_channel::<notify::Result<NotifyEvent>>();
+        let mut watcher = match RecommendedWatcher::new(
+            move |event| {
+                let _ = watch_tx.send(event);
+            },
+            NotifyConfig::default(),
+        ) {
+            Ok(watcher) => watcher,
+            Err(error) => {
+                tracing::warn!(error = %error, "artifact watcher unavailable");
+                return;
+            }
+        };
+        for root in [&sessions_root, &profiles_root] {
+            if let Err(error) = watcher.watch(root, RecursiveMode::Recursive) {
+                tracing::warn!(path = %root.display(), error = %error, "artifact watcher failed to watch");
+            }
         }
 
-        if !emit_artifacts_if_changed(&state_cloned, &sender, &session_id, &mut last_sig).await {
-            return;
-        }
-
+        let quiet = tokio::time::sleep(ARTIFACT_WATCH_DEBOUNCE);
+        tokio::pin!(quiet);
+        let mut dirty = false;
         loop {
             tokio::select! {
-                _ = heartbeat_tick.tick() => {
-                    if !send_event(&sender, "heartbeat", &SseHeartbeat { ok: true }).await {
-                        break;
-                    }
-                }
                 maybe_event = watch_rx.recv() => {
                     match maybe_event {
                         Some(Ok(event)) => {
-                            if !event_touches_artifacts(&event, &artifacts_root) {
-                                continue;
-                            }
-                            if !emit_artifacts_if_changed(&state_cloned, &sender, &session_id, &mut last_sig).await {
-                                break;
+                            if event.paths.iter().any(|path| is_session_artifacts_path(path)) {
+                                dirty = true;
+                                quiet.as_mut().reset(
+                                    tokio::time::Instant::now() + ARTIFACT_WATCH_DEBOUNCE,
+                                );
                             }
                         }
                         Some(Err(error)) => {
-                            tracing::warn!(session_id, error = %error, "artifact watcher error");
+                            tracing::warn!(error = %error, "artifact watcher error");
                         }
                         None => break,
                     }
                 }
+                () = &mut quiet, if dirty => {
+                    dirty = false;
+                    bus.publish(crate::ui_event_bus::UiEventTopics::SESSION_ARTIFACTS);
+                }
             }
         }
     });
-
-    Ok(sse)
-}
-
-fn event_touches_artifacts(event: &NotifyEvent, artifacts_root: &Path) -> bool {
-    event
-        .paths
-        .iter()
-        .any(|path| path.starts_with(artifacts_root))
-}
-
-async fn emit_artifacts_if_changed(
-    state: &DaemonState,
-    sender: &skyzen::responder::sse::Sender,
-    session_id: &str,
-    last_sig: &mut String,
-) -> bool {
-    match collect_session_artifacts(state, session_id).await {
-        Ok(entries) => {
-            let sig = artifacts_signature(&entries);
-            if sig != *last_sig {
-                if !send_event(
-                    sender,
-                    "artifacts",
-                    &ArtifactStreamPayload {
-                        count: entries.len(),
-                        signature: sig.clone(),
-                    },
-                )
-                .await
-                {
-                    return false;
-                }
-                *last_sig = sig;
-            }
-        }
-        Err(error) => {
-            tracing::warn!(session_id, error = %error, "failed to collect session artifacts");
-        }
-    }
-    true
 }
 
 pub(super) fn is_container_local_proxy_host(host: &str) -> bool {
