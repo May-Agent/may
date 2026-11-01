@@ -18,11 +18,11 @@ use crate::live_response::LiveResponseRegistry;
 
 /// How long an escalation from the main agent stays pending before it
 /// resolves as denied. The operator is not assumed to be at the screen.
-pub const MAIN_APPROVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+pub const MAIN_APPROVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(30);
 
 /// The same deadline for escalations raised by a subagent: they should
 /// not hold a run nearly as long.
-pub const SUBAGENT_APPROVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3 * 60);
+pub const SUBAGENT_APPROVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(3);
 
 /// Error returned when parsing an unknown [`PermissionRequestMode`] value.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -323,29 +323,26 @@ impl PermissionApprover {
                 .await?;
         }
 
-        match tokio::time::timeout(self.timeout, rx.recv()).await {
-            Ok(decision) => decision.map_err(|_| PermissionError::Interrupted),
-            Err(_) => {
-                // The operator never answered: resolve the pending request
-                // as denied so it stops blocking the UI and the history
-                // records the decision, then refuse the escalation. The
-                // waiter is this run itself — there is nothing to wake.
-                self.live_responses.take(&request_id);
-                if let Some(runtime_service) = &self.runtime_service {
-                    if let Err(error) = runtime_service
-                        .commit_permission_response(&request_id, false)
-                        .await
-                    {
-                        tracing::warn!(%error, "failed to persist a timed-out permission denial");
-                    }
-                }
-                Err(PermissionError::Denied(format!(
-                    "{} mode approval was not answered within {} minutes and was denied",
-                    mode.description(),
-                    self.timeout.as_secs() / 60
-                )))
-            }
+        if let Ok(decision) = tokio::time::timeout(self.timeout, rx.recv()).await {
+            return decision.map_err(|_| PermissionError::Interrupted);
         }
+        // The operator never answered: resolve the pending request as
+        // denied so it stops blocking the UI and the history records the
+        // decision, then refuse the escalation. The waiter is this run
+        // itself — there is nothing to wake.
+        self.live_responses.take(&request_id);
+        if let Some(runtime_service) = &self.runtime_service
+            && let Err(error) = runtime_service
+                .commit_permission_response(&request_id, false)
+                .await
+        {
+            tracing::warn!(%error, "failed to persist a timed-out permission denial");
+        }
+        Err(PermissionError::Denied(format!(
+            "{} mode approval was not answered within {} minutes and was denied",
+            mode.description(),
+            self.timeout.as_secs() / 60
+        )))
     }
 
     /// Resolve the pending request `request_id`: the decision is committed
@@ -388,6 +385,40 @@ impl PermissionApprover {
 impl Default for PermissionApprover {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl PermissionHandler for PermissionApprover {
+    async fn check(&self, mode: TerminalMode, script: &str) -> Result<bool, PermissionError> {
+        match mode {
+            TerminalMode::Sandboxed => Ok(true),
+            TerminalMode::Unsafe => {
+                let approved = self.request_and_wait(mode, script.to_string()).await?;
+                if approved {
+                    Ok(true)
+                } else {
+                    Err(PermissionError::Denied(format!(
+                        "{} mode denied for script",
+                        mode.description()
+                    )))
+                }
+            }
+        }
+    }
+
+    fn check_domain(&self, _domain: &str, _port: u16) -> impl Future<Output = bool> + Send {
+        std::future::ready(true)
+    }
+
+    fn will_wait_for_approval(
+        &self,
+        mode: TerminalMode,
+        _script: &str,
+    ) -> impl Future<Output = bool> + Send {
+        std::future::ready(
+            !matches!(self.approval_mode, ApprovalMode::Unavailable { .. })
+                && matches!(mode, TerminalMode::Unsafe),
+        )
     }
 }
 
@@ -449,39 +480,5 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert!(responder.respond(&pending[0], true));
         assert!(wait.await.expect("join").expect("answered"));
-    }
-}
-
-impl PermissionHandler for PermissionApprover {
-    async fn check(&self, mode: TerminalMode, script: &str) -> Result<bool, PermissionError> {
-        match mode {
-            TerminalMode::Sandboxed => Ok(true),
-            TerminalMode::Unsafe => {
-                let approved = self.request_and_wait(mode, script.to_string()).await?;
-                if approved {
-                    Ok(true)
-                } else {
-                    Err(PermissionError::Denied(format!(
-                        "{} mode denied for script",
-                        mode.description()
-                    )))
-                }
-            }
-        }
-    }
-
-    fn check_domain(&self, _domain: &str, _port: u16) -> impl Future<Output = bool> + Send {
-        std::future::ready(true)
-    }
-
-    fn will_wait_for_approval(
-        &self,
-        mode: TerminalMode,
-        _script: &str,
-    ) -> impl Future<Output = bool> + Send {
-        std::future::ready(
-            !matches!(self.approval_mode, ApprovalMode::Unavailable { .. })
-                && matches!(mode, TerminalMode::Unsafe),
-        )
     }
 }
