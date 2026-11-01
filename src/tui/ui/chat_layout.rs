@@ -106,7 +106,7 @@ impl Entry {
         images_supported: bool,
         tunnel_base: &str,
     ) -> Self {
-        let laid = element_lines(elem, state, images_supported, tunnel_base);
+        let laid = element_lines(elem, state, images_supported, tunnel_base, width);
         let mut line_starts = Vec::with_capacity(laid.lines.len());
         let mut rows = 0usize;
         for line in &laid.lines {

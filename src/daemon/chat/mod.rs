@@ -2016,6 +2016,12 @@ fn run_agent_loop<'a>(
 /// Whether an agent event is the first visible output that ends a pending
 /// reasoning phase. `Complete` is excluded: an armed phase that reaches
 /// stream end without output is closed once, after the loop.
+///
+/// `TurnComplete { has_tool_calls: true }` is also excluded. Tools already
+/// closed the phase at `ToolCallStart`; `ToolCallEnd` then re-arms it for
+/// the next model call. Treating the boundary marker as visible output
+/// closed that next phase at 0 seconds and left a bare `Thought` in front
+/// of the following burst.
 const fn closes_reasoning_phase(event: &aither_agent::AgentEvent) -> bool {
     matches!(
         event,
@@ -2023,7 +2029,10 @@ const fn closes_reasoning_phase(event: &aither_agent::AgentEvent) -> bool {
             | aither_agent::AgentEvent::ToolCallDelta { .. }
             | aither_agent::AgentEvent::ToolCallStart { .. }
             | aither_agent::AgentEvent::BuiltInToolCall { .. }
-            | aither_agent::AgentEvent::TurnComplete { .. }
+            | aither_agent::AgentEvent::TurnComplete {
+                has_tool_calls: false,
+                ..
+            }
             | aither_agent::AgentEvent::Error(_)
     )
 }
@@ -3326,6 +3335,25 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{ResumeRequestKind, ResumeResolution};
+
+    #[test]
+    fn tool_turn_complete_does_not_close_the_next_reasoning_phase() {
+        assert!(!super::closes_reasoning_phase(
+            &aither_agent::AgentEvent::turn_complete(1, true)
+        ));
+        assert!(super::closes_reasoning_phase(
+            &aither_agent::AgentEvent::turn_complete(1, false)
+        ));
+        assert!(super::closes_reasoning_phase(
+            &aither_agent::AgentEvent::text("visible")
+        ));
+        assert!(super::closes_reasoning_phase(
+            &aither_agent::AgentEvent::tool_start("id", "terminal", "{}")
+        ));
+        assert!(!super::closes_reasoning_phase(
+            &aither_agent::AgentEvent::reasoning("think")
+        ));
+    }
 
     #[test]
     fn browser_takeover_alert_tells_the_model_to_recheck_the_page() {
