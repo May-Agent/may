@@ -1173,7 +1173,7 @@ fn may_binary_path() -> PathBuf {
 }
 
 /// Release of heel whose Linux binary the harness stages as the container heel.
-const CONTAINER_HEEL_RELEASE_TAG: &str = "heel-v0.7.2";
+const CONTAINER_HEEL_RELEASE_TAG: &str = "heel-v0.7.3";
 
 /// A pinned Linux heel release asset and the SHA-256 of its published bytes.
 struct PinnedHeelAsset {
@@ -1186,12 +1186,12 @@ struct PinnedHeelAsset {
 #[cfg(target_arch = "x86_64")]
 const CONTAINER_HEEL_ASSET: PinnedHeelAsset = PinnedHeelAsset {
     name: "heel-x86_64-unknown-linux-gnu",
-    sha256: "b2d4654805fef2e81f67ee935afe02334ea8f6c64afd42f911e6220a6e52936e",
+    sha256: "06d4258dc8f9c8dc2c36263ed7fcaf36fa32176352764f1ae4e69d7e85d5506a",
 };
 #[cfg(target_arch = "aarch64")]
 const CONTAINER_HEEL_ASSET: PinnedHeelAsset = PinnedHeelAsset {
     name: "heel-aarch64-unknown-linux-gnu",
-    sha256: "d1f301e814521a0f2efbfb18d580895f9391882e4c3c30f9ceb9ba51a5f9709b",
+    sha256: "ac52692a6344c57e4ab2260db4db6be6d2be53bfea750ca2040e3393cabc5088",
 };
 
 /// Stages the pinned container heel in the test home exactly as the product's
