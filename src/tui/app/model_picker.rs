@@ -236,6 +236,43 @@ impl App {
         self.tier_picker_loading = false;
     }
 
+    /// Open the model select popup, optionally pre-narrowed by `query`.
+    ///
+    /// `/model` (an empty `query`) opens the picker with the highlight on
+    /// the current model. `/model <query>` first resolves the query
+    /// against the selector list — a hit switches at once like pressing
+    /// Enter in the picker — while an ambiguous or unmatched query opens
+    /// the picker with `query` already in the search line, narrowing
+    /// further as the catalog fetch lands.
+    pub fn open_model_select(&mut self, query: &str) -> Option<SendAction> {
+        self.model_select_list = self.collect_all_models();
+        // Seed with the catalog remembered from the last fetch so a
+        // warm open paints the full list at once; the in-flight
+        // refresh below re-merges whatever changed meanwhile.
+        let catalog = std::mem::take(&mut self.model_catalog);
+        self.merge_model_select_models(catalog);
+        self.model_select_rx = self.fetch_provider_models();
+
+        if let Some(selector) = resolve_model_query(&self.model_select_list, query) {
+            self.model_select_query.clear();
+            return Some(SendAction::SwitchModel(selector));
+        }
+
+        self.model_select_query = query.to_string();
+        self.model_select_index = 0;
+        if query.is_empty() {
+            let fallback_model = self.config.last_model.as_ref().map(ToString::to_string);
+            let current = self.current_model.as_deref().or(fallback_model.as_deref());
+            if let Some(current) = current
+                && let Some(idx) = self.model_select_position(current)
+            {
+                self.model_select_index = idx;
+            }
+        }
+        self.mode = AppMode::ModelSelect;
+        None
+    }
+
     /// Handle key in model select popup. Typing narrows the list; `j`/`k`
     /// navigate only while the query is empty, like the session picker.
     pub(super) fn handle_model_select_key(&mut self, code: KeyCode) -> Option<SendAction> {
@@ -361,6 +398,25 @@ fn filter_model_list<'a>(list: &'a [String], query: &str) -> Vec<(usize, &'a Str
         .collect()
 }
 
+/// The selector a `/model <query>` resolves to without the picker: an
+/// exact list entry first, then the entry that is the same selectable
+/// model as `query` (its effort-family twin), else the lone substring
+/// hit. `None` means the query pins down no single entry — empty,
+/// ambiguous or unmatched — and belongs in the picker's search line.
+fn resolve_model_query(list: &[String], query: &str) -> Option<String> {
+    if query.is_empty() {
+        return None;
+    }
+    if let Some(entry) = list.iter().find(|entry| *entry == query).or_else(|| {
+        list.iter()
+            .find(|entry| crate::models::same_selectable_model(entry, query))
+    }) {
+        return Some(entry.clone());
+    }
+    let filtered = filter_model_list(list, query);
+    (filtered.len() == 1).then(|| filtered[0].1.clone())
+}
+
 /// The reasoning-effort ladder a provider's wire protocol expresses. Every
 /// rung is concrete — the session's effort is the one it last selected, and
 /// "default" before any selection means medium, not a provider-decided
@@ -382,7 +438,7 @@ pub(super) const fn effort_ladder_for(
 
 #[cfg(test)]
 mod tests {
-    use super::filter_model_list;
+    use super::{filter_model_list, resolve_model_query};
 
     #[test]
     fn filter_keeps_every_entry_on_an_empty_query() {
@@ -405,5 +461,52 @@ mod tests {
         let by_model = filter_model_list(&list, "opus");
         assert_eq!(by_model.len(), 1);
         assert_eq!(by_model[0].0, 2);
+    }
+
+    #[test]
+    fn query_resolves_an_exact_selector_before_its_family_twin() {
+        let list = vec![
+            "relay::o4-mini-high".to_string(),
+            "relay::o4-mini".to_string(),
+            "google::aqa".to_string(),
+        ];
+        assert_eq!(
+            resolve_model_query(&list, "relay::o4-mini").as_deref(),
+            Some("relay::o4-mini")
+        );
+    }
+
+    #[test]
+    fn query_resolves_an_effort_suffixed_uid_to_its_family_entry() {
+        let list = vec!["relay::o4-mini".to_string(), "google::aqa".to_string()];
+        assert_eq!(
+            resolve_model_query(&list, "relay::o4-mini-max").as_deref(),
+            Some("relay::o4-mini")
+        );
+    }
+
+    #[test]
+    fn query_resolves_a_lone_substring_hit() {
+        let list = vec![
+            "relay::o4-mini".to_string(),
+            "google::aqa".to_string(),
+            "anthropic::claude-sonnet-4-6".to_string(),
+        ];
+        assert_eq!(
+            resolve_model_query(&list, "aqa").as_deref(),
+            Some("google::aqa")
+        );
+    }
+
+    #[test]
+    fn ambiguous_unmatched_and_empty_queries_stay_in_the_picker() {
+        let list = vec![
+            "relay::o4-mini".to_string(),
+            "google::aqa".to_string(),
+            "anthropic::claude-sonnet-4-6".to_string(),
+        ];
+        assert_eq!(resolve_model_query(&list, "a"), None);
+        assert_eq!(resolve_model_query(&list, "gpt-5"), None);
+        assert_eq!(resolve_model_query(&list, ""), None);
     }
 }
