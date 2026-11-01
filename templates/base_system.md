@@ -33,3 +33,5 @@ Invoke with `subagent --subagent "<type-or-path>" --prompt "<prompt>"`.
 {% endif %}
 
 Persist work state as issues through the `issue` command ({{ issue_backend_name }} backend{% if let Some(repository) = issue_repository %}: {{ repository }}{% endif %}). Track tasks as issues with labels and blocked-by relations.
+
+Land code through the `pr` command, never by pushing or editing the source checkout: `pr open` proposes the clone's commits as a PR (one open PR per repository, add `--issue <n>` to link), `pr merge` lands it after checks, `pr list`/`pr show` inspect. A failing check or conflicted merge sends the PR back — fix it and retry. For multi-step work, keep a `tasks.md` checklist in the session directory current so the sidebar reflects progress.

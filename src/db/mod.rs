@@ -12,6 +12,7 @@ mod memory;
 mod message;
 mod notification;
 mod open_questions;
+mod pr;
 mod profile;
 mod repo_usage;
 mod search_outbox;
@@ -38,6 +39,7 @@ pub use context_snapshot::ContextDebugSnapshotWrite;
 pub use issue_search::IssueSearchDoc;
 pub use message::MessageMeta;
 pub use open_questions::{CommittedAskUserAnswer, PendingAskUserQuestion};
+pub use pr::{PrEventRow, PrRow};
 pub use repo_usage::RepoUsage;
 pub use search_outbox::{IndexedMessageRow, SearchOutboxEntry};
 pub use session_run::RunFence;
@@ -111,6 +113,11 @@ impl ChatDb {
         }
         if !existing.contains("cwd") {
             query!(db, "ALTER TABLE sessions ADD COLUMN cwd TEXT")
+                .execute()
+                .await?;
+        }
+        if !existing.contains("repo") {
+            query!(db, "ALTER TABLE sessions ADD COLUMN repo TEXT")
                 .execute()
                 .await?;
         }
