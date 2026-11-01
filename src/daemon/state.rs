@@ -459,6 +459,9 @@ pub struct DaemonState {
     pub(crate) search_index_status: crate::repo_search::indexer::IndexerStatus,
     /// Signalled by `POST /api/daemon/shutdown`.
     pub(crate) daemon_shutdown: Arc<tokio::sync::Notify>,
+    /// Set once shutdown starts draining: new turns are refused so the
+    /// run count only ever falls.
+    pub(crate) draining: std::sync::atomic::AtomicBool,
     /// Build of the running executable; clients with another build replace
     /// the daemon.
     pub(crate) build_id: String,
@@ -752,6 +755,20 @@ impl AskUserApprover {
             session_id: committed.session_id,
             outcome,
         }))
+    }
+
+    /// Interrupt the pending question `request_id`: the waiter is dropped so
+    /// the asking run sees the channel close, and the persisted request is
+    /// cleared. Used when the daemon drains — no answer will ever arrive.
+    pub(crate) async fn interrupt(&self, session_id: &str, request_id: &str) {
+        self.live_responses.take(request_id);
+        if let Some(runtime) = &self.runtime_service
+            && let Err(error) = runtime
+                .clear_waiting_ask_user_request(session_id, request_id)
+                .await
+        {
+            tracing::warn!(%error, "failed to clear an interrupted ask-user request");
+        }
     }
 }
 
