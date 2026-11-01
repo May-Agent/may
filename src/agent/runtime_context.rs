@@ -19,6 +19,7 @@ use aither_core::llm::tool::ToolDefinition;
 use askama::Template;
 
 use super::may::{AgentEnvironment, MayAgentConfig, MayAgentError};
+use crate::fs_utils::display_path;
 use crate::network_policy::{CompiledNetworkPolicy, NetworkPolicyMode};
 use crate::session::{SessionPaths, SessionPlanState};
 use crate::skill::SkillManager;
@@ -322,7 +323,7 @@ struct WorkspaceDirEntry {
 impl From<&MayWorkspaceDir> for WorkspaceDirEntry {
     fn from(value: &MayWorkspaceDir) -> Self {
         Self {
-            path: value.path.display().to_string(),
+            path: display_path(&value.path),
             description: value
                 .description
                 .clone()
@@ -436,9 +437,9 @@ pub fn build_terminal_runtime_context(
         home_environment_kind: home_environment_kind_label(&config.environment).to_string(),
         operating_system: operating_system_hint(&config.environment).to_string(),
         shell_dialect: "POSIX sh",
-        home_directory: session_paths.home_root().display().to_string(),
-        session_directory: session_paths.root().display().to_string(),
-        current_working_directory: session_paths.root().display().to_string(),
+        home_directory: display_path(&session_paths.home_root()),
+        session_directory: display_path(session_paths.root()),
+        current_working_directory: display_path(session_paths.root()),
         home_layout: vec![
             "/sessions - per-session sandboxes under this home environment".to_string(),
             "/skills - profile/home-scoped skills, exposed read-only inside the session"
@@ -473,6 +474,7 @@ pub fn build_terminal_runtime_context(
             "For browser work, use the terminal `browser` command with this exact lifecycle: `browser open`, `browser read <url> --detail <brief|standard|full> --screenshot <off|viewport|full-page>`, `browser cdp-endpoint` only when CDP is required, and `browser close` when finished so the live browser sidebar closes and resources are released.".to_string(),
             "When you create a user-facing file, write it under artifacts/ so it survives and can be surfaced cleanly to the user.".to_string(),
             "Use tasks.md as the canonical working document for multi-step work; it should stay accurate enough to resume after context loss.".to_string(),
+            "Ids surfaced by tool results and reminders — sessions, tasks, questions, runs, agents, requests — are internal handles: pass them to commands and reference them in tasks.md, but never quote them to the user.".to_string(),
         ],
         environment_rules: environment_runtime_rules(&config.environment),
         modality_support,
@@ -500,8 +502,8 @@ fn resolved_model_capability(model_id: &str) -> String {
 pub fn build_workspace_context(workspace: &MayWorkspace) -> String {
     let template = WorkspaceTemplate {
         operating_system: operating_system_hint(&AgentEnvironment::Local).to_string(),
-        sandbox: workspace.sandbox.display().to_string(),
-        cwd: workspace.cwd.display().to_string(),
+        sandbox: display_path(&workspace.sandbox),
+        cwd: display_path(&workspace.cwd),
     };
     template
         .render()
@@ -533,7 +535,7 @@ pub fn build_workspace_workdirs_context(workspace: &MayWorkspace) -> Option<Stri
 pub fn build_container_environment_context(cwd: &std::path::Path) -> String {
     let template = ContainerEnvironmentContextTemplate {
         operating_system: "linux (managed container runtime)".to_string(),
-        cwd: cwd.display().to_string(),
+        cwd: display_path(cwd),
     };
     template
         .render()

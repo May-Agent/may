@@ -121,7 +121,7 @@ impl SessionRuns {
     pub async fn acquire(&self, session_id: &str) -> Result<SessionRunGuard, AcquireError> {
         let fence = RunFence {
             session_id: session_id.to_string(),
-            run_id: uuid::Uuid::new_v4().to_string(),
+            run_id: crate::id::new(),
         };
         let (cancel_tx, cancel_rx) = async_channel::bounded(1);
         {

@@ -96,7 +96,7 @@ fn persist_stopped_terminal_calls(
 /// Abstraction over how chat events are delivered to the caller.
 ///
 /// The stream protocol carries ordering metadata — `seq` (monotonic per
-/// turn, shared with pings) and `turn_id` (UUID-per-retry) — so the
+/// turn, shared with pings) and `turn_id` (fresh per retry) — so the
 /// frontend can detect gaps and reconcile with history.
 ///
 /// [`HubSink`] publishes them to every client of the session.
@@ -1313,8 +1313,7 @@ fn run_agent_loop<'a>(
         let mut turn_user_message_id: Option<i32> = None;
 
         loop {
-            let assistant_uuid = uuid::Uuid::new_v4().to_string();
-            let assistant_id = format!("assistant-{assistant_uuid}");
+            let assistant_id = format!("assistant-{}", crate::id::new());
             let started_at = Instant::now();
 
             if !sink.on_start(&req.session_id, &assistant_id).await {

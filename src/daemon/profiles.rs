@@ -336,7 +336,10 @@ pub(super) async fn create_profile(
 ) -> SkyResult<Json<ProfileInfo>> {
     let db = state.db();
 
-    let id = uuid::Uuid::new_v4().to_string();
+    let mut id = crate::id::new();
+    while db.get_profile(&id).await.map_err(internal_error)?.is_some() {
+        id = crate::id::new();
+    }
     let model = db
         .create_profile(CreateProfileParams {
             id: &id,
@@ -520,7 +523,7 @@ pub(super) async fn create_folder(
 
     let db = state.db();
 
-    let folder_id = uuid::Uuid::new_v4().to_string();
+    let folder_id = crate::id::new();
     let model = db
         .create_folder(&folder_id, &profile_id, &req.name)
         .await
