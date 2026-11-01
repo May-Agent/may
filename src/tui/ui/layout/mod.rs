@@ -6,7 +6,10 @@ mod popups;
 mod sidebar;
 
 use self::config::render_config_screen;
-use self::pickers::{render_file_picker_popup, render_profile_select_popup, render_session_popup};
+use self::pickers::{
+    render_file_picker_popup, render_profile_select_popup, render_resume_picker,
+    render_session_popup,
+};
 use self::popups::{render_mcp_popup, render_skill_popup, render_ssh_popup};
 
 use ratatui::{
@@ -321,6 +324,14 @@ fn sheet_height(app: &App, column: Rect) -> Option<u16> {
             },
             pct(60),
         ),
+        AppMode::ResumePicker(state) => (
+            if state.loading {
+                8
+            } else {
+                rows(state.filtered().len() * 2 + 8).max(12)
+            },
+            pct(70),
+        ),
         AppMode::Jobs => (
             rows(crate::tui::reducer::jobs_rows(app).len() * 2 + 3).max(6),
             pct(60),
@@ -386,6 +397,7 @@ fn render_sheet(frame: &mut Frame, sheet: Rect, app: &App) {
         AppMode::SkillManage => render_skill_popup(frame, sheet, app),
         AppMode::ProfileSelect => render_profile_select_popup(frame, sheet, app),
         AppMode::Rewind(state) => render_rewind_popup(frame, sheet, state),
+        AppMode::ResumePicker(state) => render_resume_picker(frame, sheet, state),
         AppMode::Jobs => render_jobs_panel(frame, sheet, app),
         AppMode::JobDetail(state) => render_job_detail(frame, sheet, state),
         AppMode::Btw(state) => render_btw_popup(frame, sheet, state),
