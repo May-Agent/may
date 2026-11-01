@@ -136,25 +136,18 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
     // during Chrome boot / page navigations.
     let (browser_lifecycle_tx, _) = tokio::sync::broadcast::channel(256);
 
-    // Initialize the May-managed browser runtime only when the feature is enabled.
+    // Initialize the May-managed browser runtime only when the feature is
+    // enabled; provisioning is deferred to the first browser start.
     let browser_manager = if config.browser.enabled {
         tracing::info!(backend = ?config.browser.backend, "Browser integration enabled");
-        match crate::container::browser::prepare_browser_runtime(&config.browser, &may_dir).await {
-            Ok(()) => match crate::container::browser::BrowserManager::new(
-                config.browser.clone(),
-                may_dir.clone(),
-                crate::container::browser::BrowserLifecyclePublisher::new(
-                    browser_lifecycle_tx.clone(),
-                ),
-            ) {
-                Ok(manager) => Some(Arc::new(manager)),
-                Err(error) => {
-                    tracing::error!("Failed to initialize browser manager: {error}");
-                    None
-                }
-            },
+        match crate::container::browser::BrowserManager::new(
+            config.browser.clone(),
+            may_dir.clone(),
+            crate::container::browser::BrowserLifecyclePublisher::new(browser_lifecycle_tx.clone()),
+        ) {
+            Ok(manager) => Some(Arc::new(manager)),
             Err(error) => {
-                tracing::error!("Failed to provision managed browser runtime: {error}");
+                tracing::error!("Failed to initialize browser manager: {error}");
                 None
             }
         }
