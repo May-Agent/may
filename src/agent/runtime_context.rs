@@ -20,6 +20,7 @@ use aither_core::llm::model::{Ability, Parameters};
 use askama::Template;
 
 use super::may::{AgentEnvironment, MayAgentConfig, MayAgentError};
+use crate::agent::agents_md::{self, AgentsIndex, HandoffAgentDoc};
 use crate::fs_utils::display_path;
 use crate::network_policy::{CompiledNetworkPolicy, NetworkPolicyMode};
 use crate::session::{SessionPaths, SessionPlanState};
@@ -43,6 +44,7 @@ pub mod tag {
     pub const WORKSPACE: &str = "workspace";
     pub const WORKSPACE_WORKDIRS: &str = "workspace_workdirs";
     pub const REPO_CLONES: &str = "repo_clones";
+    pub const AGENTS_MD: &str = "agents_md";
     pub const CONTAINER_ENVIRONMENT_CONTEXT: &str = "container_environment_context";
     pub const BROWSER: &str = "browser";
     pub const PROFILE_PERSONA: &str = "profile_persona";
@@ -68,6 +70,11 @@ pub struct RuntimeSystemContext {
     terminal_runtime: Option<String>,
     workspace_workdirs: Option<String>,
     repo_clones: Option<String>,
+    agents_workdir: Option<PathBuf>,
+    agents_workdir_label: Option<String>,
+    agents_md: Option<String>,
+    handoff_agents: Vec<HandoffAgentDoc>,
+    last_handoff: Option<String>,
     browser: Option<String>,
     profile_persona: Option<String>,
     profile_memories: Option<String>,
@@ -85,6 +92,11 @@ impl RuntimeSystemContext {
             terminal_runtime: None,
             workspace_workdirs: None,
             repo_clones: None,
+            agents_workdir: None,
+            agents_workdir_label: None,
+            agents_md: None,
+            handoff_agents: Vec::new(),
+            last_handoff: None,
             browser: None,
             profile_persona: None,
             profile_memories: None,
@@ -107,6 +119,23 @@ impl RuntimeSystemContext {
 
     pub(crate) fn with_repo_clones(mut self, repo_clones: Option<String>) -> Self {
         self.repo_clones = repo_clones;
+        self
+    }
+
+    pub(crate) fn with_agents_md(mut self, agents_md: Option<String>) -> Self {
+        self.agents_md = agents_md;
+        self
+    }
+
+    /// Marks the launch directory `agents_md` content is discovered from,
+    /// so [`Self::sync_agents_md`] can rescan it every turn.
+    pub(crate) fn with_agents_source(
+        mut self,
+        workdir: PathBuf,
+        workdir_label: Option<String>,
+    ) -> Self {
+        self.agents_workdir = Some(workdir);
+        self.agents_workdir_label = workdir_label;
         self
     }
 
@@ -165,6 +194,7 @@ impl RuntimeSystemContext {
             self.workspace_workdirs.clone(),
         );
         reconcile_text_block(context, tag::REPO_CLONES, self.repo_clones.clone());
+        reconcile_agents_md_block(context, self.agents_md.clone());
         reconcile_text_block(context, tag::CONTAINER_ENVIRONMENT_CONTEXT, None);
         // The platform hint is gone; a context restored from an older
         // snapshot may still carry it, so drop it unconditionally.
@@ -187,6 +217,40 @@ impl RuntimeSystemContext {
             context,
             tag::NATIVE_VOICE_INPUT,
             self.native_voice_input.clone(),
+        );
+    }
+
+    /// Refreshes the `agents_md` slot: rescans the launch directory and,
+    /// when the active handoff changed, reloads the `AGENTS.md` files it
+    /// links to. The reconcile stages any difference with a diff alert,
+    /// so the cached prefix stays warm until reassembly folds it in.
+    pub(crate) async fn sync_agents_md(&mut self, handoff: Option<&str>) {
+        let workdir = self.agents_workdir.clone();
+        let reload = handoff != self.last_handoff.as_deref();
+        let index_fut = async {
+            match &workdir {
+                Some(dir) => agents_md::discover(dir).await,
+                None => AgentsIndex::default(),
+            }
+        };
+        let docs_fut = async {
+            if !reload {
+                return Vec::new();
+            }
+            match handoff {
+                Some(markdown) => agents_md::load_referenced(markdown, workdir.as_deref()).await,
+                None => Vec::new(),
+            }
+        };
+        let (index, docs) = futures_lite::future::zip(index_fut, docs_fut).await;
+        if reload {
+            self.last_handoff = handoff.map(str::to_string);
+            self.handoff_agents = docs;
+        }
+        self.agents_md = build_agents_md_context(
+            &index,
+            self.agents_workdir_label.clone(),
+            &self.handoff_agents,
         );
     }
 
@@ -217,6 +281,46 @@ fn reconcile_text_block(
 #[template(path = "alert_memory_update.txt", escape = "none")]
 struct MemoryUpdate {
     diff: String,
+}
+
+/// Reminder surfaced when the launch directory's `AGENTS.md` index
+/// changed mid-session.
+#[derive(Template)]
+#[template(path = "alert_agents_md_update.txt", escape = "none")]
+struct AgentsMdUpdate {
+    diff: String,
+}
+
+/// Reconciles the `agents_md` block like the memory block: a change is
+/// staged rather than rewritten, and surfaced as a durable diff alert,
+/// so the cached prefix stays warm until reassembly folds the update in.
+fn reconcile_agents_md_block(context: &mut aither_agent::Context, desired: Option<String>) {
+    let Some(desired) = desired else {
+        context.remove_system_named(tag::AGENTS_MD);
+        return;
+    };
+    if !context.has_system_block(tag::AGENTS_MD) {
+        context.insert_system_text(tag::AGENTS_MD, desired);
+        return;
+    }
+    if context.staged_system_update(tag::AGENTS_MD) == Some(desired.as_str()) {
+        return;
+    }
+    let current = context
+        .system_blocks()
+        .get(tag::AGENTS_MD)
+        .cloned()
+        .unwrap_or_default();
+    if current == desired {
+        return;
+    }
+    if context.stage_system_text(tag::AGENTS_MD, desired.clone()) {
+        let diff = similar::TextDiff::from_lines(&current, &desired)
+            .unified_diff()
+            .context_radius(2)
+            .to_string();
+        context.push_alert(&AgentsMdUpdate { diff });
+    }
 }
 
 /// Reconciles the MEMORY block without invalidating the KV-cache prefix.
@@ -320,6 +424,17 @@ struct RepoClonesTemplate {
 struct RepoCloneTemplateEntry {
     path: String,
     source: String,
+}
+
+#[derive(Clone, Template)]
+#[template(path = "agents_md.txt", escape = "none")]
+struct AgentsMdTemplate {
+    workdir: Option<String>,
+    root_document: Option<String>,
+    root_truncated: bool,
+    nested: Vec<String>,
+    extra_nested: usize,
+    handoff_documents: Vec<HandoffAgentDoc>,
 }
 
 impl From<&MayWorkspaceDir> for WorkspaceDirEntry {
@@ -510,6 +625,36 @@ pub fn build_repo_clones_context(clones: &[RepoCloneEntry]) -> Option<String> {
     )
 }
 
+/// Builds the `agents_md` block from the launch-directory scan: the
+/// loaded root `AGENTS.md`, the relative paths of nested `AGENTS.md`
+/// files the agent must read before working in their subtree, and the
+/// `AGENTS.md` documents the active compaction handoff referenced.
+/// `workdir` is the launch directory as the model sees it — present only
+/// when the home environment exposes the host path (local sessions).
+/// `None` when there is nothing to say.
+pub fn build_agents_md_context(
+    index: &AgentsIndex,
+    workdir: Option<String>,
+    handoff_documents: &[HandoffAgentDoc],
+) -> Option<String> {
+    if index.root_document.is_none() && index.nested.is_empty() && handoff_documents.is_empty() {
+        return None;
+    }
+    let template = AgentsMdTemplate {
+        workdir,
+        root_document: index.root_document.clone(),
+        root_truncated: index.root_truncated,
+        nested: index.nested.clone(),
+        extra_nested: index.extra_nested,
+        handoff_documents: handoff_documents.to_vec(),
+    };
+    Some(
+        template
+            .render()
+            .unwrap_or_else(|error| panic!("failed to render agents_md context: {error}")),
+    )
+}
+
 pub async fn build_base_system_prompt(
     shared_terminal_commands: &[(String, String)],
     request_parameters: &Parameters,
@@ -680,7 +825,8 @@ mod tests {
     use aither_core::llm::model::Parameters;
 
     use super::{
-        RuntimeSystemContext, build_base_system_prompt, build_memory_context_content, tag,
+        RuntimeSystemContext, build_agents_md_context, build_base_system_prompt,
+        build_memory_context_content, tag,
     };
 
     fn test_db() -> crate::db::ChatDb {
@@ -825,6 +971,45 @@ mod tests {
             context.stable_prefix_fingerprint(),
             "adding workdirs block must change the fingerprint",
         );
+    }
+
+    #[test]
+    fn agents_md_block_is_reconciled_and_pruned() {
+        let db = test_db();
+        let mut runtime_context = RuntimeSystemContext::new(db, String::new());
+        let mut context = aither_agent::Context::default();
+        runtime_context.reconcile(&mut context);
+        assert!(!context.has_system_block(tag::AGENTS_MD));
+
+        runtime_context = runtime_context.with_agents_md(Some("project rules".to_string()));
+        runtime_context.reconcile(&mut context);
+        assert_eq!(
+            context.system_blocks().get(tag::AGENTS_MD),
+            Some(&"project rules".to_string())
+        );
+
+        runtime_context = runtime_context.with_agents_md(None);
+        runtime_context.reconcile(&mut context);
+        assert!(!context.has_system_block(tag::AGENTS_MD));
+    }
+
+    #[test]
+    fn agents_md_context_renders_document_and_nested_list() {
+        let index = crate::agent::agents_md::AgentsIndex {
+            root_document: Some("do the thing".to_string()),
+            root_truncated: false,
+            nested: vec!["crates/foo/AGENTS.md".to_string()],
+            extra_nested: 2,
+        };
+        let block = build_agents_md_context(&index, Some("/launch".to_string()), &[])
+            .expect("block renders");
+        assert!(block.contains("/launch"), "{block}");
+        assert!(block.contains("do the thing"), "{block}");
+        assert!(block.contains("crates/foo/AGENTS.md"), "{block}");
+        assert!(block.contains("2 more"), "{block}");
+
+        let empty = crate::agent::agents_md::AgentsIndex::default();
+        assert!(build_agents_md_context(&empty, None, &[]).is_none());
     }
 
     fn render_base_system_prompt(

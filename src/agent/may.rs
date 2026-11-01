@@ -17,16 +17,18 @@ use aither_sandbox::{AnyContainerExec, ContainerShellRuntime, SshServer, Termina
 use executor_core::DefaultExecutor;
 use futures_lite::Stream;
 
+use super::agents_md;
 use super::context_dump::ContextDump;
 use super::hooks::{ContextSnapshotHook, PendingSteerHook};
 use super::imagine::{ImageGeneratorConfig, resolve_image_generator_config};
 use super::permission::PermissionApprover;
 use super::provider::{RequestParameterizedModel, resolve_provider_runtime};
 use super::runtime_context::{
-    RepoCloneEntry, RuntimeSystemContext, build_base_system_prompt, build_browser_context,
-    build_location_context, build_memory_context_content, build_native_voice_context,
-    build_network_restrictions_context, build_plan_mode_context, build_repo_clones_context,
-    build_terminal_runtime_context, build_workspace_workdirs_context, tag,
+    RepoCloneEntry, RuntimeSystemContext, build_agents_md_context, build_base_system_prompt,
+    build_browser_context, build_location_context, build_memory_context_content,
+    build_native_voice_context, build_network_restrictions_context, build_plan_mode_context,
+    build_repo_clones_context, build_terminal_runtime_context, build_workspace_workdirs_context,
+    tag,
 };
 use super::tool_environment_cache::{
     Acquired, HomeBackend, ToolEnvironmentCache, ToolEnvironmentCacheError, ToolEnvironmentKey,
@@ -459,6 +461,15 @@ impl MayAgent {
         }
         runtime_system_context =
             runtime_system_context.with_repo_clones(build_repo_clones_context(&repo_clones));
+
+        // Project rules: the launch directory's AGENTS.md is loaded into
+        // the stable prefix and nested AGENTS.md files are listed, so
+        // the agent never has to find them itself.
+        let agents_index = agents_md::discover(&config.cwd).await;
+        let agents_label = (!is_container).then(|| crate::fs_utils::display_path(&config.cwd));
+        runtime_system_context = runtime_system_context
+            .with_agents_source(config.cwd.clone(), agents_label.clone())
+            .with_agents_md(build_agents_md_context(&agents_index, agents_label, &[]));
 
         let llm =
             RequestParameterizedModel::new(config.llm.clone(), config.request_parameters.clone());
@@ -1051,6 +1062,10 @@ impl MayAgent {
 
     pub(crate) async fn sync_runtime_context(&mut self) {
         self.runtime_system_context.sync_memory_content().await;
+        let handoff = handoff_markdown(self.inner.context());
+        self.runtime_system_context
+            .sync_agents_md(handoff.as_deref())
+            .await;
         self.runtime_system_context
             .reconcile(self.inner.context_mut());
     }
@@ -1109,6 +1124,15 @@ pub async fn generate_session_title(
         // Clean up title - remove quotes if present
         let title = title.trim_matches('"').trim_matches('\'').trim();
         Some(title.to_string())
+    }
+}
+
+/// Rendered markdown of the context's active handoff, if any — the text
+/// `AGENTS.md` links are extracted from.
+fn handoff_markdown(context: &aither_agent::Context) -> Option<String> {
+    match context.handoff()? {
+        aither_agent::Handoff::Text(text) => Some(text.clone()),
+        aither_agent::Handoff::Document(document) => Some(document.render_markdown()),
     }
 }
 
