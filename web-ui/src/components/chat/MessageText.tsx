@@ -15,6 +15,7 @@ import oneLight from 'react-syntax-highlighter/dist/esm/styles/prism/one-light';
 import { parseArtifactTags } from '@/lib/artifactTags';
 import { parseTunnelTags } from '@/lib/tunnelTags';
 import { SlidevArtifact } from './SlidevArtifact';
+import { ArtifactCard } from './ArtifactCard';
 import { TunnelLink } from './TunnelLink';
 
 for (const [name, lang] of Object.entries({
@@ -152,13 +153,21 @@ export const MessageText = memo(function MessageText({
         </div>
       )}
       {sessionId &&
-        artifacts.map((artifact) => (
-          <SlidevArtifact
-            key={`${artifact.type}:${artifact.path}`}
-            sessionId={sessionId}
-            path={artifact.path}
-          />
-        ))}
+        artifacts.map((artifact) =>
+          artifact.type === 'slidev' ? (
+            <SlidevArtifact
+              key={`${artifact.type}:${artifact.path}`}
+              sessionId={sessionId}
+              path={artifact.path}
+            />
+          ) : (
+            <ArtifactCard
+              key={`${artifact.type}:${artifact.path}`}
+              sessionId={sessionId}
+              path={artifact.path}
+            />
+          ),
+        )}
       {streaming && (
         <span className="inline-block w-1.5 h-3.5 bg-foreground/70 animate-pulse ml-0.5 align-middle" />
       )}

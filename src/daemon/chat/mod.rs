@@ -1394,7 +1394,7 @@ fn run_agent_loop<'a>(
                 turn_hidden_context_xml = Some(hidden_context_xml);
             }
             let model_context_window = agent.model_context_window().or_else(|| {
-                lookup_model_info(&current_model)
+                lookup_model_info(crate::model_selector::selector_model_id(&current_model))
                     .and_then(aither_models::ModelEntry::max_input_tokens)
             });
 
@@ -1436,7 +1436,7 @@ fn run_agent_loop<'a>(
                     .provider
                     .get(&provider_id)
                     .map(|instance| instance.resolve_type(&provider_id)),
-                &current_model,
+                crate::model_selector::selector_model_id(&current_model),
                 reasoning_effort,
             );
             let mut reasoning_phase = reasoning_display.then_some(started_at);

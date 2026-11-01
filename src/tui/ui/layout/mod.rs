@@ -403,8 +403,6 @@ fn render_sheet(frame: &mut Frame, sheet: Rect, app: &App) {
 /// image closes it. It stays an overlay over the whole screen rather than a
 /// sheet: it exists to show the image as large as the terminal allows.
 fn render_image_view(frame: &mut Frame, area: Rect, app: &mut App) {
-    use ratatui_image::Resize;
-
     let AppMode::ImageView(state) = &app.mode else {
         return;
     };
@@ -430,7 +428,7 @@ fn render_image_view(frame: &mut Frame, area: Rect, app: &mut App) {
 
     let image_area = rows[0];
     let state = app.image_cache.get_mut(&key).expect("checked above");
-    let fitted = state.protocol.size_for(Resize::Fit(None), image_area);
+    let fitted = state.fitted(image_area);
     let draw_area = Rect::new(
         image_area.x + image_area.width.saturating_sub(fitted.width) / 2,
         image_area.y + image_area.height.saturating_sub(fitted.height) / 2,
@@ -1960,7 +1958,6 @@ fn render_inline_images(
     occluders: &[Rect],
 ) {
     use super::streaming_markdown::IMAGE_HEIGHT;
-    use ratatui_image::Resize;
 
     let view_height = i32::from(chat_area.height);
     let block_height = i32::try_from(IMAGE_HEIGHT).unwrap_or(i32::MAX);
@@ -2005,7 +2002,7 @@ fn render_inline_images(
 
         // The fitted rect is what the image actually paints into — it is the
         // click region for the zoom view.
-        let fitted = state.protocol.size_for(Resize::Fit(None), image_area);
+        let fitted = state.fitted(image_area);
         let draw_area = Rect::new(
             image_area.x,
             image_area.y,
@@ -2045,7 +2042,7 @@ mod tests {
             image::Rgb([200, 40, 40]),
         ));
         ImageState {
-            protocol: picker.new_resize_protocol(image),
+            proto: crate::tui::ui::image::ImageProtocol::Other(picker.new_resize_protocol(image)),
         }
     }
 

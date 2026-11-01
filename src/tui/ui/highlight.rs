@@ -1,7 +1,8 @@
-//! Shell-script syntax highlighting for tool-call command text.
+//! Syntax highlighting for tool-call command text and markdown code blocks.
 //!
-//! Mirrors the web UI's Prism/bash card: one `Vec<Span>` per source line,
-//! colored with a dark syntect theme (the TUI assumes a dark terminal).
+//! Mirrors the web UI's highlighted code card: one `Vec<Span>` per source
+//! line, colored with a dark syntect theme (the TUI assumes a dark
+//! terminal).
 
 use std::sync::LazyLock;
 
@@ -40,24 +41,34 @@ fn to_style(style: syntect::highlighting::Style) -> Style {
     out
 }
 
+/// A highlighter for `language` — a fence token like `rust` or `rs`
+/// matched against syntax names and extensions; `None` when no syntax
+/// knows it.
+pub(super) fn highlighter(language: &str) -> Option<HighlightLines<'static>> {
+    SYNTAXES
+        .find_syntax_by_token(language)
+        .map(|syntax| HighlightLines::new(syntax, &THEME))
+}
+
+/// Highlight one source line, keeping parse state in `highlighter` so
+/// quotes, heredocs and open scopes carry across lines.
+pub(super) fn line_spans(highlighter: &mut HighlightLines<'_>, line: &str) -> Vec<Span<'static>> {
+    highlighter
+        .highlight_line(line, &SYNTAXES)
+        .expect("bundled syntaxes highlight without missing references")
+        .into_iter()
+        .map(|(style, text)| Span::styled(text.to_string(), to_style(style)))
+        .collect()
+}
+
 /// Highlight `script` as bash, returning one span vector per source line.
 /// The script is highlighted as a unit so state (quotes, heredocs) carries
 /// across lines. An empty script yields no lines.
 pub(super) fn shell_spans(script: &str) -> Vec<Vec<Span<'static>>> {
-    let syntax = SYNTAXES
-        .find_syntax_by_extension("bash")
-        .expect("syntect's default syntaxes include bash");
-    let mut highlighter = HighlightLines::new(syntax, &THEME);
+    let mut highlighter = highlighter("bash").expect("syntect's default syntaxes include bash");
     script
         .lines()
-        .map(|line| {
-            highlighter
-                .highlight_line(line, &SYNTAXES)
-                .expect("bundled syntaxes highlight without missing references")
-                .into_iter()
-                .map(|(style, text)| Span::styled(text.to_string(), to_style(style)))
-                .collect()
-        })
+        .map(|line| line_spans(&mut highlighter, line))
         .collect()
 }
 

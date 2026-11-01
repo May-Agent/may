@@ -703,8 +703,7 @@ impl RuntimeDeps {
         history_index: usize,
         restore_code: bool,
     ) -> Result<PendingWorkerBuild, TuiRuntimeError> {
-        let Some((content, attachments, call_ids)) = app.chat.prompt_rewind_payload(history_index)
-        else {
+        let Some((content, attachments)) = app.chat.prompt_rewind_payload(history_index) else {
             return Err(crate::session::SessionError::NotFound(format!(
                 "no prompt at history position {history_index}"
             ))
@@ -721,7 +720,7 @@ impl RuntimeDeps {
         let model = session.model.clone();
 
         if restore_code {
-            app.request_prompt_rewind(point.user_message_id, call_ids);
+            app.request_prompt_rewind(point.user_message_id);
         }
 
         app.chat.truncate_prompt_at(history_index);

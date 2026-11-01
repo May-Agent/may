@@ -1,5 +1,6 @@
-//! The right sidebar: session title, task tree with linked issues, running
-//! subagents and background terminal jobs.
+//! The right sidebar: session title, task tree with linked issues, file
+//! changes per tracked workspace, running subagents and background
+//! terminal jobs.
 
 use ratatui::{
     prelude::*,
@@ -81,6 +82,39 @@ fn heading(text: String) -> Line<'static> {
 
 fn dim(text: String) -> Line<'static> {
     Line::from(Span::styled(text, Style::default().fg(Color::DarkGray)))
+}
+
+/// `text` cut to `width` display columns keeping its tail — for paths
+/// whose basename matters more than their leading directories.
+fn truncate_tail(text: &str, width: usize) -> String {
+    if text.width() <= width {
+        return text.to_string();
+    }
+    let mut tail = String::new();
+    let mut used = 1; // the leading …
+    for ch in text.chars().rev() {
+        let w = ch.width().unwrap_or(0);
+        if used + w > width {
+            break;
+        }
+        tail.insert(0, ch);
+        used += w;
+    }
+    format!("…{tail}")
+}
+
+/// `path` with the user's home directory shown as `~`.
+fn home_label(path: &std::path::Path) -> String {
+    if let Some(home) = dirs::home_dir()
+        && let Ok(rest) = path.strip_prefix(&home)
+    {
+        return if rest.as_os_str().is_empty() {
+            "~".to_string()
+        } else {
+            format!("~/{}", rest.display())
+        };
+    }
+    path.display().to_string()
 }
 
 /// Rows of the task tree, plus the row of the first open task.
@@ -180,6 +214,45 @@ pub(super) fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
 
     // Background sections, bounded so tasks always get room too.
     let mut background: Vec<Line<'static>> = Vec::new();
+    if !app.file_status.is_empty() {
+        let total: usize = app.file_status.iter().map(|d| d.changes.len()).sum();
+        background.push(Line::from(""));
+        background.push(heading(format!("Changes ({total})")));
+        let mut rows_left = BACKGROUND_ROWS;
+        let mut hidden = 0usize;
+        for root in &app.file_status {
+            if rows_left == 0 {
+                hidden += root.changes.len();
+                continue;
+            }
+            background.push(dim(format!(
+                " {}",
+                truncate(&home_label(&root.root), width.saturating_sub(1))
+            )));
+            for stat in &root.changes {
+                if rows_left == 0 {
+                    hidden += 1;
+                    continue;
+                }
+                rows_left -= 1;
+                let adds = format!("+{}", stat.additions);
+                let dels = format!("−{}", stat.deletions);
+                let name = truncate_tail(
+                    &stat.path.to_string_lossy(),
+                    width.saturating_sub(adds.width() + dels.width() + 4),
+                );
+                background.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::raw(name),
+                    Span::styled(format!(" {adds}"), Style::default().fg(Color::Green)),
+                    Span::styled(format!(" {dels}"), Style::default().fg(Color::Red)),
+                ]));
+            }
+        }
+        if hidden > 0 {
+            background.push(dim(format!("  … {hidden} more")));
+        }
+    }
     if !app.subagents.is_empty() {
         background.push(Line::from(""));
         background.push(heading(format!("Subagents ({})", app.subagents.len())));

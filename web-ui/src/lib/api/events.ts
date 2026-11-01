@@ -10,6 +10,7 @@ export interface UiEventStreamHandle {
 export interface UiEventStreamOptions {
   abort?: AbortSignal;
   profileId?: string | null;
+  sessionId?: string | null;
 }
 
 /**
@@ -38,6 +39,7 @@ export async function openUiEventStream(
   const params = new URLSearchParams();
   if (topics.length > 0) params.set('topics', topics.join(','));
   if (opts.profileId) params.set('profileId', opts.profileId);
+  if (opts.sessionId) params.set('sessionId', opts.sessionId);
   const qs = params.toString();
   const res = await fetch(apiSseUrl(`/events${qs ? `?${qs}` : ''}`), {
     headers: { Accept: 'text/event-stream' },

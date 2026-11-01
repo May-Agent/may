@@ -1733,13 +1733,21 @@ impl PreparedEnvironment {
 
     /// The first line of the environment context May's system prompt carries
     /// for this environment.
-    const fn context_heading(&self) -> &'static str {
-        match self {
-            Self::Local { .. } => "Environment: local (user's real machine)",
-            Self::Container { .. } => {
-                "Environment: container (managed runtime, not the user's host machine)"
-            }
-        }
+    fn context_heading(&self) -> String {
+        let operating_system = match self {
+            Self::Local { .. } => match std::env::consts::OS {
+                "macos" => "macOS",
+                "linux" => "Linux",
+                "windows" => "Windows",
+                other => other,
+            },
+            Self::Container { .. } => "linux (managed container runtime)",
+        };
+        let kind = match self {
+            Self::Local { .. } => "local",
+            Self::Container { .. } => "container",
+        };
+        format!("Environment: {kind} ({operating_system}, POSIX sh)")
     }
 
     /// The physical directory a session's terminal commands start in: the
@@ -2954,7 +2962,7 @@ async fn terminal_and_terminal_input_round_trip(environment: ChatEnvironment) {
             .expect("the turn should have asked the model"),
     );
     assert!(
-        first_request_system.contains(context_heading),
+        first_request_system.contains(context_heading.as_str()),
         "the model request should carry the `{context_heading}` environment context; system text:\n{first_request_system}"
     );
     let terminal_output = agent_requests

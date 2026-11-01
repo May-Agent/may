@@ -357,7 +357,7 @@ mod tests {
         let mut context = aither_agent::Context::default();
         context.insert_system_text(BASE_SYSTEM_TAG, base_system_block());
         context.insert_system_text(tag::MEMORY, "remember this");
-        context.insert_system_text(tag::WORKSPACE, "sandbox=/tmp cwd=/tmp");
+        context.insert_system_text(tag::TERMINAL_RUNTIME_CONTEXT, "sandbox=/tmp cwd=/tmp");
         context.push(Message::user("hello"));
         context.push(Message::assistant("hi there"));
         context

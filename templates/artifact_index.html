@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ title }} — artifacts</title>
+<style>
+:root { color-scheme: light dark; }
+body { margin: 0; font: 14px/1.55 system-ui, sans-serif; color: CanvasText; }
+header { padding: 14px 20px; border-bottom: 1px solid color-mix(in srgb, CanvasText 15%, transparent); }
+header .name { font-weight: 600; }
+header .path { font-size: 12px; opacity: .6; }
+ul { list-style: none; margin: 0; padding: 8px 12px; }
+li a { display: flex; gap: 12px; padding: 8px; border-radius: 6px; color: inherit; text-decoration: none; }
+li a:hover { background: color-mix(in srgb, CanvasText 7%, transparent); }
+li .size { margin-left: auto; font-size: 12px; opacity: .5; font-variant-numeric: tabular-nums; }
+.empty { padding: 48px 20px; text-align: center; opacity: .6; }
+</style>
+</head>
+<body>
+<header>
+  <div class="name">{{ title }}</div>
+  {% if !rel_path.is_empty() %}<div class="path">{{ rel_path }}</div>{% endif %}
+</header>
+{% if entries.is_empty() && parent_href.is_none() %}
+<div class="empty">This directory is empty.</div>
+{% else %}
+<ul>
+{% if let Some(href) = parent_href %}<li><a href="{{ href }}">../<span class="size"></span></a></li>{% endif %}
+{% for entry in entries %}
+<li><a href="{{ entry.href }}">{{ entry.name }}{% if entry.is_dir %}/{% endif %}<span class="size">{{ entry.size_label }}</span></a></li>
+{% endfor %}
+</ul>
+{% endif %}
+</body>
+</html>
