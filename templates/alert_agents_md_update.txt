@@ -1,0 +1,3 @@
+The launch directory's AGENTS.md index changed since this conversation started. The agents_md block above is the previous version; apply this diff mentally (the context will fold it in later):
+<agents_md_diff>
+{{ diff }}</agents_md_diff>

@@ -1,5 +1,6 @@
 //! May agent implementation.
 
+mod agents_md;
 pub(crate) mod ask_user_tool;
 pub(crate) mod browser_tool;
 #[cfg(test)]
