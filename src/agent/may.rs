@@ -351,23 +351,24 @@ impl MayAgent {
         )?;
 
         // Mount workspace grants into the terminal sandbox: read-only dirs
-        // become readable mounts, read-write dirs writable mounts.
+        // become readable mounts, read-write dirs writable mounts. The
+        // launch directory is readable by default — `readable_dirs` carries
+        // it — and the sandbox dir is the tool's own working directory, so
+        // it needs no grant entry of its own.
         let readable = workspace
-            .config
-            .workdirs
-            .iter()
-            .filter(|dir| dir.permission == crate::workspace::Permission::ReadOnly)
-            .map(|dir| dir.path.clone());
+            .readable_dirs()
+            .into_iter()
+            .filter(|path| path.as_path() != config.sandbox_dir.as_path())
+            .cloned();
         // `~/.may/memories` is linked into the session's `~/.may`; it must be
         // writable through the symlink, so it joins the grants.
         let memories_dir = crate::session::MayHomePaths::new(config.may_dir.clone()).memories_dir();
         async_fs::create_dir_all(&memories_dir).await.ok();
         let writable = workspace
-            .config
-            .workdirs
-            .iter()
-            .filter(|dir| dir.permission == crate::workspace::Permission::ReadWrite)
-            .map(|dir| dir.path.clone())
+            .writable_dirs()
+            .into_iter()
+            .filter(|path| path.as_path() != config.sandbox_dir.as_path())
+            .cloned()
             .chain(std::iter::once(memories_dir));
 
         // Create the terminal command tool in the sandbox dir.
