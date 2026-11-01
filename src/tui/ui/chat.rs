@@ -1555,17 +1555,19 @@ fn usage_report_lines(report: &crate::agent::SessionUsageReport) -> Vec<Line<'st
             Span::styled(model.model.clone(), value),
             Span::styled(format!("  {} requests", model.requests), dim),
         ]));
-        let mut cost_text = format!(
-            "out {}  cache read {}  write {}  hit {:.0}%",
-            compact_count(model.completion_tokens),
-            compact_count(model.cache_read_tokens),
-            compact_count(model.cache_write_tokens),
-            model.cache_hit_rate * 100.0,
-        );
-        if let Some(cost) = model.cost_usd {
-            cost_text.push_str(&format!("  ${cost:.2}"));
-        }
-        lines.push(Line::styled(format!("    {cost_text}"), dim));
+        let cost_suffix = model
+            .cost_usd
+            .map_or_else(String::new, |cost| format!("  ${cost:.2}"));
+        lines.push(Line::styled(
+            format!(
+                "    out {}  cache read {}  write {}  hit {:.0}%{cost_suffix}",
+                compact_count(model.completion_tokens),
+                compact_count(model.cache_read_tokens),
+                compact_count(model.cache_write_tokens),
+                model.cache_hit_rate * 100.0,
+            ),
+            dim,
+        ));
     }
     lines
 }

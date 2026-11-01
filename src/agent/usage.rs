@@ -55,9 +55,10 @@ pub fn assemble_usage_report(
 ) -> SessionUsageReport {
     let mut models: Vec<ModelUsageRow> = Vec::new();
     for row in rows {
-        let entry = match models.iter_mut().find(|model| model.model == row.model) {
-            Some(entry) => entry,
-            None => {
+        let index = models
+            .iter()
+            .position(|model| model.model == row.model)
+            .unwrap_or_else(|| {
                 models.push(ModelUsageRow {
                     model: row.model.clone(),
                     requests: 0,
@@ -69,15 +70,18 @@ pub fn assemble_usage_report(
                     cache_hit_rate: 0.0,
                     cost_usd: None,
                 });
-                models.last_mut().expect("just pushed")
-            }
-        };
+                models.len() - 1
+            });
+        let entry = &mut models[index];
         entry.requests += 1;
-        entry.prompt_tokens += row.prompt_tokens.unwrap_or(0) as u64;
-        entry.completion_tokens += row.completion_tokens.unwrap_or(0) as u64;
-        entry.cache_read_tokens += row.cache_read_tokens.unwrap_or(0) as u64;
-        entry.cache_write_tokens += row.cache_write_tokens.unwrap_or(0) as u64;
-        entry.api_ms += row.elapsed_ms.max(0) as u64;
+        entry.prompt_tokens += u64::try_from(row.prompt_tokens.unwrap_or(0)).unwrap_or_default();
+        entry.completion_tokens +=
+            u64::try_from(row.completion_tokens.unwrap_or(0)).unwrap_or_default();
+        entry.cache_read_tokens +=
+            u64::try_from(row.cache_read_tokens.unwrap_or(0)).unwrap_or_default();
+        entry.cache_write_tokens +=
+            u64::try_from(row.cache_write_tokens.unwrap_or(0)).unwrap_or_default();
+        entry.api_ms += row.elapsed_ms.max(0).cast_unsigned();
     }
 
     let mut api_ms = 0;
@@ -105,11 +109,11 @@ pub fn assemble_usage_report(
                 row.timestamp
                     .parse::<jiff::Timestamp>()
                     .ok()
-                    .map(|ts| ts.as_millisecond())
+                    .map(jiff::Timestamp::as_millisecond)
             })
             .min()
     });
-    let wall_ms = start_ms.map_or(0, |start| (now_ms - start).max(0) as u64);
+    let wall_ms = start_ms.map_or(0, |start| (now_ms - start).max(0).cast_unsigned());
 
     SessionUsageReport {
         session_id: session_id.to_string(),
@@ -126,14 +130,16 @@ fn cost_usd(row: &ModelUsageRow) -> Option<f64> {
     // Logged model ids may carry the provider prefix (`swe2::swe-2-high`);
     // the catalog keys on the bare model id.
     let bare = row.model.rsplit("::").next().unwrap_or(&row.model);
-    let pricing = aither_models::lookup(bare).map(|entry| entry.pricing())?;
-    let mut cost = row.prompt_tokens as f64 * pricing.input_per_token()
-        + row.completion_tokens as f64 * pricing.output_per_token();
+    let pricing = aither_models::lookup(bare).map(aither_models::ModelEntry::pricing)?;
+    let mut cost = (row.completion_tokens as f64).mul_add(
+        pricing.output_per_token(),
+        row.prompt_tokens as f64 * pricing.input_per_token(),
+    );
     if let Some(rate) = pricing.cache_read_per_token() {
-        cost += row.cache_read_tokens as f64 * rate;
+        cost = (row.cache_read_tokens as f64).mul_add(rate, cost);
     }
     if let Some(rate) = pricing.cache_write_per_token() {
-        cost += row.cache_write_tokens as f64 * rate;
+        cost = (row.cache_write_tokens as f64).mul_add(rate, cost);
     }
     Some(cost)
 }
