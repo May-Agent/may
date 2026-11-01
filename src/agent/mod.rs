@@ -23,6 +23,7 @@ mod permission;
 pub(crate) mod pr_tool;
 mod provider;
 pub(crate) mod register_tool;
+pub(crate) mod repo_tool;
 pub mod runner;
 mod runtime_context;
 /// Session tool registration for the agent.
