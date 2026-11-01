@@ -199,6 +199,10 @@ async fn async_main() -> anyhow::Result<()> {
         CliMode::Resume(args) => Some(args.clone()),
         _ => None,
     };
+    let tui_repo = match &cli_mode {
+        CliMode::Tui(args) => args.repo.clone(),
+        _ => None,
+    };
     match cli_mode {
         CliMode::Help(help_text) => {
             use std::io::Write as _;
@@ -221,7 +225,7 @@ async fn async_main() -> anyhow::Result<()> {
         CliMode::Browser(args) => std::process::exit(run_browser(args).await?),
         CliMode::Exec(args) => std::process::exit(Box::pin(run_exec(args)).await?),
         CliMode::OneShot(args) => return run_oneshot(args).await,
-        CliMode::Tui | CliMode::Resume(_) => {}
+        CliMode::Tui(_) | CliMode::Resume(_) => {}
     }
 
     // Set up panic hook to restore terminal state before panicking
@@ -262,7 +266,7 @@ async fn async_main() -> anyhow::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Create app and run
-    let result = run_app(&mut terminal, image_support, log_ring, resume).await;
+    let result = run_app(&mut terminal, image_support, log_ring, resume, tui_repo).await;
 
     // Cleanup terminal
     disable_raw_mode()?;
@@ -308,12 +312,14 @@ async fn run_app<B: Backend>(
     image_support: Option<may_agent::tui::ui::image::TerminalImageSupport>,
     log_ring: may_agent::log_ring::LogRingHandle,
     resume: Option<cli::ResumeArgs>,
+    tui_repo: Option<String>,
 ) -> anyhow::Result<Option<ExitSummary>>
 where
     B::Error: Send + Sync + 'static,
 {
     let mut events = EventHandler::new();
     let mut app = App::new(events.sender(), image_support).await?;
+    app.session_manager.set_pending_repo(tui_repo);
     let mut worker: Option<AgentWorker> = None;
 
     tracing::info!("=== MAY STARTUP - channels created ===");
