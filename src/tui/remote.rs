@@ -168,7 +168,7 @@ async fn follow_session(
                     {
                         let _ = forwarding
                             .app_events
-                            .send(AppEvent::SessionRuntime(snapshot))
+                            .send(AppEvent::SessionRuntime(Box::new(snapshot)))
                             .await;
                     }
                 }
