@@ -82,6 +82,14 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             }
             Ok(None)
         }
+        AppEvent::ResumeSessionsLoaded(sessions) => {
+            if let AppMode::ResumePicker(state) = &mut app.mode {
+                state.sessions = sessions;
+                state.loading = false;
+                state.selected = 0;
+            }
+            Ok(None)
+        }
         AppEvent::SessionDeleted {
             deleted: _,
             was_current,
@@ -219,6 +227,10 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             app.sidebar.set_issues(&session_id, issues);
             Ok(None)
         }
+        AppEvent::SidebarPrs { session_id, prs } => {
+            app.sidebar.set_prs(&session_id, prs);
+            Ok(None)
+        }
         AppEvent::BackgroundLoaded { jobs, subagents } => {
             app.jobs = jobs;
             app.subagents = subagents;
@@ -230,6 +242,11 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
         }
         AppEvent::SessionRuntime(event) => {
             app.session_runtime = event.runtime;
+            app.sync_queue_from_runtime();
+            Ok(None)
+        }
+        AppEvent::IndexCoverage(index) => {
+            app.index_coverage = index;
             Ok(None)
         }
         AppEvent::TurnStarted { message_id } => {

@@ -428,6 +428,46 @@ pub struct SessionTasksPayload {
     pub(crate) plan_state: SessionPlanState,
 }
 
+/// One `prs` row over the wire — the session's PR list entry.
+#[derive(Debug, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiPr {
+    /// Per-repository PR number.
+    pub(crate) number: i64,
+    /// PR title.
+    pub(crate) title: String,
+    /// `open`, `checks_pending`, `failed`, `rejected`, `merging`, `merged`, `closed`.
+    pub(crate) state: String,
+    /// `may` or `github`.
+    pub(crate) backend: String,
+    /// External PR number, when the backend created one.
+    pub(crate) external_number: Option<i64>,
+    /// Associated issue number, when linked.
+    pub(crate) issue_number: Option<i64>,
+    /// Whether the PR merges itself once checks pass.
+    pub(crate) auto_merge: bool,
+    /// UTC timestamps.
+    pub(crate) created_at: String,
+    /// Latest update.
+    pub(crate) updated_at: String,
+    /// Merge timestamp, when merged.
+    pub(crate) merged_at: Option<String>,
+    /// Recent transition events, oldest first.
+    pub(crate) events: Vec<ApiPrEvent>,
+}
+
+/// One `pr_events` row over the wire.
+#[derive(Debug, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiPrEvent {
+    /// Transition kind (`opened`, `queued`, `merged`, ...).
+    pub(crate) kind: String,
+    /// Event payload (failure excerpt, merge sha, conflict list).
+    pub(crate) detail: Option<String>,
+    /// UTC time.
+    pub(crate) created_at: String,
+}
+
 #[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionPlanStateRequest {
@@ -727,6 +767,9 @@ pub struct ApiSession {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) reasoning_effort: Option<String>,
     pub(crate) runtime: SessionRuntimeResponse,
+    /// Repository the session is bound to, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) repo: Option<String>,
 }
 
 impl ApiSession {
@@ -754,6 +797,7 @@ impl ApiSession {
             model,
             reasoning_effort: summary.reasoning_effort.clone(),
             runtime: summary.runtime.clone().into(),
+            repo: summary.repo.clone(),
         }
     }
 
@@ -769,6 +813,7 @@ impl ApiSession {
             model,
             reasoning_effort: None,
             runtime: crate::session::SessionRuntimeSummary::default().into(),
+            repo: None,
         }
     }
 }
@@ -786,6 +831,10 @@ pub struct CreateSessionRequest {
     /// Host directory the session works in (the TUI's launch directory).
     #[serde(default)]
     pub(crate) cwd: Option<String>,
+    /// Repository to bind: `owner/repo`, a local path, or absent for a
+    /// repo-less chat.
+    #[serde(default)]
+    pub(crate) repo: Option<String>,
 }
 
 /// Request to truncate a session's history at a stored row.
@@ -814,6 +863,10 @@ pub struct UpdateSessionRequest {
     /// touched for repo usage when set.
     #[serde(default)]
     pub(crate) cwd: Option<String>,
+    /// Repository to bind: `owner/repo`, a local path, `null` clears the
+    /// binding; absent leaves it untouched.
+    #[serde(default, deserialize_with = "deserialize_present_patch")]
+    pub(crate) repo: Option<NullableStringPatch>,
     /// One-shot/non-interactive flag: set to refuse permission prompts
     /// instead of asking.
     #[serde(default)]

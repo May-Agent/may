@@ -225,9 +225,10 @@ pub(super) fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
                 hidden += root.changes.len();
                 continue;
             }
+            let root_name = root.label.clone().unwrap_or_else(|| home_label(&root.root));
             background.push(dim(format!(
                 " {}",
-                truncate(&home_label(&root.root), width.saturating_sub(1))
+                truncate(&root_name, width.saturating_sub(1))
             )));
             for stat in &root.changes {
                 if rows_left == 0 {
@@ -351,6 +352,13 @@ pub(super) fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
         _ => {
             tasks.push(heading("Tasks".to_string()));
             tasks.push(dim("No tasks yet".to_string()));
+        }
+    }
+    if !app.sidebar.prs.is_empty() {
+        tasks.push(Line::from(""));
+        tasks.push(heading("Pull requests".to_string()));
+        for pr in &app.sidebar.prs {
+            tasks.push(dim(format!("  #{} {} — {}", pr.number, pr.title, pr.state)));
         }
     }
 

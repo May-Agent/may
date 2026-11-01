@@ -58,7 +58,7 @@ pub static SLASH_COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "/resume-claude",
-        "Import a Claude Code transcript into a new session",
+        "Import a Claude Code session (opens picker)",
     ),
     (
         "/secret",
@@ -127,6 +127,14 @@ impl Completion {
     #[must_use]
     pub fn is_active(&self) -> bool {
         self.mode != CompletionMode::None
+    }
+
+    /// Whether the palette has a selectable item. Empty slash queries (a
+    /// command plus arguments) stay in slash mode so further typing can
+    /// recover matches, but they must not intercept Enter / arrows / Esc.
+    #[must_use]
+    pub fn has_matches(&self) -> bool {
+        self.is_active() && !self.items.is_empty()
     }
 
     /// Get visible items (limited for display).
@@ -360,5 +368,59 @@ impl Completion {
 impl Default for Completion {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Completion;
+
+    #[test]
+    fn slash_arguments_do_not_match_and_do_not_accept_enter() {
+        let mut completion = Completion::new();
+        completion.start_slash("resume-claude 4928f530-2440-4156-a83d-fa44be29465a");
+        assert!(
+            completion.is_active(),
+            "slash mode stays on so further edits can recover matches"
+        );
+        assert!(completion.is_empty());
+        assert!(
+            !completion.has_matches(),
+            "Enter must submit `/resume-claude <id>` instead of swallowing it"
+        );
+        assert!(completion.complete().is_none());
+    }
+
+    #[test]
+    fn slash_command_name_still_accepts_enter() {
+        let mut completion = Completion::new();
+        completion.start_slash("resume-claude");
+        assert!(completion.has_matches());
+        assert_eq!(
+            completion.complete().map(|item| item.insert.as_str()),
+            Some("/resume-claude")
+        );
+    }
+
+    #[test]
+    fn two_word_slash_command_still_accepts_enter() {
+        let mut completion = Completion::new();
+        completion.start_slash("context dump");
+        assert!(completion.has_matches());
+        assert_eq!(
+            completion.complete().map(|item| item.insert.as_str()),
+            Some("/context dump")
+        );
+    }
+
+    #[test]
+    fn slash_prefix_still_accepts_enter() {
+        let mut completion = Completion::new();
+        completion.start_slash("res");
+        assert!(completion.has_matches());
+        assert_eq!(
+            completion.complete().map(|item| item.insert.as_str()),
+            Some("/resume-codex")
+        );
     }
 }

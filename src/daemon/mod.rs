@@ -63,6 +63,45 @@ use crate::ui_event_bus::UiEventTopics;
 
 /// How long a shutdown waits for running turns before exiting anyway.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+/// How long cancelled runs get to settle their interruption before the
+/// process exits anyway.
+const CANCEL_SETTLE_GRACE: Duration = Duration::from_secs(5);
+
+/// Resolve every pending interaction as the daemon drains: a request whose
+/// answer can never arrive must not hold its run until the grace lapses.
+/// Permission and workspace requests resolve as denied; ask-user waiters
+/// are interrupted outright.
+async fn release_pending_interactions(state: &crate::daemon::state::DaemonState) {
+    let Ok(sessions) = state.db().list_sessions().await else {
+        return;
+    };
+    let session_ids: Vec<String> = sessions.into_iter().map(|session| session.id).collect();
+    let Ok(summaries) = state
+        .db()
+        .list_session_runtime_summaries(&session_ids)
+        .await
+    else {
+        return;
+    };
+    for (session_id, summary) in &summaries {
+        if let Some(request) = &summary.waiting_permission
+            && let Err(error) = state.permission_approver.resolve(&request.id, false).await
+        {
+            tracing::warn!(%error, "failed to resolve a pending permission during drain");
+        }
+        if let Some(request) = &summary.waiting_workspace
+            && let Err(error) = state.workspace_approver.resolve(&request.id, false).await
+        {
+            tracing::warn!(%error, "failed to resolve a pending workspace request during drain");
+        }
+        if let Some(request) = &summary.waiting_ask_user {
+            state
+                .ask_user_approver
+                .interrupt(session_id, &request.id)
+                .await;
+        }
+    }
+}
 
 /// Files the daemon keeps under `~/.may`.
 #[derive(Debug, Clone)]
@@ -284,6 +323,9 @@ impl ExtraListeners {
 pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
     let paths = DaemonPaths::user()?;
     let _instance = acquire_single_instance(&paths)?;
+    // heel executes the sandboxed commands this process runs; configure the
+    // managed binary before any spawned task can reach a sandbox.
+    crate::configure_heel_binary().await;
     remove_legacy_search_index(paths.root());
 
     let started = crate::daemon::start(options.mode).await?;
@@ -347,7 +389,24 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
 
     wait_for_shutdown(&state.daemon_shutdown).await;
     tracing::info!("May daemon shutting down");
+    // A pending interaction can never be answered during the drain — release
+    // it now so the waiting run settles inside the grace instead of being
+    // torn down while it still blocks on the request.
+    release_pending_interactions(&state).await;
     let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
+    while state.runtime_service.runs().live_count() > 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    // Runs that outlasted the grace stop with an explicit interruption —
+    // never the silent drop of a process kill.
+    for session_id in state.runtime_service.runs().live_session_ids() {
+        let cancelled = state
+            .runtime_service
+            .runs()
+            .cancel(&session_id, crate::session::CancelReason::DaemonRestarting);
+        tracing::info!(session_id = %session_id, cancelled, "interrupted a run outlasting the drain");
+    }
+    let deadline = tokio::time::Instant::now() + CANCEL_SETTLE_GRACE;
     while state.runtime_service.runs().live_count() > 0 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }

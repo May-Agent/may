@@ -39,6 +39,8 @@ pub enum UiEventTopic {
     SessionBackground = 1 << 13,
     /// A session's artifacts directory changed.
     SessionArtifacts = 1 << 14,
+    /// A session's worktree index coverage changed.
+    SessionIndex = 1 << 15,
 }
 
 impl UiEventTopic {
@@ -65,6 +67,7 @@ impl UiEventTopic {
             Self::SessionAgent => "session_agent",
             Self::SessionBackground => "session_background",
             Self::SessionArtifacts => "session_artifacts",
+            Self::SessionIndex => "session_index",
         }
     }
 }
@@ -89,6 +92,7 @@ impl FromStr for UiEventTopic {
             "session_agent" => Ok(Self::SessionAgent),
             "session_background" => Ok(Self::SessionBackground),
             "session_artifacts" => Ok(Self::SessionArtifacts),
+            "session_index" => Ok(Self::SessionIndex),
             _ => Err(UnknownUiEventTopic(value.to_string())),
         }
     }
@@ -131,6 +135,8 @@ impl UiEventTopics {
     pub const SESSION_BACKGROUND: Self = Self(UiEventTopic::SessionBackground.bit());
     /// `session_artifacts` topic.
     pub const SESSION_ARTIFACTS: Self = Self(UiEventTopic::SessionArtifacts.bit());
+    /// `session_index` topic.
+    pub const SESSION_INDEX: Self = Self(UiEventTopic::SessionIndex.bit());
     /// Every topic.
     pub const ALL: Self = Self(
         Self::CONFIG.0
@@ -146,7 +152,8 @@ impl UiEventTopics {
             | Self::BROWSER_LIFECYCLE.0
             | Self::SESSION_TURN.0
             | Self::SESSION_BACKGROUND.0
-            | Self::SESSION_ARTIFACTS.0,
+            | Self::SESSION_ARTIFACTS.0
+            | Self::SESSION_INDEX.0,
     );
 
     /// Whether no topics are set.

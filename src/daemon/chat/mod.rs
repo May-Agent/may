@@ -14,7 +14,7 @@ mod turn_persister;
 
 use self::tool_dispatch::{
     handle_browser_request, handle_notify_request, handle_register_skills_request,
-    handle_register_subagents_request, handle_task_request,
+    handle_task_request,
 };
 
 use std::future::Future;
@@ -39,9 +39,9 @@ use crate::ask_user;
 use crate::db::RunFence;
 use crate::prompt_mentions;
 use crate::session::{
-    AcquireError, ChatHistory, ChatMessage, ChatMessageStats, MayHomePaths, MessageRole,
-    PendingUserMessage, PersistedAttachment, RunOutcome, SessionId, SessionPaths, SessionRunGuard,
-    SessionRuntimeState, SessionStore, TerminalRuntimeState,
+    AcquireError, CancelReason, ChatHistory, ChatMessage, ChatMessageStats, MayHomePaths,
+    MessageRole, PendingUserMessage, PersistedAttachment, RunOutcome, SessionId, SessionPaths,
+    SessionRunGuard, SessionRuntimeState, SessionStore, TerminalRuntimeState,
 };
 use crate::task_trigger::EVENT_CHAT_TURN_COMPLETED;
 use crate::ui_event_bus::UiEventTopics;
@@ -715,6 +715,11 @@ fn active_session_conflict_error() -> skyzen::Error {
         .set_status(skyzen::StatusCode::CONFLICT)
 }
 
+fn draining_error() -> skyzen::Error {
+    skyzen::Error::msg("the daemon is shutting down; the next daemon takes over")
+        .set_status(skyzen::StatusCode::CONFLICT)
+}
+
 fn persisted_attachments(
     attachments: Vec<super::types::ApiAttachment>,
 ) -> Vec<PersistedAttachment> {
@@ -1120,7 +1125,10 @@ pub(super) async fn stop_session_run(
         );
     }
 
-    let cancelled = state.runtime_service.runs().cancel(&session_id);
+    let cancelled = state
+        .runtime_service
+        .runs()
+        .cancel(&session_id, CancelReason::User);
     tracing::info!(session_id = %session_id, cancelled, "received session stop request");
 
     let runtime = state
@@ -1146,6 +1154,9 @@ pub(super) async fn send_message(
         .map_err(super::error::bad_request_error)?
         .to_string();
     req.session_id.clone_from(&session_id);
+    if state.draining.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(draining_error());
+    }
     let runtime = state
         .runtime_service
         .get(&session_id)
@@ -1237,7 +1248,6 @@ pub(super) fn spawn_shared_tool_dispatchers(state: Arc<DaemonState>, queues: UiT
         notify,
         browser,
         register_skills,
-        register_subagents,
         tunnel,
     } = queues;
 
@@ -1279,20 +1289,12 @@ pub(super) fn spawn_shared_tool_dispatchers(state: Arc<DaemonState>, queues: UiT
         }
     });
 
-    let tunnel_state = state.clone();
-    let tokio_handle = state.tokio_handle.clone();
+    let tunnel_state = state;
+    let tokio_handle = tunnel_state.tokio_handle.clone();
     tokio_handle.spawn(async move {
         while let Some(request) = tunnel.next().await {
             let result =
                 super::tunnel::handle_tunnel_request(&tunnel_state, request.args.clone()).await;
-            let _ = request.respond(result);
-        }
-    });
-
-    let tokio_handle = state.tokio_handle.clone();
-    tokio_handle.spawn(async move {
-        while let Some(request) = register_subagents.next().await {
-            let result = handle_register_subagents_request(&state, request.args.clone()).await;
             let _ = request.respond(result);
         }
     });
@@ -1461,10 +1463,12 @@ fn run_agent_loop<'a>(
                     let next_event = tokio::select! {
                         biased;
                         cancel = guard.cancellation().recv() => {
-                            cancellation_reason = Some(if cancel == Ok(()) {
-                                "run cancelled by user"
-                            } else {
-                                "run cancellation channel closed unexpectedly"
+                            cancellation_reason = Some(match cancel {
+                                Ok(CancelReason::User) => "run cancelled by user",
+                                Ok(CancelReason::DaemonRestarting) => {
+                                    "run interrupted: the daemon is restarting"
+                                }
+                                Err(_) => "run cancellation channel closed unexpectedly",
                             });
                             None
                         }
@@ -2016,6 +2020,12 @@ fn run_agent_loop<'a>(
 /// Whether an agent event is the first visible output that ends a pending
 /// reasoning phase. `Complete` is excluded: an armed phase that reaches
 /// stream end without output is closed once, after the loop.
+///
+/// `TurnComplete { has_tool_calls: true }` is also excluded. Tools already
+/// closed the phase at `ToolCallStart`; `ToolCallEnd` then re-arms it for
+/// the next model call. Treating the boundary marker as visible output
+/// closed that next phase at 0 seconds and left a bare `Thought` in front
+/// of the following burst.
 const fn closes_reasoning_phase(event: &aither_agent::AgentEvent) -> bool {
     matches!(
         event,
@@ -2023,7 +2033,10 @@ const fn closes_reasoning_phase(event: &aither_agent::AgentEvent) -> bool {
             | aither_agent::AgentEvent::ToolCallDelta { .. }
             | aither_agent::AgentEvent::ToolCallStart { .. }
             | aither_agent::AgentEvent::BuiltInToolCall { .. }
-            | aither_agent::AgentEvent::TurnComplete { .. }
+            | aither_agent::AgentEvent::TurnComplete {
+                has_tool_calls: false,
+                ..
+            }
             | aither_agent::AgentEvent::Error(_)
     )
 }
@@ -2349,7 +2362,6 @@ struct ToolBrokers {
     notify: crate::agent::notify_tool::NotifyBroker,
     browser: crate::agent::browser_tool::BrowserBroker,
     register_skills: crate::agent::register_tool::RegisterBroker,
-    register_subagents: crate::agent::register_tool::RegisterBroker,
     tunnel: crate::agent::tunnel_tool::TunnelBroker,
 }
 
@@ -2679,14 +2691,6 @@ async fn resolve_session_context(
     }
 
     let user_message_id = if persist_user_message && request_has_visible_user_input(req) {
-        let needs_title = session.title.is_none();
-        if needs_title {
-            let title = truncate_preview(&req.content);
-            db.update_session(session_id.as_str(), Some(title.as_str()), None, None)
-                .await
-                .map_err(UiChatPreparationError::UpdateSessionTitle)?;
-            state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
-        }
         let row = db
             .append_chat_message_as_run(
                 fence,
@@ -2697,6 +2701,15 @@ async fn resolve_session_context(
             )
             .await
             .map_err(UiChatPreparationError::AppendUserMessage)?;
+        if session.title.is_none() {
+            // The prompt row lands first: a client reloading history on the
+            // title's `updated_at` drift already sees the message.
+            let title = truncate_preview(&req.content);
+            db.update_session(session_id.as_str(), Some(title.as_str()), None, None)
+                .await
+                .map_err(UiChatPreparationError::UpdateSessionTitle)?;
+            state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
+        }
         Some(row.id)
     } else {
         None
@@ -2994,7 +3007,6 @@ fn build_tool_brokers(state: &Arc<DaemonState>, session_id: &SessionId) -> ToolB
         notify: state.tool_dispatchers.notify.clone(),
         browser: state.tool_dispatchers.browser.clone(),
         register_skills: state.tool_dispatchers.register_skills.clone(),
-        register_subagents: state.tool_dispatchers.register_subagents.clone(),
         tunnel: state.tool_dispatchers.tunnel.clone(),
     }
 }
@@ -3159,7 +3171,6 @@ fn build_session_agent<'a>(
                     streams: state.session_streams.clone(),
                 }),
                 register_skills_broker: Some(brokers.register_skills),
-                register_subagents_broker: Some(brokers.register_subagents),
                 environment,
                 tool_distribution: state.tool_distribution.clone(),
                 tool_environments: state.tool_environments.clone(),
@@ -3326,6 +3337,25 @@ mod tests {
     use std::collections::HashMap;
 
     use super::{ResumeRequestKind, ResumeResolution};
+
+    #[test]
+    fn tool_turn_complete_does_not_close_the_next_reasoning_phase() {
+        assert!(!super::closes_reasoning_phase(
+            &aither_agent::AgentEvent::turn_complete(1, true)
+        ));
+        assert!(super::closes_reasoning_phase(
+            &aither_agent::AgentEvent::turn_complete(1, false)
+        ));
+        assert!(super::closes_reasoning_phase(
+            &aither_agent::AgentEvent::text("visible")
+        ));
+        assert!(super::closes_reasoning_phase(
+            &aither_agent::AgentEvent::tool_start("id", "terminal", "{}")
+        ));
+        assert!(!super::closes_reasoning_phase(
+            &aither_agent::AgentEvent::reasoning("think")
+        ));
+    }
 
     #[test]
     fn browser_takeover_alert_tells_the_model_to_recheck_the_page() {

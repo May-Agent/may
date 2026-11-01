@@ -17,7 +17,10 @@ enum HeelBinaryConfigurationError {
 /// Resolve the heel binary for sandbox execution: honor `HEEL_BIN` when
 /// set, otherwise use the managed download.
 ///
-///
+/// Only entry points that spawn sandboxes in-process call this — the daemon
+/// (`run_daemon`) and `may exec` — before they spawn background work. Daemon
+/// clients (the TUI, one-shot runs, `daemon` management commands, the
+/// browser service) never create local sandboxes and skip it.
 pub async fn configure_heel_binary() {
     if let Some(path) = std::env::var_os("HEEL_BIN") {
         let path = PathBuf::from(path);

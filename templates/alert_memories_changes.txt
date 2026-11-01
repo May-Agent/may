@@ -1,0 +1,4 @@
+Memory files changed under ~/.may/memories/:
+{% for file in files %}- {{ file }}
+{% endfor %}
+Review the files directly when the change matters to your work.

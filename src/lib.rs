@@ -59,6 +59,8 @@ pub use aither_sandbox::network_policy;
 pub mod notification;
 /// Large pasted text rendered for the model.
 pub mod pasted_text;
+/// `pr` — the session's landing object: numbered, session-owned PRs.
+pub mod pr;
 /// Profile model and environment resolution.
 pub mod profile;
 /// `@`-mention extraction and prompt text building.
@@ -69,6 +71,8 @@ pub mod repo_clone;
 pub mod repo_search;
 /// Scheduled task execution.
 pub mod scheduler;
+/// Repository trust: the first-contact decision, resolved per repo.
+pub mod trust;
 
 pub mod secrets;
 /// Session model, history, and on-disk layout.
@@ -77,8 +81,6 @@ pub mod session;
 pub mod skill;
 /// Startup validation of configuration files.
 pub mod startup;
-/// Subagent registration and dispatch.
-pub mod subagent;
 /// Scheduled-task trigger definitions.
 pub mod task_trigger;
 /// Background task types and execution.
@@ -124,7 +126,6 @@ pub use session::{
     SessionManager, SessionMetadata, SessionPlanState, SessionStore, SessionSummary,
 };
 pub use skill::{SkillInfo, SkillManager, SkillSource};
-pub use subagent::{SubagentInfo, SubagentManager};
 pub use terminal_commands::{SharedTerminalCommandConfig, register_shared_terminal_commands};
 pub use terminal_permission_handler::TerminalPermissionHandler;
 pub use workspace::{Workspace, WorkspaceConfig};

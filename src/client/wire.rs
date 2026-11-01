@@ -345,6 +345,30 @@ pub struct SessionRuntimeEvent {
     pub runtime: SessionRuntimeSnapshot,
 }
 
+/// One `session_index` event: coverage of the session's worktree index in
+/// repo-search.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionIndexSnapshot {
+    /// Session the coverage belongs to.
+    pub session_id: String,
+    /// The worktree index's coverage; `None` when the session is not in a
+    /// git worktree or repo-search has not indexed it.
+    pub index: Option<IndexCoverage>,
+}
+
+/// How much of a worktree index carries a vector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IndexCoverage {
+    /// The index's phase.
+    pub phase: repo_search_client::protocol::WirePhase,
+    /// Chunks with a vector.
+    pub with_vector: u64,
+    /// Chunks in total.
+    pub total: u64,
+}
+
 /// The session's blocking state, as `GET /api/sessions/{id}/runtime` and the
 /// `session_runtime` event report it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -477,6 +501,9 @@ pub struct CreateSessionRequest {
     /// Host directory the session works in.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// Repository to bind: `owner/repo`, a local path, or none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
 }
 
 /// `PUT /api/sessions/{id}` request body.
@@ -495,6 +522,9 @@ pub struct UpdateSessionRequest {
     /// Host directory the session works in.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// Repository to bind: `owner/repo`, a local path, or none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
     /// One-shot/non-interactive flag.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub non_interactive: Option<bool>,
@@ -525,6 +555,34 @@ pub struct WireSession {
     /// Reasoning effort override, if any.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// Repository binding, if any.
+    #[serde(default)]
+    pub repo: Option<String>,
+}
+
+/// One session PR over the wire, mirroring the daemon's `ApiPr`.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WirePr {
+    /// Per-repository PR number.
+    pub number: i64,
+    /// PR title.
+    pub title: String,
+    /// Lifecycle state.
+    pub state: String,
+    /// `may` or `github`.
+    pub backend: String,
+    /// External PR number, when the backend created one.
+    #[serde(default)]
+    pub external_number: Option<i64>,
+    /// Associated issue number, when linked.
+    #[serde(default)]
+    pub issue_number: Option<i64>,
+    /// Whether the PR merges itself once checks pass.
+    #[serde(default)]
+    pub auto_merge: bool,
+    /// Latest update timestamp.
+    pub updated_at: String,
 }
 
 #[cfg(test)]

@@ -61,8 +61,9 @@ pub use aither_agent::{AgentError, AgentEvent, TimedEvent};
 
 use super::state::{
     ActiveTextInput, AppMode, AskUserState, ChatgptAuthStatus, ConfigEditMode, ConfigState,
-    CopilotAuthStatus, ImageViewState, McpAddMode, PasteFilter, QuitConfirmState, SelectionPoint,
-    SkillAddMode, SshAddMode, StatusNotice, TextSelection, detect_api_key_from_env,
+    CopilotAuthStatus, ImageViewState, McpAddMode, PasteFilter, QuitConfirmState,
+    ResumePickerState, SelectionPoint, SkillAddMode, SshAddMode, StatusNotice, TextSelection,
+    detect_api_key_from_env,
 };
 
 /// Screen rect an inline image was painted into last frame — hit-tested on
@@ -112,6 +113,17 @@ pub struct App {
     pub status: Option<StatusNotice>,
     /// Whether agent is currently processing
     pub processing: bool,
+    /// Whether the in-flight turn produced any model output — a turn
+    /// stopped before its first event returns the sent draft to the
+    /// input box instead of dropping it.
+    turn_had_output: bool,
+    /// The last message handed to the agent, kept until the next send so
+    /// an aborted-before-any-action turn can put it back into the input.
+    last_sent_input: Option<String>,
+    /// Hidden context attached to the next send after a rewind: tells the
+    /// agent the conversation was cut back while the world — open and
+    /// merged PRs — stands as recorded.
+    pub rewind_notice: Option<crate::xml::XmlBlock>,
     /// File picker state (when in `FilePicker` mode)
     pub file_picker: Option<FilePicker>,
     /// Image manager for clipboard images
@@ -144,8 +156,19 @@ pub struct App {
     pub model_select_index: usize,
     /// Available models for model select (cached)
     pub model_select_list: Vec<String>,
+    /// Search query in the model select popup
+    pub model_select_query: String,
+    /// Last fetched provider catalog; seeds the next `/model` open so the
+    /// picker does not paint the configured-only list while a fetch lands
+    pub model_catalog: Vec<FetchedModel>,
     /// Effort rungs offered by the `/effort` popup
-    pub effort_ladder: &'static [&'static str],
+    pub effort_ladder: Vec<&'static str>,
+    /// Effort rungs each fetched model family serves, keyed by
+    /// `(provider_id, family base)` — the `/effort` popup shows a family's
+    /// own ladder when the catalog reports one.
+    pub family_effort_rungs: std::collections::HashMap<(String, String), Vec<&'static str>>,
+    /// When the current turn began; `None` while idle.
+    pub turn_started_at: Option<std::time::Instant>,
     /// Selected index in the effort popup
     pub effort_index: usize,
     /// Session's stored reasoning effort as last reported by the daemon
@@ -310,6 +333,10 @@ pub struct App {
     /// The session's blocking state as the daemon last reported it on the
     /// `session_runtime` stream.
     pub session_runtime: crate::client::SessionRuntimeSnapshot,
+    /// Coverage of the session's worktree index, as the `session_index`
+    /// stream last reported it; `None` until the first report or when the
+    /// session is not in an indexed worktree.
+    pub index_coverage: Option<crate::client::IndexCoverage>,
     /// Which open question `/questions` shows next, so repeated use walks
     /// through all of them.
     pub question_cursor: usize,
@@ -487,6 +514,9 @@ impl App {
             content_height: AtomicUsize::new(0),
             view_height: AtomicUsize::new(0),
             mode,
+            turn_had_output: false,
+            last_sent_input: None,
+            rewind_notice: None,
             queue: MessageQueue::new(),
             status,
             processing: false,
@@ -506,7 +536,11 @@ impl App {
             config_state,
             model_select_index: 0,
             model_select_list: Vec::new(),
-            effort_ladder: &[],
+            model_select_query: String::new(),
+            model_catalog: Vec::new(),
+            effort_ladder: Vec::new(),
+            family_effort_rungs: std::collections::HashMap::new(),
+            turn_started_at: None,
             effort_index: 0,
             current_effort: None,
             needs_setup,
@@ -584,6 +618,7 @@ impl App {
             secrets,
             open_question_count: 0,
             session_runtime: crate::client::SessionRuntimeSnapshot::default(),
+            index_coverage: None,
             question_cursor: 0,
             parked_question: None,
         })
@@ -601,8 +636,10 @@ impl App {
 
     /// Create or rebuild the file-diff worker for the current session.
     ///
-    /// The worker tracks the session sandbox plus every writable workspace
-    /// dir. Container-profile sessions are skipped: their writes land
+    /// The worker tracks the launch directory, every writable workspace
+    /// dir and the session's repo clones — the directories the session
+    /// actually works in; the session sandbox's own bookkeeping is never
+    /// tracked. Container-profile sessions are skipped: their writes land
     /// inside the container where host-side git cannot see them.
     fn ensure_file_diffs(&mut self) {
         // An ephemeral session has no dirs on disk yet; its filebase is
@@ -643,24 +680,25 @@ impl App {
         }
 
         let session_paths = crate::session::SessionPaths::new(session.sandbox_dir.clone());
-        let mut roots = vec![
-            crate::file_tracker::TrackedRootSpec::new(session.sandbox_dir.clone())
-                .exclude("filebase")
-                .exclude("tmp")
-                .exclude("outputs")
-                .exclude("skills")
-                .exclude("subagents"),
-        ];
-        if let Ok(config) =
-            crate::workspace::WorkspaceConfig::load(&session_paths.workspace_config())
-        {
-            roots.extend(
-                config
-                    .workdirs
-                    .iter()
-                    .filter(|dir| dir.permission == crate::workspace::Permission::ReadWrite)
-                    .map(|dir| crate::file_tracker::TrackedRootSpec::new(dir.path.clone())),
-            );
+        let mut roots = Self::repo_clone_specs(&session.sandbox_dir);
+        match crate::workspace::WorkspaceConfig::load(&session_paths.workspace_config()) {
+            Ok(config) => {
+                // The launch dir needs no root of its own when a grant
+                // already covers it.
+                if !config.has_write_access(&self.cwd) {
+                    roots.push(crate::file_tracker::TrackedRootSpec::new(self.cwd.clone()));
+                }
+                roots.extend(
+                    config
+                        .workdirs
+                        .iter()
+                        .filter(|dir| dir.permission == crate::workspace::Permission::ReadWrite)
+                        .map(|dir| crate::file_tracker::TrackedRootSpec::new(dir.path.clone())),
+                );
+            }
+            Err(_) => {
+                roots.push(crate::file_tracker::TrackedRootSpec::new(self.cwd.clone()));
+            }
         }
         self.file_status.clear();
         self.file_diffs =
@@ -710,8 +748,6 @@ impl App {
             targets,
             // The trailing "(current)" entry is selected first.
             selected,
-            options_for: None,
-            option_selected: 0,
         });
         true
     }
@@ -760,8 +796,44 @@ impl App {
             }
         }
         if refresh_status && let Some(handle) = &self.file_diffs {
+            // Repo clones created since the last refresh join tracking;
+            // the worker dedupes roots it already covers.
+            if let Some(session) = self
+                .session_manager
+                .current()
+                .filter(|session| session.persisted)
+            {
+                for spec in Self::repo_clone_specs(&session.sandbox_dir) {
+                    handle.request_add_root(spec);
+                }
+            }
             handle.request_status();
         }
+    }
+
+    /// Tracked-root specs for the session's repo clones: every clone under
+    /// `<sandbox>/repos/` is an embedded repository whose working tree only
+    /// diffs against a shadow repo of its own, labeled by the repository
+    /// it serves.
+    fn repo_clone_specs(
+        sandbox_dir: &std::path::Path,
+    ) -> Vec<crate::file_tracker::TrackedRootSpec> {
+        let repos = crate::repo_clone::SessionRepos::new(sandbox_dir, "");
+        let Ok(clones) = repos.clones() else {
+            return Vec::new();
+        };
+        clones
+            .iter()
+            .map(|record| {
+                let label = if record.local {
+                    crate::fs_utils::display_path(std::path::Path::new(&record.source))
+                } else {
+                    record.source.clone()
+                };
+                crate::file_tracker::TrackedRootSpec::new(repos.root().join(&record.dir))
+                    .label(format!("{label} (clone)"))
+            })
+            .collect()
     }
 
     /// Show the result of a completed code rewind in the chat stream.
@@ -1575,6 +1647,7 @@ impl App {
         self.jobs.clear();
         self.jobs_selected = 0;
         self.session_runtime = crate::client::SessionRuntimeSnapshot::default();
+        self.index_coverage = None;
         self.image_cache.clear();
         self.image_fetching.clear();
         self.image_failed.clear();
@@ -1736,6 +1809,14 @@ impl App {
                     input: &mut self.session_search,
                     filter: PasteFilter::Any,
                 });
+            }
+            AppMode::ResumePicker(_) => {
+                if let AppMode::ResumePicker(state) = &mut self.mode {
+                    return Some(ActiveTextInput::Simple {
+                        input: &mut state.search,
+                        filter: PasteFilter::Any,
+                    });
+                }
             }
             AppMode::TierModelPicker => {
                 return Some(ActiveTextInput::Simple {
@@ -2016,6 +2097,9 @@ impl App {
                 self, code,
             )),
             AppMode::Rewind(_) => Ok(super::reducer::navigation::handle_rewind_key(self, code)),
+            AppMode::ResumePicker(_) => Ok(super::reducer::navigation::handle_resume_picker_key(
+                self, code,
+            )),
             AppMode::Jobs => Ok(super::reducer::navigation::handle_jobs_key(self, code)),
             AppMode::JobDetail(_) => Ok(super::reducer::navigation::handle_job_detail_key(
                 self, code,
@@ -2068,6 +2152,18 @@ impl App {
         }
     }
 
+    /// Open the Claude Code resume picker and list transcripts off the event loop.
+    fn open_resume_picker(&mut self) {
+        self.completion.cancel();
+        self.mode = AppMode::ResumePicker(ResumePickerState::loading());
+        let tx = self.event_tx.clone();
+        spawn(async move {
+            let sessions = unblock(crate::session::import::list_claude_sessions).await;
+            let _ = tx.send(AppEvent::ResumeSessionsLoaded(sessions)).await;
+        })
+        .detach();
+    }
+
     /// Trigger async loading of session list for the session select popup.
     /// Uses profile sessions when a profile is active, falls back to flat list.
     pub fn load_session_list(&mut self) {
@@ -2110,6 +2206,7 @@ impl App {
                                 updated_at: None,
                                 content_preview: String::new(),
                                 reasoning_effort: session.reasoning_effort,
+                                repo: session.repo,
                                 runtime: crate::session::SessionRuntimeSummary::default(),
                             })
                             .collect()
@@ -2289,8 +2386,10 @@ impl App {
     fn handle_chat_key(&mut self, code: KeyCode) -> Option<SendAction> {
         match code {
             KeyCode::Enter => {
-                // Handle completion if active
-                if self.completion.is_active() {
+                // Accept a palette item when one is selected. An empty
+                // palette (slash command plus arguments) must fall through
+                // so `/resume-claude <id>` submits.
+                if self.completion.has_matches() {
                     let mode = self.completion.mode;
                     if let Some(item) = self.completion.complete() {
                         let cmd = item.insert.clone();
@@ -2306,11 +2405,11 @@ impl App {
 
                         // For file completion, insert into input
                         self.accept_completion(&cmd);
-                    } else {
-                        // No item to select, just cancel completion
-                        self.completion.cancel();
                     }
                     return None;
+                }
+                if self.completion.is_active() {
+                    self.completion.cancel();
                 }
                 if self.has_pending_attachments() {
                     self.set_status("Waiting for attachments to finish...");
@@ -2329,7 +2428,7 @@ impl App {
                 }
                 // Send as message (slash commands only work from menu selection)
                 if !self.input.is_empty() || !self.attachments.is_empty() {
-                    return Some(self.prepare_message(PendingUserMessageMode::Steer));
+                    return self.prepare_message(PendingUserMessageMode::Steer);
                 }
             }
             KeyCode::Backspace => {
@@ -2362,7 +2461,7 @@ impl App {
                 self.cursor = (self.cursor + 1).min(self.input_char_count);
             }
             KeyCode::Up => {
-                if self.completion.is_active() {
+                if self.completion.has_matches() {
                     self.completion.prev();
                 } else if let Some(entry) = self.history.prev(&self.input) {
                     self.input = entry.to_string();
@@ -2371,7 +2470,7 @@ impl App {
                 }
             }
             KeyCode::Down => {
-                if self.completion.is_active() {
+                if self.completion.has_matches() {
                     self.completion.next();
                 } else if let Some(entry) = self.history.next_entry() {
                     self.input = entry.to_string();
@@ -2400,7 +2499,7 @@ impl App {
                 self.cursor = self.input_char_count;
             }
             KeyCode::Esc => {
-                if self.completion.is_active() {
+                if self.completion.has_matches() {
                     self.completion.cancel();
                     self.last_esc_at = Some(std::time::Instant::now());
                 } else if self
@@ -2421,7 +2520,7 @@ impl App {
                 }
             }
             KeyCode::Tab => {
-                if self.completion.is_active()
+                if self.completion.has_matches()
                     && let Some(item) = self.completion.complete()
                 {
                     self.accept_completion(&item.insert.clone());
@@ -2432,7 +2531,7 @@ impl App {
                         self.set_status("Waiting for attachments to finish...");
                         return None;
                     }
-                    return Some(self.prepare_message(PendingUserMessageMode::Queue));
+                    return self.prepare_message(PendingUserMessageMode::Queue);
                 }
             }
             KeyCode::Char(c) => {
@@ -2544,6 +2643,22 @@ impl App {
             MouseEventKind::ScrollDown => self.scroll_chat_down(SCROLL_STEP_LINES),
             MouseEventKind::Down(MouseButton::Left) => {
                 let point = self.mouse_to_selection_point(mouse);
+                // A click inside the composer moves the input caret to the
+                // hit cell instead of starting a text selection.
+                if let Some(p) = point
+                    && let Some((start, rows)) = self.chat_layout.input_span()
+                    && (start..start + rows).contains(&p.line)
+                {
+                    let mut cursor = 0usize;
+                    for row in start..p.line {
+                        if let Some(text) = self.chat_layout.plain_line(row) {
+                            cursor += text.chars().count();
+                        }
+                    }
+                    self.cursor = (cursor + p.column).min(self.input_char_count);
+                    self.selection = None;
+                    return Ok(None);
+                }
                 let double_click = point.is_some_and(|p| {
                     self.last_click.is_some_and(|(at, last)| {
                         at.elapsed() <= DOUBLE_CLICK_WINDOW
@@ -2749,12 +2864,18 @@ impl App {
             }
             "/model" => {
                 self.model_select_list = self.collect_all_models();
+                // Seed with the catalog remembered from the last fetch so a
+                // warm open paints the full list at once; the in-flight
+                // refresh below re-merges whatever changed meanwhile.
+                let catalog = std::mem::take(&mut self.model_catalog);
+                self.merge_model_select_models(catalog);
+                self.model_select_query.clear();
                 self.model_select_rx = self.fetch_provider_models();
                 self.model_select_index = 0;
                 let fallback_model = self.config.last_model.as_ref().map(ToString::to_string);
                 let current = self.current_model.as_deref().or(fallback_model.as_deref());
                 if let Some(current) = current
-                    && let Some(idx) = self.model_select_list.iter().position(|m| m == current)
+                    && let Some(idx) = self.model_select_position(current)
                 {
                     self.model_select_index = idx;
                 }
@@ -2762,7 +2883,7 @@ impl App {
                 None
             }
             "/effort" => {
-                self.effort_ladder = model_picker::effort_ladder_for(self.current_provider_type());
+                self.effort_ladder = self.effort_ladder_for_current();
                 self.effort_index = self.effort_ladder_index();
                 self.mode = AppMode::EffortSelect;
                 self.fetch_current_effort();
@@ -2786,7 +2907,11 @@ impl App {
                 self.open_btw();
                 None
             }
-            "/resume-codex" | "/resume-claude" | "/secret" => {
+            "/resume-claude" => {
+                self.open_resume_picker();
+                None
+            }
+            "/resume-codex" | "/secret" => {
                 // These take arguments — leave the command in the input so
                 // the user can type them, rather than executing now.
                 self.input = format!("{cmd} ");
@@ -3030,7 +3155,6 @@ impl App {
                 output: None,
                 diffs: Vec::new(),
                 pinned: None,
-                finished_at: None,
             },
         );
         self.scroll = usize::MAX;
@@ -3067,7 +3191,7 @@ impl App {
     }
 
     /// Prepare a message for sending, returning the action.
-    fn prepare_message(&mut self, delivery_mode: PendingUserMessageMode) -> SendAction {
+    fn prepare_message(&mut self, delivery_mode: PendingUserMessageMode) -> Option<SendAction> {
         // Add to history before clearing (only if non-empty and not just whitespace)
         if !self.input.trim().is_empty() {
             self.history.push(self.input.clone());
@@ -3081,22 +3205,22 @@ impl App {
 
         let trimmed = content.trim();
         if trimmed == "/context" && attachments.is_empty() {
-            return SendAction::ContextReport;
+            return Some(SendAction::ContextReport);
         }
         if trimmed == "/context dump" && attachments.is_empty() {
-            return SendAction::ContextDump;
+            return Some(SendAction::ContextDump);
         }
         if trimmed == "/bug" && attachments.is_empty() {
-            return SendAction::BugReport;
+            return Some(SendAction::BugReport);
         }
         if let Some(rest) = trimmed.strip_prefix("/compact")
             && attachments.is_empty()
         {
             let focus = rest.trim();
             if focus.is_empty() {
-                return SendAction::Compact(None);
+                return Some(SendAction::Compact(None));
             }
-            return SendAction::Compact(Some(focus.to_string()));
+            return Some(SendAction::Compact(Some(focus.to_string())));
         }
         for (cmd, source) in [
             ("/resume-codex", crate::session::import::ForeignAgent::Codex),
@@ -3106,16 +3230,19 @@ impl App {
             ),
         ] {
             if trimmed == cmd || trimmed.starts_with(&format!("{cmd} ")) {
-                return SendAction::ResumeImport {
-                    source,
-                    query: trimmed[cmd.len()..].trim().to_string(),
-                };
+                let query = trimmed[cmd.len()..].trim().to_string();
+                if query.is_empty() && source == crate::session::import::ForeignAgent::Claude {
+                    self.open_resume_picker();
+                    return None;
+                }
+                return Some(SendAction::ResumeImport { source, query });
             }
         }
 
+        self.last_sent_input = Some(content.clone());
         let msg = PendingMessage {
             content,
-            hidden_context_xml: None,
+            hidden_context_xml: self.rewind_notice.take(),
             attachments,
             queued_at: jiff::Timestamp::now(),
             delivery_mode,
@@ -3123,15 +3250,30 @@ impl App {
         };
 
         if self.processing {
-            SendAction::EnqueuePending(msg)
+            Some(SendAction::EnqueuePending(msg))
         } else {
-            SendAction::Send(msg)
+            Some(SendAction::Send(msg))
+        }
+    }
+
+    /// A turn stopped before its first agent event puts the sent message
+    /// back into the input box — the usual "I sent a typo" recovery.
+    pub fn restore_aborted_draft(&mut self) {
+        if self.turn_had_output {
+            return;
+        }
+        if let Some(draft) = self.last_sent_input.take() {
+            self.input_char_count = draft.chars().count();
+            self.cursor = self.input_char_count;
+            self.input = draft;
         }
     }
 
     /// Called when starting to process a message.
     pub fn start_processing(&mut self, msg: &PendingMessage) {
         self.processing = true;
+        self.turn_had_output = false;
+        self.turn_started_at = Some(std::time::Instant::now());
         self.thinking_start = None;
         self.activity_phase = crate::tui::ui::chat::ActivityPhase::Thinking;
         self.decode_meter.reset();
@@ -3174,6 +3316,7 @@ impl App {
     /// sidebar's task tree is refetched from the daemon alongside.
     async fn refresh_todos(&mut self) {
         self.request_sidebar_tasks();
+        self.request_sidebar_prs();
         let Some(session) = self
             .session_manager
             .current()
@@ -3196,6 +3339,36 @@ impl App {
                 tracing::warn!(error = %error, "failed to read session tasks.md");
             }
         }
+    }
+
+    /// Fetch the current session's PRs for the sidebar from the daemon
+    /// (`GET /api/sessions/{id}/prs`); the answer arrives as
+    /// [`AppEvent::SidebarPrs`].
+    pub fn request_sidebar_prs(&mut self) {
+        let Some(session_id) = self
+            .session_manager
+            .current()
+            .map(|session| session.id.as_str().to_string())
+        else {
+            return;
+        };
+        let Some(client) = self.btw_daemon.clone() else {
+            return;
+        };
+        let tx = self.event_tx.clone();
+        spawn(async move {
+            match client
+                .get::<Vec<crate::client::WirePr>>(&format!("/api/sessions/{session_id}/prs"))
+                .await
+            {
+                Ok(prs) => {
+                    let _ = tx.send(AppEvent::SidebarPrs { session_id, prs }).await;
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "sidebar: failed to fetch PRs");
+                }
+            }
+        });
     }
 
     /// Fetch the current session's `tasks.md` for the sidebar from the
@@ -3315,7 +3488,6 @@ impl App {
                 output: None,
                 diffs: Vec::new(),
                 pinned: None,
-                finished_at: None,
             },
             ToolStartKind::Stdin { task_id, input } => {
                 let mut detail: Vec<String> = Vec::new();
@@ -3333,7 +3505,6 @@ impl App {
                     status: super::ui::chat::ToolStatus::Running,
                     output: None,
                     pinned: None,
-                    finished_at: None,
                 }
             }
             ToolStartKind::JobControl { action, task_id } => ToolDisplay::Action {
@@ -3346,7 +3517,6 @@ impl App {
                 status: super::ui::chat::ToolStatus::Running,
                 output: None,
                 pinned: None,
-                finished_at: None,
             },
             ToolStartKind::Generic {
                 name,
@@ -3360,7 +3530,6 @@ impl App {
                 status: super::ui::chat::ToolStatus::Running,
                 output: None,
                 pinned: None,
-                finished_at: None,
             },
         }
     }
@@ -3369,6 +3538,9 @@ impl App {
     pub async fn handle_agent_event(&mut self, result: Result<TimedEvent, AgentError>) -> bool {
         match result {
             Ok(TimedEvent { event, .. }) => {
+                // Any event from the agent stream counts as the turn having
+                // acted — a stop before this point restores the sent draft.
+                self.turn_had_output = true;
                 match event {
                     AgentEvent::Text(chunk) => {
                         self.activity_phase = crate::tui::ui::chat::ActivityPhase::Working;
@@ -3376,7 +3548,6 @@ impl App {
                         self.thinking_start = None;
                         self.decode_meter.note_output(chunk.len());
                         self.chat.push_text(&chunk);
-                        self.scroll = usize::MAX;
                         self.input_visible = true;
                     }
                     AgentEvent::Reasoning(chunk) => {
@@ -3493,7 +3664,6 @@ impl App {
                         self.thinking_start = None;
                         self.decode_meter.note_boundary();
                         self.chat.push_builtin(id, tool, detail);
-                        self.scroll = usize::MAX;
                     }
                     AgentEvent::BuiltInToolResult { id, tool, result } => {
                         // The provider reports the call done; the model call
@@ -3521,7 +3691,6 @@ impl App {
                         self.chat.end_text();
                         self.decode_meter.note_boundary();
                         self.pending_tool_calls.clear();
-                        self.scroll = usize::MAX;
                         self.input_visible = true;
                         // The turn may have edited tasks.md without a tool
                         // call ending after the edit (or in a foreign turn).
@@ -3551,7 +3720,6 @@ impl App {
                 self.chat.collapse_thinking();
                 self.chat.finish_running_calls();
                 self.chat.push_error(&format!("{e}"));
-                self.scroll = usize::MAX;
                 self.input_visible = true;
                 true
             }
@@ -3572,6 +3740,24 @@ impl App {
         }
     }
 
+    /// Mirror the daemon's pending-message queue from the last
+    /// `session_runtime` snapshot, so an enqueued message keeps a
+    /// `[steer]`/`[queue]` preview until the turn it starts renders it.
+    pub fn sync_queue_from_runtime(&mut self) {
+        let runtime = &self.session_runtime;
+        self.queue.replace(
+            runtime
+                .pending_immediate
+                .as_ref()
+                .map(PendingMessage::from_wire),
+            runtime
+                .queued_messages
+                .iter()
+                .map(PendingMessage::from_wire)
+                .collect(),
+        );
+    }
+
     /// Get current session ID for display.
     pub fn session_id_display(&self) -> String {
         self.session_manager
@@ -3587,6 +3773,27 @@ impl App {
             .as_deref()
             .or(self.config.last_effort.as_deref())
             .unwrap_or("medium")
+    }
+
+    /// The effort rungs `/effort` offers for the current model: the
+    /// family's served rungs when the catalog reports them, else the
+    /// provider protocol's generic ladder.
+    pub fn effort_ladder_for_current(&self) -> Vec<&'static str> {
+        let family = self
+            .current_model
+            .as_deref()
+            .and_then(|model| model.parse::<crate::ModelSelector>().ok())
+            .map(|selector| {
+                (
+                    selector.provider_id().to_string(),
+                    crate::models::effort_family_base(selector.model_id()),
+                )
+            });
+        family
+            .and_then(|key| self.family_effort_rungs.get(&key).cloned())
+            .unwrap_or_else(|| {
+                model_picker::effort_ladder_for(self.current_provider_type()).to_vec()
+            })
     }
 
     /// The ladder index of [`Self::effective_effort`], falling back to the

@@ -136,25 +136,18 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
     // during Chrome boot / page navigations.
     let (browser_lifecycle_tx, _) = tokio::sync::broadcast::channel(256);
 
-    // Initialize the May-managed browser runtime only when the feature is enabled.
+    // Initialize the May-managed browser runtime only when the feature is
+    // enabled; provisioning is deferred to the first browser start.
     let browser_manager = if config.browser.enabled {
         tracing::info!(backend = ?config.browser.backend, "Browser integration enabled");
-        match crate::container::browser::prepare_browser_runtime(&config.browser, &may_dir).await {
-            Ok(()) => match crate::container::browser::BrowserManager::new(
-                config.browser.clone(),
-                may_dir.clone(),
-                crate::container::browser::BrowserLifecyclePublisher::new(
-                    browser_lifecycle_tx.clone(),
-                ),
-            ) {
-                Ok(manager) => Some(Arc::new(manager)),
-                Err(error) => {
-                    tracing::error!("Failed to initialize browser manager: {error}");
-                    None
-                }
-            },
+        match crate::container::browser::BrowserManager::new(
+            config.browser.clone(),
+            may_dir.clone(),
+            crate::container::browser::BrowserLifecyclePublisher::new(browser_lifecycle_tx.clone()),
+        ) {
+            Ok(manager) => Some(Arc::new(manager)),
             Err(error) => {
-                tracing::error!("Failed to provision managed browser runtime: {error}");
+                tracing::error!("Failed to initialize browser manager: {error}");
                 None
             }
         }
@@ -274,11 +267,13 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
         tool_distribution,
         tool_environments: crate::agent::ToolEnvironmentCache::spawn(),
         cwd,
+        repo_search: crate::repo_search::RepoSearch::global(&may_dir),
         may_dir,
         search_index_wake_tx,
         search_index_wake,
         search_index_status: crate::repo_search::indexer::IndexerStatus::default(),
         daemon_shutdown: Arc::new(tokio::sync::Notify::new()),
+        draining: std::sync::atomic::AtomicBool::new(false),
         build_id: crate::daemon::current_build_id()
             .context("failed to identify the running build")?,
         turn_hub: Arc::new(super::chat::TurnHub::default()),
@@ -341,8 +336,9 @@ fn api_routes() -> Route {
     use super::remote_access::{get_remote_access_status, start_remote_access, stop_remote_access};
     use super::sessions::{
         append_session_history, create_session, delete_all_sessions, delete_session, get_session,
-        get_session_context_debug, get_session_history, get_session_tasks, list_sessions,
-        lookup_issues, rewind_session, save_session_tasks, set_session_plan_state, update_session,
+        get_session_context_debug, get_session_history, get_session_prs, get_session_tasks,
+        list_sessions, lookup_issues, rewind_session, save_session_tasks, set_session_plan_state,
+        update_session,
     };
     use super::tasks::{
         approve_task, create_task, delete_task, get_task, invoke_webhook_task, list_tasks,
@@ -377,6 +373,7 @@ fn api_routes() -> Route {
                     )),
                     Route::new((
                         "/tasks".at(get_session_tasks),
+                        "/prs".at(get_session_prs),
                         "/tasks".put(save_session_tasks),
                         "/tasks/plan-state".put(set_session_plan_state),
                         "/stop".post(stop_session_run),
@@ -589,6 +586,9 @@ async fn health(
 }
 
 async fn shutdown_daemon(State(state): State<Arc<DaemonState>>) -> SkyResult<Json<ApiHealth>> {
+    state
+        .draining
+        .store(true, std::sync::atomic::Ordering::SeqCst);
     state.daemon_shutdown.notify_one();
     Ok(Json(super::types::API_OK))
 }

@@ -357,42 +357,13 @@ pub fn handle_help_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
     None
 }
 
-/// Number of restoration scopes the rewind picker offers.
-const REWIND_OPTIONS: usize = 2;
-
-/// Rewind picker: pick a prompt, then the restoration scope.
+/// Rewind picker: pick a prompt to roll the conversation back to. Code
+/// is never restored — landed work is undone through a revert PR, so
+/// rewind is always conversation-only.
 pub fn handle_rewind_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
     let AppMode::Rewind(state) = &mut app.mode else {
         return None;
     };
-    if let Some(prompt_index) = state.options_for {
-        // Scope submenu: conversation only, or conversation and code.
-        match code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                state.option_selected = state.option_selected.saturating_sub(1);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if state.option_selected + 1 < REWIND_OPTIONS {
-                    state.option_selected += 1;
-                }
-            }
-            KeyCode::Enter => {
-                let restore_code = state.option_selected == 1;
-                let history_index = state.targets[prompt_index].history_index;
-                app.mode = AppMode::Chat;
-                return Some(SendAction::Rewind {
-                    history_index,
-                    restore_code,
-                });
-            }
-            KeyCode::Esc => {
-                state.options_for = None;
-                state.option_selected = 0;
-            }
-            _ => {}
-        }
-        return None;
-    }
     match code {
         KeyCode::Up | KeyCode::Char('k') => {
             state.selected = state.selected.saturating_sub(1);
@@ -408,8 +379,12 @@ pub fn handle_rewind_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
                 // "(current)": no rewind, just close.
                 app.mode = AppMode::Chat;
             } else {
-                state.options_for = Some(state.selected);
-                state.option_selected = 0;
+                let history_index = state.targets[state.selected].history_index;
+                app.mode = AppMode::Chat;
+                return Some(SendAction::Rewind {
+                    history_index,
+                    restore_code: false,
+                });
             }
         }
         KeyCode::Esc => {
@@ -577,6 +552,51 @@ pub fn handle_job_detail_key(app: &mut App, code: KeyCode) -> Option<SendAction>
             } else if let Some(run) = state.subagent.clone() {
                 app.cancel_subagent(&run);
             }
+        }
+        _ => {}
+    }
+    None
+}
+
+/// `/resume-claude` picker: type to filter, arrows to move, Enter to import.
+pub fn handle_resume_picker_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
+    let AppMode::ResumePicker(state) = &mut app.mode else {
+        return None;
+    };
+    match code {
+        KeyCode::Esc => {
+            app.mode = AppMode::Chat;
+        }
+        KeyCode::Up => {
+            state.selected = state.selected.saturating_sub(1);
+        }
+        KeyCode::Down => {
+            let len = state.filtered().len();
+            if state.selected + 1 < len {
+                state.selected += 1;
+            }
+        }
+        KeyCode::Enter => {
+            if state.loading {
+                return None;
+            }
+            let filtered = state.filtered();
+            let &index = filtered.get(state.selected)?;
+            let session = state.sessions.get(index)?;
+            let query = session.path.display().to_string();
+            app.mode = AppMode::Chat;
+            return Some(SendAction::ResumeImport {
+                source: crate::session::import::ForeignAgent::Claude,
+                query,
+            });
+        }
+        KeyCode::Backspace => {
+            state.search.pop();
+            state.selected = 0;
+        }
+        KeyCode::Char(c) => {
+            state.search.push(c);
+            state.selected = 0;
         }
         _ => {}
     }

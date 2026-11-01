@@ -19,10 +19,10 @@ use super::model_resolution::{
 };
 use super::state::DaemonState;
 use super::types::{
-    ApiHealth, ApiSession, ContextDebugMessage, CreateSessionRequest, NullableStringPatch,
-    RewindRequest, SessionContextDebugResponse, SessionContextWindowMetricsResponse,
-    SessionContextWindowSnapshotResponse, SessionPlanStateRequest, SessionPlanStateResponse,
-    SessionTasksPayload, UpdateSessionRequest,
+    ApiHealth, ApiPr, ApiPrEvent, ApiSession, ContextDebugMessage, CreateSessionRequest,
+    NullableStringPatch, RewindRequest, SessionContextDebugResponse,
+    SessionContextWindowMetricsResponse, SessionContextWindowSnapshotResponse,
+    SessionPlanStateRequest, SessionPlanStateResponse, SessionTasksPayload, UpdateSessionRequest,
 };
 
 fn session_not_found_error(session_id: &str) -> SkyError {
@@ -127,6 +127,17 @@ pub(super) async fn rewind_session(
     db.delete_messages_from(&id, cut_id)
         .await
         .map_err(internal_error)?;
+    // The audit log is append-only: every PR this session opened keeps a
+    // `rewound` event so its history records that the conversation was
+    // cut back while the proposal itself still stands.
+    if let Ok(prs) = db.list_session_prs(&id).await {
+        let detail = format!("history rewound to message {cut_id}");
+        for pr in prs {
+            let _ = db
+                .add_pr_event(pr.id, "rewound", &id, "user", None, Some(&detail))
+                .await;
+        }
+    }
     state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
     Ok(Json(cut_id))
 }
@@ -272,6 +283,48 @@ pub(super) async fn get_session_tasks(
         content,
         plan_state: runtime.plan_state,
     }))
+}
+
+/// The session's PRs with their transition events — the sidebar's list.
+pub(super) async fn get_session_prs(
+    params: Params,
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<Vec<ApiPr>>> {
+    let id = params.get("id").map_err(bad_request_error)?.to_string();
+    let rows = state
+        .db()
+        .list_session_prs(&id)
+        .await
+        .map_err(internal_error)?;
+    let mut prs = Vec::with_capacity(rows.len());
+    for row in rows {
+        let events = state
+            .db()
+            .pr_events(row.id)
+            .await
+            .map_err(internal_error)?
+            .into_iter()
+            .map(|e| ApiPrEvent {
+                kind: e.kind,
+                detail: e.detail,
+                created_at: e.created_at,
+            })
+            .collect();
+        prs.push(ApiPr {
+            number: row.number,
+            title: row.title,
+            state: row.state,
+            backend: row.backend,
+            external_number: row.external_number,
+            issue_number: row.issue_number,
+            auto_merge: row.auto_merge,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            merged_at: row.merged_at,
+            events,
+        });
+    }
+    Ok(Json(prs))
 }
 
 /// Atomically set the plan state for a session without touching task content.
@@ -440,12 +493,53 @@ pub(super) async fn create_session(
         }
     }
 
+    if let Some(repo) = resolve_repo_binding(req.repo.as_deref()).map_err(bad_request_error)? {
+        state
+            .db()
+            .set_session_repo(&id, Some(repo.as_str()))
+            .await
+            .map_err(internal_error)?;
+    }
+
     persist_last_model(&state, &model)
         .await
         .map_err(internal_error)?;
     state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS | UiEventTopics::SESSION_RUNTIMES);
 
-    Ok(Json(ApiSession::new_empty(id, model, resolved_profile_id)))
+    let mut session = ApiSession::new_empty(id, model, resolved_profile_id);
+    session.repo = resolve_repo_binding(req.repo.as_deref()).ok().flatten();
+    Ok(Json(session))
+}
+
+/// Normalize a repo spec into a stored binding: `owner/repo` or a
+/// `github:owner/repo` spec binds the GitHub repository itself; an
+/// existing path binds that repository's local identity; anything else
+/// fails.
+fn resolve_repo_binding(spec: Option<&str>) -> Result<Option<String>, String> {
+    let Some(spec) = spec.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let github = spec.strip_prefix("github:").unwrap_or(spec);
+    let looks_like_github = {
+        let mut parts = github.split('/');
+        matches!(
+            (parts.next(), parts.next(), parts.next()),
+            (Some(o), Some(r), None) if !o.is_empty() && !r.is_empty() && !o.contains(' ') && !r.contains(' ')
+        )
+    };
+    // An existing filesystem path binds the local repository identity.
+    let path = std::path::Path::new(spec);
+    if let Some(worktree) = crate::repo_search::worktree_root(path)
+        && !spec.starts_with("github:")
+    {
+        let key = crate::issue::repository_identity(&worktree)
+            .map_err(|e| format!("repository identity: {e}"))?;
+        return Ok(Some(format!("local:{}", key.display())));
+    }
+    if looks_like_github {
+        return Ok(Some(format!("github:{github}")));
+    }
+    Err(format!("invalid repo spec '{spec}'"))
 }
 
 pub(super) async fn update_session(
@@ -514,6 +608,18 @@ pub(super) async fn update_session(
             let _ = db.touch_repo_usage(&worktree).await;
         }
     }
+    let mut next_repo = session.repo.clone();
+    if let Some(patch) = req.repo.clone() {
+        next_repo = match patch {
+            crate::daemon::types::NullableStringPatch::Null => None,
+            crate::daemon::types::NullableStringPatch::Set(spec) => {
+                resolve_repo_binding(Some(spec.as_str())).map_err(bad_request_error)?
+            }
+        };
+        db.set_session_repo(&id, next_repo.as_deref())
+            .await
+            .map_err(internal_error)?;
+    }
     if req.non_interactive == Some(true) {
         db.set_session_non_interactive(&id)
             .await
@@ -541,6 +647,7 @@ pub(super) async fn update_session(
         model,
         reasoning_effort: next_effort,
         runtime: runtime.into(),
+        repo: next_repo,
     }))
 }
 
@@ -555,6 +662,27 @@ pub(super) async fn delete_session(
         .await
         .map_err(internal_error)?
         .and_then(|session| session.profile_id);
+    // Live PRs of the dying session stay on record — the audit log marks
+    // them `orphaned` so a later session knows to `pr adopt` before merge.
+    if let Ok(prs) = db.list_session_prs(&id).await {
+        for pr in prs {
+            if matches!(
+                pr.state.as_str(),
+                "open" | "checks_pending" | "failed" | "rejected" | "merging"
+            ) {
+                let _ = db
+                    .add_pr_event(
+                        pr.id,
+                        "orphaned",
+                        &id,
+                        "user",
+                        None,
+                        Some("session deleted"),
+                    )
+                    .await;
+            }
+        }
+    }
     db.delete_session(&id).await.map_err(internal_error)?;
     state.parked_agents.evict(&id);
     state.tunnels.remove_session(&id);
@@ -582,6 +710,21 @@ pub(super) async fn delete_all_sessions(
     // Delete all from DB
     let db = state.db();
     state.tunnels.remove_all();
+    // Every live PR outlives its session — mark them `orphaned` first.
+    if let Ok(prs) = db.list_prs(None, Some("open")).await {
+        for pr in prs {
+            let _ = db
+                .add_pr_event(
+                    pr.id,
+                    "orphaned",
+                    &pr.session_id,
+                    "user",
+                    None,
+                    Some("session deleted"),
+                )
+                .await;
+        }
+    }
     db.delete_all_sessions().await.map_err(internal_error)?;
     state.tool_environments.evict_all();
     #[cfg(target_os = "macos")]

@@ -3,7 +3,6 @@
 use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
 
 use aither_agent::ContextWindowPhase;
 use aither_sandbox::TerminalExecutionMode;
@@ -152,8 +151,6 @@ pub enum ToolDisplay {
         diffs: Vec<crate::file_tracker::RootDiff>,
         /// Expansion pinned by a click; `None` follows the automatic rule.
         pinned: Option<bool>,
-        /// When the call finished; drives automatic collapse.
-        finished_at: Option<Instant>,
     },
     /// A labelled action: a terminal control call (`terminal_input`,
     /// `terminal_read`, `terminal_kill`) or any other tool invocation.
@@ -174,8 +171,6 @@ pub enum ToolDisplay {
         output: Option<TerminalCallInfo>,
         /// Expansion pinned by a click; `None` follows the automatic rule.
         pinned: Option<bool>,
-        /// When the call finished; drives automatic collapse.
-        finished_at: Option<Instant>,
     },
     /// Provider-hosted (server-side) tool call — the provider executes it,
     /// the harness only observes start and result events.
@@ -190,14 +185,9 @@ pub enum ToolDisplay {
         output: Option<String>,
         /// Expansion pinned by a click; `None` follows the automatic rule.
         pinned: Option<bool>,
-        /// When the call finished; drives automatic collapse.
-        finished_at: Option<Instant>,
     },
 }
 
-/// A finished call keeps its body open this long before it auto-collapses
-/// to its headline.
-const RECENT_EXPAND: std::time::Duration = std::time::Duration::from_secs(15);
 /// Output lines previewed inside an expanded body.
 const OUTPUT_PREVIEW_LINES: usize = 3;
 /// Diff lines previewed per root inside an expanded body.
@@ -240,27 +230,12 @@ impl ToolDisplay {
         }
     }
 
-    /// When the call finished, shared by every variant.
+    /// Whether the body renders open: a click pin wins; otherwise the body
+    /// is open while the call runs and folds to its headline when it ends.
     #[must_use]
-    const fn finished_at(&self) -> Option<Instant> {
-        match self {
-            Self::Terminal { finished_at, .. }
-            | Self::Action { finished_at, .. }
-            | Self::Builtin { finished_at, .. } => *finished_at,
-        }
-    }
-
-    /// Whether the body renders open at `now`: a click pin wins; otherwise
-    /// the body is open while the call runs and for [`RECENT_EXPAND`]
-    /// after it finishes.
-    #[must_use]
-    pub fn body_open(&self, now: Instant) -> bool {
-        self.pinned().unwrap_or_else(|| {
-            matches!(self.status(), ToolStatus::Running)
-                || self
-                    .finished_at()
-                    .is_some_and(|at| now.duration_since(at) < RECENT_EXPAND)
-        })
+    pub fn body_open(&self) -> bool {
+        self.pinned()
+            .unwrap_or_else(|| matches!(self.status(), ToolStatus::Running))
     }
 
     /// Get all terminal calls for this tool.
@@ -341,7 +316,23 @@ pub enum ChatElement {
         content: String,
         /// Seconds spent thinking.
         seconds: u64,
-        /// Open while reasoning streams; click the collapsed header to reopen.
+        /// Open while reasoning streams, or after the user reopens a header.
+        expanded: bool,
+        /// Still receiving the current burst. Live bodies are a 5-line tail
+        /// window; a user-reopened block (`expanded` without `live`) is full.
+        live: bool,
+    },
+    /// A finished turn's work — thinking bursts, tool calls and the
+    /// intermediate messages between them — folded into one row when the
+    /// turn ends. A click expands the whole group; a second folds it shut.
+    WorkedFor {
+        /// Stable ID for click hit-testing.
+        id: String,
+        /// Wall-clock seconds the turn ran.
+        seconds: u64,
+        /// The folded elements.
+        elements: Vec<Self>,
+        /// Open after a click; folded by default.
         expanded: bool,
     },
     /// `/context` report — estimated context-window usage per category.
@@ -362,6 +353,11 @@ pub struct ChatStream {
     revisions: Vec<u64>,
     /// Counter generating thinking-block IDs.
     next_thinking_id: usize,
+    /// Counter generating worked-for row IDs.
+    next_worked_id: usize,
+    /// Elements before this index belong to already-folded turns and are
+    /// never folded again.
+    fold_cursor: usize,
     /// Base `http://host/tunnel` URL `<tunnel id>` tags resolve against.
     tunnel_base: String,
 }
@@ -541,6 +537,11 @@ impl ChatStream {
         true
     }
 
+    fn pop_last(&mut self) {
+        self.elements.pop();
+        self.revisions.pop();
+    }
+
     /// Start thinking block.
     pub fn start_thinking(&mut self) {
         let id = self.next_thinking_id;
@@ -550,17 +551,33 @@ impl ChatStream {
             content: String::new(),
             seconds: 0,
             expanded: true,
+            live: true,
         });
     }
 
     /// Append streamed reasoning text to the open thinking block, starting a
-    /// new block when the previous burst already collapsed.
+    /// new block when the previous burst already collapsed. An empty 0-second
+    /// stub left by a premature phase close is reused instead of sitting in
+    /// front of the real burst.
     pub fn push_thinking(&mut self, chunk: &str) {
-        if !matches!(
-            self.elements.last(),
-            Some(ChatElement::Thinking { expanded: true, .. })
-        ) {
-            self.start_thinking();
+        if chunk.is_empty() {
+            return;
+        }
+        match self.elements.last() {
+            Some(ChatElement::Thinking { live: true, .. }) => {}
+            Some(ChatElement::Thinking {
+                content,
+                seconds: 0,
+                ..
+            }) if content.is_empty() => {
+                if let Some(ChatElement::Thinking { expanded, live, .. }) = self.elements.last_mut()
+                {
+                    *expanded = true;
+                    *live = true;
+                    self.touch_last();
+                }
+            }
+            _ => self.start_thinking(),
         }
         if let Some(ChatElement::Thinking { content, .. }) = self.elements.last_mut() {
             content.push_str(chunk);
@@ -581,38 +598,90 @@ impl ChatStream {
     /// Stamp the daemon-measured duration of a reasoning phase and collapse
     /// the block — the phase ended, nothing more can stream into it. A phase
     /// that produced no readable text leaves a collapsed, non-expandable
-    /// header.
+    /// header when `seconds > 0`. A 0-second empty close is dropped so it
+    /// cannot sit in front of the next burst as a bare `Thought`.
     pub fn finish_thinking(&mut self, seconds: u64) {
-        if let Some(ChatElement::Thinking {
-            seconds: s,
-            expanded,
-            ..
-        }) = self.elements.last_mut()
-            && *expanded
-        {
-            *s = seconds;
-            *expanded = false;
-            self.touch_last();
-        } else {
-            let id = self.next_thinking_id;
-            self.next_thinking_id += 1;
-            self.push_element(ChatElement::Thinking {
-                id: format!("thinking-{id}"),
-                content: String::new(),
-                seconds,
-                expanded: false,
-            });
+        enum Finish {
+            Stamp,
+            Pop,
+            Push,
+            None,
+        }
+        let action = match self.elements.last() {
+            Some(ChatElement::Thinking {
+                content,
+                expanded,
+                live,
+                ..
+            }) if *expanded || *live => {
+                if content.is_empty() && seconds == 0 {
+                    Finish::Pop
+                } else {
+                    Finish::Stamp
+                }
+            }
+            Some(ChatElement::Thinking { content, .. }) if content.is_empty() => {
+                if seconds == 0 {
+                    Finish::Pop
+                } else {
+                    Finish::Stamp
+                }
+            }
+            _ if seconds == 0 => Finish::None,
+            _ => Finish::Push,
+        };
+        match action {
+            Finish::Pop => self.pop_last(),
+            Finish::None => {}
+            Finish::Stamp => {
+                if let Some(ChatElement::Thinking {
+                    seconds: s,
+                    expanded,
+                    live,
+                    ..
+                }) = self.elements.last_mut()
+                {
+                    *s = seconds;
+                    *expanded = false;
+                    *live = false;
+                    self.touch_last();
+                }
+            }
+            Finish::Push => {
+                let id = self.next_thinking_id;
+                self.next_thinking_id += 1;
+                self.push_element(ChatElement::Thinking {
+                    id: format!("thinking-{id}"),
+                    content: String::new(),
+                    seconds,
+                    expanded: false,
+                    live: false,
+                });
+            }
         }
     }
 
     /// Collapse the open thinking block (called when the reasoning burst
-    /// ends or first text arrives). The block stays as a collapsed header.
+    /// ends or first text arrives). The block stays as a collapsed header,
+    /// unless it is an empty 0-second stub, which is dropped.
     pub fn collapse_thinking(&mut self) {
-        if let Some(ChatElement::Thinking { expanded, .. }) = self.elements.last_mut()
-            && *expanded
-        {
-            *expanded = false;
-            self.touch_last();
+        match self.elements.last() {
+            Some(ChatElement::Thinking {
+                content,
+                seconds: 0,
+                expanded,
+                live,
+                ..
+            }) if (*expanded || *live) && content.is_empty() => self.pop_last(),
+            Some(ChatElement::Thinking { expanded, live, .. }) if *expanded || *live => {
+                if let Some(ChatElement::Thinking { expanded, live, .. }) = self.elements.last_mut()
+                {
+                    *expanded = false;
+                    *live = false;
+                    self.touch_last();
+                }
+            }
+            _ => {}
         }
     }
 
@@ -620,7 +689,6 @@ impl ChatStream {
     /// without reporting their completion, so holding their bodies open
     /// would be wrong. They collapse once the recent window lapses.
     pub fn finish_running_calls(&mut self) {
-        let now = Instant::now();
         for index in 0..self.elements.len() {
             let Some(ChatElement::ToolCall { display, .. }) = self.elements.get_mut(index) else {
                 continue;
@@ -629,27 +697,51 @@ impl ChatStream {
                 continue;
             }
             match display {
-                ToolDisplay::Terminal {
-                    status,
-                    finished_at,
-                    ..
-                }
-                | ToolDisplay::Action {
-                    status,
-                    finished_at,
-                    ..
-                }
-                | ToolDisplay::Builtin {
-                    status,
-                    finished_at,
-                    ..
-                } => {
+                ToolDisplay::Terminal { status, .. }
+                | ToolDisplay::Action { status, .. }
+                | ToolDisplay::Builtin { status, .. } => {
                     *status = ToolStatus::Failed("interrupted".to_string());
-                    *finished_at = Some(now);
                 }
             }
             self.touch(index);
         }
+    }
+
+    /// Fold the finished turn's work — thinking bursts, tool calls and the
+    /// intermediate messages between them — into a single "Worked for" row.
+    /// The turn's final reply stays visible, as do notices and reports.
+    pub fn fold_turn_work(&mut self, seconds: u64) {
+        self.fold_cursor = self.fold_cursor.min(self.elements.len());
+        let start = self
+            .elements
+            .iter()
+            .rposition(|e| matches!(e, ChatElement::UserMessage { .. }))
+            .map_or(self.fold_cursor, |i| (i + 1).max(self.fold_cursor));
+        // The reply ends the turn: everything before its last block is work.
+        let end = self
+            .elements
+            .iter()
+            .rposition(|e| matches!(e, ChatElement::AssistantText { .. }))
+            .filter(|index| *index > start)
+            .unwrap_or(self.elements.len());
+        if end <= start {
+            return;
+        }
+        let folded: Vec<ChatElement> = self.elements.splice(start..end, []).collect();
+        self.revisions.splice(start..end, []);
+        let id = self.next_worked_id;
+        self.next_worked_id += 1;
+        self.elements.insert(
+            start,
+            ChatElement::WorkedFor {
+                id: format!("work-{id}"),
+                seconds,
+                elements: folded,
+                expanded: false,
+            },
+        );
+        self.revisions.insert(start, Self::next_revision());
+        self.fold_cursor = start + 1;
     }
 
     /// Start a new assistant text block.
@@ -739,7 +831,6 @@ impl ChatStream {
                 status: ToolStatus::Running,
                 output: None,
                 pinned: None,
-                finished_at: None,
             },
         });
     }
@@ -752,19 +843,12 @@ impl ChatStream {
         });
         if let Some(index) = found {
             if let ChatElement::ToolCall {
-                display:
-                    ToolDisplay::Builtin {
-                        status,
-                        output,
-                        finished_at,
-                        ..
-                    },
+                display: ToolDisplay::Builtin { status, output, .. },
                 ..
             } = &mut self.elements[index]
             {
                 *status = ToolStatus::Done;
                 *output = Some(result);
-                *finished_at = Some(Instant::now());
             }
             self.touch(index);
             return;
@@ -778,7 +862,6 @@ impl ChatStream {
                 status: ToolStatus::Done,
                 output: Some(result),
                 pinned: None,
-                finished_at: Some(Instant::now()),
             },
         });
     }
@@ -791,19 +874,14 @@ impl ChatStream {
         };
         self.touch(index);
         if let ChatElement::ToolCall { display, .. } = &mut self.elements[index] {
-            let finished = !matches!(status, ToolStatus::Running);
             match display {
                 ToolDisplay::Terminal {
                     status: s,
                     command,
                     output: out,
-                    finished_at,
                     ..
                 } => {
                     *s = status;
-                    if finished {
-                        *finished_at = Some(Instant::now());
-                    }
                     if let Some(output_text) = output {
                         *out = Some(TerminalCallInfo {
                             command: command.clone(),
@@ -818,13 +896,9 @@ impl ChatStream {
                     chip,
                     task_id,
                     output: out,
-                    finished_at,
                     ..
                 } => {
                     *s = status;
-                    if finished {
-                        *finished_at = Some(Instant::now());
-                    }
                     if let Some(output_text) = output {
                         *out = Some(TerminalCallInfo {
                             command: chip.clone(),
@@ -840,13 +914,9 @@ impl ChatStream {
                 ToolDisplay::Builtin {
                     status: s,
                     output: out,
-                    finished_at,
                     ..
                 } => {
                     *s = status;
-                    if finished {
-                        *finished_at = Some(Instant::now());
-                    }
                     if let Some(output_text) = output {
                         *out = Some(output_text.to_string());
                     }
@@ -866,7 +936,7 @@ impl ChatStream {
                     id: tool_id,
                     display,
                 } if tool_id == id && display.expandable() => {
-                    let open = display.body_open(Instant::now());
+                    let open = display.body_open();
                     match display {
                         ToolDisplay::Terminal { pinned, .. }
                         | ToolDisplay::Action { pinned, .. }
@@ -881,6 +951,15 @@ impl ChatStream {
                     content,
                     ..
                 } if think_id == id && !content.is_empty() => {
+                    *expanded = !*expanded;
+                    touched = Some(index);
+                    break;
+                }
+                ChatElement::WorkedFor {
+                    id: work_id,
+                    expanded,
+                    ..
+                } if work_id == id => {
                     *expanded = !*expanded;
                     touched = Some(index);
                     break;
@@ -1184,7 +1263,8 @@ pub struct ActivityContext {
 pub struct StatusContext<'a> {
     /// Model display string.
     pub model: &'a str,
-    /// Token usage info (`prompt_tokens`, `context_window`).
+    /// Token usage info (`prompt_tokens`, model `context_window`). The status
+    /// bar denominator is the auto-compact window derived from the latter.
     pub usage: Option<(u64, Option<u64>)>,
     /// Queued message count.
     pub queue_count: usize,
@@ -1203,6 +1283,9 @@ pub struct StatusContext<'a> {
     pub activity: Option<ActivityContext>,
     /// Animation frame counter for the activity spinner.
     pub spinner_frame: usize,
+    /// Coverage of the session's worktree index: a slim blue bar while the
+    /// index is incomplete, absent at full coverage or with nothing to index.
+    pub index_coverage: Option<&'a crate::client::IndexCoverage>,
 }
 
 /// Queued message context for rendering queue indicator.
@@ -1314,15 +1397,7 @@ pub fn build_plain_wrapped_lines_unified(
         return Vec::new();
     }
     let mut layout = ChatLayout::default();
-    layout.sync(
-        chat,
-        width,
-        images_supported,
-        false,
-        None,
-        0,
-        Instant::now(),
-    );
+    layout.sync(chat, width, images_supported, false, None, 0);
     let mut out: Vec<String> = (0..layout.element_rows())
         .map(|row| layout.plain_line(row).unwrap_or_default().to_string())
         .collect();
@@ -1599,18 +1674,17 @@ pub(super) struct ElementState {
 }
 
 impl ElementState {
-    /// State of `elem` at `now`.
+    /// State of `elem`.
     pub(super) fn of(
         elem: &ChatElement,
         selected_tool: Option<&str>,
         hide_todos: bool,
         spinner_frame: usize,
-        now: Instant,
     ) -> Self {
         match elem {
             ChatElement::ToolCall { id, display } => Self {
                 selected: selected_tool == Some(id.as_str()),
-                open: display.expandable() && display.body_open(now),
+                open: display.expandable() && display.body_open(),
                 hide_todos,
                 spinner_frame: if matches!(display.status(), ToolStatus::Running) {
                     spinner_frame
@@ -1636,17 +1710,78 @@ pub(super) struct ElementLines {
     pub images: Vec<(String, usize, String)>,
 }
 
+/// `52s`, `1m27s` — the worked-for row's compact duration.
+fn compact_seconds(seconds: u64) -> String {
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else {
+        format!("{}m{}s", seconds / 60, seconds % 60)
+    }
+}
+
 /// Id a click on `elem` toggles, when it is collapsible.
 pub(super) fn collapsible_id(elem: &ChatElement) -> Option<&str> {
     match elem {
         ChatElement::ToolCall { id, display } if display.expandable() => Some(id.as_str()),
-        ChatElement::Thinking {
-            id,
-            expanded: false,
-            content,
-            ..
-        } if !content.is_empty() => Some(id.as_str()),
+        ChatElement::Thinking { id, content, .. } if !content.is_empty() => Some(id.as_str()),
+        ChatElement::WorkedFor { id, .. } => Some(id.as_str()),
         _ => None,
+    }
+}
+
+/// Body rows shown while a thinking burst is still streaming.
+const THINKING_LIVE_LINES: usize = 5;
+
+/// Last `n` logical lines of `text`, matching [`str::lines`] (a trailing
+/// newline does not count as an extra empty line).
+fn last_lines(text: &str, n: usize) -> &str {
+    if n == 0 {
+        return "";
+    }
+    let text = text.strip_suffix('\n').unwrap_or(text);
+    let bytes = text.as_bytes();
+    let mut remaining = n;
+    let mut i = bytes.len();
+    while i > 0 {
+        i -= 1;
+        if bytes[i] == b'\n' {
+            remaining -= 1;
+            if remaining == 0 {
+                return &text[i + 1..];
+            }
+        }
+    }
+    text
+}
+
+/// Suffix of `text` whose display width is at most `max_width`.
+fn suffix_max_width(text: &str, max_width: usize) -> &str {
+    if max_width == 0 || text.is_empty() {
+        return "";
+    }
+    let mut width = 0usize;
+    let mut start = text.len();
+    for (i, ch) in text.char_indices().rev() {
+        let w = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width.saturating_add(w) > max_width {
+            break;
+        }
+        width += w;
+        start = i;
+    }
+    &text[start..]
+}
+
+/// Tail of live thinking shown in the 5-line window: last `THINKING_LIVE_LINES`
+/// logical lines, clipped to about that many columns at `width` so a
+/// newline-less blob cannot fill the screen.
+fn live_thinking_body(content: &str, width: u16) -> &str {
+    let slice = last_lines(content, THINKING_LIVE_LINES);
+    let budget = usize::from(width.max(1)).saturating_mul(THINKING_LIVE_LINES);
+    if UnicodeWidthStr::width(slice) <= budget {
+        slice
+    } else {
+        suffix_max_width(slice, budget)
     }
 }
 
@@ -1656,6 +1791,7 @@ pub(super) fn element_lines(
     state: ElementState,
     images_supported: bool,
     tunnel_base: &str,
+    width: u16,
 ) -> ElementLines {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut images: Vec<(String, usize, String)> = Vec::new();
@@ -1807,6 +1943,7 @@ pub(super) fn element_lines(
             content,
             seconds,
             expanded,
+            live,
             ..
         } => {
             let header = if *expanded {
@@ -1826,16 +1963,47 @@ pub(super) fn element_lines(
             };
             lines.push(Line::from(Span::styled(
                 header,
-                Style::default().fg(Color::Magenta),
+                Style::default().fg(Color::DarkGray),
             )));
             if *expanded {
-                for l in content.lines() {
+                let body = if *live {
+                    live_thinking_body(content, width)
+                } else {
+                    content.as_str()
+                };
+                for l in body.lines() {
                     lines.push(Line::from(Span::styled(
                         l.to_string(),
                         Style::default()
                             .fg(Color::DarkGray)
                             .add_modifier(Modifier::ITALIC),
                     )));
+                }
+            }
+            lines.push(Line::from(""));
+        }
+
+        ChatElement::WorkedFor {
+            seconds,
+            elements,
+            expanded,
+            ..
+        } => {
+            let arrow = if *expanded { " ▾" } else { " ▸" };
+            lines.push(Line::from(Span::styled(
+                format!("✦ Worked for {}{arrow}", compact_seconds(*seconds)),
+                Style::default().fg(Color::DarkGray),
+            )));
+            if *expanded {
+                for inner in elements {
+                    let sub = element_lines(inner, state, images_supported, tunnel_base, width);
+                    let offset = lines.len();
+                    lines.extend(sub.lines);
+                    images.extend(
+                        sub.images
+                            .into_iter()
+                            .map(|(url, row, mime)| (url, offset + row, mime)),
+                    );
                 }
             }
             lines.push(Line::from(""));
@@ -1902,7 +2070,6 @@ fn render_impl(
         hide_todos,
         selected_tool,
         spinner_frame,
-        Instant::now(),
     );
     stats.elements = layout.rebuilt();
 
@@ -2019,6 +2186,12 @@ fn render_impl(
 
     // Plain mirror of the tail, for selection.
     layout.set_tail_plain(chat_layout::plain_rows(&tail, area.width, tail_rows));
+    layout.set_input_span(input_line_idx.map(|index| {
+        (
+            element_rows + tail_starts.get(index).copied().unwrap_or(0),
+            chat_layout::line_rows(&tail[index], area.width),
+        )
+    }));
 
     // Anchor the terminal cursor on the caret cell so IME composition and
     // its candidate window track the real insertion point.
@@ -2369,34 +2542,71 @@ fn render_status_line(lines: &mut Vec<Line<'_>>, ctx: &StatusContext<'_>, width:
         parts.push("↓ jobs".to_string());
     }
 
-    // Context usage pinned to the right edge: `4.8K/1M`.
-    let usage_text = ctx.usage.map(|(prompt_tokens, context_window)| {
-        let used = format_number(usize::try_from(prompt_tokens).unwrap_or(usize::MAX));
-        match context_window {
-            Some(window) => format!(
-                "{}/{}",
-                used,
-                format_number(usize::try_from(window).unwrap_or(usize::MAX))
-            ),
-            None => used,
-        }
-    });
+    // Context usage pinned to the right edge: `4.8K / 120.0K (4%)`.
+    let usage = ctx
+        .usage
+        .map(|(prompt_tokens, context_window)| format_status_usage(prompt_tokens, context_window));
+
+    // The worktree index's coverage, while incomplete: `index ▕██████░░░░▏ 62%`.
+    let index_bar = ctx.index_coverage.and_then(index_bar);
 
     let status_text = parts.join(" · ");
     let status_style = Style::default().fg(Color::Cyan);
+    let warn_style = Style::default().fg(Color::Yellow);
 
-    if let Some(usage_text) = usage_text {
+    let bar_width = index_bar.as_ref().map_or(0, |bar| {
+        bar.iter().map(Span::width).sum::<usize>() + " · ".width()
+    });
+    if let Some(usage) = usage {
         let pad = width
-            .saturating_sub(status_text.width() + usage_text.width())
+            .saturating_sub(status_text.width() + bar_width + usage.width())
             .max(1);
-        lines.push(Line::from(vec![
-            Span::styled(status_text, status_style),
-            Span::raw(" ".repeat(pad)),
-            Span::styled(usage_text, status_style),
-        ]));
+        let mut spans = vec![Span::styled(status_text, status_style)];
+        if let Some(bar) = index_bar {
+            spans.push(Span::styled(" · ", status_style));
+            spans.extend(bar);
+        }
+        spans.push(Span::raw(" ".repeat(pad)));
+        spans.push(Span::styled(usage.usage, status_style));
+        if let Some(warn) = usage.warn {
+            spans.push(Span::styled(" · ", status_style));
+            spans.push(Span::styled(warn, warn_style));
+        }
+        lines.push(Line::from(spans));
     } else {
-        lines.push(Line::from(Span::styled(status_text, status_style)));
+        let mut spans = vec![Span::styled(status_text, status_style)];
+        if let Some(bar) = index_bar {
+            spans.push(Span::styled(" · ", status_style));
+            spans.extend(bar);
+        }
+        lines.push(Line::from(spans));
     }
+}
+
+/// Cells in the status bar's index progress bar.
+const INDEX_BAR_CELLS: usize = 8;
+
+/// The status bar's index coverage segment while it is incomplete:
+/// `index ▕██████░░░░▏ 62%` in blue; `None` at full coverage or when there
+/// is nothing to index.
+fn index_bar(coverage: &crate::client::IndexCoverage) -> Option<Vec<Span<'static>>> {
+    let total = coverage.total;
+    if total == 0 || coverage.with_vector >= total {
+        return None;
+    }
+    let filled = usize::try_from(coverage.with_vector * INDEX_BAR_CELLS as u64 / total)
+        .expect("a share of at most the cell count");
+    let percent = coverage.with_vector * 100 / total;
+    let bar_style = Style::default().fg(Color::Blue);
+    Some(vec![
+        Span::styled("index ▕", bar_style),
+        Span::styled("█".repeat(filled), bar_style),
+        Span::styled(
+            "░".repeat(INDEX_BAR_CELLS - filled),
+            bar_style.add_modifier(Modifier::DIM),
+        ),
+        Span::styled(format!("▏ {percent}%"), bar_style),
+    ])
 }
 
 /// Format an elapsed duration compactly (`45s`, `2m05s`, `1h03m`).
@@ -2420,6 +2630,61 @@ pub(crate) fn format_number(n: usize) -> String {
     } else {
         n.to_string()
     }
+}
+
+/// Remaining percent of the auto-compact window below which the status bar
+/// warns that compaction is close.
+const AUTOCOMPACT_WARN_REMAINING_PCT: u8 = 10;
+
+/// Right-edge context usage for the status bar.
+struct StatusUsage {
+    /// `used / autocompact-window (percent%)`, or a bare count with no window.
+    usage: String,
+    /// Remaining-to-compact hint when headroom is under 10%.
+    warn: Option<String>,
+}
+
+impl StatusUsage {
+    fn width(&self) -> usize {
+        self.usage.width()
+            + self
+                .warn
+                .as_ref()
+                .map_or(0, |warn| " · ".width() + warn.width())
+    }
+}
+
+/// Format prompt-token usage against the auto-compact window.
+fn format_status_usage(prompt_tokens: u64, context_window: Option<u64>) -> StatusUsage {
+    let used = format_number(usize::try_from(prompt_tokens).unwrap_or(usize::MAX));
+    let Some(window) = context_window else {
+        return StatusUsage {
+            usage: used,
+            warn: None,
+        };
+    };
+    let compact =
+        crate::agent::autocompact_window_tokens(usize::try_from(window).unwrap_or(usize::MAX));
+    if compact == 0 {
+        return StatusUsage {
+            usage: used,
+            warn: None,
+        };
+    }
+    let used_n = usize::try_from(prompt_tokens).unwrap_or(usize::MAX);
+    #[allow(clippy::cast_precision_loss)]
+    let percent = used_n as f64 / compact as f64 * 100.0;
+    let usage = format!("{} / {} ({percent:.0}%)", used, format_number(compact));
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
+    let remaining_pct =
+        ((compact.saturating_sub(used_n) as f64 / compact as f64) * 100.0).round() as u8;
+    let warn = (remaining_pct < AUTOCOMPACT_WARN_REMAINING_PCT)
+        .then(|| format!("{remaining_pct}% to auto-compact"));
+    StatusUsage { usage, warn }
 }
 
 /// Render a tool call inline with optional selection highlight.
@@ -2593,7 +2858,7 @@ fn render_tool_inline<'a>(
     images_supported: bool,
     image_positions: &mut Vec<(String, usize, String)>,
 ) {
-    let open = display.expandable() && display.body_open(Instant::now());
+    let open = display.expandable() && display.body_open();
     render_tool_inline_at(
         lines,
         display,
@@ -2890,9 +3155,9 @@ pub fn render_tool_fullscreen(frame: &mut Frame, area: Rect, display: &ToolDispl
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatElement, ChatStream, InputContext, RECENT_EXPAND, ToolCallImage, ToolDisplay,
-        ToolStatus, build_plain_wrapped_lines_unified, render_input_line, render_tool_inline,
-        terminal_mode_marker,
+        ChatElement, ChatStream, InputContext, ToolCallImage, ToolDisplay, ToolStatus,
+        build_plain_wrapped_lines_unified, format_number, format_status_usage, index_bar,
+        render_input_line, render_tool_inline, terminal_mode_marker,
     };
     use crate::tui::queue::Attachment;
     use crate::tui::ui::streaming_markdown::IMAGE_HEIGHT;
@@ -2900,7 +3165,93 @@ mod tests {
     use ratatui::style::Color;
     use ratatui::text::Line;
     use std::path::PathBuf;
-    use std::time::Instant;
+
+    #[test]
+    fn status_usage_is_used_over_autocompact_window() {
+        let window = 200_000_u64;
+        let compact = crate::agent::autocompact_window_tokens(usize::try_from(window).unwrap());
+        let used = compact / 4;
+        let line = format_status_usage(u64::try_from(used).unwrap(), Some(window));
+        #[allow(clippy::cast_precision_loss)]
+        let percent = used as f64 / compact as f64 * 100.0;
+        assert_eq!(
+            line.usage,
+            format!(
+                "{} / {} ({percent:.0}%)",
+                format_number(used),
+                format_number(compact)
+            )
+        );
+        assert!(line.warn.is_none());
+    }
+
+    #[test]
+    fn status_usage_warns_within_ten_percent_of_autocompact() {
+        let window = 200_000_u64;
+        let compact = crate::agent::autocompact_window_tokens(usize::try_from(window).unwrap());
+        let used = compact - compact / 20;
+        let line = format_status_usage(u64::try_from(used).unwrap(), Some(window));
+        assert_eq!(line.warn.as_deref(), Some("5% to auto-compact"));
+    }
+
+    #[test]
+    fn status_usage_omits_warn_at_ten_percent_remaining() {
+        let window = 200_000_u64;
+        let compact = crate::agent::autocompact_window_tokens(usize::try_from(window).unwrap());
+        let used = compact - compact / 10;
+        let line = format_status_usage(u64::try_from(used).unwrap(), Some(window));
+        assert!(line.warn.is_none());
+    }
+
+    #[test]
+    fn status_usage_warns_at_zero_headroom() {
+        let window = 200_000_u64;
+        let compact = crate::agent::autocompact_window_tokens(usize::try_from(window).unwrap());
+        let line = format_status_usage(u64::try_from(compact).unwrap(), Some(window));
+        assert_eq!(line.warn.as_deref(), Some("0% to auto-compact"));
+    }
+
+    #[test]
+    fn status_usage_falls_back_to_used_without_a_window() {
+        let line = format_status_usage(33_400, None);
+        assert_eq!(line.usage, "33.4K");
+        assert!(line.warn.is_none());
+    }
+
+    fn coverage(with_vector: u64, total: u64) -> crate::client::IndexCoverage {
+        crate::client::IndexCoverage {
+            phase: repo_search_client::protocol::WirePhase::FirstIndex,
+            with_vector,
+            total,
+        }
+    }
+
+    fn bar_text(coverage: &crate::client::IndexCoverage) -> Option<String> {
+        index_bar(coverage).map(|spans| {
+            spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+    }
+
+    #[test]
+    fn index_bar_shows_fill_and_percent_while_incomplete() {
+        assert_eq!(
+            bar_text(&coverage(6, 10)).as_deref(),
+            Some("index ▕████░░░░▏ 60%")
+        );
+        assert_eq!(
+            bar_text(&coverage(0, 5)).as_deref(),
+            Some("index ▕░░░░░░░░▏ 0%")
+        );
+    }
+
+    #[test]
+    fn index_bar_is_absent_at_full_coverage_or_with_nothing_to_index() {
+        assert!(index_bar(&coverage(10, 10)).is_none());
+        assert!(index_bar(&coverage(0, 0)).is_none());
+    }
 
     #[test]
     fn live_output_appends_to_running_terminal_call() {
@@ -2915,7 +3266,6 @@ mod tests {
                 output: None,
                 diffs: Vec::new(),
                 pinned: None,
-                finished_at: None,
             },
         );
 
@@ -2962,7 +3312,6 @@ mod tests {
                 output: None,
                 diffs: Vec::new(),
                 pinned: None,
-                finished_at: None,
             }
         }
 
@@ -3010,7 +3359,6 @@ mod tests {
                 output: None,
                 diffs: Vec::new(),
                 pinned: None,
-                finished_at: None,
             },
         );
         stream.toggle_expanded("call-1");
@@ -3018,6 +3366,7 @@ mod tests {
             "call-1",
             vec![crate::file_tracker::RootDiff {
                 root: std::path::PathBuf::from("/repo"),
+                label: None,
                 changes: vec![crate::file_tracker::FileStat {
                     path: std::path::PathBuf::from("a.txt"),
                     additions: 2,
@@ -3038,7 +3387,6 @@ mod tests {
                 output: None,
                 diffs: Vec::new(),
                 pinned: None,
-                finished_at: None,
             },
         );
 
@@ -3089,7 +3437,6 @@ mod tests {
                 output: None,
                 diffs: Vec::new(),
                 pinned: None,
-                finished_at: None,
             };
             let mut lines: Vec<Line> = Vec::new();
             let mut positions = Vec::new();
@@ -3104,8 +3451,7 @@ mod tests {
         }
     }
 
-    /// A call that finished long ago — outside [`RECENT_EXPAND`], so the
-    /// automatic rule renders it collapsed.
+    /// A call that finished — the automatic rule renders it collapsed.
     fn terminal_display(command: &str) -> ToolDisplay {
         ToolDisplay::Terminal {
             description: String::new(),
@@ -3115,11 +3461,6 @@ mod tests {
             output: None,
             diffs: Vec::new(),
             pinned: None,
-            finished_at: Some(
-                Instant::now()
-                    .checked_sub(RECENT_EXPAND * 2)
-                    .expect("test clock precedes twice the expand window"),
-            ),
         }
     }
 
@@ -3149,7 +3490,6 @@ mod tests {
                 ),
                 diffs: Vec::new(),
                 pinned: None,
-                finished_at: None,
             },
         );
         chat.push_text("后台任务运行正常，已输出到第 7 行（约每秒一行）。再等它跑完：\n");
@@ -3217,6 +3557,7 @@ mod tests {
                             cwd: "~",
                             activity: None,
                             spinner_frame: 0,
+                            index_coverage: None,
                         }),
                         images_supported: true,
                         hide_todos: false,
@@ -3383,9 +3724,10 @@ mod tests {
             lines.extend(
                 super::element_lines(
                     elem,
-                    super::ElementState::of(elem, None, false, 0, Instant::now()),
+                    super::ElementState::of(elem, None, false, 0),
                     true,
                     "http://localhost:8787/tunnel",
+                    width,
                 )
                 .lines,
             );
@@ -3419,7 +3761,7 @@ mod tests {
         chat.push_user("thanks", Vec::new(), 1);
 
         let mut layout = super::ChatLayout::default();
-        layout.sync(&chat, 60, true, false, None, 0, Instant::now());
+        layout.sync(&chat, 60, true, false, None, 0);
         let images = layout.images_in(0, 1000);
         assert_eq!(images.len(), 1);
         let block_end = images[0].row + IMAGE_HEIGHT;
@@ -3467,7 +3809,6 @@ mod tests {
             status: ToolStatus::Done,
             output: None,
             pinned: None,
-            finished_at: None,
         };
         assert!(!bare.expandable());
         let builtin = ToolDisplay::Builtin {
@@ -3476,7 +3817,6 @@ mod tests {
             status: ToolStatus::Done,
             output: None,
             pinned: None,
-            finished_at: None,
         };
         assert!(!builtin.expandable());
     }
@@ -3493,11 +3833,11 @@ mod tests {
         };
         assert_eq!(text, vec!["▸ ✓ $ one".to_string()]);
 
-        // Just finished: still open, showing the whole command.
-        let ToolDisplay::Terminal { finished_at, .. } = &mut display else {
+        // A click pins it open, showing the whole command.
+        let ToolDisplay::Terminal { pinned, .. } = &mut display else {
             unreachable!()
         };
-        *finished_at = Some(Instant::now());
+        *pinned = Some(true);
         let text = {
             let mut lines: Vec<Line> = Vec::new();
             let mut positions = Vec::new();
@@ -3507,7 +3847,7 @@ mod tests {
         assert_eq!(text.len(), 6); // headline + 5 command lines
         assert_eq!(text[5], "│ five");
 
-        // A click pins it shut regardless of the recent-expansion window.
+        // A second click pins it shut.
         let ToolDisplay::Terminal { pinned, .. } = &mut display else {
             unreachable!()
         };
@@ -3530,6 +3870,7 @@ mod tests {
             };
             *diffs = vec![crate::file_tracker::RootDiff {
                 root: std::path::PathBuf::from("/tmp/root"),
+                label: None,
                 changes: vec![crate::file_tracker::FileStat {
                     path: std::path::PathBuf::from("a.txt"),
                     additions: 12,
@@ -3549,16 +3890,10 @@ mod tests {
         assert_eq!(text, vec!["▸ ✓ $ echo hi  ± 1 file (+12 −0)".to_string()]);
 
         // Expanded: command body, still no diff block.
-        let ToolDisplay::Terminal {
-            pinned,
-            finished_at,
-            ..
-        } = &mut display
-        else {
+        let ToolDisplay::Terminal { pinned, .. } = &mut display else {
             unreachable!()
         };
         *pinned = Some(true);
-        *finished_at = Some(Instant::now());
         let mut lines: Vec<Line> = Vec::new();
         let mut positions = Vec::new();
         render_tool_inline(&mut lines, &display, false, true, &mut positions);
@@ -3811,6 +4146,87 @@ mod tests {
     }
 
     #[test]
+    fn last_lines_skips_a_trailing_newline() {
+        assert_eq!(super::last_lines("a\nb\nc\n", 2), "b\nc");
+        assert_eq!(super::last_lines("a\nb\nc", 2), "b\nc");
+        assert_eq!(super::last_lines("only", 5), "only");
+        assert_eq!(super::last_lines("", 3), "");
+    }
+
+    #[test]
+    fn live_thinking_window_shows_last_five_lines_then_reopens_full() {
+        let mut chat = ChatStream::new();
+        chat.push_thinking("l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8");
+        let live = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
+        let body: Vec<&str> = live
+            .iter()
+            .skip(1)
+            .filter(|l| !l.is_empty())
+            .map(String::as_str)
+            .collect();
+        assert_eq!(body, ["l4", "l5", "l6", "l7", "l8"]);
+        assert!(live[0].contains("Thinking"));
+        assert!(!live.iter().any(|l| l.contains("l1")));
+
+        chat.collapse_thinking();
+        chat.toggle_expanded("thinking-0");
+        let reopened = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
+        let full: Vec<&str> = reopened
+            .iter()
+            .skip(1)
+            .filter(|l| !l.is_empty())
+            .map(String::as_str)
+            .collect();
+        assert_eq!(full, ["l1", "l2", "l3", "l4", "l5", "l6", "l7", "l8"]);
+    }
+
+    #[test]
+    fn empty_zero_second_thought_is_dropped() {
+        let mut chat = ChatStream::new();
+        chat.finish_thinking(0);
+        assert!(chat.elements().is_empty());
+
+        chat.start_thinking();
+        chat.collapse_thinking();
+        assert!(chat.elements().is_empty());
+    }
+
+    #[test]
+    fn premature_reasoning_end_does_not_leave_empty_thought_before_burst() {
+        let mut chat = ChatStream::new();
+        // Daemon closed a freshly re-armed phase at 0s (TurnComplete after
+        // tools), then the next burst streamed real reasoning.
+        chat.finish_thinking(0);
+        chat.push_thinking("step one");
+        chat.finish_thinking(9);
+        let lines = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
+        let headers: Vec<&str> = lines
+            .iter()
+            .filter(|l| l.contains("Thought") || l.contains("Thinking"))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(headers, ["◐ Thought for 9 sec ▸"]);
+        assert_eq!(
+            chat.elements()
+                .iter()
+                .filter(|e| matches!(e, ChatElement::Thinking { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn duration_only_header_stays_when_the_next_burst_starts() {
+        let mut chat = ChatStream::new();
+        chat.finish_thinking(4);
+        chat.push_thinking("next");
+        let lines = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
+        assert!(lines[0].contains("Thought for 4 sec"));
+        assert!(!lines[0].contains('▸'));
+        assert!(lines.iter().any(|l| l.contains("next")));
+    }
+
+    #[test]
     fn thinking_streams_then_collapses_and_reopens() {
         let mut chat = ChatStream::new();
         chat.push_thinking("step one\nstep two");
@@ -3909,7 +4325,6 @@ mod tests {
                 status: ToolStatus::Running,
                 output: None,
                 pinned: None,
-                finished_at: None,
             },
         );
         chat.finish_running_calls();
@@ -3917,7 +4332,6 @@ mod tests {
             panic!("the call stays in the stream");
         };
         assert!(matches!(display.status(), ToolStatus::Failed(_)));
-        assert!(display.finished_at().is_some());
     }
 
     /// A tasks.md document parsed into a checklist feeds the todo block —
@@ -3951,5 +4365,70 @@ mod tests {
                 .all(|element| !matches!(element, ChatElement::TodoBlock { .. })),
             "an empty checklist should remove the todo block"
         );
+    }
+
+    /// A finished turn folds its work — thinking, calls and the messages
+    /// between them — behind one "Worked for" row that clicks open and
+    /// shut again.
+    #[test]
+    fn worked_for_folds_turn_and_toggles() {
+        let mut chat = ChatStream::new();
+        chat.push_user("hi", Vec::new(), 0);
+        chat.push_thinking("draft reply");
+        chat.push_tool(
+            "t1".to_string(),
+            ToolDisplay::Terminal {
+                description: String::new(),
+                command: "echo hi".to_string(),
+                mode: TerminalExecutionMode::Default,
+                status: ToolStatus::Done,
+                output: None,
+                diffs: Vec::new(),
+                pinned: None,
+            },
+        );
+        chat.push_text("done");
+        chat.fold_turn_work(52);
+
+        // user message + folded work + the reply, which stays visible.
+        assert!(matches!(
+            chat.elements.last(),
+            Some(ChatElement::AssistantText { .. })
+        ));
+        let Some(ChatElement::WorkedFor { elements, .. }) = chat.elements.get(1) else {
+            panic!("the turn's work folds into one row");
+        };
+        assert_eq!(elements.len(), 2);
+
+        let collapsed = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
+        assert!(collapsed.iter().any(|line| line.contains("Worked for 52s")));
+        assert!(!collapsed.iter().any(|line| line.contains("draft reply")));
+
+        chat.toggle_expanded("work-0");
+        let open = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
+        assert!(open.iter().any(|line| line.contains("draft reply")));
+
+        chat.toggle_expanded("work-0");
+        let closed = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
+        assert!(!closed.iter().any(|line| line.contains("draft reply")));
+    }
+
+    /// An expanded thinking block stays clickable — a click folds it back.
+    #[test]
+    fn expanded_thinking_has_click_region() {
+        let mut chat = ChatStream::new();
+        chat.push_thinking("step one");
+        let mut regions = Vec::new();
+        let _ = build_plain_wrapped_lines_unified(
+            &chat,
+            80,
+            None,
+            None,
+            None,
+            Some(&mut regions),
+            false,
+        );
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].element_id, "thinking-0");
     }
 }
