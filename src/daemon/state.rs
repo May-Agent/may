@@ -658,7 +658,7 @@ impl AskUserApprover {
     pub(crate) async fn enqueue(&self, request: AskUserRequest, session_id: Option<String>) {
         let questions = request.args.request.clone().into_questions();
         let request_session_id = Some(request.args.session_id.clone()).or(session_id);
-        let request_id = uuid::Uuid::new_v4().to_string();
+        let request_id = crate::id::new();
         let rx = self.live_responses.open(&request_id);
 
         if let Some(session_id) = request_session_id.as_deref()
@@ -786,7 +786,7 @@ impl WorkspaceApprover {
         session_id: &str,
         request: RequestWorkspaceArgs,
     ) -> Result<bool, WorkspaceApprovalError> {
-        let request_id = uuid::Uuid::new_v4().to_string();
+        let request_id = crate::id::new();
         let rx = self.live_responses.open(&request_id);
 
         if let Some(runtime_service) = self.runtime_service.clone() {

@@ -5458,7 +5458,6 @@ dependencies = [
  "unicode-width",
  "url",
  "utoipa",
- "uuid",
  "walkdir",
  "web-push",
  "webrtc",
