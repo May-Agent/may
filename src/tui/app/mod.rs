@@ -3426,7 +3426,6 @@ impl App {
                         self.thinking_start = None;
                         self.decode_meter.note_output(chunk.len());
                         self.chat.push_text(&chunk);
-                        self.scroll = usize::MAX;
                         self.input_visible = true;
                     }
                     AgentEvent::Reasoning(chunk) => {
@@ -3543,7 +3542,6 @@ impl App {
                         self.thinking_start = None;
                         self.decode_meter.note_boundary();
                         self.chat.push_builtin(id, tool, detail);
-                        self.scroll = usize::MAX;
                     }
                     AgentEvent::BuiltInToolResult { id, tool, result } => {
                         // The provider reports the call done; the model call
@@ -3571,7 +3569,6 @@ impl App {
                         self.chat.end_text();
                         self.decode_meter.note_boundary();
                         self.pending_tool_calls.clear();
-                        self.scroll = usize::MAX;
                         self.input_visible = true;
                         // The turn may have edited tasks.md without a tool
                         // call ending after the edit (or in a foreign turn).
@@ -3601,7 +3598,6 @@ impl App {
                 self.chat.collapse_thinking();
                 self.chat.finish_running_calls();
                 self.chat.push_error(&format!("{e}"));
-                self.scroll = usize::MAX;
                 self.input_visible = true;
                 true
             }
