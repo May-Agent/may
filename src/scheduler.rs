@@ -623,7 +623,16 @@ impl TaskRuntime {
         ))
         .await?;
 
-        let task_id = uuid::Uuid::new_v4().to_string();
+        let mut task_id = crate::id::new();
+        while self
+            .db
+            .get_scheduled_task(&task_id)
+            .await
+            .map_err(|error| prefixed_error("failed to check task id: ", &error))?
+            .is_some()
+        {
+            task_id = crate::id::new();
+        }
         let persisted_trigger = normalized.trigger.clone().into_persisted();
         let model = self
             .db
@@ -868,7 +877,7 @@ impl TaskRuntime {
         task: scheduled_tasks::Model,
         invocation: TaskInvocation,
     ) -> Result<(), crate::db::ChatDbError> {
-        let run_id = uuid::Uuid::new_v4().to_string();
+        let run_id = crate::id::new();
         self.db
             .start_task_run(&run_id, &task, Self::invocation_kind(&invocation))
             .await?;
@@ -1090,7 +1099,7 @@ impl TaskRuntime {
         invocation: TaskInvocation,
         placement: &TaskFilePlacement,
     ) -> Result<MaterializedTaskExecution, String> {
-        let execution_id = uuid::Uuid::new_v4().to_string();
+        let execution_id = crate::id::new();
         let trigger_payload = serde_json::to_vec(
             &TaskExecutionEnvelope::new(task, invocation).map_err(|error| {
                 prefixed_error("failed to build task trigger payload: ", &error)
@@ -1466,11 +1475,7 @@ impl TaskRuntime {
         let placement = TaskFilePlacement::container(self.container_task_workspace(profile).await?);
         let script_file = placement
             .write(
-                temp_task_file_name(
-                    ".may-task-validate-",
-                    uuid::Uuid::new_v4().to_string().as_str(),
-                    ".sh",
-                ),
+                temp_task_file_name(".may-task-validate-", crate::id::new().as_str(), ".sh"),
                 script.content.as_bytes(),
             )
             .await?;

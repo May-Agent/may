@@ -452,9 +452,10 @@ impl ChatDb {
             let ensured = if let Some(existing) = self.get_profile_by_slug(def.slug).await? {
                 existing
             } else {
-                let id = uuid::Uuid::new_v4().to_string();
+                // Default profiles take their slug as id: stable across
+                // installs and the shortest form a path can quote.
                 self.create_profile(CreateProfileParams {
-                    id: &id,
+                    id: def.slug,
                     name: def.name,
                     environment: parse_profile_environment(def.environment)?,
                     container_image: None,

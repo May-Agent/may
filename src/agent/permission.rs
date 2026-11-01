@@ -282,7 +282,7 @@ impl PermissionApprover {
             script,
             session_id: Some(session_id.clone()),
         };
-        let request_id = uuid::Uuid::new_v4().to_string();
+        let request_id = crate::id::new();
         let rx = self.live_responses.open(&request_id);
 
         if let Some(runtime_service) = self.runtime_service.clone() {
