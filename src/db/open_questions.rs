@@ -524,11 +524,11 @@ impl ChatDb {
         &self,
         request_id: &str,
         approved: bool,
-    ) -> Result<Option<String>, ChatDbError> {
+    ) -> Result<Option<PendingWorkspaceLookup>, ChatDbError> {
         let mut tx = self.db.begin().await?;
         let Some(pending) = query!(
             tx,
-            "DELETE FROM session_pending_workspace WHERE request_id = ? RETURNING session_id",
+            "DELETE FROM session_pending_workspace WHERE request_id = ? RETURNING session_id, path, reason",
             request_id
         )
         .fetch_optional::<PendingWorkspaceLookup>()
@@ -546,6 +546,6 @@ impl ChatDb {
         )
         .await?;
         tx.commit().await?;
-        Ok(Some(pending.session_id))
+        Ok(Some(pending))
     }
 }
