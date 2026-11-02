@@ -509,6 +509,13 @@ pub(super) struct SqliteTableInfoRow {
     pub(super) name: String,
 }
 
+/// Row shape for the snapshot-layout backfill: session + its checkpoint blob.
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
+pub(super) struct SnapshotMigrationRow {
+    pub(super) session_id: String,
+    pub(super) checkpoint_blob: Vec<u8>,
+}
+
 #[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct I32ValueRow {
     pub(super) value: i32,
@@ -547,8 +554,27 @@ pub(super) struct SessionIdRow {
 pub(super) struct StoredSessionContextSnapshotRow {
     pub(super) format_version: i64,
     pub(super) checkpoint_blob: Vec<u8>,
-    pub(super) last_message_db_id: Option<i64>,
+    pub(super) applied_seq: Option<i64>,
     pub(super) updated_at: String,
+}
+
+/// One committed model-transcript entry: the aither `Message` blob the
+/// model context held at `seq`, as `rmp_serde` of that message.
+#[derive(Debug, Clone)]
+pub struct TranscriptEntry {
+    /// Monotonic position in the session's model transcript.
+    pub seq: i64,
+    /// Serialized `aither_core::llm::Message`.
+    pub message_blob: Vec<u8>,
+    /// ISO timestamp of when the item was committed.
+    pub committed_at: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
+pub(super) struct TranscriptEntryRow {
+    pub(super) seq: i64,
+    pub(super) message_blob: Vec<u8>,
+    pub(super) committed_at: String,
 }
 
 /// Parameters for upserting a persisted session context snapshot.
@@ -556,9 +582,12 @@ pub(super) struct StoredSessionContextSnapshotRow {
 pub struct SessionContextSnapshotUpsert {
     /// Serialized agent checkpoint to persist.
     pub checkpoint: aither_agent::AgentCheckpoint,
-    /// The DB `messages.id` of the last message at snapshot time.
-    /// `None` means the snapshot was taken with an empty history.
-    pub last_message_db_id: Option<i64>,
+    /// Highest transcript seq the checkpoint covers; restore appends only
+    /// entries after it.
+    pub applied_seq: i64,
+    /// Transcript entries the checkpoint commits, merged into the store
+    /// inside the same transaction (existing seqs are kept).
+    pub transcript_entries: Vec<TranscriptEntry>,
 }
 
 /// Structured snapshot loaded from SQL-backed session context storage.
@@ -566,8 +595,8 @@ pub struct SessionContextSnapshotUpsert {
 pub struct StoredSessionContextSnapshot {
     /// Deserialized agent checkpoint.
     pub checkpoint: aither_agent::AgentCheckpoint,
-    /// The DB `messages.id` of the last message at snapshot time.
-    pub last_message_db_id: Option<i64>,
+    /// Highest transcript seq the checkpoint covers.
+    pub applied_seq: i64,
     /// Last update timestamp as an ISO string.
     pub updated_at: String,
 }
