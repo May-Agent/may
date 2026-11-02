@@ -328,6 +328,13 @@ pub enum SessionAgentBody {
         /// Seconds the phase lasted. Sub-second phases keep the fraction.
         seconds: f64,
     },
+    /// The run is parked until an upstream quota reset.
+    Hold {
+        /// When the run retries.
+        until: jiff::Timestamp,
+        /// The upstream message that declared the reset.
+        message: String,
+    },
     /// The run ended.
     End {
         /// How it ended.

@@ -301,6 +301,11 @@ async fn forward_agent_frame(
                 let _ = turn.events.send(TuiEvent::ReasoningEnd { seconds }).await;
             }
         }
+        SessionAgentBody::Hold { until, message } => {
+            if let Some(turn) = current.as_mut() {
+                let _ = turn.events.send(TuiEvent::Hold { until, message }).await;
+            }
+        }
         SessionAgentBody::End { outcome } => {
             if let Some(turn) = current.take() {
                 if outcome == RunEnd::Failed && !turn.saw_error {

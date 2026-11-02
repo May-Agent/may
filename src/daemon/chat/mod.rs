@@ -40,6 +40,7 @@ use crate::agent::MayAgent;
 use crate::ask_user;
 use crate::db::RunFence;
 use crate::prompt_mentions;
+use crate::quota;
 use crate::session::{
     AcquireError, CancelReason, ChatHistory, ChatMessage, ChatMessageStats, MayHomePaths,
     MessageRole, PendingMessageState, PendingUserMessage, PersistedAttachment, RunOutcome,
@@ -61,8 +62,9 @@ use super::title_generation;
 use super::types::{
     ApiErrorCode, ApiMessage, ChatRequest, PendingMessageKind, RemovePendingMessageRequest,
     RequestLogEntry, RequestStats, SessionRuntimeResponse, SseChunkEvent, SseDoneEvent,
-    SseErrorEvent, SseSpeedEvent, SseStartEvent, SseTodoUpdateEvent, SseToolDeltaEvent,
-    SseToolEndEvent, SseToolStartEvent, TerminalStateSnapshot, ToolEventRecord, ToolVariant,
+    SseErrorEvent, SseHoldEvent, SseSpeedEvent, SseStartEvent, SseTodoUpdateEvent,
+    SseToolDeltaEvent, SseToolEndEvent, SseToolStartEvent, TerminalStateSnapshot, ToolEventRecord,
+    ToolVariant,
 };
 use crate::decode_meter::DecodeMeter;
 
@@ -153,6 +155,14 @@ trait ChatSink {
         checklist: &crate::todo_parser::TodoChecklist,
     ) -> impl Future<Output = bool> + Send;
     fn on_speed(&mut self, tokens_per_second: f64) -> impl Future<Output = bool> + Send;
+    /// The run parked until an upstream quota reset.
+    fn on_hold(
+        &mut self,
+        _until: jiff::Timestamp,
+        _message: &str,
+    ) -> impl Future<Output = bool> + Send {
+        async { true }
+    }
     fn on_error(
         &mut self,
         code: ApiErrorCode,
@@ -439,6 +449,24 @@ impl ChatSink for HubSink {
         true
     }
 
+    async fn on_hold(&mut self, until: jiff::Timestamp, message: &str) -> bool {
+        let seq = self.next_seq();
+        self.publish_turn(
+            "hold",
+            &SseHoldEvent {
+                seq,
+                turn_id: &self.turn_id,
+                until,
+                message,
+            },
+        );
+        self.publish_agent(crate::client::SessionAgentBody::Hold {
+            until,
+            message: message.to_string(),
+        });
+        true
+    }
+
     async fn on_error(&mut self, code: ApiErrorCode, message: &str, retryable: bool) -> bool {
         let seq = self.next_seq();
         self.publish_turn(
@@ -473,6 +501,51 @@ async fn emit_speed(
     };
     *last_emit = Some(Instant::now());
     sink.on_speed(rate).await
+}
+
+/// Buffer added to a provider-announced quota reset so the retry does not
+/// race the limit's boundary.
+const QUOTA_RESET_GRACE: Duration = Duration::from_secs(2);
+
+/// Race the quota-reset wait against run cancellation.
+///
+/// `Ok` means the reset arrived and the run may retry; `Err(reason)` is
+/// why the run was cancelled while parked.
+async fn wait_quota_reset(
+    guard: &SessionRunGuard,
+    until: jiff::Timestamp,
+) -> Result<(), &'static str> {
+    let wait = until.duration_since(jiff::Timestamp::now()).unsigned_abs() + QUOTA_RESET_GRACE;
+    tokio::select! {
+        biased;
+        cancel = guard.cancellation().recv() => {
+            Err(match cancel {
+                Ok(CancelReason::User) => "run cancelled by user",
+                Ok(CancelReason::DaemonRestarting) => {
+                    "run interrupted: the daemon is restarting"
+                }
+                Err(_) => "run cancellation channel closed unexpectedly",
+            })
+        }
+        () = tokio::time::sleep(wait) => Ok(()),
+    }
+}
+
+/// How a retried attempt picks the turn back up.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RetryKind {
+    /// The user message resubmits; the attempt produced nothing yet.
+    Resubmit,
+    /// The committed transcript continues; the attempt already ran tools.
+    Resume,
+}
+
+/// What a retried attempt waits out before resubmitting.
+enum RetryWait {
+    /// The short backoff between provider failover candidates.
+    Failover,
+    /// The upstream-announced quota reset instant.
+    QuotaReset(jiff::Timestamp),
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -1958,65 +2031,93 @@ fn run_agent_loop<'a>(
             if let Some(err) = terminal_error {
                 let attempt_ran_tools =
                     saw_tool_activity || !terminal_snapshot.executions.is_empty();
-                if err.is_retryable() && attempt < max_retries {
-                    if attempt_ran_tools {
-                        // The model already ran tools: resubmitting the
-                        // prompt would replay them. Commit the partial turn,
-                        // then the next provider continues the transcript
-                        // with `resume` instead.
-                        persist_stopped_terminal_calls(
-                            &mut terminal_snapshot,
-                            &mut turn_persister,
-                        )?;
-                        if !segment_text.trim().is_empty() {
-                            turn_persister.push_assistant(
-                                segment_text.clone(),
-                                segment_emitted_at(segment_at),
-                            );
+                let err_msg = err.to_string();
+                // The model already ran tools: resubmitting the prompt would
+                // replay them, so a `Resume` retry commits the partial turn
+                // and continues the transcript instead. Partial text alone
+                // cannot be retried.
+                let retry_kind = if attempt_ran_tools {
+                    Some(RetryKind::Resume)
+                } else if full_text.trim().is_empty() {
+                    Some(RetryKind::Resubmit)
+                } else {
+                    None
+                };
+                // What a retry waits out first: the next provider's short
+                // failover backoff, or — once no failover remains — the
+                // quota reset the upstream announced.
+                let retry_wait = if err.is_retryable() && attempt < max_retries {
+                    Some(RetryWait::Failover)
+                } else if err.is_retryable()
+                    && state
+                        .config_snapshot()
+                        .preferences
+                        .auto_continue_on_quota_reset
+                {
+                    quota::reset_at(&err_msg, jiff::Timestamp::now()).map(RetryWait::QuotaReset)
+                } else {
+                    None
+                };
+                if let (Some(kind), Some(wait)) = (retry_kind, retry_wait) {
+                    match wait {
+                        RetryWait::Failover => {
+                            tokio::time::sleep(Duration::from_millis(
+                                RETRY_BACKOFF_MS * (attempt as u64 + 1),
+                            ))
+                            .await;
                         }
-                        turn_persister.flush(&state.db()).await?;
-                        tokio::time::sleep(Duration::from_millis(
-                            RETRY_BACKOFF_MS * (attempt as u64 + 1),
-                        ))
-                        .await;
-                        attempt += 1;
-                        continue_from_transcript = true;
-                        continue;
+                        RetryWait::QuotaReset(until) => {
+                            let _ = sink.on_hold(until, &err_msg).await;
+                            if let Err(reason) = wait_quota_reset(guard, until).await {
+                                cancellation_reason = Some(reason);
+                            }
+                        }
                     }
-                    if full_text.trim().is_empty() {
-                        tokio::time::sleep(Duration::from_millis(
-                            RETRY_BACKOFF_MS * (attempt as u64 + 1),
-                        ))
-                        .await;
+                    if cancellation_reason.is_none() {
+                        if kind == RetryKind::Resume {
+                            persist_stopped_terminal_calls(
+                                &mut terminal_snapshot,
+                                &mut turn_persister,
+                            )?;
+                            if !segment_text.trim().is_empty() {
+                                turn_persister.push_assistant(
+                                    segment_text.clone(),
+                                    segment_emitted_at(segment_at),
+                                );
+                            }
+                            turn_persister.flush(&state.db()).await?;
+                            continue_from_transcript = true;
+                        }
                         attempt += 1;
                         continue;
                     }
                 }
 
-                let err_msg = err.to_string();
-                record_request_log(
-                    state,
-                    log_base.failure(elapsed_ms_saturating(&started_at), &err_msg),
-                )
-                .await;
-                let _ = sink
-                    .on_error(ApiErrorCode::InternalError, &err_msg, false)
+                if cancellation_reason.is_none() {
+                    record_request_log(
+                        state,
+                        log_base.failure(elapsed_ms_saturating(&started_at), &err_msg),
+                    )
                     .await;
-                if let Some(entry_id) = req.pending_entry_id {
-                    if err.is_retryable() {
-                        // Out of retries: a later run picks the entry up.
-                        let _ = state
-                            .db()
-                            .release_pending_claim(entry_id, guard.fence())
-                            .await;
-                    } else {
-                        let _ = state
-                            .db()
-                            .fail_pending_claim(entry_id, guard.fence(), &err_msg)
-                            .await;
+                    let _ = sink
+                        .on_error(ApiErrorCode::InternalError, &err_msg, false)
+                        .await;
+                    if let Some(entry_id) = req.pending_entry_id {
+                        if err.is_retryable() {
+                            // Out of retries: a later run picks the entry up.
+                            let _ = state
+                                .db()
+                                .release_pending_claim(entry_id, guard.fence())
+                                .await;
+                        } else {
+                            let _ = state
+                                .db()
+                                .fail_pending_claim(entry_id, guard.fence(), &err_msg)
+                                .await;
+                        }
                     }
+                    return Err(err.into());
                 }
-                return Err(err.into());
             }
 
             if let Some(reason) = cancellation_reason {

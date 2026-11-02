@@ -1090,6 +1090,18 @@ where
                     TuiEvent::ReasoningEnd { seconds } => {
                         app.chat.finish_thinking(seconds);
                     }
+                    TuiEvent::Hold { until, .. } => {
+                        let at = until
+                            .to_zoned(jiff::tz::TimeZone::system())
+                            .strftime("%b %d, %Y %H:%M %Z")
+                            .to_string();
+                        app.chat.push_notice(&format!(
+                            "Usage limit reached — continuing automatically at {at}"
+                        ));
+                        app.set_persistent_status(format!(
+                            "Usage limit — continuing automatically at {at} · esc to cancel"
+                        ));
+                    }
                     TuiEvent::Compacted(result) => match result {
                         Ok(Some(stats)) => {
                             app.set_status(format!(
