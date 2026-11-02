@@ -288,7 +288,7 @@ fn bind_unix(path: &Path) -> anyhow::Result<tokio::net::UnixListener> {
 /// The extra `[daemon] listen` listeners, rebound whenever the config changes.
 struct ExtraListeners {
     local_router: Arc<Router>,
-    remote_router: Arc<Router>,
+    direct_router: Arc<Router>,
     running: HashMap<SocketAddr, tokio::task::JoinHandle<()>>,
 }
 
@@ -307,11 +307,13 @@ impl ExtraListeners {
                 continue;
             }
             // A non-loopback bind is remote access: every request to it must
-            // carry an identity. Loopback extras stay on the local router.
+            // carry an identity, and no source trusts a direct bind yet —
+            // the Tailscale header is only valid through tailscale serve's
+            // own proxy on the remote listener. Loopback extras stay local.
             let router = if addr.ip().is_loopback() {
                 self.local_router.clone()
             } else {
-                self.remote_router.clone()
+                self.direct_router.clone()
             };
             match tokio::net::TcpListener::bind(addr).await {
                 Ok(listener) => {
@@ -343,6 +345,7 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
     let state = started.state;
     let router = Arc::new(started.router);
     let remote_router = Arc::new(started.remote_router);
+    let direct_router = Arc::new(started.direct_router);
 
     let config = state.config_snapshot();
     let tcp = options.tcp.unwrap_or_else(|| {
@@ -374,7 +377,7 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
 
     let mut extra = ExtraListeners {
         local_router: router.clone(),
-        remote_router: remote_router.clone(),
+        direct_router: direct_router.clone(),
         running: HashMap::new(),
     };
     extra.reconcile(&config.daemon.listen).await;
