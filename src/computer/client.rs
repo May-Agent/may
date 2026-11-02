@@ -18,7 +18,9 @@ use super::proto::{AgentRequest, AgentResponse};
 
 /// The daemon-side client for one `computer-agent` child.
 pub struct ComputerAgent {
+    #[cfg(target_os = "macos")]
     socket: PathBuf,
+    #[cfg(target_os = "macos")]
     may_dir: PathBuf,
     #[cfg(target_os = "macos")]
     child: Mutex<Option<std::process::Child>>,
@@ -26,18 +28,19 @@ pub struct ComputerAgent {
 
 impl std::fmt::Debug for ComputerAgent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ComputerAgent")
-            .field("socket", &self.socket)
-            .finish_non_exhaustive()
+        f.debug_struct("ComputerAgent").finish_non_exhaustive()
     }
 }
 
 impl ComputerAgent {
     /// Point the client at `<may_dir>/computer-agent.sock`.
     #[must_use]
+    #[allow(unused_variables)]
     pub fn new(may_dir: PathBuf) -> Self {
         Self {
+            #[cfg(target_os = "macos")]
             socket: may_dir.join("computer-agent.sock"),
+            #[cfg(target_os = "macos")]
             may_dir,
             #[cfg(target_os = "macos")]
             child: Mutex::new(None),
@@ -76,6 +79,7 @@ impl ComputerAgent {
 
     /// Kill the helper so the next request respawns it — used after the
     /// user grants permissions, since TCC applies at process launch.
+    #[allow(clippy::unused_self)]
     pub fn restart(&self) {
         #[cfg(target_os = "macos")]
         {
