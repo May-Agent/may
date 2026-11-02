@@ -514,10 +514,6 @@ impl ChatDb {
         Ok(Some(pending.session_id))
     }
 
-    /// Commit a workspace decision: the pending request `request_id` is
-    /// cleared by its id and the decision joins the history, together.
-    /// Returns the request's session, or `None` when it is not pending.
-    ///
     /// The workspace request still pending under `request_id`, without
     /// committing anything.
     ///
@@ -539,6 +535,10 @@ impl ChatDb {
         Ok(lookup)
     }
 
+    /// Commit a workspace decision: the pending request `request_id` is
+    /// cleared by its id and the decision joins the history, together.
+    /// Returns the committed request, or `None` when it is not pending.
+    ///
     /// # Errors
     /// Returns [`ChatDbError`] on storage failure.
     pub async fn commit_workspace_response(
