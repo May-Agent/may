@@ -33,7 +33,7 @@ pub use common::{
     CreateProfileParams, CreateScheduledTaskParams, MessageStatsParams, NetworkAccessLogParams,
     NetworkAccessMode, NetworkAccessSource, NotificationCallbackConsumeResult,
     ProfileEnvironmentKind, RequestLogParams, SessionContextSnapshotUpsert,
-    StoredSessionContextSnapshot, UpdateProfileParams, UpdateScheduledTaskParams,
+    StoredSessionContextSnapshot, TranscriptEntry, UpdateProfileParams, UpdateScheduledTaskParams,
 };
 pub use context_snapshot::ContextDebugSnapshotWrite;
 pub use issue_search::IssueSearchDoc;
@@ -46,8 +46,8 @@ pub use session_run::RunFence;
 
 use common::{
     AskUserRequestMessageRow, AskUserRequestQuestionOptionRow, AskUserRequestQuestionRow,
-    I64ValueRow, PermissionRequestMessageRow, SqliteTableInfoRow, db_custom_error, overflow_error,
-    row_not_found, storage_error, to_i32, to_i64_from_u64,
+    I64ValueRow, PermissionRequestMessageRow, SnapshotMigrationRow, SqliteTableInfoRow,
+    db_custom_error, overflow_error, row_not_found, storage_error, to_i32, to_i64_from_u64,
 };
 
 macro_rules! query {
@@ -294,13 +294,17 @@ impl ChatDb {
             .execute()
             .await?;
         }
-        if !existing.contains("container_dockerfile") {
-            query!(
-                db,
-                "ALTER TABLE profiles ADD COLUMN container_dockerfile TEXT"
-            )
-            .execute()
-            .await?;
+        // Custom container images were retired with the published workspace
+        // image; every profile now uses it.
+        if existing.contains("container_image") {
+            query!(db, "ALTER TABLE profiles DROP COLUMN container_image")
+                .execute()
+                .await?;
+        }
+        if existing.contains("container_dockerfile") {
+            query!(db, "ALTER TABLE profiles DROP COLUMN container_dockerfile")
+                .execute()
+                .await?;
         }
         Ok(())
     }
@@ -364,16 +368,10 @@ impl ChatDb {
         // The pre-versioning layout: it gains `format_version` defaulting to
         // 1 ("every blob written before versioning existed") so its rows are
         // then invalidated below.
-        const LEGACY_COLUMNS: [&str; 4] = [
-            "session_id",
-            "checkpoint_blob",
-            "last_message_db_id",
-            "updated_at",
-        ];
         const EXPECTED_COLUMNS: [&str; 5] = [
             "session_id",
             "checkpoint_blob",
-            "last_message_db_id",
+            "applied_seq",
             "updated_at",
             "format_version",
         ];
@@ -385,14 +383,85 @@ impl ChatDb {
             .map(|column| column.name.as_str())
             .collect::<Vec<_>>();
 
-        if actual_columns == LEGACY_COLUMNS {
+        let has_message_anchor = actual_columns.contains(&"last_message_db_id");
+        if has_message_anchor {
+            // Pre-#10 layout: keep every snapshot. `applied_seq` and the
+            // transcript entries are recovered from the blobs themselves —
+            // aither assigns item seqs, so they are the anchor's true values.
+            if !actual_columns.contains(&"format_version") {
+                query!(
+                    db,
+                    "ALTER TABLE session_context_snapshots ADD COLUMN format_version INTEGER NOT NULL DEFAULT 1"
+                )
+                .execute()
+                .await?;
+            }
+            let mut tx = db.begin().await?;
             query!(
-                db,
-                "ALTER TABLE session_context_snapshots ADD COLUMN format_version INTEGER NOT NULL DEFAULT 1"
+                tx,
+                "ALTER TABLE session_context_snapshots ADD COLUMN applied_seq INTEGER NOT NULL DEFAULT 0"
             )
             .execute()
             .await?;
-        } else if !actual_columns.is_empty() && actual_columns != EXPECTED_COLUMNS {
+            let rows = query!(
+                tx,
+                "SELECT session_id, checkpoint_blob FROM session_context_snapshots"
+            )
+            .fetch_all::<SnapshotMigrationRow>()
+            .await?;
+            for row in rows {
+                let checkpoint: aither_agent::AgentCheckpoint =
+                    rmp_serde::from_slice(&row.checkpoint_blob).map_err(|e| {
+                        storage_error(format!(
+                            "checkpoint blob for {} undecodable during snapshot migration: {e}",
+                            row.session_id
+                        ))
+                    })?;
+                let applied_seq = checkpoint
+                    .context
+                    .items()
+                    .last()
+                    .map_or(0, |item| i64::try_from(item.seq()).unwrap_or(0));
+                for item in checkpoint.context.items() {
+                    let blob = rmp_serde::to_vec_named(item.message()).map_err(|e| {
+                        storage_error(format!("transcript message encode failed: {e}"))
+                    })?;
+                    let seq = i64::try_from(item.seq())
+                        .map_err(|e| storage_error(format!("transcript seq overflow: {e}")))?;
+                    let committed_at = item.committed_at().to_string();
+                    query!(
+                        tx,
+                        "INSERT OR IGNORE INTO session_transcript_entries (session_id, seq, message_blob, committed_at) VALUES (?, ?, ?, ?)",
+                        row.session_id.as_str(),
+                        seq,
+                        blob,
+                        committed_at
+                    )
+                    .execute()
+                    .await?;
+                }
+                query!(
+                    tx,
+                    "UPDATE session_context_snapshots SET applied_seq = ? WHERE session_id = ?",
+                    applied_seq,
+                    row.session_id.as_str()
+                )
+                .execute()
+                .await?;
+            }
+            query!(
+                tx,
+                "ALTER TABLE session_context_snapshots DROP COLUMN last_message_db_id"
+            )
+            .execute()
+            .await?;
+            tx.commit().await?;
+        }
+        if actual_columns.is_empty() {
+            for statement in db_sql::statements(db_sql::SESSION_CONTEXT_SNAPSHOT_SCHEMA) {
+                query!(db, statement).execute().await?;
+            }
+        } else if !has_message_anchor && actual_columns != EXPECTED_COLUMNS {
             tracing::warn!(
                 columns = ?actual_columns,
                 "session_context_snapshots has an unexpected column layout; dropping and recreating it"
@@ -400,10 +469,9 @@ impl ChatDb {
             query!(db, db_sql::SESSION_CONTEXT_SNAPSHOT_DROP)
                 .execute()
                 .await?;
-        }
-
-        for statement in db_sql::statements(db_sql::SESSION_CONTEXT_SNAPSHOT_SCHEMA) {
-            query!(db, statement).execute().await?;
+            for statement in db_sql::statements(db_sql::SESSION_CONTEXT_SNAPSHOT_SCHEMA) {
+                query!(db, statement).execute().await?;
+            }
         }
 
         // Invalidate every snapshot whose blob was written under a different
@@ -653,7 +721,6 @@ mod tests {
             id: profile_id,
             name: "Test",
             environment: ProfileEnvironmentKind::Local,
-            container_image: None,
             slug: None,
             icon: None,
             persona: None,
@@ -756,7 +823,6 @@ mod tests {
             id: profile_id,
             name: "Test",
             environment: ProfileEnvironmentKind::Local,
-            container_image: None,
             slug: None,
             icon: None,
             persona: None,
@@ -823,7 +889,6 @@ mod tests {
             id: "daily-id",
             name: "Custom Daily",
             environment: ProfileEnvironmentKind::Container,
-            container_image: Some("custom-image"),
             slug: Some("daily"),
             icon: Some("D"),
             persona: None,
@@ -836,7 +901,6 @@ mod tests {
             id: "build-id",
             name: "Custom Build",
             environment: ProfileEnvironmentKind::Local,
-            container_image: Some("still-here"),
             slug: Some("build"),
             icon: Some("B"),
             persona: None,
@@ -880,7 +944,6 @@ mod tests {
         assert_eq!(build.environment, "local");
         assert_eq!(build.icon.as_deref(), Some("B"));
         assert!(build.location_aware);
-        assert!(build.container_image.is_none());
 
         let work = db
             .get_profile_by_slug("work")
@@ -1247,7 +1310,6 @@ mod tests {
                 id: "local-profile",
                 name: "Local",
                 environment: ProfileEnvironmentKind::Local,
-                container_image: None,
                 slug: None,
                 icon: None,
                 persona: None,
@@ -1296,7 +1358,6 @@ mod tests {
                 id: "attach-profile",
                 name: "Attach",
                 environment: ProfileEnvironmentKind::Local,
-                container_image: None,
                 slug: None,
                 icon: None,
                 persona: None,
@@ -1333,7 +1394,7 @@ mod tests {
             let now = jiff::Timestamp::now().to_string();
             super::query!(
                 db.db,
-                "INSERT INTO profiles (id, slug, name, icon, environment, container_image, container_id, persona, remote_ssh_server_id, container_dockerfile, location_aware, pinned_limit, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, 'remote', NULL, NULL, NULL, 'prod', NULL, 0, 10, 99, ?, ?)",
+                "INSERT INTO profiles (id, slug, name, icon, environment, container_id, persona, remote_ssh_server_id, location_aware, pinned_limit, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, 'remote', NULL, NULL, 'prod', 0, 10, 99, ?, ?)",
                 "legacy-remote",
                 Option::<String>::None,
                 "Legacy Remote",

@@ -82,16 +82,27 @@ pub fn handle_launch_grant_key(app: &mut App, code: KeyCode) -> Option<SendActio
         })
     };
     match code {
-        KeyCode::Char('y' | 'Y') | KeyCode::Enter => grant(app, true),
+        KeyCode::Char('y' | 'Y') => grant(app, true),
         KeyCode::Char('n' | 'N') => grant(app, false),
+        KeyCode::Enter => match &app.mode {
+            crate::tui::state::AppMode::LaunchGrant(state) => grant(app, state.selected == 0),
+            _ => None,
+        },
+        KeyCode::Up | KeyCode::Down | KeyCode::Char('k' | 'j') => {
+            if let crate::tui::state::AppMode::LaunchGrant(state) = &mut app.mode {
+                state.selected = (state.selected + 1) % 2;
+            }
+            None
+        }
         // A re-asked gate (opened by `/permission`) cancels on Esc — a
-        // recorded decision must not silently downgrade.
+        // recorded decision must not silently downgrade; on the launch
+        // gate Esc stays, the only way out is answering or quitting.
         KeyCode::Esc => match &app.mode {
             crate::tui::state::AppMode::LaunchGrant(state) if state.redecide => {
                 app.mode = crate::tui::state::AppMode::Chat;
                 None
             }
-            _ => grant(app, false),
+            _ => None,
         },
         _ => None,
     }

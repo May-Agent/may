@@ -103,7 +103,7 @@ async fn answer_oneshot_repo_trust(
     let Some(pending) = may_agent::trust::pending_decision(&app.cwd, &config_path)? else {
         return Ok(());
     };
-    let request = may_agent::trust::question_for(&pending.kind, &pending.worktree);
+    let request = may_agent::trust::question_for(&pending.kind, &pending.worktree, true);
     let questions = request
         .questions
         .iter()
@@ -427,7 +427,11 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
             }
             Event::Agent(TuiEvent::ReasoningEnd { seconds }) => {
                 app.chat.finish_thinking(seconds);
-                writeln!(output.stderr()?, "[thought for {seconds}s]")?;
+                writeln!(
+                    output.stderr()?,
+                    "[thought for {}]",
+                    may_agent::tui::ui::chat::thought_duration_label(seconds)
+                )?;
             }
             Event::Agent(TuiEvent::Complete) => {
                 runtime_deps

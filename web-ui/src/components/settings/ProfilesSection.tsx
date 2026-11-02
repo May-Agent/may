@@ -26,7 +26,7 @@ import {
   type ProfileInfo,
 } from '@/lib/api/profiles';
 import type { ProfileEnvironmentKind } from '@/lib/types';
-import { ENV_ICON, envImageOf, envKindOf } from '@/lib/profile/env';
+import { ENV_ICON, envKindOf } from '@/lib/profile/env';
 import { useConfigStore } from '@/lib/stores/config';
 
 export function ProfilesSection() {
@@ -54,7 +54,6 @@ export function ProfilesSection() {
       mode: 'create',
       name: '',
       environment: 'local',
-      containerImage: '',
       persona: '',
       locationAware: false,
     });
@@ -72,7 +71,6 @@ export function ProfilesSection() {
         await createProfile({
           name: draft.name.trim(),
           environment: draft.environment,
-          containerImage: draft.environment === 'container' ? draft.containerImage.trim() || null : null,
           persona: draft.persona.trim() || null,
           locationAware: draft.locationAware,
         });
@@ -80,7 +78,6 @@ export function ProfilesSection() {
         await updateProfile(draft.id, {
           name: draft.name.trim() || null,
           environment: draft.environment,
-          containerImage: draft.environment === 'container' ? draft.containerImage.trim() || null : null,
           persona: draft.persona.trim() || null,
           locationAware: draft.locationAware,
         });
@@ -123,7 +120,6 @@ export function ProfilesSection() {
       id: p.id,
       name: p.name,
       environment: envKindOf(p.environment),
-      containerImage: envImageOf(p.environment),
       persona: p.persona ?? '',
       locationAware: p.locationAware,
     });
@@ -182,7 +178,7 @@ export function ProfilesSection() {
                         <div className="truncate text-[11px] text-muted-foreground">
                           {kind === 'local' && 'Local · runs on this machine'}
                           {kind === 'container' && (
-                            <>Container · {envImageOf(p.environment) || 'no image set'}</>
+                            <>Container · runs in a container</>
                           )}
                           {p.locationAware && (
                             <>
@@ -234,7 +230,6 @@ type EditState =
       mode: 'create';
       name: string;
       environment: ProfileEnvironmentKind;
-      containerImage: string;
       persona: string;
       locationAware: boolean;
     }
@@ -243,7 +238,6 @@ type EditState =
       id: string;
       name: string;
       environment: ProfileEnvironmentKind;
-      containerImage: string;
       persona: string;
       locationAware: boolean;
     };
@@ -293,18 +287,6 @@ function EditCard({ draft, onChange, onSave, onCancel, busy, inline }: EditCardP
           })}
         />
       </div>
-
-      {draft.environment === 'container' && (
-        <div className="mt-3 space-y-1.5">
-          <Label>{t('settings.profiles_env.containerImage')}</Label>
-          <Input
-            value={draft.containerImage}
-            onChange={(e) => set('containerImage', e.target.value)}
-            placeholder="ubuntu:24.04"
-            className="font-mono"
-          />
-        </div>
-      )}
 
       <div className="mt-4 space-y-1.5">
         <Label>{t('settings.profiles_env.persona')}</Label>
