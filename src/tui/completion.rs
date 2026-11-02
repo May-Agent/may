@@ -37,6 +37,7 @@ pub static SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/effort", "Adjust reasoning effort for this session"),
     ("/sandbox", "Open sandbox folder in Finder"),
     ("/compact", "Compact conversation history"),
+    ("/recap", "Catch-up summary of this session"),
     ("/context", "Show context window usage"),
     ("/usage", "Show session API usage and cost"),
     (

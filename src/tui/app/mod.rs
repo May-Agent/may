@@ -1646,6 +1646,13 @@ impl App {
                     self.chat.push_text(&msg.content);
                     self.chat.end_text();
                 }
+                MessageRole::Recap => {
+                    if let Ok(record) =
+                        serde_json::from_str::<crate::daemon::RecapRecord>(&msg.content)
+                    {
+                        self.chat.push_recap(&record.summary, record.next_action);
+                    }
+                }
                 _ => {}
             }
         }
@@ -3115,6 +3122,7 @@ impl App {
             }
             "/quit" => self.request_quit(),
             "/compact" => Some(SendAction::Compact(None)),
+            "/recap" => Some(SendAction::Recap),
             "/context" => Some(SendAction::ContextReport),
             "/usage" => Some(SendAction::UsageReport),
             "/context dump" => Some(SendAction::ContextDump),
@@ -4093,6 +4101,8 @@ pub enum SendAction {
     Send(PendingMessage),
     /// Persist a pending message for later dispatch.
     EnqueuePending(PendingMessage),
+    /// Ask the daemon for a catch-up recap of the session.
+    Recap,
     /// Show an open question of the session in the answer modal.
     OpenQuestions,
     /// Reload the session's history, which turns this client missed
