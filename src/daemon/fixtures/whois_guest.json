@@ -1,0 +1,26 @@
+{
+  "Node": {
+    "ID": 3969431659199179,
+    "StableID": "nUfW3rEmzX11CNTRL",
+    "Name": "guest-phone.tailnet-example.ts.net.",
+    "User": 5512003187622119,
+    "Key": "nodekey:08bc8fc80a4a9233900ba536866adec8dd377c805aa5bb2d1f92cb592879bc4b",
+    "KeyExpiry": "2027-02-13T22:53:27Z",
+    "Addresses": ["100.64.0.20/32", "fd7a:115c:a1e0::20/128"],
+    "AllowedIPs": ["100.64.0.20/32", "fd7a:115c:a1e0::20/128"],
+    "Hostinfo": {"Hostname": "guest-phone"},
+    "Created": "2026-08-17T22:53:27.665936286Z",
+    "MachineAuthorized": true,
+    "CapMap": {"https://tailscale.com/cap/ssh": []},
+    "ComputedName": "guest-phone",
+    "ComputedNameWithHost": "guest-phone",
+    "StableTailnetID": "T6efZe9r9a11CNTRL"
+  },
+  "UserProfile": {
+    "ID": 5512003187622119,
+    "LoginName": "guest@example.com",
+    "DisplayName": "Guest",
+    "ProfilePicURL": ""
+  },
+  "CapMap": null
+}
