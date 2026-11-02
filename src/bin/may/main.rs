@@ -1526,8 +1526,49 @@ where
                                 context_handle = Some(w.usage_report());
                             }
                         } else {
-                            app.chat
-                                .push_notice("Agent is still starting — try again in a moment");
+                            // The report folds the daemon's request log — no
+                            // agent is needed, so a session without a running
+                            // worker still answers.
+                            let session = app.session_manager.current().map(|session| {
+                                (session.id.clone(), session.persisted, session.created_at)
+                            });
+                            match (runtime_deps.daemon(), session) {
+                                (Some(client), Some((session_id, true, _))) => {
+                                    match client
+                                        .get::<may_agent::agent::SessionUsageReport>(
+                                            &may_agent::client::session_path(
+                                                session_id.as_str(),
+                                                "/usage",
+                                            ),
+                                        )
+                                        .await
+                                    {
+                                        Ok(report) => {
+                                            app.chat.push_usage_report(report);
+                                            app.scroll = usize::MAX;
+                                        }
+                                        Err(error) => {
+                                            app.chat.push_error(&error.to_string());
+                                        }
+                                    }
+                                }
+                                (_, Some((session_id, false, created_at))) => {
+                                    // An ephemeral session has no requests to
+                                    // aggregate; its clock started at creation.
+                                    app.chat.push_usage_report(
+                                        may_agent::agent::assemble_usage_report(
+                                            session_id.as_str(),
+                                            &[],
+                                            Some(created_at.as_millisecond()),
+                                            jiff::Timestamp::now().as_millisecond(),
+                                        ),
+                                    );
+                                    app.scroll = usize::MAX;
+                                }
+                                _ => app
+                                    .chat
+                                    .push_notice("Agent is still starting — try again in a moment"),
+                            }
                         }
                     }
                     Some(SendAction::ContextDump) => {
