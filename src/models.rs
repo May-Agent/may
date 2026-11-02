@@ -31,6 +31,12 @@ pub enum ModelFetchError {
     /// `ChatGPT` auth error.
     #[error("ChatGPT auth error: {0}")]
     ChatgptAuth(#[from] crate::chatgpt::ChatgptAuthError),
+    /// xAI Grok not authenticated.
+    #[error("xAI Grok not authenticated")]
+    GrokNotAuthenticated,
+    /// xAI Grok auth error.
+    #[error("xAI Grok auth error: {0}")]
+    GrokAuth(#[from] crate::grok::GrokAuthError),
 }
 
 /// Fetched model info.
@@ -137,6 +143,13 @@ async fn fetch_models_for_provider(
     let api_key = instance.api_key.as_deref().unwrap_or("");
     let base_url = instance.effective_base_url(id);
 
+    if ptype == ProviderType::Grok {
+        let Some(token) = crate::grok::get_access_token().await? else {
+            return Err(ModelFetchError::GrokNotAuthenticated);
+        };
+        return fetch_openai_compatible_models(id, &token, base_url).await;
+    }
+
     if matches!(
         ptype,
         ProviderType::OpenAI
@@ -199,6 +212,7 @@ async fn fetch_models_for_provider(
         | ProviderType::Together
         | ProviderType::Mistral
         | ProviderType::XAI
+        | ProviderType::Grok
         | ProviderType::Ollama
         | ProviderType::LMStudio
         | ProviderType::Custom => unreachable!("handled above"),
