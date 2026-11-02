@@ -31,7 +31,8 @@ use webrtc::track::track_local::TrackLocal;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
 use super::capture::{CapturedFrame, DisplayCapture};
-use super::input::{self, HeldButton, InputMessage};
+use super::input::{self, InputState};
+use super::proto::InputMessage;
 use super::{DisplayError, PlatformDisplay, SessionDisplay};
 use crate::video::{BgraFrame, EncodedSample, FRAME_QUEUE_CAPACITY, RawFrame, encode_loop};
 
@@ -57,6 +58,7 @@ impl std::fmt::Debug for SessionStream {
 }
 
 struct StreamRuntime {
+    inputs: Arc<std::sync::Mutex<InputState>>,
     // Held, never touched: its Drop stops `CGDisplayStream` and frees
     // the dispatch queue. The frame channel closes with it, which ends
     // the bridge, encoder and writer tasks.
@@ -119,7 +121,11 @@ impl SessionStream {
     /// Returns [`DisplayError`] when codec/interceptor registration or
     /// the display's capture fails.
     #[allow(clippy::significant_drop_tightening)]
-    pub async fn start(&self, display: Arc<PlatformDisplay>) -> Result<(), DisplayError> {
+    pub async fn start(
+        &self,
+        display: Arc<PlatformDisplay>,
+        inputs: Arc<std::sync::Mutex<super::input::InputState>>,
+    ) -> Result<(), DisplayError> {
         let mut guard = self.runtime.lock().await;
         if guard.is_some() {
             return Ok(());
@@ -208,6 +214,7 @@ impl SessionStream {
         });
 
         *guard = Some(StreamRuntime {
+            inputs,
             _capture: capture,
             display,
             takeover_active: self.takeover_active.clone(),
@@ -316,6 +323,7 @@ impl SessionStream {
             &peer,
             runtime.display.clone(),
             runtime.takeover_active.clone(),
+            runtime.inputs.clone(),
         );
 
         let offer = RTCSessionDescription::offer(offer_sdp)
@@ -352,19 +360,17 @@ fn setup_input_channel(
     peer: &Arc<RTCPeerConnection>,
     display: Arc<PlatformDisplay>,
     takeover_active: Arc<AtomicBool>,
+    inputs: Arc<std::sync::Mutex<super::input::InputState>>,
 ) {
     peer.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
         let display = display.clone();
         let takeover_active = takeover_active.clone();
+        let inputs = inputs.clone();
         Box::pin(async move {
-            // Held-button state is per channel and mutates across
-            // messages; `on_message` hands each message a copy, so the
-            // state lives behind a lock the callbacks share.
-            let held = std::sync::Arc::new(std::sync::Mutex::new(Option::<HeldButton>::None));
             dc.on_message(Box::new(move |message: DataChannelMessage| {
                 let display = display.clone();
                 let takeover_active = takeover_active.clone();
-                let held = held.clone();
+                let inputs = inputs.clone();
                 Box::pin(async move {
                     if !takeover_active.load(Ordering::Acquire) {
                         return;
@@ -372,23 +378,10 @@ fn setup_input_channel(
                     let Ok(input) = serde_json::from_slice::<InputMessage>(&message.data) else {
                         return;
                     };
-                    let held_now = {
-                        let mut guard = held
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        if let InputMessage::Mouse(mouse) = &input {
-                            match mouse.event_kind() {
-                                super::input::MousePhase::Pressed => {
-                                    *guard = mouse.held();
-                                }
-                                super::input::MousePhase::Released => *guard = None,
-                                super::input::MousePhase::Moved
-                                | super::input::MousePhase::Wheeled => {}
-                            }
-                        }
-                        *guard
-                    };
-                    if let Err(error) = input::post_input(display.display_id(), input, held_now) {
+                    let mut state = inputs
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if let Err(error) = input::post_input(display.display_id(), input, &mut state) {
                         tracing::debug!(%error, "computer input dropped");
                     }
                 })

@@ -687,8 +687,14 @@ pub(super) async fn delete_session(
     #[cfg(target_os = "macos")]
     #[cfg(target_os = "macos")]
     {
-        state.session_displays.lock().await.release(&id);
-        state.session_streams.lock().await.release(&id);
+        drop(
+            state
+                .computer
+                .request(crate::computer::proto::AgentRequest::ReleaseDisplay {
+                    session_id: id.clone(),
+                })
+                .await,
+        );
     }
     state
         .tool_environments
@@ -729,8 +735,8 @@ pub(super) async fn delete_all_sessions(
     #[cfg(target_os = "macos")]
     #[cfg(target_os = "macos")]
     {
-        state.session_displays.lock().await.clear();
-        state.session_streams.lock().await.clear();
+        // One helper restart tears down every session desktop at once.
+        state.computer.restart();
     }
 
     // Clean up filesystem session directories

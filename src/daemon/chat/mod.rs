@@ -3311,8 +3311,7 @@ fn build_session_agent<'a>(
                     crate::agent::AgentEnvironment::Container { .. }
                 ))
                 .then(|| crate::agent::computer_tool::ComputerHandles {
-                    displays: state.session_displays.clone(),
-                    streams: state.session_streams.clone(),
+                    agent: state.computer.clone(),
                 }),
                 register_skills_broker: Some(brokers.register_skills),
                 environment,

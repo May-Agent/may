@@ -222,6 +222,19 @@ async fn async_main() -> anyhow::Result<()> {
             .await;
         }
         CliMode::Daemon(command) => return run_daemon_command(command).await,
+        CliMode::ComputerAgent(may_dir) => {
+            #[cfg(target_os = "macos")]
+            {
+                return may_agent::computer::agent::serve(&may_dir)
+                    .await
+                    .map_err(anyhow::Error::msg);
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = may_dir;
+                return Err(anyhow::Error::msg("computer-agent needs macOS"));
+            }
+        }
         CliMode::Browser(args) => std::process::exit(run_browser(args).await?),
         CliMode::Exec(args) => std::process::exit(Box::pin(run_exec(args)).await?),
         CliMode::OneShot(args) => return run_oneshot(args).await,

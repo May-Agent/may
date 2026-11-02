@@ -18,6 +18,7 @@ ui = []
 gstreamer = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
 
 [dependencies]
+libc = "0.2.191"
 # Aither framework
 aither-core = { git = "https://github.com/lexoliu/aither", branch = "dev" }
 aither-agent = { git = "https://github.com/lexoliu/aither", branch = "dev", features = ["mcp", "webfetch", "skills"] }
@@ -177,7 +178,6 @@ objc2-foundation = "0.3"
 sha2 = "0.10"
 
 [dev-dependencies]
-libc = "0.2.191"
 serial_test = "3"
 tokio-test = "0.4"
 

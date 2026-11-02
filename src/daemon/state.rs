@@ -423,14 +423,9 @@ pub struct DaemonState {
     /// Sequential lifecycle facts emitted by the browser actor, fanned out
     /// to every active SSE client subscribed to `browser_lifecycle`.
     pub(crate) browser_lifecycle_tx: broadcast::Sender<BrowserLifecycleEvent>,
-    /// Each session's virtual desktop, acquired on demand and released
-    /// with its session — computer use.
-    #[cfg(target_os = "macos")]
-    pub(crate) session_displays: Arc<Mutex<crate::computer::SessionDisplays>>,
-    /// Each session's desktop stream — created with the first start,
-    /// released with its session.
-    #[cfg(target_os = "macos")]
-    pub(crate) session_streams: Arc<Mutex<crate::computer::SessionStreams>>,
+    /// The `computer-agent` helper client — every session's desktop
+    /// (display, stream, input) lives in that respawnable process.
+    pub(crate) computer: Arc<crate::computer::ComputerAgent>,
     pub(crate) remote_access_manager: Arc<super::remote_access::RemoteAccessManager>,
     pub(crate) notification_service: Arc<crate::notification::NotificationService>,
     pub(crate) memory_processor: Option<crate::memory::MemoryProcessor>,
@@ -1083,13 +1078,8 @@ impl DaemonState {
             browser_manager: arc_swap::ArcSwapOption::empty(),
             browser_owner_session_id: arc_swap::ArcSwapOption::empty(),
             browser_lifecycle_tx,
-            #[cfg(target_os = "macos")]
-            session_displays: std::sync::Arc::new(tokio::sync::Mutex::new(
-                crate::computer::SessionDisplays::default(),
-            )),
-            #[cfg(target_os = "macos")]
-            session_streams: std::sync::Arc::new(tokio::sync::Mutex::new(
-                crate::computer::SessionStreams::default(),
+            computer: std::sync::Arc::new(crate::computer::ComputerAgent::new(
+                may_dir.to_path_buf(),
             )),
             remote_access_manager: std::sync::Arc::new(
                 super::remote_access::RemoteAccessManager::new(ui_event_bus.clone()),
