@@ -87,6 +87,7 @@ tracing = "0.1"
 anyhow = "1"
 url = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+getrandom = "0.4"
 
 # Markdown parsing
 # - streamdown-parser: incremental / streaming renderer for assistant output

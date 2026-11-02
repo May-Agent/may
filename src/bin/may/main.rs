@@ -1450,6 +1450,12 @@ where
                     Some(SendAction::StartChatgptAuth) => {
                         run_chatgpt_auth(app, events, terminal).await?;
                     }
+                    Some(SendAction::StartGrokAuth) => {
+                        run_grok_auth(app, events, terminal).await?;
+                    }
+                    Some(SendAction::StartOpenrouterAuth) => {
+                        run_openrouter_auth(app, events, terminal).await?;
+                    }
                     Some(SendAction::SwitchModel(model)) => {
                         let persisted = app
                             .session_manager
@@ -1524,6 +1530,21 @@ where
                         {
                             tracing::warn!("Failed to copy code to clipboard: {}", e);
                         }
+                        if let Err(e) = open::that(&url) {
+                            tracing::warn!("Failed to open URL in browser: {}", e);
+                        }
+                    }
+                    Some(SendAction::OpenGrokAuthUrl { url, code }) => {
+                        if let Ok(mut clipboard) = arboard::Clipboard::new()
+                            && let Err(e) = clipboard.set_text(&code)
+                        {
+                            tracing::warn!("Failed to copy code to clipboard: {}", e);
+                        }
+                        if let Err(e) = open::that(&url) {
+                            tracing::warn!("Failed to open URL in browser: {}", e);
+                        }
+                    }
+                    Some(SendAction::OpenOpenrouterAuthUrl { url }) => {
                         if let Err(e) = open::that(&url) {
                             tracing::warn!("Failed to open URL in browser: {}", e);
                         }
@@ -1932,7 +1953,9 @@ where
                         })
                         .detach();
                     }
-                    None => {}
+                    // SubmitOpenrouterCode is consumed inside
+                    // `run_openrouter_manual`'s own event loop.
+                    Some(SendAction::SubmitOpenrouterCode { .. }) | None => {}
                 }
                 phases.event = ev_start.elapsed();
             }
@@ -2309,6 +2332,336 @@ where
         terminal.draw(|frame| ui::render(frame, app))?;
     }
 
+    Ok(())
+}
+
+/// Run the xAI Grok subscription OAuth flow (device authorization).
+async fn run_grok_auth<B: Backend>(
+    app: &mut App,
+    events: &mut EventHandler,
+    terminal: &mut Terminal<B>,
+) -> anyhow::Result<()>
+where
+    B::Error: Send + Sync + 'static,
+{
+    use may_agent::grok::{self, GrokAuthError};
+
+    app.start_grok_auth();
+    terminal.draw(|frame| ui::render(frame, app))?;
+
+    macro_rules! fail {
+        ($error:expr) => {{
+            app.grok_auth_failed($error);
+            wait_for_auth_dismiss(app, events, terminal, may_agent::tui::AppMode::GrokAuth).await?;
+            return Ok(());
+        }};
+    }
+
+    let endpoint = match grok::token_endpoint().await {
+        Ok(endpoint) => endpoint,
+        Err(e) => fail!(e.to_string()),
+    };
+    let device = match grok::request_device_code().await {
+        Ok(device) => device,
+        Err(e) => fail!(e.to_string()),
+    };
+
+    let url = device
+        .verification_uri_complete
+        .clone()
+        .unwrap_or_else(|| device.verification_uri.clone());
+    app.set_grok_device_code(device.user_code.clone(), url);
+    terminal.draw(|frame| ui::render(frame, app))?;
+
+    let credentials = loop {
+        let deadline = tokio::time::Instant::now() + device.interval;
+
+        loop {
+            let timeout = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if timeout.is_zero() {
+                break;
+            }
+            let event_timeout = timeout.min(std::time::Duration::from_millis(100));
+            match tokio::time::timeout(event_timeout, events.next()).await {
+                Ok(Some(event)) => {
+                    if let Some(action) = app.handle_event(event)? {
+                        match action {
+                            SendAction::Quit => return Ok(()),
+                            SendAction::OpenGrokAuthUrl { url, code } => {
+                                if let Ok(mut clipboard) = arboard::Clipboard::new()
+                                    && let Err(e) = clipboard.set_text(&code)
+                                {
+                                    tracing::warn!("Failed to copy code to clipboard: {e}");
+                                }
+                                if let Err(e) = open::that(&url) {
+                                    tracing::warn!("Failed to open URL in browser: {e}");
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !matches!(app.mode, may_agent::tui::AppMode::GrokAuth) {
+                        return Ok(());
+                    }
+                    terminal.draw(|frame| ui::render(frame, app))?;
+                }
+                Ok(None) => return Ok(()),
+                Err(_) => {}
+            }
+        }
+
+        match grok::poll_device_code(&endpoint, &device.device_code).await {
+            Ok(mut credentials) => {
+                credentials.email = grok::fetch_account_email(&credentials.access_token).await;
+                break credentials;
+            }
+            Err(GrokAuthError::AuthorizationPending) => {
+                terminal.draw(|frame| ui::render(frame, app))?;
+            }
+            Err(e) => fail!(e.to_string()),
+        }
+    };
+
+    if let Err(e) = grok::save_credentials(&credentials).await {
+        fail!(format!("Failed to save credentials: {e}"));
+    }
+    if let Err(e) = app
+        .config
+        .ensure_authenticated_provider("grok", may_agent::config::ProviderType::Grok)
+    {
+        fail!(e.to_string());
+    }
+    app.config_state.load_providers(&app.config);
+    if let Err(e) = app.config.clone().save().await {
+        tracing::error!("Failed to save config: {e}");
+    }
+    app.grok_auth_success();
+    wait_for_auth_dismiss(app, events, terminal, may_agent::tui::AppMode::GrokAuth).await?;
+    Ok(())
+}
+
+/// Run the `OpenRouter` OAuth login flow.
+///
+/// PKCE authorization plus a loopback listener on `localhost:54549`; the
+/// callback code exchanges for a durable `sk-or-` API key stored as the
+/// provider's `api_key`. Over SSH — where the loopback redirect cannot reach
+/// this machine — or when the listener fails to bind, the screen switches to
+/// manual entry: the pasted redirect URL or code goes through the same
+/// exchange, and a pasted `sk-or-` key is validated directly.
+async fn run_openrouter_auth<B: Backend>(
+    app: &mut App,
+    events: &mut EventHandler,
+    terminal: &mut Terminal<B>,
+) -> anyhow::Result<()>
+where
+    B::Error: Send + Sync + 'static,
+{
+    use may_agent::openrouter;
+
+    app.start_openrouter_auth();
+    terminal.draw(|frame| ui::render(frame, app))?;
+
+    let pkce = openrouter::Pkce::generate();
+    let url = pkce.authorize_url();
+
+    let over_ssh =
+        std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some();
+    if over_ssh {
+        app.set_openrouter_manual_entry(url);
+        return run_openrouter_manual(app, events, terminal, pkce).await;
+    }
+
+    app.set_openrouter_auth_url(url.clone());
+    terminal.draw(|frame| ui::render(frame, app))?;
+    if let Err(e) = open::that(&url) {
+        tracing::warn!("Failed to open browser: {e}");
+    }
+
+    let listener = openrouter::listen_for_callback();
+    tokio::pin!(listener);
+
+    let code = loop {
+        tokio::select! {
+            result = &mut listener => match result {
+                Ok(code) => break code,
+                Err(e) => {
+                    tracing::warn!(
+                        "OpenRouter loopback listener failed, switching to manual entry: {e}"
+                    );
+                    app.set_openrouter_manual_entry(url);
+                    return run_openrouter_manual(app, events, terminal, pkce).await;
+                }
+            },
+            event = events.next() => match event {
+                Some(event) => {
+                    if let Some(action) = app.handle_event(event)? {
+                        match action {
+                            SendAction::Quit => return Ok(()),
+                            SendAction::OpenOpenrouterAuthUrl { url } => {
+                                if let Err(e) = open::that(&url) {
+                                    tracing::warn!("Failed to open URL in browser: {e}");
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !matches!(app.mode, may_agent::tui::AppMode::OpenrouterAuth) {
+                        return Ok(());
+                    }
+                    terminal.draw(|frame| ui::render(frame, app))?;
+                }
+                None => return Ok(()),
+            }
+        }
+    };
+
+    finish_openrouter_code(app, events, terminal, &code, pkce.verifier()).await
+}
+
+/// Manual-entry variant of the `OpenRouter` login: wait for the pasted text
+/// and resolve it — `sk-or-` key, callback URL, or bare code.
+async fn run_openrouter_manual<B: Backend>(
+    app: &mut App,
+    events: &mut EventHandler,
+    terminal: &mut Terminal<B>,
+    pkce: may_agent::openrouter::Pkce,
+) -> anyhow::Result<()>
+where
+    B::Error: Send + Sync + 'static,
+{
+    use may_agent::openrouter;
+
+    macro_rules! fail {
+        ($error:expr) => {{
+            app.openrouter_auth_failed($error);
+            wait_for_auth_dismiss(
+                app,
+                events,
+                terminal,
+                may_agent::tui::AppMode::OpenrouterAuth,
+            )
+            .await?;
+            return Ok(());
+        }};
+    }
+
+    terminal.draw(|frame| ui::render(frame, app))?;
+    loop {
+        let Some(event) = events.next().await else {
+            return Ok(());
+        };
+        if let Some(action) = app.handle_event(event)? {
+            match action {
+                SendAction::Quit => return Ok(()),
+                SendAction::OpenOpenrouterAuthUrl { url } => {
+                    if let Err(e) = open::that(&url) {
+                        tracing::warn!("Failed to open URL in browser: {e}");
+                    }
+                }
+                SendAction::SubmitOpenrouterCode { input } => {
+                    let input = input.trim().to_string();
+                    if openrouter::is_api_key(&input) {
+                        if let Err(e) = openrouter::validate_api_key(&input).await {
+                            fail!(e.to_string());
+                        }
+                        return finish_openrouter_key(app, events, terminal, input).await;
+                    }
+                    match openrouter::code_from_pasted(&input) {
+                        Ok(code) => {
+                            return finish_openrouter_code(
+                                app,
+                                events,
+                                terminal,
+                                &code,
+                                pkce.verifier(),
+                            )
+                            .await;
+                        }
+                        Err(e) => fail!(e.to_string()),
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !matches!(app.mode, may_agent::tui::AppMode::OpenrouterAuth) {
+            return Ok(());
+        }
+        terminal.draw(|frame| ui::render(frame, app))?;
+    }
+}
+
+/// Exchange a callback code for the `OpenRouter` API key and persist it.
+async fn finish_openrouter_code<B: Backend>(
+    app: &mut App,
+    events: &mut EventHandler,
+    terminal: &mut Terminal<B>,
+    code: &str,
+    verifier: &str,
+) -> anyhow::Result<()>
+where
+    B::Error: Send + Sync + 'static,
+{
+    match may_agent::openrouter::exchange_code(code, verifier).await {
+        Ok(key) => finish_openrouter_key(app, events, terminal, key).await,
+        Err(e) => {
+            app.openrouter_auth_failed(e.to_string());
+            wait_for_auth_dismiss(
+                app,
+                events,
+                terminal,
+                may_agent::tui::AppMode::OpenrouterAuth,
+            )
+            .await?;
+            Ok(())
+        }
+    }
+}
+
+/// Register the `openrouter` provider with its `sk-or-` API key.
+async fn finish_openrouter_key<B: Backend>(
+    app: &mut App,
+    events: &mut EventHandler,
+    terminal: &mut Terminal<B>,
+    key: String,
+) -> anyhow::Result<()>
+where
+    B::Error: Send + Sync + 'static,
+{
+    macro_rules! fail {
+        ($error:expr) => {{
+            app.openrouter_auth_failed($error);
+            wait_for_auth_dismiss(
+                app,
+                events,
+                terminal,
+                may_agent::tui::AppMode::OpenrouterAuth,
+            )
+            .await?;
+            return Ok(());
+        }};
+    }
+
+    if let Err(e) = app
+        .config
+        .ensure_authenticated_provider("openrouter", may_agent::config::ProviderType::OpenRouter)
+    {
+        fail!(e.to_string());
+    }
+    if let Some(instance) = app.config.provider.get_mut("openrouter") {
+        instance.api_key = Some(key);
+    }
+    app.config_state.load_providers(&app.config);
+    if let Err(e) = app.config.clone().save().await {
+        tracing::error!("Failed to save config: {e}");
+    }
+    app.openrouter_auth_success();
+    wait_for_auth_dismiss(
+        app,
+        events,
+        terminal,
+        may_agent::tui::AppMode::OpenrouterAuth,
+    )
+    .await?;
     Ok(())
 }
 

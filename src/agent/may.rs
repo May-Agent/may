@@ -80,6 +80,9 @@ pub enum MayAgentError {
     /// `ChatGPT` auth error.
     #[error("ChatGPT auth error: {0}")]
     ChatgptAuth(#[from] crate::chatgpt::ChatgptAuthError),
+    /// xAI Grok auth error.
+    #[error("xAI Grok auth error: {0}")]
+    GrokAuth(#[from] crate::grok::GrokAuthError),
     /// Workspace config error.
     #[error("Workspace config error: {0}")]
     Workspace(#[from] crate::workspace::WorkspaceConfigError),
