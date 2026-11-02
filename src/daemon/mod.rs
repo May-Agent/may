@@ -13,6 +13,8 @@ mod artifact_pages;
 mod artifacts;
 mod attachments;
 mod auth;
+#[cfg(test)]
+mod auth_tests;
 mod bootstrap;
 mod browser;
 mod chat;

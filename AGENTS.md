@@ -25,9 +25,9 @@ cargo run --bin may -- daemon stop
 cargo run --bin may -- daemon install    # launchd agent / systemd user unit
 ```
 
-- It listens on the unix socket `~/.may/daemon.sock` (mode 0600, used by the TUI and one-shot runs) and on TCP `127.0.0.1:8787` (`[daemon] port`); `[daemon] listen` adds more addresses, applied live.
+- It listens on the unix socket `~/.may/daemon.sock` (mode 0600, used by the TUI and one-shot runs) and on TCP `127.0.0.1:8787` (`[daemon] port`) — the local listener, trusting the machine's own user. A second remote listener on `127.0.0.1:0` serves the same routes behind an identity layer; `[daemon] listen` adds more addresses applied live, with non-loopback ones routed to the remote listener.
 - `~/.may/daemon.lock` keeps it single-instance. Every client starts it on demand and replaces it when its build id differs from the client's, so after a rebuild the next `cargo run` restarts it.
-- Remote access is `tailscale serve` in front of the loopback listener (`[remote_access]`), never a public listener.
+- Remote access is `tailscale serve` in front of the remote listener (`[remote_access]`), never a public listener: every remote request needs a trusted identity — a listed `Tailscale-User-Login` today — or gets a 401.
 
 ## Fast Web UI + Rust API Iteration Workflow
 
