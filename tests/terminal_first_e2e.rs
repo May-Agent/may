@@ -119,9 +119,11 @@ const FORK_ANSWER: &str = "FORK-ANSWER-OK";
 /// launch that never finishes ends the test with a message instead of hanging.
 const SUBAGENT_PROBE_MAX_REQUESTS: usize = 40;
 
-/// Waits at most eight seconds (the foreground wait is ten) for the launch
-/// job to finish, and prints what it wrote.
-const SUBAGENT_POLL_SCRIPT: &str = "i=0; while [ $i -lt 8 ]; do if [ -f sub.done ]; then echo POLL_DONE; cat sub.out; exit 0; fi; sleep 1; i=$((i+1)); done; echo POLL_PENDING";
+/// Checks whether the launch job finished, and prints what it wrote. The
+/// terminal tool refuses foreground `sleep` polling, so the wait is paced by
+/// the mock's request cadence: each pending answer earns another check.
+const SUBAGENT_POLL_SCRIPT: &str =
+    "if [ -f sub.done ]; then echo POLL_DONE; cat sub.out; else echo POLL_PENDING; fi";
 
 const ASK_USER_SCRIPT: &str =
     "ask_user --question 'Which database?' --option PostgreSQL --option SQLite";
@@ -691,6 +693,7 @@ fn verify_native_tool_surface(request: &Value) -> Result<(), String> {
     names.sort_unstable();
     if names
         != [
+            "monitor",
             "terminal",
             "terminal_input",
             "terminal_kill",
