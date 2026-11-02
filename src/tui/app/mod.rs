@@ -1659,7 +1659,6 @@ impl App {
         self.jobs.clear();
         self.jobs_selected = 0;
         self.session_runtime = crate::client::SessionRuntimeSnapshot::default();
-        self.index_coverage = None;
         self.image_cache.clear();
         self.image_fetching.clear();
         self.image_failed.clear();
