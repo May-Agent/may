@@ -229,9 +229,10 @@ impl Tool for CodeSearchTool {
 mod tests {
     use std::path::PathBuf;
 
+    use askama::Template;
     use repo_search_client::protocol::{Request, WireMode};
 
-    use super::{CodeSearchArgs, request_for};
+    use super::{CodeSearchArgs, Unavailable, request_for};
 
     fn args(cli: serde_json::Value) -> CodeSearchArgs {
         serde_json::from_value(cli).expect("valid arguments")
@@ -256,6 +257,19 @@ mod tests {
         assert_eq!(search.paths, ["src/**"]);
         assert!(search.files_only);
         assert_eq!(search.budget, 4000);
+    }
+
+    #[test]
+    fn unavailable_names_an_internal_error() {
+        let text = Unavailable {
+            reason: "connection refused",
+        }
+        .render()
+        .expect("the template renders");
+        assert_eq!(
+            text,
+            "Code search is unavailable: connection refused\nThis is an internal May error. Report a bug."
+        );
     }
 
     #[test]
