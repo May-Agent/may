@@ -25,6 +25,9 @@ pub enum IdentitySourceKind {
     /// `tailscale serve`'s `Tailscale-User-Login` header on the tailnet
     /// listener — only that proxy may attach it.
     TailscaleServe,
+    /// The peer address of a direct tailnet bind, resolved to a user login
+    /// through tailscaled's `WhoIs`.
+    TailnetWhois,
 }
 
 /// One way a remote request can prove an identity. Sources are tried in
@@ -78,9 +81,9 @@ impl Middleware for RequireIdentity {
 }
 
 /// `Tailscale-User-Login`, accepted only when it is a listed login and the
-/// request did not cross Tailscale Funnel — Funnel's identity is not trusted
-/// without a session. The allow-list swaps out whole so the remote-access
-/// actor can refresh it when settings change or the node owner resolves.
+/// request did not cross Tailscale Funnel, which is never trusted. The
+/// allow-list swaps out whole so the remote-access actor can refresh it when
+/// settings change or the node owner resolves.
 #[derive(Clone)]
 pub struct TailscaleServeIdentitySource {
     /// Swapped whole when the remote-access actor refreshes the allow-list.
@@ -100,10 +103,45 @@ impl TailscaleServeIdentitySource {
     }
 }
 
+impl TailscaleServeIdentitySource {
+    /// The direct-bind source accepting the same live allow-list.
+    pub fn whois_source(&self) -> TailnetWhoisIdentitySource {
+        TailnetWhoisIdentitySource {
+            allowed: self.allowed.clone(),
+        }
+    }
+}
+
+/// The login `tailscale whois` resolved for a connection's peer address,
+/// attached to every request of that connection. Absent when the peer has no
+/// user identity (a tagged node) or the resolution failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TailnetLogin(pub String);
+
+/// The connection's `WhoIs`-resolved login on a direct tailnet bind, accepted
+/// only when it is in the allow-list shared with [`TailscaleServeIdentitySource`].
+#[derive(Clone)]
+pub struct TailnetWhoisIdentitySource {
+    allowed: Arc<arc_swap::ArcSwap<HashSet<String>>>,
+}
+
+impl IdentitySource for TailnetWhoisIdentitySource {
+    fn authenticate(&self, request: &Request) -> Option<Identity> {
+        let TailnetLogin(login) = request.extensions().get::<TailnetLogin>()?;
+        self.allowed
+            .load()
+            .contains(login.as_str())
+            .then(|| Identity {
+                login: login.clone(),
+                source: IdentitySourceKind::TailnetWhois,
+            })
+    }
+}
+
 impl IdentitySource for TailscaleServeIdentitySource {
     fn authenticate(&self, request: &Request) -> Option<Identity> {
-        // Funnel requests must carry a session instead: the funnel header is
-        // what marks them, not the tailnet identity.
+        // Funnel traffic is public and never trusted; the funnel header is what
+        // marks it, not the tailnet identity.
         if request.headers().contains_key("Tailscale-Funnel-Request") {
             return None;
         }

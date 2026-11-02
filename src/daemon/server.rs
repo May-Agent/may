@@ -304,8 +304,7 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
     let _scheduler = scheduler.spawn();
     super::artifacts::spawn_artifact_watcher(&state);
     // The tailscale-serve listener trusts Serve's identity header; a direct
-    // non-loopback bind trusts nothing yet — every request there is a 401
-    // until passkey and tailnet WhoIs register sources for it.
+    // non-loopback bind trusts only the peer's `WhoIs`-resolved login.
     let remote_router = build_router(
         state.clone(),
         mode,
@@ -313,7 +312,16 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
             state.remote_access_manager.tailscale_identity(),
         )]),
     );
-    let direct_router = build_router(state.clone(), mode, Some(Vec::new()));
+    let direct_router = build_router(
+        state.clone(),
+        mode,
+        Some(vec![Box::new(
+            state
+                .remote_access_manager
+                .tailscale_identity()
+                .whois_source(),
+        )]),
+    );
     let router = build_router(state.clone(), mode, None);
     Ok(StartedDaemon {
         state,

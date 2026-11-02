@@ -1,0 +1,38 @@
+{
+  "Node": {
+    "ID": 3969431659199179,
+    "StableID": "nUfW3rEmzX11CNTRL",
+    "Name": "build-server.tailnet-example.ts.net.",
+    "User": 1,
+    "Key": "nodekey:08bc8fc80a4a9233900ba536866adec8dd377c805aa5bb2d1f92cb592879bc4b",
+    "KeyExpiry": "2027-02-13T22:53:27Z",
+    "Addresses": [
+      "100.64.0.10/32",
+      "fd7a:115c:a1e0::10/128"
+    ],
+    "AllowedIPs": [
+      "100.64.0.10/32",
+      "fd7a:115c:a1e0::10/128"
+    ],
+    "Hostinfo": {
+      "Hostname": "owner-laptop"
+    },
+    "Created": "2026-08-17T22:53:27.665936286Z",
+    "MachineAuthorized": true,
+    "CapMap": {
+      "https://tailscale.com/cap/ssh": []
+    },
+    "ComputedName": "owner-laptop",
+    "ComputedNameWithHost": "owner-laptop",
+    "StableTailnetID": "T6efZe9r9a11CNTRL",
+    "Tags": [
+      "tag:server"
+    ]
+  },
+  "UserProfile": {
+    "ID": 1,
+    "LoginName": "tagged-devices",
+    "DisplayName": "Tagged Devices"
+  },
+  "CapMap": null
+}
