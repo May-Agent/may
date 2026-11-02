@@ -2,6 +2,7 @@ import type { ChatRequestPayload, ChatStreamEvent } from '../types';
 import type { SessionBackground } from './background';
 import { ApiError, apiSseUrl } from './client';
 import { parseNamedSseStream, type NamedSseEvent } from '../stream/sse';
+import { markAuthRequired } from '../stores/authGate';
 
 export interface TurnStreamHandle {
   events: AsyncGenerator<ChatStreamEvent, void, void>;
@@ -57,6 +58,7 @@ export async function openSessionTurns(
     signal: controller.signal,
   });
   if (!res.ok) {
+    if (res.status === 401) markAuthRequired();
     throw new ApiError('internal_error', `turn stream failed: ${res.status}`, res.status);
   }
   return {
@@ -101,6 +103,7 @@ export async function sendMessage(payload: ChatRequestPayload): Promise<void> {
     body: JSON.stringify(payload),
   });
   if (!res.ok) {
+    if (res.status === 401) markAuthRequired();
     const message = await res.text().catch(() => '');
     throw new ApiError(
       res.status === 409 ? 'bad_request' : 'internal_error',
@@ -116,7 +119,10 @@ export async function enqueueMessage(payload: ChatRequestPayload): Promise<void>
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
-  if (!res.ok) throw new ApiError('internal_error', 'enqueue failed', res.status);
+  if (!res.ok) {
+    if (res.status === 401) markAuthRequired();
+    throw new ApiError('internal_error', 'enqueue failed', res.status);
+  }
 }
 
 export async function stopSession(sessionId: string): Promise<void> {

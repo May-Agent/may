@@ -12,14 +12,14 @@ use skyzen::{Error, Request, Response, StatusCode};
 
 /// Who a remote request belongs to and which proof brought it in.
 #[derive(Debug, Clone)]
-pub(crate) struct Identity {
-    pub(crate) login: String,
-    pub(crate) source: IdentitySourceKind,
+pub struct Identity {
+    pub login: String,
+    pub source: IdentitySourceKind,
 }
 
 /// The identity proof that accepted a request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum IdentitySourceKind {
+pub enum IdentitySourceKind {
     /// `tailscale serve`'s `Tailscale-User-Login` header on the tailnet
     /// listener — only that proxy may attach it.
     TailscaleServe,
@@ -27,7 +27,7 @@ pub(crate) enum IdentitySourceKind {
 
 /// One way a remote request can prove an identity. Sources are tried in
 /// order; the first to accept wins.
-pub(crate) trait IdentitySource: Send + Sync {
+pub trait IdentitySource: Send + Sync {
     /// The request's identity, or `None` when this source does not trust it.
     fn authenticate(&self, request: &Request) -> Option<Identity>;
 }
@@ -39,12 +39,12 @@ fn unauthorized() -> Error {
 
 /// Rejects remote requests no registered source accepts, and publishes the
 /// accepted [`Identity`] into the request extensions for handlers and logs.
-pub(crate) struct RequireIdentity {
+pub struct RequireIdentity {
     sources: Vec<Box<dyn IdentitySource>>,
 }
 
 impl RequireIdentity {
-    pub(crate) fn new(sources: Vec<Box<dyn IdentitySource>>) -> Self {
+    pub fn new(sources: Vec<Box<dyn IdentitySource>>) -> Self {
         Self { sources }
     }
 }
@@ -57,6 +57,7 @@ impl Middleware for RequireIdentity {
                 let path = request.uri().path().to_owned();
                 tracing::info!(
                     login = %identity.login,
+                    source = ?identity.source,
                     %method,
                     %path,
                     "remote request"
@@ -78,28 +79,23 @@ impl Middleware for RequireIdentity {
 /// without a session. The allow-list swaps out whole so the remote-access
 /// actor can refresh it when settings change or the node owner resolves.
 #[derive(Clone)]
-pub(crate) struct TailscaleServeIdentitySource {
+pub struct TailscaleServeIdentitySource {
     allowed: Arc<RwLock<HashSet<String>>>,
 }
 
 impl TailscaleServeIdentitySource {
-    pub(crate) fn new(allowed: HashSet<String>) -> Self {
+    pub fn new(allowed: HashSet<String>) -> Self {
         Self {
             allowed: Arc::new(RwLock::new(allowed)),
         }
     }
 
     /// Replace the accepted logins (a changed allow-list or a resolved owner).
-    pub(crate) fn set_allowed(&self, allowed: HashSet<String>) {
-        *self.allowed.write().unwrap_or_else(|e| e.into_inner()) = allowed;
-    }
-
-    /// The logins accepted right now, for the settings UI's effective list.
-    pub(crate) fn allowed(&self) -> HashSet<String> {
-        self.allowed
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
+    pub fn set_allowed(&self, allowed: HashSet<String>) {
+        *self
+            .allowed
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = allowed;
     }
 }
 
@@ -118,7 +114,7 @@ impl IdentitySource for TailscaleServeIdentitySource {
             .to_string();
         self.allowed
             .read()
-            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(login.as_str())
             .then_some(Identity {
                 login,

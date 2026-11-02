@@ -94,7 +94,8 @@ impl RemoteAccessManager {
         let (command_tx, command_rx) = mpsc::channel(8);
         let (status_tx, status_rx) = watch::channel(RemoteAccessRuntime::default().status);
         let (local_addr, local_addr_rx) = watch::channel(None);
-        let tailscale_identity = super::auth::TailscaleServeIdentitySource::new(Default::default());
+        let tailscale_identity =
+            super::auth::TailscaleServeIdentitySource::new(std::collections::HashSet::default());
         tokio::spawn(run_remote_access_actor(
             command_rx,
             status_tx,
@@ -436,10 +437,10 @@ async fn refresh_allow_list(
 ) {
     let allowed: std::collections::HashSet<String> = if config.allowed_logins.is_empty() {
         match node_owner_login(&config.tailscale_binary).await {
-            Ok(owner) => [owner].into_iter().collect(),
+            Ok(owner) => std::collections::HashSet::from([owner]),
             Err(error) => {
                 tracing::warn!(%error, "no Tailscale logins accepted: node owner unresolved");
-                Default::default()
+                std::collections::HashSet::default()
             }
         }
     } else {

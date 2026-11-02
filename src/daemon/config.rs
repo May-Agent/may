@@ -876,15 +876,17 @@ mod tests {
         );
 
         let mut cleared = saved.providers.clone();
-        cleared[0].has_api_key = false;
+        cleared[0].api_key = Some(crate::daemon::types::SecretUpdate::Remove);
         let providers = provider_map_from_ui(&config.provider, &cleared);
         assert!(
             providers["openai"].api_key.is_none(),
-            "hasApiKey: false clears the stored key"
+            "a remove clears the stored key"
         );
 
         let mut replaced = saved.providers;
-        replaced[0].api_key = Some("sk-new".to_string());
+        replaced[0].api_key = Some(crate::daemon::types::SecretUpdate::Replace(
+            "sk-new".to_string(),
+        ));
         let providers = provider_map_from_ui(&config.provider, &replaced);
         assert_eq!(
             providers["openai"].api_key.as_deref(),
