@@ -1078,13 +1078,8 @@ impl DaemonState {
             browser_manager: arc_swap::ArcSwapOption::empty(),
             browser_owner_session_id: arc_swap::ArcSwapOption::empty(),
             browser_lifecycle_tx,
-            #[cfg(target_os = "macos")]
-            session_displays: std::sync::Arc::new(tokio::sync::Mutex::new(
-                crate::computer::SessionDisplays::default(),
-            )),
-            #[cfg(target_os = "macos")]
-            session_streams: std::sync::Arc::new(tokio::sync::Mutex::new(
-                crate::computer::SessionStreams::default(),
+            computer: std::sync::Arc::new(crate::computer::ComputerAgent::new(
+                may_dir.to_path_buf(),
             )),
             remote_access_manager: std::sync::Arc::new(
                 super::remote_access::RemoteAccessManager::new(ui_event_bus.clone()),
