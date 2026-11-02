@@ -16,6 +16,18 @@ use crate::db::ChatDb;
 use crate::db::entity::profiles;
 use crate::session::SessionSummary;
 
+/// Slug of the built-in Daily profile: everyday chat on the local machine.
+/// The web UI lands on it by default.
+pub const DAILY_PROFILE_SLUG: &str = "daily";
+
+/// Slug of the built-in Build profile: coding work on the local machine.
+/// The TUI and one-shot runs land on it by default, and a session created
+/// without a profile falls back to it.
+pub const BUILD_PROFILE_SLUG: &str = "build";
+
+/// Slug of the built-in Work profile: work sessions on the local machine.
+pub const WORK_PROFILE_SLUG: &str = "work";
+
 /// User-facing preferences stored on a profile.
 #[derive(
     Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema,
