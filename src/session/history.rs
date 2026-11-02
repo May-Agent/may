@@ -152,6 +152,9 @@ pub enum MessageRole {
     AskUserRequest,
     /// User's answer to an ask-user question.
     AskUserResponse,
+    /// Daemon-generated catch-up summary shown to a returning user; never
+    /// replays into model context.
+    Recap,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,6 +180,7 @@ impl MessageRole {
             Self::WorkspaceResponse => "workspace_response",
             Self::AskUserRequest => "ask_user_request",
             Self::AskUserResponse => "ask_user_response",
+            Self::Recap => "recap",
         }
     }
 
@@ -206,7 +210,8 @@ impl MessageRole {
             | Self::WorkspaceRequest
             | Self::WorkspaceResponse
             | Self::AskUserRequest
-            | Self::AskUserResponse => SessionSummaryUpdate {
+            | Self::AskUserResponse
+            | Self::Recap => SessionSummaryUpdate {
                 touch_updated_at: true,
                 update_preview: false,
                 increment_message_count: false,
@@ -231,6 +236,7 @@ impl core::str::FromStr for MessageRole {
             "workspace_response" => Ok(Self::WorkspaceResponse),
             "ask_user_request" => Ok(Self::AskUserRequest),
             "ask_user_response" => Ok(Self::AskUserResponse),
+            "recap" => Ok(Self::Recap),
             _ => Err(s.to_string()),
         }
     }
@@ -523,7 +529,8 @@ impl ChatHistory {
                     | MessageRole::WorkspaceRequest
                     | MessageRole::WorkspaceResponse
                     | MessageRole::AskUserRequest
-                    | MessageRole::AskUserResponse => None,
+                    | MessageRole::AskUserResponse
+                    | MessageRole::Recap => None,
                 }
             })
             .collect()

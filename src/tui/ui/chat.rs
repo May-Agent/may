@@ -297,6 +297,13 @@ pub enum ChatElement {
         /// Todo items.
         items: Vec<TodoChecklistItem>,
     },
+    /// Daemon-written catch-up card (persisted `recap` history row).
+    Recap {
+        /// The catch-up summary.
+        summary: String,
+        /// The suggested next step, when the recap named one.
+        next_action: Option<String>,
+    },
     /// Error message
     Error {
         /// Error text shown in the stream.
@@ -461,6 +468,14 @@ impl ChatStream {
         self.end_text();
         self.push_element(ChatElement::Notice {
             message: message.to_string(),
+        });
+    }
+
+    /// Add a catch-up recap card.
+    pub fn push_recap(&mut self, summary: &str, next_action: Option<String>) {
+        self.push_element(ChatElement::Recap {
+            summary: summary.to_string(),
+            next_action,
         });
     }
 
@@ -2090,6 +2105,27 @@ pub(super) fn element_lines(
                 Span::styled("◈ ", Style::default().fg(Color::Cyan)),
                 Span::styled(message.clone(), Style::default().fg(Color::DarkGray)),
             ]));
+            lines.push(Line::from(""));
+        }
+
+        ChatElement::Recap {
+            summary,
+            next_action,
+        } => {
+            lines.push(Line::from(vec![
+                Span::styled("◈ ", Style::default().fg(Color::Cyan)),
+                Span::styled("Recap ", Style::default().fg(Color::Cyan)),
+                Span::styled(summary.clone(), Style::default().fg(Color::DarkGray)),
+            ]));
+            if let Some(next_action) = next_action {
+                lines.push(Line::from(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled(
+                        format!("Next: {next_action}"),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+            }
             lines.push(Line::from(""));
         }
 

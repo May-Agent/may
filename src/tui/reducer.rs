@@ -263,6 +263,28 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
                 text.map(|text| crate::tui::app::PromptSuggestion { session_id, text });
             Ok(None)
         }
+        AppEvent::Recap {
+            session_id,
+            state,
+            summary,
+            next_action,
+        } => {
+            if app
+                .session_manager
+                .current()
+                .is_some_and(|session| session.id.as_str() == session_id)
+            {
+                if state == "ready" {
+                    if let Some(summary) = summary {
+                        app.chat.push_recap(&summary, next_action);
+                        app.scroll = usize::MAX;
+                    }
+                } else {
+                    app.chat.push_notice("Recap failed — try again");
+                }
+            }
+            Ok(None)
+        }
         AppEvent::Status(message) => {
             app.set_status(message);
             Ok(None)
