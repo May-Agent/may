@@ -128,6 +128,28 @@ impl SessionRuntimeService {
             .insert(session_id.to_string(), grants);
     }
 
+    /// Drops `session_id`'s grant handle, when its agent is gone.
+    ///
+    /// # Panics
+    /// When the `terminal_grants` lock is poisoned.
+    pub fn forget_terminal_grants(&self, session_id: &str) {
+        self.terminal_grants
+            .lock()
+            .expect("terminal_grants poisoned")
+            .remove(session_id);
+    }
+
+    /// Drops every session's grant handle — sessions were deleted wholesale.
+    ///
+    /// # Panics
+    /// When the `terminal_grants` lock is poisoned.
+    pub fn forget_all_terminal_grants(&self) {
+        self.terminal_grants
+            .lock()
+            .expect("terminal_grants poisoned")
+            .clear();
+    }
+
     /// Record that `agent_id` belongs to `session_id`.
     ///
     /// # Panics
