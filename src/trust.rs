@@ -4,9 +4,10 @@
 //! meeting asks the user once, the answer persists to `[[projects]]` in
 //! `workspace.toml`, and every later session reuses it. Levels:
 //!
-//! - `full` — GitHub PRs and GitHub issues
+//! - `full` — GitHub PRs and GitHub issues; work in a session clone
 //! - `prs_only` — GitHub PRs, may issues; every published text is screened
-//! - `local` — may PR + may issue; nothing leaves the machine
+//! - `local_branch` — may PR + may issue on a session clone
+//! - `local` — write the launch checkout directly (not recommended)
 
 use std::path::Path;
 
@@ -23,7 +24,9 @@ pub enum TrustLevel {
     Full,
     /// GitHub PRs, internal may issues, outbound screen on published text.
     PrsOnly,
-    /// May PR + may issue; the session never publishes.
+    /// May PR + may issue on a session clone; the checkout stays read-only.
+    LocalBranch,
+    /// Write the launch checkout directly (not recommended).
     Local,
 }
 
@@ -34,6 +37,7 @@ impl TrustLevel {
         match value {
             "full" => Some(Self::Full),
             "prs-only" | "prs_only" => Some(Self::PrsOnly),
+            "local-branch" | "local_branch" => Some(Self::LocalBranch),
             "local" => Some(Self::Local),
             _ => None,
         }
@@ -45,15 +49,22 @@ impl TrustLevel {
         match self {
             Self::Full => "full",
             Self::PrsOnly => "prs-only",
+            Self::LocalBranch => "local-branch",
             Self::Local => "local",
         }
+    }
+
+    /// Work lands through a session clone and `pr`, not the launch checkout.
+    #[must_use]
+    pub const fn clones_work(self) -> bool {
+        matches!(self, Self::Full | Self::PrsOnly | Self::LocalBranch)
     }
 }
 
 /// Whether the launch repo is GitHub-backed: decides the option set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RepoKind {
-    /// Has a GitHub remote — the four-option dialog.
+    /// Has a GitHub remote — `full` / `prs-only` / `local-branch` / `local` / exit.
     Github {
         /// `owner/repo` of the GitHub repository.
         owner_repo: String,
@@ -112,9 +123,10 @@ pub fn trust_for(
         crate::issue::repository_identity(&p.path).is_ok_and(|k| k.as_path() == repo_key)
     })?;
     Some(match (project.pr.backend.as_deref(), &project.issues) {
+        (Some("checkout"), _) => TrustLevel::Local,
         (Some("github"), ProjectIssues::Github { .. }) => TrustLevel::Full,
         (Some("github"), ProjectIssues::May) => TrustLevel::PrsOnly,
-        _ => TrustLevel::Local,
+        _ => TrustLevel::LocalBranch,
     })
 }
 
@@ -146,7 +158,8 @@ pub fn persist(
         checks: None,
         pr: ProjectPr {
             backend: match (kind, level) {
-                (Some(RepoKind::Github { .. }), TrustLevel::Local) => Some("may".to_string()),
+                (_, TrustLevel::Local) => Some("checkout".to_string()),
+                (Some(RepoKind::Github { .. }), TrustLevel::LocalBranch) => Some("may".to_string()),
                 (Some(RepoKind::Github { .. }), _) => Some("github".to_string()),
                 _ => None,
             },
@@ -160,6 +173,11 @@ pub fn persist(
     };
     config.projects.retain(|p| p.path != worktree);
     config.projects.push(entry);
+    if level == TrustLevel::Local {
+        config.add_workdir(worktree.to_path_buf(), Some("direct checkout".to_string()));
+    } else {
+        config.remove_workdir(worktree);
+    }
     config.save(config_path)
 }
 
@@ -175,17 +193,18 @@ pub fn question_for(kind: &RepoKind, worktree: &Path) -> PersistedAskUserRequest
                 "full — Allow GitHub PRs and issues".to_string(),
                 "prs-only — GitHub PRs only; issues stay internal, published text is screened"
                     .to_string(),
-                "local — Work only in the local checkout (may PR + may issue)".to_string(),
+                "local-branch — Isolated clone and local PRs; the checkout stays read-only"
+                    .to_string(),
+                "local — Write the checkout directly (not recommended)".to_string(),
                 "exit — Do not bind this repository".to_string(),
             ],
         ),
         RepoKind::Git => (
-            format!(
-                "May works on a private clone of {}. Allow reading and modifying this checkout?",
-                worktree.display()
-            ),
+            format!("How should May work with {}?", worktree.display()),
             vec![
-                "local — Allow".to_string(),
+                "local-branch — Isolated clone and local PRs; the checkout stays read-only"
+                    .to_string(),
+                "local — Write the checkout directly (not recommended)".to_string(),
                 "exit — Do not bind this repository".to_string(),
             ],
         ),
@@ -198,5 +217,111 @@ pub fn question_for(kind: &RepoKind, worktree: &Path) -> PersistedAskUserRequest
             option: options,
             multi_select: false,
         }],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    fn git_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let status = Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(dir.path())
+            .status()
+            .expect("git init");
+        assert!(status.success());
+        dir
+    }
+
+    fn identity(path: &Path) -> std::path::PathBuf {
+        crate::issue::repository_identity(path).expect("identity")
+    }
+
+    #[test]
+    fn persist_round_trip_github_levels() {
+        let repo = git_repo();
+        let worktree = repo.path();
+        let config_path = repo.path().join("workspace.toml");
+        let config = WorkspaceConfig::default();
+        let kind = RepoKind::Github {
+            owner_repo: "acme/app".to_string(),
+        };
+        persist(
+            &config,
+            &config_path,
+            worktree,
+            Some(&kind),
+            TrustLevel::Full,
+        )
+        .expect("full");
+        let loaded = WorkspaceConfig::load(&config_path).expect("load");
+        let key = identity(worktree);
+        assert_eq!(trust_for(&loaded, &key, worktree), Some(TrustLevel::Full));
+
+        persist(
+            &loaded,
+            &config_path,
+            worktree,
+            Some(&kind),
+            TrustLevel::LocalBranch,
+        )
+        .expect("local-branch");
+        let loaded = WorkspaceConfig::load(&config_path).expect("load");
+        assert_eq!(
+            trust_for(&loaded, &key, worktree),
+            Some(TrustLevel::LocalBranch)
+        );
+        assert!(!loaded.has_write_access(worktree));
+
+        persist(
+            &loaded,
+            &config_path,
+            worktree,
+            Some(&kind),
+            TrustLevel::Local,
+        )
+        .expect("local");
+        let loaded = WorkspaceConfig::load(&config_path).expect("load");
+        assert_eq!(trust_for(&loaded, &key, worktree), Some(TrustLevel::Local));
+        assert!(loaded.has_write_access(worktree));
+        assert_eq!(loaded.projects[0].pr.backend.as_deref(), Some("checkout"));
+    }
+
+    #[test]
+    fn legacy_may_backend_is_local_branch() {
+        let repo = git_repo();
+        let mut config = WorkspaceConfig::default();
+        config.projects.push(ProjectConfig {
+            path: repo.path().to_path_buf(),
+            issues: ProjectIssues::May,
+            checks: None,
+            pr: ProjectPr {
+                backend: Some("may".to_string()),
+                ..ProjectPr::default()
+            },
+        });
+        let key = identity(repo.path());
+        assert_eq!(
+            trust_for(&config, &key, repo.path()),
+            Some(TrustLevel::LocalBranch)
+        );
+    }
+
+    #[test]
+    fn parse_aliases() {
+        assert_eq!(
+            TrustLevel::parse("local-branch"),
+            Some(TrustLevel::LocalBranch)
+        );
+        assert_eq!(
+            TrustLevel::parse("local_branch"),
+            Some(TrustLevel::LocalBranch)
+        );
+        assert_eq!(TrustLevel::parse("local"), Some(TrustLevel::Local));
+        assert!(TrustLevel::LocalBranch.clones_work());
+        assert!(!TrustLevel::Local.clones_work());
     }
 }
