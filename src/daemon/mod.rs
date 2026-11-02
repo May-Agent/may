@@ -41,7 +41,9 @@ pub(crate) mod types;
 #[cfg(test)]
 mod response_tests;
 
-pub use chat::{BtwMessage, BtwRequest, BtwResponse, CompactResponse, ContextDumpResponse};
+pub use chat::{
+    BtwMessage, BtwRequest, BtwResponse, CompactResponse, ContextDumpResponse, RecapRecord,
+};
 pub use server::{DEFAULT_PORT, DaemonMode, parse_listen_args};
 pub(crate) use server::{start, sync_remote_access};
 pub use types::DaemonHealth;

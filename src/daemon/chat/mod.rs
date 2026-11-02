@@ -2,6 +2,7 @@ mod aux;
 mod background;
 mod hosts;
 mod hub;
+mod recap;
 mod request_ledger;
 mod suggest;
 pub use aux::AuxTasks;
@@ -15,6 +16,7 @@ pub use hosts::{
     ParkedAgents, btw, compact_session, context_dump, context_report, release_agent, usage_report,
 };
 pub use hub::{TurnFrame, TurnHub};
+pub use recap::{RecapRecord, recap_session};
 mod tool_dispatch;
 mod turn_persister;
 

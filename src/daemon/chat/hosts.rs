@@ -123,7 +123,7 @@ impl ParkedAgents {
     }
 }
 
-fn session_id_param(params: &Params) -> SkyResult<String> {
+pub(super) fn session_id_param(params: &Params) -> SkyResult<String> {
     Ok(params.get("id").map_err(bad_request_error)?.to_string())
 }
 
