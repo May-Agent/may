@@ -632,6 +632,30 @@ pub enum WorkspaceApprovalError {
     Interrupted,
 }
 
+/// Why a workspace response could not be resolved.
+#[derive(Debug, thiserror::Error)]
+pub enum WorkspaceResolveError {
+    /// Storing the decision or reading the session/request failed.
+    #[error("failed to commit workspace response: {0}")]
+    Commit(#[from] crate::db::ChatDbError),
+    /// The committed request's session is gone from the store.
+    #[error("session {0} not found")]
+    SessionMissing(String),
+    /// The approved path does not resolve to a canonical directory.
+    #[error("workspace path {path} cannot be resolved: {source}")]
+    Canonicalize {
+        /// The path the request asked for.
+        path: String,
+        /// Why canonicalization failed.
+        #[source]
+        source: std::io::Error,
+    },
+    /// The grant reached the running terminal but `workspace.toml` rejected
+    /// it — a rebuilt session will not carry it.
+    #[error("workspace grant could not be persisted: {0}")]
+    PersistGrant(#[source] crate::workspace::WorkspaceConfigError),
+}
+
 impl AskUserApprover {
     pub(crate) fn new() -> Self {
         Self {
@@ -853,8 +877,13 @@ impl WorkspaceApprover {
     /// request is not pending.
     ///
     /// # Errors
-    /// Returns [`crate::db::ChatDbError`] when the commit fails; nothing is
-    /// woken then.
+    /// [`WorkspaceResolveError::Commit`] on a storage failure,
+    /// [`WorkspaceResolveError::Canonicalize`] when an approved path does not
+    /// resolve (nothing is committed and nobody is woken then),
+    /// [`WorkspaceResolveError::SessionMissing`] when the committed session
+    /// vanished, and [`WorkspaceResolveError::PersistGrant`] when the
+    /// decision was committed and the run woken but `workspace.toml`
+    /// rejected the grant.
     ///
     /// # Panics
     /// Panics if the approver has no runtime service.
@@ -862,43 +891,72 @@ impl WorkspaceApprover {
         &self,
         request_id: &str,
         approved: bool,
-    ) -> Result<Option<crate::session::ResolvedRequest>, crate::db::ChatDbError> {
+    ) -> Result<Option<crate::session::ResolvedRequest>, WorkspaceResolveError> {
         let runtime = self
             .runtime_service
             .as_ref()
             .expect("resolving a workspace request needs the runtime service");
+        let canonical = if approved {
+            let Some(pending) = runtime.db().pending_workspace(request_id).await? else {
+                return Ok(None);
+            };
+            // Canonicalize before the decision is committed: a path that does
+            // not resolve leaves the request pending for another approval.
+            Some(
+                async_fs::canonicalize(&pending.path)
+                    .await
+                    .map_err(|source| WorkspaceResolveError::Canonicalize {
+                        path: pending.path.clone(),
+                        source,
+                    })?,
+            )
+        } else {
+            None
+        };
         let Some(lookup) = runtime
             .commit_workspace_response(request_id, approved)
             .await?
         else {
             return Ok(None);
         };
-        if approved {
-            let path = std::fs::canonicalize(&lookup.path)
-                .unwrap_or_else(|_| std::path::PathBuf::from(&lookup.path));
-            // Persist first so a rebuilt session keeps the grant, then push
-            // it into the running terminal's grant handle before the run
-            // wakes.
-            let config_path = crate::session::MayHomePaths::new(
+        if let Some(path) = canonical {
+            let session = runtime
+                .db()
+                .get_session(&lookup.session_id)
+                .await?
+                .ok_or_else(|| WorkspaceResolveError::SessionMissing(lookup.session_id.clone()))?;
+            // Persist under the session's profile home so a rebuilt agent
+            // keeps the grant, then push it into the running terminal's
+            // grant handle before the run wakes.
+            let config_path = crate::session::SessionStore::new(crate::session::MayHomePaths::new(
                 self.may_dir
                     .clone()
                     .expect("workspace approval needs the may dir"),
-            )
-            .session_paths(&lookup.session_id)
+            ))
+            .session_paths(&lookup.session_id, session.profile_id.as_deref())
             .workspace_config();
-            let mut workspace =
-                crate::workspace::WorkspaceConfig::load(&config_path).map_err(|e| {
-                    crate::db::ChatDbError::Storage(format!(
-                        "failed to load workspace config for grant: {e}"
-                    ))
-                })?;
-            workspace.add_workdir(path.clone(), Some(lookup.reason.clone()));
-            workspace.save(&config_path).map_err(|e| {
-                crate::db::ChatDbError::Storage(format!("failed to persist workspace grant: {e}"))
-            })?;
+            let reason = lookup.reason.clone();
+            let grant_path = path.clone();
+            let persist = blocking::unblock(
+                move || -> Result<(), crate::workspace::WorkspaceConfigError> {
+                    let mut config = crate::workspace::WorkspaceConfig::load(&config_path)?;
+                    config.add_workdir(grant_path, Some(reason));
+                    config.save(&config_path)
+                },
+            )
+            .await;
             if let Some(grants) = runtime.terminal_grants(&lookup.session_id) {
                 grants.add_writable(path);
             }
+            let session_id = lookup.session_id;
+            let woke = self.live_responses.resolve(request_id, approved);
+            // The decision is already committed as approved and the run
+            // woken: a persist failure still reports so the client knows the
+            // grant will not survive a rebuild.
+            return match persist {
+                Ok(()) => Ok(Some(crate::session::ResolvedRequest { session_id, woke })),
+                Err(error) => Err(WorkspaceResolveError::PersistGrant(error)),
+            };
         }
         let session_id = lookup.session_id;
         let woke = self.live_responses.resolve(request_id, approved);
