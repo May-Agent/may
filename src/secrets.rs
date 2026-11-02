@@ -15,9 +15,6 @@ use serde::{Deserialize, Serialize};
 /// Keychain service secrets are stored under.
 const SERVICE: &str = "dev.may.secrets";
 
-/// File name of the env file written into a session's working directory.
-pub const SECRETS_ENV_FILE: &str = ".may-secrets";
-
 /// Warning shown when a secret is detected in bash-mode input or output.
 pub const SECRET_WARNING: &str = "Secret detected — masked from transcript. Please don't type secrets in bash mode; use /secret KEY VALUE to store them in the keychain.";
 
@@ -281,59 +278,11 @@ fn token_patterns() -> &'static [regex::Regex] {
     })
 }
 
-/// Render `export NAME='<value>'` lines the session shell can source.
-#[must_use]
-pub fn render_env_file(secrets: &Secrets) -> String {
-    let mut content = String::from(
-        "# Provisioned by `may /secret` — source this file to load secrets\n\
-         # as environment variables. Never print its contents.\n",
-    );
-    for (name, value) in secrets.env_pairs() {
-        content.push_str("export ");
-        content.push_str(name);
-        content.push('=');
-        content.push_str(&shell_words::quote(value));
-        content.push('\n');
-    }
-    content
-}
-
-/// Write the secrets env file with owner-only permissions; removes a stale
-/// file when no secrets remain.
-///
-/// # Errors
-///
-/// Returns `std::io::Error` when the file cannot be created or written.
-pub async fn write_env_file(path: &Path, secrets: &Secrets) -> std::io::Result<()> {
-    use std::io::Write;
-
-    if secrets.env_pairs().next().is_none() {
-        return remove_env_file(path).await;
-    }
-    let content = render_env_file(secrets);
-    let path = path.to_path_buf();
-    blocking::unblock(move || {
-        let file = std::fs::File::create(&path)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
-        let mut file = file;
-        file.write_all(content.as_bytes())
-    })
-    .await
-}
-
-/// Remove the env file, ignoring a missing one.
-///
-/// # Errors
-///
-/// Returns `std::io::Error` when the file exists but cannot be removed.
-pub async fn remove_env_file(path: &Path) -> std::io::Result<()> {
-    match async_fs::remove_file(path).await {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        result => result,
+/// Keychain secrets feed the terminal tool's env injection, re-read for
+/// every spawned command so `/secret` takes effect without a rebuild.
+impl aither_sandbox::TerminalEnvSource for SecretStore {
+    fn env(&self) -> Vec<(String, String)> {
+        self.values()
     }
 }
 
@@ -375,19 +324,5 @@ mod tests {
         assert_eq!(masked, "export MY_SECRET=***");
         let (_, hit) = secrets.mask("set name=lexo debug=1");
         assert!(!hit);
-    }
-
-    #[test]
-    fn env_file_renders_escaped_exports() {
-        let secrets = Secrets {
-            entries: vec![
-                ("A".to_string(), "one".to_string()),
-                ("B".to_string(), "two 'quoted'".to_string()),
-            ],
-            extra_values: Vec::new(),
-        };
-        let content = render_env_file(&secrets);
-        assert!(content.contains("export A=one"));
-        assert!(content.contains("export B='two '\\''quoted'\\'''"));
     }
 }
