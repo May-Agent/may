@@ -1227,6 +1227,8 @@ pub struct InputContext<'a> {
     pub cursor: usize,
     /// Pending attachments.
     pub attachments: &'a [Attachment],
+    /// Ghost text suggested for the empty input; `None` hides it.
+    pub suggestion: Option<&'a str>,
 }
 
 /// What the run is doing right now, for the activity line above the
@@ -2546,6 +2548,15 @@ fn render_input_line(
         display[byte_idx.max(usize::from(bash_mode(&display)))..].to_string(),
     ));
 
+    // Ghost text trails the caret of an empty input.
+    if display.is_empty()
+        && let Some(suggestion) = ctx.suggestion
+    {
+        let ghost = format!("{suggestion}  (tab to accept)");
+        line.spans
+            .push(Span::styled(ghost, Style::default().fg(Color::DarkGray)));
+    }
+
     // The bash-mode affordance hugs the input line, below any attachment
     // previews.
     if bash_mode(&display) {
@@ -3777,6 +3788,7 @@ mod tests {
                             input: "draft",
                             cursor: 5,
                             attachments: &[],
+                            suggestion: None,
                         }),
                         input_caret_active: true,
                         queue_ctx: None,
@@ -4274,6 +4286,7 @@ mod tests {
             input: "send it",
             cursor: 7,
             attachments: &attachments,
+            suggestion: None,
         };
         let mut lines: Vec<Line> = Vec::new();
         let mut positions = Vec::new();
@@ -4297,6 +4310,7 @@ mod tests {
             input: "send it",
             cursor: 7,
             attachments: &attachments,
+            suggestion: None,
         };
         let mut lines: Vec<Line> = Vec::new();
         render_input_line(&mut lines, &ctx, 80, false, None);
@@ -4316,6 +4330,7 @@ mod tests {
             input: "!ls -la",
             cursor: 7,
             attachments: &[],
+            suggestion: None,
         };
         let mut lines: Vec<Line> = Vec::new();
         let index = render_input_line(&mut lines, &ctx, 80, false, None);
@@ -4340,6 +4355,7 @@ mod tests {
             input: "/secret KEY hunter2",
             cursor: 19,
             attachments: &[],
+            suggestion: None,
         };
         let mut lines: Vec<Line> = Vec::new();
         render_input_line(&mut lines, &ctx, 80, false, None);
