@@ -2372,10 +2372,7 @@ fn wrapped_line_rows(line: &Line<'_>, width: usize) -> usize {
 }
 
 /// Style of the leading `!` chip while the composer is in bash mode.
-const BANG_STYLE: Style = Style::new()
-    .fg(Color::Black)
-    .bg(Color::Yellow)
-    .add_modifier(Modifier::BOLD);
+const BANG_PROMPT_STYLE: Style = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
 
 /// `true` when the composer input is a bash-mode (`!`) command — the same
 /// gate `submit_bash` uses.
@@ -2420,9 +2417,15 @@ fn composer_display(input: &str) -> Cow<'_, str> {
 /// anchors.
 fn input_caret_line(ctx: &InputContext<'_>) -> Line<'static> {
     let mut spans = Vec::new();
+    let bash = bash_mode(ctx.input);
 
-    // Prompt
-    spans.push(Span::styled("> ", Style::default().fg(Color::Cyan)));
+    // Prompt — `!` occupies the prompt cell in bash mode instead of sitting
+    // inside the text next to `>`.
+    if bash {
+        spans.push(Span::styled("! ", BANG_PROMPT_STYLE));
+    } else {
+        spans.push(Span::styled("> ", Style::default().fg(Color::Cyan)));
+    }
 
     // Render image attachments
     for att in ctx.attachments {
@@ -2458,12 +2461,8 @@ fn input_caret_line(ctx: &InputContext<'_>) -> Line<'static> {
 
     let display = composer_display(ctx.input);
     let byte_idx = char_to_byte_index(&display, ctx.cursor);
-    if bash_mode(&display) && byte_idx > 0 {
-        spans.push(Span::styled("!", BANG_STYLE));
-        spans.push(Span::raw(display[1..byte_idx].to_string()));
-    } else {
-        spans.push(Span::raw(display[..byte_idx].to_string()));
-    }
+    let start = usize::from(bash);
+    spans.push(Span::raw(display[start..byte_idx.max(start)].to_string()));
     spans.push(Span::styled("│", Style::default().fg(Color::Yellow)));
     Line::from(spans)
 }
@@ -2527,12 +2526,9 @@ fn render_input_line(
     line.spans.pop();
     let display = composer_display(ctx.input);
     let byte_idx = char_to_byte_index(&display, ctx.cursor);
-    if bash_mode(&display) && byte_idx == 0 {
-        line.spans.push(Span::styled("!", BANG_STYLE));
-        line.spans.push(Span::raw(display[1..].to_string()));
-    } else {
-        line.spans.push(Span::raw(display[byte_idx..].to_string()));
-    }
+    line.spans.push(Span::raw(
+        display[byte_idx.max(usize::from(bash_mode(&display)))..].to_string(),
+    ));
 
     // The bash-mode affordance hugs the input line, below any attachment
     // previews.
