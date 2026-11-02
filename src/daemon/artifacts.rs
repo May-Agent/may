@@ -1329,6 +1329,9 @@ pub(super) async fn report_artifact_diagnostics(
     .map_err(internal_error)?;
     let hidden_context_xml = crate::XmlBlock::parse(reminder_text).map_err(internal_error)?;
     let pending = crate::session::PendingUserMessage {
+        id: None,
+        state: crate::session::PendingMessageState::default(),
+        error: None,
         content: String::new(),
         attachments: Vec::new(),
         hidden_context_xml: Some(hidden_context_xml),

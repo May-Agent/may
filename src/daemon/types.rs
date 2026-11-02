@@ -909,6 +909,9 @@ pub struct ChatRequest {
     pub(crate) hidden_context_xml: Option<XmlBlock>,
     #[serde(default)]
     pub(crate) delivery_mode: PendingUserMessageMode,
+    /// Queue entry claimed for this run; committed with the user append.
+    #[serde(default)]
+    pub(crate) pending_entry_id: Option<i64>,
 }
 
 /// `POST /api/sessions/{id}/bash` payload.

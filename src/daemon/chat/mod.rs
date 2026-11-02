@@ -42,8 +42,9 @@ use crate::db::RunFence;
 use crate::prompt_mentions;
 use crate::session::{
     AcquireError, CancelReason, ChatHistory, ChatMessage, ChatMessageStats, MayHomePaths,
-    MessageRole, PendingUserMessage, PersistedAttachment, RunOutcome, SessionId, SessionPaths,
-    SessionRunGuard, SessionRuntimeState, SessionStore, TerminalRuntimeState,
+    MessageRole, PendingMessageState, PendingUserMessage, PersistedAttachment, RunOutcome,
+    SessionId, SessionPaths, SessionRunGuard, SessionRuntimeState, SessionStore,
+    TerminalRuntimeState,
 };
 use crate::task_trigger::EVENT_CHAT_TURN_COMPLETED;
 use crate::ui_event_bus::UiEventTopics;
@@ -740,6 +741,9 @@ fn persisted_attachments(
 
 fn pending_user_message_from_request(req: ChatRequest) -> PendingUserMessage {
     PendingUserMessage {
+        id: None,
+        state: PendingMessageState::default(),
+        error: None,
         content: req.content,
         attachments: persisted_attachments(req.attachments),
         hidden_context_xml: req.hidden_context_xml,
@@ -830,7 +834,11 @@ fn spawn_continued_run(state: Arc<DaemonState>, guard: SessionRunGuard) {
 async fn dispatch_follow_ups(state: Arc<DaemonState>, mut guard: SessionRunGuard) {
     let session_id = guard.session_id().to_string();
     loop {
-        let next = match state.runtime_service.take_next_for_run(&session_id).await {
+        let next = match state
+            .runtime_service
+            .take_next_for_run(guard.fence(), &session_id)
+            .await
+        {
             Ok(next) => next,
             Err(error) => {
                 tracing::warn!(session_id = %session_id, error = %error, "failed to load next pending message");
@@ -858,6 +866,7 @@ async fn dispatch_follow_ups(state: Arc<DaemonState>, mut guard: SessionRunGuard
             attachments: api_attachments_from_persisted(next.attachments),
             hidden_context_xml: next.hidden_context_xml,
             delivery_mode: next.delivery_mode,
+            pending_entry_id: next.id,
         };
         if let Err(error) = Box::pin(run_chat_collect_with_receiver(
             state.clone(),
@@ -960,6 +969,9 @@ pub(super) async fn queue_waiting_turn_resume(
     resolution: ResumeResolution,
 ) -> Result<WaitingTurnResume, ScheduleWaitingTurnError> {
     let pending = PendingUserMessage {
+        id: None,
+        state: PendingMessageState::default(),
+        error: None,
         content: String::new(),
         attachments: Vec::new(),
         hidden_context_xml: Some(resume_waiting_turn_reminder(request_kind, resolution)?),
@@ -1015,6 +1027,9 @@ async fn schedule_browser_takeover_resume(
     session_id: &str,
 ) -> Result<crate::session::SessionRuntimeSummary, crate::db::ChatDbError> {
     let pending = PendingUserMessage {
+        id: None,
+        state: PendingMessageState::default(),
+        error: None,
         content: String::new(),
         attachments: Vec::new(),
         hidden_context_xml: None,
@@ -1399,6 +1414,14 @@ fn run_agent_loop<'a>(
                     let _ = sink
                         .on_error(error.api_code(), &error.to_string(), false)
                         .await;
+                    // Preparation never reached the transcript: the claimed
+                    // queue entry goes back to pending for a later run.
+                    if let Some(entry_id) = req.pending_entry_id {
+                        let _ = state
+                            .db()
+                            .release_pending_claim(entry_id, guard.fence())
+                            .await;
+                    }
                     return Err(error.into());
                 }
             };
@@ -1979,6 +2002,20 @@ fn run_agent_loop<'a>(
                 let _ = sink
                     .on_error(ApiErrorCode::InternalError, &err_msg, false)
                     .await;
+                if let Some(entry_id) = req.pending_entry_id {
+                    if err.is_retryable() {
+                        // Out of retries: a later run picks the entry up.
+                        let _ = state
+                            .db()
+                            .release_pending_claim(entry_id, guard.fence())
+                            .await;
+                    } else {
+                        let _ = state
+                            .db()
+                            .fail_pending_claim(entry_id, guard.fence(), &err_msg)
+                            .await;
+                    }
+                }
                 return Err(err.into());
             }
 
@@ -2127,6 +2164,7 @@ pub(super) async fn start_background_turn(
         attachments: Vec::new(),
         hidden_context_xml: None,
         delivery_mode: crate::session::PendingUserMessageMode::default(),
+        pending_entry_id: None,
     };
     tracing::info!(%session_id, events = wake.events.len(), "background commands resume the session");
     if let Err(error) = Box::pin(run_published_turn(
@@ -2761,16 +2799,19 @@ async fn resolve_session_context(
     }
 
     let user_message_id = if persist_user_message && request_has_visible_user_input(req) {
-        let row = db
-            .append_chat_message_as_run(
-                fence,
-                &ChatMessage::user_with_attachments(
-                    req.content.clone(),
-                    persisted_attachments(req.attachments.clone()),
-                ),
-            )
-            .await
-            .map_err(UiChatPreparationError::AppendUserMessage)?;
+        let user_message = ChatMessage::user_with_attachments(
+            req.content.clone(),
+            persisted_attachments(req.attachments.clone()),
+        );
+        // A claimed queue entry commits in the same fenced transaction as
+        // its user message: either both land or neither does.
+        let row = if let Some(entry_id) = req.pending_entry_id {
+            db.append_chat_message_as_run_and_commit_pending(fence, entry_id, &user_message)
+                .await
+        } else {
+            db.append_chat_message_as_run(fence, &user_message).await
+        }
+        .map_err(UiChatPreparationError::AppendUserMessage)?;
         if session.title.is_none() {
             // The prompt row lands first: a client reloading history on the
             // title's `updated_at` drift already sees the message.
@@ -4077,6 +4118,7 @@ mod tests {
             attachments: Vec::new(),
             hidden_context_xml: None,
             delivery_mode: crate::session::PendingUserMessageMode::default(),
+            pending_entry_id: None,
         };
         let guard = state
             .runtime_service
@@ -4161,6 +4203,7 @@ mod tests {
             attachments: Vec::new(),
             hidden_context_xml: None,
             delivery_mode: crate::session::PendingUserMessageMode::default(),
+            pending_entry_id: None,
         };
         let guard = state
             .runtime_service
