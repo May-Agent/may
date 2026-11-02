@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { ChevronDown, Sparkles } from 'lucide-react';
-import { cn } from '@/lib/utils';
+import { cn, formatThoughtDuration } from '@/lib/utils';
 import { useTranslation } from '@/lib/i18n';
 
 interface ReasoningBlockProps {
@@ -30,7 +30,7 @@ export function ReasoningBlock({ text, seconds, streaming }: ReasoningBlockProps
   const label = streaming
     ? `${t('chat.thinking')}…`
     : seconds != null
-      ? t('chat.thoughtFor', { seconds })
+      ? t('chat.thoughtFor', { duration: formatThoughtDuration(seconds) })
       : t('chat.thought');
 
   if (!expandable) {

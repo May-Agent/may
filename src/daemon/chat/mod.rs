@@ -123,7 +123,7 @@ trait ChatSink {
     /// A reasoning phase closed after `seconds`, whether or not it produced
     /// readable text. Emitted just before the first visible output that
     /// follows the phase.
-    fn on_reasoning_end(&mut self, _seconds: u64) -> impl Future<Output = bool> + Send {
+    fn on_reasoning_end(&mut self, _seconds: f64) -> impl Future<Output = bool> + Send {
         async { true }
     }
     fn on_tool_delta(
@@ -249,7 +249,7 @@ impl HubSink {
 struct ReasoningEndEvent<'a> {
     seq: u64,
     turn_id: &'a str,
-    seconds: u64,
+    seconds: f64,
 }
 
 /// The last `session_turn` event of every turn, however it ended.
@@ -334,7 +334,7 @@ impl ChatSink for HubSink {
         true
     }
 
-    async fn on_reasoning_end(&mut self, seconds: u64) -> bool {
+    async fn on_reasoning_end(&mut self, seconds: f64) -> bool {
         let seq = self.next_seq();
         self.publish_turn(
             "reasoning_end",
@@ -1544,7 +1544,7 @@ fn run_agent_loop<'a>(
                             .as_ref()
                             .map_or(true, |(_, event)| closes_reasoning_phase(event))
                         && let Some(started) = reasoning_phase.take()
-                        && !sink.on_reasoning_end(started.elapsed().as_secs()).await
+                        && !sink.on_reasoning_end(started.elapsed().as_secs_f64()).await
                     {
                         cancellation_reason = Some("client disconnected during reasoning end");
                         break;
@@ -1886,7 +1886,7 @@ fn run_agent_loop<'a>(
 
             // A stream that ended mid-phase still reports the reasoning wait.
             if let Some(started) = reasoning_phase.take() {
-                let _ = sink.on_reasoning_end(started.elapsed().as_secs()).await;
+                let _ = sink.on_reasoning_end(started.elapsed().as_secs_f64()).await;
             }
 
             decode_meter.note_boundary();
