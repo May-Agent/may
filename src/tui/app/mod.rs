@@ -209,6 +209,9 @@ pub struct App {
     /// Per-root session file changes shown in the sidebar's Changes
     /// section; refreshed from the diff worker's status outcomes.
     pub file_status: Vec<crate::file_tracker::RootDiff>,
+    /// Clone-based trust (`full` / `prs-only` / `local-branch`) hides the
+    /// Changes section; PRs and issues carry the work instead.
+    pub sidebar_file_changes: bool,
     /// Receiver for clipboard paste resolution (oneshot)
     pub clipboard_rx: Option<Receiver<Result<ClipboardPasteResult, TuiError>>>,
     /// Pending paste results waiting to be handled
@@ -560,6 +563,7 @@ impl App {
             model_select_rx: None,
             file_diffs: None,
             file_status: Vec::new(),
+            sidebar_file_changes: true,
             clipboard_rx: None,
             pending_paste_results: std::collections::VecDeque::new(),
             pending_attachment_jobs: 0,
@@ -636,10 +640,9 @@ impl App {
 
     /// Create or rebuild the file-diff worker for the current session.
     ///
-    /// The worker tracks the launch directory, every writable workspace
-    /// dir and the session's repo clones — the directories the session
-    /// actually works in; the session sandbox's own bookkeeping is never
-    /// tracked. Container-profile sessions are skipped: their writes land
+    /// Clone-based trust tracks session clones only (sidebar hides Changes).
+    /// Direct-checkout trust tracks this worktree and excludes nested git
+    /// worktrees. Container-profile sessions are skipped: their writes land
     /// inside the container where host-side git cannot see them.
     fn ensure_file_diffs(&mut self) {
         // An ephemeral session has no dirs on disk yet; its filebase is
@@ -680,25 +683,34 @@ impl App {
         }
 
         let session_paths = crate::session::SessionPaths::new(session.sandbox_dir.clone());
-        let mut roots = Self::repo_clone_specs(&session.sandbox_dir);
-        match crate::workspace::WorkspaceConfig::load(&session_paths.workspace_config()) {
-            Ok(config) => {
-                // The launch dir needs no root of its own when a grant
-                // already covers it.
-                if !config.has_write_access(&self.cwd) {
-                    roots.push(crate::file_tracker::TrackedRootSpec::new(self.cwd.clone()));
-                }
-                roots.extend(
-                    config
-                        .workdirs
-                        .iter()
-                        .filter(|dir| dir.permission == crate::workspace::Permission::ReadWrite)
-                        .map(|dir| crate::file_tracker::TrackedRootSpec::new(dir.path.clone())),
-                );
+        let config =
+            crate::workspace::WorkspaceConfig::load(&session_paths.workspace_config()).ok();
+        let trust = config.as_ref().and_then(|config| {
+            let worktree = crate::repo_search::worktree_root(&self.cwd)?;
+            let key = crate::issue::repository_identity(&worktree).ok()?;
+            crate::trust::trust_for(config, &key, &worktree)
+        });
+        self.sidebar_file_changes = !trust.is_some_and(crate::trust::TrustLevel::clones_work);
+        let mut roots = Vec::new();
+        if trust.is_some_and(crate::trust::TrustLevel::clones_work) {
+            roots = Self::repo_clone_specs(&session.sandbox_dir);
+        } else if let Some(config) = &config {
+            if !config.has_write_access(&self.cwd) {
+                roots.push(crate::file_tracker::TrackedRootSpec::checkout(
+                    self.cwd.clone(),
+                ));
             }
-            Err(_) => {
-                roots.push(crate::file_tracker::TrackedRootSpec::new(self.cwd.clone()));
-            }
+            roots.extend(
+                config
+                    .workdirs
+                    .iter()
+                    .filter(|dir| dir.permission == crate::workspace::Permission::ReadWrite)
+                    .map(|dir| crate::file_tracker::TrackedRootSpec::checkout(dir.path.clone())),
+            );
+        } else {
+            roots.push(crate::file_tracker::TrackedRootSpec::checkout(
+                self.cwd.clone(),
+            ));
         }
         self.file_status.clear();
         self.file_diffs =
