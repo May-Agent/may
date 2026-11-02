@@ -321,6 +321,7 @@ fn sheet_height(app: &App, column: Rect) -> Option<u16> {
             rows(confirm_body_rows(&state.path.display().to_string(), column.width) + 9),
             pct(70),
         ),
+        AppMode::RepoTrust(state) => (ask_user_rows(&state.ask, column.width), pct(60)),
         AppMode::QuitConfirm(_) => (9, pct(70)),
         AppMode::Chat
         | AppMode::ImageView(_)
@@ -377,6 +378,7 @@ fn render_sheet(frame: &mut Frame, sheet: Rect, app: &App) {
             render_workspace_confirm(frame, sheet, &state.path, &state.reason);
         }
         AppMode::LaunchGrant(state) => render_launch_grant(frame, sheet, state),
+        AppMode::RepoTrust(state) => render_ask_user(frame, sheet, &state.ask),
         AppMode::QuitConfirm(_) => render_quit_confirm(frame, sheet),
         _ => {}
     }
