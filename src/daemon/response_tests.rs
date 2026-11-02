@@ -160,18 +160,28 @@ impl Prompt for Permission {
     }
 }
 
-struct Workspace(WorkspaceApprover);
+struct Workspace {
+    approver: WorkspaceApprover,
+    _may_dir: tempfile::TempDir,
+}
 
 impl Prompt for Workspace {
     const BREAK_HISTORY: &'static str = "CREATE TRIGGER fail_response_history BEFORE INSERT ON message_workspace_responses BEGIN SELECT RAISE(ABORT, 'disk full'); END";
     const RESPONSE_ROLE: &'static str = "workspace_response";
 
     fn new(runtime: &Arc<SessionRuntimeService>) -> Self {
-        Self(WorkspaceApprover::new().with_runtime_service(runtime.clone()))
+        let may_dir = tempfile::tempdir().expect("may dir");
+        std::fs::write(may_dir.path().join("workspace.toml"), "").expect("workspace.toml");
+        Self {
+            approver: WorkspaceApprover::new()
+                .with_runtime_service(runtime.clone())
+                .with_may_dir(may_dir.path().to_path_buf()),
+            _may_dir: may_dir,
+        }
     }
 
     fn wait(&self, runtime: &Arc<SessionRuntimeService>) -> JoinHandle<Woken> {
-        let approver = self.0.clone();
+        let approver = self.approver.clone();
         let runtime = runtime.clone();
         tokio::spawn(async move {
             let accepted = approver
@@ -196,7 +206,7 @@ impl Prompt for Workspace {
     }
 
     async fn respond(&self, id: &str, accept: bool) -> Result<Option<bool>, String> {
-        self.0
+        self.approver
             .resolve(id, accept)
             .await
             .map(|resolved| resolved.map(|resolved| resolved.woke))
@@ -690,4 +700,121 @@ async fn a_resume_of_a_session_without_a_live_run_queues_the_reminder_under_the_
         .finish_idle(crate::session::RunOutcome::Completed)
         .await
         .expect("the resumed run ends");
+}
+
+/// An approved workspace request writes the workdir to `workspace.toml`
+/// and pushes it into the running terminal's grants before the run wakes.
+#[tokio::test]
+async fn an_approved_workspace_request_persists_and_grants_the_dir() {
+    init_executor();
+    let fixture = Fixture::new().await;
+    let may_dir = tempfile::tempdir().expect("may dir");
+    let config_path = may_dir.path().join("workspace.toml");
+    std::fs::write(&config_path, "").expect("workspace.toml");
+    let approved_dir = tempfile::tempdir().expect("approved dir");
+    let grants = aither_sandbox::TerminalGrants::new();
+    fixture
+        .runtime
+        .set_terminal_grants("session", grants.clone());
+
+    let approver = WorkspaceApprover::new()
+        .with_runtime_service(fixture.runtime.clone())
+        .with_may_dir(may_dir.path().to_path_buf());
+    let requested_path = approved_dir.path().display().to_string();
+    let waiter = approver.clone();
+    let waiting = tokio::spawn(async move {
+        waiter
+            .request_and_wait(
+                "session",
+                RequestWorkspaceArgs {
+                    path: requested_path,
+                    reason: "needed for the build".to_string(),
+                },
+            )
+            .await
+    });
+    let request_id = bounded("the request to pend", async {
+        loop {
+            let summary = fixture.runtime.get("session").await.expect("runtime loads");
+            if let Some(request) = summary.waiting_workspace {
+                return request.id;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    let resolved = bounded("the approval", approver.resolve(&request_id, true))
+        .await
+        .expect("resolve")
+        .expect("pending request");
+    assert!(resolved.woke);
+    assert!(waiting.await.expect("waiter finished").expect("accepted"));
+
+    let canonical = std::fs::canonicalize(approved_dir.path()).expect("canonical");
+    assert!(
+        grants.snapshot().writable.contains(&canonical),
+        "the running terminal gained the writable grant"
+    );
+    let stored = std::fs::read_to_string(&config_path).expect("workspace.toml");
+    assert!(
+        stored.contains(&canonical.display().to_string()),
+        "workspace.toml keeps the approved dir: {stored}"
+    );
+}
+
+/// A denied request persists nothing and grants nothing.
+#[tokio::test]
+async fn a_denied_workspace_request_grants_nothing() {
+    init_executor();
+    let fixture = Fixture::new().await;
+    let may_dir = tempfile::tempdir().expect("may dir");
+    let config_path = may_dir.path().join("workspace.toml");
+    std::fs::write(&config_path, "").expect("workspace.toml");
+    let denied_dir = tempfile::tempdir().expect("denied dir");
+    let grants = aither_sandbox::TerminalGrants::new();
+    fixture
+        .runtime
+        .set_terminal_grants("session", grants.clone());
+
+    let approver = WorkspaceApprover::new()
+        .with_runtime_service(fixture.runtime.clone())
+        .with_may_dir(may_dir.path().to_path_buf());
+    let requested_path = denied_dir.path().display().to_string();
+    let waiter = approver.clone();
+    let waiting = tokio::spawn(async move {
+        waiter
+            .request_and_wait(
+                "session",
+                RequestWorkspaceArgs {
+                    path: requested_path,
+                    reason: "wanted in".to_string(),
+                },
+            )
+            .await
+    });
+    let request_id = bounded("the request to pend", async {
+        loop {
+            let summary = fixture.runtime.get("session").await.expect("runtime loads");
+            if let Some(request) = summary.waiting_workspace {
+                return request.id;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    let _ = bounded("the denial", approver.resolve(&request_id, false))
+        .await
+        .expect("resolve")
+        .expect("pending request");
+    let _ = waiting.await.expect("waiter finished");
+
+    assert!(
+        grants.snapshot().writable.is_empty(),
+        "a denial leaves the terminal's grants untouched"
+    );
+    let stored = std::fs::read_to_string(&config_path).expect("workspace.toml");
+    assert!(
+        !stored.contains(&denied_dir.path().display().to_string()),
+        "workspace.toml gains no denied dir"
+    );
 }

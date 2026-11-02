@@ -3326,6 +3326,9 @@ fn build_session_agent<'a>(
         .await
         .map_err(UiChatPreparationError::BuildAgent)?;
         state
+            .runtime_service
+            .set_terminal_grants(ctx.session_id.as_str(), agent.terminal_grants());
+        state
             .session_background
             .add_job_registry(ctx.session_id.as_str(), agent.job_registry());
 

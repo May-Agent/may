@@ -52,6 +52,11 @@ pub struct SessionRuntimeService {
     /// Agent id → owning session, for every agent the daemon has seen:
     /// the address map agent-to-agent messaging routes through.
     agents: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
+    /// Session id → the running terminal's runtime grant handle, installed
+    /// when its agent is built.
+    terminal_grants: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, aither_sandbox::TerminalGrants>>,
+    >,
 }
 
 impl std::fmt::Debug for SessionRuntimeService {
@@ -71,6 +76,9 @@ impl SessionRuntimeService {
             ui_event_bus,
             runs,
             agents: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            terminal_grants: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         }
     }
 
@@ -92,6 +100,32 @@ impl SessionRuntimeService {
     #[must_use]
     pub fn db(&self) -> ChatDb {
         self.db.clone()
+    }
+
+    /// The running terminal's grant handle for `session_id`, when an agent
+    /// currently carries it.
+    ///
+    /// # Panics
+    /// When the `terminal_grants` lock is poisoned.
+    #[must_use]
+    pub fn terminal_grants(&self, session_id: &str) -> Option<aither_sandbox::TerminalGrants> {
+        self.terminal_grants
+            .lock()
+            .expect("terminal_grants poisoned")
+            .get(session_id)
+            .cloned()
+    }
+
+    /// Installs the shared grant handle of the terminal `session_id`'s agent
+    /// just built, so an approved workspace request can reach it at runtime.
+    ///
+    /// # Panics
+    /// When the `terminal_grants` lock is poisoned.
+    pub fn set_terminal_grants(&self, session_id: &str, grants: aither_sandbox::TerminalGrants) {
+        self.terminal_grants
+            .lock()
+            .expect("terminal_grants poisoned")
+            .insert(session_id.to_string(), grants);
     }
 
     /// Record that `agent_id` belongs to `session_id`.
@@ -590,15 +624,15 @@ impl SessionRuntimeService {
         &self,
         request_id: &str,
         approved: bool,
-    ) -> Result<Option<String>, crate::db::ChatDbError> {
-        let session_id = self
+    ) -> Result<Option<crate::db::PendingWorkspaceLookup>, crate::db::ChatDbError> {
+        let committed = self
             .db
             .commit_workspace_response(request_id, approved)
             .await?;
-        if session_id.is_some() {
+        if committed.is_some() {
             self.publish_ui(UiEventTopics::SESSION_RUNTIME | UiEventTopics::SESSION_RUNTIMES);
         }
-        Ok(session_id)
+        Ok(committed)
     }
 
     /// Mark a peer as owning browser input for the session.

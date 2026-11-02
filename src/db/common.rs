@@ -298,8 +298,11 @@ pub struct PendingAskUserLookup {
 }
 
 #[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
+/// The committed workspace request: what the resolve path grants and where.
 pub struct PendingWorkspaceLookup {
     pub(crate) session_id: String,
+    pub(crate) path: String,
+    pub(crate) reason: String,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
