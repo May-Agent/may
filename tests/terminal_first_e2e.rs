@@ -691,6 +691,7 @@ fn verify_native_tool_surface(request: &Value) -> Result<(), String> {
     names.sort_unstable();
     if names
         != [
+            "monitor",
             "terminal",
             "terminal_input",
             "terminal_kill",
