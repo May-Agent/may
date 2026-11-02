@@ -321,21 +321,19 @@ impl ContainerManager {
                 ContainerError::Bootstrap("container image has no architecture".into())
             })?,
         )?;
-        let bundle = self
+        let image = self.tool_distribution.image_tools(&target)?;
+        let staged = self
             .tool_distribution
-            .load(&target, &home_paths.tool_artifacts_dir())
+            .stage_image_tools(
+                &target,
+                &home_paths.tool_artifacts_dir(),
+                &home_paths.tool_runtimes_dir(),
+            )
             .await?;
-        let (tools_mount, host_tools) = bundle
-            .prepare_container_mount(&home_paths.tool_runtimes_dir())
-            .await?;
-        let writable = std::iter::once(&spec.workspace).chain(
-            spec.mounts
-                .iter()
-                .filter(|mount| mount.access == MountAccess::ReadWrite)
-                .map(|mount| &mount.host_path),
-        );
-        host_tools.ensure_readonly(writable).await?;
-        Ok(tools_mount)
+        Ok(aither_sandbox::MountSpec::read_only(
+            &staged,
+            image.container_directory()?,
+        ))
     }
 
     /// Ensures the global memories directory and its index exist, returning
