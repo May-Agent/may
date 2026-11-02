@@ -71,30 +71,60 @@ pub fn handle_repo_trust_key(app: &mut App, code: KeyCode) -> Option<SendAction>
     let AppMode::RepoTrust(state) = &mut app.mode else {
         return None;
     };
-    match handle_key(&mut state.ask, code) {
-        AskUserKey::Stay => None,
-        AskUserKey::Close => {
-            let AppMode::RepoTrust(state) = std::mem::replace(&mut app.mode, AppMode::Chat) else {
-                unreachable!("the key was handled in the repo-trust sheet");
-            };
-            Some(SendAction::RespondRepoTrust {
-                worktree: state.worktree,
-                kind: state.kind,
-                config_path: state.config_path,
-                level: None,
-            })
+    let qi = state.ask.current_question;
+    let count = state.ask.questions[qi].option.len().max(1);
+    match code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            let cursor = &mut state.ask.question_states[qi].cursor;
+            *cursor = (*cursor + count - 1) % count;
+            None
         }
-        AskUserKey::Submit(answers) => {
-            let AppMode::RepoTrust(state) = std::mem::replace(&mut app.mode, AppMode::Chat) else {
-                unreachable!("the key was handled in the repo-trust sheet");
-            };
-            Some(SendAction::RespondRepoTrust {
-                worktree: state.worktree,
-                kind: state.kind,
-                config_path: state.config_path,
-                level: answers.first().and_then(crate::trust::level_for_answer),
-            })
+        KeyCode::Down | KeyCode::Char('j') => {
+            let cursor = &mut state.ask.question_states[qi].cursor;
+            *cursor = (*cursor + 1) % count;
+            None
         }
+        // Esc cancels a `/permission` re-ask; on the launch gate it stays —
+        // the only way out is answering or quitting.
+        KeyCode::Esc => {
+            if state.redecide {
+                let AppMode::RepoTrust(state) = std::mem::replace(&mut app.mode, AppMode::Chat)
+                else {
+                    unreachable!("the key was handled in the repo-trust gate");
+                };
+                Some(SendAction::RespondRepoTrust {
+                    worktree: state.worktree,
+                    kind: state.kind,
+                    config_path: state.config_path,
+                    level: None,
+                })
+            } else {
+                None
+            }
+        }
+        KeyCode::Enter => {
+            let AppMode::RepoTrust(state) = std::mem::replace(&mut app.mode, AppMode::Chat) else {
+                unreachable!("the key was handled in the repo-trust gate");
+            };
+            let qi = state.ask.current_question;
+            let question = &state.ask.questions[qi];
+            let cursor = state.ask.question_states[qi].cursor;
+            let answer = QuestionAnswer {
+                section: question.section.clone(),
+                answer: AnswerValue::Selected(vec![question.option[cursor].clone()]),
+            };
+            match crate::trust::level_for_answer(&answer) {
+                // "exit — Do not bind this repository" quits for real.
+                None => Some(SendAction::Quit),
+                level => Some(SendAction::RespondRepoTrust {
+                    worktree: state.worktree,
+                    kind: state.kind,
+                    config_path: state.config_path,
+                    level,
+                }),
+            }
+        }
+        _ => None,
     }
 }
 
