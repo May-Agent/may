@@ -7,7 +7,7 @@ const UI_EVENT_BUS_CAPACITY: usize = 256;
 
 /// Topics the UI event bus publishes cache/state invalidations on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u16)]
+#[repr(u32)]
 pub enum UiEventTopic {
     /// Server configuration changed.
     Config = 1 << 0,
@@ -41,11 +41,13 @@ pub enum UiEventTopic {
     SessionArtifacts = 1 << 14,
     /// A session's worktree index coverage changed.
     SessionIndex = 1 << 15,
+    /// A session's prompt suggestion state changed.
+    SessionSuggestion = 1 << 16,
 }
 
 impl UiEventTopic {
-    const fn bit(self) -> u16 {
-        self as u16
+    const fn bit(self) -> u32 {
+        self as u32
     }
 
     /// Wire string form used in SSE event kinds and query params.
@@ -68,6 +70,7 @@ impl UiEventTopic {
             Self::SessionBackground => "session_background",
             Self::SessionArtifacts => "session_artifacts",
             Self::SessionIndex => "session_index",
+            Self::SessionSuggestion => "session_suggestion",
         }
     }
 }
@@ -93,6 +96,7 @@ impl FromStr for UiEventTopic {
             "session_background" => Ok(Self::SessionBackground),
             "session_artifacts" => Ok(Self::SessionArtifacts),
             "session_index" => Ok(Self::SessionIndex),
+            "session_suggestion" => Ok(Self::SessionSuggestion),
             _ => Err(UnknownUiEventTopic(value.to_string())),
         }
     }
@@ -100,7 +104,7 @@ impl FromStr for UiEventTopic {
 
 /// Bitmask set of [`UiEventTopic`] values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct UiEventTopics(u16);
+pub struct UiEventTopics(u32);
 
 impl UiEventTopics {
     /// No topics.
@@ -137,6 +141,8 @@ impl UiEventTopics {
     pub const SESSION_ARTIFACTS: Self = Self(UiEventTopic::SessionArtifacts.bit());
     /// `session_index` topic.
     pub const SESSION_INDEX: Self = Self(UiEventTopic::SessionIndex.bit());
+    /// `session_suggestion` topic bit.
+    pub const SESSION_SUGGESTION: Self = Self(UiEventTopic::SessionSuggestion.bit());
     /// Every topic.
     pub const ALL: Self = Self(
         Self::CONFIG.0

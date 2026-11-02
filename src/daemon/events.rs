@@ -103,10 +103,11 @@ pub(super) async fn stream_events(
     let turn_kinds = TurnKinds {
         turn: subscribed_topics.contains(UiEventTopics::SESSION_TURN),
         agent: subscribed_topics.contains(UiEventTopics::SESSION_AGENT),
+        suggestion: subscribed_topics.contains(UiEventTopics::SESSION_SUGGESTION),
     };
     let turns = session_id
         .as_deref()
-        .filter(|_| turn_kinds.turn || turn_kinds.agent)
+        .filter(|_| turn_kinds.turn || turn_kinds.agent || turn_kinds.suggestion)
         .map(|session_id| state.turn_hub.subscribe(session_id, query.after));
     let (turn_replay, mut turn_rx, turn_gap) = match turns {
         Some(subscription) => (
@@ -277,6 +278,7 @@ pub(super) async fn stream_events(
 struct TurnKinds {
     turn: bool,
     agent: bool,
+    suggestion: bool,
 }
 
 impl TurnKinds {
@@ -284,6 +286,7 @@ impl TurnKinds {
         match frame.kind {
             "session_turn" => self.turn,
             "session_agent" => self.agent,
+            "session_suggestion" => self.suggestion,
             _ => false,
         }
     }
