@@ -234,32 +234,37 @@ pub fn persist(
 }
 
 /// The first-contact `ask_user` request for one repository.
+/// `include_exit` appends the quit option — the launch gate offers it,
+/// `/permission`'s re-ask does not.
 #[must_use]
-pub fn question_for(kind: &RepoKind, worktree: &Path) -> PersistedAskUserRequest {
-    let (question, options) = match kind {
-        RepoKind::Github { owner_repo } => (
+pub fn question_for(
+    kind: &RepoKind,
+    worktree: &Path,
+    include_exit: bool,
+) -> PersistedAskUserRequest {
+    let mut options = match kind {
+        RepoKind::Github { .. } => vec![
+            "full — Allow GitHub PRs and issues".to_string(),
+            "prs-only — GitHub PRs only; issues stay internal, published text is screened"
+                .to_string(),
+            "local-branch — Isolated clone and local PRs; the checkout stays read-only".to_string(),
+            "local — Write the checkout directly (not recommended)".to_string(),
+        ],
+        RepoKind::Git => vec![
+            "local-branch — Isolated clone and local PRs; the checkout stays read-only".to_string(),
+            "local — Write the checkout directly (not recommended)".to_string(),
+        ],
+    };
+    if include_exit {
+        options.push("exit — Do not bind this repository".to_string());
+    }
+    let question = match kind {
+        RepoKind::Github { owner_repo } => {
             format!(
                 "May can open pull requests on {owner_repo}. How should it work with this repository?"
-            ),
-            vec![
-                "full — Allow GitHub PRs and issues".to_string(),
-                "prs-only — GitHub PRs only; issues stay internal, published text is screened"
-                    .to_string(),
-                "local-branch — Isolated clone and local PRs; the checkout stays read-only"
-                    .to_string(),
-                "local — Write the checkout directly (not recommended)".to_string(),
-                "exit — Do not bind this repository".to_string(),
-            ],
-        ),
-        RepoKind::Git => (
-            format!("How should May work with {}?", worktree.display()),
-            vec![
-                "local-branch — Isolated clone and local PRs; the checkout stays read-only"
-                    .to_string(),
-                "local — Write the checkout directly (not recommended)".to_string(),
-                "exit — Do not bind this repository".to_string(),
-            ],
-        ),
+            )
+        }
+        RepoKind::Git => format!("How should May work with {}?", worktree.display()),
     };
     PersistedAskUserRequest {
         id: crate::id::new(),
