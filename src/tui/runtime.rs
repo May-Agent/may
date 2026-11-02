@@ -648,6 +648,20 @@ impl RuntimeDeps {
         msg: PendingMessage,
         title_gen: &mut Option<TitleGenContext>,
     ) -> Result<AgentHandle, TuiRuntimeError> {
+        let turn = Self::show_agent_turn(app, msg, title_gen)?;
+        Ok(worker.send(turn))
+    }
+
+    /// Shows `msg` as a turn in progress (user bubble, loading indicator) and
+    /// returns the turn to hand to a worker, which may not exist yet.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] when an attachment cannot be persisted.
+    pub fn show_agent_turn(
+        app: &mut App,
+        msg: PendingMessage,
+        title_gen: &mut Option<TitleGenContext>,
+    ) -> Result<crate::agent::RemoteTurn, TuiRuntimeError> {
         let needs_title = app
             .session_manager
             .current()
@@ -659,17 +673,16 @@ impl RuntimeDeps {
             });
         }
 
-        Self::send_remote_turn(app, worker, msg)
+        Self::display_remote_turn(app, msg)
     }
 
-    /// Hands `msg` to the daemon. The daemon writes the turn's rows; the
-    /// in-memory history records the message now so the chat's history
-    /// positions stay aligned until the turn's end reloads them.
-    fn send_remote_turn(
+    /// Shows `msg` and builds the turn the daemon will run. The daemon writes
+    /// the turn's rows; the in-memory history records the message now so the
+    /// chat's history positions stay aligned until the turn's end reloads them.
+    fn display_remote_turn(
         app: &mut App,
-        worker: &AgentWorker,
         msg: PendingMessage,
-    ) -> Result<AgentHandle, TuiRuntimeError> {
+    ) -> Result<crate::agent::RemoteTurn, TuiRuntimeError> {
         let attachments = msg
             .attachments
             .iter()
@@ -685,11 +698,11 @@ impl RuntimeDeps {
                 attachments.clone(),
             ));
         app.start_processing(&msg);
-        Ok(worker.send(crate::agent::RemoteTurn {
+        Ok(crate::agent::RemoteTurn {
             content: msg.content,
             attachments,
             hidden_context_xml: msg.hidden_context_xml.as_ref().map(ToString::to_string),
-        }))
+        })
     }
 
     /// Settle the app after a run finishes: persist the assistant message, save
@@ -884,17 +897,30 @@ impl RuntimeDeps {
         app: &mut App,
         message: PendingMessage,
     ) -> Result<(), TuiRuntimeError> {
+        // The local queue mirrors the message for display until the daemon
+        // dispatches it, and the next `session_runtime` snapshot makes it
+        // authoritative.
+        app.queue.enqueue(message.clone());
+        self.post_enqueue(app, &message).await
+    }
+
+    /// Posts an already displayed queued message to the daemon, which
+    /// dispatches queued and steering messages itself; the turns they start
+    /// reach this TUI as foreign turns.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] on storage or daemon failure.
+    pub async fn post_enqueue(
+        &self,
+        app: &mut App,
+        message: &PendingMessage,
+    ) -> Result<(), TuiRuntimeError> {
         let session_id = app
             .session_manager
             .current()
             .map(|session| session.id.clone())
             .ok_or(TuiRuntimeError::NoActiveSession)?;
         if let Some(client) = &self.daemon {
-            // The daemon dispatches queued and steering messages itself;
-            // the turns they start reach this TUI as foreign turns. The
-            // local queue mirrors the message for display until then, and
-            // the next `session_runtime` snapshot makes it authoritative.
-            app.queue.enqueue(message.clone());
             let body = serde_json::json!({
                 "sessionId": session_id.as_str(),
                 "content": message.content,

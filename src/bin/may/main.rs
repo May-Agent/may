@@ -662,6 +662,15 @@ struct WorkerBuild {
     build: may_agent::tui::runtime::PendingWorkerBuild,
 }
 
+/// The first turn of a session whose worker is still being built: already
+/// shown, handed to the worker once it exists (`turn` is then `None`).
+/// Messages sent meanwhile stay in the local queue and reach the daemon only
+/// once the turn has started there, so none of them runs ahead of it.
+struct HeldTurn {
+    turn: Option<may_agent::agent::RemoteTurn>,
+    behind: Vec<may_agent::tui::queue::PendingMessage>,
+}
+
 fn report_startup_failure(app: &mut may_agent::tui::App, error: &impl std::fmt::Display) {
     tracing::warn!("Initial session start failed: {}", error);
     app.mode = may_agent::tui::AppMode::Chat;
@@ -746,6 +755,7 @@ where
 
     // For title generation
     let mut pending_title_gen: Option<TitleGenContext> = None;
+    let mut held_turn: Option<HeldTurn> = None;
     // The busy status shows once per episode of another run holding the session.
     let mut busy_elsewhere_notified = false;
     let mut assistant_response = AssistantReply::default();
@@ -1047,6 +1057,12 @@ where
                     .take()
                     .expect("a built worker comes from the pending worker build");
                 finish_worker_build(app, worker, finished, *built).await?;
+                if let Some(w) = worker.as_ref()
+                    && let Some(turn) = held_turn.as_mut().and_then(|held| held.turn.take())
+                {
+                    agent_handle = Some(w.send(turn));
+                    assistant_response.clear();
+                }
             }
 
             Event::ForeignTurn(turn) => {
@@ -1080,6 +1096,13 @@ where
             }
 
             Event::Agent(tui_event) => {
+                // The handed-over turn has started in the daemon: what was
+                // sent behind it now queues after it.
+                if let Some(held) = held_turn.take_if(|held| held.turn.is_none()) {
+                    for message in &held.behind {
+                        runtime_deps.post_enqueue(app, message).await?;
+                    }
+                }
                 match tui_event {
                     TuiEvent::Agent(result) => {
                         // Capture text for title generation
@@ -1304,9 +1327,11 @@ where
                         break;
                     }
                     Some(SendAction::NewSession) => {
+                        held_turn = None;
                         runtime_deps.begin_new_session(app, worker).await?;
                     }
                     Some(SendAction::LoadSession(id)) => {
+                        held_turn = None;
                         worker_build = Some(WorkerBuild {
                             purpose: WorkerBuildPurpose::Session,
                             build: runtime_deps.begin_load_session(app, worker, &id).await?,
@@ -1355,7 +1380,16 @@ where
                                 build,
                             });
                         }
-                        if agent_handle.is_none()
+                        if agent_handle.is_none() && worker.is_none() && worker_build.is_some() {
+                            // The worker is still being built: show the turn
+                            // now and send it as soon as the worker exists.
+                            let turn =
+                                RuntimeDeps::show_agent_turn(app, msg, &mut pending_title_gen)?;
+                            held_turn = Some(HeldTurn {
+                                turn: Some(turn),
+                                behind: Vec::new(),
+                            });
+                        } else if agent_handle.is_none()
                             && let Some(w) = worker.as_ref()
                         {
                             if runtime_deps.begin_run(app)? {
@@ -1386,7 +1420,12 @@ where
                                 build,
                             });
                         }
-                        runtime_deps.enqueue_pending_message(app, msg).await?;
+                        if let Some(held) = held_turn.as_mut() {
+                            app.queue.enqueue(msg.clone());
+                            held.behind.push(msg);
+                        } else {
+                            runtime_deps.enqueue_pending_message(app, msg).await?;
+                        }
                     }
                     Some(SendAction::RespondAskUser {
                         request_id,
