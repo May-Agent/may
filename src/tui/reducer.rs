@@ -27,8 +27,10 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             // Sweep a transient status notice whose deadline passed; the tick
             // cadence bounds how long an expired notice can linger.
             StatusNotice::clear_expired(&mut app.status, std::time::Instant::now());
-            if app.processing {
+            if app.processing || app.index_loading {
                 app.spinner_frame = app.spinner_frame.wrapping_add(1);
+            }
+            if app.processing {
                 if let Some(start) = app.thinking_start {
                     app.chat.update_thinking(start.elapsed().as_secs_f64());
                 }
@@ -245,6 +247,7 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             Ok(None)
         }
         AppEvent::IndexCoverage(snapshot) => {
+            app.index_loading = false;
             app.index_failed = snapshot.error.is_some();
             if snapshot.error.is_none() {
                 app.index_coverage = snapshot.index;
