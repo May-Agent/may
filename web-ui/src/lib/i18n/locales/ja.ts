@@ -154,6 +154,7 @@ export const ja: Messages = {
     tasksEmpty: 'タスクはまだありません',
     contextUsage: '{total} トークンのうち {used}% を使用',
     decodeSpeed: '{rate} tok/s',
+    quotaHold: '利用量の上限に達しました — {at} に自動的に再開します',
     configGuard: {
       title: 'プロバイダが有効化されていません',
       body: '設定でプロバイダを有効化するとチャットを開始できます。',

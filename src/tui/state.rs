@@ -611,15 +611,16 @@ fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
-/// A status-line notice. Notices are transient: they clear once the
-/// deadline passes or the user presses a key — nothing stays on screen
-/// indefinitely.
+/// A status-line notice. Transient notices carry a deadline and clear once
+/// it passes; a persistent notice is live state (a quota-reset wait) and
+/// stays until its owner clears it.
 #[derive(Debug, Clone)]
 pub struct StatusNotice {
     /// Text shown in the status line.
     pub text: String,
-    /// Deadline after which the notice clears.
-    pub expires_at: std::time::Instant,
+    /// Deadline after which the notice clears; `None` marks a persistent
+    /// notice.
+    pub expires_at: Option<std::time::Instant>,
 }
 
 impl StatusNotice {
@@ -627,14 +628,30 @@ impl StatusNotice {
     pub fn transient(text: impl Into<String>, lifetime: std::time::Duration) -> Self {
         Self {
             text: text.into(),
-            expires_at: std::time::Instant::now() + lifetime,
+            expires_at: Some(std::time::Instant::now() + lifetime),
         }
     }
 
-    /// Whether the notice's deadline passed at `now`.
+    /// A notice that stays until cleared explicitly — live state, not a
+    /// flash; only owners that know why it exists may set it.
+    pub fn persistent(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            expires_at: None,
+        }
+    }
+
+    /// Whether the notice survives until cleared explicitly.
+    #[must_use]
+    pub const fn is_persistent(&self) -> bool {
+        self.expires_at.is_none()
+    }
+
+    /// Whether the notice's deadline passed at `now`. Persistent notices
+    /// never expire.
     #[must_use]
     pub fn expired(&self, now: std::time::Instant) -> bool {
-        now >= self.expires_at
+        self.expires_at.is_some_and(|deadline| now >= deadline)
     }
 
     /// Drop the notice in `slot` once its deadline has passed. Event-loop
@@ -995,9 +1012,7 @@ mod tests {
     }
 
     #[test]
-    fn every_notice_expires() {
-        // There is no persistent variant: a notice always carries a
-        // deadline and the sweep drops it once it passes.
+    fn every_transient_notice_expires() {
         let mut status = Some(StatusNotice::transient(
             "^C Press Ctrl+C again to exit",
             Duration::from_secs(2),
@@ -1005,5 +1020,15 @@ mod tests {
 
         StatusNotice::clear_expired(&mut status, Instant::now() + Duration::from_secs(3600));
         assert!(status.is_none());
+    }
+
+    #[test]
+    fn persistent_notice_survives_the_sweep() {
+        let mut status = Some(StatusNotice::persistent(
+            "Usage limit reached — continuing automatically at 2am",
+        ));
+
+        StatusNotice::clear_expired(&mut status, Instant::now() + Duration::from_secs(3600));
+        assert!(status.is_some());
     }
 }

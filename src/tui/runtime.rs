@@ -709,6 +709,7 @@ impl RuntimeDeps {
             .map(|session| session.id.clone());
         *agent_handle = None;
         app.finish_processing();
+        app.clear_persistent_status();
         app.chat
             .fold_turn_work(app.turn_started_at.map_or(0, |at| at.elapsed().as_secs()));
 
