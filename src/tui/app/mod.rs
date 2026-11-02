@@ -379,6 +379,9 @@ pub struct App {
     /// Set when the last `session_index` report said repo-search could not
     /// be reached. The status bar shows a red cross instead of coverage.
     pub index_failed: bool,
+    /// Waiting for the daemon's first index snapshot; the status bar shows a
+    /// spinner meanwhile.
+    pub index_loading: bool,
     /// Which open question `/questions` shows next, so repeated use walks
     /// through all of them.
     pub question_cursor: usize,
@@ -668,6 +671,7 @@ impl App {
             session_runtime: crate::client::SessionRuntimeSnapshot::default(),
             index_coverage: None,
             index_failed: false,
+            index_loading: false,
             question_cursor: 0,
             parked_question: None,
         })
