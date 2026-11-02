@@ -385,17 +385,17 @@ impl MayAgent {
             .with_network_audit_log(network_audit)
             .with_process_priority(config.command_priority.process_priority())
             .with_readable_paths(readable)
-            .with_writable_paths(writable);
+            .with_writable_paths(writable)
+            // Keychain secrets (`/secret`) land as env vars in every spawned
+            // command; the store is re-read per call, so additions take
+            // effect without rebuilding the agent.
+            .with_env_source(crate::secrets::SecretStore::new(&config.may_dir));
         let job_registry = terminal_tool.job_registry();
         let subagents = config.subagents.clone().unwrap_or_default();
         let subagent_runs = subagents.runs;
 
-        // Provision the session env file the shell sources for stored
-        // secrets (`/secret`); refreshed in place on every build.
-        let secrets_file = session_paths.root().join(crate::secrets::SECRETS_ENV_FILE);
-        if let Err(error) = crate::secrets::write_env_file(&secrets_file, &config.secrets).await {
-            tracing::warn!(%error, "failed to write session secrets env file");
-        }
+        // The session env file is gone: keychain secrets reach every spawned
+        // command through the terminal tool's env source instead.
 
         let ssh_servers: Vec<SshServer> = config
             .ssh_servers
