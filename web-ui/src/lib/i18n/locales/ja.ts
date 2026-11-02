@@ -447,6 +447,18 @@ export const ja: Messages = {
       url: '公開 URL',
       lastError: '最後のエラー',
       logs: '最近のログ',
+      allowedLogins: {
+        title: '許可するログイン',
+        placeholder: 'name@example.com',
+        add: '追加',
+        remove: '{login} を削除',
+        saving: '保存中…',
+        pending: '許可対象を確認中…',
+        empty: '他に登録されたログインはありません。',
+        hint: '共有デバイスのユーザーは、登録しない限り許可されません。',
+        owner: 'このノードの所有者 {login} は常に許可されます。',
+        unresolved: 'このノードの所有者を特定できませんでした ({reason})。登録したログインのみアクセスできます。',
+      },
       states: {
         disabled: '無効',
         starting: '起動中…',

@@ -109,6 +109,8 @@ export interface UiRemoteAccessConfig {
   tailscaleBinary: string;
   httpsPort: number;
   allowLocalEnvironment: boolean;
+  /** Tailscale logins accepted besides the login owning this node, which is always accepted. */
+  allowedLogins: string[];
 }
 
 export type CommandPriority = 'normal' | 'low' | 'lowest';
@@ -161,6 +163,20 @@ export function withCacheLifetime(
 /** `full` with the compaction model replaced; `null` compacts on the session model. */
 export function withCompactionModel(full: UiFullConfig, selector: string | null): UiFullConfig {
   return { ...full, models: { ...full.models, compactionModel: selector } };
+}
+
+/**
+ * `logins` with `input` appended: trimmed, and unchanged when blank or an
+ * exact duplicate.
+ */
+export function addAllowedLogin(logins: string[], input: string): string[] {
+  const login = input.trim();
+  return login === '' || logins.includes(login) ? logins : [...logins, login];
+}
+
+/** `full` with the remote-access allow-list replaced. */
+export function withAllowedLogins(full: UiFullConfig, allowedLogins: string[]): UiFullConfig {
+  return { ...full, remoteAccess: { ...full.remoteAccess, allowedLogins } };
 }
 
 export function setFullConfig(full: UiFullConfig): Promise<void> {
