@@ -186,6 +186,13 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 input: &app.input,
                 cursor: app.cursor,
                 attachments: &app.attachments,
+                suggestion: crate::tui::app::visible_suggestion(
+                    app.prompt_suggestion.as_ref(),
+                    &app.input,
+                    app.session_manager
+                        .current()
+                        .map(|session| session.id.as_str()),
+                ),
             }),
             input_caret_active: matches!(app.mode, AppMode::Chat),
             queue_ctx: if queue_messages.is_empty() {
