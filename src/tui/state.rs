@@ -31,6 +31,12 @@ pub enum AppMode {
     CopilotAuth,
     /// `ChatGPT` subscription OAuth authentication
     ChatgptAuth,
+    /// `/login` provider picker
+    Login,
+    /// xAI Grok OAuth authentication
+    GrokAuth,
+    /// `OpenRouter` OAuth authentication
+    OpenrouterAuth,
     /// Permission approval dialog for elevated terminal modes.
     PermissionConfirm(PermissionConfirmState),
     /// Workspace access confirmation dialog
@@ -91,6 +97,9 @@ impl AppMode {
             Self::TierModelPicker => "tier-model-picker",
             Self::CopilotAuth => "copilot-auth",
             Self::ChatgptAuth => "chatgpt-auth",
+            Self::Login => "login",
+            Self::GrokAuth => "grok-auth",
+            Self::OpenrouterAuth => "openrouter-auth",
             Self::PermissionConfirm(_) => "permission-confirm",
             Self::WorkspaceConfirm(_) => "workspace-confirm",
             Self::LaunchGrant(_) => "launch-grant",
@@ -492,6 +501,87 @@ pub enum ChatgptAuthStatus {
     Failed(String),
 }
 
+/// Status of xAI Grok OAuth authentication flow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrokAuthStatus {
+    /// Requesting device code from xAI
+    RequestingCode,
+    /// Waiting for user to authorize on the verification page
+    WaitingForUser {
+        /// User code shown for device authorization.
+        user_code: String,
+        /// URL the user must visit to authorize.
+        verification_uri: String,
+    },
+    /// Successfully authenticated
+    Success,
+    /// Authentication failed
+    Failed(String),
+}
+
+/// Status of `OpenRouter` OAuth login flow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenrouterAuthStatus {
+    /// Building the authorization URL / binding the callback listener.
+    Working,
+    /// Waiting for the browser callback on localhost:54549.
+    WaitingForCallback {
+        /// Authorization URL shown to the user.
+        url: String,
+    },
+    /// Manual entry: the loopback callback cannot reach this machine, so the
+    /// user pastes the redirect URL, the code, or an `sk-or-` key.
+    ManualEntry {
+        /// Authorization URL shown to the user.
+        url: String,
+        /// Input buffer collecting the pasted text.
+        input: String,
+    },
+    /// Successfully authenticated
+    Success,
+    /// Authentication failed
+    Failed(String),
+}
+
+/// Which screen an OAuth flow returns to when it closes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthReturn {
+    /// Back to the settings screen (flow started from a provider row).
+    Config,
+    /// Back to the `/login` picker (flow started there).
+    Login,
+}
+
+/// One entry in the `/login` provider picker.
+#[derive(Debug, Clone, Copy)]
+pub struct LoginProvider {
+    /// Stable identifier dispatched on selection.
+    pub id: &'static str,
+    /// Display name.
+    pub name: &'static str,
+    /// What the sign-in unlocks.
+    pub detail: &'static str,
+}
+
+/// Providers offered by `/login`, in display order.
+pub const LOGIN_PROVIDERS: &[LoginProvider] = &[
+    LoginProvider {
+        id: "chatgpt",
+        name: "OpenAI",
+        detail: "ChatGPT Plus/Pro subscription (Codex)",
+    },
+    LoginProvider {
+        id: "grok",
+        name: "xAI Grok",
+        detail: "SuperGrok / X Premium+ subscription",
+    },
+    LoginProvider {
+        id: "openrouter",
+        name: "OpenRouter",
+        detail: "one key for every model",
+    },
+];
+
 /// Character filter for paste validation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PasteFilter {
@@ -881,6 +971,7 @@ pub fn detect_api_key_from_env(provider: ProviderType) -> Option<(String, &'stat
         ProviderType::XAI => &["XAI_API_KEY", "GROK_API_KEY"][..],
         ProviderType::Copilot
         | ProviderType::Chatgpt
+        | ProviderType::Grok
         | ProviderType::Ollama
         | ProviderType::LMStudio
         | ProviderType::Custom => return None,
