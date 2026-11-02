@@ -115,7 +115,7 @@ pub enum AppEvent {
     /// `session_runtime` stream.
     SessionRuntime(Box<crate::client::SessionRuntimeEvent>),
     /// The session's worktree index coverage, from the `session_index` stream.
-    IndexCoverage(Option<crate::client::IndexCoverage>),
+    IndexCoverage(crate::client::SessionIndexSnapshot),
     /// A turn started in the daemon (this client's or another's), carrying
     /// the stored user-message row id — the prompt-mark key file rewind
     /// checkpoints hang on.
