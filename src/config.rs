@@ -163,6 +163,8 @@ pub enum ProviderType {
     Mistral,
     /// xAI Grok
     XAI,
+    /// xAI Grok subscription (OAuth, `api.x.ai`)
+    Grok,
     /// Custom provider (user specifies `base_url`)
     Custom,
 }
@@ -175,7 +177,7 @@ impl ProviderType {
             Self::Google => Some(aither_models::Provider::Google),
             Self::DeepSeek => Some(aither_models::Provider::DeepSeek),
             Self::Mistral => Some(aither_models::Provider::Mistral),
-            Self::XAI => Some(aither_models::Provider::XAI),
+            Self::XAI | Self::Grok => Some(aither_models::Provider::XAI),
             Self::Groq => Some(aither_models::Provider::Groq),
             Self::Together => Some(aither_models::Provider::Together),
             Self::OpenRouter
@@ -230,6 +232,7 @@ impl ProviderType {
         Self::Together,
         Self::Mistral,
         Self::XAI,
+        Self::Grok,
         Self::Custom,
     ];
 
@@ -250,6 +253,7 @@ impl ProviderType {
             Self::Together => "Together AI",
             Self::Mistral => "Mistral AI",
             Self::XAI => "xAI (Grok)",
+            Self::Grok => "xAI Grok (subscription)",
             Self::Custom => "Custom Provider",
         }
     }
@@ -271,6 +275,7 @@ impl ProviderType {
             Self::Together => "together",
             Self::Mistral => "mistral",
             Self::XAI => "xai",
+            Self::Grok => "grok",
             Self::Custom => "custom",
         }
     }
@@ -301,7 +306,7 @@ impl ProviderType {
             Self::Groq => Some("https://api.groq.com/openai/v1"),
             Self::Together => Some("https://api.together.xyz/v1"),
             Self::Mistral => Some("https://api.mistral.ai/v1"),
-            Self::XAI => Some("https://api.x.ai/v1"),
+            Self::XAI | Self::Grok => Some("https://api.x.ai/v1"),
             Self::Custom => None,
         }
     }
@@ -317,7 +322,7 @@ impl ProviderType {
             Self::Chatgpt => "chatgpt",
             Self::DeepSeek => "deepseek",
             Self::Mistral => "mistral",
-            Self::XAI => "xai",
+            Self::XAI | Self::Grok => "xai",
             Self::Groq => "groq",
             Self::Together => "together",
             Self::OpenRouter | Self::Ollama | Self::LMStudio | Self::Custom => "unknown",
@@ -330,7 +335,12 @@ impl ProviderType {
     pub const fn requires_api_key(self) -> bool {
         !matches!(
             self,
-            Self::Ollama | Self::LMStudio | Self::Copilot | Self::Chatgpt | Self::Custom
+            Self::Ollama
+                | Self::LMStudio
+                | Self::Copilot
+                | Self::Chatgpt
+                | Self::Grok
+                | Self::Custom
         )
     }
 
@@ -343,7 +353,7 @@ impl ProviderType {
     /// Whether this provider type uses OAuth authentication.
     #[must_use]
     pub const fn uses_oauth(self) -> bool {
-        matches!(self, Self::Copilot | Self::Chatgpt)
+        matches!(self, Self::Copilot | Self::Chatgpt | Self::Grok)
     }
 
     /// Parse provider type from an ID string.
@@ -363,7 +373,8 @@ impl ProviderType {
             "groq" => Self::Groq,
             "together" => Self::Together,
             "mistral" => Self::Mistral,
-            "xai" | "grok" => Self::XAI,
+            "xai" => Self::XAI,
+            "grok" | "xai-oauth" => Self::Grok,
             _ => Self::Custom,
         }
     }
