@@ -5,8 +5,10 @@
 //! respawns it when macOS privacy grants change (TCC evaluates per
 //! process at launch, so only a fresh process sees a fresh grant).
 
+#[cfg(target_os = "macos")]
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
+#[cfg(target_os = "macos")]
 use std::sync::Mutex;
 
 #[cfg(target_os = "macos")]

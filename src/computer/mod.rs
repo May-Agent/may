@@ -14,7 +14,6 @@ pub(crate) mod client;
 pub(crate) mod input;
 #[cfg(target_os = "macos")]
 pub(crate) mod permissions;
-#[cfg(target_os = "macos")]
 pub(crate) mod proto;
 #[cfg(target_os = "macos")]
 pub(crate) mod screenshot;
