@@ -4,6 +4,7 @@ mod aux;
 mod background;
 mod hosts;
 mod hub;
+mod request_ledger;
 pub use aux::AuxTasks;
 pub use background::SessionBackgrounds;
 pub use background::spawn_watcher as spawn_background_watcher;
@@ -1528,7 +1529,15 @@ fn run_agent_loop<'a>(
                     .and_then(aither_models::ModelEntry::max_input_tokens)
             });
 
+            // The newest request's usage: the context the window holds now.
             let mut usage = Usage::default();
+            let mut ledger = request_ledger::RequestLedger::new(
+                session_id.as_str(),
+                &current_model,
+                &provider_id,
+                model_context_window,
+                Instant::now(),
+            );
             let mut decode_meter = DecodeMeter::default();
             let mut last_speed_emit: Option<Instant> = None;
             let mut segment_text = String::new(); // current text segment, flushed on tool calls
@@ -1680,6 +1689,7 @@ fn run_agent_loop<'a>(
                         }
                         Ok(aither_agent::AgentEvent::Usage(u)) => {
                             decode_meter.note_usage(u.completion_tokens);
+                            record_request_log(state, ledger.completed(&u, Instant::now())).await;
                             usage = u;
                         }
                         Ok(aither_agent::AgentEvent::ToolCallDelta {
@@ -1978,14 +1988,6 @@ fn run_agent_loop<'a>(
                 cancellation_reason = None;
             }
 
-            let log_base = RequestLogEntry::new(
-                session_id.as_str(),
-                &current_model,
-                &provider_id,
-                &usage,
-                model_context_window,
-            );
-
             if browser_takeover_paused {
                 const TAKEOVER_PAUSED_MESSAGE: &str =
                     "Browser takeover is active for this session; model execution paused";
@@ -2012,7 +2014,7 @@ fn run_agent_loop<'a>(
 
                 record_request_log(
                     state,
-                    log_base.failure(elapsed_ms_saturating(&started_at), TAKEOVER_PAUSED_MESSAGE),
+                    ledger.interrupted(Instant::now(), TAKEOVER_PAUSED_MESSAGE),
                 )
                 .await;
                 schedule_browser_takeover_resume(state, session_id.as_str()).await?;
@@ -2063,6 +2065,7 @@ fn run_agent_loop<'a>(
                     None
                 };
                 if let (Some(kind), Some(wait)) = (retry_kind, retry_wait) {
+                    record_request_log(state, ledger.interrupted(Instant::now(), &err_msg)).await;
                     match wait {
                         RetryWait::Failover => {
                             tokio::time::sleep(Duration::from_millis(
@@ -2098,11 +2101,7 @@ fn run_agent_loop<'a>(
                 }
 
                 if cancellation_reason.is_none() {
-                    record_request_log(
-                        state,
-                        log_base.failure(elapsed_ms_saturating(&started_at), &err_msg),
-                    )
-                    .await;
+                    record_request_log(state, ledger.interrupted(Instant::now(), &err_msg)).await;
                     let _ = sink
                         .on_error(ApiErrorCode::InternalError, &err_msg, false)
                         .await;
@@ -2140,11 +2139,7 @@ fn run_agent_loop<'a>(
                 }
                 // Flush the entire turn atomically before returning
                 turn_persister.flush(&state.db()).await?;
-                record_request_log(
-                    state,
-                    log_base.failure(elapsed_ms_saturating(&started_at), reason),
-                )
-                .await;
+                record_request_log(state, ledger.interrupted(Instant::now(), reason)).await;
                 return Err(AgentLoopError::Cancelled(reason));
             }
 
@@ -2158,11 +2153,7 @@ fn run_agent_loop<'a>(
             let has_tool_activity = has_terminal_output || saw_tool_activity;
             if !has_assistant_text && !has_tool_activity {
                 let err = "Model returned an empty assistant response";
-                record_request_log(
-                    state,
-                    log_base.failure(elapsed_ms_saturating(&started_at), err),
-                )
-                .await;
+                record_request_log(state, ledger.interrupted(Instant::now(), err)).await;
                 let _ = sink.on_error(ApiErrorCode::InternalError, err, false).await;
                 return Err(AgentLoopError::EmptyAssistantResponse);
             }
@@ -2192,7 +2183,9 @@ fn run_agent_loop<'a>(
                 elapsed_ms,
             )
             .await?;
-            record_request_log(state, log_base.success(elapsed_ms)).await;
+            if let Some(entry) = ledger.finished(Instant::now()) {
+                record_request_log(state, entry).await;
+            }
 
             // Post-completion hooks
             schedule_profile_memory_processing(state, profile_id.as_deref()).await;
