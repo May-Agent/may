@@ -127,6 +127,18 @@ impl LogRingHandle {
         lock_ring(&self.inner).snapshot()
     }
 
+    /// Run `write` over each buffered chunk without blocking: returns false
+    /// when the ring is locked. Used by the crash-signal dump, which must
+    /// never wait on the lock a dead thread may hold.
+    pub(crate) fn try_write_chunks(&self, mut write: impl FnMut(&[u8])) -> bool {
+        self.inner.try_lock().is_ok_and(|guard| {
+            for chunk in &guard.chunks {
+                write(chunk.as_bytes());
+            }
+            true
+        })
+    }
+
     /// Write `header` followed by the ring snapshot to `path`, creating the
     /// parent directory when needed. Synchronous: also used from the panic
     /// hook, where no executor may be running.
