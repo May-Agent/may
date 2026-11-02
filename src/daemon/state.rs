@@ -30,7 +30,7 @@ use crate::workspace_request::RequestWorkspaceArgs;
 #[serde(rename_all = "snake_case")]
 pub enum ContainerPrepareStage {
     Checking,
-    Building,
+    Pulling,
     Ready,
     Failed,
 }
@@ -895,7 +895,6 @@ impl DaemonState {
             crate::container::lifecycle::ContainerManager::new(
                 Arc::new(runtime),
                 self.may_dir.clone(),
-                self.tool_distribution.clone(),
             ),
         ))
     }

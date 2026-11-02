@@ -2473,9 +2473,7 @@ enum UiChatPreparationError {
     ReconcileContainerLayout(#[source] crate::session::StoreError),
     #[error("no container runtime available for container profile: {0}")]
     ResolveContainerRuntime(#[source] crate::container::ContainerError),
-    #[error("invalid container profile image tag: {0}")]
-    InvalidContainerImageTag(#[source] crate::container::ContainerError),
-    #[error("container image build failed: {0}")]
+    #[error("container image pull failed: {0}")]
     EnsureContainerImage(#[source] crate::container::ContainerError),
     #[error("container start failed: {0}")]
     StartContainer(#[source] crate::container::ContainerError),
@@ -2503,13 +2501,13 @@ impl UiChatPreparationError {
             Self::MissingModelConfiguration => ApiErrorCode::ModelNotConfigured,
             Self::NoProviderAvailable { .. } => ApiErrorCode::ProviderUnavailable,
             Self::InvalidFileMentionPath(_) => ApiErrorCode::BadRequest,
-            Self::MissingContainerProfileModel
-            | Self::ParseProfileEnvironment(_)
-            | Self::InvalidContainerImageTag(_) => ApiErrorCode::ProfileConfigurationInvalid,
+            Self::MissingContainerProfileModel | Self::ParseProfileEnvironment(_) => {
+                ApiErrorCode::ProfileConfigurationInvalid
+            }
             Self::ResolveContainerRuntime(_) | Self::ResolveContainerIpcRoute(_) => {
                 ApiErrorCode::ContainerRuntimeUnavailable
             }
-            Self::EnsureContainerImage(_) => ApiErrorCode::ContainerBuildFailed,
+            Self::EnsureContainerImage(_) => ApiErrorCode::ContainerPullFailed,
             Self::StartContainer(_) => ApiErrorCode::ContainerStartFailed,
             Self::LoadLocation(_) => ApiErrorCode::LocationUnavailable,
             Self::LoadSession(_)
@@ -2921,23 +2919,10 @@ async fn setup_agent_environment(
                 .load_container_profile_preferences(profile)
                 .await
                 .map_err(UiChatPreparationError::ParseProfileEnvironment)?;
-            let default_image_tag = Box::pin(crate::container::profile::default_image_tag(
-                &state.may_dir,
-                profile,
-                container_preferences.clone(),
-            ))
-            .await
-            .map_err(UiChatPreparationError::InvalidContainerImageTag)?;
-
-            let image_spec = crate::container::profile::image_spec_for_profile(
-                &state.may_dir,
-                profile,
-                &default_image_tag,
-                container_preferences.clone(),
-            );
             let extra_mounts = crate::container::profile::mounts_for_profile(container_preferences);
+            let image = crate::container::image::MAY_WORKSPACE_IMAGE;
 
-            crate::container::image::ensure_image(container_manager.runtime(), &image_spec)
+            crate::container::image::ensure_image(container_manager.runtime(), image)
                 .await
                 .map_err(UiChatPreparationError::EnsureContainerImage)?;
 
@@ -2975,7 +2960,7 @@ async fn setup_agent_environment(
 
             let mut launch_spec = ContainerLaunchSpec::new(
                 container_name,
-                image_spec.tag.clone(),
+                image.to_string(),
                 ctx.sandbox_dir.clone(),
             );
             for mount in extra_mounts {

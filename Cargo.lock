@@ -122,7 +122,7 @@ dependencies = [
 [[package]]
 name = "aither-agent"
 version = "0.11.0"
-source = "git+https://github.com/lexoliu/aither?branch=dev#ebf4d5987e10fe47f68a2313e91b638f21db4e1b"
+source = "git+https://github.com/lexoliu/aither?branch=dev#554c3b5282d0e85f6a24f0a65797a9a884411d58"
 dependencies = [
  "aither-attachments",
  "aither-core",
@@ -165,7 +165,7 @@ dependencies = [
 [[package]]
 name = "aither-attachments"
 version = "0.11.0"
-source = "git+https://github.com/lexoliu/aither?branch=dev#ebf4d5987e10fe47f68a2313e91b638f21db4e1b"
+source = "git+https://github.com/lexoliu/aither?branch=dev#554c3b5282d0e85f6a24f0a65797a9a884411d58"
 dependencies = [
  "async-fs",
  "const-hex",
@@ -178,7 +178,7 @@ dependencies = [
 [[package]]
 name = "aither-browser"
 version = "0.11.0"
-source = "git+https://github.com/lexoliu/aither?branch=dev#ebf4d5987e10fe47f68a2313e91b638f21db4e1b"
+source = "git+https://github.com/lexoliu/aither?branch=dev#554c3b5282d0e85f6a24f0a65797a9a884411d58"
 dependencies = [
  "aither-agent",
  "aither-core",
@@ -191,7 +191,7 @@ dependencies = [
 [[package]]
 name = "aither-claude"
 version = "0.11.0"
-source = "git+https://github.com/lexoliu/aither?branch=dev#ebf4d5987e10fe47f68a2313e91b638f21db4e1b"
+source = "git+https://github.com/lexoliu/aither?branch=dev#554c3b5282d0e85f6a24f0a65797a9a884411d58"
 dependencies = [
  "aither-core",
  "aither-models",
@@ -209,7 +209,7 @@ dependencies = [
 [[package]]
 name = "aither-cloud"
 version = "0.11.0"
-source = "git+https://github.com/lexoliu/aither?branch=dev#ebf4d5987e10fe47f68a2313e91b638f21db4e1b"
+source = "git+https://github.com/lexoliu/aither?branch=dev#554c3b5282d0e85f6a24f0a65797a9a884411d58"
 dependencies = [
  "aither-claude",
  "aither-codex",
@@ -226,7 +226,7 @@ dependencies = [
 [[package]]
 name = "aither-codex"
 version = "0.11.0"
-source = "git+https://github.com/lexoliu/aither?branch=dev#ebf4d5987e10fe47f68a2313e91b638f21db4e1b"
+source = "git+https://github.com/lexoliu/aither?branch=dev#554c3b5282d0e85f6a24f0a65797a9a884411d58"
 dependencies = [
  "aither-core",
  "aither-models",
@@ -250,7 +250,7 @@ dependencies = [
 [[package]]
 name = "aither-copilot"
 version = "0.11.0"
-source = "git+https://github.com/lexoliu/aither?branch=dev#ebf4d5987e10fe47f68a2313e91b638f21db4e1b"
+source = "git+https://github.com/lexoliu/aither?branch=dev#554c3b5282d0e85f6a24f0a65797a9a884411d58"
 dependencies = [
  "aither-core",
  "aither-models",
@@ -271,7 +271,7 @@ dependencies = [
 [[package]]
 name = "aither-core"
 version = "0.11.0"
-source = "git+https://github.com/lexoliu/aither?branch=dev#ebf4d5987e10fe47f68a2313e91b638f21db4e1b"
+source = "git+https://github.com/lexoliu/aither?branch=dev#554c3b5282d0e85f6a24f0a65797a9a884411d58"
 dependencies = [
  "aither-derive",
  "anyhow",
@@ -288,7 +288,7 @@ dependencies = [
 [[package]]
 name = "aither-derive"
 version = "0.11.0"
-source = "git+https://github.com/lexoliu/aither?branch=dev#ebf4d5987e10fe47f68a2313e91b638f21db4e1b"
+source = "git+https://github.com/lexoliu/aither?branch=dev#554c3b5282d0e85f6a24f0a65797a9a884411d58"
 dependencies = [
  "convert_case 0.12.0",
  "proc-macro2",
@@ -299,7 +299,7 @@ dependencies = [
 [[package]]
 name = "aither-gemini"
 version = "0.11.0"
-source = "git+https://github.com/lexoliu/aither?branch=dev#ebf4d5987e10fe47f68a2313e91b638f21db4e1b"
+source = "git+https://github.com/lexoliu/aither?branch=dev#554c3b5282d0e85f6a24f0a65797a9a884411d58"
 dependencies = [
  "aither-attachments",
  "aither-core",
@@ -326,7 +326,7 @@ dependencies = [
 [[package]]
 name = "aither-mcp"
 version = "0.11.0"
-source = "git+https://github.com/lexoliu/aither?branch=dev#ebf4d5987e10fe47f68a2313e91b638f21db4e1b"
+source = "git+https://github.com/lexoliu/aither?branch=dev#554c3b5282d0e85f6a24f0a65797a9a884411d58"
 dependencies = [
  "aither-core",
  "aither-sandbox",
@@ -349,7 +349,7 @@ dependencies = [
 [[package]]
 name = "aither-models"
 version = "0.11.0"
-source = "git+https://github.com/lexoliu/aither?branch=dev#ebf4d5987e10fe47f68a2313e91b638f21db4e1b"
+source = "git+https://github.com/lexoliu/aither?branch=dev#554c3b5282d0e85f6a24f0a65797a9a884411d58"
 dependencies = [
  "aither-core",
  "serde",
@@ -359,7 +359,7 @@ dependencies = [
 [[package]]
 name = "aither-openai"
 version = "0.11.0"
-source = "git+https://github.com/lexoliu/aither?branch=dev#ebf4d5987e10fe47f68a2313e91b638f21db4e1b"
+source = "git+https://github.com/lexoliu/aither?branch=dev#554c3b5282d0e85f6a24f0a65797a9a884411d58"
 dependencies = [
  "aither-attachments",
  "aither-core",
@@ -385,7 +385,7 @@ dependencies = [
 [[package]]
 name = "aither-sandbox"
 version = "0.11.0"
-source = "git+https://github.com/lexoliu/aither?branch=dev#ebf4d5987e10fe47f68a2313e91b638f21db4e1b"
+source = "git+https://github.com/lexoliu/aither?branch=dev#554c3b5282d0e85f6a24f0a65797a9a884411d58"
 dependencies = [
  "aither-core",
  "anyhow",
@@ -412,7 +412,7 @@ dependencies = [
  "lzma-rust2 0.24.0",
  "magika",
  "ort",
- "procfs-core",
+ "regex",
  "rmp-serde",
  "rs-tree-sitter-languages",
  "schemars",
@@ -439,7 +439,7 @@ dependencies = [
 [[package]]
 name = "aither-skills"
 version = "0.11.0"
-source = "git+https://github.com/lexoliu/aither?branch=dev#ebf4d5987e10fe47f68a2313e91b638f21db4e1b"
+source = "git+https://github.com/lexoliu/aither?branch=dev#554c3b5282d0e85f6a24f0a65797a9a884411d58"
 dependencies = [
  "async-fs",
  "futures-lite 2.6.1",
@@ -451,7 +451,7 @@ dependencies = [
 [[package]]
 name = "aither-webfetch"
 version = "0.11.0"
-source = "git+https://github.com/lexoliu/aither?branch=dev#ebf4d5987e10fe47f68a2313e91b638f21db4e1b"
+source = "git+https://github.com/lexoliu/aither?branch=dev#554c3b5282d0e85f6a24f0a65797a9a884411d58"
 dependencies = [
  "aither-core",
  "anyhow",
@@ -539,7 +539,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -550,7 +550,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2204,7 +2204,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d045de693cb712d0b22c6a64be5b953f67b3ce00ab5ad3dd5d8b441886ab8e1a"
 dependencies = [
  "quote",
- "syn 2.0.119",
+ "syn 3.0.7",
 ]
 
 [[package]]
@@ -2263,7 +2263,7 @@ dependencies = [
  "openssl-sys",
  "schannel",
  "socket2 0.6.5",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2279,7 +2279,7 @@ dependencies = [
  "openssl-sys",
  "pkg-config",
  "vcpkg",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2592,7 +2592,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2883,7 +2883,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4266,7 +4266,7 @@ dependencies = [
  "tokio",
  "tower-service",
  "tracing",
- "windows-registry 0.6.1",
+ "windows-registry 0.5.3",
 ]
 
 [[package]]
@@ -5795,7 +5795,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6878,16 +6878,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "procfs-core"
-version = "0.18.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6401bf7b6af22f78b563665d15a22e9aef27775b79b149a66ca022468a4e405"
-dependencies = [
- "bitflags 2.13.2",
- "hex",
-]
-
-[[package]]
 name = "proptest"
 version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7013,7 +7003,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -7052,9 +7042,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7788,7 +7778,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7847,7 +7837,7 @@ dependencies = [
  "security-framework 3.7.0",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8642,7 +8632,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -8923,7 +8913,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9254,10 +9244,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand 2.5.0",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.6",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9279,7 +9269,7 @@ dependencies = [
  "parking_lot",
  "rustix 1.1.6",
  "signal-hook",
- "windows-sys 0.60.2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10684,7 +10674,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

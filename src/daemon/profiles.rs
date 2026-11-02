@@ -31,8 +31,6 @@ pub(super) struct CreateProfileRequest {
     #[serde(default = "default_env")]
     pub environment: ProfileEnvironmentKind,
     #[serde(default)]
-    pub container_image: Option<String>,
-    #[serde(default)]
     pub persona: Option<String>,
     #[serde(default)]
     pub preferences: Option<ProfilePreferences>,
@@ -151,23 +149,7 @@ async fn prepare_profile_environment(
         }
     };
 
-    let container_preferences = db
-        .load_container_profile_preferences(&profile)
-        .await
-        .map_err(internal_error)?;
-    let default_image_tag = crate::container::profile::default_image_tag(
-        &state.may_dir,
-        &profile,
-        container_preferences.clone(),
-    )
-    .await
-    .map_err(internal_error)?;
-    let image_spec = crate::container::profile::image_spec_for_profile(
-        &state.may_dir,
-        &profile,
-        &default_image_tag,
-        container_preferences,
-    );
+    let image = crate::container::image::MAY_WORKSPACE_IMAGE;
 
     if !state.try_begin_container_prepare(profile_id).await {
         let summary = state.get_container_prepare_status(profile_id).map_or_else(
@@ -184,19 +166,19 @@ async fn prepare_profile_environment(
         let checking_status = ContainerPrepareStatus {
             profile_id: profile_id.to_string(),
             stage: ContainerPrepareStage::Checking,
-            summary: format!("checking image {}", image_spec.tag),
+            summary: format!("checking image {image}"),
             recent_logs: Vec::new(),
         };
         state.set_container_prepare_status(checking_status);
 
         let (progress_tx, mut progress_rx) =
-            tokio::sync::mpsc::unbounded_channel::<crate::container::image::ImageBuildProgress>();
+            tokio::sync::mpsc::unbounded_channel::<crate::container::image::ImagePullProgress>();
         let progress_state = state.clone();
         let progress_profile_id = profile_id.to_string();
         let progress_task = tokio::spawn(async move {
             let mut recent_logs = VecDeque::new();
             while let Some(progress) = progress_rx.recv().await {
-                if progress.phase == crate::container::image::ImageBuildPhase::BuildOutput {
+                if progress.phase == crate::container::image::ImagePullPhase::PullProgress {
                     if recent_logs.len() >= 12 {
                         let _ = recent_logs.pop_front();
                     }
@@ -204,16 +186,16 @@ async fn prepare_profile_environment(
                 }
 
                 let prepare_stage = match progress.phase {
-                    crate::container::image::ImageBuildPhase::CheckingExisting => {
+                    crate::container::image::ImagePullPhase::CheckingExisting => {
                         ContainerPrepareStage::Checking
                     }
-                    crate::container::image::ImageBuildPhase::AlreadyExists
-                    | crate::container::image::ImageBuildPhase::BuildCompleted => {
+                    crate::container::image::ImagePullPhase::AlreadyExists
+                    | crate::container::image::ImagePullPhase::PullCompleted => {
                         ContainerPrepareStage::Ready
                     }
-                    crate::container::image::ImageBuildPhase::BuildStarting
-                    | crate::container::image::ImageBuildPhase::BuildOutput => {
-                        ContainerPrepareStage::Building
+                    crate::container::image::ImagePullPhase::PullStarting
+                    | crate::container::image::ImagePullPhase::PullProgress => {
+                        ContainerPrepareStage::Pulling
                     }
                 };
 
@@ -229,7 +211,7 @@ async fn prepare_profile_environment(
 
         let ensure_result = crate::container::image::ensure_image_with_progress(
             manager.runtime(),
-            &image_spec,
+            image,
             move |progress| {
                 let _ = progress_tx.send(progress);
             },
@@ -252,13 +234,13 @@ async fn prepare_profile_environment(
                 state.set_container_prepare_status(ContainerPrepareStatus {
                     profile_id: profile_id.to_string(),
                     stage: ContainerPrepareStage::Failed,
-                    summary: format!("container build failed: {error}"),
+                    summary: format!("container pull failed: {error}"),
                     recent_logs,
                 });
 
                 Err(ContainerPrepareError::Domain {
-                    code: ApiErrorCode::ContainerBuildFailed,
-                    message: format!("Container image build failed: {error}"),
+                    code: ApiErrorCode::ContainerPullFailed,
+                    message: format!("Container image pull failed: {error}"),
                 })
             }
         }
@@ -278,8 +260,6 @@ pub(super) struct UpdateProfileRequest {
     pub icon: Option<String>,
     #[serde(default)]
     pub environment: Option<ProfileEnvironmentKind>,
-    #[serde(default)]
-    pub container_image: Option<String>,
     #[serde(default)]
     pub sort_order: Option<i32>,
     #[serde(default)]
@@ -345,7 +325,6 @@ pub(super) async fn create_profile(
             id: &id,
             name: &req.name,
             environment: req.environment,
-            container_image: req.container_image.as_deref(),
             slug: None,
             icon: req.icon.as_deref(),
             persona: req.persona.as_deref(),
@@ -380,7 +359,6 @@ pub(super) async fn update_profile(
             name: req.name.as_deref(),
             icon: req.icon.as_deref().map(Some),
             environment: req.environment,
-            container_image: req.container_image.as_deref().map(Some),
             container_id: None,
             sort_order: req.sort_order,
             persona: req.persona.as_deref().map(Some),
