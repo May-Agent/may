@@ -20,11 +20,8 @@ pub enum ResolveAgentEnvironmentError {
     /// No container runtime available for container profile.
     #[error("no container runtime available for container profile: {0}")]
     DetectContainerRuntime(crate::container::ContainerError),
-    /// Invalid container profile image tag.
-    #[error("invalid container profile image tag: {0}")]
-    ContainerImageTag(crate::container::ContainerError),
-    /// Container image build failed.
-    #[error("container image build failed: {0}")]
+    /// Container image pull failed.
+    #[error("container image pull failed: {0}")]
     EnsureContainerImage(crate::container::ContainerError),
     /// Container start failed.
     #[error("container start failed: {0}")]
@@ -51,7 +48,6 @@ pub async fn resolve_agent_environment_for_session(
     may_dir: &Path,
     sandbox_dir: &Path,
     session_id: &SessionId,
-    tool_distribution: &Arc<aither_sandbox::ToolDistribution>,
 ) -> Result<AgentEnvironment, ResolveAgentEnvironmentError> {
     match profile_environment {
         Some(ProfileEnvironment::Container { .. }) => {}
@@ -64,38 +60,19 @@ pub async fn resolve_agent_environment_for_session(
     let runtime = ContainerRuntime::detect()
         .await
         .map_err(ResolveAgentEnvironmentError::DetectContainerRuntime)?;
-    let container_manager = ContainerManager::new(
-        Arc::new(runtime),
-        may_dir.to_path_buf(),
-        tool_distribution.clone(),
-    );
+    let container_manager = ContainerManager::new(Arc::new(runtime), may_dir.to_path_buf());
 
-    let default_image_tag = Box::pin(crate::container::profile::default_image_tag(
-        may_dir,
-        profile,
-        container_preferences.clone(),
-    ))
-    .await
-    .map_err(ResolveAgentEnvironmentError::ContainerImageTag)?;
-    let image_spec = crate::container::profile::image_spec_for_profile(
-        may_dir,
-        profile,
-        &default_image_tag,
-        container_preferences.clone(),
-    );
     let extra_mounts = crate::container::profile::mounts_for_profile(container_preferences);
+    let image = crate::container::image::MAY_WORKSPACE_IMAGE;
 
-    crate::container::image::ensure_image(container_manager.runtime(), &image_spec)
+    crate::container::image::ensure_image(container_manager.runtime(), image)
         .await
         .map_err(ResolveAgentEnvironmentError::EnsureContainerImage)?;
 
     let container_name =
         crate::container::profile::container_name_for_profile_session(profile, session_id);
-    let mut launch_spec = ContainerLaunchSpec::new(
-        container_name,
-        image_spec.tag.clone(),
-        sandbox_dir.to_path_buf(),
-    );
+    let mut launch_spec =
+        ContainerLaunchSpec::new(container_name, image.to_string(), sandbox_dir.to_path_buf());
     for mount in extra_mounts {
         launch_spec = launch_spec.with_mount(mount);
     }

@@ -355,6 +355,11 @@ where
             app.status = None;
             app.btw_daemon = Some(client.clone());
             app.session_manager.attach_daemon(client.clone());
+            may_agent::tui::remote::spawn_index_coverage(
+                client.clone(),
+                app.cwd.clone(),
+                events.sender(),
+            );
             if let Ok(profiles) = client
                 .get::<Vec<may_agent::profile::ProfileInfo>>("/api/profiles")
                 .await
@@ -415,11 +420,12 @@ where
         Some(StartupGate::RepoTrust(trust)) => {
             app.mode = may_agent::tui::AppMode::RepoTrust(may_agent::tui::state::RepoTrustState {
                 ask: may_agent::tui::AskUserState::for_open_question(
-                    may_agent::trust::question_for(&trust.kind, &trust.worktree),
+                    may_agent::trust::question_for(&trust.kind, &trust.worktree, true),
                 ),
                 worktree: trust.worktree.clone(),
                 kind: trust.kind.clone(),
                 config_path: trust.config_path.clone(),
+                redecide: false,
             });
         }
         Some(StartupGate::LaunchGrant(grant)) => {
@@ -428,6 +434,7 @@ where
                     path: grant.dir.clone(),
                     config_path: grant.config_path.clone(),
                     redecide: false,
+                    selected: 0,
                 });
         }
         None => {}

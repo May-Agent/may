@@ -1,5 +1,4 @@
 use aither_agent::{AgentCheckpoint, CheckpointContext};
-use aither_core::llm::Message as LlmMessage;
 
 use crate::{
     MayAgent,
@@ -12,8 +11,9 @@ use crate::{
 pub struct PersistedContextSnapshot {
     /// The agent checkpoint captured at snapshot time.
     pub checkpoint: AgentCheckpoint,
-    /// The DB `messages.id` of the last message at snapshot time.
-    pub last_message_db_id: Option<i64>,
+    /// Highest transcript `seq` the checkpoint covers; restore appends only
+    /// entries after it.
+    pub applied_seq: i64,
 }
 
 /// Convert a stored snapshot row into a [`PersistedContextSnapshot`].
@@ -23,7 +23,7 @@ pub fn parse_persisted_context_snapshot(
 ) -> PersistedContextSnapshot {
     PersistedContextSnapshot {
         checkpoint: snapshot.checkpoint,
-        last_message_db_id: snapshot.last_message_db_id,
+        applied_seq: snapshot.applied_seq,
     }
 }
 
@@ -36,60 +36,6 @@ pub fn checkpoint_from_hook(ctx: &CheckpointContext<'_>) -> AgentCheckpoint {
         context_window: ctx.window.clone(),
         has_background_tasks: ctx.has_background_tasks,
     }
-}
-
-/// `messages` row ids of the rows that produce LLM history messages.
-///
-/// Row order is kept — the `db_message_ids` argument of
-/// [`history_delta_since_snapshot`]. Rows of interaction roles carry no
-/// LLM message and must not shift the index alignment.
-#[must_use]
-pub fn llm_row_ids(db_messages: &[crate::db::entity::messages::Model]) -> Vec<i64> {
-    db_messages
-        .iter()
-        .filter(|row| {
-            row.role
-                .parse::<crate::session::MessageRole>()
-                .is_ok_and(|role| role.is_llm_visible())
-        })
-        .map(|row| i64::from(row.id))
-        .collect()
-}
-
-/// Compute the history messages that were added after the snapshot was taken.
-///
-/// `db_message_ids` should be the `id` column of each row returned by
-/// `get_messages(session_id)`, in the same order as `history_messages`.
-/// The caller must guarantee that `history_messages[i]` came from the DB
-/// row whose id is `db_message_ids[i]`.
-///
-/// Returns `None` if the snapshot anchor is stale (the anchor ID is not found
-/// among current messages), signalling the caller should fall back to full
-/// history replay.
-#[must_use]
-pub fn history_delta_since_snapshot(
-    history_messages: &[LlmMessage],
-    db_message_ids: &[i64],
-    last_message_db_id: Option<i64>,
-) -> Option<Vec<LlmMessage>> {
-    let Some(anchor_id) = last_message_db_id else {
-        // Snapshot was taken with empty history — replay everything
-        return Some(history_messages.to_vec());
-    };
-    // Find the position of the first message *after* the anchor
-    let start_idx = db_message_ids.iter().position(|&id| id > anchor_id);
-    start_idx.map_or_else(
-        || {
-            // Either all messages are <= anchor (no new messages — empty delta)
-            // or the anchor is missing entirely (stale snapshot)
-            if db_message_ids.contains(&anchor_id) {
-                Some(Vec::new()) // anchor exists, just no newer messages
-            } else {
-                None // stale anchor — caller should fall back
-            }
-        },
-        |idx| Some(history_messages[idx..].to_vec()),
-    )
 }
 
 /// Error type for persisting a session's context snapshot.
@@ -123,12 +69,37 @@ async fn persist_checkpoint(
     fence: &RunFence,
     checkpoint: AgentCheckpoint,
 ) -> Result<(), crate::db::ChatDbError> {
-    let last_message_db_id = db.max_message_id(&fence.session_id).await?;
+    // The transcript records exactly what the agent committed: every
+    // checkpoint item with its seq. `applied_seq` is the highest committed
+    // seq, so a restore appends only items committed after the checkpoint.
+    let transcript_entries = checkpoint
+        .context
+        .items()
+        .iter()
+        .map(|item| {
+            Ok(crate::db::TranscriptEntry {
+                seq: i64::try_from(item.seq())
+                    .map_err(|e| crate::db::ChatDbError::Storage(format!("seq too large: {e}")))?,
+                message_blob: rmp_serde::to_vec_named(item.message()).map_err(|e| {
+                    crate::db::ChatDbError::Storage(format!(
+                        "failed to encode transcript message: {e}"
+                    ))
+                })?,
+                committed_at: item.committed_at().to_string(),
+            })
+        })
+        .collect::<Result<Vec<_>, crate::db::ChatDbError>>()?;
+    let applied_seq = checkpoint
+        .context
+        .items()
+        .last()
+        .map_or(0, |item| i64::try_from(item.seq()).unwrap_or(0));
     db.upsert_session_context_snapshot_as_run(
         fence,
         crate::db::SessionContextSnapshotUpsert {
             checkpoint,
-            last_message_db_id,
+            applied_seq,
+            transcript_entries,
         },
     )
     .await?;

@@ -325,8 +325,8 @@ pub enum SessionAgentBody {
     /// A reasoning phase of the run closed; `seconds` is how long the model
     /// spent on it, whether or not the provider returned readable text.
     ReasoningEnd {
-        /// Seconds the phase lasted.
-        seconds: u64,
+        /// Seconds the phase lasted. Sub-second phases keep the fraction.
+        seconds: f64,
     },
     /// The run ended.
     End {
@@ -345,15 +345,15 @@ pub struct SessionRuntimeEvent {
     pub runtime: SessionRuntimeSnapshot,
 }
 
-/// One `session_index` event: coverage of the session's worktree index in
-/// repo-search.
+/// One `session_index` event: coverage of the worktree index in repo-search.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionIndexSnapshot {
-    /// Session the coverage belongs to.
+    /// Session the coverage belongs to; empty when the subscriber named a
+    /// cwd and no session is persisted yet.
     pub session_id: String,
-    /// The worktree index's coverage; `None` when the session is not in a
-    /// git worktree or repo-search has not indexed it.
+    /// The worktree index's coverage; `None` when the path is not a git
+    /// worktree or repo-search has not indexed it.
     pub index: Option<IndexCoverage>,
 }
 

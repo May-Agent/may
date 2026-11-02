@@ -1359,35 +1359,18 @@ impl TaskRuntime {
                 invalid_profile_component_error("invalid container profile preferences: ", &error)
             })?;
 
-        let default_image_tag = Box::pin(crate::container::profile::default_image_tag(
-            &self.may_dir,
-            profile,
-            container_preferences.clone(),
-        ))
-        .await
-        .map_err(|error| {
-            invalid_profile_component_error("invalid container profile image tag: ", &error)
-        })?;
-        let image_spec = crate::container::profile::image_spec_for_profile(
-            &self.may_dir,
-            profile,
-            &default_image_tag,
-            container_preferences.clone(),
-        );
         let extra_mounts = crate::container::profile::mounts_for_profile(container_preferences);
+        let image = crate::container::image::MAY_WORKSPACE_IMAGE;
 
-        crate::container::image::ensure_image(container_manager.runtime(), &image_spec)
+        crate::container::image::ensure_image(container_manager.runtime(), image)
             .await
-            .map_err(|error| prefixed_error("container image check/build failed: ", &error))?;
+            .map_err(|error| prefixed_error("container image pull failed: ", &error))?;
 
         let container_name = container_profile_name(profile);
         let workspace_dir = self.container_task_workspace(profile).await?;
 
-        let mut launch_spec = ContainerLaunchSpec::new(
-            container_name,
-            image_spec.tag.clone(),
-            workspace_dir.clone(),
-        );
+        let mut launch_spec =
+            ContainerLaunchSpec::new(container_name, image.to_string(), workspace_dir.clone());
         for mount in extra_mounts {
             launch_spec = launch_spec.with_mount(mount);
         }
