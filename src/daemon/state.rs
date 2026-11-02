@@ -460,6 +460,9 @@ pub struct DaemonState {
     pub(crate) turn_hub: Arc<super::chat::TurnHub>,
     /// Each session's agent between turns.
     pub(crate) parked_agents: super::chat::ParkedAgents,
+    /// Each session's in-flight aux task (suggestion, recap), if any.
+    #[allow(dead_code)]
+    pub(crate) aux_tasks: super::chat::AuxTasks,
     /// Each session's background jobs and subagent runs, across turns.
     pub(crate) session_background: super::chat::SessionBackgrounds,
     pub(crate) tunnels: Arc<super::tunnel::TunnelRegistry>,
@@ -1106,6 +1109,7 @@ impl DaemonState {
             build_id: "test".to_string(),
             turn_hub: std::sync::Arc::new(super::chat::TurnHub::default()),
             parked_agents: super::chat::ParkedAgents::default(),
+            aux_tasks: super::chat::AuxTasks::default(),
             session_background: super::chat::SessionBackgrounds::default(),
             tunnels: std::sync::Arc::new(super::tunnel::TunnelRegistry::new()),
         })
