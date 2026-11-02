@@ -178,7 +178,9 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
     ));
     let permission_approver =
         crate::agent::PermissionApprover::new().with_runtime_service(runtime_service.clone());
-    let workspace_approver = WorkspaceApprover::new().with_runtime_service(runtime_service.clone());
+    let workspace_approver = WorkspaceApprover::new()
+        .with_runtime_service(runtime_service.clone())
+        .with_may_dir(may_dir.clone());
     let ask_user_approver = AskUserApprover::new().with_runtime_service(runtime_service.clone());
 
     // Initialize memory processor with fast-tier provider chain

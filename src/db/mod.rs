@@ -32,7 +32,7 @@ pub use common::{
     AssistantCacheUsageSummary, ChatDbError, ContextDebugSnapshot, ContextDebugSnapshotMessage,
     CreateProfileParams, CreateScheduledTaskParams, MessageStatsParams, NetworkAccessLogParams,
     NetworkAccessMode, NetworkAccessSource, NotificationCallbackConsumeResult,
-    ProfileEnvironmentKind, RequestLogParams, SessionContextSnapshotUpsert,
+    PendingWorkspaceLookup, ProfileEnvironmentKind, RequestLogParams, SessionContextSnapshotUpsert,
     StoredSessionContextSnapshot, TranscriptEntry, UpdateProfileParams, UpdateScheduledTaskParams,
 };
 pub use context_snapshot::ContextDebugSnapshotWrite;

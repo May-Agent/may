@@ -514,9 +514,30 @@ impl ChatDb {
         Ok(Some(pending.session_id))
     }
 
+    /// The workspace request still pending under `request_id`, without
+    /// committing anything.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn pending_workspace(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<PendingWorkspaceLookup>, ChatDbError> {
+        let mut tx = self.db.begin().await?;
+        let lookup = query!(
+            tx,
+            "SELECT session_id, path, reason FROM session_pending_workspace WHERE request_id = ?",
+            request_id
+        )
+        .fetch_optional::<PendingWorkspaceLookup>()
+        .await?;
+        tx.commit().await?;
+        Ok(lookup)
+    }
+
     /// Commit a workspace decision: the pending request `request_id` is
     /// cleared by its id and the decision joins the history, together.
-    /// Returns the request's session, or `None` when it is not pending.
+    /// Returns the committed request, or `None` when it is not pending.
     ///
     /// # Errors
     /// Returns [`ChatDbError`] on storage failure.
@@ -524,11 +545,11 @@ impl ChatDb {
         &self,
         request_id: &str,
         approved: bool,
-    ) -> Result<Option<String>, ChatDbError> {
+    ) -> Result<Option<PendingWorkspaceLookup>, ChatDbError> {
         let mut tx = self.db.begin().await?;
         let Some(pending) = query!(
             tx,
-            "DELETE FROM session_pending_workspace WHERE request_id = ? RETURNING session_id",
+            "DELETE FROM session_pending_workspace WHERE request_id = ? RETURNING session_id, path, reason",
             request_id
         )
         .fetch_optional::<PendingWorkspaceLookup>()
@@ -546,6 +567,6 @@ impl ChatDb {
         )
         .await?;
         tx.commit().await?;
-        Ok(Some(pending.session_id))
+        Ok(Some(pending))
     }
 }
