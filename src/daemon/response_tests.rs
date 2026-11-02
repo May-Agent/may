@@ -162,6 +162,9 @@ impl Prompt for Permission {
 
 struct Workspace {
     approver: WorkspaceApprover,
+    /// A real directory the request can be approved for — an approval
+    /// canonicalizes it before the decision commits.
+    requested_dir: tempfile::TempDir,
     _may_dir: tempfile::TempDir,
 }
 
@@ -172,10 +175,12 @@ impl Prompt for Workspace {
     fn new(runtime: &Arc<SessionRuntimeService>) -> Self {
         let may_dir = tempfile::tempdir().expect("may dir");
         std::fs::write(may_dir.path().join("workspace.toml"), "").expect("workspace.toml");
+        let requested_dir = tempfile::tempdir().expect("requested dir");
         Self {
             approver: WorkspaceApprover::new()
                 .with_runtime_service(runtime.clone())
                 .with_may_dir(may_dir.path().to_path_buf()),
+            requested_dir,
             _may_dir: may_dir,
         }
     }
@@ -183,12 +188,13 @@ impl Prompt for Workspace {
     fn wait(&self, runtime: &Arc<SessionRuntimeService>) -> JoinHandle<Woken> {
         let approver = self.approver.clone();
         let runtime = runtime.clone();
+        let requested_path = self.requested_dir.path().display().to_string();
         tokio::spawn(async move {
             let accepted = approver
                 .request_and_wait(
                     "session",
                     RequestWorkspaceArgs {
-                        path: "/srv/data".to_string(),
+                        path: requested_path,
                         reason: "read the dataset".to_string(),
                     },
                 )
@@ -816,5 +822,167 @@ async fn a_denied_workspace_request_grants_nothing() {
     assert!(
         !stored.contains(&denied_dir.path().display().to_string()),
         "workspace.toml gains no denied dir"
+    );
+}
+
+/// An approval whose path cannot be resolved commits nothing: the
+/// request stays pending, the waiter never wakes, and no grant or
+/// `workspace.toml` entry appears.
+#[tokio::test]
+async fn an_approval_with_an_unresolvable_path_leaves_the_request_pending() {
+    init_executor();
+    let fixture = Fixture::new().await;
+    let may_dir = tempfile::tempdir().expect("may dir");
+    let config_path = may_dir.path().join("workspace.toml");
+    std::fs::write(&config_path, "").expect("workspace.toml");
+    let grants = aither_sandbox::TerminalGrants::new();
+    fixture
+        .runtime
+        .set_terminal_grants("session", grants.clone());
+    let missing = may_dir.path().join("does-not-exist");
+
+    let approver = WorkspaceApprover::new()
+        .with_runtime_service(fixture.runtime.clone())
+        .with_may_dir(may_dir.path().to_path_buf());
+    let waiter = approver.clone();
+    let missing_path = missing.display().to_string();
+    let waiting = tokio::spawn(async move {
+        waiter
+            .request_and_wait(
+                "session",
+                RequestWorkspaceArgs {
+                    path: missing_path,
+                    reason: "read it".to_string(),
+                },
+            )
+            .await
+    });
+    let request_id = bounded("the request to pend", async {
+        loop {
+            let summary = fixture.runtime.get("session").await.expect("runtime loads");
+            if let Some(request) = summary.waiting_workspace {
+                return request.id;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    let error = approver
+        .resolve(&request_id, true)
+        .await
+        .expect_err("an unresolvable path fails the approval");
+    assert!(
+        matches!(
+            error,
+            super::state::WorkspaceResolveError::Canonicalize { .. }
+        ),
+        "the path error reports as Canonicalize: {error}"
+    );
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !waiting.is_finished(),
+        "the waiter is still pending after a failed approval"
+    );
+    waiting.abort();
+    let summary = fixture.runtime.get("session").await.expect("runtime loads");
+    assert!(
+        summary.waiting_workspace.is_some(),
+        "the request stays pending after a failed approval"
+    );
+    assert!(grants.snapshot().writable.is_empty(), "no grant was added");
+    let stored = std::fs::read_to_string(&config_path).expect("workspace.toml");
+    assert!(stored.is_empty(), "workspace.toml stayed empty");
+}
+
+/// An approval for a session created inside a profile writes that
+/// profile's `workspace.toml` and leaves the global one untouched.
+#[tokio::test]
+async fn an_approved_request_writes_the_profile_workspace_toml() {
+    init_executor();
+    let fixture = Fixture::new().await;
+    fixture
+        .runtime
+        .db()
+        .create_session_in_profile(
+            "profile-session",
+            Some("Profile Session"),
+            Some("test-model"),
+            Some("profile-1"),
+        )
+        .await
+        .expect("profile session");
+    let may_dir = tempfile::tempdir().expect("may dir");
+    let global_config = may_dir.path().join("workspace.toml");
+    std::fs::write(&global_config, "").expect("global workspace.toml");
+    let profile_config = may_dir.path().join("profiles/profile-1/workspace.toml");
+    std::fs::create_dir_all(profile_config.parent().expect("profile dir")).expect("profile dir");
+    std::fs::write(&profile_config, "").expect("profile workspace.toml");
+    let approved_dir = tempfile::tempdir().expect("approved dir");
+
+    let approver = WorkspaceApprover::new()
+        .with_runtime_service(fixture.runtime.clone())
+        .with_may_dir(may_dir.path().to_path_buf());
+    let waiter = approver.clone();
+    let requested_path = approved_dir.path().display().to_string();
+    let waiting = tokio::spawn(async move {
+        waiter
+            .request_and_wait(
+                "profile-session",
+                RequestWorkspaceArgs {
+                    path: requested_path,
+                    reason: "needed".to_string(),
+                },
+            )
+            .await
+    });
+    let request_id = bounded("the request to pend", async {
+        loop {
+            let summary = fixture
+                .runtime
+                .get("profile-session")
+                .await
+                .expect("runtime loads");
+            if let Some(request) = summary.waiting_workspace {
+                return request.id;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    let resolved = bounded("the approval", approver.resolve(&request_id, true))
+        .await
+        .expect("resolve")
+        .expect("pending request");
+    assert!(resolved.woke);
+    let _ = waiting.await.expect("waiter finished");
+
+    let canonical = std::fs::canonicalize(approved_dir.path()).expect("canonical");
+    let profile_stored = std::fs::read_to_string(&profile_config).expect("profile workspace.toml");
+    assert!(
+        profile_stored.contains(&canonical.display().to_string()),
+        "the profile workspace.toml keeps the approved dir"
+    );
+    let global_stored = std::fs::read_to_string(&global_config).expect("global workspace.toml");
+    assert!(
+        global_stored.is_empty(),
+        "the global workspace.toml is untouched"
+    );
+}
+
+/// Forgetting a session's grant handle drops it from the registry.
+#[tokio::test]
+async fn forgetting_terminal_grants_removes_the_handle() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = ChatDb::open(&dir.path().join("history.db"))
+        .await
+        .expect("open database");
+    let runtime = SessionRuntimeService::new(db, UiEventBus::new());
+    runtime.set_terminal_grants("session", aither_sandbox::TerminalGrants::new());
+    assert!(runtime.terminal_grants("session").is_some());
+    runtime.forget_terminal_grants("session");
+    assert!(
+        runtime.terminal_grants("session").is_none(),
+        "the handle is gone after forget"
     );
 }
