@@ -1572,11 +1572,18 @@ fn usage_report_lines(report: &crate::agent::SessionUsageReport) -> Vec<Line<'st
 /// A USD amount: cents from $0.01 up, two significant digits below that so
 /// a sub-cent spend never reads as `$0.00`.
 fn format_cost_usd(cost: f64) -> String {
+    assert!(cost >= 0.0, "a cost is never negative: {cost}");
     if cost == 0.0 || cost >= 0.01 {
         return format!("${cost:.2}");
     }
-    // The first significant digit sits at 10^floor(log10(cost)); keep one more.
-    let decimals = (1.0 - cost.log10().floor()) as usize;
+    // Move `place` down to the first significant digit (0.001 holds four
+    // decimals: that digit and one past it).
+    let mut decimals = 4;
+    let mut place = 0.001;
+    while cost < place {
+        place /= 10.0;
+        decimals += 1;
+    }
     format!("${cost:.decimals$}")
 }
 
