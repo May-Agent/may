@@ -21,6 +21,16 @@ use crate::ui_event_bus::UiEventTopics;
 #[serde(rename_all = "camelCase")]
 pub(super) struct ComputerStatus {
     running: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    needs_permissions: Option<ComputerPermissions>,
+}
+
+/// macOS TCC grants the desktop stack is missing; `null` when granted.
+#[derive(serde::Serialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ComputerPermissions {
+    pub screen_recording: bool,
+    pub accessibility: bool,
 }
 
 #[derive(serde::Deserialize, skyzen::ToSchema)]
@@ -49,6 +59,7 @@ pub(super) async fn computer_status(
     let id = params.get("id").map_err(bad_request_error)?.to_string();
     Ok(Json(ComputerStatus {
         running: is_running(&state, &id).await,
+        needs_permissions: needs_permissions(&state).await,
     }))
 }
 
@@ -57,6 +68,19 @@ pub(super) async fn computer_start(
     State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<ComputerStatus>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
+    if let Some(permissions) = needs_permissions(&state).await {
+        // An explicit start is the consent point: raise the TCC prompts,
+        // then respawn the helper so the next call sees a fresh grant.
+        let _ = state
+            .computer
+            .request(AgentRequest::RequestPermissions)
+            .await;
+        state.computer.restart();
+        return Ok(Json(ComputerStatus {
+            running: false,
+            needs_permissions: Some(permissions),
+        }));
+    }
     let tokio_handle = state.tokio_handle.clone();
     let running = tokio_handle
         .spawn({
@@ -68,7 +92,10 @@ pub(super) async fn computer_start(
             internal_error_message("computer start task panicked before producing a response")
         })??;
     state.notify_ui_events(UiEventTopics::BROWSER_STATUS);
-    Ok(Json(ComputerStatus { running }))
+    Ok(Json(ComputerStatus {
+        running,
+        needs_permissions: needs_permissions(&state).await,
+    }))
 }
 
 pub(super) async fn computer_stop(
@@ -127,95 +154,87 @@ pub(super) async fn computer_takeover_stop(
     }))
 }
 
-#[cfg_attr(not(target_os = "macos"), allow(clippy::unused_async))]
+use crate::computer::proto::{AgentRequest, AgentResponse};
+
+/// The TCC grants the helper is still missing; `None` when all granted.
+/// Read-only — status polls must never raise prompts or kill the helper.
+async fn needs_permissions(state: &DaemonState) -> Option<ComputerPermissions> {
+    let Ok(AgentResponse::Permissions {
+        screen_recording,
+        accessibility,
+    }) = state.computer.request(AgentRequest::Preflight).await
+    else {
+        return None;
+    };
+    (!screen_recording || !accessibility).then_some(ComputerPermissions {
+        screen_recording,
+        accessibility,
+    })
+}
+
+async fn rpc(state: &DaemonState, request: AgentRequest) -> SkyResult<AgentResponse> {
+    state
+        .computer
+        .request(request)
+        .await
+        .map_err(|error| skyzen::Error::msg(error).set_status(StatusCode::INTERNAL_SERVER_ERROR))
+}
+
 async fn run_computer_start(state: Arc<DaemonState>, id: String) -> SkyResult<bool> {
-    #[cfg(target_os = "macos")]
-    {
-        let (stream, display) = {
-            let stream = state.session_streams.lock().await.stream(&id);
-            let display = state
-                .session_displays
-                .lock()
-                .await
-                .acquire(&id)
-                .map_err(|error| {
-                    skyzen::Error::msg(error.to_string())
-                        .set_status(StatusCode::INTERNAL_SERVER_ERROR)
-                })?;
-            (stream, display)
-        };
-        stream.start(display).await.map_err(|error| {
-            skyzen::Error::msg(error.to_string()).set_status(StatusCode::INTERNAL_SERVER_ERROR)
-        })?;
-        Ok(true)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (state, id);
-        Err(
-            skyzen::Error::msg("session desktops are macOS-only for now")
-                .set_status(StatusCode::NOT_FOUND),
-        )
+    match rpc(&state, AgentRequest::StartStream { session_id: id }).await? {
+        AgentResponse::Ok => Ok(true),
+        AgentResponse::Error { error } => {
+            Err(skyzen::Error::msg(error).set_status(StatusCode::INTERNAL_SERVER_ERROR))
+        }
+        _ => Err(skyzen::Error::msg("unexpected reply from computer-agent")
+            .set_status(StatusCode::INTERNAL_SERVER_ERROR)),
     }
 }
 
-#[cfg(target_os = "macos")]
 async fn is_running(state: &DaemonState, id: &str) -> bool {
-    state
-        .session_streams
-        .lock()
-        .await
-        .stream(id)
-        .is_running()
-        .await
-}
-
-#[cfg(not(target_os = "macos"))]
-#[allow(clippy::unused_async)]
-async fn is_running(_state: &DaemonState, _id: &str) -> bool {
-    false
-}
-
-#[cfg(target_os = "macos")]
-async fn stop_stream(state: &DaemonState, id: &str) {
-    state.session_streams.lock().await.stream(id).stop().await;
-}
-
-#[cfg(not(target_os = "macos"))]
-#[allow(clippy::unused_async)]
-async fn stop_stream(_state: &DaemonState, _id: &str) {}
-
-#[cfg(target_os = "macos")]
-async fn answer_offer(state: &DaemonState, id: &str, offer_sdp: String) -> SkyResult<String> {
-    state
-        .session_streams
-        .lock()
-        .await
-        .stream(id)
-        .handle_offer(offer_sdp)
-        .await
-        .map_err(|error| skyzen::Error::msg(error.to_string()))
-}
-
-#[cfg(not(target_os = "macos"))]
-#[allow(clippy::unused_async)]
-async fn answer_offer(_state: &DaemonState, _id: &str, _offer_sdp: String) -> SkyResult<String> {
-    Err(
-        skyzen::Error::msg("session desktops are macOS-only for now")
-            .set_status(StatusCode::NOT_FOUND),
+    matches!(
+        state
+            .computer
+            .request(AgentRequest::StreamRunning {
+                session_id: id.to_owned(),
+            })
+            .await,
+        Ok(AgentResponse::Flag { value: true })
     )
 }
 
-#[cfg(target_os = "macos")]
-async fn set_takeover(state: &DaemonState, id: &str, active: bool) {
-    state
-        .session_streams
-        .lock()
-        .await
-        .stream(id)
-        .set_takeover(active);
+async fn stop_stream(state: &DaemonState, id: &str) {
+    let _ = state
+        .computer
+        .request(AgentRequest::StopStream {
+            session_id: id.to_owned(),
+        })
+        .await;
 }
 
-#[cfg(not(target_os = "macos"))]
-#[allow(clippy::unused_async)]
-async fn set_takeover(_state: &DaemonState, _id: &str, _active: bool) {}
+async fn answer_offer(state: &DaemonState, id: &str, offer_sdp: String) -> SkyResult<String> {
+    match rpc(
+        state,
+        AgentRequest::Offer {
+            session_id: id.to_owned(),
+            sdp: offer_sdp,
+        },
+    )
+    .await?
+    {
+        AgentResponse::Sdp { sdp } => Ok(sdp),
+        AgentResponse::Error { error } => Err(skyzen::Error::msg(error)),
+        _ => Err(skyzen::Error::msg("unexpected reply from computer-agent")
+            .set_status(StatusCode::INTERNAL_SERVER_ERROR)),
+    }
+}
+
+async fn set_takeover(state: &DaemonState, id: &str, active: bool) {
+    let _ = state
+        .computer
+        .request(AgentRequest::SetTakeover {
+            session_id: id.to_owned(),
+            active,
+        })
+        .await;
+}
