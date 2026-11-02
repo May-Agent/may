@@ -314,8 +314,8 @@ pub enum ChatElement {
         id: String,
         /// Reasoning text received so far.
         content: String,
-        /// Seconds spent thinking.
-        seconds: u64,
+        /// Seconds spent thinking. Sub-second phases keep the fraction.
+        seconds: f64,
         /// Open while reasoning streams, or after the user reopens a header.
         expanded: bool,
         /// Still receiving the current burst. Live bodies are a 5-line tail
@@ -557,7 +557,7 @@ impl ChatStream {
         self.push_element(ChatElement::Thinking {
             id: format!("thinking-{id}"),
             content: String::new(),
-            seconds: 0,
+            seconds: 0.0,
             expanded: true,
             live: true,
         });
@@ -574,10 +574,8 @@ impl ChatStream {
         match self.elements.last() {
             Some(ChatElement::Thinking { live: true, .. }) => {}
             Some(ChatElement::Thinking {
-                content,
-                seconds: 0,
-                ..
-            }) if content.is_empty() => {
+                content, seconds, ..
+            }) if content.is_empty() && thought_millis(*seconds) == 0 => {
                 if let Some(ChatElement::Thinking { expanded, live, .. }) = self.elements.last_mut()
                 {
                     *expanded = true;
@@ -594,9 +592,9 @@ impl ChatStream {
     }
 
     /// Update thinking time.
-    pub fn update_thinking(&mut self, seconds: u64) {
+    pub fn update_thinking(&mut self, seconds: f64) {
         if let Some(ChatElement::Thinking { seconds: s, .. }) = self.elements.last_mut()
-            && *s != seconds
+            && thought_duration_label(*s) != thought_duration_label(seconds)
         {
             *s = seconds;
             self.touch_last();
@@ -606,15 +604,17 @@ impl ChatStream {
     /// Stamp the daemon-measured duration of a reasoning phase and collapse
     /// the block — the phase ended, nothing more can stream into it. A phase
     /// that produced no readable text leaves a collapsed, non-expandable
-    /// header when `seconds > 0`. A 0-second empty close is dropped so it
-    /// cannot sit in front of the next burst as a bare `Thought`.
-    pub fn finish_thinking(&mut self, seconds: u64) {
+    /// header when the duration is measurable. A zero-duration empty close
+    /// is dropped so it cannot sit in front of the next burst as a bare
+    /// `Thought`.
+    pub fn finish_thinking(&mut self, seconds: f64) {
         enum Finish {
             Stamp,
             Pop,
             Push,
             None,
         }
+        let zero = thought_millis(seconds) == 0;
         let action = match self.elements.last() {
             Some(ChatElement::Thinking {
                 content,
@@ -622,20 +622,21 @@ impl ChatStream {
                 live,
                 ..
             }) if *expanded || *live => {
-                if content.is_empty() && seconds == 0 {
+                if content.is_empty() && zero {
                     Finish::Pop
                 } else {
                     Finish::Stamp
                 }
             }
             Some(ChatElement::Thinking { content, .. }) if content.is_empty() => {
-                if seconds == 0 {
+                if zero {
                     Finish::Pop
                 } else {
                     Finish::Stamp
                 }
             }
-            _ if seconds == 0 => Finish::None,
+            Some(ChatElement::Thinking { .. }) => Finish::Stamp,
+            _ if zero => Finish::None,
             _ => Finish::Push,
         };
         match action {
@@ -676,11 +677,13 @@ impl ChatStream {
         match self.elements.last() {
             Some(ChatElement::Thinking {
                 content,
-                seconds: 0,
+                seconds,
                 expanded,
                 live,
                 ..
-            }) if (*expanded || *live) && content.is_empty() => self.pop_last(),
+            }) if (*expanded || *live) && content.is_empty() && thought_millis(*seconds) == 0 => {
+                self.pop_last();
+            }
             Some(ChatElement::Thinking { expanded, live, .. }) if *expanded || *live => {
                 if let Some(ChatElement::Thinking { expanded, live, .. }) = self.elements.last_mut()
                 {
@@ -1797,6 +1800,62 @@ fn compact_seconds(seconds: u64) -> String {
     }
 }
 
+fn thought_millis(seconds: f64) -> u64 {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return 0;
+    }
+    let ms = seconds * 1000.0;
+    if ms >= u64::MAX as f64 {
+        return u64::MAX;
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    {
+        ms.round() as u64
+    }
+}
+
+/// Thinking-header duration: integer milliseconds below 0.1s, one decimal
+/// below 1s, then `12s` / `1m 4s` / `1h 2m`.
+#[must_use]
+pub fn thought_duration_label(seconds: f64) -> String {
+    let ms = thought_millis(seconds);
+    if ms < 100 {
+        return format!("{ms}ms");
+    }
+    if ms < 1000 {
+        let tenths = (ms + 50) / 100;
+        if tenths < 10 {
+            return format!("{}.{}s", tenths / 10, tenths % 10);
+        }
+        return thought_whole_seconds(1);
+    }
+    thought_whole_seconds(ms.saturating_add(500) / 1000)
+}
+
+fn thought_whole_seconds(total: u64) -> String {
+    const MIN: u64 = 60;
+    const HOUR: u64 = 60 * 60;
+    if total >= HOUR {
+        let hours = total / HOUR;
+        let minutes = (total % HOUR) / MIN;
+        if minutes == 0 {
+            format!("{hours}h")
+        } else {
+            format!("{hours}h {minutes}m")
+        }
+    } else if total >= MIN {
+        let minutes = total / MIN;
+        let secs = total % MIN;
+        if secs == 0 {
+            format!("{minutes}m")
+        } else {
+            format!("{minutes}m {secs}s")
+        }
+    } else {
+        format!("{total}s")
+    }
+}
+
 /// Id a click on `elem` toggles, when it is collapsible.
 pub(super) fn collapsible_id(elem: &ChatElement) -> Option<&str> {
     match elem {
@@ -2029,19 +2088,15 @@ pub(super) fn element_lines(
             ..
         } => {
             let header = if *expanded {
-                if *seconds == 0 {
+                if thought_millis(*seconds) == 0 {
                     "◐ Thinking...".to_string()
                 } else {
-                    format!("◐ Thinking... ({seconds} sec)")
+                    format!("◐ Thinking... ({})", thought_duration_label(*seconds))
                 }
             } else {
                 // An empty block is a timing marker only: no expand affordance.
                 let arrow = if content.is_empty() { "" } else { " ▸" };
-                if *seconds == 0 {
-                    format!("◐ Thought{arrow}")
-                } else {
-                    format!("◐ Thought for {seconds} sec{arrow}")
-                }
+                format!("◐ Thought for {}{arrow}", thought_duration_label(*seconds))
             };
             lines.push(Line::from(Span::styled(
                 header,
@@ -4341,7 +4396,7 @@ mod tests {
     #[test]
     fn empty_zero_second_thought_is_dropped() {
         let mut chat = ChatStream::new();
-        chat.finish_thinking(0);
+        chat.finish_thinking(0.0);
         assert!(chat.elements().is_empty());
 
         chat.start_thinking();
@@ -4354,16 +4409,16 @@ mod tests {
         let mut chat = ChatStream::new();
         // Daemon closed a freshly re-armed phase at 0s (TurnComplete after
         // tools), then the next burst streamed real reasoning.
-        chat.finish_thinking(0);
+        chat.finish_thinking(0.0);
         chat.push_thinking("step one");
-        chat.finish_thinking(9);
+        chat.finish_thinking(9.0);
         let lines = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
         let headers: Vec<&str> = lines
             .iter()
             .filter(|l| l.contains("Thought") || l.contains("Thinking"))
             .map(String::as_str)
             .collect();
-        assert_eq!(headers, ["◐ Thought for 9 sec ▸"]);
+        assert_eq!(headers, ["◐ Thought for 9s ▸"]);
         assert_eq!(
             chat.elements()
                 .iter()
@@ -4376,10 +4431,10 @@ mod tests {
     #[test]
     fn duration_only_header_stays_when_the_next_burst_starts() {
         let mut chat = ChatStream::new();
-        chat.finish_thinking(4);
+        chat.finish_thinking(4.0);
         chat.push_thinking("next");
         let lines = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
-        assert!(lines[0].contains("Thought for 4 sec"));
+        assert!(lines[0].contains("Thought for 4s"));
         assert!(!lines[0].contains('▸'));
         assert!(lines.iter().any(|l| l.contains("next")));
     }
@@ -4388,7 +4443,7 @@ mod tests {
     fn thinking_streams_then_collapses_and_reopens() {
         let mut chat = ChatStream::new();
         chat.push_thinking("step one\nstep two");
-        chat.update_thinking(3);
+        chat.update_thinking(3.0);
         // While streaming, the header plus both content lines are visible.
         let open = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
         assert_eq!(open.len(), 4); // header + 2 lines + trailing blank
@@ -4408,7 +4463,7 @@ mod tests {
             false,
         );
         assert_eq!(collapsed.len(), 2); // collapsed header + trailing blank
-        assert!(collapsed[0].contains("Thought for 3 sec"));
+        assert!(collapsed[0].contains("Thought for 3s"));
         assert_eq!(regions.len(), 1);
         assert_eq!(regions[0].element_id, "thinking-0");
 
@@ -4427,7 +4482,7 @@ mod tests {
         chat.push_text("answer");
         chat.push_thinking("second");
         let lines = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
-        assert!(lines[0].contains("Thought")); // first burst collapsed
+        assert!(lines[0].contains("Thought for 0ms")); // first burst collapsed
         assert!(lines.iter().any(|l| l.contains("second")));
     }
 
@@ -4435,7 +4490,7 @@ mod tests {
     fn empty_thinking_block_is_not_collapsible() {
         let mut chat = ChatStream::new();
         // A reasoning phase that produced no readable text: only a duration.
-        chat.finish_thinking(4);
+        chat.finish_thinking(4.0);
         let mut regions = Vec::new();
         let lines = build_plain_wrapped_lines_unified(
             &chat,
@@ -4447,7 +4502,7 @@ mod tests {
             false,
         );
         assert_eq!(lines.len(), 2); // header + trailing blank
-        assert!(lines[0].contains("Thought for 4 sec"));
+        assert!(lines[0].contains("Thought for 4s"));
         assert!(!lines[0].contains('▸'));
         assert!(regions.is_empty());
 
@@ -4461,15 +4516,54 @@ mod tests {
     fn finish_thinking_collapses_the_phase() {
         let mut chat = ChatStream::new();
         chat.push_thinking("chunk");
-        chat.finish_thinking(6);
+        chat.finish_thinking(6.0);
         // The phase ended: the block collapses to its header at once, it does
         // not wait for the next element to arrive.
         let lines = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
-        assert!(lines[0].contains("Thought for 6 sec ▸"));
+        assert!(lines[0].contains("Thought for 6s ▸"));
 
         chat.collapse_thinking();
         let collapsed = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
-        assert!(collapsed[0].contains("Thought for 6 sec ▸"));
+        assert!(collapsed[0].contains("Thought for 6s ▸"));
+    }
+
+    #[test]
+    fn thought_duration_label_matches_the_display_rules() {
+        assert_eq!(super::thought_duration_label(0.0), "0ms");
+        assert_eq!(super::thought_duration_label(0.047), "47ms");
+        assert_eq!(super::thought_duration_label(0.1), "0.1s");
+        assert_eq!(super::thought_duration_label(0.5), "0.5s");
+        assert_eq!(super::thought_duration_label(12.0), "12s");
+        assert_eq!(super::thought_duration_label(64.0), "1m 4s");
+        assert_eq!(super::thought_duration_label(60.0), "1m");
+        assert_eq!(super::thought_duration_label(3720.0), "1h 2m");
+        assert_eq!(super::thought_duration_label(3600.0), "1h");
+    }
+
+    #[test]
+    fn subsecond_thinking_with_content_keeps_a_duration_header() {
+        let mut chat = ChatStream::new();
+        chat.push_thinking("step");
+        chat.finish_thinking(0.5);
+        let lines = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
+        assert_eq!(lines[0], "◐ Thought for 0.5s ▸");
+    }
+
+    #[test]
+    fn finish_thinking_stamps_a_collapsed_block() {
+        let mut chat = ChatStream::new();
+        chat.push_thinking("step");
+        chat.collapse_thinking();
+        chat.finish_thinking(0.047);
+        let lines = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
+        assert_eq!(lines[0], "◐ Thought for 47ms ▸");
+        assert_eq!(
+            chat.elements()
+                .iter()
+                .filter(|e| matches!(e, ChatElement::Thinking { .. }))
+                .count(),
+            1
+        );
     }
 
     #[test]

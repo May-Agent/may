@@ -61,8 +61,8 @@ pub enum TuiEvent {
     /// A reasoning phase closed after `seconds`, whether or not it produced
     /// readable text. Emitted just before the output that follows it.
     ReasoningEnd {
-        /// Seconds the phase lasted.
-        seconds: u64,
+        /// Seconds the phase lasted. Sub-second phases keep the fraction.
+        seconds: f64,
     },
     /// Agent stream completed (ready for next prompt).
     Complete,
