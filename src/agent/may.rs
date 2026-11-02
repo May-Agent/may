@@ -454,8 +454,7 @@ impl MayAgent {
         {
             // The first-contact trust decision picks the binding: GitHub
             // and local-branch clone; `local` writes the checkout; undecided
-            // binds nothing yet — the question is posted once the session
-            // runtime exists below.
+            // binds nothing — the launch gate asks before the session starts.
             let trust = crate::trust::trust_for(&workspace.config, &repo_key, &worktree);
             let clone = match trust {
                 Some(
@@ -553,20 +552,6 @@ impl MayAgent {
             .cache_lifetime(config.cache_lifetime.into())
             .background_jobs(config.background_jobs);
         if let Some(runtime) = hook_runtime.clone() {
-            // First-contact: an unknown repository asks once; the answer
-            // persists through `repo trust set` and later sessions reuse it.
-            if let Some(worktree) = crate::repo_search::worktree_root(&config.cwd)
-                && let Ok(repo_key) = crate::issue::repository_identity(&worktree)
-                && crate::trust::trust_for(&workspace.config, &repo_key, &worktree).is_none()
-            {
-                let kind = crate::trust::repo_kind(&worktree);
-                let _ = runtime
-                    .open_question(
-                        config.session_id.as_str(),
-                        &crate::trust::question_for(&kind, &worktree),
-                    )
-                    .await;
-            }
             builder = builder
                 .context_source(super::ask_user_tool::OpenQuestionsContext::new(
                     runtime.clone(),

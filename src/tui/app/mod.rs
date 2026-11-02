@@ -2101,6 +2101,9 @@ impl App {
             AppMode::LaunchGrant(_) => {
                 Ok(super::reducer::manage::handle_launch_grant_key(self, code))
             }
+            AppMode::RepoTrust(_) => {
+                Ok(super::reducer::ask_user::handle_repo_trust_key(self, code))
+            }
             AppMode::McpManage => Ok(super::reducer::manage::handle_mcp_key(self, code)),
             AppMode::SshManage => Ok(super::reducer::manage::handle_ssh_key(self, code)),
             AppMode::AskUser(_) => Ok(super::reducer::ask_user::handle_ask_user_key(self, code)),
@@ -3958,6 +3961,11 @@ pub enum SendAction {
     RespondLaunchGrant {
         /// Whether the user granted read/write access to the launch dir.
         approved: bool,
+    },
+    /// Answer the startup repo-trust prompt.
+    RespondRepoTrust {
+        /// The picked level; `None` binds nothing this launch.
+        level: Option<crate::trust::TrustLevel>,
     },
     /// Submit a workspace approval response.
     RespondWorkspace {

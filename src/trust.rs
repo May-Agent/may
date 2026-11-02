@@ -9,8 +9,9 @@
 //! - `local_branch` — may PR + may issue on a session clone
 //! - `local` — write the launch checkout directly (not recommended)
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use crate::ask_user::{AnswerValue, QuestionAnswer};
 use crate::session::{PersistedAskUserQuestion, PersistedAskUserRequest};
 use crate::workspace::{
     GitHubRepository, ProjectConfig, ProjectIssues, ProjectPr, WorkspaceConfig,
@@ -109,6 +110,57 @@ pub fn remote_url(worktree: &Path) -> Option<String> {
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+}
+
+/// A launch repository with no persisted trust decision: the worktree and
+/// its detected kind, which pick the gate's option set.
+#[derive(Debug, Clone)]
+pub struct PendingTrust {
+    /// The launch repository's worktree root.
+    pub worktree: PathBuf,
+    /// Whether the remote is GitHub-backed.
+    pub kind: RepoKind,
+}
+
+/// The trust decision `cwd`'s repository still waits for.
+///
+/// `Some` when `cwd` is inside a worktree whose repository has no
+/// `[[projects]]` entry. Outside a repository there is no repo gate —
+/// the write-grant applies.
+///
+/// # Errors
+/// Fails when `config_path` exists but cannot be read or parsed.
+pub fn pending_decision(
+    cwd: &Path,
+    config_path: &Path,
+) -> Result<Option<PendingTrust>, WorkspaceConfigError> {
+    let Some(worktree) = crate::repo_search::worktree_root(cwd) else {
+        return Ok(None);
+    };
+    let Ok(repo_key) = crate::issue::repository_identity(&worktree) else {
+        return Ok(None);
+    };
+    let config = WorkspaceConfig::load(config_path)?;
+    if trust_for(&config, &repo_key, &worktree).is_some() {
+        return Ok(None);
+    }
+    Ok(Some(PendingTrust {
+        kind: repo_kind(&worktree),
+        worktree,
+    }))
+}
+
+/// The trust level a gate answer selects. `exit`, dismissal and custom text
+/// that is not a level name bind nothing — the repository stays undecided.
+#[must_use]
+pub fn level_for_answer(answer: &QuestionAnswer) -> Option<TrustLevel> {
+    let text = match &answer.answer {
+        AnswerValue::Selected(values) => values.first()?.as_str(),
+        AnswerValue::Custom(text) => text.as_str(),
+        AnswerValue::Skipped => return None,
+    };
+    // Options read `level — description`; custom text is a bare level name.
+    TrustLevel::parse(text.split(" —").next().unwrap_or(text).trim())
 }
 
 /// The persisted trust for a repository identity, when a `[[projects]]`
@@ -223,6 +275,7 @@ pub fn question_for(kind: &RepoKind, worktree: &Path) -> PersistedAskUserRequest
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ask_user::{AnswerValue, QuestionAnswer};
     use std::process::Command;
 
     fn git_repo() -> tempfile::TempDir {
@@ -323,5 +376,43 @@ mod tests {
         assert_eq!(TrustLevel::parse("local"), Some(TrustLevel::Local));
         assert!(TrustLevel::LocalBranch.clones_work());
         assert!(!TrustLevel::Local.clones_work());
+    }
+
+    fn answer(value: AnswerValue) -> QuestionAnswer {
+        QuestionAnswer {
+            section: "repo-trust".to_string(),
+            answer: value,
+        }
+    }
+
+    #[test]
+    fn a_gate_answer_maps_to_its_level() {
+        for (option, level) in [
+            ("full — Allow GitHub PRs and issues", TrustLevel::Full),
+            (
+                "prs-only — GitHub PRs only; issues stay internal",
+                TrustLevel::PrsOnly,
+            ),
+            (
+                "local-branch — Isolated clone and local PRs",
+                TrustLevel::LocalBranch,
+            ),
+            (
+                "local — Write the checkout directly (not recommended)",
+                TrustLevel::Local,
+            ),
+        ] {
+            let selected = answer(AnswerValue::Selected(vec![option.to_string()]));
+            assert_eq!(level_for_answer(&selected), Some(level));
+        }
+        for value in [
+            AnswerValue::Selected(vec!["exit — Do not bind this repository".to_string()]),
+            AnswerValue::Custom("not a level".to_string()),
+            AnswerValue::Skipped,
+        ] {
+            assert_eq!(level_for_answer(&answer(value)), None);
+        }
+        let custom = answer(AnswerValue::Custom("prs-only".to_string()));
+        assert_eq!(level_for_answer(&custom), Some(TrustLevel::PrsOnly));
     }
 }
