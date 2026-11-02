@@ -1286,8 +1286,11 @@ pub struct StatusContext<'a> {
     /// Animation frame counter for the activity spinner.
     pub spinner_frame: usize,
     /// Coverage of the session's worktree index: a slim blue bar while the
-    /// index is incomplete, absent at full coverage or with nothing to index.
+    /// index is incomplete, `index ✓` once full, a red `index ✗` when
+    /// repo-search is down.
     pub index_coverage: Option<&'a crate::client::IndexCoverage>,
+    /// Repo-search could not be reached; the status bar shows a red cross.
+    pub index_failed: bool,
 }
 
 /// Queued message context for rendering queue indicator.
@@ -2672,8 +2675,9 @@ fn render_status_line(lines: &mut Vec<Line<'_>>, ctx: &StatusContext<'_>, width:
         .usage
         .map(|(prompt_tokens, context_window)| format_status_usage(prompt_tokens, context_window));
 
-    // The worktree index: fill bar while incomplete, `index ✓` once full.
-    let index_bar = ctx.index_coverage.and_then(index_bar);
+    // The worktree index: fill bar while incomplete, `index ✓` once full,
+    // red `index ✗` when repo-search is down.
+    let index_bar = index_bar(ctx.index_coverage, ctx.index_failed);
 
     let status_text = parts.join(" · ");
     let status_style = Style::default().fg(Color::Cyan);
@@ -2735,8 +2739,19 @@ fn counted(n: usize, one: &str, many: &str) -> String {
 const INDEX_BAR_CELLS: usize = 8;
 
 /// The status bar's index coverage segment: `index ▕██████░░░░▏ 62%` while
-/// incomplete, `index ✓` once full; `None` when there is nothing to index.
-fn index_bar(coverage: &crate::client::IndexCoverage) -> Option<Vec<Span<'static>>> {
+/// incomplete, `index ✓` once full, `index ✗` in red when repo-search is
+/// down; `None` when there is nothing to index.
+fn index_bar(
+    coverage: Option<&crate::client::IndexCoverage>,
+    failed: bool,
+) -> Option<Vec<Span<'static>>> {
+    if failed {
+        return Some(vec![Span::styled(
+            "index ✗",
+            Style::default().fg(Color::Red),
+        )]);
+    }
+    let coverage = coverage?;
     let total = coverage.total;
     if total == 0 {
         return None;
@@ -3384,8 +3399,8 @@ mod tests {
         }
     }
 
-    fn bar_text(coverage: &crate::client::IndexCoverage) -> Option<String> {
-        index_bar(coverage).map(|spans| {
+    fn bar_text(coverage: Option<&crate::client::IndexCoverage>, failed: bool) -> Option<String> {
+        index_bar(coverage, failed).map(|spans| {
             spans
                 .iter()
                 .map(|span| span.content.as_ref())
@@ -3395,25 +3410,46 @@ mod tests {
 
     #[test]
     fn index_bar_shows_fill_and_percent_while_incomplete() {
+        let six = coverage(6, 10);
+        let zero = coverage(0, 5);
         assert_eq!(
-            bar_text(&coverage(6, 10)).as_deref(),
+            bar_text(Some(&six), false).as_deref(),
             Some("index ▕████░░░░▏ 60%")
         );
         assert_eq!(
-            bar_text(&coverage(0, 5)).as_deref(),
+            bar_text(Some(&zero), false).as_deref(),
             Some("index ▕░░░░░░░░▏ 0%")
         );
     }
 
     #[test]
     fn index_bar_shows_checkmark_at_full_coverage() {
-        assert_eq!(bar_text(&coverage(10, 10)).as_deref(), Some("index ✓"));
-        assert_eq!(bar_text(&coverage(12, 10)).as_deref(), Some("index ✓"));
+        let full = coverage(10, 10);
+        let over = coverage(12, 10);
+        assert_eq!(bar_text(Some(&full), false).as_deref(), Some("index ✓"));
+        assert_eq!(bar_text(Some(&over), false).as_deref(), Some("index ✓"));
     }
 
     #[test]
     fn index_bar_is_absent_with_nothing_to_index() {
-        assert!(index_bar(&coverage(0, 0)).is_none());
+        let empty = coverage(0, 0);
+        assert!(index_bar(Some(&empty), false).is_none());
+        assert!(index_bar(None, false).is_none());
+    }
+
+    #[test]
+    fn index_bar_shows_a_red_cross_when_search_is_down() {
+        let full = coverage(10, 10);
+        let spans = index_bar(Some(&full), true).expect("a failed search is visible");
+        assert_eq!(
+            spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "index ✗"
+        );
+        assert!(spans.iter().all(|span| span.style.fg == Some(Color::Red)));
+        assert_eq!(bar_text(None, true).as_deref(), Some("index ✗"));
     }
 
     #[test]
@@ -3734,6 +3770,7 @@ mod tests {
                             activity: None,
                             spinner_frame: 0,
                             index_coverage: None,
+                            index_failed: false,
                         }),
                         images_supported: true,
                         hide_todos: false,

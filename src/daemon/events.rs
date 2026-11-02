@@ -506,9 +506,21 @@ async fn emit_session_index_if_changed(
     let Some(worktree) = worktree else {
         return true;
     };
+    let (index, error) = match index_coverage(state, &worktree).await {
+        Ok(index) => (index, None),
+        Err(error) => {
+            tracing::debug!(
+                worktree = %worktree.display(),
+                %error,
+                "index coverage poll failed"
+            );
+            (None, Some(error))
+        }
+    };
     let payload = crate::client::SessionIndexSnapshot {
         session_id: session_filter.unwrap_or_default().to_string(),
-        index: index_coverage(state, &worktree).await,
+        index,
+        error,
     };
     if let Ok(sig) = serde_json::to_string(&payload)
         && sig != *last_sig
@@ -534,10 +546,13 @@ async fn coverage_worktree(
 }
 
 /// Coverage of `worktree` when repo-search answers its status.
+///
+/// `Err` when the daemon cannot be reached. `Ok(None)` when the worktree
+/// has no index yet.
 async fn index_coverage(
     state: &Arc<DaemonState>,
     worktree: &std::path::Path,
-) -> Option<crate::client::IndexCoverage> {
+) -> Result<Option<crate::client::IndexCoverage>, String> {
     let status = async {
         let client = state
             .repo_search
@@ -554,18 +569,14 @@ async fn index_coverage(
             .await
             .map_err(|e| e.to_string())
     }
-    .await;
+    .await?;
     match status {
-        Ok(Final::Status(report)) => report.index.map(|index| crate::client::IndexCoverage {
+        Final::Status(report) => Ok(report.index.map(|index| crate::client::IndexCoverage {
             phase: index.phase,
             with_vector: index.chunks_with_vector,
             total: index.chunks_total,
-        }),
-        Ok(_) => None,
-        Err(error) => {
-            tracing::debug!(worktree = %worktree.display(), %error, "index coverage poll failed");
-            None
-        }
+        })),
+        _ => Err("unexpected status reply".to_string()),
     }
 }
 
