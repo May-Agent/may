@@ -546,7 +546,7 @@ fn artifact_page_routes() -> Route {
     ))
 }
 
-fn build_router(
+pub(super) fn build_router(
     state: Arc<DaemonState>,
     mode: DaemonMode,
     auth: Option<super::auth::RequireIdentity>,
