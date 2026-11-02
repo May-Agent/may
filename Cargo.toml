@@ -70,7 +70,6 @@ partial-json-fixer = "0.5"
 # Utils
 jiff = { version = "0.2", features = ["serde"] }
 petname = "2"
-hostname = "0.4"
 cron = "0.15"
 chrono = "0.4"
 shell-escape = "0.1"
