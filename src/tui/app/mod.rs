@@ -77,6 +77,31 @@ pub struct ImageRegion {
     /// Path or URL shown under the zoomed image.
     pub caption: String,
 }
+/// A suggested next prompt the daemon generated for a session.
+#[derive(Debug)]
+pub struct PromptSuggestion {
+    /// Session the suggestion belongs to.
+    pub session_id: String,
+    /// The suggested prompt.
+    pub text: String,
+}
+
+/// The suggested prompt while it belongs to the attached session and the
+/// input is empty — the only state in which ghost text shows.
+///
+/// Field-level borrows keep it callable while another field is mutably
+/// borrowed.
+#[must_use]
+pub fn visible_suggestion<'a>(
+    prompt_suggestion: Option<&'a PromptSuggestion>,
+    input: &str,
+    current_session_id: Option<&str>,
+) -> Option<&'a str> {
+    let suggestion = prompt_suggestion?;
+    (input.is_empty() && current_session_id == Some(suggestion.session_id.as_str()))
+        .then_some(suggestion.text.as_str())
+}
+
 /// Application state (UI only - agent managed externally).
 #[derive(Debug)]
 pub struct App {
@@ -93,6 +118,9 @@ pub struct App {
     pub cursor: usize,
     /// Cached character count for input (avoids O(n) .`chars().count()`)
     pub input_char_count: usize,
+    /// The daemon's suggested next prompt, drawn as ghost text while the
+    /// input is empty; `Tab` lifts it into the draft.
+    pub prompt_suggestion: Option<PromptSuggestion>,
     /// Pending attachments
     pub attachments: Vec<Attachment>,
     /// Chat stream for display
@@ -521,6 +549,7 @@ impl App {
             input: String::new(),
             cursor: 0,
             input_char_count: 0,
+            prompt_suggestion: None,
             attachments: Vec::new(),
             chat: ChatStream::new().with_tunnel_base(tunnel_base),
             scroll: usize::MAX, // Follow bottom by default
@@ -2668,7 +2697,10 @@ impl App {
                 self.cursor = self.input_char_count;
             }
             KeyCode::Esc => {
-                if self.completion.has_matches() {
+                if self.prompt_suggestion.is_some() {
+                    self.prompt_suggestion = None;
+                    self.last_esc_at = Some(std::time::Instant::now());
+                } else if self.completion.has_matches() {
                     self.completion.cancel();
                     self.last_esc_at = Some(std::time::Instant::now());
                 } else if self
@@ -2693,6 +2725,13 @@ impl App {
                     && let Some(item) = self.completion.complete()
                 {
                     self.accept_completion(&item.insert.clone());
+                    return None;
+                }
+                if let Some(suggestion) = self.own_visible_suggestion().map(str::to_owned) {
+                    self.input_char_count = suggestion.chars().count();
+                    self.input = suggestion;
+                    self.cursor = self.input_char_count;
+                    self.prompt_suggestion = None;
                     return None;
                 }
                 if self.processing && (!self.input.is_empty() || !self.attachments.is_empty()) {
@@ -3905,6 +3944,18 @@ impl App {
         } else {
             None
         }
+    }
+
+    /// The suggested prompt when it belongs to the attached session and
+    /// the input is empty — the only state in which ghost text shows.
+    fn own_visible_suggestion(&self) -> Option<&str> {
+        visible_suggestion(
+            self.prompt_suggestion.as_ref(),
+            &self.input,
+            self.session_manager
+                .current()
+                .map(|session| session.id.as_str()),
+        )
     }
 
     /// Mirror the daemon's pending-message queue from the last

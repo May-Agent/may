@@ -126,6 +126,16 @@ pub enum AppEvent {
     /// The daemon dropped turn frames this client missed: the session's
     /// history must be reloaded.
     HistoryStale,
+    /// A `session_suggestion` frame arrived: `text` is the new ghost text,
+    /// `None` clears it.
+    PromptSuggestion {
+        /// The aux request that produced the update.
+        request_id: u64,
+        /// Session the suggestion belongs to.
+        session_id: String,
+        /// The suggested prompt, or `None` to clear it.
+        text: Option<String>,
+    },
     /// A kill request finished; `true` when the job accepted it.
     JobKilled {
         /// Process ID the kill targeted.
@@ -194,6 +204,7 @@ impl AppEvent {
             Self::IndexCoverage(_) => "index_coverage",
             Self::TurnStarted { .. } => "turn_started",
             Self::HistoryStale => "history_stale",
+            Self::PromptSuggestion { .. } => "prompt_suggestion",
             Self::JobKilled { .. } => "job_killed",
             Self::JobDetailLoaded { .. } => "job_detail_loaded",
             Self::TerminalOutputs(_) => "terminal_outputs",

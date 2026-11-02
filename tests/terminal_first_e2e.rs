@@ -992,6 +992,9 @@ impl TestHarness {
             .expect("test may dir should be created");
 
         let mut config = MayConfig::default();
+        // Aux generation would fire an unscripted request per completed
+        // turn into the mock provider and starve the scripted responses.
+        config.suggestions.enabled = false;
         config.provider.insert(
             TEST_PROVIDER_ID.to_string(),
             ProviderInstance::new(ProviderType::Custom)
