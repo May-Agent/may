@@ -1721,6 +1721,32 @@ impl App {
         );
     }
 
+    /// `/permission` re-asks the launch directory's access decision — the
+    /// repo-trust sheet inside a worktree, the write-grant outside one.
+    /// The answer overwrites the persisted decision.
+    fn open_permission_gate(&mut self) {
+        let home = crate::session::MayHomePaths::new(self.session_manager.may_dir().to_path_buf());
+        let config_path = self.session_manager.current_profile_id().map_or_else(
+            || home.workspace_config(),
+            |id| home.profile_home(id).workspace_config(),
+        );
+        if let Some(worktree) = crate::repo_search::worktree_root(&self.cwd) {
+            let kind = crate::trust::repo_kind(&worktree);
+            self.mode = AppMode::RepoTrust(crate::tui::state::RepoTrustState {
+                ask: AskUserState::for_open_question(crate::trust::question_for(&kind, &worktree)),
+                worktree,
+                kind,
+                config_path,
+            });
+        } else {
+            self.mode = AppMode::LaunchGrant(crate::tui::state::LaunchGrantState {
+                path: self.cwd.clone(),
+                config_path,
+                redecide: true,
+            });
+        }
+    }
+
     /// Offer the open-question panel: it opens now when the chat is up,
     /// parks behind whatever screen is open otherwise. Used when a new open
     /// question arrives so the user sees it without the panel ripping a
@@ -2929,6 +2955,10 @@ impl App {
                 self.mode = AppMode::SshManage;
                 None
             }
+            "/permission" => {
+                self.open_permission_gate();
+                None
+            }
             "/skill" => {
                 let tx = self.event_tx.clone();
                 let may_dir = self.session_manager.may_dir().to_path_buf();
@@ -3956,14 +3986,24 @@ pub enum SendAction {
         /// Name of the SSH server to remove.
         name: String,
     },
-    /// Answer the startup launch-directory grant prompt.
+    /// Answer the launch-directory grant prompt.
     RespondLaunchGrant {
+        /// The directory being decided.
+        dir: std::path::PathBuf,
+        /// `workspace.toml` the decision is written to.
+        config_path: std::path::PathBuf,
         /// Whether the user granted read/write access to the launch dir.
         approved: bool,
     },
-    /// Answer the startup repo-trust prompt.
+    /// Answer the repo-trust prompt.
     RespondRepoTrust {
-        /// The picked level; `None` binds nothing this launch.
+        /// The repository's worktree root.
+        worktree: std::path::PathBuf,
+        /// Whether the remote is GitHub-backed.
+        kind: crate::trust::RepoKind,
+        /// `workspace.toml` the decision is written to.
+        config_path: std::path::PathBuf,
+        /// The picked level; `None` leaves the decision unchanged.
         level: Option<crate::trust::TrustLevel>,
     },
     /// Submit a workspace approval response.

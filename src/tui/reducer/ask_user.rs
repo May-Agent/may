@@ -74,13 +74,26 @@ pub fn handle_repo_trust_key(app: &mut App, code: KeyCode) -> Option<SendAction>
     match handle_key(&mut state.ask, code) {
         AskUserKey::Stay => None,
         AskUserKey::Close => {
-            app.mode = AppMode::Chat;
-            Some(SendAction::RespondRepoTrust { level: None })
+            let AppMode::RepoTrust(state) = std::mem::replace(&mut app.mode, AppMode::Chat) else {
+                unreachable!("the key was handled in the repo-trust sheet");
+            };
+            Some(SendAction::RespondRepoTrust {
+                worktree: state.worktree,
+                kind: state.kind,
+                config_path: state.config_path,
+                level: None,
+            })
         }
         AskUserKey::Submit(answers) => {
-            app.mode = AppMode::Chat;
-            let level = answers.first().and_then(crate::trust::level_for_answer);
-            Some(SendAction::RespondRepoTrust { level })
+            let AppMode::RepoTrust(state) = std::mem::replace(&mut app.mode, AppMode::Chat) else {
+                unreachable!("the key was handled in the repo-trust sheet");
+            };
+            Some(SendAction::RespondRepoTrust {
+                worktree: state.worktree,
+                kind: state.kind,
+                config_path: state.config_path,
+                level: answers.first().and_then(crate::trust::level_for_answer),
+            })
         }
     }
 }
