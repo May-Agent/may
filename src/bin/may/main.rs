@@ -417,12 +417,17 @@ where
                 ask: may_agent::tui::AskUserState::for_open_question(
                     may_agent::trust::question_for(&trust.kind, &trust.worktree),
                 ),
+                worktree: trust.worktree.clone(),
+                kind: trust.kind.clone(),
+                config_path: trust.config_path.clone(),
             });
         }
-        Some(StartupGate::LaunchGrant(_)) => {
+        Some(StartupGate::LaunchGrant(grant)) => {
             app.mode =
                 may_agent::tui::AppMode::LaunchGrant(may_agent::tui::state::LaunchGrantState {
-                    path: app.cwd.clone(),
+                    path: grant.dir.clone(),
+                    config_path: grant.config_path.clone(),
+                    redecide: false,
                 });
         }
         None => {}
@@ -1670,75 +1675,89 @@ where
                             }
                         }
                     }
-                    Some(SendAction::RespondLaunchGrant { approved }) => {
-                        if let Some(StartupGate::LaunchGrant(grant)) = startup_gate.take() {
-                            // Grant or denial, the decision is recorded: a
-                            // covered directory is never asked again.
-                            let result =
-                                may_agent::workspace::WorkspaceConfig::load(&grant.config_path)
-                                    .and_then(|mut config| {
-                                        config.record_workdir(
-                                            grant.dir.clone(),
-                                            if approved {
-                                                may_agent::workspace::Permission::ReadWrite
-                                            } else {
-                                                may_agent::workspace::Permission::ReadOnly
-                                            },
-                                            Some("launch directory".to_string()),
-                                        );
-                                        config.save(&grant.config_path)
-                                    });
-                            match result {
-                                Ok(()) => {
+                    Some(SendAction::RespondLaunchGrant {
+                        dir,
+                        config_path,
+                        approved,
+                    }) => {
+                        let deferred = startup_gate.take().is_some();
+                        // Grant or denial, the decision is recorded: a
+                        // covered directory is never asked again.
+                        let result = may_agent::workspace::WorkspaceConfig::load(&config_path)
+                            .and_then(|mut config| {
+                                config.record_workdir(
+                                    dir.clone(),
                                     if approved {
-                                        app.track_workspace_dir(&grant.dir);
-                                    }
+                                        may_agent::workspace::Permission::ReadWrite
+                                    } else {
+                                        may_agent::workspace::Permission::ReadOnly
+                                    },
+                                    Some("launch directory".to_string()),
+                                );
+                                config.save(&config_path)
+                            });
+                        match result {
+                            Ok(()) => {
+                                if approved {
+                                    app.track_workspace_dir(&dir);
                                 }
-                                Err(error) => app.chat.push_error(&format!(
-                                    "Could not record workspace access for {}: {error}",
-                                    grant.dir.display()
-                                )),
                             }
+                            Err(error) => app.chat.push_error(&format!(
+                                "Could not record workspace access for {}: {error}",
+                                dir.display()
+                            )),
                         }
                         // The prompt this answered was the only thing holding
                         // the startup session back — `may resume`'s session
                         // included.
-                        worker_build = start_deferred_session(
-                            app,
-                            worker,
-                            &runtime_deps,
-                            pending_resume.take(),
-                        )
-                        .await?;
+                        if deferred {
+                            worker_build = start_deferred_session(
+                                app,
+                                worker,
+                                &runtime_deps,
+                                pending_resume.take(),
+                            )
+                            .await?;
+                        }
                     }
-                    Some(SendAction::RespondRepoTrust { level }) => {
-                        if let (Some(StartupGate::RepoTrust(trust)), Some(level)) =
-                            (startup_gate.take(), level)
-                        {
-                            let result =
-                                may_agent::workspace::WorkspaceConfig::load(&trust.config_path)
-                                    .and_then(|config| {
-                                        may_agent::trust::persist(
-                                            &config,
-                                            &trust.config_path,
-                                            &trust.worktree,
-                                            Some(&trust.kind),
-                                            level,
-                                        )
-                                    });
-                            if let Err(error) = result {
-                                app.chat.push_error(&format!(
+                    Some(SendAction::RespondRepoTrust {
+                        worktree,
+                        kind,
+                        config_path,
+                        level,
+                    }) => {
+                        let deferred = startup_gate.take().is_some();
+                        if let Some(level) = level {
+                            let result = may_agent::workspace::WorkspaceConfig::load(&config_path)
+                                .and_then(|config| {
+                                    may_agent::trust::persist(
+                                        &config,
+                                        &config_path,
+                                        &worktree,
+                                        Some(&kind),
+                                        level,
+                                    )
+                                });
+                            match result {
+                                Ok(()) => app.chat.push_notice(&format!(
+                                    "Repository trust for {} is now {}",
+                                    worktree.display(),
+                                    level.as_str()
+                                )),
+                                Err(error) => app.chat.push_error(&format!(
                                     "Could not persist repository trust: {error}"
-                                ));
+                                )),
                             }
                         }
-                        worker_build = start_deferred_session(
-                            app,
-                            worker,
-                            &runtime_deps,
-                            pending_resume.take(),
-                        )
-                        .await?;
+                        if deferred {
+                            worker_build = start_deferred_session(
+                                app,
+                                worker,
+                                &runtime_deps,
+                                pending_resume.take(),
+                            )
+                            .await?;
+                        }
                     }
                     Some(SendAction::RespondWorkspace {
                         request_id,
