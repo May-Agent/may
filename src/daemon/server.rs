@@ -249,9 +249,7 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
         browser_manager: arc_swap::ArcSwapOption::from(browser_manager),
         browser_owner_session_id: arc_swap::ArcSwapOption::empty(),
         browser_lifecycle_tx,
-        #[cfg(target_os = "macos")]
         computer: Arc::new(crate::computer::ComputerAgent::new(may_dir.clone())),
-        #[cfg(target_os = "macos")]
         remote_access_manager,
         notification_service: notification_service.clone(),
         memory_processor,
