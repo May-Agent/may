@@ -325,6 +325,7 @@ async fn run_save_full_config(state: Arc<DaemonState>, req: UiFullConfig) -> Sky
             .clone_from(&req.remote_access.tailscale_binary);
         config.remote_access.https_port = req.remote_access.https_port;
         config.remote_access.allow_local_environment = req.remote_access.allow_local_environment;
+        config.remote_access.allowed_logins = normalize_logins(&req.remote_access.allowed_logins);
     });
 
     updated
@@ -350,6 +351,17 @@ async fn run_save_full_config(state: Arc<DaemonState>, req: UiFullConfig) -> Sky
         .map_err(internal_error)?;
     state.notify_ui_events(UiEventTopics::CONFIG | UiEventTopics::BROWSER_STATUS);
     Ok(ApiHealth { ok: true })
+}
+
+/// Logins trimmed, with blanks and repeats dropped, in their given order.
+fn normalize_logins(logins: &[String]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    logins
+        .iter()
+        .map(|login| login.trim())
+        .filter(|login| !login.is_empty() && seen.insert(*login))
+        .map(str::to_string)
+        .collect()
 }
 
 pub(super) async fn set_last_model(
@@ -904,5 +916,33 @@ mod tests {
             serde_json::from_value::<super::UiFullConfig>(ui).is_err(),
             "an unknown priority must be rejected"
         );
+    }
+}
+
+#[cfg(test)]
+mod allowed_logins_tests {
+    use super::normalize_logins;
+    use crate::config::RemoteAccessConfig;
+    use crate::daemon::types::UiRemoteAccessConfig;
+
+    #[test]
+    fn normalization_trims_and_drops_blanks_and_repeats() {
+        let input = [" a@x.com ", "", "b@x.com", "a@x.com", "  "].map(String::from);
+        assert_eq!(normalize_logins(&input), ["a@x.com", "b@x.com"]);
+    }
+
+    #[test]
+    fn allowed_logins_round_trip_through_the_ui_config() {
+        let config = RemoteAccessConfig {
+            allowed_logins: vec!["a@x.com".into(), "b@x.com".into()],
+            ..RemoteAccessConfig::default()
+        };
+        let json = serde_json::to_value(UiRemoteAccessConfig::from(&config)).expect("serializes");
+        assert_eq!(
+            json["allowedLogins"],
+            serde_json::json!(["a@x.com", "b@x.com"])
+        );
+        let back: UiRemoteAccessConfig = serde_json::from_value(json).expect("deserializes");
+        assert_eq!(back.allowed_logins, config.allowed_logins);
     }
 }

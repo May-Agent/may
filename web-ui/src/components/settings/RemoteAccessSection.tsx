@@ -1,8 +1,9 @@
 import { useEffect, useState } from 'react';
-import { Play, Square, Copy, ChevronDown, ChevronRight, Cloud, AlertCircle, Loader2 } from 'lucide-react';
+import { Play, Square, Copy, ChevronDown, ChevronRight, Cloud, AlertCircle, Loader2, Plus, X } from 'lucide-react';
 import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
+import { Input } from '@/components/ui/input';
 import { SectionHeader } from './SectionHeader';
 import { useTranslation } from '@/lib/i18n';
 import { useRuntimeStore } from '@/lib/stores/runtime';
@@ -11,6 +12,7 @@ import {
   startRemoteAccess,
   stopRemoteAccess,
 } from '@/lib/api/remoteAccess';
+import { addAllowedLogin, getConfig, setFullConfig, withAllowedLogins } from '@/lib/api/config';
 import type { RemoteAccessState, RemoteAccessStatusResponse } from '@/lib/types';
 import { cn } from '@/lib/utils';
 
@@ -28,13 +30,20 @@ export function RemoteAccessSection() {
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [logsOpen, setLogsOpen] = useState(false);
+  // The configured list; null until the config is loaded.
+  const [logins, setLogins] = useState<string[] | null>(null);
+  const [draft, setDraft] = useState('');
+  const [savingLogins, setSavingLogins] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
     void (async () => {
       try {
-        const res = await getRemoteAccessStatus();
-        if (!cancelled) setFallback(res);
+        const [res, cfg] = await Promise.all([getRemoteAccessStatus(), getConfig()]);
+        if (!cancelled) {
+          setFallback(res);
+          setLogins(cfg.fullConfig.remoteAccess.allowedLogins);
+        }
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -62,6 +71,32 @@ export function RemoteAccessSection() {
     } finally {
       setBusy(false);
     }
+  };
+
+  const saveLogins = async (next: string[]) => {
+    setSavingLogins(true);
+    try {
+      const cfg = await getConfig();
+      await setFullConfig(withAllowedLogins(cfg.fullConfig, next));
+      setLogins(next);
+      setDraft('');
+    } catch (err) {
+      toast.error(t('errors.generic'), {
+        description: err instanceof Error ? err.message : undefined,
+      });
+    } finally {
+      setSavingLogins(false);
+    }
+  };
+
+  const submitLogin = () => {
+    if (!logins) return;
+    const next = addAllowedLogin(logins, draft);
+    if (next === logins) {
+      setDraft('');
+      return;
+    }
+    void saveLogins(next);
   };
 
   const copyUrl = async () => {
@@ -170,6 +205,94 @@ export function RemoteAccessSection() {
                 </div>
                 <div className="font-mono text-destructive/80">{status.lastError}</div>
               </div>
+            )}
+          </div>
+
+          <div className="rounded-xl border border-border bg-card/30 p-5">
+            <div className="text-sm font-medium">{t('settings.remote.allowedLogins.title')}</div>
+            <p
+              className={cn(
+                'mt-1 text-xs',
+                status.accepted?.owner.state === 'unresolved'
+                  ? 'text-destructive'
+                  : 'text-muted-foreground',
+              )}
+            >
+              {!status.accepted
+                ? t('settings.remote.allowedLogins.pending')
+                : status.accepted.owner.state === 'resolved'
+                  ? t('settings.remote.allowedLogins.owner', { login: status.accepted.owner.login })
+                  : t('settings.remote.allowedLogins.unresolved', {
+                      reason: status.accepted.owner.reason,
+                    })}
+            </p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {t('settings.remote.allowedLogins.hint')}
+            </p>
+
+            {logins === null ? (
+              <div className="mt-3 flex items-center gap-2 text-xs text-muted-foreground">
+                <Loader2 className="size-3.5 animate-spin" /> {t('common.loading')}
+              </div>
+            ) : (
+              <>
+                {logins.length === 0 ? (
+                  <p className="mt-3 text-xs text-muted-foreground">
+                    {t('settings.remote.allowedLogins.empty')}
+                  </p>
+                ) : (
+                  <ul className="mt-3 space-y-1.5">
+                    {logins.map((login) => (
+                      <li
+                        key={login}
+                        className="flex items-center gap-2 rounded-md border border-border bg-background px-3 py-1.5"
+                      >
+                        <span className="min-w-0 flex-1 truncate font-mono text-xs">{login}</span>
+                        <Button
+                          size="icon"
+                          variant="ghost"
+                          disabled={savingLogins}
+                          aria-label={t('settings.remote.allowedLogins.remove', { login })}
+                          onClick={() => void saveLogins(logins.filter((l) => l !== login))}
+                        >
+                          <X className="size-3.5" />
+                        </Button>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                <div className="mt-3 flex items-center gap-2">
+                  <Input
+                    value={draft}
+                    disabled={savingLogins}
+                    placeholder={t('settings.remote.allowedLogins.placeholder')}
+                    onChange={(e) => setDraft(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        submitLogin();
+                      }
+                    }}
+                  />
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    disabled={savingLogins || draft.trim() === ''}
+                    onClick={submitLogin}
+                  >
+                    {savingLogins ? (
+                      <>
+                        <Loader2 className="size-3.5 animate-spin" />{' '}
+                        {t('settings.remote.allowedLogins.saving')}
+                      </>
+                    ) : (
+                      <>
+                        <Plus className="size-3.5" /> {t('settings.remote.allowedLogins.add')}
+                      </>
+                    )}
+                  </Button>
+                </div>
+              </>
             )}
           </div>
 

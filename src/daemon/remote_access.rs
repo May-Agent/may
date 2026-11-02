@@ -23,7 +23,9 @@ use crate::ui_event_bus::UiEventBus;
 use super::auth::TailnetLogin;
 use super::error::{bad_request_error, internal_error};
 use super::state::DaemonState;
-use super::types::{ApiHealth, RemoteAccessState, RemoteAccessStatusResponse};
+use super::types::{
+    AcceptedLogins, ApiHealth, OwnerLogin, RemoteAccessState, RemoteAccessStatusResponse,
+};
 
 const MAX_REMOTE_ACCESS_LOGS: usize = 48;
 /// How often a running serve is checked against `tailscale serve status`.
@@ -55,6 +57,7 @@ impl Default for RemoteAccessRuntime {
                 public_url: None,
                 last_error: None,
                 recent_logs: Vec::new(),
+                accepted: None,
             },
             serving: None,
         }
@@ -242,7 +245,8 @@ async fn run_remote_access_actor(
                 match command {
                     RemoteAccessCommand::Sync { config, has_local_profile, response } => {
                         let addr = *local_addr.borrow();
-                        refresh_allow_list(&tailscale_identity, &config).await;
+                        runtime.status.accepted =
+                            Some(refresh_allow_list(&tailscale_identity, &config).await);
                         let result = sync_runtime(&mut runtime, config, has_local_profile, addr).await;
                         if let Err(error) = &result {
                             runtime.status.state = RemoteAccessState::Error;
@@ -505,26 +509,34 @@ async fn tailnet_host(binary: &str) -> Result<String, String> {
     parse_tailnet_host(&output)
 }
 
-/// The logins the Tailscale identity source accepts: the configured
-/// allow-list when it names any, otherwise the login owning this node. An
-/// owner that cannot be resolved accepts nobody — a remote request then
-/// needs a different identity rather than slipping past unchecked.
+/// The logins the Tailscale identity sources accept: the login owning this
+/// node plus the configured allow-list.
 async fn refresh_allow_list(
     identity: &super::auth::TailscaleServeIdentitySource,
     config: &RemoteAccessConfig,
-) {
-    let allowed: std::collections::HashSet<String> = if config.allowed_logins.is_empty() {
-        match node_owner_login(&tailscale_binary(config)).await {
-            Ok(owner) => std::collections::HashSet::from([owner]),
-            Err(error) => {
-                tracing::warn!(%error, "no Tailscale logins accepted: node owner unresolved");
-                std::collections::HashSet::default()
-            }
+) -> AcceptedLogins {
+    let accepted = accepted_logins(
+        node_owner_login(&tailscale_binary(config)).await,
+        &config.allowed_logins,
+    );
+    identity.set_allowed(accepted.allow_list());
+    accepted
+}
+
+/// The node owner (when resolved) together with the listed logins. An owner
+/// that cannot be resolved is warned about and leaves only the listed logins.
+fn accepted_logins(owner: Result<String, String>, listed: &[String]) -> AcceptedLogins {
+    let owner = match owner {
+        Ok(login) => OwnerLogin::Resolved { login },
+        Err(reason) => {
+            tracing::warn!(%reason, "Tailscale node owner unresolved; only listed logins accepted");
+            OwnerLogin::Unresolved { reason }
         }
-    } else {
-        config.allowed_logins.iter().cloned().collect()
     };
-    identity.set_allowed(allowed);
+    AcceptedLogins {
+        owner,
+        listed: listed.to_vec(),
+    }
 }
 
 /// The login that owns this node: `tailscale status --json`'s `Self.UserID`
@@ -706,5 +718,67 @@ mod tests {
         let other = r#"{"Web":{"mac.tail1234.ts.net:443":{"Handlers":{"/":{"Proxy":"http://127.0.0.1:3000"}}}}}"#;
         assert!(!serves(other, &spec));
         assert!(!serves("{}", &spec));
+    }
+
+    fn set(logins: &[&str]) -> std::collections::HashSet<String> {
+        logins.iter().map(ToString::to_string).collect()
+    }
+
+    fn listed() -> Vec<String> {
+        vec!["a@example.com".into(), "b@example.com".into()]
+    }
+
+    #[test]
+    fn owner_and_list_are_united() {
+        let accepted = accepted_logins(Ok("me@example.com".into()), &listed());
+        assert_eq!(
+            accepted.allow_list(),
+            set(&["me@example.com", "a@example.com", "b@example.com"])
+        );
+    }
+
+    #[test]
+    fn owner_alone_when_nothing_is_listed() {
+        let accepted = accepted_logins(Ok("me@example.com".into()), &[]);
+        assert_eq!(accepted.allow_list(), set(&["me@example.com"]));
+    }
+
+    #[test]
+    fn unresolved_owner_leaves_only_the_list() {
+        let accepted = accepted_logins(Err("not connected".into()), &listed());
+        assert_eq!(
+            accepted.allow_list(),
+            set(&["a@example.com", "b@example.com"])
+        );
+        assert_eq!(
+            accepted.owner,
+            OwnerLogin::Unresolved {
+                reason: "not connected".into()
+            }
+        );
+    }
+
+    #[test]
+    fn unresolved_owner_and_empty_list_accept_nobody() {
+        let accepted = accepted_logins(Err("not connected".into()), &[]);
+        assert!(accepted.allow_list().is_empty());
+        let json = serde_json::to_value(&accepted).expect("serializes");
+        assert_eq!(json["owner"]["state"], "unresolved");
+        assert_eq!(json["owner"]["reason"], "not connected");
+        assert_eq!(json["listed"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn refresh_applies_the_union_to_the_identity_source() {
+        let identity = super::super::auth::TailscaleServeIdentitySource::new(set(&[]));
+        let config = RemoteAccessConfig {
+            allowed_logins: listed(),
+            // No such binary: the owner stays unresolved, the list still applies.
+            tailscale_binary: "/nonexistent/tailscale".into(),
+            ..RemoteAccessConfig::default()
+        };
+        let accepted = futures_lite::future::block_on(refresh_allow_list(&identity, &config));
+        assert!(matches!(accepted.owner, OwnerLogin::Unresolved { .. }));
+        assert_eq!(accepted.listed, listed());
     }
 }
