@@ -1326,6 +1326,21 @@ fn run_agent_loop<'a>(
         let mut turn_hidden_context_xml: Option<String> = None;
         // The stored user message, from the first attempt.
         let mut turn_user_message_id: Option<i32> = None;
+        // The largest history row id before this turn persists anything. A
+        // retry that resubmits the prompt rebuilds context only up to it,
+        // so the rows the turn itself wrote are not fed back alongside the
+        // resubmitted prompt.
+        let turn_boundary = crate::session::load_history_from_db(&state.db(), &req.session_id)
+            .await
+            .map_err(UiChatPreparationError::LoadHistory)?
+            .messages()
+            .iter()
+            .filter_map(|message| message.id)
+            .max();
+        // Set once a retry follows tool activity: later attempts continue
+        // the committed transcript with `resume` instead of resubmitting
+        // the prompt.
+        let mut continue_from_transcript = false;
 
         loop {
             let assistant_id = format!("assistant-{}", crate::id::new());
@@ -1361,7 +1376,17 @@ fn run_agent_loop<'a>(
                 guard.fence(),
                 persist_user_message && attempt == 0 && !kind.is_resume(),
                 use_persisted_context_snapshot,
-                attempt,
+                TurnAttempt {
+                    provider_attempt: attempt,
+                    // A resubmitting retry rebuilds context only up to the
+                    // turn boundary; a resume retry replays the committed
+                    // transcript in full.
+                    turn_boundary: if continue_from_transcript {
+                        None
+                    } else {
+                        turn_boundary
+                    },
+                },
                 kind,
             )
             .await
@@ -1447,16 +1472,20 @@ fn run_agent_loop<'a>(
             {
                 agent.sync_runtime_context().await;
                 let mut stream = match kind {
-                    TurnKind::Prompt => {
+                    TurnKind::Prompt if !continue_from_transcript => {
                         futures_util::future::Either::Left(agent.run_with_hidden_context(
                             &prompt,
                             turn_hidden_context_xml.as_deref(),
                             attachments,
                         ))
                     }
-                    TurnKind::Resume(wake_events) => {
+                    _ => {
+                        let wake_events = match kind {
+                            TurnKind::Resume(wake_events) => wake_events.clone(),
+                            TurnKind::Prompt => Vec::new(),
+                        };
                         futures_util::future::Either::Right(futures_lite::StreamExt::chain(
-                            futures_lite::stream::iter(wake_events.clone().into_iter().map(Ok)),
+                            futures_lite::stream::iter(wake_events.into_iter().map(Ok)),
                             agent.resume(),
                         ))
                     }
@@ -1903,13 +1932,37 @@ fn run_agent_loop<'a>(
 
             // Handle terminal errors with provider failover.
             if let Some(err) = terminal_error {
-                if err.is_retryable() && attempt < max_retries && full_text.trim().is_empty() {
-                    tokio::time::sleep(Duration::from_millis(
-                        RETRY_BACKOFF_MS * (attempt as u64 + 1),
-                    ))
-                    .await;
-                    attempt += 1;
-                    continue;
+                let attempt_ran_tools =
+                    saw_tool_activity || !terminal_snapshot.executions.is_empty();
+                if err.is_retryable() && attempt < max_retries {
+                    if attempt_ran_tools {
+                        // The model already ran tools: resubmitting the
+                        // prompt would replay them. Commit the partial turn,
+                        // then the next provider continues the transcript
+                        // with `resume` instead.
+                        if !segment_text.trim().is_empty() {
+                            turn_persister.push_assistant(
+                                segment_text.clone(),
+                                segment_emitted_at(segment_at),
+                            );
+                        }
+                        turn_persister.flush(&state.db()).await?;
+                        tokio::time::sleep(Duration::from_millis(
+                            RETRY_BACKOFF_MS * (attempt as u64 + 1),
+                        ))
+                        .await;
+                        attempt += 1;
+                        continue_from_transcript = true;
+                        continue;
+                    }
+                    if full_text.trim().is_empty() {
+                        tokio::time::sleep(Duration::from_millis(
+                            RETRY_BACKOFF_MS * (attempt as u64 + 1),
+                        ))
+                        .await;
+                        attempt += 1;
+                        continue;
+                    }
                 }
 
                 let err_msg = err.to_string();
@@ -2539,6 +2592,7 @@ async fn resolve_session_context(
     fence: &RunFence,
     persist_user_message: bool,
     use_persisted_context_snapshot: bool,
+    turn_boundary: Option<i32>,
 ) -> Result<SessionContext, UiChatPreparationError> {
     let session_id = SessionId::from_string(req.session_id.clone());
 
@@ -2552,9 +2606,18 @@ async fn resolve_session_context(
         .await
         .map_err(UiChatPreparationError::LoadSession)?
         .ok_or_else(|| UiChatPreparationError::SessionNotFound(session_id.clone()))?;
-    let history = crate::session::load_history_from_db(&db, session_id.as_str())
+    let mut history = crate::session::load_history_from_db(&db, session_id.as_str())
         .await
         .map_err(UiChatPreparationError::LoadHistory)?;
+    if let Some(boundary) = turn_boundary {
+        // A resubmitted prompt attempt rebuilds context from before the
+        // turn: its own rows were persisted by attempt 0 and the prompt
+        // carries the user message, so replaying them too would double
+        // the input.
+        history
+            .messages_mut()
+            .retain(|message| message.id.is_none_or(|id| id <= boundary));
+    }
 
     let session_model = session.model.clone();
     let cfg = state.config_snapshot();
@@ -3030,6 +3093,15 @@ fn agent_messaging(state: &Arc<DaemonState>) -> crate::agent_link::AgentMessagin
     }
 }
 
+/// One attempt of a turn: the provider candidate it builds on, and the
+/// history row boundary it rebuilds context up to when it resubmits the
+/// prompt (`None` replays the committed transcript in full).
+#[derive(Clone, Copy)]
+struct TurnAttempt {
+    provider_attempt: usize,
+    turn_boundary: Option<i32>,
+}
+
 /// Resolves the session context and builds the agent for one chat turn.
 ///
 /// Built on the heap for the reason given on [`run_agent_loop`].
@@ -3039,7 +3111,7 @@ fn prepare_agent_for_request<'a>(
     fence: &'a RunFence,
     persist_user_message: bool,
     use_persisted_context_snapshot: bool,
-    provider_attempt: usize,
+    attempt: TurnAttempt,
     kind: &'a TurnKind,
 ) -> Pin<Box<impl Future<Output = Result<PreparedAgent, UiChatPreparationError>> + 'a>> {
     Box::pin(async move {
@@ -3049,6 +3121,7 @@ fn prepare_agent_for_request<'a>(
             fence,
             persist_user_message,
             use_persisted_context_snapshot,
+            attempt.turn_boundary,
         ))
         .await?;
         let config = state.config_snapshot();
@@ -3056,7 +3129,7 @@ fn prepare_agent_for_request<'a>(
         // The session's idle agent continues the conversation when it was
         // built from the same inputs; a resumed turn exists only for what
         // that agent collected, so it takes the agent whatever changed.
-        let reused = if provider_attempt == 0 {
+        let reused = if attempt.provider_attempt == 0 {
             let fits = (!kind.is_resume()).then_some(build_key);
             state
                 .parked_agents
@@ -3068,7 +3141,15 @@ fn prepare_agent_for_request<'a>(
         let mut agent = match reused {
             Some(agent) => agent,
             None if kind.is_resume() => return Err(UiChatPreparationError::NothingToResume),
-            None => Box::pin(build_session_agent(state, &config, &ctx, provider_attempt)).await?,
+            None => {
+                Box::pin(build_session_agent(
+                    state,
+                    &config,
+                    &ctx,
+                    attempt.provider_attempt,
+                ))
+                .await?
+            }
         };
 
         let provider_id = agent.provider_id().to_string();
