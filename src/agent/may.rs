@@ -291,6 +291,9 @@ type MayBuilder<S = Unprepared> = TerminalAgentBuilder<
 /// The May agent.
 pub struct MayAgent {
     inner: MayAgentInner,
+    /// The terminal's runtime grant handle: an approved workspace request
+    /// reaches this session's sandbox through it.
+    terminal_grants: aither_sandbox::TerminalGrants,
     session_id: SessionId,
     sandbox_dir: PathBuf,
     provider_id: String,
@@ -546,6 +549,7 @@ impl MayAgent {
         } else {
             config.max_iterations
         };
+        let terminal_grants = terminal_tool.grants();
         let mut builder = TerminalAgentBuilder::new(llm, terminal_tool)
             .hook(context_snapshot_hook)
             .hook(pending_steer_hook)
@@ -653,6 +657,7 @@ impl MayAgent {
 
         Ok(Self {
             inner: agent,
+            terminal_grants,
             session_id: config.session_id,
             sandbox_dir: actual_sandbox_dir,
             provider_id: config.provider_id,
@@ -990,6 +995,12 @@ impl MayAgent {
         &self.session_id
     }
 
+    /// Shared handle to the terminal's runtime grants.
+    #[must_use]
+    pub(crate) fn terminal_grants(&self) -> aither_sandbox::TerminalGrants {
+        self.terminal_grants.clone()
+    }
+
     /// Get session sandbox directory.
     #[must_use]
     pub fn sandbox_dir(&self) -> PathBuf {
@@ -1192,6 +1203,7 @@ pub async fn test_agent(
     (
         MayAgent {
             inner,
+            terminal_grants: aither_sandbox::TerminalGrants::new(),
             session_id,
             job_registry,
             subagent_runs: aither_agent::specialized::SubagentRuns::default(),

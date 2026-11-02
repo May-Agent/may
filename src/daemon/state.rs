@@ -619,6 +619,7 @@ pub struct AskUserApprover {
 pub struct WorkspaceApprover {
     live_responses: Arc<LiveResponseRegistry<bool>>,
     runtime_service: Option<Arc<crate::session::SessionRuntimeService>>,
+    may_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -773,6 +774,7 @@ impl WorkspaceApprover {
         Self {
             live_responses: Arc::new(LiveResponseRegistry::new()),
             runtime_service: None,
+            may_dir: None,
         }
     }
 
@@ -782,6 +784,12 @@ impl WorkspaceApprover {
         runtime_service: Arc<crate::session::SessionRuntimeService>,
     ) -> Self {
         self.runtime_service = Some(runtime_service);
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_may_dir(mut self, may_dir: PathBuf) -> Self {
+        self.may_dir = Some(may_dir);
         self
     }
 
@@ -859,12 +867,40 @@ impl WorkspaceApprover {
             .runtime_service
             .as_ref()
             .expect("resolving a workspace request needs the runtime service");
-        let Some(session_id) = runtime
+        let Some(lookup) = runtime
             .commit_workspace_response(request_id, approved)
             .await?
         else {
             return Ok(None);
         };
+        if approved {
+            let path = std::fs::canonicalize(&lookup.path)
+                .unwrap_or_else(|_| std::path::PathBuf::from(&lookup.path));
+            // Persist first so a rebuilt session keeps the grant, then push
+            // it into the running terminal's grant handle before the run
+            // wakes.
+            let config_path = crate::session::MayHomePaths::new(
+                self.may_dir
+                    .clone()
+                    .expect("workspace approval needs the may dir"),
+            )
+            .session_paths(&lookup.session_id)
+            .workspace_config();
+            let mut workspace =
+                crate::workspace::WorkspaceConfig::load(&config_path).map_err(|e| {
+                    crate::db::ChatDbError::Storage(format!(
+                        "failed to load workspace config for grant: {e}"
+                    ))
+                })?;
+            workspace.add_workdir(path.clone(), Some(lookup.reason.clone()));
+            workspace.save(&config_path).map_err(|e| {
+                crate::db::ChatDbError::Storage(format!("failed to persist workspace grant: {e}"))
+            })?;
+            if let Some(grants) = runtime.terminal_grants(&lookup.session_id) {
+                grants.add_writable(path);
+            }
+        }
+        let session_id = lookup.session_id;
         let woke = self.live_responses.resolve(request_id, approved);
         Ok(Some(crate::session::ResolvedRequest { session_id, woke }))
     }
@@ -977,7 +1013,8 @@ impl DaemonState {
             permission_approver: crate::agent::PermissionApprover::new()
                 .with_runtime_service(runtime_service.clone()),
             workspace_approver: WorkspaceApprover::new()
-                .with_runtime_service(runtime_service.clone()),
+                .with_runtime_service(runtime_service.clone())
+                .with_may_dir(may_dir.to_path_buf()),
             ask_user_approver: AskUserApprover::new().with_runtime_service(runtime_service.clone()),
             tool_dispatchers,
             fetched_models_cache: RefreshableCache::new(Duration::from_secs(20)),
