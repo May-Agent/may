@@ -352,9 +352,13 @@ pub struct SessionIndexSnapshot {
     /// Session the coverage belongs to; empty when the subscriber named a
     /// cwd and no session is persisted yet.
     pub session_id: String,
-    /// The worktree index's coverage; `None` when the path is not a git
-    /// worktree or repo-search has not indexed it.
+    /// The worktree index's coverage; `None` when repo-search has not
+    /// indexed it yet.
     pub index: Option<IndexCoverage>,
+    /// Why coverage could not be read; set when repo-search is unreachable.
+    /// Absent on a successful poll.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// How much of a worktree index carries a vector.

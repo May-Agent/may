@@ -244,8 +244,11 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             app.sync_queue_from_runtime();
             Ok(None)
         }
-        AppEvent::IndexCoverage(index) => {
-            app.index_coverage = index;
+        AppEvent::IndexCoverage(snapshot) => {
+            app.index_failed = snapshot.error.is_some();
+            if snapshot.error.is_none() {
+                app.index_coverage = snapshot.index;
+            }
             Ok(None)
         }
         AppEvent::TurnStarted { message_id } => {

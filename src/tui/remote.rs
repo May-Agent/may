@@ -138,9 +138,7 @@ async fn follow_index(client: DaemonClient, cwd: std::path::PathBuf, app_events:
             let Ok(snapshot) = serde_json::from_str::<SessionIndexSnapshot>(&event.data) else {
                 continue;
             };
-            let _ = app_events
-                .send(AppEvent::IndexCoverage(snapshot.index))
-                .await;
+            let _ = app_events.send(AppEvent::IndexCoverage(snapshot)).await;
         }
         tokio::time::sleep(RECONNECT_DELAY).await;
     }
@@ -240,7 +238,7 @@ async fn follow_session(
                     {
                         let _ = forwarding
                             .app_events
-                            .send(AppEvent::IndexCoverage(snapshot.index))
+                            .send(AppEvent::IndexCoverage(snapshot))
                             .await;
                     }
                 }
