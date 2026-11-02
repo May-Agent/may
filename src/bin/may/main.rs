@@ -378,6 +378,7 @@ where
             app.status = None;
             app.btw_daemon = Some(client.clone());
             app.session_manager.attach_daemon(client.clone());
+            app.index_loading = true;
             may_agent::tui::remote::spawn_index_coverage(
                 client.clone(),
                 app.cwd.clone(),
