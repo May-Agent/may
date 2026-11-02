@@ -309,4 +309,31 @@ describe('reducer', () => {
     expect(t.lastSeq).toBe(3);
     expect(t.status).toBe('streaming');
   });
+
+  test('hold records the quota reset and a retried start clears it', () => {
+    const held = stream([
+      { kind: 'start', seq: 1, turnId: 't1', sessionId: 's1', assistantId: 'a1' },
+      {
+        kind: 'hold',
+        seq: 2,
+        turnId: 't1',
+        until: '2026-11-04T05:40:00Z',
+        message: 'usage limit reached',
+      },
+    ]);
+    expect(held.hold).toEqual({
+      until: '2026-11-04T05:40:00Z',
+      message: 'usage limit reached',
+    });
+
+    const retried = applyEvent(held, {
+      kind: 'start',
+      seq: 3,
+      turnId: 't2',
+      sessionId: 's1',
+      assistantId: 'a2',
+    });
+    expect(retried.hold).toBeNull();
+    expect(retried.turnId).toBe('t2');
+  });
 });

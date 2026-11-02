@@ -152,6 +152,7 @@ export const enUS = {
     tasksEmpty: 'No tasks yet',
     contextUsage: '{used}% of {total} tokens used',
     decodeSpeed: '{rate} tok/s',
+    quotaHold: 'Usage limit reached — continuing automatically at {at}',
     configGuard: {
       title: 'No provider enabled',
       body: 'Enable a provider in settings to start chatting.',
