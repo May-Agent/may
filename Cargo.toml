@@ -236,3 +236,6 @@ opt-level = 3
 
 [profile.dev.package.tar]
 opt-level = 3
+
+[profile.dev.package.lzma-rust2]
+opt-level = 3

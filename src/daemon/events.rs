@@ -502,7 +502,9 @@ async fn emit_session_background_if_changed(
 
 /// Worktree index coverage. Sent on the opening snapshot and re-polled
 /// every [`INDEX_POLL`] while a `session_index` subscriber is attached.
-/// A persisted session's cwd wins; otherwise the subscriber's `cwd`.
+/// A persisted session's cwd wins; otherwise the subscriber's `cwd`. Outside
+/// a git worktree the snapshot carries no index, so a client waiting for the
+/// first snapshot always gets one.
 async fn emit_session_index_if_changed(
     state: &Arc<DaemonState>,
     sender: &skyzen::responder::sse::Sender,
@@ -510,20 +512,19 @@ async fn emit_session_index_if_changed(
     cwd: Option<&str>,
     last_sig: &mut String,
 ) -> bool {
-    let worktree = coverage_worktree(state, session_filter, cwd).await;
-    let Some(worktree) = worktree else {
-        return true;
-    };
-    let (index, error) = match index_coverage(state, &worktree).await {
-        Ok(index) => (index, None),
-        Err(error) => {
-            tracing::debug!(
-                worktree = %worktree.display(),
-                %error,
-                "index coverage poll failed"
-            );
-            (None, Some(error))
-        }
+    let (index, error) = match coverage_worktree(state, session_filter, cwd).await {
+        None => (None, None),
+        Some(worktree) => match index_coverage(state, &worktree).await {
+            Ok(index) => (index, None),
+            Err(error) => {
+                tracing::debug!(
+                    worktree = %worktree.display(),
+                    %error,
+                    "index coverage poll failed"
+                );
+                (None, Some(error))
+            }
+        },
     };
     let payload = crate::client::SessionIndexSnapshot {
         session_id: session_filter.unwrap_or_default().to_string(),
