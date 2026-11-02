@@ -1308,6 +1308,9 @@ pub struct StatusContext<'a> {
     pub index_coverage: Option<&'a crate::client::IndexCoverage>,
     /// Repo-search could not be reached; the status bar shows a red cross.
     pub index_failed: bool,
+    /// The first index snapshot has not arrived; the status bar shows a
+    /// spinner.
+    pub index_loading: bool,
 }
 
 /// Queued message context for rendering queue indicator.
@@ -2736,7 +2739,11 @@ fn render_status_line(lines: &mut Vec<Line<'_>>, ctx: &StatusContext<'_>, width:
 
     // The worktree index: fill bar while incomplete, `index ✓` once full,
     // red `index ✗` when repo-search is down.
-    let index_bar = index_bar(ctx.index_coverage, ctx.index_failed);
+    let index_bar = index_bar(
+        ctx.index_coverage,
+        ctx.index_failed,
+        ctx.index_loading.then_some(ctx.spinner_frame),
+    );
 
     let status_text = parts.join(" · ");
     let status_style = Style::default().fg(Color::Cyan);
@@ -2799,15 +2806,24 @@ const INDEX_BAR_CELLS: usize = 8;
 
 /// The status bar's index coverage segment: `index ▕██████░░░░▏ 62%` while
 /// incomplete, `index ✓` once full, `index ✗` in red when repo-search is
-/// down; `None` when there is nothing to index.
+/// down, `index` with a spinner at `loading` frame until the first snapshot;
+/// `None` when there is nothing to index.
 fn index_bar(
     coverage: Option<&crate::client::IndexCoverage>,
     failed: bool,
+    loading: Option<usize>,
 ) -> Option<Vec<Span<'static>>> {
     if failed {
         return Some(vec![Span::styled(
             "index ✗",
             Style::default().fg(Color::Red),
+        )]);
+    }
+    if let Some(frame) = loading {
+        let spinner = SPINNER_FRAMES[frame % SPINNER_FRAMES.len()];
+        return Some(vec![Span::styled(
+            format!("index {spinner}"),
+            Style::default().fg(Color::DarkGray),
         )]);
     }
     let coverage = coverage?;
@@ -3470,7 +3486,7 @@ mod tests {
     }
 
     fn bar_text(coverage: Option<&crate::client::IndexCoverage>, failed: bool) -> Option<String> {
-        index_bar(coverage, failed).map(|spans| {
+        index_bar(coverage, failed, None).map(|spans| {
             spans
                 .iter()
                 .map(|span| span.content.as_ref())
@@ -3503,14 +3519,28 @@ mod tests {
     #[test]
     fn index_bar_is_absent_with_nothing_to_index() {
         let empty = coverage(0, 0);
-        assert!(index_bar(Some(&empty), false).is_none());
-        assert!(index_bar(None, false).is_none());
+        assert!(index_bar(Some(&empty), false, None).is_none());
+        assert!(index_bar(None, false, None).is_none());
+    }
+
+    #[test]
+    fn index_bar_spins_until_the_first_snapshot() {
+        let loading = index_bar(None, false, Some(1)).expect("loading is visible");
+        assert_eq!(
+            loading
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            format!("index {}", super::SPINNER_FRAMES[1])
+        );
+        let failed = index_bar(None, true, Some(1)).expect("a failure is visible");
+        assert_eq!(failed[0].content.as_ref(), "index ✗");
     }
 
     #[test]
     fn index_bar_shows_a_red_cross_when_search_is_down() {
         let full = coverage(10, 10);
-        let spans = index_bar(Some(&full), true).expect("a failed search is visible");
+        let spans = index_bar(Some(&full), true, None).expect("a failed search is visible");
         assert_eq!(
             spans
                 .iter()
@@ -3842,6 +3872,7 @@ mod tests {
                             spinner_frame: 0,
                             index_coverage: None,
                             index_failed: false,
+                            index_loading: false,
                         }),
                         images_supported: true,
                         hide_todos: false,
