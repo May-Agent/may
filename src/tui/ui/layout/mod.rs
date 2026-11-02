@@ -219,6 +219,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 spinner_frame: app.spinner_frame,
                 index_coverage: app.index_coverage.as_ref(),
                 index_failed: app.index_failed,
+                index_loading: app.index_loading,
             }),
             images_supported,
             // The sidebar shows the task tree; the inline block would repeat it.
