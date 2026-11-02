@@ -60,6 +60,8 @@ export interface TurnState {
   status: 'streaming' | 'done';
   /** Latest decode-rate sample reported by the backend, in tokens/second. */
   tokensPerSecond: number | null;
+  /** Set while the turn waits out an upstream quota reset. */
+  hold: { until: string; message: string } | null;
   lastSeq: number;
 }
 
@@ -81,6 +83,7 @@ export function emptyTurn(
     error: null,
     status: 'streaming',
     tokensPerSecond: null,
+    hold: null,
     lastSeq: 0,
   };
 }
@@ -274,6 +277,13 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
 
     case 'speed':
       return { ...state, tokensPerSecond: event.tokensPerSecond, lastSeq: event.seq };
+
+    case 'hold':
+      return {
+        ...state,
+        hold: { until: event.until, message: event.message },
+        lastSeq: event.seq,
+      };
   }
 }
 

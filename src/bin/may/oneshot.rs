@@ -454,6 +454,15 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                 | TuiEvent::ContextDump(_)
                 | TuiEvent::ContextDumpSaved { .. },
             ) => {}
+            Event::Agent(TuiEvent::Hold { until, .. }) => {
+                writeln!(
+                    output.stderr()?,
+                    "[waiting] usage limit reached — continuing automatically at {}",
+                    until
+                        .to_zoned(jiff::tz::TimeZone::system())
+                        .strftime("%b %d, %Y %H:%M %Z")
+                )?;
+            }
             Event::Agent(TuiEvent::Error(error)) => {
                 writeln!(output.stderr()?, "[error] {error}")?;
                 runtime_deps

@@ -89,7 +89,14 @@ export function AssistantTurn({
           <span>{t('chat.decodeSpeed', { rate: formatRate(turn.tokensPerSecond) })}</span>
         </div>
       )}
-      {streaming && !hasAnySegment && !turn.todo && !turn.reasoning && (
+      {streaming && turn.hold && (
+        <div className="flex items-center gap-2 text-sm text-muted-foreground">
+          <span className="shimmer-text">
+            {t('chat.quotaHold', { at: new Date(turn.hold.until).toLocaleString() })}
+          </span>
+        </div>
+      )}
+      {streaming && !hasAnySegment && !turn.todo && !turn.reasoning && !turn.hold && (
         <div className="flex items-center gap-2 text-sm text-muted-foreground">
           {reasoningEnabled ? (
             <span className="shimmer-text">{t('chat.thinking')}…</span>

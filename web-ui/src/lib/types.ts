@@ -336,6 +336,15 @@ export interface SseSpeed {
   tokensPerSecond: number;
 }
 
+/** The turn parked on an upstream quota reset; `until` is when it retries. */
+export interface SseHold {
+  kind: 'hold';
+  seq: number;
+  turnId: string;
+  until: string;
+  message: string;
+}
+
 export type ChatStreamEvent =
   | SseStart
   | SseText
@@ -350,7 +359,8 @@ export type ChatStreamEvent =
   | SsePaused
   | SseEnd
   | SsePing
-  | SseSpeed;
+  | SseSpeed
+  | SseHold;
 
 // ── UI event stream /api/events ─────────────────────────────
 
