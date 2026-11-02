@@ -447,6 +447,18 @@ export const zhHant: Messages = {
       url: '公開網址',
       lastError: '最後錯誤',
       logs: '最近的紀錄',
+      allowedLogins: {
+        title: '允許的登入',
+        placeholder: 'name@example.com',
+        add: '新增',
+        remove: '移除 {login}',
+        saving: '儲存中…',
+        pending: '正在確認允許的對象…',
+        empty: '沒有列出其他登入。',
+        hint: '共用裝置的使用者除非列在這裡，否則不會被接受。',
+        owner: '這個節點的擁有者 {login} 一律會被接受。',
+        unresolved: '無法確定這個節點的擁有者（{reason}）；只有列出的登入可以進入。',
+      },
       states: {
         disabled: '已停用',
         starting: '啟動中…',

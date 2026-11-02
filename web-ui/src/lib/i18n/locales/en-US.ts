@@ -445,6 +445,18 @@ export const enUS = {
       url: 'Public URL',
       lastError: 'Last error',
       logs: 'Recent logs',
+      allowedLogins: {
+        title: 'Allowed logins',
+        placeholder: 'name@example.com',
+        add: 'Add',
+        remove: 'Remove {login}',
+        saving: 'Saving…',
+        pending: 'Resolving who is accepted…',
+        empty: 'No other logins are listed.',
+        hint: 'Users of shared devices are not accepted unless listed.',
+        owner: 'This node\'s owner, {login}, is always accepted.',
+        unresolved: 'This node\'s owner could not be resolved ({reason}); only listed logins can get in.',
+      },
       states: {
         disabled: 'Disabled',
         starting: 'Starting…',
