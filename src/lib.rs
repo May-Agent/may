@@ -30,6 +30,8 @@ pub mod config;
 pub mod container;
 /// GitHub Copilot OAuth flow.
 pub mod copilot;
+#[cfg(unix)]
+pub mod crash_signal;
 /// The resident daemon that runs every agent loop and serves the UIs.
 pub mod daemon;
 /// SQLite persistence for sessions, messages, and app state.
