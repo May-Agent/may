@@ -35,7 +35,7 @@ impl std::fmt::Debug for ComputerAgent {
 impl ComputerAgent {
     /// Point the client at `<may_dir>/computer-agent.sock`.
     #[must_use]
-    #[allow(unused_variables)]
+    #[allow(unused_variables, clippy::needless_pass_by_value)]
     pub fn new(may_dir: PathBuf) -> Self {
         Self {
             #[cfg(target_os = "macos")]
@@ -72,28 +72,30 @@ impl ComputerAgent {
     /// # Errors
     /// Always fails — virtual desktops are macOS-only for now.
     #[cfg(not(target_os = "macos"))]
-    #[allow(clippy::unused_async)]
-    pub async fn request(&self, _request: AgentRequest) -> Result<AgentResponse, String> {
+    pub async fn request(&self, request: AgentRequest) -> Result<AgentResponse, String> {
+        let _ = request;
+        std::future::ready(()).await;
         Err("virtual desktops need macOS".to_owned())
     }
 
     /// Kill the helper so the next request respawns it — used after the
     /// user grants permissions, since TCC applies at process launch.
-    #[allow(clippy::unused_self)]
+    #[cfg(target_os = "macos")]
     pub fn restart(&self) {
-        #[cfg(target_os = "macos")]
-        {
-            let mut child = self
-                .child
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
-            if let Some(child) = child.as_mut() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
+        let mut child = self
+            .child
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(child) = child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
+
+    /// Nothing to respawn outside macOS.
+    #[cfg(not(target_os = "macos"))]
+    pub const fn restart(&self) {}
 
     #[cfg(target_os = "macos")]
     #[allow(clippy::significant_drop_tightening)]
