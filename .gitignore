@@ -6,3 +6,7 @@
 .heel/
 .codex-*
 .playwright-cli/
+
+# CI-generated container workspace context
+container/workspace/heel
+container/workspace/tools/

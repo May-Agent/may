@@ -52,7 +52,7 @@ impl ChatDb {
             })
         })
         .collect::<Result<Vec<_>, ChatDbError>>()?;
-        Ok(build_profile_preferences(profile, mounts))
+        Ok(build_profile_preferences(mounts))
     }
 
     /// Convert a profile row into [`ProfileInfo`](crate::profile::ProfileInfo),
@@ -187,14 +187,6 @@ impl ChatDb {
         let now = jiff::Timestamp::now().to_string();
         let sort_order = self.max_profile_sort_order().await? + 1;
         let preferences = normalize_profile_preferences(params.environment, params.preferences);
-        let container_image = match params.environment {
-            ProfileEnvironmentKind::Local => None,
-            ProfileEnvironmentKind::Container => params.container_image,
-        };
-        let container_dockerfile = preferences
-            .as_ref()
-            .and_then(|value| value.container.as_ref())
-            .and_then(|value| value.dockerfile.as_deref());
         let container_mounts = preferences
             .as_ref()
             .and_then(|value| value.container.as_ref())
@@ -202,16 +194,14 @@ impl ChatDb {
         let mut tx = self.db.begin().await?;
         query!(
             tx,
-            "INSERT INTO profiles (id, slug, name, icon, environment, container_image, container_id, persona, container_dockerfile, location_aware, pinned_limit, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO profiles (id, slug, name, icon, environment, container_id, persona, location_aware, pinned_limit, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params.id,
             params.slug,
             params.name,
             params.icon,
             params.environment.as_str(),
-            container_image,
             Option::<String>::None,
             params.persona,
-            container_dockerfile,
             params.location_aware,
             10_i32,
             sort_order,
@@ -289,12 +279,8 @@ impl ChatDb {
         if let Some(environment) = params.environment {
             existing.environment = environment.as_str().to_string();
             if matches!(environment, ProfileEnvironmentKind::Local) {
-                existing.container_image = None;
                 existing.container_id = None;
             }
-        }
-        if let Some(container_image) = params.container_image {
-            existing.container_image = container_image.map(ToOwned::to_owned);
         }
         if let Some(container_id) = params.container_id {
             existing.container_id = container_id.map(ToOwned::to_owned);
@@ -315,10 +301,6 @@ impl ChatDb {
             .map_or(current_preferences, |preferences| {
                 normalize_profile_preferences(environment, preferences)
             });
-        existing.container_dockerfile = merged_preferences
-            .as_ref()
-            .and_then(|value| value.container.as_ref())
-            .and_then(|value| value.dockerfile.clone());
         let container_mounts = merged_preferences
             .as_ref()
             .and_then(|value| value.container.as_ref())
@@ -327,14 +309,12 @@ impl ChatDb {
         let mut tx = self.db.begin().await?;
         query!(
             tx,
-            "UPDATE profiles SET name = ?, icon = ?, environment = ?, container_image = ?, container_id = ?, persona = ?, container_dockerfile = ?, location_aware = ?, pinned_limit = ?, sort_order = ?, created_at = ?, updated_at = ? WHERE id = ?",
+            "UPDATE profiles SET name = ?, icon = ?, environment = ?, container_id = ?, persona = ?, location_aware = ?, pinned_limit = ?, sort_order = ?, created_at = ?, updated_at = ? WHERE id = ?",
             existing.name.as_str(),
             existing.icon.as_deref(),
             existing.environment.as_str(),
-            existing.container_image.as_deref(),
             existing.container_id.as_deref(),
             existing.persona.as_deref(),
-            existing.container_dockerfile.as_deref(),
             existing.location_aware,
             existing.pinned_limit,
             existing.sort_order,
@@ -456,7 +436,6 @@ impl ChatDb {
                     id: def.slug,
                     name: def.name,
                     environment: parse_profile_environment(def.environment)?,
-                    container_image: None,
                     slug: Some(def.slug),
                     icon: Some(def.icon),
                     persona: None,

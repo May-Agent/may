@@ -58,7 +58,7 @@ function ActiveProfileLabel({ profile }: { profile: ProfileInfo }) {
       <EnvIcon className="size-3 shrink-0" />
       <span className="truncate">
         {profile.environment.type === 'container'
-          ? profile.environment.image || t('profile.environment')
+          ? t('profile.environment')
           : envKindOf(profile.environment)}
       </span>
     </div>

@@ -16,9 +16,6 @@ use crate::session::SessionPaths;
 // Embed the skills directory at compile time
 static SKILLS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/skills");
 
-// Embed container build context managed by May.
-static CONTAINER_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/container");
-
 /// Bundle extraction error.
 #[derive(Debug, thiserror::Error)]
 pub enum BundleError {
@@ -33,7 +30,7 @@ pub struct Bundle;
 
 impl Bundle {
     /// Extract bundled resources to ~/.may/ if not already present.
-    /// Creates ~/.may/skills/ and ~/.may/container/ directories.
+    /// Creates ~/.may/skills/ directory.
     ///
     /// # Errors
     ///
@@ -41,31 +38,13 @@ impl Bundle {
     /// cannot be extracted under `may_dir`.
     pub async fn ensure_extracted(may_dir: &Path) -> Result<(), BundleError> {
         let skills_dir = may_dir.join("skills");
-        let container_dir = may_dir.join("container");
-        let heel_dir = container_dir.join("heel");
-        let heel_bin_dir = heel_dir.join("bin");
-
         Self::ensure_materialized_dir(&skills_dir).await?;
-        Self::ensure_materialized_dir(&container_dir).await?;
-        Self::ensure_materialized_dir(&heel_dir).await?;
-        Self::remove_legacy_heel_source_tree(&heel_dir).await?;
-        async_fs::create_dir_all(&heel_bin_dir).await?;
 
         // Built-in resources must stay in lockstep with the running binary.
         // Always overwrite bundled content to avoid stale skills after upgrades.
         Self::extract_dir_overwrite(&SKILLS_DIR, &skills_dir).await?;
 
-        // Extract container build context. Managed files are always overwritten since they
-        // are owned by the running May binary rather than user content.
-        Self::extract_dir_overwrite(&CONTAINER_DIR, &container_dir).await?;
-
         Ok(())
-    }
-
-    /// Get the container build context directory path.
-    #[must_use]
-    pub fn container_context_dir(may_dir: &Path) -> std::path::PathBuf {
-        may_dir.join("container")
     }
 
     /// Create symlinks in a local/heel session sandbox pointing to its home-scoped resources.
@@ -133,35 +112,6 @@ impl Bundle {
                 async_fs::create_dir_all(path).await?;
                 Ok(())
             }
-            Err(error) => Err(BundleError::Io(error)),
-        }
-    }
-
-    async fn remove_legacy_heel_source_tree(heel_dir: &Path) -> Result<(), BundleError> {
-        for legacy_entry in [
-            "Cargo.lock",
-            "Cargo.toml",
-            "cli",
-            "nodejs",
-            "src",
-            "templates",
-        ] {
-            Self::remove_path_if_exists(&heel_dir.join(legacy_entry)).await?;
-        }
-        Ok(())
-    }
-
-    async fn remove_path_if_exists(path: &Path) -> Result<(), BundleError> {
-        match async_fs::symlink_metadata(path).await {
-            Ok(metadata) if metadata.is_dir() => {
-                async_fs::remove_dir_all(path).await?;
-                Ok(())
-            }
-            Ok(_) => {
-                async_fs::remove_file(path).await?;
-                Ok(())
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(BundleError::Io(error)),
         }
     }
