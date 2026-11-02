@@ -84,6 +84,7 @@ impl ChatDb {
         Self::ensure_pending_permission_agent_id_column(&db).await?;
         Self::ensure_scheduled_task_columns(&db).await?;
         Self::ensure_session_context_snapshot_table(&db).await?;
+        Self::ensure_pending_message_claim_columns(&db).await?;
         Self::ensure_session_run_layout(&db).await?;
         Self::migrate_legacy_remote_profiles(&db).await?;
         Self::migrate_removed_waiting_terminal_input(&db).await?;
@@ -307,6 +308,43 @@ impl ChatDb {
     /// Drop the retired `session_run_leases` table and give
     /// `session_runtimes` the `run_id` fencing column. Run ownership lived
     /// there before it moved into the daemon's memory.
+    /// Pending messages gained a claim lifecycle: `state`
+    /// (`pending`/`claimed`/`committed`/`failed`), `claimed_run_id` fencing
+    /// the claim to a run, and `claim_error` recording a `failed` entry.
+    async fn ensure_pending_message_claim_columns(db: &SkyDb) -> Result<(), ChatDbError> {
+        let columns = query!(
+            db,
+            "SELECT name FROM pragma_table_info('session_pending_message_entries')"
+        )
+        .fetch_all::<SqliteTableInfoRow>()
+        .await?;
+        if !columns.iter().any(|column| column.name == "state") {
+            query!(
+                db,
+                "ALTER TABLE session_pending_message_entries ADD COLUMN state TEXT NOT NULL DEFAULT 'pending'"
+            )
+            .execute()
+            .await?;
+        }
+        if !columns.iter().any(|column| column.name == "claimed_run_id") {
+            query!(
+                db,
+                "ALTER TABLE session_pending_message_entries ADD COLUMN claimed_run_id TEXT"
+            )
+            .execute()
+            .await?;
+        }
+        if !columns.iter().any(|column| column.name == "claim_error") {
+            query!(
+                db,
+                "ALTER TABLE session_pending_message_entries ADD COLUMN claim_error TEXT"
+            )
+            .execute()
+            .await?;
+        }
+        Ok(())
+    }
+
     async fn ensure_session_run_layout(db: &SkyDb) -> Result<(), ChatDbError> {
         query!(db, "DROP TABLE IF EXISTS session_run_leases")
             .execute()
@@ -580,7 +618,7 @@ mod tests {
     use crate::db::entity::scheduled_task_runs;
     use crate::profile::ProfileEnvironment;
     use crate::session::{
-        PendingUserMessage, PendingUserMessageMode, PersistedAskUserQuestion,
+        PendingMessageState, PendingUserMessage, PendingUserMessageMode, PersistedAskUserQuestion,
         PersistedAskUserRequest, PersistedPermissionRequest, PersistedPermissionRequestPayload,
         PersistedWorkspaceRequest, PersistedWorkspaceRequestPayload, SessionPlanState,
         SessionRuntimeState, TerminalRuntimeState,
@@ -591,6 +629,9 @@ mod tests {
 
     fn test_pending_message(content: &str, mode: PendingUserMessageMode) -> PendingUserMessage {
         PendingUserMessage {
+            id: None,
+            state: PendingMessageState::default(),
+            error: None,
             content: content.to_string(),
             attachments: Vec::new(),
             hidden_context_xml: None,
@@ -898,14 +939,26 @@ mod tests {
         );
 
         let first = db
-            .take_next_pending_message(session_id)
+            .claim_next_pending_message(
+                &RunFence {
+                    session_id: session_id.to_string(),
+                    run_id: "run".to_string(),
+                },
+                session_id,
+            )
             .await
             .expect("first pending should load")
             .expect("first pending should exist");
         assert_eq!(first.content, "second steer");
 
         let second = db
-            .take_next_pending_message(session_id)
+            .claim_next_pending_message(
+                &RunFence {
+                    session_id: session_id.to_string(),
+                    run_id: "run".to_string(),
+                },
+                session_id,
+            )
             .await
             .expect("second pending should load")
             .expect("second pending should exist");
@@ -1469,7 +1522,13 @@ mod tests {
         .expect("waiting permission should persist");
 
         let blocked = db
-            .take_next_dispatchable_pending_message(session_id)
+            .take_next_dispatchable_pending_message(
+                &RunFence {
+                    session_id: session_id.to_string(),
+                    run_id: "run".to_string(),
+                },
+                session_id,
+            )
             .await
             .expect("dispatchable lookup should succeed");
         assert!(blocked.is_none());
@@ -1482,7 +1541,13 @@ mod tests {
             .expect("runtime should become idle before resumed dispatch");
 
         let resumed = db
-            .take_next_dispatchable_pending_message(session_id)
+            .take_next_dispatchable_pending_message(
+                &RunFence {
+                    session_id: session_id.to_string(),
+                    run_id: "run".to_string(),
+                },
+                session_id,
+            )
             .await
             .expect("dispatchable lookup should succeed")
             .expect("pending steer should dispatch once idle");
@@ -1622,7 +1687,13 @@ mod tests {
                 tokio::spawn(async move {
                     for index in 0..MESSAGES {
                         let message = db
-                            .take_next_pending_message(&session_id)
+                            .claim_next_pending_message(
+                                &RunFence {
+                                    session_id: session_id.clone(),
+                                    run_id: "run".to_string(),
+                                },
+                                &session_id,
+                            )
                             .await
                             .unwrap_or_else(|error| {
                                 panic!("take {index} of {session_id} failed: {error}")
@@ -1633,10 +1704,16 @@ mod tests {
                         assert_eq!(message.content, format!("message {index}"));
                     }
                     assert!(
-                        db.take_next_pending_message(&session_id)
-                            .await
-                            .expect("final take should succeed")
-                            .is_none(),
+                        db.claim_next_pending_message(
+                            &RunFence {
+                                session_id: session_id.clone(),
+                                run_id: "run".to_string()
+                            },
+                            &session_id
+                        )
+                        .await
+                        .expect("final take should succeed")
+                        .is_none(),
                         "{session_id} should have no pending message left"
                     );
                 })
@@ -1681,6 +1758,163 @@ mod tests {
                 .expect("session exists")
                 .archived,
             "the auto-archive pass must leave the draft session open"
+        );
+    }
+
+    fn queue_entry_fence(session_id: &str) -> RunFence {
+        RunFence {
+            session_id: session_id.to_string(),
+            run_id: "run-1".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_prep_failure_after_claim_returns_the_message_to_pending() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db");
+        let session_id = "claim-release";
+        db.create_session(session_id, Some("t"), Some("model"))
+            .await
+            .expect("session");
+        db.set_pending_immediate_message(
+            session_id,
+            test_pending_message("queued input", PendingUserMessageMode::Queue),
+        )
+        .await
+        .expect("enqueue");
+        let fence = queue_entry_fence(session_id);
+        assert!(db.claim_session_run(&fence).await.expect("run claim"));
+
+        let claimed = db
+            .claim_next_pending_message(&fence, session_id)
+            .await
+            .expect("claim")
+            .expect("message waits in the queue");
+        assert_eq!(claimed.state, PendingMessageState::Claimed);
+        let entry_id = claimed.id.expect("claimed rows carry their entry id");
+        assert_eq!(
+            db.load_session_runtime_summary(session_id)
+                .await
+                .expect("summary")
+                .queued_messages
+                .len(),
+            1,
+            "a claimed entry stays visible to the queue's readers"
+        );
+
+        db.release_pending_claim(entry_id, &fence)
+            .await
+            .expect("release");
+        let reclaimed = db
+            .claim_next_pending_message(&fence, session_id)
+            .await
+            .expect("second claim")
+            .expect("the released entry is pending again and still runs");
+        assert_eq!(reclaimed.content, "queued input");
+    }
+
+    #[tokio::test]
+    async fn a_lost_claim_returns_to_pending_on_recovery() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db");
+        let session_id = "claim-crash";
+        db.create_session(session_id, Some("t"), Some("model"))
+            .await
+            .expect("session");
+        db.set_pending_immediate_message(
+            session_id,
+            test_pending_message("queued input", PendingUserMessageMode::Queue),
+        )
+        .await
+        .expect("enqueue");
+        let fence = queue_entry_fence(session_id);
+        assert!(db.claim_session_run(&fence).await.expect("run claim"));
+        db.claim_next_pending_message(&fence, session_id)
+            .await
+            .expect("claim")
+            .expect("message waits in the queue");
+
+        db.recover_session_runtimes_after_restart()
+            .await
+            .expect("recovery");
+        let fence2 = RunFence {
+            session_id: session_id.to_string(),
+            run_id: "run-2".to_string(),
+        };
+        assert!(
+            db.claim_session_run(&fence2).await.expect("new run claim"),
+            "the expired lease frees the session"
+        );
+        let reclaimed = db
+            .claim_next_pending_message(&fence2, session_id)
+            .await
+            .expect("second claim")
+            .expect("the dead run's claim returns to pending");
+        assert_eq!(reclaimed.content, "queued input");
+    }
+
+    #[tokio::test]
+    async fn a_committed_pending_message_never_runs_again() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db");
+        let session_id = "claim-commit";
+        db.create_session(session_id, Some("t"), Some("model"))
+            .await
+            .expect("session");
+        db.set_pending_immediate_message(
+            session_id,
+            test_pending_message("queued input", PendingUserMessageMode::Queue),
+        )
+        .await
+        .expect("enqueue");
+        let fence = queue_entry_fence(session_id);
+        assert!(db.claim_session_run(&fence).await.expect("run claim"));
+        let claimed = db
+            .claim_next_pending_message(&fence, session_id)
+            .await
+            .expect("claim")
+            .expect("message waits in the queue");
+        let entry_id = claimed.id.expect("claimed rows carry their entry id");
+
+        db.append_chat_message_as_run_and_commit_pending(
+            &fence,
+            entry_id,
+            &crate::session::ChatMessage::user("queued input"),
+        )
+        .await
+        .expect("commit");
+        assert!(
+            db.claim_next_pending_message(&fence, session_id)
+                .await
+                .expect("second claim")
+                .is_none(),
+            "a committed entry never runs twice"
+        );
+        assert!(
+            db.load_session_runtime_summary(session_id)
+                .await
+                .expect("summary")
+                .queued_messages
+                .is_empty(),
+            "a committed entry leaves the queue"
+        );
+        let history = crate::session::load_history_from_db(&db, session_id)
+            .await
+            .expect("history");
+        assert_eq!(
+            history
+                .messages()
+                .iter()
+                .filter(|m| m.role == crate::session::MessageRole::User)
+                .count(),
+            1,
+            "the committed input lands in the transcript exactly once"
         );
     }
 }

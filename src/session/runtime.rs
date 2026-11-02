@@ -189,10 +189,72 @@ impl SessionInteractionState {
     }
 }
 
+/// Lifecycle state of a queued user message: `pending` (claimable),
+/// `claimed` (a run owns it), `committed` (landed in the transcript),
+/// `failed` (ended with a recorded error).
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+    skyzen::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingMessageState {
+    /// Waiting to run.
+    #[default]
+    Pending,
+    /// A run claimed it and is preparing or running it.
+    Claimed,
+    /// Appended to the transcript by its claiming run.
+    Committed,
+    /// The run ended on a non-retryable error; `error` explains.
+    Failed,
+}
+
+impl PendingMessageState {
+    /// Stored form.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Claimed => "claimed",
+            Self::Committed => "committed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl std::str::FromStr for PendingMessageState {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "claimed" => Ok(Self::Claimed),
+            "committed" => Ok(Self::Committed),
+            "failed" => Ok(Self::Failed),
+            _ => Err(format!("invalid pending message state: {value}")),
+        }
+    }
+}
+
 /// Server-owned user message waiting to be processed.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PendingUserMessage {
+    /// Queue row id once stored; `None` before insertion.
+    #[serde(default)]
+    pub id: Option<i64>,
+    /// Lifecycle state.
+    #[serde(default)]
+    pub state: PendingMessageState,
+    /// Recorded error when `state` is `failed`.
+    #[serde(default)]
+    pub error: Option<String>,
     /// Message body text.
     pub content: String,
     /// Attachments carried by the message.
@@ -408,8 +470,14 @@ impl SessionRuntimeSummary {
 
     /// Whether any user message is pending (immediate or queued).
     #[must_use]
-    pub const fn has_pending_messages(&self) -> bool {
-        self.pending_immediate.is_some() || !self.queued_messages.is_empty()
+    pub fn has_pending_messages(&self) -> bool {
+        self.pending_immediate
+            .as_ref()
+            .is_some_and(|m| m.state == PendingMessageState::Pending)
+            || self
+                .queued_messages
+                .iter()
+                .any(|m| m.state == PendingMessageState::Pending)
     }
 
     /// Whether a queued message can be dispatched now (idle, no active interaction, pending messages).
@@ -422,7 +490,7 @@ impl SessionRuntimeSummary {
 
     /// Whether the session should block auto-archive: running, pending messages, active plan, or live interaction.
     #[must_use]
-    pub const fn blocks_auto_archive(&self) -> bool {
+    pub fn blocks_auto_archive(&self) -> bool {
         self.state.is_executing()
             || self.has_pending_messages()
             || self.plan_state.blocks_auto_archive()
@@ -433,7 +501,7 @@ impl SessionRuntimeSummary {
     /// messages and no live interaction. A draft plan does not block
     /// admission — it only keeps the session out of auto-archive.
     #[must_use]
-    pub const fn admits_new_request(&self) -> bool {
+    pub fn admits_new_request(&self) -> bool {
         !(self.state.is_executing() || self.has_pending_messages() || self.interactions.is_active())
     }
 }

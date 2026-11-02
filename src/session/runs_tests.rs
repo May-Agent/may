@@ -8,7 +8,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 use super::{
-    AcquireError, CancelReason, PendingUserMessage, PendingUserMessageMode,
+    AcquireError, CancelReason, PendingMessageState, PendingUserMessage, PendingUserMessageMode,
     PersistedAskUserQuestion, PersistedAskUserRequest, PersistedPermissionRequest,
     PersistedPermissionRequestPayload, PersistedWorkspaceRequest, PersistedWorkspaceRequestPayload,
     RunOutcome, SessionRuntimeService, SessionRuntimeState,
@@ -58,6 +58,9 @@ impl Fixture {
 
 fn pending_message(content: &str) -> PendingUserMessage {
     PendingUserMessage {
+        id: None,
+        state: PendingMessageState::default(),
+        error: None,
         content: content.to_string(),
         attachments: Vec::new(),
         hidden_context_xml: None,

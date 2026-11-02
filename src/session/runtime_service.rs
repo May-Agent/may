@@ -242,11 +242,12 @@ impl SessionRuntimeService {
     /// Returns [`crate::db::ChatDbError`] on storage failure.
     pub async fn take_next_dispatchable(
         &self,
+        fence: &crate::db::RunFence,
         session_id: &str,
     ) -> Result<Option<PendingUserMessage>, crate::db::ChatDbError> {
         let next = self
             .db
-            .take_next_dispatchable_pending_message(session_id)
+            .take_next_dispatchable_pending_message(fence, session_id)
             .await?;
         self.publish_ui(UiEventTopics::SESSION_RUNTIME | UiEventTopics::SESSION_RUNTIMES);
         Ok(next)
@@ -288,11 +289,12 @@ impl SessionRuntimeService {
     /// Returns [`crate::db::ChatDbError`] on storage failure.
     pub async fn take_next_for_run(
         &self,
+        fence: &crate::db::RunFence,
         session_id: &str,
     ) -> Result<Option<PendingUserMessage>, crate::db::ChatDbError> {
         let next = self
             .db
-            .take_next_pending_message_for_run(session_id)
+            .take_next_pending_message_for_run(fence, session_id)
             .await?;
         self.publish_ui(UiEventTopics::SESSION_RUNTIME | UiEventTopics::SESSION_RUNTIMES);
         Ok(next)

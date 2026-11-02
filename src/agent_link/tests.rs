@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::{Activity, AgentDirectory, AgentLinkError, AgentMessaging, parse_roots};
-use crate::db::ChatDb;
+use crate::db::{ChatDb, RunFence};
 use crate::session::{MayHomePaths, SessionRuntimeService, SessionRuntimeState};
 use crate::ui_event_bus::UiEventBus;
 
@@ -131,7 +131,13 @@ async fn a_send_enqueues_the_message_and_wakes_the_recipient() {
     let pending = host
         .runtime_service
         .db()
-        .take_next_pending_message("peer")
+        .claim_next_pending_message(
+            &RunFence {
+                session_id: "peer".to_string(),
+                run_id: "run".to_string(),
+            },
+            "peer",
+        )
         .await
         .expect("queue read")
         .expect("the message is stored");
@@ -214,7 +220,13 @@ async fn a_hostile_body_arrives_inside_the_single_agent_message_block() {
     let pending = host
         .runtime_service
         .db()
-        .take_next_pending_message("peer")
+        .claim_next_pending_message(
+            &RunFence {
+                session_id: "peer".to_string(),
+                run_id: "run".to_string(),
+            },
+            "peer",
+        )
         .await
         .expect("queue read")
         .expect("the message is stored");

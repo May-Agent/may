@@ -8,6 +8,7 @@
 //! the session subsystem reads as one file instead of being buried in
 //! the 5k-line monolith.
 
+use super::RunFence;
 use std::collections::HashMap;
 
 use crate::scheduler::TaskRunStatus;
@@ -165,6 +166,9 @@ impl ChatDb {
             hidden_context_xml: row.hidden_context_xml.map(XmlBlock::parse).transpose()?,
             created_at: row.created_at,
             delivery_mode: parse_pending_user_message_mode(&row.delivery_mode)?,
+            id: Some(row.id),
+            state: row.state.parse().map_err(storage_error)?,
+            error: row.claim_error,
         })
     }
 
@@ -354,7 +358,7 @@ impl ChatDb {
         .await?;
         let message_rows = query!(
             self.db,
-            "SELECT * FROM session_pending_message_entries WHERE session_id = ? ORDER BY id ASC",
+            "SELECT * FROM session_pending_message_entries WHERE session_id = ? AND state != 'committed' ORDER BY id ASC",
             session_id
         )
         .fetch_all::<PendingMessageEntryRow>()
@@ -611,13 +615,17 @@ impl ChatDb {
         Ok(())
     }
 
-    /// Atomically dequeue the next pending message.
-    /// Priority: newest steer first, then oldest queued.
+    /// Atomically claim the next pending message for `fence`'s run.
+    /// Priority: newest steer first, then oldest queued. The entry stays in
+    /// the queue marked `claimed` until its run commits it with the user
+    /// message append — a failed preparation or a dead run returns it to
+    /// `pending`, never silently drops it.
     ///
     /// # Errors
     /// Returns [`ChatDbError`] on storage failure or malformed rows.
-    pub async fn take_next_pending_message(
+    pub async fn claim_next_pending_message(
         &self,
+        fence: &RunFence,
         session_id: &str,
     ) -> Result<Option<PendingUserMessage>, ChatDbError> {
         let mut tx = self.db.begin().await?;
@@ -629,7 +637,8 @@ impl ChatDb {
         // Two-level sort: steer before queue, then newest steer or oldest queue.
         let row = query!(
             tx,
-            "DELETE FROM session_pending_message_entries WHERE id = (SELECT id FROM session_pending_message_entries WHERE session_id = ? ORDER BY CASE delivery_mode WHEN 'steer' THEN 0 ELSE 1 END, CASE delivery_mode WHEN 'steer' THEN -id ELSE id END LIMIT 1) RETURNING *",
+            "UPDATE session_pending_message_entries SET state = 'claimed', claimed_run_id = ? WHERE id = (SELECT id FROM session_pending_message_entries WHERE session_id = ? AND state = 'pending' ORDER BY CASE delivery_mode WHEN 'steer' THEN 0 ELSE 1 END, CASE delivery_mode WHEN 'steer' THEN -id ELSE id END LIMIT 1) AND state = 'pending' RETURNING *",
+            fence.run_id.as_str(),
             session_id
         )
         .fetch_optional::<PendingMessageEntryRow>()
@@ -638,20 +647,12 @@ impl ChatDb {
             tx.commit().await?;
             return Ok(None);
         };
-        let row_id = row.id;
         let attachment_rows = query!(
             tx,
             "SELECT * FROM session_pending_message_attachments WHERE message_id = ? ORDER BY ordinal ASC",
-            row_id
+            row.id
         )
         .fetch_all::<PendingMessageAttachmentRow>()
-        .await?;
-        query!(
-            tx,
-            "DELETE FROM session_pending_message_attachments WHERE message_id = ?",
-            row_id
-        )
-        .execute()
         .await?;
         tx.commit().await?;
         Ok(Some(Self::pending_user_message_from_parts(
@@ -660,12 +661,57 @@ impl ChatDb {
         )?))
     }
 
+    /// Return a claimed entry to `pending` when the run that claimed it did
+    /// not commit it — a preparation failure hands it back untouched.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn release_pending_claim(
+        &self,
+        entry_id: i64,
+        fence: &RunFence,
+    ) -> Result<(), ChatDbError> {
+        query!(
+            self.db,
+            "UPDATE session_pending_message_entries SET state = 'pending', claimed_run_id = NULL WHERE id = ? AND claimed_run_id = ? AND state = 'claimed'",
+            entry_id,
+            fence.run_id.as_str()
+        )
+        .execute()
+        .await?;
+        Ok(())
+    }
+
+    /// Mark a claimed entry `failed`, recording why: only a non-retryable
+    /// error ends a claim this way, and the row stays visible to the UI.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn fail_pending_claim(
+        &self,
+        entry_id: i64,
+        fence: &RunFence,
+        error: &str,
+    ) -> Result<(), ChatDbError> {
+        query!(
+            self.db,
+            "UPDATE session_pending_message_entries SET state = 'failed', claim_error = ? WHERE id = ? AND claimed_run_id = ? AND state = 'claimed'",
+            error,
+            entry_id,
+            fence.run_id.as_str()
+        )
+        .execute()
+        .await?;
+        Ok(())
+    }
+
     /// Remove and return the next pending message only when follow-up execution is allowed.
     ///
     /// # Errors
     /// Returns [`ChatDbError`] on storage failure or malformed rows.
     pub async fn take_next_dispatchable_pending_message(
         &self,
+        fence: &RunFence,
         session_id: &str,
     ) -> Result<Option<PendingUserMessage>, ChatDbError> {
         // Check dispatchability atomically by reading the runtime state
@@ -673,7 +719,7 @@ impl ChatDb {
         if !summary.can_dispatch_follow_up() {
             return Ok(None);
         }
-        self.take_next_pending_message(session_id).await
+        self.claim_next_pending_message(fence, session_id).await
     }
 
     /// Remove all steer (pending-immediate) messages for a session.
@@ -1255,6 +1301,14 @@ impl ChatDb {
             tx,
             "UPDATE session_runtimes SET state = 'idle', run_id = NULL, terminal_task_id = NULL, terminal_output_file = NULL, terminal_output_preview = NULL, terminal_input_notice = NULL, terminal_background_reason = NULL, updated_at = ? WHERE run_id IS NOT NULL OR state = 'running'",
             jiff::Timestamp::now().to_string()
+        )
+        .execute()
+        .await?;
+        // A claim dies with its process: claimed entries go back to
+        // `pending` so the next run picks them up.
+        query!(
+            tx,
+            "UPDATE session_pending_message_entries SET state = 'pending', claimed_run_id = NULL WHERE state = 'claimed'"
         )
         .execute()
         .await?;
