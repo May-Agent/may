@@ -16,7 +16,7 @@ pub use hosts::{
     ParkedAgents, btw, compact_session, context_dump, context_report, release_agent, usage_report,
 };
 pub use hub::{TurnFrame, TurnHub};
-pub use recap::{RecapRecord, recap_session};
+pub use recap::{RecapRecord, RecapSchedules, recap_session, seed as recap_seed};
 mod tool_dispatch;
 mod turn_persister;
 
@@ -2285,6 +2285,7 @@ async fn run_published_turn(
     kind: TurnKind,
 ) -> Result<(), crate::db::ChatDbError> {
     suggest::cancel(&state, &req.session_id);
+    recap::unarm(&state, &req.session_id);
     let mut sink = HubSink::new(&state, &req);
     let result = run_agent_loop(&state, &req, &mut sink, &guard, true, true, &kind).await;
     let response_session_id = req.session_id.clone();
@@ -2309,6 +2310,7 @@ async fn run_published_turn(
                 spawn_continued_run(state.clone(), continued);
             } else {
                 suggest::maybe_suggest(&state, &response_session_id);
+                recap::arm(&state, &response_session_id);
             }
         }
         Err(AgentLoopError::BrowserTakeoverPaused(result)) => {

@@ -273,6 +273,7 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
         turn_hub: Arc::new(super::chat::TurnHub::default()),
         parked_agents: super::chat::ParkedAgents::default(),
         aux_tasks: super::chat::AuxTasks::default(),
+        recap_schedules: super::chat::RecapSchedules::default(),
         session_background: super::chat::SessionBackgrounds::default(),
         tunnels: Arc::new(super::tunnel::TunnelRegistry::new()),
     });
@@ -289,6 +290,9 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
     super::chat::spawn_shared_tool_dispatchers(state.clone(), tool_queues);
     super::title_generation::spawn_worker(state.clone(), title_generation_rx);
     super::chat::spawn_background_watcher(state.clone(), state.ui_event_bus.clone());
+    state
+        .tokio_handle
+        .spawn(super::chat::recap_seed(state.clone()));
     let scheduler = crate::scheduler::TaskScheduler::new(task_runtime);
     let _scheduler = scheduler.spawn();
     super::artifacts::spawn_artifact_watcher(&state);
