@@ -6,10 +6,6 @@ export function envKindOf(env: HomeEnvironment): ProfileEnvironmentKind {
   return env.type;
 }
 
-export function envImageOf(env: HomeEnvironment): string {
-  return env.type === 'container' ? env.image ?? '' : '';
-}
-
 export const ENV_ICON: Record<ProfileEnvironmentKind, LucideIcon> = {
   local: Laptop,
   container: Box,

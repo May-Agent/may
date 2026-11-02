@@ -58,7 +58,6 @@ const DEFAULT_AUTO_STOP_MINUTES: u64 = 30;
 #[derive(Debug, Clone)]
 struct SharedHostPaths {
     memories_dir: PathBuf,
-    tools_mount: aither_sandbox::MountSpec,
 }
 
 #[derive(serde::Serialize)]
@@ -77,8 +76,6 @@ struct SpecFingerprintPayload<'a> {
 pub struct ContainerManager {
     runtime: Arc<ContainerRuntime>,
     may_dir: PathBuf,
-    /// Baseline tool distribution mounted read-only into every container.
-    tool_distribution: Arc<aither_sandbox::ToolDistribution>,
     /// Last activity timestamp per container ID.
     activity: Arc<ArcSwap<HashMap<String, Instant>>>,
 }
@@ -87,15 +84,10 @@ impl ContainerManager {
     /// Create a container manager bound to a detected `runtime`, persisting
     /// managed-container state under `may_dir`.
     #[must_use]
-    pub fn new(
-        runtime: Arc<ContainerRuntime>,
-        may_dir: PathBuf,
-        tool_distribution: Arc<aither_sandbox::ToolDistribution>,
-    ) -> Self {
+    pub fn new(runtime: Arc<ContainerRuntime>, may_dir: PathBuf) -> Self {
         Self {
             runtime,
             may_dir,
-            tool_distribution,
             activity: Arc::new(ArcSwap::from_pointee(HashMap::new())),
         }
     }
@@ -124,7 +116,7 @@ impl ContainerManager {
         use bollard::models::ContainerSummaryStateEnum;
 
         let host_gateway = self.runtime.host_gateway().to_string();
-        let shared_paths = self.ensure_shared_paths(spec).await?;
+        let shared_paths = self.ensure_shared_paths().await?;
         let spec_fingerprint = Self::compute_spec_fingerprint(spec, &host_gateway, &shared_paths)?;
 
         if let Some(container) = self.find_container_by_name(spec.name.as_str()).await? {
@@ -284,56 +276,10 @@ impl ContainerManager {
         Ok(response.id)
     }
 
-    async fn ensure_shared_paths(
-        &self,
-        spec: &ContainerLaunchSpec,
-    ) -> Result<SharedHostPaths, ContainerError> {
+    async fn ensure_shared_paths(&self) -> Result<SharedHostPaths, ContainerError> {
         let home_paths = MayHomePaths::new(self.may_dir.clone());
-        let (tools_mount, memories_dir) = futures_lite::future::try_zip(
-            self.prepare_tools_mount(spec, &home_paths),
-            Self::ensure_memories_dir(&home_paths),
-        )
-        .await?;
-        Ok(SharedHostPaths {
-            memories_dir,
-            tools_mount,
-        })
-    }
-
-    /// Prepares the image's baseline tool bundle on the host and describes
-    /// its read-only mount, rejecting writable grants that would expose it.
-    async fn prepare_tools_mount(
-        &self,
-        spec: &ContainerLaunchSpec,
-        home_paths: &MayHomePaths,
-    ) -> Result<aither_sandbox::MountSpec, ContainerError> {
-        let image = self
-            .runtime
-            .client
-            .inspect_image(&spec.image)
-            .await
-            .map_err(ContainerError::Docker)?;
-        let target = aither_sandbox::ToolTarget::from_probe(
-            image.os.as_deref().ok_or_else(|| {
-                ContainerError::Bootstrap("container image has no operating system".into())
-            })?,
-            image.architecture.as_deref().ok_or_else(|| {
-                ContainerError::Bootstrap("container image has no architecture".into())
-            })?,
-        )?;
-        let image = self.tool_distribution.image_tools(&target)?;
-        let staged = self
-            .tool_distribution
-            .stage_image_tools(
-                &target,
-                &home_paths.tool_artifacts_dir(),
-                &home_paths.tool_runtimes_dir(),
-            )
-            .await?;
-        Ok(aither_sandbox::MountSpec::read_only(
-            &staged,
-            image.container_directory()?,
-        ))
+        let memories_dir = Self::ensure_memories_dir(&home_paths).await?;
+        Ok(SharedHostPaths { memories_dir })
     }
 
     /// Ensures the global memories directory and its index exist, returning
@@ -422,13 +368,6 @@ impl ContainerManager {
             });
         }
 
-        mounts.push(Mount {
-            target: Some(shared_paths.tools_mount.container_path.to_string()),
-            source: Some(shared_paths.tools_mount.host_path.display().to_string()),
-            typ: Some(MountType::BIND),
-            read_only: Some(true),
-            ..Default::default()
-        });
         mounts
     }
 
@@ -625,51 +564,42 @@ mod tests {
     fn shared_paths() -> SharedHostPaths {
         SharedHostPaths {
             memories_dir: "/managed/memories".into(),
-            tools_mount: aither_sandbox::MountSpec::read_only(
-                "/managed/tools/bundle",
-                ContainerPath::new("/opt/aither/tools/bundle").unwrap(),
-            ),
         }
     }
 
     #[test]
-    fn tool_mount_is_readonly_and_preserves_workspace_mounts() {
+    fn profile_mounts_preserve_access_and_workspace_mounts() {
         let spec = ContainerLaunchSpec::new("test", "test-image", "/workspace-host").with_mount(
-            aither_sandbox::MountSpec::read_write(
+            aither_sandbox::MountSpec::read_only(
                 "/project-host",
                 ContainerPath::new("/project").unwrap(),
             ),
         );
         let shared = shared_paths();
         let mounts = ContainerManager::effective_mounts(&spec, &shared);
-        let tools = mounts
+        let project = mounts
             .iter()
-            .find(|mount| mount.target.as_deref() == Some("/opt/aither/tools/bundle"))
+            .find(|mount| mount.target.as_deref() == Some("/project"))
             .unwrap();
-        assert_eq!(tools.source.as_deref(), Some("/managed/tools/bundle"));
-        assert_eq!(tools.typ, Some(MountType::BIND));
-        assert_eq!(tools.read_only, Some(true));
-        for target in ["/workspace", "/project"] {
-            assert_eq!(
-                mounts
-                    .iter()
-                    .find(|mount| mount.target.as_deref() == Some(target))
-                    .unwrap()
-                    .read_only,
-                Some(false)
-            );
-        }
+        assert_eq!(project.source.as_deref(), Some("/project-host"));
+        assert_eq!(project.typ, Some(MountType::BIND));
+        assert_eq!(project.read_only, Some(true));
+        assert_eq!(
+            mounts
+                .iter()
+                .find(|mount| mount.target.as_deref() == Some("/workspace"))
+                .unwrap()
+                .read_only,
+            Some(false)
+        );
     }
 
     #[test]
-    fn bundle_change_invalidates_container_fingerprint() {
+    fn shared_path_change_invalidates_container_fingerprint() {
         let spec = ContainerLaunchSpec::new("test", "test-image", "/workspace-host");
         let first = shared_paths();
         let mut second = first.clone();
-        second.tools_mount = aither_sandbox::MountSpec::read_only(
-            "/managed/tools/new-bundle",
-            ContainerPath::new("/opt/aither/tools/new-bundle").unwrap(),
-        );
+        second.memories_dir = "/managed/memories-2".into();
         assert_ne!(
             ContainerManager::compute_spec_fingerprint(&spec, "host.docker.internal", &first)
                 .unwrap(),

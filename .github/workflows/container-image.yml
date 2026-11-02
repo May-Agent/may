@@ -1,0 +1,188 @@
+name: Container image
+
+on:
+  push:
+    branches: [dev, main]
+    paths:
+      - 'container/**'
+      - 'src/tools/*.json'
+      - 'src/container/image_ref.rs'
+      - 'build.rs'
+      - 'Cargo.lock'
+      - 'examples/container_image.rs'
+      - '.github/workflows/container-image.yml'
+  pull_request:
+    branches: [dev, main]
+    paths:
+      - 'container/**'
+      - 'src/tools/*.json'
+      - 'src/container/image_ref.rs'
+      - 'build.rs'
+      - 'Cargo.lock'
+      - 'examples/container_image.rs'
+      - '.github/workflows/container-image.yml'
+
+concurrency:
+  group: container-image-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+  packages: write
+
+# Fork pull requests cannot push to GHCR; they build each image for its
+# platform only to prove it compiles.
+env:
+  CAN_PUSH: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+
+jobs:
+  refs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      base: ${{ steps.refs.outputs.base }}
+      workspace: ${{ steps.refs.outputs.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - id: refs
+        run: cargo run --locked --example container_image -- refs >> "$GITHUB_OUTPUT"
+
+  base:
+    needs: refs
+    strategy:
+      matrix:
+        include:
+          - { arch: amd64, runner: ubuntu-24.04 }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    env:
+      REF: ${{ needs.refs.outputs.base }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: exists
+        if: env.CAN_PUSH == 'true'
+        run: |
+          if docker buildx imagetools inspect "$REF" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: docker/login-action@v3
+        if: env.CAN_PUSH == 'true' && steps.exists.outputs.exists != 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push linux/${{ matrix.arch }}
+        if: env.CAN_PUSH == 'true' && steps.exists.outputs.exists != 'true'
+        run: |
+          docker buildx build \
+            --platform linux/${{ matrix.arch }} \
+            --tag "$REF-${{ matrix.arch }}" \
+            --push \
+            ./container/base
+      - name: Build linux/${{ matrix.arch }} (no push)
+        if: env.CAN_PUSH != 'true'
+        run: |
+          docker buildx build \
+            --platform linux/${{ matrix.arch }} \
+            --tag "$REF-${{ matrix.arch }}" \
+            --load \
+            ./container/base
+
+  base-manifest:
+    needs: [refs, base]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    env:
+      REF: ${{ needs.refs.outputs.base }}
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create the multi-arch manifest
+        run: |
+          if docker buildx imagetools inspect "$REF" >/dev/null 2>&1; then
+            echo "$REF already published; leaving it untouched"
+            exit 0
+          fi
+          docker buildx imagetools create -t "$REF" "$REF-amd64" "$REF-arm64"
+
+  workspace:
+    needs: [refs, base-manifest]
+    strategy:
+      matrix:
+        include:
+          - { arch: amd64, runner: ubuntu-24.04 }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    env:
+      REF: ${{ needs.refs.outputs.workspace }}
+      BASE: ${{ needs.refs.outputs.base }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - id: exists
+        if: env.CAN_PUSH == 'true'
+        run: |
+          if docker buildx imagetools inspect "$REF" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: docker/login-action@v3
+        if: env.CAN_PUSH == 'true' && steps.exists.outputs.exists != 'true'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Stage the workspace context
+        if: steps.exists.outputs.exists != 'true'
+        run: cargo run --locked --example container_image -- stage ${{ matrix.arch }} ./container/workspace
+      - name: Build and push linux/${{ matrix.arch }}
+        if: env.CAN_PUSH == 'true' && steps.exists.outputs.exists != 'true'
+        run: |
+          docker buildx build \
+            --platform linux/${{ matrix.arch }} \
+            --build-arg "BASE=$BASE" \
+            --tag "$REF-${{ matrix.arch }}" \
+            --push \
+            ./container/workspace
+      - name: Build linux/${{ matrix.arch }} (no push)
+        if: env.CAN_PUSH != 'true'
+        run: |
+          docker buildx build \
+            --platform linux/${{ matrix.arch }} \
+            --build-arg "BASE=$BASE" \
+            --tag "$REF-${{ matrix.arch }}" \
+            --load \
+            ./container/workspace
+
+  workspace-manifest:
+    needs: [refs, workspace]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    env:
+      REF: ${{ needs.refs.outputs.workspace }}
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create the multi-arch manifest
+        run: |
+          if docker buildx imagetools inspect "$REF" >/dev/null 2>&1; then
+            echo "$REF already published; leaving it untouched"
+            exit 0
+          fi
+          docker buildx imagetools create -t "$REF" "$REF-amd64" "$REF-arm64"
