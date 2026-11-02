@@ -1543,7 +1543,7 @@ fn usage_report_lines(report: &crate::agent::SessionUsageReport) -> Vec<Line<'st
     if let Some(cost) = report.total_cost_usd {
         lines.push(Line::from(vec![
             Span::styled("Total cost ", dim),
-            Span::styled(format!("${cost:.2}"), value),
+            Span::styled(format_cost_usd(cost), value),
         ]));
     }
     for model in &report.models {
@@ -1554,7 +1554,7 @@ fn usage_report_lines(report: &crate::agent::SessionUsageReport) -> Vec<Line<'st
         ]));
         let cost_suffix = model
             .cost_usd
-            .map_or_else(String::new, |cost| format!("  ${cost:.2}"));
+            .map_or_else(String::new, |cost| format!("  {}", format_cost_usd(cost)));
         lines.push(Line::styled(
             format!(
                 "    out {}  cache read {}  write {}  hit {:.0}%{cost_suffix}",
@@ -1567,6 +1567,17 @@ fn usage_report_lines(report: &crate::agent::SessionUsageReport) -> Vec<Line<'st
         ));
     }
     lines
+}
+
+/// A USD amount: cents from $0.01 up, two significant digits below that so
+/// a sub-cent spend never reads as `$0.00`.
+fn format_cost_usd(cost: f64) -> String {
+    if cost == 0.0 || cost >= 0.01 {
+        return format!("${cost:.2}");
+    }
+    // The first significant digit sits at 10^floor(log10(cost)); keep one more.
+    let decimals = (1.0 - cost.log10().floor()) as usize;
+    format!("${cost:.decimals$}")
 }
 
 /// `1234567` as `1.2m`, `12345` as `12.3k`.
@@ -3325,10 +3336,21 @@ pub fn render_tool_fullscreen(frame: &mut Frame, area: Rect, display: &ToolDispl
 mod tests {
     use super::{
         ChatElement, ChatStream, InputContext, ToolCallImage, ToolDisplay, ToolStatus,
-        background_summary, build_plain_wrapped_lines_unified, format_number, format_status_usage,
-        index_bar, render_input_line, render_tool_inline, terminal_mode_marker,
+        background_summary, build_plain_wrapped_lines_unified, format_cost_usd, format_number,
+        format_status_usage, index_bar, render_input_line, render_tool_inline,
+        terminal_mode_marker,
     };
     use crate::tui::queue::Attachment;
+
+    #[test]
+    fn cost_formatting_keeps_sub_cent_precision() {
+        assert_eq!(format_cost_usd(0.0), "$0.00");
+        assert_eq!(format_cost_usd(1.234), "$1.23");
+        assert_eq!(format_cost_usd(0.01), "$0.01");
+        assert_eq!(format_cost_usd(0.0099), "$0.0099");
+        assert_eq!(format_cost_usd(0.00337), "$0.0034");
+        assert_eq!(format_cost_usd(0.000_004_2), "$0.0000042");
+    }
     use crate::tui::ui::streaming_markdown::IMAGE_HEIGHT;
     use aither_sandbox::TerminalExecutionMode;
     use ratatui::style::Color;
