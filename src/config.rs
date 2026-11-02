@@ -989,6 +989,10 @@ pub struct RemoteAccessConfig {
     /// Whether local-environment profiles may be exposed remotely.
     #[serde(default)]
     pub allow_local_environment: bool,
+    /// Tailscale logins allowed to use remote access; empty accepts only the
+    /// login that owns this node.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_logins: Vec<String>,
 }
 
 fn default_tailscale_binary() -> String {
@@ -1005,6 +1009,7 @@ impl Default for RemoteAccessConfig {
             enabled: false,
             tailscale_binary: default_tailscale_binary(),
             https_port: default_tailscale_https_port(),
+            allowed_logins: Vec::new(),
             allow_local_environment: false,
         }
     }

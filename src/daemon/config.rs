@@ -200,12 +200,14 @@ fn provider_map_from_ui(
         .iter()
         .map(|p| {
             let mut instance = ProviderInstance::new(p.provider_type);
-            instance.api_key = match p.api_key.clone().filter(|v| !v.trim().is_empty()) {
-                Some(new_key) => Some(new_key),
-                None if p.has_api_key => stored
+            instance.api_key = match &p.api_key {
+                Some(crate::daemon::types::SecretUpdate::Replace(new_key)) => {
+                    (!new_key.trim().is_empty()).then(|| new_key.clone())
+                }
+                Some(crate::daemon::types::SecretUpdate::Remove) => None,
+                None | Some(crate::daemon::types::SecretUpdate::Keep) => stored
                     .get(&p.id)
                     .and_then(|instance| instance.api_key.clone()),
-                None => None,
             };
             instance.base_url = p.base_url.clone().filter(|v| !v.trim().is_empty());
             instance.display_name = p.display_name.clone().filter(|v| !v.trim().is_empty());
@@ -874,15 +876,17 @@ mod tests {
         );
 
         let mut cleared = saved.providers.clone();
-        cleared[0].has_api_key = false;
+        cleared[0].api_key = Some(crate::daemon::types::SecretUpdate::Remove);
         let providers = provider_map_from_ui(&config.provider, &cleared);
         assert!(
             providers["openai"].api_key.is_none(),
-            "hasApiKey: false clears the stored key"
+            "a remove clears the stored key"
         );
 
         let mut replaced = saved.providers;
-        replaced[0].api_key = Some("sk-new".to_string());
+        replaced[0].api_key = Some(crate::daemon::types::SecretUpdate::Replace(
+            "sk-new".to_string(),
+        ));
         let providers = provider_map_from_ui(&config.provider, &replaced);
         assert_eq!(
             providers["openai"].api_key.as_deref(),
