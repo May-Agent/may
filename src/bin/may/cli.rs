@@ -18,6 +18,7 @@ pub enum CliMode {
     Daemon(DaemonCommand),
     Exec(ExecArgs),
     Browser(BrowserCliArgs),
+    ComputerAgent(std::path::PathBuf),
     OneShot(OneShotArgs),
     Help(&'static str),
 }
@@ -169,6 +170,17 @@ pub fn parse_cli_mode(args: &[String]) -> CliMode {
             Some("--help" | "-h") => CliMode::Help(ResumeArgs::help_text()),
             _ => CliMode::Resume(parse_resume_args(&args[2..])),
         },
+        Some("computer-agent") => {
+            let may_dir = args
+                .iter()
+                .position(|a| a == "--may-dir")
+                .and_then(|i| args.get(i + 1))
+                .map_or_else(
+                    || dirs::home_dir().unwrap_or_default().join(".may"),
+                    std::path::PathBuf::from,
+                );
+            CliMode::ComputerAgent(may_dir)
+        }
         Some("browser") => match args.get(2).map(String::as_str) {
             Some("--help" | "-h") => CliMode::Help(BrowserCliArgs::help_text()),
             _ => CliMode::Browser(parse_browser_args(&args[2..])),
