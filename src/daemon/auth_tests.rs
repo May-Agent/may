@@ -8,7 +8,7 @@ use std::sync::Arc;
 use skyzen::extract::PeerAddr;
 use skyzen::{Request, StatusCode};
 
-use super::auth::{RequireIdentity, TailscaleServeIdentitySource};
+use super::auth::TailscaleServeIdentitySource;
 use super::server::{DaemonMode, build_router};
 use super::state::DaemonState;
 use crate::config::MayConfig;
@@ -35,7 +35,7 @@ fn remote_router(
     build_router(
         state.clone(),
         DaemonMode::Rest,
-        Some(RequireIdentity::new(vec![Box::new(source)])),
+        Some(vec![Box::new(source)]),
     )
 }
 
@@ -164,6 +164,24 @@ async fn a_funnel_request_needs_a_session_not_its_header() {
         status(&router, req).await,
         StatusCode::UNAUTHORIZED,
         "a Funnel request is not a tailnet identity"
+    );
+}
+
+#[tokio::test]
+async fn a_direct_bind_rejects_even_a_listed_tailscale_login() {
+    // A non-loopback `[daemon] listen` address is remote access with no
+    // trusted source yet: tailscale serve's header is only trustworthy on
+    // the remote listener its proxy connects to, never on a direct bind.
+    let state = state().await;
+    let router = build_router(state.clone(), DaemonMode::Rest, Some(Vec::new()));
+    assert_eq!(
+        status(
+            &router,
+            tailscale_request("GET", "/api/health", "owner@example.com"),
+        )
+        .await,
+        StatusCode::UNAUTHORIZED,
+        "a header that only tailscale serve sets is meaningless on a direct bind"
     );
 }
 
