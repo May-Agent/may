@@ -56,8 +56,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             return;
         }
         // The launch gates own the frame — the decision happens before
-        // the session, not over the chat.
-        AppMode::LaunchGrant(_) | AppMode::RepoTrust(_) => {
+        // the session, not over the chat. `/permission` re-asks the same
+        // decision mid-session, where it pops a bottom sheet instead.
+        mode @ (AppMode::LaunchGrant(_) | AppMode::RepoTrust(_)) if !is_gate_sheet(mode) => {
             render_gate_screen(frame, area, app);
             return;
         }
@@ -344,6 +345,9 @@ fn sheet_height(app: &App, column: Rect) -> Option<u16> {
             pct(70),
         ),
         AppMode::QuitConfirm(_) => (9, pct(70)),
+        mode @ (AppMode::LaunchGrant(_) | AppMode::RepoTrust(_)) if is_gate_sheet(mode) => {
+            (rows(gate_sheet_rows(mode)), pct(60))
+        }
         AppMode::LaunchGrant(_)
         | AppMode::RepoTrust(_)
         | AppMode::Chat
@@ -404,6 +408,9 @@ fn render_sheet(frame: &mut Frame, sheet: Rect, app: &App) {
             render_workspace_confirm(frame, sheet, &state.path, &state.reason);
         }
         AppMode::QuitConfirm(_) => render_quit_confirm(frame, sheet),
+        mode @ (AppMode::LaunchGrant(_) | AppMode::RepoTrust(_)) if is_gate_sheet(mode) => {
+            render_gate_sheet(frame, sheet, mode);
+        }
         _ => {}
     }
 }
@@ -2021,10 +2028,22 @@ fn render_workspace_confirm(frame: &mut Frame, area: Rect, path: &str, reason: &
     frame.render_widget(widget, area);
 }
 
-/// The launch gate — workspace write access or repository trust — owns
-/// the frame: label, path, question, option list, hint.
-fn render_gate_screen(frame: &mut Frame, area: Rect, app: &App) {
-    let (label, path, question, description, options, selected) = match &app.mode {
+/// Whether the launch gate shows as a bottom sheet — only a `/permission`
+/// re-ask (`redecide`); the startup gate owns the whole frame.
+const fn is_gate_sheet(mode: &AppMode) -> bool {
+    match mode {
+        AppMode::LaunchGrant(state) => state.redecide,
+        AppMode::RepoTrust(state) => state.redecide,
+        _ => false,
+    }
+}
+
+/// The launch gate's content — label, path, question, option list, hint —
+/// shared by the full-screen gate that opens before the session and the
+/// `/permission` bottom sheet over it. The hint differs: the startup gate
+/// only quits, while a mid-session re-ask cancels on Esc.
+fn gate_lines(mode: &AppMode) -> Option<Vec<Line<'static>>> {
+    let (label, path, question, description, options, selected, redecide) = match mode {
         AppMode::LaunchGrant(state) => (
             "Accessing workspace:",
             state.path.display().to_string(),
@@ -2035,6 +2054,7 @@ fn render_gate_screen(frame: &mut Frame, area: Rect, app: &App) {
                 "No, keep it read-only".to_string(),
             ],
             state.selected,
+            state.redecide,
         ),
         AppMode::RepoTrust(state) => {
             let question = &state.ask.questions[state.ask.current_question];
@@ -2045,9 +2065,10 @@ fn render_gate_screen(frame: &mut Frame, area: Rect, app: &App) {
                 " works in an isolated clone; the choice is remembered.".to_string(),
                 question.option.clone(),
                 state.ask.question_states[state.ask.current_question].cursor,
+                state.redecide,
             )
         }
-        _ => return,
+        _ => return None,
     };
     let mut lines = vec![
         Line::from(Span::styled(
@@ -2076,14 +2097,27 @@ fn render_gate_screen(frame: &mut Frame, area: Rect, app: &App) {
         lines.push(Line::from(Span::styled(format!("{prefix}{option}"), style)));
     }
     lines.push(Line::from(""));
+    let (key, action) = if redecide {
+        ("esc", " Cancel")
+    } else {
+        ("ctrl+c", " Quit")
+    };
     lines.push(Line::from(vec![
         Span::styled("↑/↓ Navigate · ", Style::default().fg(Color::DarkGray)),
         Span::styled("enter", Style::default().fg(Color::Cyan)),
         Span::styled(" Confirm · ", Style::default().fg(Color::DarkGray)),
-        Span::styled("ctrl+c", Style::default().fg(Color::Cyan)),
-        Span::styled(" Quit", Style::default().fg(Color::DarkGray)),
+        Span::styled(key, Style::default().fg(Color::Cyan)),
+        Span::styled(action, Style::default().fg(Color::DarkGray)),
     ]));
+    Some(lines)
+}
 
+/// The launch gate — workspace write access or repository trust — owns
+/// the frame: label, path, question, option list, hint.
+fn render_gate_screen(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(lines) = gate_lines(&app.mode) else {
+        return;
+    };
     frame.render_widget(Clear, area);
     frame.render_widget(Paragraph::new(lines), area);
     // The model reads like the reference's bottom-right status text.
@@ -2099,6 +2133,32 @@ fn render_gate_screen(frame: &mut Frame, area: Rect, app: &App) {
         )))
         .alignment(Alignment::Right),
         model_area,
+    );
+}
+
+/// Rows the launch-gate sheet takes: its content lines plus the border.
+fn gate_sheet_rows(mode: &AppMode) -> usize {
+    gate_lines(mode).map_or(3, |lines| lines.len() + 2)
+}
+
+/// The launch gate as a bottom sheet: `/permission` re-asks the launch
+/// decision over the running session instead of owning the frame.
+fn render_gate_sheet(frame: &mut Frame, area: Rect, mode: &AppMode) {
+    let Some(lines) = gate_lines(mode) else {
+        return;
+    };
+    let title = match mode {
+        AppMode::LaunchGrant(_) => " Workspace Access ",
+        _ => " Repository Trust ",
+    };
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow))
+                .title(title),
+        ),
+        area,
     );
 }
 
@@ -2573,10 +2633,12 @@ mod tests {
     use super::super::test_screen::{IMAGE_MARK, ScreenBackend, buffer_screen};
     use super::render_inline_images;
     use crate::tui::app::ImageRegion;
+    use crate::tui::state::{AppMode, AskUserState, LaunchGrantState, RepoTrustState};
     use ratatui::Terminal;
     use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
     use ratatui_image::picker::{Picker, ProtocolType};
+    use std::path::PathBuf;
 
     #[allow(deprecated)] // a fixed font size keeps the test off the real terminal
     fn image_state(protocol: ProtocolType) -> ImageState {
@@ -2765,6 +2827,88 @@ mod tests {
         let (shown, regions) = draw(&mut terminal, &chat, &mut layout, &mut cache, 0);
         assert_eq!(regions.len(), 1);
         assert!(shown.iter().any(|row| row.contains(IMAGE_MARK)));
+    }
+
+    fn launch_grant(redecide: bool) -> AppMode {
+        AppMode::LaunchGrant(LaunchGrantState {
+            path: PathBuf::from("/work/dir"),
+            config_path: PathBuf::from("/cfg/workspace.toml"),
+            redecide,
+            selected: 0,
+        })
+    }
+
+    fn repo_trust(redecide: bool) -> AppMode {
+        let worktree = PathBuf::from("/work/repo");
+        let kind = crate::trust::RepoKind::Git;
+        AppMode::RepoTrust(RepoTrustState {
+            ask: AskUserState::for_open_question(crate::trust::question_for(
+                &kind, &worktree, false,
+            )),
+            worktree,
+            kind,
+            config_path: PathBuf::from("/cfg/workspace.toml"),
+            redecide,
+        })
+    }
+
+    /// Only a `/permission` re-ask is a bottom sheet; the startup gate and
+    /// every other mode are not.
+    #[test]
+    fn gate_sheet_is_only_the_permission_redecide() {
+        assert!(super::is_gate_sheet(&launch_grant(true)));
+        assert!(super::is_gate_sheet(&repo_trust(true)));
+        assert!(!super::is_gate_sheet(&launch_grant(false)));
+        assert!(!super::is_gate_sheet(&repo_trust(false)));
+        assert!(!super::is_gate_sheet(&AppMode::Chat));
+    }
+
+    /// The redecide sheet cancels on Esc; the startup gate offers no cancel
+    /// — its only way out unanswered is ctrl+c.
+    #[test]
+    fn gate_hint_esc_cancels_a_redecide_and_ctrl_c_quits_at_launch() {
+        let hint = |mode: &AppMode| {
+            let lines = super::gate_lines(mode).expect("gate lines");
+            lines
+                .last()
+                .expect("hint line")
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+        assert!(hint(&launch_grant(true)).contains("esc Cancel"));
+        assert!(hint(&launch_grant(false)).contains("ctrl+c Quit"));
+        assert!(hint(&repo_trust(true)).contains("esc Cancel"));
+    }
+
+    /// The `/permission` sheet renders the gate inside a bordered box, not
+    /// over the whole frame.
+    #[test]
+    fn permission_gate_renders_as_a_bordered_sheet() {
+        let mode = launch_grant(true);
+        let mut terminal = Terminal::new(ScreenBackend::new(60, 20)).unwrap();
+        terminal
+            .draw(|frame| {
+                super::render_gate_sheet(frame, Rect::new(0, 4, 60, 16), &mode);
+            })
+            .unwrap();
+        let shown = terminal.backend().screen();
+        assert!(shown[4].contains("Workspace Access"), "{shown:#?}");
+        assert!(
+            shown
+                .iter()
+                .any(|row| row.contains("Do you trust the contents of this project?")),
+            "{shown:#?}"
+        );
+        assert!(
+            shown
+                .iter()
+                .any(|row| row.contains("> Yes, I trust this folder")),
+            "{shown:#?}"
+        );
+        // The sheet's row count covers exactly its content plus the border.
+        assert_eq!(super::gate_sheet_rows(&mode), 14);
     }
 
     #[test]
