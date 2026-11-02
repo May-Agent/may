@@ -69,15 +69,30 @@ pub fn handle_chatgpt_auth_key(app: &mut App, code: KeyCode) -> Option<SendActio
 }
 
 pub fn handle_launch_grant_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
+    let grant = |app: &mut App, approved: bool| {
+        let crate::tui::state::AppMode::LaunchGrant(state) =
+            std::mem::replace(&mut app.mode, crate::tui::state::AppMode::Chat)
+        else {
+            unreachable!("the key was handled in the launch-grant sheet");
+        };
+        Some(SendAction::RespondLaunchGrant {
+            dir: state.path,
+            config_path: state.config_path,
+            approved,
+        })
+    };
     match code {
-        KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
-            app.mode = crate::tui::state::AppMode::Chat;
-            Some(SendAction::RespondLaunchGrant { approved: true })
-        }
-        KeyCode::Char('n' | 'N') | KeyCode::Esc => {
-            app.mode = crate::tui::state::AppMode::Chat;
-            Some(SendAction::RespondLaunchGrant { approved: false })
-        }
+        KeyCode::Char('y' | 'Y') | KeyCode::Enter => grant(app, true),
+        KeyCode::Char('n' | 'N') => grant(app, false),
+        // A re-asked gate (opened by `/permission`) cancels on Esc — a
+        // recorded decision must not silently downgrade.
+        KeyCode::Esc => match &app.mode {
+            crate::tui::state::AppMode::LaunchGrant(state) if state.redecide => {
+                app.mode = crate::tui::state::AppMode::Chat;
+                None
+            }
+            _ => grant(app, false),
+        },
         _ => None,
     }
 }
