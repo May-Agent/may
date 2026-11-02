@@ -59,7 +59,7 @@ export function ProvidersSection() {
         ...cfg.fullConfig,
         providers: cfg.fullConfig.providers.map((p) => ({
           ...p,
-          apiKey: p.apiKey?.trim() ? p.apiKey : undefined,
+          apiKey: p.apiKey ?? undefined,
         })),
       });
       toast.success(t('common.save'));

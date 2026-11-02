@@ -1,4 +1,5 @@
 import type { ApiErrorCode } from '../types';
+import { markAuthRequired } from '../stores/authGate';
 
 export class ApiError extends Error {
   constructor(
@@ -19,6 +20,7 @@ interface ApiErrorBody {
 
 async function decodeError(response: Response): Promise<ApiError> {
   const status = response.status;
+  if (status === 401) markAuthRequired();
   try {
     const body = (await response.json()) as ApiErrorBody;
     return new ApiError(

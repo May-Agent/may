@@ -1,4 +1,5 @@
 import type { UiEvent } from '../types';
+import { markAuthRequired } from '../stores/authGate';
 import { apiSseUrl } from './client';
 import { parseNamedSseStream } from '../stream/sse';
 
@@ -46,6 +47,7 @@ export async function openUiEventStream(
     signal: controller.signal,
   });
   if (!res.ok) {
+    if (res.status === 401) markAuthRequired();
     throw new Error(`ui events stream failed: ${res.status}`);
   }
 

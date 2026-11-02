@@ -12,6 +12,9 @@ pub mod serve;
 mod artifact_pages;
 mod artifacts;
 mod attachments;
+mod auth;
+#[cfg(test)]
+mod auth_tests;
 mod bootstrap;
 mod browser;
 mod chat;
@@ -284,7 +287,8 @@ fn bind_unix(path: &Path) -> anyhow::Result<tokio::net::UnixListener> {
 
 /// The extra `[daemon] listen` listeners, rebound whenever the config changes.
 struct ExtraListeners {
-    router: Arc<Router>,
+    local_router: Arc<Router>,
+    direct_router: Arc<Router>,
     running: HashMap<SocketAddr, tokio::task::JoinHandle<()>>,
 }
 
@@ -302,13 +306,20 @@ impl ExtraListeners {
             if self.running.contains_key(addr) {
                 continue;
             }
+            // A non-loopback bind is remote access: every request to it must
+            // carry an identity, and no source trusts a direct bind yet —
+            // the Tailscale header is only valid through tailscale serve's
+            // own proxy on the remote listener. Loopback extras stay local.
+            let router = if addr.ip().is_loopback() {
+                self.local_router.clone()
+            } else {
+                self.direct_router.clone()
+            };
             match tokio::net::TcpListener::bind(addr).await {
                 Ok(listener) => {
-                    tracing::info!(%addr, "listening");
-                    self.running.insert(
-                        *addr,
-                        tokio::spawn(serve::serve_tcp(listener, self.router.clone())),
-                    );
+                    tracing::info!(%addr, remote = !addr.ip().is_loopback(), "listening");
+                    self.running
+                        .insert(*addr, tokio::spawn(serve::serve_tcp(listener, router)));
                 }
                 Err(error) => tracing::warn!(%addr, %error, "failed to listen"),
             }
@@ -333,6 +344,8 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
     let started = crate::daemon::start(options.mode).await?;
     let state = started.state;
     let router = Arc::new(started.router);
+    let remote_router = Arc::new(started.remote_router);
+    let direct_router = Arc::new(started.direct_router);
 
     let config = state.config_snapshot();
     let tcp = options.tcp.unwrap_or_else(|| {
@@ -341,16 +354,21 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
     let tcp_listener = tokio::net::TcpListener::bind(tcp)
         .await
         .with_context(|| format!("failed to listen on {tcp}"))?;
+    // Remote access needs identity: it forwards the tailnet to the remote
+    // listener, bound on loopback because only the tunnel process connects.
+    let remote_listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .context("failed to bind the remote listener")?;
     let unix_listener = bind_unix(&paths.socket())?;
-    // Remote access forwards the tailnet to this listener.
     state.remote_access_manager.set_local_addr(
-        tcp_listener
+        remote_listener
             .local_addr()
-            .context("the daemon's TCP listener has no address")?,
+            .context("the daemon's remote listener has no address")?,
     );
     crate::daemon::sync_remote_access(&state).await?;
     tokio::spawn(serve::serve_tcp(tcp_listener, router.clone()));
     tokio::spawn(serve::serve_unix(unix_listener, router.clone()));
+    tokio::spawn(serve::serve_tcp(remote_listener, remote_router.clone()));
     tracing::info!(%tcp, socket = %paths.socket().display(), "May daemon listening");
     eprintln!(
         "May daemon listening on http://{tcp} and {}",
@@ -358,7 +376,8 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
     );
 
     let mut extra = ExtraListeners {
-        router: router.clone(),
+        local_router: router.clone(),
+        direct_router: direct_router.clone(),
         running: HashMap::new(),
     };
     extra.reconcile(&config.daemon.listen).await;

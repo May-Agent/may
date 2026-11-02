@@ -1,0 +1,202 @@
+//! The remote listener requires an identity everywhere — config reads, chat
+//! sends, approval responses and the event stream — while the local loopback
+//! listener keeps trusting the machine's own user. The Tailscale identity
+//! accepts only a listed `Tailscale-User-Login`, never a Funnel request.
+
+use std::sync::Arc;
+
+use skyzen::extract::PeerAddr;
+use skyzen::{Request, StatusCode};
+
+use super::auth::TailscaleServeIdentitySource;
+use super::server::{DaemonMode, build_router};
+use super::state::DaemonState;
+use crate::config::MayConfig;
+
+async fn state() -> Arc<DaemonState> {
+    // The home must outlive the state: `for_test` opens the database inside
+    // it but does not keep the directory handle.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let state = DaemonState::for_test(dir.path(), dir.path(), MayConfig::default())
+        .await
+        .expect("daemon state");
+    std::mem::forget(dir);
+    Arc::new(state)
+}
+
+fn tailscale_source(allowed: &[&str]) -> TailscaleServeIdentitySource {
+    TailscaleServeIdentitySource::new(allowed.iter().map(|s| (*s).to_string()).collect())
+}
+
+fn remote_router(
+    state: &Arc<DaemonState>,
+    source: TailscaleServeIdentitySource,
+) -> skyzen::routing::Router {
+    build_router(
+        state.clone(),
+        DaemonMode::Rest,
+        Some(vec![Box::new(source)]),
+    )
+}
+
+fn local_router(state: &Arc<DaemonState>) -> skyzen::routing::Router {
+    build_router(state.clone(), DaemonMode::Rest, None)
+}
+
+fn request(method: &str, uri: &str) -> Request {
+    hyper::Request::builder()
+        .method(method)
+        .uri(uri)
+        .body(skyzen::Body::empty())
+        .expect("request builds")
+}
+
+fn tailscale_request(method: &str, uri: &str, login: &str) -> Request {
+    hyper::Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("Tailscale-User-Login", login)
+        .body(skyzen::Body::empty())
+        .expect("request builds")
+}
+
+/// The status a request gets through `router.go` — `Ok` carries the route's
+/// status, `Err` the error's HTTP status.
+async fn status(router: &skyzen::routing::Router, request: Request) -> StatusCode {
+    match router.go(request).await {
+        Ok(response) => response.status(),
+        Err(error) => skyzen::error_response(&*error).status(),
+    }
+}
+
+const API_PATHS: [(&str, &str); 5] = [
+    ("GET", "/api/health"),
+    ("GET", "/api/config"),
+    ("POST", "/api/chat/enqueue"),
+    ("POST", "/api/permissions/respond"),
+    ("GET", "/api/events"),
+];
+
+#[tokio::test]
+async fn the_remote_listener_rejects_every_unauthenticated_api_and_event_request() {
+    let state = state().await;
+    let router = remote_router(&state, tailscale_source(&["owner@example.com"]));
+    for (method, uri) in API_PATHS {
+        let response = status(&router, request(method, uri)).await;
+        assert_eq!(
+            response,
+            StatusCode::UNAUTHORIZED,
+            "{method} {uri} should be 401 without an identity"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_local_listener_serves_them_without_identity() {
+    let state = state().await;
+    let router = local_router(&state);
+    for (method, uri) in API_PATHS {
+        let response = status(&router, request(method, uri)).await;
+        assert_ne!(
+            response,
+            StatusCode::UNAUTHORIZED,
+            "{method} {uri} must not 401 on the local listener"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_loopback_peer_on_the_remote_listener_is_not_exempt() {
+    let state = state().await;
+    let router = remote_router(&state, tailscale_source(&["owner@example.com"]));
+    let mut req = request("GET", "/api/health");
+    req.extensions_mut()
+        .insert(PeerAddr("127.0.0.1:43210".parse().expect("peer")));
+    assert_eq!(
+        status(&router, req).await,
+        StatusCode::UNAUTHORIZED,
+        "a loopback connection is still remote and still needs an identity"
+    );
+}
+
+#[tokio::test]
+async fn a_listed_tailscale_login_is_accepted() {
+    let state = state().await;
+    let router = remote_router(&state, tailscale_source(&["owner@example.com"]));
+    let response = status(
+        &router,
+        tailscale_request("GET", "/api/health", "owner@example.com"),
+    )
+    .await;
+    assert_ne!(
+        response,
+        StatusCode::UNAUTHORIZED,
+        "a listed Tailscale-User-Login passes the identity layer"
+    );
+}
+
+#[tokio::test]
+async fn an_unlisted_tailscale_login_is_rejected() {
+    let state = state().await;
+    let router = remote_router(&state, tailscale_source(&["owner@example.com"]));
+    assert_eq!(
+        status(
+            &router,
+            tailscale_request("GET", "/api/health", "stranger@example.com"),
+        )
+        .await,
+        StatusCode::UNAUTHORIZED,
+    );
+}
+
+#[tokio::test]
+async fn a_funnel_request_needs_a_session_not_its_header() {
+    let state = state().await;
+    let router = remote_router(&state, tailscale_source(&["owner@example.com"]));
+    let req = hyper::Request::builder()
+        .method("GET")
+        .uri("/api/health")
+        .header("Tailscale-User-Login", "owner@example.com")
+        .header("Tailscale-Funnel-Request", "?1")
+        .body(skyzen::Body::empty())
+        .expect("request builds");
+    assert_eq!(
+        status(&router, req).await,
+        StatusCode::UNAUTHORIZED,
+        "a Funnel request is not a tailnet identity"
+    );
+}
+
+#[tokio::test]
+async fn a_direct_bind_rejects_even_a_listed_tailscale_login() {
+    // A non-loopback `[daemon] listen` address is remote access with no
+    // trusted source yet: tailscale serve's header is only trustworthy on
+    // the remote listener its proxy connects to, never on a direct bind.
+    let state = state().await;
+    let router = build_router(state.clone(), DaemonMode::Rest, Some(Vec::new()));
+    assert_eq!(
+        status(
+            &router,
+            tailscale_request("GET", "/api/health", "owner@example.com"),
+        )
+        .await,
+        StatusCode::UNAUTHORIZED,
+        "a header that only tailscale serve sets is meaningless on a direct bind"
+    );
+}
+
+#[tokio::test]
+async fn the_local_listener_ignores_tailscale_headers() {
+    let state = state().await;
+    let router = local_router(&state);
+    let response = status(
+        &router,
+        tailscale_request("GET", "/api/health", "anyone@example.com"),
+    )
+    .await;
+    assert_ne!(
+        response,
+        StatusCode::UNAUTHORIZED,
+        "the local listener never checks identity"
+    );
+}
