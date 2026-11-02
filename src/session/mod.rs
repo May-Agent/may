@@ -39,8 +39,8 @@ pub(crate) use persisted_message::{PersistedMessage, PersistedMessageError};
 pub use plan::SessionPlanState;
 pub use runs::{AcquireError, CancelReason, RunOutcome, SessionBusy, SessionRunGuard, SessionRuns};
 pub use runtime::{
-    AttachmentKind, BrowserInteractionState, PendingUserMessage, PendingUserMessageMode,
-    PersistedAskUserQuestion, PersistedAskUserRequest, PersistedAttachment,
+    AttachmentKind, BrowserInteractionState, PendingMessageState, PendingUserMessage,
+    PendingUserMessageMode, PersistedAskUserQuestion, PersistedAskUserRequest, PersistedAttachment,
     PersistedPermissionRequest, PersistedPermissionRequestPayload, PersistedWorkspaceRequest,
     PersistedWorkspaceRequestPayload, SessionInteractionState, SessionRuntimeState,
     SessionRuntimeSummary, TerminalRuntimeState,

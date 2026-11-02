@@ -32,6 +32,8 @@ pub struct MessageMeta<'a> {
     pub reasoning: Option<&'a str>,
     /// Serialized tool calls (JSON) on an assistant message.
     pub tool_calls: Option<&'a str>,
+    /// Claimed queue entry the append commits in the same transaction.
+    pub commit_pending_entry: Option<i64>,
 }
 
 impl ChatDb {
@@ -68,6 +70,7 @@ impl ChatDb {
             attachments,
             reasoning,
             tool_calls,
+            commit_pending_entry,
         } = meta;
         let now = jiff::Timestamp::now().to_string();
         let prompt_tokens = stats
@@ -139,6 +142,22 @@ impl ChatDb {
                 preview.as_deref(),
                 session_update.increment_message_count,
             )
+            .await?;
+        }
+        if let Some(entry_id) = commit_pending_entry {
+            query!(
+                tx,
+                "UPDATE session_pending_message_entries SET state = 'committed' WHERE id = ? AND state = 'claimed'",
+                entry_id
+            )
+            .execute()
+            .await?;
+            query!(
+                tx,
+                "DELETE FROM session_pending_message_attachments WHERE message_id = ?",
+                entry_id
+            )
+            .execute()
             .await?;
         }
         tx.commit().await?;
@@ -525,7 +544,7 @@ impl ChatDb {
         session_id: &str,
         message: &ChatMessage,
     ) -> Result<messages::Model, ChatDbError> {
-        self.append_chat_message_fenced(None, session_id, message)
+        self.append_chat_message_fenced(None, session_id, message, None)
             .await
     }
 
@@ -540,7 +559,24 @@ impl ChatDb {
         fence: &RunFence,
         message: &ChatMessage,
     ) -> Result<messages::Model, ChatDbError> {
-        self.append_chat_message_fenced(Some(fence), &fence.session_id, message)
+        self.append_chat_message_fenced(Some(fence), &fence.session_id, message, None)
+            .await
+    }
+
+    /// Append a chat history message and commit the claimed pending entry
+    /// it answers in the same fenced transaction: the queued input reaches
+    /// the transcript or stays claimed, never both.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError::RunLost`] when the lease was taken over or
+    /// released, or [`ChatDbError`] on storage failure.
+    pub async fn append_chat_message_as_run_and_commit_pending(
+        &self,
+        fence: &RunFence,
+        entry_id: i64,
+        message: &ChatMessage,
+    ) -> Result<messages::Model, ChatDbError> {
+        self.append_chat_message_fenced(Some(fence), &fence.session_id, message, Some(entry_id))
             .await
     }
 
@@ -549,6 +585,7 @@ impl ChatDb {
         fence: Option<&RunFence>,
         session_id: &str,
         message: &ChatMessage,
+        commit_pending_entry: Option<i64>,
     ) -> Result<messages::Model, ChatDbError> {
         let timestamp = message.timestamp.map(|value| value.to_string());
         let stats = message
@@ -590,6 +627,7 @@ impl ChatDb {
                 attachments: attachments.as_deref(),
                 reasoning: reasoning.as_deref(),
                 tool_calls: tool_calls.as_deref(),
+                commit_pending_entry,
             },
         )
         .await

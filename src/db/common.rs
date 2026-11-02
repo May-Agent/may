@@ -339,6 +339,8 @@ pub(super) struct PendingMessageEntryRow {
     pub(super) content: String,
     pub(super) hidden_context_xml: Option<String>,
     pub(super) created_at: String,
+    pub(super) state: String,
+    pub(super) claim_error: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
