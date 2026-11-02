@@ -169,6 +169,7 @@ keyring = { version = "3", default-features = false, features = ["apple-native",
 # Direct NSPasteboard reads skip the decode-to-RGBA / re-encode round trip
 # that arboard's get_image performs on every clipboard image.
 block2 = "0.6"
+libc = "0.2.191"
 objc2 = "0.6"
 objc2-app-kit = "0.3"
 objc2-foundation = "0.3"
@@ -177,7 +178,6 @@ objc2-foundation = "0.3"
 sha2 = "0.10"
 
 [dev-dependencies]
-libc = "0.2.191"
 serial_test = "3"
 tokio-test = "0.4"
 

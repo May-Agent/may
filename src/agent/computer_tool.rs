@@ -8,22 +8,21 @@ use aither_core::llm::tool::ToolResultPart;
 use aither_core::llm::{Tool, ToolResult};
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tokio::sync::Mutex;
 
 use crate::computer::input::{
-    self, InputMessage, KeyboardEventKind, KeyboardInput, MouseButtonInput, MouseEventKind,
-    MouseInput,
+    InputMessage, KeyboardEventKind, KeyboardInput, MouseButtonInput, MouseEventKind, MouseInput,
 };
-use crate::computer::{SessionDisplay, SessionDisplays, SessionStreams};
+use crate::computer::{
+    ComputerAgent,
+    proto::{AgentRequest, AgentResponse},
+};
 
-/// Handles the daemon hands the tool so commands run against this
-/// session's desktop in-process.
+/// What the daemon hands the tool: a client to `computer-agent`, the
+/// helper that owns every session's desktop.
 #[derive(Clone)]
 pub struct ComputerHandles {
-    /// The daemon's per-session displays.
-    pub displays: Arc<Mutex<SessionDisplays>>,
-    /// The daemon's per-session desktop streams (checked for takeover).
-    pub streams: Arc<Mutex<SessionStreams>>,
+    /// The daemon's computer-agent client.
+    pub agent: Arc<ComputerAgent>,
 }
 
 /// `computer` tool: see and drive the session's virtual desktop.
@@ -69,27 +68,35 @@ impl ComputerTool {
 
     /// The session's display, creating it on first use — provisioning is
     /// the point: an agent asking for its desktop gets one.
-    async fn display_id(&self) -> Result<u32, crate::computer::DisplayError> {
-        let display = {
-            let mut displays = self.handles.displays.lock().await;
-            displays.acquire(&self.session_id)?
-        };
-        Ok(display.display_id())
+    async fn ensure_desktop(&self) -> Result<(), String> {
+        match self
+            .handles
+            .agent
+            .request(AgentRequest::EnsureDisplay {
+                session_id: self.session_id.clone(),
+            })
+            .await?
+        {
+            AgentResponse::Display { .. } => Ok(()),
+            AgentResponse::Error { error } => Err(error),
+            _ => Err("unexpected reply from computer-agent".to_owned()),
+        }
     }
 
     async fn check_agent_owns_desktop(&self) -> Result<(), String> {
-        let user_is_driving = {
-            let streams = self.handles.streams.lock().await;
-            streams
-                .get(&self.session_id)
-                .is_some_and(|stream| stream.takeover_active())
-        };
-        if user_is_driving {
-            return Err(
+        match self
+            .handles
+            .agent
+            .request(AgentRequest::TakeoverActive {
+                session_id: self.session_id.clone(),
+            })
+            .await?
+        {
+            AgentResponse::Flag { value: true } => Err(
                 "the user is currently driving this desktop; wait until takeover ends".to_owned(),
-            );
+            ),
+            _ => Ok(()),
         }
-        Ok(())
     }
 }
 
@@ -127,13 +134,19 @@ impl ComputerTool {
     }
 
     async fn capture(&self, with_text: bool) -> Result<ToolResult, String> {
-        let display_id = self.display_id().await.map_err(|e| e.to_string())?;
-        let png = tokio::task::spawn_blocking(move || {
-            crate::computer::screenshot::screenshot_png(display_id)
-        })
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())?;
+        self.ensure_desktop().await?;
+        let png = match self
+            .handles
+            .agent
+            .request(AgentRequest::Screenshot {
+                session_id: self.session_id.clone(),
+            })
+            .await?
+        {
+            AgentResponse::Png { data } => data,
+            AgentResponse::Error { error } => return Err(error),
+            _ => return Err("unexpected reply from computer-agent".to_owned()),
+        };
         if with_text {
             Ok(ToolResult::parts(vec![
                 ToolResultPart::text("The attached image is the session desktop's current screen."),
@@ -146,7 +159,7 @@ impl ComputerTool {
 
     async fn drive(&self, action: &str, rest: &[String]) -> Result<ToolResult, String> {
         self.check_agent_owns_desktop().await?;
-        let display_id = self.display_id().await.map_err(|e| e.to_string())?;
+        self.ensure_desktop().await?;
         let at = |i: usize| -> Result<f64, String> {
             rest.get(i)
                 .and_then(|s| s.parse::<f64>().ok())
@@ -252,16 +265,20 @@ impl ComputerTool {
             _ => return Err(usage().to_owned()),
         };
 
-        let mut held = None;
         for message in messages {
-            if let InputMessage::Mouse(m) = &message {
-                match m.event_kind() {
-                    input::MousePhase::Pressed => held = m.held(),
-                    input::MousePhase::Released => held = None,
-                    _ => {}
-                }
+            match self
+                .handles
+                .agent
+                .request(AgentRequest::Input {
+                    session_id: self.session_id.clone(),
+                    message,
+                })
+                .await?
+            {
+                AgentResponse::Ok => {}
+                AgentResponse::Error { error } => return Err(error),
+                _ => return Err("unexpected reply from computer-agent".to_owned()),
             }
-            input::post_input(display_id, message, held)?;
         }
         Ok(ToolResult::text(format!("done: {action}")))
     }

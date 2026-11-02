@@ -6,15 +6,24 @@
 //! behind the same trait later.
 
 #[cfg(target_os = "macos")]
+pub mod agent;
+#[cfg(target_os = "macos")]
 mod capture;
+pub(crate) mod client;
 #[cfg(target_os = "macos")]
 pub(crate) mod input;
+#[cfg(target_os = "macos")]
+pub(crate) mod permissions;
+#[cfg(target_os = "macos")]
+pub(crate) mod proto;
 #[cfg(target_os = "macos")]
 pub(crate) mod screenshot;
 #[cfg(target_os = "macos")]
 mod skylight;
 #[cfg(target_os = "macos")]
 mod stream;
+
+pub use client::ComputerAgent;
 
 #[cfg(target_os = "macos")]
 use std::collections::HashMap;
