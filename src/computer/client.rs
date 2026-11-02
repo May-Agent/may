@@ -22,8 +22,10 @@ pub struct ComputerAgent {
     socket: PathBuf,
     #[cfg(target_os = "macos")]
     may_dir: PathBuf,
+    /// Serializes `open` launches — the helper reports liveness through
+    /// its pid file, so a launch in flight must not overlap another.
     #[cfg(target_os = "macos")]
-    child: Mutex<Option<std::process::Child>>,
+    spawn_lock: Mutex<()>,
 }
 
 impl std::fmt::Debug for ComputerAgent {
@@ -43,7 +45,7 @@ impl ComputerAgent {
             #[cfg(target_os = "macos")]
             may_dir,
             #[cfg(target_os = "macos")]
-            child: Mutex::new(None),
+            spawn_lock: Mutex::new(()),
         }
     }
 
@@ -82,14 +84,8 @@ impl ComputerAgent {
     /// user grants permissions, since TCC applies at process launch.
     #[cfg(target_os = "macos")]
     pub fn restart(&self) {
-        let mut child = self
-            .child
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(child) = child.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
+        if let Some(pid) = self.helper_pid() {
+            unsafe { libc::kill(pid, libc::SIGTERM) };
         }
     }
 
@@ -97,41 +93,97 @@ impl ComputerAgent {
     #[cfg(not(target_os = "macos"))]
     pub const fn restart(&self) {}
 
+    /// A stale pid file or a dead pid both mean "not running".
+    #[cfg(target_os = "macos")]
+    fn helper_pid(&self) -> Option<libc::pid_t> {
+        let pid: libc::pid_t = std::fs::read_to_string(self.may_dir.join("computer-agent.pid"))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()?;
+        (unsafe { libc::kill(pid, 0) } == 0).then_some(pid)
+    }
+
+    /// `~/.may/MayComputerAgent.app` — the bundle screen recording needs.
+    ///
+    /// TCC only credits a kTCCServiceScreenCapture request to a process
+    /// with its own bundle identity; a bare binary inherits the
+    /// responsible process (the terminal). Materializing the app here and
+    /// launching it through `open` gives the helper a stable
+    /// `ai.may.computer-agent` subject — the same shape cua-driver and
+    /// Codex Computer Use take.
+    #[cfg(target_os = "macos")]
+    fn materialize_app(&self) -> Result<PathBuf, String> {
+        let app = self.may_dir.join("MayComputerAgent.app");
+        let macos_dir = app.join("Contents/MacOS");
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        let dst = macos_dir.join("may");
+        // Refresh when the binary changed — compares cheaply, good enough
+        // for dev rebuilds and reinstalls alike.
+        let stale = match (std::fs::metadata(&dst), std::fs::metadata(&exe)) {
+            (Ok(d), Ok(e)) => d.len() != e.len() || d.modified().ok() < e.modified().ok(),
+            _ => true,
+        };
+        if stale {
+            std::fs::create_dir_all(&macos_dir).map_err(|e| e.to_string())?;
+            std::fs::copy(&exe, &dst).map_err(|e| format!("copy helper into bundle: {e}"))?;
+            std::fs::write(
+                app.join("Contents/Info.plist"),
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>ai.may.computer-agent</string>
+<key>CFBundleExecutable</key><string>may</string>
+<key>CFBundleName</key><string>May Computer Agent</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>LSUIElement</key><true/>
+</dict></plist>
+"#,
+            )
+            .map_err(|e| e.to_string())?;
+        }
+        Ok(app)
+    }
+
     #[cfg(target_os = "macos")]
     #[allow(clippy::significant_drop_tightening)]
     fn ensure_running(&self) -> Result<(), String> {
-        let mut guard = self
-            .child
+        let _launch = self
+            .spawn_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let alive = guard
-            .as_mut()
-            .is_some_and(|child| matches!(child.try_wait(), Ok(None)));
-        if !alive {
-            *guard = None;
+        if self.helper_pid().is_some() && self.socket.exists() {
+            return Ok(());
         }
-        if guard.is_none() {
-            let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-            let child = std::process::Command::new(exe)
-                .arg("computer-agent")
-                .arg("--may-dir")
-                .arg(&self.may_dir)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .map_err(|e| format!("spawn computer-agent: {e}"))?;
-            *guard = Some(child);
-            // The listener needs a beat to bind its socket.
-            for _ in 0..30 {
-                if self.socket.exists() {
-                    return Ok(());
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
+        let app = self.materialize_app()?;
+        // `open` routes through LaunchServices, which is what breaks the
+        // responsible-process chain; a plain spawn would inherit the
+        // daemon's (or a terminal's) TCC subject.
+        let status = std::process::Command::new("open")
+            .arg("-n")
+            .arg(&app)
+            .arg("--args")
+            .arg("computer-agent")
+            .arg("--may-dir")
+            .arg(&self.may_dir)
+            .arg("--stderr")
+            .arg(self.may_dir.join("computer-agent.log"))
+            .output()
+            .map_err(|e| format!("launch computer-agent app: {e}"))?;
+        if !status.status.success() {
+            return Err(format!(
+                "open {} failed: {}",
+                app.display(),
+                String::from_utf8_lossy(&status.stderr)
+            ));
+        }
+        // The listener needs a beat to bind its socket.
+        for _ in 0..50 {
+            if self.socket.exists() {
+                return Ok(());
             }
-            return Err("computer-agent did not bind its socket".to_owned());
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        Ok(())
+        Err("computer-agent did not bind its socket".to_owned())
     }
 }
 
