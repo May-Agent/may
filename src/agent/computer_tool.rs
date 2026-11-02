@@ -9,7 +9,7 @@ use aither_core::llm::{Tool, ToolResult};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use crate::computer::input::{
+use crate::computer::proto::{
     InputMessage, KeyboardEventKind, KeyboardInput, MouseButtonInput, MouseEventKind, MouseInput,
 };
 use crate::computer::{
