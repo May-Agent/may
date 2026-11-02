@@ -18,6 +18,7 @@ ui = []
 gstreamer = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
 
 [dependencies]
+libc = "0.2.191"
 # Aither framework
 aither-core = { git = "https://github.com/lexoliu/aither", branch = "dev" }
 aither-agent = { git = "https://github.com/lexoliu/aither", branch = "dev", features = ["mcp", "webfetch", "skills"] }
@@ -169,7 +170,6 @@ keyring = { version = "3", default-features = false, features = ["apple-native",
 # Direct NSPasteboard reads skip the decode-to-RGBA / re-encode round trip
 # that arboard's get_image performs on every clipboard image.
 block2 = "0.6"
-libc = "0.2.191"
 objc2 = "0.6"
 objc2-app-kit = "0.3"
 objc2-foundation = "0.3"

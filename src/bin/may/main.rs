@@ -232,9 +232,7 @@ async fn async_main() -> anyhow::Result<()> {
             #[cfg(not(target_os = "macos"))]
             {
                 let _ = may_dir;
-                return Err(std::io::Error::other(
-                    "computer-agent needs macOS".to_owned(),
-                ));
+                return Err(anyhow::Error::msg("computer-agent needs macOS"));
             }
         }
         CliMode::Browser(args) => std::process::exit(run_browser(args).await?),
