@@ -72,9 +72,6 @@ pub struct CodeSearchArgs {
     /// Symbol path pattern, e.g. `Env::*`.
     #[serde(default)]
     pub symbol: Option<String>,
-    /// Also search files git ignores.
-    #[serde(default)]
-    pub include_ignored: bool,
     /// With `index`: return once every chunk has a vector.
     #[serde(default)]
     pub wait: bool,
@@ -198,7 +195,6 @@ fn request_for(args: &CodeSearchArgs, worktree: PathBuf) -> Request {
             symbol: args.symbol.clone(),
             budget: args.budget.unwrap_or(DEFAULT_BUDGET),
             files_only: args.files,
-            include_ignored: args.include_ignored,
             format: Format::Text,
         }),
     }
