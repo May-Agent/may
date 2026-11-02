@@ -287,6 +287,7 @@ fn bind_unix(path: &Path) -> anyhow::Result<tokio::net::UnixListener> {
 
 /// The extra `[daemon] listen` listeners, rebound whenever the config changes.
 struct ExtraListeners {
+    state: Arc<state::DaemonState>,
     local_router: Arc<Router>,
     direct_router: Arc<Router>,
     running: HashMap<SocketAddr, tokio::task::JoinHandle<()>>,
@@ -307,19 +308,24 @@ impl ExtraListeners {
                 continue;
             }
             // A non-loopback bind is remote access: every request to it must
-            // carry an identity, and no source trusts a direct bind yet —
-            // the Tailscale header is only valid through tailscale serve's
-            // own proxy on the remote listener. Loopback extras stay local.
-            let router = if addr.ip().is_loopback() {
-                self.local_router.clone()
-            } else {
-                self.direct_router.clone()
-            };
+            // carry an identity, resolved from the peer address through
+            // tailscaled's `WhoIs` — the Tailscale header is only valid
+            // through tailscale serve's own proxy on the remote listener.
+            // Loopback extras stay local.
+            let direct = !addr.ip().is_loopback();
             match tokio::net::TcpListener::bind(addr).await {
                 Ok(listener) => {
                     tracing::info!(%addr, remote = !addr.ip().is_loopback(), "listening");
-                    self.running
-                        .insert(*addr, tokio::spawn(serve::serve_tcp(listener, router)));
+                    let task = if direct {
+                        tokio::spawn(serve::serve_tcp_tailnet(
+                            listener,
+                            self.direct_router.clone(),
+                            self.state.clone(),
+                        ))
+                    } else {
+                        tokio::spawn(serve::serve_tcp(listener, self.local_router.clone()))
+                    };
+                    self.running.insert(*addr, task);
                 }
                 Err(error) => tracing::warn!(%addr, %error, "failed to listen"),
             }
@@ -376,6 +382,7 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
     );
 
     let mut extra = ExtraListeners {
+        state: state.clone(),
         local_router: router.clone(),
         direct_router: direct_router.clone(),
         running: HashMap::new(),
