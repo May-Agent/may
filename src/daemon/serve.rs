@@ -109,7 +109,7 @@ pub async fn serve_tcp(listener: tokio::net::TcpListener, router: Arc<Router>) {
 
 /// Accepts TCP connections on a direct tailnet bind, resolving every peer's
 /// login through `tailscale whois` before its first request is served.
-pub async fn serve_tcp_tailnet(
+pub(super) async fn serve_tcp_tailnet(
     listener: tokio::net::TcpListener,
     router: Arc<Router>,
     state: Arc<DaemonState>,
