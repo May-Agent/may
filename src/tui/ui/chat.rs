@@ -4301,10 +4301,10 @@ mod tests {
             .collect();
         assert!(hint.starts_with(" (bash mode) ───"));
         let prompt = &lines[1];
-        assert_eq!(prompt.spans[0].content, "> ");
-        assert_eq!(prompt.spans[1].content, "!");
-        assert_eq!(prompt.spans[1].style.bg, Some(Color::Yellow));
-        assert_eq!(prompt.spans[2].content, "ls -la");
+        assert_eq!(prompt.spans[0].content, "! ");
+        assert_eq!(prompt.spans[0].style.fg, Some(Color::Yellow));
+        assert_eq!(prompt.spans[0].style.bg, None);
+        assert_eq!(prompt.spans[1].content, "ls -la");
     }
 
     #[test]
