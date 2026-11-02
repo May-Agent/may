@@ -41,6 +41,10 @@ pub(super) struct EventsQuery {
     /// reconnects receives only the frames after it.
     #[serde(default)]
     after: Option<u64>,
+    /// Launch cwd when there is no session yet; `session_index` covers its
+    /// worktree.
+    #[serde(default)]
+    cwd: Option<String>,
 }
 
 #[derive(Default)]
@@ -113,6 +117,12 @@ pub(super) async fn stream_events(
         None => (Vec::new(), None, false),
     };
     let mut last_turn_index = query.after.unwrap_or(0);
+    let cwd = query
+        .cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
 
     state.tokio_handle.spawn(async move {
         let mut signatures = EventSignatures::default();
@@ -127,6 +137,7 @@ pub(super) async fn stream_events(
             &sender,
             session_id.as_deref(),
             profile_id.as_deref(),
+            cwd.as_deref(),
             subscribed_topics,
             &mut signatures,
         )
@@ -134,6 +145,9 @@ pub(super) async fn stream_events(
         {
             return;
         }
+        // Opening snapshot already sent session_index; drop the interval's
+        // immediate tick so the next Status is INDEX_POLL later.
+        let _ = index_tick.tick().await;
         if turn_gap && !send_resync(&sender, session_id.as_deref()).await {
             return;
         }
@@ -215,6 +229,7 @@ pub(super) async fn stream_events(
                         &sender,
                         session_id.as_deref(),
                         profile_id.as_deref(),
+                        cwd.as_deref(),
                         dirty_topics,
                         &mut signatures,
                     ).await {
@@ -239,6 +254,7 @@ pub(super) async fn stream_events(
                         &state_cloned,
                         &sender,
                         session_id.as_deref(),
+                        cwd.as_deref(),
                         &mut signatures.session_index,
                     ).await {
                         break;
@@ -307,6 +323,7 @@ async fn emit_topics_if_changed(
     sender: &skyzen::responder::sse::Sender,
     session_filter: Option<&str>,
     profile_filter: Option<&str>,
+    cwd: Option<&str>,
     topics: UiEventTopics,
     signatures: &mut EventSignatures,
 ) -> bool {
@@ -407,6 +424,18 @@ async fn emit_topics_if_changed(
     {
         return false;
     }
+    if topics.contains(UiEventTopics::SESSION_INDEX)
+        && !emit_session_index_if_changed(
+            state,
+            sender,
+            session_filter,
+            cwd,
+            &mut signatures.session_index,
+        )
+        .await
+    {
+        return false;
+    }
     true
 }
 
@@ -463,20 +492,23 @@ async fn emit_session_background_if_changed(
     true
 }
 
-/// The filtered session's worktree index coverage, re-polled every
-/// [`INDEX_POLL`] while a `session_index` subscriber is attached.
+/// Worktree index coverage. Sent on the opening snapshot and re-polled
+/// every [`INDEX_POLL`] while a `session_index` subscriber is attached.
+/// A persisted session's cwd wins; otherwise the subscriber's `cwd`.
 async fn emit_session_index_if_changed(
     state: &Arc<DaemonState>,
     sender: &skyzen::responder::sse::Sender,
     session_filter: Option<&str>,
+    cwd: Option<&str>,
     last_sig: &mut String,
 ) -> bool {
-    let Some(session_id) = session_filter else {
+    let worktree = coverage_worktree(state, session_filter, cwd).await;
+    let Some(worktree) = worktree else {
         return true;
     };
     let payload = crate::client::SessionIndexSnapshot {
-        session_id: session_id.to_string(),
-        index: index_coverage(state, session_id).await,
+        session_id: session_filter.unwrap_or_default().to_string(),
+        index: index_coverage(state, &worktree).await,
     };
     if let Ok(sig) = serde_json::to_string(&payload)
         && sig != *last_sig
@@ -489,14 +521,23 @@ async fn emit_session_index_if_changed(
     true
 }
 
-/// The session's worktree index coverage, when the session is in a git
-/// worktree and repo-search answers its status.
+async fn coverage_worktree(
+    state: &Arc<DaemonState>,
+    session_id: Option<&str>,
+    cwd: Option<&str>,
+) -> Option<std::path::PathBuf> {
+    if let Some(session_id) = session_id {
+        let session = state.db().get_session(session_id).await.ok()??;
+        return crate::repo_search::worktree_root(std::path::Path::new(session.cwd?.as_str()));
+    }
+    crate::repo_search::worktree_root(std::path::Path::new(cwd?))
+}
+
+/// Coverage of `worktree` when repo-search answers its status.
 async fn index_coverage(
     state: &Arc<DaemonState>,
-    session_id: &str,
+    worktree: &std::path::Path,
 ) -> Option<crate::client::IndexCoverage> {
-    let session = state.db().get_session(session_id).await.ok()??;
-    let worktree = crate::repo_search::worktree_root(std::path::Path::new(session.cwd?.as_str()))?;
     let status = async {
         let client = state
             .repo_search
@@ -504,7 +545,9 @@ async fn index_coverage(
             .await
             .map_err(|e| e.to_string())?;
         client
-            .request(Request::Status { worktree })
+            .request(Request::Status {
+                worktree: worktree.to_path_buf(),
+            })
             .await
             .map_err(|e| e.to_string())?
             .finish()
@@ -520,7 +563,7 @@ async fn index_coverage(
         }),
         Ok(_) => None,
         Err(error) => {
-            tracing::debug!(session_id, %error, "index coverage poll failed");
+            tracing::debug!(worktree = %worktree.display(), %error, "index coverage poll failed");
             None
         }
     }
