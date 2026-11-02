@@ -27,7 +27,7 @@ pub enum ApiErrorCode {
     ProviderUnavailable,
     ProfileConfigurationInvalid,
     ContainerPreparing,
-    ContainerBuildFailed,
+    ContainerPullFailed,
     ContainerStartFailed,
     ContainerRuntimeUnavailable,
     ManagedPodmanApprovalRequired,
