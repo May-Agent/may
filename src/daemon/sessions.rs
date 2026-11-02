@@ -682,6 +682,7 @@ pub(super) async fn delete_session(
     }
     db.delete_session(&id).await.map_err(internal_error)?;
     state.parked_agents.evict(&id);
+    state.runtime_service.forget_terminal_grants(&id);
     state.tunnels.remove_session(&id);
     #[cfg(target_os = "macos")]
     #[cfg(target_os = "macos")]
@@ -723,6 +724,7 @@ pub(super) async fn delete_all_sessions(
         }
     }
     db.delete_all_sessions().await.map_err(internal_error)?;
+    state.runtime_service.forget_all_terminal_grants();
     state.tool_environments.evict_all();
     #[cfg(target_os = "macos")]
     #[cfg(target_os = "macos")]
