@@ -46,8 +46,8 @@ pub use session_run::RunFence;
 
 use common::{
     AskUserRequestMessageRow, AskUserRequestQuestionOptionRow, AskUserRequestQuestionRow,
-    I64ValueRow, PermissionRequestMessageRow, SqliteTableInfoRow, db_custom_error, overflow_error,
-    row_not_found, storage_error, to_i32, to_i64_from_u64,
+    I64ValueRow, PermissionRequestMessageRow, SnapshotMigrationRow, SqliteTableInfoRow,
+    db_custom_error, overflow_error, row_not_found, storage_error, to_i32, to_i64_from_u64,
 };
 
 macro_rules! query {
@@ -364,12 +364,10 @@ impl ChatDb {
         // The pre-versioning layout: it gains `format_version` defaulting to
         // 1 ("every blob written before versioning existed") so its rows are
         // then invalidated below.
-        const LEGACY_COLUMNS: [&str; 4] =
-            ["session_id", "checkpoint_blob", "applied_seq", "updated_at"];
         const EXPECTED_COLUMNS: [&str; 5] = [
             "session_id",
             "checkpoint_blob",
-            "last_message_db_id",
+            "applied_seq",
             "updated_at",
             "format_version",
         ];
@@ -381,14 +379,85 @@ impl ChatDb {
             .map(|column| column.name.as_str())
             .collect::<Vec<_>>();
 
-        if actual_columns == LEGACY_COLUMNS {
+        let has_message_anchor = actual_columns.contains(&"last_message_db_id");
+        if has_message_anchor {
+            // Pre-#10 layout: keep every snapshot. `applied_seq` and the
+            // transcript entries are recovered from the blobs themselves —
+            // aither assigns item seqs, so they are the anchor's true values.
+            if !actual_columns.contains(&"format_version") {
+                query!(
+                    db,
+                    "ALTER TABLE session_context_snapshots ADD COLUMN format_version INTEGER NOT NULL DEFAULT 1"
+                )
+                .execute()
+                .await?;
+            }
+            let mut tx = db.begin().await?;
             query!(
-                db,
-                "ALTER TABLE session_context_snapshots ADD COLUMN format_version INTEGER NOT NULL DEFAULT 1"
+                tx,
+                "ALTER TABLE session_context_snapshots ADD COLUMN applied_seq INTEGER NOT NULL DEFAULT 0"
             )
             .execute()
             .await?;
-        } else if !actual_columns.is_empty() && actual_columns != EXPECTED_COLUMNS {
+            let rows = query!(
+                tx,
+                "SELECT session_id, checkpoint_blob FROM session_context_snapshots"
+            )
+            .fetch_all::<SnapshotMigrationRow>()
+            .await?;
+            for row in rows {
+                let checkpoint: aither_agent::AgentCheckpoint =
+                    rmp_serde::from_slice(&row.checkpoint_blob).map_err(|e| {
+                        storage_error(format!(
+                            "checkpoint blob for {} undecodable during snapshot migration: {e}",
+                            row.session_id
+                        ))
+                    })?;
+                let applied_seq = checkpoint
+                    .context
+                    .items()
+                    .last()
+                    .map_or(0, |item| i64::try_from(item.seq()).unwrap_or(0));
+                for item in checkpoint.context.items() {
+                    let blob = rmp_serde::to_vec_named(item.message()).map_err(|e| {
+                        storage_error(format!("transcript message encode failed: {e}"))
+                    })?;
+                    let seq = i64::try_from(item.seq())
+                        .map_err(|e| storage_error(format!("transcript seq overflow: {e}")))?;
+                    let committed_at = item.committed_at().to_string();
+                    query!(
+                        tx,
+                        "INSERT OR IGNORE INTO session_transcript_entries (session_id, seq, message_blob, committed_at) VALUES (?, ?, ?, ?)",
+                        row.session_id.as_str(),
+                        seq,
+                        blob,
+                        committed_at
+                    )
+                    .execute()
+                    .await?;
+                }
+                query!(
+                    tx,
+                    "UPDATE session_context_snapshots SET applied_seq = ? WHERE session_id = ?",
+                    applied_seq,
+                    row.session_id.as_str()
+                )
+                .execute()
+                .await?;
+            }
+            query!(
+                tx,
+                "ALTER TABLE session_context_snapshots DROP COLUMN last_message_db_id"
+            )
+            .execute()
+            .await?;
+            tx.commit().await?;
+        }
+        if actual_columns.is_empty() {
+            for statement in db_sql::statements(db_sql::SESSION_CONTEXT_SNAPSHOT_SCHEMA) {
+                query!(db, statement).execute().await?;
+            }
+        } else if !has_message_anchor && actual_columns != EXPECTED_COLUMNS {
             tracing::warn!(
                 columns = ?actual_columns,
                 "session_context_snapshots has an unexpected column layout; dropping and recreating it"
@@ -396,10 +465,9 @@ impl ChatDb {
             query!(db, db_sql::SESSION_CONTEXT_SNAPSHOT_DROP)
                 .execute()
                 .await?;
-        }
-
-        for statement in db_sql::statements(db_sql::SESSION_CONTEXT_SNAPSHOT_SCHEMA) {
-            query!(db, statement).execute().await?;
+            for statement in db_sql::statements(db_sql::SESSION_CONTEXT_SNAPSHOT_SCHEMA) {
+                query!(db, statement).execute().await?;
+            }
         }
 
         // Invalidate every snapshot whose blob was written under a different
