@@ -51,6 +51,8 @@ CREATE INDEX IF NOT EXISTS idx_message_workspace_responses_request_id ON message
 CREATE INDEX IF NOT EXISTS idx_message_ask_user_requests_request_id ON message_ask_user_requests(request_id);
 CREATE INDEX IF NOT EXISTS idx_message_ask_user_responses_request_id ON message_ask_user_responses(request_id);
 CREATE INDEX IF NOT EXISTS idx_session_pending_message_entries_session_created ON session_pending_message_entries(session_id, created_at);
+
+CREATE TABLE IF NOT EXISTS session_transcript_entries (session_id TEXT NOT NULL, seq INTEGER NOT NULL, message_blob BLOB NOT NULL, committed_at TEXT NOT NULL, PRIMARY KEY (session_id, seq));
 CREATE INDEX IF NOT EXISTS idx_session_pending_message_attachments_message ON session_pending_message_attachments(message_id, ordinal);
 CREATE INDEX IF NOT EXISTS idx_session_pending_ask_user_requests_v2_session ON session_pending_ask_user_requests_v2(session_id);
 CREATE INDEX IF NOT EXISTS idx_context_debug_snapshot_headers_timestamp ON context_debug_snapshot_headers(timestamp);
