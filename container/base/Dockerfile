@@ -1,15 +1,14 @@
-# May workspace container
-# Fedora-based environment with Python/uv, data science libs, CJK fonts, and dev tools.
+# May workspace base image: OS, language runtimes and libraries shared by
+# every workspace layer. Fedora stays at 41; every other version is pinned.
 FROM fedora:41
 
-# Core system tools
+# Core system tools (ripgrep/jq/ast-grep come from the aither baseline tools
+# staged by the workspace layer, not from dnf).
 RUN dnf install -y \
     bash \
     git \
     curl \
     wget \
-    jq \
-    ripgrep \
     fd-find \
     tree \
     less \
@@ -46,46 +45,17 @@ RUN dnf install -y \
     google-noto-serif-cjk-fonts \
     && dnf clean all
 
-# Python via uv
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+# Python via uv, installer and interpreter packages both pinned.
+ARG UV_VERSION=0.13.6
+RUN curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" | sh
 ENV PATH="/root/.bun/bin:/root/.local/bin:${PATH}"
+COPY requirements.txt /tmp/requirements.txt
+RUN uv pip install --system -r /tmp/requirements.txt
 
-# Data science and web scraping libraries
-RUN uv pip install --system \
-    numpy \
-    pandas \
-    polars \
-    pyarrow \
-    duckdb \
-    matplotlib \
-    seaborn \
-    scikit-learn \
-    scipy \
-    statsmodels \
-    requests \
-    httpx \
-    beautifulsoup4 \
-    pillow \
-    opencv-python-headless
+# Bun runtime, pinned to an explicit release.
+ARG BUN_VERSION=bun-v1.4.4
+RUN curl -fsSL https://bun.sh/install | bash -s "${BUN_VERSION}"
 
-# Bun runtime
-RUN curl -fsSL https://bun.sh/install | bash
-
-# Playwright client only (Chromium runs on host, connected via CDP)
-RUN uv pip install --system playwright
-
-# JavaScript runtime + CLI tooling (browser automation + ast-grep)
+# Playwright CLI only, pinned (Chromium runs on host, connected via CDP).
 RUN dnf install -y nodejs && dnf clean all
-RUN bun add --global @playwright/cli@latest @ast-grep/cli@latest
-
-# Prebuilt heel binary for IPC command wrappers inside container terminal sessions.
-COPY heel/bin/heel /usr/local/bin/heel
-RUN chmod +x /usr/local/bin/heel
-
-# Entrypoint generates playwright-cli.json from BROWSER_CDP_ENDPOINT
-COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
-
-WORKDIR /workspace
-ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
-CMD ["sleep", "infinity"]
+RUN bun add --global @playwright/cli@0.1.23

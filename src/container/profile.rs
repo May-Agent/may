@@ -1,40 +1,12 @@
-//! Profile-driven container overrides (Dockerfile + mounts).
+//! Profile-driven container mounts and per-session naming.
 
-use std::collections::BTreeMap;
-use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use aither_sandbox::{ContainerImageSpec, MountSpec};
-use async_fs;
-use futures_lite::{StreamExt, io::AsyncReadExt};
-use sha2::Digest;
+use aither_sandbox::MountSpec;
 
-use super::{ContainerError, image::MAY_IMAGE_TAG};
 use crate::db::entity::profiles;
 use crate::profile::{ContainerMountAccess, ContainerProfilePreferences};
 use crate::session::SessionId;
-
-/// Build a container image spec from profile preferences.
-#[must_use]
-pub fn image_spec_for_profile(
-    may_dir: &Path,
-    _profile: &profiles::Model,
-    default_tag: &str,
-    preferences: Option<ContainerProfilePreferences>,
-) -> ContainerImageSpec {
-    let context_dir = may_dir.join("container");
-    let mut spec = ContainerImageSpec::new(default_tag.to_string(), context_dir.clone());
-    let Some(preferences) = preferences else {
-        return spec;
-    };
-    let Some(dockerfile) = preferences.dockerfile else {
-        return spec;
-    };
-
-    let dockerfile_path = normalize_path(&context_dir, &dockerfile);
-    spec = spec.with_dockerfile(dockerfile_path);
-    spec
-}
 
 /// Build typed mount specs from profile preferences.
 #[must_use]
@@ -55,151 +27,6 @@ pub fn mounts_for_profile(preferences: Option<ContainerProfilePreferences>) -> V
         mounts.push(spec);
     }
     mounts
-}
-
-fn normalize_path(context_dir: &Path, configured: &str) -> PathBuf {
-    let path = PathBuf::from(configured);
-    if path.is_absolute() {
-        return path;
-    }
-    context_dir.join(path)
-}
-
-/// Stage the assets the container runtime needs (the managed `heel` binary)
-/// under `may_dir`.
-///
-/// # Errors
-///
-/// Returns [`ContainerError`] when preparing the heel binary fails.
-pub async fn ensure_container_runtime_assets(may_dir: &Path) -> Result<(), ContainerError> {
-    super::heel::ensure_container_heel_binary(may_dir).await
-}
-
-/// Resolve the default image tag for a profile when no explicit `container_image` is set.
-///
-/// Profiles without a custom Dockerfile share the global May workspace image to
-/// avoid duplicate builds across `daily` / `work` style profiles.
-///
-/// # Errors
-///
-/// Returns [`ContainerError`] when preparing container runtime assets fails or
-/// the container context directory cannot be hashed.
-pub async fn default_image_tag(
-    may_dir: &Path,
-    profile: &profiles::Model,
-    preferences: Option<ContainerProfilePreferences>,
-) -> Result<String, ContainerError> {
-    if let Some(image) = profile
-        .container_image
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return Ok(image.to_string());
-    }
-
-    ensure_container_runtime_assets(may_dir).await?;
-
-    let uses_custom_dockerfile = preferences
-        .and_then(|preferences| preferences.dockerfile)
-        .is_some_and(|dockerfile| !dockerfile.trim().is_empty());
-    let context_hash = container_context_hash_hex(may_dir).await?;
-    let repo = MAY_IMAGE_TAG
-        .split(':')
-        .next()
-        .filter(|value| !value.is_empty())
-        .unwrap_or("may-workspace");
-
-    if uses_custom_dockerfile {
-        return Ok(format!(
-            "{repo}-{}:{context_hash}",
-            profile.slug.as_deref().unwrap_or(profile.id.as_str()),
-        ));
-    }
-
-    Ok(format!("{repo}:{context_hash}"))
-}
-
-async fn container_context_hash_hex(may_dir: &Path) -> Result<String, ContainerError> {
-    let context_dir = may_dir.join("container");
-    let mut hasher = sha2::Sha256::new();
-    Box::pin(hash_path_recursive(&context_dir, &context_dir, &mut hasher)).await?;
-    // First 16 hex chars keep the tag at its previous length.
-    let mut tag = String::with_capacity(16);
-    for byte in &hasher.finalize()[..8] {
-        write!(tag, "{byte:02x}").expect("hex formatting into a String cannot fail");
-    }
-    Ok(tag)
-}
-
-/// Feed one length-prefixed field so adjacent fields cannot smear into each
-/// other. File contents stream unframed because a file's bytes are always
-/// the last field of its entry.
-fn feed_context_hash(hasher: &mut sha2::Sha256, field: &[u8]) {
-    hasher.update((field.len() as u64).to_le_bytes());
-    hasher.update(field);
-}
-
-async fn hash_path_recursive(
-    root: &Path,
-    path: &Path,
-    hasher: &mut sha2::Sha256,
-) -> Result<(), ContainerError> {
-    enum Pending {
-        DirEntry(String),
-        Path(PathBuf),
-    }
-
-    let mut stack = vec![Pending::Path(path.to_path_buf())];
-    while let Some(item) = stack.pop() {
-        match item {
-            Pending::DirEntry(name) => {
-                feed_context_hash(hasher, b"dir-entry");
-                feed_context_hash(hasher, name.as_bytes());
-            }
-            Pending::Path(path) => {
-                let metadata = async_fs::metadata(&path).await?;
-                if metadata.is_dir() {
-                    let mut entries = BTreeMap::<String, PathBuf>::new();
-                    let mut read_dir = async_fs::read_dir(&path).await?;
-                    while let Some(entry) = read_dir.next().await {
-                        let entry = entry?;
-                        let name = entry.file_name().to_string_lossy().to_string();
-                        entries.insert(name, entry.path());
-                    }
-                    for (name, child_path) in entries.into_iter().rev() {
-                        stack.push(Pending::Path(child_path));
-                        stack.push(Pending::DirEntry(name));
-                    }
-                    continue;
-                }
-
-                if !metadata.is_file() {
-                    continue;
-                }
-
-                feed_context_hash(hasher, b"file");
-                feed_context_hash(
-                    hasher,
-                    path.strip_prefix(root)
-                        .unwrap_or(&path)
-                        .to_string_lossy()
-                        .as_bytes(),
-                );
-
-                let mut file = async_fs::File::open(&path).await?;
-                let mut buffer = [0_u8; 16 * 1024];
-                loop {
-                    let read = file.read(&mut buffer).await?;
-                    if read == 0 {
-                        break;
-                    }
-                    hasher.update(&buffer[..read]);
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Resolve a deterministic container name for one profile session.
@@ -224,10 +51,7 @@ pub fn container_name_for_profile_session(
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-
     use aither_sandbox::{ContainerPath, MountAccess};
-    use tempfile::TempDir;
 
     use super::*;
     use crate::profile::ContainerMountPreference;
@@ -239,11 +63,9 @@ mod tests {
             name: "Daily".to_string(),
             icon: None,
             environment: "container".to_string(),
-            container_image: None,
             container_id: None,
             persona: None,
             remote_ssh_server_id: None,
-            container_dockerfile: None,
             location_aware: false,
             pinned_limit: 10,
             sort_order: 0,
@@ -252,43 +74,9 @@ mod tests {
         }
     }
 
-    fn make_may_dir_with_container_context() -> TempDir {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let context_dir = temp.path().join("container");
-        fs::create_dir_all(context_dir.join("heel").join("bin")).expect("create context");
-        fs::write(context_dir.join("Dockerfile"), "FROM debian:bookworm\n").expect("dockerfile");
-        fs::write(context_dir.join("heel").join("bin").join("heel"), "binary")
-            .expect("heel binary");
-        temp
-    }
-
-    #[test]
-    fn image_spec_uses_profile_dockerfile_relative_to_context() {
-        let may_dir = PathBuf::from("/tmp/may");
-        let spec = image_spec_for_profile(
-            &may_dir,
-            &profile_model(),
-            "may-workspace:test",
-            Some(ContainerProfilePreferences {
-                dockerfile: Some("custom/Dockerfile.profile".to_string()),
-                mounts: Vec::new(),
-            }),
-        );
-
-        assert_eq!(spec.tag, "may-workspace:test");
-        assert_eq!(spec.context_dir, PathBuf::from("/tmp/may/container"));
-        assert_eq!(
-            spec.dockerfile,
-            Some(PathBuf::from(
-                "/tmp/may/container/custom/Dockerfile.profile"
-            ))
-        );
-    }
-
     #[test]
     fn mounts_support_read_only_and_read_write() {
         let mounts = mounts_for_profile(Some(ContainerProfilePreferences {
-            dockerfile: None,
             mounts: vec![
                 ContainerMountPreference {
                     host_path: "/host/ro".to_string(),
@@ -321,57 +109,6 @@ mod tests {
                 .contains("container path must be absolute"),
             "unexpected error: {error}"
         );
-    }
-
-    #[tokio::test]
-    async fn container_context_hash_changes_when_heel_binary_changes() {
-        let may_dir = make_may_dir_with_container_context();
-        let first_hash = container_context_hash_hex(may_dir.path())
-            .await
-            .expect("first hash");
-        fs::write(
-            may_dir.path().join("container/heel/bin/heel"),
-            "updated binary",
-        )
-        .expect("rewrite heel binary");
-        let second_hash = container_context_hash_hex(may_dir.path())
-            .await
-            .expect("second hash");
-
-        assert_ne!(first_hash, second_hash);
-    }
-
-    #[tokio::test]
-    async fn container_context_hash_ignores_release_state_outside_the_context() {
-        let may_dir = make_may_dir_with_container_context();
-        let first_hash = container_context_hash_hex(may_dir.path())
-            .await
-            .expect("first hash");
-        assert_eq!(first_hash.len(), 16, "tag keeps its previous length");
-
-        // The managed heel's release state lives outside the build context,
-        // so creating or rewriting it must not change the context hash.
-        let state_path = may_dir
-            .path()
-            .join("state")
-            .join("container-heel-release.json");
-        fs::create_dir_all(state_path.parent().expect("state path has a parent"))
-            .expect("create state dir");
-        fs::write(&state_path, r#"{"release_tag":"heel-v9.9.9"}"#).expect("write state");
-        let second_hash = container_context_hash_hex(may_dir.path())
-            .await
-            .expect("second hash");
-        fs::write(
-            &state_path,
-            r#"{"release_tag":"heel-v9.9.9","checked":"later"}"#,
-        )
-        .expect("rewrite state");
-        let third_hash = container_context_hash_hex(may_dir.path())
-            .await
-            .expect("third hash");
-
-        assert_eq!(first_hash, second_hash);
-        assert_eq!(first_hash, third_hash);
     }
 
     #[test]

@@ -294,13 +294,17 @@ impl ChatDb {
             .execute()
             .await?;
         }
-        if !existing.contains("container_dockerfile") {
-            query!(
-                db,
-                "ALTER TABLE profiles ADD COLUMN container_dockerfile TEXT"
-            )
-            .execute()
-            .await?;
+        // Custom container images were retired with the published workspace
+        // image; every profile now uses it.
+        if existing.contains("container_image") {
+            query!(db, "ALTER TABLE profiles DROP COLUMN container_image")
+                .execute()
+                .await?;
+        }
+        if existing.contains("container_dockerfile") {
+            query!(db, "ALTER TABLE profiles DROP COLUMN container_dockerfile")
+                .execute()
+                .await?;
         }
         Ok(())
     }
@@ -717,7 +721,6 @@ mod tests {
             id: profile_id,
             name: "Test",
             environment: ProfileEnvironmentKind::Local,
-            container_image: None,
             slug: None,
             icon: None,
             persona: None,
@@ -820,7 +823,6 @@ mod tests {
             id: profile_id,
             name: "Test",
             environment: ProfileEnvironmentKind::Local,
-            container_image: None,
             slug: None,
             icon: None,
             persona: None,
@@ -887,7 +889,6 @@ mod tests {
             id: "daily-id",
             name: "Custom Daily",
             environment: ProfileEnvironmentKind::Container,
-            container_image: Some("custom-image"),
             slug: Some("daily"),
             icon: Some("D"),
             persona: None,
@@ -900,7 +901,6 @@ mod tests {
             id: "build-id",
             name: "Custom Build",
             environment: ProfileEnvironmentKind::Local,
-            container_image: Some("still-here"),
             slug: Some("build"),
             icon: Some("B"),
             persona: None,
@@ -944,7 +944,6 @@ mod tests {
         assert_eq!(build.environment, "local");
         assert_eq!(build.icon.as_deref(), Some("B"));
         assert!(build.location_aware);
-        assert!(build.container_image.is_none());
 
         let work = db
             .get_profile_by_slug("work")
@@ -1311,7 +1310,6 @@ mod tests {
                 id: "local-profile",
                 name: "Local",
                 environment: ProfileEnvironmentKind::Local,
-                container_image: None,
                 slug: None,
                 icon: None,
                 persona: None,
@@ -1360,7 +1358,6 @@ mod tests {
                 id: "attach-profile",
                 name: "Attach",
                 environment: ProfileEnvironmentKind::Local,
-                container_image: None,
                 slug: None,
                 icon: None,
                 persona: None,
@@ -1397,7 +1394,7 @@ mod tests {
             let now = jiff::Timestamp::now().to_string();
             super::query!(
                 db.db,
-                "INSERT INTO profiles (id, slug, name, icon, environment, container_image, container_id, persona, remote_ssh_server_id, container_dockerfile, location_aware, pinned_limit, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, 'remote', NULL, NULL, NULL, 'prod', NULL, 0, 10, 99, ?, ?)",
+                "INSERT INTO profiles (id, slug, name, icon, environment, container_id, persona, remote_ssh_server_id, location_aware, pinned_limit, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?, 'remote', NULL, NULL, 'prod', 0, 10, 99, ?, ?)",
                 "legacy-remote",
                 Option::<String>::None,
                 "Legacy Remote",

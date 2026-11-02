@@ -29,7 +29,6 @@ interface NewProfileDialogProps {
 interface DraftState {
   name: string;
   environment: ProfileEnvironmentKind;
-  containerImage: string;
   persona: string;
   locationAware: boolean;
 }
@@ -37,7 +36,6 @@ interface DraftState {
 const EMPTY_DRAFT: DraftState = {
   name: '',
   environment: 'local',
-  containerImage: '',
   persona: '',
   locationAware: false,
 };
@@ -73,8 +71,6 @@ export function NewProfileDialog({ open, onOpenChange }: NewProfileDialogProps) 
       const created = await create({
         name,
         environment: draft.environment,
-        containerImage:
-          draft.environment === 'container' ? draft.containerImage.trim() || null : null,
         persona: draft.persona.trim() || null,
         locationAware: draft.locationAware,
       });
@@ -122,18 +118,6 @@ export function NewProfileDialog({ open, onOpenChange }: NewProfileDialogProps) 
               })}
             />
           </div>
-
-          {draft.environment === 'container' && (
-            <div className="space-y-1.5">
-              <Label>{t('settings.profiles_env.containerImage')}</Label>
-              <Input
-                value={draft.containerImage}
-                onChange={(e) => set('containerImage', e.target.value)}
-                placeholder="ubuntu:24.04"
-                className="font-mono"
-              />
-            </div>
-          )}
 
           <div className="space-y-1.5">
             <Label>{t('settings.profiles_env.persona')}</Label>

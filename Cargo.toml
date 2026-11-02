@@ -173,6 +173,9 @@ objc2 = "0.6"
 objc2-app-kit = "0.3"
 objc2-foundation = "0.3"
 
+[build-dependencies]
+sha2 = "0.10"
+
 [dev-dependencies]
 libc = "0.2.191"
 serial_test = "3"
