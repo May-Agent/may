@@ -4,7 +4,8 @@
 //! request posted mid-turn queues behind the run guard and summarizes the
 //! finished conversation instead.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -196,6 +197,103 @@ fn publish(
         .expect("recap frame serializes")
         .into();
     state.turn_hub.publish(session_id, "session_recap", data);
+}
+
+/// Per-session idle-recap timers, at most one per session.
+#[derive(Default)]
+pub struct RecapSchedules {
+    schedules: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
+}
+
+impl std::fmt::Debug for RecapSchedules {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecapSchedules").finish_non_exhaustive()
+    }
+}
+
+impl RecapSchedules {
+    fn schedules(&self) -> std::sync::MutexGuard<'_, HashMap<String, tokio::task::JoinHandle<()>>> {
+        self.schedules
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Replaces `session_id`'s idle timer: after `idle_minutes` with no turn
+    /// the task recaps the session if its history outgrew the last recap.
+    fn arm(&self, state: &Arc<DaemonState>, session_id: &str) {
+        let idle = state.config.load().recap.idle_minutes;
+        let task_state = Arc::clone(state);
+        let task_session = session_id.to_string();
+        let handle = state.tokio_handle.spawn(async move {
+            tokio::time::sleep(Duration::from_secs(idle * 60)).await;
+            if freshness(&task_state, &task_session).await {
+                request_recap(&task_state, &task_session);
+            }
+            task_state.recap_schedules.schedules().remove(&task_session);
+        });
+        let previous = self.schedules().insert(session_id.to_string(), handle);
+        if let Some(previous) = previous {
+            previous.abort();
+        }
+    }
+
+    /// Drops `session_id`'s idle timer, if any.
+    fn unarm(&self, session_id: &str) {
+        let handle = self.schedules().remove(session_id);
+        if let Some(handle) = handle {
+            handle.abort();
+        }
+    }
+}
+
+/// Arms the idle-recap timer after a completed turn left `session_id` idle.
+/// No-op while `[recap] auto` is off.
+pub(super) fn arm(state: &Arc<DaemonState>, session_id: &str) {
+    if state.config.load().recap.auto {
+        state.recap_schedules.arm(state, session_id);
+    }
+}
+
+/// Drops `session_id`'s idle timer: a new message supersedes it.
+pub(super) fn unarm(state: &Arc<DaemonState>, session_id: &str) {
+    state.recap_schedules.unarm(session_id);
+}
+
+/// Re-arms idle timers for sessions whose history outgrew their last recap,
+/// so recaps survive a daemon restart.
+pub async fn seed(state: Arc<DaemonState>) {
+    if !state.config.load().recap.auto {
+        return;
+    }
+    let Ok(sessions) = state.db().list_sessions().await else {
+        return;
+    };
+    for session in sessions {
+        if freshness(&state, &session.id).await {
+            state.recap_schedules.arm(&state, &session.id);
+        }
+    }
+}
+
+/// Whether `session_id` has user messages its latest recap never covered:
+/// the point where an idle session owes the user a catch-up card.
+async fn freshness(state: &Arc<DaemonState>, session_id: &str) -> bool {
+    let Ok(history) = crate::session::load_history_from_db(&state.db(), session_id).await else {
+        return false;
+    };
+    let mut user_turns = 0;
+    let mut covered = 0;
+    for message in history.messages() {
+        match message.role {
+            MessageRole::User => user_turns += 1,
+            MessageRole::Recap => {
+                covered = serde_json::from_str::<RecapRecord>(&message.content)
+                    .map_or(user_turns, |record| record.turns);
+            }
+            _ => {}
+        }
+    }
+    user_turns > covered
 }
 
 #[cfg(test)]
