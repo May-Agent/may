@@ -2423,7 +2423,9 @@ struct SessionContext {
     cwd: std::path::PathBuf,
     /// Whether nobody answers this session's prompts.
     non_interactive: bool,
-    history_messages: Vec<LlmMessage>,
+    /// Model transcript entries as `(seq, message)`: exactly what was
+    /// committed to the model context, never UI history.
+    transcript: Vec<(i64, LlmMessage)>,
     context_snapshot: Option<crate::session::PersistedContextSnapshot>,
     hidden_context_xml: Option<String>,
     profile_persona: Option<String>,
@@ -2711,9 +2713,68 @@ async fn resolve_session_context(
         .map_err(UiChatPreparationError::LoadRuntime)?
         .unwrap_or_default();
 
-    let history_messages = history
-        .to_aither_messages()
-        .map_err(UiChatPreparationError::HistoryReplay)?;
+    let mut transcript = Vec::<(i64, LlmMessage)>::new();
+    for entry in db
+        .transcript_entries_after(session_id.as_str(), -1)
+        .await
+        .map_err(UiChatPreparationError::LoadContextSnapshot)?
+    {
+        let message: LlmMessage = rmp_serde::from_slice(&entry.message_blob).map_err(|error| {
+            UiChatPreparationError::LoadContextSnapshot(crate::db::ChatDbError::Storage(format!(
+                "failed to decode transcript entry {}: {error}",
+                entry.seq
+            )))
+        })?;
+        transcript.push((entry.seq, message));
+    }
+    if transcript.is_empty() {
+        // One-time migration: a session with only UI history seeds its
+        // transcript from it once, inside the run's fenced transaction.
+        let seeded = history
+            .to_aither_messages()
+            .map_err(UiChatPreparationError::HistoryReplay)?;
+        if !seeded.is_empty() {
+            let committed_at = jiff::Timestamp::now().to_string();
+            let entries = seeded
+                .iter()
+                .enumerate()
+                .map(|(index, message)| {
+                    Ok(crate::db::TranscriptEntry {
+                        seq: i64::try_from(index + 1).map_err(|error| {
+                            UiChatPreparationError::LoadContextSnapshot(
+                                crate::db::ChatDbError::Storage(format!("seed seq: {error}")),
+                            )
+                        })?,
+                        message_blob: rmp_serde::to_vec_named(message).map_err(|error| {
+                            UiChatPreparationError::LoadContextSnapshot(
+                                crate::db::ChatDbError::Storage(format!(
+                                    "failed to encode seeded transcript message: {error}"
+                                )),
+                            )
+                        })?,
+                        committed_at: committed_at.clone(),
+                    })
+                })
+                .collect::<Result<Vec<_>, UiChatPreparationError>>()?;
+            db.insert_transcript_entries_as_run(fence, &entries)
+                .await
+                .map_err(UiChatPreparationError::LoadContextSnapshot)?;
+            transcript = seeded
+                .into_iter()
+                .enumerate()
+                .map(|(index, message)| {
+                    Ok((
+                        i64::try_from(index + 1).map_err(|error| {
+                            UiChatPreparationError::LoadContextSnapshot(
+                                crate::db::ChatDbError::Storage(format!("seed seq: {error}")),
+                            )
+                        })?,
+                        message,
+                    ))
+                })
+                .collect::<Result<Vec<_>, UiChatPreparationError>>()?;
+        }
+    }
     let context_snapshot = if use_persisted_context_snapshot {
         db.get_session_context_snapshot(session_id.as_str())
             .await
@@ -2854,7 +2915,7 @@ async fn resolve_session_context(
         sandbox_dir,
         cwd,
         non_interactive: session.non_interactive,
-        history_messages,
+        transcript,
         context_snapshot,
         hidden_context_xml: (!hidden_context_parts.is_empty())
             .then(|| hidden_context_parts.join("\n\n")),
@@ -3315,41 +3376,21 @@ fn build_session_agent<'a>(
             .add_job_registry(ctx.session_id.as_str(), agent.job_registry());
 
         if let Some(snapshot) = ctx.context_snapshot.as_ref() {
-            // Try to restore from checkpoint with ID-based delta.
-            // If the snapshot anchor is stale, fall back to full history replay.
-            let db_messages = state
-                .db()
-                .get_messages(ctx.session_id.as_str())
-                .await
-                .map_err(UiChatPreparationError::LoadSession)?;
-            let db_ids = crate::session::llm_row_ids(&db_messages);
-            if let Some(delta) = crate::session::history_delta_since_snapshot(
-                &ctx.history_messages,
-                &db_ids,
-                snapshot.last_message_db_id,
-            ) {
-                agent
-                    .restore_checkpoint(snapshot.checkpoint.clone())
-                    .map_err(UiChatPreparationError::RestoreCheckpoint)?;
-                for message in delta {
-                    agent.push_message(message);
-                }
-            } else {
-                tracing::warn!(
-                    session_id = %ctx.session_id.as_str(),
-                    "context snapshot anchor is stale, falling back to full history replay"
-                );
-                // Delete the stale snapshot so future requests don't hit this path
-                let _ = state
-                    .db()
-                    .delete_session_context_snapshot(ctx.session_id.as_str())
-                    .await;
-                for message in &ctx.history_messages {
-                    agent.push_message(message.clone());
-                }
+            // Restore the checkpoint, then append only transcript entries
+            // committed after it — never UI history, so the checkpoint's own
+            // answer cannot appear twice.
+            agent
+                .restore_checkpoint(snapshot.checkpoint.clone())
+                .map_err(UiChatPreparationError::RestoreCheckpoint)?;
+            for (_, message) in ctx
+                .transcript
+                .iter()
+                .filter(|(seq, _)| *seq > snapshot.applied_seq)
+            {
+                agent.push_message(message.clone());
             }
         } else {
-            for message in &ctx.history_messages {
+            for (_, message) in &ctx.transcript {
                 agent.push_message(message.clone());
             }
         }
@@ -3461,7 +3502,6 @@ async fn take_over_alert_pending(state: &DaemonState, session_id: &SessionId) ->
 
 #[cfg(test)]
 mod tests {
-    use aither_core::llm::Message as LlmMessage;
     use skyzen::{HttpError, StatusCode};
     use std::collections::HashMap;
     use std::future::Future;
@@ -3537,39 +3577,7 @@ mod tests {
     }
 
     #[test]
-    fn history_delta_since_snapshot_returns_suffix_after_anchor_id() {
-        let history = vec![
-            LlmMessage::system("memory"),
-            LlmMessage::user("first"),
-            LlmMessage::assistant("second"),
-        ];
-        let db_ids = vec![10, 20, 30];
-
-        let delta = crate::session::history_delta_since_snapshot(&history, &db_ids, Some(20))
-            .expect("anchor should be valid");
-        assert_eq!(delta, vec![LlmMessage::assistant("second")]);
-    }
-
-    #[test]
-    fn history_delta_since_snapshot_returns_none_for_stale_anchor() {
-        let history = vec![LlmMessage::user("only")];
-        let db_ids = vec![10];
-        // Anchor 999 does not exist among message IDs
-        let result = crate::session::history_delta_since_snapshot(&history, &db_ids, Some(999));
-        assert!(result.is_none(), "stale anchor should return None");
-    }
-
-    #[test]
-    fn history_delta_since_snapshot_empty_anchor_replays_all() {
-        let history = vec![LlmMessage::user("a"), LlmMessage::assistant("b")];
-        let db_ids = vec![1, 2];
-        let delta = crate::session::history_delta_since_snapshot(&history, &db_ids, None)
-            .expect("None anchor replays all");
-        assert_eq!(delta.len(), 2);
-    }
-
-    #[test]
-    fn parse_persisted_context_snapshot_reads_last_message_db_id() {
+    fn parse_persisted_context_snapshot_reads_applied_seq() {
         let snapshot = crate::session::parse_persisted_context_snapshot(
             crate::db::StoredSessionContextSnapshot {
                 checkpoint: aither_agent::AgentCheckpoint {
@@ -3593,12 +3601,12 @@ mod tests {
                     },
                     has_background_tasks: false,
                 },
-                last_message_db_id: Some(42),
+                applied_seq: 42,
                 updated_at: "2026-03-14T00:00:00Z".to_string(),
             },
         );
 
-        assert_eq!(snapshot.last_message_db_id, Some(42));
+        assert_eq!(snapshot.applied_seq, 42);
         assert!(snapshot.checkpoint.context.is_empty());
     }
 

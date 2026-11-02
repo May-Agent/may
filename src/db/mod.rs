@@ -33,7 +33,7 @@ pub use common::{
     CreateProfileParams, CreateScheduledTaskParams, MessageStatsParams, NetworkAccessLogParams,
     NetworkAccessMode, NetworkAccessSource, NotificationCallbackConsumeResult,
     ProfileEnvironmentKind, RequestLogParams, SessionContextSnapshotUpsert,
-    StoredSessionContextSnapshot, UpdateProfileParams, UpdateScheduledTaskParams,
+    StoredSessionContextSnapshot, TranscriptEntry, UpdateProfileParams, UpdateScheduledTaskParams,
 };
 pub use context_snapshot::ContextDebugSnapshotWrite;
 pub use issue_search::IssueSearchDoc;
@@ -364,12 +364,8 @@ impl ChatDb {
         // The pre-versioning layout: it gains `format_version` defaulting to
         // 1 ("every blob written before versioning existed") so its rows are
         // then invalidated below.
-        const LEGACY_COLUMNS: [&str; 4] = [
-            "session_id",
-            "checkpoint_blob",
-            "last_message_db_id",
-            "updated_at",
-        ];
+        const LEGACY_COLUMNS: [&str; 4] =
+            ["session_id", "checkpoint_blob", "applied_seq", "updated_at"];
         const EXPECTED_COLUMNS: [&str; 5] = [
             "session_id",
             "checkpoint_blob",

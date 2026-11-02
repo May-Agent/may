@@ -4,7 +4,8 @@ use super::common::{
     ContextDebugMessageAttachmentRow, ContextDebugMessageRow, ContextDebugMessageToolCallRow,
     ContextDebugPromptAttachmentRow, ContextDebugSnapshot, ContextDebugSnapshotHeaderRow,
     ContextDebugSnapshotMessage, SessionContextSnapshotUpsert, StoredSessionContextSnapshot,
-    StoredSessionContextSnapshotRow, overflow_error, storage_error,
+    StoredSessionContextSnapshotRow, TranscriptEntry, TranscriptEntryRow, overflow_error,
+    storage_error,
 };
 use super::session_run::RunFence;
 use super::{ChatDb, ChatDbError, query};
@@ -291,12 +292,24 @@ impl ChatDb {
             Some(fence) => self.begin_fenced(fence).await?,
             None => self.db.begin().await?,
         };
+        for entry in &snapshot.transcript_entries {
+            query!(
+                tx,
+                "INSERT OR IGNORE INTO session_transcript_entries (session_id, seq, message_blob, committed_at) VALUES (?, ?, ?, ?)",
+                session_id,
+                entry.seq,
+                entry.message_blob.as_slice(),
+                entry.committed_at.as_str()
+            )
+            .execute()
+            .await?;
+        }
         query!(
             tx,
-            "INSERT INTO session_context_snapshots (session_id, checkpoint_blob, last_message_db_id, updated_at, format_version) VALUES (?, ?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET checkpoint_blob = excluded.checkpoint_blob, last_message_db_id = excluded.last_message_db_id, updated_at = excluded.updated_at, format_version = excluded.format_version",
+            "INSERT INTO session_context_snapshots (session_id, checkpoint_blob, applied_seq, updated_at, format_version) VALUES (?, ?, ?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET checkpoint_blob = excluded.checkpoint_blob, applied_seq = excluded.applied_seq, updated_at = excluded.updated_at, format_version = excluded.format_version",
             session_id,
             checkpoint_blob,
-            snapshot.last_message_db_id,
+            snapshot.applied_seq,
             updated_at,
             CONTEXT_SNAPSHOT_FORMAT
         )
@@ -316,7 +329,7 @@ impl ChatDb {
     ) -> Result<Option<StoredSessionContextSnapshot>, ChatDbError> {
         let Some(row) = query!(
             self.db,
-            "SELECT format_version, checkpoint_blob, last_message_db_id, updated_at FROM session_context_snapshots WHERE session_id = ?",
+            "SELECT format_version, checkpoint_blob, applied_seq, updated_at FROM session_context_snapshots WHERE session_id = ?",
             session_id
         )
             .fetch_optional::<StoredSessionContextSnapshotRow>()
@@ -341,9 +354,65 @@ impl ChatDb {
         })?;
         Ok(Some(StoredSessionContextSnapshot {
             checkpoint,
-            last_message_db_id: row.last_message_db_id,
+            applied_seq: row.applied_seq.unwrap_or(0),
             updated_at: row.updated_at,
         }))
+    }
+
+    /// Transcript entries for a session with `seq` strictly after `seq`
+    /// (or every entry when `seq` is negative), in seq order.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn transcript_entries_after(
+        &self,
+        session_id: &str,
+        seq: i64,
+    ) -> Result<Vec<TranscriptEntry>, ChatDbError> {
+        let rows = query!(
+            self.db,
+            "SELECT seq, message_blob, committed_at FROM session_transcript_entries WHERE session_id = ? AND seq > ? ORDER BY seq ASC",
+            session_id,
+            seq
+        )
+        .fetch_all::<TranscriptEntryRow>()
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| TranscriptEntry {
+                seq: row.seq,
+                message_blob: row.message_blob,
+                committed_at: row.committed_at,
+            })
+            .collect())
+    }
+
+    /// Insert transcript entries for a session as part of a run's fenced
+    /// transaction; existing `(session_id, seq)` rows are kept.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError::RunLost`] when the lease was taken over or
+    /// released, or [`ChatDbError`] on storage failure.
+    pub async fn insert_transcript_entries_as_run(
+        &self,
+        fence: &RunFence,
+        entries: &[TranscriptEntry],
+    ) -> Result<(), ChatDbError> {
+        let mut tx = self.begin_fenced(fence).await?;
+        for entry in entries {
+            query!(
+                tx,
+                "INSERT OR IGNORE INTO session_transcript_entries (session_id, seq, message_blob, committed_at) VALUES (?, ?, ?, ?)",
+                fence.session_id.as_str(),
+                entry.seq,
+                entry.message_blob.as_slice(),
+                entry.committed_at.as_str()
+            )
+            .execute()
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Delete a persisted context snapshot for a session.
@@ -436,7 +505,8 @@ mod tests {
             session_id,
             SessionContextSnapshotUpsert {
                 checkpoint: representative_checkpoint(),
-                last_message_db_id: Some(42),
+                applied_seq: 42,
+                transcript_entries: vec![],
             },
         )
         .await
@@ -447,7 +517,7 @@ mod tests {
             .await
             .expect("get should succeed")
             .expect("snapshot should exist");
-        assert_eq!(stored.last_message_db_id, Some(42));
+        assert_eq!(stored.applied_seq, 42);
         assert_eq!(stored.checkpoint.tool_surface_hash, "tool-surface-hash");
         assert_eq!(stored.checkpoint.context_window.messages.len(), 1);
         assert!(!stored.checkpoint.has_background_tasks);
@@ -480,7 +550,8 @@ mod tests {
             "session-times",
             SessionContextSnapshotUpsert {
                 checkpoint: snapshot,
-                last_message_db_id: None,
+                applied_seq: 0,
+                transcript_entries: vec![],
             },
         )
         .await
@@ -513,7 +584,7 @@ mod tests {
         let raw = SkyDb::connect_sqlite(&url)
             .await
             .expect("raw db should connect");
-        raw.query("CREATE TABLE session_context_snapshots (session_id TEXT PRIMARY KEY, checkpoint_blob BLOB NOT NULL, last_message_db_id INTEGER, updated_at TEXT NOT NULL)")
+        raw.query("CREATE TABLE session_context_snapshots (session_id TEXT PRIMARY KEY, checkpoint_blob BLOB NOT NULL, applied_seq INTEGER NOT NULL, updated_at TEXT NOT NULL)")
             .execute()
             .await
             .expect("legacy table should be created");
@@ -530,7 +601,7 @@ mod tests {
             rmp_serde::from_slice::<aither_agent::AgentCheckpoint>(&legacy_blob).is_err(),
             "seeded legacy blob must fail to decode"
         );
-        raw.query("INSERT INTO session_context_snapshots (session_id, checkpoint_blob, last_message_db_id, updated_at) VALUES (?, ?, NULL, ?)")
+        raw.query("INSERT INTO session_context_snapshots (session_id, checkpoint_blob, applied_seq, updated_at) VALUES (?, ?, 0, ?)")
             .bind(session_id)
             .bind(legacy_blob)
             .bind(jiff::Timestamp::now().to_string())
@@ -567,7 +638,7 @@ mod tests {
 
         let session_id = "session-corrupt";
         db.db
-            .query("INSERT INTO session_context_snapshots (session_id, checkpoint_blob, last_message_db_id, updated_at, format_version) VALUES (?, ?, NULL, ?, ?)")
+            .query("INSERT INTO session_context_snapshots (session_id, checkpoint_blob, applied_seq, updated_at, format_version) VALUES (?, ?, 0, ?, ?)")
             .bind(session_id)
             .bind(vec![0xde, 0xad, 0xbe, 0xef])
             .bind(jiff::Timestamp::now().to_string())
@@ -599,7 +670,7 @@ mod tests {
             .expect("checkpoint should encode");
         let other_version = CONTEXT_SNAPSHOT_FORMAT + 1;
         db.db
-            .query("INSERT INTO session_context_snapshots (session_id, checkpoint_blob, last_message_db_id, updated_at, format_version) VALUES (?, ?, NULL, ?, ?)")
+            .query("INSERT INTO session_context_snapshots (session_id, checkpoint_blob, applied_seq, updated_at, format_version) VALUES (?, ?, 0, ?, ?)")
             .bind(session_id)
             .bind(blob)
             .bind(jiff::Timestamp::now().to_string())
@@ -619,5 +690,143 @@ mod tests {
                 && message.contains(&CONTEXT_SNAPSHOT_FORMAT.to_string()),
             "error should name the session and both versions: {message}"
         );
+    }
+
+    fn transcript_entry(
+        seq: i64,
+        message: &aither_core::llm::Message,
+    ) -> crate::db::TranscriptEntry {
+        crate::db::TranscriptEntry {
+            seq,
+            message_blob: rmp_serde::to_vec_named(message).expect("message encodes"),
+            committed_at: jiff::Timestamp::now().to_string(),
+        }
+    }
+
+    fn decode(entry: &crate::db::TranscriptEntry) -> aither_core::llm::Message {
+        rmp_serde::from_slice(&entry.message_blob).expect("transcript message decodes")
+    }
+
+    #[tokio::test]
+    async fn a_text_answer_restores_exactly_once() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db");
+        let session_id = "restore-once";
+        let answer = aither_core::llm::Message::assistant("the answer");
+        db.upsert_session_context_snapshot(
+            session_id,
+            SessionContextSnapshotUpsert {
+                checkpoint: representative_checkpoint(),
+                applied_seq: 2,
+                transcript_entries: vec![
+                    transcript_entry(1, &aither_core::llm::Message::user("question")),
+                    transcript_entry(2, &answer),
+                ],
+            },
+        )
+        .await
+        .expect("upsert");
+
+        let stored = db
+            .get_session_context_snapshot(session_id)
+            .await
+            .expect("snapshot")
+            .expect("snapshot exists");
+        let delta = db
+            .transcript_entries_after(session_id, stored.applied_seq)
+            .await
+            .expect("delta");
+        assert!(
+            delta.is_empty(),
+            "restore appends nothing the checkpoint already covers"
+        );
+        let all = db
+            .transcript_entries_after(session_id, -1)
+            .await
+            .expect("entries");
+        assert_eq!(all.len(), 2);
+        assert_eq!(decode(&all[1]), answer);
+    }
+
+    #[tokio::test]
+    async fn a_tool_turn_replays_protocol_valid_without_a_checkpoint() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db");
+        let session_id = "tool-replay";
+        db.create_session(session_id, Some("t"), Some("model"))
+            .await
+            .expect("session");
+        let fence = crate::db::RunFence {
+            session_id: session_id.to_string(),
+            run_id: "run".to_string(),
+        };
+        assert!(db.claim_session_run(&fence).await.expect("claim"));
+        let call = aither_core::llm::ToolCall::new(
+            "call_1",
+            "terminal",
+            serde_json::json!({"script": "ls"}),
+        );
+        db.insert_transcript_entries_as_run(
+            &fence,
+            &[
+                transcript_entry(1, &aither_core::llm::Message::user("run it")),
+                transcript_entry(
+                    2,
+                    &aither_core::llm::Message::assistant_with_tool_calls("", vec![call.clone()]),
+                ),
+                transcript_entry(3, &aither_core::llm::Message::tool("call_1", "done")),
+            ],
+        )
+        .await
+        .expect("insert");
+
+        let entries = db
+            .transcript_entries_after(session_id, -1)
+            .await
+            .expect("entries");
+        assert_eq!(entries.len(), 3);
+        let assistant = decode(&entries[1]);
+        assert_eq!(assistant.tool_calls().len(), 1, "call survives replay");
+        assert_eq!(assistant.tool_calls()[0], call);
+        let result = decode(&entries[2]);
+        assert_eq!(result, aither_core::llm::Message::tool("call_1", "done"));
+    }
+
+    #[tokio::test]
+    async fn attachments_survive_transcript_replay() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db");
+        let session_id = "attachment-replay";
+        db.create_session(session_id, Some("t"), Some("model"))
+            .await
+            .expect("session");
+        let fence = crate::db::RunFence {
+            session_id: session_id.to_string(),
+            run_id: "run".to_string(),
+        };
+        assert!(db.claim_session_run(&fence).await.expect("claim"));
+        let message = aither_core::llm::Message::user("with file").with_attachments(vec![
+            aither_core::llm::Attachment::new(
+                url::Url::parse("https://example.com/a.txt").expect("url"),
+                "text/plain".parse::<mime::Mime>().expect("mime"),
+            ),
+        ]);
+        db.insert_transcript_entries_as_run(&fence, &[transcript_entry(1, &message)])
+            .await
+            .expect("insert");
+
+        let entries = db
+            .transcript_entries_after(session_id, -1)
+            .await
+            .expect("entries");
+        let decoded = decode(&entries[0]);
+        assert_eq!(decoded, message);
+        assert_eq!(decoded.attachments().len(), 1);
     }
 }
