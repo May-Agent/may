@@ -75,8 +75,11 @@ enum RemoteAccessCommand {
 pub struct RemoteAccessManager {
     command_tx: mpsc::Sender<RemoteAccessCommand>,
     status_rx: watch::Receiver<RemoteAccessStatusResponse>,
-    /// The daemon's loopback TCP address, once it listens.
+    /// The daemon's remote TCP address, once it listens.
     local_addr: watch::Sender<Option<SocketAddr>>,
+    /// Accepts `Tailscale-User-Login` identities the tailnet is allowed to use;
+    /// the actor keeps its allow-list current.
+    tailscale_identity: super::auth::TailscaleServeIdentitySource,
 }
 
 impl std::fmt::Debug for RemoteAccessManager {
@@ -91,17 +94,25 @@ impl RemoteAccessManager {
         let (command_tx, command_rx) = mpsc::channel(8);
         let (status_tx, status_rx) = watch::channel(RemoteAccessRuntime::default().status);
         let (local_addr, local_addr_rx) = watch::channel(None);
+        let tailscale_identity = super::auth::TailscaleServeIdentitySource::new(Default::default());
         tokio::spawn(run_remote_access_actor(
             command_rx,
             status_tx,
             local_addr_rx,
             ui_event_bus,
+            tailscale_identity.clone(),
         ));
         Self {
             command_tx,
             status_rx,
             local_addr,
+            tailscale_identity,
         }
+    }
+
+    /// The identity source the remote listener's Tailcheck layer accepts.
+    pub(crate) fn tailscale_identity(&self) -> super::auth::TailscaleServeIdentitySource {
+        self.tailscale_identity.clone()
     }
 
     /// Records the TCP address the daemon serves on; remote access forwards
@@ -216,6 +227,7 @@ async fn run_remote_access_actor(
     status_tx: watch::Sender<RemoteAccessStatusResponse>,
     local_addr: watch::Receiver<Option<SocketAddr>>,
     ui_event_bus: UiEventBus,
+    tailscale_identity: super::auth::TailscaleServeIdentitySource,
 ) {
     let mut runtime = RemoteAccessRuntime::default();
     let mut check = tokio::time::interval(SERVE_CHECK_INTERVAL);
@@ -228,6 +240,7 @@ async fn run_remote_access_actor(
                 match command {
                     RemoteAccessCommand::Sync { config, has_local_profile, response } => {
                         let addr = *local_addr.borrow();
+                        refresh_allow_list(&tailscale_identity, &config).await;
                         let result = sync_runtime(&mut runtime, config, has_local_profile, addr).await;
                         if let Err(error) = &result {
                             runtime.status.state = RemoteAccessState::Error;
@@ -389,18 +402,75 @@ struct TailscaleStatus {
     backend_state: String,
     #[serde(rename = "Self")]
     self_node: Option<TailscaleNode>,
+    #[serde(rename = "User", default)]
+    user: std::collections::BTreeMap<u64, TailscaleUser>,
 }
 
 #[derive(Debug, Deserialize)]
 struct TailscaleNode {
     #[serde(rename = "DNSName", default)]
     dns_name: String,
+    #[serde(rename = "UserID", default)]
+    user_id: u64,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct TailscaleUser {
+    #[serde(rename = "LoginName", default)]
+    login_name: String,
 }
 
 /// The machine's `MagicDNS` name, from `tailscale status --json`.
 async fn tailnet_host(binary: &str) -> Result<String, String> {
     let output = tailscale(binary, vec!["status".into(), "--json".into()]).await?;
     parse_tailnet_host(&output)
+}
+
+/// The logins the Tailscale identity source accepts: the configured
+/// allow-list when it names any, otherwise the login owning this node. An
+/// owner that cannot be resolved accepts nobody — a remote request then
+/// needs a different identity rather than slipping past unchecked.
+async fn refresh_allow_list(
+    identity: &super::auth::TailscaleServeIdentitySource,
+    config: &RemoteAccessConfig,
+) {
+    let allowed: std::collections::HashSet<String> = if config.allowed_logins.is_empty() {
+        match node_owner_login(&config.tailscale_binary).await {
+            Ok(owner) => [owner].into_iter().collect(),
+            Err(error) => {
+                tracing::warn!(%error, "no Tailscale logins accepted: node owner unresolved");
+                Default::default()
+            }
+        }
+    } else {
+        config.allowed_logins.iter().cloned().collect()
+    };
+    identity.set_allowed(allowed);
+}
+
+/// The login that owns this node: `tailscale status --json`'s `Self.UserID`
+/// looked up in the `User` map.
+async fn node_owner_login(binary: &str) -> Result<String, String> {
+    let output = tailscale(binary, vec!["status".into(), "--json".into()]).await?;
+    let status: TailscaleStatus = serde_json::from_str(&output)
+        .map_err(|error| format!("unexpected `tailscale status` output: {error}"))?;
+    if status.backend_state != "Running" {
+        return Err(format!(
+            "Tailscale is not connected (state: {})",
+            status.backend_state
+        ));
+    }
+    let user_id = status
+        .self_node
+        .map(|node| node.user_id)
+        .filter(|&id| id != 0)
+        .ok_or_else(|| "this node reports no owner".to_string())?;
+    status
+        .user
+        .get(&user_id)
+        .map(|user| user.login_name.clone())
+        .filter(|login| !login.is_empty())
+        .ok_or_else(|| "this node's owner has no login name".to_string())
 }
 
 fn parse_tailnet_host(output: &str) -> Result<String, String> {

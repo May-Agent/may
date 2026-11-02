@@ -1389,18 +1389,31 @@ impl From<&UiNativeToolsConfig> for NativeToolsConfig {
     }
 }
 
+/// What a config update does with a stored secret: keep it as stored,
+/// replace it with new material, or remove it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum SecretUpdate {
+    /// Leave the stored secret untouched.
+    Keep,
+    /// Replace it with new material.
+    Replace(String),
+    /// Remove the stored secret.
+    Remove,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct UiProviderConfig {
     pub(crate) id: String,
     pub(crate) provider_type: ProviderType,
-    /// Whether an API key is stored for this provider. On save, `false`
-    /// clears the stored key unless `api_key` carries new material.
+    /// Whether an API key is stored for this provider. The response only
+    /// reports this, never key material.
     pub(crate) has_api_key: bool,
-    /// New key material entered by the user. Never serialized back out: the
-    /// config response only reports `has_api_key`.
+    /// What to do with the stored key on save: keep it, replace it with new
+    /// material, or remove it. Never serialized back out.
     #[serde(default, skip_serializing)]
-    pub(crate) api_key: Option<String>,
+    pub(crate) api_key: Option<SecretUpdate>,
     pub(crate) base_url: Option<String>,
     pub(crate) display_name: Option<String>,
     pub(crate) enabled: bool,
