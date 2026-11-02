@@ -103,7 +103,7 @@ async fn answer_oneshot_repo_trust(
     let Some(pending) = may_agent::trust::pending_decision(&app.cwd, &config_path)? else {
         return Ok(());
     };
-    let request = may_agent::trust::question_for(&pending.kind, &pending.worktree);
+    let request = may_agent::trust::question_for(&pending.kind, &pending.worktree, true);
     let questions = request
         .questions
         .iter()
