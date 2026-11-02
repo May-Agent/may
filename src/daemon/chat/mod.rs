@@ -1,10 +1,9 @@
-// Callers land in #446 (prompt suggestion) and #447 (/recap).
-#[allow(dead_code)]
 mod aux;
 mod background;
 mod hosts;
 mod hub;
 mod request_ledger;
+mod suggest;
 pub use aux::AuxTasks;
 pub use background::SessionBackgrounds;
 pub use background::spawn_watcher as spawn_background_watcher;
@@ -2283,6 +2282,7 @@ async fn run_published_turn(
     guard: SessionRunGuard,
     kind: TurnKind,
 ) -> Result<(), crate::db::ChatDbError> {
+    suggest::cancel(&state, &req.session_id);
     let mut sink = HubSink::new(&state, &req);
     let result = run_agent_loop(&state, &req, &mut sink, &guard, true, true, &kind).await;
     let response_session_id = req.session_id.clone();
@@ -2305,6 +2305,8 @@ async fn run_published_turn(
             );
             if let Some(continued) = continued {
                 spawn_continued_run(state.clone(), continued);
+            } else {
+                suggest::maybe_suggest(&state, &response_session_id);
             }
         }
         Err(AgentLoopError::BrowserTakeoverPaused(result)) => {

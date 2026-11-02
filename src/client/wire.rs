@@ -304,6 +304,23 @@ pub struct SessionAgentFrame {
     pub body: SessionAgentBody,
 }
 
+/// One frame of the `session_suggestion` event kind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SuggestionFrame {
+    /// The aux request that produced the update.
+    #[serde(default)]
+    pub request_id: u64,
+    /// Session the suggestion belongs to.
+    #[serde(default)]
+    pub session_id: String,
+    /// `ready` with `text`, or `cleared`.
+    pub state: String,
+    /// The suggested prompt when `state` is `ready`.
+    #[serde(default)]
+    pub text: Option<String>,
+}
+
 /// What a `session_agent` frame reports.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

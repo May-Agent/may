@@ -151,7 +151,7 @@ fn events_query(session_id: &str, after: Option<&str>) -> String {
     query
         .append_pair(
             "topics",
-            "session_agent,session_turn,session_background,session_runtime,session_index",
+            "session_agent,session_turn,session_background,session_runtime,session_index,session_suggestion",
         )
         .append_pair("sessionId", session_id);
     if let Some(after) = after {
@@ -203,6 +203,20 @@ async fn follow_session(
                     .await;
                 }
                 "session_turn" => forward_turn_error(&event.data, &mut current).await,
+                "session_suggestion" => {
+                    if let Ok(frame) =
+                        serde_json::from_str::<crate::client::SuggestionFrame>(&event.data)
+                    {
+                        let _ = forwarding
+                            .app_events
+                            .send(AppEvent::PromptSuggestion {
+                                request_id: frame.request_id,
+                                session_id: frame.session_id,
+                                text: frame.text,
+                            })
+                            .await;
+                    }
+                }
                 "session_runtime" => {
                     if let Ok(snapshot) =
                         serde_json::from_str::<crate::client::SessionRuntimeEvent>(&event.data)

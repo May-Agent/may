@@ -256,6 +256,13 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             Ok(None)
         }
         AppEvent::HistoryStale => Ok(Some(SendAction::ReloadHistory)),
+        AppEvent::PromptSuggestion {
+            session_id, text, ..
+        } => {
+            app.prompt_suggestion =
+                text.map(|text| crate::tui::app::PromptSuggestion { session_id, text });
+            Ok(None)
+        }
         AppEvent::Status(message) => {
             app.set_status(message);
             Ok(None)
