@@ -117,7 +117,7 @@ const FORK_TASK_MARKER: &str = "FORK-PROBE-TASK";
 const FORK_ANSWER: &str = "FORK-ANSWER-OK";
 /// Requests the probe scenario may serve before the harness fails it, so a
 /// launch that never finishes ends the test with a message instead of hanging.
-const SUBAGENT_PROBE_MAX_REQUESTS: usize = 40;
+const SUBAGENT_PROBE_MAX_REQUESTS: usize = 200;
 
 /// Prints the launch job's result once its completion resumed the turn —
 /// the job only writes `sub.done`/`sub.out` after it exits.

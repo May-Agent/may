@@ -1894,12 +1894,6 @@ where
                     Some(SendAction::StoreSecret { key, value }) => {
                         let tx = events.sender();
                         let may_dir = app.session_manager.may_dir().to_path_buf();
-                        let sandbox_dir = app
-                            .session_manager
-                            .current()
-                            .filter(|session| session.persisted)
-                            .map(|session| session.sandbox_dir.clone());
-                        let config = app.config.clone();
                         spawn(async move {
                             let store_dir = may_dir.clone();
                             let store_key = key.clone();
@@ -1909,24 +1903,6 @@ where
                                     .map_err(|error| error.to_string())
                             })
                             .await;
-                            // Refresh the live session's shell env file so the
-                            // agent picks the secret up on its next command.
-                            if result.is_ok()
-                                && let Some(dir) = sandbox_dir
-                            {
-                                let secrets = may_agent::secrets::Secrets::load(
-                                    &may_agent::secrets::SecretStore::new(&may_dir),
-                                    &config,
-                                );
-                                if let Err(error) = may_agent::secrets::write_env_file(
-                                    &dir.join(may_agent::secrets::SECRETS_ENV_FILE),
-                                    &secrets,
-                                )
-                                .await
-                                {
-                                    tracing::warn!(%error, "failed to refresh secrets env file");
-                                }
-                            }
                             let _ = tx.send(AppEvent::SecretStored { key, result }).await;
                         })
                         .detach();
