@@ -13,7 +13,7 @@ pub use sse::{ServerEvent, SseParser};
 pub use wire::{
     CreateSessionRequest, IndexCoverage, RewindRequest, RunEnd, SessionAgentBody,
     SessionAgentFrame, SessionIndexSnapshot, SessionRuntimeEvent, SessionRuntimeSnapshot,
-    UpdateSessionRequest, WireAgentError, WireAgentEvent, WirePr, WireSession,
+    SuggestionFrame, UpdateSessionRequest, WireAgentError, WireAgentEvent, WirePr, WireSession,
 };
 
 use std::path::PathBuf;

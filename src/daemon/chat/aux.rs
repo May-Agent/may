@@ -47,16 +47,19 @@ impl AuxTasks {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Claims `session_id`'s aux slot for `task`, aborting whatever it
-    /// replaces. Returns the request id the caller tags its result with.
-    pub fn start(
+    /// Claims `session_id`'s aux slot for the task `make_task` builds with
+    /// the issued request id, aborting whatever it replaces.
+    pub fn start<F>(
         &self,
         session_id: &str,
-        task: impl std::future::Future<Output = ()> + Send + 'static,
+        make_task: impl FnOnce(u64) -> F,
         rt: &tokio::runtime::Handle,
-    ) -> u64 {
+    ) -> u64
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
         let request_id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let handle = rt.spawn(task);
+        let handle = rt.spawn(make_task(request_id));
         let previous = self
             .tasks()
             .insert(session_id.to_string(), AuxTask { request_id, handle });
@@ -230,7 +233,7 @@ mod tests {
         let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel::<()>();
         let first = registry.start(
             "s",
-            async move {
+            |_| async move {
                 // Abort drops the future and its captured sender.
                 let _dropped_tx = dropped_tx;
                 std::future::pending::<()>().await;
@@ -238,7 +241,7 @@ mod tests {
             &rt,
         );
         assert!(registry.is_current("s", first));
-        let second = registry.start("s", std::future::pending(), &rt);
+        let second = registry.start("s", |_| std::future::pending(), &rt);
         assert!(registry.is_current("s", second));
         assert!(!registry.is_current("s", first));
         dropped_rx
@@ -252,11 +255,14 @@ mod tests {
     async fn clear_releases_only_the_owning_request() {
         let rt = tokio::runtime::Handle::current();
         let registry = AuxTasks::default();
-        let request_id = registry.start("s", std::future::pending(), &rt);
+        let request_id = registry.start("s", |_| std::future::pending(), &rt);
         registry.clear("s", request_id + 1);
         assert!(registry.is_current("s", request_id));
         registry.clear("s", request_id);
         assert!(!registry.is_current("s", request_id));
-        assert_ne!(registry.start("s", std::future::pending(), &rt), request_id);
+        assert_ne!(
+            registry.start("s", |_| std::future::pending(), &rt),
+            request_id
+        );
     }
 }

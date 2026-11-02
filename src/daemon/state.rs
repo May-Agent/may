@@ -461,7 +461,6 @@ pub struct DaemonState {
     /// Each session's agent between turns.
     pub(crate) parked_agents: super::chat::ParkedAgents,
     /// Each session's in-flight aux task (suggestion, recap), if any.
-    #[allow(dead_code)]
     pub(crate) aux_tasks: super::chat::AuxTasks,
     /// Each session's background jobs and subagent runs, across turns.
     pub(crate) session_background: super::chat::SessionBackgrounds,

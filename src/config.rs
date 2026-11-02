@@ -1093,6 +1093,9 @@ pub struct MayConfig {
     /// Daemon listener settings.
     #[serde(default)]
     pub daemon: DaemonConfig,
+    /// Prompt suggestion settings.
+    #[serde(default)]
+    pub suggestions: SuggestionsConfig,
     /// Last model selected via /model command (used as default for new sessions).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_model: Option<ModelSelector>,
@@ -1103,6 +1106,20 @@ pub struct MayConfig {
     /// Preconfigured SSH targets available to the agent.
     #[serde(default)]
     pub ssh_servers: Vec<SshServerConfig>,
+}
+
+/// `[suggestions]` section: the generated next-prompt ghost text.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SuggestionsConfig {
+    /// Whether a completed turn schedules a suggested next prompt.
+    pub enabled: bool,
+}
+
+impl Default for SuggestionsConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 /// Where the May daemon listens besides its unix socket.
@@ -1134,6 +1151,7 @@ impl Default for MayConfig {
             browser: BrowserConfig::default(),
             remote_access: RemoteAccessConfig::default(),
             daemon: DaemonConfig::default(),
+            suggestions: SuggestionsConfig::default(),
             last_model: None,
             last_effort: None,
             ssh_servers: Vec::new(),
