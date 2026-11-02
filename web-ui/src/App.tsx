@@ -1,4 +1,6 @@
 import { BrowserRouter, Route, Routes } from 'react-router-dom';
+import { SignInRequired } from '@/components/auth/SignInRequired';
+import { useAuthGate } from '@/lib/stores/authGate';
 import { AppShell } from '@/components/shell/AppShell';
 import { HomePage } from '@/routes/HomePage';
 import { SessionPage } from '@/routes/SessionPage';
@@ -6,6 +8,9 @@ import { SettingsPage } from '@/routes/SettingsPage';
 import { ProfileRedirect } from '@/routes/ProfileRedirect';
 
 export function App() {
+  if (useAuthGate((state) => state.required)) {
+    return <SignInRequired />;
+  }
   return (
     <BrowserRouter>
       <Routes>

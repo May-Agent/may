@@ -40,7 +40,7 @@ export interface UiProviderConfig {
   providerType: ProviderType;
   /** Whether the server holds a key for this provider. Never carries key material. */
   hasApiKey: boolean;
-  /** New key material entered by the user; sent only on save, absent on reads. */
+  /** Key material the user typed in the editor, or `null` to mark it removed; absent on reads and untouched drafts. */
   apiKey?: string | null;
   baseUrl?: string | null;
   displayName?: string | null;
@@ -49,6 +49,19 @@ export interface UiProviderConfig {
   cacheLifetime: CacheLifetime;
   api?: ProviderApi | null;
 }
+
+/** What a config save does with a stored secret. */
+export type SecretUpdate = 'keep' | 'remove' | { replace: string };
+
+/** A provider as the save endpoint expects it: `apiKey` is a SecretUpdate. */
+export type UiProviderSaveConfig = Omit<UiProviderConfig, 'apiKey'> & {
+  apiKey?: SecretUpdate;
+};
+
+/** The save payload: providers carry SecretUpdate instead of raw key text. */
+export type UiFullSaveConfig = Omit<UiFullConfig, 'providers'> & {
+  providers: UiProviderSaveConfig[];
+};
 
 export interface UiModelsConfig {
   advanced: string[];
@@ -151,7 +164,23 @@ export function withCompactionModel(full: UiFullConfig, selector: string | null)
 }
 
 export function setFullConfig(full: UiFullConfig): Promise<void> {
-  return apiPost<void>('/config/full', full);
+  // The draft's raw key text becomes the save's SecretUpdate: untouched
+  // fields keep the stored secret, typed text replaces it, a cleared field
+  // or explicit null removes it.
+  const body: UiFullSaveConfig = {
+    ...full,
+    providers: full.providers.map((provider) => {
+      const apiKey = provider.apiKey;
+      const update =
+        apiKey === undefined
+          ? undefined
+          : apiKey && apiKey.trim()
+            ? { replace: apiKey }
+            : 'remove';
+      return { ...provider, apiKey: update };
+    }),
+  };
+  return apiPost<void>('/config/full', body);
 }
 
 export function upsertSshServer(server: UiSshServerConfig): Promise<void> {

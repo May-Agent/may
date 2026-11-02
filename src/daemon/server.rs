@@ -82,8 +82,15 @@ pub const DEFAULT_PORT: u16 = 8787;
 pub struct StartedDaemon {
     /// Shared server state.
     pub(crate) state: Arc<DaemonState>,
-    /// Router serving the API (and the web UI when embedded).
+    /// Router serving the API (and the web UI when embedded), unauthenticated
+    /// for the loopback listener.
     pub(crate) router: Router,
+    /// The same routes behind the identity layer, for the remote listener
+    /// `tailscale serve` targets.
+    pub(crate) remote_router: Router,
+    /// The same routes behind an identity layer with no trusted source yet,
+    /// for direct non-loopback `[daemon] listen` binds: every request is 401.
+    pub(crate) direct_router: Router,
 }
 
 /// Builds the server state, starts its background work (scheduler, title
@@ -296,8 +303,24 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
     let scheduler = crate::scheduler::TaskScheduler::new(task_runtime);
     let _scheduler = scheduler.spawn();
     super::artifacts::spawn_artifact_watcher(&state);
-    let router = build_router(state.clone(), mode);
-    Ok(StartedDaemon { state, router })
+    // The tailscale-serve listener trusts Serve's identity header; a direct
+    // non-loopback bind trusts nothing yet — every request there is a 401
+    // until passkey and tailnet WhoIs register sources for it.
+    let remote_router = build_router(
+        state.clone(),
+        mode,
+        Some(vec![Box::new(
+            state.remote_access_manager.tailscale_identity(),
+        )]),
+    );
+    let direct_router = build_router(state.clone(), mode, Some(Vec::new()));
+    let router = build_router(state.clone(), mode, None);
+    Ok(StartedDaemon {
+        state,
+        router,
+        remote_router,
+        direct_router,
+    })
 }
 
 fn api_routes() -> Route {
@@ -538,33 +561,43 @@ fn artifact_page_routes() -> Route {
     ))
 }
 
-fn build_router(state: Arc<DaemonState>, mode: DaemonMode) -> Router {
+pub(super) fn build_router(
+    state: Arc<DaemonState>,
+    mode: DaemonMode,
+    auth: Option<Vec<Box<dyn super::auth::IdentitySource>>>,
+) -> Router {
     let api = "/api".route(api_routes());
     let tunnel = tunnel_routes();
     let artifact_pages = "/profile".route(artifact_page_routes());
     let fallback = super::tunnel::TunnelRefererFallback::new(state.clone());
 
+    // The remote listener keeps the same routes but requires an identity
+    // first; the local loopback listener trusts the machine's user.
     match mode {
-        DaemonMode::Rest => Route::new((api, tunnel, artifact_pages))
-            .middleware(State(state))
-            .build()
-            .layer(fallback),
+        DaemonMode::Rest => {
+            let mut routes = Route::new((api, tunnel, artifact_pages));
+            if let Some(sources) = auth {
+                routes = routes.middleware(super::auth::RequireIdentity::new(sources));
+            }
+            routes.middleware(State(state)).build().layer(fallback)
+        }
         DaemonMode::Ui => {
             #[cfg(feature = "ui")]
             {
-                Route::new((
+                let mut routes = Route::new((
                     api,
                     tunnel,
                     artifact_pages,
                     EmbeddedStaticDir::new("/", &WEB_UI_DIST).spa(),
-                ))
-                .middleware(State(state))
-                .build()
-                .layer(fallback)
+                ));
+                if let Some(sources) = auth {
+                    routes = routes.middleware(super::auth::RequireIdentity::new(sources));
+                }
+                routes.middleware(State(state)).build().layer(fallback)
             }
-
             #[cfg(not(feature = "ui"))]
             {
+                let _ = api;
                 panic!(
                     "`may ui` should fail before router construction when the `ui` feature is disabled"
                 );
