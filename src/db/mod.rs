@@ -792,40 +792,31 @@ mod tests {
         .await
         .expect("daily profile should be created");
         db.create_profile(CreateProfileParams {
-            id: "work-id",
-            name: "Custom Work",
-            environment: ProfileEnvironmentKind::Container,
-            container_image: Some("work-image"),
-            slug: Some("work"),
-            icon: Some("W"),
-            persona: None,
-            preferences: None,
-            location_aware: true,
-        })
-        .await
-        .expect("work profile should be created");
-        db.create_profile(CreateProfileParams {
-            id: "local-id",
-            name: "Custom Local",
+            id: "build-id",
+            name: "Custom Build",
             environment: ProfileEnvironmentKind::Local,
             container_image: Some("still-here"),
-            slug: Some("local"),
-            icon: Some("L"),
+            slug: Some("build"),
+            icon: Some("B"),
             persona: None,
             preferences: None,
             location_aware: true,
         })
         .await
-        .expect("local profile should be created");
+        .expect("build profile should be created");
 
-        let first_id = db
+        let fallback_id = db
             .ensure_default_profiles()
             .await
             .expect("default profiles should exist");
-        assert_eq!(first_id, "daily-id");
+        assert_eq!(fallback_id, "build-id");
 
         let all = db.list_profiles().await.expect("profiles should be listed");
-        assert_eq!(all.len(), 3, "existing slugged profiles should be reused");
+        assert_eq!(
+            all.len(),
+            3,
+            "existing slugged profiles are reused and the missing default is created"
+        );
 
         let daily = db
             .get_profile_by_slug("daily")
@@ -838,28 +829,27 @@ mod tests {
         assert_eq!(daily.icon.as_deref(), Some("D"));
         assert!(!daily.location_aware);
 
+        let build = db
+            .get_profile_by_slug("build")
+            .await
+            .expect("build query should succeed")
+            .expect("build profile should exist");
+        assert_eq!(build.id, "build-id");
+        assert_eq!(build.name, "Custom Build");
+        assert_eq!(build.environment, "local");
+        assert_eq!(build.icon.as_deref(), Some("B"));
+        assert!(build.location_aware);
+        assert!(build.container_image.is_none());
+
         let work = db
             .get_profile_by_slug("work")
             .await
             .expect("work query should succeed")
             .expect("work profile should exist");
-        assert_eq!(work.id, "work-id");
-        assert_eq!(work.name, "Custom Work");
-        assert_eq!(work.environment, "container");
-        assert_eq!(work.icon.as_deref(), Some("W"));
-        assert!(work.location_aware);
-
-        let local = db
-            .get_profile_by_slug("local")
-            .await
-            .expect("local query should succeed")
-            .expect("local profile should exist");
-        assert_eq!(local.id, "local-id");
-        assert_eq!(local.name, "Custom Local");
-        assert_eq!(local.environment, "local");
-        assert_eq!(local.icon.as_deref(), Some("L"));
-        assert!(local.location_aware);
-        assert!(local.container_image.is_none());
+        assert_eq!(work.id, "work");
+        assert_eq!(work.name, "Work");
+        assert_eq!(work.environment, "local");
+        assert!(!work.location_aware);
     }
 
     #[tokio::test]

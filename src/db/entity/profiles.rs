@@ -5,7 +5,7 @@
 pub struct Model {
     /// Profile id.
     pub id: String,
-    /// Well-known identifier: "daily", "work", "local", or None for custom profiles.
+    /// Well-known identifier: "daily", "build", "work", or None for custom profiles.
     pub slug: Option<String>,
     /// Display name.
     pub name: String,
