@@ -55,6 +55,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             render_tier_model_picker(frame, area, app);
             return;
         }
+        // The launch gates own the frame — the decision happens before
+        // the session, not over the chat.
+        AppMode::LaunchGrant(_) | AppMode::RepoTrust(_) => {
+            render_gate_screen(frame, area, app);
+            return;
+        }
         // The OAuth device/browser flows are steps of the settings screen
         // (entered from a provider there and returning to it), so they keep
         // its full-screen frame rather than popping a sheet over the chat.
@@ -317,13 +323,10 @@ fn sheet_height(app: &App, column: Rect) -> Option<u16> {
             rows(confirm_body_rows(&state.reason, column.width) + 9),
             pct(70),
         ),
-        AppMode::LaunchGrant(state) => (
-            rows(confirm_body_rows(&state.path.display().to_string(), column.width) + 9),
-            pct(70),
-        ),
-        AppMode::RepoTrust(state) => (ask_user_rows(&state.ask, column.width), pct(60)),
         AppMode::QuitConfirm(_) => (9, pct(70)),
-        AppMode::Chat
+        AppMode::LaunchGrant(_)
+        | AppMode::RepoTrust(_)
+        | AppMode::Chat
         | AppMode::ImageView(_)
         | AppMode::Config
         | AppMode::TierModelPicker
@@ -377,8 +380,6 @@ fn render_sheet(frame: &mut Frame, sheet: Rect, app: &App) {
         AppMode::WorkspaceConfirm(state) => {
             render_workspace_confirm(frame, sheet, &state.path, &state.reason);
         }
-        AppMode::LaunchGrant(state) => render_launch_grant(frame, sheet, state),
-        AppMode::RepoTrust(state) => render_ask_user(frame, sheet, &state.ask),
         AppMode::QuitConfirm(_) => render_quit_confirm(frame, sheet),
         _ => {}
     }
@@ -1660,44 +1661,85 @@ fn render_workspace_confirm(frame: &mut Frame, area: Rect, path: &str, reason: &
     frame.render_widget(widget, area);
 }
 
-/// Render the launch-directory grant prompt as a bottom sheet.
-fn render_launch_grant(frame: &mut Frame, area: Rect, state: &crate::tui::state::LaunchGrantState) {
-    let content = vec![
+/// The launch gate — workspace write access or repository trust — owns
+/// the frame: label, path, question, option list, hint.
+fn render_gate_screen(frame: &mut Frame, area: Rect, app: &App) {
+    let (label, path, question, description, options, selected) = match &app.mode {
+        AppMode::LaunchGrant(state) => (
+            "Accessing workspace:",
+            state.path.display().to_string(),
+            "Do you trust the contents of this project?".to_string(),
+            " requires permission to read, edit, and execute files here.".to_string(),
+            vec![
+                "Yes, I trust this folder".to_string(),
+                "No, keep it read-only".to_string(),
+            ],
+            state.selected,
+        ),
+        AppMode::RepoTrust(state) => {
+            let question = &state.ask.questions[state.ask.current_question];
+            (
+                "Accessing repository:",
+                state.worktree.display().to_string(),
+                question.question.clone(),
+                " works in an isolated clone; the choice is remembered.".to_string(),
+                question.option.clone(),
+                state.ask.question_states[state.ask.current_question].cursor,
+            )
+        }
+        _ => return,
+    };
+    let mut lines = vec![
         Line::from(Span::styled(
-            "May was opened in this directory:",
-            Style::default().fg(Color::White),
-        )),
-        Line::from(Span::styled(
-            format!("  {}", state.path.display()),
+            label,
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Yellow)
                 .add_modifier(ratatui::style::Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from(Span::styled(
-            "Grant the agent read/write access to it?",
-            Style::default().fg(Color::White),
-        )),
+        Line::from(Span::styled(path, Style::default().fg(Color::White))),
+        Line::from(""),
+        Line::from(Span::styled(question, Style::default().fg(Color::White))),
         Line::from(""),
         Line::from(vec![
-            Span::styled("[Y/Enter] ", Style::default().fg(Color::Green)),
-            Span::styled("Grant", Style::default().fg(Color::White)),
-            Span::raw("    "),
-            Span::styled("[N/Esc] ", Style::default().fg(Color::Red)),
-            Span::styled("Keep read-only", Style::default().fg(Color::White)),
+            Span::styled("May", Style::default().fg(Color::Cyan)),
+            Span::styled(description, Style::default().fg(Color::White)),
         ]),
+        Line::from(""),
     ];
+    for (index, option) in options.iter().enumerate() {
+        let (prefix, style) = if index == selected {
+            ("> ", Style::default().fg(Color::White))
+        } else {
+            ("  ", Style::default().fg(Color::DarkGray))
+        };
+        lines.push(Line::from(Span::styled(format!("{prefix}{option}"), style)));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("↑/↓ Navigate · ", Style::default().fg(Color::DarkGray)),
+        Span::styled("enter", Style::default().fg(Color::Cyan)),
+        Span::styled(" Confirm · ", Style::default().fg(Color::DarkGray)),
+        Span::styled("ctrl+c", Style::default().fg(Color::Cyan)),
+        Span::styled(" Quit", Style::default().fg(Color::DarkGray)),
+    ]));
 
-    let widget = Paragraph::new(content)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow))
-                .title(" Workspace Access "),
-        )
-        .wrap(ratatui::widgets::Wrap { trim: false });
-
-    frame.render_widget(widget, area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(lines), area);
+    // The model reads like the reference's bottom-right status text.
+    let model_area = Rect {
+        y: area.y + area.height.saturating_sub(1),
+        height: 1,
+        ..area
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            app.model_display(),
+            Style::default().fg(Color::DarkGray),
+        )))
+        .alignment(Alignment::Right),
+        model_area,
+    );
 }
 
 /// Render the quit confirmation for a session whose agent still runs.

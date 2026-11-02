@@ -405,6 +405,8 @@ pub struct LaunchGrantState {
     /// `/permission` re-asks an answered gate: Esc cancels rather than
     /// downgrading a recorded decision.
     pub redecide: bool,
+    /// Cursor over the grant options — grant first, read-only second.
+    pub selected: usize,
 }
 
 /// Startup prompt deciding the launch repository's trust level. The
@@ -420,6 +422,9 @@ pub struct RepoTrustState {
     pub kind: crate::trust::RepoKind,
     /// `workspace.toml` the decision is written to.
     pub config_path: std::path::PathBuf,
+    /// `/permission` re-asks an answered gate: no `exit` option and Esc
+    /// cancels instead of quitting.
+    pub redecide: bool,
 }
 
 /// Pending workspace-access confirmation shown in the TUI.
