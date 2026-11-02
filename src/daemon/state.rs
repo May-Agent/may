@@ -927,3 +927,103 @@ impl DaemonState {
         self.container_prepare.snapshot_payload()
     }
 }
+
+#[cfg(test)]
+impl DaemonState {
+    /// A daemon state for tests: a real `ChatDb` and tool machinery on a
+    /// temporary may home, with background services absent.
+    pub(crate) async fn for_test(
+        may_dir: &std::path::Path,
+        cwd: &std::path::Path,
+        config: MayConfig,
+    ) -> anyhow::Result<Self> {
+        let db = crate::db::ChatDb::open(&may_dir.join("history.db")).await?;
+        let ui_event_bus = crate::ui_event_bus::UiEventBus::new();
+        let lease_handle = tokio::runtime::Handle::current();
+        let runtime_service = std::sync::Arc::new(
+            crate::session::SessionRuntimeService::new(db.clone(), ui_event_bus.clone())
+                .with_spawner(std::sync::Arc::new(move |task| {
+                    lease_handle.spawn(task);
+                })),
+        );
+        let (title_generation_queue, _rx) = TitleGenerationQueue::new();
+        let (tool_dispatchers, _queues) = tool_dispatch_channels();
+        let tool_distribution = std::sync::Arc::new(crate::tools::embedded_distribution()?);
+        let (search_index_wake_tx, search_index_wake) = async_channel::bounded(1);
+        let (browser_lifecycle_tx, _) = tokio::sync::broadcast::channel(4);
+        let notification_manager = std::sync::Arc::new(
+            crate::notification::NotificationManager::new(may_dir, db.clone()).await?,
+        );
+        let notification_service =
+            std::sync::Arc::new(crate::notification::NotificationService::new(
+                db.clone(),
+                notification_manager,
+                ui_event_bus.clone(),
+            ));
+        let task_runtime = std::sync::Arc::new(
+            crate::scheduler::TaskRuntime::load(
+                db.clone(),
+                may_dir.to_path_buf(),
+                tool_distribution.clone(),
+            )
+            .await?,
+        );
+        Ok(Self {
+            tokio_handle: tokio::runtime::Handle::current(),
+            db,
+            default_profile_id: "test".to_string(),
+            mcp_service: McpService::spawn(crate::mcp::McpManager::new(
+                crate::mcp::McpConfig::default(),
+            )),
+            permission_approver: crate::agent::PermissionApprover::new()
+                .with_runtime_service(runtime_service.clone()),
+            workspace_approver: WorkspaceApprover::new()
+                .with_runtime_service(runtime_service.clone()),
+            ask_user_approver: AskUserApprover::new().with_runtime_service(runtime_service.clone()),
+            tool_dispatchers,
+            fetched_models_cache: RefreshableCache::new(Duration::from_secs(20)),
+            config: arc_swap::ArcSwap::from_pointee(config),
+            ui_event_bus: ui_event_bus.clone(),
+            container_prepare: ContainerPrepareTracker::new(ui_event_bus.clone()),
+            container_manager: None,
+            browser_manager: arc_swap::ArcSwapOption::empty(),
+            browser_owner_session_id: arc_swap::ArcSwapOption::empty(),
+            browser_lifecycle_tx,
+            #[cfg(target_os = "macos")]
+            session_displays: std::sync::Arc::new(tokio::sync::Mutex::new(
+                crate::computer::SessionDisplays::default(),
+            )),
+            #[cfg(target_os = "macos")]
+            session_streams: std::sync::Arc::new(tokio::sync::Mutex::new(
+                crate::computer::SessionStreams::default(),
+            )),
+            remote_access_manager: std::sync::Arc::new(
+                super::remote_access::RemoteAccessManager::new(ui_event_bus.clone()),
+            ),
+            notification_service,
+            memory_processor: None,
+            local_url_port_mapper: std::sync::Arc::new(
+                super::local_url_mapper::LocalUrlPortMapper::new(),
+            ),
+            title_generation_queue,
+            location_provider: crate::location::LocationProvider::new(),
+            runtime_service,
+            task_runtime,
+            tool_distribution,
+            tool_environments: crate::agent::ToolEnvironmentCache::spawn(),
+            cwd: cwd.to_path_buf(),
+            may_dir: may_dir.to_path_buf(),
+            repo_search: crate::repo_search::RepoSearch::global(may_dir),
+            search_index_wake_tx,
+            search_index_wake,
+            search_index_status: crate::repo_search::indexer::IndexerStatus::default(),
+            daemon_shutdown: std::sync::Arc::new(tokio::sync::Notify::new()),
+            draining: std::sync::atomic::AtomicBool::new(false),
+            build_id: "test".to_string(),
+            turn_hub: std::sync::Arc::new(super::chat::TurnHub::default()),
+            parked_agents: super::chat::ParkedAgents::default(),
+            session_background: super::chat::SessionBackgrounds::default(),
+            tunnels: std::sync::Arc::new(super::tunnel::TunnelRegistry::new()),
+        })
+    }
+}
