@@ -71,6 +71,10 @@ pub static SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/permission", "Re-decide the launch directory's access"),
     ("/config", "Open configuration"),
     (
+        "/login",
+        "Sign in to a provider account (OpenAI, Grok, OpenRouter)",
+    ),
+    (
         "/bug",
         "Save a bug snapshot (recent logs + session info) to ~/.may/bugs",
     ),
