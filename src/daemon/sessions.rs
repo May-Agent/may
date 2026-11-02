@@ -433,9 +433,6 @@ pub(super) async fn create_session_for_profile(
             let environment = ProfileEnvironmentKind::from_str(profile.environment.as_str())
                 .map_err(internal_error)?;
             if environment == ProfileEnvironmentKind::Container {
-                crate::container::profile::ensure_container_runtime_assets(&state.may_dir)
-                    .await
-                    .map_err(internal_error)?;
                 SandboxResourceLayout::ContainerMountPoints
             } else {
                 SandboxResourceLayout::Symlinked

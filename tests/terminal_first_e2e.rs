@@ -1628,7 +1628,7 @@ enum ChatEnvironment {
 
 /// Upper bound on building the May workspace image from the repository's
 /// container context on a cold runtime.
-const CONTAINER_IMAGE_BUILD_TIMEOUT: Duration = Duration::from_mins(20);
+const CONTAINER_IMAGE_PULL_TIMEOUT: Duration = Duration::from_mins(20);
 
 /// Extra time a container session's first turn gets for starting its
 /// container and preparing the container's tool bundle before the model is
@@ -1663,7 +1663,7 @@ impl ChatEnvironment {
                 // Listing a container profile's sessions builds its image
                 // from the bundled container context first.
                 let Ok(response) = tokio::time::timeout(
-                    CONTAINER_IMAGE_BUILD_TIMEOUT,
+                    CONTAINER_IMAGE_PULL_TIMEOUT,
                     client
                         .get(format!(
                             "{}/api/profiles/{profile_id}/sessions",
@@ -1675,7 +1675,7 @@ impl ChatEnvironment {
                 else {
                     panic!(
                         "container profile image was not ready within \
-                         {CONTAINER_IMAGE_BUILD_TIMEOUT:?}; server logs:\n{}",
+                         {CONTAINER_IMAGE_PULL_TIMEOUT:?}; server logs:\n{}",
                         server.log.contents().await
                     );
                 };
@@ -1687,14 +1687,11 @@ impl ChatEnvironment {
                     ),
                 };
                 expect_status(&server.log, response, StatusCode::OK).await;
-                let tool_distribution = may_agent::tools::embedded_distribution()
-                    .expect("embedded distribution should validate");
                 PreparedEnvironment::Container {
                     profile_id,
                     manager: may_agent::container::lifecycle::ContainerManager::new(
                         Arc::new(runtime),
                         harness.may_dir.clone(),
-                        Arc::new(tool_distribution),
                     ),
                 }
             }
@@ -1854,7 +1851,6 @@ async fn create_container_profile(harness: &TestHarness) -> String {
         id: "e2e-container",
         name: "e2e-container",
         environment: ProfileEnvironmentKind::Container,
-        container_image: None,
         slug: None,
         icon: None,
         persona: None,
@@ -3744,7 +3740,6 @@ async fn oneshot_run_starts_the_daemon_and_streams_its_turn() {
             name: None,
             icon: None,
             environment: Some(may_agent::db::ProfileEnvironmentKind::Local),
-            container_image: None,
             container_id: None,
             sort_order: None,
             persona: None,

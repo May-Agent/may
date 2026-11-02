@@ -45,9 +45,6 @@ pub struct ProfilePreferences {
 )]
 #[serde(rename_all = "camelCase")]
 pub struct ContainerProfilePreferences {
-    /// Custom Dockerfile override for the container image.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dockerfile: Option<String>,
     /// Extra host paths mounted into the container.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mounts: Vec<ContainerMountPreference>,
@@ -166,7 +163,6 @@ impl ProfileInfo {
     ) -> Result<Self, crate::db::ChatDbError> {
         let environment = match m.environment.as_str() {
             "container" => ProfileEnvironment::Container {
-                image: m.container_image,
                 container_id: m.container_id,
             },
             "local" => ProfileEnvironment::Local,
@@ -246,8 +242,6 @@ pub enum ProfileEnvironment {
     Local,
     /// Run agents inside a container.
     Container {
-        /// Container image override.
-        image: Option<String>,
         /// Running container id once started.
         container_id: Option<String>,
     },
@@ -432,11 +426,9 @@ mod tests {
             name: "Local".to_string(),
             icon: None,
             environment: environment.to_string(),
-            container_image: None,
             container_id: None,
             persona: None,
             remote_ssh_server_id: None,
-            container_dockerfile: None,
             location_aware: false,
             pinned_limit: 10,
             sort_order: 0,
