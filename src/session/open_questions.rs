@@ -11,7 +11,9 @@ use askama::Template;
 use crate::ask_user::{AnswerValue, QuestionAnswer};
 use crate::xml::XmlBlock;
 
-use super::{PendingUserMessage, PendingUserMessageMode, PersistedAskUserRequest};
+use super::{
+    PendingMessageState, PendingUserMessage, PendingUserMessageMode, PersistedAskUserRequest,
+};
 
 /// The answers do not answer the questions they claim to.
 #[derive(Debug, thiserror::Error)]
@@ -113,6 +115,9 @@ pub fn answer_delivery(
     .render()
     .expect("answer delivery template must render");
     PendingUserMessage {
+        id: None,
+        state: PendingMessageState::default(),
+        error: None,
         content: String::new(),
         attachments: Vec::new(),
         hidden_context_xml: Some(

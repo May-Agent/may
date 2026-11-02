@@ -16,7 +16,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::ChatDbError;
 use crate::session::{
-    MayHomePaths, PendingUserMessage, PendingUserMessageMode, SessionRuntimeService,
+    MayHomePaths, PendingMessageState, PendingUserMessage, PendingUserMessageMode,
+    SessionRuntimeService,
 };
 use crate::xml::{XmlBlock, XmlBlockError};
 
@@ -323,6 +324,9 @@ impl AgentMessaging {
         .render()
         .expect("agent message template must render");
         let message = PendingUserMessage {
+            id: None,
+            state: PendingMessageState::default(),
+            error: None,
             content: String::new(),
             attachments: Vec::new(),
             hidden_context_xml: Some(XmlBlock::parse(text)?),
