@@ -427,7 +427,11 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
             }
             Event::Agent(TuiEvent::ReasoningEnd { seconds }) => {
                 app.chat.finish_thinking(seconds);
-                writeln!(output.stderr()?, "[thought for {seconds}s]")?;
+                writeln!(
+                    output.stderr()?,
+                    "[thought for {}]",
+                    may_agent::tui::ui::chat::thought_duration_label(seconds)
+                )?;
             }
             Event::Agent(TuiEvent::Complete) => {
                 runtime_deps

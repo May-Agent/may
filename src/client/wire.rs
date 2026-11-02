@@ -325,8 +325,8 @@ pub enum SessionAgentBody {
     /// A reasoning phase of the run closed; `seconds` is how long the model
     /// spent on it, whether or not the provider returned readable text.
     ReasoningEnd {
-        /// Seconds the phase lasted.
-        seconds: u64,
+        /// Seconds the phase lasted. Sub-second phases keep the fraction.
+        seconds: f64,
     },
     /// The run ended.
     End {
