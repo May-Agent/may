@@ -359,7 +359,14 @@ where
                 .get::<Vec<may_agent::profile::ProfileInfo>>("/api/profiles")
                 .await
             {
-                app.current_profile_id = profiles.first().map(|p| p.id.clone());
+                // The TUI lands on the built-in Build profile by default.
+                app.current_profile_id = profiles
+                    .iter()
+                    .find(|profile| {
+                        profile.slug.as_deref() == Some(may_agent::profile::BUILD_PROFILE_SLUG)
+                    })
+                    .or_else(|| profiles.first())
+                    .map(|p| p.id.clone());
                 if let Some(ref profile_id) = app.current_profile_id {
                     app.session_manager.set_current_profile(profile_id.clone());
                 }
