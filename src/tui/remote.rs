@@ -103,6 +103,49 @@ impl ForwardedTurn {
     }
 }
 
+/// Follow worktree index coverage for `cwd` for as long as the TUI runs.
+/// The session worker is not required: a new TUI has no daemon session
+/// until the first message.
+pub fn spawn_index_coverage(
+    client: DaemonClient,
+    cwd: std::path::PathBuf,
+    app_events: EventSender,
+) {
+    tokio::spawn(follow_index(client, cwd, app_events));
+}
+
+async fn follow_index(client: DaemonClient, cwd: std::path::PathBuf, app_events: EventSender) {
+    let query = {
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        query
+            .append_pair("topics", "session_index")
+            .append_pair("cwd", &cwd.display().to_string());
+        query.finish()
+    };
+    loop {
+        let mut stream = match client.events(&query).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                tracing::debug!(%error, "index event stream unavailable");
+                tokio::time::sleep(RECONNECT_DELAY).await;
+                continue;
+            }
+        };
+        while let Ok(Some(event)) = stream.next().await {
+            if event.kind != "session_index" {
+                continue;
+            }
+            let Ok(snapshot) = serde_json::from_str::<SessionIndexSnapshot>(&event.data) else {
+                continue;
+            };
+            let _ = app_events
+                .send(AppEvent::IndexCoverage(snapshot.index))
+                .await;
+        }
+        tokio::time::sleep(RECONNECT_DELAY).await;
+    }
+}
+
 /// The session's event query: a reopened stream names the last turn frame
 /// it saw (`after`), so the daemon sends only what came after it.
 fn events_query(session_id: &str, after: Option<&str>) -> String {
