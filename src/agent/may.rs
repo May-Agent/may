@@ -453,32 +453,27 @@ impl MayAgent {
             && let Ok(repo_key) = crate::issue::repository_identity(&worktree)
         {
             // The first-contact trust decision picks the binding: GitHub
-            // trust clones the remote (cloud is the source of truth), local
-            // trust clones the checkout, undecided binds nothing yet — the
-            // question is posted once the session runtime exists below.
+            // and local-branch clone; `local` writes the checkout; undecided
+            // binds nothing yet — the question is posted once the session
+            // runtime exists below.
             let trust = crate::trust::trust_for(&workspace.config, &repo_key, &worktree);
             let clone = match trust {
-                Some(crate::trust::TrustLevel::Full | crate::trust::TrustLevel::PrsOnly) => {
-                    Some(match crate::trust::repo_kind(&worktree) {
-                        crate::trust::RepoKind::Github { owner_repo } => {
-                            match crate::trust::remote_url(&worktree) {
-                                Some(url) => {
-                                    session_repos.ensure_remote_clone(&url, &owner_repo).await
-                                }
-                                None => {
-                                    session_repos.ensure_local_clone(&worktree, &repo_key).await
-                                }
-                            }
+                Some(
+                    crate::trust::TrustLevel::Full
+                    | crate::trust::TrustLevel::PrsOnly
+                    | crate::trust::TrustLevel::LocalBranch,
+                ) => Some(match crate::trust::repo_kind(&worktree) {
+                    crate::trust::RepoKind::Github { owner_repo } => {
+                        match crate::trust::remote_url(&worktree) {
+                            Some(url) => session_repos.ensure_remote_clone(&url, &owner_repo).await,
+                            None => session_repos.ensure_local_clone(&worktree, &repo_key).await,
                         }
-                        crate::trust::RepoKind::Git => {
-                            session_repos.ensure_local_clone(&worktree, &repo_key).await
-                        }
-                    })
-                }
-                Some(crate::trust::TrustLevel::Local) => {
-                    Some(session_repos.ensure_local_clone(&worktree, &repo_key).await)
-                }
-                None => None,
+                    }
+                    crate::trust::RepoKind::Git => {
+                        session_repos.ensure_local_clone(&worktree, &repo_key).await
+                    }
+                }),
+                Some(crate::trust::TrustLevel::Local) | None => None,
             };
             match clone {
                 Some(Ok(clone_path)) => repo_clones.push(RepoCloneEntry {

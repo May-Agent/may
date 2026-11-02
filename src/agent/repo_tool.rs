@@ -21,13 +21,13 @@ pub struct RepoContext {
 }
 
 /// Repository trust: `repo trust` shows the launch repo's level,
-/// `repo trust set <full|prs-only|local>` persists the decision.
+/// `repo trust set <full|prs-only|local-branch|local>` persists the decision.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(tag = "action", rename_all = "snake_case")]
 pub enum RepoArgs {
     /// Show or set the launch repository's trust level.
     Trust {
-        /// Set and persist: `full`, `prs-only` or `local`.
+        /// Set and persist: `full`, `prs-only`, `local-branch` or `local`.
         #[serde(default)]
         set: Option<String>,
     },
@@ -94,7 +94,7 @@ impl Tool for RepoTool {
                     },
                     |value| {
                         TrustLevel::parse(&value).map_or_else(
-                            || "level must be full, prs-only or local".to_string(),
+                            || "level must be full, prs-only, local-branch or local".to_string(),
                             |level| {
                                 let kind = trust::repo_kind(&worktree);
                                 match trust::persist(

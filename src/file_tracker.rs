@@ -53,6 +53,15 @@ impl TrackedRootSpec {
         self.label = Some(label.into());
         self
     }
+
+    /// Track a git checkout, excluding every other linked worktree that
+    /// lives under it so sibling PR trees are not session changes.
+    #[must_use]
+    pub fn checkout(worktree: PathBuf) -> Self {
+        nested_worktree_excludes(&worktree)
+            .into_iter()
+            .fold(Self::new(worktree), Self::exclude)
+    }
 }
 
 /// One file's line-change counts inside a [`RootDiff`].
@@ -369,6 +378,36 @@ impl FileChangeTracker {
 /// Stable key for a root's shadow repository: the normalized worktree path
 /// hashed, so reordered or shrunken root sets cannot reattribute another
 /// root's baselines and checkpoints.
+/// `info/exclude` patterns for git worktrees nested under `root`, relative
+/// to `root`. The checkout at `root` itself is kept.
+fn nested_worktree_excludes(root: &Path) -> Vec<String> {
+    let Ok(output) = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let root = normalize_path(root);
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .map(PathBuf::from)
+        .filter_map(|path| {
+            let path = normalize_path(&path);
+            if path == root {
+                return None;
+            }
+            let rel = path.strip_prefix(&root).ok()?;
+            Some(format!("{}/", rel.display()))
+        })
+        .collect()
+}
+
 fn shadow_key(worktree: &Path) -> String {
     use sha2::Digest;
     let digest = sha2::Sha256::digest(worktree.as_os_str().as_encoded_bytes());
@@ -681,6 +720,63 @@ mod tests {
         assert_eq!(diffs[0].additions, 1);
         assert_eq!(diffs[0].deletions, 0);
         assert_eq!(diffs[0].changes[0].path, PathBuf::from("a.txt"));
+    }
+
+    #[test]
+    fn nested_worktree_is_excluded_from_checkout_spec() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let main = temp.path().join("main");
+        fs::create_dir_all(&main).expect("main");
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .current_dir(&main)
+                .args(args)
+                .status()
+                .expect("git");
+            assert!(status.success(), "{args:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&[
+            "-c",
+            "user.name=m",
+            "-c",
+            "user.email=m@e",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "init",
+        ]);
+        let nested = main.join(".worktrees").join("other");
+        fs::create_dir_all(nested.parent().expect("parent")).expect("worktrees");
+        git(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "other",
+            nested.to_str().expect("utf8"),
+        ]);
+        let state_dir = temp.path().join("state");
+        let mut tracker =
+            FileChangeTracker::new(state_dir, vec![TrackedRootSpec::checkout(main.clone())])
+                .expect("tracker");
+        fs::write(main.join("root.txt"), "main\n").expect("root file");
+        fs::write(nested.join("nested.txt"), "other\n").expect("nested file");
+        let diffs = tracker.snapshot();
+        assert_eq!(diffs.len(), 1);
+        let paths: Vec<_> = diffs[0]
+            .changes
+            .iter()
+            .map(|c| c.path.to_string_lossy().into_owned())
+            .collect();
+        assert!(paths.iter().any(|p| p == "root.txt"), "{paths:?}");
+        assert!(
+            paths
+                .iter()
+                .all(|p| !p.contains("nested") && !p.contains("worktrees")),
+            "{paths:?}"
+        );
     }
 
     #[test]
