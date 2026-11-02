@@ -413,6 +413,37 @@ pub enum RemoteAccessState {
     Error,
 }
 
+/// The login owning this node, as `tailscale status` reports it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum OwnerLogin {
+    Resolved { login: String },
+    Unresolved { reason: String },
+}
+
+/// Who remote access accepts right now: the node owner (when resolved) plus
+/// the listed logins.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AcceptedLogins {
+    pub(crate) owner: OwnerLogin,
+    pub(crate) listed: Vec<String>,
+}
+
+impl AcceptedLogins {
+    /// The accepted logins as the identity sources' allow-list.
+    pub(crate) fn allow_list(&self) -> std::collections::HashSet<String> {
+        let owner = match &self.owner {
+            OwnerLogin::Resolved { login } => Some(login.clone()),
+            OwnerLogin::Unresolved { .. } => None,
+        };
+        owner
+            .into_iter()
+            .chain(self.listed.iter().cloned())
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteAccessStatusResponse {
@@ -424,6 +455,9 @@ pub struct RemoteAccessStatusResponse {
     pub(crate) last_error: Option<String>,
     #[serde(default)]
     pub(crate) recent_logs: Vec<String>,
+    /// Who is accepted now; absent until the allow-list is first resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) accepted: Option<AcceptedLogins>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
@@ -1490,6 +1524,9 @@ pub struct UiRemoteAccessConfig {
     pub(crate) tailscale_binary: String,
     pub(crate) https_port: u16,
     pub(crate) allow_local_environment: bool,
+    /// Tailscale logins accepted for remote access besides the login owning
+    /// this node, which is always accepted.
+    pub(crate) allowed_logins: Vec<String>,
 }
 
 impl From<&RemoteAccessConfig> for UiRemoteAccessConfig {
@@ -1499,6 +1536,7 @@ impl From<&RemoteAccessConfig> for UiRemoteAccessConfig {
             tailscale_binary: value.tailscale_binary.clone(),
             https_port: value.https_port,
             allow_local_environment: value.allow_local_environment,
+            allowed_logins: value.allowed_logins.clone(),
         }
     }
 }

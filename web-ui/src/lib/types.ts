@@ -644,12 +644,25 @@ export interface SessionContextDebugResponse {
 
 export type RemoteAccessState = 'disabled' | 'starting' | 'running' | 'error';
 
+/** The login owning this node, as Tailscale reports it. */
+export type OwnerLogin =
+  | { state: 'resolved'; login: string }
+  | { state: 'unresolved'; reason: string };
+
+/** Who remote access accepts now: the node owner (when resolved) plus the listed logins. */
+export interface AcceptedLogins {
+  owner: OwnerLogin;
+  listed: string[];
+}
+
 export interface RemoteAccessStatusResponse {
   state: RemoteAccessState;
   enabled: boolean;
   publicUrl?: string | null;
   lastError?: string | null;
   recentLogs: string[];
+  /** Absent until the daemon first resolves the allow-list. */
+  accepted?: AcceptedLogins | null;
 }
 
 // ── Profiles (expanded) ────────────────────────────────────
