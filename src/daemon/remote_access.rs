@@ -8,7 +8,7 @@
 //! place.
 
 use std::collections::VecDeque;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,6 +20,7 @@ use crate::config::RemoteAccessConfig;
 use crate::db::ChatDb;
 use crate::ui_event_bus::UiEventBus;
 
+use super::auth::TailnetLogin;
 use super::error::{bad_request_error, internal_error};
 use super::state::DaemonState;
 use super::types::{ApiHealth, RemoteAccessState, RemoteAccessStatusResponse};
@@ -351,13 +352,8 @@ fn serve_spec(
     let port = local_addr
         .map(|addr| addr.port())
         .ok_or_else(|| "the May daemon is not listening on TCP yet".to_string())?;
-    let binary = config.tailscale_binary.trim();
     Ok(ServeSpec {
-        tailscale_binary: if binary.is_empty() {
-            crate::config::DEFAULT_TAILSCALE_BINARY.to_string()
-        } else {
-            binary.to_string()
-        },
+        tailscale_binary: tailscale_binary(config),
         https_port: config.https_port,
         target: format!("http://127.0.0.1:{port}"),
     })
@@ -372,6 +368,16 @@ fn public_url(host: &str, https_port: u16) -> String {
         format!("https://{host}")
     } else {
         format!("https://{host}:{https_port}")
+    }
+}
+
+/// The configured `tailscale` binary, or the default when none is set.
+fn tailscale_binary(config: &RemoteAccessConfig) -> String {
+    let binary = config.tailscale_binary.trim();
+    if binary.is_empty() {
+        crate::config::DEFAULT_TAILSCALE_BINARY.to_string()
+    } else {
+        binary.to_string()
     }
 }
 
@@ -415,6 +421,78 @@ struct TailscaleNode {
     user_id: u64,
 }
 
+/// `tailscale whois --json`: the node a tailnet address belongs to and the
+/// user owning it.
+#[derive(Debug, Deserialize)]
+struct TailscaleWhois {
+    #[serde(rename = "Node")]
+    node: WhoisNode,
+    #[serde(rename = "UserProfile")]
+    user_profile: Option<WhoisUserProfile>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WhoisNode {
+    /// Present only on tagged nodes, which have no user identity.
+    #[serde(rename = "Tags", default)]
+    tags: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WhoisUserProfile {
+    #[serde(rename = "LoginName", default)]
+    login_name: String,
+}
+
+/// The user login in `tailscale whois --json` output; a tagged node has none.
+pub(super) fn parse_whois_login(output: &str) -> Result<Option<TailnetLogin>, String> {
+    let whois: TailscaleWhois = serde_json::from_str(output)
+        .map_err(|error| format!("unexpected `tailscale whois` output: {error}"))?;
+    if !whois.node.tags.is_empty() {
+        return Ok(None);
+    }
+    Ok(whois
+        .user_profile
+        .map(|profile| profile.login_name)
+        .filter(|login| !login.is_empty())
+        .map(TailnetLogin))
+}
+
+/// Resolves a peer address to its user login through the CLI's `WhoIs`
+/// (`tailscale whois --json <ip>`). A failure or a peer without a user
+/// identity yields `None`, so the connection is never attributed.
+pub(super) async fn whois_login(binary: &str, peer: IpAddr) -> Option<TailnetLogin> {
+    let args = vec!["whois".into(), "--json".into(), peer.to_string()];
+    let output = match tailscale(binary, args).await {
+        Ok(output) => output,
+        Err(error) => {
+            tracing::warn!(%peer, %error, "tailnet WhoIs failed; peer rejected");
+            return None;
+        }
+    };
+    match parse_whois_login(&output) {
+        Ok(Some(login)) => Some(login),
+        Ok(None) => {
+            tracing::warn!(%peer, "tailnet peer is a tagged node without a user; rejected");
+            None
+        }
+        Err(error) => {
+            tracing::warn!(%peer, %error, "tailnet WhoIs unreadable; peer rejected");
+            None
+        }
+    }
+}
+
+/// The login of a direct-bind connection's peer, using the `tailscale`
+/// binary configured now.
+pub(super) async fn resolve_tailnet_login(
+    state: &DaemonState,
+    peer: IpAddr,
+) -> Option<TailnetLogin> {
+    let binary = tailscale_binary(&state.config_snapshot().remote_access);
+    whois_login(&binary, peer.to_canonical()).await
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct TailscaleUser {
     #[serde(rename = "LoginName", default)]
@@ -436,7 +514,7 @@ async fn refresh_allow_list(
     config: &RemoteAccessConfig,
 ) {
     let allowed: std::collections::HashSet<String> = if config.allowed_logins.is_empty() {
-        match node_owner_login(&config.tailscale_binary).await {
+        match node_owner_login(&tailscale_binary(config)).await {
             Ok(owner) => std::collections::HashSet::from([owner]),
             Err(error) => {
                 tracing::warn!(%error, "no Tailscale logins accepted: node owner unresolved");
