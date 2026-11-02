@@ -191,6 +191,16 @@ async fn async_main() -> anyhow::Result<()> {
         previous_hook(panic_info);
     }));
 
+    // A fatal signal — an overflow never reaches the panic hook — dumps the
+    // same ring to the same directory before the signal's usual outcome.
+    // Forensics must not stop startup, so a failed install only warns.
+    #[cfg(unix)]
+    if let Some(bugs_dir) = dirs::home_dir().map(|home| home.join(".may").join("bugs"))
+        && let Err(error) = may_agent::crash_signal::install(log_ring.clone(), bugs_dir)
+    {
+        tracing::warn!("fatal-signal log dump not installed: {error}");
+    }
+
     if !matches!(cli_mode, CliMode::Help(_)) {
         may_agent::startup::validate_configuration().await?;
     }
