@@ -400,6 +400,11 @@ impl AskUserState {
 pub struct LaunchGrantState {
     /// The launch directory being offered.
     pub path: std::path::PathBuf,
+    /// `workspace.toml` the decision is written to.
+    pub config_path: std::path::PathBuf,
+    /// `/permission` re-asks an answered gate: Esc cancels rather than
+    /// downgrading a recorded decision.
+    pub redecide: bool,
 }
 
 /// Startup prompt deciding the launch repository's trust level. The
@@ -409,6 +414,12 @@ pub struct LaunchGrantState {
 pub struct RepoTrustState {
     /// The option-list sheet state.
     pub ask: AskUserState,
+    /// The repository's worktree root.
+    pub worktree: std::path::PathBuf,
+    /// Whether the remote is GitHub-backed.
+    pub kind: crate::trust::RepoKind,
+    /// `workspace.toml` the decision is written to.
+    pub config_path: std::path::PathBuf,
 }
 
 /// Pending workspace-access confirmation shown in the TUI.

@@ -151,7 +151,7 @@ pub fn pending_decision(
 }
 
 /// The trust level a gate answer selects. `exit`, dismissal and custom text
-/// that is not a level name bind nothing — the repository stays undecided.
+/// that is not a level name decide nothing — the repository stays as it was.
 #[must_use]
 pub fn level_for_answer(answer: &QuestionAnswer) -> Option<TrustLevel> {
     let text = match &answer.answer {
