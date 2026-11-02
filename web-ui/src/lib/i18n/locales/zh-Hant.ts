@@ -138,7 +138,7 @@ export const zhHant: Messages = {
     responding: '回應中',
     scrollToBottom: '回到最新',
     thought: '思考過程',
-    thoughtFor: '思考了 {seconds} 秒',
+    thoughtFor: '思考了 {duration}',
     plan: '計畫',
     assistantStreaming: 'May 正在回覆',
     artifacts: '檔案',

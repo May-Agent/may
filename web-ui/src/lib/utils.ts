@@ -26,6 +26,37 @@ export function formatDurationMs(ms: number): string {
   return `${minutes}m ${remSeconds}s`;
 }
 
+/** Thinking-header duration: integer ms below 0.1s, one decimal below 1s, then `12s` / `1m 4s` / `1h 2m`. */
+export function formatThoughtDuration(seconds: number): string {
+  const value = Number.isFinite(seconds) && seconds > 0 ? seconds : 0;
+  if (value < 0.1) {
+    const ms = Math.round(value * 1000);
+    if (ms < 100) return `${ms}ms`;
+  }
+  if (value < 1) {
+    const tenths = Math.round(value * 10);
+    if (tenths < 10) return `${Math.floor(tenths / 10)}.${tenths % 10}s`;
+    return formatThoughtWholeSeconds(1);
+  }
+  return formatThoughtWholeSeconds(Math.round(value));
+}
+
+function formatThoughtWholeSeconds(total: number): string {
+  const hour = 3600;
+  const minute = 60;
+  if (total >= hour) {
+    const hours = Math.floor(total / hour);
+    const minutes = Math.floor((total % hour) / minute);
+    return minutes === 0 ? `${hours}h` : `${hours}h ${minutes}m`;
+  }
+  if (total >= minute) {
+    const minutes = Math.floor(total / minute);
+    const secs = total % minute;
+    return secs === 0 ? `${minutes}m` : `${minutes}m ${secs}s`;
+  }
+  return `${total}s`;
+}
+
 function toDate(value: string | number | Date): Date | null {
   const date = typeof value === 'string' || typeof value === 'number' ? new Date(value) : value;
   return Number.isNaN(date.getTime()) ? null : date;
