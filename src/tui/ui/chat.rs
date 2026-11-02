@@ -1576,14 +1576,12 @@ fn format_cost_usd(cost: f64) -> String {
     if cost == 0.0 || cost >= 0.01 {
         return format!("${cost:.2}");
     }
-    // Move `place` down to the first significant digit (0.001 holds four
-    // decimals: that digit and one past it).
-    let mut decimals = 4;
-    let mut place = 0.001;
-    while cost < place {
-        place /= 10.0;
-        decimals += 1;
-    }
+    // The first significant digit sits at 10^-exp; keep one digit past it.
+    // 324 bounds the search at the smallest positive f64.
+    let exp = (3_i32..=324)
+        .find(|&exp| cost >= 10f64.powi(-exp))
+        .expect("a positive f64 is at least 10^-324");
+    let decimals = usize::try_from(exp + 1).expect("exp is positive");
     format!("${cost:.decimals$}")
 }
 
