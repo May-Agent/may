@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, mock, test } from 'bun:test';
 import {
   DEFAULT_CACHE_LIFETIME,
+  addAllowedLogin,
+  withAllowedLogins,
   setFullConfig,
   withCacheLifetime,
   withCompactionModel,
@@ -64,6 +66,7 @@ function makeConfig(): UiFullConfig {
       tailscaleBinary: 'tailscale',
       httpsPort: 443,
       allowLocalEnvironment: false,
+      allowedLogins: [],
     },
     sandbox: { commandPriority: 'low' },
   };
@@ -123,5 +126,30 @@ describe('cache lifetime and compaction model saves', () => {
     expect(set.models.compactionModel).toBe('chatgpt::gpt-5-mini');
     const cleared = await savedBody(withCompactionModel(base, null));
     expect(cleared.models.compactionModel).toBeNull();
+  });
+});
+
+describe('remote-access allow-list', () => {
+  test('addAllowedLogin trims, ignores blanks and exact duplicates', () => {
+    const base = ['a@x.com'];
+    expect(addAllowedLogin(base, '  b@x.com ')).toEqual(['a@x.com', 'b@x.com']);
+    expect(addAllowedLogin(base, 'a@x.com')).toBe(base);
+    expect(addAllowedLogin(base, '   ')).toBe(base);
+  });
+
+  test('posts allowedLogins, including an empty list', async () => {
+    let captured: unknown;
+    globalThis.fetch = mock(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      captured = JSON.parse(init?.body as string);
+      return new Response('{}', { status: 200 });
+    }) as unknown as typeof fetch;
+    type Body = { remoteAccess: { allowedLogins: string[]; httpsPort: number } };
+
+    await setFullConfig(withAllowedLogins(makeConfig(), ['a@x.com', 'b@x.com']));
+    expect((captured as Body).remoteAccess.allowedLogins).toEqual(['a@x.com', 'b@x.com']);
+    expect((captured as Body).remoteAccess.httpsPort).toBe(443);
+
+    await setFullConfig(withAllowedLogins(makeConfig(), []));
+    expect((captured as Body).remoteAccess.allowedLogins).toEqual([]);
   });
 });
