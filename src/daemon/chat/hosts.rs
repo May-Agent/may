@@ -129,7 +129,10 @@ fn session_id_param(params: &Params) -> SkyResult<String> {
 
 /// The session's idle agent, built from its persisted context when the
 /// daemon has none (it restarted, or the session never ran here).
-async fn idle_agent(state: &Arc<DaemonState>, session_id: &str) -> SkyResult<Arc<AgentWorker>> {
+pub(super) async fn idle_agent(
+    state: &Arc<DaemonState>,
+    session_id: &str,
+) -> SkyResult<Arc<AgentWorker>> {
     if let Some(worker) = state.parked_agents.get(session_id) {
         return Ok(worker);
     }
