@@ -38,6 +38,12 @@ pub async fn serve(may_dir: &Path) -> Result<(), String> {
     }
     let listener =
         UnixListener::bind(&sock).map_err(|e| format!("bind {}: {e}", sock.display()))?;
+    // The daemon reads this to know the helper is alive and to kill it
+    // after permission grants — `open` gives no child handle.
+    let _ = std::fs::write(
+        may_dir.join("computer-agent.pid"),
+        std::process::id().to_string(),
+    );
     let state = Arc::new(Mutex::new(AgentState {
         displays: SessionDisplays::default(),
         streams: SessionStreams::default(),
