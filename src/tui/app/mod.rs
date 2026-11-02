@@ -340,6 +340,9 @@ pub struct App {
     /// stream last reported it; `None` until the first report or when the
     /// session is not in an indexed worktree.
     pub index_coverage: Option<crate::client::IndexCoverage>,
+    /// Set when the last `session_index` report said repo-search could not
+    /// be reached. The status bar shows a red cross instead of coverage.
+    pub index_failed: bool,
     /// Which open question `/questions` shows next, so repeated use walks
     /// through all of them.
     pub question_cursor: usize,
@@ -623,6 +626,7 @@ impl App {
             open_question_count: 0,
             session_runtime: crate::client::SessionRuntimeSnapshot::default(),
             index_coverage: None,
+            index_failed: false,
             question_cursor: 0,
             parked_question: None,
         })
