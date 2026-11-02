@@ -7494,7 +7494,7 @@ dependencies = [
 [[package]]
 name = "repo-search-client"
 version = "0.0.5"
-source = "git+https://github.com/May-Agent/repo-search?branch=dev#b9442af1de390c613f6e1438f8b789f38869a7b8"
+source = "git+https://github.com/May-Agent/repo-search?branch=dev#599425edc2057876be0604ba58215bdead52fee3"
 dependencies = [
  "askama 0.16.1",
  "etcetera 0.11.0",
