@@ -18,29 +18,6 @@ use crate::db::ChatDb;
 /// Default answer budget, matching the repo-search CLI.
 const DEFAULT_BUDGET: u32 = 4000;
 
-/// How a query is matched.
-#[derive(Debug, Clone, Copy, Default, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum CodeSearchMode {
-    /// Lexical and semantic matches, fused.
-    #[default]
-    Hybrid,
-    /// Identifier and keyword matches only.
-    Lexical,
-    /// Meaning matches only.
-    Semantic,
-}
-
-impl From<CodeSearchMode> for WireMode {
-    fn from(mode: CodeSearchMode) -> Self {
-        match mode {
-            CodeSearchMode::Hybrid => Self::Hybrid,
-            CodeSearchMode::Lexical => Self::Lexical,
-            CodeSearchMode::Semantic => Self::Semantic,
-        }
-    }
-}
-
 /// Search the repository for code you can describe but cannot name.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct CodeSearchArgs {
@@ -57,9 +34,6 @@ pub struct CodeSearchArgs {
     /// List matching files only.
     #[serde(default)]
     pub files: bool,
-    /// Matching: `hybrid` (default), `lexical` or `semantic`.
-    #[serde(default)]
-    pub mode: CodeSearchMode,
     /// Glob restricting the searched paths; repeatable.
     #[serde(default)]
     pub path: Vec<String>,
@@ -188,7 +162,7 @@ fn request_for(args: &CodeSearchArgs, worktree: PathBuf) -> Request {
         query => Request::Search(SearchRequest {
             worktree,
             query: query.to_string(),
-            mode: args.mode.into(),
+            mode: WireMode::Hybrid,
             paths: args.path.clone(),
             langs: args.lang.clone(),
             kinds: args.kind.clone(),
@@ -243,7 +217,6 @@ mod tests {
         let request = request_for(
             &args(serde_json::json!({
                 "query": "where tokens are refreshed",
-                "mode": "semantic",
                 "path": ["src/**"],
                 "files": true
             })),
@@ -253,7 +226,7 @@ mod tests {
             panic!("expected a search request");
         };
         assert_eq!(search.query, "where tokens are refreshed");
-        assert_eq!(search.mode, WireMode::Semantic);
+        assert_eq!(search.mode, WireMode::Hybrid);
         assert_eq!(search.paths, ["src/**"]);
         assert!(search.files_only);
         assert_eq!(search.budget, 4000);
