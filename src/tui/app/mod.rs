@@ -1733,16 +1733,20 @@ impl App {
         if let Some(worktree) = crate::repo_search::worktree_root(&self.cwd) {
             let kind = crate::trust::repo_kind(&worktree);
             self.mode = AppMode::RepoTrust(crate::tui::state::RepoTrustState {
-                ask: AskUserState::for_open_question(crate::trust::question_for(&kind, &worktree)),
+                ask: AskUserState::for_open_question(crate::trust::question_for(
+                    &kind, &worktree, false,
+                )),
                 worktree,
                 kind,
                 config_path,
+                redecide: true,
             });
         } else {
             self.mode = AppMode::LaunchGrant(crate::tui::state::LaunchGrantState {
                 path: self.cwd.clone(),
                 config_path,
                 redecide: true,
+                selected: 0,
             });
         }
     }
