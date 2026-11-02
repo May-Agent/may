@@ -1096,6 +1096,9 @@ pub struct MayConfig {
     /// Prompt suggestion settings.
     #[serde(default)]
     pub suggestions: SuggestionsConfig,
+    /// Recap settings.
+    #[serde(default)]
+    pub recap: RecapConfig,
     /// Last model selected via /model command (used as default for new sessions).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_model: Option<ModelSelector>,
@@ -1119,6 +1122,25 @@ pub struct SuggestionsConfig {
 impl Default for SuggestionsConfig {
     fn default() -> Self {
         Self { enabled: true }
+    }
+}
+
+/// `[recap]` section: the catch-up card an idle session receives.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RecapConfig {
+    /// Whether an idle session that outgrew its last recap gets a new one.
+    pub auto: bool,
+    /// Minutes of inactivity before an auto recap is generated.
+    pub idle_minutes: u64,
+}
+
+impl Default for RecapConfig {
+    fn default() -> Self {
+        Self {
+            auto: true,
+            idle_minutes: 30,
+        }
     }
 }
 
@@ -1152,6 +1174,7 @@ impl Default for MayConfig {
             remote_access: RemoteAccessConfig::default(),
             daemon: DaemonConfig::default(),
             suggestions: SuggestionsConfig::default(),
+            recap: RecapConfig::default(),
             last_model: None,
             last_effort: None,
             ssh_servers: Vec::new(),
