@@ -148,13 +148,14 @@ impl ChatDb {
     /// Returns [`ChatDbError`] on storage failure.
     pub async fn take_next_pending_message_for_run(
         &self,
+        fence: &RunFence,
         session_id: &str,
     ) -> Result<Option<crate::session::PendingUserMessage>, ChatDbError> {
         let summary = self.load_session_runtime_summary(session_id).await?;
         if summary.interactions.is_active() || !summary.has_pending_messages() {
             return Ok(None);
         }
-        self.take_next_pending_message(session_id).await
+        self.claim_next_pending_message(fence, session_id).await
     }
 }
 
