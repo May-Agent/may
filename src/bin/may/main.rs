@@ -1557,6 +1557,32 @@ where
                             .chat
                             .push_error(&format!("Failed to save bug snapshot: {error}")),
                     },
+                    Some(SendAction::Recap) => {
+                        let session_id = app
+                            .session_manager
+                            .current()
+                            .map(|session| session.id.clone());
+                        match (runtime_deps.daemon(), session_id) {
+                            (Some(client), Some(session_id)) => {
+                                app.set_status("Summarizing the session…");
+                                let posted = client
+                                    .post::<_, serde_json::Value>(
+                                        &may_agent::client::session_path(
+                                            session_id.as_str(),
+                                            "/recap",
+                                        ),
+                                        &serde_json::json!({}),
+                                    )
+                                    .await;
+                                if let Err(error) = posted {
+                                    app.chat.push_error(&error.to_string());
+                                }
+                            }
+                            _ => app
+                                .chat
+                                .push_notice("No session is attached — nothing to recap"),
+                        }
+                    }
                     Some(SendAction::Compact(focus)) => {
                         if agent_handle.is_none() {
                             if let Some(w) = worker.as_ref() {
