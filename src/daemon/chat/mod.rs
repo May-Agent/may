@@ -2426,6 +2426,10 @@ struct SessionContext {
     /// Model transcript entries as `(seq, message)`: exactly what was
     /// committed to the model context, never UI history.
     transcript: Vec<(i64, LlmMessage)>,
+    /// UI-history messages to seed a first-ever agent with when the
+    /// transcript is empty; the agent assigns its own seqs before the
+    /// transcript store records them.
+    seed_messages: Vec<LlmMessage>,
     context_snapshot: Option<crate::session::PersistedContextSnapshot>,
     hidden_context_xml: Option<String>,
     profile_persona: Option<String>,
@@ -2727,54 +2731,16 @@ async fn resolve_session_context(
         })?;
         transcript.push((entry.seq, message));
     }
-    if transcript.is_empty() {
-        // One-time migration: a session with only UI history seeds its
-        // transcript from it once, inside the run's fenced transaction.
-        let seeded = history
+    // One-time migration: a session with only UI history feeds it to the
+    // fresh agent once; `build_session_agent` then persists the agent's own
+    // checkpoint, so every transcript seq is one aither assigned.
+    let seed_messages = if transcript.is_empty() {
+        history
             .to_aither_messages()
-            .map_err(UiChatPreparationError::HistoryReplay)?;
-        if !seeded.is_empty() {
-            let committed_at = jiff::Timestamp::now().to_string();
-            let entries = seeded
-                .iter()
-                .enumerate()
-                .map(|(index, message)| {
-                    Ok(crate::db::TranscriptEntry {
-                        seq: i64::try_from(index + 1).map_err(|error| {
-                            UiChatPreparationError::LoadContextSnapshot(
-                                crate::db::ChatDbError::Storage(format!("seed seq: {error}")),
-                            )
-                        })?,
-                        message_blob: rmp_serde::to_vec_named(message).map_err(|error| {
-                            UiChatPreparationError::LoadContextSnapshot(
-                                crate::db::ChatDbError::Storage(format!(
-                                    "failed to encode seeded transcript message: {error}"
-                                )),
-                            )
-                        })?,
-                        committed_at: committed_at.clone(),
-                    })
-                })
-                .collect::<Result<Vec<_>, UiChatPreparationError>>()?;
-            db.insert_transcript_entries_as_run(fence, &entries)
-                .await
-                .map_err(UiChatPreparationError::LoadContextSnapshot)?;
-            transcript = seeded
-                .into_iter()
-                .enumerate()
-                .map(|(index, message)| {
-                    Ok((
-                        i64::try_from(index + 1).map_err(|error| {
-                            UiChatPreparationError::LoadContextSnapshot(
-                                crate::db::ChatDbError::Storage(format!("seed seq: {error}")),
-                            )
-                        })?,
-                        message,
-                    ))
-                })
-                .collect::<Result<Vec<_>, UiChatPreparationError>>()?;
-        }
-    }
+            .map_err(UiChatPreparationError::HistoryReplay)?
+    } else {
+        Vec::new()
+    };
     let context_snapshot = if use_persisted_context_snapshot {
         db.get_session_context_snapshot(session_id.as_str())
             .await
@@ -2916,6 +2882,7 @@ async fn resolve_session_context(
         cwd,
         non_interactive: session.non_interactive,
         transcript,
+        seed_messages,
         context_snapshot,
         hidden_context_xml: (!hidden_context_parts.is_empty())
             .then(|| hidden_context_parts.join("\n\n")),
@@ -3253,6 +3220,7 @@ fn prepare_agent_for_request<'a>(
                     state,
                     &config,
                     &ctx,
+                    fence,
                     attempt.provider_attempt,
                 ))
                 .await?
@@ -3313,6 +3281,7 @@ fn build_session_agent<'a>(
     state: &'a Arc<DaemonState>,
     config: &'a crate::config::MayConfig,
     ctx: &'a SessionContext,
+    fence: &'a RunFence,
     provider_attempt: usize,
 ) -> Pin<Box<impl Future<Output = Result<MayAgent, UiChatPreparationError>> + 'a>> {
     Box::pin(async move {
@@ -3389,6 +3358,20 @@ fn build_session_agent<'a>(
             {
                 agent.push_message(message.clone());
             }
+        } else if ctx.transcript.is_empty() && !ctx.seed_messages.is_empty() {
+            // First-ever transcript: the agent assigns seqs to the seeded
+            // messages; persist its checkpoint so the store only ever holds
+            // aither-assigned seqs.
+            for message in &ctx.seed_messages {
+                agent.push_message(message.clone());
+            }
+            crate::session::persist_agent_context_snapshot(&state.db(), fence, &mut agent)
+                .await
+                .map_err(|error| {
+                    UiChatPreparationError::LoadContextSnapshot(crate::db::ChatDbError::Storage(
+                        format!("failed to persist seeded context: {error}"),
+                    ))
+                })?;
         } else {
             for (_, message) in &ctx.transcript {
                 agent.push_message(message.clone());
@@ -3506,7 +3489,10 @@ mod tests {
     use std::collections::HashMap;
     use std::future::Future;
 
-    use super::{ApiErrorCode, ChatRequest, DaemonState, TurnKind, run_agent_loop};
+    use super::{
+        ApiErrorCode, ChatRequest, DaemonState, TurnKind, build_session_agent,
+        resolve_session_context, run_agent_loop,
+    };
     use crate::config::MayConfig;
     use aither_core::llm::ToolResult;
 
@@ -4251,5 +4237,133 @@ mod tests {
                 .any(|m| matches!(m.role, super::MessageRole::Tool)),
             "the partial turn was persisted"
         );
+    }
+
+    /// A turn persisted through the checkpoint hook restores with its answer
+    /// exactly once: the transcript's `applied_seq` boundary keeps whatever the
+    /// checkpoint already covers from being pushed again.
+    #[tokio::test]
+    async fn a_restored_turn_contains_the_answer_exactly_once() {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let provider = stub_provider(vec![sse_text("the answer")]).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let state = failover_state(may_dir.path(), cwd.path(), &provider, &provider).await;
+        let req = ChatRequest {
+            session_id: "session".to_string(),
+            content: "hello".to_string(),
+            attachments: Vec::new(),
+            hidden_context_xml: None,
+            delivery_mode: crate::session::PendingUserMessageMode::default(),
+            pending_entry_id: None,
+        };
+        let guard = state
+            .runtime_service
+            .runs()
+            .acquire("session")
+            .await
+            .expect("acquire run");
+        let mut sink = TestSink;
+        run_agent_loop(
+            &state,
+            &req,
+            &mut sink,
+            &guard,
+            true,
+            true,
+            &TurnKind::Prompt,
+        )
+        .await
+        .expect("the turn must succeed");
+
+        // Rebuild the agent from storage exactly as the next turn would.
+        let config = state.config_snapshot();
+        let ctx = resolve_session_context(&state, &req, guard.fence(), false, true, None)
+            .await
+            .expect("context resolves");
+        assert!(
+            ctx.context_snapshot.is_some(),
+            "the turn's checkpoint must have persisted"
+        );
+        let mut agent = build_session_agent(&state, &config, &ctx, guard.fence(), 0)
+            .await
+            .expect("agent builds from storage");
+        let checkpoint = agent.export_checkpoint().await.expect("checkpoint");
+        let answers = checkpoint
+            .context
+            .items()
+            .iter()
+            .filter(|item| format!("{:?}", item.message()).contains("the answer"))
+            .count();
+        assert_eq!(answers, 1, "the answer appears in context exactly once");
+    }
+
+    /// Seeding from UI history produces transcript seqs the agent itself
+    /// assigned — the stored entries and the agent's own checkpoint agree.
+    #[tokio::test]
+    async fn seeded_transcript_seqs_are_the_agents_own() {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let provider = stub_provider(vec![]).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let state = failover_state(may_dir.path(), cwd.path(), &provider, &provider).await;
+        let guard = state
+            .runtime_service
+            .runs()
+            .acquire("session")
+            .await
+            .expect("acquire run");
+        let fence = guard.fence();
+        let db = state.db();
+        db.append_message(
+            "session",
+            crate::session::MessageRole::User,
+            "earlier question",
+            None,
+            crate::db::MessageMeta::default(),
+        )
+        .await
+        .expect("seed user row");
+        db.append_message(
+            "session",
+            crate::session::MessageRole::Assistant,
+            "earlier answer",
+            None,
+            crate::db::MessageMeta::default(),
+        )
+        .await
+        .expect("seed assistant row");
+        let req = ChatRequest {
+            session_id: "session".to_string(),
+            content: "next".to_string(),
+            attachments: Vec::new(),
+            hidden_context_xml: None,
+            delivery_mode: crate::session::PendingUserMessageMode::default(),
+            pending_entry_id: None,
+        };
+        let ctx = resolve_session_context(&state, &req, fence, false, true, None)
+            .await
+            .expect("context resolves");
+        let config = state.config_snapshot();
+        let mut agent = build_session_agent(&state, &config, &ctx, fence, 0)
+            .await
+            .expect("agent builds");
+        let checkpoint = agent.export_checkpoint().await.expect("checkpoint");
+        let entries = db
+            .transcript_entries_after("session", -1)
+            .await
+            .expect("transcript");
+        assert_eq!(
+            entries.len(),
+            checkpoint.context.items().len(),
+            "every agent-committed item is a transcript entry"
+        );
+        for (entry, item) in entries.iter().zip(checkpoint.context.items()) {
+            assert_eq!(
+                entry.seq,
+                i64::try_from(item.seq()).expect("seq"),
+                "transcript seqs are aither's own seqs"
+            );
+        }
     }
 }

@@ -829,4 +829,58 @@ mod tests {
         assert_eq!(decoded, message);
         assert_eq!(decoded.attachments().len(), 1);
     }
+
+    #[tokio::test]
+    async fn an_old_layout_snapshot_migrates_keeping_its_checkpoint() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db_path = dir.path().join("history.db");
+        let url = format!("sqlite://{}?mode=rwc", db_path.display());
+        let raw = SkyDb::connect_sqlite(&url).await.expect("raw db");
+        raw.query(
+            "CREATE TABLE session_context_snapshots (session_id TEXT PRIMARY KEY, checkpoint_blob BLOB NOT NULL, last_message_db_id INTEGER, updated_at TEXT NOT NULL, format_version INTEGER NOT NULL)",
+        )
+        .execute()
+        .await
+        .expect("old-layout table");
+        let mut context = aither_agent::Context::default();
+        context.push(aither_core::llm::Message::user("question"));
+        context.push(aither_core::llm::Message::assistant("the answer"));
+        let mut checkpoint = representative_checkpoint();
+        checkpoint.context = context.checkpoint();
+        let blob = rmp_serde::to_vec_named(&checkpoint).expect("blob");
+        raw.query(
+            "INSERT INTO session_context_snapshots (session_id, checkpoint_blob, last_message_db_id, updated_at, format_version) VALUES (?, ?, 42, ?, ?)",
+        )
+        .bind("session-old")
+        .bind(blob)
+        .bind(jiff::Timestamp::now().to_string())
+        .bind(CONTEXT_SNAPSHOT_FORMAT)
+        .execute()
+        .await
+        .expect("old row");
+        drop(raw);
+
+        let db = ChatDb::open(&db_path).await.expect("db opens");
+        let stored = db
+            .get_session_context_snapshot("session-old")
+            .await
+            .expect("get")
+            .expect("the migration keeps the checkpoint");
+        let items = stored.checkpoint.context.items();
+        assert_eq!(items.len(), 2, "the checkpoint survives the migration");
+        assert_eq!(
+            stored.applied_seq,
+            i64::try_from(items.last().expect("items").seq()).expect("seq"),
+            "applied_seq is the checkpoint's own last seq"
+        );
+        let entries = db
+            .transcript_entries_after("session-old", -1)
+            .await
+            .expect("transcript");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            decode(&entries[1]),
+            aither_core::llm::Message::assistant("the answer")
+        );
+    }
 }

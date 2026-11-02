@@ -509,6 +509,13 @@ pub(super) struct SqliteTableInfoRow {
     pub(super) name: String,
 }
 
+/// Row shape for the snapshot-layout backfill: session + its checkpoint blob.
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
+pub(super) struct SnapshotMigrationRow {
+    pub(super) session_id: String,
+    pub(super) checkpoint_blob: Vec<u8>,
+}
+
 #[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
 pub(super) struct I32ValueRow {
     pub(super) value: i32,
