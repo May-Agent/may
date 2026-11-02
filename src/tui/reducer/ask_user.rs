@@ -64,6 +64,27 @@ pub fn handle_ask_user_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
     }
 }
 
+/// Apply `code` to the launch gate's repo-trust sheet: the same option
+/// list as an answer modal, but the answer goes to the client, which
+/// persists the level — `None` means bind nothing this launch.
+pub fn handle_repo_trust_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
+    let AppMode::RepoTrust(state) = &mut app.mode else {
+        return None;
+    };
+    match handle_key(&mut state.ask, code) {
+        AskUserKey::Stay => None,
+        AskUserKey::Close => {
+            app.mode = AppMode::Chat;
+            Some(SendAction::RespondRepoTrust { level: None })
+        }
+        AskUserKey::Submit(answers) => {
+            app.mode = AppMode::Chat;
+            let level = answers.first().and_then(crate::trust::level_for_answer);
+            Some(SendAction::RespondRepoTrust { level })
+        }
+    }
+}
+
 /// Apply `code` to the answer modal `state`.
 pub fn handle_key(state: &mut AskUserState, code: KeyCode) -> AskUserKey {
     if let Some(qs) = state.current_state_mut()

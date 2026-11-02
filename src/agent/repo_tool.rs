@@ -88,7 +88,7 @@ impl Tool for RepoTool {
                     || {
                         trust::trust_for(&self.context.workspace_config, &key, &worktree)
                             .map_or_else(
-                                || "trust undecided — answer the repo-trust question".to_string(),
+                                || "trust undecided — the launch gate asks on startup; `repo trust set` decides it here".to_string(),
                                 |level| format!("trust: {}", level.as_str()),
                             )
                     },
@@ -157,7 +157,7 @@ impl Tool for SubagentRepoTool {
                     Err(e) => return Ok(ToolResult::text(e)),
                 };
                 trust::trust_for(&self.context.workspace_config, &key, &worktree).map_or_else(
-                    || "trust undecided — answer the repo-trust question".to_string(),
+                    || "trust undecided — the launch gate asks on startup".to_string(),
                     |level| format!("trust: {}", level.as_str()),
                 )
             }
