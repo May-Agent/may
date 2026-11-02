@@ -5,7 +5,7 @@
 //! and the request log record it.
 
 use std::collections::HashSet;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use skyzen::middleware::{Middleware, Next};
 use skyzen::{Error, Request, Response, StatusCode};
@@ -13,7 +13,9 @@ use skyzen::{Error, Request, Response, StatusCode};
 /// Who a remote request belongs to and which proof brought it in.
 #[derive(Debug, Clone)]
 pub struct Identity {
+    /// The login the source proved, as it appears in logs and audit trails.
     pub login: String,
+    /// Which identity proof accepted the request.
     pub source: IdentitySourceKind,
 }
 
@@ -44,6 +46,7 @@ pub struct RequireIdentity {
 }
 
 impl RequireIdentity {
+    /// Sources tried in order for each request; an empty list accepts nobody.
     pub fn new(sources: Vec<Box<dyn IdentitySource>>) -> Self {
         Self { sources }
     }
@@ -80,22 +83,20 @@ impl Middleware for RequireIdentity {
 /// actor can refresh it when settings change or the node owner resolves.
 #[derive(Clone)]
 pub struct TailscaleServeIdentitySource {
-    allowed: Arc<RwLock<HashSet<String>>>,
+    /// Swapped whole when the remote-access actor refreshes the allow-list.
+    allowed: Arc<arc_swap::ArcSwap<HashSet<String>>>,
 }
 
 impl TailscaleServeIdentitySource {
     pub fn new(allowed: HashSet<String>) -> Self {
         Self {
-            allowed: Arc::new(RwLock::new(allowed)),
+            allowed: Arc::new(arc_swap::ArcSwap::from_pointee(allowed)),
         }
     }
 
     /// Replace the accepted logins (a changed allow-list or a resolved owner).
     pub fn set_allowed(&self, allowed: HashSet<String>) {
-        *self
-            .allowed
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = allowed;
+        self.allowed.store(Arc::new(allowed));
     }
 }
 
@@ -113,8 +114,7 @@ impl IdentitySource for TailscaleServeIdentitySource {
             .ok()?
             .to_string();
         self.allowed
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .load()
             .contains(login.as_str())
             .then_some(Identity {
                 login,

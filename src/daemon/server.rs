@@ -86,8 +86,11 @@ pub struct StartedDaemon {
     /// for the loopback listener.
     pub(crate) router: Router,
     /// The same routes behind the identity layer, for the remote listener
-    /// and non-loopback `[daemon] listen` addresses.
+    /// `tailscale serve` targets.
     pub(crate) remote_router: Router,
+    /// The same routes behind an identity layer with no trusted source yet,
+    /// for direct non-loopback `[daemon] listen` binds: every request is 401.
+    pub(crate) direct_router: Router,
 }
 
 /// Builds the server state, starts its background work (scheduler, title
@@ -296,15 +299,23 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
     let scheduler = crate::scheduler::TaskScheduler::new(task_runtime);
     let _scheduler = scheduler.spawn();
     super::artifacts::spawn_artifact_watcher(&state);
-    let remote_auth = super::auth::RequireIdentity::new(vec![Box::new(
-        state.remote_access_manager.tailscale_identity(),
-    )]);
-    let remote_router = build_router(state.clone(), mode, Some(remote_auth));
+    // The tailscale-serve listener trusts Serve's identity header; a direct
+    // non-loopback bind trusts nothing yet — every request there is a 401
+    // until passkey and tailnet WhoIs register sources for it.
+    let remote_router = build_router(
+        state.clone(),
+        mode,
+        Some(vec![Box::new(
+            state.remote_access_manager.tailscale_identity(),
+        )]),
+    );
+    let direct_router = build_router(state.clone(), mode, Some(Vec::new()));
     let router = build_router(state.clone(), mode, None);
     Ok(StartedDaemon {
         state,
         router,
         remote_router,
+        direct_router,
     })
 }
 
@@ -549,7 +560,7 @@ fn artifact_page_routes() -> Route {
 pub(super) fn build_router(
     state: Arc<DaemonState>,
     mode: DaemonMode,
-    auth: Option<super::auth::RequireIdentity>,
+    auth: Option<Vec<Box<dyn super::auth::IdentitySource>>>,
 ) -> Router {
     let api = "/api".route(api_routes());
     let tunnel = tunnel_routes();
@@ -561,8 +572,8 @@ pub(super) fn build_router(
     match mode {
         DaemonMode::Rest => {
             let mut routes = Route::new((api, tunnel, artifact_pages));
-            if let Some(auth) = auth {
-                routes = routes.middleware(auth);
+            if let Some(sources) = auth {
+                routes = routes.middleware(super::auth::RequireIdentity::new(sources));
             }
             routes.middleware(State(state)).build().layer(fallback)
         }
@@ -575,8 +586,8 @@ pub(super) fn build_router(
                     artifact_pages,
                     EmbeddedStaticDir::new("/", &WEB_UI_DIST).spa(),
                 ));
-                if let Some(auth) = auth {
-                    routes = routes.middleware(auth);
+                if let Some(sources) = auth {
+                    routes = routes.middleware(super::auth::RequireIdentity::new(sources));
                 }
                 routes.middleware(State(state)).build().layer(fallback)
             }
