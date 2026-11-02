@@ -1781,6 +1781,23 @@ impl App {
         self.status = Some(StatusNotice::transient(text, STATUS_NOTICE_TTL));
     }
 
+    /// Show a status notice that stays until [`Self::clear_persistent_status`]
+    /// or another status replaces it — for live state like a quota-reset wait.
+    pub fn set_persistent_status(&mut self, text: impl Into<String>) {
+        self.status = Some(StatusNotice::persistent(text));
+    }
+
+    /// Drop a persistent notice; transient notices are untouched.
+    pub fn clear_persistent_status(&mut self) {
+        if self
+            .status
+            .as_ref()
+            .is_some_and(StatusNotice::is_persistent)
+        {
+            self.status = None;
+        }
+    }
+
     /// Whether an agent run is still in flight for the current session —
     /// a turn this client follows or one the daemon reports.
     #[must_use]

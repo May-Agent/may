@@ -65,6 +65,8 @@ pub mod pr;
 pub mod profile;
 /// `@`-mention extraction and prompt text building.
 pub mod prompt_mentions;
+
+mod quota;
 /// Per-session repository clones inside the session sandbox.
 pub mod repo_clone;
 /// repo-search daemon: code, session and issue search.
