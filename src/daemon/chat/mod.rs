@@ -1336,7 +1336,8 @@ fn run_agent_loop<'a>(
             .messages()
             .iter()
             .filter_map(|message| message.id)
-            .max();
+            .max()
+            .unwrap_or(0);
         // Set once a retry follows tool activity: later attempts continue
         // the committed transcript with `resume` instead of resubmitting
         // the prompt.
@@ -1384,7 +1385,7 @@ fn run_agent_loop<'a>(
                     turn_boundary: if continue_from_transcript {
                         None
                     } else {
-                        turn_boundary
+                        Some(turn_boundary)
                     },
                 },
                 kind,
@@ -1940,6 +1941,10 @@ fn run_agent_loop<'a>(
                         // prompt would replay them. Commit the partial turn,
                         // then the next provider continues the transcript
                         // with `resume` instead.
+                        persist_stopped_terminal_calls(
+                            &mut terminal_snapshot,
+                            &mut turn_persister,
+                        )?;
                         if !segment_text.trim().is_empty() {
                             turn_persister.push_assistant(
                                 segment_text.clone(),
@@ -3418,6 +3423,11 @@ mod tests {
     use aither_core::llm::Message as LlmMessage;
     use skyzen::{HttpError, StatusCode};
     use std::collections::HashMap;
+    use std::future::Future;
+
+    use super::{ApiErrorCode, ChatRequest, DaemonState, TurnKind, run_agent_loop};
+    use crate::config::MayConfig;
+    use aither_core::llm::ToolResult;
 
     use super::{ResumeRequestKind, ResumeResolution};
 
@@ -3808,6 +3818,387 @@ mod tests {
             super::check_tasks_update(&paths, &mut last_hash)
                 .await
                 .is_none()
+        );
+    }
+
+    /// Records nothing and never disconnects.
+    struct TestSink;
+
+    impl super::ChatSink for TestSink {
+        fn on_start(&mut self, _s: &str, _a: &str) -> impl Future<Output = bool> + Send {
+            std::future::ready(true)
+        }
+        fn on_text(&mut self, _c: &str) -> impl Future<Output = bool> + Send {
+            std::future::ready(true)
+        }
+        fn on_reasoning(&mut self, _c: &str) -> impl Future<Output = bool> + Send {
+            std::future::ready(true)
+        }
+        fn on_tool_delta(
+            &mut self,
+            _i: &str,
+            _n: &str,
+            _f: &str,
+            _s: crate::daemon::tool_summary::ToolSummary,
+        ) -> impl Future<Output = bool> + Send {
+            std::future::ready(true)
+        }
+        fn on_tool_start(
+            &mut self,
+            _i: &str,
+            _n: &str,
+            _a: &str,
+            _s: crate::daemon::tool_summary::ToolSummary,
+        ) -> impl Future<Output = bool> + Send {
+            std::future::ready(true)
+        }
+        fn on_tool_end(
+            &mut self,
+            _i: &str,
+            _n: &str,
+            _a: Option<&str>,
+            _r: &ToolResult,
+            _s: crate::daemon::tool_summary::ToolSummary,
+        ) -> impl Future<Output = bool> + Send {
+            std::future::ready(true)
+        }
+        fn on_todo_update(
+            &mut self,
+            _c: &crate::todo_parser::TodoChecklist,
+        ) -> impl Future<Output = bool> + Send {
+            std::future::ready(true)
+        }
+        fn on_speed(&mut self, _t: f64) -> impl Future<Output = bool> + Send {
+            std::future::ready(true)
+        }
+        fn on_error(
+            &mut self,
+            _c: ApiErrorCode,
+            _m: &str,
+            _r: bool,
+        ) -> impl Future<Output = bool> + Send {
+            std::future::ready(true)
+        }
+    }
+
+    /// A scripted OpenAI-compatible stub: answers every request with the
+    /// queued responses and records the request bodies it receives.
+    struct StubProvider {
+        url: String,
+        bodies: async_channel::Receiver<String>,
+    }
+
+    fn sse_chunk(chunk: &str) -> String {
+        format!("data: {chunk}\n\n")
+    }
+
+    fn sse_text(text: &str) -> String {
+        let chunk = serde_json::json!({
+            "choices": [{"index": 0, "delta": {"content": text}}]
+        });
+        let done = serde_json::json!({
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+        });
+        format!(
+            "{}{}{}",
+            sse_chunk(&chunk.to_string()),
+            sse_chunk(&done.to_string()),
+            sse_chunk("[DONE]")
+        )
+    }
+
+    fn sse_tool_call(id: &str, name: &str, arguments: &str) -> String {
+        let chunk = serde_json::json!({
+            "choices": [{"index": 0, "delta": {"tool_calls": [{
+                "index": 0, "id": id, "type": "function",
+                "function": {"name": name, "arguments": arguments}
+            }]}}]
+        });
+        let done = serde_json::json!({
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]
+        });
+        format!(
+            "{}{}{}",
+            sse_chunk(&chunk.to_string()),
+            sse_chunk(&done.to_string()),
+            sse_chunk("[DONE]")
+        )
+    }
+
+    /// Spawns the stub; `responses` are consumed per /chat/completions POST,
+    /// the last one repeating. Request bodies arrive on `bodies`.
+    async fn stub_provider(responses: Vec<String>) -> StubProvider {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub");
+        let addr = listener.local_addr().expect("stub addr");
+        let (body_tx, bodies) = async_channel::unbounded::<String>();
+        let responses = std::sync::Arc::new(std::sync::Mutex::new(responses));
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let body_tx = body_tx.clone();
+                let responses = responses.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 8192];
+                    // Read until the headers are complete, then until the
+                    // body is complete (Content-Length or chunked).
+                    let body = loop {
+                        let n = socket.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            break Vec::new();
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        let Some(head_end) =
+                            buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
+                        else {
+                            continue;
+                        };
+                        let headers = String::from_utf8_lossy(&buf[..head_end]);
+                        if headers.starts_with("GET /v1/models") {
+                            let _ = socket
+                                .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                                .await;
+                            return;
+                        }
+                        if headers.contains("transfer-encoding: chunked") {
+                            // Complete once the terminal 0-length chunk is in.
+                            if buf[head_end..].windows(5).any(|w| w == b"0\r\n\r\n") {
+                                let raw = &buf[head_end..];
+                                let mut body = Vec::new();
+                                let mut rest = raw;
+                                while let Some(size_end) =
+                                    rest.windows(2).position(|w| w == b"\r\n")
+                                {
+                                    let size = usize::from_str_radix(
+                                        std::str::from_utf8(&rest[..size_end])
+                                            .unwrap_or("0")
+                                            .trim(),
+                                        16,
+                                    )
+                                    .unwrap_or(0);
+                                    if size == 0 {
+                                        break;
+                                    }
+                                    let start = size_end + 2;
+                                    body.extend_from_slice(&rest[start..start + size]);
+                                    rest = &rest[start + size + 2..];
+                                }
+                                break body;
+                            }
+                            continue;
+                        }
+                        let length = headers
+                            .split("\r\n")
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .and_then(|v| v.parse::<usize>().ok())
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= head_end + length {
+                            break buf[head_end..head_end + length].to_vec();
+                        }
+                    };
+                    if !body.is_empty() {
+                        let _ = body_tx.try_send(String::from_utf8_lossy(&body).to_string());
+                    }
+                    let response = {
+                        let mut queued = responses.lock().expect("stub queue");
+                        if queued.len() > 1 {
+                            queued.remove(0)
+                        } else {
+                            queued[0].clone()
+                        }
+                    };
+                    let (status, body_out) = match response.as_str() {
+                        "500" => ("HTTP/1.1 500 Internal Server Error", String::new()),
+                        body => ("HTTP/1.1 200 OK", body.to_string()),
+                    };
+                    let wire = format!(
+                        "{status}\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{body_out}",
+                        body_out.len()
+                    );
+                    let _ = socket.write_all(wire.as_bytes()).await;
+                });
+            }
+        });
+        StubProvider {
+            url: format!("http://{addr}/v1"),
+            bodies,
+        }
+    }
+
+    /// A daemon state whose session model fails over from `first` to
+    /// `second`, both scripted `custom` providers.
+    async fn failover_state(
+        may_dir: &std::path::Path,
+        cwd: &std::path::Path,
+        first: &StubProvider,
+        second: &StubProvider,
+    ) -> std::sync::Arc<DaemonState> {
+        use crate::config::{ProviderInstance, ProviderType};
+        let mut config = MayConfig::default();
+        for (id, stub) in [("a", first), ("b", second)] {
+            let mut instance = ProviderInstance::new(ProviderType::Custom);
+            instance.api_key = Some("test-key".to_string());
+            instance.base_url = Some(stub.url.clone());
+            config.provider.insert(id.to_string(), instance);
+        }
+        let state = std::sync::Arc::new(
+            DaemonState::for_test(may_dir, cwd, config)
+                .await
+                .expect("test daemon state"),
+        );
+        state
+            .db()
+            .create_session("session", Some("test"), Some("a::gpt-4o"))
+            .await
+            .expect("session");
+        state
+    }
+
+    /// A first attempt whose provider fails retryably retries on the next
+    /// provider with the same context: the user message reaches it exactly
+    /// once and history holds it once.
+    #[tokio::test]
+    async fn a_failed_first_attempt_retries_without_repeating_the_user_message() {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let provider_a = stub_provider(vec!["500".to_string()]).await;
+        let provider_b = stub_provider(vec![sse_text("done")]).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let state = failover_state(may_dir.path(), cwd.path(), &provider_a, &provider_b).await;
+
+        let req = ChatRequest {
+            session_id: "session".to_string(),
+            content: "hello".to_string(),
+            attachments: Vec::new(),
+            hidden_context_xml: None,
+            delivery_mode: crate::session::PendingUserMessageMode::default(),
+        };
+        let guard = state
+            .runtime_service
+            .runs()
+            .acquire("session")
+            .await
+            .expect("acquire run");
+        let mut sink = TestSink;
+        let result = run_agent_loop(
+            &state,
+            &req,
+            &mut sink,
+            &guard,
+            true,
+            true,
+            &TurnKind::Prompt,
+        )
+        .await;
+        assert!(result.is_ok(), "the retry must succeed: {result:?}");
+
+        let body =
+            tokio::time::timeout(std::time::Duration::from_secs(5), provider_b.bodies.recv())
+                .await
+                .expect("provider B answered a request")
+                .expect("request body");
+        let messages: Vec<serde_json::Value> = serde_json::from_str::<serde_json::Value>(&body)
+            .expect("request json")["messages"]
+            .as_array()
+            .expect("messages array")
+            .clone();
+        let user_messages = messages
+            .iter()
+            .filter(|message| {
+                message["role"] == "user" && message["content"].to_string().contains("hello")
+            })
+            .count();
+        assert_eq!(user_messages, 1, "the user message reaches B exactly once");
+
+        let history = crate::session::load_history_from_db(&state.db(), "session")
+            .await
+            .expect("history");
+        let stored = history
+            .messages()
+            .iter()
+            .filter(|m| matches!(m.role, super::MessageRole::User) && m.content == "hello")
+            .count();
+        assert_eq!(stored, 1, "history holds the user message once");
+    }
+
+    /// A retryable failure after a tool executed never reruns it: the turn
+    /// continues on the next provider from the committed transcript.
+    #[tokio::test]
+    async fn a_failure_after_a_tool_call_continues_without_replaying_it() {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let cwd = tempfile::tempdir().expect("cwd");
+        // Session-scoped `files/` is the writable side of the workspace.
+        let session_files = may_dir.path().join("sessions/session/files");
+        let marker = session_files.join("count");
+        let command = format!(
+            "mkdir -p {} && echo x >> {}",
+            session_files.display(),
+            marker.display()
+        );
+        let arguments = serde_json::json!({
+            "script": command,
+            "description": "writes a marker line",
+            "timeout": 10
+        })
+        .to_string();
+        let provider_a = stub_provider(vec![
+            sse_tool_call("call_1", "terminal", &arguments),
+            "500".to_string(),
+        ])
+        .await;
+        let provider_b = stub_provider(vec![sse_text("done")]).await;
+        let state = failover_state(may_dir.path(), cwd.path(), &provider_a, &provider_b).await;
+
+        let req = ChatRequest {
+            session_id: "session".to_string(),
+            content: "run it".to_string(),
+            attachments: Vec::new(),
+            hidden_context_xml: None,
+            delivery_mode: crate::session::PendingUserMessageMode::default(),
+        };
+        let guard = state
+            .runtime_service
+            .runs()
+            .acquire("session")
+            .await
+            .expect("acquire run");
+        let mut sink = TestSink;
+        let result = run_agent_loop(
+            &state,
+            &req,
+            &mut sink,
+            &guard,
+            true,
+            true,
+            &TurnKind::Prompt,
+        )
+        .await;
+        assert!(
+            result.is_ok(),
+            "the resume must finish the turn: {result:?}"
+        );
+
+        let runs = std::fs::read_to_string(&marker)
+            .expect("the tool wrote a marker")
+            .lines()
+            .count();
+        assert_eq!(runs, 1, "the tool executed exactly once");
+
+        let history = crate::session::load_history_from_db(&state.db(), "session")
+            .await
+            .expect("history");
+        assert!(
+            history
+                .messages()
+                .iter()
+                .any(|m| matches!(m.role, super::MessageRole::Tool)),
+            "the partial turn was persisted"
         );
     }
 }
