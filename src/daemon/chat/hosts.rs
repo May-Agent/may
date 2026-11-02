@@ -145,6 +145,7 @@ async fn idle_agent(state: &Arc<DaemonState>, session_id: &str) -> SkyResult<Arc
         attachments: Vec::new(),
         hidden_context_xml: None,
         delivery_mode: crate::session::PendingUserMessageMode::default(),
+        pending_entry_id: None,
     };
     let prepared = super::prepare_agent_for_request(
         state,
