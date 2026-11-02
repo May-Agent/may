@@ -214,7 +214,7 @@ pub(super) fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
 
     // Background sections, bounded so tasks always get room too.
     let mut background: Vec<Line<'static>> = Vec::new();
-    if !app.file_status.is_empty() {
+    if app.sidebar_file_changes && !app.file_status.is_empty() {
         let total: usize = app.file_status.iter().map(|d| d.changes.len()).sum();
         background.push(Line::from(""));
         background.push(heading(format!("Changes ({total})")));
@@ -338,26 +338,32 @@ pub(super) fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
             let (rows, open) = task_rows(tree, width);
             first_open = open.map(|row| row + 1);
             tasks.extend(rows);
-            if !app.sidebar.issues.is_empty() {
-                tasks.push(Line::from(""));
-                tasks.push(heading("Issues".to_string()));
-                tasks.extend(
-                    app.sidebar
-                        .issues
-                        .iter()
-                        .map(|issue| issue_row(issue, width)),
-                );
-            }
         }
         _ => {
             tasks.push(heading("Tasks".to_string()));
             tasks.push(dim("No tasks yet".to_string()));
         }
     }
-    if !app.sidebar.prs.is_empty() {
+    if !app.sidebar.issues.is_empty() {
+        tasks.push(Line::from(""));
+        tasks.push(heading("Issues".to_string()));
+        tasks.extend(
+            app.sidebar
+                .issues
+                .iter()
+                .map(|issue| issue_row(issue, width)),
+        );
+    }
+    let open_prs: Vec<_> = app
+        .sidebar
+        .prs
+        .iter()
+        .filter(|pr| pr.state == "open")
+        .collect();
+    if !open_prs.is_empty() {
         tasks.push(Line::from(""));
         tasks.push(heading("Pull requests".to_string()));
-        for pr in &app.sidebar.prs {
+        for pr in open_prs {
             tasks.push(dim(format!("  #{} {} — {}", pr.number, pr.title, pr.state)));
         }
     }
