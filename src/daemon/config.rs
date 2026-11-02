@@ -200,12 +200,14 @@ fn provider_map_from_ui(
         .iter()
         .map(|p| {
             let mut instance = ProviderInstance::new(p.provider_type);
-            instance.api_key = match p.api_key.clone().filter(|v| !v.trim().is_empty()) {
-                Some(new_key) => Some(new_key),
-                None if p.has_api_key => stored
+            instance.api_key = match &p.api_key {
+                Some(crate::daemon::types::SecretUpdate::Replace(new_key)) => {
+                    (!new_key.trim().is_empty()).then(|| new_key.clone())
+                }
+                Some(crate::daemon::types::SecretUpdate::Remove) => None,
+                None | Some(crate::daemon::types::SecretUpdate::Keep) => stored
                     .get(&p.id)
                     .and_then(|instance| instance.api_key.clone()),
-                None => None,
             };
             instance.base_url = p.base_url.clone().filter(|v| !v.trim().is_empty());
             instance.display_name = p.display_name.clone().filter(|v| !v.trim().is_empty());
