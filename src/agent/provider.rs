@@ -227,14 +227,38 @@ where
     }
 }
 
+/// Provider candidates for `selector` in failover order: the provider the
+/// selector names first, then every configured generic proxy able to serve
+/// the model, ordered by provider id for a stable retry sequence.
+fn provider_candidates(
+    config: &MayConfig,
+    selector: &ModelSelector,
+) -> Vec<(String, ProviderInstance)> {
+    let mut candidates: Vec<(String, ProviderInstance)> = resolve_model_selector(config, selector)
+        .map(|instance| (selector.provider_id().to_string(), instance))
+        .into_iter()
+        .collect();
+    let mut proxies = config
+        .provider
+        .iter()
+        .filter(|(id, instance)| {
+            id.as_str() != selector.provider_id()
+                && instance.is_valid(id)
+                && instance.is_generic_model_proxy(id)
+                && instance.can_serve_model(id, selector.model_id())
+        })
+        .map(|(id, instance)| (id.clone(), instance.clone()))
+        .collect::<Vec<_>>();
+    proxies.sort_by(|left, right| left.0.cmp(&right.0));
+    candidates.extend(proxies);
+    candidates
+}
+
 /// Number of runnable provider candidates for `selector`.
 #[must_use]
 pub fn provider_candidate_count(config: &MayConfig, selector: &str) -> usize {
-    usize::from(
-        parse_model_selector(selector)
-            .and_then(|selector| resolve_model_selector(config, &selector))
-            .is_ok(),
-    )
+    parse_model_selector(selector)
+        .map_or(0, |selector| provider_candidates(config, &selector).len())
 }
 
 /// The concrete runtime produced by [`resolve_provider_runtime`].
@@ -256,15 +280,22 @@ pub struct ResolvedProviderRuntime {
 pub async fn resolve_provider_runtime(
     may_config: &MayConfig,
     selector: &ModelSelector,
-    _provider_attempt: usize,
+    provider_attempt: usize,
 ) -> Result<ResolvedProviderRuntime, MayAgentError> {
-    let provider_instance = resolve_model_selector(may_config, selector)?;
-    let provider_id = selector.provider_id().to_string();
+    let candidates = provider_candidates(may_config, selector);
+    let Some((provider_id, provider_instance)) = candidates.get(provider_attempt) else {
+        return Err(MayAgentError::MissingApiKey(err_no_provider(
+            selector.model_id(),
+        )));
+    };
     let llm =
-        build_cloud_provider_from_instance(&provider_id, &provider_instance, selector.model_id())
+        build_cloud_provider_from_instance(provider_id, provider_instance, selector.model_id())
             .await?;
 
-    Ok(ResolvedProviderRuntime { provider_id, llm })
+    Ok(ResolvedProviderRuntime {
+        provider_id: provider_id.clone(),
+        llm,
+    })
 }
 
 /// Tier-resolved models for the `ask` terminal command, each carrying the

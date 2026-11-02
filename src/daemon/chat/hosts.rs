@@ -152,7 +152,11 @@ async fn idle_agent(state: &Arc<DaemonState>, session_id: &str) -> SkyResult<Arc
         guard.fence(),
         false,
         true,
-        0,
+        // No turn is resubmitting a prompt here: replay the full history.
+        super::TurnAttempt {
+            provider_attempt: 0,
+            turn_boundary: None,
+        },
         &super::TurnKind::Prompt,
     )
     .await
