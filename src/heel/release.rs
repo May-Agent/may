@@ -66,8 +66,6 @@ pub enum ManagedHeelError {
         os: &'static str,
         arch: &'static str,
     },
-    #[error("unsupported heel linux target architecture: {arch}")]
-    UnsupportedLinuxArch { arch: &'static str },
     #[error("failed to create managed heel directory {path:?}")]
     CreateDir {
         path: PathBuf,
@@ -142,7 +140,7 @@ struct ManagedHeelState {
 const CHECK_INTERVAL: jiff::SignedDuration = jiff::SignedDuration::from_hours(24);
 
 /// Maps an OS/arch pair onto the managed heel release asset published for it.
-fn host_heel_asset(
+pub fn host_heel_asset(
     os: &'static str,
     arch: &'static str,
 ) -> Result<ManagedHeelAsset, ManagedHeelError> {
@@ -177,20 +175,6 @@ fn host_heel_asset(
 
 pub fn current_host_heel_asset() -> Result<ManagedHeelAsset, ManagedHeelError> {
     host_heel_asset(std::env::consts::OS, std::env::consts::ARCH)
-}
-
-pub fn linux_heel_asset_for_current_arch() -> Result<ManagedHeelAsset, ManagedHeelError> {
-    match std::env::consts::ARCH {
-        "x86_64" => Ok(ManagedHeelAsset {
-            release_asset_name: "heel-x86_64-unknown-linux-gnu",
-            local_binary_name: HEEL_BINARY_FILE,
-        }),
-        "aarch64" => Ok(ManagedHeelAsset {
-            release_asset_name: "heel-aarch64-unknown-linux-gnu",
-            local_binary_name: HEEL_BINARY_FILE,
-        }),
-        arch => Err(ManagedHeelError::UnsupportedLinuxArch { arch }),
-    }
 }
 
 pub async fn ensure_managed_heel_binary(
@@ -653,7 +637,7 @@ mod tests {
 
     #[test]
     fn current_arch_maps_to_linux_release_asset_name() {
-        let asset = linux_heel_asset_for_current_arch().expect("supported test arch");
+        let asset = host_heel_asset("linux", std::env::consts::ARCH).expect("supported test arch");
         assert!(asset.release_asset_name().starts_with("heel-"));
         assert!(asset.release_asset_name().ends_with("-unknown-linux-gnu"));
         assert_eq!(asset.local_binary_name(), HEEL_BINARY_FILE);

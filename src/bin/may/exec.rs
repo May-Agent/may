@@ -130,7 +130,6 @@ pub async fn run_exec(args: ExecArgs) -> Result<i32, ExecError> {
         &context.may_dir,
         &context.sandbox_dir,
         &context.session_id,
-        &tool_distribution,
     )
     .await
     .map_err(ExecError::ResolveEnvironment)?;

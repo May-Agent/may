@@ -4,10 +4,11 @@
 //! heel sandbox.
 
 pub mod browser;
-pub mod heel;
 pub mod image;
+pub mod image_ref;
 pub mod lifecycle;
 pub mod profile;
+pub mod stage;
 
 use std::path::{Path, PathBuf};
 
@@ -36,9 +37,9 @@ pub enum ContainerError {
     /// Container not found.
     #[error("Container not found: {0}")]
     NotFound(String),
-    /// Image build failed.
-    #[error("Image build failed: {0}")]
-    ImageBuildFailed(String),
+    /// Image pull failed.
+    #[error("Image pull failed: {0}")]
+    ImagePullFailed(String),
     /// Container runtime bootstrap failed.
     #[error("Container runtime bootstrap failed: {0}")]
     Bootstrap(String),

@@ -7,7 +7,7 @@ import type {
 
 export type HomeEnvironment =
   | { type: 'local' }
-  | { type: 'container'; image?: string | null; container_id?: string | null };
+  | { type: 'container'; container_id?: string | null };
 
 export interface ProfileInfo {
   id: string;

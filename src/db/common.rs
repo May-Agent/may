@@ -12,8 +12,6 @@ use skyzen_services::DbError as SkyDbError;
 use crate::profile::{ContainerMountPreference, ContainerProfilePreferences, ProfilePreferences};
 use crate::session::{ChatMessageStats, SessionPlanState, SessionRuntimeState};
 
-use super::entity::profiles;
-
 /// Error type for database operations.
 #[derive(Debug, thiserror::Error)]
 pub enum ChatDbError {
@@ -68,15 +66,13 @@ pub struct CreateProfileParams<'a> {
     pub name: &'a str,
     /// Environment the profile's agents run in.
     pub environment: ProfileEnvironmentKind,
-    /// Container image reference; only meaningful for `Container` environments.
-    pub container_image: Option<&'a str>,
     /// Optional friendly slug; a default is derived when absent.
     pub slug: Option<&'a str>,
     /// Optional icon identifier for pickers.
     pub icon: Option<&'a str>,
     /// Optional persona text folded into the system prompt.
     pub persona: Option<&'a str>,
-    /// Optional initial preferences (mounts, dockerfile, ..).
+    /// Optional initial preferences (mounts).
     pub preferences: Option<&'a crate::profile::ProfilePreferences>,
     /// Whether the profile may use device location context.
     pub location_aware: bool,
@@ -91,8 +87,6 @@ pub struct UpdateProfileParams<'a> {
     pub icon: Option<Option<&'a str>>,
     /// Environment update.
     pub environment: Option<ProfileEnvironmentKind>,
-    /// Container image update; `Some(None)` clears it.
-    pub container_image: Option<Option<&'a str>>,
     /// Attached container id update; `Some(None)` detaches.
     pub container_id: Option<Option<&'a str>>,
     /// Sort position update.
@@ -842,16 +836,12 @@ pub(super) fn normalize_profile_preferences(
 }
 
 pub(super) fn build_profile_preferences(
-    model: &profiles::Model,
     mounts: Vec<ContainerMountPreference>,
 ) -> Option<ProfilePreferences> {
-    let container = if model.container_dockerfile.is_some() || !mounts.is_empty() {
-        Some(ContainerProfilePreferences {
-            dockerfile: model.container_dockerfile.clone(),
-            mounts,
-        })
-    } else {
+    let container = if mounts.is_empty() {
         None
+    } else {
+        Some(ContainerProfilePreferences { mounts })
     };
     container
         .is_some()

@@ -472,7 +472,6 @@ export const ja: Messages = {
       environment: '環境',
       envLocal: 'ローカル',
       envContainer: 'コンテナ',
-      containerImage: 'コンテナイメージ',
       persona: 'ペルソナ / システムプロンプト拡張',
       locationAware: '位置情報の利用',
       icon: 'アイコン',
@@ -568,7 +567,7 @@ export const ja: Messages = {
     providerUnavailable: 'プロバイダが利用できません',
     modelNotConfigured: 'モデルが設定されていません',
     containerPreparing: 'コンテナ準備中です。しばらくしてからお試しください',
-    containerBuildFailed: 'コンテナのビルドに失敗しました',
+    containerPullFailed: 'コンテナイメージのプルに失敗しました',
     profileInvalid: 'プロファイル設定が無効です',
   },
 };

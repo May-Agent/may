@@ -121,7 +121,6 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
                 crate::container::lifecycle::ContainerManager::new(
                     Arc::new(runtime),
                     may_dir.clone(),
-                    tool_distribution.clone(),
                 ),
             ))
         }

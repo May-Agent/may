@@ -654,7 +654,6 @@ export interface ProfileContainerMount {
 
 export interface ProfilePreferences {
   container?: {
-    dockerfile?: string | null;
     mounts?: ProfileContainerMount[] | null;
   } | null;
 }
@@ -663,7 +662,6 @@ export interface CreateProfileRequest {
   name: string;
   icon?: string | null;
   environment?: ProfileEnvironmentKind;
-  containerImage?: string | null;
   persona?: string | null;
   preferences?: ProfilePreferences | null;
   locationAware?: boolean;
@@ -673,7 +671,6 @@ export interface UpdateProfileRequest {
   name?: string | null;
   icon?: string | null;
   environment?: ProfileEnvironmentKind | null;
-  containerImage?: string | null;
   sortOrder?: number | null;
   persona?: string | null;
   preferences?: ProfilePreferences | null;
