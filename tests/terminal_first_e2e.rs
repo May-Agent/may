@@ -91,8 +91,8 @@ const FINISHING_JOB_SCRIPT: &str = "sleep 2; echo BG-DONE-7731";
 /// A scripted main agent / subagent pair sharing one mock model.
 ///
 /// The main agent runs `setup`, launches `subagent start` with `grant_flags`
-/// in a background job, polls until the launch command finished, then runs
-/// `final_script`. The child runs `child_script` once and ends. A request is
+/// in a background job and ends its turn; the job's completion resumes it as
+/// a reminder, it reads the launch's output, then runs `final_script`. The child runs `child_script` once and ends. A request is
 /// the child's when a user or system message carries [`SUBAGENT_PROBE_MARKER`],
 /// which only the subagent's prompt file does.
 #[derive(Clone)]
@@ -119,9 +119,12 @@ const FORK_ANSWER: &str = "FORK-ANSWER-OK";
 /// launch that never finishes ends the test with a message instead of hanging.
 const SUBAGENT_PROBE_MAX_REQUESTS: usize = 40;
 
-/// Waits at most eight seconds (the foreground wait is ten) for the launch
-/// job to finish, and prints what it wrote.
-const SUBAGENT_POLL_SCRIPT: &str = "i=0; while [ $i -lt 8 ]; do if [ -f sub.done ]; then echo POLL_DONE; cat sub.out; exit 0; fi; sleep 1; i=$((i+1)); done; echo POLL_PENDING";
+/// Prints the launch job's result once its completion resumed the turn —
+/// the job only writes `sub.done`/`sub.out` after it exits.
+const SUBAGENT_READ_SCRIPT: &str = "echo POLL_DONE; cat sub.out";
+
+/// How long a probe may wait for the turn a finished launch job resumes.
+const SUBAGENT_PROBE_DONE_TIMEOUT: Duration = Duration::from_secs(60);
 
 const ASK_USER_SCRIPT: &str =
     "ask_user --question 'Which database?' --option PostgreSQL --option SQLite";
@@ -158,6 +161,7 @@ impl RequestGate {
 struct MockOpenAiServer {
     addr: SocketAddr,
     requests: Arc<tokio::sync::Mutex<Vec<Value>>>,
+    state: Arc<tokio::sync::Mutex<MockScenarioState>>,
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -186,13 +190,14 @@ impl MockOpenAiServer {
         }
         let state = Arc::new(tokio::sync::Mutex::new(MockScenarioState::new(scenario)));
         let requests_for_task = requests.clone();
+        let state_for_task = state.clone();
         let handle = tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     break;
                 };
                 let io = TokioIo::new(stream);
-                let state = state.clone();
+                let state = state_for_task.clone();
                 let requests = requests_for_task.clone();
                 let transcript = transcript.clone();
                 let gate = gate.clone();
@@ -213,6 +218,7 @@ impl MockOpenAiServer {
         Self {
             addr,
             requests,
+            state,
             handle,
         }
     }
@@ -223,6 +229,47 @@ impl MockOpenAiServer {
 
     async fn request_count(&self) -> usize {
         self.requests.lock().await.len()
+    }
+
+    /// Waits until a probe script served its final response — the last steps
+    /// run on the turn the finished launch job resumes, after the turn that
+    /// launched it already ended.
+    async fn wait_probe_done(&self, what: &str) {
+        let done = tokio::time::timeout(SUBAGENT_PROBE_DONE_TIMEOUT, async {
+            loop {
+                if self.state.lock().await.probe_done {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        if done.is_err() {
+            let signatures = self
+                .agent_requests()
+                .await
+                .iter()
+                .enumerate()
+                .map(|(index, request)| {
+                    format!(
+                        "#{index} job_finished={} subagent={} fork={} latest={:?} last_msg={:?}",
+                        launch_job_finished(request),
+                        is_subagent_request(request),
+                        is_fork_request(request),
+                        latest_tool_output(request)
+                            .map(|output| output.chars().take(60).collect::<String>()),
+                        request
+                            .get("messages")
+                            .and_then(Value::as_array)
+                            .and_then(|messages| messages.last())
+                            .map(|message| {
+                                format!("{:.300}", message.get("content").unwrap_or(&Value::Null))
+                            })
+                    )
+                })
+                .collect::<Vec<_>>();
+            panic!("{what} never finished its resumed turn; requests: {signatures:?}");
+        }
     }
 
     /// The agent-turn requests received so far, in arrival order; session
@@ -248,6 +295,9 @@ struct MockScenarioState {
     scenario: MockChatScenario,
     request_index: usize,
     task_id: Option<String>,
+    /// Set once a probe script served its final response, so the test can
+    /// wait for a turn the job's completion resumed on its own.
+    probe_done: bool,
 }
 
 impl MockScenarioState {
@@ -256,6 +306,7 @@ impl MockScenarioState {
             scenario,
             request_index: 0,
             task_id: None,
+            probe_done: false,
         }
     }
 
@@ -560,11 +611,17 @@ impl MockScenarioState {
                     );
                     terminal_call(true, &id, &launch)
                 }
-                Some(output) if output.contains("MAIN_FINAL") => text("probe complete".to_string()),
+                Some(output) if output.contains("MAIN_FINAL") => {
+                    self.probe_done = true;
+                    text("probe complete".to_string())
+                }
                 Some(output) if output.contains("POLL_DONE") => {
                     terminal_call(false, &id, probe.final_script)
                 }
-                Some(_) => terminal_call(false, &id, SUBAGENT_POLL_SCRIPT),
+                _ if launch_job_finished(request) => {
+                    terminal_call(false, &id, SUBAGENT_READ_SCRIPT)
+                }
+                _ => text("the launch is running in the background".to_string()),
             }
         };
         self.request_index += 1;
@@ -611,7 +668,10 @@ impl MockScenarioState {
         } else {
             match latest_tool_output(request) {
                 None => terminal_call(false, &id, FORK_SECRET_SCRIPT),
-                Some(output) if output.contains("MAIN_FINAL") => text("fork probe complete"),
+                Some(output) if output.contains("MAIN_FINAL") => {
+                    self.probe_done = true;
+                    text("fork probe complete")
+                }
                 Some(output) if output.contains("POLL_DONE") => {
                     terminal_call(false, &id, "echo MAIN_FINAL")
                 }
@@ -621,7 +681,10 @@ impl MockScenarioState {
                     );
                     terminal_call(true, &id, &launch)
                 }
-                Some(_) => terminal_call(false, &id, SUBAGENT_POLL_SCRIPT),
+                _ if launch_job_finished(request) => {
+                    terminal_call(false, &id, SUBAGENT_READ_SCRIPT)
+                }
+                _ => text("the launch is running in the background"),
             }
         };
         self.request_index += 1;
@@ -1567,6 +1630,24 @@ where
 }
 
 /// The text of the latest tool message the model was shown.
+/// Whether the launch job announced its completion: the sandbox reports a
+/// finished background task as a reminder in the next request, and the
+/// launch is the only background job this probe starts.
+fn launch_job_finished(request: &Value) -> bool {
+    request
+        .get("messages")
+        .and_then(Value::as_array)
+        .is_some_and(|messages| {
+            messages
+                .iter()
+                .filter_map(|message| message.get("content").and_then(Value::as_str))
+                .any(|content| {
+                    content.contains("Background task")
+                        && (content.contains("finished") || content.contains("failed"))
+                })
+        })
+}
+
 fn latest_tool_output(request: &Value) -> Option<String> {
     let messages = request.get("messages")?.as_array()?;
     messages.iter().rev().find_map(|message| {
@@ -2358,6 +2439,7 @@ async fn run_probe_turn(
         "the probe turn should complete; events: {events:?}; server logs:\n{}",
         server.log.contents().await
     );
+    mock.wait_probe_done("the subagent probe").await;
     let files = ProbeFiles::read(&sandbox_dir);
     server.stop().await;
     environment.release(&harness, &session_id).await;
