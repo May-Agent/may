@@ -1,6 +1,10 @@
+// Callers land in #446 (prompt suggestion) and #447 (/recap).
+#[allow(dead_code)]
+mod aux;
 mod background;
 mod hosts;
 mod hub;
+pub use aux::AuxTasks;
 pub use background::SessionBackgrounds;
 pub use background::spawn_watcher as spawn_background_watcher;
 pub use background::{
