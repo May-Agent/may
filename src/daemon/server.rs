@@ -396,6 +396,7 @@ fn api_routes() -> Route {
                         "/messages".post(send_message),
                         "/bash".post(super::chat::run_bash),
                         "/compact".post(super::chat::compact_session),
+                        "/recap".post(super::chat::recap_session),
                         "/context-report".at(super::chat::context_report),
                         "/usage".at(super::chat::usage_report),
                         "/context-dump".post(super::chat::context_dump),

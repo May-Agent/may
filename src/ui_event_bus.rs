@@ -43,6 +43,8 @@ pub enum UiEventTopic {
     SessionIndex = 1 << 15,
     /// A session's prompt suggestion state changed.
     SessionSuggestion = 1 << 16,
+    /// A session's recap card was generated.
+    SessionRecap = 1 << 17,
 }
 
 impl UiEventTopic {
@@ -71,6 +73,7 @@ impl UiEventTopic {
             Self::SessionArtifacts => "session_artifacts",
             Self::SessionIndex => "session_index",
             Self::SessionSuggestion => "session_suggestion",
+            Self::SessionRecap => "session_recap",
         }
     }
 }
@@ -97,6 +100,7 @@ impl FromStr for UiEventTopic {
             "session_artifacts" => Ok(Self::SessionArtifacts),
             "session_index" => Ok(Self::SessionIndex),
             "session_suggestion" => Ok(Self::SessionSuggestion),
+            "session_recap" => Ok(Self::SessionRecap),
             _ => Err(UnknownUiEventTopic(value.to_string())),
         }
     }
@@ -143,6 +147,8 @@ impl UiEventTopics {
     pub const SESSION_INDEX: Self = Self(UiEventTopic::SessionIndex.bit());
     /// `session_suggestion` topic bit.
     pub const SESSION_SUGGESTION: Self = Self(UiEventTopic::SessionSuggestion.bit());
+    /// `session_recap` topic bit.
+    pub const SESSION_RECAP: Self = Self(UiEventTopic::SessionRecap.bit());
     /// Every topic.
     pub const ALL: Self = Self(
         Self::CONFIG.0
@@ -159,7 +165,8 @@ impl UiEventTopics {
             | Self::SESSION_TURN.0
             | Self::SESSION_BACKGROUND.0
             | Self::SESSION_ARTIFACTS.0
-            | Self::SESSION_INDEX.0,
+            | Self::SESSION_INDEX.0
+            | Self::SESSION_RECAP.0,
     );
 
     /// Whether no topics are set.

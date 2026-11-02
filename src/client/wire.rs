@@ -321,6 +321,26 @@ pub struct SuggestionFrame {
     pub text: Option<String>,
 }
 
+/// One frame of the `session_recap` event kind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecapFrame {
+    /// The aux request that produced the update.
+    #[serde(default)]
+    pub request_id: u64,
+    /// Session the recap belongs to.
+    #[serde(default)]
+    pub session_id: String,
+    /// `ready` with a card, or `error`.
+    pub state: String,
+    /// The catch-up summary when `state` is `ready`.
+    #[serde(default)]
+    pub summary: Option<String>,
+    /// The suggested next step, when the recap named one.
+    #[serde(default)]
+    pub next_action: Option<String>,
+}
+
 /// What a `session_agent` frame reports.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

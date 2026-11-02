@@ -136,6 +136,18 @@ pub enum AppEvent {
         /// The suggested prompt, or `None` to clear it.
         text: Option<String>,
     },
+    /// A `session_recap` frame arrived: `ready` carries the card's
+    /// summary, `error` reports a failed generation.
+    Recap {
+        /// Session the recap belongs to.
+        session_id: String,
+        /// `ready` or `error`.
+        state: String,
+        /// The catch-up summary when `state` is `ready`.
+        summary: Option<String>,
+        /// The suggested next step, when the recap named one.
+        next_action: Option<String>,
+    },
     /// A kill request finished; `true` when the job accepted it.
     JobKilled {
         /// Process ID the kill targeted.
@@ -205,6 +217,7 @@ impl AppEvent {
             Self::TurnStarted { .. } => "turn_started",
             Self::HistoryStale => "history_stale",
             Self::PromptSuggestion { .. } => "prompt_suggestion",
+            Self::Recap { .. } => "recap",
             Self::JobKilled { .. } => "job_killed",
             Self::JobDetailLoaded { .. } => "job_detail_loaded",
             Self::TerminalOutputs(_) => "terminal_outputs",
