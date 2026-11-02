@@ -68,6 +68,7 @@ pub static SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/mcp", "Manage MCP servers"),
     ("/ssh", "Manage preconfigured SSH servers"),
     ("/skill", "Manage installed skills"),
+    ("/permission", "Re-decide the launch directory's access"),
     ("/config", "Open configuration"),
     (
         "/bug",
