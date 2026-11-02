@@ -105,10 +105,16 @@ impl App {
                 } else if let Some(id) = state.provider_ids.get(state.selected).cloned() {
                     // OAuth providers restart their login flow on Enter.
                     if id == "copilot" {
+                        self.auth_return = crate::tui::state::AuthReturn::Config;
                         return Some(SendAction::StartCopilotAuth);
                     }
                     if id == "chatgpt" {
+                        self.auth_return = crate::tui::state::AuthReturn::Config;
                         return Some(SendAction::StartChatgptAuth);
+                    }
+                    if id == "grok" {
+                        self.auth_return = crate::tui::state::AuthReturn::Config;
+                        return Some(SendAction::StartGrokAuth);
                     }
                     // Check if this is a custom provider (has base_url)
                     let instance = self.config.provider.get(&id);
@@ -216,7 +222,14 @@ impl App {
                         // For ChatGPT, start subscription OAuth
                         if *provider_type == ProviderType::Chatgpt {
                             state.edit_mode = ConfigEditMode::None;
+                            self.auth_return = crate::tui::state::AuthReturn::Config;
                             return Some(SendAction::StartChatgptAuth);
+                        }
+                        // For Grok, start subscription OAuth
+                        if *provider_type == ProviderType::Grok {
+                            state.edit_mode = ConfigEditMode::None;
+                            self.auth_return = crate::tui::state::AuthReturn::Config;
+                            return Some(SendAction::StartGrokAuth);
                         }
                         // For Custom provider, need name + base_url + api_key
                         if *provider_type == ProviderType::Custom {

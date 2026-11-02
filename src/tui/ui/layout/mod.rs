@@ -24,8 +24,8 @@ use ratatui::Frame;
 use super::super::app::{App, ImageRegion};
 use super::super::completion::CompletionMode;
 use super::super::state::{
-    AppMode, AskUserState, BtwState, ChatgptAuthStatus, CopilotAuthStatus, JobDetailState,
-    JobDetailTarget, RewindState,
+    AppMode, AskUserState, BtwState, ChatgptAuthStatus, CopilotAuthStatus, GrokAuthStatus,
+    JobDetailState, JobDetailTarget, LOGIN_PROVIDERS, OpenrouterAuthStatus, RewindState,
 };
 use super::chat::{self, InputContext, QueueContext, StatusContext, UnifiedRenderContext};
 
@@ -70,6 +70,18 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         }
         AppMode::ChatgptAuth => {
             render_chatgpt_auth_screen(frame, area, app);
+            return;
+        }
+        AppMode::Login => {
+            render_login_screen(frame, area, app);
+            return;
+        }
+        AppMode::GrokAuth => {
+            render_grok_auth_screen(frame, area, app);
+            return;
+        }
+        AppMode::OpenrouterAuth => {
+            render_openrouter_auth_screen(frame, area, app);
             return;
         }
         _ => {}
@@ -332,7 +344,10 @@ fn sheet_height(app: &App, column: Rect) -> Option<u16> {
         | AppMode::Config
         | AppMode::TierModelPicker
         | AppMode::CopilotAuth
-        | AppMode::ChatgptAuth => return None,
+        | AppMode::ChatgptAuth
+        | AppMode::Login
+        | AppMode::GrokAuth
+        | AppMode::OpenrouterAuth => return None,
     };
     Some(fit_sheet(wanted, cap, full))
 }
@@ -1614,6 +1629,343 @@ fn render_chatgpt_auth_screen(frame: &mut Frame, area: Rect, app: &App) {
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Magenta))
                 .title(" ChatGPT Authentication ")
+                .title_alignment(ratatui::layout::Alignment::Center),
+        )
+        .alignment(ratatui::layout::Alignment::Left);
+
+    frame.render_widget(widget, center_chunks[1]);
+}
+
+/// Render the `/login` provider picker.
+fn render_login_screen(frame: &mut Frame, area: Rect, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(25),
+            Constraint::Min(12),
+            Constraint::Percentage(25),
+        ])
+        .split(area);
+
+    let center_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(15),
+            Constraint::Min(60),
+            Constraint::Percentage(15),
+        ])
+        .split(chunks[1]);
+
+    let mut content = vec![Line::from("")];
+    for (index, provider) in LOGIN_PROVIDERS.iter().enumerate() {
+        let selected = index == app.login_selected;
+        let mut spans = vec![
+            Span::styled(
+                if selected { " › " } else { "   " },
+                Style::default().fg(Color::Cyan),
+            ),
+            Span::styled(
+                provider.name,
+                Style::default().fg(if selected { Color::Cyan } else { Color::White }),
+            ),
+            Span::styled(
+                format!(" — {}", provider.detail),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ];
+        if app.login_signed_in(provider.id) {
+            spans.push(Span::styled(
+                "  signed in",
+                Style::default().fg(Color::Green),
+            ));
+        }
+        content.push(Line::from(spans));
+    }
+    content.push(Line::from(""));
+    content.push(Line::from(""));
+    content.push(Line::from(Span::styled(
+        "[Enter: sign in | Esc: close]",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let widget = Paragraph::new(content)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Magenta))
+                .title(" Sign in to a provider ")
+                .title_alignment(ratatui::layout::Alignment::Center),
+        )
+        .alignment(ratatui::layout::Alignment::Left);
+
+    frame.render_widget(widget, center_chunks[1]);
+}
+
+/// Render xAI Grok OAuth authentication screen.
+fn render_grok_auth_screen(frame: &mut Frame, area: Rect, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(25),
+            Constraint::Min(12),
+            Constraint::Percentage(25),
+        ])
+        .split(area);
+
+    let center_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(15),
+            Constraint::Min(50),
+            Constraint::Percentage(15),
+        ])
+        .split(chunks[1]);
+
+    let content = match &app.grok_auth_status {
+        Some(GrokAuthStatus::RequestingCode) => {
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Requesting authorization code...",
+                    Style::default().fg(Color::Yellow),
+                )),
+                Line::from(""),
+            ]
+        }
+        Some(GrokAuthStatus::WaitingForUser {
+            user_code,
+            verification_uri,
+        }) => {
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "1. Sign in with your xAI account at:",
+                    Style::default().fg(Color::White),
+                )),
+                Line::from(Span::styled(
+                    format!("   {verification_uri}"),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "2. Enter the code:",
+                    Style::default().fg(Color::White),
+                )),
+                Line::from(Span::styled(
+                    format!("   {user_code}"),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Waiting for authorization...",
+                    Style::default().fg(Color::Yellow),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "[Enter: open browser & copy code | Esc: cancel]",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]
+        }
+        Some(GrokAuthStatus::Success) => {
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Authentication successful!",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "[Press Enter to continue]",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]
+        }
+        Some(GrokAuthStatus::Failed(error)) => {
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Authentication failed:",
+                    Style::default()
+                        .fg(Color::Red)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    format!("  {error}"),
+                    Style::default().fg(Color::Red),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "[Press Enter to go back]",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]
+        }
+        None => {
+            vec![Line::from("")]
+        }
+    };
+
+    let widget = Paragraph::new(content)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Magenta))
+                .title(" xAI Grok Authentication ")
+                .title_alignment(ratatui::layout::Alignment::Center),
+        )
+        .alignment(ratatui::layout::Alignment::Left);
+
+    frame.render_widget(widget, center_chunks[1]);
+}
+
+/// Render `OpenRouter` OAuth authentication screen.
+fn render_openrouter_auth_screen(frame: &mut Frame, area: Rect, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(20),
+            Constraint::Min(14),
+            Constraint::Percentage(20),
+        ])
+        .split(area);
+
+    let center_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(10),
+            Constraint::Min(60),
+            Constraint::Percentage(10),
+        ])
+        .split(chunks[1]);
+
+    let content = match &app.openrouter_auth_status {
+        Some(OpenrouterAuthStatus::Working) => {
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Preparing sign-in...",
+                    Style::default().fg(Color::Yellow),
+                )),
+                Line::from(""),
+            ]
+        }
+        Some(OpenrouterAuthStatus::WaitingForCallback { url }) => {
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "1. Open this URL in your browser and authorize:",
+                    Style::default().fg(Color::White),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("   {url}"),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "2. The browser will redirect to localhost:54549 automatically.",
+                    Style::default().fg(Color::White),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Waiting for authorization callback...",
+                    Style::default().fg(Color::Yellow),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "[Enter: open browser | Esc: cancel]",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]
+        }
+        Some(OpenrouterAuthStatus::ManualEntry { url, input }) => {
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "1. Open this URL in a browser and authorize:",
+                    Style::default().fg(Color::White),
+                )),
+                Line::from(Span::styled(
+                    format!("   {url}"),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "2. Paste the redirect URL, the code, or an sk-or- API key:",
+                    Style::default().fg(Color::White),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("   > {input}"),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "[Enter: submit | Esc: cancel]",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]
+        }
+        Some(OpenrouterAuthStatus::Success) => {
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Authentication successful!",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "[Press Enter to continue]",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]
+        }
+        Some(OpenrouterAuthStatus::Failed(error)) => {
+            vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Authentication failed:",
+                    Style::default()
+                        .fg(Color::Red)
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    format!("  {error}"),
+                    Style::default().fg(Color::Red),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "[Press Enter to go back]",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ]
+        }
+        None => {
+            vec![Line::from("")]
+        }
+    };
+
+    let widget = Paragraph::new(content)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Magenta))
+                .title(" OpenRouter Sign-in ")
                 .title_alignment(ratatui::layout::Alignment::Center),
         )
         .alignment(ratatui::layout::Alignment::Left);
