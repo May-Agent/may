@@ -31,7 +31,8 @@ use webrtc::track::track_local::TrackLocal;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
 use super::capture::{CapturedFrame, DisplayCapture};
-use super::input::{self, InputMessage, InputState};
+use super::input::{self, InputState};
+use super::proto::InputMessage;
 use super::{DisplayError, PlatformDisplay, SessionDisplay};
 use crate::video::{BgraFrame, EncodedSample, FRAME_QUEUE_CAPACITY, RawFrame, encode_loop};
 

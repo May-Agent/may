@@ -16,7 +16,9 @@
 
 use std::ffi::c_void;
 
-use serde::{Deserialize, Serialize};
+use super::proto::{
+    InputMessage, KeyboardEventKind, KeyboardInput, MouseButtonInput, MouseEventKind, MouseInput,
+};
 
 // ── CoreGraphics event FFI ─────────────────────────────────────────────────────
 
@@ -170,46 +172,6 @@ pub struct InputState {
     pub focus: Option<ProcessSerialNumber>,
 }
 
-// ── DataChannel messages (same wire shape the browser input uses) ──────────────
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "camelCase")]
-pub enum InputMessage {
-    Mouse(MouseInput),
-    Keyboard(KeyboardInput),
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct MouseInput {
-    pub event_type: MouseEventKind,
-    pub x: f64,
-    pub y: f64,
-    #[serde(default)]
-    pub button: Option<MouseButtonInput>,
-    #[serde(default)]
-    pub click_count: Option<i32>,
-    #[serde(default)]
-    pub delta_x: Option<f64>,
-    #[serde(default)]
-    pub delta_y: Option<f64>,
-    #[serde(default)]
-    pub modifiers: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub enum MouseEventKind {
-    #[serde(rename = "mousePressed")]
-    Pressed,
-    #[serde(rename = "mouseReleased")]
-    Released,
-    #[serde(rename = "mouseMoved")]
-    Moved,
-    #[serde(rename = "mouseWheel")]
-    Wheel,
-}
-
 /// Where a mouse message sits in a press/drag/release sequence.
 #[derive(Debug, Clone, Copy)]
 pub enum MousePhase {
@@ -243,33 +205,6 @@ impl MouseInput {
             MouseButtonInput::Middle => HeldButton::Middle,
         })
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum MouseButtonInput {
-    Left,
-    Right,
-    Middle,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct KeyboardInput {
-    pub event_type: KeyboardEventKind,
-    #[serde(default)]
-    pub code: Option<String>,
-    #[serde(default)]
-    pub text: Option<String>,
-    #[serde(default)]
-    pub modifiers: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub enum KeyboardEventKind {
-    KeyDown,
-    KeyUp,
 }
 
 // ── Posting ────────────────────────────────────────────────────────────────────
