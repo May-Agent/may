@@ -43,7 +43,7 @@ export function AssistantTurn({
       {(turn.reasoning.length > 0 || turn.reasoningMs != null) && (
         <ReasoningBlock
           text={turn.reasoning}
-          seconds={turn.reasoningMs != null ? Math.round(turn.reasoningMs / 1000) : undefined}
+          seconds={turn.reasoningMs != null ? turn.reasoningMs / 1000 : undefined}
           streaming={reasoningStreaming}
         />
       )}

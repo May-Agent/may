@@ -3564,8 +3564,7 @@ impl App {
                         self.chat.push_thinking(&chunk);
                         // Update thinking time
                         if let Some(start) = self.thinking_start {
-                            let secs = start.elapsed().as_secs();
-                            self.chat.update_thinking(secs);
+                            self.chat.update_thinking(start.elapsed().as_secs_f64());
                         }
                     }
                     AgentEvent::ToolCallDelta {

@@ -30,8 +30,7 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             if app.processing {
                 app.spinner_frame = app.spinner_frame.wrapping_add(1);
                 if let Some(start) = app.thinking_start {
-                    let secs = start.elapsed().as_secs();
-                    app.chat.update_thinking(secs);
+                    app.chat.update_thinking(start.elapsed().as_secs_f64());
                 }
                 // Bind running terminal calls to their jobs and poll live
                 // output + file-diff previews.
