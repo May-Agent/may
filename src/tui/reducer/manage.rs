@@ -1,15 +1,17 @@
 use crossterm::event::KeyCode;
 
 use crate::tui::app::{App, SendAction};
+use crate::tui::state::{AppMode, AuthReturn, LOGIN_PROVIDERS};
 use crate::tui::state::{
-    ChatgptAuthStatus, CopilotAuthStatus, McpAddMode, SkillAddMode, SshAddMode,
+    ChatgptAuthStatus, CopilotAuthStatus, GrokAuthStatus, McpAddMode, OpenrouterAuthStatus,
+    SkillAddMode, SshAddMode,
 };
 
 pub fn handle_copilot_auth_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
     match code {
         KeyCode::Esc => {
             app.copilot_auth_status = None;
-            app.mode = crate::tui::state::AppMode::Config;
+            app.mode = app.auth_return_mode();
         }
         KeyCode::Enter => {
             if let Some(CopilotAuthStatus::WaitingForUser {
@@ -27,7 +29,7 @@ pub fn handle_copilot_auth_key(app: &mut App, code: KeyCode) -> Option<SendActio
                 Some(CopilotAuthStatus::Success | CopilotAuthStatus::Failed(_))
             ) {
                 app.copilot_auth_status = None;
-                app.mode = crate::tui::state::AppMode::Config;
+                app.mode = app.auth_return_mode();
             }
         }
         _ => {}
@@ -39,7 +41,7 @@ pub fn handle_chatgpt_auth_key(app: &mut App, code: KeyCode) -> Option<SendActio
     match code {
         KeyCode::Esc => {
             app.chatgpt_auth_status = None;
-            app.mode = crate::tui::state::AppMode::Config;
+            app.mode = app.auth_return_mode();
         }
         KeyCode::Enter => match &app.chatgpt_auth_status {
             Some(ChatgptAuthStatus::WaitingForCallback { url }) => {
@@ -59,10 +61,111 @@ pub fn handle_chatgpt_auth_key(app: &mut App, code: KeyCode) -> Option<SendActio
             }
             Some(ChatgptAuthStatus::Success | ChatgptAuthStatus::Failed(_)) => {
                 app.chatgpt_auth_status = None;
-                app.mode = crate::tui::state::AppMode::Config;
+                app.mode = app.auth_return_mode();
             }
             Some(ChatgptAuthStatus::Working) | None => {}
         },
+        _ => {}
+    }
+    None
+}
+
+/// Key handling for the `/login` provider picker.
+pub fn handle_login_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
+    match code {
+        KeyCode::Esc => {
+            app.mode = AppMode::Chat;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.login_selected = app.login_selected.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if app.login_selected + 1 < LOGIN_PROVIDERS.len() {
+                app.login_selected += 1;
+            }
+        }
+        KeyCode::Enter => {
+            app.auth_return = AuthReturn::Login;
+            return match LOGIN_PROVIDERS.get(app.login_selected).map(|p| p.id) {
+                Some("chatgpt") => Some(SendAction::StartChatgptAuth),
+                Some("grok") => Some(SendAction::StartGrokAuth),
+                Some("openrouter") => Some(SendAction::StartOpenrouterAuth),
+                _ => None,
+            };
+        }
+        _ => {}
+    }
+    None
+}
+
+/// Key handling for the xAI Grok device-authorization screen.
+pub fn handle_grok_auth_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
+    match code {
+        KeyCode::Esc => {
+            app.grok_auth_status = None;
+            app.mode = app.auth_return_mode();
+        }
+        KeyCode::Enter => {
+            if let Some(GrokAuthStatus::WaitingForUser {
+                user_code,
+                verification_uri,
+            }) = &app.grok_auth_status
+            {
+                return Some(SendAction::OpenGrokAuthUrl {
+                    url: verification_uri.clone(),
+                    code: user_code.clone(),
+                });
+            }
+            if matches!(
+                app.grok_auth_status,
+                Some(GrokAuthStatus::Success | GrokAuthStatus::Failed(_))
+            ) {
+                app.grok_auth_status = None;
+                app.mode = app.auth_return_mode();
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
+/// Key handling for the `OpenRouter` OAuth screen.
+pub fn handle_openrouter_auth_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
+    match code {
+        KeyCode::Esc => {
+            app.openrouter_auth_status = None;
+            app.mode = app.auth_return_mode();
+        }
+        KeyCode::Enter => match &mut app.openrouter_auth_status {
+            Some(OpenrouterAuthStatus::WaitingForCallback { url }) => {
+                return Some(SendAction::OpenOpenrouterAuthUrl { url: url.clone() });
+            }
+            Some(OpenrouterAuthStatus::ManualEntry { input, .. }) => {
+                let input = input.trim().to_string();
+                if !input.is_empty() {
+                    return Some(SendAction::SubmitOpenrouterCode { input });
+                }
+            }
+            Some(OpenrouterAuthStatus::Success | OpenrouterAuthStatus::Failed(_)) => {
+                app.openrouter_auth_status = None;
+                app.mode = app.auth_return_mode();
+            }
+            Some(OpenrouterAuthStatus::Working) | None => {}
+        },
+        KeyCode::Backspace => {
+            if let Some(OpenrouterAuthStatus::ManualEntry { input, .. }) =
+                &mut app.openrouter_auth_status
+            {
+                input.pop();
+            }
+        }
+        KeyCode::Char(c) => {
+            if let Some(OpenrouterAuthStatus::ManualEntry { input, .. }) =
+                &mut app.openrouter_auth_status
+            {
+                input.push(c);
+            }
+        }
         _ => {}
     }
     None

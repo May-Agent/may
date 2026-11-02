@@ -548,6 +548,18 @@ pub(super) async fn build_cloud_provider_from_instance(
             }
             client.into()
         }
+        ProviderType::Grok => {
+            let Some(token) = crate::grok::get_access_token().await? else {
+                return Err(MayAgentError::MissingApiKey(
+                    "xAI Grok not authenticated. Use /login to sign in.".to_string(),
+                ));
+            };
+            let mut client = OpenAI::new(&token).with_model(model);
+            if let Some(url) = base_url {
+                client = client.with_base_url(url);
+            }
+            client.into()
+        }
         ProviderType::OpenAI
         | ProviderType::Groq
         | ProviderType::Together
