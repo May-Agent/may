@@ -1,5 +1,13 @@
-//! Viewer input into a session desktop: `DataChannel` messages become
-//! `CGEvent`s posted at the HID tap.
+//! Viewer and agent input into a session desktop: `DataChannel`/`Input`
+//! messages become `CGEvent`s delivered to the owning app's event queue.
+//!
+//! Events never go through the HID tap — that path would warp the user's
+//! physical cursor and focus real windows. Instead we hit-test the window
+//! under the point inside the virtual display's bounds, resolve its owner
+//! to a `ProcessSerialNumber`, and post the serialized event record
+//! through `SLPSPostEventRecordTo` — the same non-warping dispatch
+//! cua-driver uses. The desktop's key focus follows the last app a press
+//! landed on.
 //!
 //! The display's stream pixels are its points, so an incoming `(x, y)`
 //! lands in global space at `CGDisplayBounds(display).origin + (x, y)`.
@@ -8,7 +16,7 @@
 
 use std::ffi::c_void;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 // ── CoreGraphics event FFI ─────────────────────────────────────────────────────
 
@@ -51,7 +59,6 @@ const K_CG_MOUSE_BUTTON_LEFT: u32 = 0;
 const K_CG_MOUSE_BUTTON_RIGHT: u32 = 1;
 const K_CG_MOUSE_BUTTON_CENTER: u32 = 2;
 
-const K_CG_HID_EVENT_TAP: u32 = 0;
 const K_CG_SCROLL_EVENT_UNIT_PIXEL: u32 = 1;
 
 const K_CG_EVENT_FLAG_MASK_SHIFT: u64 = 0x0002_0000;
@@ -79,28 +86,100 @@ unsafe extern "C" {
     fn CGEventKeyboardSetUnicodeString(event: CGEventRef, len: usize, chars: *const u16);
     fn CGEventSetFlags(event: CGEventRef, flags: u64);
     fn CGEventSetIntegerValueField(event: CGEventRef, field: u32, value: i64);
-    fn CGEventPost(tap: u32, event: CGEventRef);
+    fn CGEventCreateData(allocator: *const c_void, event: CGEventRef) -> *const c_void;
     fn CGDisplayBounds(display: u32) -> CGRect;
+    fn CGWindowListCopyWindowInfo(option: u32, relative_to_window: u32) -> *const c_void;
+}
+
+#[link(name = "ApplicationServices", kind = "framework")]
+unsafe extern "C" {
+    fn GetProcessForPID(pid: i32, psn: *mut ProcessSerialNumber) -> i32;
+}
+
+// The private dispatch cua-driver uses: deliver a serialized CGEvent
+// record straight into one process's queue — no cursor warp, no focus
+// steal, and it lands on the virtual display even with no physical seat.
+// SkyLight is a private framework — resolve the symbol at runtime like
+// the `skylight` module resolves its display classes.
+type SlpsPostEventRecordTo = unsafe extern "C" fn(*const ProcessSerialNumber, *const u8) -> i32;
+
+fn slps_post_event_record_to() -> Option<SlpsPostEventRecordTo> {
+    unsafe {
+        let handle = libc::dlopen(
+            c"/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight".as_ptr(),
+            libc::RTLD_LAZY,
+        );
+        if handle.is_null() {
+            return None;
+        }
+        let symbol = libc::dlsym(handle, c"SLPSPostEventRecordTo".as_ptr());
+        if symbol.is_null() {
+            return None;
+        }
+        Some(std::mem::transmute::<*mut c_void, SlpsPostEventRecordTo>(
+            symbol,
+        ))
+    }
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     fn CFRelease(cf: *const c_void);
+    fn CFArrayGetCount(array: *const c_void) -> isize;
+    fn CFArrayGetValueAtIndex(array: *const c_void, index: isize) -> *const c_void;
+    fn CFDictionaryGetValue(dict: *const c_void, key: *const c_void) -> *const c_void;
+    fn CFNumberGetValue(number: *const c_void, ty: i32, out: *mut c_void) -> bool;
+    fn CFStringCreateWithBytes(
+        alloc: *const c_void,
+        bytes: *const u8,
+        len: isize,
+        encoding: u32,
+        ext: bool,
+    ) -> *const c_void;
+    fn CFDataGetBytePtr(data: *const c_void) -> *const u8;
+    fn CGRectMakeWithDictionaryRepresentation(dict: *const c_void, rect: *mut CGRect) -> bool;
 }
+
+/// kCFNumberSInt32Type for pid/layer reads.
+const K_CF_NUMBER_SINT32_TYPE: i32 = 2;
+/// kCFNumberCGFloatType for the alpha read.
+const K_CF_NUMBER_CGFLOAT_TYPE: i32 = 16;
+const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+// kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements
+const K_CG_WINDOW_LIST_OPTIONS: u32 = (1 << 0) | (1 << 4);
 
 // kCGMouseEventClickState: lets double/triple clicks through.
 const K_CG_MOUSE_EVENT_CLICK_STATE: u32 = 0x36;
 
+/// The process address `SkyLight` routes records to.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct ProcessSerialNumber {
+    high_long_of_psn: u32,
+    low_long_of_psn: u32,
+}
+
+/// Per-session input state: which button a drag holds, and which process
+/// the desktop's keyboard focus conceptually sits in (the last window a
+/// press landed on).
+#[derive(Debug, Default)]
+pub struct InputState {
+    /// Button held since the last press, if the press hasn't been released.
+    pub held: Option<HeldButton>,
+    /// The process that received the last press — keyboard events go here.
+    pub focus: Option<ProcessSerialNumber>,
+}
+
 // ── DataChannel messages (same wire shape the browser input uses) ──────────────
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum InputMessage {
     Mouse(MouseInput),
     Keyboard(KeyboardInput),
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MouseInput {
     pub event_type: MouseEventKind,
@@ -118,7 +197,7 @@ pub struct MouseInput {
     pub modifiers: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum MouseEventKind {
     #[serde(rename = "mousePressed")]
@@ -132,7 +211,7 @@ pub enum MouseEventKind {
 }
 
 /// Where a mouse message sits in a press/drag/release sequence.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub enum MousePhase {
     /// A button went down.
     Pressed,
@@ -166,7 +245,7 @@ impl MouseInput {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MouseButtonInput {
     Left,
@@ -174,7 +253,7 @@ pub enum MouseButtonInput {
     Middle,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KeyboardInput {
     pub event_type: KeyboardEventKind,
@@ -186,7 +265,7 @@ pub struct KeyboardInput {
     pub modifiers: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum KeyboardEventKind {
     KeyDown,
@@ -197,7 +276,7 @@ pub enum KeyboardEventKind {
 
 /// The button a peer is holding between press and release — moves
 /// while held are drags, not plain motion.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub enum HeldButton {
     /// Left button drag.
     Left,
@@ -206,25 +285,38 @@ pub enum HeldButton {
     /// Middle button drag.
     Middle,
 }
-
-/// Posts one input message at the display's global origin offset.
-/// `held` is the caller's drag state: set on press, cleared on release.
-///
-/// # Errors
-/// Returns the message text when the event kind is unknown — the client
-/// sent something the desktop does not consume.
-pub fn post_input(
-    display_id: u32,
-    message: InputMessage,
-    held: Option<HeldButton>,
-) -> Result<(), String> {
-    match message {
-        InputMessage::Mouse(input) => post_mouse(display_id, input, held),
-        InputMessage::Keyboard(input) => post_keyboard(&input),
+impl HeldButton {
+    const fn of(button: MouseButtonInput) -> Self {
+        match button {
+            MouseButtonInput::Left => Self::Left,
+            MouseButtonInput::Right => Self::Right,
+            MouseButtonInput::Middle => Self::Middle,
+        }
     }
 }
 
-fn post_mouse(display_id: u32, input: MouseInput, held: Option<HeldButton>) -> Result<(), String> {
+/// Posts one input message at the display's global origin offset.
+///
+/// Mouse events resolve the topmost window under the point inside the
+/// display's bounds and deliver to its owner; keyboard events go to the
+/// last press target (the desktop's implicit focus). `state` carries the
+/// held-button and focus bookkeeping across messages.
+///
+/// # Errors
+/// Returns the message text when the event kind is unknown or no window
+/// owns the point.
+pub fn post_input(
+    display_id: u32,
+    message: InputMessage,
+    state: &mut InputState,
+) -> Result<(), String> {
+    match message {
+        InputMessage::Mouse(input) => post_mouse(display_id, &input, state),
+        InputMessage::Keyboard(input) => post_keyboard(display_id, &input, state),
+    }
+}
+
+fn post_mouse(display_id: u32, input: &MouseInput, state: &mut InputState) -> Result<(), String> {
     let bounds = unsafe { CGDisplayBounds(display_id) };
     let point = CGPoint {
         x: bounds.origin.x + input.x,
@@ -232,6 +324,30 @@ fn post_mouse(display_id: u32, input: MouseInput, held: Option<HeldButton>) -> R
     };
     let button = input.button.unwrap_or(MouseButtonInput::Left);
     let flags = cg_flags(input.modifiers.unwrap_or(0));
+
+    // Where this goes: a press re-targets the window under it and claims
+    // the desktop's focus; a held move/release sticks to that same
+    // process so drags stay coherent; free moves and scrolls just
+    // hit-test their own point.
+    let psn = match input.event_type {
+        MouseEventKind::Pressed => {
+            let psn = psn_at(display_id, point).ok_or_else(no_window_error)?;
+            state.focus = Some(psn);
+            state.held = Some(HeldButton::of(button));
+            psn
+        }
+        MouseEventKind::Released | MouseEventKind::Moved => {
+            if let (Some(_), Some(psn)) = (state.held, state.focus) {
+                psn
+            } else {
+                psn_at(display_id, point).ok_or_else(no_window_error)?
+            }
+        }
+        MouseEventKind::Wheel => psn_at(display_id, point).ok_or_else(no_window_error)?,
+    };
+    if matches!(input.event_type, MouseEventKind::Released) {
+        state.held = None;
+    }
 
     let event = match input.event_type {
         MouseEventKind::Wheel => unsafe {
@@ -269,7 +385,7 @@ fn post_mouse(display_id: u32, input: MouseInput, held: Option<HeldButton>) -> R
             let (event_type, event_button) = match input.event_type {
                 MouseEventKind::Pressed => (down, cg_button),
                 MouseEventKind::Released => (up, cg_button),
-                MouseEventKind::Moved => match held {
+                MouseEventKind::Moved => match state.held {
                     Some(HeldButton::Left) => {
                         (K_CG_EVENT_LEFT_MOUSE_DRAGGED, K_CG_MOUSE_BUTTON_LEFT)
                     }
@@ -294,10 +410,19 @@ fn post_mouse(display_id: u32, input: MouseInput, held: Option<HeldButton>) -> R
         },
     };
 
-    post(event, flags)
+    post(&psn, event, flags)
 }
 
-fn post_keyboard(input: &KeyboardInput) -> Result<(), String> {
+fn post_keyboard(
+    display_id: u32,
+    input: &KeyboardInput,
+    state: &mut InputState,
+) -> Result<(), String> {
+    let psn = state
+        .focus
+        .or_else(|| topmost_psn(display_id))
+        .ok_or_else(no_window_error)?;
+    state.focus = Some(psn);
     let down = matches!(input.event_type, KeyboardEventKind::KeyDown);
     let flags = cg_flags(input.modifiers.unwrap_or(0));
 
@@ -312,7 +437,7 @@ fn post_keyboard(input: &KeyboardInput) -> Result<(), String> {
             }
             event
         };
-        return post(event, flags);
+        return post(&psn, event, flags);
     }
 
     let Some(code) = input.code.as_deref() else {
@@ -322,10 +447,15 @@ fn post_keyboard(input: &KeyboardInput) -> Result<(), String> {
         return Err(format!("unmapped key code {code}"));
     };
     let event = unsafe { CGEventCreateKeyboardEvent(std::ptr::null_mut(), keycode, down) };
-    post(event, flags)
+    post(&psn, event, flags)
 }
 
-fn post(event: CGEventRef, flags: u64) -> Result<(), String> {
+fn no_window_error() -> String {
+    "no window owns that point on the desktop".to_owned()
+}
+
+/// Serializes the event and posts the record to `psn`'s queue.
+fn post(psn: &ProcessSerialNumber, event: CGEventRef, flags: u64) -> Result<(), String> {
     if event.is_null() {
         return Err("CoreGraphics refused the event".to_owned());
     }
@@ -333,10 +463,144 @@ fn post(event: CGEventRef, flags: u64) -> Result<(), String> {
         if flags != 0 {
             CGEventSetFlags(event, flags);
         }
-        CGEventPost(K_CG_HID_EVENT_TAP, event);
+        let data = CGEventCreateData(std::ptr::null(), event);
         CFRelease(event);
+        if data.is_null() {
+            return Err("CoreGraphics refused to serialize the event".to_owned());
+        }
+        let Some(post_record) = slps_post_event_record_to() else {
+            CFRelease(data);
+            return Err("SkyLight event dispatch is unavailable".to_owned());
+        };
+        let status = post_record(psn, CFDataGetBytePtr(data));
+        CFRelease(data);
+        if status != 0 {
+            return Err(format!("event delivery failed (status {status})"));
+        }
     }
     Ok(())
+}
+
+/// The topmost on-screen normal window's owner PSN on this display.
+fn topmost_psn(display_id: u32) -> Option<ProcessSerialNumber> {
+    let bounds = unsafe { CGDisplayBounds(display_id) };
+    let center = CGPoint {
+        x: bounds.origin.x + bounds.size.width / 2.0,
+        y: bounds.origin.y + bounds.size.height / 2.0,
+    };
+    psn_at(display_id, center)
+}
+
+/// The owner PSN of the topmost on-screen layer-0 window that contains
+/// `point` and lives on this display.
+fn psn_at(display_id: u32, point: CGPoint) -> Option<ProcessSerialNumber> {
+    let display = unsafe { CGDisplayBounds(display_id) };
+    let list = unsafe { CGWindowListCopyWindowInfo(K_CG_WINDOW_LIST_OPTIONS, 0) };
+    if list.is_null() {
+        return None;
+    }
+    let keys = [
+        cfstr("kCGWindowOwnerPID"),
+        cfstr("kCGWindowBounds"),
+        cfstr("kCGWindowLayer"),
+        cfstr("kCGWindowAlpha"),
+    ];
+    let mut found = None;
+    unsafe {
+        for i in 0..CFArrayGetCount(list) {
+            let info = CFArrayGetValueAtIndex(list, i);
+            if info.is_null() {
+                continue;
+            }
+            let layer = number_i32(CFDictionaryGetValue(info, keys[2])).unwrap_or(-1);
+            let alpha = number_f64(CFDictionaryGetValue(info, keys[3])).unwrap_or(0.0);
+            if layer != 0 || alpha <= 0.0 {
+                continue;
+            }
+            let mut rect = CGRect {
+                origin: CGPoint { x: 0.0, y: 0.0 },
+                size: CGSize {
+                    width: 0.0,
+                    height: 0.0,
+                },
+            };
+            if !CGRectMakeWithDictionaryRepresentation(
+                CFDictionaryGetValue(info, keys[1]),
+                &raw mut rect,
+            ) {
+                continue;
+            }
+            let inside = point.x >= rect.origin.x
+                && point.x < rect.origin.x + rect.size.width
+                && point.y >= rect.origin.y
+                && point.y < rect.origin.y + rect.size.height;
+            let on_display = rect.origin.x < display.origin.x + display.size.width
+                && rect.origin.x + rect.size.width > display.origin.x
+                && rect.origin.y < display.origin.y + display.size.height
+                && rect.origin.y + rect.size.height > display.origin.y;
+            if !inside || !on_display {
+                continue;
+            }
+            let Some(pid) = number_i32(CFDictionaryGetValue(info, keys[0])) else {
+                continue;
+            };
+            let mut psn = ProcessSerialNumber {
+                high_long_of_psn: 0,
+                low_long_of_psn: 0,
+            };
+            if GetProcessForPID(pid, &raw mut psn) == 0 {
+                found = Some(psn);
+                break;
+            }
+        }
+        CFRelease(list);
+        for key in keys {
+            CFRelease(key);
+        }
+    }
+    found
+}
+
+fn cfstr(s: &str) -> *const c_void {
+    unsafe {
+        CFStringCreateWithBytes(
+            std::ptr::null(),
+            s.as_ptr(),
+            isize::try_from(s.len()).unwrap_or(isize::MAX),
+            K_CF_STRING_ENCODING_UTF8,
+            false,
+        )
+    }
+}
+
+fn number_i32(value: *const c_void) -> Option<i32> {
+    if value.is_null() {
+        return None;
+    }
+    let mut out: i32 = 0;
+    unsafe {
+        CFNumberGetValue(
+            value,
+            K_CF_NUMBER_SINT32_TYPE,
+            (&raw mut out).cast::<c_void>(),
+        )
+    }
+    .then_some(out)
+}
+
+fn number_f64(value: *const c_void) -> Option<f64> {
+    if value.is_null() {
+        return None;
+    }
+    let mut out: f64 = 0.0;
+    unsafe {
+        CFNumberGetValue(
+            value,
+            K_CF_NUMBER_CGFLOAT_TYPE,
+            (&raw mut out).cast::<c_void>(),
+        )
+    }
+    .then_some(out)
 }
 
 /// CDP-order modifier bitmap → `CGEventFlags`.
