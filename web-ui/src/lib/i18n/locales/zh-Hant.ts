@@ -154,6 +154,7 @@ export const zhHant: Messages = {
     tasksEmpty: '尚無任務',
     contextUsage: '已使用 {total} 中 {used}% 的 token',
     decodeSpeed: '{rate} tok/s',
+    quotaHold: '已達用量上限 — 將於 {at} 自動繼續',
     configGuard: {
       title: '尚未啟用任何服務供應商',
       body: '請到設定中啟用一個服務供應商即可開始對話。',

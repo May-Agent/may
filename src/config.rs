@@ -730,6 +730,10 @@ pub struct Preferences {
     /// Show real-time decode speed (tok/s) while responses stream.
     #[serde(default = "default_true")]
     pub show_decode_speed: bool,
+    /// Park a turn on an upstream quota or rate limit and resume it at the
+    /// reset instant the provider announces.
+    #[serde(default = "default_true")]
+    pub auto_continue_on_quota_reset: bool,
     /// Global network restriction settings.
     #[serde(default)]
     pub network_policy: NetworkPolicyConfig,
@@ -741,6 +745,7 @@ impl Default for Preferences {
             warn_on_model_change: true,
             show_token_usage: true,
             show_decode_speed: true,
+            auto_continue_on_quota_reset: true,
             network_policy: NetworkPolicyConfig::default(),
         }
     }

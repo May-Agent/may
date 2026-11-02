@@ -184,6 +184,18 @@ pub struct SseSpeedEvent<'a> {
     pub(crate) tokens_per_second: f64,
 }
 
+/// A `session_turn` frame parking the turn on an upstream quota reset:
+/// `until` is when it retries.
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SseHoldEvent<'a> {
+    pub(crate) seq: u64,
+    pub(crate) turn_id: &'a str,
+    #[schema(value_type = String)]
+    pub(crate) until: jiff::Timestamp,
+    pub(crate) message: &'a str,
+}
+
 #[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SseTodoUpdateEvent {
