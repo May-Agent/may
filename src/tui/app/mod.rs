@@ -60,10 +60,10 @@ pub(super) fn char_to_byte_index(s: &str, char_idx: usize) -> usize {
 pub use aither_agent::{AgentError, AgentEvent, TimedEvent};
 
 use super::state::{
-    ActiveTextInput, AppMode, AskUserState, ChatgptAuthStatus, ConfigEditMode, ConfigState,
-    CopilotAuthStatus, ImageViewState, McpAddMode, PasteFilter, QuitConfirmState,
-    ResumePickerState, SelectionPoint, SkillAddMode, SshAddMode, StatusNotice, TextSelection,
-    detect_api_key_from_env,
+    ActiveTextInput, AppMode, AskUserState, AuthReturn, ChatgptAuthStatus, ConfigEditMode,
+    ConfigState, CopilotAuthStatus, GrokAuthStatus, ImageViewState, McpAddMode,
+    OpenrouterAuthStatus, PasteFilter, QuitConfirmState, ResumePickerState, SelectionPoint,
+    SkillAddMode, SshAddMode, StatusNotice, TextSelection, detect_api_key_from_env,
 };
 
 /// Screen rect an inline image was painted into last frame — hit-tested on
@@ -188,6 +188,14 @@ pub struct App {
     pub copilot_auth_status: Option<CopilotAuthStatus>,
     /// `ChatGPT` OAuth authentication status
     pub chatgpt_auth_status: Option<ChatgptAuthStatus>,
+    /// xAI Grok OAuth authentication status
+    pub grok_auth_status: Option<GrokAuthStatus>,
+    /// `OpenRouter` OAuth authentication status
+    pub openrouter_auth_status: Option<OpenrouterAuthStatus>,
+    /// Selected row in the `/login` provider picker
+    pub login_selected: usize,
+    /// Screen an OAuth flow returns to when it closes
+    pub auth_return: AuthReturn,
     /// Tier being edited in `TierModelPicker` mode
     pub tier_picker_tier: Option<ModelTier>,
     /// All available models for tier picker
@@ -556,6 +564,10 @@ impl App {
             thinking_start: None,
             copilot_auth_status: None,
             chatgpt_auth_status: None,
+            grok_auth_status: None,
+            openrouter_auth_status: None,
+            login_selected: 0,
+            auth_return: AuthReturn::Config,
             tier_picker_tier: None,
             tier_picker_models: Vec::new(),
             tier_picker_filtered: Vec::new(),
@@ -1866,6 +1878,16 @@ impl App {
                     _ => {}
                 }
             }
+            AppMode::OpenrouterAuth => {
+                if let Some(OpenrouterAuthStatus::ManualEntry { input, .. }) =
+                    &mut self.openrouter_auth_status
+                {
+                    return Some(ActiveTextInput::Simple {
+                        input,
+                        filter: PasteFilter::Any,
+                    });
+                }
+            }
             AppMode::SessionSelect => {
                 return Some(ActiveTextInput::Simple {
                     input: &mut self.session_search,
@@ -2142,6 +2164,11 @@ impl App {
             AppMode::TierModelPicker => Ok(self.handle_tier_model_picker_key(code)),
             AppMode::CopilotAuth => Ok(super::reducer::manage::handle_copilot_auth_key(self, code)),
             AppMode::ChatgptAuth => Ok(super::reducer::manage::handle_chatgpt_auth_key(self, code)),
+            AppMode::Login => Ok(super::reducer::manage::handle_login_key(self, code)),
+            AppMode::GrokAuth => Ok(super::reducer::manage::handle_grok_auth_key(self, code)),
+            AppMode::OpenrouterAuth => Ok(super::reducer::manage::handle_openrouter_auth_key(
+                self, code,
+            )),
             AppMode::PermissionConfirm(_) => Ok(
                 super::reducer::manage::handle_permission_confirm_key(self, code),
             ),
@@ -2445,6 +2472,83 @@ impl App {
     /// Mark `ChatGPT` auth as failed.
     pub fn chatgpt_auth_failed(&mut self, error: String) {
         self.chatgpt_auth_status = Some(ChatgptAuthStatus::Failed(error));
+    }
+
+    /// The screen an OAuth flow returns to when it closes.
+    #[must_use]
+    pub const fn auth_return_mode(&self) -> AppMode {
+        match self.auth_return {
+            AuthReturn::Config => AppMode::Config,
+            AuthReturn::Login => AppMode::Login,
+        }
+    }
+
+    /// Start the xAI Grok OAuth flow (requesting a device code).
+    pub fn start_grok_auth(&mut self) {
+        self.mode = AppMode::GrokAuth;
+        self.grok_auth_status = Some(GrokAuthStatus::RequestingCode);
+    }
+
+    /// Show the device-flow verification URL and user code.
+    pub fn set_grok_device_code(&mut self, user_code: String, verification_uri: String) {
+        self.grok_auth_status = Some(GrokAuthStatus::WaitingForUser {
+            user_code,
+            verification_uri,
+        });
+    }
+
+    /// Mark xAI Grok auth as successful.
+    pub fn grok_auth_success(&mut self) {
+        self.grok_auth_status = Some(GrokAuthStatus::Success);
+    }
+
+    /// Mark xAI Grok auth as failed.
+    pub fn grok_auth_failed(&mut self, error: String) {
+        self.grok_auth_status = Some(GrokAuthStatus::Failed(error));
+    }
+
+    /// Start the `OpenRouter` OAuth flow (initial "working" state).
+    pub fn start_openrouter_auth(&mut self) {
+        self.mode = AppMode::OpenrouterAuth;
+        self.openrouter_auth_status = Some(OpenrouterAuthStatus::Working);
+    }
+
+    /// Show the browser authorization URL while the loopback listener waits.
+    pub fn set_openrouter_auth_url(&mut self, url: String) {
+        self.openrouter_auth_status = Some(OpenrouterAuthStatus::WaitingForCallback { url });
+    }
+
+    /// Switch the `OpenRouter` screen to manual code/URL entry.
+    pub fn set_openrouter_manual_entry(&mut self, url: String) {
+        self.openrouter_auth_status = Some(OpenrouterAuthStatus::ManualEntry {
+            url,
+            input: String::new(),
+        });
+    }
+
+    /// Mark `OpenRouter` auth as successful.
+    pub fn openrouter_auth_success(&mut self) {
+        self.openrouter_auth_status = Some(OpenrouterAuthStatus::Success);
+    }
+
+    /// Mark `OpenRouter` auth as failed.
+    pub fn openrouter_auth_failed(&mut self, error: String) {
+        self.openrouter_auth_status = Some(OpenrouterAuthStatus::Failed(error));
+    }
+
+    /// Whether the `/login` provider `id` already has working credentials.
+    #[must_use]
+    pub fn login_signed_in(&self, id: &str) -> bool {
+        match id {
+            "chatgpt" => crate::chatgpt::has_credentials(),
+            "grok" => crate::grok::has_credentials(),
+            "openrouter" => self
+                .config
+                .provider
+                .get("openrouter")
+                .is_some_and(|instance| instance.api_key.is_some()),
+            _ => false,
+        }
     }
 
     /// Handle key in chat mode (unified input + navigation).
@@ -2955,6 +3059,11 @@ impl App {
             }
             "/resume-claude" => {
                 self.open_resume_picker();
+                None
+            }
+            "/login" => {
+                self.login_selected = 0;
+                self.mode = AppMode::Login;
                 None
             }
             "/resume-codex" | "/secret" => {
@@ -3964,6 +4073,27 @@ pub enum SendAction {
         url: String,
         /// Device-flow user code to copy to the clipboard (empty for browser flow).
         code: String,
+    },
+    /// Start xAI Grok OAuth authentication.
+    StartGrokAuth,
+    /// Open the xAI verification URL in a browser and copy the user code.
+    OpenGrokAuthUrl {
+        /// Verification URL to open in the browser.
+        url: String,
+        /// Device-flow user code to copy to the clipboard.
+        code: String,
+    },
+    /// Start `OpenRouter` OAuth authentication.
+    StartOpenrouterAuth,
+    /// Open the `OpenRouter` authorization URL in a browser.
+    OpenOpenrouterAuthUrl {
+        /// Authorization URL to open in the browser.
+        url: String,
+    },
+    /// Submit the pasted `OpenRouter` callback URL, code, or `sk-or-` key.
+    SubmitOpenrouterCode {
+        /// The pasted text to resolve.
+        input: String,
     },
     /// Switch to a different model for this session.
     SwitchModel(String),

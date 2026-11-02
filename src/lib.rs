@@ -38,6 +38,8 @@ pub mod db;
 pub mod decode_meter;
 mod file_tracker;
 mod fs_utils;
+/// xAI Grok subscription OAuth flow.
+pub mod grok;
 mod heel;
 mod id;
 /// Issue tracking: may issues by default, GitHub when configured.
@@ -57,6 +59,8 @@ pub mod models;
 pub use aither_sandbox::network_policy;
 /// Web-push notification delivery and mailbox.
 pub mod notification;
+/// `OpenRouter` OAuth login flow.
+pub mod openrouter;
 /// Large pasted text rendered for the model.
 pub mod pasted_text;
 /// `pr` — the session's landing object: numbered, session-owned PRs.
