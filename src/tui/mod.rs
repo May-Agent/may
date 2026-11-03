@@ -8,6 +8,8 @@ pub mod app;
 pub mod clipboard;
 /// Slash-command and file-mention completion state.
 pub mod completion;
+/// The `/connect` picker for ACP agents.
+pub mod connect;
 /// TUI error type and result alias.
 pub mod error;
 /// Terminal event polling and app event channel.

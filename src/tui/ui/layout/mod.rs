@@ -7,8 +7,8 @@ mod sidebar;
 
 use self::config::render_config_screen;
 use self::pickers::{
-    render_file_picker_popup, render_profile_select_popup, render_resume_picker,
-    render_session_popup,
+    connect_picker_rows, render_connect_picker, render_file_picker_popup,
+    render_profile_select_popup, render_resume_picker, render_session_popup,
 };
 use self::popups::{render_mcp_popup, render_skill_popup, render_ssh_popup};
 
@@ -331,6 +331,7 @@ fn sheet_height(app: &App, column: Rect) -> Option<u16> {
             },
             pct(70),
         ),
+        AppMode::Connect(state) => (rows(connect_picker_rows(state)).max(6), pct(70)),
         AppMode::Jobs => (
             rows(crate::tui::reducer::jobs_rows(app).len() * 2 + 3).max(6),
             pct(60),
@@ -401,6 +402,7 @@ fn render_sheet(frame: &mut Frame, sheet: Rect, app: &App) {
         AppMode::ProfileSelect => render_profile_select_popup(frame, sheet, app),
         AppMode::Rewind(state) => render_rewind_popup(frame, sheet, state),
         AppMode::ResumePicker(state) => render_resume_picker(frame, sheet, state),
+        AppMode::Connect(state) => render_connect_picker(frame, sheet, state, app.spinner_frame),
         AppMode::Jobs => render_jobs_panel(frame, sheet, app),
         AppMode::JobDetail(state) => render_job_detail(frame, sheet, state),
         AppMode::Btw(state) => render_btw_popup(frame, sheet, state),

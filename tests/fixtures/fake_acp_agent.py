@@ -1,0 +1,738 @@
+#!/usr/bin/env python3
+"""Fake ACP agent over stdio for acpsub tests.
+
+Answers initialize / session/new / session/load / session/set_mode /
+session/set_config_option. On session/prompt it streams a thought chunk, a
+plan, message chunks, and a tool_call with tool_call_update updates, then:
+
+- "PERMISSION" in the prompt -> a session/request_permission request whose
+  outcome is recorded into the reply.
+- "READ <path>" in the prompt -> an fs/read_text_file request; the content's
+  first 40 chars (or the error) are recorded into the reply.
+- "WRITE <path>" in the prompt -> an fs/write_text_file request; "fsw:ok" or
+  the error is recorded into the reply.
+- "RUN <cmd>" / "RUNLINE <cmd>" in the prompt -> terminal/create,
+  wait_for_exit, output; the output, exit code, signal, and truncation flag
+  are recorded into the reply.
+- "KILL <cmd>" -> terminal/create, terminal/kill, then wait_for_exit and
+  output; the kill's signal exit is recorded into the reply.
+- "wait" -> the prompt never completes until session/cancel.
+- "loops" -> a busy-looping turn that never completes: an edit call and
+  the standard call stay open ~0.3 s while three same-titled calls run
+  and close, leaving one long in-progress call.
+- "gated <path>" -> the turn completes normally once that file exists.
+- "gather" -> the prompt completes once a steered prompt arrives; the
+  steered text is recorded into the reply.
+- "die" -> the process exits mid-turn with status 3.
+- "fail" -> the prompt's request returns a JSON-RPC error; the process
+  stays alive (a dropped model stream, a backend error).
+
+FAKE_RATE_LIMIT=<secs> makes the agent's provider rate-limit it: a
+prompt containing "ratelimit" starts a per-user window of that length,
+and every prompt while the window is open answers a -32010 error whose
+data carries `cognition.ai/errorKind: "unavailable"` and
+`cognition.ai/retryable: true` — the shape Devin reports its free-model
+limit with. The reset is named in the message's `(at HH:MM:SS UTC)`
+clause; FAKE_RATE_LIMIT_VAGUE=1 strips the clause, so no readable reset
+exists at all. FAKE_RATE_LIMIT_DELAY=<secs> answers the error after a
+beat, keeping the turn in flight for a bound `wait`.
+FAKE_RATE_LIMIT_GATE=<path> answers the error only once that file
+exists — the test holds the turn in flight itself, releasing it with a
+file in its own tempdir.
+
+A session/prompt that arrives while a prompt is pending is a steer: its
+request resolves with the same result as the turn's own prompt, and its
+text joins the turn via "steer:<text>" in the reply. FAKE_NO_STEER=1 makes
+the agent reject a concurrent prompt instead. FAKE_QUEUE_PROMPTS=1 makes
+the agent park a concurrent prompt and run it as its own turn after the
+current one ends (agents that serialize prompts instead of injecting).
+FAKE_FOLD_STEER=1 makes the agent fold a concurrent prompt into the
+running turn and never answer its request (codex-acp) — unless its text
+starts with "LATE ", which plays a steer that landed behind the turn's
+end: the running turn finishes and the steer runs, and answers, as a turn
+of its own.
+FAKE_LATE_STEER=<path> answers the turn's own prompt first and each
+steered prompt only once that file exists — a steer that resolves after
+its turn already settled.
+
+- "hold" -> the turn stays open until a queued prompt arrives
+  (FAKE_QUEUE_PROMPTS mode only).
+
+session/cancel answers the pending prompt (and every steer) with
+stopReason cancelled.
+FAKE_LOAD_GATE=<path> holds the session/load response until the file
+exists, so a test can keep a launch in flight deterministically.
+FAKE_NO_LOAD=1 in the environment makes the agent not advertise loadSession.
+FAKE_NO_MODES=1 makes the agent advertise no session modes at all:
+session/new and session/load return no mode list and no `mode` config
+option.
+FAKE_NO_MODEL=1 drops the `model` config option from the advertised list.
+FAKE_NO_OPTIONS=1 makes the advertised `model` config option carry no
+selectable values.
+FAKE_RATE_LIMIT=<secs> makes "ratelimit" prompts — then every prompt
+until the window lifts — answer the Devin rate-limit shape.
+FAKE_RATE_LIMIT_GATE=<path> holds a rate-limited prompt's error answer
+until the file exists (polled — it is another process's signal), so the
+turn ends when the test says, not when a delay runs out; the named reset
+is measured from the answer, so a long-held gate still parks for the
+window's length rather than a day.
+FAKE_RATE_LIMIT_HOLD=<path> keeps the window itself open while the file
+is absent — every prompt errors again, whatever its text — and lifts the
+limit for good once the file exists: a test holds a park open for as long
+as it takes to observe it, then releases it.
+FAKE_MODE_IGNORED=1 makes session/set_mode a no-op: the call succeeds but
+the session's mode — reported by the `mode` config option — never changes.
+Session ids are `sess-<pid>-<n>` so concurrently spawned agents never
+collide.
+"""
+
+import json
+import math
+import os
+import shlex
+import sys
+import threading
+import time
+
+
+def send(message):
+    sys.stdout.write(json.dumps(message) + "\n")
+    sys.stdout.flush()
+
+
+def respond(request_id, result):
+    send({"jsonrpc": "2.0", "id": request_id, "result": result})
+
+
+def update(session_id, update_payload):
+    send(
+        {
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {"sessionId": session_id, "update": update_payload},
+        }
+    )
+
+
+pending_prompt = None
+pending_text = ""
+rate_limited_until = None  # epoch seconds the provider limit binds until
+steered = []        # request ids of prompts injected mid-turn
+queued = []         # (request_id, text) parked in FAKE_QUEUE_PROMPTS mode
+session_id = ""
+session_count = 0
+current_mode = "default"  # the mode the session is actually in
+current_model = "a"       # the model the session is actually using
+next_req = 0
+outbound = {}       # request id -> kind: perm | fs | fsw | term-create |
+                    #   term-kill-create | term-kill | term-wait |
+                    #   term-output | term-release
+terminal_id = None
+collected = []      # markers appended to the final reply
+
+
+def new_request(method, params, kind):
+    global next_req
+    request_id = f"agent-{next_req}"
+    next_req += 1
+    outbound[request_id] = kind
+    send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+
+
+def answer_all(result):
+    """Resolve the pending prompt and every steer with the same result, then
+    start the next agent-side queued prompt, if any. FAKE_LATE_STEER=<path>
+    answers the turn's prompt first and each steered prompt only once that
+    file exists."""
+    global pending_prompt
+    late_gate = os.environ.get("FAKE_LATE_STEER")
+    if late_gate and steered:
+        if pending_prompt is not None:
+            respond(pending_prompt, result)
+            pending_prompt = None
+        held = list(steered)
+        steered.clear()
+
+        def answer_late():
+            while not os.path.exists(late_gate):
+                time.sleep(0.02)
+            for steer_id in held:
+                respond(steer_id, result)
+
+        threading.Thread(target=answer_late, daemon=True).start()
+    else:
+        for steer_id in steered:
+            respond(steer_id, result)
+        steered.clear()
+        if pending_prompt is not None:
+            respond(pending_prompt, result)
+            pending_prompt = None
+    if pending_prompt is None and queued:
+        request_id, text = queued.pop(0)
+        begin_turn(request_id, text)
+
+
+def finish_prompt():
+    if pending_prompt is None or outbound:
+        return
+    update(
+        session_id,
+        {"sessionUpdate": "tool_call_update", "toolCallId": "tc-1", "status": "completed"},
+    )
+    text = "world" + (" " + " ".join(collected) if collected else "")
+    update(
+        session_id,
+        {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": text},
+        },
+    )
+    answer_all({"stopReason": "end_turn"})
+
+
+def begin_turn(request_id, text):
+    """Open a turn for request_id and stream the standard updates."""
+    global pending_prompt, pending_text, collected
+    pending_prompt = request_id
+    pending_text = text
+    collected = []
+    update(
+        session_id,
+        {
+            "sessionUpdate": "agent_thought_chunk",
+            "content": {"type": "text", "text": "thinking about it"},
+        },
+    )
+    update(
+        session_id,
+        {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "Hello "},
+        },
+    )
+    update(
+        session_id,
+        {
+            "sessionUpdate": "plan",
+            "entries": [
+                {"content": "do the thing", "status": "in_progress"},
+                {"content": "report back", "status": "pending"},
+            ],
+        },
+    )
+    update(
+        session_id,
+        {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "tc-1",
+            "title": "fake-tool",
+            "kind": "execute",
+            "status": "pending",
+            "locations": [{"path": "/tmp/fake.py", "line": 1}],
+            "rawInput": {"cmd": "fake"},
+        },
+    )
+    update(
+        session_id,
+        {"sessionUpdate": "tool_call_update", "toolCallId": "tc-1", "status": "in_progress"},
+    )
+    if text.startswith("gated "):
+        # "gated <path>": the turn stays open until that file exists,
+        # then completes normally — the test ends the turn on its own
+        # event, never on a delay.
+        while not os.path.exists(text[len("gated "):]):
+            time.sleep(0.02)
+    if text in ("wait", "gather", "hold"):
+        return
+    if text == "loops":
+        # A busy-looping turn: tc-1 and an edit call stay in progress for
+        # ~0.3 s while three same-titled calls run, then everything closes
+        # but a long in-progress call — all inside any wait's window.
+        update(
+            session_id,
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "tc-edit",
+                "title": "edit src/main.rs",
+                "kind": "edit",
+                "status": "in_progress",
+                "locations": [{"path": "/tmp/fake/src/main.rs", "line": 1}],
+            },
+        )
+        update(
+            session_id,
+            {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "tc-sleep",
+                "title": "run sleep 300",
+                "kind": "execute",
+                "status": "in_progress",
+            },
+        )
+
+        def loop_traffic():
+            time.sleep(0.3)
+            update(
+                session_id,
+                {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "tc-1",
+                    "status": "completed",
+                },
+            )
+            for i in range(3):
+                update(
+                    session_id,
+                    {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": f"tc-loop-{i}",
+                        "title": "run check",
+                        "kind": "execute",
+                        "status": "completed",
+                    },
+                )
+            update(
+                session_id,
+                {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "tc-edit",
+                    "status": "completed",
+                },
+            )
+
+        threading.Thread(target=loop_traffic, daemon=True).start()
+        return
+    if "PERMISSION" in text:
+        new_request(
+            "session/request_permission",
+            {
+                "sessionId": session_id,
+                "toolCall": {
+                    "toolCallId": "tc-1",
+                    "title": "fake-tool",
+                    "status": "in_progress",
+                },
+                "options": [
+                    {"optionId": "allow-1", "name": "Allow once", "kind": "allow_once"},
+                    {"optionId": "allow-2", "name": "Allow always", "kind": "allow_always"},
+                    {"optionId": "deny-1", "name": "Deny", "kind": "reject_once"},
+                ],
+            },
+            "perm",
+        )
+    if text.startswith("READ "):
+        path = text[5:].strip()
+        new_request(
+            "fs/read_text_file",
+            {"sessionId": session_id, "path": path},
+            "fs",
+        )
+    if text.startswith("WRITE "):
+        new_request(
+            "fs/write_text_file",
+            {
+                "sessionId": session_id,
+                "path": text[6:].strip(),
+                "content": "written-by-fake-agent",
+            },
+            "fsw",
+        )
+    if text.startswith("KILL "):
+        argv = shlex.split(text[5:].strip())
+        new_request(
+            "terminal/create",
+            {
+                "sessionId": session_id,
+                "command": argv[0],
+                "args": argv[1:],
+                "outputByteLimit": 4096,
+            },
+            "term-kill-create",
+        )
+    if text.startswith("RUNLINE "):
+        new_request(
+            "terminal/create",
+            {
+                "sessionId": session_id,
+                "command": text[8:].strip(),
+                "outputByteLimit": 4096,
+            },
+            "term-create",
+        )
+    elif text.startswith("RUN "):
+        argv = shlex.split(text[4:].strip())
+        new_request(
+            "terminal/create",
+            {
+                "sessionId": session_id,
+                "command": argv[0],
+                "args": argv[1:],
+                "outputByteLimit": 4096,
+            },
+            "term-create",
+        )
+    update(
+        session_id,
+        {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "ab"},
+        },
+    )
+    finish_prompt()
+
+
+def session_modes():
+    """Modes advertised in session/new and session/load; FAKE_NO_MODES=1
+    omits the list."""
+    if os.environ.get("FAKE_NO_MODES") == "1":
+        return None
+    return {
+        "currentModeId": current_mode,
+        "availableModes": [
+            {"id": "default", "name": "Default"},
+            {"id": "bypass", "name": "Bypass"},
+        ],
+    }
+
+
+def session_config_options():
+    """Config options advertised in session/new and session/load, with the
+    values currently in effect; FAKE_NO_OPTIONS=1 gives `model` no
+    selectable values, FAKE_NO_MODEL=1 drops `model` and FAKE_NO_MODES=1
+    drops `mode` from the list entirely."""
+    options = []
+    if os.environ.get("FAKE_NO_MODEL") != "1":
+        model = {
+            "id": "model",
+            "name": "Model",
+            "type": "select",
+            "category": "model",
+            "currentValue": current_model,
+        }
+        if os.environ.get("FAKE_NO_OPTIONS") != "1":
+            model["options"] = [
+                {"value": "a", "name": "A"},
+                {"value": "b", "name": "B"},
+            ]
+        options.append(model)
+    if os.environ.get("FAKE_NO_MODES") != "1":
+        options.append(
+            {
+                "id": "mode",
+                "name": "Mode",
+                "type": "select",
+                "category": "mode",
+                "currentValue": current_mode,
+                "options": [
+                    {"value": "default", "name": "Default"},
+                    {"value": "bypass", "name": "Bypass"},
+                ],
+            }
+        )
+    return options
+
+
+def session_result(request_id, result):
+    modes = session_modes()
+    if modes is not None:
+        result["modes"] = modes
+    result["configOptions"] = session_config_options()
+    respond(request_id, result)
+
+
+def rate_limit_error(request_id):
+    """Answer the prompt with the provider rate-limit shape: -32010 with
+    structured `errorKind`/`retryable`, the reset in the message's
+    `(at HH:MM:SS UTC)` clause (unless FAKE_RATE_LIMIT_VAGUE)."""
+    remaining = max(0.1, rate_limited_until - time.time())
+    # Whole-second truncation must round up: a clause that names a time
+    # before the window lifts would resume the session early — into a
+    # still-active limit.
+    reset_utc = time.strftime("%H:%M:%S", time.gmtime(math.ceil(rate_limited_until)))
+    data = {
+        "cognition.ai/errorKind": "unavailable",
+        "cognition.ai/retryable": True,
+    }
+    if os.environ.get("FAKE_RATE_LIMIT_VAGUE") == "1":
+        message = (
+            "Reached free model rate limit. Please switch to a "
+            "different model. (trace ID: t-%d)" % os.getpid()
+        )
+    else:
+        message = (
+            "Reached free model rate limit. Please switch to a different model. "
+            "Your limit will reset in %d minutes (at %s UTC). (trace ID: t-%d)"
+            % (int(remaining // 60) + 1, reset_utc, os.getpid())
+        )
+    send(
+        {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "error": {"code": -32010, "message": message, "data": data},
+        }
+    )
+
+
+def on_prompt(request_id, params):
+    global session_id, rate_limited_until
+    session_id = params.get("sessionId", session_id)
+    text = (params.get("prompt") or [{}])[0].get("text", "")
+    if text == "die":
+        sys.exit(3)
+    if text == "fail":
+        # The request errors but the process keeps running — a failed turn
+        # on a live agent.
+        send(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "error": {
+                    "code": -32603,
+                    "message": "stream disconnected before completion",
+                },
+            }
+        )
+        return
+    # FAKE_RATE_LIMIT: a prompt containing "ratelimit" opens the window;
+    # every prompt — steers included — errors until it lifts.
+    limit_secs = float(os.environ.get("FAKE_RATE_LIMIT", "0") or 0)
+    if limit_secs and "ratelimit" in text and rate_limited_until is None:
+        rate_limited_until = time.time() + limit_secs
+    # FAKE_RATE_LIMIT_HOLD=<path>: the provider's limit stands while the
+    # file is absent — every prompt errors again, the window re-arming at
+    # each answer so the park it causes always has a live reset — and is
+    # gone entirely once the file exists: the test lifts the limit on its
+    # own event, never on a window's end.
+    hold = os.environ.get("FAKE_RATE_LIMIT_HOLD")
+    if hold is not None:
+        if not os.path.exists(hold):
+            rate_limited_until = time.time() + limit_secs
+        else:
+            rate_limited_until = None
+    if rate_limited_until is not None:
+        if time.time() < rate_limited_until:
+            gate = os.environ.get("FAKE_RATE_LIMIT_GATE")
+            if gate:
+                # The error waits on the gate file: the test holds the
+                # turn in flight itself instead of a fixed delay. The
+                # window re-arms at the answer — a reset measured from
+                # the prompt's arrival can land in the past under a held
+                # gate, and a past reset parks the session for a day.
+                while not os.path.exists(gate):
+                    time.sleep(0.02)
+                rate_limited_until = time.time() + limit_secs
+            else:
+                delay = float(os.environ.get("FAKE_RATE_LIMIT_DELAY", "0.35") or 0.35)
+                time.sleep(delay)
+            rate_limit_error(request_id)
+            return
+        rate_limited_until = None
+    if pending_prompt is not None:
+        # A prompt arriving while a turn runs is a steer injection — unless
+        # FAKE_NO_STEER=1 rejects it, FAKE_QUEUE_PROMPTS=1 parks it
+        # agent-side to run as its own turn after this one ends, or
+        # FAKE_FOLD_STEER=1 folds it in and leaves its request unanswered.
+        if os.environ.get("FAKE_NO_STEER") == "1":
+            send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {"code": -32600, "message": "prompt in flight"},
+                }
+            )
+            return
+        if os.environ.get("FAKE_FOLD_STEER") == "1":
+            if text.startswith("LATE "):
+                # The steer landed behind the turn's end: the running turn
+                # finishes, then the steer runs — and answers — as a turn
+                # of its own.
+                queued.append((request_id, text[5:]))
+                finish_prompt()
+            else:
+                collected.append("steer:" + text)
+                update(
+                    session_id,
+                    {
+                        "sessionUpdate": "user_message_chunk",
+                        "content": {"type": "text", "text": text},
+                    },
+                )
+                if pending_text == "gather":
+                    finish_prompt()
+            return
+        if os.environ.get("FAKE_QUEUE_PROMPTS") == "1":
+            queued.append((request_id, text))
+            if pending_text == "hold":
+                finish_prompt()
+            return
+        steered.append(request_id)
+        collected.append("steer:" + text)
+        update(
+            session_id,
+            {
+                "sessionUpdate": "user_message_chunk",
+                "content": {"type": "text", "text": text},
+            },
+        )
+        if pending_text == "gather":
+            finish_prompt()
+        return
+    begin_turn(request_id, text)
+
+
+def on_response(msg):
+    global terminal_id
+    request_id = msg.get("id")
+    kind = outbound.pop(request_id, None)
+    if kind is None:
+        return
+    if kind == "perm":
+        if "result" in msg:
+            outcome = msg["result"].get("outcome", {})
+            collected.append("perm:" + str(outcome.get("optionId", "cancelled")))
+        else:
+            collected.append("perm:error")
+    elif kind == "fs":
+        if "result" in msg:
+            collected.append("fs:" + msg["result"].get("content", "")[:40].replace("\n", "\\n"))
+        else:
+            collected.append("fserr:" + msg.get("error", {}).get("message", "?")[:60])
+    elif kind == "fsw":
+        if "result" in msg:
+            collected.append("fsw:ok")
+        else:
+            collected.append("fswerr:" + msg.get("error", {}).get("message", "?"))
+    elif kind == "term-create":
+        if "result" in msg:
+            terminal_id = msg["result"]["terminalId"]
+            new_request(
+                "terminal/wait_for_exit",
+                {"sessionId": session_id, "terminalId": terminal_id},
+                "term-wait",
+            )
+        else:
+            collected.append("termerr:" + msg.get("error", {}).get("message", "?"))
+    elif kind == "term-kill-create":
+        if "result" in msg:
+            terminal_id = msg["result"]["terminalId"]
+            new_request(
+                "terminal/kill",
+                {"sessionId": session_id, "terminalId": terminal_id},
+                "term-kill",
+            )
+        else:
+            collected.append("termerr:" + msg.get("error", {}).get("message", "?"))
+    elif kind == "term-kill":
+        if "result" in msg:
+            new_request(
+                "terminal/wait_for_exit",
+                {"sessionId": session_id, "terminalId": terminal_id},
+                "term-wait",
+            )
+        else:
+            collected.append("killerr:" + msg.get("error", {}).get("message", "?"))
+    elif kind == "term-wait":
+        result = msg.get("result", {})
+        collected.append("exit:" + str(result.get("exitCode")))
+        if result.get("signal") is not None:
+            collected.append("signal:" + str(result["signal"]))
+        new_request(
+            "terminal/output",
+            {"sessionId": session_id, "terminalId": terminal_id},
+            "term-output",
+        )
+    elif kind == "term-output":
+        result = msg.get("result", {})
+        output = result.get("output", "")
+        collected.append("term:" + output.strip()[:40])
+        if result.get("truncated"):
+            collected.append("trunc")
+            collected.append("tail:" + output.strip()[-40:])
+        new_request(
+            "terminal/release",
+            {"sessionId": session_id, "terminalId": terminal_id},
+            "term-release",
+        )
+    elif kind == "term-release":
+        pass
+    finish_prompt()
+
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        msg = json.loads(line)
+    except ValueError:
+        continue
+
+    if "method" in msg and "id" in msg:
+        method, request_id, params = msg["method"], msg["id"], msg.get("params") or {}
+        if method == "initialize":
+            respond(
+                request_id,
+                {
+                    "protocolVersion": 1,
+                    "agentCapabilities": {
+                        "loadSession": os.environ.get("FAKE_NO_LOAD") != "1",
+                    },
+                    "agentInfo": {"name": "fake-agent-py", "version": "0.1.0"},
+                },
+            )
+        elif method == "session/new":
+            session_count += 1
+            session_id = f"sess-{os.getpid()}-{session_count}"
+            session_result(request_id, {"sessionId": session_id})
+        elif method == "session/load":
+            session_id = params.get("sessionId", session_id)
+            gate = os.environ.get("FAKE_LOAD_GATE")
+            if gate:
+                while not os.path.exists(gate):
+                    time.sleep(0.02)
+            update(
+                session_id,
+                {
+                    "sessionUpdate": "user_message_chunk",
+                    "content": {"type": "text", "text": "loaded user message"},
+                },
+            )
+            session_result(request_id, {})
+        elif method == "session/set_mode":
+            # FAKE_MODE_IGNORED=1 accepts the call but never switches mode:
+            # no update is sent and the `mode` config option keeps reporting
+            # the mode the session actually runs. Otherwise the accepted
+            # mode is applied and reported like a real agent — a
+            # current_mode_update ahead of the (empty) response.
+            if os.environ.get("FAKE_MODE_IGNORED") != "1":
+                current_mode = params["modeId"]
+                update(
+                    session_id,
+                    {
+                        "sessionUpdate": "current_mode_update",
+                        "currentModeId": current_mode,
+                    },
+                )
+            respond(request_id, {})
+        elif method == "session/set_config_option":
+            if params["configId"] == "model":
+                current_model = params["value"]
+            elif params["configId"] == "mode":
+                current_mode = params["value"]
+            respond(request_id, {"configOptions": session_config_options()})
+        elif method == "session/prompt":
+            on_prompt(request_id, params)
+        else:
+            send(
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {"code": -32601, "message": "Method not found"},
+                }
+            )
+    elif "method" in msg:
+        if msg["method"] == "session/cancel" and pending_prompt is not None:
+            answer_all({"stopReason": "cancelled"})
+            outbound.clear()
+    elif "id" in msg:
+        on_response(msg)
