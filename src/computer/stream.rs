@@ -277,23 +277,7 @@ impl SessionStream {
                     state,
                     RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
                 ) {
-                    let gone = state_for_peer
-                        .lock()
-                        .await
-                        .as_mut()
-                        .and_then(|runtime| runtime.peers.remove(&gone_id));
-                    // Closing stops the RTP sender, which ends the peer's RTCP
-                    // follower and takes its estimate out of the encoder's
-                    // minimum. It runs apart from this handler, which webrtc
-                    // holds while it runs and `close` raises again.
-                    if let Some(peer) = gone {
-                        tokio::spawn(async move {
-                            if let Err(error) = peer.close().await {
-                                tracing::debug!(%error, "closing a computer stream peer failed");
-                            }
-                        });
-                    }
-                    tracing::debug!(peer_id = %gone_id, "computer peer went away");
+                    forget_peer(&state_for_peer, &gone_id).await;
                 }
             })
         }));
@@ -303,6 +287,8 @@ impl SessionStream {
             runtime.display.clone(),
             runtime.takeover_active.clone(),
             runtime.inputs.clone(),
+            self.runtime.clone(),
+            peer_id.clone(),
         );
 
         let offer = RTCSessionDescription::offer(offer_sdp)
@@ -332,6 +318,26 @@ impl SessionStream {
     }
 }
 
+/// Forgets a viewer that left and closes its connection. Closing stops the
+/// RTP sender, which ends the viewer's RTCP follower and takes its estimate
+/// out of the encoder's minimum. It runs apart from the caller, which may be
+/// a webrtc handler that `close` raises again.
+async fn forget_peer(runtime: &Mutex<Option<StreamRuntime>>, peer_id: &str) {
+    let gone = runtime
+        .lock()
+        .await
+        .as_mut()
+        .and_then(|runtime| runtime.peers.remove(peer_id));
+    if let Some(peer) = gone {
+        tracing::debug!(peer_id, "computer peer went away");
+        tokio::spawn(async move {
+            if let Err(error) = peer.close().await {
+                tracing::debug!(%error, "closing a computer stream peer failed");
+            }
+        });
+    }
+}
+
 /// Routes a peer's `DataChannel` input into the display while takeover
 /// is held. Each channel carries its own held-button state so drags
 /// survive across messages.
@@ -340,12 +346,24 @@ fn setup_input_channel(
     display: Arc<PlatformDisplay>,
     takeover_active: Arc<AtomicBool>,
     inputs: Arc<std::sync::Mutex<super::input::InputState>>,
+    runtime: Arc<Mutex<Option<StreamRuntime>>>,
+    peer_id: String,
 ) {
     peer.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
         let display = display.clone();
         let takeover_active = takeover_active.clone();
         let inputs = inputs.clone();
+        let runtime = runtime.clone();
+        let peer_id = peer_id.clone();
         Box::pin(async move {
+            // The channel closes with the viewer's connection, long before ICE
+            // gives up on a viewer that closed: webrtc does not move the
+            // connection to `Closed` on the viewer's DTLS close alert.
+            dc.on_close(Box::new(move || {
+                let runtime = runtime.clone();
+                let peer_id = peer_id.clone();
+                Box::pin(async move { forget_peer(&runtime, &peer_id).await })
+            }));
             dc.on_message(Box::new(move |message: DataChannelMessage| {
                 let display = display.clone();
                 let takeover_active = takeover_active.clone();
