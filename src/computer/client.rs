@@ -74,18 +74,22 @@ impl ComputerAgent {
     /// Returns the message text when the helper is unreachable or the
     /// request itself failed.
     #[cfg(target_os = "macos")]
-    pub async fn request(&self, request: AgentRequest) -> Result<AgentResponse, String> {
-        self.ensure_running()?;
-        let socket = self.socket.clone();
+    pub async fn request(self: &Arc<Self>, request: AgentRequest) -> Result<AgentResponse, String> {
         let payload = serde_json::to_vec(&request)
             .map_err(|e| e.to_string())
             .map(|mut v| {
                 v.push(b'\n');
                 v
             })?;
-        tokio::task::spawn_blocking(move || round_trip(&socket, &payload))
-            .await
-            .map_err(|e| e.to_string())?
+        // Launching may sign the bundle and wait for the helper; none of it
+        // runs on the async thread.
+        let agent = self.clone();
+        tokio::task::spawn_blocking(move || {
+            agent.ensure_running()?;
+            round_trip(&agent.socket, &payload)
+        })
+        .await
+        .map_err(|e| e.to_string())?
     }
 
     /// Every computer request is unsupported outside macOS.
