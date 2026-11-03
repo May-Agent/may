@@ -14,7 +14,12 @@ use std::sync::Mutex;
 #[cfg(target_os = "macos")]
 use std::os::unix::net::UnixStream;
 
+use std::sync::Arc;
+
+use arc_swap::ArcSwap;
+
 use super::proto::{AgentRequest, AgentResponse};
+use crate::config::MayConfig;
 
 #[cfg(target_os = "macos")]
 const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
@@ -27,6 +32,9 @@ const HELPER_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 
 /// The daemon-side client for one `computer-agent` child.
 pub struct ComputerAgent {
+    /// The daemon's live config; `[computer]` is read per launch.
+    #[cfg(target_os = "macos")]
+    config: Arc<ArcSwap<MayConfig>>,
     #[cfg(target_os = "macos")]
     socket: PathBuf,
     #[cfg(target_os = "macos")]
@@ -47,8 +55,10 @@ impl ComputerAgent {
     /// Point the client at `<may_dir>/computer-agent.sock`.
     #[must_use]
     #[allow(unused_variables, clippy::needless_pass_by_value)]
-    pub fn new(may_dir: PathBuf) -> Self {
+    pub fn new(may_dir: PathBuf, config: Arc<ArcSwap<MayConfig>>) -> Self {
         Self {
+            #[cfg(target_os = "macos")]
+            config,
             #[cfg(target_os = "macos")]
             socket: may_dir.join("computer-agent.sock"),
             #[cfg(target_os = "macos")]
@@ -170,35 +180,41 @@ impl ComputerAgent {
     /// launching it through `open` gives the helper a stable
     /// `ai.may.computer-agent` subject — the same shape cua-driver and
     /// Codex Computer Use take.
+    ///
+    /// The whole bundle is signed with `identity` (ad hoc when `None`) so
+    /// the Info.plist is bound and the designated requirement is the
+    /// identifier plus certificate; the bundle is rebuilt, and a running
+    /// helper stopped, whenever the source binary or the identity differs
+    /// from what the bundle was built from.
     #[cfg(target_os = "macos")]
-    fn materialize_app(&self) -> Result<PathBuf, String> {
+    fn materialize_app(&self, identity: Option<&str>) -> Result<PathBuf, String> {
         let app = self.may_dir.join("MayComputerAgent.app");
-        let macos_dir = app.join("Contents/MacOS");
+        let stamp_path = self.may_dir.join(BUNDLE_STAMP_FILE);
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-        let dst = macos_dir.join("may");
-        // Refresh when the binary changed — compares cheaply, good enough
-        // for dev rebuilds and reinstalls alike.
-        let stale = match (std::fs::metadata(&dst), std::fs::metadata(&exe)) {
-            (Ok(d), Ok(e)) => d.len() != e.len() || d.modified().ok() < e.modified().ok(),
-            _ => true,
-        };
-        if stale {
-            std::fs::create_dir_all(&macos_dir).map_err(|e| e.to_string())?;
-            std::fs::copy(&exe, &dst).map_err(|e| format!("copy helper into bundle: {e}"))?;
-            std::fs::write(
-                app.join("Contents/Info.plist"),
-                r#"<?xml version="1.0" encoding="UTF-8"?>
-<plist version="1.0"><dict>
-<key>CFBundleIdentifier</key><string>ai.may.computer-agent</string>
-<key>CFBundleExecutable</key><string>may</string>
-<key>CFBundleName</key><string>May Computer Agent</string>
-<key>CFBundlePackageType</key><string>APPL</string>
-<key>LSUIElement</key><true/>
-</dict></plist>
-"#,
-            )
-            .map_err(|e| e.to_string())?;
+        let dst = app.join("Contents/MacOS/may");
+        let wanted = BundleStamp::of(&exe, identity)?;
+        let recorded = std::fs::read(&stamp_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<BundleStamp>(&bytes).ok());
+        if !needs_rebuild(recorded.as_ref(), &wanted, dst.exists()) {
+            return Ok(app);
         }
+        // The running helper executes the old bundle; replace it only
+        // once that process is gone.
+        self.stop_helper()?;
+        match std::fs::remove_file(&stamp_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("remove bundle stamp: {e}")),
+        }
+        let macos_dir = app.join("Contents/MacOS");
+        std::fs::create_dir_all(&macos_dir).map_err(|e| e.to_string())?;
+        std::fs::copy(&exe, &dst).map_err(|e| format!("copy helper into bundle: {e}"))?;
+        std::fs::write(app.join("Contents/Info.plist"), include_str!("Info.plist"))
+            .map_err(|e| e.to_string())?;
+        sign_bundle(&app, identity)?;
+        let stamp = serde_json::to_vec(&wanted).map_err(|e| e.to_string())?;
+        std::fs::write(&stamp_path, stamp).map_err(|e| format!("write bundle stamp: {e}"))?;
         Ok(app)
     }
 
@@ -209,10 +225,13 @@ impl ComputerAgent {
             .spawn_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Read live: a changed identity rebuilds the bundle and stops the
+        // running helper before the liveness check below.
+        let identity = self.config.load().computer.signing_identity.clone();
+        let app = self.materialize_app(identity.as_deref())?;
         if self.responds() {
             return Ok(());
         }
-        let app = self.materialize_app()?;
         // `open` routes through LaunchServices, which is what breaks the
         // responsible-process chain; a plain spawn would inherit the
         // daemon's (or a terminal's) TCC subject.
@@ -247,6 +266,65 @@ impl ComputerAgent {
     }
 }
 
+/// Where the stamp of what the bundle was built from lives — beside the
+/// bundle, because a file inside it would break its seal.
+#[cfg(target_os = "macos")]
+const BUNDLE_STAMP_FILE: &str = "MayComputerAgent.stamp";
+
+/// What a materialized bundle was built from.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct BundleStamp {
+    source_len: u64,
+    source_modified: Option<std::time::SystemTime>,
+    /// The `codesign` identity, `-` for ad hoc.
+    identity: String,
+}
+
+#[cfg(target_os = "macos")]
+impl BundleStamp {
+    fn of(exe: &std::path::Path, identity: Option<&str>) -> Result<Self, String> {
+        let meta = std::fs::metadata(exe).map_err(|e| format!("stat {}: {e}", exe.display()))?;
+        Ok(Self {
+            source_len: meta.len(),
+            source_modified: meta.modified().ok(),
+            identity: identity.unwrap_or("-").to_owned(),
+        })
+    }
+}
+
+/// The bundle is rebuilt unless it exists and was built from exactly
+/// what is wanted now.
+#[cfg(target_os = "macos")]
+fn needs_rebuild(
+    recorded: Option<&BundleStamp>,
+    wanted: &BundleStamp,
+    bundle_present: bool,
+) -> bool {
+    !bundle_present || recorded != Some(wanted)
+}
+
+/// Sign the whole bundle so the Info.plist is bound and the designated
+/// requirement is identifier plus certificate.
+#[cfg(target_os = "macos")]
+fn sign_bundle(app: &std::path::Path, identity: Option<&str>) -> Result<(), String> {
+    let output = std::process::Command::new("codesign")
+        .args(["--force", "--sign", identity.unwrap_or("-")])
+        .args(["--identifier", "ai.may.computer-agent"])
+        .arg(app)
+        .output()
+        .map_err(|e| format!("run codesign: {e}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "codesign {} failed: {}",
+            app.display(),
+            String::from_utf8_lossy(&output.stderr)
+        ))
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn round_trip(socket: &PathBuf, payload: &[u8]) -> Result<AgentResponse, String> {
     let mut conn = UnixStream::connect(socket).map_err(|e| format!("connect: {e}"))?;
@@ -256,4 +334,41 @@ fn round_trip(socket: &PathBuf, payload: &[u8]) -> Result<AgentResponse, String>
         .read_line(&mut line)
         .map_err(|e| e.to_string())?;
     serde_json::from_str(&line).map_err(|e| format!("bad reply: {e}"))
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::{BundleStamp, needs_rebuild};
+
+    fn stamp(len: u64, identity: &str) -> BundleStamp {
+        BundleStamp {
+            source_len: len,
+            source_modified: Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(len)),
+            identity: identity.to_owned(),
+        }
+    }
+
+    #[test]
+    fn bundle_is_reused_only_when_built_from_the_same_source_and_identity() {
+        let built = stamp(10, "-");
+        assert!(!needs_rebuild(Some(&built), &built.clone(), true));
+        // No stamp, or a missing bundle.
+        assert!(needs_rebuild(None, &built, true));
+        assert!(needs_rebuild(Some(&built), &built, false));
+        // Rebuilt binary.
+        assert!(needs_rebuild(Some(&built), &stamp(11, "-"), true));
+        let mut touched = built.clone();
+        touched.source_modified = Some(std::time::UNIX_EPOCH);
+        assert!(needs_rebuild(Some(&built), &touched, true));
+        // Changed identity.
+        assert!(needs_rebuild(Some(&built), &stamp(10, "ABCDEF"), true));
+    }
+
+    #[test]
+    fn stamp_survives_its_file_form() {
+        let built = stamp(10, "ABCDEF");
+        let bytes = serde_json::to_vec(&built).expect("serialize");
+        let read: BundleStamp = serde_json::from_slice(&bytes).expect("parse");
+        assert_eq!(read, built);
+    }
 }
