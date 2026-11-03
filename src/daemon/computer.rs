@@ -181,7 +181,16 @@ async fn rpc(state: &DaemonState, request: AgentRequest) -> SkyResult<AgentRespo
 }
 
 async fn run_computer_start(state: Arc<DaemonState>, id: String) -> SkyResult<bool> {
-    match rpc(&state, AgentRequest::StartStream { session_id: id }).await? {
+    let codec = state.config_snapshot().stream.codec;
+    match rpc(
+        &state,
+        AgentRequest::StartStream {
+            session_id: id,
+            codec,
+        },
+    )
+    .await?
+    {
         AgentResponse::Ok => Ok(true),
         AgentResponse::Error { error } => {
             Err(skyzen::Error::msg(error).set_status(StatusCode::INTERNAL_SERVER_ERROR))
@@ -223,6 +232,10 @@ async fn answer_offer(state: &DaemonState, id: &str, offer_sdp: String) -> SkyRe
     .await?
     {
         AgentResponse::Sdp { sdp } => Ok(sdp),
+        // The viewer's offer is the problem, as on the browser stream.
+        AgentResponse::OfferRefused { error } => {
+            Err(skyzen::Error::msg(error).set_status(StatusCode::UNPROCESSABLE_ENTITY))
+        }
         AgentResponse::Error { error } => Err(skyzen::Error::msg(error)),
         _ => Err(skyzen::Error::msg("unexpected reply from computer-agent")
             .set_status(StatusCode::INTERNAL_SERVER_ERROR)),

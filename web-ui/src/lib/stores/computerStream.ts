@@ -1,5 +1,6 @@
 import { useEffect } from 'react';
 import { create } from 'zustand';
+import { useConfigStore } from './config';
 import {
   type ComputerStreamHandle,
   connectComputerStream,
@@ -16,12 +17,15 @@ interface ComputerStreamState {
   sessionId: string | null;
   stream: MediaStream | null;
   state: RTCPeerConnectionState;
+  /** Why the last connection attempt failed, as the server reported it. */
+  error: string | null;
 }
 
 export const useComputerStreamStore = create<ComputerStreamState>(() => ({
   sessionId: null,
   stream: null,
   state: 'new',
+  error: null,
 }));
 
 const CLOSE_DELAY_MS = 1500;
@@ -35,7 +39,7 @@ function close(): void {
   generation += 1;
   handle?.close();
   handle = null;
-  useComputerStreamStore.setState({ sessionId: null, stream: null, state: 'new' });
+  useComputerStreamStore.setState({ sessionId: null, stream: null, state: 'new', error: null });
 }
 
 async function open(sessionId: string): Promise<void> {
@@ -43,7 +47,7 @@ async function open(sessionId: string): Promise<void> {
   const set = (patch: Partial<ComputerStreamState>) => {
     if (gen === generation) useComputerStreamStore.setState(patch);
   };
-  useComputerStreamStore.setState({ sessionId, stream: null, state: 'connecting' });
+  useComputerStreamStore.setState({ sessionId, stream: null, state: 'connecting', error: null });
   try {
     const next = await connectComputerStream({
       sessionId,
@@ -55,10 +59,21 @@ async function open(sessionId: string): Promise<void> {
       return;
     }
     handle = next;
-  } catch {
-    set({ state: 'failed' });
+  } catch (err) {
+    set({ state: 'failed', error: err instanceof Error ? err.message : String(err) });
   }
 }
+
+// The agent restarts the stream when the stream codec changes and closes
+// every viewer's connection; the open view renegotiates against the new codec.
+useConfigStore.subscribe((next, prev) => {
+  const was = prev.config?.fullConfig.stream.codec;
+  if (was === undefined || next.config?.fullConfig.stream.codec === was) return;
+  const { sessionId } = useComputerStreamStore.getState();
+  if (!sessionId || users === 0) return;
+  close();
+  void open(sessionId);
+});
 
 function acquire(sessionId: string): void {
   users += 1;

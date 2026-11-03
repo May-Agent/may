@@ -1543,6 +1543,13 @@ impl From<&RemoteAccessConfig> for UiRemoteAccessConfig {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct UiStreamConfig {
+    #[schema(value_type = String)]
+    pub(crate) codec: crate::config::StreamCodec,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct UiSandboxConfig {
     #[schema(value_type = String)]
     pub(crate) command_priority: CommandPriority,
@@ -1560,6 +1567,7 @@ pub struct UiFullConfig {
     pub(crate) browser: UiBrowserConfig,
     pub(crate) remote_access: UiRemoteAccessConfig,
     pub(crate) sandbox: UiSandboxConfig,
+    pub(crate) stream: UiStreamConfig,
 }
 
 #[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
