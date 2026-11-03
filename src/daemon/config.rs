@@ -26,8 +26,9 @@ use super::types::{
     LastModelRequest, McpCreateRequest, MemoryPayload, MemorySaveRequest, SkillInfoDto,
     SkillInstallRequest, SseHeartbeat, SshServerRequest, UiAppearanceConfig, UiBrowserConfig,
     UiConfigResponse, UiFullConfig, UiModelsConfig, UiNativeToolsConfig, UiPreferencesConfig,
-    UiProviderConfig, UiRemoteAccessConfig, UiSandboxConfig,
+    UiProviderConfig, UiRemoteAccessConfig, UiSandboxConfig, UiStreamConfig,
 };
+use crate::computer::proto::{AgentRequest, AgentResponse};
 
 #[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -169,6 +170,9 @@ pub(super) fn build_ui_full_config(config: &MayConfig) -> UiFullConfig {
         sandbox: UiSandboxConfig {
             command_priority: config.sandbox.command_priority,
         },
+        stream: UiStreamConfig {
+            codec: config.stream.codec,
+        },
     }
 }
 
@@ -221,8 +225,22 @@ fn provider_map_from_ui(
         .collect()
 }
 
+/// A stream codec this host cannot serve is the request's problem; every
+/// other browser failure is the daemon's.
+fn browser_stream_error(error: crate::container::browser::BrowserError) -> skyzen::Error {
+    match error {
+        crate::container::browser::BrowserError::CodecSelection(error) => bad_request_error(error),
+        error => internal_error(error),
+    }
+}
+
 async fn run_save_full_config(state: Arc<DaemonState>, req: UiFullConfig) -> SkyResult<ApiHealth> {
     let previous_browser_manager = state.browser_manager();
+    let previous_config = state.config_snapshot();
+    let codec = req.stream.codec;
+    // Each stream selects the codec for its own format before it changes
+    // anything, so a codec this host cannot serve leaves both as they were.
+    let codec_changed = codec != previous_config.stream.codec;
     let next_browser_manager = if req.browser.enabled {
         let next_browser_config = crate::config::BrowserConfig {
             enabled: req.browser.enabled,
@@ -247,19 +265,50 @@ async fn run_save_full_config(state: Arc<DaemonState>, req: UiFullConfig) -> Sky
             }),
         };
         next_browser_config.validate().map_err(bad_request_error)?;
-        Some(Arc::new(
-            crate::container::browser::BrowserManager::new(
-                next_browser_config,
-                state.may_dir.clone(),
-                crate::container::browser::BrowserLifecyclePublisher::new(
-                    state.browser_lifecycle_tx.clone(),
-                ),
-            )
-            .map_err(internal_error)?,
-        ))
+        match &previous_browser_manager {
+            // Nothing but possibly the codec changed: the running browser
+            // keeps its pages and only its stream moves to the new codec.
+            Some(manager) if next_browser_config == previous_config.browser => {
+                if codec_changed {
+                    manager
+                        .set_codec(codec)
+                        .await
+                        .map_err(browser_stream_error)?;
+                }
+                Some(manager.clone())
+            }
+            _ => Some(Arc::new(
+                crate::container::browser::BrowserManager::new(
+                    next_browser_config,
+                    state.may_dir.clone(),
+                    crate::container::browser::BrowserLifecyclePublisher::new(
+                        state.browser_lifecycle_tx.clone(),
+                    ),
+                    codec,
+                )
+                .map_err(browser_stream_error)?,
+            )),
+        }
     } else {
         None
     };
+    if codec_changed && state.computer.is_running() {
+        match state
+            .computer
+            .request(AgentRequest::SetStreamCodec { codec })
+            .await
+        {
+            Ok(AgentResponse::Ok) => {}
+            Ok(AgentResponse::Error { error }) | Err(error) => {
+                return Err(internal_error_message(error));
+            }
+            Ok(_) => {
+                return Err(internal_error_message(
+                    "unexpected reply from computer-agent",
+                ));
+            }
+        }
+    }
 
     let updated = state.update_config(|config| {
         config.provider = provider_map_from_ui(&config.provider, &req.providers);
@@ -297,6 +346,7 @@ async fn run_save_full_config(state: Arc<DaemonState>, req: UiFullConfig) -> Sky
         });
         config.max_iterations = req.max_iterations;
         config.sandbox.command_priority = req.sandbox.command_priority;
+        config.stream.codec = codec;
         config.browser.enabled = req.browser.enabled;
         config.browser.backend = req.browser.backend;
         config.browser.port = req.browser.port;
@@ -336,7 +386,11 @@ async fn run_save_full_config(state: Arc<DaemonState>, req: UiFullConfig) -> Sky
         .map_err(bad_request_error)?;
 
     updated.save().await.map_err(internal_error)?;
-    if let Some(previous_browser_manager) = previous_browser_manager {
+    if let Some(previous_browser_manager) = previous_browser_manager
+        && !next_browser_manager
+            .as_ref()
+            .is_some_and(|next| Arc::ptr_eq(next, &previous_browser_manager))
+    {
         previous_browser_manager
             .stop()
             .await
@@ -906,6 +960,20 @@ mod tests {
             Some("sk-new"),
             "newly entered key material replaces the stored key"
         );
+    }
+
+    #[test]
+    fn full_config_carries_the_stream_codec() {
+        let ui = serde_json::to_value(build_ui_full_config(&MayConfig::default()))
+            .expect("ui config serializes");
+        assert_eq!(ui["stream"]["codec"], "auto");
+
+        let mut config = MayConfig::default();
+        config.stream.codec = crate::config::StreamCodec::Av1;
+        let ui = serde_json::to_value(build_ui_full_config(&config)).expect("ui config serializes");
+        assert_eq!(ui["stream"]["codec"], "av1");
+        let saved: super::UiFullConfig = serde_json::from_value(ui).expect("deserializes");
+        assert_eq!(saved.stream.codec, crate::config::StreamCodec::Av1);
     }
 
     #[test]

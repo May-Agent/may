@@ -3,6 +3,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::StreamCodec;
+
 /// What the daemon asks the agent to do.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
@@ -18,7 +20,12 @@ pub enum AgentRequest {
     /// PNG of the display's current framebuffer.
     Screenshot { session_id: String },
     /// Begin capturing + accepting WebRTC peers for the session.
-    StartStream { session_id: String },
+    StartStream {
+        session_id: String,
+        codec: StreamCodec,
+    },
+    /// Move every running stream to another codec; its viewers reconnect.
+    SetStreamCodec { codec: StreamCodec },
     /// Stop the session's stream and its peers.
     StopStream { session_id: String },
     /// Whether the session's stream is up.
@@ -59,6 +66,9 @@ pub enum AgentResponse {
     Png { data: Vec<u8> },
     /// `offer` result — the answer SDP.
     Sdp { sdp: String },
+    /// `offer` refused because of the viewer's offer itself (unparsable, or
+    /// without the stream's codec); `error` is human-readable.
+    OfferRefused { error: String },
     /// Boolean-bearing replies (`stream_running`, `takeover_active`).
     Flag { value: bool },
 }

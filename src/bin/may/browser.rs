@@ -340,6 +340,7 @@ async fn run_browser_service(
             config.browser.clone(),
             may_dir.clone(),
             may_agent::container::browser::BrowserLifecyclePublisher::noop(),
+            config.stream.codec,
         )
         .map_err(|error| error.to_string())?,
     );
