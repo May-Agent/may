@@ -119,6 +119,12 @@ export interface UiSandboxConfig {
   commandPriority: CommandPriority;
 }
 
+export type StreamCodec = 'auto' | 'h264' | 'av1';
+
+export interface UiStreamConfig {
+  codec: StreamCodec;
+}
+
 export interface UiFullConfig {
   providers: UiProviderConfig[];
   models: UiModelsConfig;
@@ -129,6 +135,7 @@ export interface UiFullConfig {
   browser: UiBrowserConfig;
   remoteAccess: UiRemoteAccessConfig;
   sandbox: UiSandboxConfig;
+  stream: UiStreamConfig;
 }
 
 export interface UiSshServerConfig {

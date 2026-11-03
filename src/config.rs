@@ -869,7 +869,7 @@ pub enum BrowserBackendKind {
 }
 
 /// Settings for the browser automation runtime.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserConfig {
     /// Whether browser automation is enabled.
     #[serde(default)]
@@ -923,7 +923,7 @@ pub struct BrowserConfig {
 }
 
 /// Existing Chromium profile seeded into the managed browser on first launch.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SystemProfileConfig {
     /// Absolute path to a Chromium-family user-data-dir/profile-dir to
@@ -1118,6 +1118,27 @@ impl CommandPriority {
     }
 }
 
+/// Which video codec the browser and desktop streams offer viewers.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamCodec {
+    /// Hardware H.264 where the host has an encoder, software AV1 otherwise.
+    #[default]
+    Auto,
+    /// Hardware H.264 only; a host without an encoder fails the stream.
+    H264,
+    /// Software AV1 only, even where hardware H.264 exists.
+    Av1,
+}
+
+/// Settings shared by the browser and desktop streams.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StreamConfig {
+    /// Codec the streams encode and negotiate.
+    #[serde(default)]
+    pub codec: StreamCodec,
+}
+
 /// Local and container command sandboxing settings.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct SandboxConfig {
@@ -1153,6 +1174,9 @@ pub struct MayConfig {
     /// Managed browser automation settings.
     #[serde(default)]
     pub browser: BrowserConfig,
+    /// Settings shared by the browser and desktop streams.
+    #[serde(default)]
+    pub stream: StreamConfig,
     /// Remote access settings.
     #[serde(default)]
     pub remote_access: RemoteAccessConfig,
@@ -1241,6 +1265,7 @@ impl Default for MayConfig {
             preferences: Preferences::default(),
             appearance: Appearance::default(),
             browser: BrowserConfig::default(),
+            stream: StreamConfig::default(),
             remote_access: RemoteAccessConfig::default(),
             daemon: DaemonConfig::default(),
             suggestions: SuggestionsConfig::default(),
@@ -1695,6 +1720,26 @@ mod tests {
         config
             .validate()
             .expect_err("a hand-edited colliding name fails validation");
+    }
+
+    #[test]
+    fn stream_codec_defaults_to_auto_and_roundtrips() {
+        assert_eq!(MayConfig::default().stream.codec, StreamCodec::Auto);
+        let config: MayConfig = toml::from_str("").expect("a config without stream parses");
+        assert_eq!(config.stream.codec, StreamCodec::Auto);
+        for (input, expected) in [
+            ("auto", StreamCodec::Auto),
+            ("h264", StreamCodec::H264),
+            ("av1", StreamCodec::Av1),
+        ] {
+            let config: MayConfig =
+                toml::from_str(&format!("[stream]\ncodec = \"{input}\"\n")).expect("codec parses");
+            assert_eq!(config.stream.codec, expected);
+            let saved = toml::to_string(&config).expect("config serializes");
+            let reloaded: MayConfig = toml::from_str(&saved).expect("saved config parses");
+            assert_eq!(reloaded.stream.codec, expected);
+        }
+        assert!(toml::from_str::<MayConfig>("[stream]\ncodec = \"vp9\"\n").is_err());
     }
 
     #[test]

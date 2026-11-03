@@ -158,6 +158,7 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
             config.browser.clone(),
             may_dir.clone(),
             crate::container::browser::BrowserLifecyclePublisher::new(browser_lifecycle_tx.clone()),
+            config.stream.codec,
         ) {
             Ok(manager) => Some(Arc::new(manager)),
             Err(error) => {

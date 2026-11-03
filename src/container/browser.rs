@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::config::StreamCodec;
 use crate::video::{
     EncodedSample, EncoderControl, FRAME_QUEUE_CAPACITY, GateChange, RawFrame, SourceGate,
     StreamFormat, VideoCodec, encode_loop, encoder_control,
@@ -144,6 +145,12 @@ pub enum BrowserError {
     /// No usable page appeared during startup.
     #[error(transparent)]
     BrowserPageReady(#[from] BrowserPageReadyError),
+    /// The stream codec could not be selected.
+    #[error(transparent)]
+    CodecSelection(#[from] crate::video::FrameError),
+    /// The viewer's offer cannot use the stream's codec.
+    #[error(transparent)]
+    OfferCodec(#[from] crate::video::OfferCodecError),
 }
 
 impl BrowserError {
@@ -438,6 +445,12 @@ enum BrowserCommand {
     DropPeer {
         peer_id: String,
     },
+    /// Switch the stream to another codec: close every peer, rebuild the
+    /// WebRTC stack and restart the encoder, leaving the browser running.
+    SetCodec {
+        preference: StreamCodec,
+        reply: oneshot::Sender<Result<(), BrowserError>>,
+    },
     /// Mirror takeover ownership from the database into the actor so the
     /// `DataChannel` input gate has a consistent, lock-free view without
     /// async DB round-trips on the hot path.
@@ -710,6 +723,52 @@ impl BrowserRuntime {
         }
     }
 
+    /// Switches to the codec `preference` selects. The new codec is selected
+    /// before anything changes, so a refusal leaves the stream as it was.
+    async fn set_codec(
+        &mut self,
+        preference: StreamCodec,
+        config: &MayBrowserConfig,
+    ) -> Result<(), BrowserError> {
+        let codec = VideoCodec::select(stream_format(config), preference)?;
+        let (api, video_track) = codec
+            .webrtc("video", "browser-screencast")
+            .map_err(|error| BrowserError::web_rtc_operation("build webrtc stack", error))?;
+
+        // Peers negotiated the old codec; they reconnect and renegotiate.
+        for (_, peer) in std::mem::take(&mut self.peers) {
+            tokio::spawn(async move {
+                let _ = peer.close().await;
+            });
+        }
+        self.sync_screencast(config).await?;
+
+        self.codec = codec;
+        self.webrtc_api = api;
+        self.video_track = video_track;
+
+        if let Some(session) = self.session.as_mut() {
+            // The old reader's queue closes with it, which ends the old
+            // encoder thread; the writer ends with the encoder.
+            session.cdp_reader.abort();
+            session.sample_writer.abort();
+            let (control, requests) = encoder_control();
+            let (cdp_reader, sample_writer, frames) = start_encoding_pipeline(
+                session.page.clone(),
+                self.video_track.clone(),
+                self.codec,
+                requests,
+            )
+            .await?;
+            session.cdp_reader = cdp_reader;
+            session.sample_writer = sample_writer;
+            session.frames = frames;
+            self.encoder_control = Some(control);
+        }
+        tracing::info!(codec = codec.name(), "stream codec switched");
+        Ok(())
+    }
+
     async fn resize_viewport(
         &self,
         width: u32,
@@ -767,16 +826,12 @@ impl BrowserManager {
         config: MayBrowserConfig,
         may_dir: PathBuf,
         lifecycle: BrowserLifecyclePublisher,
+        preference: StreamCodec,
     ) -> Result<Self, BrowserError> {
         config
             .validate()
             .map_err(|error| BrowserError::browser_operation("validate browser config", error))?;
-        let codec = VideoCodec::select(StreamFormat {
-            max_width: config.screencast_max_width,
-            max_height: config.screencast_max_height,
-            initial_bitrate_kbps: config.encoder_initial_bitrate_kbps,
-        })
-        .map_err(|error| BrowserError::browser_operation("select video codec", error))?;
+        let codec = VideoCodec::select(stream_format(&config), preference)?;
         // Shared video track — all peer connections receive from this single track
         let (api, video_track) = codec
             .webrtc("video", "browser-screencast")
@@ -821,6 +876,11 @@ impl BrowserManager {
                     }
                     BrowserCommand::DropPeer { peer_id } => {
                         runtime.drop_peer(peer_id.as_str(), &config).await;
+                    }
+                    BrowserCommand::SetCodec { preference, reply } => {
+                        let result = runtime.set_codec(preference, &config).await;
+                        runtime.publish_snapshot(&snapshot_tx);
+                        let _ = reply.send(result);
                     }
                     BrowserCommand::SetTakeover { session_id } => {
                         runtime.set_takeover(session_id);
@@ -886,6 +946,27 @@ impl BrowserManager {
             })?;
         reply_rx.await.map_err(|_| BrowserError::ActorClosed {
             operation: "await start reply",
+        })?
+    }
+
+    /// Move the stream to the codec `preference` selects: viewers are
+    /// disconnected (they renegotiate), the encoder restarts, and the browser
+    /// itself keeps running. Nothing changes when the codec cannot be selected.
+    ///
+    /// # Errors
+    /// Returns [`BrowserError::CodecSelection`] when the codec is unavailable on this host, or the actor's restart error.
+    pub async fn set_codec(&self, preference: StreamCodec) -> Result<(), BrowserError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.command_tx
+            .send(BrowserCommand::SetCodec {
+                preference,
+                reply: reply_tx,
+            })
+            .map_err(|_| BrowserError::ActorClosed {
+                operation: "set stream codec",
+            })?;
+        reply_rx.await.map_err(|_| BrowserError::ActorClosed {
+            operation: "await set codec reply",
         })?
     }
 
@@ -1394,6 +1475,7 @@ impl BrowserRuntime {
         peer_events: mpsc::UnboundedSender<BrowserCommand>,
         config: &MayBrowserConfig,
     ) -> Result<String, BrowserError> {
+        self.codec.check_offer(&offer_sdp)?;
         let page = self
             .session
             .as_ref()
@@ -2149,6 +2231,14 @@ async fn capture_page_screenshot(
 fn snapshot_scale(viewport: (f64, f64), dpr: f64, max: (u32, u32)) -> f64 {
     let fit = |pixels: f64, limit: u32| f64::from(limit) / (pixels * dpr);
     fit(viewport.0, max.0).min(fit(viewport.1, max.1)).min(1.0)
+}
+
+const fn stream_format(config: &MayBrowserConfig) -> StreamFormat {
+    StreamFormat {
+        max_width: config.screencast_max_width,
+        max_height: config.screencast_max_height,
+        initial_bitrate_kbps: config.encoder_initial_bitrate_kbps,
+    }
 }
 
 async fn start_encoding_pipeline(

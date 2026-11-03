@@ -310,6 +310,7 @@ export const enUS = {
       remote: 'Remote access',
       remoteServers: 'Remote servers',
       execution: 'Command Priority',
+      stream: 'Stream codec',
     },
     language: {
       title: 'Interface language',
@@ -437,6 +438,14 @@ export const enUS = {
       low: 'Low',
       lowest: 'Lowest',
       info: 'Lower priority changes scheduling under contention; it does not cap CPU usage.',
+    },
+    stream: {
+      title: 'Stream codec',
+      description: 'The video codec of the browser and desktop streams. A running stream restarts and viewers reconnect.',
+      auto: 'Automatic (default)',
+      h264: 'H.264 only',
+      av1: 'AV1 only',
+      info: 'Automatic uses hardware H.264 when this computer has an encoder, and software AV1 otherwise. H.264 only fails on a computer without a hardware encoder. AV1 only encodes in software even where hardware H.264 exists.',
     },
     remote: {
       title: 'Remote access',
