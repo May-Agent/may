@@ -179,6 +179,9 @@ pub struct AgentWorker {
     /// Model clone for `/btw` side questions; `None` when the agent runs in
     /// the daemon, which answers `/btw` itself.
     btw_llm: Option<RequestParameterizedModel<aither_cloud::CloudProvider>>,
+    /// The agent's prompt-cache entry; `None` when the agent runs in the
+    /// daemon.
+    warmth: Option<aither_agent::CacheWarmth>,
     /// Tracker shared with the session's `subagent` IPC command.
     subagent_tracker: crate::agent::SubagentTracker,
     /// Turns of the session another client (or the daemon's queue) started,
@@ -380,6 +383,13 @@ impl AgentWorker {
         self.btw_llm.as_ref()
     }
 
+    /// The agent's prompt-cache entry, which keeps tracking the agent's
+    /// later requests.
+    #[must_use]
+    pub const fn cache_warmth(&self) -> Option<&aither_agent::CacheWarmth> {
+        self.warmth.as_ref()
+    }
+
     /// A worker over `command_tx` whose agent runs in the daemon.
     pub(crate) fn remote(
         command_tx: Sender<WorkerCommand>,
@@ -391,6 +401,7 @@ impl AgentWorker {
             job_registry: None,
             subagent_runs: None,
             btw_llm: None,
+            warmth: None,
             subagent_tracker: crate::agent::SubagentTracker::default(),
             foreign_turns: Some(foreign_turns),
             background: Some(background),
@@ -485,6 +496,7 @@ pub fn spawn_idle_worker<E: Executor + 'static>(
     let job_registry = agent.job_registry();
     let subagent_runs = agent.subagent_runs();
     let btw_llm = agent.btw_llm();
+    let warmth = agent.cache_warmth();
     let subagent_tracker = agent.subagent_tracker();
 
     executor
@@ -503,6 +515,7 @@ pub fn spawn_idle_worker<E: Executor + 'static>(
         job_registry: Some(job_registry),
         subagent_runs: Some(subagent_runs),
         btw_llm: Some(btw_llm),
+        warmth: Some(warmth),
         subagent_tracker,
         foreign_turns: None,
         background: None,

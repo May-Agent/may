@@ -116,6 +116,11 @@ impl ParkedAgents {
         self.workers().contains_key(session_id)
     }
 
+    /// The prompt-cache entry of `session_id`'s idle agent, when it has one.
+    pub(crate) fn cache_warmth(&self, session_id: &str) -> Option<aither_agent::CacheWarmth> {
+        self.get(session_id)?.cache_warmth().cloned()
+    }
+
     fn get(&self, session_id: &str) -> Option<Arc<AgentWorker>> {
         self.workers()
             .get(session_id)
