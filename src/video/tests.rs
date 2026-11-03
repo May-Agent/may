@@ -43,6 +43,7 @@ fn jpeg(width: u32, height: u32, step: u32) -> RawFrame {
 }
 
 /// NAL unit types of an Annex B access unit.
+#[cfg(target_os = "macos")]
 fn nal_types(data: &[u8]) -> Vec<u8> {
     data.windows(4)
         .enumerate()
@@ -51,6 +52,7 @@ fn nal_types(data: &[u8]) -> Vec<u8> {
         .collect()
 }
 
+#[cfg(target_os = "macos")]
 fn is_idr(packet: &EncodedPacket) -> bool {
     packet.keyframe && nal_types(&packet.data).contains(&5)
 }
