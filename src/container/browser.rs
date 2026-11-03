@@ -600,6 +600,7 @@ impl BrowserRuntime {
 
     fn drop_peer(&mut self, peer_id: &str) {
         if let Some(peer) = self.peers.remove(peer_id) {
+            tracing::debug!(peer_id, "browser peer went away");
             // Closing stops the RTP sender, which ends the peer's RTCP follower
             // and takes its bandwidth estimate out of the encoder's minimum.
             tokio::spawn(async move {
@@ -1374,6 +1375,8 @@ impl BrowserRuntime {
             page,
             session_id,
             self.takeover_owner.clone(),
+            peer_id.clone(),
+            peer_events.clone(),
         );
 
         setup_peer_connection_lifecycle(&peer_connection, peer_id.clone(), peer_events);
@@ -2171,14 +2174,28 @@ fn setup_data_channel_handler(
     page: Arc<Page>,
     peer_session_id: String,
     takeover_owner: Arc<ArcSwapOption<String>>,
+    peer_id: String,
+    peer_events: mpsc::UnboundedSender<BrowserCommand>,
 ) {
     pc.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
         let page = page.clone();
         let peer_session_id = peer_session_id.clone();
         let takeover_owner = takeover_owner.clone();
+        let peer_id = peer_id.clone();
+        let peer_events = peer_events.clone();
         Box::pin(async move {
             let label = dc.label().to_owned();
             tracing::debug!(label, "DataChannel opened for browser input");
+
+            // The channel closes with the viewer's connection, long before ICE
+            // gives up on a viewer that closed: webrtc does not move the
+            // connection to `Closed` on the viewer's DTLS close alert.
+            dc.on_close(Box::new(move || {
+                let _ = peer_events.send(BrowserCommand::DropPeer {
+                    peer_id: peer_id.clone(),
+                });
+                Box::pin(async {})
+            }));
 
             dc.on_message(Box::new(move |msg: DataChannelMessage| {
                 let page = page.clone();
