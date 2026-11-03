@@ -2,9 +2,11 @@
 //! that cannot reach the encoder as surfaces (software AV1, odd-sized
 //! frames, hosts without a platform JPEG decoder).
 
+#[cfg(target_os = "macos")]
+use yuv::bgra_to_yuv_nv12;
 use yuv::{
     BufferStoreMut, YuvBiPlanarImageMut, YuvConversionMode, YuvError, YuvRange, YuvStandardMatrix,
-    bgra_to_yuv_nv12, rgb_to_yuv_nv12,
+    rgb_to_yuv_nv12,
 };
 
 /// Matrix and range of the NV12 this module produces. The encoder is
