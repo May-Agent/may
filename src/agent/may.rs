@@ -1065,6 +1065,13 @@ impl MayAgent {
         self.model_context_window
     }
 
+    /// The agent's prompt-cache entry; clones keep observing it after the
+    /// agent is gone.
+    #[must_use]
+    pub fn cache_warmth(&self) -> aither_agent::CacheWarmth {
+        self.inner.cache_warmth()
+    }
+
     /// Stop every terminal task that is still running for this agent.
     pub async fn kill_running_terminal_jobs(&self) -> usize {
         self.inner.kill_running_terminal_jobs().await

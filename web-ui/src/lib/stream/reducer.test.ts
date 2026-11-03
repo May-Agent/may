@@ -336,4 +336,23 @@ describe('reducer', () => {
     expect(retried.hold).toBeNull();
     expect(retried.turnId).toBe('t2');
   });
+
+  test('retract discards the streamed text but keeps tools', () => {
+    const t = stream([
+      { kind: 'start', seq: 1, turnId: 't1', sessionId: 's1', assistantId: 'a1' },
+      { kind: 'text', seq: 2, turnId: 't1', chunk: 'partial ans' },
+      { kind: 'retract', seq: 3, turnId: 't1' },
+      {
+        kind: 'hold',
+        seq: 4,
+        turnId: 't1',
+        until: '2026-11-04T05:40:00Z',
+        message: 'overloaded',
+        retry: 2,
+      },
+    ]);
+    expect(t.text).toBe('');
+    expect(t.segments).toEqual([]);
+    expect(t.hold?.retry).toBe(2);
+  });
 });

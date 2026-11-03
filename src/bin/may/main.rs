@@ -1106,6 +1106,8 @@ where
                 }
                 match tui_event {
                     TuiEvent::Agent(result) => {
+                        // The wait that followed a failure is over.
+                        app.clear_persistent_status();
                         // Capture text for title generation
                         if let Ok(TimedEvent {
                             at,
@@ -1137,17 +1139,31 @@ where
                     TuiEvent::ReasoningEnd { seconds } => {
                         app.chat.finish_thinking(seconds);
                     }
-                    TuiEvent::Hold { until, .. } => {
-                        let at = until
-                            .to_zoned(jiff::tz::TimeZone::system())
-                            .strftime("%b %d, %Y %H:%M %Z")
-                            .to_string();
-                        app.chat.push_notice(&format!(
-                            "Usage limit reached — continuing automatically at {at}"
-                        ));
-                        app.set_persistent_status(format!(
-                            "Usage limit — continuing automatically at {at} · esc to cancel"
-                        ));
+                    TuiEvent::Hold { until, retry, .. } => {
+                        if let Some(retry) = retry {
+                            let at = until
+                                .to_zoned(jiff::tz::TimeZone::system())
+                                .strftime("%H:%M:%S")
+                                .to_string();
+                            app.set_persistent_status(format!(
+                                "Provider error — retrying ({retry}) at {at} · esc to cancel"
+                            ));
+                        } else {
+                            let at = until
+                                .to_zoned(jiff::tz::TimeZone::system())
+                                .strftime("%b %d, %Y %H:%M %Z")
+                                .to_string();
+                            app.chat.push_notice(&format!(
+                                "Usage limit reached — continuing automatically at {at}"
+                            ));
+                            app.set_persistent_status(format!(
+                                "Usage limit — continuing automatically at {at} · esc to cancel"
+                            ));
+                        }
+                    }
+                    TuiEvent::Retract => {
+                        app.chat.retract_text();
+                        assistant_response.clear();
                     }
                     TuiEvent::Compacted(result) => match result {
                         Ok(Some(stats)) => {

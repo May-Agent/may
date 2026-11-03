@@ -15,10 +15,12 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::video::{EncodedSample, FRAME_QUEUE_CAPACITY, RawFrame, encode_loop};
+use crate::video::{
+    EncodedSample, EncoderControl, FRAME_QUEUE_CAPACITY, RawFrame, StreamFormat, VideoCodec,
+    encode_loop, encoder_control,
+};
 use arc_swap::ArcSwapOption;
 use base64::Engine;
 use chromiumoxide::browser::{Browser, BrowserConfig};
@@ -47,19 +49,14 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot, watch};
 use walkdir::WalkDir;
-use webrtc::api::APIBuilder;
-use webrtc::api::interceptor_registry::register_default_interceptors;
-use webrtc::api::media_engine::{MIME_TYPE_H264, MediaEngine};
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::ice_transport::ice_server::RTCIceServer;
-use webrtc::interceptor::registry::Registry;
 use webrtc::media::Sample;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
-use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::track::track_local::TrackLocal;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
@@ -547,11 +544,12 @@ struct BrowserRuntime {
     webrtc_api: webrtc::api::API,
     peers: HashMap<String, Arc<RTCPeerConnection>>,
     lifecycle: BrowserLifecyclePublisher,
-    /// Set to `true` when a new peer is about to subscribe to the video
-    /// track. The encoder loop swaps it back to `false` and forces an IDR
-    /// so the new viewer doesn't have to wait up to 2 s for the next
-    /// scheduled keyframe.
-    keyframe_request: Arc<AtomicBool>,
+    /// The codec the stream was negotiated with, fixed at construction.
+    codec: VideoCodec,
+    /// The running encoder's request channel: a new peer asks it for an IDR
+    /// so the viewer doesn't wait for the next scheduled keyframe, and each
+    /// peer reports its bandwidth estimate. `None` while the browser is off.
+    encoder_control: Option<EncoderControl>,
     /// The session currently authorised to drive the browser via its
     /// `DataChannel`. `None` means the agent owns the page and any peer
     /// input is silently dropped.
@@ -560,6 +558,7 @@ struct BrowserRuntime {
 
 impl BrowserRuntime {
     fn new(
+        codec: VideoCodec,
         video_track: Arc<TrackLocalStaticSample>,
         webrtc_api: webrtc::api::API,
         lifecycle: BrowserLifecyclePublisher,
@@ -570,7 +569,8 @@ impl BrowserRuntime {
             webrtc_api,
             peers: HashMap::new(),
             lifecycle,
-            keyframe_request: Arc::new(AtomicBool::new(false)),
+            codec,
+            encoder_control: None,
             takeover_owner: Arc::new(ArcSwapOption::empty()),
         }
     }
@@ -620,9 +620,12 @@ impl BrowserRuntime {
         } else {
             1.0
         };
+        // An even viewport gives even frames at an integral scale factor, which
+        // the encoder takes as surfaces; an odd one costs a CPU crop per frame.
+        // Rounding up adds one CSS pixel and cuts none.
         let params = SetDeviceMetricsOverrideParams::builder()
-            .width(i64::from(width))
-            .height(i64::from(height))
+            .width(i64::from(width.saturating_add(width % 2)))
+            .height(i64::from(height.saturating_add(height % 2)))
             .device_scale_factor(dpr)
             .mobile(false)
             .build()
@@ -635,9 +638,7 @@ impl BrowserRuntime {
         page.execute(params).await.map_err(|error| {
             BrowserError::browser_operation("set device metrics override", error)
         })?;
-        // Force an IDR after a resize: the codec sees a new resolution
-        // and the next sample needs to be a keyframe anyway.
-        self.keyframe_request.store(true, Ordering::Release);
+        // A new frame size makes the encoder start over with an IDR by itself.
         Ok(())
     }
 }
@@ -646,7 +647,7 @@ impl BrowserRuntime {
 
 /// Manages a browser instance with WebRTC live streaming and input forwarding.
 ///
-/// Video pipeline: CDP screencast → JPEG → H.264 (Screen Content) → WebRTC
+/// Video pipeline: CDP screencast → JPEG → hardware H.264 (software AV1 without one) → WebRTC
 /// Input pipeline: WebRTC `DataChannel` → JSON → CDP Input.dispatch*
 #[derive(Debug)]
 pub struct BrowserManager {
@@ -667,41 +668,22 @@ impl BrowserManager {
         config
             .validate()
             .map_err(|error| BrowserError::browser_operation("validate browser config", error))?;
-        // Register default codecs: H.264, VP8, VP9, AV1 — SDP negotiation picks the best
-        let mut media_engine = MediaEngine::default();
-        media_engine
-            .register_default_codecs()
-            .map_err(|error| BrowserError::web_rtc_operation("register default codecs", error))?;
-
-        let mut registry = Registry::new();
-        registry = register_default_interceptors(registry, &mut media_engine).map_err(|error| {
-            BrowserError::web_rtc_operation("register default interceptors", error)
-        })?;
-
-        let api = APIBuilder::new()
-            .with_media_engine(media_engine)
-            .with_interceptor_registry(registry)
-            .build();
-
+        let codec = VideoCodec::select(StreamFormat {
+            max_width: config.screencast_max_width,
+            max_height: config.screencast_max_height,
+            initial_bitrate_kbps: config.encoder_initial_bitrate_kbps,
+        })
+        .map_err(|error| BrowserError::browser_operation("select video codec", error))?;
         // Shared video track — all peer connections receive from this single track
-        let video_track = Arc::new(TrackLocalStaticSample::new(
-            RTCRtpCodecCapability {
-                mime_type: MIME_TYPE_H264.to_owned(),
-                clock_rate: 90_000,
-                sdp_fmtp_line:
-                    "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
-                        .to_string(),
-                ..Default::default()
-            },
-            "video".to_owned(),
-            "browser-screencast".to_owned(),
-        ));
+        let (api, video_track) = codec
+            .webrtc("video", "browser-screencast")
+            .map_err(|error| BrowserError::web_rtc_operation("build webrtc stack", error))?;
         let (command_tx, mut command_rx) = mpsc::unbounded_channel();
         let actor_tx = command_tx.clone();
         let (snapshot_tx, snapshot_rx) = watch::channel(BrowserRuntimeSnapshot::default());
 
         tokio::spawn(async move {
-            let mut runtime = BrowserRuntime::new(video_track, api, lifecycle);
+            let mut runtime = BrowserRuntime::new(codec, video_track, api, lifecycle);
             runtime.publish_snapshot(&snapshot_tx);
 
             while let Some(command) = command_rx.recv().await {
@@ -1282,13 +1264,11 @@ impl BrowserRuntime {
             }
         }
 
-        let (cdp_reader, sample_writer) = start_encoding_pipeline(
-            page.clone(),
-            self.video_track.clone(),
-            config.encoder_initial_bitrate_kbps,
-            self.keyframe_request.clone(),
-        )
-        .await?;
+        let (control, requests) = encoder_control();
+        let (cdp_reader, sample_writer) =
+            start_encoding_pipeline(page.clone(), self.video_track.clone(), self.codec, requests)
+                .await?;
+        self.encoder_control = Some(control);
 
         self.session = Some(BrowserSession {
             browser,
@@ -1309,6 +1289,7 @@ impl BrowserRuntime {
             let _ = peer.close().await;
         }
 
+        self.encoder_control = None;
         let was_running = self.session.is_some();
         if let Some(mut session) = self.session.take() {
             session.cdp_reader.abort();
@@ -1372,31 +1353,14 @@ impl BrowserRuntime {
         // through CDP, and previously we advertised an Opus track that
         // only carried silence. That forced every viewer to negotiate an
         // audio m-line for nothing and drained RTCP into /dev/null.
-        let keyframe_request_for_rtcp = self.keyframe_request.clone();
-        tokio::spawn(async move {
-            // Drain RTCP from the peer and translate viewer feedback into
-            // encoder hints. PLI / FIR mean the decoder has lost sync
-            // (packet loss, codec reset) and needs an IDR; we flip the
-            // shared atomic and the encoder thread emits a keyframe on
-            // its next iteration. Other RTCP types (RR / TWCC / REMB)
-            // are reserved for the ABR follow-up and currently ignored.
-            while let Ok((packets, _)) = video_rtp_sender.read_rtcp().await {
-                for packet in packets {
-                    let any = packet.as_any();
-                    if any
-                        .downcast_ref::<webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication>()
-                        .is_some()
-                        || any
-                            .downcast_ref::<webrtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest>()
-                            .is_some()
-                    {
-                        tracing::debug!("RTCP PLI/FIR received; requesting IDR");
-                        keyframe_request_for_rtcp
-                            .store(true, Ordering::Release);
-                    }
-                }
-            }
-        });
+        // Viewer RTCP → encoder: PLI/FIR request an IDR, REMB reports the
+        // viewer's bandwidth estimate.
+        let control = self
+            .encoder_control
+            .clone()
+            .ok_or(BrowserError::NotRunning)?;
+        let peer_id = crate::id::new();
+        tokio::spawn(control.follow_peer(video_rtp_sender, peer_id.clone()));
 
         setup_data_channel_handler(
             &peer_connection,
@@ -1405,7 +1369,6 @@ impl BrowserRuntime {
             self.takeover_owner.clone(),
         );
 
-        let peer_id = crate::id::new();
         setup_peer_connection_lifecycle(&peer_connection, peer_id.clone(), peer_events);
 
         let offer = RTCSessionDescription::offer(offer_sdp)
@@ -1422,10 +1385,12 @@ impl BrowserRuntime {
 
         let mut gather_complete = peer_connection.gathering_complete_promise().await;
 
-        // Flip the IDR request *before* the answer is sent so the encoder
-        // emits a keyframe in the very next GOP, giving the new viewer a
-        // decodable first frame as soon as RTP packets start flowing.
-        self.keyframe_request.store(true, Ordering::Release);
+        // Ask for the IDR *before* the answer is sent so the encoder emits a
+        // keyframe on its next frame, giving the new viewer a decodable first
+        // frame as soon as RTP packets start flowing.
+        if let Some(control) = &self.encoder_control {
+            control.request_keyframe();
+        }
 
         peer_connection
             .set_local_description(answer)
@@ -2097,8 +2062,8 @@ async fn capture_page_screenshot(
 async fn start_encoding_pipeline(
     page: Arc<Page>,
     video_track: Arc<TrackLocalStaticSample>,
-    initial_bitrate_kbps: u32,
-    keyframe_request: Arc<AtomicBool>,
+    codec: VideoCodec,
+    requests: crate::video::EncoderRequests,
 ) -> Result<(tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>), BrowserError> {
     let mut event_stream = page
         .event_listener::<EventScreencastFrame>()
@@ -2150,7 +2115,7 @@ async fn start_encoding_pipeline(
     // shape as tokio::spawn, so the rest of the pipeline lifecycle
     // (abort on session stop) is uniform.
     tokio::task::spawn_blocking(move || {
-        encode_loop(jpeg_rx, &sample_tx, initial_bitrate_kbps, &keyframe_request);
+        encode_loop(jpeg_rx, &sample_tx, codec, &requests);
     });
 
     let sample_writer = tokio::spawn(async move {
@@ -2421,50 +2386,8 @@ mod tests {
     use std::sync::Arc;
 
     use arc_swap::ArcSwapOption;
-    use image::{Rgb, RgbImage};
 
     use super::takeover_allows_input;
-    use crate::video::normalize_rgb_frame_for_h264;
-
-    #[test]
-    fn normalize_rgb_frame_for_h264_preserves_even_dimensions() {
-        let mut rgb = RgbImage::new(4, 6);
-        rgb.put_pixel(3, 5, Rgb([12, 34, 56]));
-
-        let normalized = normalize_rgb_frame_for_h264(rgb.clone());
-
-        assert_eq!(normalized.width(), 4);
-        assert_eq!(normalized.height(), 6);
-        assert_eq!(normalized, rgb);
-    }
-
-    #[test]
-    fn normalize_rgb_frame_for_h264_pads_odd_dimensions_with_edge_pixels() {
-        let mut rgb = RgbImage::new(3, 5);
-        for y in 0..5 {
-            for x in 0..3 {
-                rgb.put_pixel(
-                    x,
-                    y,
-                    Rgb([
-                        u8::try_from(x * 10).unwrap(),
-                        u8::try_from(y * 20).unwrap(),
-                        99,
-                    ]),
-                );
-            }
-        }
-
-        let normalized = normalize_rgb_frame_for_h264(rgb);
-
-        assert_eq!(normalized.width(), 4);
-        assert_eq!(normalized.height(), 6);
-        assert_eq!(*normalized.get_pixel(0, 0), Rgb([0, 0, 99]));
-        assert_eq!(*normalized.get_pixel(2, 4), Rgb([20, 80, 99]));
-        assert_eq!(*normalized.get_pixel(3, 1), Rgb([20, 20, 99]));
-        assert_eq!(*normalized.get_pixel(1, 5), Rgb([10, 80, 99]));
-        assert_eq!(*normalized.get_pixel(3, 5), Rgb([20, 80, 99]));
-    }
 
     #[test]
     fn takeover_gate_blocks_input_when_no_owner() {
