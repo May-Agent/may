@@ -16,6 +16,15 @@ use std::os::unix::net::UnixStream;
 
 use super::proto::{AgentRequest, AgentResponse};
 
+#[cfg(target_os = "macos")]
+const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+/// How long a launched helper has to start answering.
+#[cfg(target_os = "macos")]
+const HELPER_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long a terminated helper has to exit.
+#[cfg(target_os = "macos")]
+const HELPER_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The daemon-side client for one `computer-agent` child.
 pub struct ComputerAgent {
     #[cfg(target_os = "macos")]
@@ -80,11 +89,18 @@ impl ComputerAgent {
         Err("virtual desktops need macOS".to_owned())
     }
 
-    /// Whether the helper process is up; asking never spawns it.
+    /// Whether a helper answers on the socket; asking never spawns it.
     #[cfg(target_os = "macos")]
     #[must_use]
     pub fn is_running(&self) -> bool {
-        self.helper_pid().is_some()
+        self.responds()
+    }
+
+    /// A connect succeeds only while a live helper owns the socket; a
+    /// leftover socket file refuses it.
+    #[cfg(target_os = "macos")]
+    fn responds(&self) -> bool {
+        UnixStream::connect(&self.socket).is_ok()
     }
 
     /// There is no helper outside macOS.
@@ -94,18 +110,46 @@ impl ComputerAgent {
         false
     }
 
-    /// Kill the helper so the next request respawns it — used after the
-    /// user grants permissions, since TCC applies at process launch.
+    /// Stop the helper and wait until it has exited, so the next request
+    /// spawns exactly one fresh helper — used after the user grants
+    /// permissions, since TCC applies at process launch.
+    ///
+    /// # Errors
+    /// Returns a message when the helper is still alive after the wait.
     #[cfg(target_os = "macos")]
-    pub fn restart(&self) {
-        if let Some(pid) = self.helper_pid() {
-            unsafe { libc::kill(pid, libc::SIGTERM) };
-        }
+    pub fn restart(&self) -> Result<(), String> {
+        let _launch = self
+            .spawn_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.stop_helper()
     }
 
     /// Nothing to respawn outside macOS.
+    ///
+    /// # Errors
+    /// Never fails.
     #[cfg(not(target_os = "macos"))]
-    pub const fn restart(&self) {}
+    pub const fn restart(&self) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// SIGTERM the pid-file helper and wait for that process to exit.
+    #[cfg(target_os = "macos")]
+    fn stop_helper(&self) -> Result<(), String> {
+        let Some(pid) = self.helper_pid() else {
+            return Ok(());
+        };
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+        let deadline = std::time::Instant::now() + HELPER_EXIT_TIMEOUT;
+        while self.helper_pid() == Some(pid) {
+            if std::time::Instant::now() >= deadline {
+                return Err(format!("computer-agent (pid {pid}) did not exit"));
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        Ok(())
+    }
 
     /// A stale pid file or a dead pid both mean "not running".
     #[cfg(target_os = "macos")]
@@ -165,7 +209,7 @@ impl ComputerAgent {
             .spawn_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.helper_pid().is_some() && self.socket.exists() {
+        if self.responds() {
             return Ok(());
         }
         let app = self.materialize_app()?;
@@ -190,14 +234,16 @@ impl ComputerAgent {
                 String::from_utf8_lossy(&status.stderr)
             ));
         }
-        // The listener needs a beat to bind its socket.
-        for _ in 0..50 {
-            if self.socket.exists() {
+        // A socket file proves nothing — the previous helper's survives —
+        // so wait until a connect is accepted.
+        let deadline = std::time::Instant::now() + HELPER_START_TIMEOUT;
+        while std::time::Instant::now() < deadline {
+            if self.responds() {
                 return Ok(());
             }
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            std::thread::sleep(POLL_INTERVAL);
         }
-        Err("computer-agent did not bind its socket".to_owned())
+        Err("computer-agent did not start answering on its socket".to_owned())
     }
 }
 

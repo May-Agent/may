@@ -59,7 +59,7 @@ pub(super) async fn computer_status(
     let id = params.get("id").map_err(bad_request_error)?.to_string();
     Ok(Json(ComputerStatus {
         running: is_running(&state, &id).await,
-        needs_permissions: needs_permissions(&state).await,
+        needs_permissions: needs_permissions(&state).await?,
     }))
 }
 
@@ -68,14 +68,18 @@ pub(super) async fn computer_start(
     State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<ComputerStatus>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
-    if let Some(permissions) = needs_permissions(&state).await {
+    if let Some(permissions) = needs_permissions(&state).await? {
         // An explicit start is the consent point: raise the TCC prompts,
         // then respawn the helper so the next call sees a fresh grant.
         let _ = state
             .computer
             .request(AgentRequest::RequestPermissions)
             .await;
-        state.computer.restart();
+        let computer = state.computer.clone();
+        tokio::task::spawn_blocking(move || computer.restart())
+            .await
+            .map_err(internal_error_message)?
+            .map_err(internal_error_message)?;
         return Ok(Json(ComputerStatus {
             running: false,
             needs_permissions: Some(permissions),
@@ -94,7 +98,7 @@ pub(super) async fn computer_start(
     state.notify_ui_events(UiEventTopics::BROWSER_STATUS);
     Ok(Json(ComputerStatus {
         running,
-        needs_permissions: needs_permissions(&state).await,
+        needs_permissions: needs_permissions(&state).await?,
     }))
 }
 
@@ -158,18 +162,22 @@ use crate::computer::proto::{AgentRequest, AgentResponse};
 
 /// The TCC grants the helper is still missing; `None` when all granted.
 /// Read-only — status polls must never raise prompts or kill the helper.
-async fn needs_permissions(state: &DaemonState) -> Option<ComputerPermissions> {
-    let Ok(AgentResponse::Permissions {
-        screen_recording,
-        accessibility,
-    }) = state.computer.request(AgentRequest::Preflight).await
-    else {
-        return None;
-    };
-    (!screen_recording || !accessibility).then_some(ComputerPermissions {
-        screen_recording,
-        accessibility,
-    })
+/// An unreachable helper is an error, never a permission state.
+async fn needs_permissions(state: &DaemonState) -> SkyResult<Option<ComputerPermissions>> {
+    match rpc(state, AgentRequest::Preflight).await? {
+        AgentResponse::Permissions {
+            screen_recording,
+            accessibility,
+        } => Ok((!screen_recording || !accessibility).then_some(ComputerPermissions {
+            screen_recording,
+            accessibility,
+        })),
+        AgentResponse::Error { error } => {
+            Err(skyzen::Error::msg(error).set_status(StatusCode::INTERNAL_SERVER_ERROR))
+        }
+        _ => Err(skyzen::Error::msg("unexpected reply from computer-agent")
+            .set_status(StatusCode::INTERNAL_SERVER_ERROR)),
+    }
 }
 
 async fn rpc(state: &DaemonState, request: AgentRequest) -> SkyResult<AgentResponse> {
