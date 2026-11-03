@@ -238,6 +238,7 @@ impl SessionParts {
             notify_broker: None,
             tunnel_broker: None,
             browser_broker: None,
+            acp_host: None,
             register_skills_broker: None,
             environment: AgentEnvironment::Local,
             tool_distribution: Arc::new(

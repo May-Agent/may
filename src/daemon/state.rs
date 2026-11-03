@@ -405,6 +405,8 @@ impl McpService {
 }
 
 pub struct DaemonState {
+    /// Runs the connected ACP agents; reads the live config on every spawn.
+    pub(crate) acp_host: acpsub::Host,
     pub(crate) tokio_handle: tokio::runtime::Handle,
     pub(crate) db: crate::db::ChatDb,
     pub(crate) default_profile_id: String,
@@ -414,7 +416,7 @@ pub struct DaemonState {
     pub(crate) ask_user_approver: AskUserApprover,
     pub(crate) tool_dispatchers: UiToolDispatchers,
     pub(crate) fetched_models_cache: RefreshableCache<Vec<crate::models::FetchedModel>>,
-    pub(crate) config: ArcSwap<MayConfig>,
+    pub(crate) config: Arc<ArcSwap<MayConfig>>,
     pub(crate) ui_event_bus: UiEventBus,
     pub(crate) container_prepare: ContainerPrepareTracker,
     pub(crate) container_manager: Option<Arc<crate::container::lifecycle::ContainerManager>>,
@@ -1060,7 +1062,9 @@ impl DaemonState {
             )
             .await?,
         );
+        let config = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(config));
         Ok(Self {
+            acp_host: crate::agent::acp_subagent::live_host(config.clone(), may_dir)?,
             tokio_handle: tokio::runtime::Handle::current(),
             db,
             default_profile_id: "test".to_string(),
@@ -1075,7 +1079,7 @@ impl DaemonState {
             ask_user_approver: AskUserApprover::new().with_runtime_service(runtime_service.clone()),
             tool_dispatchers,
             fetched_models_cache: RefreshableCache::new(Duration::from_secs(20)),
-            config: arc_swap::ArcSwap::from_pointee(config),
+            config,
             ui_event_bus: ui_event_bus.clone(),
             container_prepare: ContainerPrepareTracker::new(ui_event_bus.clone()),
             container_manager: None,
