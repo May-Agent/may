@@ -599,7 +599,14 @@ impl BrowserRuntime {
     }
 
     fn drop_peer(&mut self, peer_id: &str) {
-        if self.peers.remove(peer_id).is_some() {
+        if let Some(peer) = self.peers.remove(peer_id) {
+            // Closing stops the RTP sender, which ends the peer's RTCP follower
+            // and takes its bandwidth estimate out of the encoder's minimum.
+            tokio::spawn(async move {
+                if let Err(error) = peer.close().await {
+                    tracing::debug!(%error, "closing a browser stream peer failed");
+                }
+            });
             self.lifecycle
                 .emit(BrowserLifecycleEvent::PeerDisconnected {
                     count: self.peers.len(),
@@ -2148,11 +2155,10 @@ fn setup_peer_connection_lifecycle(
         let peer_id = peer_id.clone();
         let peer_events = peer_events.clone();
         Box::pin(async move {
+            // `Disconnected` is transient: ICE recovers or moves on to `Failed`.
             if matches!(
                 state,
-                RTCPeerConnectionState::Disconnected
-                    | RTCPeerConnectionState::Failed
-                    | RTCPeerConnectionState::Closed
+                RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
             ) {
                 let _ = peer_events.send(BrowserCommand::DropPeer { peer_id });
             }
