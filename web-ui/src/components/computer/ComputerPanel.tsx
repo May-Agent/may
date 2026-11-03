@@ -18,7 +18,7 @@ export function ComputerPanel({ sessionId, visible }: { sessionId: string; visib
   const openViewer = useComputerViewStore((s) => s.openViewer);
   const { profile } = useActiveProfile();
   const [running, setRunning] = useState<boolean | null>(null);
-  const { stream, state } = useComputerStream(sessionId, visible && running === true);
+  const { stream, state, error } = useComputerStream(sessionId, visible && running === true);
   const [busy, setBusy] = useState(false);
   const agent = profile?.name ?? t('appName');
 
@@ -76,7 +76,7 @@ export function ComputerPanel({ sessionId, visible }: { sessionId: string; visib
             className="absolute inset-0 flex items-center justify-center gap-2 text-xs text-muted-foreground"
           >
             {lost ? (
-              t('computer.streamLost')
+              (error ?? t('computer.streamLost'))
             ) : (
               <>
                 <Loader2 className="size-3.5 animate-spin" aria-hidden />

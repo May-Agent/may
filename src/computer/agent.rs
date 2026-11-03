@@ -15,6 +15,7 @@ use tokio::net::UnixListener;
 
 use super::input::{self, InputState};
 use super::proto::{AgentRequest, AgentResponse};
+use super::stream::OfferError;
 use super::{SessionDisplay, SessionDisplays, SessionStreams, permissions, screenshot};
 
 /// Everything the agent holds across requests.
@@ -150,7 +151,23 @@ async fn dispatch_inner(request: AgentRequest, state: Arc<Mutex<AgentState>>) ->
                 },
             }
         }
-        AgentRequest::StartStream { session_id } => {
+        AgentRequest::SetStreamCodec { codec } => {
+            let streams = {
+                let state = state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                state.streams.all()
+            };
+            for stream in streams {
+                if let Err(e) = stream.restart(codec).await {
+                    return AgentResponse::Error {
+                        error: e.to_string(),
+                    };
+                }
+            }
+            AgentResponse::Ok
+        }
+        AgentRequest::StartStream { session_id, codec } => {
             let (display, stream, inputs) = {
                 let mut state = state
                     .lock()
@@ -168,7 +185,7 @@ async fn dispatch_inner(request: AgentRequest, state: Arc<Mutex<AgentState>>) ->
                     }
                 }
             };
-            match stream.start(display, inputs).await {
+            match stream.start(display, inputs, codec).await {
                 Ok(()) => AgentResponse::Ok,
                 Err(e) => AgentResponse::Error {
                     error: e.to_string(),
@@ -205,7 +222,10 @@ async fn dispatch_inner(request: AgentRequest, state: Arc<Mutex<AgentState>>) ->
             match stream {
                 Some(stream) => match stream.handle_offer(sdp).await {
                     Ok(answer) => AgentResponse::Sdp { sdp: answer },
-                    Err(e) => AgentResponse::Error {
+                    Err(OfferError::Codec(e)) => AgentResponse::OfferRefused {
+                        error: e.to_string(),
+                    },
+                    Err(OfferError::Display(e)) => AgentResponse::Error {
                         error: e.to_string(),
                     },
                 },

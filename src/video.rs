@@ -27,6 +27,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
+use crate::config::StreamCodec;
 use mediax_codec::{
     Bitrate, BitstreamFormat, CodecError, Encoder, EncoderCodec, EncoderConfig, EncoderProfile,
     EvenDimension, FrameRate, H264Profile, H264Settings,
@@ -93,6 +94,10 @@ pub enum RawFrame {
 pub enum FrameError {
     #[error("the {width}x{height} stream needs more than H.264 level 5.2")]
     StreamTooLarge { width: u32, height: u32 },
+    #[error(
+        "the stream codec is set to H.264 only, but this host has no hardware H.264 encoder: {0}"
+    )]
+    H264Unavailable(String),
     #[error("stream dimension {0} is not usable")]
     Dimension(u32),
     #[error("frame is {width}x{height}, above the stream's {max_width}x{max_height}")]
@@ -116,6 +121,17 @@ pub enum FrameError {
     PixelFormat(u32),
 }
 
+/// A viewer's offer that cannot use the stream's codec.
+#[derive(Debug, thiserror::Error)]
+pub enum OfferCodecError {
+    #[error("the viewer's offer is not valid SDP: {0}")]
+    Invalid(#[from] webrtc::sdp::Error),
+    #[error(
+        "this stream sends {codec} only (the stream codec setting), and the viewer's offer does not include {codec}"
+    )]
+    Missing { codec: &'static str },
+}
+
 /// The size and rate a stream is sized for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamFormat {
@@ -133,17 +149,40 @@ pub struct VideoCodec {
 }
 
 impl VideoCodec {
-    /// Picks the codec: hardware H.264 at the lowest level admitting the
-    /// stream, or AV1 when the host has no hardware encoder.
+    /// Picks the codec the `preference` allows: hardware H.264 at the lowest
+    /// level admitting the stream, or software AV1.
     ///
-    /// Software AV1 on `CodecError::Unsupported` is the project's decided
-    /// policy for hosts without an encoder; any other encoder failure is
-    /// returned.
+    /// `Auto` takes software AV1 on `CodecError::Unsupported` (the project's
+    /// decided policy for hosts without an encoder); `H264` never does.
     ///
     /// # Errors
-    /// Returns [`FrameError`] when the stream exceeds H.264 level 5.2 or the
-    /// encoder fails for a reason other than being unsupported.
-    pub fn select(format: StreamFormat) -> Result<Self, FrameError> {
+    /// Returns [`FrameError`] when H.264 is wanted and the stream exceeds
+    /// level 5.2, the host has no hardware encoder under `H264`, or the
+    /// encoder fails for another reason.
+    pub fn select(format: StreamFormat, preference: StreamCodec) -> Result<Self, FrameError> {
+        Self::select_with(format, preference, |config| Encoder::new(config).map(drop))
+    }
+
+    /// [`select`](Self::select) with the hardware H.264 probe supplied by the
+    /// caller: it opens (and drops) an encoder for the given config.
+    ///
+    /// `Auto` falls back to AV1 on `CodecError::Unsupported`; `H264` fails
+    /// with [`FrameError::H264Unavailable`] instead; `Av1` never probes.
+    ///
+    /// # Errors
+    /// See [`select`](Self::select).
+    pub fn select_with(
+        format: StreamFormat,
+        preference: StreamCodec,
+        probe: impl FnOnce(EncoderConfig) -> Result<(), CodecError>,
+    ) -> Result<Self, FrameError> {
+        let av1 = Self {
+            codec: EncoderCodec::Av1,
+            format,
+        };
+        if preference == StreamCodec::Av1 {
+            return Ok(av1);
+        }
         let level = level::h264_level(format.max_width, format.max_height, STREAM_FRAME_RATE)
             .ok_or(FrameError::StreamTooLarge {
                 width: format.max_width,
@@ -158,16 +197,53 @@ impl VideoCodec {
             format,
         };
         let (width, height) = h264.ceiling()?;
-        match Encoder::new(h264.encoder_config(width, height, h264.initial_bitrate())) {
-            Ok(_probe) => Ok(h264),
-            Err(CodecError::Unsupported(reason)) => {
+        match probe(h264.encoder_config(width, height, h264.initial_bitrate())) {
+            Ok(()) => Ok(h264),
+            Err(CodecError::Unsupported(reason)) if preference == StreamCodec::Auto => {
                 tracing::info!(%reason, "no hardware H.264 encoder; streaming AV1");
-                Ok(Self {
-                    codec: EncoderCodec::Av1,
-                    format,
-                })
+                Ok(av1)
             }
+            Err(CodecError::Unsupported(reason)) => Err(FrameError::H264Unavailable(reason)),
             Err(error) => Err(error.into()),
+        }
+    }
+
+    /// The codec's name as a viewer-facing message spells it.
+    pub const fn name(self) -> &'static str {
+        match self.codec {
+            EncoderCodec::H264(_) => "H.264",
+            EncoderCodec::Av1 => "AV1",
+            EncoderCodec::H265(_) => "H.265",
+        }
+    }
+
+    /// Checks that a viewer's SDP offer lists this codec in a video section.
+    ///
+    /// # Errors
+    /// Returns [`OfferCodecError::Invalid`] when the offer does not parse,
+    /// and [`OfferCodecError::Missing`] naming the codec when no video
+    /// section of the offer lists it.
+    pub fn check_offer(self, offer_sdp: &str) -> Result<(), OfferCodecError> {
+        let rtp_name = match self.codec {
+            EncoderCodec::H264(_) => "H264",
+            EncoderCodec::Av1 => "AV1",
+            EncoderCodec::H265(_) => "H265",
+        };
+        let offer = webrtc::sdp::SessionDescription::unmarshal(&mut std::io::Cursor::new(
+            offer_sdp.as_bytes(),
+        ))?;
+        let offered = offer
+            .media_descriptions
+            .iter()
+            .filter(|media| media.media_name.media == "video")
+            .flat_map(|media| &media.media_name.formats)
+            .filter_map(|format| format.parse::<u8>().ok())
+            .filter_map(|payload_type| offer.get_codec_for_payload_type(payload_type).ok())
+            .any(|codec| codec.name.eq_ignore_ascii_case(rtp_name));
+        if offered {
+            Ok(())
+        } else {
+            Err(OfferCodecError::Missing { codec: self.name() })
         }
     }
 

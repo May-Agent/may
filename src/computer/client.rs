@@ -80,6 +80,20 @@ impl ComputerAgent {
         Err("virtual desktops need macOS".to_owned())
     }
 
+    /// Whether the helper process is up; asking never spawns it.
+    #[cfg(target_os = "macos")]
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        self.helper_pid().is_some()
+    }
+
+    /// There is no helper outside macOS.
+    #[cfg(not(target_os = "macos"))]
+    #[must_use]
+    pub const fn is_running(&self) -> bool {
+        false
+    }
+
     /// Kill the helper so the next request respawns it — used after the
     /// user grants permissions, since TCC applies at process launch.
     #[cfg(target_os = "macos")]

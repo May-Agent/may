@@ -312,6 +312,7 @@ export const zhHant: Messages = {
       remote: '遠端存取',
       remoteServers: '遠端伺服器',
       execution: '命令優先權',
+      stream: '串流編解碼器',
     },
     language: {
       title: '介面語言',
@@ -439,6 +440,14 @@ export const zhHant: Messages = {
       low: '低',
       lowest: '最低',
       info: '降低優先權會改變資源競爭時的排程，但不會限制 CPU 用量。',
+    },
+    stream: {
+      title: '串流編解碼器',
+      description: '瀏覽器與桌面串流的影像編解碼器。執行中的串流會重新啟動，檢視端會重新連線。',
+      auto: '自動（預設）',
+      h264: '僅 H.264',
+      av1: '僅 AV1',
+      info: '自動：這台電腦有硬體編碼器時使用硬體 H.264，否則使用軟體 AV1。僅 H.264：沒有硬體編碼器的電腦會失敗。僅 AV1：即使有硬體 H.264 也以軟體編碼。',
     },
     remote: {
       title: '遠端存取',

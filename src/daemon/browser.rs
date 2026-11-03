@@ -246,7 +246,13 @@ async fn run_browser_offer(
     let answer_sdp = bm
         .handle_offer(session_id.to_string(), req.sdp)
         .await
-        .map_err(internal_error)?;
+        .map_err(|error| match error {
+            // The viewer cannot decode the stream's codec: its offer is the problem.
+            crate::container::browser::BrowserError::OfferCodec(error) => {
+                skyzen::Error::msg(error.to_string()).set_status(StatusCode::UNPROCESSABLE_ENTITY)
+            }
+            error => internal_error(error),
+        })?;
 
     Ok(WebRtcAnswerResponse { sdp: answer_sdp })
 }

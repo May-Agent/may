@@ -232,8 +232,12 @@ workspace = true
 # artifacts before every agent is built; unoptimized, these crates make that
 # take seconds in dev and test builds.
 # The software AV1 encoder (hosts without a hardware encoder) is unusable
-# unoptimized: seconds per 640x360 frame in dev and test builds.
+# unoptimized: seconds per 640x360 frame in dev and test builds. Its generic
+# code is instantiated in mediax-codec, which needs the same level.
 [profile.dev.package.rav1e]
+opt-level = 3
+
+[profile.dev.package.mediax-codec]
 opt-level = 3
 
 [profile.dev.package.sha2]

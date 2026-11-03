@@ -151,6 +151,12 @@ impl SessionStreams {
         self.streams.get(session_id).cloned()
     }
 
+    /// Every stream holder, running or asleep.
+    #[must_use]
+    pub fn all(&self) -> Vec<Arc<SessionStream>> {
+        self.streams.values().cloned().collect()
+    }
+
     /// Ends the session's stream when its session ends.
     pub fn release(&mut self, session_id: &str) {
         self.streams.remove(session_id);
