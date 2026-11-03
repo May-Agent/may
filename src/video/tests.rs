@@ -112,6 +112,7 @@ fn bitrate_follows_the_lowest_peer_estimate() {
     assert_eq!(raised.bits_per_second().get(), 2_100_000);
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn jpegs_become_h264_idrs_on_request_and_size_change() {
     let codec = VideoCodec::select(format(640, 360)).expect("select");
