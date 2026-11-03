@@ -92,12 +92,14 @@ export function AssistantTurn({
       {streaming && turn.hold && (
         <div className="flex items-center gap-2 text-sm text-muted-foreground">
           <span className="shimmer-text">
-            {turn.hold.retry == null
+            {turn.hold.reason === 'quota'
               ? t('chat.quotaHold', { at: new Date(turn.hold.until).toLocaleString() })
-              : t('chat.retryHold', {
-                  n: String(turn.hold.retry),
-                  at: new Date(turn.hold.until).toLocaleTimeString(),
-                })}
+              : turn.hold.reason === 'retry'
+                ? t('chat.retryHold', {
+                    n: String(turn.hold.retry),
+                    at: new Date(turn.hold.until).toLocaleTimeString(),
+                  })
+                : t('chat.networkHold')}
           </span>
         </div>
       )}

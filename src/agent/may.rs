@@ -129,6 +129,10 @@ pub struct MayAgentConfig {
     /// What a run does with background commands still running when the
     /// model ends its turn.
     pub background_jobs: aither_agent::BackgroundJobPolicy,
+    /// The daemon's connectivity source: the agent abandons a response on
+    /// sleep or network loss, and its terminal records the outages commands
+    /// ran through.
+    pub connectivity: aither_connectivity::Connectivity,
     /// Trusted baseline tool distribution used by every configured backend.
     pub tool_distribution: Arc<aither_sandbox::ToolDistribution>,
     /// Prepared tool environments kept across rebuilds of a session's agent.
@@ -282,6 +286,8 @@ pub struct MayAgentSessionInput<'a> {
     /// model ends its turn: the daemon detaches them and resumes the
     /// session when one finishes.
     pub background_jobs: aither_agent::BackgroundJobPolicy,
+    /// The daemon's connectivity source.
+    pub connectivity: aither_connectivity::Connectivity,
 }
 
 type MayAgentInner = Agent<
@@ -565,7 +571,8 @@ impl MayAgent {
             .hook(context_snapshot_hook)
             .hook(pending_steer_hook)
             .cache_lifetime(config.cache_lifetime.into())
-            .background_jobs(config.background_jobs);
+            .background_jobs(config.background_jobs)
+            .connectivity(config.connectivity.clone());
         if let Some(runtime) = hook_runtime.clone() {
             builder = builder
                 .context_source(super::ask_user_tool::OpenQuestionsContext::new(
@@ -741,6 +748,7 @@ impl MayAgent {
             provider_attempt,
             subagents,
             background_jobs,
+            connectivity,
         } = input;
         let selector = super::provider::parse_model_selector(model)?;
         let resolved_provider =
@@ -792,6 +800,7 @@ impl MayAgent {
         Ok(MayAgentConfig {
             subagents,
             background_jobs,
+            connectivity,
             tool_distribution,
             tool_environments,
             command_priority: may_config.sandbox.command_priority,

@@ -165,14 +165,11 @@ trait ChatSink {
         checklist: &crate::todo_parser::TodoChecklist,
     ) -> impl Future<Output = bool> + Send;
     fn on_speed(&mut self, tokens_per_second: f64) -> impl Future<Output = bool> + Send;
-    /// The run waits to `until` before it continues: for an upstream quota
-    /// reset (`retry` is `None`) or before retry number `retry` of a
-    /// transient provider failure.
+    /// The run waits for `reason` before it continues.
     fn on_hold(
         &mut self,
-        _until: jiff::Timestamp,
+        _reason: crate::client::HoldReason,
         _message: &str,
-        _retry: Option<u32>,
     ) -> impl Future<Output = bool> + Send {
         async { true }
     }
@@ -483,22 +480,20 @@ impl ChatSink for HubSink {
         true
     }
 
-    async fn on_hold(&mut self, until: jiff::Timestamp, message: &str, retry: Option<u32>) -> bool {
+    async fn on_hold(&mut self, reason: crate::client::HoldReason, message: &str) -> bool {
         let seq = self.next_seq();
         self.publish_turn(
             "hold",
             &SseHoldEvent {
                 seq,
                 turn_id: &self.turn_id,
-                until,
+                reason,
                 message,
-                retry,
             },
         );
         self.publish_agent(crate::client::SessionAgentBody::Hold {
-            until,
+            reason,
             message: message.to_string(),
-            retry,
         });
         true
     }
@@ -573,16 +568,29 @@ async fn wait_quota_reset(
 async fn wait_or_cancel(guard: &SessionRunGuard, wait: Duration) -> Result<(), &'static str> {
     tokio::select! {
         biased;
-        cancel = guard.cancellation().recv() => {
-            Err(match cancel {
-                Ok(CancelReason::User) => "run cancelled by user",
-                Ok(CancelReason::DaemonRestarting) => {
-                    "run interrupted: the daemon is restarting"
-                }
-                Err(_) => "run cancellation channel closed unexpectedly",
-            })
-        }
+        cancel = guard.cancellation().recv() => Err(cancellation_reason_of(&cancel)),
         () = tokio::time::sleep(wait) => Ok(()),
+    }
+}
+
+const fn cancellation_reason_of<E>(cancel: &Result<CancelReason, E>) -> &'static str {
+    match cancel {
+        Ok(CancelReason::User) => "run cancelled by user",
+        Ok(CancelReason::DaemonRestarting) => "run interrupted: the daemon is restarting",
+        Err(_) => "run cancellation channel closed unexpectedly",
+    }
+}
+
+/// Race the wait for the network to return against run cancellation:
+/// `Err(reason)` is why the run was cancelled while it waited.
+async fn wait_online_or_cancel(
+    guard: &SessionRunGuard,
+    connectivity: &aither_connectivity::Connectivity,
+) -> Result<(), &'static str> {
+    tokio::select! {
+        biased;
+        cancel = guard.cancellation().recv() => Err(cancellation_reason_of(&cancel)),
+        () = connectivity.online() => Ok(()),
     }
 }
 
@@ -604,6 +612,8 @@ enum RetryWait {
     SameProvider { wait: Duration, retry: u32 },
     /// The upstream-announced quota reset instant.
     QuotaReset(jiff::Timestamp),
+    /// The network's return, on the same provider candidate.
+    Network,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -2126,8 +2136,10 @@ fn run_agent_loop<'a>(
                     warmth,
                     candidate_left,
                     same_provider_retries,
+                    state.connectivity.is_online(),
                 ) {
                     retry::RetryDecision::Fail => None,
+                    retry::RetryDecision::WaitForNetwork => Some(RetryWait::Network),
                     retry::RetryDecision::SameProvider { wait } => Some(RetryWait::SameProvider {
                         wait,
                         retry: same_provider_retries + 1,
@@ -2163,17 +2175,37 @@ fn run_agent_loop<'a>(
                             let until = jiff::Timestamp::now()
                                 .checked_add(wait)
                                 .expect("a retry wait is far below the timestamp range");
-                            let _ = sink.on_hold(until, &err_msg, Some(retry)).await;
+                            let _ = sink
+                                .on_hold(
+                                    crate::client::HoldReason::Retry { until, retry },
+                                    &err_msg,
+                                )
+                                .await;
                             if let Err(reason) = wait_or_cancel(guard, wait).await {
                                 cancellation_reason = Some(reason);
                             }
                             same_provider_retries = retry;
                         }
                         RetryWait::QuotaReset(until) => {
-                            let _ = sink.on_hold(until, &err_msg, None).await;
+                            let _ = sink
+                                .on_hold(crate::client::HoldReason::Quota { until }, &err_msg)
+                                .await;
                             if let Err(reason) = wait_quota_reset(guard, until).await {
                                 cancellation_reason = Some(reason);
                             }
+                        }
+                        RetryWait::Network => {
+                            let _ = sink
+                                .on_hold(crate::client::HoldReason::Network, &err_msg)
+                                .await;
+                            if let Err(reason) =
+                                wait_online_or_cancel(guard, &state.connectivity).await
+                            {
+                                cancellation_reason = Some(reason);
+                            }
+                            // The outage says nothing about the provider: the
+                            // next failure starts its backoff afresh.
+                            same_provider_retries = 0;
                         }
                     }
                     if cancellation_reason.is_none() {
@@ -3525,6 +3557,7 @@ fn build_session_agent<'a>(
                 provider_attempt,
                 subagents: Some(state.session_background.subagents(ctx.session_id.as_str())),
                 background_jobs: aither_agent::BackgroundJobPolicy::Detach,
+                connectivity: state.connectivity.clone(),
             },
         )
         .await
@@ -4048,8 +4081,32 @@ mod tests {
         );
     }
 
-    /// Records nothing and never disconnects.
-    struct TestSink;
+    /// What a run told its clients about waiting and discarding text.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Note {
+        Hold(crate::client::HoldReason),
+        Retract,
+    }
+
+    /// Reports holds and retractions on `notes` when given one, and never
+    /// disconnects.
+    #[derive(Default)]
+    struct TestSink {
+        notes: Option<async_channel::Sender<Note>>,
+    }
+
+    impl TestSink {
+        fn noting() -> (Self, async_channel::Receiver<Note>) {
+            let (tx, rx) = async_channel::unbounded();
+            (Self { notes: Some(tx) }, rx)
+        }
+
+        fn note(&self, note: Note) {
+            if let Some(notes) = &self.notes {
+                notes.try_send(note).expect("the notes receiver is alive");
+            }
+        }
+    }
 
     impl super::ChatSink for TestSink {
         fn on_start(&mut self, _s: &str, _a: &str) -> impl Future<Output = bool> + Send {
@@ -4096,6 +4153,18 @@ mod tests {
             std::future::ready(true)
         }
         fn on_speed(&mut self, _t: f64) -> impl Future<Output = bool> + Send {
+            std::future::ready(true)
+        }
+        fn on_hold(
+            &mut self,
+            reason: crate::client::HoldReason,
+            _m: &str,
+        ) -> impl Future<Output = bool> + Send {
+            self.note(Note::Hold(reason));
+            std::future::ready(true)
+        }
+        fn on_retract(&mut self) -> impl Future<Output = bool> + Send {
+            self.note(Note::Retract);
             std::future::ready(true)
         }
         fn on_error(
@@ -4255,6 +4324,21 @@ mod tests {
                             queued[0].clone()
                         }
                     };
+                    // The connection dies before any response.
+                    if response == "drop" {
+                        return;
+                    }
+                    // The response starts streaming and then goes silent,
+                    // like a socket that sleep killed.
+                    if let Some(partial) = response.strip_prefix("stall:") {
+                        let wire = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{partial}",
+                            partial.len() + 1_000_000
+                        );
+                        let _ = socket.write_all(wire.as_bytes()).await;
+                        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                        return;
+                    }
                     let (status, body_out) = match response.as_str() {
                         "500" => ("HTTP/1.1 500 Internal Server Error", String::new()),
                         body => ("HTTP/1.1 200 OK", body.to_string()),
@@ -4281,6 +4365,24 @@ mod tests {
         first: &StubProvider,
         second: &StubProvider,
     ) -> std::sync::Arc<DaemonState> {
+        failover_state_on(
+            aither_connectivity::Connectivity::manual(true).0,
+            may_dir,
+            cwd,
+            first,
+            second,
+        )
+        .await
+    }
+
+    /// [`failover_state`] on a given connectivity source.
+    async fn failover_state_on(
+        connectivity: aither_connectivity::Connectivity,
+        may_dir: &std::path::Path,
+        cwd: &std::path::Path,
+        first: &StubProvider,
+        second: &StubProvider,
+    ) -> std::sync::Arc<DaemonState> {
         use crate::config::{ProviderInstance, ProviderType};
         let mut config = MayConfig::default();
         for (id, stub) in [("a", first), ("b", second)] {
@@ -4290,7 +4392,7 @@ mod tests {
             config.provider.insert(id.to_string(), instance);
         }
         let state = std::sync::Arc::new(
-            DaemonState::for_test(may_dir, cwd, config)
+            DaemonState::for_test_with_connectivity(may_dir, cwd, config, connectivity)
                 .await
                 .expect("test daemon state"),
         );
@@ -4332,7 +4434,7 @@ mod tests {
             .acquire("session")
             .await
             .expect("acquire run");
-        let mut sink = TestSink;
+        let mut sink = TestSink::default();
         let result = run_agent_loop(
             &state,
             &req,
@@ -4415,7 +4517,7 @@ mod tests {
             .acquire("session")
             .await
             .expect("acquire run");
-        let mut sink = TestSink;
+        let mut sink = TestSink::default();
         let result = run_agent_loop(
             &state,
             &req,
@@ -4449,6 +4551,145 @@ mod tests {
         );
     }
 
+    /// Runs one prompt turn of "session" to completion on `sink`.
+    async fn run_prompt_turn(
+        state: &std::sync::Arc<DaemonState>,
+        sink: &mut TestSink,
+    ) -> Result<super::AgentRunResult, super::AgentLoopError> {
+        let req = ChatRequest {
+            session_id: "session".to_string(),
+            content: "hello".to_string(),
+            attachments: Vec::new(),
+            hidden_context_xml: None,
+            delivery_mode: crate::session::PendingUserMessageMode::default(),
+            pending_entry_id: None,
+        };
+        let guard = state
+            .runtime_service
+            .runs()
+            .acquire("session")
+            .await
+            .expect("acquire run");
+        run_agent_loop(state, &req, sink, &guard, true, true, &TurnKind::Prompt).await
+    }
+
+    /// The assistant answers the history holds, in order.
+    async fn stored_assistant_texts(state: &DaemonState) -> Vec<String> {
+        crate::session::load_history_from_db(&state.db(), "session")
+            .await
+            .expect("history")
+            .messages()
+            .iter()
+            .filter(|m| matches!(m.role, super::MessageRole::Assistant))
+            .map(|m| m.content.clone())
+            .collect()
+    }
+
+    /// A network failure while the machine is offline neither fails over nor
+    /// ends the turn: it announces a network hold, waits for the network, and
+    /// completes on the same provider with nothing of the outage in history.
+    #[tokio::test]
+    async fn a_network_failure_offline_waits_for_the_network_on_the_same_provider() {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let mut script = vec!["drop".to_string(); OPENAI_CLIENT_ATTEMPTS];
+        script.push(sse_text("back online"));
+        let provider_a = stub_provider(script).await;
+        let provider_b = stub_provider(vec![sse_text("wrong provider")]).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let (connectivity, controller) = aither_connectivity::Connectivity::manual(false);
+        let state = failover_state_on(
+            connectivity,
+            may_dir.path(),
+            cwd.path(),
+            &provider_a,
+            &provider_b,
+        )
+        .await;
+
+        let (mut sink, notes) = TestSink::noting();
+        let network_returns = async {
+            let note = tokio::time::timeout(std::time::Duration::from_secs(60), notes.recv())
+                .await
+                .expect("the turn announces its wait")
+                .expect("notes");
+            assert_eq!(note, Note::Hold(crate::client::HoldReason::Network));
+            // Holding means the turn is parked: nothing else happens until
+            // the network returns.
+            assert!(notes.try_recv().is_err());
+            controller.set_online(true);
+        };
+        let (result, ()) = tokio::join!(run_prompt_turn(&state, &mut sink), network_returns);
+        assert!(result.is_ok(), "the turn must complete: {result:?}");
+
+        assert_eq!(
+            stored_assistant_texts(&state).await,
+            vec!["back online".to_string()],
+            "the outage leaves nothing in history"
+        );
+        assert!(
+            provider_b.bodies.try_recv().is_err(),
+            "the turn never failed over: every provider shares the network"
+        );
+    }
+
+    /// A wake aborts the response in flight: its partial text is retracted
+    /// and the prompt resubmits to the same provider.
+    #[tokio::test]
+    async fn a_wake_mid_stream_aborts_and_resubmits() {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let partial = sse_chunk(
+            &serde_json::json!({
+                "choices": [{"index": 0, "delta": {"content": "half an ans"}}]
+            })
+            .to_string(),
+        );
+        let provider_a =
+            stub_provider(vec![format!("stall:{partial}"), sse_text("whole answer")]).await;
+        let provider_b = stub_provider(vec![sse_text("wrong provider")]).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let (connectivity, controller) = aither_connectivity::Connectivity::manual(true);
+        let state = failover_state_on(
+            connectivity,
+            may_dir.path(),
+            cwd.path(),
+            &provider_a,
+            &provider_b,
+        )
+        .await;
+
+        let (mut sink, notes) = TestSink::noting();
+        let machine_wakes = async {
+            // The request reached the provider, which then went silent.
+            last_body(&provider_a, 1).await;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            controller.sleep();
+            controller.wake();
+        };
+        let (result, ()) = tokio::join!(run_prompt_turn(&state, &mut sink), machine_wakes);
+        assert!(result.is_ok(), "the turn must complete: {result:?}");
+
+        let mut seen = Vec::new();
+        while let Ok(note) = notes.try_recv() {
+            seen.push(note);
+        }
+        assert_eq!(seen.first(), Some(&Note::Retract), "notes: {seen:?}");
+        assert!(
+            matches!(
+                seen.get(1),
+                Some(Note::Hold(crate::client::HoldReason::Retry { .. }))
+            ),
+            "the resubmission waits its backoff: {seen:?}"
+        );
+        assert_eq!(
+            stored_assistant_texts(&state).await,
+            vec!["whole answer".to_string()],
+            "the abandoned partial text never reaches history"
+        );
+        assert!(provider_b.bodies.try_recv().is_err(), "no failover");
+    }
+
     /// A turn persisted through the checkpoint hook restores with its answer
     /// exactly once: the transcript's `applied_seq` boundary keeps whatever the
     /// checkpoint already covers from being pushed again.
@@ -4473,7 +4714,7 @@ mod tests {
             .acquire("session")
             .await
             .expect("acquire run");
-        let mut sink = TestSink;
+        let mut sink = TestSink::default();
         run_agent_loop(
             &state,
             &req,

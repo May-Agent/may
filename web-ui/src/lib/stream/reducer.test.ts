@@ -317,11 +317,13 @@ describe('reducer', () => {
         kind: 'hold',
         seq: 2,
         turnId: 't1',
+        reason: 'quota',
         until: '2026-11-04T05:40:00Z',
         message: 'usage limit reached',
       },
     ]);
     expect(held.hold).toEqual({
+      reason: 'quota',
       until: '2026-11-04T05:40:00Z',
       message: 'usage limit reached',
     });
@@ -346,6 +348,7 @@ describe('reducer', () => {
         kind: 'hold',
         seq: 4,
         turnId: 't1',
+        reason: 'retry',
         until: '2026-11-04T05:40:00Z',
         message: 'overloaded',
         retry: 2,
@@ -353,6 +356,14 @@ describe('reducer', () => {
     ]);
     expect(t.text).toBe('');
     expect(t.segments).toEqual([]);
-    expect(t.hold?.retry).toBe(2);
+    expect(t.hold).toMatchObject({ reason: 'retry', retry: 2 });
+  });
+
+  test('a network hold carries no instant', () => {
+    const t = stream([
+      { kind: 'start', seq: 1, turnId: 't1', sessionId: 's1', assistantId: 'a1' },
+      { kind: 'hold', seq: 2, turnId: 't1', reason: 'network', message: 'offline' },
+    ]);
+    expect(t.hold).toEqual({ reason: 'network', message: 'offline' });
   });
 });
