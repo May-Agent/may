@@ -76,7 +76,7 @@ export function ComputerViewer() {
   const [running, setRunning] = useState(false);
   const [takeover, setTakeover] = useState(false);
   const shown = open && sessionId !== null;
-  const { stream, state } = useComputerStream(sessionId, shown && running);
+  const { stream, state, error } = useComputerStream(sessionId, shown && running);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const [busy, setBusy] = useState(false);
@@ -250,7 +250,7 @@ export function ComputerViewer() {
                       )}
                     </>
                   ) : lost ? (
-                    t('computer.streamLost')
+                    (error ?? t('computer.streamLost'))
                   ) : (
                     <>
                       <Loader2 className="size-5 animate-spin" aria-hidden />

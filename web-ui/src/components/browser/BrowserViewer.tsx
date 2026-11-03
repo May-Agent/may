@@ -73,7 +73,7 @@ export function BrowserViewer() {
 
   const running = browser?.running ?? false;
   const shown = open && sessionId !== null;
-  const { stream, state } = useBrowserStream(sessionId, shown && running);
+  const { stream, state, error } = useBrowserStream(sessionId, shown && running);
   const takeover = sessionId !== null && browser?.takeoverSessionId === sessionId;
 
   const stageRef = useRef<HTMLDivElement | null>(null);
@@ -240,7 +240,7 @@ export function BrowserViewer() {
                       )}
                     </>
                   ) : lost ? (
-                    t('browser.streamLost')
+                    (error ?? t('browser.streamLost'))
                   ) : (
                     <>
                       <Loader2 className="size-5 animate-spin" aria-hidden />

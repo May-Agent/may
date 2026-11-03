@@ -25,14 +25,27 @@ use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 use webrtc::track::track_local::TrackLocal;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
+use crate::config::StreamCodec;
+
 use super::capture::{CapturedFrame, DisplayCapture};
 use super::input::{self, InputState};
 use super::proto::InputMessage;
 use super::{DisplayError, PlatformDisplay, SessionDisplay};
 use crate::video::{
-    EncodedSample, EncoderControl, FRAME_QUEUE_CAPACITY, GateChange, RawFrame, SourceGate,
-    StreamFormat, VideoCodec, encode_loop, encoder_control,
+    EncodedSample, EncoderControl, FRAME_QUEUE_CAPACITY, GateChange, OfferCodecError, RawFrame,
+    SourceGate, StreamFormat, VideoCodec, encode_loop, encoder_control,
 };
+
+/// Why a viewer's offer got no answer.
+#[derive(Debug, thiserror::Error)]
+pub enum OfferError {
+    /// The viewer's offer is the problem: it does not parse, or it cannot
+    /// receive the stream's codec.
+    #[error(transparent)]
+    Codec(#[from] OfferCodecError),
+    #[error(transparent)]
+    Display(#[from] DisplayError),
+}
 
 /// Encoder bitrate for a desktop stream. The display is 1920×1200@2x —
 /// one step above the browser's viewport default.
@@ -73,6 +86,7 @@ struct StreamRuntime {
     takeover_active: Arc<AtomicBool>,
     video_track: Arc<TrackLocalStaticSample>,
     webrtc_api: webrtc::api::API,
+    codec: VideoCodec,
     peers: HashMap<String, Arc<RTCPeerConnection>>,
     control: EncoderControl,
     tasks: Vec<tokio::task::JoinHandle<()>>,
@@ -147,19 +161,43 @@ impl SessionStream {
         &self,
         display: Arc<PlatformDisplay>,
         inputs: Arc<std::sync::Mutex<super::input::InputState>>,
+        preference: StreamCodec,
     ) -> Result<(), DisplayError> {
         let mut guard = self.runtime.lock().await;
         if guard.is_some() {
             return Ok(());
         }
+        let codec = select_codec(&display, preference)?;
+        self.start_locked(&mut guard, display, inputs, codec)
+    }
 
-        let (width, height) = display.size();
-        let codec = VideoCodec::select(StreamFormat {
-            max_width: width,
-            max_height: height,
-            initial_bitrate_kbps: DESKTOP_BITRATE_KBPS,
-        })
-        .map_err(|e| DisplayError(format!("select video codec: {e}")))?;
+    /// Moves a running stream to the codec `preference` selects: its peers
+    /// close (viewers reconnect) and the capture and encoder restart. A
+    /// stream that is asleep stays asleep. The codec is selected before
+    /// anything stops, so an unavailable codec leaves the stream running.
+    ///
+    /// # Errors
+    /// Returns [`DisplayError`] when the codec cannot be selected or the
+    /// restarted stream fails to start.
+    #[allow(clippy::significant_drop_tightening)]
+    pub async fn restart(&self, preference: StreamCodec) -> Result<(), DisplayError> {
+        let mut guard = self.runtime.lock().await;
+        let Some(running) = guard.as_ref() else {
+            return Ok(());
+        };
+        let (display, inputs) = (running.display.clone(), running.inputs.clone());
+        let codec = select_codec(&display, preference)?;
+        *guard = None;
+        self.start_locked(&mut guard, display, inputs, codec)
+    }
+
+    fn start_locked(
+        &self,
+        guard: &mut Option<StreamRuntime>,
+        display: Arc<PlatformDisplay>,
+        inputs: Arc<std::sync::Mutex<super::input::InputState>>,
+        codec: VideoCodec,
+    ) -> Result<(), DisplayError> {
         let (webrtc_api, video_track) = codec
             .webrtc("video", "session-desktop")
             .map_err(|e| DisplayError(format!("build webrtc stack: {e}")))?;
@@ -221,6 +259,7 @@ impl SessionStream {
             takeover_active: self.takeover_active.clone(),
             video_track,
             webrtc_api,
+            codec,
             peers: HashMap::new(),
             control,
             tasks: vec![bridge, encoder, writer],
@@ -250,14 +289,16 @@ impl SessionStream {
     /// Answers a viewer's WebRTC offer with this stream's video track.
     ///
     /// # Errors
-    /// Returns [`DisplayError`] when the stream is asleep, the offer is
-    /// malformed, or the peer cannot be created or negotiated.
+    /// Returns [`OfferError::Codec`] when the offer is malformed or lacks the
+    /// stream's codec, and [`OfferError::Display`] when the stream is asleep
+    /// or the peer cannot be created or negotiated.
     #[allow(clippy::significant_drop_tightening)]
-    pub async fn handle_offer(&self, offer_sdp: String) -> Result<String, DisplayError> {
+    pub async fn handle_offer(&self, offer_sdp: String) -> Result<String, OfferError> {
         let mut guard = self.runtime.lock().await;
         let runtime = guard
             .as_mut()
             .ok_or_else(|| DisplayError("the session desktop is asleep".to_owned()))?;
+        runtime.codec.check_offer(&offer_sdp)?;
 
         let config = RTCConfiguration {
             ice_servers: vec![RTCIceServer {
@@ -343,10 +384,26 @@ impl SessionStream {
                     let _ = peer.close().await;
                 });
             }
-            return Err(error);
+            return Err(error.into());
         }
         Ok(local.sdp)
     }
+}
+
+fn select_codec(
+    display: &PlatformDisplay,
+    preference: StreamCodec,
+) -> Result<VideoCodec, DisplayError> {
+    let (width, height) = display.size();
+    VideoCodec::select(
+        StreamFormat {
+            max_width: width,
+            max_height: height,
+            initial_bitrate_kbps: DESKTOP_BITRATE_KBPS,
+        },
+        preference,
+    )
+    .map_err(|e| DisplayError(format!("select video codec: {e}")))
 }
 
 /// Forgets a viewer that left and closes its connection. Closing stops the

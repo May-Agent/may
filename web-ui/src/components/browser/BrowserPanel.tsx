@@ -22,7 +22,7 @@ export function BrowserPanel({ sessionId, visible }: { sessionId: string; visibl
   const openViewer = useBrowserViewStore((s) => s.openViewer);
   const { profile } = useActiveProfile();
   const running = browser?.running ?? false;
-  const { stream, state } = useBrowserStream(sessionId, visible && running);
+  const { stream, state, error } = useBrowserStream(sessionId, visible && running);
   const [busy, setBusy] = useState(false);
   const agent = profile?.name ?? t('appName');
 
@@ -72,7 +72,7 @@ export function BrowserPanel({ sessionId, visible }: { sessionId: string; visibl
             className="absolute inset-0 flex items-center justify-center gap-2 text-xs text-muted-foreground"
           >
             {lost ? (
-              t('browser.streamLost')
+              (error ?? t('browser.streamLost'))
             ) : (
               <>
                 <Loader2 className="size-3.5 animate-spin" aria-hidden />

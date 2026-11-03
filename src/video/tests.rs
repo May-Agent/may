@@ -7,7 +7,102 @@ use std::time::{Duration, Instant};
 use mediax_codec::{EncodedPacket, EncoderCodec};
 
 use super::pipeline::FramePipeline;
-use super::{BitrateTarget, RawFrame, StreamFormat, VideoCodec};
+use super::{BitrateTarget, FrameError, OfferCodecError, RawFrame, StreamFormat, VideoCodec};
+use crate::config::StreamCodec;
+use mediax_codec::{CodecError, EncoderConfig};
+
+#[allow(clippy::unnecessary_wraps)]
+fn has_hardware(_: EncoderConfig) -> Result<(), CodecError> {
+    Ok(())
+}
+
+fn no_hardware(_: EncoderConfig) -> Result<(), CodecError> {
+    Err(CodecError::Unsupported("no encoder".into()))
+}
+
+fn never_probed(_: EncoderConfig) -> Result<(), CodecError> {
+    panic!("the AV1 preference must not probe hardware");
+}
+
+fn is_h264(codec: VideoCodec) -> bool {
+    matches!(codec.codec, EncoderCodec::H264(_))
+}
+
+#[test]
+fn auto_takes_hardware_h264_and_falls_back_to_av1() {
+    let f = format(640, 360);
+    let with = VideoCodec::select_with(f, StreamCodec::Auto, has_hardware).expect("select");
+    assert!(is_h264(with));
+    let without = VideoCodec::select_with(f, StreamCodec::Auto, no_hardware).expect("select");
+    assert_eq!(without.name(), "AV1");
+}
+
+#[test]
+fn h264_never_falls_back_to_av1() {
+    let f = format(640, 360);
+    let with = VideoCodec::select_with(f, StreamCodec::H264, has_hardware).expect("select");
+    assert!(is_h264(with));
+    let error = VideoCodec::select_with(f, StreamCodec::H264, no_hardware).expect_err("no AV1");
+    assert!(matches!(error, FrameError::H264Unavailable(_)));
+    assert!(error.to_string().contains("H.264"));
+}
+
+#[test]
+fn av1_is_software_even_with_hardware_h264() {
+    let codec =
+        VideoCodec::select_with(format(640, 360), StreamCodec::Av1, never_probed).expect("select");
+    assert_eq!(codec.name(), "AV1");
+}
+
+#[test]
+fn other_encoder_failures_are_not_swallowed() {
+    let failing = |_: EncoderConfig| Err(CodecError::InitializationFailed("bad".into()));
+    for preference in [StreamCodec::Auto, StreamCodec::H264] {
+        let error = VideoCodec::select_with(format(640, 360), preference, failing)
+            .expect_err("a real failure");
+        assert!(matches!(error, FrameError::Codec(_)));
+    }
+}
+
+const SDP_HEAD: &str = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n";
+
+fn offer(media: &str) -> String {
+    format!("{SDP_HEAD}{media}")
+}
+
+#[test]
+fn an_offer_without_the_codec_is_refused_naming_it() {
+    let f = format(640, 360);
+    let chrome = offer(
+        "m=video 9 UDP/TLS/RTP/SAVPF 96 97\r\nc=IN IP4 0.0.0.0\r\na=rtpmap:96 VP8/90000\r\na=rtpmap:97 H264/90000\r\n",
+    );
+    let h264 = VideoCodec::select_with(f, StreamCodec::H264, has_hardware).expect("select");
+    h264.check_offer(&chrome).expect("offered");
+    let av1 = av1(f);
+    let error = av1.check_offer(&chrome).expect_err("AV1 not offered");
+    assert!(matches!(error, OfferCodecError::Missing { codec: "AV1" }));
+    assert!(error.to_string().contains("AV1"));
+    // A payload type mapped outside a video section does not count.
+    let data_only =
+        offer("m=application 9 UDP/DTLS/SCTP 45\r\nc=IN IP4 0.0.0.0\r\na=rtpmap:45 AV1/90000\r\n");
+    assert!(matches!(
+        av1.check_offer(&data_only),
+        Err(OfferCodecError::Missing { .. })
+    ));
+    av1.check_offer(&offer(
+        "m=video 9 UDP/TLS/RTP/SAVPF 45\r\nc=IN IP4 0.0.0.0\r\na=rtpmap:45 av1/90000\r\n",
+    ))
+    .expect("case-insensitive");
+}
+
+#[test]
+fn an_offer_that_is_not_sdp_is_reported_as_invalid() {
+    let av1 = av1(format(640, 360));
+    assert!(matches!(
+        av1.check_offer("not an offer"),
+        Err(OfferCodecError::Invalid(_))
+    ));
+}
 
 fn format(width: u32, height: u32) -> StreamFormat {
     StreamFormat {
@@ -99,7 +194,7 @@ fn report(label: &str, times: &[Duration]) {
 
 #[test]
 fn the_sdp_names_the_level_the_encoder_runs_at() {
-    let codec = VideoCodec::select(format(640, 360)).expect("select");
+    let codec = VideoCodec::select(format(640, 360), StreamCodec::Auto).expect("select");
     let capability = codec.capability();
     match codec.codec {
         EncoderCodec::H264(_) => {
@@ -136,7 +231,7 @@ fn bitrate_follows_the_lowest_peer_estimate() {
 #[cfg(target_os = "macos")]
 #[test]
 fn jpegs_become_h264_idrs_on_request_and_size_change() {
-    let codec = VideoCodec::select(format(640, 360)).expect("select");
+    let codec = VideoCodec::select(format(640, 360), StreamCodec::Auto).expect("select");
     assert!(
         matches!(codec.codec, EncoderCodec::H264(_)),
         "this test needs a hardware H.264 encoder"
@@ -247,7 +342,7 @@ mod surfaces {
 
     #[test]
     fn surfaces_become_h264_idrs_without_a_cpu_copy() {
-        let codec = VideoCodec::select(format(1280, 720)).expect("select");
+        let codec = VideoCodec::select(format(1280, 720), StreamCodec::Auto).expect("select");
         assert!(matches!(codec.codec, EncoderCodec::H264(_)));
         assert!(codec.takes_surfaces());
         let mut feed = Feed::new(codec);
