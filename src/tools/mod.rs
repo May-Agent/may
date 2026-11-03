@@ -2,13 +2,13 @@
 
 use aither_sandbox::{ToolDistribution, ToolRuntimeError};
 
-/// Release asset `tool-distribution-0.11.0.json` of aither's `patch-v0.11.0`
+/// Release asset `tool-distribution-0.12.0.json` of aither's `patch-v0.12.0`
 /// release, byte for byte.
-const EMBEDDED_DISTRIBUTION: &[u8] = include_bytes!("tool-distribution-0.11.0.json");
-/// SHA-256 of the `patch-v0.11.0` `tool-distribution-0.11.0.json` release asset.
+const EMBEDDED_DISTRIBUTION: &[u8] = include_bytes!("tool-distribution-0.12.0.json");
+/// SHA-256 of the `patch-v0.12.0` `tool-distribution-0.12.0.json` release asset.
 #[cfg(test)]
 const EMBEDDED_DISTRIBUTION_SHA256: &str =
-    "c0108572ea69c8ab7efb4dc9aba07c355f82c9efe1d04e4c7219b8ffd236fc7d";
+    "0a433ee0fc02e36ad2be7eef7d3d34412d3b27b1648232c7ff36dcd210f3f601";
 
 /// Loads the embedded, hash-pinned baseline distribution.
 ///
@@ -28,7 +28,7 @@ const HOST_PROGRAMS: &[u8] = include_bytes!("host-programs.json");
 /// SHA-256 of `host-programs.json`, so an accidental edit fails a test.
 #[cfg(test)]
 const HOST_PROGRAMS_SHA256: &str =
-    "bf34c73fd16335f5cbeedd24863ad2ae1435239fb61b30f97fefa1e92e37433b";
+    "62a1ad2a2a716a3e2ba88060ba77651c6d6a92984eea3a7b68e00b9a5209ada9";
 
 /// Loads May's hash-pinned host-program manifest.
 ///
