@@ -336,18 +336,22 @@ export interface SseSpeed {
   tokensPerSecond: number;
 }
 
-/**
- * The turn is parked and continues at `until`: after an upstream quota reset
- * (`retry` absent) or as retry number `retry` of a transient provider failure.
- */
-export interface SseHold {
+/** What a parked turn waits for. */
+export type HoldReason =
+  /** An upstream quota reset; the turn continues at `until`. */
+  | { reason: 'quota'; until: string }
+  /** Retry number `retry` of a transient provider failure, at `until`. */
+  | { reason: 'retry'; until: string; retry: number }
+  /** The network is gone; the turn continues once it is back. */
+  | { reason: 'network' };
+
+/** The turn is parked. */
+export type SseHold = {
   kind: 'hold';
   seq: number;
   turnId: string;
-  until: string;
   message: string;
-  retry?: number;
-}
+} & HoldReason;
 
 /** The text the turn streamed so far is discarded: its attempt failed and is resubmitted. */
 export interface SseRetract {

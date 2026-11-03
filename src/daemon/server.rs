@@ -115,7 +115,15 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
 
     let (tool_dispatchers, tool_queues) = tool_dispatch_channels();
 
-    let config = MayConfig::load().await.context("Failed to load config")?;
+    // Starting the monitor waits for the OS's first reachability report, so it
+    // runs alongside loading the config.
+    let (connectivity, config) = futures_lite::future::zip(
+        blocking::unblock(aither_connectivity::Connectivity::start),
+        MayConfig::load(),
+    )
+    .await;
+    let connectivity = connectivity.context("failed to start the connectivity monitor")?;
+    let config = config.context("Failed to load config")?;
     let tool_distribution = Arc::new(
         crate::tools::embedded_distribution().context("embedded tool distribution is invalid")?,
     );
@@ -231,7 +239,8 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
     .with_notifier(notification_service.clone())
     .with_ui_event_bus(ui_event_bus.clone())
     .with_network_policy(&config.preferences.network_policy)
-    .map_err(|error| anyhow!(error))?;
+    .map_err(|error| anyhow!(error))?
+    .with_connectivity(connectivity.clone());
     if let Some(ref manager) = container_manager {
         task_runtime = task_runtime.with_container_manager(manager.clone());
     }
@@ -288,6 +297,7 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
         recap_schedules: super::chat::RecapSchedules::default(),
         session_background: super::chat::SessionBackgrounds::default(),
         tunnels: Arc::new(super::tunnel::TunnelRegistry::new()),
+        connectivity,
     });
 
     super::chat::resume_pending_follow_up_runs(state.clone())

@@ -469,6 +469,10 @@ pub struct DaemonState {
     /// Each session's background jobs and subagent runs, across turns.
     pub(crate) session_background: super::chat::SessionBackgrounds,
     pub(crate) tunnels: Arc<super::tunnel::TunnelRegistry>,
+    /// The machine's reachability and sleep/wake state: the one source every
+    /// agent and terminal the daemon builds watches, and the turn runner
+    /// waits on after a network failure.
+    pub(crate) connectivity: aither_connectivity::Connectivity,
 }
 
 impl DaemonState {
@@ -1031,6 +1035,22 @@ impl DaemonState {
         cwd: &std::path::Path,
         config: MayConfig,
     ) -> anyhow::Result<Self> {
+        Self::for_test_with_connectivity(
+            may_dir,
+            cwd,
+            config,
+            aither_connectivity::Connectivity::manual(true).0,
+        )
+        .await
+    }
+
+    /// [`Self::for_test`] on a given connectivity source.
+    pub(crate) async fn for_test_with_connectivity(
+        may_dir: &std::path::Path,
+        cwd: &std::path::Path,
+        config: MayConfig,
+        connectivity: aither_connectivity::Connectivity,
+    ) -> anyhow::Result<Self> {
         let db = crate::db::ChatDb::open(&may_dir.join("history.db")).await?;
         let ui_event_bus = crate::ui_event_bus::UiEventBus::new();
         let lease_handle = tokio::runtime::Handle::current();
@@ -1118,6 +1138,7 @@ impl DaemonState {
             recap_schedules: super::chat::RecapSchedules::default(),
             session_background: super::chat::SessionBackgrounds::default(),
             tunnels: std::sync::Arc::new(super::tunnel::TunnelRegistry::new()),
+            connectivity,
         })
     }
 }

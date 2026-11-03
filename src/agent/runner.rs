@@ -64,16 +64,12 @@ pub enum TuiEvent {
         /// Seconds the phase lasted. Sub-second phases keep the fraction.
         seconds: f64,
     },
-    /// The daemon parked the run: for an upstream quota reset, or before a
-    /// retry of a transient provider failure.
+    /// The daemon parked the run.
     Hold {
-        /// When the run continues.
-        until: jiff::Timestamp,
+        /// What the run waits for.
+        reason: crate::client::HoldReason,
         /// The upstream message behind the wait.
         message: String,
-        /// Which retry of a transient failure the run waits for; absent for
-        /// a quota reset.
-        retry: Option<u32>,
     },
     /// The text streamed so far is discarded: the attempt failed and the
     /// prompt is resubmitted.
