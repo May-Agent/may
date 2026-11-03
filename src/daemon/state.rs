@@ -1099,7 +1099,7 @@ impl DaemonState {
             ask_user_approver: AskUserApprover::new().with_runtime_service(runtime_service.clone()),
             tool_dispatchers,
             fetched_models_cache: RefreshableCache::new(Duration::from_secs(20)),
-            config,
+            config: config.clone(),
             ui_event_bus: ui_event_bus.clone(),
             container_prepare: ContainerPrepareTracker::new(ui_event_bus.clone()),
             container_manager: None,
@@ -1108,6 +1108,7 @@ impl DaemonState {
             browser_lifecycle_tx,
             computer: std::sync::Arc::new(crate::computer::ComputerAgent::new(
                 may_dir.to_path_buf(),
+                config,
             )),
             remote_access_manager: std::sync::Arc::new(
                 super::remote_access::RemoteAccessManager::new(ui_event_bus.clone()),

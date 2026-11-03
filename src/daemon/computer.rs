@@ -168,10 +168,12 @@ async fn needs_permissions(state: &DaemonState) -> SkyResult<Option<ComputerPerm
         AgentResponse::Permissions {
             screen_recording,
             accessibility,
-        } => Ok((!screen_recording || !accessibility).then_some(ComputerPermissions {
-            screen_recording,
-            accessibility,
-        })),
+        } => Ok(
+            (!screen_recording || !accessibility).then_some(ComputerPermissions {
+                screen_recording,
+                accessibility,
+            }),
+        ),
         AgentResponse::Error { error } => {
             Err(skyzen::Error::msg(error).set_status(StatusCode::INTERNAL_SERVER_ERROR))
         }
