@@ -10,15 +10,17 @@
 use std::ffi::c_void;
 
 use block2::RcBlock;
+use objc2_core_foundation::{CFDictionary, CFNumber, CFString};
+use objc2_io_surface::IOSurfaceRef as Surface;
 
 use super::DisplayError;
+use crate::video::PixelBuffer;
 
-/// One captured frame: tightly packed BGRA8 pixels.
+/// One captured frame: the display's `IOSurface`, held until the encoder is
+/// done with it. No pixel is copied.
+#[derive(Debug)]
 pub struct CapturedFrame {
-    pub bgra: Vec<u8>,
-    pub width: usize,
-    pub height: usize,
-    pub bytes_per_row: usize,
+    pub surface: PixelBuffer,
 }
 
 /// Frames as the stream hands them off, newest last.
@@ -34,7 +36,11 @@ type DispatchQueue = *mut c_void;
 const K_DISPLAY_STREAM_BLANK_SCREEN: i64 = 0;
 const K_DISPLAY_STREAM_FRAME_STATUS_COMPLETE: i64 = 1;
 const K_CG_BASE_BYTE_ORDER_32_LITTLE: u32 = 0x4247_5241; // 'BGRA'
-const K_IO_SURFACE_READ_ONLY: u32 = 1;
+// Surfaces the stream may have out at once. Each captured frame keeps its
+// surface in use until the encoder drops it, and the stream stops delivering
+// when none is free, so the depth covers the encoder queue and the frame
+// being encoded. 8 is the largest depth `CGDisplayStream` accepts.
+const DISPLAY_STREAM_QUEUE_DEPTH: i32 = 8;
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
@@ -51,6 +57,11 @@ unsafe extern "C" {
     fn CGDisplayStreamStop(stream: CGDisplayStreamRef);
 }
 
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    static kCGDisplayStreamQueueDepth: &'static CFString;
+}
+
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     fn CFRelease(cf: *const c_void);
@@ -58,16 +69,6 @@ unsafe extern "C" {
 
 unsafe extern "C" {
     fn dispatch_queue_create(label: *const i8, attr: *const c_void) -> DispatchQueue;
-}
-
-#[link(name = "IOSurface", kind = "framework")]
-unsafe extern "C" {
-    fn IOSurfaceLock(surface: IOSurfaceRef, options: u32, seed: *mut u32) -> i32;
-    fn IOSurfaceUnlock(surface: IOSurfaceRef, options: u32, seed: *mut u32) -> i32;
-    fn IOSurfaceGetBaseAddress(surface: IOSurfaceRef) -> *mut u8;
-    fn IOSurfaceGetBytesPerRow(surface: IOSurfaceRef) -> usize;
-    fn IOSurfaceGetWidth(surface: IOSurfaceRef) -> usize;
-    fn IOSurfaceGetHeight(surface: IOSurfaceRef) -> usize;
 }
 
 /// A running capture on one virtual display. Dropping it stops the
@@ -109,7 +110,15 @@ impl DisplayCapture {
                 if status != K_DISPLAY_STREAM_FRAME_STATUS_COMPLETE || surface.is_null() {
                     return;
                 }
-                let frame = copy_surface(surface);
+                // SAFETY: the stream hands the handler a live `IOSurfaceRef`.
+                let surface = unsafe { &*surface.cast::<Surface>() };
+                let frame = match PixelBuffer::from_io_surface(surface) {
+                    Ok(surface) => CapturedFrame { surface },
+                    Err(error) => {
+                        tracing::warn!(%error, "dropping a captured frame");
+                        return;
+                    }
+                };
                 match frames.try_send(frame) {
                     Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
@@ -117,6 +126,11 @@ impl DisplayCapture {
                     }
                 }
             },
+        );
+        // SAFETY: `kCGDisplayStreamQueueDepth` is a constant CoreGraphics exports.
+        let properties = CFDictionary::<CFString, CFNumber>::from_slices(
+            &[unsafe { kCGDisplayStreamQueueDepth }],
+            &[&*CFNumber::new_i32(DISPLAY_STREAM_QUEUE_DEPTH)],
         );
         // SAFETY: the stream is created on a queue we own and stopped
         // before the handler block is released.
@@ -129,7 +143,7 @@ impl DisplayCapture {
                 width,
                 height,
                 K_CG_BASE_BYTE_ORDER_32_LITTLE,
-                std::ptr::null(),
+                (&raw const *properties).cast::<c_void>(),
                 RcBlock::as_ptr(&handler).cast::<c_void>(),
             );
             if stream.is_null() {
@@ -154,36 +168,6 @@ impl Drop for DisplayCapture {
             CGDisplayStreamStop(self.stream);
             CFRelease(self.stream);
             CFRelease(self.queue);
-        }
-    }
-}
-
-/// Copies a locked `IOSurface`'s BGRA pixels out while the frame is
-/// held — the surface is recycled underneath us otherwise.
-fn copy_surface(surface: IOSurfaceRef) -> CapturedFrame {
-    unsafe {
-        let mut seed = 0u32;
-        if IOSurfaceLock(surface, K_IO_SURFACE_READ_ONLY, &raw mut seed) != 0 {
-            return CapturedFrame {
-                bgra: Vec::new(),
-                width: 0,
-                height: 0,
-                bytes_per_row: 0,
-            };
-        }
-        let base = IOSurfaceGetBaseAddress(surface);
-        let row = IOSurfaceGetBytesPerRow(surface);
-        let (width, height) = (IOSurfaceGetWidth(surface), IOSurfaceGetHeight(surface));
-        let mut bgra = Vec::with_capacity(row.saturating_mul(height));
-        if !base.is_null() {
-            bgra.extend_from_slice(std::slice::from_raw_parts(base, row.saturating_mul(height)));
-        }
-        IOSurfaceUnlock(surface, K_IO_SURFACE_READ_ONLY, &raw mut seed);
-        CapturedFrame {
-            bgra,
-            width,
-            height,
-            bytes_per_row: row,
         }
     }
 }

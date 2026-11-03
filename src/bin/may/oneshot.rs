@@ -724,6 +724,7 @@ mod tests {
             },
             stderr: None,
             outcome,
+            interruptions: Vec::new(),
         }))
     }
 
