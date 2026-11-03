@@ -1,15 +1,72 @@
 //! The shared screen-content video path every streamed surface uses.
 //!
-//! Raw frames in, H.264 (Screen Content) samples out for a WebRTC
-//! `TrackLocalStaticSample`.
+//! Raw frames in, encoded samples out for a WebRTC `TrackLocalStaticSample`.
+//! The encoder is `mediax-codec`: hardware H.264 (Constrained Baseline,
+//! Annex B) where the host has an encoder, software AV1 otherwise. The codec
+//! is chosen once per stream by [`VideoCodec::select`] and the WebRTC stack
+//! built by [`VideoCodec::webrtc`] advertises exactly that codec.
 //!
-//! Today two sources feed it — the managed browser's CDP screencast
-//! JPEGs and a session desktop's `CGDisplayStream` surfaces — so the
-//! frame type is [`RawFrame`]: the encoder loop takes whatever decode
-//! each source needs.
+//! Two sources feed it: the managed browser's CDP screencast JPEGs and a
+//! session desktop's `CGDisplayStream` surfaces, so the frame type is
+//! [`RawFrame`]. Where the host allows, neither touches the CPU: the surface
+//! goes to the encoder as a `CVPixelBuffer` and a JPEG is decoded by the
+//! platform into one.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+mod level;
+mod nv12;
+mod pipeline;
+#[cfg(target_os = "macos")]
+mod surface;
+#[cfg(test)]
+mod tests;
+
+use std::collections::HashMap;
+use std::num::NonZeroU32;
+use std::sync::Arc;
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
+
+use mediax_codec::{
+    Bitrate, BitstreamFormat, CodecError, Encoder, EncoderCodec, EncoderConfig, EncoderProfile,
+    EvenDimension, FrameRate, H264Profile, H264Settings,
+};
+use webrtc::api::APIBuilder;
+use webrtc::api::interceptor_registry::{configure_nack, configure_rtcp_reports};
+use webrtc::api::media_engine::{MIME_TYPE_AV1, MIME_TYPE_H264, MediaEngine};
+use webrtc::interceptor::registry::Registry;
+use webrtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
+use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
+use webrtc::rtcp::payload_feedbacks::receiver_estimated_maximum_bitrate::ReceiverEstimatedMaximumBitrate;
+use webrtc::rtp_transceiver::rtp_codec::{
+    RTCRtpCodecCapability, RTCRtpCodecParameters, RTPCodecType,
+};
+use webrtc::rtp_transceiver::{RTCPFeedback, rtp_sender::RTCRtpSender};
+use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
+
+use pipeline::FramePipeline;
+#[cfg(target_os = "macos")]
+pub use surface::PixelBuffer;
+
+/// Capacity of the frame → encoder queue. Tuned so a transient encoder
+/// stall (~250 ms at 30 fps) absorbs without dropping frames, while still
+/// catching unbounded growth on a stuck consumer.
+pub const FRAME_QUEUE_CAPACITY: usize = 8;
+
+/// The frame rate the encoder and the H.264 level are sized for.
+pub const STREAM_FRAME_RATE: u32 = 30;
+
+/// The longest span between keyframes; viewer joins and PLI/FIR ask for
+/// earlier ones.
+const KEYFRAME_INTERVAL: Duration = Duration::from_secs(2);
+
+/// RTP payload type of the one codec a stream offers (dynamic range).
+const PAYLOAD_TYPE: u8 = 96;
+
+/// A new bitrate estimate is applied once it differs from the applied target
+/// by this fraction. The software AV1 encoder restarts its rate control (and
+/// emits a keyframe) on every change, and REMB reports arrive about once a
+/// second.
+const BITRATE_STEP: f64 = 0.1;
 
 /// An encoded video frame ready for WebRTC.
 pub struct EncodedSample {
@@ -17,201 +74,391 @@ pub struct EncodedSample {
     pub duration: Duration,
 }
 
-/// A frame on its way to the encoder. Each source supplies the decode
-/// it already has: the browser hands JPEG bytes off the wire, a
-/// display hands locked `IOSurface` pixels.
+/// A frame on its way to the encoder. Each source supplies what it already
+/// has: the browser hands JPEG bytes off the wire, a display hands the
+/// captured surface.
+#[derive(Debug)]
 pub enum RawFrame {
     /// An encoded JPEG frame (the browser's CDP screencast).
     Jpeg(Vec<u8>),
-    /// BGRA pixels copied out of a display surface, with the row stride
-    /// the surface carried.
+    /// A captured display surface, handed over without a copy.
     #[cfg(target_os = "macos")]
-    Bgra(BgraFrame),
+    Surface(PixelBuffer),
 }
 
-/// A captured display frame in BGRA order, as the display stream hands it over.
-#[cfg(target_os = "macos")]
-pub struct BgraFrame {
-    pub data: Vec<u8>,
-    /// Distance in bytes between two consecutive rows, which may exceed
-    /// `width * 4` (`IOSurface` aligns rows).
-    pub stride: usize,
-    pub width: usize,
-    pub height: usize,
+/// Why a frame or the stream could not be encoded.
+#[derive(Debug, thiserror::Error)]
+pub enum FrameError {
+    #[error("the {width}x{height} stream needs more than H.264 level 5.2")]
+    StreamTooLarge { width: u32, height: u32 },
+    #[error("stream dimension {0} is not usable")]
+    Dimension(u32),
+    #[error("frame is {width}x{height}, above the stream's {max_width}x{max_height}")]
+    FrameTooLarge {
+        width: u32,
+        height: u32,
+        max_width: u32,
+        max_height: u32,
+    },
+    #[error("the encoder failed: {0}")]
+    Codec(#[from] CodecError),
+    #[error("JPEG decode failed: {0}")]
+    Jpeg(#[from] image::ImageError),
+    #[error("NV12 conversion failed: {0}")]
+    Convert(#[from] yuv::YuvError),
+    #[cfg(target_os = "macos")]
+    #[error("CoreVideo refused the surface: status {0}")]
+    Surface(i32),
+    #[cfg(target_os = "macos")]
+    #[error("pixel buffer format {0:#010x} is not BGRA")]
+    PixelFormat(u32),
 }
 
-#[cfg(target_os = "macos")]
-impl BgraFrame {
-    /// Drops the alpha byte and reorders to RGB, honouring the surface
-    /// stride — the only conversion the display-capture source needs.
-    fn to_rgb(&self) -> image::RgbImage {
-        let mut rgb = image::RgbImage::new(
-            u32::try_from(self.width).unwrap_or(u32::MAX),
-            u32::try_from(self.height).unwrap_or(u32::MAX),
-        );
-        for (y, row) in self
-            .data
-            .chunks_exact(self.stride)
-            .take(self.height)
-            .enumerate()
-        {
-            for (x, px) in row.as_chunks::<4>().0.iter().take(self.width).enumerate() {
-                #[allow(clippy::cast_possible_truncation)]
-                rgb.put_pixel(x as u32, y as u32, image::Rgb([px[2], px[1], px[0]]));
+/// The size and rate a stream is sized for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamFormat {
+    /// The largest frame the source will deliver.
+    pub max_width: u32,
+    pub max_height: u32,
+    pub initial_bitrate_kbps: u32,
+}
+
+/// The codec a stream uses, fixed for its lifetime.
+#[derive(Debug, Clone, Copy)]
+pub struct VideoCodec {
+    codec: EncoderCodec,
+    format: StreamFormat,
+}
+
+impl VideoCodec {
+    /// Picks the codec: hardware H.264 at the lowest level admitting the
+    /// stream, or AV1 when the host has no hardware encoder.
+    ///
+    /// Software AV1 on `CodecError::Unsupported` is the project's decided
+    /// policy for hosts without an encoder; any other encoder failure is
+    /// returned.
+    ///
+    /// # Errors
+    /// Returns [`FrameError`] when the stream exceeds H.264 level 5.2 or the
+    /// encoder fails for a reason other than being unsupported.
+    pub fn select(format: StreamFormat) -> Result<Self, FrameError> {
+        let level = level::h264_level(format.max_width, format.max_height, STREAM_FRAME_RATE)
+            .ok_or(FrameError::StreamTooLarge {
+                width: format.max_width,
+                height: format.max_height,
+            })?;
+        let h264 = Self {
+            codec: EncoderCodec::H264(H264Settings {
+                profile: H264Profile::ConstrainedBaseline,
+                level,
+                bitstream: BitstreamFormat::AnnexB,
+            }),
+            format,
+        };
+        let (width, height) = h264.ceiling()?;
+        match Encoder::new(h264.encoder_config(width, height, h264.initial_bitrate())) {
+            Ok(_probe) => Ok(h264),
+            Err(CodecError::Unsupported(reason)) => {
+                tracing::info!(%reason, "no hardware H.264 encoder; streaming AV1");
+                Ok(Self {
+                    codec: EncoderCodec::Av1,
+                    format,
+                })
             }
+            Err(error) => Err(error.into()),
         }
-        rgb
+    }
+
+    /// Whether frames can reach the encoder as platform surfaces.
+    pub(crate) const fn takes_surfaces(self) -> bool {
+        cfg!(target_os = "macos") && matches!(self.codec, EncoderCodec::H264(_))
+    }
+
+    pub(crate) fn ceiling(self) -> Result<(EvenDimension, EvenDimension), FrameError> {
+        let even = |pixels: u32| {
+            EvenDimension::new(pixels & !1).map_err(|_| FrameError::Dimension(pixels))
+        };
+        Ok((even(self.format.max_width)?, even(self.format.max_height)?))
+    }
+
+    pub(crate) fn initial_bitrate(self) -> Bitrate {
+        let bits = self.format.initial_bitrate_kbps.saturating_mul(1000).max(1);
+        Bitrate::new(NonZeroU32::new(bits).expect("clamped to at least one"))
+    }
+
+    // `VideoColorInfo` lives in `mediax-core`, which this crate does not name.
+    #[allow(clippy::default_trait_access)]
+    pub(crate) fn encoder_config(
+        self,
+        width: EvenDimension,
+        height: EvenDimension,
+        bitrate: Bitrate,
+    ) -> EncoderConfig {
+        EncoderConfig {
+            codec: self.codec,
+            width,
+            height,
+            // BT.709, limited range: what `nv12` converts to.
+            color: Default::default(),
+            profile: EncoderProfile::Realtime,
+            bitrate,
+            frame_rate: FrameRate::new(
+                NonZeroU32::new(STREAM_FRAME_RATE).expect("non-zero"),
+                NonZeroU32::MIN,
+            ),
+            keyframe_interval: Some(KEYFRAME_INTERVAL),
+        }
+    }
+
+    /// The codec as the SDP offers it. H.264 carries `packetization-mode=1`
+    /// and the encoder's own `profile-level-id`.
+    pub fn capability(self) -> RTCRtpCodecCapability {
+        let (mime_type, sdp_fmtp_line) = match self.codec {
+            EncoderCodec::H264(settings) => {
+                let [profile, constraints, level] = settings.profile_level_id();
+                (
+                    MIME_TYPE_H264,
+                    format!(
+                        "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id={profile:02x}{constraints:02x}{level:02x}"
+                    ),
+                )
+            }
+            EncoderCodec::Av1 => (MIME_TYPE_AV1, "profile-id=0".to_owned()),
+            EncoderCodec::H265(_) => unreachable!("H.265 is never selected"),
+        };
+        RTCRtpCodecCapability {
+            mime_type: mime_type.to_owned(),
+            clock_rate: 90_000,
+            channels: 0,
+            sdp_fmtp_line,
+            // NACK and PLI come from the interceptor registry; these two are
+            // the bitrate estimate and the keyframe request.
+            rtcp_feedback: vec![
+                RTCPFeedback {
+                    typ: "goog-remb".to_owned(),
+                    parameter: String::new(),
+                },
+                RTCPFeedback {
+                    typ: "ccm".to_owned(),
+                    parameter: "fir".to_owned(),
+                },
+            ],
+        }
+    }
+
+    /// A WebRTC API whose media engine knows exactly this codec, and the
+    /// track every peer of the stream receives.
+    ///
+    /// Transport-cc is deliberately not negotiated: webrtc-rs 0.17 has no
+    /// congestion controller to read it, and with only `goog-remb` offered
+    /// the viewer reports its estimate as REMB.
+    ///
+    /// # Errors
+    /// Returns the WebRTC error when registration fails.
+    pub fn webrtc(
+        self,
+        track_id: &str,
+        stream_id: &str,
+    ) -> Result<(webrtc::api::API, Arc<TrackLocalStaticSample>), webrtc::Error> {
+        let mut media_engine = MediaEngine::default();
+        media_engine.register_codec(
+            RTCRtpCodecParameters {
+                capability: self.capability(),
+                payload_type: PAYLOAD_TYPE,
+                ..Default::default()
+            },
+            RTPCodecType::Video,
+        )?;
+        let registry = configure_nack(Registry::new(), &mut media_engine);
+        let registry = configure_rtcp_reports(registry);
+        let api = APIBuilder::new()
+            .with_media_engine(media_engine)
+            .with_interceptor_registry(registry)
+            .build();
+        let track = Arc::new(TrackLocalStaticSample::new(
+            self.capability(),
+            track_id.to_owned(),
+            stream_id.to_owned(),
+        ));
+        Ok((api, track))
     }
 }
 
-/// Capacity of the frame → encoder queue. Tuned so a transient encoder
-/// stall (~250 ms at 30 fps) absorbs without dropping frames, while still
-/// catching unbounded growth on a stuck consumer.
-pub const FRAME_QUEUE_CAPACITY: usize = 8;
+// ── Encoder requests ───────────────────────────────────────────────────────────
 
-// ── H.264 encoding loop (dedicated blocking task) ──────────────────────────────
+/// What the transport asks of the encoder.
+#[derive(Debug)]
+enum EncoderRequest {
+    Keyframe,
+    Bitrate { peer: String, bits_per_second: u32 },
+    PeerGone { peer: String },
+}
 
-/// Runs on a blocking-pool thread: receives frames, encodes Screen
-/// Content H.264, emits [`EncodedSample`]s until the frame channel
-/// closes or the sample channel dies.
+/// The transport's handle on a stream's encoder: keyframe requests and
+/// bitrate estimates, delivered to the encoder thread between frames.
+#[derive(Debug, Clone)]
+pub struct EncoderControl {
+    tx: Sender<EncoderRequest>,
+}
+
+/// The encoder thread's end of an [`EncoderControl`].
+#[derive(Debug)]
+pub struct EncoderRequests {
+    rx: Receiver<EncoderRequest>,
+}
+
+/// A control handle and the receiving end for the encoder thread.
+pub fn encoder_control() -> (EncoderControl, EncoderRequests) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    (EncoderControl { tx }, EncoderRequests { rx })
+}
+
+impl EncoderControl {
+    /// The next frame is an IDR (viewer join, PLI, FIR).
+    pub fn request_keyframe(&self) {
+        // The encoder thread is gone when the stream stops; nothing to ask.
+        let _ = self.tx.send(EncoderRequest::Keyframe);
+    }
+
+    /// Follows `peer`'s feedback on `sender` until the peer goes away: PLI and
+    /// FIR request a keyframe, REMB reports the peer's bandwidth estimate.
+    pub async fn follow_peer(self, sender: Arc<RTCRtpSender>, peer: String) {
+        while let Ok((packets, _)) = sender.read_rtcp().await {
+            for packet in packets {
+                let any = packet.as_any();
+                if any.is::<PictureLossIndication>() || any.is::<FullIntraRequest>() {
+                    tracing::debug!("RTCP PLI/FIR received; requesting IDR");
+                    self.request_keyframe();
+                } else if let Some(remb) = any.downcast_ref::<ReceiverEstimatedMaximumBitrate>() {
+                    // `bitrate` is a non-negative estimate in bits per second.
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let bits_per_second = remb.bitrate as u32;
+                    let _ = self.tx.send(EncoderRequest::Bitrate {
+                        peer: peer.clone(),
+                        bits_per_second,
+                    });
+                }
+            }
+        }
+        let _ = self.tx.send(EncoderRequest::PeerGone { peer });
+    }
+}
+
+impl EncoderRequests {
+    fn try_next(&self) -> Option<EncoderRequest> {
+        // Empty, or the transport side is gone: either way nothing to apply.
+        self.rx.try_recv().ok()
+    }
+}
+
+/// Folds the peers' bandwidth estimates into the encoder's one target: the
+/// lowest estimate, since every peer receives the same stream.
+#[derive(Debug)]
+struct BitrateTarget {
+    estimates: HashMap<String, u32>,
+    applied: u32,
+}
+
+impl BitrateTarget {
+    fn new(applied: Bitrate) -> Self {
+        Self {
+            estimates: HashMap::new(),
+            applied: applied.bits_per_second().get(),
+        }
+    }
+
+    fn report(&mut self, peer: String, bits_per_second: u32) -> Option<Bitrate> {
+        self.estimates.insert(peer, bits_per_second);
+        self.retarget()
+    }
+
+    fn peer_gone(&mut self, peer: &str) -> Option<Bitrate> {
+        self.estimates.remove(peer);
+        self.retarget()
+    }
+
+    /// The new target when it moved far enough from the applied one.
+    fn retarget(&mut self) -> Option<Bitrate> {
+        let lowest = self.estimates.values().copied().min()?;
+        let bits = NonZeroU32::new(lowest)?;
+        let moved = f64::from(bits.get().abs_diff(self.applied));
+        if moved < f64::from(self.applied) * BITRATE_STEP {
+            return None;
+        }
+        self.applied = bits.get();
+        Some(Bitrate::new(bits))
+    }
+}
+
+// ── Encoding loop (dedicated blocking task) ────────────────────────────────────
+
+/// Runs on a blocking-pool thread: receives frames, encodes them and emits
+/// [`EncodedSample`]s until the frame channel closes or the sample channel
+/// dies.
 pub fn encode_loop(
     mut frame_rx: tokio::sync::mpsc::Receiver<RawFrame>,
     sample_tx: &tokio::sync::mpsc::Sender<EncodedSample>,
-    initial_bitrate_kbps: u32,
-    keyframe_request: &AtomicBool,
+    codec: VideoCodec,
+    requests: &EncoderRequests,
 ) {
-    use openh264::OpenH264API;
-    use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, UsageType};
-    use openh264::formats::{RgbSliceU8, YUVBuffer};
-
-    // Screen Content Real-Time mode: optimized for text/UI edges, solid backgrounds
-    let config = EncoderConfig::new()
-        .usage_type(UsageType::ScreenContentRealTime)
-        .bitrate(BitRate::from_bps(initial_bitrate_kbps.saturating_mul(1000)))
-        .max_frame_rate(FrameRate::from_hz(30.0));
-
-    let api = OpenH264API::from_source();
-    let mut encoder = match Encoder::with_api_config(api, config) {
-        Ok(enc) => enc,
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to create H.264 encoder");
-            return;
-        }
-    };
-
-    let mut last_frame_time: Option<Instant> = None;
-    let mut last_keyframe = Instant::now();
-    let keyframe_interval = Duration::from_secs(2);
+    let mut pipeline = FramePipeline::new(codec);
+    let mut target = BitrateTarget::new(codec.initial_bitrate());
+    let mut keyframe = false;
+    let mut last_sample = Instant::now();
 
     // `blocking_recv` is the documented bridge between tokio mpsc and
     // a `spawn_blocking` task. It blocks the current OS thread (which
     // is the blocking-pool thread we own here) until a frame arrives.
     while let Some(frame) = frame_rx.blocking_recv() {
-        // Decode to RGB by whatever the source handed us.
-        let img = match frame {
-            RawFrame::Jpeg(jpeg_bytes) => {
-                match image::load_from_memory_with_format(&jpeg_bytes, image::ImageFormat::Jpeg) {
-                    Ok(img) => img.to_rgb8(),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "JPEG decode failed");
-                        continue;
-                    }
+        while let Some(request) = requests.try_next() {
+            let new_bitrate = match request {
+                EncoderRequest::Keyframe => {
+                    keyframe = true;
+                    None
+                }
+                EncoderRequest::Bitrate {
+                    peer,
+                    bits_per_second,
+                } => target.report(peer, bits_per_second),
+                EncoderRequest::PeerGone { peer } => target.peer_gone(&peer),
+            };
+            if let Some(bitrate) = new_bitrate {
+                tracing::debug!(bits_per_second = bitrate.bits_per_second().get(), "bitrate");
+                if let Err(error) = pipeline.set_bitrate(bitrate) {
+                    tracing::warn!(%error, "setting the encoder bitrate failed");
                 }
             }
-            #[cfg(target_os = "macos")]
-            RawFrame::Bgra(frame) => frame.to_rgb(),
-        };
-
-        let rgb = normalize_rgb_frame_for_h264(img);
-        let (w, h) = (rgb.width() as usize, rgb.height() as usize);
-
-        // Compute inter-frame duration
-        let now = Instant::now();
-        let duration = last_frame_time.map_or(Duration::from_millis(33), |t| now.duration_since(t));
-        last_frame_time = Some(now);
-
-        // Force IDR on viewer-join (drains the request flag) or on the
-        // periodic interval. Without this a fresh peer can wait up to
-        // `keyframe_interval` for the next decodable frame.
-        let join_idr = keyframe_request.swap(false, Ordering::AcqRel);
-        if join_idr || now.duration_since(last_keyframe) > keyframe_interval {
-            encoder.force_intra_frame();
-            last_keyframe = now;
         }
 
-        // RGB → YUV420 → H.264
-        let rgb_source = RgbSliceU8::new(rgb.as_raw(), (w, h));
-        let yuv = YUVBuffer::from_rgb_source(rgb_source);
-        let bitstream = match encoder.encode(&yuv) {
-            Ok(bs) => bs,
-            Err(e) => {
-                tracing::warn!(error = %e, "H.264 encode failed");
+        let wanted_keyframe = std::mem::take(&mut keyframe);
+        let packets = match pipeline.encode(frame, wanted_keyframe) {
+            Ok(packets) => packets,
+            Err(error @ (FrameError::StreamTooLarge { .. } | FrameError::Dimension(_))) => {
+                tracing::error!(%error, "video stream cannot be encoded");
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(%error, "dropping frame");
+                keyframe = wanted_keyframe;
                 continue;
             }
         };
 
-        let data = bitstream.to_vec();
-        if data.is_empty() {
-            continue;
-        }
-
-        if sample_tx
-            .blocking_send(EncodedSample { data, duration })
-            .is_err()
-        {
-            break; // WebRTC writer stopped
+        for packet in packets {
+            let now = Instant::now();
+            let duration = now.duration_since(last_sample);
+            last_sample = now;
+            if sample_tx
+                .blocking_send(EncodedSample {
+                    data: packet.data,
+                    duration,
+                })
+                .is_err()
+            {
+                return; // WebRTC writer stopped
+            }
         }
     }
 
     tracing::info!("encoder thread stopped");
-}
-
-/// H.264 requires even dimensions; pad odd frames by duplicating the
-/// edge row/column rather than cropping a visible pixel.
-pub fn normalize_rgb_frame_for_h264(rgb: image::RgbImage) -> image::RgbImage {
-    let width = rgb.width();
-    let height = rgb.height();
-    let normalized_width = if width.is_multiple_of(2) {
-        width
-    } else {
-        width + 1
-    };
-    let normalized_height = if height.is_multiple_of(2) {
-        height
-    } else {
-        height + 1
-    };
-
-    if normalized_width == width && normalized_height == height {
-        return rgb;
-    }
-
-    let mut normalized = image::RgbImage::new(normalized_width, normalized_height);
-
-    for y in 0..height {
-        for x in 0..width {
-            normalized.put_pixel(x, y, *rgb.get_pixel(x, y));
-        }
-    }
-
-    if normalized_width != width {
-        let edge_x = width - 1;
-        for y in 0..height {
-            normalized.put_pixel(normalized_width - 1, y, *rgb.get_pixel(edge_x, y));
-        }
-    }
-
-    if normalized_height != height {
-        let edge_y = height - 1;
-        for x in 0..normalized_width {
-            let source_x = x.min(width - 1);
-            normalized.put_pixel(
-                x,
-                normalized_height - 1,
-                *normalized.get_pixel(source_x, edge_y),
-            );
-        }
-    }
-
-    normalized
 }
