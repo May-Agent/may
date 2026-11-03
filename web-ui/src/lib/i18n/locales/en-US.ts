@@ -154,6 +154,7 @@ export const enUS = {
     decodeSpeed: '{rate} tok/s',
     quotaHold: 'Usage limit reached — continuing automatically at {at}',
     retryHold: 'Provider error — retrying ({n}) at {at}',
+    networkHold: 'Waiting for the network — continuing automatically',
     configGuard: {
       title: 'No provider enabled',
       body: 'Enable a provider in settings to start chatting.',

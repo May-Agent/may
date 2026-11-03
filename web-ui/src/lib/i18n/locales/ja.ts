@@ -156,6 +156,7 @@ export const ja: Messages = {
     decodeSpeed: '{rate} tok/s',
     quotaHold: '利用量の上限に達しました — {at} に自動的に再開します',
     retryHold: 'プロバイダーエラー — {at} に再試行します（{n} 回目）',
+    networkHold: 'ネットワークに接続できません — 復旧したら自動的に再開します',
     configGuard: {
       title: 'プロバイダが有効化されていません',
       body: '設定でプロバイダを有効化するとチャットを開始できます。',
