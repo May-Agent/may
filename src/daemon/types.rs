@@ -184,8 +184,9 @@ pub struct SseSpeedEvent<'a> {
     pub(crate) tokens_per_second: f64,
 }
 
-/// A `session_turn` frame parking the turn on an upstream quota reset:
-/// `until` is when it retries.
+/// A `session_turn` frame parking the turn: `until` is when it continues,
+/// after an upstream quota reset (`retry` absent) or as retry number `retry`
+/// of a transient provider failure.
 #[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SseHoldEvent<'a> {
@@ -194,6 +195,8 @@ pub struct SseHoldEvent<'a> {
     #[schema(value_type = String)]
     pub(crate) until: jiff::Timestamp,
     pub(crate) message: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) retry: Option<u32>,
 }
 
 #[derive(Debug, serde::Serialize, skyzen::ToSchema)]
