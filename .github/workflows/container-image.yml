@@ -102,6 +102,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
     env:
       REF: ${{ needs.refs.outputs.base }}
     steps:
@@ -111,12 +116,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Create the multi-arch manifest
+        id: manifest
         run: |
           if docker buildx imagetools inspect "$REF" >/dev/null 2>&1; then
             echo "$REF already published; leaving it untouched"
             exit 0
           fi
           docker buildx imagetools create -t "$REF" "$REF-amd64" "$REF-arm64"
+          echo "digest=$(docker buildx imagetools inspect "$REF" --format '{{.Manifest.Digest}}')" >> "$GITHUB_OUTPUT"
+      - uses: actions/attest@v4
+        if: steps.manifest.outputs.digest != ''
+        with:
+          subject-name: ghcr.io/may-agent/may-workspace-base
+          subject-digest: ${{ steps.manifest.outputs.digest }}
+          push-to-registry: true
 
   workspace:
     needs: [refs, base-manifest]
@@ -179,6 +192,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
     env:
       REF: ${{ needs.refs.outputs.workspace }}
     steps:
@@ -188,9 +206,17 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Create the multi-arch manifest
+        id: manifest
         run: |
           if docker buildx imagetools inspect "$REF" >/dev/null 2>&1; then
             echo "$REF already published; leaving it untouched"
             exit 0
           fi
           docker buildx imagetools create -t "$REF" "$REF-amd64" "$REF-arm64"
+          echo "digest=$(docker buildx imagetools inspect "$REF" --format '{{.Manifest.Digest}}')" >> "$GITHUB_OUTPUT"
+      - uses: actions/attest@v4
+        if: steps.manifest.outputs.digest != ''
+        with:
+          subject-name: ghcr.io/may-agent/may-workspace
+          subject-digest: ${{ steps.manifest.outputs.digest }}
+          push-to-registry: true
