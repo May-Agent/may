@@ -156,6 +156,7 @@ export const zhHant: Messages = {
     decodeSpeed: '{rate} tok/s',
     quotaHold: '已達用量上限 — 將於 {at} 自動繼續',
     retryHold: '供應商錯誤 — 將於 {at} 重試（第 {n} 次）',
+    networkHold: '網路中斷 — 恢復後將自動繼續',
     configGuard: {
       title: '尚未啟用任何服務供應商',
       body: '請到設定中啟用一個服務供應商即可開始對話。',
