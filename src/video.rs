@@ -170,8 +170,9 @@ impl VideoCodec {
     }
 
     /// Whether frames can reach the encoder as platform surfaces.
+    #[cfg(target_os = "macos")]
     pub(crate) const fn takes_surfaces(self) -> bool {
-        cfg!(target_os = "macos") && matches!(self.codec, EncoderCodec::H264(_))
+        matches!(self.codec, EncoderCodec::H264(_))
     }
 
     pub(crate) fn ceiling(self) -> Result<(EvenDimension, EvenDimension), FrameError> {
