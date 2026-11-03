@@ -17,7 +17,7 @@ pub enum WireAgentError {
     Llm {
         /// Provider error.
         message: String,
-        /// How the provider failure classifies.
+        /// How the failure classifies.
         failure: WireFailure,
     },
     /// A tool failed.
@@ -44,12 +44,14 @@ pub enum WireAgentError {
     },
 }
 
-/// A provider failure's classification, as it crosses the socket.
+/// A provider [`Failure`], as it crosses the socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WireFailure {
     /// What kind of failure it is.
     pub kind: WireFailureKind,
-    /// The retry delay the upstream asked for, in milliseconds.
+    /// The delay the upstream asked for, in milliseconds.
+    #[serde(default)]
     pub retry_after_ms: Option<u64>,
 }
 
@@ -63,7 +65,7 @@ pub enum WireFailureKind {
     Transient,
     /// A quota or usage limit is exhausted.
     Quota,
-    /// Everything else.
+    /// Anything a retry cannot fix.
     Permanent,
 }
 
@@ -85,14 +87,13 @@ impl From<Failure> for WireFailure {
 
 impl From<WireFailure> for Failure {
     fn from(failure: WireFailure) -> Self {
-        let kind = match failure.kind {
+        Self::new(match failure.kind {
             WireFailureKind::Network => FailureKind::Network,
             WireFailureKind::Transient => FailureKind::Transient,
             WireFailureKind::Quota => FailureKind::Quota,
             WireFailureKind::Permanent => FailureKind::Permanent,
-        };
-        Self::new(kind)
-            .with_retry_after(failure.retry_after_ms.map(std::time::Duration::from_millis))
+        })
+        .with_retry_after(failure.retry_after_ms.map(std::time::Duration::from_millis))
     }
 }
 
@@ -423,13 +424,21 @@ pub enum SessionAgentBody {
         /// Seconds the phase lasted. Sub-second phases keep the fraction.
         seconds: f64,
     },
-    /// The run is parked until an upstream quota reset.
+    /// The run is parked: for an upstream quota reset, or before a retry of
+    /// a transient provider failure.
     Hold {
-        /// When the run retries.
+        /// When the run continues.
         until: jiff::Timestamp,
-        /// The upstream message that declared the reset.
+        /// The upstream message behind the wait.
         message: String,
+        /// Which retry of a transient failure the run waits for; absent for
+        /// a quota reset.
+        #[serde(default)]
+        retry: Option<u32>,
     },
+    /// The text the run streamed so far is discarded: its attempt failed and
+    /// the prompt is resubmitted.
+    Retract,
     /// The run ended.
     End {
         /// How it ended.
@@ -694,7 +703,7 @@ pub struct WirePr {
 #[cfg(test)]
 mod tests {
     use aither_agent::{AgentError, AgentEvent};
-    use aither_core::llm::{Failure, ToolResult};
+    use aither_core::llm::ToolResult;
 
     use super::WireAgentEvent;
 
@@ -717,18 +726,18 @@ mod tests {
 
     #[test]
     fn errors_come_back_as_errors() {
-        let error = AgentError::Llm {
+        let failure = aither_core::llm::Failure::transient()
+            .with_retry_after(Some(std::time::Duration::from_secs(5)));
+        let wire = WireAgentEvent::from_agent(Err(&AgentError::Llm {
             message: "overloaded".to_string(),
-            failure: Failure::transient().with_retry_after(Some(std::time::Duration::from_secs(5))),
-        };
-        let wire = WireAgentEvent::from_agent(Err(&error)).expect("rendered error");
+            failure,
+        }))
+        .expect("rendered error");
         let back = wire.into_timed(jiff::Timestamp::UNIX_EPOCH);
         assert!(matches!(
             back,
-            Err(AgentError::Llm { message, failure })
-                if message == "overloaded"
-                    && failure == Failure::transient()
-                        .with_retry_after(Some(std::time::Duration::from_secs(5)))
+            Err(AgentError::Llm { message, failure: back_failure })
+                if message == "overloaded" && back_failure == failure
         ));
     }
 }

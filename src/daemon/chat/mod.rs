@@ -4,6 +4,7 @@ mod hosts;
 mod hub;
 mod recap;
 mod request_ledger;
+mod retry;
 mod suggest;
 pub use aux::AuxTasks;
 pub use background::SessionBackgrounds;
@@ -39,6 +40,7 @@ use skyzen::utils::{Json, State};
 use aither_core::llm::{
     Attachment as LlmAttachment, Message as LlmMessage, Role as LlmRole, ToolResult, Usage,
 };
+use aither_core::llm::{Failure, FailureKind};
 use aither_models::lookup as lookup_model_info;
 use aither_sandbox::{AnyContainerExec, BollardContainerExec, ContainerLaunchSpec};
 
@@ -161,12 +163,20 @@ trait ChatSink {
         checklist: &crate::todo_parser::TodoChecklist,
     ) -> impl Future<Output = bool> + Send;
     fn on_speed(&mut self, tokens_per_second: f64) -> impl Future<Output = bool> + Send;
-    /// The run parked until an upstream quota reset.
+    /// The run waits to `until` before it continues: for an upstream quota
+    /// reset (`retry` is `None`) or before retry number `retry` of a
+    /// transient provider failure.
     fn on_hold(
         &mut self,
         _until: jiff::Timestamp,
         _message: &str,
+        _retry: Option<u32>,
     ) -> impl Future<Output = bool> + Send {
+        async { true }
+    }
+    /// The text streamed since the attempt began is discarded: the attempt
+    /// failed and the prompt is resubmitted.
+    fn on_retract(&mut self) -> impl Future<Output = bool> + Send {
         async { true }
     }
     fn on_error(
@@ -187,6 +197,8 @@ struct HubSink {
     content: Option<String>,
     seq: u64,
     turn_id: String,
+    /// The `session_agent` start frame of the run went out.
+    run_announced: bool,
 }
 
 impl HubSink {
@@ -198,6 +210,7 @@ impl HubSink {
             content: Some(req.content.clone()).filter(|content| !content.trim().is_empty()),
             seq: 1,
             turn_id: String::new(),
+            run_announced: false,
         }
     }
 
@@ -258,6 +271,14 @@ impl HubSink {
     }
 }
 
+/// `session_turn` frame discarding the text the turn streamed so far.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SseRetractEvent<'a> {
+    seq: u64,
+    turn_id: &'a str,
+}
+
 /// `session_turn` frame closing a reasoning phase: `seconds` is its length
 /// whether or not the provider returned readable reasoning text.
 #[derive(Serialize)]
@@ -309,6 +330,11 @@ impl ChatSink for HubSink {
     // The TUI's start frame waits for the stored message, so a client that
     // reloaded its history can tell the turn's message is already there.
     fn on_prepared(&mut self, user_message_id: Option<i32>) {
+        // A retry prepares again, but the run is the one clients already
+        // follow.
+        if std::mem::replace(&mut self.run_announced, true) {
+            return;
+        }
         self.publish_agent(crate::client::SessionAgentBody::Start {
             content: self.content.clone(),
             message_id: user_message_id,
@@ -455,7 +481,7 @@ impl ChatSink for HubSink {
         true
     }
 
-    async fn on_hold(&mut self, until: jiff::Timestamp, message: &str) -> bool {
+    async fn on_hold(&mut self, until: jiff::Timestamp, message: &str, retry: Option<u32>) -> bool {
         let seq = self.next_seq();
         self.publish_turn(
             "hold",
@@ -464,12 +490,27 @@ impl ChatSink for HubSink {
                 turn_id: &self.turn_id,
                 until,
                 message,
+                retry,
             },
         );
         self.publish_agent(crate::client::SessionAgentBody::Hold {
             until,
             message: message.to_string(),
+            retry,
         });
+        true
+    }
+
+    async fn on_retract(&mut self) -> bool {
+        let seq = self.next_seq();
+        self.publish_turn(
+            "retract",
+            &SseRetractEvent {
+                seq,
+                turn_id: &self.turn_id,
+            },
+        );
+        self.publish_agent(crate::client::SessionAgentBody::Retract);
         true
     }
 
@@ -522,6 +563,12 @@ async fn wait_quota_reset(
     until: jiff::Timestamp,
 ) -> Result<(), &'static str> {
     let wait = until.duration_since(jiff::Timestamp::now()).unsigned_abs() + QUOTA_RESET_GRACE;
+    wait_or_cancel(guard, wait).await
+}
+
+/// Race a wait of `wait` against run cancellation: `Err(reason)` is why the
+/// run was cancelled while it waited.
+async fn wait_or_cancel(guard: &SessionRunGuard, wait: Duration) -> Result<(), &'static str> {
     tokio::select! {
         biased;
         cancel = guard.cancellation().recv() => {
@@ -548,8 +595,11 @@ enum RetryKind {
 
 /// What a retried attempt waits out before resubmitting.
 enum RetryWait {
-    /// The short backoff between provider failover candidates.
+    /// The short backoff before the next provider candidate.
     Failover,
+    /// The backoff before resubmitting to the same provider candidate;
+    /// `retry` counts the retries on it, this one included.
+    SameProvider { wait: Duration, retry: u32 },
     /// The upstream-announced quota reset instant.
     QuotaReset(jiff::Timestamp),
 }
@@ -1416,7 +1466,15 @@ fn run_agent_loop<'a>(
 ) -> Pin<Box<impl Future<Output = Result<AgentRunResult, AgentLoopError>> + 'a>> {
     Box::pin(async move {
         let mut attempt = 0usize;
-        let mut max_retries = 0usize;
+        // The provider candidate the next attempt builds on, how many
+        // candidates there are, and how many retries the current one had.
+        let mut candidate = 0usize;
+        let mut candidate_count = 1usize;
+        let mut same_provider_retries = 0u32;
+        // The current candidate's cache entry, as the agent that last made
+        // progress on it left it. A rebuilt agent starts an entry of its own,
+        // so the handle outlives the agent that failed.
+        let mut candidate_warmth: Option<aither_agent::CacheWarmth> = None;
         let mut turn_hidden_context_xml: Option<String> = None;
         // The stored user message, from the first attempt.
         let mut turn_user_message_id: Option<i32> = None;
@@ -1472,7 +1530,7 @@ fn run_agent_loop<'a>(
                 persist_user_message && attempt == 0 && !kind.is_resume(),
                 use_persisted_context_snapshot,
                 TurnAttempt {
-                    provider_attempt: attempt,
+                    provider_attempt: candidate,
                     // A resubmitting retry rebuilds context only up to the
                     // turn boundary; a resume retry replays the committed
                     // transcript in full.
@@ -1516,7 +1574,7 @@ fn run_agent_loop<'a>(
             // A resumed turn runs on the agent that collected its events; a
             // provider retry would rebuild it without them.
             if attempt == 0 && !kind.is_resume() {
-                max_retries = provider_candidate_count.saturating_sub(1);
+                candidate_count = provider_candidate_count.max(1);
             }
             if user_message_id.is_some() {
                 turn_user_message_id = user_message_id;
@@ -2042,40 +2100,75 @@ fn run_agent_loop<'a>(
                 // The model already ran tools: resubmitting the prompt would
                 // replay them, so a `Resume` retry commits the partial turn
                 // and continues the transcript instead. Partial text alone
-                // cannot be retried.
+                // is discarded and the prompt resubmits.
                 let retry_kind = if attempt_ran_tools {
-                    Some(RetryKind::Resume)
-                } else if full_text.trim().is_empty() {
-                    Some(RetryKind::Resubmit)
+                    RetryKind::Resume
                 } else {
-                    None
+                    RetryKind::Resubmit
                 };
-                // What a retry waits out first: the next provider's short
-                // failover backoff, or — once no failover remains — the
-                // quota reset the upstream announced.
-                let retry_wait = if provider_may_recover(&err) && attempt < max_retries {
-                    Some(RetryWait::Failover)
-                } else if provider_may_recover(&err)
-                    && state
+                // A request that streamed anything refreshed the provider's
+                // cache entry; a bare failure did not.
+                if candidate_warmth.is_none() || attempt_ran_tools || !full_text.is_empty() {
+                    candidate_warmth = Some(agent.cache_warmth());
+                }
+                let warmth = candidate_warmth.as_ref().map_or(
+                    aither_agent::CacheState::Cold,
+                    aither_agent::CacheWarmth::state,
+                );
+                let candidate_left = candidate + 1 < candidate_count;
+                // What a retry waits out first: the same provider's backoff
+                // while its cache is warm, the next provider's short failover
+                // backoff, or the quota reset the upstream announced.
+                let retry_wait = match retry::decide(
+                    err.failure(),
+                    warmth,
+                    candidate_left,
+                    same_provider_retries,
+                ) {
+                    retry::RetryDecision::Fail => None,
+                    retry::RetryDecision::SameProvider { wait } => Some(RetryWait::SameProvider {
+                        wait,
+                        retry: same_provider_retries + 1,
+                    }),
+                    retry::RetryDecision::NextProvider => Some(RetryWait::Failover),
+                    retry::RetryDecision::QuotaReset => state
                         .config_snapshot()
                         .preferences
                         .auto_continue_on_quota_reset
-                {
-                    quota::reset_at(&err_msg, jiff::Timestamp::now()).map(RetryWait::QuotaReset)
-                } else {
-                    None
+                        .then(|| quota::reset_at(&err_msg, jiff::Timestamp::now()))
+                        .flatten()
+                        .map(RetryWait::QuotaReset),
                 };
-                if let (Some(kind), Some(wait)) = (retry_kind, retry_wait) {
+                if let Some(wait) = retry_wait {
+                    let kind = retry_kind;
                     record_request_log(state, ledger.interrupted(Instant::now(), &err_msg)).await;
+                    // Text of a cut stream is discarded with the attempt;
+                    // clients drop what they already rendered of it.
+                    if kind == RetryKind::Resubmit && !full_text.is_empty() {
+                        let _ = sink.on_retract().await;
+                    }
                     match wait {
                         RetryWait::Failover => {
                             tokio::time::sleep(Duration::from_millis(
-                                RETRY_BACKOFF_MS * (attempt as u64 + 1),
+                                RETRY_BACKOFF_MS * (candidate as u64 + 1),
                             ))
                             .await;
+                            candidate += 1;
+                            same_provider_retries = 0;
+                            candidate_warmth = None;
+                        }
+                        RetryWait::SameProvider { wait, retry } => {
+                            let until = jiff::Timestamp::now()
+                                .checked_add(wait)
+                                .expect("a retry wait is far below the timestamp range");
+                            let _ = sink.on_hold(until, &err_msg, Some(retry)).await;
+                            if let Err(reason) = wait_or_cancel(guard, wait).await {
+                                cancellation_reason = Some(reason);
+                            }
+                            same_provider_retries = retry;
                         }
                         RetryWait::QuotaReset(until) => {
-                            let _ = sink.on_hold(until, &err_msg).await;
+                            let _ = sink.on_hold(until, &err_msg, None).await;
                             if let Err(reason) = wait_quota_reset(guard, until).await {
                                 cancellation_reason = Some(reason);
                             }
@@ -2102,21 +2195,26 @@ fn run_agent_loop<'a>(
                 }
 
                 if cancellation_reason.is_none() {
+                    let retryable = err.failure().is_some_and(Failure::is_retryable);
                     record_request_log(state, ledger.interrupted(Instant::now(), &err_msg)).await;
                     let _ = sink
-                        .on_error(ApiErrorCode::InternalError, &err_msg, false)
+                        .on_error(ApiErrorCode::InternalError, &err_msg, retryable)
                         .await;
                     if let Some(entry_id) = req.pending_entry_id {
-                        if provider_may_recover(&err) {
-                            // Out of retries: a later run picks the entry up.
+                        // Only a permanent failure fails the entry; a later
+                        // run picks up anything else, an exhausted quota included.
+                        let permanent = err
+                            .failure()
+                            .is_none_or(|failure| failure.kind == FailureKind::Permanent);
+                        if permanent {
                             let _ = state
                                 .db()
-                                .release_pending_claim(entry_id, guard.fence())
+                                .fail_pending_claim(entry_id, guard.fence(), &err_msg)
                                 .await;
                         } else {
                             let _ = state
                                 .db()
-                                .fail_pending_claim(entry_id, guard.fence(), &err_msg)
+                                .release_pending_claim(entry_id, guard.fence())
                                 .await;
                         }
                     }
@@ -3474,16 +3572,6 @@ fn build_session_agent<'a>(
     })
 }
 
-/// Whether another attempt, on the next provider or after a quota reset, can
-/// succeed where `error` failed: the provider was unreachable, faulted
-/// temporarily or ran out of quota. Permanent failures and errors that are
-/// not the provider's never recover.
-fn provider_may_recover(error: &aither_agent::AgentError) -> bool {
-    error.failure().is_some_and(|failure| {
-        failure.is_retryable() || failure.kind == aither_core::llm::FailureKind::Quota
-    })
-}
-
 /// A fingerprint of everything `ctx`'s agent is built from, so a turn can
 /// tell whether the session's idle agent still fits: the configuration, the
 /// model and its reasoning effort, the profile, its persona and memories,
@@ -4064,6 +4152,22 @@ mod tests {
 
     /// Spawns the stub; `responses` are consumed per /chat/completions POST,
     /// the last one repeating. Request bodies arrive on `bodies`.
+    /// Requests the aither `OpenAI` client sends for one failing call: the first
+    /// plus its three own retries.
+    const OPENAI_CLIENT_ATTEMPTS: usize = 4;
+
+    /// The `n`-th request body `stub` received (1-based).
+    async fn last_body(stub: &StubProvider, n: usize) -> String {
+        let mut body = String::new();
+        for _ in 0..n {
+            body = tokio::time::timeout(std::time::Duration::from_secs(60), stub.bodies.recv())
+                .await
+                .expect("the provider received a request")
+                .expect("request body");
+        }
+        body
+    }
+
     async fn stub_provider(responses: Vec<String>) -> StubProvider {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -4196,14 +4300,18 @@ mod tests {
         state
     }
 
-    /// A first attempt whose provider fails retryably retries on the next
-    /// provider with the same context: the user message reaches it exactly
-    /// once and history holds it once.
+    /// A first attempt whose provider fails retryably retries with the same
+    /// context: the user message reaches the retry exactly once and history
+    /// holds it once.
     #[tokio::test]
     async fn a_failed_first_attempt_retries_without_repeating_the_user_message() {
         let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
-        let provider_a = stub_provider(vec!["500".to_string()]).await;
-        let provider_b = stub_provider(vec![sse_text("done")]).await;
+        // One failure more than the OpenAI client retries on its own, so the
+        // turn retries; the cache is warm, so it stays on provider A.
+        let mut script = vec!["500".to_string(); OPENAI_CLIENT_ATTEMPTS];
+        script.push(sse_text("done"));
+        let provider_a = stub_provider(script).await;
+        let provider_b = stub_provider(Vec::new()).await;
         let may_dir = tempfile::tempdir().expect("may dir");
         let cwd = tempfile::tempdir().expect("cwd");
         let state = failover_state(may_dir.path(), cwd.path(), &provider_a, &provider_b).await;
@@ -4235,11 +4343,7 @@ mod tests {
         .await;
         assert!(result.is_ok(), "the retry must succeed: {result:?}");
 
-        let body =
-            tokio::time::timeout(std::time::Duration::from_secs(5), provider_b.bodies.recv())
-                .await
-                .expect("provider B answered a request")
-                .expect("request body");
+        let body = last_body(&provider_a, OPENAI_CLIENT_ATTEMPTS + 1).await;
         let messages: Vec<serde_json::Value> = serde_json::from_str::<serde_json::Value>(&body)
             .expect("request json")["messages"]
             .as_array()
@@ -4251,7 +4355,10 @@ mod tests {
                 message["role"] == "user" && message["content"].to_string().contains("hello")
             })
             .count();
-        assert_eq!(user_messages, 1, "the user message reaches B exactly once");
+        assert_eq!(
+            user_messages, 1,
+            "the retry carries the user message exactly once"
+        );
 
         let history = crate::session::load_history_from_db(&state.db(), "session")
             .await
@@ -4265,7 +4372,7 @@ mod tests {
     }
 
     /// A retryable failure after a tool executed never reruns it: the turn
-    /// continues on the next provider from the committed transcript.
+    /// continues from the committed transcript.
     #[tokio::test]
     async fn a_failure_after_a_tool_call_continues_without_replaying_it() {
         let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
@@ -4285,12 +4392,11 @@ mod tests {
             "timeout": 10
         })
         .to_string();
-        let provider_a = stub_provider(vec![
-            sse_tool_call("call_1", "terminal", &arguments),
-            "500".to_string(),
-        ])
-        .await;
-        let provider_b = stub_provider(vec![sse_text("done")]).await;
+        let mut script = vec![sse_tool_call("call_1", "terminal", &arguments)];
+        script.extend(vec!["500".to_string(); OPENAI_CLIENT_ATTEMPTS]);
+        script.push(sse_text("done"));
+        let provider_a = stub_provider(script).await;
+        let provider_b = stub_provider(Vec::new()).await;
         let state = failover_state(may_dir.path(), cwd.path(), &provider_a, &provider_b).await;
 
         let req = ChatRequest {

@@ -63,6 +63,12 @@ enum MockChatScenario {
     /// Answers every agent turn with the same text, so one session can run
     /// several turns against one mock server.
     TextEveryTurn(String),
+    /// The first `failures` agent requests are refused with an overloaded
+    /// (529) status; every later one gets `text`.
+    OverloadedThenText {
+        failures: usize,
+        text: String,
+    },
     /// First turn writes `tasks.md` through the terminal tool; every later
     /// request gets a plain text reply, so follow-up turns can probe what
     /// the model side injects from the file.
@@ -324,6 +330,14 @@ impl MockScenarioState {
         let response = match &self.scenario {
             MockChatScenario::SubagentProbe(_) | MockChatScenario::ForkProbe => {
                 unreachable!("handled before the match")
+            }
+            MockChatScenario::OverloadedThenText { failures, text } => {
+                verify_initial_tool_contract(request)?;
+                if self.request_index < *failures {
+                    MockHttpResponse::Overloaded
+                } else {
+                    MockHttpResponse::sse(text_stream_frames(vec![text.clone()], Duration::ZERO))
+                }
             }
             MockChatScenario::TextEveryTurn(text) => {
                 // Every rebuilt agent must still present the prepared tools,
@@ -789,6 +803,8 @@ fn verify_initial_tool_contract(request: &Value) -> Result<(), String> {
 
 enum MockHttpResponse {
     Sse(Vec<MockSseFrame>),
+    /// The upstream is overloaded: status 529.
+    Overloaded,
 }
 
 impl MockHttpResponse {
@@ -922,6 +938,10 @@ async fn handle_mock_openai_request(
 
     Ok(match response {
         MockHttpResponse::Sse(frames) => sse_response(frames),
+        MockHttpResponse::Overloaded => json_response(
+            StatusCode::from_u16(529).expect("529 is a valid status code"),
+            &serde_json::json!({ "error": { "type": "overloaded_error", "message": "Overloaded" } }),
+        ),
     })
 }
 
@@ -1324,7 +1344,7 @@ async fn pinned_container_heel() -> PathBuf {
     }
 
     let url = format!(
-        "https://github.com/lexoliu/heel/releases/download/{CONTAINER_HEEL_RELEASE_TAG}/{}",
+        "https://github.com/May-Agent/heel/releases/download/{CONTAINER_HEEL_RELEASE_TAG}/{}",
         CONTAINER_HEEL_ASSET.name
     );
     let bytes = reqwest::get(&url)
@@ -3175,6 +3195,77 @@ async fn chat_turns_on_one_session_prepare_tools_once(environment: ChatEnvironme
     assert_eq!(
         prepared, 1,
         "only the first turn should prepare tools; readiness logs: {ready_lines:#?}"
+    );
+
+    server.stop().await;
+    environment.release(&harness, &session_id).await;
+}
+
+/// A burst of upstream 529s that outlasts the `OpenAI` client's own retries
+/// (the first request plus `OPENAI_CLIENT_RETRIES`) is retried by the turn on
+/// the same provider: it completes without an error after one announced wait,
+/// and the failed attempt never reaches history.
+#[tokio::test]
+#[serial]
+async fn ui_chat_turn_survives_upstream_overload_on_its_own_provider() {
+    // The aither OpenAI client retries a retryable failure three times
+    // before it surfaces to the turn.
+    const OPENAI_CLIENT_RETRIES: usize = 3;
+    const FAILURES: usize = OPENAI_CLIENT_RETRIES + 1;
+    let mock = MockOpenAiServer::spawn(MockChatScenario::OverloadedThenText {
+        failures: FAILURES,
+        text: "recovered answer".to_string(),
+    })
+    .await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
+    let client = reqwest::Client::new();
+    let environment = ChatEnvironment::Local
+        .prepare(&harness, &client, &server)
+        .await;
+    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+
+    let response = send_turn(
+        &client,
+        &server.base_url,
+        &serde_json::json!({
+            "sessionId": session_id,
+            "content": "Answer despite the overload."
+        }),
+    )
+    .await
+    .expect("chat stream request should succeed");
+    let response = expect_status(&server.log, response, StatusCode::OK).await;
+    let events = tokio::time::timeout(Duration::from_secs(90), collect_sse_events(response))
+        .await
+        .expect("the turn should finish after its retries");
+
+    assert!(
+        events.iter().any(|(kind, _)| kind == "done"),
+        "turn should complete; events: {events:?}"
+    );
+    assert!(
+        events.iter().all(|(kind, _)| kind != "error"),
+        "no error should reach the client; events: {events:?}"
+    );
+    let holds = events.iter().filter(|(kind, _)| kind == "hold").count();
+    assert_eq!(holds, 1, "the turn's retry announces its wait: {events:?}");
+    assert_eq!(mock.agent_requests().await.len(), FAILURES + 1);
+
+    let session = client
+        .get(format!("{}/api/sessions/{session_id}", server.base_url))
+        .send()
+        .await
+        .expect("get session request should succeed");
+    let session: Value = expect_status(&server.log, session, StatusCode::OK)
+        .await
+        .json()
+        .await
+        .expect("session should be valid JSON");
+    assert_eq!(
+        extract_assistant_messages(&session),
+        vec!["recovered answer".to_string()],
+        "the failed attempts leave nothing in history: {session}"
     );
 
     server.stop().await;
