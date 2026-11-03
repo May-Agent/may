@@ -6,7 +6,8 @@
 //! other variant keeps the shape `ToolResult` itself serializes to.
 
 use aither_core::llm::{
-    CommandOutcome, CommandResult, CommandStream, StoredFile, ToolResult, tool::ToolResultPart,
+    CommandOutcome, CommandResult, CommandStream, Interruption, StoredFile, ToolResult,
+    tool::ToolResultPart,
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -73,6 +74,8 @@ pub struct WireCommand {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stderr: Option<WireStream>,
     outcome: CommandOutcome,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    interruptions: Vec<Interruption>,
 }
 
 /// Wire form of a [`ToolResult`].
@@ -84,7 +87,7 @@ pub enum WireToolResult {
     Tsv { text: String },
     Binary { mime: String, content: Vec<u8> },
     Error { message: String },
-    Command(WireCommand),
+    Command(Box<WireCommand>),
     Parts { parts: Vec<ToolResultPart> },
 }
 
@@ -101,11 +104,12 @@ impl From<&ToolResult> for WireToolResult {
             ToolResult::Error { message } => Self::Error {
                 message: message.clone(),
             },
-            ToolResult::Command(command) => Self::Command(WireCommand {
+            ToolResult::Command(command) => Self::Command(Box::new(WireCommand {
                 stdout: WireStream::from(&command.stdout),
                 stderr: command.stderr.as_ref().map(WireStream::from),
                 outcome: command.outcome.clone(),
-            }),
+                interruptions: command.interruptions.clone(),
+            })),
             ToolResult::Parts { parts } => Self::Parts {
                 parts: parts.clone(),
             },
@@ -125,6 +129,7 @@ impl From<WireToolResult> for ToolResult {
                 stdout: command.stdout.into(),
                 stderr: command.stderr.map(Into::into),
                 outcome: command.outcome,
+                interruptions: command.interruptions,
             })),
             WireToolResult::Parts { parts } => Self::Parts { parts },
         }
@@ -158,6 +163,7 @@ mod tests {
             stdout,
             stderr,
             outcome: CommandOutcome::Exited { code: 3 },
+            interruptions: Vec::new(),
         }))
     }
 

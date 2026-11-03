@@ -64,13 +64,20 @@ pub enum TuiEvent {
         /// Seconds the phase lasted. Sub-second phases keep the fraction.
         seconds: f64,
     },
-    /// The daemon parked the run until an upstream quota reset.
+    /// The daemon parked the run: for an upstream quota reset, or before a
+    /// retry of a transient provider failure.
     Hold {
-        /// When the run retries.
+        /// When the run continues.
         until: jiff::Timestamp,
-        /// The upstream message that declared the reset.
+        /// The upstream message behind the wait.
         message: String,
+        /// Which retry of a transient failure the run waits for; absent for
+        /// a quota reset.
+        retry: Option<u32>,
     },
+    /// The text streamed so far is discarded: the attempt failed and the
+    /// prompt is resubmitted.
+    Retract,
     /// Agent stream completed (ready for next prompt).
     Complete,
     /// Agent encountered a fatal error.

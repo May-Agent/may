@@ -454,6 +454,19 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                 | TuiEvent::ContextDump(_)
                 | TuiEvent::ContextDumpSaved { .. },
             ) => {}
+            Event::Agent(TuiEvent::Hold {
+                until,
+                retry: Some(retry),
+                ..
+            }) => {
+                writeln!(
+                    output.stderr()?,
+                    "[retrying] provider error — retry {retry} at {}",
+                    until
+                        .to_zoned(jiff::tz::TimeZone::system())
+                        .strftime("%H:%M:%S")
+                )?;
+            }
             Event::Agent(TuiEvent::Hold { until, .. }) => {
                 writeln!(
                     output.stderr()?,
@@ -461,6 +474,12 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                     until
                         .to_zoned(jiff::tz::TimeZone::system())
                         .strftime("%b %d, %Y %H:%M %Z")
+                )?;
+            }
+            Event::Agent(TuiEvent::Retract) => {
+                writeln!(
+                    output.stderr()?,
+                    "[retrying] the response was cut off; the text above is discarded"
                 )?;
             }
             Event::Agent(TuiEvent::Error(error)) => {
@@ -705,6 +724,7 @@ mod tests {
             },
             stderr: None,
             outcome,
+            interruptions: Vec::new(),
         }))
     }
 
@@ -750,7 +770,7 @@ mod tests {
         let mut output = output();
         let before = Timestamp::now();
         output
-            .event(&Err(aither_agent::AgentError::Llm("boom".to_string())))
+            .event(&Err(aither_agent::AgentError::llm_local("boom")))
             .expect("render must succeed");
         let after = Timestamp::now();
         let line = stderr(&output);

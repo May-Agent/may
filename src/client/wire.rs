@@ -6,7 +6,7 @@
 //! is the same whether the agent runs in-process or in the daemon.
 
 use aither_agent::{AgentError, AgentEvent, TimedEvent};
-use aither_core::llm::{ToolResult, Usage};
+use aither_core::llm::{Failure, FailureKind, ToolResult, Usage};
 use serde::{Deserialize, Serialize};
 
 /// An agent failure, as it crosses the socket.
@@ -17,6 +17,8 @@ pub enum WireAgentError {
     Llm {
         /// Provider error.
         message: String,
+        /// How the failure classifies.
+        failure: WireFailure,
     },
     /// A tool failed.
     ToolExecution {
@@ -42,11 +44,65 @@ pub enum WireAgentError {
     },
 }
 
+/// A provider [`Failure`], as it crosses the socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WireFailure {
+    /// What kind of failure it is.
+    pub kind: WireFailureKind,
+    /// The delay the upstream asked for, in milliseconds.
+    #[serde(default)]
+    pub retry_after_ms: Option<u64>,
+}
+
+/// [`FailureKind`], as it crosses the socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WireFailureKind {
+    /// No response came back from the network.
+    Network,
+    /// The upstream answered with a temporary fault.
+    Transient,
+    /// A quota or usage limit is exhausted.
+    Quota,
+    /// Anything a retry cannot fix.
+    Permanent,
+}
+
+impl From<Failure> for WireFailure {
+    fn from(failure: Failure) -> Self {
+        Self {
+            kind: match failure.kind {
+                FailureKind::Network => WireFailureKind::Network,
+                FailureKind::Transient => WireFailureKind::Transient,
+                FailureKind::Quota => WireFailureKind::Quota,
+                FailureKind::Permanent => WireFailureKind::Permanent,
+            },
+            retry_after_ms: failure
+                .retry_after
+                .map(|delay| u64::try_from(delay.as_millis()).unwrap_or(u64::MAX)),
+        }
+    }
+}
+
+impl From<WireFailure> for Failure {
+    fn from(failure: WireFailure) -> Self {
+        Self::new(match failure.kind {
+            WireFailureKind::Network => FailureKind::Network,
+            WireFailureKind::Transient => FailureKind::Transient,
+            WireFailureKind::Quota => FailureKind::Quota,
+            WireFailureKind::Permanent => FailureKind::Permanent,
+        })
+        .with_retry_after(failure.retry_after_ms.map(std::time::Duration::from_millis))
+    }
+}
+
 impl From<&AgentError> for WireAgentError {
     fn from(error: &AgentError) -> Self {
         match error {
-            AgentError::Llm(message) => Self::Llm {
+            AgentError::Llm { message, failure } => Self::Llm {
                 message: message.clone(),
+                failure: (*failure).into(),
             },
             AgentError::ToolExecution { name, error } => Self::ToolExecution {
                 name: name.clone(),
@@ -64,7 +120,10 @@ impl From<&AgentError> for WireAgentError {
 impl From<WireAgentError> for AgentError {
     fn from(error: WireAgentError) -> Self {
         match error {
-            WireAgentError::Llm { message } => Self::Llm(message),
+            WireAgentError::Llm { message, failure } => Self::Llm {
+                message,
+                failure: failure.into(),
+            },
             WireAgentError::ToolExecution { name, error } => Self::ToolExecution { name, error },
             WireAgentError::MaxIterations { limit } => Self::MaxIterations { limit },
             WireAgentError::ToolNotFound { name } => Self::ToolNotFound { name },
@@ -365,13 +424,21 @@ pub enum SessionAgentBody {
         /// Seconds the phase lasted. Sub-second phases keep the fraction.
         seconds: f64,
     },
-    /// The run is parked until an upstream quota reset.
+    /// The run is parked: for an upstream quota reset, or before a retry of
+    /// a transient provider failure.
     Hold {
-        /// When the run retries.
+        /// When the run continues.
         until: jiff::Timestamp,
-        /// The upstream message that declared the reset.
+        /// The upstream message behind the wait.
         message: String,
+        /// Which retry of a transient failure the run waits for; absent for
+        /// a quota reset.
+        #[serde(default)]
+        retry: Option<u32>,
     },
+    /// The text the run streamed so far is discarded: its attempt failed and
+    /// the prompt is resubmitted.
+    Retract,
     /// The run ended.
     End {
         /// How it ended.
@@ -659,9 +726,18 @@ mod tests {
 
     #[test]
     fn errors_come_back_as_errors() {
-        let wire = WireAgentEvent::from_agent(Err(&AgentError::Llm("overloaded".to_string())))
-            .expect("rendered error");
+        let failure = aither_core::llm::Failure::transient()
+            .with_retry_after(Some(std::time::Duration::from_secs(5)));
+        let wire = WireAgentEvent::from_agent(Err(&AgentError::Llm {
+            message: "overloaded".to_string(),
+            failure,
+        }))
+        .expect("rendered error");
         let back = wire.into_timed(jiff::Timestamp::UNIX_EPOCH);
-        assert!(matches!(back, Err(AgentError::Llm(message)) if message == "overloaded"));
+        assert!(matches!(
+            back,
+            Err(AgentError::Llm { message, failure: back_failure })
+                if message == "overloaded" && back_failure == failure
+        ));
     }
 }

@@ -328,9 +328,25 @@ async fn forward_agent_frame(
                 let _ = turn.events.send(TuiEvent::ReasoningEnd { seconds }).await;
             }
         }
-        SessionAgentBody::Hold { until, message } => {
+        SessionAgentBody::Hold {
+            until,
+            message,
+            retry,
+        } => {
             if let Some(turn) = current.as_mut() {
-                let _ = turn.events.send(TuiEvent::Hold { until, message }).await;
+                let _ = turn
+                    .events
+                    .send(TuiEvent::Hold {
+                        until,
+                        message,
+                        retry,
+                    })
+                    .await;
+            }
+        }
+        SessionAgentBody::Retract => {
+            if let Some(turn) = current.as_mut() {
+                let _ = turn.events.send(TuiEvent::Retract).await;
             }
         }
         SessionAgentBody::End { outcome } => {
