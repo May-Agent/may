@@ -114,6 +114,16 @@ pub enum AuxError {
     Timeout,
 }
 
+/// The warm prompt-cache entry of `session_id`'s idle agent. `None` when the
+/// session has no idle agent or its cache is cold: an automatic aux run
+/// would pay the full prefix price, so it does not start.
+pub fn warm_cache(state: &DaemonState, session_id: &str) -> Option<aither_agent::CacheWarmth> {
+    state
+        .parked_agents
+        .cache_warmth(session_id)
+        .filter(aither_agent::CacheWarmth::is_warm)
+}
+
 /// The session's persisted conversation as replay messages — the same
 /// prefix an agent rebuilt from history sees, so provider prefix caches
 /// still hit.
