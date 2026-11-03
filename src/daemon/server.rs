@@ -239,7 +239,12 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
     let container_prepare = super::state::ContainerPrepareTracker::new(ui_event_bus.clone());
     let (search_index_wake_tx, search_index_wake) = async_channel::bounded(1);
 
+    let config = Arc::new(arc_swap::ArcSwap::from_pointee(config));
+    let acp_host = crate::agent::acp_subagent::live_host(config.clone(), &may_dir)
+        .context("failed to open the ACP session registry")?;
+
     let state = Arc::new(DaemonState {
+        acp_host,
         tokio_handle: tokio::runtime::Handle::current(),
         db: db_for_archive.clone(),
         default_profile_id,
@@ -249,7 +254,7 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
         ask_user_approver,
         tool_dispatchers,
         fetched_models_cache: super::state::RefreshableCache::new(Duration::from_secs(20)),
-        config: arc_swap::ArcSwap::from_pointee(config),
+        config,
         ui_event_bus,
         container_prepare,
         container_manager,
@@ -488,6 +493,11 @@ fn api_routes() -> Route {
             "/ssh".route(Route::new((
                 "".post(add_ssh_server),
                 "/{name}".delete(remove_ssh_server),
+            ))),
+            "/acp-agents".route(Route::new((
+                "".at(super::acp_agents::list_acp_agents),
+                "".post(super::acp_agents::connect_acp_agent),
+                "/{name}".delete(super::acp_agents::disconnect_acp_agent),
             ))),
             "/mcp".route(Route::new((
                 "".at(list_mcp_servers),

@@ -79,6 +79,7 @@ pub(super) async fn get_ui_config(
 pub(super) fn build_ui_config_response(config: &MayConfig) -> UiConfigResponse {
     UiConfigResponse {
         ssh_servers: config.ssh_servers.clone(),
+        acp_agents: super::acp_agents::connected_dto(config),
         max_iterations: config.max_iterations,
         ui_font: config.appearance.font.clone(),
         ui_theme: config.appearance.theme.clone(),

@@ -92,6 +92,9 @@ pub enum MayAgentError {
     /// MCP error.
     #[error("MCP error: {0}")]
     Mcp(#[from] crate::mcp::McpConnectionLoadError),
+    /// Terminal command registration error.
+    #[error("terminal command error: {0}")]
+    Commands(#[from] crate::terminal_commands::TerminalCommandsError),
 }
 
 /// Execution environment for a `MayAgent`.
@@ -192,6 +195,9 @@ pub struct MayAgentConfig {
     pub tunnel_broker: Option<crate::agent::tunnel_tool::TunnelBroker>,
     /// Optional broker for `browser` command requests.
     pub browser_broker: Option<BrowserBroker>,
+    /// Connected ACP agents registered as subagent types, when the daemon
+    /// hosts the session.
+    pub acp: Option<super::acp_subagent::AcpAgents>,
     /// Daemon handles for the `computer` command — a session virtual
     /// desktop exists only on macOS local environments.
     #[cfg(target_os = "macos")]
@@ -253,6 +259,8 @@ pub struct MayAgentSessionInput<'a> {
     pub notify_broker: Option<crate::agent::notify_tool::NotifyBroker>,
     /// Channel for tunnel registrations.
     pub tunnel_broker: Option<crate::agent::tunnel_tool::TunnelBroker>,
+    /// The daemon's acpsub host and runtime; connected ACP agents run on it.
+    pub acp_host: Option<(acpsub::Host, tokio::runtime::Handle)>,
     /// Channel for browser requests.
     pub browser_broker: Option<BrowserBroker>,
     /// Daemon handles for `computer` commands (macOS local only).
@@ -607,6 +615,7 @@ impl MayAgent {
                 issue_store: issue_store.clone(),
                 workspace_config: workspace.config.clone(),
                 agent_messaging,
+                acp: config.acp.clone(),
                 #[cfg(target_os = "macos")]
                 computer: config.computer.clone(),
             },
@@ -722,6 +731,7 @@ impl MayAgent {
             notify_broker,
             tunnel_broker,
             browser_broker,
+            acp_host,
             #[cfg(target_os = "macos")]
             computer,
             register_skills_broker,
@@ -819,6 +829,11 @@ impl MayAgent {
             notify_broker,
             tunnel_broker,
             browser_broker,
+            acp: acp_host.map(|(host, runtime)| super::acp_subagent::AcpAgents {
+                host,
+                runtime,
+                connected: may_config.acp_agents.clone(),
+            }),
             #[cfg(target_os = "macos")]
             computer,
             register_skills_broker,
