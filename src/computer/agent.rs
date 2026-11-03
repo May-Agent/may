@@ -28,6 +28,33 @@ struct AgentState {
     inputs: HashMap<String, Arc<Mutex<InputState>>>,
 }
 
+/// How often a helper checks that it still owns its socket path.
+const OWNERSHIP_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Identity of the file at the socket path: device and inode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SocketId {
+    dev: u64,
+    ino: u64,
+}
+
+impl SocketId {
+    /// `None` when nothing exists at `path`.
+    fn of(path: &Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::symlink_metadata(path).ok()?;
+        Some(Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        })
+    }
+
+    /// Whether the path still holds the file this helper bound.
+    fn is_current(self, now: Option<Self>) -> bool {
+        now == Some(self)
+    }
+}
+
 /// Serve requests on `<may_dir>/computer-agent.sock` until killed.
 ///
 /// # Errors
@@ -50,8 +77,21 @@ pub async fn serve(may_dir: &Path) -> Result<(), String> {
         streams: SessionStreams::default(),
         inputs: HashMap::new(),
     }));
+    let owned = SocketId::of(&sock).ok_or_else(|| format!("stat {}", sock.display()))?;
+    let mut ownership = tokio::time::interval(OWNERSHIP_CHECK_INTERVAL);
     loop {
-        let (conn, _) = listener.accept().await.map_err(|e| e.to_string())?;
+        let conn = tokio::select! {
+            accepted = listener.accept() => accepted.map_err(|e| e.to_string())?.0,
+            _ = ownership.tick() => {
+                if owned.is_current(SocketId::of(&sock)) {
+                    continue;
+                }
+                // A newer helper replaced the socket, or the may dir is
+                // gone: nobody connects here any more.
+                tracing::info!(socket = %sock.display(), "computer-agent lost its socket; exiting");
+                return Ok(());
+            }
+        };
         let state = state.clone();
         tokio::spawn(async move {
             let (mut reader, mut writer) = conn.into_split();
@@ -288,5 +328,29 @@ async fn dispatch_inner(request: AgentRequest, state: Arc<Mutex<AgentState>>) ->
                 Err(e) => AgentResponse::Error { error: e },
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SocketId;
+
+    #[test]
+    fn socket_ownership_follows_the_file_at_the_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agent.sock");
+        std::fs::write(&path, b"").expect("create");
+        let owned = SocketId::of(&path).expect("exists");
+        assert!(owned.is_current(SocketId::of(&path)));
+
+        // Replaced by another file: a newer helper bound the path.
+        std::fs::remove_file(&path).expect("remove");
+        let _occupied = std::fs::File::create(dir.path().join("other")).expect("occupy inode");
+        std::fs::write(&path, b"").expect("recreate");
+        assert!(!owned.is_current(SocketId::of(&path)));
+
+        // Removed outright, as when the may dir is deleted.
+        std::fs::remove_file(&path).expect("remove");
+        assert!(!owned.is_current(SocketId::of(&path)));
     }
 }

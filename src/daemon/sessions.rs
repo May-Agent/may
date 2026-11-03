@@ -685,8 +685,8 @@ pub(super) async fn delete_session(
     state.runtime_service.forget_terminal_grants(&id);
     state.tunnels.remove_session(&id);
     #[cfg(target_os = "macos")]
-    #[cfg(target_os = "macos")]
-    {
+    if state.computer.is_running() {
+        // No helper means no display to release; never launch one to say so.
         drop(
             state
                 .computer
@@ -736,7 +736,9 @@ pub(super) async fn delete_all_sessions(
     #[cfg(target_os = "macos")]
     {
         // One helper restart tears down every session desktop at once.
-        state.computer.restart();
+        if let Err(error) = state.computer.restart() {
+            tracing::warn!(%error, "computer-agent did not stop after session deletion");
+        }
     }
 
     // Clean up filesystem session directories
