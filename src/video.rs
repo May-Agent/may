@@ -16,12 +16,13 @@ mod gate;
 mod level;
 mod nv12;
 mod pipeline;
+mod rate;
+mod send_time;
 #[cfg(target_os = "macos")]
 mod surface;
 #[cfg(test)]
 mod tests;
 
-use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
@@ -39,14 +40,16 @@ use webrtc::interceptor::registry::Registry;
 use webrtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest;
 use webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication;
 use webrtc::rtcp::payload_feedbacks::receiver_estimated_maximum_bitrate::ReceiverEstimatedMaximumBitrate;
+use webrtc::rtcp::receiver_report::ReceiverReport;
 use webrtc::rtp_transceiver::rtp_codec::{
-    RTCRtpCodecCapability, RTCRtpCodecParameters, RTPCodecType,
+    RTCRtpCodecCapability, RTCRtpCodecParameters, RTCRtpHeaderExtensionCapability, RTPCodecType,
 };
 use webrtc::rtp_transceiver::{RTCPFeedback, rtp_sender::RTCRtpSender};
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
 pub use gate::{GateChange, SourceGate};
 use pipeline::FramePipeline;
+use rate::{BitrateTarget, Reception};
 #[cfg(target_os = "macos")]
 pub use surface::PixelBuffer;
 
@@ -64,12 +67,6 @@ const KEYFRAME_INTERVAL: Duration = Duration::from_secs(2);
 
 /// RTP payload type of the one codec a stream offers (dynamic range).
 const PAYLOAD_TYPE: u8 = 96;
-
-/// A new bitrate estimate is applied once it differs from the applied target
-/// by this fraction. The software AV1 encoder restarts its rate control (and
-/// emits a keyframe) on every change, and REMB reports arrive about once a
-/// second.
-const BITRATE_STEP: f64 = 0.1;
 
 /// An encoded video frame ready for WebRTC.
 pub struct EncodedSample {
@@ -348,7 +345,19 @@ impl VideoCodec {
             },
             RTPCodecType::Video,
         )?;
-        let registry = configure_nack(Registry::new(), &mut media_engine);
+        media_engine.register_header_extension(
+            RTCRtpHeaderExtensionCapability {
+                uri: send_time::ABS_SEND_TIME_URI.to_owned(),
+            },
+            RTPCodecType::Video,
+            None,
+        )?;
+        // Interceptors wrap the transport in registration order, so the
+        // first is the one next to the socket: the send time is stamped
+        // there, on NACK retransmissions as well.
+        let mut registry = Registry::new();
+        registry.add(Box::new(send_time::SendTimeBuilder));
+        let registry = configure_nack(registry, &mut media_engine);
         let registry = configure_rtcp_reports(registry);
         let api = APIBuilder::new()
             .with_media_engine(media_engine)
@@ -369,8 +378,19 @@ impl VideoCodec {
 #[derive(Debug)]
 enum EncoderRequest {
     Keyframe,
-    Bitrate { peer: String, bits_per_second: u32 },
-    PeerGone { peer: String },
+    Bitrate {
+        peer: String,
+        bits_per_second: u32,
+    },
+    /// The peer's RTCP reception counters.
+    Reception {
+        peer: String,
+        reception: Reception,
+        at: Instant,
+    },
+    PeerGone {
+        peer: String,
+    },
 }
 
 /// The transport's handle on a stream's encoder: keyframe requests and
@@ -400,7 +420,8 @@ impl EncoderControl {
     }
 
     /// Follows `peer`'s feedback on `sender` until the peer goes away: PLI and
-    /// FIR request a keyframe, REMB reports the peer's bandwidth estimate.
+    /// FIR request a keyframe, REMB reports the peer's bandwidth estimate and
+    /// receiver reports its loss.
     pub async fn follow_peer(self, sender: Arc<RTCRtpSender>, peer: String) {
         while let Ok((packets, _)) = sender.read_rtcp().await {
             for packet in packets {
@@ -412,9 +433,26 @@ impl EncoderControl {
                     // `bitrate` is a non-negative estimate in bits per second.
                     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                     let bits_per_second = remb.bitrate as u32;
+                    tracing::trace!(%peer, bits_per_second, ssrcs = ?remb.ssrcs, "REMB");
                     let _ = self.tx.send(EncoderRequest::Bitrate {
                         peer: peer.clone(),
                         bits_per_second,
+                    });
+                } else if let Some(report) = any
+                    .downcast_ref::<ReceiverReport>()
+                    .and_then(|report| report.reports.first())
+                {
+                    // The peer receives this one video stream, so its one
+                    // reception report is the stream's.
+                    let reception = Reception {
+                        highest_sequence: report.last_sequence_number,
+                        total_lost: report.total_lost,
+                    };
+                    tracing::trace!(%peer, ?reception, "receiver report");
+                    let _ = self.tx.send(EncoderRequest::Reception {
+                        peer: peer.clone(),
+                        reception,
+                        at: Instant::now(),
                     });
                 }
             }
@@ -427,45 +465,6 @@ impl EncoderRequests {
     fn try_next(&self) -> Option<EncoderRequest> {
         // Empty, or the transport side is gone: either way nothing to apply.
         self.rx.try_recv().ok()
-    }
-}
-
-/// Folds the peers' bandwidth estimates into the encoder's one target: the
-/// lowest estimate, since every peer receives the same stream.
-#[derive(Debug)]
-struct BitrateTarget {
-    estimates: HashMap<String, u32>,
-    applied: u32,
-}
-
-impl BitrateTarget {
-    fn new(applied: Bitrate) -> Self {
-        Self {
-            estimates: HashMap::new(),
-            applied: applied.bits_per_second().get(),
-        }
-    }
-
-    fn report(&mut self, peer: String, bits_per_second: u32) -> Option<Bitrate> {
-        self.estimates.insert(peer, bits_per_second);
-        self.retarget()
-    }
-
-    fn peer_gone(&mut self, peer: &str) -> Option<Bitrate> {
-        self.estimates.remove(peer);
-        self.retarget()
-    }
-
-    /// The new target when it moved far enough from the applied one.
-    fn retarget(&mut self) -> Option<Bitrate> {
-        let lowest = self.estimates.values().copied().min()?;
-        let bits = NonZeroU32::new(lowest)?;
-        let moved = f64::from(bits.get().abs_diff(self.applied));
-        if moved < f64::from(self.applied) * BITRATE_STEP {
-            return None;
-        }
-        self.applied = bits.get();
-        Some(Bitrate::new(bits))
     }
 }
 
@@ -502,7 +501,12 @@ pub fn encode_loop(
                 EncoderRequest::Bitrate {
                     peer,
                     bits_per_second,
-                } => target.report(peer, bits_per_second),
+                } => target.estimate(peer, bits_per_second),
+                EncoderRequest::Reception {
+                    peer,
+                    reception,
+                    at,
+                } => target.reception(&peer, reception, at),
                 EncoderRequest::PeerGone { peer } => target.peer_gone(&peer),
             };
             if let Some(bitrate) = new_bitrate {
