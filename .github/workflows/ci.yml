@@ -45,6 +45,10 @@ jobs:
       - name: bun install
         working-directory: web-ui
         run: bun install --frozen-lockfile
+      # rav1e's x86_64 assembly is built with nasm.
+      - name: Install nasm
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        run: sudo apt-get update && sudo apt-get install -y nasm
       - name: cargo clippy (default features)
         run: cargo clippy --locked --all-targets -- -D warnings
       - name: cargo clippy (ui)
@@ -81,6 +85,10 @@ jobs:
           executable="${RUNNER_TEMP}/heel-runtime/bin/heel"
           "${executable}" --version
           echo "HEEL_BIN=${executable}" >> "${GITHUB_ENV}"
+      # rav1e's x86_64 assembly is built with nasm.
+      - name: Install nasm
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        run: sudo apt-get update && sudo apt-get install -y nasm
       - name: cargo build
         run: cargo build --locked --all-targets
       - name: cargo test
