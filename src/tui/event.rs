@@ -32,6 +32,10 @@ pub enum AppEvent {
     // ─── Async operation results ───────────────────────────────────────
     /// Session list loaded from background task
     SessionsLoaded(Result<Vec<SessionSummary>, TuiError>),
+    /// Installed and connected ACP agents listed for the `/connect` picker
+    AcpAgentsLoaded(Result<crate::client::acp::AcpAgentsResponse, TuiError>),
+    /// A `/connect` request finished
+    AcpConnectFinished(Result<super::connect::ConnectOutcome, TuiError>),
     /// Claude Code transcripts listed for the `/resume-claude` picker
     ResumeSessionsLoaded(Vec<ForeignSessionSummary>),
     /// Session deleted from background task (includes refreshed list)
@@ -196,6 +200,8 @@ impl AppEvent {
             Self::Paste(_) => "paste",
             Self::Mouse(_) => "mouse",
             Self::SessionsLoaded(_) => "sessions_loaded",
+            Self::AcpAgentsLoaded(_) => "acp_agents_loaded",
+            Self::AcpConnectFinished(_) => "acp_connect_finished",
             Self::ResumeSessionsLoaded(_) => "resume_sessions_loaded",
             Self::SessionDeleted { .. } => "session_deleted",
             Self::SkillsLoaded(_) => "skills_loaded",

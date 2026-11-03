@@ -1,0 +1,1 @@
+{{ name }} {{ version }}, an external coding agent reached over ACP. It works in the working directory of the subagent call and writes only there.

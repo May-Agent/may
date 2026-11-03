@@ -83,6 +83,14 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             }
             Ok(None)
         }
+        AppEvent::AcpAgentsLoaded(result) => {
+            app.acp_agents_loaded(result);
+            Ok(None)
+        }
+        AppEvent::AcpConnectFinished(result) => {
+            app.acp_connect_finished(result);
+            Ok(None)
+        }
         AppEvent::ResumeSessionsLoaded(sessions) => {
             if let AppMode::ResumePicker(state) = &mut app.mode {
                 state.sessions = sessions;

@@ -3507,6 +3507,7 @@ fn build_session_agent<'a>(
                 notify_broker: Some(brokers.notify),
                 tunnel_broker: Some(brokers.tunnel),
                 browser_broker: state.browser_manager().map(|_| brokers.browser),
+                acp_host: Some((state.acp_host.clone(), state.tokio_handle.clone())),
                 #[cfg(target_os = "macos")]
                 computer: (!matches!(
                     environment,

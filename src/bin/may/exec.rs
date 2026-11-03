@@ -44,8 +44,8 @@ pub enum ExecError {
     },
     #[error("failed to resolve agent environment: {0}")]
     ResolveEnvironment(may_agent::ResolveAgentEnvironmentError),
-    #[error("failed to load MCP terminal commands: {0}")]
-    LoadMcpConnections(may_agent::mcp::McpConnectionLoadError),
+    #[error("failed to register terminal commands: {0}")]
+    RegisterCommands(may_agent::TerminalCommandsError),
     #[error("failed to read the current working directory: {0}")]
     CurrentDir(std::io::Error),
     #[error("failed to resolve the session issue backend: {0}")]
@@ -541,10 +541,11 @@ where
             .map_err(ExecError::WorkspaceConfig)?,
             // exec is no main agent: it has no turn boundary to deliver at.
             agent_messaging: None,
+            acp: None,
         },
     )
     .await
-    .map_err(ExecError::LoadMcpConnections)?;
+    .map_err(ExecError::RegisterCommands)?;
     Ok(Arc::new(builder.build(
         SessionPaths::new(context.sandbox_dir.clone()).outputs_dir(),
     )))

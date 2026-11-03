@@ -134,7 +134,9 @@ pub use session::{
     SessionManager, SessionMetadata, SessionPlanState, SessionStore, SessionSummary,
 };
 pub use skill::{SkillInfo, SkillManager, SkillSource};
-pub use terminal_commands::{SharedTerminalCommandConfig, register_shared_terminal_commands};
+pub use terminal_commands::{
+    SharedTerminalCommandConfig, TerminalCommandsError, register_shared_terminal_commands,
+};
 pub use terminal_permission_handler::TerminalPermissionHandler;
 pub use workspace::{Workspace, WorkspaceConfig};
 pub use workspace_request::{WorkspaceRequest, WorkspaceRequestBroker, WorkspaceRequestQueue};

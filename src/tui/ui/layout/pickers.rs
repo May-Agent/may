@@ -12,6 +12,7 @@ use unicode_width::UnicodeWidthStr;
 use jiff::Timestamp;
 
 use super::super::super::app::App;
+use crate::tui::connect::{ConnectStage, ConnectState};
 use crate::tui::state::ResumePickerState;
 
 /// Render session selection popup with profile sections.
@@ -742,4 +743,142 @@ fn relative_age(ts: Timestamp) -> String {
     } else {
         format!("{}d", (secs / 86_400.0).round())
     }
+}
+
+/// Braille frames of the connect picker's loading indicator.
+const CONNECT_SPINNER: [char; 4] = ['⠋', '⠙', '⠹', '⠸'];
+
+/// Rows the `/connect` picker wants.
+pub(super) const fn connect_picker_rows(state: &ConnectState) -> usize {
+    match &state.stage {
+        ConnectStage::Detecting | ConnectStage::Connecting(_) => 6,
+        ConnectStage::Agents {
+            detected,
+            connected,
+        } => detected.len() + connected.len() + 6,
+        ConnectStage::Choose { valid, .. } => valid.len() + 6,
+    }
+}
+
+/// Render the `/connect` picker.
+pub(super) fn render_connect_picker(
+    frame: &mut Frame,
+    area: Rect,
+    state: &ConnectState,
+    spinner_frame: usize,
+) {
+    frame.render_widget(Clear, area);
+    let dim = Style::default().fg(Color::DarkGray);
+    let spinner = CONNECT_SPINNER[spinner_frame % CONNECT_SPINNER.len()];
+    let row = |selected: bool, text: String, detail: String| {
+        let (prefix, style) = if selected {
+            (
+                "> ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(ratatui::style::Modifier::BOLD),
+            )
+        } else {
+            ("  ", Style::default().fg(Color::White))
+        };
+        Line::from(vec![
+            Span::styled(prefix, style),
+            Span::styled(text, style),
+            Span::styled(detail, dim),
+        ])
+    };
+    let mut lines = Vec::new();
+    let (title, footer) = match &state.stage {
+        ConnectStage::Detecting => {
+            lines.push(Line::from(Span::styled(
+                format!("{spinner} Looking for installed ACP agents..."),
+                dim,
+            )));
+            ("Connect an ACP agent", "[Esc] Close")
+        }
+        ConnectStage::Connecting(request) => {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "{spinner} Opening a trial session with {}...",
+                    request.command
+                ),
+                dim,
+            )));
+            ("Connect an ACP agent", "[Esc] Close")
+        }
+        ConnectStage::Agents {
+            detected,
+            connected,
+        } => {
+            if detected.is_empty() {
+                lines.push(Line::from(Span::styled(
+                    "No installed ACP agent found. Use /connect <command> [args].",
+                    dim,
+                )));
+            }
+            for (index, agent) in detected.iter().enumerate() {
+                let detail = agent.connected_as.as_ref().map_or_else(
+                    || format!("  {} {}", agent.command, agent.args.join(" ")),
+                    |name| format!("  connected as {name}"),
+                );
+                lines.push(row(
+                    index == state.selected,
+                    format!("{} {}", agent.name, agent.version),
+                    detail,
+                ));
+            }
+            let others: Vec<_> = connected
+                .iter()
+                .filter(|agent| {
+                    !detected
+                        .iter()
+                        .any(|found| found.connected_as.as_ref() == Some(&agent.name))
+                })
+                .collect();
+            if !others.is_empty() {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled("Also connected:", dim)));
+                for agent in others {
+                    lines.push(Line::from(Span::styled(
+                        format!("  {}  ({})", agent.name, agent.command),
+                        dim,
+                    )));
+                }
+            }
+            (
+                "Connect an ACP agent",
+                "[↑↓] Navigate  [Enter] Connect  [Esc] Close",
+            )
+        }
+        ConnectStage::Choose { choice, valid, .. } => {
+            for (index, id) in valid.iter().enumerate() {
+                lines.push(row(index == state.selected, id.clone(), String::new()));
+            }
+            (
+                match choice {
+                    crate::client::acp::AcpChoice::ModelRequired => "Choose the agent's model",
+                    crate::client::acp::AcpChoice::ModeRequired => "Choose the agent's mode",
+                },
+                "[↑↓] Navigate  [Enter] Choose  [Esc] Cancel",
+            )
+        }
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    frame.render_widget(Paragraph::new(lines), chunks[0]);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            footer,
+            Style::default().fg(Color::Cyan),
+        ))),
+        chunks[1],
+    );
 }

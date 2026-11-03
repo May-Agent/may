@@ -1,5 +1,7 @@
 //! May agent implementation.
 
+pub(crate) mod acp_known;
+pub mod acp_subagent;
 mod agents_md;
 pub(crate) mod ask_user_tool;
 pub(crate) mod browser_tool;
