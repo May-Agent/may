@@ -33,6 +33,8 @@ pub enum AppMode {
     ChatgptAuth,
     /// `/login` provider picker
     Login,
+    /// `/connect` picker for ACP agents
+    Connect(super::connect::ConnectState),
     /// xAI Grok OAuth authentication
     GrokAuth,
     /// `OpenRouter` OAuth authentication
@@ -98,6 +100,7 @@ impl AppMode {
             Self::CopilotAuth => "copilot-auth",
             Self::ChatgptAuth => "chatgpt-auth",
             Self::Login => "login",
+            Self::Connect(_) => "connect",
             Self::GrokAuth => "grok-auth",
             Self::OpenrouterAuth => "openrouter-auth",
             Self::PermissionConfirm(_) => "permission-confirm",

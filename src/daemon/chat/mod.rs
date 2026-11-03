@@ -2053,9 +2053,9 @@ fn run_agent_loop<'a>(
                 // What a retry waits out first: the next provider's short
                 // failover backoff, or — once no failover remains — the
                 // quota reset the upstream announced.
-                let retry_wait = if err.is_retryable() && attempt < max_retries {
+                let retry_wait = if provider_may_recover(&err) && attempt < max_retries {
                     Some(RetryWait::Failover)
-                } else if err.is_retryable()
+                } else if provider_may_recover(&err)
                     && state
                         .config_snapshot()
                         .preferences
@@ -2107,7 +2107,7 @@ fn run_agent_loop<'a>(
                         .on_error(ApiErrorCode::InternalError, &err_msg, false)
                         .await;
                     if let Some(entry_id) = req.pending_entry_id {
-                        if err.is_retryable() {
+                        if provider_may_recover(&err) {
                             // Out of retries: a later run picks the entry up.
                             let _ = state
                                 .db()
@@ -3409,6 +3409,7 @@ fn build_session_agent<'a>(
                 notify_broker: Some(brokers.notify),
                 tunnel_broker: Some(brokers.tunnel),
                 browser_broker: state.browser_manager().map(|_| brokers.browser),
+                acp_host: Some((state.acp_host.clone(), state.tokio_handle.clone())),
                 #[cfg(target_os = "macos")]
                 computer: (!matches!(
                     environment,
@@ -3470,6 +3471,16 @@ fn build_session_agent<'a>(
         }
 
         Ok(agent)
+    })
+}
+
+/// Whether another attempt, on the next provider or after a quota reset, can
+/// succeed where `error` failed: the provider was unreachable, faulted
+/// temporarily or ran out of quota. Permanent failures and errors that are
+/// not the provider's never recover.
+fn provider_may_recover(error: &aither_agent::AgentError) -> bool {
+    error.failure().is_some_and(|failure| {
+        failure.is_retryable() || failure.kind == aither_core::llm::FailureKind::Quota
     })
 }
 

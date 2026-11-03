@@ -6,7 +6,7 @@
 //! is the same whether the agent runs in-process or in the daemon.
 
 use aither_agent::{AgentError, AgentEvent, TimedEvent};
-use aither_core::llm::{ToolResult, Usage};
+use aither_core::llm::{Failure, FailureKind, ToolResult, Usage};
 use serde::{Deserialize, Serialize};
 
 /// An agent failure, as it crosses the socket.
@@ -17,6 +17,8 @@ pub enum WireAgentError {
     Llm {
         /// Provider error.
         message: String,
+        /// How the provider failure classifies.
+        failure: WireFailure,
     },
     /// A tool failed.
     ToolExecution {
@@ -42,11 +44,64 @@ pub enum WireAgentError {
     },
 }
 
+/// A provider failure's classification, as it crosses the socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WireFailure {
+    /// What kind of failure it is.
+    pub kind: WireFailureKind,
+    /// The retry delay the upstream asked for, in milliseconds.
+    pub retry_after_ms: Option<u64>,
+}
+
+/// [`FailureKind`], as it crosses the socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WireFailureKind {
+    /// No response came back from the network.
+    Network,
+    /// The upstream answered with a temporary fault.
+    Transient,
+    /// A quota or usage limit is exhausted.
+    Quota,
+    /// Everything else.
+    Permanent,
+}
+
+impl From<Failure> for WireFailure {
+    fn from(failure: Failure) -> Self {
+        Self {
+            kind: match failure.kind {
+                FailureKind::Network => WireFailureKind::Network,
+                FailureKind::Transient => WireFailureKind::Transient,
+                FailureKind::Quota => WireFailureKind::Quota,
+                FailureKind::Permanent => WireFailureKind::Permanent,
+            },
+            retry_after_ms: failure
+                .retry_after
+                .map(|delay| u64::try_from(delay.as_millis()).unwrap_or(u64::MAX)),
+        }
+    }
+}
+
+impl From<WireFailure> for Failure {
+    fn from(failure: WireFailure) -> Self {
+        let kind = match failure.kind {
+            WireFailureKind::Network => FailureKind::Network,
+            WireFailureKind::Transient => FailureKind::Transient,
+            WireFailureKind::Quota => FailureKind::Quota,
+            WireFailureKind::Permanent => FailureKind::Permanent,
+        };
+        Self::new(kind)
+            .with_retry_after(failure.retry_after_ms.map(std::time::Duration::from_millis))
+    }
+}
+
 impl From<&AgentError> for WireAgentError {
     fn from(error: &AgentError) -> Self {
         match error {
-            AgentError::Llm(message) => Self::Llm {
+            AgentError::Llm { message, failure } => Self::Llm {
                 message: message.clone(),
+                failure: (*failure).into(),
             },
             AgentError::ToolExecution { name, error } => Self::ToolExecution {
                 name: name.clone(),
@@ -64,7 +119,10 @@ impl From<&AgentError> for WireAgentError {
 impl From<WireAgentError> for AgentError {
     fn from(error: WireAgentError) -> Self {
         match error {
-            WireAgentError::Llm { message } => Self::Llm(message),
+            WireAgentError::Llm { message, failure } => Self::Llm {
+                message,
+                failure: failure.into(),
+            },
             WireAgentError::ToolExecution { name, error } => Self::ToolExecution { name, error },
             WireAgentError::MaxIterations { limit } => Self::MaxIterations { limit },
             WireAgentError::ToolNotFound { name } => Self::ToolNotFound { name },
@@ -636,7 +694,7 @@ pub struct WirePr {
 #[cfg(test)]
 mod tests {
     use aither_agent::{AgentError, AgentEvent};
-    use aither_core::llm::ToolResult;
+    use aither_core::llm::{Failure, ToolResult};
 
     use super::WireAgentEvent;
 
@@ -659,9 +717,18 @@ mod tests {
 
     #[test]
     fn errors_come_back_as_errors() {
-        let wire = WireAgentEvent::from_agent(Err(&AgentError::Llm("overloaded".to_string())))
-            .expect("rendered error");
+        let error = AgentError::Llm {
+            message: "overloaded".to_string(),
+            failure: Failure::transient().with_retry_after(Some(std::time::Duration::from_secs(5))),
+        };
+        let wire = WireAgentEvent::from_agent(Err(&error)).expect("rendered error");
         let back = wire.into_timed(jiff::Timestamp::UNIX_EPOCH);
-        assert!(matches!(back, Err(AgentError::Llm(message)) if message == "overloaded"));
+        assert!(matches!(
+            back,
+            Err(AgentError::Llm { message, failure })
+                if message == "overloaded"
+                    && failure == Failure::transient()
+                        .with_retry_after(Some(std::time::Duration::from_secs(5)))
+        ));
     }
 }

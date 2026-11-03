@@ -1192,6 +1192,7 @@ pub struct WorkspaceRespondRequest {
 #[serde(rename_all = "camelCase")]
 pub struct UiConfigResponse {
     pub(crate) ssh_servers: Vec<SshServerConfig>,
+    pub(crate) acp_agents: Vec<crate::client::acp::ConnectedAcpAgent>,
     pub(crate) max_iterations: usize,
     pub(crate) ui_font: String,
     pub(crate) ui_theme: String,

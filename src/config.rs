@@ -48,7 +48,7 @@
 
 use async_fs;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use crate::cache_lifetime::CacheLifetime;
@@ -101,6 +101,14 @@ pub enum ConfigError {
         expected: ProviderType,
         /// Provider type the existing instance resolves to.
         actual: ProviderType,
+    },
+    /// An ACP agent cannot be registered as a subagent type under its name.
+    #[error("cannot connect ACP agent `{name}`: {reason}")]
+    InvalidAcpAgent {
+        /// The subagent type name.
+        name: String,
+        /// Why the name cannot be used.
+        reason: String,
     },
     /// Invalid provider config.
     #[error("invalid provider config for `{id}`: {reason}")]
@@ -729,6 +737,59 @@ pub struct SshServerConfig {
     pub target: String,
 }
 
+/// An installed ACP agent connected as a subagent type (`/connect`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, skyzen::ToSchema)]
+pub struct AcpAgentConfig {
+    /// Program to launch, resolved through `PATH`.
+    pub command: String,
+    /// Arguments to the program.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Extra environment variables for the agent process.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// The model every session runs, when the agent advertises models.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The session mode every session runs, when the agent advertises modes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// What the main agent reads to decide when to delegate to this agent.
+    pub description: String,
+}
+
+/// Whether `name` can be the subagent type of a connected ACP agent.
+///
+/// The `subagent` command reads a name containing `/` or ending in `.md` as a
+/// subagent file, and the built-in types own their names, so a connection
+/// under either would never be reachable or would shadow a built-in.
+///
+/// # Errors
+/// Returns [`ConfigError::InvalidAcpAgent`] naming the reason.
+pub fn check_acp_agent_name(name: &str) -> Result<(), ConfigError> {
+    let reject = |reason: &str| {
+        Err(ConfigError::InvalidAcpAgent {
+            name: name.to_string(),
+            reason: reason.to_string(),
+        })
+    };
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return reject("a name holds only ASCII letters, digits, `-` and `_`");
+    }
+    if name == "fork"
+        || aither_agent::builtin_subagents()
+            .iter()
+            .any(|def| def.id == name)
+    {
+        return reject("the name belongs to a built-in subagent type");
+    }
+    Ok(())
+}
+
 /// Global preferences.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Preferences {
@@ -1114,6 +1175,10 @@ pub struct MayConfig {
     /// Preconfigured SSH targets available to the agent.
     #[serde(default)]
     pub ssh_servers: Vec<SshServerConfig>,
+    /// Connected ACP agents, keyed by the subagent type name they register.
+    /// Example: `[acp_agents.devin]`
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub acp_agents: BTreeMap<String, AcpAgentConfig>,
 }
 
 /// `[suggestions]` section: the generated next-prompt ghost text.
@@ -1183,6 +1248,7 @@ impl Default for MayConfig {
             last_model: None,
             last_effort: None,
             ssh_servers: Vec::new(),
+            acp_agents: BTreeMap::new(),
         }
     }
 }
@@ -1264,7 +1330,31 @@ impl MayConfig {
         for (id, instance) in &self.provider {
             instance.validate(id)?;
         }
+        for name in self.acp_agents.keys() {
+            check_acp_agent_name(name)?;
+        }
         Ok(())
+    }
+
+    /// Connect an ACP agent as a subagent type, replacing the connection
+    /// already under `name`.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::InvalidAcpAgent`] when `name` cannot be a
+    /// subagent type name; nothing is changed then.
+    pub fn connect_acp_agent(
+        &mut self,
+        name: String,
+        agent: AcpAgentConfig,
+    ) -> Result<(), ConfigError> {
+        check_acp_agent_name(&name)?;
+        self.acp_agents.insert(name, agent);
+        Ok(())
+    }
+
+    /// Disconnect the ACP agent under `name`. Returns true if it was connected.
+    pub fn disconnect_acp_agent(&mut self, name: &str) -> bool {
+        self.acp_agents.remove(name).is_some()
     }
 
     /// Check if configuration is complete enough to use.
@@ -1538,6 +1628,73 @@ mod tests {
             .set_provider_cache_lifetime("openai", "soon")
             .expect_err("not a duration");
         assert!(config.provider["openai"].cache_lifetime.is_default());
+    }
+
+    fn devin_connection() -> AcpAgentConfig {
+        AcpAgentConfig {
+            command: "devin".to_string(),
+            args: vec!["acp".to_string()],
+            env: BTreeMap::from([("DEVIN_LOG".to_string(), "warn".to_string())]),
+            model: Some("opus".to_string()),
+            mode: None,
+            description: "Devin CLI".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn connected_acp_agents_survive_a_saved_config() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("config.toml");
+        let mut config = MayConfig::default();
+        config
+            .connect_acp_agent("devin".to_string(), devin_connection())
+            .expect("a plain name connects");
+        config.save_to(&path).await.expect("config saves");
+
+        let written = std::fs::read_to_string(&path).expect("config file");
+        assert!(written.contains("[acp_agents.devin]"), "{written}");
+        let section = &written[written.find("[acp_agents.devin]").expect("section")..];
+        assert!(
+            !section.contains("\nmode ="),
+            "unset mode is omitted: {section}"
+        );
+
+        let loaded = MayConfig::load_from(&path).await.expect("config loads");
+        assert_eq!(loaded.acp_agents["devin"], devin_connection());
+
+        let minimal: MayConfig = toml::from_str(
+            "[acp_agents.codex]\ncommand = \"codex-acp\"\ndescription = \"Codex\"\n",
+        )
+        .expect("only command and description are required");
+        let codex = &minimal.acp_agents["codex"];
+        assert!(codex.args.is_empty() && codex.env.is_empty());
+        assert!(codex.model.is_none() && codex.mode.is_none());
+    }
+
+    #[test]
+    fn acp_agent_names_that_cannot_be_subagent_types_are_refused() {
+        let mut config = MayConfig::default();
+        for name in [
+            "explore", "plan", "research", "fork", "", "a/b", "notes.md", "x y",
+        ] {
+            let error = config
+                .connect_acp_agent(name.to_string(), devin_connection())
+                .expect_err(name);
+            assert!(
+                matches!(error, ConfigError::InvalidAcpAgent { .. }),
+                "{name}"
+            );
+        }
+        assert!(
+            config.acp_agents.is_empty(),
+            "a refused name changes nothing"
+        );
+        config
+            .acp_agents
+            .insert("plan".to_string(), devin_connection());
+        config
+            .validate()
+            .expect_err("a hand-edited colliding name fails validation");
     }
 
     #[test]

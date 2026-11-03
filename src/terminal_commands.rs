@@ -94,6 +94,9 @@ pub struct SharedTerminalCommandConfig<LLM> {
     /// Discovery and messaging between main agents, when the session has a
     /// persistent queue to deliver through.
     pub agent_messaging: Option<crate::agent_link::AgentMessaging>,
+    /// Connected ACP agents, registered as subagent types; `None` outside
+    /// the daemon.
+    pub acp: Option<crate::agent::acp_subagent::AcpAgents>,
     /// Daemon handles for the `computer` command — present when the
     /// session may own a virtual desktop (macOS, local environment).
     #[cfg(target_os = "macos")]
@@ -113,6 +116,17 @@ pub struct SharedTerminalCommands {
     pub fork_source: aither_agent::ForkSource,
 }
 
+/// Why the shared terminal commands could not be registered.
+#[derive(Debug, thiserror::Error)]
+pub enum TerminalCommandsError {
+    /// An MCP connection failed to load.
+    #[error(transparent)]
+    Mcp(#[from] crate::mcp::McpConnectionLoadError),
+    /// A connected ACP agent cannot be a subagent type.
+    #[error(transparent)]
+    Acp(#[from] crate::config::ConfigError),
+}
+
 /// Register every shared IPC command on the terminal tool's command registry.
 ///
 /// # Errors
@@ -120,7 +134,7 @@ pub struct SharedTerminalCommands {
 pub async fn register_shared_terminal_commands<LLM>(
     builder: &mut ToolRegistryBuilder,
     config: SharedTerminalCommandConfig<LLM>,
-) -> Result<SharedTerminalCommands, crate::mcp::McpConnectionLoadError>
+) -> Result<SharedTerminalCommands, TerminalCommandsError>
 where
     LLM: LanguageModel + Clone + 'static,
 {
@@ -299,7 +313,7 @@ where
         );
     }
 
-    let subagent_tool = SubagentTool::new(UsageObservedModel::new(config.llm))
+    let mut subagent_tool = SubagentTool::new(UsageObservedModel::new(config.llm))
         .with_runs(config.subagent_runs)
         .with_builtins()
         .with_base_dir(&config.sandbox_dir)
@@ -307,6 +321,9 @@ where
             SubagentFileMount::new(PathBuf::from("."), config.sandbox_dir.clone()),
             SubagentFileMount::new(PathBuf::from("skills"), config.sandbox_dir.join("skills")),
         ]);
+    if let Some(acp) = &config.acp {
+        subagent_tool = acp.register(subagent_tool)?;
+    }
     let subagent_tracker = config.subagent_tracker;
     let fork_source = subagent_tool.fork_source();
     describe_tool(&mut descriptions, &subagent_tool);
@@ -395,6 +412,12 @@ mod tests {
 
     impl std::error::Error for MockError {}
 
+    impl aither_core::llm::Classify for MockError {
+        fn failure(&self) -> aither_core::llm::Failure {
+            aither_core::llm::Failure::permanent()
+        }
+    }
+
     impl LanguageModel for MockLlm {
         type Error = MockError;
 
@@ -478,6 +501,7 @@ mod tests {
                 issue_store: test_issue_store(temp.path()).await,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
+                acp: None,
             },
         )
         .await
@@ -534,6 +558,7 @@ mod tests {
                 issue_store: test_issue_store(temp.path()).await,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
+                acp: None,
             },
         )
         .await
@@ -590,6 +615,7 @@ mod tests {
                 issue_store: test_issue_store(temp.path()).await,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
+                acp: None,
             },
         )
         .await
@@ -640,6 +666,7 @@ mod tests {
                 issue_store: test_issue_store(temp.path()).await,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
+                acp: None,
             },
         )
         .await
@@ -686,6 +713,7 @@ mod tests {
                 issue_store: test_issue_store(temp.path()).await,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
+                acp: None,
             },
         )
         .await
@@ -849,6 +877,7 @@ mod tests {
                 issue_store,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: Some(messaging),
+                acp: None,
             },
         )
         .await
@@ -924,6 +953,7 @@ mod tests {
                 issue_store: test_issue_store(temp.path()).await,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
+                acp: None,
             },
         )
         .await

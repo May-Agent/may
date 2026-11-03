@@ -101,15 +101,12 @@ impl RepoSearch {
             .prepared
             .get_or_try_init(|| async {
                 let distribution = crate::tools::host_program_distribution()?;
-                let binary = distribution
-                    .load_host_program(
+                let path = distribution
+                    .prepare_host_program(
                         HostProgram::RepoSearch,
                         &ToolTarget::native()?,
-                        &self.inner.cache_root.join("artifacts"),
+                        &self.inner.cache_root,
                     )
-                    .await?;
-                let path = binary
-                    .prepare_local(&self.inner.cache_root.join("bin"))
                     .await?;
                 let program = path.path().to_path_buf();
                 let hello = Hello::new(BuildId::of_file(&program)?);
