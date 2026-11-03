@@ -121,7 +121,12 @@ http-body-util = "0.1"
 chromiumoxide = { version = "0.8", default-features = false, features = ["tokio-runtime"] }
 chromiumoxide_fetcher = "0.9.1"
 webrtc = "0.17"
-openh264 = "0.9"
+# Hardware H.264 (software AV1 on hosts without an encoder) and the
+# platform JPEG decode that feeds it.
+mediax-codec = { git = "https://github.com/water-rs/mediax", branch = "dev", default-features = false, features = ["software-encode"] }
+# RGB/BGRA to NV12 for the frames that cannot go to the encoder as surfaces;
+# already in the lockfile through mediax-codec.
+yuv = { version = "0.8", default-features = false }
 
 # GStreamer encoding (optional, runtime-detected, user installs GStreamer)
 gstreamer = { version = "0.23", optional = true }
@@ -174,6 +179,9 @@ block2 = "0.6"
 objc2 = "0.6"
 objc2-app-kit = "0.3"
 objc2-foundation = "0.3"
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFDictionary", "CFNumber", "CFString"] }
+objc2-core-video = { version = "0.3", default-features = false, features = ["std", "objc2-io-surface", "CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVPixelBufferIOSurface", "CVReturn"] }
+objc2-io-surface = { version = "0.3", default-features = false, features = ["std", "IOSurfaceRef"] }
 
 [build-dependencies]
 sha2 = "0.10"
@@ -216,6 +224,11 @@ workspace = true
 # Baseline tool preparation hashes and inflates ~120 MB of pinned tool
 # artifacts before every agent is built; unoptimized, these crates make that
 # take seconds in dev and test builds.
+# The software AV1 encoder (hosts without a hardware encoder) is unusable
+# unoptimized: seconds per 640x360 frame in dev and test builds.
+[profile.dev.package.rav1e]
+opt-level = 3
+
 [profile.dev.package.sha2]
 opt-level = 3
 
