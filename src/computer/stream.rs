@@ -272,16 +272,26 @@ impl SessionStream {
             let state_for_peer = state_for_peer.clone();
             let gone_id = gone_id.clone();
             Box::pin(async move {
+                // `Disconnected` is transient: ICE recovers or moves on to `Failed`.
                 if matches!(
                     state,
-                    RTCPeerConnectionState::Disconnected
-                        | RTCPeerConnectionState::Failed
-                        | RTCPeerConnectionState::Closed
+                    RTCPeerConnectionState::Failed | RTCPeerConnectionState::Closed
                 ) {
-                    #[allow(clippy::significant_drop_tightening)]
-                    let mut guard = state_for_peer.lock().await;
-                    if let Some(runtime) = guard.as_mut() {
-                        runtime.peers.remove(&gone_id);
+                    let gone = state_for_peer
+                        .lock()
+                        .await
+                        .as_mut()
+                        .and_then(|runtime| runtime.peers.remove(&gone_id));
+                    // Closing stops the RTP sender, which ends the peer's RTCP
+                    // follower and takes its estimate out of the encoder's
+                    // minimum. It runs apart from this handler, which webrtc
+                    // holds while it runs and `close` raises again.
+                    if let Some(peer) = gone {
+                        tokio::spawn(async move {
+                            if let Err(error) = peer.close().await {
+                                tracing::debug!(%error, "closing a computer stream peer failed");
+                            }
+                        });
                     }
                     tracing::debug!(peer_id = %gone_id, "computer peer went away");
                 }
