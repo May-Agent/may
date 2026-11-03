@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use aither_agent::CacheWarmth;
 use serde::{Deserialize, Serialize};
 use skyzen::Result as SkyResult;
 use skyzen::routing::Params;
@@ -219,14 +220,16 @@ impl RecapSchedules {
     }
 
     /// Replaces `session_id`'s idle timer: after `idle_minutes` with no turn
-    /// the task recaps the session if its history outgrew the last recap.
-    fn arm(&self, state: &Arc<DaemonState>, session_id: &str) {
-        let idle = state.config.load().recap.idle_minutes;
+    /// the task recaps the session if its history outgrew the last recap and
+    /// its prompt cache is still warm.
+    fn arm(&self, state: &Arc<DaemonState>, session_id: &str, warmth: CacheWarmth) {
+        let idle = Duration::from_secs(state.config.load().recap.idle_minutes * 60);
         let task_state = Arc::clone(state);
         let task_session = session_id.to_string();
         let handle = state.tokio_handle.spawn(async move {
-            tokio::time::sleep(Duration::from_secs(idle * 60)).await;
-            if freshness(&task_state, &task_session).await {
+            if idle_with_warm_cache(&warmth, idle, aither_core::time::sleep).await
+                && freshness(&task_state, &task_session).await
+            {
                 request_recap(&task_state, &task_session);
             }
             task_state.recap_schedules.schedules().remove(&task_session);
@@ -246,33 +249,33 @@ impl RecapSchedules {
     }
 }
 
+/// Waits out `idle` with `sleep`, then reports whether the cache entry is
+/// still warm. Warmth is read from its own clock, which keeps counting while
+/// the machine sleeps, so a timer that fires late after a lid close finds
+/// the entry cold and reports `false`.
+pub(super) async fn idle_with_warm_cache<S: Future<Output = ()>>(
+    warmth: &CacheWarmth,
+    idle: Duration,
+    sleep: impl FnOnce(Duration) -> S,
+) -> bool {
+    sleep(idle).await;
+    warmth.is_warm()
+}
+
 /// Arms the idle-recap timer after a completed turn left `session_id` idle.
-/// No-op while `[recap] auto` is off.
+/// No-op while `[recap] auto` is off or the session's prompt cache is cold.
 pub(super) fn arm(state: &Arc<DaemonState>, session_id: &str) {
-    if state.config.load().recap.auto {
-        state.recap_schedules.arm(state, session_id);
+    if !state.config.load().recap.auto {
+        return;
+    }
+    if let Some(warmth) = super::aux::warm_cache(state, session_id) {
+        state.recap_schedules.arm(state, session_id, warmth);
     }
 }
 
 /// Drops `session_id`'s idle timer: a new message supersedes it.
 pub(super) fn unarm(state: &Arc<DaemonState>, session_id: &str) {
     state.recap_schedules.unarm(session_id);
-}
-
-/// Re-arms idle timers for sessions whose history outgrew their last recap,
-/// so recaps survive a daemon restart.
-pub async fn seed(state: Arc<DaemonState>) {
-    if !state.config.load().recap.auto {
-        return;
-    }
-    let Ok(sessions) = state.db().list_sessions().await else {
-        return;
-    };
-    for session in sessions {
-        if freshness(&state, &session.id).await {
-            state.recap_schedules.arm(&state, &session.id);
-        }
-    }
 }
 
 /// Whether `session_id` has user messages its latest recap never covered:
