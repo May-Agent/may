@@ -34,10 +34,13 @@ struct SuggestionFrame<'a> {
 }
 
 /// Schedules a suggested next prompt for `session_id` after a completed
-/// turn left it idle. No-op while `[suggestions] enabled` is off; an aux
-/// task already in flight is superseded.
+/// turn left it idle. No-op while `[suggestions] enabled` is off or the
+/// session's prompt cache is cold; an aux task already in flight is
+/// superseded.
 pub(super) fn maybe_suggest(state: &Arc<DaemonState>, session_id: &str) {
-    if !state.config.load().suggestions.enabled {
+    if !state.config.load().suggestions.enabled
+        || super::aux::warm_cache(state, session_id).is_none()
+    {
         return;
     }
     let task_state = Arc::clone(state);
