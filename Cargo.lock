@@ -5669,6 +5669,7 @@ dependencies = [
  "async-lock 3.4.2",
  "async-net",
  "async-stream",
+ "async-trait",
  "base64 0.22.1",
  "block2",
  "blocking",

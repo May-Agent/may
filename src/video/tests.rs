@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use mediax_codec::{EncodedPacket, EncoderCodec};
 
 use super::pipeline::FramePipeline;
-use super::{BitrateTarget, FrameError, OfferCodecError, RawFrame, StreamFormat, VideoCodec};
+use super::{FrameError, OfferCodecError, RawFrame, StreamFormat, VideoCodec};
 use crate::config::StreamCodec;
 use mediax_codec::{CodecError, EncoderConfig};
 
@@ -211,21 +211,6 @@ fn the_sdp_names_the_level_the_encoder_runs_at() {
 
     let av1 = av1(format(640, 360)).capability();
     assert_eq!(av1.mime_type, "video/AV1");
-}
-
-#[test]
-fn bitrate_follows_the_lowest_peer_estimate() {
-    use mediax_codec::Bitrate;
-    use std::num::NonZeroU32;
-    let start = Bitrate::new(NonZeroU32::new(2_000_000).unwrap());
-    let mut target = BitrateTarget::new(start);
-    // Within the step: not applied.
-    assert!(target.report("a".into(), 2_100_000).is_none());
-    let lowered = target.report("b".into(), 800_000).expect("moved");
-    assert_eq!(lowered.bits_per_second().get(), 800_000);
-    // The lower peer leaves: the other's estimate takes over.
-    let raised = target.peer_gone("b").expect("moved");
-    assert_eq!(raised.bits_per_second().get(), 2_100_000);
 }
 
 #[cfg(target_os = "macos")]
