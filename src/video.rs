@@ -12,6 +12,7 @@
 //! goes to the encoder as a `CVPixelBuffer` and a JPEG is decoded by the
 //! platform into one.
 
+mod gate;
 mod level;
 mod nv12;
 mod pipeline;
@@ -43,6 +44,7 @@ use webrtc::rtp_transceiver::rtp_codec::{
 use webrtc::rtp_transceiver::{RTCPFeedback, rtp_sender::RTCRtpSender};
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
+pub use gate::{GateChange, SourceGate};
 use pipeline::FramePipeline;
 #[cfg(target_os = "macos")]
 pub use surface::PixelBuffer;
