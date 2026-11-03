@@ -46,6 +46,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # rav1e's x86_64 assembly is built with nasm.
+      - name: Install nasm
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        run: sudo apt-get update && sudo apt-get install -y nasm
       - id: refs
         run: cargo run --locked --example container_image -- refs >> "$GITHUB_OUTPUT"
 
@@ -144,6 +148,10 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # rav1e's x86_64 assembly is built with nasm.
+      - name: Install nasm
+        if: steps.exists.outputs.exists != 'true' && runner.arch == 'X64'
+        run: sudo apt-get update && sudo apt-get install -y nasm
       - name: Stage the workspace context
         if: steps.exists.outputs.exists != 'true'
         run: cargo run --locked --example container_image -- stage ${{ matrix.arch }} ./container/workspace

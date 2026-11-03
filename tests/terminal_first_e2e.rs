@@ -1344,7 +1344,7 @@ async fn pinned_container_heel() -> PathBuf {
     }
 
     let url = format!(
-        "https://github.com/lexoliu/heel/releases/download/{CONTAINER_HEEL_RELEASE_TAG}/{}",
+        "https://github.com/May-Agent/heel/releases/download/{CONTAINER_HEEL_RELEASE_TAG}/{}",
         CONTAINER_HEEL_ASSET.name
     );
     let bytes = reqwest::get(&url)
