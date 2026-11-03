@@ -1,6 +1,8 @@
 //! From a [`RawFrame`] to encoded packets: decode or wrap the frame, keep an
 //! encoder of the frame's size, and force the IDR a new encoder needs.
 
+use std::time::Duration;
+
 use mediax_codec::{Bitrate, EncodedPacket, Encoder, EvenDimension, FrameOptions};
 
 use super::nv12::{self, Nv12, Packed};
@@ -72,8 +74,9 @@ impl FramePipeline {
         Ok(())
     }
 
-    /// Encodes one frame. `keyframe` makes it an IDR; so does the first frame
-    /// at a new size, which is encoded by a new encoder.
+    /// Encodes one frame shown at `presentation_time` on the stream's
+    /// timeline. `keyframe` makes it an IDR; so does the first frame at a new
+    /// size, which is encoded by a new encoder.
     ///
     /// An encoder may hold a frame back (software AV1 releases a frame's
     /// packet a few submissions later), so the result can be empty.
@@ -84,6 +87,7 @@ impl FramePipeline {
     pub fn encode(
         &mut self,
         frame: RawFrame,
+        presentation_time: Duration,
         keyframe: bool,
     ) -> Result<Vec<EncodedPacket>, FrameError> {
         let prepared = self.prepare(frame)?;
@@ -100,8 +104,14 @@ impl FramePipeline {
         let options = FrameOptions { keyframe };
         let stream = match &prepared {
             #[cfg(target_os = "macos")]
-            Prepared::Surface(buffer) => live.encoder.encode_pixel_buffer(buffer.buffer(), options),
-            Prepared::Nv12(frame) => live.encoder.encode_nv12(&frame.data, options),
+            Prepared::Surface(buffer) => {
+                live.encoder
+                    .encode_pixel_buffer(buffer.buffer(), presentation_time, options)
+            }
+            Prepared::Nv12(frame) => {
+                live.encoder
+                    .encode_nv12(&frame.data, presentation_time, options)
+            }
         };
         Ok(stream.collect::<Result<Vec<_>, _>>()?)
     }
