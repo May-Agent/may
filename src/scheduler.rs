@@ -48,6 +48,9 @@ pub struct TaskRuntime {
     tool_distribution: Arc<aither_sandbox::ToolDistribution>,
     network_policy: Arc<ArcSwap<Option<CompiledNetworkPolicy>>>,
     active_tasks: Arc<ArcSwap<TaskCatalog>>,
+    /// The daemon's connectivity source; task terminals record the outages
+    /// their commands ran through.
+    connectivity: Option<aither_connectivity::Connectivity>,
 }
 
 /// Time-based wrapper that periodically asks [`TaskRuntime`] to run due tasks.
@@ -480,9 +483,18 @@ impl TaskRuntime {
             tool_distribution,
             network_policy: Arc::new(ArcSwap::from_pointee(None)),
             active_tasks: Arc::new(ArcSwap::from_pointee(TaskCatalog::default())),
+            connectivity: None,
         };
         runtime.reload_active_tasks().await?;
         Ok(runtime)
+    }
+
+    /// Record the sleep and offline intervals commands of local tasks run
+    /// through.
+    #[must_use]
+    pub fn with_connectivity(mut self, connectivity: aither_connectivity::Connectivity) -> Self {
+        self.connectivity = Some(connectivity);
+        self
     }
 
     /// Attach a notification manager for sending push notifications on task completion.
@@ -1291,6 +1303,10 @@ impl TaskRuntime {
         )
         .await?;
         let registry = Arc::new(ToolRegistryBuilder::new().build(workspace.join("outputs")));
+        let terminal_tool = match &self.connectivity {
+            Some(connectivity) => terminal_tool.with_connectivity(connectivity),
+            None => terminal_tool,
+        };
         terminal_tool
             .with_network_audit_log(network_audit)
             .with_shell_sessions(shell_sessions)

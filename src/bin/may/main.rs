@@ -51,6 +51,7 @@ use ratatui::backend::CrosstermBackend;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
 use may_agent::agent::{AgentHandle, AgentWorker, TuiEvent};
+use may_agent::client::HoldReason;
 use may_agent::session::RunOutcome;
 use may_agent::tui::runtime::{
     AssistantReply, QueuedRunStart, ResponseCommit, RuntimeDeps, TitleGenContext,
@@ -1139,8 +1140,8 @@ where
                     TuiEvent::ReasoningEnd { seconds } => {
                         app.chat.finish_thinking(seconds);
                     }
-                    TuiEvent::Hold { until, retry, .. } => {
-                        if let Some(retry) = retry {
+                    TuiEvent::Hold { reason, .. } => match reason {
+                        HoldReason::Retry { until, retry } => {
                             let at = until
                                 .to_zoned(jiff::tz::TimeZone::system())
                                 .strftime("%H:%M:%S")
@@ -1148,7 +1149,8 @@ where
                             app.set_persistent_status(format!(
                                 "Provider error — retrying ({retry}) at {at} · esc to cancel"
                             ));
-                        } else {
+                        }
+                        HoldReason::Quota { until } => {
                             let at = until
                                 .to_zoned(jiff::tz::TimeZone::system())
                                 .strftime("%b %d, %Y %H:%M %Z")
@@ -1160,7 +1162,13 @@ where
                                 "Usage limit — continuing automatically at {at} · esc to cancel"
                             ));
                         }
-                    }
+                        HoldReason::Network => {
+                            app.set_persistent_status(
+                                "Waiting for the network — continuing automatically · esc to cancel"
+                                    .to_string(),
+                            );
+                        }
+                    },
                     TuiEvent::Retract => {
                         app.chat.retract_text();
                         assistant_response.clear();

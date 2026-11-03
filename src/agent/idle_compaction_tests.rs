@@ -247,6 +247,7 @@ impl SessionParts {
             provider_attempt: 0,
             subagents: None,
             background_jobs: aither_agent::BackgroundJobPolicy::Await,
+            connectivity: aither_connectivity::Connectivity::manual(true).0,
         }
     }
 }
