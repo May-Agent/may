@@ -76,6 +76,9 @@ unsafe extern "C" {
 pub struct DisplayCapture {
     stream: CGDisplayStreamRef,
     queue: DispatchQueue,
+    // Whether the stream is started: it is created stopped and runs only
+    // while the desktop stream has viewers.
+    running: bool,
     // The block must outlive the stream: it fires on `queue` until
     // `CGDisplayStreamStop` returns.
     _handler: RcBlock<dyn Fn(i64, u64, IOSurfaceRef, *mut c_void)>,
@@ -93,13 +96,12 @@ impl std::fmt::Debug for DisplayCapture {
 unsafe impl Send for DisplayCapture {}
 
 impl DisplayCapture {
-    /// Starts capturing `display_id` at `size`, handing each delivered
-    /// frame to `frames`.
+    /// Creates a stopped capture of `display_id` at `size`; once
+    /// [resumed](Self::resume) it hands each delivered frame to `frames`.
     ///
     /// # Errors
-    /// Returns [`DisplayError`] when the stream cannot be created or
-    /// started.
-    pub fn start(
+    /// Returns [`DisplayError`] when the stream cannot be created.
+    pub fn new(
         display_id: u32,
         size: (u32, u32),
         frames: FrameSender,
@@ -149,23 +151,46 @@ impl DisplayCapture {
             if stream.is_null() {
                 return Err(DisplayError("CGDisplayStream refused the display".into()));
             }
-            if CGDisplayStreamStart(stream) != 0 {
-                CFRelease(stream);
-                return Err(DisplayError("CGDisplayStream failed to start".into()));
-            }
             Ok(Self {
                 stream,
                 queue,
+                running: false,
                 _handler: handler,
             })
+        }
+    }
+
+    /// Starts delivering frames; the first frame follows at once.
+    ///
+    /// # Errors
+    /// Returns [`DisplayError`] when the stream cannot be started.
+    pub fn resume(&mut self) -> Result<(), DisplayError> {
+        if self.running {
+            return Ok(());
+        }
+        // SAFETY: `stream` is the live stream this capture created.
+        if unsafe { CGDisplayStreamStart(self.stream) } != 0 {
+            return Err(DisplayError("CGDisplayStream failed to start".into()));
+        }
+        self.running = true;
+        Ok(())
+    }
+
+    /// Stops delivering frames; the display is no longer captured until
+    /// [`Self::resume`].
+    pub fn pause(&mut self) {
+        if self.running {
+            // SAFETY: `stream` is the live stream this capture created.
+            unsafe { CGDisplayStreamStop(self.stream) };
+            self.running = false;
         }
     }
 }
 
 impl Drop for DisplayCapture {
     fn drop(&mut self) {
+        self.pause();
         unsafe {
-            CGDisplayStreamStop(self.stream);
             CFRelease(self.stream);
             CFRelease(self.queue);
         }

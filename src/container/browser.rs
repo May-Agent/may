@@ -18,8 +18,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::video::{
-    EncodedSample, EncoderControl, FRAME_QUEUE_CAPACITY, RawFrame, StreamFormat, VideoCodec,
-    encode_loop, encoder_control,
+    EncodedSample, EncoderControl, FRAME_QUEUE_CAPACITY, GateChange, RawFrame, SourceGate,
+    StreamFormat, VideoCodec, encode_loop, encoder_control,
 };
 use arc_swap::ArcSwapOption;
 use base64::Engine;
@@ -34,8 +34,9 @@ use chromiumoxide::cdp::browser_protocol::input::{
     MouseButton,
 };
 use chromiumoxide::cdp::browser_protocol::page::{
-    AddScriptToEvaluateOnNewDocumentParams, CaptureScreenshotFormat, EventScreencastFrame,
-    ScreencastFrameAckParams, StartScreencastFormat, StartScreencastParams,
+    AddScriptToEvaluateOnNewDocumentParams, CaptureScreenshotFormat, CaptureScreenshotParams,
+    EventScreencastFrame, ScreencastFrameAckParams, StartScreencastFormat, StartScreencastParams,
+    StopScreencastParams, Viewport,
 };
 use chromiumoxide::cdp::browser_protocol::target::{TargetId, TargetInfo};
 use chromiumoxide::error::CdpError;
@@ -340,6 +341,11 @@ struct BrowserSession {
     handler: tokio::task::JoinHandle<()>,
     cdp_reader: tokio::task::JoinHandle<()>,
     sample_writer: tokio::task::JoinHandle<()>,
+    /// Whether the CDP screencast runs: only while a viewer is attached.
+    screencast: SourceGate,
+    /// Feeds the encoder beside the screencast reader, for the snapshot a
+    /// joining viewer gets.
+    frames: mpsc::Sender<RawFrame>,
 }
 
 enum BrowserSessionBacking {
@@ -598,7 +604,93 @@ impl BrowserRuntime {
         });
     }
 
-    fn drop_peer(&mut self, peer_id: &str) {
+    /// Brings the CDP screencast in line with the peers map: running while at
+    /// least one viewer is attached, stopped otherwise so nothing is captured,
+    /// decoded or encoded for nobody.
+    async fn sync_screencast(&mut self, config: &MayBrowserConfig) -> Result<(), BrowserError> {
+        let viewers = self.peers.len();
+        let Some(session) = self.session.as_mut() else {
+            return Ok(());
+        };
+        let Some(change) = session.screencast.required(viewers) else {
+            return Ok(());
+        };
+        match change {
+            GateChange::Start => {
+                let params = StartScreencastParams::builder()
+                    .format(StartScreencastFormat::Jpeg)
+                    .quality(i64::from(config.screencast_jpeg_quality))
+                    .max_width(i64::from(config.screencast_max_width))
+                    .max_height(i64::from(config.screencast_max_height))
+                    .every_nth_frame(i64::from(config.every_nth_frame.max(1)))
+                    .build();
+                session
+                    .page
+                    .execute(params)
+                    .await
+                    .map_err(|error| BrowserError::browser_operation("start screencast", error))?;
+            }
+            GateChange::Stop => {
+                session
+                    .page
+                    .execute(StopScreencastParams::default())
+                    .await
+                    .map_err(|error| BrowserError::browser_operation("stop screencast", error))?;
+            }
+        }
+        session.screencast.applied(change);
+        tracing::debug!(?change, viewers, "browser screencast gate");
+        Ok(())
+    }
+
+    /// Pushes one fresh frame of the page to the encoder so a joining viewer
+    /// gets a picture at once: the screencast emits only on damage, and a
+    /// still page would leave the pending keyframe request unanswered.
+    async fn push_snapshot(&self, config: &MayBrowserConfig) -> Result<(), BrowserError> {
+        let session = self.session.as_ref().ok_or(BrowserError::NotRunning)?;
+        let (width, height, dpr): (f64, f64, f64) = session
+            .page
+            .evaluate("[innerWidth, innerHeight, devicePixelRatio]")
+            .await
+            .map_err(|error| BrowserError::browser_operation("measure the viewport", error))?
+            .into_value()
+            .map_err(|error| BrowserError::browser_operation("read the viewport", error))?;
+        let clip = Viewport {
+            x: 0.0,
+            y: 0.0,
+            width,
+            height,
+            scale: snapshot_scale(
+                (width, height),
+                dpr,
+                (config.screencast_max_width, config.screencast_max_height),
+            ),
+        };
+        let params = CaptureScreenshotParams::builder()
+            .format(CaptureScreenshotFormat::Jpeg)
+            .quality(i64::from(config.screencast_jpeg_quality))
+            .clip(clip)
+            .build();
+        let shot = session
+            .page
+            .execute(params)
+            .await
+            .map_err(|error| BrowserError::browser_operation("capture a snapshot", error))?;
+        let data: &str = shot.result.data.as_ref();
+        let jpeg = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .map_err(|error| {
+                BrowserError::browser_operation("decode a snapshot", std::io::Error::other(error))
+            })?;
+        // Like the screencast reader: a full queue already holds frames the
+        // pending keyframe request applies to, and the actor never blocks.
+        match session.frames.try_send(RawFrame::Jpeg(jpeg)) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => Ok(()),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(BrowserError::NotRunning),
+        }
+    }
+
+    async fn drop_peer(&mut self, peer_id: &str, config: &MayBrowserConfig) {
         if let Some(peer) = self.peers.remove(peer_id) {
             tracing::debug!(peer_id, "browser peer went away");
             // Closing stops the RTP sender, which ends the peer's RTCP follower
@@ -612,6 +704,9 @@ impl BrowserRuntime {
                 .emit(BrowserLifecycleEvent::PeerDisconnected {
                     count: self.peers.len(),
                 });
+            if let Err(error) = self.sync_screencast(config).await {
+                tracing::warn!(%error, "stopping the screencast failed");
+            }
         }
     }
 
@@ -713,7 +808,7 @@ impl BrowserManager {
                     } => {
                         let _ = reply.send(
                             runtime
-                                .handle_offer(session_id, offer_sdp, actor_tx.clone())
+                                .handle_offer(session_id, offer_sdp, actor_tx.clone(), &config)
                                 .await,
                         );
                     }
@@ -725,7 +820,7 @@ impl BrowserManager {
                         let _ = reply.send(runtime.read_page(url.as_str(), options).await);
                     }
                     BrowserCommand::DropPeer { peer_id } => {
-                        runtime.drop_peer(peer_id.as_str());
+                        runtime.drop_peer(peer_id.as_str(), &config).await;
                     }
                     BrowserCommand::SetTakeover { session_id } => {
                         runtime.set_takeover(session_id);
@@ -1238,42 +1333,10 @@ impl BrowserRuntime {
                 .map_err(|error| BrowserError::browser_operation("inject stealth shim", error))?;
         }
 
-        let max_width = i64::from(config.screencast_max_width);
-        let max_height = i64::from(config.screencast_max_height);
-        let every_nth_frame = i64::from(config.every_nth_frame.max(1));
-        let start_screencast = page.execute(
-            StartScreencastParams::builder()
-                .format(StartScreencastFormat::Jpeg)
-                .quality(i64::from(config.screencast_jpeg_quality))
-                .max_width(max_width)
-                .max_height(max_height)
-                .every_nth_frame(every_nth_frame)
-                .build(),
-        );
-        match &backing {
-            BrowserSessionBacking::Managed { owns_process } => {
-                let timeout = managed_browser_start_operation_timeout();
-                tokio::time::timeout(timeout, start_screencast)
-                    .await
-                    .map_err(|_| {
-                        managed_browser_start_timeout_error(
-                            &mut browser,
-                            *owns_process,
-                            "start screencast",
-                            timeout,
-                        )
-                    })?
-                    .map_err(|error| BrowserError::browser_operation("start screencast", error))?;
-            }
-            BrowserSessionBacking::RemoteCdp => {
-                start_screencast
-                    .await
-                    .map_err(|error| BrowserError::browser_operation("start screencast", error))?;
-            }
-        }
-
+        // The screencast starts with the first viewer (`sync_screencast`): a
+        // browser nobody watches captures and encodes nothing.
         let (control, requests) = encoder_control();
-        let (cdp_reader, sample_writer) =
+        let (cdp_reader, sample_writer, frames) =
             start_encoding_pipeline(page.clone(), self.video_track.clone(), self.codec, requests)
                 .await?;
         self.encoder_control = Some(control);
@@ -1285,6 +1348,8 @@ impl BrowserRuntime {
             handler: handler_task,
             cdp_reader,
             sample_writer,
+            screencast: SourceGate::stopped(),
+            frames,
         });
 
         tracing::info!(backend = ?config.backend, "Browser started with WebRTC streaming");
@@ -1327,6 +1392,7 @@ impl BrowserRuntime {
         session_id: String,
         offer_sdp: String,
         peer_events: mpsc::UnboundedSender<BrowserCommand>,
+        config: &MayBrowserConfig,
     ) -> Result<String, BrowserError> {
         let page = self
             .session
@@ -1335,7 +1401,7 @@ impl BrowserRuntime {
             .page
             .clone();
 
-        let config = RTCConfiguration {
+        let rtc_config = RTCConfiguration {
             ice_servers: vec![RTCIceServer {
                 urls: vec!["stun:stun.l.google.com:19302".to_owned()],
                 ..Default::default()
@@ -1345,7 +1411,7 @@ impl BrowserRuntime {
 
         let peer_connection = Arc::new(
             self.webrtc_api
-                .new_peer_connection(config)
+                .new_peer_connection(rtc_config)
                 .await
                 .map_err(|error| {
                     BrowserError::web_rtc_operation("create peer connection", error)
@@ -1423,7 +1489,16 @@ impl BrowserRuntime {
             )
         })?;
 
-        self.peers.insert(peer_id, peer_connection);
+        // The keyframe requested above is read at the first frame of the
+        // screencast this starts, so the viewer's first frame is an IDR.
+        self.peers.insert(peer_id.clone(), peer_connection);
+        if let Err(error) = self.sync_screencast(config).await {
+            self.drop_peer(&peer_id, config).await;
+            return Err(error);
+        }
+        if let Err(error) = self.push_snapshot(config).await {
+            tracing::warn!(%error, "snapshot for the joining viewer failed");
+        }
         self.lifecycle.emit(BrowserLifecycleEvent::PeerConnected {
             count: self.peers.len(),
         });
@@ -2069,12 +2144,26 @@ async fn capture_page_screenshot(
     }))
 }
 
+/// The clip scale that keeps a snapshot of a `viewport` (CSS pixels) at
+/// `dpr` within `max` pixels, as the screencast does; never above 1.
+fn snapshot_scale(viewport: (f64, f64), dpr: f64, max: (u32, u32)) -> f64 {
+    let fit = |pixels: f64, limit: u32| f64::from(limit) / (pixels * dpr);
+    fit(viewport.0, max.0).min(fit(viewport.1, max.1)).min(1.0)
+}
+
 async fn start_encoding_pipeline(
     page: Arc<Page>,
     video_track: Arc<TrackLocalStaticSample>,
     codec: VideoCodec,
     requests: crate::video::EncoderRequests,
-) -> Result<(tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>), BrowserError> {
+) -> Result<
+    (
+        tokio::task::JoinHandle<()>,
+        tokio::task::JoinHandle<()>,
+        mpsc::Sender<RawFrame>,
+    ),
+    BrowserError,
+> {
     let mut event_stream = page
         .event_listener::<EventScreencastFrame>()
         .await
@@ -2089,6 +2178,7 @@ async fn start_encoding_pipeline(
     let (jpeg_tx, jpeg_rx) = tokio::sync::mpsc::channel::<RawFrame>(FRAME_QUEUE_CAPACITY);
     let (sample_tx, mut sample_rx) = tokio::sync::mpsc::channel::<EncodedSample>(16);
 
+    let snapshot_tx = jpeg_tx.clone();
     let page_ack = page.clone();
     let cdp_reader = tokio::spawn(async move {
         while let Some(event) = event_stream.next().await {
@@ -2144,7 +2234,7 @@ async fn start_encoding_pipeline(
         tracing::info!("WebRTC sample writer stopped");
     });
 
-    Ok((cdp_reader, sample_writer))
+    Ok((cdp_reader, sample_writer, snapshot_tx))
 }
 
 // ── DataChannel input handler ──────────────────────────────────────────────────
@@ -2410,7 +2500,22 @@ mod tests {
 
     use arc_swap::ArcSwapOption;
 
-    use super::takeover_allows_input;
+    use super::{snapshot_scale, takeover_allows_input};
+
+    #[test]
+    fn snapshot_within_the_limit_is_not_scaled() {
+        assert!((snapshot_scale((1280.0, 720.0), 1.0, (1920, 1080)) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn snapshot_shrinks_to_the_tighter_limit_counting_the_pixel_ratio() {
+        // 1920x1080 CSS at 2x is 3840x2160 device pixels: half fits 1920x1080.
+        let scale = snapshot_scale((1920.0, 1080.0), 2.0, (1920, 1080));
+        assert!((scale - 0.5).abs() < 1e-9);
+        // Width is the tighter side here.
+        let scale = snapshot_scale((4000.0, 1000.0), 1.0, (2000, 2000));
+        assert!((scale - 0.5).abs() < 1e-9);
+    }
 
     #[test]
     fn takeover_gate_blocks_input_when_no_owner() {
