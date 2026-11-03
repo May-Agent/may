@@ -1,10 +1,10 @@
 //! A session desktop's video path: the virtual display's captured
-//! frames through the shared H.264 encoder onto one WebRTC video track,
+//! surfaces through the shared encoder onto one WebRTC video track,
 //! with a peer per watching client.
 //!
 //! The runtime mirrors the browser's (`container::browser`) — one
-//! `TrackLocalStaticSample` feeds every peer, RTCP PLI/FIR flips a
-//! shared keyframe request, and a disconnecting peer is dropped — minus
+//! `TrackLocalStaticSample` feeds every peer, RTCP PLI/FIR and bandwidth
+//! estimates reach the encoder, and a disconnecting peer is dropped — minus
 //! everything a browser needs and a desktop does not (CDP, DOM reads,
 //! input data channel).
 
@@ -14,19 +14,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::sync::Mutex;
-use webrtc::api::APIBuilder;
-use webrtc::api::interceptor_registry::register_default_interceptors;
-use webrtc::api::media_engine::{MIME_TYPE_H264, MediaEngine};
 use webrtc::data_channel::RTCDataChannel;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
 use webrtc::ice_transport::ice_server::RTCIceServer;
-use webrtc::interceptor::registry::Registry;
 use webrtc::media::Sample;
 use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::peer_connection::configuration::RTCConfiguration;
 use webrtc::peer_connection::peer_connection_state::RTCPeerConnectionState;
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
-use webrtc::rtp_transceiver::rtp_codec::RTCRtpCodecCapability;
 use webrtc::track::track_local::TrackLocal;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 
@@ -34,11 +29,18 @@ use super::capture::{CapturedFrame, DisplayCapture};
 use super::input::{self, InputState};
 use super::proto::InputMessage;
 use super::{DisplayError, PlatformDisplay, SessionDisplay};
-use crate::video::{BgraFrame, EncodedSample, FRAME_QUEUE_CAPACITY, RawFrame, encode_loop};
+use crate::video::{
+    EncodedSample, EncoderControl, FRAME_QUEUE_CAPACITY, RawFrame, StreamFormat, VideoCodec,
+    encode_loop, encoder_control,
+};
 
 /// Encoder bitrate for a desktop stream. The display is 1920×1200@2x —
 /// one step above the browser's viewport default.
 const DESKTOP_BITRATE_KBPS: u32 = 8_000;
+
+/// Frames queued for the encoder. Every queued frame keeps its capture
+/// surface in use, so the queue stays well inside the capture stream's depth.
+const DESKTOP_FRAME_QUEUE: usize = 4;
 
 /// One session's desktop stream — the holder a route asks for.
 ///
@@ -71,7 +73,7 @@ struct StreamRuntime {
     video_track: Arc<TrackLocalStaticSample>,
     webrtc_api: webrtc::api::API,
     peers: HashMap<String, Arc<RTCPeerConnection>>,
-    keyframe_request: Arc<AtomicBool>,
+    control: EncoderControl,
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
@@ -131,32 +133,19 @@ impl SessionStream {
             return Ok(());
         }
 
-        let mut media_engine = MediaEngine::default();
-        media_engine
-            .register_default_codecs()
-            .map_err(|e| DisplayError(format!("register default codecs: {e}")))?;
-        let registry = register_default_interceptors(Registry::new(), &mut media_engine)
-            .map_err(|e| DisplayError(format!("register default interceptors: {e}")))?;
-        let webrtc_api = APIBuilder::new()
-            .with_media_engine(media_engine)
-            .with_interceptor_registry(registry)
-            .build();
+        let (width, height) = display.size();
+        let codec = VideoCodec::select(StreamFormat {
+            max_width: width,
+            max_height: height,
+            initial_bitrate_kbps: DESKTOP_BITRATE_KBPS,
+        })
+        .map_err(|e| DisplayError(format!("select video codec: {e}")))?;
+        let (webrtc_api, video_track) = codec
+            .webrtc("video", "session-desktop")
+            .map_err(|e| DisplayError(format!("build webrtc stack: {e}")))?;
 
-        let video_track = Arc::new(TrackLocalStaticSample::new(
-            RTCRtpCodecCapability {
-                mime_type: MIME_TYPE_H264.to_owned(),
-                clock_rate: 90_000,
-                sdp_fmtp_line:
-                    "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"
-                        .to_owned(),
-                ..Default::default()
-            },
-            "video".to_owned(),
-            "session-desktop".to_owned(),
-        ));
-
-        let keyframe_request = Arc::new(AtomicBool::new(false));
-        let (frame_tx, frame_rx) = tokio::sync::mpsc::channel(FRAME_QUEUE_CAPACITY);
+        let (control, requests) = encoder_control();
+        let (frame_tx, frame_rx) = tokio::sync::mpsc::channel(DESKTOP_FRAME_QUEUE);
         let (sample_tx, mut sample_rx) = tokio::sync::mpsc::channel::<EncodedSample>(16);
         let (captured_tx, mut captured_rx) =
             tokio::sync::mpsc::channel::<CapturedFrame>(FRAME_QUEUE_CAPACITY);
@@ -171,15 +160,7 @@ impl SessionStream {
         // nothing the next one does not carry.
         let bridge = tokio::spawn(async move {
             while let Some(frame) = captured_rx.recv().await {
-                if frame.bgra.is_empty() {
-                    continue;
-                }
-                let raw = RawFrame::Bgra(BgraFrame {
-                    data: frame.bgra,
-                    stride: frame.bytes_per_row,
-                    width: frame.width,
-                    height: frame.height,
-                });
+                let raw = RawFrame::Surface(frame.surface);
                 match frame_tx.try_send(raw) {
                     Ok(()) => {}
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
@@ -191,9 +172,8 @@ impl SessionStream {
             tracing::info!("computer capture bridge stopped");
         });
 
-        let encode_keyframe = keyframe_request.clone();
         let encoder = tokio::task::spawn_blocking(move || {
-            encode_loop(frame_rx, &sample_tx, DESKTOP_BITRATE_KBPS, &encode_keyframe);
+            encode_loop(frame_rx, &sample_tx, codec, &requests);
         });
 
         let writer_track = video_track.clone();
@@ -221,7 +201,7 @@ impl SessionStream {
             video_track,
             webrtc_api,
             peers: HashMap::new(),
-            keyframe_request,
+            control,
             tasks: vec![bridge, encoder, writer],
         });
         Ok(())
@@ -277,26 +257,15 @@ impl SessionStream {
             .await
             .map_err(|e| DisplayError(format!("add video track: {e}")))?;
 
-        // Viewer RTCP → encoder hints, as in the browser stream.
-        let keyframe_for_rtcp = runtime.keyframe_request.clone();
-        tokio::spawn(async move {
-            while let Ok((packets, _)) = rtp_sender.read_rtcp().await {
-                for packet in packets {
-                    let any = packet.as_any();
-                    if any
-                        .downcast_ref::<webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication>()
-                        .is_some()
-                        || any
-                            .downcast_ref::<webrtc::rtcp::payload_feedbacks::full_intra_request::FullIntraRequest>()
-                            .is_some()
-                    {
-                        keyframe_for_rtcp.store(true, Ordering::Release);
-                    }
-                }
-            }
-        });
-
+        // Viewer RTCP → encoder: keyframe requests and bandwidth estimates.
         let peer_id = crate::id::new();
+        tokio::spawn(
+            runtime
+                .control
+                .clone()
+                .follow_peer(rtp_sender, peer_id.clone()),
+        );
+
         let state_for_peer = self.runtime.clone();
         let gone_id = peer_id.clone();
         peer.on_peer_connection_state_change(Box::new(move |state| {
@@ -336,7 +305,7 @@ impl SessionStream {
             .await
             .map_err(|e| DisplayError(format!("create answer: {e}")))?;
         let mut gather = peer.gathering_complete_promise().await;
-        runtime.keyframe_request.store(true, Ordering::Release);
+        runtime.control.request_keyframe();
         peer.set_local_description(answer)
             .await
             .map_err(|e| DisplayError(format!("set local description: {e}")))?;
