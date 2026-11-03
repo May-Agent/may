@@ -33,8 +33,11 @@ type CGDisplayStreamRef = *mut c_void;
 type IOSurfaceRef = *mut c_void;
 type DispatchQueue = *mut c_void;
 
-const K_DISPLAY_STREAM_BLANK_SCREEN: i64 = 0;
-const K_DISPLAY_STREAM_FRAME_STATUS_COMPLETE: i64 = 1;
+/// `CGDisplayStreamFrameStatus`, an `int32_t` enum in `CGDisplayStream.h`.
+type CGDisplayStreamFrameStatus = i32;
+/// `kCGDisplayStreamFrameStatusFrameComplete`: the Window Server generated a
+/// new frame, and only then does the handler receive a surface to encode.
+const K_CG_DISPLAY_STREAM_FRAME_STATUS_FRAME_COMPLETE: CGDisplayStreamFrameStatus = 0;
 const K_CG_BASE_BYTE_ORDER_32_LITTLE: u32 = 0x4247_5241; // 'BGRA'
 // Surfaces the stream may have out at once. Each captured frame keeps its
 // surface in use until the encoder drops it, and the stream stops delivering
@@ -81,7 +84,7 @@ pub struct DisplayCapture {
     running: bool,
     // The block must outlive the stream: it fires on `queue` until
     // `CGDisplayStreamStop` returns.
-    _handler: RcBlock<dyn Fn(i64, u64, IOSurfaceRef, *mut c_void)>,
+    _handler: RcBlock<dyn Fn(CGDisplayStreamFrameStatus, u64, IOSurfaceRef, *mut c_void)>,
 }
 
 impl std::fmt::Debug for DisplayCapture {
@@ -108,8 +111,11 @@ impl DisplayCapture {
     ) -> Result<Self, DisplayError> {
         let (width, height) = (size.0 as usize, size.1 as usize);
         let handler = RcBlock::new(
-            move |status: i64, _display_time: u64, surface: IOSurfaceRef, _update: *mut c_void| {
-                if status != K_DISPLAY_STREAM_FRAME_STATUS_COMPLETE || surface.is_null() {
+            move |status: CGDisplayStreamFrameStatus,
+                  _display_time: u64,
+                  surface: IOSurfaceRef,
+                  _update: *mut c_void| {
+                if status != K_CG_DISPLAY_STREAM_FRAME_STATUS_FRAME_COMPLETE || surface.is_null() {
                     return;
                 }
                 // SAFETY: the stream hands the handler a live `IOSurfaceRef`.
@@ -196,8 +202,3 @@ impl Drop for DisplayCapture {
         }
     }
 }
-
-// Referenced so the constant documents itself rather than the magic
-// `1` at the call site being the only record.
-#[allow(dead_code)]
-const _: i64 = K_DISPLAY_STREAM_BLANK_SCREEN;
