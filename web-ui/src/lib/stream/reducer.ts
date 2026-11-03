@@ -1,6 +1,7 @@
 import type {
   ApiErrorCode,
   ChatStreamEvent,
+  HoldReason,
   ToolSummary,
   ToolVariant,
   SseTodoItem,
@@ -61,7 +62,7 @@ export interface TurnState {
   /** Latest decode-rate sample reported by the backend, in tokens/second. */
   tokensPerSecond: number | null;
   /** Set while the turn waits out a quota reset or a provider retry. */
-  hold: { until: string; message: string; retry?: number } | null;
+  hold: ({ message: string } & HoldReason) | null;
   lastSeq: number;
 }
 
@@ -278,12 +279,10 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
     case 'speed':
       return { ...state, tokensPerSecond: event.tokensPerSecond, lastSeq: event.seq };
 
-    case 'hold':
-      return {
-        ...state,
-        hold: { until: event.until, message: event.message, retry: event.retry },
-        lastSeq: event.seq,
-      };
+    case 'hold': {
+      const { kind: _kind, seq: _seq, turnId: _turnId, ...hold } = event;
+      return { ...state, hold, lastSeq: event.seq };
+    }
 
     case 'retract':
       return {

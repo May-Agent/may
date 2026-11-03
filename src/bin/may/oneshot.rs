@@ -13,6 +13,7 @@ use aither_agent::{AgentEvent, TimedEvent};
 use jiff::Timestamp;
 
 use may_agent::agent::{AgentWorker, TuiEvent};
+use may_agent::client::HoldReason;
 use may_agent::session::RunOutcome;
 use may_agent::tui::runtime::{AssistantReply, ResponseCommit, RuntimeDeps, TitleGenContext};
 use may_agent::tui::{App, PendingMessage};
@@ -455,8 +456,7 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                 | TuiEvent::ContextDumpSaved { .. },
             ) => {}
             Event::Agent(TuiEvent::Hold {
-                until,
-                retry: Some(retry),
+                reason: HoldReason::Retry { until, retry },
                 ..
             }) => {
                 writeln!(
@@ -467,7 +467,19 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                         .strftime("%H:%M:%S")
                 )?;
             }
-            Event::Agent(TuiEvent::Hold { until, .. }) => {
+            Event::Agent(TuiEvent::Hold {
+                reason: HoldReason::Network,
+                ..
+            }) => {
+                writeln!(
+                    output.stderr()?,
+                    "[waiting] no network — continuing automatically once it is back"
+                )?;
+            }
+            Event::Agent(TuiEvent::Hold {
+                reason: HoldReason::Quota { until },
+                ..
+            }) => {
                 writeln!(
                     output.stderr()?,
                     "[waiting] usage limit reached — continuing automatically at {}",

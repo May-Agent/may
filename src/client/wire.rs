@@ -400,6 +400,28 @@ pub struct RecapFrame {
     pub next_action: Option<String>,
 }
 
+/// What a parked run waits for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, skyzen::ToSchema)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum HoldReason {
+    /// An upstream quota reset.
+    Quota {
+        /// When the run continues.
+        #[schema(value_type = String)]
+        until: jiff::Timestamp,
+    },
+    /// The backoff before a retry of a transient provider failure.
+    Retry {
+        /// When the run continues.
+        #[schema(value_type = String)]
+        until: jiff::Timestamp,
+        /// Which retry on the provider this is.
+        retry: u32,
+    },
+    /// The network is gone; the run continues once it is back.
+    Network,
+}
+
 /// What a `session_agent` frame reports.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -424,17 +446,13 @@ pub enum SessionAgentBody {
         /// Seconds the phase lasted. Sub-second phases keep the fraction.
         seconds: f64,
     },
-    /// The run is parked: for an upstream quota reset, or before a retry of
-    /// a transient provider failure.
+    /// The run is parked.
     Hold {
-        /// When the run continues.
-        until: jiff::Timestamp,
+        /// What the run waits for.
+        #[serde(flatten)]
+        reason: HoldReason,
         /// The upstream message behind the wait.
         message: String,
-        /// Which retry of a transient failure the run waits for; absent for
-        /// a quota reset.
-        #[serde(default)]
-        retry: Option<u32>,
     },
     /// The text the run streamed so far is discarded: its attempt failed and
     /// the prompt is resubmitted.
