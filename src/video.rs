@@ -405,7 +405,11 @@ pub fn encode_loop(
     let mut pipeline = FramePipeline::new(codec);
     let mut target = BitrateTarget::new(codec.initial_bitrate());
     let mut keyframe = false;
-    let mut last_sample = Instant::now();
+    // Frames are timed by their arrival on the stream's timeline; a sample
+    // lasts until the next packet's presentation time, which software AV1
+    // releases frames after the frame it encodes.
+    let start = Instant::now();
+    let mut last_presentation = Duration::ZERO;
 
     // `blocking_recv` is the documented bridge between tokio mpsc and
     // a `spawn_blocking` task. It blocks the current OS thread (which
@@ -432,7 +436,7 @@ pub fn encode_loop(
         }
 
         let wanted_keyframe = std::mem::take(&mut keyframe);
-        let packets = match pipeline.encode(frame, wanted_keyframe) {
+        let packets = match pipeline.encode(frame, start.elapsed(), wanted_keyframe) {
             Ok(packets) => packets,
             Err(error @ (FrameError::StreamTooLarge { .. } | FrameError::Dimension(_))) => {
                 tracing::error!(%error, "video stream cannot be encoded");
@@ -446,9 +450,8 @@ pub fn encode_loop(
         };
 
         for packet in packets {
-            let now = Instant::now();
-            let duration = now.duration_since(last_sample);
-            last_sample = now;
+            let duration = packet.presentation_time.saturating_sub(last_presentation);
+            last_presentation = packet.presentation_time;
             if sample_tx
                 .blocking_send(EncodedSample {
                     data: packet.data,

@@ -57,14 +57,33 @@ fn is_idr(packet: &EncodedPacket) -> bool {
     packet.keyframe && nal_types(&packet.data).contains(&5)
 }
 
-fn timed(
-    pipeline: &mut FramePipeline,
-    frame: RawFrame,
-    keyframe: bool,
-) -> (Vec<EncodedPacket>, Duration) {
-    let started = Instant::now();
-    let packets = pipeline.encode(frame, keyframe).expect("encode");
-    (packets, started.elapsed())
+/// A pipeline fed one frame per 30 fps tick.
+struct Feed {
+    pipeline: FramePipeline,
+    frames: u32,
+}
+
+impl Feed {
+    const FRAME: Duration = Duration::from_nanos(1_000_000_000 / 30);
+
+    fn new(codec: VideoCodec) -> Self {
+        Self {
+            pipeline: FramePipeline::new(codec),
+            frames: 0,
+        }
+    }
+
+    /// Encodes the next frame and times the call.
+    fn timed(&mut self, frame: RawFrame, keyframe: bool) -> (Vec<EncodedPacket>, Duration) {
+        let presentation_time = Self::FRAME * self.frames;
+        self.frames += 1;
+        let started = Instant::now();
+        let packets = self
+            .pipeline
+            .encode(frame, presentation_time, keyframe)
+            .expect("encode");
+        (packets, started.elapsed())
+    }
 }
 
 fn report(label: &str, times: &[Duration]) {
@@ -122,10 +141,10 @@ fn jpegs_become_h264_idrs_on_request_and_size_change() {
         matches!(codec.codec, EncoderCodec::H264(_)),
         "this test needs a hardware H.264 encoder"
     );
-    let mut pipeline = FramePipeline::new(codec);
+    let mut feed = Feed::new(codec);
     let mut times = Vec::new();
 
-    let (packets, elapsed) = timed(&mut pipeline, jpeg(640, 360, 0), false);
+    let (packets, elapsed) = feed.timed(jpeg(640, 360, 0), false);
     times.push(elapsed);
     assert_eq!(packets.len(), 1);
     assert!(packets[0].data.starts_with(&[0, 0, 0, 1]), "Annex B");
@@ -137,31 +156,31 @@ fn jpegs_become_h264_idrs_on_request_and_size_change() {
     );
 
     for step in 1..30 {
-        let (packets, elapsed) = timed(&mut pipeline, jpeg(640, 360, step), false);
+        let (packets, elapsed) = feed.timed(jpeg(640, 360, step), false);
         times.push(elapsed);
         assert_eq!(packets.len(), 1);
         assert!(!packets[0].keyframe, "frame {step} is a delta frame");
     }
 
-    let (packets, elapsed) = timed(&mut pipeline, jpeg(640, 360, 30), true);
+    let (packets, elapsed) = feed.timed(jpeg(640, 360, 30), true);
     times.push(elapsed);
     assert!(is_idr(&packets[0]), "a requested keyframe is an IDR");
 
     // A viewport resize: new even size, new encoder, IDR without a request.
-    let (packets, elapsed) = timed(&mut pipeline, jpeg(480, 270, 31), false);
+    let (packets, elapsed) = feed.timed(jpeg(480, 270, 31), false);
     times.push(elapsed);
     assert!(is_idr(&packets[0]), "a size change starts with an IDR");
-    let (packets, _) = timed(&mut pipeline, jpeg(480, 270, 32), false);
+    let (packets, _) = feed.timed(jpeg(480, 270, 32), false);
     assert!(!packets[0].keyframe);
 
     // An odd size is cropped to even and encoded through NV12.
-    let (packets, elapsed) = timed(&mut pipeline, jpeg(521, 301, 33), false);
+    let (packets, elapsed) = feed.timed(jpeg(521, 301, 33), false);
     times.push(elapsed);
     assert!(
         is_idr(&packets[0]),
         "the odd frame's even crop is a new size"
     );
-    let (packets, _) = timed(&mut pipeline, jpeg(521, 301, 34), false);
+    let (packets, _) = feed.timed(jpeg(521, 301, 34), false);
     assert!(!packets[0].keyframe);
 
     report("jpeg -> hardware H.264", &times);
@@ -231,29 +250,29 @@ mod surfaces {
         let codec = VideoCodec::select(format(1280, 720)).expect("select");
         assert!(matches!(codec.codec, EncoderCodec::H264(_)));
         assert!(codec.takes_surfaces());
-        let mut pipeline = FramePipeline::new(codec);
+        let mut feed = Feed::new(codec);
         let mut times = Vec::new();
 
-        let (packets, elapsed) = timed(&mut pipeline, surface(1280, 720, 0), false);
+        let (packets, elapsed) = feed.timed(surface(1280, 720, 0), false);
         times.push(elapsed);
         assert!(is_idr(&packets[0]));
         assert!(packets[0].data.starts_with(&[0, 0, 0, 1]));
 
         for step in 1..30 {
-            let (packets, elapsed) = timed(&mut pipeline, surface(1280, 720, step), false);
+            let (packets, elapsed) = feed.timed(surface(1280, 720, step), false);
             times.push(elapsed);
             assert!(!packets[0].keyframe);
         }
-        let (packets, elapsed) = timed(&mut pipeline, surface(1280, 720, 30), true);
+        let (packets, elapsed) = feed.timed(surface(1280, 720, 30), true);
         times.push(elapsed);
         assert!(is_idr(&packets[0]));
 
-        let (packets, elapsed) = timed(&mut pipeline, surface(1024, 576, 31), false);
+        let (packets, elapsed) = feed.timed(surface(1024, 576, 31), false);
         times.push(elapsed);
         assert!(is_idr(&packets[0]), "a size change starts with an IDR");
 
         // An odd-sized surface takes the crop path.
-        let (packets, elapsed) = timed(&mut pipeline, surface(1023, 575, 32), false);
+        let (packets, elapsed) = feed.timed(surface(1023, 575, 32), false);
         times.push(elapsed);
         assert!(is_idr(&packets[0]));
 
@@ -262,11 +281,11 @@ mod surfaces {
 
     #[test]
     fn surfaces_reach_av1_through_nv12() {
-        let mut pipeline = FramePipeline::new(av1(format(640, 360)));
+        let mut feed = Feed::new(av1(format(640, 360)));
         let mut keyframes = 0;
         let mut packets_seen = 0;
         for step in 0..24 {
-            let (packets, _) = timed(&mut pipeline, surface(640, 360, step), step == 12);
+            let (packets, _) = feed.timed(surface(640, 360, step), step == 12);
             packets_seen += packets.len();
             keyframes += packets.iter().filter(|p| p.keyframe).count();
         }
@@ -280,12 +299,12 @@ mod surfaces {
 
 #[test]
 fn jpegs_reach_av1_through_nv12() {
-    let mut pipeline = FramePipeline::new(av1(format(640, 360)));
+    let mut feed = Feed::new(av1(format(640, 360)));
     let mut times = Vec::new();
     let mut keyframes = 0;
     let mut packets_seen = 0;
     for step in 0..24 {
-        let (packets, elapsed) = timed(&mut pipeline, jpeg(640, 360, step), step == 12);
+        let (packets, elapsed) = feed.timed(jpeg(640, 360, step), step == 12);
         times.push(elapsed);
         packets_seen += packets.len();
         keyframes += packets.iter().filter(|p| p.keyframe).count();
