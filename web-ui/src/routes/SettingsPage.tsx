@@ -16,6 +16,7 @@ import {
   Activity,
   Cloud,
   Network,
+  Video,
 } from 'lucide-react';
 import { ChevronLeft, ChevronRight } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -31,6 +32,7 @@ import { ProvidersSection } from '@/components/settings/ProvidersSection';
 import { McpSection } from '@/components/settings/McpSection';
 import { SkillsSection } from '@/components/settings/SkillsSection';
 import { BrowserSection } from '@/components/settings/BrowserSection';
+import { StreamCodecSection } from '@/components/settings/StreamCodecSection';
 import { NotificationsSection } from '@/components/settings/NotificationsSection';
 import { MemorySection } from '@/components/settings/MemorySection';
 import { TriggersSection } from '@/components/settings/TriggersSection';
@@ -41,6 +43,7 @@ import { RemoteServersSection } from '@/components/settings/RemoteServersSection
 import { CommandPrioritySection } from '@/components/settings/CommandPrioritySection';
 
 type SectionId =
+  | 'stream'
   | 'appearance'
   | 'language'
   | 'profiles'
@@ -99,6 +102,7 @@ const GROUPS: SectionGroup[] = [
     items: [
       { id: 'execution', icon: Cpu, labelKey: 'settings.sections.execution', Component: CommandPrioritySection },
       { id: 'browser', icon: Globe2, labelKey: 'settings.sections.browser', Component: BrowserSection },
+      { id: 'stream', icon: Video, labelKey: 'settings.sections.stream', Component: StreamCodecSection },
       { id: 'notifications', icon: Bell, labelKey: 'settings.sections.notifications', Component: NotificationsSection },
       { id: 'network', icon: Shield, labelKey: 'settings.sections.network', Component: NetworkSection },
       { id: 'logs', icon: Activity, labelKey: 'settings.sections.logs', Component: ActivityLogsSection },

@@ -69,6 +69,7 @@ function makeConfig(): UiFullConfig {
       allowedLogins: [],
     },
     sandbox: { commandPriority: 'low' },
+    stream: { codec: 'auto' },
   };
 }
 
