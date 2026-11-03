@@ -14,6 +14,13 @@ enum Prepared {
 }
 
 impl Prepared {
+    #[cfg_attr(
+        not(target_os = "macos"),
+        expect(
+            clippy::missing_const_for_fn,
+            reason = "only the macOS surface arm calls a non-const accessor"
+        )
+    )]
     fn size(&self) -> (u32, u32) {
         match self {
             #[cfg(target_os = "macos")]

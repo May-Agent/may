@@ -26,6 +26,8 @@ pub struct Nv12 {
 #[derive(Debug, Clone, Copy)]
 pub enum Packed {
     Rgb,
+    /// Display surfaces, which only macOS captures.
+    #[cfg(target_os = "macos")]
     Bgra,
 }
 
@@ -59,6 +61,7 @@ pub fn convert(
     let stride = u32::try_from(stride).expect("a row stride fits u32");
     match layout {
         Packed::Rgb => rgb_to_yuv_nv12(&mut image, pixels, stride, RANGE, MATRIX, MODE)?,
+        #[cfg(target_os = "macos")]
         Packed::Bgra => bgra_to_yuv_nv12(&mut image, pixels, stride, RANGE, MATRIX, MODE)?,
     }
     Ok(Nv12 {
@@ -81,6 +84,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn bgra_honours_the_row_stride() {
         // 4x2 pixels in rows padded to 20 bytes; the padding is poison.
         let mut bgra = vec![0xFFu8; 20 * 2];
