@@ -796,6 +796,20 @@ impl ChatStream {
         }
     }
 
+    /// Drop the text of the attempt being retried: the streaming text block
+    /// at the end of the stream, when there is one.
+    pub fn retract_text(&mut self) {
+        if matches!(
+            self.elements.last(),
+            Some(ChatElement::AssistantText {
+                streaming: true,
+                ..
+            })
+        ) {
+            self.pop_last();
+        }
+    }
+
     /// Mark the current text element as done streaming.
     pub fn end_text(&mut self) {
         if let Some(ChatElement::AssistantText { streaming, .. }) = self.elements.last_mut()
