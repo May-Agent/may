@@ -733,11 +733,18 @@ pub(super) async fn delete_all_sessions(
     state.runtime_service.forget_all_terminal_grants();
     state.tool_environments.evict_all();
     #[cfg(target_os = "macos")]
-    #[cfg(target_os = "macos")]
     {
-        // One helper restart tears down every session desktop at once.
-        if let Err(error) = state.computer.restart() {
-            tracing::warn!(%error, "computer-agent did not stop after session deletion");
+        // One helper restart tears down every session desktop at once; the
+        // wait for it to exit runs off the async thread.
+        let computer = state.computer.clone();
+        match tokio::task::spawn_blocking(move || computer.restart()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "computer-agent did not stop after session deletion");
+            }
+            Err(error) => {
+                tracing::warn!(%error, "computer-agent restart task failed");
+            }
         }
     }
 
