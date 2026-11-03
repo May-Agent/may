@@ -66,6 +66,10 @@ pub static SLASH_COMMANDS: &[(&str, &str)] = &[
         "/secret",
         "Store a secret in the OS keychain (injected into shell env)",
     ),
+    (
+        "/connect",
+        "Use an installed ACP agent as a subagent (or /connect <command> [args])",
+    ),
     ("/mcp", "Manage MCP servers"),
     ("/ssh", "Manage preconfigured SSH servers"),
     ("/skill", "Manage installed skills"),

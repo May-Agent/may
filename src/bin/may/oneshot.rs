@@ -750,7 +750,7 @@ mod tests {
         let mut output = output();
         let before = Timestamp::now();
         output
-            .event(&Err(aither_agent::AgentError::Llm("boom".to_string())))
+            .event(&Err(aither_agent::AgentError::llm_local("boom")))
             .expect("render must succeed");
         let after = Timestamp::now();
         let line = stderr(&output);

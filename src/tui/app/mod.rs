@@ -2205,6 +2205,10 @@ impl App {
             AppMode::CopilotAuth => Ok(super::reducer::manage::handle_copilot_auth_key(self, code)),
             AppMode::ChatgptAuth => Ok(super::reducer::manage::handle_chatgpt_auth_key(self, code)),
             AppMode::Login => Ok(super::reducer::manage::handle_login_key(self, code)),
+            AppMode::Connect(_) => {
+                super::connect::handle_connect_key(self, code);
+                Ok(None)
+            }
             AppMode::GrokAuth => Ok(super::reducer::manage::handle_grok_auth_key(self, code)),
             AppMode::OpenrouterAuth => Ok(super::reducer::manage::handle_openrouter_auth_key(
                 self, code,
@@ -3111,6 +3115,10 @@ impl App {
                 self.open_resume_picker();
                 None
             }
+            "/connect" => {
+                self.open_connect_picker();
+                None
+            }
             "/login" => {
                 self.login_selected = 0;
                 self.mode = AppMode::Login;
@@ -3448,6 +3456,22 @@ impl App {
                 }
                 return Some(SendAction::ResumeImport { source, query });
             }
+        }
+        // `/connect` opens the picker; `/connect <command> [args…]` connects
+        // that command directly.
+        if attachments.is_empty()
+            && let Some(rest) = trimmed.strip_prefix("/connect")
+            && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+        {
+            if rest.trim().is_empty() {
+                self.open_connect_picker();
+            } else {
+                match super::connect::parse_custom(rest) {
+                    Ok((command, args)) => self.connect_custom(command, args),
+                    Err(message) => self.chat.push_error(&format!("/connect: {message}")),
+                }
+            }
+            return None;
         }
         // `/model` opens the picker and `/model <query>` searches it —
         // either way the line is a command, never a message to the agent.

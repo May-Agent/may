@@ -29,6 +29,10 @@ aither-codex = { git = "https://github.com/lexoliu/aither", branch = "dev" }
 aither-models = { git = "https://github.com/lexoliu/aither", branch = "dev" }
 aither-mcp = { git = "https://github.com/lexoliu/aither", branch = "dev" }
 aither-browser = { git = "https://github.com/lexoliu/aither", branch = "dev" }
+aither-acp = { git = "https://github.com/lexoliu/aither", branch = "dev" }
+
+# ACP agents as subagents (`/connect`); its CLI and second SQLite stay off.
+acpsub = { git = "https://github.com/lexoliu/acpsub", branch = "dev", default-features = false }
 
 # repo-search daemon client; its crate version is 0.0.5 inside the
 # v0.0.9 binary pinned in `src/tools/host-programs.json`. Not published
@@ -82,6 +86,8 @@ fastrand = "2"
 web-push = "0.11"
 p256 = "0.13"
 dirs = "6"
+which = { version = "8", default-features = false }
+shlex = "2"
 thiserror = "2"
 tracing = "0.1"
 anyhow = "1"
@@ -212,6 +218,12 @@ clippy.cast_precision_loss = { level = "allow", priority = 1 }
 
 [lints]
 workspace = true
+
+# acpsub depends on the crates.io aither; unify it with the git `dev` copy May uses.
+[patch.crates-io]
+aither-core = { git = "https://github.com/lexoliu/aither", branch = "dev" }
+aither-mcp = { git = "https://github.com/lexoliu/aither", branch = "dev" }
+aither-acp = { git = "https://github.com/lexoliu/aither", branch = "dev" }
 
 # Baseline tool preparation hashes and inflates ~120 MB of pinned tool
 # artifacts before every agent is built; unoptimized, these crates make that
