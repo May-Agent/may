@@ -336,13 +336,24 @@ export interface SseSpeed {
   tokensPerSecond: number;
 }
 
-/** The turn parked on an upstream quota reset; `until` is when it retries. */
+/**
+ * The turn is parked and continues at `until`: after an upstream quota reset
+ * (`retry` absent) or as retry number `retry` of a transient provider failure.
+ */
 export interface SseHold {
   kind: 'hold';
   seq: number;
   turnId: string;
   until: string;
   message: string;
+  retry?: number;
+}
+
+/** The text the turn streamed so far is discarded: its attempt failed and is resubmitted. */
+export interface SseRetract {
+  kind: 'retract';
+  seq: number;
+  turnId: string;
 }
 
 export type ChatStreamEvent =
@@ -360,7 +371,8 @@ export type ChatStreamEvent =
   | SseEnd
   | SsePing
   | SseSpeed
-  | SseHold;
+  | SseHold
+  | SseRetract;
 
 // ── UI event stream /api/events ─────────────────────────────
 

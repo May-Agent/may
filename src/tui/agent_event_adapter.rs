@@ -540,6 +540,7 @@ mod tests {
             stdout,
             stderr: None,
             outcome: CommandOutcome::Exited { code: 0 },
+            interruptions: Vec::new(),
         }))
     }
 
@@ -641,6 +642,7 @@ mod tests {
                 },
                 stderr: None,
                 outcome,
+                interruptions: Vec::new(),
             }));
             match parse_tool_end(&result) {
                 ToolEndKind::Output(out) => {

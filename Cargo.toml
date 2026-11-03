@@ -20,15 +20,15 @@ gstreamer = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
 [dependencies]
 libc = "0.2.191"
 # Aither framework
-aither-core = { version = "0.12.0" }
-aither-agent = { version = "0.12.0", features = ["mcp", "webfetch", "skills"] }
-aither-sandbox = { version = "0.12.0", features = ["code-folding"] }
-aither-cloud = { version = "0.12.0" }
-aither-copilot = { version = "0.12.0" }
-aither-codex = { version = "0.12.0" }
-aither-models = { version = "0.12.0" }
-aither-mcp = { version = "0.12.0" }
-aither-browser = { version = "0.12.0" }
+aither-core = { version = "0.13.0" }
+aither-agent = { version = "0.13.0", features = ["mcp", "webfetch", "skills"] }
+aither-sandbox = { version = "0.13.0", features = ["code-folding"] }
+aither-cloud = { version = "0.13.0" }
+aither-copilot = { version = "0.13.0" }
+aither-codex = { version = "0.13.0" }
+aither-models = { version = "0.13.0" }
+aither-mcp = { version = "0.13.0" }
+aither-browser = { version = "0.13.0" }
 
 # repo-search daemon client; its crate version is 0.0.5 inside the
 # v0.0.9 binary pinned in `src/tools/host-programs.json`. Not published
