@@ -35,7 +35,7 @@ use crate::session::{SessionId, SessionPlanState};
 
 const SESSION_PROVIDER: &str = "session";
 const COMPACTION_PROVIDER: &str = "compaction";
-pub(super) const SESSION_MODEL: &str = "session-model";
+pub const SESSION_MODEL: &str = "session-model";
 const COMPACTION_MODEL: &str = "compaction-model";
 /// Opening words of aither's compaction instruction.
 const COMPACTION_MARKER: &str = "Your context window is being compacted";
@@ -48,13 +48,13 @@ struct Traffic {
 }
 
 /// Stub `OpenAI` server: plain text for a turn, a handoff for a compaction.
-pub(super) struct StubModel {
-    pub(super) base_url: String,
-    pub(super) requests: Arc<tokio::sync::Mutex<Vec<String>>>,
+pub struct StubModel {
+    pub base_url: String,
+    pub requests: Arc<tokio::sync::Mutex<Vec<String>>>,
 }
 
 impl StubModel {
-    pub(super) async fn spawn(model: &'static str) -> Self {
+    pub async fn spawn(model: &'static str) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind stub model server");
@@ -158,12 +158,12 @@ fn reply(status: StatusCode, content_type: &'static str, body: String) -> Respon
 }
 
 /// What building a session agent needs besides the config.
-pub(super) struct SessionParts {
+pub struct SessionParts {
     dir: std::path::PathBuf,
-    pub(super) db: crate::db::ChatDb,
+    pub db: crate::db::ChatDb,
     session_id: SessionId,
     /// The runtime the session persists its interactions through, when it has one.
-    pub(super) runtime: Option<Arc<crate::session::SessionRuntimeService>>,
+    pub runtime: Option<Arc<crate::session::SessionRuntimeService>>,
     workspace_broker: crate::workspace_request::WorkspaceRequestBroker,
     ask_user_broker: crate::ask_user::AskUserBroker,
     tool_environments: ToolEnvironmentCache,
@@ -252,11 +252,11 @@ impl SessionParts {
 }
 
 /// A session agent built from a saved config that points at stub servers.
-pub(super) struct Session {
-    pub(super) agent: MayAgent,
-    clock: ManualClock,
-    pub(super) parts: SessionParts,
-    _temp: tempfile::TempDir,
+pub struct Session {
+    pub agent: MayAgent,
+    pub clock: ManualClock,
+    pub parts: SessionParts,
+    pub temp: tempfile::TempDir,
 }
 
 fn stub_provider(server: &StubModel) -> ProviderInstance {
@@ -267,7 +267,7 @@ fn stub_provider(server: &StubModel) -> ProviderInstance {
 
 /// A saved config whose session provider is `session` and, when given, whose
 /// compaction model lives on `compaction`.
-pub(super) fn saved_config(session: &StubModel, compaction: Option<&StubModel>) -> MayConfig {
+pub fn saved_config(session: &StubModel, compaction: Option<&StubModel>) -> MayConfig {
     let mut config = MayConfig::default();
     config
         .provider
@@ -285,7 +285,7 @@ pub(super) fn saved_config(session: &StubModel, compaction: Option<&StubModel>) 
 }
 
 impl Session {
-    pub(super) async fn start(config: &MayConfig) -> Self {
+    pub async fn start(config: &MayConfig) -> Self {
         Self::start_with(config, false).await
     }
 
@@ -320,7 +320,7 @@ impl Session {
             agent,
             clock,
             parts,
-            _temp: temp,
+            temp,
         }
     }
 
@@ -358,7 +358,7 @@ impl Session {
 }
 
 /// Runs one user turn to completion.
-pub(super) async fn run_turn(agent: &mut MayAgent) {
+pub async fn run_turn(agent: &mut MayAgent) {
     let mut stream = agent.run("Say hello.", []);
     while let Some(event) = stream.next().await {
         event.expect("the turn runs");

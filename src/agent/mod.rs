@@ -12,7 +12,7 @@ mod context_report;
 mod environment;
 mod hooks;
 #[cfg(test)]
-mod idle_compaction_tests;
+pub(crate) mod idle_compaction_tests;
 pub(crate) mod imagine;
 pub(crate) mod issue_tool;
 mod live_settings;

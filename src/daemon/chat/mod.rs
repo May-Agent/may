@@ -17,9 +17,11 @@ pub use hosts::{
     ParkedAgents, btw, compact_session, context_dump, context_report, release_agent, usage_report,
 };
 pub use hub::{TurnFrame, TurnHub};
-pub use recap::{RecapRecord, RecapSchedules, recap_session, seed as recap_seed};
+pub use recap::{RecapRecord, RecapSchedules, recap_session};
 mod tool_dispatch;
 mod turn_persister;
+#[cfg(test)]
+mod warm_aux_tests;
 
 use self::tool_dispatch::{
     handle_browser_request, handle_notify_request, handle_register_skills_request,
