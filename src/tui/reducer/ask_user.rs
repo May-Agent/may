@@ -286,6 +286,7 @@ mod tests {
                 question: "Which database?".to_string(),
                 option: vec!["PostgreSQL".to_string(), "SQLite".to_string()],
                 multi_select,
+                secret: None,
             }],
         })
     }
