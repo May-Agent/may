@@ -240,7 +240,7 @@ impl MockOpenAiServer {
     /// Waits until a probe script served its final response — the last steps
     /// run on the turn the finished launch job resumes, after the turn that
     /// launched it already ended.
-    async fn wait_probe_done(&self, what: &str) {
+    async fn wait_probe_done(&self, what: &str, log: &ServerLog) {
         let done = tokio::time::timeout(SUBAGENT_PROBE_DONE_TIMEOUT, async {
             loop {
                 if self.state.lock().await.probe_done {
@@ -274,7 +274,10 @@ impl MockOpenAiServer {
                     )
                 })
                 .collect::<Vec<_>>();
-            panic!("{what} never finished its resumed turn; requests: {signatures:?}");
+            panic!(
+                "{what} never finished its resumed turn; requests: {signatures:?}; server logs:\n{}",
+                strip_ansi_escapes(&log.contents().await)
+            );
         }
     }
 
@@ -2462,7 +2465,8 @@ async fn run_probe_turn(
         "the probe turn should complete; events: {events:?}; server logs:\n{}",
         server.log.contents().await
     );
-    mock.wait_probe_done("the subagent probe").await;
+    mock.wait_probe_done("the subagent probe", &server.log)
+        .await;
     let files = ProbeFiles::read(&sandbox_dir);
     server.stop().await;
     environment.release(&harness, &session_id).await;
