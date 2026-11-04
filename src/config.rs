@@ -1063,6 +1063,16 @@ pub struct RemoteAccessConfig {
     /// its whole port.
     #[serde(default = "default_tailscale_https_port")]
     pub funnel_port: u16,
+    /// Largest webhook delivery body, in bytes, accepted on any listener;
+    /// a larger delivery is refused with 413 before it is buffered.
+    #[serde(default = "default_webhook_max_body_bytes")]
+    pub webhook_max_body_bytes: u64,
+}
+
+/// Default for `[remote_access] webhook_max_body_bytes`: 10 MiB.
+#[must_use]
+pub const fn default_webhook_max_body_bytes() -> u64 {
+    10 * 1024 * 1024
 }
 
 fn default_tailscale_binary() -> String {
@@ -1083,6 +1093,7 @@ impl Default for RemoteAccessConfig {
             allow_local_environment: false,
             funnel: false,
             funnel_port: default_tailscale_https_port(),
+            webhook_max_body_bytes: default_webhook_max_body_bytes(),
         }
     }
 }
