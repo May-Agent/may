@@ -9,13 +9,12 @@
 //! alongside the messages. Numbers are estimates at ~4 bytes per token,
 //! the same heuristic the agent uses for its own context budgeting.
 
-use aither_agent::{ContextPolicy, ContextWindowMetrics, ContextWindowPhase, Handoff};
+use aither_agent::{
+    ContextPolicy, ContextWindowMetrics, ContextWindowPhase, Handoff, InstructionSlot,
+};
 use aither_sandbox::TerminalArgs;
 
 use super::runtime_context::tag;
-
-/// Tag aither-agent uses for the stable base-system block.
-const BASE_SYSTEM_TAG: &str = "base_system";
 
 /// A context-usage category, matching the rows Claude Code shows for
 /// `/context` with `Commands` added for May's terminal command index.
@@ -166,9 +165,9 @@ impl ContextReport {
         let mut subagent_chars = 0usize;
         let mut subagent_count = 0usize;
 
-        for (block_tag, content) in context.system_blocks() {
-            match block_tag.as_str() {
-                BASE_SYSTEM_TAG => {
+        for (slot, content) in context.instructions().iter() {
+            match slot {
+                slot if *slot == InstructionSlot::BASE_SYSTEM => {
                     let carved = carve_base_system(content, mcp_command_names);
                     system_prompt_chars += carved.architecture_chars;
                     native_tool_chars += carved.native_tool_chars;
@@ -182,7 +181,9 @@ impl ContextReport {
                     subagent_chars += carved.subagent_chars;
                     subagent_count += carved.subagent_count;
                 }
-                tag::MEMORY | tag::PROFILE_MEMORIES => memory_chars += content.len(),
+                slot if *slot == tag::MEMORY || *slot == tag::PROFILE_MEMORIES => {
+                    memory_chars += content.len();
+                }
                 _ => system_prompt_chars += content.len(),
             }
         }
@@ -372,10 +373,11 @@ mod tests {
     }
 
     fn test_context() -> aither_agent::Context {
-        let mut context = aither_agent::Context::default();
-        context.insert_system_text(BASE_SYSTEM_TAG, base_system_block());
-        context.insert_system_text(tag::MEMORY, "remember this");
-        context.insert_system_text(tag::TERMINAL_RUNTIME_CONTEXT, "sandbox=/tmp cwd=/tmp");
+        let mut context = aither_agent::Context::with_layout(tag::layout());
+        let instructions = context.instructions_mut();
+        instructions.insert(&InstructionSlot::BASE_SYSTEM, base_system_block());
+        instructions.insert(&tag::MEMORY, "remember this");
+        instructions.insert(&tag::TERMINAL_RUNTIME_CONTEXT, "sandbox=/tmp cwd=/tmp");
         context.push(Message::user("hello"));
         context.push(Message::assistant("hi there"));
         context
@@ -491,12 +493,9 @@ mod tests {
             report.used_tokens + report.free_tokens + report.autocompact_buffer_tokens,
             report.window_tokens
         );
-        // Default context policy: compaction forks at 0.6 of the window.
-        assert_eq!(
-            report.autocompact_buffer_tokens,
-            report.window_tokens * 2 / 5
-        );
-        assert_eq!(autocompact_window_tokens(200_000), 120_000);
+        // Default context policy: compaction triggers at 0.8 of the window.
+        assert_eq!(report.autocompact_buffer_tokens, report.window_tokens / 5);
+        assert_eq!(autocompact_window_tokens(200_000), 160_000);
         assert_eq!(
             autocompact_window_tokens(200_000) + autocompact_buffer_tokens(200_000),
             200_000

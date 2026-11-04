@@ -4,7 +4,7 @@
 //! the agent's prompt — workspace descriptions, environment hints,
 //! browser status, terminal runtime rules, etc. [`RuntimeSystemContext`]
 //! stores each slot as pre-rendered raw text and reconciles the slots
-//! into an [`aither_agent::Context`] via `insert_system_text`, so the
+//! into an [`aither_agent::Context`] as raw instruction blocks, so the
 //! final prompt is plain prose rather than serde-derived XML.
 //!
 //! Each slot is keyed by a short `snake_case` tag (see the [`tag`]
@@ -16,6 +16,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use aither_agent::InstructionSlot;
 use aither_core::llm::model::{Ability, Parameters};
 use askama::Template;
 use async_fs;
@@ -32,34 +33,55 @@ const NATIVE_VOICE_AVAILABLE_HINT: &str = "Native voice input is available in th
 const PLAN_MODE_DRAFT_HINT: &str = include_str!("../texts/plan_mode_draft.txt");
 const PLAN_MODE_APPROVED_HINT: &str = include_str!("../texts/plan_mode_approved.txt");
 
-/// Tag name constants for the stable system blocks managed by
-/// [`RuntimeSystemContext`]. Each tag is inserted with raw text content,
-/// with no XML wrapping, so these strings end up as the `IndexMap` keys
-/// in `aither_agent::Context::system_blocks` and as stable KV-cache
-/// prefix segments.
+/// Instruction slots of the stable system blocks managed by
+/// [`RuntimeSystemContext`]. Each slot holds raw text content, with no XML
+/// wrapping, and renders at its position in [`layout`] as a stable KV-cache
+/// prefix segment.
 pub mod tag {
-    pub const MEMORY: &str = "memory";
-    pub const TERMINAL_RUNTIME_CONTEXT: &str = "terminal_runtime_context";
-    pub const WORKSPACE: &str = "workspace";
-    pub const WORKSPACE_WORKDIRS: &str = "workspace_workdirs";
-    pub const REPO_CLONES: &str = "repo_clones";
-    pub const AGENTS_MD: &str = "agents_md";
-    pub const CONTAINER_ENVIRONMENT_CONTEXT: &str = "container_environment_context";
-    pub const BROWSER: &str = "browser";
-    pub const PROFILE_PERSONA: &str = "profile_persona";
-    pub const PROFILE_MEMORIES: &str = "profile_memories";
-    pub const PLAN_MODE: &str = "plan_mode";
-    pub const NETWORK_RESTRICTIONS: &str = "network_restrictions";
-    pub const LOCATION_CONTEXT: &str = "location_context";
-    pub const NATIVE_VOICE_INPUT: &str = "native_voice_input";
-    pub const PLATFORM: &str = "platform";
+    use aither_agent::{InstructionSlot, SystemLayout};
+
+    pub const MEMORY: InstructionSlot = InstructionSlot::new("memory");
+    pub const TERMINAL_RUNTIME_CONTEXT: InstructionSlot =
+        InstructionSlot::new("terminal_runtime_context");
+    pub const WORKSPACE_WORKDIRS: InstructionSlot = InstructionSlot::new("workspace_workdirs");
+    pub const REPO_CLONES: InstructionSlot = InstructionSlot::new("repo_clones");
+    pub const AGENTS_MD: InstructionSlot = InstructionSlot::new("agents_md");
+    pub const BROWSER: InstructionSlot = InstructionSlot::new("browser");
+    pub const PROFILE_PERSONA: InstructionSlot = InstructionSlot::new("profile_persona");
+    pub const PROFILE_MEMORIES: InstructionSlot = InstructionSlot::new("profile_memories");
+    pub const PLAN_MODE: InstructionSlot = InstructionSlot::new("plan_mode");
+    pub const NETWORK_RESTRICTIONS: InstructionSlot = InstructionSlot::new("network_restrictions");
+    pub const LOCATION_CONTEXT: InstructionSlot = InstructionSlot::new("location_context");
+    pub const NATIVE_VOICE_INPUT: InstructionSlot = InstructionSlot::new("native_voice_input");
+
+    /// The system prompt's order: aither's own blocks, then May's.
+    #[must_use]
+    pub fn layout() -> SystemLayout {
+        SystemLayout::new(
+            InstructionSlot::BUILTIN.into_iter().chain([
+                MEMORY,
+                TERMINAL_RUNTIME_CONTEXT,
+                WORKSPACE_WORKDIRS,
+                REPO_CLONES,
+                AGENTS_MD,
+                BROWSER,
+                PROFILE_PERSONA,
+                PROFILE_MEMORIES,
+                PLAN_MODE,
+                NETWORK_RESTRICTIONS,
+                LOCATION_CONTEXT,
+                NATIVE_VOICE_INPUT,
+            ]),
+            [],
+        )
+    }
 }
 
 /// Stable per-session system prefix managed by [`MayAgent`].
 ///
 /// Each slot holds a pre-rendered string that is reconciled into the
 /// underlying [`aither_agent::Context`] as a raw-text persistent system
-/// block (see `insert_system_text`). Keeping the slots as pre-rendered
+/// block (see `reconcile_text_block`). Keeping the slots as pre-rendered
 /// strings means reconcile is a cheap set/unset operation with no
 /// additional templating cost and no XML wrapping.
 #[derive(Clone)]
@@ -184,41 +206,33 @@ impl RuntimeSystemContext {
         );
         reconcile_text_block(
             context,
-            tag::TERMINAL_RUNTIME_CONTEXT,
+            &tag::TERMINAL_RUNTIME_CONTEXT,
             self.terminal_runtime.clone(),
         );
-        // The workspace and container-environment blocks were folded into the
-        // terminal-runtime block; a context restored from an older snapshot may
-        // still carry them, so drop them unconditionally.
-        reconcile_text_block(context, tag::WORKSPACE, None);
         reconcile_text_block(
             context,
-            tag::WORKSPACE_WORKDIRS,
+            &tag::WORKSPACE_WORKDIRS,
             self.workspace_workdirs.clone(),
         );
-        reconcile_text_block(context, tag::REPO_CLONES, self.repo_clones.clone());
+        reconcile_text_block(context, &tag::REPO_CLONES, self.repo_clones.clone());
         reconcile_agents_md_block(context, self.agents_md.clone());
-        reconcile_text_block(context, tag::CONTAINER_ENVIRONMENT_CONTEXT, None);
-        // The platform hint is gone; a context restored from an older
-        // snapshot may still carry it, so drop it unconditionally.
-        reconcile_text_block(context, tag::PLATFORM, None);
-        reconcile_text_block(context, tag::BROWSER, self.browser.clone());
-        reconcile_text_block(context, tag::PROFILE_PERSONA, self.profile_persona.clone());
+        reconcile_text_block(context, &tag::BROWSER, self.browser.clone());
+        reconcile_text_block(context, &tag::PROFILE_PERSONA, self.profile_persona.clone());
         reconcile_text_block(
             context,
-            tag::PROFILE_MEMORIES,
+            &tag::PROFILE_MEMORIES,
             self.profile_memories.clone(),
         );
-        reconcile_text_block(context, tag::PLAN_MODE, self.plan_mode.clone());
+        reconcile_text_block(context, &tag::PLAN_MODE, self.plan_mode.clone());
         reconcile_text_block(
             context,
-            tag::NETWORK_RESTRICTIONS,
+            &tag::NETWORK_RESTRICTIONS,
             self.network_restrictions.clone(),
         );
-        reconcile_text_block(context, tag::LOCATION_CONTEXT, self.location.clone());
+        reconcile_text_block(context, &tag::LOCATION_CONTEXT, self.location.clone());
         reconcile_text_block(
             context,
-            tag::NATIVE_VOICE_INPUT,
+            &tag::NATIVE_VOICE_INPUT,
             self.native_voice_input.clone(),
         );
     }
@@ -348,12 +362,14 @@ fn collect_memory_paths(text: &str, out: &mut HashSet<String>) {
 
 fn reconcile_text_block(
     context: &mut aither_agent::Context,
-    tag: &'static str,
+    slot: &InstructionSlot,
     value: Option<String>,
 ) {
     match value {
-        Some(text) => context.insert_system_text(tag, text),
-        None => context.remove_system_named(tag),
+        Some(text) => context.instructions_mut().insert(slot, text),
+        None => {
+            context.instructions_mut().remove(slot);
+        }
     }
 }
 
@@ -384,25 +400,25 @@ struct AgentsMdUpdate {
 /// so the cached prefix stays warm until reassembly folds the update in.
 fn reconcile_agents_md_block(context: &mut aither_agent::Context, desired: Option<String>) {
     let Some(desired) = desired else {
-        context.remove_system_named(tag::AGENTS_MD);
+        context.instructions_mut().remove(&tag::AGENTS_MD);
         return;
     };
-    if !context.has_system_block(tag::AGENTS_MD) {
-        context.insert_system_text(tag::AGENTS_MD, desired);
+    let instructions = context.instructions_mut();
+    if !instructions.contains(&tag::AGENTS_MD) {
+        instructions.insert(&tag::AGENTS_MD, desired);
         return;
     }
-    if context.staged_system_update(tag::AGENTS_MD) == Some(desired.as_str()) {
+    if instructions.staged(&tag::AGENTS_MD) == Some(&desired) {
         return;
     }
-    let current = context
-        .system_blocks()
-        .get(tag::AGENTS_MD)
+    let current = instructions
+        .get(&tag::AGENTS_MD)
         .cloned()
         .unwrap_or_default();
     if current == desired {
         return;
     }
-    if context.stage_system_text(tag::AGENTS_MD, desired.clone()) {
+    if instructions.stage(&tag::AGENTS_MD, desired.clone()) {
         let diff = similar::TextDiff::from_lines(&current, &desired)
             .unified_diff()
             .context_radius(2)
@@ -417,19 +433,16 @@ fn reconcile_agents_md_block(context: &mut aither_agent::Context, desired: Optio
 /// next reassembly, when the cache is invalidated anyway) and surfaced to
 /// the model as an appended diff alert instead of a block rewrite.
 fn reconcile_memory_block(context: &mut aither_agent::Context, desired: String) {
-    if !context.has_system_block(tag::MEMORY) {
-        context.insert_system_text(tag::MEMORY, desired);
+    let instructions = context.instructions_mut();
+    if !instructions.contains(&tag::MEMORY) {
+        instructions.insert(&tag::MEMORY, desired);
         return;
     }
-    if context.staged_system_update(tag::MEMORY) == Some(desired.as_str()) {
+    if instructions.staged(&tag::MEMORY) == Some(&desired) {
         return;
     }
-    let current = context
-        .system_blocks()
-        .get(tag::MEMORY)
-        .cloned()
-        .unwrap_or_default();
-    if context.stage_system_text(tag::MEMORY, desired.clone()) {
+    let current = instructions.get(&tag::MEMORY).cloned().unwrap_or_default();
+    if instructions.stage(&tag::MEMORY, desired.clone()) {
         let diff = similar::TextDiff::from_lines(&current, &desired)
             .unified_diff()
             .context_radius(2)
@@ -770,11 +783,14 @@ pub async fn build_base_system_prompt(
         })
         .collect::<Vec<_>>();
 
-    let mut subagents: Vec<BaseSystemSubagent> = aither_agent::builtin_subagents()
-        .into_iter()
-        .map(|def| BaseSystemSubagent {
-            id: def.id,
-            description: def.description,
+    let mut subagents: Vec<BaseSystemSubagent> = aither_agent::BUNDLED_SUBAGENTS
+        .iter()
+        .map(|bundled| {
+            let definition = bundled.definition();
+            BaseSystemSubagent {
+                id: definition.name,
+                description: definition.description,
+            }
         })
         .collect();
     subagents.push(BaseSystemSubagent {
@@ -932,6 +948,10 @@ mod tests {
         build_memory_context_content, tag,
     };
 
+    fn test_context() -> aither_agent::Context {
+        aither_agent::Context::with_layout(tag::layout())
+    }
+
     fn test_memory_file() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempdir().expect("temp dir should be created");
         let path = dir.path().join("MEMORY.md");
@@ -956,20 +976,24 @@ mod tests {
     fn runtime_system_context_reinstates_memory_and_prunes_absent_blocks() {
         let (_dir, memory_path) = test_memory_file();
         let runtime_context = RuntimeSystemContext::new(memory_path, "remember this".to_string());
-        let mut context = aither_agent::Context::default();
-        context.insert_system_text(tag::PROFILE_PERSONA, "stale persona");
-        context.insert_system_text(tag::WORKSPACE, "stale workspace");
+        let mut context = test_context();
+        context
+            .instructions_mut()
+            .insert(&tag::PROFILE_PERSONA, "stale persona");
+        context
+            .instructions_mut()
+            .insert(&tag::REPO_CLONES, "stale clones");
 
         runtime_context.reconcile(&mut context);
 
-        assert!(context.has_system_block(tag::MEMORY));
+        assert!(context.instructions().contains(&tag::MEMORY));
         let memory = context
-            .system_blocks()
-            .get(tag::MEMORY)
+            .instructions()
+            .get(&tag::MEMORY)
             .expect("memory block should be present");
         assert_eq!(memory, &build_memory_context_content("remember this"));
-        assert!(!context.has_system_block(tag::PROFILE_PERSONA));
-        assert!(!context.has_system_block(tag::WORKSPACE));
+        assert!(!context.instructions().contains(&tag::PROFILE_PERSONA));
+        assert!(!context.instructions().contains(&tag::REPO_CLONES));
     }
 
     #[test]
@@ -979,7 +1003,7 @@ mod tests {
 
         let mut runtime_context =
             RuntimeSystemContext::new(memory_path.clone(), "before".to_string());
-        let mut context = aither_agent::Context::default();
+        let mut context = test_context();
         runtime_context.reconcile(&mut context);
 
         std::fs::write(&memory_path, "after").expect("update memory");
@@ -989,13 +1013,13 @@ mod tests {
         // Cache-friendly: the live block still holds the old content; the
         // change is staged and surfaced as an appended diff alert.
         let memory = context
-            .system_blocks()
-            .get(tag::MEMORY)
+            .instructions()
+            .get(&tag::MEMORY)
             .expect("memory block should be present");
         assert_eq!(memory, &build_memory_context_content("before"));
         assert_eq!(
-            context.staged_system_update(tag::MEMORY),
-            Some(build_memory_context_content("after").as_str())
+            context.instructions().staged(&tag::MEMORY),
+            Some(&build_memory_context_content("after"))
         );
         let alerts = system_alerts(&context);
         assert_eq!(alerts.len(), 1);
@@ -1020,8 +1044,8 @@ mod tests {
         let report = context.reassemble();
         assert_eq!(report.staged_updates_applied, 1);
         let memory = context
-            .system_blocks()
-            .get(tag::MEMORY)
+            .instructions()
+            .get(&tag::MEMORY)
             .expect("memory block should be present");
         assert_eq!(memory, &build_memory_context_content("after"));
         assert_eq!(system_alerts(&context), [] as [std::string::String; 0]);
@@ -1032,12 +1056,12 @@ mod tests {
         let (_dir, memory_path) = test_memory_file();
         let runtime_context = RuntimeSystemContext::new(memory_path, "remember this".to_string())
             .with_terminal_runtime("Model: demo-model\nHome environment kind: local".to_string());
-        let mut context = aither_agent::Context::default();
+        let mut context = test_context();
         runtime_context.reconcile(&mut context);
 
         let terminal_runtime = context
-            .system_blocks()
-            .get(tag::TERMINAL_RUNTIME_CONTEXT)
+            .instructions()
+            .get(&tag::TERMINAL_RUNTIME_CONTEXT)
             .expect("terminal runtime block should be present");
         assert!(
             terminal_runtime.contains("demo-model"),
@@ -1050,13 +1074,11 @@ mod tests {
     }
 
     #[test]
-    fn workspace_and_workdirs_are_reconciled_independently() {
+    fn workdirs_are_reconciled_independently() {
         let (_dir, memory_path) = test_memory_file();
         let mut runtime_context = RuntimeSystemContext::new(memory_path, String::new())
             .with_terminal_runtime("Model: demo-model".to_string());
-        let mut context = aither_agent::Context::default();
-        context.insert_system_text(tag::WORKSPACE, "stale workspace");
-        context.insert_system_text(tag::CONTAINER_ENVIRONMENT_CONTEXT, "stale container");
+        let mut context = test_context();
         runtime_context.reconcile(&mut context);
         let without_workdirs_fingerprint = context.stable_prefix_fingerprint();
 
@@ -1064,9 +1086,7 @@ mod tests {
             .with_workspace_workdirs("Approved workspace directories:\n- /foo".to_string());
         runtime_context.reconcile(&mut context);
 
-        assert!(!context.has_system_block(tag::WORKSPACE));
-        assert!(!context.has_system_block(tag::CONTAINER_ENVIRONMENT_CONTEXT));
-        assert!(context.has_system_block(tag::WORKSPACE_WORKDIRS));
+        assert!(context.instructions().contains(&tag::WORKSPACE_WORKDIRS));
         assert_ne!(
             without_workdirs_fingerprint,
             context.stable_prefix_fingerprint(),
@@ -1078,20 +1098,20 @@ mod tests {
     fn agents_md_block_is_reconciled_and_pruned() {
         let (_dir, memory_path) = test_memory_file();
         let mut runtime_context = RuntimeSystemContext::new(memory_path, String::new());
-        let mut context = aither_agent::Context::default();
+        let mut context = test_context();
         runtime_context.reconcile(&mut context);
-        assert!(!context.has_system_block(tag::AGENTS_MD));
+        assert!(!context.instructions().contains(&tag::AGENTS_MD));
 
         runtime_context = runtime_context.with_agents_md(Some("project rules".to_string()));
         runtime_context.reconcile(&mut context);
         assert_eq!(
-            context.system_blocks().get(tag::AGENTS_MD),
+            context.instructions().get(&tag::AGENTS_MD),
             Some(&"project rules".to_string())
         );
 
         runtime_context = runtime_context.with_agents_md(None);
         runtime_context.reconcile(&mut context);
-        assert!(!context.has_system_block(tag::AGENTS_MD));
+        assert!(!context.instructions().contains(&tag::AGENTS_MD));
     }
 
     #[test]
