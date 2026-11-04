@@ -3,6 +3,7 @@
 use crate::MayConfig;
 use crate::ask_user::{AskUserRequest, Question};
 use crate::config::ProviderType;
+use crate::session::PersistedSecretRequest;
 use crate::session::import::ForeignSessionSummary;
 use crate::workspace_request::WorkspaceRequest;
 
@@ -271,7 +272,6 @@ pub struct RewindState {
 }
 
 /// Per-question interaction state.
-#[derive(Debug)]
 pub struct AskUserQuestionState {
     /// Cursor position in the option list (includes the extra custom item).
     pub cursor: usize,
@@ -279,8 +279,22 @@ pub struct AskUserQuestionState {
     pub selections: Vec<usize>,
     /// Whether the user is typing a custom answer.
     pub custom_mode: bool,
-    /// Custom answer text buffer.
+    /// Custom answer text buffer; the secret value of a secret question.
     pub custom_text: String,
+    /// The user declined to give the secret this question asks for.
+    pub declined: bool,
+}
+
+impl std::fmt::Debug for AskUserQuestionState {
+    /// Without the text buffer, which may hold a secret.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AskUserQuestionState")
+            .field("cursor", &self.cursor)
+            .field("selections", &self.selections)
+            .field("custom_mode", &self.custom_mode)
+            .field("declined", &self.declined)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for AskUserQuestionState {
@@ -290,11 +304,11 @@ impl Default for AskUserQuestionState {
 }
 
 impl AskUserQuestionState {
-    /// Whether the user chose an option or wrote a text. Nothing else
-    /// answers a question.
+    /// Whether the user chose an option, wrote a text or declined a secret.
+    /// Nothing else answers a question.
     #[must_use]
     pub fn is_answered(&self) -> bool {
-        !self.selections.is_empty() || !self.custom_text.trim().is_empty()
+        self.declined || !self.selections.is_empty() || !self.custom_text.trim().is_empty()
     }
 
     /// Create empty question state.
@@ -305,6 +319,7 @@ impl AskUserQuestionState {
             selections: Vec::new(),
             custom_mode: false,
             custom_text: String::new(),
+            declined: false,
         }
     }
 }
@@ -328,6 +343,8 @@ pub struct AskUserState {
     pub request: Option<AskUserRequest>,
     /// Normalized list of questions.
     pub questions: Vec<Question>,
+    /// The secret each question collects, parallel to `questions`.
+    pub secrets: Vec<Option<PersistedSecretRequest>>,
     /// Current question index.
     pub current_question: usize,
     /// Per-question state.
@@ -338,29 +355,36 @@ impl AskUserState {
     /// Build interaction state for `request` and its `questions`.
     #[must_use]
     pub fn new(request_id: String, request: AskUserRequest, questions: Vec<Question>) -> Self {
-        Self::build(request_id, Some(request), questions)
+        let secrets = questions.iter().map(|_| None).collect();
+        Self::build(request_id, Some(request), questions, secrets)
     }
 
     /// Build interaction state for the open question `open`.
     #[must_use]
     pub fn for_open_question(open: crate::session::PersistedAskUserRequest) -> Self {
-        let questions = open
+        let (questions, secrets) = open
             .questions
             .into_iter()
-            .map(|question| Question {
-                section: question.section,
-                question: question.question,
-                option: question.option,
-                multi_select: question.multi_select,
+            .map(|question| {
+                (
+                    Question {
+                        section: question.section,
+                        question: question.question,
+                        option: question.option,
+                        multi_select: question.multi_select,
+                    },
+                    question.secret,
+                )
             })
-            .collect();
-        Self::build(open.id, None, questions)
+            .unzip();
+        Self::build(open.id, None, questions, secrets)
     }
 
     fn build(
         request_id: String,
         request: Option<AskUserRequest>,
         questions: Vec<Question>,
+        secrets: Vec<Option<PersistedSecretRequest>>,
     ) -> Self {
         let states = questions
             .iter()
@@ -370,6 +394,7 @@ impl AskUserState {
             request_id,
             request,
             questions,
+            secrets,
             current_question: 0,
             question_states: states,
         }
@@ -397,6 +422,12 @@ impl AskUserState {
     #[must_use]
     pub fn current_item_count(&self) -> usize {
         self.current().map_or(0, |q| q.option.len() + 1)
+    }
+
+    /// The secret the current question collects, if it asks for one.
+    #[must_use]
+    pub fn current_secret(&self) -> Option<&PersistedSecretRequest> {
+        self.secrets.get(self.current_question)?.as_ref()
     }
 
     /// Whether there are multiple questions.

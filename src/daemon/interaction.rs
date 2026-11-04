@@ -3,10 +3,8 @@ use std::sync::Arc;
 use skyzen::Result as SkyResult;
 use skyzen::utils::{Json, State};
 
-use crate::ask_user::QuestionAnswer;
-
 use super::error::{bad_request_error, internal_error};
-use super::state::{AskUserOutcome, AskUserRespondRequest, DaemonState};
+use super::state::{AskUserOutcome, AskUserRespondError, AskUserRespondRequest, DaemonState};
 use super::types::{PermissionRespondRequest, SessionRuntimeResponse, WorkspaceRespondRequest};
 use crate::session::AnswerError;
 
@@ -67,30 +65,35 @@ pub(super) async fn respond_permission_request(
     Ok(Json(runtime.into()))
 }
 
+/// The status of a question that is no longer open.
+///
+/// Withdrawn or already answered; clients tell it apart from a failure to
+/// store the answer, a `5xx`, and from an answer that does not fit the
+/// question, a `400`.
+pub const ASK_USER_NOT_OPEN: skyzen::StatusCode = skyzen::StatusCode::NOT_FOUND;
+
+fn ask_user_not_open_error() -> skyzen::Error {
+    skyzen::Error::msg("ask_user request not found or withdrawn").set_status(ASK_USER_NOT_OPEN)
+}
+
 pub(super) async fn respond_ask_user_request(
     Json(req): Json<AskUserRespondRequest>,
     State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<SessionRuntimeResponse>> {
-    let answers = req
-        .answers
-        .into_iter()
-        .map(|answer| {
-            Ok(QuestionAnswer {
-                section: answer.section,
-                answer: answer.answer.try_into().map_err(bad_request_error)?,
-            })
-        })
-        .collect::<SkyResult<Vec<_>>>()?;
-
     let resolved = state
         .ask_user_approver
-        .resolve(&req.id, answers)
+        .respond(&req.id, req.answers)
         .await
         .map_err(|error| match error {
-            AnswerError::Mismatch(error) => bad_request_error(error.to_string()),
-            AnswerError::Storage(error) => internal_error(error),
+            AskUserRespondError::Input(error) => bad_request_error(error.to_string()),
+            AskUserRespondError::Answer(AnswerError::Mismatch(error)) => {
+                bad_request_error(error.to_string())
+            }
+            error @ (AskUserRespondError::Answer(AnswerError::Storage(_))
+            | AskUserRespondError::Lookup(_)
+            | AskUserRespondError::Store { .. }) => internal_error(error),
         })?
-        .ok_or_else(|| bad_request_error("ask_user request not found or withdrawn"))?;
+        .ok_or_else(ask_user_not_open_error)?;
     let runtime = match resolved.outcome {
         AskUserOutcome::Woke | AskUserOutcome::AlreadyAnswered => state
             .runtime_service
@@ -149,4 +152,17 @@ pub(super) async fn respond_workspace_request(
     };
 
     Ok(Json(runtime.into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_question_that_is_not_open_is_a_404() {
+        assert_eq!(
+            ask_user_not_open_error().status(),
+            skyzen::StatusCode::NOT_FOUND
+        );
+    }
 }

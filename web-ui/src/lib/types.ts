@@ -147,6 +147,8 @@ export interface PersistedAskUserQuestion {
   question: string;
   option: string[];
   multiSelect: boolean;
+  /** Set when the question asks for a secret value, which is stored and never read back. */
+  secret?: { name: string; scope: 'global' | 'session' } | null;
 }
 
 export interface PersistedAskUserRequest {
@@ -515,12 +517,17 @@ export type TimeTriggerType = 'once' | 'cron';
 export type TaskTriggerRequest =
   | { kind: 'time'; triggerType: TimeTriggerType; runAtUtc?: string | null; cronUtc?: string | null }
   | { kind: 'event'; eventName: string }
-  | { kind: 'webhook' };
+  | { kind: 'webhook'; signature?: WebhookSignature | null };
+
+export interface WebhookSignature {
+  secret: string;
+  header: string;
+}
 
 export type TaskTriggerResponse =
   | { kind: 'time'; triggerType: TimeTriggerType; runAtUtc?: string | null; cronUtc?: string | null }
   | { kind: 'event'; eventName: string }
-  | { kind: 'webhook'; token: string; webhookPath: string };
+  | { kind: 'webhook'; token: string; webhookPath: string; signature?: WebhookSignature | null };
 
 export interface ScheduledTaskResponse {
   id: string;

@@ -41,4 +41,32 @@ pub struct Model {
     pub created_at: String,
     /// Last update timestamp (ISO 8601).
     pub updated_at: String,
+    /// Secret name whose value keys the signature a webhook delivery must carry.
+    pub webhook_signature_secret: Option<String>,
+    /// Lowercase request header the webhook signature arrives in.
+    pub webhook_signature_header: Option<String>,
+}
+
+impl Model {
+    /// The trigger this row stores.
+    ///
+    /// # Errors
+    /// Returns a message when the stored trigger is not valid.
+    pub fn persisted_trigger(&self) -> Result<crate::task_trigger::PersistedTaskTrigger, String> {
+        let signature = match (
+            &self.webhook_signature_secret,
+            &self.webhook_signature_header,
+        ) {
+            (Some(secret), Some(header)) => Some(crate::task_trigger::WebhookSignature {
+                secret: secret.clone(),
+                header: header.clone(),
+            }),
+            _ => None,
+        };
+        crate::task_trigger::PersistedTaskTrigger::from_storage(
+            &self.trigger_kind,
+            &self.trigger_type,
+            signature,
+        )
+    }
 }

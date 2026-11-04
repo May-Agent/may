@@ -62,6 +62,9 @@ pub(super) use query;
 #[derive(Debug, Clone)]
 pub struct ChatDb {
     pub(super) db: SkyDb,
+    /// Test seam: suspends a run claim or finish at its await.
+    #[cfg(test)]
+    pub(crate) run_gates: session_run::RunGates,
 }
 
 impl ChatDb {
@@ -81,6 +84,7 @@ impl ChatDb {
         Self::ensure_session_columns(&db).await?;
         Self::ensure_message_columns(&db).await?;
         Self::ensure_ask_user_blocking_column(&db).await?;
+        Self::ensure_ask_user_secret_columns(&db).await?;
         Self::ensure_pending_permission_agent_id_column(&db).await?;
         Self::ensure_scheduled_task_columns(&db).await?;
         Self::ensure_session_context_snapshot_table(&db).await?;
@@ -89,7 +93,11 @@ impl ChatDb {
         Self::migrate_legacy_remote_profiles(&db).await?;
         Self::migrate_removed_waiting_terminal_input(&db).await?;
         Self::ensure_search_outbox(&db).await?;
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            #[cfg(test)]
+            run_gates: session_run::RunGates::default(),
+        })
     }
 
     /// Run `sql` as given, so a test can break the storage a commit needs.
@@ -154,6 +162,24 @@ impl ChatDb {
         Ok(())
     }
 
+    async fn ensure_ask_user_secret_columns(db: &SkyDb) -> Result<(), ChatDbError> {
+        let columns = query!(
+            db,
+            "PRAGMA table_info(session_pending_ask_user_questions_v2)"
+        )
+        .fetch_all::<SqliteTableInfoRow>()
+        .await?;
+        for column in ["secret_name", "secret_scope"] {
+            if !columns.iter().any(|existing| existing.name == column) {
+                let sql = format!(
+                    "ALTER TABLE session_pending_ask_user_questions_v2 ADD COLUMN {column} TEXT"
+                );
+                query!(db, sql.as_str()).execute().await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn ensure_pending_permission_agent_id_column(db: &SkyDb) -> Result<(), ChatDbError> {
         let columns = query!(
             db,
@@ -186,6 +212,43 @@ impl ChatDb {
             )
             .execute()
             .await?;
+        }
+        for column in ["webhook_signature_secret", "webhook_signature_header"] {
+            if !columns.iter().any(|existing| existing.name == column) {
+                let sql = format!("ALTER TABLE scheduled_tasks ADD COLUMN {column} TEXT");
+                query!(db, sql.as_str()).execute().await?;
+            }
+        }
+        Self::remint_weak_webhook_tokens(db).await
+    }
+
+    /// Webhook tokens minted before they were 256-bit random secrets are
+    /// replaced, so no weak token is accepted; the new path shows in the task.
+    async fn remint_weak_webhook_tokens(db: &SkyDb) -> Result<(), ChatDbError> {
+        let tasks = query!(
+            db,
+            "SELECT * FROM scheduled_tasks WHERE trigger_kind = ?",
+            crate::task_trigger::TRIGGER_KIND_WEBHOOK
+        )
+        .fetch_all::<entity::scheduled_tasks::Model>()
+        .await?;
+        for task in tasks {
+            if crate::task_trigger::is_strong_webhook_token(&task.trigger_type) {
+                continue;
+            }
+            let token = crate::task_trigger::new_webhook_token();
+            query!(
+                db,
+                "UPDATE scheduled_tasks SET trigger_type = ? WHERE id = ?",
+                token,
+                task.id.clone()
+            )
+            .execute()
+            .await?;
+            tracing::warn!(
+                task_id = %task.id,
+                "re-minted a weak webhook token; the task's webhook path changed"
+            );
         }
         Ok(())
     }
@@ -1465,6 +1528,7 @@ mod tests {
                     question: "Proceed?".to_string(),
                     option: vec!["yes".to_string()],
                     multi_select: false,
+                    secret: None,
                 }],
             }),
         )
