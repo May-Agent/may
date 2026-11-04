@@ -47,21 +47,39 @@ pub(super) fn maybe_suggest(state: &Arc<DaemonState>, session_id: &str) {
     let task_session = session_id.to_string();
     state.aux_tasks.start(
         session_id,
+        super::aux::AuxKind::Suggestion,
         |request_id| async move {
             let text = generate(&task_state, &task_session).await;
             // Only the task that still owns the session's slot publishes,
-            // ordered against a cancelling turn by the slot's lock.
-            task_state
-                .aux_tasks
-                .commit(&task_session, request_id, || match text.as_deref() {
+            // ordered against a cancelling turn by the slot's lock. The
+            // setting is read live: a suggestion never appears under a
+            // disabled setting.
+            task_state.aux_tasks.commit(&task_session, request_id, || {
+                let text = text
+                    .as_deref()
+                    .filter(|_| task_state.config.load().suggestions.enabled);
+                match text {
                     Some(text) => {
                         publish(&task_state, &task_session, request_id, "ready", Some(text));
                     }
                     None => publish(&task_state, &task_session, request_id, "cleared", None),
-                });
+                }
+            });
         },
         &state.tokio_handle,
     );
+}
+
+/// Applies the live `[suggestions]` setting: once disabled, every
+/// suggestion in flight is cancelled and its composer cleared.
+pub(super) fn apply_settings(state: &Arc<DaemonState>) {
+    if !state.config.load().suggestions.enabled {
+        state
+            .aux_tasks
+            .cancel_kind(super::aux::AuxKind::Suggestion, |session_id| {
+                publish(state, session_id, 0, "cleared", None);
+            });
+    }
 }
 
 /// Cancels `session_id`'s in-flight suggestion, if any, and broadcasts

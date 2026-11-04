@@ -26,7 +26,8 @@ use super::types::{
     LastModelRequest, McpCreateRequest, MemoryPayload, MemorySaveRequest, SkillInfoDto,
     SkillInstallRequest, SseHeartbeat, SshServerRequest, UiAppearanceConfig, UiBrowserConfig,
     UiConfigResponse, UiFullConfig, UiModelsConfig, UiNativeToolsConfig, UiPreferencesConfig,
-    UiProviderConfig, UiRemoteAccessConfig, UiSandboxConfig, UiStreamConfig,
+    UiProviderConfig, UiRecapConfig, UiRemoteAccessConfig, UiSandboxConfig, UiStreamConfig,
+    UiSuggestionsConfig,
 };
 use crate::computer::proto::{AgentRequest, AgentResponse};
 
@@ -173,6 +174,13 @@ pub(super) fn build_ui_full_config(config: &MayConfig) -> UiFullConfig {
         stream: UiStreamConfig {
             codec: config.stream.codec,
         },
+        suggestions: Some(UiSuggestionsConfig {
+            enabled: config.suggestions.enabled,
+        }),
+        recap: Some(UiRecapConfig {
+            auto: config.recap.auto,
+            idle_minutes: config.recap.idle_minutes,
+        }),
     }
 }
 
@@ -377,6 +385,13 @@ async fn run_save_full_config(state: Arc<DaemonState>, req: UiFullConfig) -> Sky
         config.remote_access.https_port = req.remote_access.https_port;
         config.remote_access.allow_local_environment = req.remote_access.allow_local_environment;
         config.remote_access.allowed_logins = normalize_logins(&req.remote_access.allowed_logins);
+        if let Some(suggestions) = &req.suggestions {
+            config.suggestions.enabled = suggestions.enabled;
+        }
+        if let Some(recap) = &req.recap {
+            config.recap.auto = recap.auto;
+            config.recap.idle_minutes = recap.idle_minutes;
+        }
     });
 
     updated
@@ -809,6 +824,25 @@ mod tests {
                 "{id}"
             );
         }
+    }
+
+    #[test]
+    fn full_config_carries_the_aux_settings_and_tolerates_their_absence() {
+        let mut config = MayConfig::default();
+        config.suggestions.enabled = false;
+        config.recap.auto = false;
+        config.recap.idle_minutes = 7;
+        let mut ui = serde_json::to_value(build_ui_full_config(&config)).expect("serializes");
+        assert_eq!(ui["suggestions"]["enabled"], false);
+        assert_eq!(ui["recap"]["auto"], false);
+        assert_eq!(ui["recap"]["idleMinutes"], 7);
+
+        // A client that predates the sections leaves them as they are.
+        let object = ui.as_object_mut().expect("object");
+        object.remove("suggestions");
+        object.remove("recap");
+        let saved: super::UiFullConfig = serde_json::from_value(ui).expect("deserializes");
+        assert!(saved.suggestions.is_none() && saved.recap.is_none());
     }
 
     #[test]
