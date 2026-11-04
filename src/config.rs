@@ -1245,8 +1245,9 @@ pub struct DaemonConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
     /// Further TCP addresses to serve on, such as a tailnet address
-    /// (`"100.101.102.103:8787"`). Requests on these are accepted from any
-    /// peer that can reach the address.
+    /// (`"100.101.102.103:8787"`). A loopback address serves the local
+    /// routes; on any other address each peer must be identified through
+    /// tailscaled's `WhoIs` or its request is refused.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub listen: Vec<std::net::SocketAddr>,
 }
