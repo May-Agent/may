@@ -1069,10 +1069,11 @@ pub struct RemoteAccessConfig {
     pub webhook_max_body_bytes: u64,
 }
 
-/// Default for `[remote_access] webhook_max_body_bytes`: 10 MiB.
+/// Default for `[remote_access] webhook_max_body_bytes`: 25 MiB, which holds
+/// the largest payload GitHub delivers (it caps webhook payloads at 25 MB).
 #[must_use]
 pub const fn default_webhook_max_body_bytes() -> u64 {
-    10 * 1024 * 1024
+    25 * 1024 * 1024
 }
 
 fn default_tailscale_binary() -> String {
