@@ -389,6 +389,7 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
         running: HashMap::new(),
     };
     extra.reconcile(&config.daemon.listen).await;
+    chat::watch_aux_settings(&state);
     let config_state = state.clone();
     let mut config_events = state.ui_event_bus.subscribe();
     tokio::spawn(async move {

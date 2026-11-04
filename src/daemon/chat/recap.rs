@@ -14,6 +14,7 @@ use skyzen::Result as SkyResult;
 use skyzen::routing::Params;
 use skyzen::utils::{Json, State};
 
+use super::aux::AuxKind;
 use crate::daemon::state::DaemonState;
 use crate::session::MessageRole;
 
@@ -91,7 +92,7 @@ async fn begin_recap(state: &Arc<DaemonState>, session_id: &str) -> SkyResult<Re
     if !has_user_messages(state, session_id).await {
         return Ok(RecapResponse { started: false });
     }
-    request_recap(state, session_id);
+    request_recap(state, session_id, AuxKind::ManualRecap);
     Ok(RecapResponse { started: true })
 }
 
@@ -109,21 +110,26 @@ async fn has_user_messages(state: &Arc<DaemonState>, session_id: &str) -> bool {
 }
 
 /// Starts `session_id`'s recap on its aux slot, superseding whatever aux
-/// work was in flight.
-pub(super) fn request_recap(state: &Arc<DaemonState>, session_id: &str) {
+/// work was in flight. An automatic recap is governed by `[recap] auto`,
+/// read live.
+pub(super) fn request_recap(state: &Arc<DaemonState>, session_id: &str, kind: AuxKind) {
     let task_state = Arc::clone(state);
     let task_session = session_id.to_string();
     state.aux_tasks.start(
         session_id,
+        kind,
         |request_id| async move {
             let record = generate(&task_state, &task_session).await;
             // The commit is atomic with a cancelling turn. A recap card is
             // history, so once the task owns the slot, writing the card and
             // announcing it run as one unit that no later cancellation can
             // split.
+            let allowed = kind != AuxKind::AutoRecap || task_state.config.load().recap.auto;
             task_state
                 .aux_tasks
                 .commit(&task_session, request_id, || match record {
+                    // Disabled while generating: nothing is written or sent.
+                    _ if !allowed => {}
                     Some(record) => {
                         let unit_state = Arc::clone(&task_state);
                         let unit_session = task_session.clone();
@@ -308,9 +314,10 @@ impl RecapSchedules {
         let task_session = session_id.to_string();
         let handle = state.tokio_handle.spawn(async move {
             if idle_with_warm_cache(&warmth, idle, aither_core::time::sleep).await
+                && task_state.config.load().recap.auto
                 && freshness(&task_state, &task_session).await
             {
-                request_recap(&task_state, &task_session);
+                request_recap(&task_state, &task_session, AuxKind::AutoRecap);
             }
             task_state.recap_schedules.schedules().remove(&task_session);
         });
@@ -324,6 +331,14 @@ impl RecapSchedules {
     #[cfg(test)]
     pub(super) fn is_armed(&self, session_id: &str) -> bool {
         self.schedules().contains_key(session_id)
+    }
+
+    /// Drops every idle timer.
+    fn unarm_all(&self) {
+        let handles: Vec<_> = self.schedules().drain().map(|(_, handle)| handle).collect();
+        for handle in handles {
+            handle.abort();
+        }
     }
 
     /// Drops `session_id`'s idle timer, if any.
@@ -356,6 +371,15 @@ pub(super) fn arm(state: &Arc<DaemonState>, session_id: &str) {
     }
     if let Some(warmth) = super::aux::warm_cache(state, session_id) {
         state.recap_schedules.arm(state, session_id, warmth);
+    }
+}
+
+/// Applies the live `[recap]` setting: once `auto` is off, every armed idle
+/// timer and every automatic generation in flight is dropped.
+pub(super) fn apply_settings(state: &Arc<DaemonState>) {
+    if !state.config.load().recap.auto {
+        state.recap_schedules.unarm_all();
+        state.aux_tasks.cancel_kind(AuxKind::AutoRecap, |_| {});
     }
 }
 
