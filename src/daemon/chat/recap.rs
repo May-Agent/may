@@ -314,6 +314,12 @@ impl RecapSchedules {
         }
     }
 
+    /// Whether `session_id` has an idle timer pending.
+    #[cfg(test)]
+    pub(super) fn is_armed(&self, session_id: &str) -> bool {
+        self.schedules().contains_key(session_id)
+    }
+
     /// Drops `session_id`'s idle timer, if any.
     fn unarm(&self, session_id: &str) {
         let handle = self.schedules().remove(session_id);
