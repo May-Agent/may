@@ -974,6 +974,9 @@ fn spawn_continued_run(state: Arc<DaemonState>, guard: SessionRunGuard) {
 /// until the queue is empty and finishing the guard finds no new work.
 async fn dispatch_follow_ups(state: Arc<DaemonState>, mut guard: SessionRunGuard) {
     let session_id = guard.session_id().to_string();
+    // Whether the newest turn ran to completion, so the session is idle
+    // once the queue drains.
+    let mut last_turn_completed = false;
     loop {
         let next = match state
             .runtime_service
@@ -993,7 +996,12 @@ async fn dispatch_follow_ups(state: Arc<DaemonState>, mut guard: SessionRunGuard
                     guard = continued;
                     continue;
                 }
-                Ok(None) => return,
+                Ok(None) => {
+                    if last_turn_completed {
+                        session_became_idle(&state, &session_id);
+                    }
+                    return;
+                }
                 Err(error) => {
                     tracing::error!(session_id = %session_id, error = %error, "failed to release session run after follow-up dispatch");
                     return;
@@ -1009,7 +1017,7 @@ async fn dispatch_follow_ups(state: Arc<DaemonState>, mut guard: SessionRunGuard
             delivery_mode: next.delivery_mode,
             pending_entry_id: next.id,
         };
-        if let Err(error) = Box::pin(run_chat_collect_with_receiver(
+        match Box::pin(run_chat_collect_with_receiver(
             state.clone(),
             request,
             true,
@@ -1018,9 +1026,12 @@ async fn dispatch_follow_ups(state: Arc<DaemonState>, mut guard: SessionRunGuard
         ))
         .await
         {
-            tracing::warn!(session_id = %session_id, error = %error, "follow-up run failed");
-            finish_failed_run(guard).await;
-            return;
+            Ok(end) => last_turn_completed = end == TurnEnd::Completed,
+            Err(error) => {
+                tracing::warn!(session_id = %session_id, error = %error, "follow-up run failed");
+                finish_failed_run(guard).await;
+                return;
+            }
         }
     }
 }
@@ -1477,6 +1488,10 @@ fn run_agent_loop<'a>(
     kind: &'a TurnKind,
 ) -> Pin<Box<impl Future<Output = Result<AgentRunResult, AgentLoopError>> + 'a>> {
     Box::pin(async move {
+        // Whatever path started the turn, it supersedes the on-screen
+        // suggestion and the idle-recap timer.
+        suggest::cancel(state, &req.session_id);
+        recap::unarm(state, &req.session_id);
         let mut attempt = 0usize;
         // The provider candidate the next attempt builds on, how many
         // candidates there are, and how many retries the current one had.
@@ -2421,14 +2436,21 @@ pub(super) async fn start_background_turn(
     }
 }
 
+/// A completed turn left `session_id` idle with nothing pending: it gets one
+/// suggested next prompt and an armed idle-recap timer. Every path that ends
+/// a session's turns calls this, so a published, queued or background turn
+/// leaves the same state behind.
+fn session_became_idle(state: &Arc<DaemonState>, session_id: &str) {
+    suggest::maybe_suggest(state, session_id);
+    recap::arm(state, session_id);
+}
+
 async fn run_published_turn(
     state: Arc<DaemonState>,
     req: ChatRequest,
     guard: SessionRunGuard,
     kind: TurnKind,
 ) -> Result<(), crate::db::ChatDbError> {
-    suggest::cancel(&state, &req.session_id);
-    recap::unarm(&state, &req.session_id);
     let mut sink = HubSink::new(&state, &req);
     let result = run_agent_loop(&state, &req, &mut sink, &guard, true, true, &kind).await;
     let response_session_id = req.session_id.clone();
@@ -2452,8 +2474,7 @@ async fn run_published_turn(
             if let Some(continued) = continued {
                 spawn_continued_run(state.clone(), continued);
             } else {
-                suggest::maybe_suggest(&state, &response_session_id);
-                recap::arm(&state, &response_session_id);
+                session_became_idle(&state, &response_session_id);
             }
         }
         Err(AgentLoopError::BrowserTakeoverPaused(result)) => {
@@ -2482,6 +2503,15 @@ async fn run_published_turn(
     Ok(())
 }
 
+/// How a turn driven by [`run_chat_collect_with_receiver`] ended without
+/// failing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TurnEnd {
+    Completed,
+    /// A browser takeover paused the turn; the session is not idle.
+    Paused,
+}
+
 /// Drive a chat turn without an attached SSE client — used by the follow-up
 /// queue to dispatch server-side enqueued messages. All assistant text and
 /// tool events are still persisted by the main loop; the sink only
@@ -2493,7 +2523,7 @@ async fn run_chat_collect_with_receiver(
     persist_user_message: bool,
     use_persisted_context_snapshot: bool,
     guard: &SessionRunGuard,
-) -> Result<(), ChatCollectError> {
+) -> Result<TurnEnd, ChatCollectError> {
     let mut sink = HubSink::new(&state, &req);
     let result = run_agent_loop(
         &state,
@@ -2508,11 +2538,11 @@ async fn run_chat_collect_with_receiver(
     match result {
         Ok(_) => {
             sink.finish(None, crate::client::RunEnd::Completed);
-            Ok(())
+            Ok(TurnEnd::Completed)
         }
         Err(AgentLoopError::BrowserTakeoverPaused(_)) => {
             sink.finish(None, crate::client::RunEnd::Paused);
-            Ok(())
+            Ok(TurnEnd::Paused)
         }
         Err(AgentLoopError::Preparation(error)) => {
             sink.finish(None, crate::client::RunEnd::Failed);
@@ -4583,6 +4613,114 @@ mod tests {
                 .any(|m| matches!(m.role, super::MessageRole::Tool)),
             "the partial turn was persisted"
         );
+    }
+
+    /// Queues `contents` as pending messages of "session".
+    async fn queue_messages(state: &std::sync::Arc<DaemonState>, contents: &[&str]) {
+        for content in contents {
+            let req = ChatRequest {
+                session_id: "session".to_string(),
+                content: (*content).to_string(),
+                attachments: Vec::new(),
+                hidden_context_xml: None,
+                delivery_mode: crate::session::PendingUserMessageMode::Queue,
+                pending_entry_id: None,
+            };
+            state
+                .runtime_service
+                .enqueue(
+                    "session",
+                    super::pending_user_message_from_request(req),
+                    crate::session::PendingUserMessageMode::Queue,
+                )
+                .await
+                .expect("enqueue");
+        }
+    }
+
+    /// Every turn clears the idle-recap timer when it starts, whatever path
+    /// started it.
+    #[tokio::test]
+    async fn a_turn_unarms_the_recap_timer_when_it_starts() {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let provider_a = stub_provider(vec![sse_text("one"), sse_text("two")]).await;
+        let provider_b = stub_provider(Vec::new()).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let state = failover_state(may_dir.path(), cwd.path(), &provider_a, &provider_b).await;
+
+        run_prompt_turn(&state, &mut TestSink::default())
+            .await
+            .expect("first turn");
+        super::recap::arm(&state, "session");
+        assert!(state.recap_schedules.is_armed("session"), "idle session");
+
+        run_prompt_turn(&state, &mut TestSink::default())
+            .await
+            .expect("second turn");
+        assert!(!state.recap_schedules.is_armed("session"));
+    }
+
+    /// A queue of two turns draining leaves the session idle with its recap
+    /// timer armed, as a published turn does.
+    #[tokio::test]
+    async fn a_drained_queue_arms_the_recap_timer() {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let provider_a = stub_provider(vec![sse_text("one"), sse_text("two")]).await;
+        let provider_b = stub_provider(Vec::new()).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let state = failover_state(may_dir.path(), cwd.path(), &provider_a, &provider_b).await;
+        queue_messages(&state, &["first", "second"]).await;
+
+        let guard = state
+            .runtime_service
+            .runs()
+            .acquire("session")
+            .await
+            .expect("acquire run");
+        super::dispatch_follow_ups(state.clone(), guard).await;
+
+        assert_eq!(stored_assistant_texts(&state).await, ["one", "two"]);
+        assert!(
+            state.recap_schedules.is_armed("session"),
+            "the drained queue left the session idle"
+        );
+    }
+
+    /// A message enqueued on an idle session starts a turn that ends with the
+    /// session idle and its recap timer armed.
+    #[tokio::test]
+    async fn an_enqueue_on_an_idle_session_arms_the_recap_timer() {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let provider_a = stub_provider(vec![sse_text("answer")]).await;
+        let provider_b = stub_provider(Vec::new()).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let state = failover_state(may_dir.path(), cwd.path(), &provider_a, &provider_b).await;
+
+        let req = ChatRequest {
+            session_id: "session".to_string(),
+            content: "hello".to_string(),
+            attachments: Vec::new(),
+            hidden_context_xml: None,
+            delivery_mode: crate::session::PendingUserMessageMode::Queue,
+            pending_entry_id: None,
+        };
+        super::enqueue_chat(
+            skyzen::utils::Json(req),
+            skyzen::utils::State(state.clone()),
+        )
+        .await
+        .expect("enqueue");
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while !state.recap_schedules.is_armed("session") {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the enqueued turn leaves the session idle with its timer armed");
+        assert_eq!(stored_assistant_texts(&state).await, ["answer"]);
     }
 
     /// A resumed turn whose provider call fails and is retried on the same
