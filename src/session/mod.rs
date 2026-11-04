@@ -37,7 +37,9 @@ pub use manager::{
 };
 pub(crate) use persisted_message::{PersistedMessage, PersistedMessageError};
 pub use plan::SessionPlanState;
-pub use runs::{AcquireError, CancelReason, RunOutcome, SessionBusy, SessionRunGuard, SessionRuns};
+pub use runs::{
+    AcquireError, CancelReason, RunOutcome, RunReleased, SessionBusy, SessionRunGuard, SessionRuns,
+};
 pub use runtime::{
     AttachmentKind, BrowserInteractionState, PendingMessageState, PendingUserMessage,
     PendingUserMessageMode, PersistedAskUserQuestion, PersistedAskUserRequest, PersistedAttachment,
