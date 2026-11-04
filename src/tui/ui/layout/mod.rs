@@ -2754,6 +2754,58 @@ mod tests {
     use ratatui_image::picker::{Picker, ProtocolType};
     use std::path::PathBuf;
 
+    /// A link in a user message, drawn as the chat column draws it, is
+    /// painted (underlined when hovered) on the cells the frame shows.
+    #[test]
+    fn hovered_link_in_user_message_is_painted() {
+        let mut chat = ChatStream::new();
+        chat.push_user("see https://example.com/docs and /etc/hosts", Vec::new(), 0);
+        let mut layout = ChatLayout::default();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+        let mut painted = None;
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_unified(
+                    frame,
+                    area,
+                    &chat,
+                    &mut layout,
+                    usize::MAX,
+                    UnifiedRenderContext {
+                        selected_tool: None,
+                        content_height_out: None,
+                        view_height_out: None,
+                        input_ctx: None,
+                        input_caret_active: false,
+                        queue_ctx: None,
+                        status_ctx: None,
+                        images_supported: true,
+                        hide_todos: false,
+                        image_positions_out: None,
+                        spinner_frame: 0,
+                    },
+                );
+                let runs = layout.link_runs(0, usize::from(area.height), area);
+                assert!(!runs.is_empty(), "the user message has link runs");
+                let hovered = runs[0].hit.id;
+                super::super::links::paint(frame.buffer_mut(), &runs, Some(hovered));
+                painted = Some((frame.buffer_mut().clone(), runs));
+            })
+            .unwrap();
+        let (buf, runs) = painted.expect("drawn");
+        let first = &runs[0];
+        assert!(
+            buf[(first.x, first.y)]
+                .modifier
+                .contains(ratatui::style::Modifier::UNDERLINED),
+            "hovered run at ({}, {}) not underlined; screen: {:#?}",
+            first.x,
+            first.y,
+            buffer_screen(&buf)
+        );
+    }
+
     #[allow(deprecated)] // a fixed font size keeps the test off the real terminal
     fn image_state(protocol: ProtocolType) -> ImageState {
         let mut picker = Picker::from_fontsize((10, 20));

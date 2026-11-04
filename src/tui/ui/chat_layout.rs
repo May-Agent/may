@@ -600,6 +600,23 @@ mod tests {
     }
 
     #[test]
+    fn url_and_path_in_user_message_are_links() {
+        let mut chat = ChatStream::new();
+        chat.push_user("see https://example.com/docs and /etc/hosts", Vec::new(), 0);
+        let layout = layout_of(&chat, 120);
+        let uris: std::collections::BTreeSet<String> = hits(&layout, 120)
+            .into_iter()
+            .map(|(.., hit)| hit.uri)
+            .collect();
+        assert_eq!(
+            uris,
+            ["file:///etc/hosts", "https://example.com/docs"]
+                .map(str::to_string)
+                .into()
+        );
+    }
+
+    #[test]
     fn text_without_links_has_none() {
         let mut chat = ChatStream::new();
         chat.push_text("run /help, then open src/main.rs");
