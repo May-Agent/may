@@ -117,28 +117,34 @@ pub(super) fn request_recap(state: &Arc<DaemonState>, session_id: &str) {
         session_id,
         |request_id| async move {
             let record = generate(&task_state, &task_session).await;
-            // A superseding request aborted this task before it could
-            // publish; whatever survives still owns the session's slot.
-            if task_state.aux_tasks.is_current(&task_session, request_id) {
-                match record {
+            // The commit is atomic with a cancelling turn. A recap card is
+            // history, so once the task owns the slot, writing the card and
+            // announcing it run as one unit that no later cancellation can
+            // split.
+            task_state
+                .aux_tasks
+                .commit(&task_session, request_id, || match record {
                     Some(record) => {
-                        let persisted = persist(&task_state, &task_session, &record).await.is_ok();
-                        if !persisted {
-                            tracing::warn!("failed to persist the recap");
-                        }
-                        publish(
-                            &task_state,
-                            &task_session,
-                            request_id,
-                            if persisted { "ready" } else { "error" },
-                            Some(&record.summary),
-                            record.next_action.as_deref(),
-                        );
+                        let unit_state = Arc::clone(&task_state);
+                        let unit_session = task_session.clone();
+                        task_state.tokio_handle.spawn(async move {
+                            let persisted =
+                                persist(&unit_state, &unit_session, &record).await.is_ok();
+                            if !persisted {
+                                tracing::warn!("failed to persist the recap");
+                            }
+                            publish(
+                                &unit_state,
+                                &unit_session,
+                                request_id,
+                                if persisted { "ready" } else { "error" },
+                                Some(&record.summary),
+                                record.next_action.as_deref(),
+                            );
+                        });
                     }
                     None => publish(&task_state, &task_session, request_id, "error", None, None),
-                }
-                task_state.aux_tasks.clear(&task_session, request_id);
-            }
+                });
         },
         &state.tokio_handle,
     );
