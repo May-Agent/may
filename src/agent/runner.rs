@@ -51,6 +51,8 @@ pub enum TuiEvent {
     UsageReport(crate::agent::SessionUsageReport),
     /// Assembled-context dump for `/context dump` is ready.
     ContextDump(Result<ContextDump, aither_agent::AgentError>),
+    /// The agent's effective context, read for a side request.
+    ContextMessages(Result<Vec<aither_core::llm::Message>, aither_agent::AgentError>),
     /// The daemon wrote the `/context dump` to `path`.
     ContextDumpSaved {
         /// Where the dump was written.
@@ -148,6 +150,8 @@ pub(crate) enum WorkerCommand {
     UsageReport { event_tx: Sender<TuiEvent> },
     /// Dump the assembled context for `/context dump`.
     ContextDump { event_tx: Sender<TuiEvent> },
+    /// Read the effective context as request messages.
+    ContextMessages { event_tx: Sender<TuiEvent> },
     /// Run a turn in the daemon (remote workers only).
     Send {
         turn: RemoteTurn,
@@ -174,7 +178,7 @@ pub struct AgentWorker {
     subagent_runs: Option<aither_agent::specialized::SubagentRuns>,
     /// Model clone for `/btw` side questions; `None` when the agent runs in
     /// the daemon, which answers `/btw` itself.
-    btw_llm: Option<RequestParameterizedModel<aither_cloud::CloudProvider>>,
+    btw_llm: Option<RequestParameterizedModel<crate::agent::ProviderLlm>>,
     /// The agent's prompt-cache entry; `None` when the agent runs in the
     /// daemon.
     warmth: Option<aither_agent::CacheWarmth>,
@@ -314,6 +318,28 @@ impl AgentWorker {
         }
     }
 
+    /// Request the agent's effective context (system prefix, handoff, kept
+    /// turns) as the messages its next request would carry. Reading changes
+    /// nothing: no runtime block is reconciled and no source is consumed.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the worker command channel is already closed — the worker
+    /// task has stopped unexpectedly.
+    #[must_use]
+    pub fn context_messages(&self) -> AgentHandle {
+        const ERR_WORKER_CHANNEL_CLOSED: &str =
+            include_str!("../texts/agent_worker_channel_closed.txt");
+        let (event_tx, event_rx) = unbounded();
+        self.command_tx
+            .try_send(WorkerCommand::ContextMessages { event_tx })
+            .unwrap_or_else(|_| panic!("{}", ERR_WORKER_CHANNEL_CLOSED.trim()));
+        AgentHandle {
+            event_rx,
+            command_tx: self.command_tx.clone(),
+        }
+    }
+
     /// Run `turn` in the daemon; only a worker from
     /// [`crate::tui::remote::spawn_remote_worker`] accepts it.
     ///
@@ -375,7 +401,7 @@ impl AgentWorker {
 
     /// Model clone for `/btw` side questions.
     #[must_use]
-    pub const fn btw_llm(&self) -> Option<&RequestParameterizedModel<aither_cloud::CloudProvider>> {
+    pub const fn btw_llm(&self) -> Option<&RequestParameterizedModel<crate::agent::ProviderLlm>> {
         self.btw_llm.as_ref()
     }
 
@@ -478,6 +504,16 @@ pub fn spawn_worker<E: Executor + 'static>(
     spawn_idle_worker(executor, agent, snapshot_db, runs, None)
 }
 
+/// Where an idle worker reports the background commands its earlier runs
+/// detached.
+#[derive(Debug)]
+pub struct BackgroundWakes {
+    /// Receives each wake that needs the model.
+    pub wakes: Sender<aither_agent::BackgroundWake>,
+    /// The worker starts waiting on background commands once this fires.
+    pub released: crate::session::RunReleased,
+}
+
 /// Spawns a worker like [`spawn_worker`] whose idle agent also waits on the
 /// background commands its earlier runs detached; each wake that needs the
 /// model is sent on `background_wakes`.
@@ -486,7 +522,7 @@ pub fn spawn_idle_worker<E: Executor + 'static>(
     agent: MayAgent,
     snapshot_db: ChatDb,
     runs: SessionRuns,
-    background_wakes: Option<Sender<aither_agent::BackgroundWake>>,
+    background_wakes: Option<BackgroundWakes>,
 ) -> AgentWorker {
     let (command_tx, command_rx) = unbounded::<WorkerCommand>();
     let job_registry = agent.job_registry();
@@ -525,7 +561,7 @@ async fn run_worker(
     command_tx: Sender<WorkerCommand>,
     snapshot_db: ChatDb,
     runs: SessionRuns,
-    background_wakes: Option<Sender<aither_agent::BackgroundWake>>,
+    background_wakes: Option<BackgroundWakes>,
 ) {
     loop {
         // Wait for a command; an idle session is compacted on the way, and
@@ -624,6 +660,11 @@ async fn run_worker(
                 let _ = event_tx.send(TuiEvent::ContextDump(dump)).await;
                 let _ = event_tx.send(TuiEvent::Complete).await;
             }
+            WorkerCommand::ContextMessages { event_tx } => {
+                let messages = agent.context_messages().await;
+                let _ = event_tx.send(TuiEvent::ContextMessages(messages)).await;
+                let _ = event_tx.send(TuiEvent::Complete).await;
+            }
             WorkerCommand::Send { event_tx, .. } => {
                 let _ = event_tx
                     .send(TuiEvent::Error(ERR_SEND_IN_PROCESS.to_string()))
@@ -657,7 +698,7 @@ async fn next_command(
     command_rx: &Receiver<WorkerCommand>,
     snapshot_db: &ChatDb,
     runs: &SessionRuns,
-    background_wakes: Option<&Sender<aither_agent::BackgroundWake>>,
+    background_wakes: Option<&BackgroundWakes>,
 ) -> Option<WorkerCommand> {
     loop {
         let compaction_due_in = agent.idle_compaction_due_in();
@@ -675,7 +716,13 @@ async fn next_command(
                 },
                 async {
                     match background_wakes {
-                        Some(_) => IdleStep::Background(agent.wait_background().await),
+                        Some(background) => {
+                            // A job finishing before the run that parked the
+                            // agent released the session would wake a host
+                            // that finds the session held.
+                            background.released.wait().await;
+                            IdleStep::Background(agent.wait_background().await)
+                        }
                         None => std::future::pending().await,
                     }
                 },
@@ -688,9 +735,9 @@ async fn next_command(
                 // The wake is recorded in the agent's context; a wake that
                 // needs the model asks the host for a run.
                 if wake.needs_model
-                    && let Some(wakes) = background_wakes
+                    && let Some(background) = background_wakes
                 {
-                    let _ = wakes.try_send(wake);
+                    let _ = background.wakes.try_send(wake);
                 }
             }
             IdleStep::Compact => {
@@ -804,7 +851,8 @@ async fn race_against_commands<F: Future>(
                 | WorkerCommand::Release { .. }
                 | WorkerCommand::ContextReport { .. }
                 | WorkerCommand::UsageReport { .. }
-                | WorkerCommand::ContextDump { .. } => deferred.push(command),
+                | WorkerCommand::ContextDump { .. }
+                | WorkerCommand::ContextMessages { .. } => deferred.push(command),
                 WorkerCommand::Compact { event_tx, .. } => {
                     let _ = event_tx
                         .send(TuiEvent::Error(ERR_WORKER_BUSY.trim().to_string()))
@@ -993,12 +1041,15 @@ mod tests {
         });
 
         let llm = crate::agent::RequestParameterizedModel::new(
-            aither_cloud::CloudProvider::OpenAI(
-                aither_cloud::openai::OpenAI::builder("test-key")
-                    .base_url(format!("http://{addr}"))
-                    .model("gpt-5")
-                    .no_retry()
-                    .build(),
+            crate::agent::RedactedModel::new(
+                aither_cloud::CloudProvider::OpenAI(
+                    aither_cloud::openai::OpenAI::builder("test-key")
+                        .base_url(format!("http://{addr}"))
+                        .model("gpt-5")
+                        .no_retry()
+                        .build(),
+                ),
+                crate::secrets::SecretRedactor::new(std::path::Path::new("/nonexistent")),
             ),
             aither_core::llm::model::Parameters::default(),
         );

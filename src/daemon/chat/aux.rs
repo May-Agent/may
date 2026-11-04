@@ -5,8 +5,10 @@
 //! agent, or the session's tools. Callers (prompt suggestion, recap) own
 //! eligibility and message construction; [`AuxTasks`] owns identity and
 //! cancellation so a superseded or stale result can never be applied —
-//! a result may be applied only while [`AuxTasks::is_current`] still holds
-//! for its request id.
+//! a result is published only through [`AuxTasks::commit`], which checks
+//! ownership and publishes under one lock, and [`AuxTasks::cancel`]
+//! publishes its own frame under that same lock, so a cancelled task's
+//! result can never follow the cancellation.
 //!
 //! Cancellation is cooperative: replacing or cancelling a session's slot
 //! aborts the task, and every cancellation path the issue describes (new
@@ -29,8 +31,20 @@ pub struct AuxTasks {
     next_id: AtomicU64,
 }
 
+/// What an aux task generates, and so which setting governs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuxKind {
+    /// A prompt suggestion, governed by `[suggestions] enabled`.
+    Suggestion,
+    /// A recap the idle timer started, governed by `[recap] auto`.
+    AutoRecap,
+    /// A recap the user asked for.
+    ManualRecap,
+}
+
 struct AuxTask {
     request_id: u64,
+    kind: AuxKind,
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -52,6 +66,7 @@ impl AuxTasks {
     pub fn start<F>(
         &self,
         session_id: &str,
+        kind: AuxKind,
         make_task: impl FnOnce(u64) -> F,
         rt: &tokio::runtime::Handle,
     ) -> u64
@@ -59,37 +74,75 @@ impl AuxTasks {
         F: std::future::Future<Output = ()> + Send + 'static,
     {
         let request_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        // The slot is claimed under the lock the task's commit takes, so a
+        // task that finishes at once still finds itself the owner.
+        let mut tasks = self.tasks();
         let handle = rt.spawn(make_task(request_id));
-        let previous = self
-            .tasks()
-            .insert(session_id.to_string(), AuxTask { request_id, handle });
+        let previous = tasks.insert(
+            session_id.to_string(),
+            AuxTask {
+                request_id,
+                kind,
+                handle,
+            },
+        );
+        drop(tasks);
         if let Some(previous) = previous {
             previous.handle.abort();
         }
         request_id
     }
 
-    /// Aborts and forgets `session_id`'s in-flight aux task, if any.
-    pub fn cancel(&self, session_id: &str) {
-        let task = self.tasks().remove(session_id);
-        if let Some(task) = task {
+    /// Aborts and forgets `session_id`'s in-flight aux task, if any, then
+    /// runs `publish` (the cancellation's own frame), all under the lock
+    /// [`Self::commit`] takes: a result either published before this call or
+    /// is rejected after it.
+    pub fn cancel(&self, session_id: &str, publish: impl FnOnce()) {
+        let mut tasks = self.tasks();
+        if let Some(task) = tasks.remove(session_id) {
             task.handle.abort();
         }
+        publish();
+        drop(tasks);
     }
 
-    /// Forgets `session_id`'s task while `request_id` still owns it. A
-    /// finishing task releases its slot through this without being aborted.
-    pub fn clear(&self, session_id: &str, request_id: u64) {
-        if let std::collections::hash_map::Entry::Occupied(entry) =
-            self.tasks().entry(session_id.to_string())
-            && entry.get().request_id == request_id
-        {
-            entry.remove();
+    /// Aborts every in-flight task of `kind` and runs `publish` with each
+    /// one's session, under the lock [`Self::commit`] takes: the setting
+    /// governing `kind` went off, and no such result may follow.
+    pub fn cancel_kind(&self, kind: AuxKind, mut publish: impl FnMut(&str)) {
+        let mut tasks = self.tasks();
+        let sessions: Vec<String> = tasks
+            .iter()
+            .filter(|(_, task)| task.kind == kind)
+            .map(|(session_id, _)| session_id.clone())
+            .collect();
+        for session_id in sessions {
+            if let Some(task) = tasks.remove(&session_id) {
+                task.handle.abort();
+            }
+            publish(&session_id);
         }
+        drop(tasks);
     }
 
-    /// Whether `request_id` still owns `session_id`'s aux slot. A result is
-    /// applied only while this holds.
+    /// Publishes the result of `request_id` through `publish` and releases
+    /// its slot, while `request_id` still owns `session_id`'s slot; the
+    /// check and the publication are one step under the lock. Returns
+    /// whether the task owned the slot.
+    pub fn commit(&self, session_id: &str, request_id: u64, publish: impl FnOnce()) -> bool {
+        let mut tasks = self.tasks();
+        let owns = tasks
+            .get(session_id)
+            .is_some_and(|task| task.request_id == request_id);
+        if owns {
+            publish();
+            tasks.remove(session_id);
+        }
+        owns
+    }
+
+    /// Whether `request_id` currently owns `session_id`'s aux slot.
+    #[cfg(test)]
     pub fn is_current(&self, session_id: &str, request_id: u64) -> bool {
         self.tasks()
             .get(session_id)
@@ -124,19 +177,26 @@ pub fn warm_cache(state: &DaemonState, session_id: &str) -> Option<aither_agent:
         .filter(aither_agent::CacheWarmth::is_warm)
 }
 
-/// The session's persisted conversation as replay messages — the same
-/// prefix an agent rebuilt from history sees, so provider prefix caches
-/// still hit.
-pub async fn history_messages(
+/// The messages the session's idle agent would send next: its system
+/// prefix, compaction handoff and kept turns. Read without changing the
+/// agent, so the request shares the main agent's cached prefix and carries
+/// nothing a compaction replaced.
+pub async fn context_messages(
     state: &Arc<DaemonState>,
     session_id: &str,
 ) -> Result<Vec<aither_core::llm::Message>, AuxError> {
-    let history = crate::session::load_history_from_db(&state.db(), session_id)
+    let worker = super::hosts::idle_agent(state, session_id)
         .await
         .map_err(|error| AuxError::Session(error.to_string()))?;
-    history
-        .to_aither_messages()
-        .map_err(|error| AuxError::Session(error.to_string()))
+    let handle = worker.context_messages();
+    while let Some(event) = handle.recv().await {
+        if let crate::agent::TuiEvent::ContextMessages(result) = event {
+            return result.map_err(|error| AuxError::Session(error.to_string()));
+        }
+    }
+    Err(AuxError::Session(
+        "the agent stopped before it gave its context".to_string(),
+    ))
 }
 
 /// Streams `messages` through the session's own model via its parked agent
@@ -243,6 +303,7 @@ mod tests {
         let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel::<()>();
         let first = registry.start(
             "s",
+            AuxKind::Suggestion,
             |_| async move {
                 // Abort drops the future and its captured sender.
                 let _dropped_tx = dropped_tx;
@@ -251,28 +312,72 @@ mod tests {
             &rt,
         );
         assert!(registry.is_current("s", first));
-        let second = registry.start("s", |_| std::future::pending(), &rt);
+        let second = registry.start("s", AuxKind::Suggestion, |_| std::future::pending(), &rt);
         assert!(registry.is_current("s", second));
         assert!(!registry.is_current("s", first));
         dropped_rx
             .await
             .expect_err("the first task was not aborted");
-        registry.cancel("s");
+        registry.cancel("s", || {});
         assert!(!registry.is_current("s", second));
     }
 
     #[tokio::test]
-    async fn clear_releases_only_the_owning_request() {
+    async fn commit_releases_only_the_owning_request() {
         let rt = tokio::runtime::Handle::current();
         let registry = AuxTasks::default();
-        let request_id = registry.start("s", |_| std::future::pending(), &rt);
-        registry.clear("s", request_id + 1);
+        let request_id = registry.start("s", AuxKind::Suggestion, |_| std::future::pending(), &rt);
+        assert!(!registry.commit("s", request_id + 1, || panic!("not the owner")));
         assert!(registry.is_current("s", request_id));
-        registry.clear("s", request_id);
+        assert!(registry.commit("s", request_id, || {}));
         assert!(!registry.is_current("s", request_id));
         assert_ne!(
-            registry.start("s", |_| std::future::pending(), &rt),
+            registry.start("s", AuxKind::Suggestion, |_| std::future::pending(), &rt),
             request_id
         );
+    }
+
+    fn logged(log: &Mutex<Vec<&'static str>>, entry: &'static str) {
+        log.lock().expect("log").push(entry);
+    }
+
+    #[tokio::test]
+    async fn a_result_never_follows_the_cancellation_it_raced() {
+        let rt = tokio::runtime::Handle::current();
+        // Interleave the two on real threads many times: whichever wins,
+        // the cancellation's frame is last, and a rejected commit
+        // publishes nothing.
+        for _ in 0..500 {
+            let registry = Arc::new(AuxTasks::default());
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let request_id =
+                registry.start("s", AuxKind::Suggestion, |_| std::future::pending(), &rt);
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let committing = {
+                let (registry, log, barrier) = (registry.clone(), log.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    registry.commit("s", request_id, || logged(&log, "ready"))
+                })
+            };
+            barrier.wait();
+            registry.cancel("s", || logged(&log, "cleared"));
+            let committed = committing.join().expect("commit thread");
+            let log = log.lock().expect("log");
+            assert_eq!(log.last(), Some(&"cleared"), "{log:?}");
+            assert_eq!(log.len(), if committed { 2 } else { 1 }, "{log:?}");
+            drop(log);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_commit_after_a_cancel_is_rejected() {
+        let rt = tokio::runtime::Handle::current();
+        let registry = AuxTasks::default();
+        let log = Mutex::new(Vec::new());
+        let request_id = registry.start("s", AuxKind::Suggestion, |_| std::future::pending(), &rt);
+        registry.cancel("s", || logged(&log, "cleared"));
+        assert!(!registry.commit("s", request_id, || logged(&log, "ready")));
+        assert_eq!(*log.lock().expect("log"), ["cleared"]);
     }
 }

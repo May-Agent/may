@@ -287,6 +287,12 @@ export const enUS = {
       other: 'Other',
       failed: 'Could not send the answer. The question may no longer be open.',
       openTitle: 'May asked a question',
+      secretLabel: 'Secret value',
+      secretHintGlobal: 'Stored as {name} for every session. May never sees the value.',
+      secretHintSession: 'Stored as {name} for this session only. May never sees the value.',
+      secretDecline: 'Decline',
+      secretDeclined: 'Declined. Submit to tell May.',
+      secretProvide: 'Enter a value instead',
     },
   },
   settings: {
@@ -553,6 +559,11 @@ export const enUS = {
     killConfirmBody: 'The process is killed. Output written so far is kept.',
     stopping: 'Stopping…',
     loadFailed: 'Couldn’t load: {message}',
+  },
+  yolo: {
+    label: 'Yolo',
+    description: 'Grant every approval request in this chat without asking',
+    failed: 'Couldn’t change yolo: {message}',
   },
   plan: {
     approved: 'Approved',

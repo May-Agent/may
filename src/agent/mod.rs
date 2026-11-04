@@ -29,6 +29,8 @@ pub(crate) mod register_tool;
 pub(crate) mod repo_tool;
 pub mod runner;
 mod runtime_context;
+#[cfg(test)]
+mod secret_redaction_tests;
 /// Session tool registration for the agent.
 pub mod session_tool;
 /// Authorization for `terminal` ssh-mode targets.
@@ -60,12 +62,12 @@ pub use permission::{
 };
 pub(crate) use provider::reasoning_text_requested;
 pub use provider::{
-    RequestParameterizedModel, ResolvedProviderRuntime, build_fast_provider_chain,
-    provider_candidate_count, resolve_provider_runtime,
+    ProviderLlm, RedactedModel, RequestParameterizedModel, ResolvedProviderRuntime,
+    build_fast_provider_chain, provider_candidate_count, resolve_provider_runtime,
 };
 pub use runner::{
-    AgentHandle, AgentWorker, ForeignTurn, RemoteTurn, RunLease, TuiEvent, spawn_idle_worker,
-    spawn_worker,
+    AgentHandle, AgentWorker, BackgroundWakes, ForeignTurn, RemoteTurn, RunLease, TuiEvent,
+    spawn_idle_worker, spawn_worker,
 };
 pub use subagent_tracker::{
     SubagentHandles, SubagentRunSnapshot, SubagentTracker, TrackedSubagentTool, UsageObservedModel,

@@ -362,6 +362,8 @@ pub(super) struct PendingAskUserQuestionRow {
     pub(super) section: String,
     pub(super) question: String,
     pub(super) multi_select: bool,
+    pub(super) secret_name: Option<String>,
+    pub(super) secret_scope: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
@@ -626,7 +628,7 @@ pub struct CreateScheduledTaskParams<'a> {
 }
 
 /// Parameters for updating a scheduled task.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct UpdateScheduledTaskParams<'a> {
     /// New task name, if changing.
     pub name: Option<&'a str>,

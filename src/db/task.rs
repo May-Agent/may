@@ -20,9 +20,17 @@ impl ChatDb {
         let trigger_type = params.trigger.storage_trigger_type();
         let now = jiff::Timestamp::now().to_string();
         let timeout_secs = i64::from(params.timeout_secs);
+        let signature_secret = params
+            .trigger
+            .webhook_signature()
+            .map(|signature| signature.secret.clone());
+        let signature_header = params
+            .trigger
+            .webhook_signature()
+            .map(|signature| signature.header.clone());
         query!(
             self.db,
-            "INSERT INTO scheduled_tasks (id, profile_id, session_id, name, trigger_kind, trigger_type, cron_expression, run_at, script_path, script_inline, needs_network, timeout_secs, approved, enabled, last_run_at, last_run_status, last_run_output, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO scheduled_tasks (id, profile_id, session_id, name, trigger_kind, trigger_type, cron_expression, run_at, script_path, script_inline, needs_network, timeout_secs, approved, enabled, last_run_at, last_run_status, last_run_output, created_at, updated_at, webhook_signature_secret, webhook_signature_header) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params.id,
             params.profile_id,
             params.session_id,
@@ -41,7 +49,9 @@ impl ChatDb {
             Option::<String>::None,
             Option::<String>::None,
             now.clone(),
-            now.clone()
+            now.clone(),
+            signature_secret.clone(),
+            signature_header.clone()
         )
         .execute()
         .await?;
@@ -65,6 +75,8 @@ impl ChatDb {
             last_run_output: None,
             created_at: now.clone(),
             updated_at: now,
+            webhook_signature_secret: signature_secret,
+            webhook_signature_header: signature_header,
         })
     }
 
@@ -166,6 +178,33 @@ impl ChatDb {
             .execute()
             .await?;
         Ok(())
+    }
+
+    /// Store a task created by `session_id` approved and enabled when the
+    /// session is in yolo mode; otherwise return it unchanged.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn grant_task_under_yolo(
+        &self,
+        session_id: &str,
+        task: scheduled_tasks::Model,
+    ) -> Result<scheduled_tasks::Model, ChatDbError> {
+        if !self.session_yolo(session_id).await? {
+            return Ok(task);
+        }
+        self.update_scheduled_task(
+            &task.id,
+            UpdateScheduledTaskParams {
+                enabled: Some(true),
+                approved: Some(true),
+                ..Default::default()
+            },
+        )
+        .await?;
+        self.get_scheduled_task(&task.id)
+            .await?
+            .ok_or_else(|| ChatDbError::RowNotFound(format!("scheduled task {}", task.id)))
     }
 
     /// Approve a task for execution.
@@ -281,19 +320,17 @@ impl ChatDb {
         .await?)
     }
 
-    /// List tasks whose webhook trigger token matches `token`.
+    /// List every enabled, approved webhook task. The caller matches the
+    /// presented token against each one in constant time, so the lookup never
+    /// reveals how much of a token was right.
     ///
     /// # Errors
     /// Returns [`ChatDbError`] on storage failure.
-    pub async fn list_tasks_for_webhook(
-        &self,
-        token: &str,
-    ) -> Result<Vec<scheduled_tasks::Model>, ChatDbError> {
+    pub async fn list_webhook_tasks(&self) -> Result<Vec<scheduled_tasks::Model>, ChatDbError> {
         Ok(query!(
             self.db,
-            "SELECT * FROM scheduled_tasks WHERE enabled = TRUE AND approved = TRUE AND trigger_kind = ? AND trigger_type = ?",
-            TRIGGER_KIND_WEBHOOK,
-            token
+            "SELECT * FROM scheduled_tasks WHERE enabled = TRUE AND approved = TRUE AND trigger_kind = ?",
+            TRIGGER_KIND_WEBHOOK
         )
         .fetch_all::<scheduled_tasks::Model>()
         .await?)

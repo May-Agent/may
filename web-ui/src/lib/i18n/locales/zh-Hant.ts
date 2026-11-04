@@ -289,6 +289,12 @@ export const zhHant: Messages = {
       other: '其他',
       failed: '無法送出回答。此問題可能已不再開放。',
       openTitle: 'May 提出了一個問題',
+      secretLabel: '密鑰內容',
+      secretHintGlobal: '將以 {name} 儲存，供所有工作階段使用。May 不會看到內容。',
+      secretHintSession: '將以 {name} 儲存，僅供此工作階段使用。May 不會看到內容。',
+      secretDecline: '拒絕提供',
+      secretDeclined: '已拒絕。送出後會告知 May。',
+      secretProvide: '改為輸入內容',
     },
   },
   settings: {
@@ -555,6 +561,11 @@ export const zhHant: Messages = {
     killConfirmBody: '程序會被終止，已寫入的輸出會保留。',
     stopping: '正在停止…',
     loadFailed: '無法載入：{message}',
+  },
+  yolo: {
+    label: 'Yolo',
+    description: '自動允許此對話中的所有核准請求，不再詢問',
+    failed: '無法變更 Yolo：{message}',
   },
   plan: {
     approved: '已核准',
