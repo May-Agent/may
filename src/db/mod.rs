@@ -84,6 +84,7 @@ impl ChatDb {
         Self::ensure_session_columns(&db).await?;
         Self::ensure_message_columns(&db).await?;
         Self::ensure_ask_user_blocking_column(&db).await?;
+        Self::ensure_ask_user_secret_columns(&db).await?;
         Self::ensure_pending_permission_agent_id_column(&db).await?;
         Self::ensure_scheduled_task_columns(&db).await?;
         Self::ensure_session_context_snapshot_table(&db).await?;
@@ -157,6 +158,24 @@ impl ChatDb {
             )
             .execute()
             .await?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_ask_user_secret_columns(db: &SkyDb) -> Result<(), ChatDbError> {
+        let columns = query!(
+            db,
+            "PRAGMA table_info(session_pending_ask_user_questions_v2)"
+        )
+        .fetch_all::<SqliteTableInfoRow>()
+        .await?;
+        for column in ["secret_name", "secret_scope"] {
+            if !columns.iter().any(|existing| existing.name == column) {
+                let sql = format!(
+                    "ALTER TABLE session_pending_ask_user_questions_v2 ADD COLUMN {column} TEXT"
+                );
+                query!(db, sql.as_str()).execute().await?;
+            }
         }
         Ok(())
     }
@@ -1509,6 +1528,7 @@ mod tests {
                     question: "Proceed?".to_string(),
                     option: vec!["yes".to_string()],
                     multi_select: false,
+                    secret: None,
                 }],
             }),
         )

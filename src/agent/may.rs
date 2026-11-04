@@ -411,7 +411,10 @@ impl MayAgent {
             // Keychain secrets (`/secret`) land as env vars in every spawned
             // command; the store is re-read per call, so additions take
             // effect without rebuilding the agent.
-            .with_env_source(crate::secrets::SecretStore::new(&config.may_dir));
+            .with_env_source(crate::secrets::SessionEnv::new(
+                crate::secrets::SecretStore::new(&config.may_dir),
+                config.session_id.as_str(),
+            ));
         let job_registry = terminal_tool.job_registry();
         let subagents = config.subagents.clone().unwrap_or_default();
         let subagent_runs = subagents.runs;
@@ -572,8 +575,9 @@ impl MayAgent {
         let mut builder = TerminalAgentBuilder::new(llm, terminal_tool)
             .hook(context_snapshot_hook)
             .hook(pending_steer_hook)
-            .hook(SecretRedactionHook::new(SecretRedactor::new(
+            .hook(SecretRedactionHook::new(SecretRedactor::for_session(
                 &config.may_dir,
+                config.session_id.as_str(),
             )))
             .cache_lifetime(config.cache_lifetime.into())
             .background_jobs(config.background_jobs)
@@ -756,7 +760,7 @@ impl MayAgent {
             connectivity,
         } = input;
         let selector = super::provider::parse_model_selector(model)?;
-        let redactor = crate::secrets::SecretRedactor::new(&may_dir);
+        let redactor = crate::secrets::SecretRedactor::for_session(&may_dir, session_id.as_str());
         let resolved_provider =
             resolve_provider_runtime(may_config, &selector, provider_attempt, &redactor).await?;
         let provider_id = resolved_provider.provider_id;
@@ -803,8 +807,11 @@ impl MayAgent {
             .ok_or_else(|| {
                 MayAgentError::Llm(format!("provider '{provider_id}' is not configured"))
             })?;
-        let secrets =
-            crate::secrets::Secrets::load(&crate::secrets::SecretStore::new(&may_dir), may_config);
+        let secrets = crate::secrets::Secrets::load_for_session(
+            &crate::secrets::SecretStore::new(&may_dir),
+            may_config,
+            session_id.as_str(),
+        );
         Ok(MayAgentConfig {
             subagents,
             background_jobs,

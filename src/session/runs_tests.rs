@@ -197,6 +197,7 @@ async fn stop_in_each_waiting_state_ends_idle_with_the_run_released() {
                                 question: "Proceed?".to_string(),
                                 option: vec!["yes".to_string()],
                                 multi_select: false,
+                                secret: None,
                             }],
                         }),
                     )
