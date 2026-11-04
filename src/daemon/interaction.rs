@@ -65,6 +65,17 @@ pub(super) async fn respond_permission_request(
     Ok(Json(runtime.into()))
 }
 
+/// The status of a question that is no longer open.
+///
+/// Withdrawn or already answered; clients tell it apart from a failure to
+/// store the answer, a `5xx`, and from an answer that does not fit the
+/// question, a `400`.
+pub const ASK_USER_NOT_OPEN: skyzen::StatusCode = skyzen::StatusCode::NOT_FOUND;
+
+fn ask_user_not_open_error() -> skyzen::Error {
+    skyzen::Error::msg("ask_user request not found or withdrawn").set_status(ASK_USER_NOT_OPEN)
+}
+
 pub(super) async fn respond_ask_user_request(
     Json(req): Json<AskUserRespondRequest>,
     State(state): State<Arc<DaemonState>>,
@@ -82,7 +93,7 @@ pub(super) async fn respond_ask_user_request(
             | AskUserRespondError::Lookup(_)
             | AskUserRespondError::Store { .. }) => internal_error(error),
         })?
-        .ok_or_else(|| bad_request_error("ask_user request not found or withdrawn"))?;
+        .ok_or_else(ask_user_not_open_error)?;
     let runtime = match resolved.outcome {
         AskUserOutcome::Woke | AskUserOutcome::AlreadyAnswered => state
             .runtime_service
@@ -141,4 +152,17 @@ pub(super) async fn respond_workspace_request(
     };
 
     Ok(Json(runtime.into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_question_that_is_not_open_is_a_404() {
+        assert_eq!(
+            ask_user_not_open_error().status(),
+            skyzen::StatusCode::NOT_FOUND
+        );
+    }
 }

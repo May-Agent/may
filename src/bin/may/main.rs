@@ -1490,13 +1490,32 @@ where
                                     "That prompt was withdrawn; your answer was not sent",
                                 ),
                             }
-                        } else if !runtime_deps
-                            .answer_open_question(&request_id, &answers)
-                            .await?
-                        {
-                            app.chat.push_notice(
-                                "That question is no longer open; your answer was not sent",
-                            );
+                        } else {
+                            match runtime_deps
+                                .answer_open_question(&request_id, &answers)
+                                .await
+                            {
+                                Ok(true) => {}
+                                Ok(false) => app.chat.push_notice(
+                                    "That question is no longer open; your answer was not sent",
+                                ),
+                                Err(error) => {
+                                    app.chat.push_notice(&format!(
+                                        "Your answer was not sent and the question is still open: {error}"
+                                    ));
+                                    if let Some(open) = app
+                                        .session_runtime
+                                        .open_questions
+                                        .iter()
+                                        .find(|open| open.id == request_id)
+                                        .cloned()
+                                    {
+                                        app.mode = may_agent::tui::AppMode::AskUser(
+                                            may_agent::tui::AskUserState::for_open_question(open),
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
                     Some(SendAction::ReloadHistory) => {
