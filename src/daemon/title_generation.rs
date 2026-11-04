@@ -73,6 +73,7 @@ async fn process_task(state: Arc<DaemonState>, task: TitleGenerationTask) {
         &config,
         &task.user_message,
         &task.assistant_response,
+        &crate::secrets::SecretRedactor::new(&state.may_dir),
     ))
     .await
     else {

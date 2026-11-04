@@ -91,6 +91,8 @@ pub mod skill;
 pub mod startup;
 /// Scheduled-task trigger definitions.
 pub mod task_trigger;
+/// The command a scheduled task's run uses to prompt its session.
+pub mod task_wake;
 /// Background task types and execution.
 pub mod tasks;
 /// Terminal commands exposed to the agent.

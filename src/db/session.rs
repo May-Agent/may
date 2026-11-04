@@ -230,6 +230,16 @@ impl ChatDb {
                         .map(|option| option.value)
                         .collect(),
                     multi_select: question.multi_select,
+                    secret: question.secret_name.map(|name| {
+                        let scope = question
+                            .secret_scope
+                            .as_deref()
+                            .and_then(crate::secrets::SecretScope::parse)
+                            .unwrap_or_else(|| {
+                                panic!("pending secret question {name} has no readable scope")
+                            });
+                        crate::session::PersistedSecretRequest { name, scope }
+                    }),
                 })
                 .collect(),
         }
@@ -972,12 +982,14 @@ impl ChatDb {
                 .map_err(|error| overflow_error("ask-user question ordinal", &error))?;
             query!(
                 tx,
-                "INSERT INTO session_pending_ask_user_questions_v2 (request_id, ordinal, section, question, multi_select) VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO session_pending_ask_user_questions_v2 (request_id, ordinal, section, question, multi_select, secret_name, secret_scope) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 request.id.as_str(),
                 question_ordinal,
                 question.section.as_str(),
                 question.question.as_str(),
-                question.multi_select
+                question.multi_select,
+                question.secret.as_ref().map(|secret| secret.name.as_str()),
+                question.secret.as_ref().map(|secret| secret.scope.as_str())
             )
             .execute()
             .await?;
@@ -1402,6 +1414,7 @@ mod tests {
                 question: "Pick one".to_string(),
                 option: vec!["a".to_string(), "b".to_string()],
                 multi_select: false,
+                secret: None,
             }],
         }
     }

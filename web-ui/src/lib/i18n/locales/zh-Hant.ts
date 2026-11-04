@@ -289,6 +289,12 @@ export const zhHant: Messages = {
       other: '其他',
       failed: '無法送出回答。此問題可能已不再開放。',
       openTitle: 'May 提出了一個問題',
+      secretLabel: '密鑰內容',
+      secretHintGlobal: '將以 {name} 儲存，供所有工作階段使用。May 不會看到內容。',
+      secretHintSession: '將以 {name} 儲存，僅供此工作階段使用。May 不會看到內容。',
+      secretDecline: '拒絕提供',
+      secretDeclined: '已拒絕。送出後會告知 May。',
+      secretProvide: '改為輸入內容',
     },
   },
   settings: {
