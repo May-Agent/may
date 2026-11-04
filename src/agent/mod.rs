@@ -66,8 +66,8 @@ pub use provider::{
     build_fast_provider_chain, provider_candidate_count, resolve_provider_runtime,
 };
 pub use runner::{
-    AgentHandle, AgentWorker, ForeignTurn, RemoteTurn, RunLease, TuiEvent, spawn_idle_worker,
-    spawn_worker,
+    AgentHandle, AgentWorker, BackgroundWakes, ForeignTurn, RemoteTurn, RunLease, TuiEvent,
+    spawn_idle_worker, spawn_worker,
 };
 pub use subagent_tracker::{
     SubagentHandles, SubagentRunSnapshot, SubagentTracker, TrackedSubagentTool, UsageObservedModel,
