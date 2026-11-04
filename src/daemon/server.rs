@@ -91,6 +91,9 @@ pub struct StartedDaemon {
     /// The same routes behind an identity layer with no trusted source yet,
     /// for direct non-loopback `[daemon] listen` binds: every request is 401.
     pub(crate) direct_router: Router,
+    /// The webhook routes alone, for the public listener Tailscale Funnel
+    /// targets. It holds no other route.
+    pub(crate) webhook_router: Router,
 }
 
 /// Builds the server state, starts its background work (scheduler, title
@@ -351,11 +354,13 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
         )]),
     );
     let router = build_router(state.clone(), mode, None);
+    let webhook_router = build_webhook_router(state.clone());
     Ok(StartedDaemon {
         state,
         router,
         remote_router,
         direct_router,
+        webhook_router,
     })
 }
 
@@ -600,6 +605,17 @@ fn artifact_page_routes() -> Route {
         "/{profileId}/session/{sessionId}/artifacts".at(serve_artifact),
         "/{profileId}/session/{sessionId}/artifacts/{*path}".at(serve_artifact),
     ))
+}
+
+/// The router of the public Funnel listener: the webhook delivery route and
+/// nothing else, so no other route is reachable through it. Authentication
+/// is the delivery's own token and signature.
+pub(super) fn build_webhook_router(state: Arc<DaemonState>) -> Router {
+    use super::tasks::invoke_webhook_task;
+    let api = "/api".route(Route::new((
+        "/tasks".route(Route::new(("/webhook/{token}".post(invoke_webhook_task),))),
+    )));
+    Route::new((api,)).middleware(State(state)).build()
 }
 
 pub(super) fn build_router(

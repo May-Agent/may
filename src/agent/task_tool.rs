@@ -319,6 +319,7 @@ mod tests {
                 TaskTriggerResponse::Webhook {
                     token: "secret".to_string(),
                     webhook_path: "/hooks/secret".to_string(),
+                    public_url: None,
                     signature: None,
                 },
                 true,
@@ -331,6 +332,20 @@ mod tests {
                 TaskTriggerResponse::Webhook {
                     token: "secret".to_string(),
                     webhook_path: "/hooks/secret".to_string(),
+                    public_url: Some("https://mac.ts.net/hooks/secret".to_string()),
+                    signature: None,
+                },
+                true,
+                true,
+            ),
+            "Scheduled task t1 was created under profile p1. It runs when its webhook path /hooks/secret is called, publicly at https://mac.ts.net/hooks/secret. The task is approved and enabled."
+        );
+        assert_eq!(
+            text(
+                TaskTriggerResponse::Webhook {
+                    token: "secret".to_string(),
+                    webhook_path: "/hooks/secret".to_string(),
+                    public_url: None,
                     signature: Some(crate::task_trigger::WebhookSignature {
                         secret: "GH_SECRET".to_string(),
                         header: "x-hub-signature-256".to_string(),

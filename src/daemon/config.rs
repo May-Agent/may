@@ -385,6 +385,8 @@ async fn run_save_full_config(state: Arc<DaemonState>, req: UiFullConfig) -> Sky
         config.remote_access.https_port = req.remote_access.https_port;
         config.remote_access.allow_local_environment = req.remote_access.allow_local_environment;
         config.remote_access.allowed_logins = normalize_logins(&req.remote_access.allowed_logins);
+        config.remote_access.funnel = req.remote_access.funnel;
+        config.remote_access.funnel_port = req.remote_access.funnel_port;
         if let Some(suggestions) = &req.suggestions {
             config.suggestions.enabled = suggestions.enabled;
         }
