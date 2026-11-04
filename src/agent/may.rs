@@ -1031,6 +1031,21 @@ impl MayAgent {
         ))
     }
 
+    /// The messages the next request would carry: the system prefix, the
+    /// compaction handoff, the kept conversation and the volatile tail.
+    ///
+    /// A pure read for a side request. Unlike [`Self::context_dump`] it
+    /// reconciles no runtime block, so the system prefix is exactly the one
+    /// the last request sent and a provider's prefix cache still hits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError`] when the model profiles cannot be fetched
+    /// during initialization.
+    pub async fn context_messages(&mut self) -> Result<Vec<LlmMessage>, AgentError> {
+        Ok(self.inner.snapshot_context_window().await?.messages)
+    }
+
     /// Get session ID.
     #[must_use]
     pub const fn session_id(&self) -> &SessionId {
