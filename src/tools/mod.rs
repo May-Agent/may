@@ -2,6 +2,11 @@
 
 use aither_sandbox::{ToolDistribution, ToolRuntimeError};
 
+#[cfg(test)]
+mod fixture;
+#[cfg(test)]
+pub(crate) use fixture::fixture_distribution;
+
 /// Release asset `tool-distribution-0.14.1.json` of aither's `patch-v0.14.1`
 /// release, byte for byte.
 const EMBEDDED_DISTRIBUTION: &[u8] = include_bytes!("tool-distribution-0.14.1.json");
