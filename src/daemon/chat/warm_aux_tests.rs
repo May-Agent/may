@@ -34,7 +34,13 @@ async fn state_with_idle_agent(
         run_turn(&mut session.agent).await;
     }
     let clock = session.clock.clone();
-    state.parked_agents.park(&state, SESSION, session.agent, 0);
+    state.parked_agents.park(
+        &state,
+        SESSION,
+        session.agent,
+        0,
+        crate::session::RunReleased::already_released(),
+    );
     (state, clock, session.temp)
 }
 
