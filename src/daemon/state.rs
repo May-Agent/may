@@ -1228,7 +1228,9 @@ impl DaemonState {
         );
         let (title_generation_queue, _rx) = TitleGenerationQueue::new();
         let (tool_dispatchers, _queues) = tool_dispatch_channels();
-        let tool_distribution = std::sync::Arc::new(crate::tools::embedded_distribution()?);
+        let tool_distribution = std::sync::Arc::new(crate::tools::fixture_distribution(
+            &may_dir.join("tool-fixtures"),
+        ));
         let (search_index_wake_tx, search_index_wake) = async_channel::bounded(1);
         let (browser_lifecycle_tx, _) = tokio::sync::broadcast::channel(4);
         let notification_manager = std::sync::Arc::new(
