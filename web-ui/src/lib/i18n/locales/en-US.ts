@@ -560,6 +560,11 @@ export const enUS = {
     stopping: 'Stopping…',
     loadFailed: 'Couldn’t load: {message}',
   },
+  yolo: {
+    label: 'Yolo',
+    description: 'Grant every approval request in this chat without asking',
+    failed: 'Couldn’t change yolo: {message}',
+  },
   plan: {
     approved: 'Approved',
     awaiting: 'Waiting for your approval',

@@ -16,4 +16,5 @@ pub mod session_pending_permissions;
 pub mod session_pending_workspace;
 pub mod session_plans;
 pub mod session_runtimes;
+pub mod session_yolo;
 pub mod sessions;
