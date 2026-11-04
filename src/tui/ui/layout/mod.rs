@@ -2262,11 +2262,103 @@ fn ask_user_rows(state: &AskUserState, width: u16) -> u16 {
     let (Some(question), Some(qs)) = (state.current(), state.current_state()) else {
         return 3;
     };
+    if state.current_secret().is_some() {
+        // question, the masked field, a status line, help and borders
+        return ask_question_rows(&question.question, width).saturating_add(3 + 2);
+    }
     let items = u16::try_from(question.option.len() + 1).unwrap_or(u16::MAX);
     ask_question_rows(&question.question, width)
         .saturating_add(items)
         .saturating_add(u16::from(qs.custom_mode))
         .saturating_add(1 + 2)
+}
+
+/// Render a secret question: the typed value shows only as one bullet per
+/// character, never as text.
+fn render_secret_question(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AskUserState,
+    question: &crate::ask_user::Question,
+    qs: &crate::tui::state::AskUserQuestionState,
+    secret: &crate::session::PersistedSecretRequest,
+) {
+    let scope = match secret.scope {
+        crate::secrets::SecretScope::Global => "global",
+        crate::secrets::SecretScope::Session => "this session",
+    };
+    let title = if state.is_multi() {
+        format!(
+            " Secret {} ({}/{}) ",
+            secret.name,
+            state.current_question + 1,
+            state.questions.len()
+        )
+    } else {
+        format!(" Secret {} ", secret.name)
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(title)
+        .title_alignment(Alignment::Center);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(ask_question_rows(&question.question, area.width)),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            &question.question,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )))
+        .wrap(ratatui::widgets::Wrap { trim: false }),
+        chunks[0],
+    );
+    let columns = UnicodeWidthStr::width(qs.custom_text.as_str());
+    let masked = "\u{2022}".repeat(columns);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("  > ", Style::default().fg(Color::Cyan)),
+            Span::styled(masked, Style::default().fg(Color::White)),
+        ])),
+        chunks[1],
+    );
+    let shown = u16::try_from(columns).unwrap_or(u16::MAX);
+    frame.set_cursor_position((
+        (chunks[1].x + 4)
+            .saturating_add(shown)
+            .min(chunks[1].right().saturating_sub(1)),
+        chunks[1].y,
+    ));
+    let status = if qs.declined {
+        "declined".to_string()
+    } else {
+        format!("Stored as ${} for {scope}", secret.name)
+    };
+    frame.render_widget(
+        Paragraph::new(status).style(Style::default().fg(Color::Magenta)),
+        chunks[2],
+    );
+    let close = if state.request.is_none() {
+        " | Esc: close (stays open)"
+    } else {
+        ""
+    };
+    frame.render_widget(
+        Paragraph::new(format!("Enter: store | Del: decline{close}"))
+            .style(Style::default().fg(Color::DarkGray))
+            .alignment(Alignment::Center),
+        chunks[3],
+    );
 }
 
 /// Render the `AskUser` dialog as a bottom sheet.
@@ -2277,6 +2369,10 @@ fn render_ask_user(frame: &mut Frame, area: Rect, state: &AskUserState) {
     let Some(qs) = state.current_state() else {
         return;
     };
+    if let Some(secret) = state.current_secret() {
+        render_secret_question(frame, area, state, question, qs, secret);
+        return;
+    }
 
     // Item count: options + Custom answer
     let opt_count = question.option.len();

@@ -680,6 +680,13 @@ pub(super) async fn delete_session(
             }
         }
     }
+    // The session's own secrets go first: a keychain failure keeps the
+    // session, so the delete can be retried instead of orphaning them.
+    let secrets = crate::secrets::SecretStore::new(&state.may_dir);
+    let session_id = id.clone();
+    blocking::unblock(move || secrets.remove_session(&session_id))
+        .await
+        .map_err(internal_error)?;
     db.delete_session(&id).await.map_err(internal_error)?;
     state.parked_agents.evict(&id);
     state.runtime_service.forget_terminal_grants(&id);
@@ -729,6 +736,10 @@ pub(super) async fn delete_all_sessions(
                 .await;
         }
     }
+    let secrets = crate::secrets::SecretStore::new(&state.may_dir);
+    blocking::unblock(move || secrets.remove_all_sessions())
+        .await
+        .map_err(internal_error)?;
     db.delete_all_sessions().await.map_err(internal_error)?;
     state.runtime_service.forget_all_terminal_grants();
     state.tool_environments.evict_all();

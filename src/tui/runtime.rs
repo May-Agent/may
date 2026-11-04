@@ -128,13 +128,68 @@ pub enum ResponseCommit<R> {
     Withdrawn,
 }
 
-/// Answers as `POST /api/ask-user/respond` takes them.
+/// Read the daemon's answer to `POST /api/ask-user/respond`: `false` when the
+/// question is no longer open, an error for every other failure.
+fn committed_or_not_open<T>(
+    result: Result<T, crate::client::DaemonClientError>,
+) -> Result<bool, TuiRuntimeError> {
+    match result {
+        Ok(_) => Ok(true),
+        Err(crate::client::DaemonClientError::Status { status, .. })
+            if status == crate::daemon::ASK_USER_NOT_OPEN =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(test)]
+mod ask_user_commit_tests {
+    use super::*;
+    use crate::client::DaemonClientError;
+
+    fn refused(status: hyper::StatusCode, message: &str) -> Result<(), DaemonClientError> {
+        Err(DaemonClientError::Status {
+            path: "/api/ask-user/respond".to_string(),
+            status,
+            message: message.to_string(),
+        })
+    }
+
+    #[test]
+    fn an_answer_the_daemon_took_is_committed() {
+        assert!(committed_or_not_open(Ok(())).expect("committed"));
+    }
+
+    #[test]
+    fn a_question_that_is_not_open_is_not_an_error() {
+        let result = committed_or_not_open(refused(
+            crate::daemon::ASK_USER_NOT_OPEN,
+            "ask_user request not found or withdrawn",
+        ));
+        assert!(!result.expect("not open is not a failure"));
+    }
+
+    #[test]
+    fn a_storage_failure_is_an_error_naming_it() {
+        let error = committed_or_not_open(refused(
+            hyper::StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to store secret deploy_token: keychain error",
+        ))
+        .expect_err("a storage failure is not 'not open'");
+        assert!(error.to_string().contains("keychain error"), "{error}");
+    }
+}
+
+/// Answers as `POST /api/ask-user/respond` takes them. A skipped answer is
+/// the user declining to give a secret.
 fn answers_json(answers: &[QuestionAnswer]) -> serde_json::Value {
     use crate::ask_user::AnswerValue;
     serde_json::Value::Array(
         answers
             .iter()
-            .filter_map(|answer| {
+            .map(|answer| {
                 let value = match &answer.answer {
                     AnswerValue::Selected(values) => {
                         serde_json::json!({ "kind": "selected", "values": values })
@@ -142,9 +197,9 @@ fn answers_json(answers: &[QuestionAnswer]) -> serde_json::Value {
                     AnswerValue::Custom(text) => {
                         serde_json::json!({ "kind": "custom", "text": text })
                     }
-                    AnswerValue::Skipped => return None,
+                    AnswerValue::Skipped => serde_json::json!({ "kind": "declined" }),
                 };
-                Some(serde_json::json!({ "section": answer.section, "answer": value }))
+                serde_json::json!({ "section": answer.section, "answer": value })
             })
             .collect(),
     )
@@ -1002,21 +1057,23 @@ impl RuntimeDeps {
     /// call committed them: `false` when the question is no longer open.
     ///
     /// # Errors
-    /// Returns [`TuiRuntimeError`] when the answers do not fit the question
-    /// or on storage failure.
+    /// Returns [`TuiRuntimeError::Daemon`] carrying the daemon's message when
+    /// the answers do not fit the question or could not be stored; the
+    /// question is still open then.
     pub async fn answer_open_question(
         &self,
         request_id: &str,
         answers: &[QuestionAnswer],
     ) -> Result<bool, TuiRuntimeError> {
         if let Some(client) = &self.daemon {
-            return Ok(client
-                .post::<_, serde_json::Value>(
-                    "/api/ask-user/respond",
-                    &serde_json::json!({ "id": request_id, "answers": answers_json(answers) }),
-                )
-                .await
-                .is_ok());
+            return committed_or_not_open(
+                client
+                    .post::<_, serde_json::Value>(
+                        "/api/ask-user/respond",
+                        &serde_json::json!({ "id": request_id, "answers": answers_json(answers) }),
+                    )
+                    .await,
+            );
         }
         Ok(false)
     }
@@ -1036,13 +1093,14 @@ impl RuntimeDeps {
         let Some(client) = &self.daemon else {
             return Ok(ResponseCommit::Lost(answers.to_vec()));
         };
-        let committed = client
-            .post::<_, serde_json::Value>(
-                "/api/ask-user/respond",
-                &serde_json::json!({ "id": request_id, "answers": answers_json(answers) }),
-            )
-            .await
-            .is_ok();
+        let committed = committed_or_not_open(
+            client
+                .post::<_, serde_json::Value>(
+                    "/api/ask-user/respond",
+                    &serde_json::json!({ "id": request_id, "answers": answers_json(answers) }),
+                )
+                .await,
+        )?;
         Ok(if committed {
             ResponseCommit::Committed
         } else {
