@@ -12,7 +12,7 @@ use skyzen::utils::{Json, State};
 use skyzen::{Body, Request, Result as SkyResult, StatusCode};
 
 use crate::db::{CreateScheduledTaskParams, UpdateScheduledTaskParams};
-use crate::scheduler::TaskRunStatus;
+use crate::scheduler::{TaskRunStatus, WebhookOutcome};
 use crate::task_trigger::{
     NormalizedTaskTrigger, PersistedTaskTrigger, TaskTriggerKind, TaskTriggerRequest,
     TaskTriggerResponse, TaskWebhookRequest,
@@ -46,10 +46,10 @@ pub(super) struct ScheduledTaskResponse {
 
 impl ScheduledTaskResponse {
     fn from_model(m: crate::db::entity::scheduled_tasks::Model) -> Self {
-        let trigger =
-            PersistedTaskTrigger::from_storage(m.trigger_kind.as_str(), m.trigger_type.as_str())
-                .expect("scheduled task trigger must remain valid")
-                .response(m.run_at.clone(), m.cron_expression.clone());
+        let trigger = m
+            .persisted_trigger()
+            .expect("scheduled task trigger must remain valid")
+            .response(m.run_at.clone(), m.cron_expression.clone());
         Self {
             id: m.id,
             profile_id: m.profile_id,
@@ -188,11 +188,7 @@ fn validate_existing_trigger(
     next_cron: Option<&str>,
     next_run_at: Option<&str>,
 ) -> SkyResult<TaskTriggerKind> {
-    let trigger = PersistedTaskTrigger::from_storage(
-        current.trigger_kind.as_str(),
-        current.trigger_type.as_str(),
-    )
-    .map_err(bad_request_error)?;
+    let trigger = current.persisted_trigger().map_err(bad_request_error)?;
     match trigger {
         PersistedTaskTrigger::Time { trigger_type } => {
             TaskTriggerRequest::Time {
@@ -597,14 +593,19 @@ async fn run_invoke_webhook_task(
     token: String,
     webhook_request: TaskWebhookRequest,
 ) -> SkyResult<super::types::TaskTriggerResponse> {
-    let triggered = state
+    let triggered = match state
         .task_runtime
-        .dispatch_webhook(token, webhook_request)
+        .dispatch_webhook(&token, webhook_request)
         .await
-        .map_err(internal_error)?;
-    if triggered == 0 {
-        return Err(bad_request_error("Webhook task not found"));
-    }
+        .map_err(internal_error)?
+    {
+        WebhookOutcome::NotFound => return Err(bad_request_error("Webhook task not found")),
+        WebhookOutcome::SignatureRefused => {
+            return Err(skyzen::Error::msg("Webhook signature missing or invalid")
+                .set_status(StatusCode::UNAUTHORIZED));
+        }
+        WebhookOutcome::Triggered(triggered) => triggered,
+    };
 
     Ok(super::types::TaskTriggerResponse {
         ok: true,
