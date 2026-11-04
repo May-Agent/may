@@ -59,7 +59,7 @@ A skill is a directory with `SKILL.md` (frontmatter `name`, `description`) and o
 
 ## Subagents
 
-`subagent start --subagent <type or path.md> --prompt-file <path> [--model advanced|balanced|fast] [--worktrees ...] [--commit-worktrees ...]` and `subagent resume --id <n> --prompt-file <path>`. The prompt is always a file you wrote first; inline prompt text is rejected (the `--prompt "<prompt>"` wording in the base system prompt is out of date). Built-in types: `explore`, `plan`, `research`, `fork`. Without `--model`, a small model reads the prompt and picks a tier. A resume id expires with the provider's prompt cache. Subagents cannot use `ask_user` or `agent`; for them `issue`, `pr` and `repo` only read. Write access beyond their own space comes only from `--worktrees` and `--commit-worktrees`, and their commits are listed in the result.
+`subagent <name> --prompt-file <path> [--worktrees ...] [--commit-worktrees ...]`, `subagent resume --id <n> --prompt-file <path>`, `subagent fork --prompt-file <path>` and `subagent external --agent <name> --prompt-file <path>`; `subagent` alone lists the names. A bare `subagent` runs nothing. The prompt is always a file you wrote first; inline prompt text is rejected. Each name is a definition in `~/.may/subagents/<name>.toml` (rewritten at startup) or in `agents/` under the working directory. Bundled: `explore`, `research` (fast, read-only), `audit`, `review`, `plan` (advanced, read-only) and `general` (the fast model routes each brief to a tier; writes the granted worktrees). The tiers run on the models `ask --model` offers. Every subagent reads the workspace and writes only its own working directory, plus the worktrees granted to a definition that allows it. A resume id expires with the provider's prompt cache. Subagents cannot use `ask_user` or `agent`; for them `issue`, `pr` and `repo` only read. Write access beyond their own space comes only from `--worktrees` and `--commit-worktrees`, and their commits are listed in the result.
 
 ## Repositories, PRs and CI
 
@@ -84,7 +84,7 @@ Work on a git repository happens in a clone inside the session, and `pr` lands i
 ### Subagents and repositories
 
 - Subagents cannot push or open PRs. In the subagent command registry (`configure_role_tools` in `src/terminal_commands.rs`) `pr` accepts only `list` and `show`, and `repo` and `issue` only read. The main agent reviews a subagent's work and opens the PR itself.
-- A subagent writes only where `subagent start` granted it: `--worktrees` (writable to it, no commits) and `--commit-worktrees` (it may commit there, on a `subagent/<id>/` branch). Its commits are listed in the result; read them with `git log` and `git diff` before bringing them into the clone `pr` lands.
+- A subagent writes only where `subagent` granted it: `--worktrees` (writable to it, no commits) and `--commit-worktrees` (it may commit there, on a `subagent/<id>/` branch). Its commits are listed in the result; read them with `git log` and `git diff` before bringing them into the clone `pr` lands.
 - Not implemented (May-Agent/may#318): a child clone of the session clone at `subagents/<run>` for each subagent run. `SessionRepos::child_clone` in `src/repo_clone.rs` exists but nothing calls it, so grant a worktree instead.
 - Not implemented (May-Agent/aither#206): approval of a subagent's `unsafe` command by its parent. Today the request is attributed to the parent's session and goes to the user, who has 3 minutes before it is denied; the parent neither sees nor decides it. A subagent that needs host access should say so in its result so the main agent can run the command.
 
@@ -99,6 +99,5 @@ There is no `compact` tool you can call. The conversation is compacted into a ha
 ## Defects to know
 
 - `ask_user` positional form fails (above).
-- The `subagent` description in the base system prompt names `--prompt`; only `--prompt-file` works.
 - The terminal's `sandboxed` mode text claims the network is denied; it is not.
 - The "descendants were killed" alert points to a `terminal_background` command that does not exist; use `background: true`.
