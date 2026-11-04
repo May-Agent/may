@@ -216,14 +216,14 @@ pub struct AgentMessaging {
 
 /// Tag names that frame text for the recipient; text from another agent must
 /// not be able to open or close them.
-const FRAMING_TAGS: [&str; 2] = ["system-reminder", "agent-message"];
+const FRAMING_TAGS: [&str; 3] = ["system-reminder", "agent-message", "task-message"];
 
 /// Text written by another agent. Displaying it turns the `<` of any opening
 /// or closing `system-reminder` or `agent-message` tag into `&lt;`, so it can
 /// neither close its own block nor open a harness one; all other text,
 /// code included, is verbatim.
 #[derive(Debug, Clone, Copy)]
-struct UntrustedText<'a>(&'a str);
+pub(crate) struct UntrustedText<'a>(pub(crate) &'a str);
 
 impl std::fmt::Display for UntrustedText<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -245,7 +245,7 @@ impl std::fmt::Display for UntrustedText<'_> {
 
 /// A session name rendered safe inside a double-quoted attribute.
 #[derive(Debug, Clone, Copy)]
-struct AttributeText<'a>(&'a str);
+pub(crate) struct AttributeText<'a>(pub(crate) &'a str);
 
 impl std::fmt::Display for AttributeText<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -380,7 +380,7 @@ pub struct AgentTool {
 /// The host file behind a path as the session's terminal spells it. In a
 /// container session the sandbox is mounted at the container root, so an
 /// absolute path must lie beneath it and nothing may climb out of it.
-fn resolve_prompt_path(
+pub(crate) fn resolve_prompt_path(
     sandbox_dir: &Path,
     mount: Option<&aither_sandbox::MountRoot>,
     prompt_file: &str,

@@ -197,6 +197,7 @@ async fn stop_in_each_waiting_state_ends_idle_with_the_run_released() {
                                 question: "Proceed?".to_string(),
                                 option: vec!["yes".to_string()],
                                 multi_select: false,
+                                secret: None,
                             }],
                         }),
                     )
@@ -388,4 +389,87 @@ async fn recovery_settles_sessions_a_dead_run_left_owned() {
         service.db().finish_session_run(&stale_fence).await,
         Ok(false)
     ));
+}
+
+/// Poll `acquire` until the cleanup of a dropped future has freed the session.
+async fn acquire_after_drop(service: &SessionRuntimeService) -> super::SessionRunGuard {
+    bounded("the session to be free after a dropped future", async {
+        loop {
+            match service.runs().acquire("session").await {
+                Ok(guard) => return guard,
+                Err(AcquireError::Busy(_)) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(other) => panic!("unexpected acquire failure: {other:?}"),
+            }
+        }
+    })
+    .await
+}
+
+/// A handler dropped while `acquire` awaits its claim, after the claim landed,
+/// leaves the session free for the next run.
+#[tokio::test]
+async fn dropping_acquire_at_the_claim_frees_the_session() {
+    let fixture = Fixture::new(&["session"]).await;
+    let service = &fixture.service;
+    let entered = service.db().run_gates.claim.arm();
+
+    let mut acquire = Box::pin(service.runs().acquire("session"));
+    tokio::select! {
+        _ = &mut acquire => panic!("acquire must suspend at the claim"),
+        _ = entered.recv() => {}
+    }
+    assert!(service.runs().is_held("session"));
+    drop(acquire);
+
+    let run = acquire_after_drop(service).await;
+    run.finish_idle(RunOutcome::Completed)
+        .await
+        .expect("finish");
+    assert!(!service.runs().is_held("session"));
+}
+
+/// A handler dropped while a run settles leaves the session free for the next
+/// run: `Drop` repeats the finish.
+#[tokio::test]
+async fn dropping_settle_at_the_finish_frees_the_session() {
+    let fixture = Fixture::new(&["session"]).await;
+    let service = &fixture.service;
+    let run = service.runs().acquire("session").await.expect("acquire");
+    let entered = service.db().run_gates.finish.arm();
+
+    let mut settle = Box::pin(run.finish_idle(RunOutcome::Cancelled));
+    tokio::select! {
+        _ = &mut settle => panic!("settle must suspend at the finish"),
+        _ = entered.recv() => {}
+    }
+    drop(settle);
+
+    let run = acquire_after_drop(service).await;
+    run.finish_idle(RunOutcome::Completed)
+        .await
+        .expect("finish");
+}
+
+/// `settle_stopped` returns once a settle it started was dropped.
+#[tokio::test]
+async fn settle_stopped_returns_after_a_dropped_settle() {
+    let fixture = Fixture::new(&["session"]).await;
+    let service = &fixture.service;
+    let run = service.runs().acquire("session").await.expect("acquire");
+    let entered = service.db().run_gates.finish.arm();
+
+    let mut settle = Box::pin(run.finish_idle(RunOutcome::Cancelled));
+    tokio::select! {
+        _ = &mut settle => panic!("settle must suspend at the finish"),
+        _ = entered.recv() => {}
+    }
+    drop(settle);
+
+    let runtime = bounded("the stop to settle", service.settle_stopped("session"))
+        .await
+        .expect("settle");
+    assert_eq!(runtime.state, SessionRuntimeState::Idle);
+    assert!(!service.runs().is_held("session"));
 }

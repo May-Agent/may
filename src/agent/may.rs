@@ -8,7 +8,6 @@ use aither_agent::{
     Agent, AgentError, AgentKind, CompactResult, HCons, Prepared, TerminalAgentBuilder, TimedEvent,
     Unprepared,
 };
-use aither_cloud::CloudProvider;
 use aither_core::llm::{
     Attachment as LlmAttachment, Message as LlmMessage,
     model::{Parameters, ReasoningEffort},
@@ -19,10 +18,10 @@ use futures_lite::Stream;
 
 use super::agents_md;
 use super::context_dump::ContextDump;
-use super::hooks::{ContextSnapshotHook, PendingSteerHook};
+use super::hooks::{ContextSnapshotHook, PendingSteerHook, SecretRedactionHook};
 use super::imagine::{ImageGeneratorConfig, resolve_image_generator_config};
 use super::permission::PermissionApprover;
-use super::provider::{RequestParameterizedModel, resolve_provider_runtime};
+use super::provider::{ProviderLlm, RequestParameterizedModel, resolve_provider_runtime};
 use super::runtime_context::{
     RepoCloneEntry, RuntimeSystemContext, build_agents_md_context, build_base_system_prompt,
     build_browser_context, build_location_context, build_memory_context_content,
@@ -39,6 +38,7 @@ use crate::agent::task_tool::TaskRuntimeKind;
 use crate::ask_user::AskUserBroker;
 use crate::config::MayConfig;
 use crate::network_policy::CompiledNetworkPolicy;
+use crate::secrets::SecretRedactor;
 use crate::session::{SessionId, SessionPaths, SessionPlanState};
 use crate::terminal_commands::{
     ImagineCommandConfig, SharedTerminalCommandConfig, register_shared_terminal_commands,
@@ -140,7 +140,7 @@ pub struct MayAgentConfig {
     /// Scheduling priority applied to commands this agent runs.
     pub command_priority: crate::config::CommandPriority,
     /// The LLM provider.
-    pub llm: CloudProvider,
+    pub llm: ProviderLlm,
     /// The concrete model identifier selected for this request.
     pub model_id: String,
     /// Provider ID selected for this request.
@@ -148,7 +148,7 @@ pub struct MayAgentConfig {
     /// Tier-resolved models for the `ask` terminal command.
     pub ask_models: super::provider::AskTierModels,
     /// Model compaction runs on; `None` compacts on the session model.
-    pub compaction_llm: Option<RequestParameterizedModel<CloudProvider>>,
+    pub compaction_llm: Option<RequestParameterizedModel<ProviderLlm>>,
     /// How long the session provider keeps the conversation cached; idle
     /// compaction and reassembly follow it.
     pub cache_lifetime: crate::cache_lifetime::CacheLifetime,
@@ -291,17 +291,19 @@ pub struct MayAgentSessionInput<'a> {
 }
 
 type MayAgentInner = Agent<
-    RequestParameterizedModel<CloudProvider>,
-    RequestParameterizedModel<CloudProvider>,
-    RequestParameterizedModel<CloudProvider>,
-    HCons<PendingSteerHook, HCons<ContextSnapshotHook, ()>>,
+    RequestParameterizedModel<ProviderLlm>,
+    RequestParameterizedModel<ProviderLlm>,
+    RequestParameterizedModel<ProviderLlm>,
+    MayHooks,
 >;
 
+type MayHooks = HCons<SecretRedactionHook, HCons<PendingSteerHook, HCons<ContextSnapshotHook, ()>>>;
+
 type MayBuilder<S = Unprepared> = TerminalAgentBuilder<
-    RequestParameterizedModel<CloudProvider>,
+    RequestParameterizedModel<ProviderLlm>,
     TerminalPermissionHandler,
     DefaultExecutor,
-    HCons<PendingSteerHook, HCons<ContextSnapshotHook, ()>>,
+    MayHooks,
     S,
 >;
 
@@ -323,7 +325,7 @@ pub struct MayAgent {
     job_registry: aither_sandbox::JobRegistry,
     subagent_runs: aither_agent::specialized::SubagentRuns,
     /// Model clone reserved for `/btw` side questions.
-    btw_llm: RequestParameterizedModel<CloudProvider>,
+    btw_llm: RequestParameterizedModel<ProviderLlm>,
     subagent_tracker: crate::agent::subagent_tracker::SubagentTracker,
 }
 
@@ -409,7 +411,10 @@ impl MayAgent {
             // Keychain secrets (`/secret`) land as env vars in every spawned
             // command; the store is re-read per call, so additions take
             // effect without rebuilding the agent.
-            .with_env_source(crate::secrets::SecretStore::new(&config.may_dir));
+            .with_env_source(crate::secrets::SessionEnv::new(
+                crate::secrets::SecretStore::new(&config.may_dir),
+                config.session_id.as_str(),
+            ));
         let job_registry = terminal_tool.job_registry();
         let subagents = config.subagents.clone().unwrap_or_default();
         let subagent_runs = subagents.runs;
@@ -570,6 +575,10 @@ impl MayAgent {
         let mut builder = TerminalAgentBuilder::new(llm, terminal_tool)
             .hook(context_snapshot_hook)
             .hook(pending_steer_hook)
+            .hook(SecretRedactionHook::new(SecretRedactor::for_session(
+                &config.may_dir,
+                config.session_id.as_str(),
+            )))
             .cache_lifetime(config.cache_lifetime.into())
             .background_jobs(config.background_jobs)
             .connectivity(config.connectivity.clone());
@@ -751,8 +760,9 @@ impl MayAgent {
             connectivity,
         } = input;
         let selector = super::provider::parse_model_selector(model)?;
+        let redactor = crate::secrets::SecretRedactor::for_session(&may_dir, session_id.as_str());
         let resolved_provider =
-            resolve_provider_runtime(may_config, &selector, provider_attempt).await?;
+            resolve_provider_runtime(may_config, &selector, provider_attempt, &redactor).await?;
         let provider_id = resolved_provider.provider_id;
         let llm = resolved_provider.llm;
         let model_info = aither_models::lookup(selector.model_id());
@@ -780,6 +790,7 @@ impl MayAgent {
             &provider_id,
             selector.model_id(),
             &session_id,
+            &redactor,
         )
         .await?;
         let compaction_llm = super::provider::resolve_compaction_model(
@@ -787,6 +798,7 @@ impl MayAgent {
             &provider_id,
             selector.model_id(),
             &session_id,
+            &redactor,
         )
         .await?;
         let cache_lifetime = may_config
@@ -795,8 +807,11 @@ impl MayAgent {
             .ok_or_else(|| {
                 MayAgentError::Llm(format!("provider '{provider_id}' is not configured"))
             })?;
-        let secrets =
-            crate::secrets::Secrets::load(&crate::secrets::SecretStore::new(&may_dir), may_config);
+        let secrets = crate::secrets::Secrets::load_for_session(
+            &crate::secrets::SecretStore::new(&may_dir),
+            may_config,
+            session_id.as_str(),
+        );
         Ok(MayAgentConfig {
             subagents,
             background_jobs,
@@ -1051,7 +1066,7 @@ impl MayAgent {
     /// Model clone for `/btw` side questions — shares the agent's provider
     /// but runs outside the agent, so answers never enter its history.
     #[must_use]
-    pub fn btw_llm(&self) -> RequestParameterizedModel<CloudProvider> {
+    pub fn btw_llm(&self) -> RequestParameterizedModel<ProviderLlm> {
         self.btw_llm.clone()
     }
 
@@ -1148,6 +1163,7 @@ pub async fn generate_session_title(
     config: &MayConfig,
     user_message: &str,
     assistant_response: &str,
+    redactor: &crate::secrets::SecretRedactor,
 ) -> Option<String> {
     use aither_core::LanguageModel;
     use aither_core::llm::{LLMRequest, Message};
@@ -1165,6 +1181,7 @@ pub async fn generate_session_title(
         provider_id,
         provider,
         selector.model_id(),
+        redactor,
     )
     .await
     .ok()?;
@@ -1219,7 +1236,7 @@ fn truncate_at_char_boundary(input: &str, max_chars: usize) -> &str {
 /// constructed without a live database, which makes them no-ops.
 #[cfg(test)]
 pub async fn test_agent(
-    llm: RequestParameterizedModel<CloudProvider>,
+    llm: RequestParameterizedModel<ProviderLlm>,
     provider_id: &str,
     model_id: &str,
 ) -> (MayAgent, tempfile::TempDir) {
@@ -1231,6 +1248,9 @@ pub async fn test_agent(
     let inner = Agent::builder(llm.clone())
         .hook(ContextSnapshotHook::new(None, &session_id))
         .hook(PendingSteerHook::new(None, &session_id))
+        .hook(SecretRedactionHook::new(SecretRedactor::new(
+            std::path::Path::new("/nonexistent"),
+        )))
         .build();
     let (job_registry, service) = aither_sandbox::job_registry::job_registry_channel();
     tokio::spawn(service.serve());
@@ -1399,18 +1419,23 @@ async fn prepare_tools(
 
 #[cfg(test)]
 mod tests {
+    use aither_cloud::CloudProvider;
     use aither_core::llm::Role;
 
+    use super::super::provider::RedactedModel;
     use super::*;
 
     /// A `Codex` provider — its `profile()` is a static `aither-models`
     /// lookup, so initialization never touches the network.
-    fn codex_llm() -> RequestParameterizedModel<CloudProvider> {
+    fn codex_llm() -> RequestParameterizedModel<ProviderLlm> {
         RequestParameterizedModel::new(
-            CloudProvider::Codex(aither_cloud::codex::Codex::new(
-                aither_cloud::codex::auth::CodexCredentials::new("test-access", "test-refresh"),
-                "gpt-5",
-            )),
+            RedactedModel::new(
+                CloudProvider::Codex(aither_cloud::codex::Codex::new(
+                    aither_cloud::codex::auth::CodexCredentials::new("test-access", "test-refresh"),
+                    "gpt-5",
+                )),
+                crate::secrets::SecretRedactor::new(std::path::Path::new("/nonexistent")),
+            ),
             Parameters::default(),
         )
     }
