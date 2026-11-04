@@ -393,3 +393,43 @@ impl ContextSource for OpenQuestionsContext {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use aither_sandbox::ToolRegistryBuilder;
+
+    use super::{ASK_USER_DESCRIPTION, AskUserTool};
+
+    /// Every `ask_user ...` line of the description is a call the command
+    /// line accepts, parsed against the command's real argument schema.
+    #[tokio::test]
+    async fn every_example_in_the_description_is_accepted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = crate::db::ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("chat db opens");
+        db.create_session("session", None, None)
+            .await
+            .expect("session is created");
+        let runtime = Arc::new(crate::session::SessionRuntimeService::new(
+            db,
+            crate::ui_event_bus::UiEventBus::new(),
+        ));
+        let mut builder = ToolRegistryBuilder::new();
+        builder.configure_tool(AskUserTool::new(runtime, "session"));
+        let registry = builder.build(dir.path().join("outputs"));
+
+        let examples: Vec<&str> = ASK_USER_DESCRIPTION
+            .lines()
+            .filter(|line| line.starts_with("ask_user "))
+            .collect();
+        assert_eq!(examples.len(), 3, "single, several and secret questions");
+        for example in examples {
+            let words = shell_words::split(example).expect("the example is shell syntax");
+            let reply = registry.query_tool_handler("ask_user", &words[1..]).await;
+            assert!(reply.ok, "{example}: {reply:?}");
+        }
+    }
+}
