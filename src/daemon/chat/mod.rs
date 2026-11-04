@@ -4855,18 +4855,22 @@ mod tests {
         .await;
 
         let (mut sink, notes) = TestSink::noting();
-        let network_returns = async {
-            let note = tokio::time::timeout(std::time::Duration::from_secs(60), notes.recv())
-                .await
-                .expect("the turn announces its wait")
-                .expect("notes");
-            assert_eq!(note, Note::Hold(crate::client::HoldReason::Network));
-            // Holding means the turn is parked: nothing else happens until
-            // the network returns.
-            assert!(notes.try_recv().is_err());
-            controller.set_online(true);
+        // The hold comes only after the provider client's own backoff sleeps
+        // and the turn's setup, both of which stretch with host load, so no
+        // wall-clock bound stands in for the event: the test waits for the
+        // note, and fails at once if the turn ends without ever holding.
+        let turn = run_prompt_turn(&state, &mut sink);
+        tokio::pin!(turn);
+        let note = tokio::select! {
+            note = notes.recv() => note.expect("notes"),
+            result = &mut turn => panic!("the turn ended without holding for the network: {result:?}"),
         };
-        let (result, ()) = tokio::join!(run_prompt_turn(&state, &mut sink), network_returns);
+        assert_eq!(note, Note::Hold(crate::client::HoldReason::Network));
+        // Holding means the turn is parked: nothing else happens until the
+        // network returns.
+        assert!(notes.try_recv().is_err());
+        controller.set_online(true);
+        let result = turn.await;
         assert!(result.is_ok(), "the turn must complete: {result:?}");
 
         assert_eq!(
