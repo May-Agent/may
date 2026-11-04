@@ -58,6 +58,7 @@ impl ParkedAgents {
         session_id: &str,
         agent: MayAgent,
         build_key: u64,
+        released: crate::session::RunReleased,
     ) {
         // One pending wake is enough: the agent's context holds every event
         // a later wake would add, and the run it starts sees them all.
@@ -67,7 +68,7 @@ impl ParkedAgents {
             agent,
             state.db(),
             state.runtime_service.runs().clone(),
-            Some(wakes),
+            Some(crate::agent::BackgroundWakes { wakes, released }),
         );
         let previous = self.workers().insert(
             session_id.to_string(),
@@ -178,9 +179,13 @@ pub(super) async fn idle_agent(
         tracing::warn!(%session_id, %error, "failed to release the session after building its agent");
     }
     let prepared = prepared?;
-    state
-        .parked_agents
-        .park(state, session_id, prepared.agent, prepared.build_key);
+    state.parked_agents.park(
+        state,
+        session_id,
+        prepared.agent,
+        prepared.build_key,
+        crate::session::RunReleased::already_released(),
+    );
     state
         .parked_agents
         .get(session_id)

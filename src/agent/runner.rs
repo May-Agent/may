@@ -504,6 +504,16 @@ pub fn spawn_worker<E: Executor + 'static>(
     spawn_idle_worker(executor, agent, snapshot_db, runs, None)
 }
 
+/// Where an idle worker reports the background commands its earlier runs
+/// detached.
+#[derive(Debug)]
+pub struct BackgroundWakes {
+    /// Receives each wake that needs the model.
+    pub wakes: Sender<aither_agent::BackgroundWake>,
+    /// The worker starts waiting on background commands once this fires.
+    pub released: crate::session::RunReleased,
+}
+
 /// Spawns a worker like [`spawn_worker`] whose idle agent also waits on the
 /// background commands its earlier runs detached; each wake that needs the
 /// model is sent on `background_wakes`.
@@ -512,7 +522,7 @@ pub fn spawn_idle_worker<E: Executor + 'static>(
     agent: MayAgent,
     snapshot_db: ChatDb,
     runs: SessionRuns,
-    background_wakes: Option<Sender<aither_agent::BackgroundWake>>,
+    background_wakes: Option<BackgroundWakes>,
 ) -> AgentWorker {
     let (command_tx, command_rx) = unbounded::<WorkerCommand>();
     let job_registry = agent.job_registry();
@@ -551,7 +561,7 @@ async fn run_worker(
     command_tx: Sender<WorkerCommand>,
     snapshot_db: ChatDb,
     runs: SessionRuns,
-    background_wakes: Option<Sender<aither_agent::BackgroundWake>>,
+    background_wakes: Option<BackgroundWakes>,
 ) {
     loop {
         // Wait for a command; an idle session is compacted on the way, and
@@ -688,7 +698,7 @@ async fn next_command(
     command_rx: &Receiver<WorkerCommand>,
     snapshot_db: &ChatDb,
     runs: &SessionRuns,
-    background_wakes: Option<&Sender<aither_agent::BackgroundWake>>,
+    background_wakes: Option<&BackgroundWakes>,
 ) -> Option<WorkerCommand> {
     loop {
         let compaction_due_in = agent.idle_compaction_due_in();
@@ -706,7 +716,13 @@ async fn next_command(
                 },
                 async {
                     match background_wakes {
-                        Some(_) => IdleStep::Background(agent.wait_background().await),
+                        Some(background) => {
+                            // A job finishing before the run that parked the
+                            // agent released the session would wake a host
+                            // that finds the session held.
+                            background.released.wait().await;
+                            IdleStep::Background(agent.wait_background().await)
+                        }
                         None => std::future::pending().await,
                     }
                 },
@@ -719,9 +735,9 @@ async fn next_command(
                 // The wake is recorded in the agent's context; a wake that
                 // needs the model asks the host for a run.
                 if wake.needs_model
-                    && let Some(wakes) = background_wakes
+                    && let Some(background) = background_wakes
                 {
-                    let _ = wakes.try_send(wake);
+                    let _ = background.wakes.try_send(wake);
                 }
             }
             IdleStep::Compact => {
