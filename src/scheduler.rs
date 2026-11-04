@@ -592,6 +592,32 @@ impl TaskRuntime {
         Ok(())
     }
 
+    /// Delete a task, then its working directory, which only it owns, and
+    /// drop it from the active set.
+    ///
+    /// # Errors
+    /// Returns a message when the row or the directory cannot be removed.
+    pub async fn delete_task(&self, id: &str) -> Result<(), String> {
+        self.db
+            .delete_scheduled_task(id)
+            .await
+            .map_err(|error| prefixed_error("failed to delete task: ", &error))?;
+        let dir = crate::session::MayHomePaths::new(self.may_dir.clone()).inline_task_dir(id);
+        match tokio::fs::remove_dir_all(&dir).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "failed to remove task directory {}: {error}",
+                    dir.display()
+                ));
+            }
+        }
+        self.reload_active_tasks()
+            .await
+            .map_err(|error| prefixed_error("failed to reload tasks: ", &error))
+    }
+
     /// Validate that a task script can be parsed in the target profile runtime.
     ///
     /// # Errors
@@ -2477,6 +2503,59 @@ mod tests {
         );
         assert!(!task_dir.starts_with(may_dir.join("tools")));
         assert!(!may_dir.join("tools").starts_with(&task_dir));
+    }
+
+    /// Deleting a task removes its working directory, and deleting one that
+    /// never ran is fine.
+    #[tokio::test]
+    async fn deleting_a_task_removes_its_inline_directory() {
+        let host = WakeHost::new().await;
+        let db = host.runtime_service.db();
+        db.create_scheduled_task(CreateScheduledTaskParams {
+            id: "inline-2",
+            profile_id: host.profile_id.as_str(),
+            session_id: None,
+            name: "Inline",
+            trigger: &TIME_ONCE,
+            cron_expression: None,
+            run_at: None,
+            script_path: None,
+            script_inline: Some("echo hi"),
+            needs_network: false,
+            timeout_secs: 60,
+        })
+        .await
+        .expect("task should persist");
+        let task = db
+            .get_scheduled_task("inline-2")
+            .await
+            .expect("task reads")
+            .expect("task exists");
+        Box::pin(host.runtime.execute_task_inner(
+            &task,
+            crate::task_trigger::TaskInvocation::Time {
+                trigger_type: crate::task_trigger::TimeTriggerType::Once,
+            },
+        ))
+        .await
+        .expect("the inline task run succeeds");
+        let dir = crate::session::MayHomePaths::new(host.dir.path().join(".may"))
+            .inline_task_dir("inline-2");
+        assert!(dir.is_dir(), "the run created {dir:?}");
+
+        host.runtime.delete_task("inline-2").await.expect("delete");
+
+        assert!(!dir.exists(), "{dir:?} is removed with the task");
+        assert!(
+            db.get_scheduled_task("inline-2")
+                .await
+                .expect("read")
+                .is_none()
+        );
+        host.runtime
+            .delete_task("inline-2")
+            .await
+            .expect("an absent directory is fine");
     }
 
     const TIME_ONCE: PersistedTaskTrigger = PersistedTaskTrigger::Time {
