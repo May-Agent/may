@@ -337,7 +337,7 @@ pub struct App {
     /// when the agent worker installs).
     pub background: Option<crate::client::background::RemoteBackground>,
     /// Model clone for `/btw` side questions (outside conversation history).
-    pub btw_llm: Option<crate::agent::RequestParameterizedModel<aither_cloud::CloudProvider>>,
+    pub btw_llm: Option<crate::agent::RequestParameterizedModel<crate::agent::ProviderLlm>>,
     /// Daemon that answers `/btw` when the agent runs there.
     pub btw_daemon: Option<crate::client::DaemonClient>,
     /// Right sidebar: task tree, linked issues (background lists come
@@ -4316,7 +4316,7 @@ fn btw_message(role: &str, content: impl Into<String>) -> crate::daemon::BtwMess
 
 /// Streams a `/btw` answer from the session's model into the overlay.
 async fn stream_btw_answer(
-    llm: crate::agent::RequestParameterizedModel<aither_cloud::CloudProvider>,
+    llm: crate::agent::RequestParameterizedModel<crate::agent::ProviderLlm>,
     messages: Vec<crate::daemon::BtwMessage>,
     tx: EventSender,
 ) {
