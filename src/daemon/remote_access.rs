@@ -72,9 +72,15 @@ impl PublicListener {
         Ok(Self { addr, task })
     }
 
-    /// Proxy target, `http://127.0.0.1:<port>`.
+    /// Proxy target, `http://127.0.0.1:<port>/api/tasks/webhook`. Tailscale
+    /// strips the mount path before proxying and joins what remains onto the
+    /// target's own path, so the target carries the mount back.
     fn target(&self) -> String {
-        format!("http://127.0.0.1:{}", self.addr.port())
+        format!(
+            "http://127.0.0.1:{}{}",
+            self.addr.port(),
+            crate::task_trigger::WEBHOOK_MOUNT
+        )
     }
 }
 

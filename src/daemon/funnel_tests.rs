@@ -44,10 +44,30 @@ fn funnel_target(dir: &Path) -> String {
         .to_owned()
 }
 
-/// Sends one request to `target` (`http://127.0.0.1:<port>`) and returns the
+/// `host:port` and path of a proxy target URL.
+fn split_target(target: &str) -> (&str, &str) {
+    let rest = target.trim_start_matches("http://");
+    rest.split_once('/')
+        .map_or((rest, ""), |(addr, _)| (addr, &rest[addr.len()..]))
+}
+
+/// A request to the public Funnel name, forwarded the way Tailscale does:
+/// only paths under the mount are proxied, the mount is stripped, and what
+/// remains is joined onto the target's own path.
+async fn through_funnel(target: &str, method: &str, public_path: &str) -> u16 {
+    let (addr, base) = split_target(target);
+    let mount = crate::task_trigger::WEBHOOK_MOUNT;
+    let rest = match public_path.strip_prefix(mount) {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => rest,
+        _ => return 404,
+    };
+    let forwarded = format!("{}{rest}", base.trim_end_matches('/'));
+    raw_status(addr, method, &forwarded).await
+}
+
+/// Sends one request straight to the listener at `addr` and returns the
 /// response status.
-async fn http_status(target: &str, method: &str, path: &str) -> u16 {
-    let addr = target.trim_start_matches("http://");
+async fn raw_status(addr: &str, method: &str, path: &str) -> u16 {
     let mut stream = tokio::net::TcpStream::connect(addr)
         .await
         .expect("listener accepts");
@@ -65,8 +85,9 @@ async fn http_status(target: &str, method: &str, path: &str) -> u16 {
 }
 
 async fn listener_is_closed(target: &str) -> bool {
-    let addr = target.trim_start_matches("http://");
-    tokio::net::TcpStream::connect(addr).await.is_err()
+    tokio::net::TcpStream::connect(split_target(target).0)
+        .await
+        .is_err()
 }
 
 #[tokio::test]
@@ -139,10 +160,11 @@ async fn funnel_serves_only_webhooks_and_turning_it_off_removes_everything() {
     // A delivery reaches the webhook handler; the signed task refuses it
     // without a signature, an unknown token is not found.
     let hook = format!("/api/tasks/webhook/{token}");
-    assert_eq!(http_status(&target, "POST", &hook).await, 401);
+    assert!(target.ends_with("/api/tasks/webhook"));
+    assert_eq!(through_funnel(&target, "POST", &hook).await, 401);
     let unknown = format!("/api/tasks/webhook/{}", new_webhook_token());
-    assert_eq!(http_status(&target, "POST", &unknown).await, 400);
-    // Nothing else is routed on the public listener.
+    assert_eq!(through_funnel(&target, "POST", &unknown).await, 400);
+    // Nothing else is routed on the public listener, even asked directly.
     for (method, path) in [
         ("GET", "/api/health"),
         ("GET", "/api/config"),
@@ -153,7 +175,7 @@ async fn funnel_serves_only_webhooks_and_turning_it_off_removes_everything() {
         ("GET", "/"),
     ] {
         assert_eq!(
-            http_status(&target, method, path).await,
+            raw_status(split_target(&target).0, method, path).await,
             404,
             "{method} {path}"
         );
