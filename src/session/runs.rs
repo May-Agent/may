@@ -149,27 +149,31 @@ impl SessionRuns {
                 },
             );
         }
-        match self.db.claim_session_run(&fence).await {
+        // The guard owns the registry entry from here on: a drop while the
+        // claim is awaited runs its cleanup, whose fenced finish releases a
+        // claim that landed and touches nothing for one that did not.
+        let mut guard = SessionRunGuard {
+            runs: self.clone(),
+            fence,
+            cancel_rx,
+            settled: false,
+        };
+        match self.db.claim_session_run(&guard.fence).await {
             Ok(true) => {}
             Ok(false) => {
-                self.unregister(&fence);
+                guard.disarm();
                 return Err(SessionBusy {
                     session_id: session_id.to_string(),
                 }
                 .into());
             }
             Err(error) => {
-                self.unregister(&fence);
+                guard.disarm();
                 return Err(AcquireError::Storage(error));
             }
         }
         self.publish_runtime_change();
-        Ok(SessionRunGuard {
-            runs: self.clone(),
-            fence,
-            cancel_rx,
-            settled: false,
-        })
+        Ok(guard)
     }
 
     fn unregister(&self, fence: &RunFence) {
@@ -268,14 +272,31 @@ impl SessionRunGuard {
         &self.cancel_rx
     }
 
+    /// Release the registry entry of a claim that did not land; nothing is
+    /// left to settle.
+    fn disarm(&mut self) {
+        self.settled = true;
+        self.runs.unregister(&self.fence);
+    }
+
     /// Settle the session: resolve its waiting requests and terminal
     /// resources, move it to `Idle` and clear the run id. Returns whether
     /// the run still held the session; a superseded run leaves the session
     /// to the run that took it.
     async fn settle(&mut self, outcome: RunOutcome) -> Result<bool, ChatDbError> {
-        self.settled = true;
+        // `settled` is set only once the finish returned, so a settle
+        // dropped at the await falls through to `Drop`, which repeats the
+        // fenced, idempotent finish. A storage error leaves the session to
+        // restart recovery.
         self.runs.unregister(&self.fence);
-        let held = self.runs.db.finish_session_run(&self.fence).await?;
+        let held = match self.runs.db.finish_session_run(&self.fence).await {
+            Ok(held) => held,
+            Err(error) => {
+                self.settled = true;
+                return Err(error);
+            }
+        };
+        self.settled = true;
         if !held {
             tracing::warn!(
                 session_id = %self.fence.session_id,
