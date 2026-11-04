@@ -65,6 +65,8 @@ pub struct TaskRuntime {
     connectivity: Option<aither_connectivity::Connectivity>,
     /// Where a run's `wake` command stores its prompt.
     session_prompts: Option<crate::task_wake::SessionPrompts>,
+    /// Where webhook signing secrets are read.
+    secrets: crate::secrets::SecretStore,
 }
 
 /// Time-based wrapper that periodically asks [`TaskRuntime`] to run due tasks.
@@ -504,6 +506,7 @@ impl TaskRuntime {
             db,
             notifier: None,
             ui_event_bus: None,
+            secrets: crate::secrets::SecretStore::new(&may_dir),
             may_dir,
             container_manager: None,
             tool_distribution,
@@ -514,6 +517,14 @@ impl TaskRuntime {
         };
         runtime.reload_active_tasks().await?;
         Ok(runtime)
+    }
+
+    /// Read webhook signing secrets from `secrets` instead of the OS keychain.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_secret_store(mut self, secrets: crate::secrets::SecretStore) -> Self {
+        self.secrets = secrets;
+        self
     }
 
     /// Give task runs a `wake` command that prompts the session that created
@@ -850,9 +861,8 @@ impl TaskRuntime {
             .iter()
             .filter_map(|task| task.webhook_signature_secret.clone())
             .collect::<Vec<_>>();
-        let may_dir = self.may_dir.clone();
+        let store = self.secrets.clone();
         let secrets = blocking::unblock(move || {
-            let store = crate::secrets::SecretStore::new(&may_dir);
             names
                 .into_iter()
                 .filter_map(|name| match store.get(&name) {
