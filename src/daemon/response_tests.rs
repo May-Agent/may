@@ -562,6 +562,7 @@ async fn an_answer_to_an_open_question_is_queued_once_and_a_retry_finds_it_commi
                     question: "Which database?".to_string(),
                     option: vec!["yes".to_string(), "no".to_string()],
                     multi_select: false,
+                    secret: None,
                 }],
             },
         )

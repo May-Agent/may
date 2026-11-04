@@ -1996,14 +1996,19 @@ impl App {
                 }
             }
             AppMode::AskUser(_) => {
-                if let AppMode::AskUser(state) = &mut self.mode
-                    && let Some(qs) = state.current_state_mut()
-                    && qs.custom_mode
-                {
-                    return Some(ActiveTextInput::Simple {
-                        input: &mut qs.custom_text,
-                        filter: PasteFilter::Any,
-                    });
+                if let AppMode::AskUser(state) = &mut self.mode {
+                    let secret = state.current_secret().is_some();
+                    if let Some(qs) = state.current_state_mut()
+                        && (qs.custom_mode || secret)
+                    {
+                        if secret {
+                            qs.declined = false;
+                        }
+                        return Some(ActiveTextInput::Simple {
+                            input: &mut qs.custom_text,
+                            filter: PasteFilter::Any,
+                        });
+                    }
                 }
             }
             // FilePicker is handled separately (has its own insert_str method)

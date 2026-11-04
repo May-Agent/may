@@ -41,9 +41,9 @@ pub use runs::{AcquireError, CancelReason, RunOutcome, SessionBusy, SessionRunGu
 pub use runtime::{
     AttachmentKind, BrowserInteractionState, PendingMessageState, PendingUserMessage,
     PendingUserMessageMode, PersistedAskUserQuestion, PersistedAskUserRequest, PersistedAttachment,
-    PersistedPermissionRequest, PersistedPermissionRequestPayload, PersistedWorkspaceRequest,
-    PersistedWorkspaceRequestPayload, SessionInteractionState, SessionRuntimeState,
-    SessionRuntimeSummary, TerminalRuntimeState,
+    PersistedPermissionRequest, PersistedPermissionRequestPayload, PersistedSecretRequest,
+    PersistedWorkspaceRequest, PersistedWorkspaceRequestPayload, SessionInteractionState,
+    SessionRuntimeState, SessionRuntimeSummary, TerminalRuntimeState,
 };
 pub use runtime_service::{AnswerError, AskUserAnswer, ResolvedRequest, SessionRuntimeService};
 pub use store::{SandboxResourceLayout, SessionStore, StoreError};

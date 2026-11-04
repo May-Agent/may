@@ -147,6 +147,8 @@ export interface PersistedAskUserQuestion {
   question: string;
   option: string[];
   multiSelect: boolean;
+  /** Set when the question asks for a secret value, which is stored and never read back. */
+  secret?: { name: string; scope: 'global' | 'session' } | null;
 }
 
 export interface PersistedAskUserRequest {
