@@ -91,11 +91,21 @@ pub(super) fn cancel(state: &Arc<DaemonState>, session_id: &str) {
 }
 
 async fn generate(state: &Arc<DaemonState>, session_id: &str) -> Option<String> {
-    let mut messages = super::aux::history_messages(state, session_id).await.ok()?;
+    let mut messages = match super::aux::context_messages(state, session_id).await {
+        Ok(messages) => messages,
+        Err(error) => {
+            tracing::warn!(%session_id, %error, "suggestion: reading the agent context failed");
+            return None;
+        }
+    };
     messages.push(aither_core::llm::Message::user(PROMPT));
-    let response = super::aux::run(state, session_id, messages, GENERATION_TIMEOUT)
-        .await
-        .ok()?;
+    let response = match super::aux::run(state, session_id, messages, GENERATION_TIMEOUT).await {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(%session_id, %error, "suggestion: the request failed");
+            return None;
+        }
+    };
     super::aux::parse_strict::<GeneratedSuggestion>(&response, SUGGESTION_MAX_CHARS)?.suggestion
 }
 
