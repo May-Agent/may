@@ -36,6 +36,16 @@ Paths are relative to the May source checkout. `aither-sandbox` and `aither-agen
 - `src/memory.rs`: profile memory extraction; `templates/memory_context_hint.txt`: memory directory hint.
 - `src/agent/may.rs`: builds the agent (skills, compaction model, hooks); `templates/base_system.md`: the base system prompt.
 
+## Repositories, PRs and CI
+
+- `src/repo_clone.rs`: `SessionRepos` (`ensure_local_clone`, `ensure_remote_clone`, `delete_clone`, `delete_all`, unused `child_clone`), `uncommitted_changes` (the dirty-clone check), the `repos/repos.toml` registry.
+- `src/pr.rs`: `PrStore` (`resolve` clone choice and trust gate, `open`, `merge`, `merge_github`, `pull_sync`, `screen_outbound`), `land` (fetch `refs/may/<session>`, `merge-tree` preflight, overlap check, `--no-ff` merge), `gh` wrapper, `screen_with_llm`.
+- `src/agent/pr_tool.rs`: `PrTool` (all subcommands) and `SubagentPrTool` (`list`, `show`); `src/agent/repo_tool.rs`: `repo trust`; `src/trust.rs`: trust levels.
+- `src/terminal_commands.rs`: `PrContext` construction and `configure_role_tools(pr_tool, subagent_pr_tool)`.
+- `src/workspace.rs`: `ProjectConfig.checks` and `ProjectPr` (`backend`, `screen`, `auto_merge`, `require_review`).
+- `src/db/pr.rs` and `prs` / `pr_events` in `src/db/sql/chat_schema.sql`: PR rows and the event trail.
+- `src/agent/permission.rs`: `for_subagent` and `SUBAGENT_APPROVAL_TIMEOUT` (no parent-approval step). `aither-agent/src/specialized/task.rs`: `worktrees` and `commit_worktrees` grants.
+
 ## Search
 
 - `src/repo_search/`: `RepoSearch` client of the repo-search daemon, `indexer.rs` (outbox-driven indexing of sessions and issues), `auto_index.rs` (frequently searched worktrees).
