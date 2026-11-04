@@ -1648,8 +1648,16 @@ where
                                         &serde_json::json!({}),
                                     )
                                     .await;
-                                if let Err(error) = posted {
-                                    app.chat.push_error(&error.to_string());
+                                match posted {
+                                    Ok(response) => {
+                                        if response["started"] == false {
+                                            app.set_status("");
+                                            app.chat.push_notice(
+                                                "This session is empty — nothing to recap",
+                                            );
+                                        }
+                                    }
+                                    Err(error) => app.chat.push_error(&error.to_string()),
                                 }
                             }
                             _ => app
