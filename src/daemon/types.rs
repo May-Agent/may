@@ -1536,6 +1536,9 @@ pub struct UiRemoteAccessConfig {
     /// Funnel HTTPS port: 443, 8443 or 10000.
     #[serde(default = "default_funnel_port")]
     pub(crate) funnel_port: u16,
+    /// Largest webhook delivery body in bytes; larger ones get 413.
+    #[serde(default = "crate::config::default_webhook_max_body_bytes")]
+    pub(crate) webhook_max_body_bytes: u64,
 }
 
 const fn default_funnel_port() -> u16 {
@@ -1552,6 +1555,7 @@ impl From<&RemoteAccessConfig> for UiRemoteAccessConfig {
             allowed_logins: value.allowed_logins.clone(),
             funnel: value.funnel,
             funnel_port: value.funnel_port,
+            webhook_max_body_bytes: value.webhook_max_body_bytes,
         }
     }
 }

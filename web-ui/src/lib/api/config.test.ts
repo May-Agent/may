@@ -68,6 +68,7 @@ function makeConfig(): UiFullConfig {
       allowLocalEnvironment: false,
       funnel: false,
       funnelPort: 443,
+      webhookMaxBodyBytes: 10485760,
       allowedLogins: [],
     },
     sandbox: { commandPriority: 'low' },
