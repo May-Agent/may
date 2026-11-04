@@ -1651,6 +1651,35 @@ where
                             .chat
                             .push_error(&format!("Failed to save bug snapshot: {error}")),
                     },
+                    Some(SendAction::ToggleYolo) => {
+                        let session_id = app
+                            .session_manager
+                            .current()
+                            .map(|session| session.id.clone());
+                        match (runtime_deps.daemon(), session_id) {
+                            (Some(client), Some(session_id)) => {
+                                let enable = !app.session_runtime.yolo;
+                                let put = client
+                                    .put::<_, serde_json::Value>(
+                                        &may_agent::client::session_path(
+                                            session_id.as_str(),
+                                            "/yolo",
+                                        ),
+                                        &serde_json::json!({ "yolo": enable }),
+                                    )
+                                    .await;
+                                match put {
+                                    Ok(_) => app.chat.push_notice(if enable {
+                                        "Yolo on: every approval request in this session is granted"
+                                    } else {
+                                        "Yolo off: approval requests ask again"
+                                    }),
+                                    Err(error) => app.chat.push_error(&error.to_string()),
+                                }
+                            }
+                            _ => app.chat.push_notice("No session is attached"),
+                        }
+                    }
                     Some(SendAction::Recap) => {
                         let session_id = app
                             .session_manager
