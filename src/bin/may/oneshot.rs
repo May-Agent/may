@@ -295,9 +295,12 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
             {
                 answer_oneshot_questions(&runtime_deps, &session_id, &request, &mut output).await?;
             } else {
-                let questions = request
+                // A one-shot run has no masked input: it declines the secret
+                // questions rather than read a value in the clear.
+                let plain = request
                     .questions
                     .iter()
+                    .filter(|question| question.secret.is_none())
                     .map(|question| may_agent::ask_user::Question {
                         section: question.section.clone(),
                         question: question.question.clone(),
@@ -305,7 +308,32 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                         multi_select: question.multi_select,
                     })
                     .collect::<Vec<_>>();
-                let answers = prompt_oneshot_questions(&questions, output.stderr()?)?;
+                let mut plain_answers =
+                    prompt_oneshot_questions(&plain, output.stderr()?)?.into_iter();
+                let answers = request
+                    .questions
+                    .iter()
+                    .map(|question| {
+                        if question.secret.is_some() {
+                            may_agent::ask_user::QuestionAnswer {
+                                section: question.section.clone(),
+                                answer: may_agent::ask_user::AnswerValue::Skipped,
+                            }
+                        } else {
+                            plain_answers.next().expect("one answer per plain question")
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                if request
+                    .questions
+                    .iter()
+                    .any(|question| question.secret.is_some())
+                {
+                    writeln!(
+                        output.stderr()?,
+                        "[notice] secret questions are declined in one-shot runs; use /secret or the TUI to store a secret"
+                    )?;
+                }
                 if !runtime_deps
                     .answer_open_question(&request.id, &answers)
                     .await?
