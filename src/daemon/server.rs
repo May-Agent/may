@@ -200,7 +200,12 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
     let ask_user_approver = AskUserApprover::new().with_runtime_service(runtime_service.clone());
 
     // Initialize memory processor with fast-tier provider chain
-    let memory_processor = match crate::agent::build_fast_provider_chain(&config).await {
+    let memory_processor = match crate::agent::build_fast_provider_chain(
+        &config,
+        &crate::secrets::SecretRedactor::new(&may_dir),
+    )
+    .await
+    {
         Ok(memory_providers) => {
             tracing::info!("Profile memory processor enabled");
             Some(crate::memory::MemoryProcessor::new(

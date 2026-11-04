@@ -4,6 +4,7 @@
 //! (cron or one-time), and executes them through profile-specific runtimes.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -35,6 +36,17 @@ use crate::task_trigger::{
     normalize_event_name,
 };
 use crate::ui_event_bus::{UiEventBus, UiEventTopics};
+
+/// What a webhook delivery did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebhookOutcome {
+    /// No enabled, approved task has the presented token.
+    NotFound,
+    /// Tasks match the token but every one required a signature the delivery lacked.
+    SignatureRefused,
+    /// This many tasks were started.
+    Triggered(usize),
+}
 
 /// Shared task execution facility used by the scheduler, REST API, and agent tools.
 #[derive(Debug, Clone)]
@@ -266,10 +278,9 @@ fn task_value_error(
 fn stored_task_trigger(
     task: &scheduled_tasks::Model,
 ) -> Result<PersistedTaskTrigger, crate::db::ChatDbError> {
-    PersistedTaskTrigger::from_storage(task.trigger_kind.as_str(), task.trigger_type.as_str())
-        .map_err(|error| {
-            task_value_error(task.id.as_str(), "invalid stored trigger for task ", &error)
-        })
+    task.persisted_trigger().map_err(|error| {
+        task_value_error(task.id.as_str(), "invalid stored trigger for task ", &error)
+    })
 }
 
 fn workspace_prepare_error(path: &std::path::Path, error: &impl std::fmt::Display) -> String {
@@ -408,12 +419,10 @@ struct TaskCallbackReminder<'a> {
 
 impl TaskExecutionEnvelope {
     fn new(task: &scheduled_tasks::Model, invocation: TaskInvocation) -> Result<Self, String> {
-        let trigger = PersistedTaskTrigger::from_storage(
-            task.trigger_kind.as_str(),
-            task.trigger_type.as_str(),
-        )
-        .map_err(|error| prefixed_error("invalid persisted task trigger: ", &error))?
-        .response(task.run_at.clone(), task.cron_expression.clone());
+        let trigger = task
+            .persisted_trigger()
+            .map_err(|error| prefixed_error("invalid persisted task trigger: ", &error))?
+            .response(task.run_at.clone(), task.cron_expression.clone());
         Ok(Self {
             task: TaskExecutionTask {
                 id: task.id.clone(),
@@ -688,12 +697,10 @@ impl TaskRuntime {
         self.reload_active_tasks()
             .await
             .map_err(|e| e.to_string())?;
-        let trigger = PersistedTaskTrigger::from_storage(
-            model.trigger_kind.as_str(),
-            model.trigger_type.as_str(),
-        )
-        .map_err(|error| prefixed_error("failed to decode persisted task trigger: ", &error))?
-        .response(model.run_at.clone(), model.cron_expression.clone());
+        let trigger = model
+            .persisted_trigger()
+            .map_err(|error| prefixed_error("failed to decode persisted task trigger: ", &error))?
+            .response(model.run_at.clone(), model.cron_expression.clone());
 
         Ok(TaskCreateResult {
             task_id: model.id,
@@ -795,28 +802,106 @@ impl TaskRuntime {
         Ok(dispatched)
     }
 
-    /// Run every enabled task whose webhook trigger matches `token`.
+    /// Run every enabled task whose webhook token matches `token` and whose
+    /// required signature, keyed by a secret from the keychain, verifies.
     ///
     /// # Errors
     /// Returns [`crate::db::ChatDbError`] on storage failure or task spawn failure.
     pub async fn dispatch_webhook(
         &self,
-        token: String,
+        token: &str,
         request: TaskWebhookRequest,
-    ) -> Result<usize, crate::db::ChatDbError> {
-        let tasks = self.db.list_tasks_for_webhook(&token).await?;
-        let triggered = tasks.len();
+    ) -> Result<WebhookOutcome, crate::db::ChatDbError> {
+        let tasks = self.webhook_tasks_for_token(token).await?;
+        let names = tasks
+            .iter()
+            .filter_map(|task| task.webhook_signature_secret.clone())
+            .collect::<Vec<_>>();
+        let may_dir = self.may_dir.clone();
+        let secrets = blocking::unblock(move || {
+            let store = crate::secrets::SecretStore::new(&may_dir);
+            names
+                .into_iter()
+                .filter_map(|name| match store.get(&name) {
+                    Ok(Some(value)) => Some((name, value)),
+                    Ok(None) => None,
+                    Err(error) => {
+                        tracing::warn!(secret = %name, %error, "failed to read webhook signing secret");
+                        None
+                    }
+                })
+                .collect::<BTreeMap<_, _>>()
+        })
+        .await;
+        self.fire_webhook_tasks(tasks, &secrets, request).await
+    }
+
+    /// Enabled, approved webhook tasks whose token equals `token`. Every
+    /// stored token is compared in constant time with no early exit.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] on storage failure.
+    pub async fn webhook_tasks_for_token(
+        &self,
+        token: &str,
+    ) -> Result<Vec<scheduled_tasks::Model>, crate::db::ChatDbError> {
+        let mut matched = Vec::new();
+        for task in self.db.list_webhook_tasks().await? {
+            if crate::task_trigger::webhook_tokens_match(&task.trigger_type, token) {
+                matched.push(task);
+            }
+        }
+        Ok(matched)
+    }
+
+    /// Run the `tasks` whose signature requirement `secrets` satisfies for
+    /// `request`; a task whose secret is absent or whose signature is
+    /// missing or wrong does not run.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] when a task fails to spawn.
+    pub async fn fire_webhook_tasks(
+        &self,
+        tasks: Vec<scheduled_tasks::Model>,
+        secrets: &BTreeMap<String, String>,
+        mut request: TaskWebhookRequest,
+    ) -> Result<WebhookOutcome, crate::db::ChatDbError> {
+        if tasks.is_empty() {
+            return Ok(WebhookOutcome::NotFound);
+        }
+        // The path carries the token; tasks and run records never see it.
+        request.path = crate::task_trigger::WEBHOOK_ROUTE_REDACTED.to_string();
+        let mut triggered = 0;
         for task in tasks {
+            let trigger = stored_task_trigger(&task)?;
+            if let Some(signature) = trigger.webhook_signature() {
+                let verdict = secrets.get(&signature.secret).map_or_else(
+                    || Err(format!("secret {} is not stored", signature.secret)),
+                    |secret| {
+                        signature
+                            .verify(secret, &request)
+                            .map_err(|error| error.to_string())
+                    },
+                );
+                if let Err(reason) = verdict {
+                    tracing::warn!(task_id = %task.id, %reason, "refused a webhook delivery");
+                    continue;
+                }
+            }
+            triggered += 1;
             self.spawn_task(
                 task,
                 TaskInvocation::Webhook {
-                    token: token.clone(),
                     request: request.clone(),
                 },
             )
             .await?;
         }
-        Ok(triggered)
+        Ok(if triggered == 0 {
+            WebhookOutcome::SignatureRefused
+        } else {
+            WebhookOutcome::Triggered(triggered)
+        })
     }
 
     fn is_due(
@@ -1852,6 +1937,196 @@ mod tests {
             .expect("event dispatch should succeed");
 
         assert_eq!(triggered, 1);
+    }
+
+    fn webhook_request(
+        signature: Option<String>,
+        body: &[u8],
+    ) -> crate::task_trigger::TaskWebhookRequest {
+        use base64::Engine as _;
+        let mut headers = std::collections::BTreeMap::new();
+        if let Some(signature) = signature {
+            headers.insert("x-hub-signature-256".to_string(), vec![signature]);
+        }
+        crate::task_trigger::TaskWebhookRequest {
+            method: "POST".to_string(),
+            path: "/api/tasks/webhook/secret-token".to_string(),
+            query: None,
+            headers,
+            body_base64: base64::engine::general_purpose::STANDARD.encode(body),
+            body_text: None,
+            body_json: None,
+            remote_addr: None,
+            body_size_bytes: body.len(),
+        }
+    }
+
+    fn sign(secret: &str, body: &[u8]) -> String {
+        use hmac::{Hmac, Mac};
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).expect("key");
+        mac.update(body);
+        format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+    }
+
+    #[tokio::test]
+    async fn webhook_delivery_needs_the_token_and_any_required_signature() {
+        use super::WebhookOutcome;
+        use crate::task_trigger::WebhookSignature;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let may_dir = dir.path().join(".may");
+        std::fs::create_dir_all(&may_dir).expect("may dir should be created");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db should initialize");
+        let profile_id = db
+            .ensure_default_profiles()
+            .await
+            .expect("default profiles should exist");
+
+        let plain_token = crate::task_trigger::new_webhook_token();
+        let signed_token = crate::task_trigger::new_webhook_token();
+        for (id, token, signature) in [
+            ("plain", plain_token.clone(), None),
+            (
+                "signed",
+                signed_token.clone(),
+                Some(WebhookSignature {
+                    secret: "HOOK_SECRET".to_string(),
+                    header: "x-hub-signature-256".to_string(),
+                }),
+            ),
+        ] {
+            let trigger = PersistedTaskTrigger::Webhook { token, signature };
+            db.create_scheduled_task(CreateScheduledTaskParams {
+                id,
+                profile_id: profile_id.as_str(),
+                session_id: None,
+                name: id,
+                trigger: &trigger,
+                cron_expression: None,
+                run_at: None,
+                script_path: None,
+                script_inline: Some("echo hi"),
+                needs_network: false,
+                timeout_secs: 60,
+            })
+            .await
+            .expect("task should persist");
+            db.approve_scheduled_task(id)
+                .await
+                .expect("task should be approved");
+        }
+        let runtime = TaskRuntime::load(
+            db,
+            may_dir,
+            Arc::new(crate::tools::embedded_distribution().expect("embedded distribution")),
+        )
+        .await
+        .expect("task runtime should load");
+        let secrets =
+            std::collections::BTreeMap::from([("HOOK_SECRET".to_string(), "s3cret".to_string())]);
+        let body = br#"{"event":"push"}"#;
+        let deliver = |token: String, signature: Option<String>| {
+            let runtime = runtime.clone();
+            let secrets = secrets.clone();
+            async move {
+                let tasks = runtime
+                    .webhook_tasks_for_token(&token)
+                    .await
+                    .expect("lookup should succeed");
+                runtime
+                    .fire_webhook_tasks(tasks, &secrets, webhook_request(signature, body))
+                    .await
+                    .expect("dispatch should succeed")
+            }
+        };
+
+        // A wrong token, including the old petname shape, runs nothing.
+        assert_eq!(
+            deliver(crate::task_trigger::new_webhook_token(), None).await,
+            WebhookOutcome::NotFound
+        );
+        assert_eq!(
+            deliver("quiet-brave-mint-otter".to_string(), None).await,
+            WebhookOutcome::NotFound
+        );
+        // An unsigned task needs only its token.
+        assert_eq!(
+            deliver(plain_token, None).await,
+            WebhookOutcome::Triggered(1)
+        );
+        // A signed task refuses a missing or wrong signature before running.
+        assert_eq!(
+            deliver(signed_token.clone(), None).await,
+            WebhookOutcome::SignatureRefused
+        );
+        assert_eq!(
+            deliver(signed_token.clone(), Some(sign("wrong", body))).await,
+            WebhookOutcome::SignatureRefused
+        );
+        // A correctly signed delivery runs it.
+        assert_eq!(
+            deliver(signed_token.clone(), Some(sign("s3cret", body))).await,
+            WebhookOutcome::Triggered(1)
+        );
+        // A signed task whose secret is not stored refuses everything.
+        let tasks = runtime
+            .webhook_tasks_for_token(&signed_token)
+            .await
+            .expect("lookup should succeed");
+        assert_eq!(
+            runtime
+                .fire_webhook_tasks(
+                    tasks,
+                    &std::collections::BTreeMap::new(),
+                    webhook_request(Some(sign("s3cret", body)), body)
+                )
+                .await
+                .expect("dispatch should succeed"),
+            WebhookOutcome::SignatureRefused
+        );
+    }
+
+    #[tokio::test]
+    async fn opening_the_database_replaces_weak_webhook_tokens() {
+        let dir = tempdir().expect("temp dir should be created");
+        let path = dir.path().join("history.db");
+        let db = ChatDb::open(&path).await.expect("db should initialize");
+        let profile_id = db
+            .ensure_default_profiles()
+            .await
+            .expect("default profiles should exist");
+        let trigger = PersistedTaskTrigger::Webhook {
+            token: "quiet-brave-mint-otter".to_string(),
+            signature: None,
+        };
+        db.create_scheduled_task(CreateScheduledTaskParams {
+            id: "old",
+            profile_id: profile_id.as_str(),
+            session_id: None,
+            name: "old",
+            trigger: &trigger,
+            cron_expression: None,
+            run_at: None,
+            script_path: None,
+            script_inline: Some("echo hi"),
+            needs_network: false,
+            timeout_secs: 60,
+        })
+        .await
+        .expect("task should persist");
+        drop(db);
+
+        let db = ChatDb::open(&path).await.expect("db should reopen");
+        let task = db
+            .get_scheduled_task("old")
+            .await
+            .expect("task should load")
+            .expect("task should exist");
+        assert!(crate::task_trigger::is_strong_webhook_token(
+            &task.trigger_type
+        ));
     }
 
     #[tokio::test]

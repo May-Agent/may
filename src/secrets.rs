@@ -8,8 +8,12 @@
 //! agent's terminal via a `.may-secrets` env file written into the session
 //! working directory — and masked out of every transcript-facing string.
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
+use aither_core::llm::{
+    CommandOutcome, CommandStream, LLMRequest, Message, ToolResult, tool::ToolResultPart,
+};
 use serde::{Deserialize, Serialize};
 
 /// Keychain service secrets are stored under.
@@ -36,7 +40,7 @@ pub enum SecretError {
 }
 
 /// Keychain access plus the names index under `~/.may`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SecretStore {
     index_path: PathBuf,
 }
@@ -51,7 +55,11 @@ impl SecretStore {
     }
 
     /// Env-var-safe secret name?
-    fn validate_name(key: &str) -> Result<&str, SecretError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecretError::InvalidName`] when `key` is not a valid name.
+    pub fn validate_name(key: &str) -> Result<&str, SecretError> {
         let valid = !key.is_empty()
             && key
                 .chars()
@@ -110,6 +118,19 @@ impl SecretStore {
             self.write_names(&names)?;
         }
         Ok(())
+    }
+
+    /// The stored value of `key`, or `None` when no such secret exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecretError`] when the name is invalid or the keychain read fails.
+    pub fn get(&self, key: &str) -> Result<Option<String>, SecretError> {
+        match Self::entry(Self::validate_name(key)?)?.get_password() {
+            Ok(value) => Ok(Some(value)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Remove `key` from the keychain and index. Returns whether it existed.
@@ -229,7 +250,7 @@ impl Secrets {
             .iter()
             .map(|(_, value)| value.as_str())
             .chain(self.extra_values.iter().map(String::as_str))
-            .filter(|value| value.len() >= 6)
+            .filter(|value| value.len() >= MIN_SECRET_LEN)
             .collect();
         values.sort_unstable_by_key(|value| std::cmp::Reverse(value.len()));
         for value in values {
@@ -278,6 +299,175 @@ fn token_patterns() -> &'static [regex::Regex] {
     })
 }
 
+/// Shortest stored value that is masked or redacted: shorter values would
+/// rewrite ordinary text.
+const MIN_SECRET_LEN: usize = 6;
+
+/// Reads the stored secrets afresh for every redaction, so a secret added
+/// with `/secret` while a session runs is covered from its next request.
+///
+/// Cheap to clone: it holds only the path of the names index.
+#[derive(Debug, Clone)]
+pub struct SecretRedactor {
+    store: SecretStore,
+    /// Secrets tests stand in for the keychain.
+    #[cfg(test)]
+    fixed: Option<Vec<(String, String)>>,
+}
+
+impl SecretRedactor {
+    /// Redactor over the secrets stored under `may_dir` (`~/.may`).
+    #[must_use]
+    pub fn new(may_dir: &Path) -> Self {
+        Self {
+            store: SecretStore::new(may_dir),
+            #[cfg(test)]
+            fixed: None,
+        }
+    }
+
+    /// Redactor over exactly `secrets`, without touching the keychain.
+    #[cfg(test)]
+    pub(crate) fn fixed(secrets: &[(&str, &str)]) -> Self {
+        Self {
+            fixed: Some(
+                secrets
+                    .iter()
+                    .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                    .collect(),
+            ),
+            ..Self::new(Path::new("/nonexistent"))
+        }
+    }
+
+    /// The secrets stored right now. Keychain reads run off the caller's
+    /// thread.
+    pub async fn current(&self) -> Redactions {
+        #[cfg(test)]
+        if let Some(fixed) = &self.fixed {
+            return Redactions::new(fixed.clone());
+        }
+        let store = self.store.clone();
+        Redactions::new(blocking::unblock(move || store.values()).await)
+    }
+}
+
+/// A snapshot of stored secrets that replaces each value with its name.
+///
+/// Values are replaced longest first, ties by name, so the same text and the
+/// same secrets always give the same bytes.
+#[derive(Debug, Clone)]
+pub struct Redactions {
+    /// `(name, value)` pairs, longest value first.
+    entries: Vec<(String, String)>,
+}
+
+impl Redactions {
+    fn new(mut entries: Vec<(String, String)>) -> Self {
+        entries.retain(|(_, value)| value.len() >= MIN_SECRET_LEN);
+        entries.sort_unstable_by(|(left_name, left), (right_name, right)| {
+            right
+                .len()
+                .cmp(&left.len())
+                .then_with(|| left_name.cmp(right_name))
+        });
+        Self { entries }
+    }
+
+    /// `text` with every stored value replaced by its secret's name.
+    #[must_use]
+    pub fn redact<'a>(&self, text: &'a str) -> Cow<'a, str> {
+        let mut redacted = Cow::Borrowed(text);
+        for (name, value) in &self.entries {
+            if redacted.contains(value.as_str()) {
+                redacted = Cow::Owned(redacted.replace(value.as_str(), name));
+            }
+        }
+        redacted
+    }
+
+    fn redact_in_place(&self, text: &mut String) {
+        if let Cow::Owned(redacted) = self.redact(text) {
+            *text = redacted;
+        }
+    }
+
+    fn redact_json(&self, value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::String(text) => self.redact_in_place(text),
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    self.redact_json(item);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for item in map.values_mut() {
+                    self.redact_json(item);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn redact_stream(&self, stream: &mut CommandStream) {
+        match stream {
+            CommandStream::Inline { text } => self.redact_in_place(text),
+            CommandStream::Stored { preview, .. } => self.redact_in_place(preview),
+            CommandStream::Image { .. } => {}
+        }
+    }
+
+    /// Redacts the text a tool result carries.
+    pub fn redact_tool_result(&self, result: &mut ToolResult) {
+        match result {
+            ToolResult::Text { text } | ToolResult::Tsv { text } => self.redact_in_place(text),
+            ToolResult::Error { message } => self.redact_in_place(message),
+            ToolResult::Command(record) => {
+                self.redact_stream(&mut record.stdout);
+                if let Some(stderr) = &mut record.stderr {
+                    self.redact_stream(stderr);
+                }
+                if let CommandOutcome::Killed { notice, .. } = &mut record.outcome {
+                    self.redact_in_place(notice);
+                }
+            }
+            ToolResult::Parts { parts } => {
+                for part in parts {
+                    if let ToolResultPart::Text { text } | ToolResultPart::Tsv { text } = part {
+                        self.redact_in_place(text);
+                    }
+                }
+            }
+            ToolResult::Done | ToolResult::Binary { .. } => {}
+        }
+    }
+
+    /// Redacts every message of `request`: text of every role and the
+    /// string arguments of tool calls. Reasoning state is left untouched.
+    pub fn redact_request(&self, request: &mut LLMRequest) {
+        if self.entries.is_empty() {
+            return;
+        }
+        for message in request.messages_mut() {
+            match message {
+                Message::User { content, .. }
+                | Message::System { content }
+                | Message::Tool { content, .. } => self.redact_in_place(content),
+                Message::Assistant {
+                    content,
+                    tool_calls,
+                    ..
+                } => {
+                    self.redact_in_place(content);
+                    for call in tool_calls {
+                        self.redact_json(&mut call.arguments);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Keychain secrets feed the terminal tool's env injection, re-read for
 /// every spawned command so `/secret` takes effect without a rebuild.
 impl aither_sandbox::TerminalEnvSource for SecretStore {
@@ -324,5 +514,105 @@ mod tests {
         assert_eq!(masked, "export MY_SECRET=***");
         let (_, hit) = secrets.mask("set name=lexo debug=1");
         assert!(!hit);
+    }
+
+    fn redactions() -> Redactions {
+        Redactions::new(vec![
+            ("SHORT".to_string(), "abc".to_string()),
+            (
+                "DB_PASSWORD".to_string(),
+                "hunter2-correct-horse".to_string(),
+            ),
+            (
+                "DB_PASSWORD_PREFIX".to_string(),
+                "hunter2-correct".to_string(),
+            ),
+        ])
+    }
+
+    #[test]
+    fn redaction_replaces_values_with_names_longest_first() {
+        let redactions = redactions();
+        assert_eq!(
+            redactions.redact("a hunter2-correct-horse b hunter2-correct c"),
+            "a DB_PASSWORD b DB_PASSWORD_PREFIX c"
+        );
+        // Values under the floor stay: they would rewrite ordinary text.
+        assert_eq!(redactions.redact("abc"), "abc");
+    }
+
+    #[test]
+    fn redaction_is_deterministic() {
+        let text = "x hunter2-correct-horse y hunter2-correct";
+        assert_eq!(redactions().redact(text), redactions().redact(text));
+        let reversed = Redactions::new(vec![
+            (
+                "DB_PASSWORD_PREFIX".to_string(),
+                "hunter2-correct".to_string(),
+            ),
+            (
+                "DB_PASSWORD".to_string(),
+                "hunter2-correct-horse".to_string(),
+            ),
+        ]);
+        assert_eq!(reversed.redact(text), redactions().redact(text));
+    }
+
+    #[test]
+    fn redaction_covers_command_results() {
+        let redactions = redactions();
+        let mut result = ToolResult::Command(Box::new(aither_core::llm::CommandResult {
+            stdout: CommandStream::Inline {
+                text: "hunter2-correct-horse\n".to_string(),
+            },
+            stderr: Some(CommandStream::Inline {
+                text: "bad hunter2-correct-horse".to_string(),
+            }),
+            outcome: CommandOutcome::Exited { code: 0 },
+            interruptions: Vec::new(),
+        }));
+        redactions.redact_tool_result(&mut result);
+        let ToolResult::Command(record) = result else {
+            panic!("a command result stays a command result");
+        };
+        assert_eq!(
+            record.stdout,
+            CommandStream::Inline {
+                text: "DB_PASSWORD\n".to_string()
+            }
+        );
+        assert_eq!(
+            record.stderr,
+            Some(CommandStream::Inline {
+                text: "bad DB_PASSWORD".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn request_redaction_covers_every_role_and_leaves_reasoning() {
+        let reasoning = aither_core::llm::ReasoningState::new("claude", "hunter2-correct-horse");
+        let call = aither_core::llm::ToolCall::new(
+            "c1",
+            "terminal",
+            serde_json::json!({"command": "echo hunter2-correct-horse", "n": 1}),
+        );
+        let mut request = LLMRequest::new(vec![
+            Message::system("sys hunter2-correct-horse"),
+            Message::user("user hunter2-correct-horse"),
+            Message::assistant_with_reasoning("", vec![call], vec![reasoning.clone()]),
+            Message::tool("c1", "tool hunter2-correct-horse"),
+        ]);
+        redactions().redact_request(&mut request);
+        let rendered = format!("{:?}", request.messages());
+        assert!(!rendered.contains("echo hunter2"), "{rendered}");
+        assert_eq!(request.messages()[0].content(), "sys DB_PASSWORD");
+        assert_eq!(request.messages()[1].content(), "user DB_PASSWORD");
+        assert_eq!(request.messages()[3].content(), "tool DB_PASSWORD");
+        assert_eq!(
+            request.messages()[2].tool_calls()[0].arguments["command"],
+            "echo DB_PASSWORD"
+        );
+        assert_eq!(request.messages()[2].reasoning(), [reasoning]);
     }
 }
