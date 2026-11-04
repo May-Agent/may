@@ -9,7 +9,7 @@ use std::process::Command;
 mod image_ref;
 
 /// The pinned tool-distribution manifest the workspace image stages.
-const TOOL_DISTRIBUTION_MANIFEST: &str = "src/tools/tool-distribution-0.12.0.json";
+const TOOL_DISTRIBUTION_MANIFEST: &str = "src/tools/tool-distribution-0.14.1.json";
 
 fn main() {
     println!("cargo:rerun-if-env-changed=MAY_SKIP_WEB_UI_BUILD");
