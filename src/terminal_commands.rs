@@ -732,11 +732,9 @@ mod tests {
         let main = builder.build(session_dir.join("outputs"));
         let subagent = main.for_subagent(None, None);
 
-        // `subagent` is built per terminal, so a subagent launches with its own
-        // authority; it is not reserved for the main agent.
-        assert!(!main.is_reserved("subagent"));
-        assert!(!subagent.is_reserved("subagent"));
-        assert!(subagent.is_tool_configured("subagent"));
+        // A subagent's terminal has no `subagent` command.
+        assert!(main.is_tool_configured("subagent"));
+        assert!(!subagent.is_tool_configured("subagent"));
 
         // The main agent creates an issue; the subagent can read it.
         let created = main
