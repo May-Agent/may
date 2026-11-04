@@ -174,7 +174,7 @@ pub struct AgentWorker {
     subagent_runs: Option<aither_agent::specialized::SubagentRuns>,
     /// Model clone for `/btw` side questions; `None` when the agent runs in
     /// the daemon, which answers `/btw` itself.
-    btw_llm: Option<RequestParameterizedModel<aither_cloud::CloudProvider>>,
+    btw_llm: Option<RequestParameterizedModel<crate::agent::ProviderLlm>>,
     /// The agent's prompt-cache entry; `None` when the agent runs in the
     /// daemon.
     warmth: Option<aither_agent::CacheWarmth>,
@@ -375,7 +375,7 @@ impl AgentWorker {
 
     /// Model clone for `/btw` side questions.
     #[must_use]
-    pub const fn btw_llm(&self) -> Option<&RequestParameterizedModel<aither_cloud::CloudProvider>> {
+    pub const fn btw_llm(&self) -> Option<&RequestParameterizedModel<crate::agent::ProviderLlm>> {
         self.btw_llm.as_ref()
     }
 
@@ -993,12 +993,15 @@ mod tests {
         });
 
         let llm = crate::agent::RequestParameterizedModel::new(
-            aither_cloud::CloudProvider::OpenAI(
-                aither_cloud::openai::OpenAI::builder("test-key")
-                    .base_url(format!("http://{addr}"))
-                    .model("gpt-5")
-                    .no_retry()
-                    .build(),
+            crate::agent::RedactedModel::new(
+                aither_cloud::CloudProvider::OpenAI(
+                    aither_cloud::openai::OpenAI::builder("test-key")
+                        .base_url(format!("http://{addr}"))
+                        .model("gpt-5")
+                        .no_retry()
+                        .build(),
+                ),
+                crate::secrets::SecretRedactor::new(std::path::Path::new("/nonexistent")),
             ),
             aither_core::llm::model::Parameters::default(),
         );
