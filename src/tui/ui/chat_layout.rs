@@ -27,6 +27,7 @@ use unicode_width::UnicodeWidthStr;
 use super::chat::{
     ChatElement, ChatStream, ClickRegion, ElementState, collapsible_id, element_lines,
 };
+use super::links::{self, LinkHit, LinkId, LinkRun, ScreenRun};
 use super::streaming_markdown::IMAGE_HEIGHT;
 
 /// How far ahead the cache looks for an element that moved because
@@ -52,8 +53,20 @@ pub(super) fn line_rows(line: &Line<'_>, width: u16) -> usize {
 /// Plain text of each wrapped row of `lines`, read back from a scratch
 /// render so it matches the screen cell for cell (wide graphemes included).
 pub(super) fn plain_rows(lines: &[Line<'_>], width: u16, rows: usize) -> Vec<String> {
+    scratch(lines, width, rows).plain
+}
+
+/// What a scratch render of an element reveals.
+#[derive(Debug, Default)]
+struct Scratch {
+    plain: Vec<String>,
+    /// Link cells, from lines tagged by [`links::mark_lines`].
+    runs: Vec<LinkRun>,
+}
+
+fn scratch(lines: &[Line<'_>], width: u16, rows: usize) -> Scratch {
     if width == 0 || rows == 0 {
-        return Vec::new();
+        return Scratch::default();
     }
     let height = u16::try_from(rows).unwrap_or(u16::MAX);
     let area = Rect::new(0, 0, width, height);
@@ -62,7 +75,9 @@ pub(super) fn plain_rows(lines: &[Line<'_>], width: u16, rows: usize) -> Vec<Str
         .wrap(Wrap { trim: false })
         .render(area, &mut buf);
     let mut out = Vec::with_capacity(rows);
+    let mut runs = Vec::new();
     for y in 0..height {
+        runs.extend(links::scan_row(&buf, y, width));
         let mut row = String::new();
         let mut x = 0u16;
         while x < width {
@@ -74,7 +89,7 @@ pub(super) fn plain_rows(lines: &[Line<'_>], width: u16, rows: usize) -> Vec<Str
         }
         out.push(row.trim_end().to_string());
     }
-    out
+    Scratch { plain: out, runs }
 }
 
 /// One laid-out element.
@@ -92,8 +107,13 @@ struct Entry {
     collapsible: Option<String>,
     /// The images are markdown references the TUI fetches itself.
     markdown_images: bool,
-    /// Plain text per wrapped row, built on first use.
-    plain: OnceLock<Vec<String>>,
+    /// Link targets, indexed by the markers of `marked`.
+    link_targets: Vec<String>,
+    /// `lines` with their links tagged, scratch-rendered instead of
+    /// `lines` when the element has links.
+    marked: Option<Vec<Line<'static>>>,
+    /// Scratch render, built on first use (at build for linked elements).
+    scratch: OnceLock<Scratch>,
 }
 
 impl Entry {
@@ -120,7 +140,8 @@ impl Entry {
                 (key, row, caption)
             })
             .collect();
-        Self {
+        let (marked, link_targets) = links::mark_lines(&laid.lines).unzip();
+        let entry = Self {
             revision,
             state,
             lines: laid.lines,
@@ -129,13 +150,30 @@ impl Entry {
             images,
             collapsible: collapsible_id(elem).map(str::to_string),
             markdown_images: matches!(elem, ChatElement::AssistantText { .. }),
-            plain: OnceLock::new(),
+            link_targets: link_targets.unwrap_or_default(),
+            marked,
+            scratch: OnceLock::new(),
+        };
+        // Link cells are needed every frame: find them now, with the
+        // layout, not in the draw path.
+        if entry.marked.is_some() {
+            entry.scratch(width);
         }
+        entry
+    }
+
+    fn scratch(&self, width: u16) -> &Scratch {
+        self.scratch.get_or_init(|| {
+            scratch(
+                self.marked.as_deref().unwrap_or(&self.lines),
+                width,
+                self.rows,
+            )
+        })
     }
 
     fn plain(&self, width: u16) -> &[String] {
-        self.plain
-            .get_or_init(|| plain_rows(&self.lines, width, self.rows))
+        &self.scratch(width).plain
     }
 
     /// Index of the line holding entry row `row`.
@@ -379,6 +417,68 @@ impl ChatLayout {
             .map(String::as_str)
     }
 
+    /// Link cells of the elements overlapping document rows
+    /// `[top, top + height)`, placed on screen inside `area`.
+    #[must_use]
+    pub fn link_runs(&self, top: usize, height: usize, area: Rect) -> Vec<ScreenRun> {
+        let bottom = top.saturating_add(height);
+        let mut out = Vec::new();
+        if self.entries.is_empty() || top >= self.element_rows {
+            return out;
+        }
+        for (index, entry) in self.entries.iter().enumerate().skip(self.entry_at(top)) {
+            let start = self.offsets[index];
+            if start >= bottom {
+                break;
+            }
+            for run in &entry.scratch(self.width).runs {
+                let row = start + run.row;
+                if row < top || row >= bottom {
+                    continue;
+                }
+                let y = self.top_padding + row - top;
+                out.push(ScreenRun {
+                    x: area.x + run.col,
+                    y: area.y + u16::try_from(y).unwrap_or(u16::MAX),
+                    width: run.width,
+                    text: run.text.clone(),
+                    hit: LinkHit {
+                        id: LinkId {
+                            entry: index,
+                            link: run.link,
+                        },
+                        uri: entry.link_targets[run.link as usize].clone(),
+                    },
+                });
+            }
+        }
+        out
+    }
+
+    /// The link whose cells include column `col` of document row `row`
+    /// (elements only; every wrapped row of a link shares its identity).
+    #[must_use]
+    pub fn link_at(&self, row: usize, col: u16) -> Option<LinkHit> {
+        if row >= self.element_rows {
+            return None;
+        }
+        let index = self.entry_at(row);
+        let entry = self.entries.get(index)?;
+        let local = row - self.offsets[index];
+        entry
+            .scratch(self.width)
+            .runs
+            .iter()
+            .find(|run| run.row == local && (run.col..run.col + run.width).contains(&col))
+            .map(|run| LinkHit {
+                id: LinkId {
+                    entry: index,
+                    link: run.link,
+                },
+                uri: entry.link_targets[run.link as usize].clone(),
+            })
+    }
+
     /// Row span of every collapsible element, for click hit-testing.
     #[must_use]
     pub fn collapse_regions(&self) -> Vec<ClickRegion> {
@@ -402,5 +502,125 @@ impl ChatLayout {
             .iter()
             .filter(|entry| entry.markdown_images)
             .flat_map(|entry| entry.images.iter().map(|(key, _, _)| key.as_str()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::ui::chat::ChatStream;
+
+    const URL: &str = "https://example.com/some/long/path/segment/that/wraps?query=1";
+
+    fn layout_of(chat: &ChatStream, width: u16) -> ChatLayout {
+        let mut layout = ChatLayout::default();
+        layout.sync(chat, width, false, false, None, 0);
+        layout
+    }
+
+    /// Every `(row, col)` of the transcript that hits a link.
+    fn hits(layout: &ChatLayout, width: u16) -> Vec<(usize, u16, LinkHit)> {
+        let mut out = Vec::new();
+        for row in 0..layout.element_rows() {
+            for col in 0..width {
+                if let Some(hit) = layout.link_at(row, col) {
+                    out.push((row, col, hit));
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn url_in_assistant_text_is_a_link_with_its_exact_cells() {
+        let mut chat = ChatStream::new();
+        chat.push_text(&format!("See {URL} for details."));
+        chat.end_text();
+        let layout = layout_of(&chat, 120);
+        let found = hits(&layout, 120);
+        assert_eq!(found.len(), URL.len());
+        assert!(found.iter().all(|(_, _, hit)| hit.uri == URL));
+        let (row, first, _) = &found[0];
+        let line = layout.plain_line(*row).unwrap();
+        let tail = line.get(usize::from(*first)..).unwrap();
+        assert_eq!(tail.get(..URL.len()), Some(URL));
+    }
+
+    #[test]
+    fn wrapped_url_is_one_link_across_every_row() {
+        let mut chat = ChatStream::new();
+        chat.push_text(&format!("See {URL} for details."));
+        chat.end_text();
+        let layout = layout_of(&chat, 24);
+        let found = hits(&layout, 24);
+        let rows: std::collections::BTreeSet<usize> = found.iter().map(|(row, ..)| *row).collect();
+        assert!(rows.len() >= 3, "link should wrap over rows: {rows:?}");
+        let ids: std::collections::HashSet<LinkId> = found.iter().map(|(.., hit)| hit.id).collect();
+        assert_eq!(ids.len(), 1, "one logical link");
+        assert!(found.iter().all(|(.., hit)| hit.uri == URL));
+        // The hit cells, read back from the rows, spell the whole URL.
+        let mut spelled = String::new();
+        for (row, col, _) in &found {
+            let line = layout.plain_line(*row).unwrap();
+            spelled.push_str(line.get(usize::from(*col)..=usize::from(*col)).unwrap());
+        }
+        assert_eq!(spelled, URL);
+    }
+
+    #[test]
+    fn link_runs_place_wrapped_rows_on_screen() {
+        let mut chat = ChatStream::new();
+        chat.push_text(&format!("See {URL} for details."));
+        chat.end_text();
+        let layout = layout_of(&chat, 24);
+        let runs = layout.link_runs(0, 40, Rect::new(2, 5, 24, 40));
+        assert!(runs.len() >= 3);
+        assert!(runs.iter().all(|run| run.x >= 2 && run.y >= 5));
+        let joined: String = runs.iter().map(|run| run.text.as_str()).collect();
+        assert_eq!(joined, URL);
+    }
+
+    #[test]
+    fn path_next_to_wide_text_hits_on_cell_columns() {
+        let mut chat = ChatStream::new();
+        chat.push_notice("文件 /tmp/笔记/a.md 已保存");
+        let layout = layout_of(&chat, 60);
+        let found = hits(&layout, 60);
+        assert!(found.len() > 4);
+        assert!(
+            found
+                .iter()
+                .all(|(.., hit)| hit.uri == "file:///tmp/%E7%AC%94%E8%AE%B0/a.md")
+        );
+        let (row, col, _) = &found[0];
+        // Two wide glyphs and a space precede the path.
+        assert!(*col >= 5);
+        assert!(layout.link_at(*row, 0).is_none());
+        assert!(layout.link_at(*row, 59).is_none());
+    }
+
+    #[test]
+    fn url_and_path_in_user_message_are_links() {
+        let mut chat = ChatStream::new();
+        chat.push_user("see https://example.com/docs and /etc/hosts", Vec::new(), 0);
+        let layout = layout_of(&chat, 120);
+        let uris: std::collections::BTreeSet<String> = hits(&layout, 120)
+            .into_iter()
+            .map(|(.., hit)| hit.uri)
+            .collect();
+        assert_eq!(
+            uris,
+            ["file:///etc/hosts", "https://example.com/docs"]
+                .map(str::to_string)
+                .into()
+        );
+    }
+
+    #[test]
+    fn text_without_links_has_none() {
+        let mut chat = ChatStream::new();
+        chat.push_text("run /help, then open src/main.rs");
+        chat.end_text();
+        assert_eq!(hits(&layout_of(&chat, 60), 60).len(), 0);
     }
 }
