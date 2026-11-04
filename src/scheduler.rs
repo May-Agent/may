@@ -1965,8 +1965,10 @@ mod tests {
 
         let runtime = TaskRuntime::load(
             db.clone(),
-            may_dir,
-            Arc::new(crate::tools::embedded_distribution().expect("embedded distribution")),
+            may_dir.clone(),
+            Arc::new(crate::tools::fixture_distribution(
+                &may_dir.join("tool-fixtures"),
+            )),
         )
         .await
         .expect("task runtime should load");
@@ -2063,8 +2065,10 @@ mod tests {
         }
         let runtime = TaskRuntime::load(
             db,
-            may_dir,
-            Arc::new(crate::tools::embedded_distribution().expect("embedded distribution")),
+            may_dir.clone(),
+            Arc::new(crate::tools::fixture_distribution(
+                &may_dir.join("tool-fixtures"),
+            )),
         )
         .await
         .expect("task runtime should load");
@@ -2225,8 +2229,10 @@ mod tests {
             .expect("db should initialize");
         let runtime = TaskRuntime::load(
             db,
-            may_dir,
-            Arc::new(crate::tools::embedded_distribution().expect("embedded distribution")),
+            may_dir.clone(),
+            Arc::new(crate::tools::fixture_distribution(
+                &may_dir.join("tool-fixtures"),
+            )),
         )
         .await
         .expect("task runtime should load");
@@ -2381,8 +2387,10 @@ mod tests {
             let (wake_tx, wakes) = async_channel::unbounded();
             let runtime = TaskRuntime::load(
                 db,
-                may_dir,
-                Arc::new(crate::tools::embedded_distribution().expect("embedded distribution")),
+                may_dir.clone(),
+                Arc::new(crate::tools::fixture_distribution(
+                    &may_dir.join("tool-fixtures"),
+                )),
             )
             .await
             .expect("task runtime should load")
