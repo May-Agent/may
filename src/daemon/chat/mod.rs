@@ -4836,8 +4836,19 @@ mod tests {
     #[tokio::test]
     async fn a_job_finishing_before_the_release_resumes_the_session_after_it() {
         let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let may_dir = tempfile::tempdir().expect("may dir");
+        // The session's `files/` is what the sandboxed command can write and
+        // read.
+        let session_files = may_dir.path().join("sessions/session/files");
+        std::fs::create_dir_all(&session_files).expect("session files");
+        let gate = session_files.join("go");
+        let done = session_files.join("done");
         let arguments = serde_json::json!({
-            "script": "sleep 1; echo finished",
+            "script": format!(
+                "while [ ! -e {} ]; do sleep 0.05; done; echo finished; touch {}",
+                gate.display(),
+                done.display()
+            ),
             "description": "finishes after the turn ends",
             "background": true,
             "timeout": 30
@@ -4850,7 +4861,6 @@ mod tests {
         ])
         .await;
         let provider_b = stub_provider(Vec::new()).await;
-        let may_dir = tempfile::tempdir().expect("may dir");
         let cwd = tempfile::tempdir().expect("cwd");
         let state = failover_state(may_dir.path(), cwd.path(), &provider_a, &provider_b).await;
 
@@ -4883,8 +4893,21 @@ mod tests {
         .expect("the turn completes");
         assert!(state.parked_agents.contains("session"));
 
-        // The command ends while the run still holds the session.
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        // The command ends only now, while the run still holds the session;
+        // the idle agent's worker is observed through its job registry.
+        // The registry cannot show it: the agent's own background wait
+        // records completions, and that wait starts only after the release.
+        // The command reports through a file instead.
+        std::fs::write(&gate, "").expect("open the gate");
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            while !done.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the command finishes");
+        // The process exits right after writing the file.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         assert!(
             provider_a.bodies.try_recv().is_ok() && provider_a.bodies.try_recv().is_ok(),
             "the turn made two requests"
