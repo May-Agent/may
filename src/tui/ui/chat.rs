@@ -1301,6 +1301,8 @@ pub struct StatusContext<'a> {
     pub queue_count: usize,
     /// Questions the agent asked that wait for an answer.
     pub open_questions: usize,
+    /// The session grants every approval request without asking.
+    pub yolo: bool,
     /// Running background terminal jobs (the sidebar lists each command).
     pub shells: usize,
     /// Running subagents (the sidebar lists each one).
@@ -2738,6 +2740,10 @@ fn render_status_line(lines: &mut Vec<Line<'_>>, ctx: &StatusContext<'_>, width:
         parts.push(format!("Q:{}", ctx.queue_count));
     }
 
+    if ctx.yolo {
+        parts.push("yolo on · /yolo".to_string());
+    }
+
     if ctx.open_questions > 0 {
         parts.push(format!("? {} open · /questions", ctx.open_questions));
     }
@@ -3877,6 +3883,7 @@ mod tests {
                             usage: None,
                             queue_count: 0,
                             open_questions: 0,
+                            yolo: false,
                             shells: 0,
                             subagents: 0,
                             decode_rate: None,

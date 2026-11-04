@@ -694,6 +694,10 @@ pub enum WorkspaceApprovalError {
     PersistHistory(#[source] crate::db::ChatDbError),
     #[error("workspace request interrupted")]
     Interrupted,
+    #[error("failed to read the session's yolo switch: {0}")]
+    Yolo(#[source] crate::db::ChatDbError),
+    #[error("failed to grant the workspace request under yolo: {0}")]
+    YoloGrant(#[source] Box<WorkspaceResolveError>),
 }
 
 /// Why a workspace response could not be resolved.
@@ -1035,6 +1039,19 @@ impl WorkspaceApprover {
                 )
                 .await
                 .map_err(WorkspaceApprovalError::PersistHistory)?;
+
+            // A yolo session grants at once, through the same commit a user
+            // approval takes.
+            if runtime_service
+                .db()
+                .session_yolo(session_id)
+                .await
+                .map_err(WorkspaceApprovalError::Yolo)?
+            {
+                self.resolve(&request_id, true)
+                    .await
+                    .map_err(|error| WorkspaceApprovalError::YoloGrant(Box::new(error)))?;
+            }
         }
 
         rx.recv()

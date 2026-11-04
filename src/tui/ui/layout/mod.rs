@@ -208,6 +208,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                 usage: usage_info,
                 queue_count: app.queue.len(),
                 open_questions: app.open_question_count,
+                yolo: app.session_runtime.yolo,
                 shells: running_shells,
                 subagents: app.subagents.len(),
                 decode_rate,
