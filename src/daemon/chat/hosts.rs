@@ -165,6 +165,7 @@ pub(super) async fn idle_agent(
         super::TurnAttempt {
             provider_attempt: 0,
             turn_boundary: None,
+            retained_agent: None,
         },
         &super::TurnKind::Prompt,
     )
