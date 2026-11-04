@@ -65,6 +65,47 @@ export function AskUserForm({ request }: { request: PersistedAskUserRequest }) {
       <div className="space-y-5 py-3 max-h-[60vh] overflow-y-auto scrollbar-thin">
         {request.questions.map((q) => {
           const state = sections.get(q.section) ?? emptySectionAnswer();
+          if (q.secret) {
+            const { name, scope } = q.secret;
+            return (
+              <div key={q.section} className="space-y-2">
+                <div className="text-xs uppercase tracking-wider text-muted-foreground">{name}</div>
+                <div className="text-sm font-medium">{q.question}</div>
+                <input
+                  type="password"
+                  autoComplete="off"
+                  spellCheck={false}
+                  aria-label={t('modals.askUser.secretLabel')}
+                  placeholder={t('modals.askUser.secretLabel')}
+                  value={state.custom}
+                  disabled={state.declined}
+                  onChange={(e) =>
+                    updateSection(q.section, (s) => ({ ...s, custom: e.target.value, declined: false }))
+                  }
+                  className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1 text-sm outline-none focus:ring-2 focus:ring-ring disabled:opacity-50"
+                />
+                <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
+                  <span>
+                    {state.declined
+                      ? t('modals.askUser.secretDeclined')
+                      : t(scope === 'global' ? 'modals.askUser.secretHintGlobal' : 'modals.askUser.secretHintSession', {
+                          name,
+                        })}
+                  </span>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    onClick={() =>
+                      updateSection(q.section, (s) => ({ ...s, custom: '', declined: !s.declined }))
+                    }
+                  >
+                    {state.declined ? t('modals.askUser.secretProvide') : t('modals.askUser.secretDecline')}
+                  </Button>
+                </div>
+              </div>
+            );
+          }
           return (
             <div key={q.section} className="space-y-2">
               <div className="text-xs uppercase tracking-wider text-muted-foreground">

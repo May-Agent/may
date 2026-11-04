@@ -289,6 +289,12 @@ export const ja: Messages = {
       other: 'その他',
       failed: '回答を送信できませんでした。質問はすでに閉じられている可能性があります。',
       openTitle: 'May からの質問',
+      secretLabel: 'シークレットの値',
+      secretHintGlobal: '{name} としてすべてのセッションに保存されます。May は値を見ません。',
+      secretHintSession: '{name} としてこのセッションにのみ保存されます。May は値を見ません。',
+      secretDecline: '拒否する',
+      secretDeclined: '拒否しました。送信すると May に伝わります。',
+      secretProvide: '代わりに値を入力する',
     },
   },
   settings: {
