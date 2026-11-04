@@ -26,6 +26,7 @@ mod error_chain;
 mod events;
 mod helpers;
 mod interaction;
+pub use interaction::ASK_USER_NOT_OPEN;
 mod local_url_mapper;
 mod message_mapping;
 mod model_resolution;
