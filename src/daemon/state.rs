@@ -1248,7 +1248,8 @@ impl DaemonState {
                 may_dir.to_path_buf(),
                 tool_distribution.clone(),
             )
-            .await?,
+            .await?
+            .with_secret_store(SecretStore::in_memory(may_dir)),
         );
         let config = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(config));
         Ok(Self {

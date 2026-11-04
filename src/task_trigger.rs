@@ -19,6 +19,9 @@ pub const TRIGGER_TYPE_CRON: &str = "cron";
 /// Event name emitted when a chat turn finishes.
 pub const EVENT_CHAT_TURN_COMPLETED: &str = "chat.turn.completed";
 const WEBHOOK_ROUTE_PREFIX: &str = "/api/tasks/webhook/";
+/// The path every webhook route lives under, without the trailing slash: what
+/// Tailscale Funnel mounts.
+pub const WEBHOOK_MOUNT: &str = "/api/tasks/webhook";
 /// The webhook route with its token replaced, for records that must not hold the token.
 pub const WEBHOOK_ROUTE_REDACTED: &str = "/api/tasks/webhook/{token}";
 
@@ -392,6 +395,7 @@ impl PersistedTaskTrigger {
             Self::Webhook { token, signature } => TaskTriggerResponse::Webhook {
                 token: token.clone(),
                 webhook_path: webhook_path(token.as_str()),
+                public_url: None,
                 signature: signature.clone(),
             },
         }
@@ -570,10 +574,33 @@ pub enum TaskTriggerResponse {
         /// Computed public webhook path.
         #[serde(rename = "webhookPath")]
         webhook_path: String,
+        /// Full internet-facing URL, while Tailscale Funnel exposes webhooks.
+        #[serde(default, rename = "publicUrl", skip_serializing_if = "Option::is_none")]
+        public_url: Option<String>,
         /// Signed-delivery requirement, when the task has one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         signature: Option<WebhookSignature>,
     },
+}
+
+impl TaskTriggerResponse {
+    /// Adds the public URL of a webhook trigger, given the Funnel base URL
+    /// (`https://host[:port]`); other kinds are unchanged.
+    #[must_use]
+    pub fn with_funnel_base(mut self, base: Option<&str>) -> Self {
+        if let (
+            Self::Webhook {
+                webhook_path,
+                public_url,
+                ..
+            },
+            Some(base),
+        ) = (&mut self, base)
+        {
+            *public_url = Some(format!("{base}{webhook_path}"));
+        }
+        self
+    }
 }
 
 /// Generate a fresh webhook token: 256 bits from the OS CSPRNG, URL-safe base64.
@@ -880,6 +907,40 @@ mod tests {
         assert_eq!(normalized.kind(), TaskTriggerKind::Webhook);
         assert_ne!(token, "");
         assert_eq!(webhook_path(&token), format!("/api/tasks/webhook/{token}"));
+    }
+
+    #[test]
+    fn webhook_mount_is_the_route_prefix() {
+        assert_eq!(
+            format!("{}/", super::WEBHOOK_MOUNT),
+            super::WEBHOOK_ROUTE_PREFIX
+        );
+    }
+
+    #[test]
+    fn funnel_base_gives_a_webhook_its_public_url() {
+        let trigger = PersistedTaskTrigger::Webhook {
+            token: "abc123".to_string(),
+            signature: None,
+        };
+        let response = trigger
+            .response(None, None)
+            .with_funnel_base(Some("https://mac.ts.net:8443"));
+        match response {
+            super::TaskTriggerResponse::Webhook { public_url, .. } => assert_eq!(
+                public_url.as_deref(),
+                Some("https://mac.ts.net:8443/api/tasks/webhook/abc123")
+            ),
+            other => panic!("unexpected response: {other:?}"),
+        }
+        let off = trigger.response(None, None).with_funnel_base(None);
+        assert!(matches!(
+            off,
+            super::TaskTriggerResponse::Webhook {
+                public_url: None,
+                ..
+            }
+        ));
     }
 
     #[test]
