@@ -25,10 +25,13 @@ pub(super) async fn handle_task_request(
     state: &Arc<DaemonState>,
     request: crate::agent::task_tool::TaskCreateRequest,
 ) -> Result<crate::agent::task_tool::TaskCreateResult, String> {
-    state
+    let mut result = state
         .task_runtime
         .create_task_from_tool_request(request)
-        .await
+        .await?;
+    let funnel = state.remote_access_manager.snapshot().funnel_url;
+    result.trigger = result.trigger.with_funnel_base(funnel.as_deref());
+    Ok(result)
 }
 
 pub(super) async fn handle_notify_request(
