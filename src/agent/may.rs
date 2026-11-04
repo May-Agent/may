@@ -1371,19 +1371,18 @@ async fn prepare_tools(
             "adopted",
         ),
         Acquired::Prepare(lease) => {
-            let builder = builder
-                .initialize_tools(
-                    &config.tool_distribution,
-                    &crate::session::MayHomePaths::new(config.may_dir.clone()).tools_dir(),
-                )
-                .await
-                .inspect_err(|error| {
-                    tracing::error!(
-                        stage = "tool_preparation",
-                        %error,
-                        "tool environment preparation failed"
-                    );
-                })?;
+            let builder = Box::pin(builder.initialize_tools(
+                &config.tool_distribution,
+                &crate::session::MayHomePaths::new(config.may_dir.clone()).tools_dir(),
+            ))
+            .await
+            .inspect_err(|error| {
+                tracing::error!(
+                    stage = "tool_preparation",
+                    %error,
+                    "tool environment preparation failed"
+                );
+            })?;
             lease.complete(builder.shell_sessions().clone());
             (builder, "prepared")
         }
