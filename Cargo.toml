@@ -180,6 +180,7 @@ sha2 = "0.10"
 similar = "3.1.1"
 dunce = "1.0.5"
 keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "linux-native"] }
+linkify = { version = "0.11.0", default-features = false }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Direct NSPasteboard reads skip the decode-to-RGBA / re-encode round trip
