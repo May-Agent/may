@@ -11,6 +11,7 @@
 use std::path::Path;
 
 use aither_sandbox::{ManagedTool, ToolDistribution, ToolTarget};
+use askama::Template;
 use sha2::{Digest, Sha256};
 
 /// Version every fixture tool is pinned to and reports.
@@ -18,61 +19,69 @@ const VERSION: &str = "1.0.0";
 /// Version of the interpreter the fixture `uv` installs.
 const PYTHON_VERSION: &str = "3.13.1";
 
-/// The script the fixture `uv` installs as `python3`.
-fn interpreter() -> String {
-    format!("#!/bin/sh\nprintf '%s\\n' 'Python {PYTHON_VERSION}'\n")
+/// The interpreter the fixture `uv` installs as `python3`.
+#[derive(Template)]
+#[template(path = "fixture_interpreter.sh", escape = "none")]
+struct Interpreter {
+    version: &'static str,
 }
 
-/// A script that reports `<command> 1.0.0` to `--version` and, as a multicall
-/// tool, lists its aliases to `--list`.
+/// A `uv` that reports its version and installs the interpreter the way
+/// `uv python install <request>` lays out one.
+#[derive(Template)]
+#[template(path = "fixture_uv.sh", escape = "none")]
+struct Uv {
+    version: &'static str,
+    interpreter: String,
+}
+
+/// The fixture `bash`, which runs the host's.
+#[derive(Template)]
+#[template(path = "fixture_bash.sh", escape = "none")]
+struct Bash {
+    version: &'static str,
+}
+
+/// A tool reporting `<command> <version>`; a multicall tool lists its aliases
+/// to `--list`.
+#[derive(Template)]
+#[template(path = "fixture_tool.sh", escape = "none")]
+struct Tool {
+    command: &'static str,
+    version: &'static str,
+    aliases: &'static [&'static str],
+}
+
+fn interpreter() -> String {
+    Interpreter {
+        version: PYTHON_VERSION,
+    }
+    .render()
+    .expect("the interpreter template renders")
+}
+
+/// The interpreter file as the fixture `uv` writes it: the template's text
+/// followed by the newline its heredoc adds.
+fn installed_interpreter() -> String {
+    format!("{}\n", interpreter().trim())
+}
+
 fn script_tool(tool: ManagedTool) -> String {
     match tool {
-        ManagedTool::Bash => format!(
-            "#!/bin/sh\ncase \"$1\" in --version) printf '%s\\n' 'GNU bash, version {VERSION}(1)-release (fixture)'; exit 0;; esac\nexec /bin/bash \"$@\"\n"
-        ),
-        ManagedTool::Uv => fixture_uv(),
-        _ => {
-            let multicall = if tool.aliases().is_empty() {
-                String::new()
-            } else {
-                format!(
-                    "case \"${{0##*/}}\" in {}) ;; *) PATH=/usr/bin:/bin exec \"${{0##*/}}\" \"$@\";; esac\ncase \"$1\" in --list) printf '%s\\n' {}; exit 0;; esac\n",
-                    tool.command(),
-                    tool.aliases().join(" ")
-                )
-            };
-            format!(
-                "#!/bin/sh\n{multicall}printf '%s\\n' '{} {VERSION}'\n",
-                tool.command()
-            )
+        ManagedTool::Bash => Bash { version: VERSION }.render(),
+        ManagedTool::Uv => Uv {
+            version: VERSION,
+            interpreter: interpreter(),
         }
+        .render(),
+        _ => Tool {
+            command: tool.command(),
+            version: VERSION,
+            aliases: tool.aliases(),
+        }
+        .render(),
     }
-}
-
-/// A `uv` that reports its version and installs [`interpreter`] the way
-/// `uv python install <request>` lays out an interpreter.
-fn fixture_uv() -> String {
-    format!(
-        r#"#!/bin/sh
-PATH=/usr/bin:/bin
-case "$1" in
---version) printf '%s\n' 'uv {VERSION}'; exit 0;;
-python)
-    for request; do :; done
-    dir="$UV_PYTHON_INSTALL_DIR/$request"
-    mkdir -p "$dir/bin" "$UV_PYTHON_INSTALL_DIR/.temp"
-    cat > "$dir/bin/python3.13" <<'INTERPRETER'
-{}INTERPRETER
-    chmod 755 "$dir/bin/python3.13"
-    ln -s python3.13 "$dir/bin/python3"
-    ln -s "$dir" "$UV_PYTHON_INSTALL_DIR/cpython-3.13-minor"
-    : > "$UV_PYTHON_INSTALL_DIR/.lock"
-    exit 0;;
-esac
-printf '%s\n' 'uv {VERSION}'
-"#,
-        interpreter()
-    )
+    .expect("the fixture tool templates render")
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -111,7 +120,7 @@ pub fn fixture_distribution(dir: &Path) -> ToolDistribution {
             serde_json::json!({
                 "version": PYTHON_VERSION,
                 "target": target_json,
-                "interpreter_sha256": sha256_hex(interpreter().as_bytes()),
+                "interpreter_sha256": sha256_hex(installed_interpreter().as_bytes()),
             })
         })
         .into_iter()
