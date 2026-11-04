@@ -130,6 +130,9 @@ pub fn handle_repo_trust_key(app: &mut App, code: KeyCode) -> Option<SendAction>
 
 /// Apply `code` to the answer modal `state`.
 pub fn handle_key(state: &mut AskUserState, code: KeyCode) -> AskUserKey {
+    if state.current_secret().is_some() {
+        return handle_secret_key(state, code);
+    }
     if let Some(qs) = state.current_state_mut()
         && qs.custom_mode
     {
@@ -221,6 +224,41 @@ pub fn handle_key(state: &mut AskUserState, code: KeyCode) -> AskUserKey {
     AskUserKey::Stay
 }
 
+/// Apply `code` to a secret question: the value is typed straight into the
+/// masked field, `Del` declines to give it, `Esc` leaves the question open.
+fn handle_secret_key(state: &mut AskUserState, code: KeyCode) -> AskUserKey {
+    match code {
+        KeyCode::Char(c) => {
+            if let Some(qs) = state.current_state_mut() {
+                qs.declined = false;
+                qs.custom_text.push(c);
+            }
+        }
+        KeyCode::Backspace => {
+            if let Some(qs) = state.current_state_mut() {
+                qs.custom_text.pop();
+            }
+        }
+        KeyCode::Delete => {
+            if let Some(qs) = state.current_state_mut() {
+                qs.custom_text.clear();
+                qs.declined = true;
+            }
+            return advance_or_submit(state);
+        }
+        KeyCode::Enter => return advance_or_submit(state),
+        KeyCode::Tab | KeyCode::Right if state.current_question + 1 < state.questions.len() => {
+            state.current_question += 1;
+        }
+        KeyCode::BackTab | KeyCode::Left if state.current_question > 0 => {
+            state.current_question -= 1;
+        }
+        KeyCode::Esc if state.request.is_none() => return AskUserKey::Close,
+        _ => {}
+    }
+    AskUserKey::Stay
+}
+
 /// Move on to the next question, or submit after the last. An unanswered
 /// question holds the user where it is: nothing is committed for it.
 fn advance_or_submit(state: &mut AskUserState) -> AskUserKey {
@@ -253,7 +291,9 @@ fn answers(state: &AskUserState) -> Vec<QuestionAnswer> {
         .iter()
         .zip(state.question_states.iter())
         .map(|(q, qs)| {
-            let answer = if qs.custom_text.trim().is_empty() {
+            let answer = if qs.custom_text.trim().is_empty() && qs.declined {
+                AnswerValue::Skipped
+            } else if qs.custom_text.trim().is_empty() {
                 let selected: Vec<String> = qs
                     .selections
                     .iter()
@@ -473,5 +513,63 @@ mod tests {
         assert_eq!(state.request_id, "open-1");
         assert!(state.question_states[0].custom_mode);
         assert_eq!(state.question_states[0].custom_text, "M");
+    }
+
+    fn secret_question() -> AskUserState {
+        AskUserState::for_open_question(PersistedAskUserRequest {
+            id: "secret-1".to_string(),
+            questions: vec![PersistedAskUserQuestion {
+                section: "DEPLOY_TOKEN".to_string(),
+                question: "Deploy token?".to_string(),
+                option: Vec::new(),
+                multi_select: false,
+                secret: Some(crate::session::PersistedSecretRequest {
+                    name: "DEPLOY_TOKEN".to_string(),
+                    scope: crate::secrets::SecretScope::Session,
+                }),
+            }],
+        })
+    }
+
+    /// A secret question is typed into directly and submits the value as
+    /// the answer text; the state never prints it.
+    #[test]
+    fn a_secret_value_is_typed_straight_into_the_field_and_submitted() {
+        let mut state = secret_question();
+        let mut codes: Vec<KeyCode> = "s3cret".chars().map(KeyCode::Char).collect();
+        codes.push(KeyCode::Backspace);
+        codes.extend("t!".chars().map(KeyCode::Char));
+        codes.push(KeyCode::Enter);
+        let AskUserKey::Submit(answers) = press(&mut state, &codes) else {
+            panic!("the value is submitted");
+        };
+        assert!(matches!(&answers[0].answer, AnswerValue::Custom(text) if text == "s3cret!"));
+        assert!(!format!("{state:?}").contains("s3cret!"));
+    }
+
+    /// Del declines the secret: the answer is the skipped marker, which the
+    /// client sends as a refusal. An empty value cannot be submitted.
+    #[test]
+    fn a_secret_can_be_declined_but_not_submitted_empty() {
+        let mut state = secret_question();
+        assert!(matches!(
+            press(&mut state, &[KeyCode::Enter]),
+            AskUserKey::Stay
+        ));
+        let AskUserKey::Submit(answers) = press(&mut state, &[KeyCode::Char('x'), KeyCode::Delete])
+        else {
+            panic!("declining submits");
+        };
+        assert!(matches!(answers[0].answer, AnswerValue::Skipped));
+    }
+
+    /// Esc leaves the secret question open.
+    #[test]
+    fn escape_leaves_a_secret_question_open() {
+        let mut state = secret_question();
+        assert!(matches!(
+            press(&mut state, &[KeyCode::Char('x'), KeyCode::Esc]),
+            AskUserKey::Close
+        ));
     }
 }
