@@ -2494,6 +2494,7 @@ mod tests {
                 Some("main"),
                 &PersistedTaskTrigger::Webhook {
                     token: "tok".to_string(),
+                    signature: None,
                 },
                 "wake \"$MAY_TASK_TRIGGER_FILE\"",
             )
@@ -2502,7 +2503,6 @@ mod tests {
         Box::pin(host.runtime.execute_task_inner(
             &task,
             crate::task_trigger::TaskInvocation::Webhook {
-                token: "tok".to_string(),
                 request: crate::task_trigger::TaskWebhookRequest {
                     method: "POST".to_string(),
                     path: "/hook".to_string(),
