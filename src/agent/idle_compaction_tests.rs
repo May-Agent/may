@@ -347,6 +347,11 @@ impl Session {
 
 /// Runs one user turn to completion.
 pub async fn run_turn(agent: &mut MayAgent) {
+    // A context under the policy's compaction floor is left alone, so the
+    // turn runs on top of history above it.
+    agent.push_message(aither_core::llm::Message::assistant(
+        "x".repeat(4 * aither_agent::ContextPolicy::default().compaction_floor),
+    ));
     let mut stream = agent.run("Say hello.", []);
     while let Some(event) = stream.next().await {
         event.expect("the turn runs");

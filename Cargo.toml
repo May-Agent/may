@@ -20,16 +20,19 @@ gstreamer = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
 [dependencies]
 libc = "0.2.191"
 # Aither framework
-aither-core = { version = "0.14.1" }
-aither-agent = { version = "0.14.1", features = ["mcp", "webfetch", "skills", "connectivity"] }
-aither-connectivity = { version = "0.14.1" }
-aither-sandbox = { version = "0.14.1", features = ["code-folding", "connectivity"] }
-aither-cloud = { version = "0.14.1" }
-aither-copilot = { version = "0.14.1" }
-aither-codex = { version = "0.14.1" }
-aither-models = { version = "0.14.1" }
-aither-mcp = { version = "0.14.1" }
-aither-browser = { version = "0.14.1" }
+aither-core = { version = "0.15.0" }
+aither-agent = { version = "0.15.0", features = ["mcp", "webfetch", "skills", "connectivity"] }
+aither-connectivity = { version = "0.15.0" }
+aither-sandbox = { version = "0.15.0", features = ["code-folding", "connectivity"] }
+aither-cloud = { version = "0.15.0" }
+aither-copilot = { version = "0.15.0" }
+aither-codex = { version = "0.15.0" }
+aither-models = { version = "0.15.0" }
+aither-mcp = { version = "0.15.0" }
+aither-browser = { version = "0.15.0" }
+# Held at the version acpsub is built against: `StopReason` crosses its API
+# in `TurnEnd`, so this crate must be the very one acpsub names. Moves to 0.15
+# once acpsub's dev branch depends on aither 0.15.
 aither-acp = { version = "0.14.1" }
 
 # ACP agents as subagents (`/connect`); its CLI and second SQLite stay off.
