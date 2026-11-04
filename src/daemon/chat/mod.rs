@@ -1506,6 +1506,10 @@ fn run_agent_loop<'a>(
         // the committed transcript with `resume` instead of resubmitting
         // the prompt.
         let mut continue_from_transcript = false;
+        // A resumed turn exists only for what the agent it took collected,
+        // and it never fails over (it has one provider candidate): a retry
+        // waits and continues with that same agent.
+        let mut retained_agent: Option<MayAgent> = None;
 
         loop {
             let assistant_id = format!("assistant-{}", crate::id::new());
@@ -1551,6 +1555,7 @@ fn run_agent_loop<'a>(
                     } else {
                         Some(turn_boundary)
                     },
+                    retained_agent: retained_agent.take(),
                 },
                 kind,
             )
@@ -1661,9 +1666,11 @@ fn run_agent_loop<'a>(
                         ))
                     }
                     _ => {
+                        // The wake events reach clients with the first
+                        // attempt only; a retry would show them twice.
                         let wake_events = match kind {
-                            TurnKind::Resume(wake_events) => wake_events.clone(),
-                            TurnKind::Prompt => Vec::new(),
+                            TurnKind::Resume(wake_events) if attempt == 0 => wake_events.clone(),
+                            TurnKind::Resume(_) | TurnKind::Prompt => Vec::new(),
                         };
                         futures_util::future::Either::Right(futures_lite::StreamExt::chain(
                             futures_lite::stream::iter(wake_events.into_iter().map(Ok)),
@@ -2154,6 +2161,7 @@ fn run_agent_loop<'a>(
                         .map(RetryWait::QuotaReset),
                 };
                 if let Some(wait) = retry_wait {
+                    let turn_is_resume = kind.is_resume();
                     let kind = retry_kind;
                     record_request_log(state, ledger.interrupted(Instant::now(), &err_msg)).await;
                     // Text of a cut stream is discarded with the attempt;
@@ -2222,6 +2230,9 @@ fn run_agent_loop<'a>(
                             }
                             turn_persister.flush(&state.db()).await?;
                             continue_from_transcript = true;
+                        }
+                        if turn_is_resume {
+                            retained_agent = Some(agent);
                         }
                         attempt += 1;
                         continue;
@@ -3391,10 +3402,12 @@ fn agent_messaging(state: &Arc<DaemonState>) -> crate::agent_link::AgentMessagin
 /// One attempt of a turn: the provider candidate it builds on, and the
 /// history row boundary it rebuilds context up to when it resubmits the
 /// prompt (`None` replays the committed transcript in full).
-#[derive(Clone, Copy)]
 struct TurnAttempt {
     provider_attempt: usize,
     turn_boundary: Option<i32>,
+    /// The agent a retry on the same provider continues with: the one the
+    /// failed attempt took, which holds what a resumed turn exists for.
+    retained_agent: Option<MayAgent>,
 }
 
 /// Resolves the session context and builds the agent for one chat turn.
@@ -3424,7 +3437,9 @@ fn prepare_agent_for_request<'a>(
         // The session's idle agent continues the conversation when it was
         // built from the same inputs; a resumed turn exists only for what
         // that agent collected, so it takes the agent whatever changed.
-        let reused = if attempt.provider_attempt == 0 {
+        let reused = if let Some(agent) = attempt.retained_agent {
+            Some(agent)
+        } else if attempt.provider_attempt == 0 {
             let fits = (!kind.is_resume()).then_some(build_key);
             state
                 .parked_agents
@@ -4093,12 +4108,23 @@ mod tests {
     #[derive(Default)]
     struct TestSink {
         notes: Option<async_channel::Sender<Note>>,
+        /// How many times the run showed the text `WAKE_TEXT` as an agent event.
+        wake_texts: usize,
     }
+
+    /// The text of the background event a test resume turn opens with.
+    const WAKE_TEXT: &str = "background command finished";
 
     impl TestSink {
         fn noting() -> (Self, async_channel::Receiver<Note>) {
             let (tx, rx) = async_channel::unbounded();
-            (Self { notes: Some(tx) }, rx)
+            (
+                Self {
+                    notes: Some(tx),
+                    ..Self::default()
+                },
+                rx,
+            )
         }
 
         fn note(&self, note: Note) {
@@ -4109,6 +4135,14 @@ mod tests {
     }
 
     impl super::ChatSink for TestSink {
+        fn on_agent_event(
+            &mut self,
+            event: Result<&aither_agent::AgentEvent, &aither_agent::AgentError>,
+        ) {
+            if matches!(event, Ok(aither_agent::AgentEvent::Text(text)) if text == WAKE_TEXT) {
+                self.wake_texts += 1;
+            }
+        }
         fn on_start(&mut self, _s: &str, _a: &str) -> impl Future<Output = bool> + Send {
             std::future::ready(true)
         }
@@ -4551,6 +4585,62 @@ mod tests {
         );
     }
 
+    /// A resumed turn whose provider call fails and is retried on the same
+    /// provider continues with the agent it took, and clients see its
+    /// background events once.
+    #[tokio::test]
+    async fn a_resume_turn_retries_with_the_agent_it_took() {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let mut script = vec![sse_text("first")];
+        script.extend(vec!["500".to_string(); OPENAI_CLIENT_ATTEMPTS]);
+        script.push(sse_text("resumed"));
+        let provider_a = stub_provider(script).await;
+        let provider_b = stub_provider(Vec::new()).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let state = failover_state(may_dir.path(), cwd.path(), &provider_a, &provider_b).await;
+
+        // A first turn leaves the session's idle agent behind.
+        let mut sink = TestSink::default();
+        run_prompt_turn(&state, &mut sink)
+            .await
+            .expect("the first turn completes");
+        assert!(state.parked_agents.contains("session"));
+
+        let req = ChatRequest {
+            session_id: "session".to_string(),
+            content: String::new(),
+            attachments: Vec::new(),
+            hidden_context_xml: None,
+            delivery_mode: crate::session::PendingUserMessageMode::default(),
+            pending_entry_id: None,
+        };
+        let guard = state
+            .runtime_service
+            .runs()
+            .acquire("session")
+            .await
+            .expect("acquire run");
+        let wake = vec![aither_agent::TimedEvent {
+            at: jiff::Timestamp::now(),
+            event: aither_agent::AgentEvent::Text(WAKE_TEXT.to_string()),
+        }];
+        let mut sink = TestSink::default();
+        let result = run_agent_loop(
+            &state,
+            &req,
+            &mut sink,
+            &guard,
+            false,
+            true,
+            &TurnKind::Resume(wake),
+        )
+        .await;
+        let result = result.expect("the retried resume completes");
+        assert_eq!(result.full_text, "resumed");
+        assert_eq!(sink.wake_texts, 1, "the background events are shown once");
+    }
+
     /// Runs one prompt turn of "session" to completion on `sink`.
     async fn run_prompt_turn(
         state: &std::sync::Arc<DaemonState>,
@@ -4570,7 +4660,12 @@ mod tests {
             .acquire("session")
             .await
             .expect("acquire run");
-        run_agent_loop(state, &req, sink, &guard, true, true, &TurnKind::Prompt).await
+        let result = run_agent_loop(state, &req, sink, &guard, true, true, &TurnKind::Prompt).await;
+        guard
+            .finish_idle(crate::session::RunOutcome::Completed)
+            .await
+            .expect("release the run");
+        result
     }
 
     /// The assistant answers the history holds, in order.
