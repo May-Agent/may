@@ -84,6 +84,80 @@ async fn raw_status(addr: &str, method: &str, path: &str) -> u16 {
         .expect("status line")
 }
 
+/// Sends `request` verbatim and returns the response status, without ever
+/// closing the write side: a refusal must not wait for the body to end.
+async fn status_of_raw(addr: &str, request: &str) -> u16 {
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("listener accepts");
+    stream.write_all(request.as_bytes()).await.expect("sent");
+    let mut head = vec![0_u8; 64];
+    let read = tokio::time::timeout(std::time::Duration::from_secs(10), stream.read(&mut head))
+        .await
+        .expect("responded without the body")
+        .expect("read");
+    String::from_utf8_lossy(&head[..read])
+        .split(' ')
+        .nth(1)
+        .and_then(|status| status.parse().ok())
+        .expect("status line")
+}
+
+#[tokio::test]
+async fn oversized_webhook_bodies_are_refused_before_buffering() {
+    let home = tempfile::tempdir().expect("temp dir");
+    let fake = tempfile::tempdir().expect("temp dir");
+    let binary = install_fake_tailscale(fake.path());
+    let state = Arc::new(
+        DaemonState::for_test(home.path(), home.path(), MayConfig::default())
+            .await
+            .expect("daemon state"),
+    );
+    let manager = RemoteAccessManager::new(UiEventBus::new());
+    manager.set_webhook_router(Arc::new(build_webhook_router(state.clone())));
+    let on = RemoteAccessConfig {
+        funnel: true,
+        funnel_port: 8443,
+        tailscale_binary: binary,
+        webhook_max_body_bytes: 16,
+        ..RemoteAccessConfig::default()
+    };
+    state.update_config(|config| config.remote_access = on.clone());
+    manager.sync(on, false).await.expect("funnel on");
+    let target = funnel_target(fake.path());
+    let (addr, base) = split_target(&target);
+    let path = format!("{}/{}", base.trim_end_matches('/'), new_webhook_token());
+
+    // Declared length over the cap: refused from the headers alone, the body
+    // is never sent.
+    let declared =
+        format!("POST {path} HTTP/1.1\r\nHost: mac.ts.net\r\nContent-Length: 1000000\r\n\r\n");
+    assert_eq!(status_of_raw(addr, &declared).await, 413);
+
+    // Chunked, no declared length: refused as soon as the chunks pass the
+    // cap, without the terminating chunk ever being sent.
+    let chunked = format!(
+        "POST {path} HTTP/1.1\r\nHost: mac.ts.net\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{}\r\n",
+        32,
+        "a".repeat(32)
+    );
+    assert_eq!(status_of_raw(addr, &chunked).await, 413);
+
+    // A delivery within the cap still reaches the handler (unknown token).
+    let small = format!(
+        "POST {path} HTTP/1.1\r\nHost: mac.ts.net\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+    );
+    assert_eq!(status_of_raw(addr, &small).await, 400);
+
+    // The cap is live: raising it admits the delivery that was refused.
+    state.update_config(|config| config.remote_access.webhook_max_body_bytes = 2_000_000);
+    let declared_again = format!(
+        "POST {path} HTTP/1.1\r\nHost: mac.ts.net\r\nContent-Length: 1000000\r\nConnection: close\r\n\r\n{}",
+        "a".repeat(1_000_000)
+    );
+    assert_eq!(status_of_raw(addr, &declared_again).await, 400);
+}
+
 async fn listener_is_closed(target: &str) -> bool {
     tokio::net::TcpStream::connect(split_target(target).0)
         .await
