@@ -36,6 +36,9 @@ use tokio::time::{Instant, sleep};
 
 const TEST_PROVIDER_ID: &str = "mock";
 const TEST_MODEL: &str = "test-model";
+const TIER_FLAGSHIP_MODEL: &str = "tier-flagship";
+const TIER_BALANCED_MODEL: &str = "tier-balanced";
+const TIER_FAST_MODEL: &str = "tier-fast";
 const TEST_SELECTOR: &str = "mock::test-model";
 const TEST_API_KEY: &str = "test-api-key";
 const TITLE_REQUEST_PREFIX: &str =
@@ -77,7 +80,7 @@ enum MockChatScenario {
     /// scripted child runs one probe; see [`SubagentProbe`].
     SubagentProbe(SubagentProbe),
     /// The main agent prints a secret, then forks itself with
-    /// `subagent start fork`; the fork answers with [`FORK_ANSWER`].
+    /// `subagent fork`; the fork answers with [`FORK_ANSWER`].
     ForkProbe,
     /// The first request asks the user a question through the `ask_user`
     /// terminal command; every later request gets a plain text reply.
@@ -96,18 +99,16 @@ const FINISHING_JOB_SCRIPT: &str = "sleep 2; echo BG-DONE-7731";
 
 /// A scripted main agent / subagent pair sharing one mock model.
 ///
-/// The main agent runs `setup`, launches `subagent start` with `grant_flags`
-/// in a background job and ends its turn; the job's completion resumes it as
-/// a reminder, it reads the launch's output, then runs `final_script`. The child runs `child_script` once and ends. A request is
-/// the child's when a user or system message carries [`SUBAGENT_PROBE_MARKER`],
-/// which only the subagent's prompt file does.
+/// The main agent runs `setup`, then `launch` (shell lines that start
+/// subagents with `prompt.md` as the brief) in a background job and ends its
+/// turn; the job's completion resumes it as a reminder, it reads the launch's
+/// output, then runs `final_script`. Each child runs `child_script` once and
+/// ends. A request is the child's when a user or system message carries
+/// [`SUBAGENT_PROBE_MARKER`], which only the subagent's prompt file does.
 #[derive(Clone)]
 struct SubagentProbe {
     setup: &'static str,
-    /// Model selection flags on the launch line — `--model fast` picks the
-    /// tier outright; empty leaves the choice to the router request.
-    model_flags: &'static str,
-    grant_flags: &'static str,
+    launch: &'static str,
     child_script: &'static str,
     final_script: &'static str,
 }
@@ -572,13 +573,13 @@ impl MockScenarioState {
                 self.request_index
             ));
         }
-        // A launch with no model flag asks the fast model which tier fits
-        // the prompt first; answer the routing request, then the launch
-        // continues on the routed model.
+        // A subagent whose definition declares no tier asks the fast model
+        // which tier fits the prompt first; answer the routing request with
+        // the balanced tier, then the launch continues on the routed model.
         if is_routing_request(request) {
             self.request_index += 1;
             return Ok(MockHttpResponse::sse(text_stream_frames(
-                vec!["{\"model\": \"fast\"}".to_string()],
+                vec!["{\"model\": \"balanced\"}".to_string()],
                 Duration::from_millis(10),
             )));
         }
@@ -621,10 +622,9 @@ impl MockScenarioState {
             match latest {
                 None => {
                     let launch = format!(
-                        "( {setup}\nprintf '{SUBAGENT_PROBE_MARKER}: run the probe.\\n' > prompt.md\nsubagent start explore prompt.md{model_flags} {flags} ) > sub.out 2>&1; touch sub.done",
+                        "( {setup}\nprintf '{SUBAGENT_PROBE_MARKER}: run the probe.\\n' > prompt.md\n{launch}\n) > sub.out 2>&1; touch sub.done",
                         setup = probe.setup,
-                        model_flags = probe.model_flags,
-                        flags = probe.grant_flags,
+                        launch = probe.launch,
                     );
                     terminal_call(true, &id, &launch)
                 }
@@ -651,6 +651,16 @@ impl MockScenarioState {
                 "fork probe still running after {} requests: the launch never finished",
                 self.request_index
             ));
+        }
+        // A context near its compaction point starts a background compaction;
+        // its handoff arrives long after the probe is over, so the context
+        // stays near the point while the fork is tried.
+        if is_compaction_request(request) {
+            self.request_index += 1;
+            return Ok(MockHttpResponse::sse(text_stream_frames(
+                vec![COMPACTION_HANDOFF.to_string()],
+                COMPACTION_ANSWER_DELAY,
+            )));
         }
         let terminal_call = |background: bool, id: &str, script: &str| {
             MockHttpResponse::sse(vec![
@@ -694,7 +704,7 @@ impl MockScenarioState {
                 }
                 Some(output) if output.contains(FORK_SECRET) => {
                     let launch = format!(
-                        "( printf '{FORK_TASK_MARKER}: report what you know.\\n' > prompt.md\nsubagent start fork prompt.md ) > sub.out 2>&1; touch sub.done"
+                        "( printf '{FORK_TASK_MARKER}: report what you know.\\n' > prompt.md\nsubagent fork --prompt-file prompt.md ) > sub.out 2>&1; touch sub.done"
                     );
                     terminal_call(true, &id, &launch)
                 }
@@ -771,6 +781,7 @@ fn verify_native_tool_surface(request: &Value) -> Result<(), String> {
     names.sort_unstable();
     if names
         != [
+            "compact",
             "monitor",
             "terminal",
             "terminal_input",
@@ -878,15 +889,22 @@ async fn handle_mock_openai_request(
     gate: Option<Arc<RequestGate>>,
 ) -> Result<Response<http_body_util::combinators::BoxBody<Bytes, Infallible>>, Infallible> {
     if request.method() == Method::GET && request.uri().path() == "/v1/models" {
+        let data = [
+            TEST_MODEL,
+            TIER_FLAGSHIP_MODEL,
+            TIER_BALANCED_MODEL,
+            TIER_FAST_MODEL,
+        ]
+        .map(|id| {
+            serde_json::json!({
+                "id": id,
+                "owned_by": "mock",
+                "context_length": 128_000
+            })
+        });
         return Ok(json_response(
             StatusCode::OK,
-            &serde_json::json!({
-                "data": [{
-                    "id": TEST_MODEL,
-                    "owned_by": "mock",
-                    "context_length": 128_000
-                }]
-            }),
+            &serde_json::json!({ "data": data }),
         ));
     }
 
@@ -1008,6 +1026,17 @@ struct TestHarness {
 
 impl TestHarness {
     async fn new(config_base_url: &str) -> Self {
+        Self::build(config_base_url, false).await
+    }
+
+    /// A harness whose three model tiers are three models of their own,
+    /// none of them the session's, so a request's model names the tier it
+    /// ran on.
+    async fn new_with_tier_models(config_base_url: &str) -> Self {
+        Self::build(config_base_url, true).await
+    }
+
+    async fn build(config_base_url: &str, tier_models: bool) -> Self {
         let home = tempfile::tempdir().expect("test home tempdir should be created");
         let may_dir = home.path().join(".may");
         tokio::fs::create_dir_all(&may_dir)
@@ -1024,7 +1053,15 @@ impl TestHarness {
                 .with_api_key(TEST_API_KEY)
                 .with_base_url(config_base_url),
         );
-        config.models.advanced = vec![ModelSelector::new(TEST_PROVIDER_ID, TEST_MODEL)];
+        if tier_models {
+            config.models.advanced =
+                vec![ModelSelector::new(TEST_PROVIDER_ID, TIER_FLAGSHIP_MODEL)];
+            config.models.balanced =
+                vec![ModelSelector::new(TEST_PROVIDER_ID, TIER_BALANCED_MODEL)];
+            config.models.fast = vec![ModelSelector::new(TEST_PROVIDER_ID, TIER_FAST_MODEL)];
+        } else {
+            config.models.advanced = vec![ModelSelector::new(TEST_PROVIDER_ID, TEST_MODEL)];
+        }
         config.last_model = Some(ModelSelector::new(TEST_PROVIDER_ID, TEST_MODEL));
         config
             .save_to(&may_dir.join("config.toml"))
@@ -2437,8 +2474,13 @@ async fn run_probe_turn(
     scenario: MockChatScenario,
     content: &str,
 ) -> (ProbeFiles, MockOpenAiServer) {
+    let tier_models = matches!(scenario, MockChatScenario::SubagentProbe(_));
     let mock = MockOpenAiServer::spawn(scenario).await;
-    let harness = TestHarness::new(&mock.base_url()).await;
+    let harness = if tier_models {
+        TestHarness::new_with_tier_models(&mock.base_url()).await
+    } else {
+        TestHarness::new(&mock.base_url()).await
+    };
     let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
     let client = reqwest::Client::new();
     let environment = ChatEnvironment::Local
@@ -2548,8 +2590,31 @@ fn is_fork_request(request: &Value) -> bool {
         })
 }
 
+/// A valid handoff document, the answer to a compaction request.
+const COMPACTION_HANDOFF: &str = r#"{"current_task":"run the fork probe","key_decisions":[],"context_files":[],"errors_fixes":[],"pending_work":[],"recovery_hints":[],"skills":[]}"#;
+/// How long the mock holds a compaction's answer back.
+const COMPACTION_ANSWER_DELAY: Duration = Duration::from_secs(600);
+
+/// Whether a model request asks for a compaction handoff: the conversation
+/// followed by the compaction instruction and the schema it must answer to.
+fn is_compaction_request(request: &Value) -> bool {
+    request
+        .get("messages")
+        .and_then(Value::as_array)
+        .is_some_and(|messages| {
+            messages.iter().rev().take(3).any(|message| {
+                message
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|content| {
+                        content.contains("Your context window is being compacted")
+                    })
+            })
+        })
+}
+
 /// A user turn long enough to put the main agent's context between the
-/// refusal point (90% of the 60% compaction point) and the compaction point.
+/// refusal point (90% of the 80% compaction point) and the compaction point.
 fn near_compaction_user_turn() -> String {
     format!(
         "Run the fork probe. {}",
@@ -2557,7 +2622,7 @@ fn near_compaction_user_turn() -> String {
     )
 }
 
-const FORK_FILLER_REPEATS: usize = 24_000;
+const FORK_FILLER_REPEATS: usize = 30_000;
 
 #[tokio::test]
 #[serial]
@@ -2640,8 +2705,7 @@ const CHILD_COMMIT: &str = "cd ../../wt && echo x > f.txt && echo WROTE_FILE && 
 async fn subagent_cannot_write_tasks_md_but_the_main_agent_can() {
     let (files, mock) = run_subagent_probe(SubagentProbe {
         setup: "printf -- '- [x] original\\n' > tasks.md",
-        model_flags: " --model fast",
-        grant_flags: "",
+        launch: "subagent explore --prompt-file prompt.md",
         child_script: "printf -- '- [x] hacked\\n' >> ../../tasks.md; echo CHILD_RC=$?",
         final_script: "cp tasks.md tasks.before; printf -- '- [x] original\\n- [x] main wrote\\n' > tasks.md; echo MAIN_FINAL",
     })
@@ -2670,8 +2734,7 @@ async fn subagent_cannot_write_tasks_md_but_the_main_agent_can() {
 async fn subagent_without_a_commit_grant_cannot_commit_in_a_worktree() {
     let (files, mock) = run_subagent_probe(SubagentProbe {
         setup: WORKTREE_SETUP,
-        model_flags: " --model fast",
-        grant_flags: "--worktrees \"$PWD/wt\"",
+        launch: "subagent general --prompt-file prompt.md --worktrees \"$PWD/wt\"",
         child_script: CHILD_COMMIT,
         final_script: WORKTREE_FINAL,
     })
@@ -2699,25 +2762,27 @@ async fn subagent_without_a_commit_grant_cannot_commit_in_a_worktree() {
     );
 }
 
-/// A launch with no `--model` asks the fast model which tier fits before the
-/// child starts — the routed path is what overflows the tokio worker's
-/// default 512 KiB stack on macOS without a configured worker stack.
+/// `general` declares no tier, so the fast model picks one before the child
+/// starts — the routed path is what overflows the tokio worker's default
+/// 512 KiB stack on macOS without a configured worker stack. The result
+/// reports the tier and model the routing picked.
 #[tokio::test]
 #[serial]
-async fn subagent_without_a_model_flag_is_routed_then_runs() {
+async fn general_is_routed_by_the_fast_model_and_reports_the_pick() {
     let (files, mock) = run_subagent_probe(SubagentProbe {
         setup: ":",
-        model_flags: "",
-        grant_flags: "",
+        launch: "subagent general --prompt-file prompt.md",
         child_script: "echo CHILD_RC=0",
         final_script: "echo MAIN_FINAL",
     })
     .await;
 
     let requests = mock.agent_requests().await;
-    assert!(
-        requests.iter().any(is_routing_request),
-        "no routing request reached the mock: {requests:?}"
+    let routing: Vec<&Value> = requests.iter().filter(|r| is_routing_request(r)).collect();
+    assert_eq!(routing.len(), 1, "one routing request: {requests:?}");
+    assert_eq!(
+        routing[0]["model"], TIER_FAST_MODEL,
+        "the fast model routes the brief"
     );
     let outputs = child_probe_outputs(&mock).await;
     assert_eq!(
@@ -2725,12 +2790,145 @@ async fn subagent_without_a_model_flag_is_routed_then_runs() {
         0,
         "the routed subagent's probe must succeed: {outputs:?}"
     );
+    assert_eq!(
+        child_request_models(&requests),
+        [TIER_BALANCED_MODEL],
+        "the child runs on the model the routing picked"
+    );
+    let result = files.get("sub.out");
     assert!(
-        files
-            .get("sub.out")
-            .contains("Subagent 'explore' completed"),
-        "the routed launch must report completion: {}",
-        files.get("sub.out")
+        result.contains(&format!(
+            "Subagent 'general' completed (balanced tier, model: {TIER_BALANCED_MODEL})"
+        )),
+        "the result must report the routing's pick: {result}"
+    );
+}
+
+/// The models of the subagents' requests, in order, one entry per run of
+/// consecutive requests on a model.
+fn child_request_models(requests: &[Value]) -> Vec<String> {
+    let mut models: Vec<String> = Vec::new();
+    for request in requests
+        .iter()
+        .filter(|request| is_subagent_request(request) && !is_routing_request(request))
+    {
+        let model = request["model"]
+            .as_str()
+            .expect("request model")
+            .to_string();
+        if models.last() != Some(&model) {
+            models.push(model);
+        }
+    }
+    models
+}
+
+/// The names `subagent` offers.
+const SUBAGENT_NAMES: [&str; 7] = [
+    "explore", "research", "audit", "review", "plan", "general", "fork",
+];
+
+/// `subagent` alone runs nothing and fails with the list of subcommands.
+#[tokio::test]
+#[serial]
+async fn subagent_without_a_subcommand_fails_with_the_list() {
+    let (files, mock) = run_subagent_probe(SubagentProbe {
+        setup: ":",
+        launch: "subagent; echo BARE_RC=$?",
+        child_script: "echo CHILD_RC=0",
+        final_script: "echo MAIN_FINAL",
+    })
+    .await;
+
+    let result = files.get("sub.out");
+    assert!(
+        !result.contains("BARE_RC=0") && result.contains("BARE_RC="),
+        "a bare `subagent` must fail: {result}"
+    );
+    for name in SUBAGENT_NAMES {
+        assert!(
+            result.contains(&format!("- {name}:")),
+            "the failure must list `{name}`: {result}"
+        );
+    }
+    assert!(
+        mock.agent_requests()
+            .await
+            .iter()
+            .all(|request| !is_subagent_request(request)),
+        "no subagent may run"
+    );
+}
+
+/// Every subcommand runs on its tier's model; only `general`, given a
+/// worktree, writes outside its scratch directory, and only there.
+#[tokio::test]
+#[serial]
+async fn each_subcommand_runs_on_its_model_and_only_general_writes_the_workspace() {
+    let (files, mock) = run_subagent_probe(SubagentProbe {
+        setup: WORKTREE_SETUP,
+        launch: "for name in explore research audit review plan; do\n  subagent $name --prompt-file prompt.md > sub.$name 2>&1\ndone\nsubagent general --prompt-file prompt.md --worktrees \"$PWD/wt\" > sub.general 2>&1",
+        child_script: "echo x > ../../workspace.txt; echo WORKSPACE_RC=$?; echo y > scratch.txt; echo SCRATCH_RC=$?; echo z > ../../wt/f.txt; echo WORKTREE_RC=$?",
+        final_script: "echo MAIN_FINAL",
+    })
+    .await;
+
+    let requests = mock.agent_requests().await;
+    assert_eq!(
+        child_request_models(&requests),
+        [TIER_FAST_MODEL, TIER_FLAGSHIP_MODEL, TIER_BALANCED_MODEL],
+        "explore and research on the fast model, audit, review and plan on the flagship, general on the routed one"
+    );
+    for (name, tier) in [
+        ("explore", "fast"),
+        ("research", "fast"),
+        ("audit", "advanced"),
+        ("review", "advanced"),
+        ("plan", "advanced"),
+        ("general", "balanced"),
+    ] {
+        let result = files.get(&format!("sub.{name}"));
+        assert!(
+            result.contains(&format!("Subagent '{name}' completed ({tier} tier")),
+            "{name} must complete on the {tier} tier: {result}"
+        );
+    }
+
+    let outputs = child_probe_outputs(&mock).await;
+    assert_eq!(outputs.len(), SUBAGENT_NAMES.len() - 1, "{outputs:?}");
+    let code = |output: &str, key: &str| -> i32 {
+        let start = output
+            .find(key)
+            .unwrap_or_else(|| panic!("no {key} in {output}"))
+            + key.len();
+        output[start..]
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .and_then(|digits| digits.parse().ok())
+            .unwrap_or_else(|| panic!("no code after {key} in {output}"))
+    };
+    for (index, output) in outputs.iter().enumerate() {
+        let name = SUBAGENT_NAMES[index];
+        assert_ne!(
+            code(output, "WORKSPACE_RC="),
+            0,
+            "{name}'s write to the workspace must be refused: {output}"
+        );
+        assert_eq!(
+            code(output, "SCRATCH_RC="),
+            0,
+            "{name}'s write to its scratch directory must succeed: {output}"
+        );
+        let worktree = code(output, "WORKTREE_RC=");
+        if name == "general" {
+            assert_eq!(worktree, 0, "general writes its granted worktree: {output}");
+        } else {
+            assert_ne!(worktree, 0, "{name} must not write a worktree: {output}");
+        }
+    }
+    assert!(
+        !files.0.contains_key("workspace.txt"),
+        "no subagent may have written the session root"
     );
 }
 
@@ -2739,8 +2937,7 @@ async fn subagent_without_a_model_flag_is_routed_then_runs() {
 async fn subagent_with_a_commit_grant_commits_and_the_main_agent_gets_the_listing() {
     let (files, mock) = run_subagent_probe(SubagentProbe {
         setup: WORKTREE_SETUP,
-        model_flags: " --model fast",
-        grant_flags: "--commit-worktrees \"$PWD/wt\"",
+        launch: "subagent general --prompt-file prompt.md --commit-worktrees \"$PWD/wt\"",
         child_script: CHILD_COMMIT,
         final_script: WORKTREE_FINAL,
     })
