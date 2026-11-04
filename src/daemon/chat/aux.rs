@@ -31,8 +31,20 @@ pub struct AuxTasks {
     next_id: AtomicU64,
 }
 
+/// What an aux task generates, and so which setting governs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuxKind {
+    /// A prompt suggestion, governed by `[suggestions] enabled`.
+    Suggestion,
+    /// A recap the idle timer started, governed by `[recap] auto`.
+    AutoRecap,
+    /// A recap the user asked for.
+    ManualRecap,
+}
+
 struct AuxTask {
     request_id: u64,
+    kind: AuxKind,
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -54,6 +66,7 @@ impl AuxTasks {
     pub fn start<F>(
         &self,
         session_id: &str,
+        kind: AuxKind,
         make_task: impl FnOnce(u64) -> F,
         rt: &tokio::runtime::Handle,
     ) -> u64
@@ -65,7 +78,14 @@ impl AuxTasks {
         // task that finishes at once still finds itself the owner.
         let mut tasks = self.tasks();
         let handle = rt.spawn(make_task(request_id));
-        let previous = tasks.insert(session_id.to_string(), AuxTask { request_id, handle });
+        let previous = tasks.insert(
+            session_id.to_string(),
+            AuxTask {
+                request_id,
+                kind,
+                handle,
+            },
+        );
         drop(tasks);
         if let Some(previous) = previous {
             previous.handle.abort();
@@ -83,6 +103,25 @@ impl AuxTasks {
             task.handle.abort();
         }
         publish();
+        drop(tasks);
+    }
+
+    /// Aborts every in-flight task of `kind` and runs `publish` with each
+    /// one's session, under the lock [`Self::commit`] takes: the setting
+    /// governing `kind` went off, and no such result may follow.
+    pub fn cancel_kind(&self, kind: AuxKind, mut publish: impl FnMut(&str)) {
+        let mut tasks = self.tasks();
+        let sessions: Vec<String> = tasks
+            .iter()
+            .filter(|(_, task)| task.kind == kind)
+            .map(|(session_id, _)| session_id.clone())
+            .collect();
+        for session_id in sessions {
+            if let Some(task) = tasks.remove(&session_id) {
+                task.handle.abort();
+            }
+            publish(&session_id);
+        }
         drop(tasks);
     }
 
@@ -257,6 +296,7 @@ mod tests {
         let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel::<()>();
         let first = registry.start(
             "s",
+            AuxKind::Suggestion,
             |_| async move {
                 // Abort drops the future and its captured sender.
                 let _dropped_tx = dropped_tx;
@@ -265,7 +305,7 @@ mod tests {
             &rt,
         );
         assert!(registry.is_current("s", first));
-        let second = registry.start("s", |_| std::future::pending(), &rt);
+        let second = registry.start("s", AuxKind::Suggestion, |_| std::future::pending(), &rt);
         assert!(registry.is_current("s", second));
         assert!(!registry.is_current("s", first));
         dropped_rx
@@ -279,13 +319,13 @@ mod tests {
     async fn commit_releases_only_the_owning_request() {
         let rt = tokio::runtime::Handle::current();
         let registry = AuxTasks::default();
-        let request_id = registry.start("s", |_| std::future::pending(), &rt);
+        let request_id = registry.start("s", AuxKind::Suggestion, |_| std::future::pending(), &rt);
         assert!(!registry.commit("s", request_id + 1, || panic!("not the owner")));
         assert!(registry.is_current("s", request_id));
         assert!(registry.commit("s", request_id, || {}));
         assert!(!registry.is_current("s", request_id));
         assert_ne!(
-            registry.start("s", |_| std::future::pending(), &rt),
+            registry.start("s", AuxKind::Suggestion, |_| std::future::pending(), &rt),
             request_id
         );
     }
@@ -303,7 +343,8 @@ mod tests {
         for _ in 0..500 {
             let registry = Arc::new(AuxTasks::default());
             let log = Arc::new(Mutex::new(Vec::new()));
-            let request_id = registry.start("s", |_| std::future::pending(), &rt);
+            let request_id =
+                registry.start("s", AuxKind::Suggestion, |_| std::future::pending(), &rt);
             let barrier = Arc::new(std::sync::Barrier::new(2));
             let committing = {
                 let (registry, log, barrier) = (registry.clone(), log.clone(), barrier.clone());
@@ -327,7 +368,7 @@ mod tests {
         let rt = tokio::runtime::Handle::current();
         let registry = AuxTasks::default();
         let log = Mutex::new(Vec::new());
-        let request_id = registry.start("s", |_| std::future::pending(), &rt);
+        let request_id = registry.start("s", AuxKind::Suggestion, |_| std::future::pending(), &rt);
         registry.cancel("s", || logged(&log, "cleared"));
         assert!(!registry.commit("s", request_id, || logged(&log, "ready")));
         assert_eq!(*log.lock().expect("log"), ["cleared"]);

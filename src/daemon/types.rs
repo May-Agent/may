@@ -1568,6 +1568,25 @@ pub struct UiFullConfig {
     pub(crate) remote_access: UiRemoteAccessConfig,
     pub(crate) sandbox: UiSandboxConfig,
     pub(crate) stream: UiStreamConfig,
+    /// A save without the section leaves the setting as it is.
+    #[serde(default)]
+    pub(crate) suggestions: Option<UiSuggestionsConfig>,
+    /// A save without the section leaves the setting as it is.
+    #[serde(default)]
+    pub(crate) recap: Option<UiRecapConfig>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UiSuggestionsConfig {
+    pub(crate) enabled: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UiRecapConfig {
+    pub(crate) auto: bool,
+    pub(crate) idle_minutes: u64,
 }
 
 #[derive(Debug, serde::Deserialize, skyzen::ToSchema)]

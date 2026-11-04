@@ -2450,6 +2450,35 @@ pub(super) async fn start_background_turn(
     }
 }
 
+/// Applies the current `[suggestions]` and `[recap]` settings to work
+/// already scheduled: a setting turned off cancels its armed timers and
+/// in-flight generations.
+fn apply_aux_settings(state: &Arc<DaemonState>) {
+    suggest::apply_settings(state);
+    recap::apply_settings(state);
+}
+
+/// Applies the aux settings whenever the configuration changes, for the
+/// daemon's lifetime.
+pub(super) fn watch_aux_settings(state: &Arc<DaemonState>) {
+    let mut events = state.ui_event_bus.subscribe();
+    let state = Arc::clone(state);
+    let handle = state.tokio_handle.clone();
+    handle.spawn(async move {
+        loop {
+            match events.recv().await {
+                Ok(topics) if topics.contains(UiEventTopics::CONFIG) => apply_aux_settings(&state),
+                // A lagged receiver may have missed the change.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    apply_aux_settings(&state);
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+}
+
 /// A completed turn left `session_id` idle with nothing pending: it gets one
 /// suggested next prompt and an armed idle-recap timer. Every path that ends
 /// a session's turns calls this, so a published, queued or background turn
