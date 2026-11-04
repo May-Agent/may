@@ -25,7 +25,7 @@ cargo run --bin may -- daemon stop
 cargo run --bin may -- daemon install    # launchd agent / systemd user unit
 ```
 
-- It listens on the unix socket `~/.may/daemon.sock` (mode 0600, used by the TUI and one-shot runs) and on TCP `127.0.0.1:8787` (`[daemon] port`) — the local listener, trusting the machine's own user. A second remote listener on `127.0.0.1:0` serves the same routes behind an identity layer; `[daemon] listen` adds more addresses applied live, with non-loopback ones routed to the remote listener.
+- It listens on the unix socket `~/.may/daemon.sock` (mode 0600, used by the TUI and one-shot runs) and on TCP `127.0.0.1:8787` (`[daemon] port`) — the local listener, trusting the machine's own user. A second remote listener on `127.0.0.1:0` serves the same routes behind an identity layer; `[daemon] listen` adds more addresses applied live; a non-loopback one is served directly and identifies each peer through tailscaled's `WhoIs`.
 - `~/.may/daemon.lock` keeps it single-instance. Every client starts it on demand and replaces it when its build id differs from the client's, so after a rebuild the next `cargo run` restarts it.
 - Remote access is `tailscale serve` in front of the remote listener (`[remote_access]`), never a public listener: every remote request needs a trusted identity — a listed `Tailscale-User-Login` today — or gets a 401.
 
@@ -90,16 +90,22 @@ May is a terminal-based AI assistant built as an application layer on the **aith
 └──────────────────────────────────────────────────────────────┘
 ```
 
-- **aither-agent**: Core `Agent` abstraction, `TerminalAgentBuilder`, event streaming (`AgentEvent`)
-- **aither-cloud**: Provider implementations (Claude, Gemini, OpenAI) via `CloudProvider` enum
-- **aither-sandbox**: `TerminalTool`/`TerminalMode` (legacy names for terminal-command execution), `PermissionHandler` trait
+- **aither-agent**: Core `Agent` abstraction, `TerminalAgentBuilder`, event streaming (`AgentEvent`), subagents (`subagent` command and built-in types), skill loading, compaction
+- **aither-cloud**: Provider implementations (Claude, Gemini, OpenAI) via `CloudProvider` enum; `aither-copilot` and `aither-codex` add the Copilot and ChatGPT-subscription backends
+- **aither-sandbox**: `TerminalTool`/`TerminalMode` (legacy names for terminal-command execution), `PermissionHandler` trait, the `monitor` tool, background jobs, stdin watch, output overflow
 - **aither-models**: Model metadata database for tier lookups
-- **heel**: Native sandbox for isolated command execution
+- **aither-mcp**, **aither-browser**, **aither-acp**, **aither-connectivity**: MCP servers as terminal commands, the managed browser, ACP agents as subagent types, connectivity checks
+- **heel**: Native sandbox for isolated command execution (managed binary configured in `src/heel/`)
 
 ### Module Structure
 
 **`src/agent/`** - MayAgent wrapper
-- `may.rs`: Wraps `aither_agent::Agent` with May-specific system prompt (via Askama template at `templates/system.md`), permission handling, and session context
+- `may.rs`: Wraps `aither_agent::Agent`: the persona prompt (`templates/system.md`, via `include_str!`), the base system prompt (`templates/base_system.md`), skill and subagent registration, compaction model, permission handling, and session context
+- `runtime_context.rs`: renders the terminal runtime context (`templates/terminal_runtime_context.txt`); `permission.rs`: `PermissionApprover` for `unsafe` mode; `*_tool.rs`: the IPC commands (`ask_user`, `issue`, `pr`, `repo`, `session`, `task`, `notify`, `tunnel`, `browser`, `computer`, `register-skills`)
+
+**`src/terminal_commands.rs`** - `register_shared_terminal_commands`, which registers every IPC command; `src/terminal_permission_handler.rs` applies the network policy and audit log
+
+**Other top-level modules** - `agent_link` (main agents on one machine exchange messages), `computer` (a virtual desktop per session), `container` (container sandbox), `db` (SQLite persistence: `~/.may/history.db`), `issue` (May and GitHub issue backends), `pr` (session-owned PRs), `repo_clone` (per-session repository clones), `profile` (profiles), `memory` (profile memory extraction), `mcp`, `notification` (web push), `scheduler` and `task_trigger` (scheduled tasks), `skill` (skill management), `heel` (managed sandbox binary), `cache_lifetime` (provider prompt-cache lifetime)
 
 **`src/daemon/`** - The resident daemon and its API
 - `mod.rs`: `run_daemon`, single-instance lock, listeners, auto-index
@@ -117,30 +123,32 @@ May is a terminal-based AI assistant built as an application layer on the **aith
 
 **`src/session/`** - Session lifecycle
 - `manager.rs`: Creates/loads/lists sessions, manages current session
-- `store.rs`: Filesystem persistence to `~/.may/sessions/<uuid>/`
-- `history.rs`: Chat history with YAML frontmatter format (see format below)
+- `layout.rs`: typed paths; a session sandbox is `~/.may/profiles/<profile>/sessions/<id>/`
+- `store.rs`: creates the session sandbox directories and links its skills and memories
+- `runtime.rs`, `runtime_service.rs`, `runs.rs`: per-session runtime state, pending messages (`steer` / `queue`) and live runs
+- `history.rs`: in-memory chat history rebuilt from the database (see below)
 
 **`src/tui/`** - Terminal UI (ratatui-based), a daemon client
 - `remote.rs`: the `AgentWorker` whose turns run in the daemon; turns other clients start arrive as foreign turns
-- `app.rs`: State machine with modes: `Chat`, `SessionSelect`, `FilePicker`, `Help`, `ToolDetail`, `Welcome`, `ProviderConfig`
-- `ui/chat.rs`: `ChatStream` containing `ChatElement` variants (UserMessage, AssistantText, ToolCall, TodoBlock, Error, Loading, Thinking)
+- `app/mod.rs`: `App` state machine; `AppMode` (in `state.rs`) has `Chat`, `SessionSelect`, `FilePicker`, `Help`, `ToolDetail`, `Config`, the model and effort selectors, the OAuth login modes, permission, workspace and repo-trust dialogs, `AskUser`, `Jobs`, `Btw` and more; `reducer/` handles keys per mode
+- `ui/chat.rs`: `ChatStream` containing `ChatElement` variants (UserMessage, AssistantText, ToolCall, TodoBlock, Recap, Error, Notice, Thinking, WorkedFor)
 - `event.rs`: Terminal event capture via crossterm
 - `completion.rs`: Slash commands (`/help`, `/session`) and file mentions (`@path`)
 - `clipboard.rs`: Image/text paste handling
 
 **`src/config.rs`** - Configuration
-- Provider enum with 11 backends (Anthropic, OpenAI, Google, OpenRouter, DeepSeek, Ollama, Groq, Together, Mistral, XAI, Custom)
+- `ProviderType` enum with 15 backends (Anthropic, OpenAI, Google, Copilot, Chatgpt, OpenRouter, DeepSeek, Ollama, LMStudio, Groq, Together, Mistral, XAI, Grok, Custom)
 - Tier-based model selection: Advanced, Balanced, Fast
 - Stored at `~/.may/config.toml`
 
 **`src/workspace.rs`** - Permission model
-- Sandbox (`~/.may/sessions/<id>/workdir`): Full read/write
+- Sandbox (the session directory `~/.may/profiles/<profile>/sessions/<id>/`): Full read/write
 - CWD: Read-only by default
-- Workdirs: User-approved directories with read/write (stored in `~/.may/workspace.toml`)
+- Workdirs: User-approved directories with read/write (stored in the profile's `workspace.toml`, `~/.may/profiles/<profile>/workspace.toml`)
 
 **`src/bundle/`** - Embedded resources
-- Skills bundled via `include_str!`; subagent types (`explore`, `plan`, `research`, `fork`) are aither built-ins, not files
-- Extracted with symlinks at `~/.may/skills/`
+- Skills in `skills/` are embedded with `include_dir!`; subagent types (`explore`, `plan`, `research`, `fork`) are aither built-ins, not files
+- Written (overwriting) to `~/.may/skills/` at startup, copied into each profile's `skills/`, and linked into the session sandbox as `skills`; container sessions mount it
 
 ### Session Storage Format
 
@@ -167,7 +175,7 @@ During streaming:
 ```
 
 # Terminal-first tool calling
-The native tools are `terminal`, `monitor`, the terminal controls (`terminal_kill`, `terminal_input`, `terminal_read`) and `compact`. This describes command execution capability and does not imply a specific shell implementation.
+The native tools are `terminal`, `monitor`, the terminal controls (`terminal_kill`, `terminal_input`, `terminal_read`) and `compact` (by design a native tool; aither 0.14.1 does not provide it yet, May-Agent/may#127). This describes command execution capability and does not imply a specific shell implementation.
 
 Everything else is exposed as CLI commands through the terminal tool's IPC bridge rather than as additional native tools.
 A tool the model provider executes server-side is the exception: it is passed to the provider natively and, while enabled, replaces the corresponding terminal command. Web search is always that hosted tool (`web_search` / `google_search`); May does not register a `websearch` command or a client-side search engine. High-frequency browser work should use the May-managed `browser` command rather than ad-hoc shell recipes or direct browser installers.
@@ -181,7 +189,7 @@ Do not leave high-frequency capabilities as ad-hoc shell snippets the agent has 
 - **Streaming priority**: Agent events drained before terminal events to ensure responsive streaming display
 - **Scroll sentinel**: `scroll = usize::MAX` means "follow bottom", normalized lazily
 - **Provider abstraction**: All providers unified through `CloudProvider` enum from aither-cloud
-- **Permission handler**: `MayPermissionHandler` implements `aither_sandbox::PermissionHandler` trait
+- **Permission handler**: `TerminalPermissionHandler` implements `aither_sandbox::PermissionHandler` and delegates `unsafe` approvals to `PermissionApprover`
 
 
 # Bad smell
