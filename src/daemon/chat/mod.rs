@@ -2366,10 +2366,16 @@ fn run_agent_loop<'a>(
             enqueue_event_triggered_tasks(state, &session_id, profile_id.as_deref());
             // The turn's messages are in the search outbox now.
             let _ = state.search_index_wake_tx.try_send(());
-            // The agent stays as the session's idle agent until the next turn.
-            state
-                .parked_agents
-                .park(state, session_id.as_str(), agent, build_key);
+            // The agent stays as the session's idle agent until the next turn;
+            // it waits on background commands once this run releases the
+            // session.
+            state.parked_agents.park(
+                state,
+                session_id.as_str(),
+                agent,
+                build_key,
+                guard.released(),
+            );
 
             return Ok(AgentRunResult {
                 assistant_id,
@@ -2412,8 +2418,10 @@ const fn closes_reasoning_phase(event: &aither_agent::AgentEvent) -> bool {
 /// Runs one turn under `guard`, publishing it to the session's clients, and
 /// settles the guard: a continued guard (more queued work) runs next.
 /// Starts a turn for `session_id` whose idle agent collected background
-/// commands that need the model (`wake`). Nothing runs when the session is
-/// busy: the turn holding it continues with the same agent and sees them.
+/// commands that need the model (`wake`). An idle agent waits on background
+/// commands only after the run that parked it released the session, so the
+/// only thing that can hold the session here is a new turn, which takes the
+/// parked agent and sees the results; nothing runs then.
 pub(super) async fn start_background_turn(
     state: &Arc<DaemonState>,
     session_id: &str,
@@ -2425,7 +2433,7 @@ pub(super) async fn start_background_turn(
     let guard = match state.runtime_service.runs().acquire(session_id).await {
         Ok(guard) => guard,
         Err(error) => {
-            tracing::info!(%session_id, %error, "a running turn will see the background results");
+            tracing::info!(%session_id, %error, "a new turn holds the session and takes the parked agent, which sees the background results");
             return;
         }
     };
@@ -4820,6 +4828,105 @@ mod tests {
         let result = result.expect("the retried resume completes");
         assert_eq!(result.full_text, "resumed");
         assert_eq!(sink.wake_texts, 1, "the background events are shown once");
+    }
+
+    /// A background command that finishes after the turn parked its agent but
+    /// before the turn's run released the session still resumes the session
+    /// once the release happens.
+    #[tokio::test]
+    async fn a_job_finishing_before_the_release_resumes_the_session_after_it() {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let may_dir = tempfile::tempdir().expect("may dir");
+        // The session's `files/` is what the sandboxed command can write and
+        // read.
+        let session_files = may_dir.path().join("sessions/session/files");
+        std::fs::create_dir_all(&session_files).expect("session files");
+        let gate = session_files.join("go");
+        let done = session_files.join("done");
+        let arguments = serde_json::json!({
+            "script": format!(
+                "while [ ! -e {} ]; do sleep 0.05; done; echo finished; touch {}",
+                gate.display(),
+                done.display()
+            ),
+            "description": "finishes after the turn ends",
+            "background": true,
+            "timeout": 30
+        })
+        .to_string();
+        let provider_a = stub_provider(vec![
+            sse_tool_call("call_1", "terminal", &arguments),
+            sse_text("started"),
+            sse_text("resumed"),
+        ])
+        .await;
+        let provider_b = stub_provider(Vec::new()).await;
+        let cwd = tempfile::tempdir().expect("cwd");
+        let state = failover_state(may_dir.path(), cwd.path(), &provider_a, &provider_b).await;
+
+        let req = ChatRequest {
+            session_id: "session".to_string(),
+            content: "start it".to_string(),
+            attachments: Vec::new(),
+            hidden_context_xml: None,
+            delivery_mode: crate::session::PendingUserMessageMode::default(),
+            pending_entry_id: None,
+        };
+        // The run keeps the session while its agent is already parked.
+        let guard = state
+            .runtime_service
+            .runs()
+            .acquire("session")
+            .await
+            .expect("acquire run");
+        let mut sink = TestSink::default();
+        run_agent_loop(
+            &state,
+            &req,
+            &mut sink,
+            &guard,
+            true,
+            true,
+            &TurnKind::Prompt,
+        )
+        .await
+        .expect("the turn completes");
+        assert!(state.parked_agents.contains("session"));
+
+        // The command ends only now, while the run still holds the session;
+        // the idle agent's worker is observed through its job registry.
+        // The registry cannot show it: the agent's own background wait
+        // records completions, and that wait starts only after the release.
+        // The command reports through a file instead.
+        std::fs::write(&gate, "").expect("open the gate");
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            while !done.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the command finishes");
+        // The process exits right after writing the file.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            provider_a.bodies.try_recv().is_ok() && provider_a.bodies.try_recv().is_ok(),
+            "the turn made two requests"
+        );
+        assert!(
+            provider_a.bodies.try_recv().is_err(),
+            "nothing resumed the session while it was held"
+        );
+
+        guard
+            .finish_idle(crate::session::RunOutcome::Completed)
+            .await
+            .expect("release the run");
+        let body =
+            tokio::time::timeout(std::time::Duration::from_secs(20), provider_a.bodies.recv())
+                .await
+                .expect("the release resumes the session")
+                .expect("request body");
+        assert!(body.contains("finished"), "the resume sees the result");
     }
 
     /// Runs one prompt turn of "session" to completion on `sink`.
