@@ -447,9 +447,14 @@ async fn build_exec_terminal_tool(
         },
         futures_lite::future::try_zip(
             async {
-                resolve_provider_runtime(may_config, model, 0)
-                    .await
-                    .map_err(ExecError::ResolveProviderRuntime)
+                resolve_provider_runtime(
+                    may_config,
+                    model,
+                    0,
+                    &may_agent::secrets::SecretRedactor::new(&context.may_dir),
+                )
+                .await
+                .map_err(ExecError::ResolveProviderRuntime)
             },
             async {
                 may_agent::tool_dispatch::ToolDispatchers::spawn(
