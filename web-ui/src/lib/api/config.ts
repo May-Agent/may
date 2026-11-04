@@ -111,6 +111,8 @@ export interface UiRemoteAccessConfig {
   allowLocalEnvironment: boolean;
   funnel: boolean;
   funnelPort: number;
+  /** Largest webhook delivery body in bytes; larger deliveries get 413. */
+  webhookMaxBodyBytes: number;
   /** Tailscale logins accepted besides the login owning this node, which is always accepted. */
   allowedLogins: string[];
 }
