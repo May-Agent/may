@@ -347,6 +347,23 @@ pub(super) async fn set_session_plan_state(
     }))
 }
 
+/// Set the session's yolo switch; it applies to the next approval request.
+pub(super) async fn set_session_yolo(
+    params: Params,
+    Json(payload): Json<super::types::SessionYoloRequest>,
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<super::types::SessionYoloResponse>> {
+    let id = params.get("id").map_err(bad_request_error)?.to_string();
+    let runtime = state
+        .runtime_service
+        .set_yolo(&id, payload.yolo)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(super::types::SessionYoloResponse {
+        yolo: runtime.yolo,
+    }))
+}
+
 pub(super) async fn save_session_tasks(
     params: Params,
     Json(payload): Json<SessionTasksPayload>,

@@ -396,7 +396,7 @@ fn api_routes() -> Route {
         append_session_history, create_session, delete_all_sessions, delete_session, get_session,
         get_session_context_debug, get_session_history, get_session_prs, get_session_tasks,
         list_sessions, lookup_issues, rewind_session, save_session_tasks, set_session_plan_state,
-        update_session,
+        set_session_yolo, update_session,
     };
     use super::tasks::{
         approve_task, create_task, delete_task, get_task, invoke_webhook_task, list_tasks,
@@ -434,6 +434,7 @@ fn api_routes() -> Route {
                         "/prs".at(get_session_prs),
                         "/tasks".put(save_session_tasks),
                         "/tasks/plan-state".put(set_session_plan_state),
+                        "/yolo".put(set_session_yolo),
                         "/stop".post(stop_session_run),
                         "/runtime".route(Route::new((
                             "".at(get_session_runtime),

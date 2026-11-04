@@ -159,6 +159,7 @@ export interface PersistedAskUserRequest {
 export interface SessionRuntimeSummary {
   state?: SessionRuntimeState;
   planState?: SessionPlanState;
+  yolo?: boolean;
   interactions?: SessionInteractionState;
   queuedCount?: number;
   pendingImmediate?: PendingUserMessage | null;
@@ -496,6 +497,10 @@ export interface SessionPlanStateRequest {
 
 export interface SessionPlanStateResponse {
   planState: SessionPlanState;
+}
+
+export interface SessionYoloResponse {
+  yolo: boolean;
 }
 
 // ── Memory ─────────────────────────────────────────────────

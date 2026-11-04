@@ -47,6 +47,8 @@ pub(crate) mod types;
 mod response_tests;
 #[cfg(test)]
 mod secret_question_tests;
+#[cfg(test)]
+mod yolo_tests;
 
 pub use chat::{
     BtwMessage, BtwRequest, BtwResponse, CompactResponse, ContextDumpResponse, RecapRecord,
