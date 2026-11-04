@@ -6,7 +6,7 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -211,6 +211,13 @@ fn task_script_failure(exit_code: i32, output: &str) -> String {
 
 fn temp_task_file_name(prefix: &str, execution_id: &str, suffix: &str) -> String {
     format!("{prefix}{execution_id}{suffix}")
+}
+
+/// Creates the directory a local task runs in; an existing one is kept.
+async fn prepare_working_dir(dir: &Path) -> Result<(), String> {
+    tokio::fs::create_dir_all(dir)
+        .await
+        .map_err(|error| workspace_prepare_error(dir, &error))
 }
 
 fn profile_workspace_key(profile: &profiles::Model) -> &str {
@@ -1021,7 +1028,11 @@ impl TaskRuntime {
             .await
             .map_err(|error| invalid_profile_error(profile.id.as_str(), &error))?;
         let script = self
-            .resolve_script_source(script_path, script_inline)
+            .resolve_script_source(
+                script_path,
+                script_inline,
+                crate::session::MayHomePaths::new(self.may_dir.clone()).task_validation_dir(),
+            )
             .await?;
 
         match profile_info.environment.kind() {
@@ -1189,6 +1200,7 @@ impl TaskRuntime {
     ) -> Result<TaskFilePlacement, String> {
         match environment {
             ProfileEnvironment::Local => {
+                prepare_working_dir(&script.host_working_dir).await?;
                 Ok(TaskFilePlacement::local(script.host_working_dir.clone()))
             }
             ProfileEnvironment::Container { .. } => self
@@ -1267,6 +1279,7 @@ impl TaskRuntime {
         &self,
         script_path: Option<&str>,
         script_inline: Option<&str>,
+        inline_dir: PathBuf,
     ) -> Result<TaskScript, String> {
         match (
             script_inline.map(str::trim).filter(|s| !s.is_empty()),
@@ -1274,7 +1287,7 @@ impl TaskRuntime {
         ) {
             (Some(inline), None) => Ok(TaskScript {
                 content: inline.to_string(),
-                host_working_dir: self.may_dir.clone(),
+                host_working_dir: inline_dir,
             }),
             (None, Some(path)) => {
                 let canonical = tokio::fs::canonicalize(path)
@@ -1308,8 +1321,12 @@ impl TaskRuntime {
     }
 
     async fn resolve_script(&self, task: &scheduled_tasks::Model) -> Result<TaskScript, String> {
-        self.resolve_script_source(task.script_path.as_deref(), task.script_inline.as_deref())
-            .await
+        self.resolve_script_source(
+            task.script_path.as_deref(),
+            task.script_inline.as_deref(),
+            crate::session::MayHomePaths::new(self.may_dir.clone()).inline_task_dir(&task.id),
+        )
+        .await
     }
 
     async fn execute_local(
@@ -1347,6 +1364,7 @@ impl TaskRuntime {
         script: &TaskScript,
         timeout: TaskTimeout,
     ) -> Result<(), String> {
+        prepare_working_dir(&script.host_working_dir).await?;
         let terminal_tool = self
             .local_terminal_tool(
                 profile_id,
@@ -2409,6 +2427,56 @@ mod tests {
                 .expect("queue read")
                 .expect("the prompt is stored")
         }
+    }
+
+    /// An inline script runs in a directory of the task's own, apart from the
+    /// managed tools and the rest of the may home.
+    #[tokio::test]
+    async fn an_inline_local_task_runs_in_its_own_directory() {
+        let host = WakeHost::new().await;
+        let db = host.runtime_service.db();
+        db.create_scheduled_task(CreateScheduledTaskParams {
+            id: "inline-1",
+            profile_id: host.profile_id.as_str(),
+            session_id: None,
+            name: "Inline",
+            trigger: &TIME_ONCE,
+            cron_expression: None,
+            run_at: None,
+            script_path: None,
+            script_inline: Some("echo hi; pwd -P"),
+            needs_network: false,
+            timeout_secs: 60,
+        })
+        .await
+        .expect("task should persist");
+        let task = db
+            .get_scheduled_task("inline-1")
+            .await
+            .expect("task reads")
+            .expect("task exists");
+
+        let output = Box::pin(host.runtime.execute_task_inner(
+            &task,
+            crate::task_trigger::TaskInvocation::Time {
+                trigger_type: crate::task_trigger::TimeTriggerType::Once,
+            },
+        ))
+        .await
+        .expect("the inline task run succeeds");
+
+        let may_dir = host.dir.path().join(".may");
+        let task_dir = crate::session::MayHomePaths::new(may_dir.clone())
+            .inline_task_dir("inline-1")
+            .canonicalize()
+            .expect("the task directory was created");
+        assert!(output.contains("hi"), "the output: {output}");
+        assert!(
+            output.contains(task_dir.to_str().expect("utf-8 path")),
+            "the working directory is {task_dir:?}: {output}"
+        );
+        assert!(!task_dir.starts_with(may_dir.join("tools")));
+        assert!(!may_dir.join("tools").starts_with(&task_dir));
     }
 
     const TIME_ONCE: PersistedTaskTrigger = PersistedTaskTrigger::Time {
