@@ -7,7 +7,7 @@ use may_agent::container::stage::stage_workspace_context;
 
 /// Byte for byte the manifest `embedded_distribution` loads; it is one of the
 /// workspace reference's hash inputs.
-const TOOL_DISTRIBUTION: &[u8] = include_bytes!("../src/tools/tool-distribution-0.12.0.json");
+const TOOL_DISTRIBUTION: &[u8] = include_bytes!("../src/tools/tool-distribution-0.14.1.json");
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
