@@ -13,10 +13,14 @@
 //! the run in this process; the steer hook also ends the turn of a run that
 //! lost its lease.
 
-use aither_agent::{CheckpointContext, Hook, TurnBoundaryAction, TurnBoundaryContext};
+use aither_agent::{
+    CheckpointContext, Hook, PostToolAction, ToolResultContext, TurnBoundaryAction,
+    TurnBoundaryContext,
+};
 
 use std::sync::Arc;
 
+use crate::secrets::SecretRedactor;
 use crate::session::{SessionId, SessionRuntimeService};
 
 /// Ends the current agent turn when the host-side session runtime
@@ -52,6 +56,33 @@ impl Hook for PendingSteerHook {
             TurnBoundaryAction::EndTurn
         } else {
             TurnBoundaryAction::Continue
+        }
+    }
+}
+
+/// Replaces stored secret values in every tool result with the secret's
+/// name before the agent commits it, so the session context, the persisted
+/// history and the published events only ever carry the name.
+#[derive(Debug, Clone)]
+pub(super) struct SecretRedactionHook {
+    redactor: SecretRedactor,
+}
+
+impl SecretRedactionHook {
+    pub(super) const fn new(redactor: SecretRedactor) -> Self {
+        Self { redactor }
+    }
+}
+
+impl Hook for SecretRedactionHook {
+    async fn post_tool_use(&self, ctx: &ToolResultContext<'_>) -> PostToolAction {
+        let redactions = self.redactor.current().await;
+        let mut result = ctx.result.clone();
+        redactions.redact_tool_result(&mut result);
+        if result == *ctx.result {
+            PostToolAction::Keep
+        } else {
+            PostToolAction::Replace(result)
         }
     }
 }
