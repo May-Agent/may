@@ -664,6 +664,7 @@ impl MayAgent {
             .ssh_authorizer(super::ssh_authorizer::MaySshAuthorizer::new(
                 config.session_id.as_str().to_string(),
                 ssh_authorizer_broker,
+                config.db.clone(),
             ))
             .agent_kind(AgentKind::Chatbot)
             .persona_prompt(include_str!("../../templates/system.md"))

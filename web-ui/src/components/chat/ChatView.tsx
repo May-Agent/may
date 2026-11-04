@@ -14,6 +14,7 @@ import { Composer } from './Composer';
 import { SessionHeader } from './SessionHeader';
 import { BrowserTakeoverBanner } from './BrowserTakeoverBanner';
 import { PlanBanner } from './PlanBanner';
+import { YoloToggle } from './YoloToggle';
 import { Button } from '@/components/ui/button';
 import { useTranslation } from '@/lib/i18n';
 import type { ApiAttachment, ApiMessage } from '@/lib/types';
@@ -218,6 +219,9 @@ export function ChatView({ sessionId }: { sessionId: string }) {
         sessionId={active.id}
         planState={active.runtime?.planState ?? 'disabled'}
       />
+      {isDraftSessionId(active.id) ? null : (
+        <YoloToggle sessionId={active.id} yolo={active.runtime?.yolo ?? false} />
+      )}
       <BrowserTakeoverBanner session={active} />
       <ScrollArea
         ref={scrollerRef}

@@ -562,6 +562,11 @@ export const ja: Messages = {
     stopping: '停止中…',
     loadFailed: '読み込めませんでした：{message}',
   },
+  yolo: {
+    label: 'Yolo',
+    description: 'このチャットの承認リクエストをすべて確認なしで許可する',
+    failed: 'Yoloを変更できませんでした: {message}',
+  },
   plan: {
     approved: '承認済み',
     awaiting: '承認待ち',

@@ -628,7 +628,7 @@ pub struct CreateScheduledTaskParams<'a> {
 }
 
 /// Parameters for updating a scheduled task.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct UpdateScheduledTaskParams<'a> {
     /// New task name, if changing.
     pub name: Option<&'a str>,

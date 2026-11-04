@@ -562,6 +562,11 @@ export const zhHant: Messages = {
     stopping: '正在停止…',
     loadFailed: '無法載入：{message}',
   },
+  yolo: {
+    label: 'Yolo',
+    description: '自動允許此對話中的所有核准請求，不再詢問',
+    failed: '無法變更 Yolo：{message}',
+  },
   plan: {
     approved: '已核准',
     awaiting: '等待你核准',

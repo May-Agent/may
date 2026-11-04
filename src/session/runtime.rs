@@ -346,6 +346,9 @@ pub struct SessionRuntimeSummary {
     /// Plan-mode state.
     #[serde(default, skip_serializing_if = "session_plan_state_is_disabled")]
     pub plan_state: SessionPlanState,
+    /// Yolo switch: every approval request of the session is granted at once.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub yolo: bool,
     /// Interactive-resource sub-state (browser, terminal).
     #[serde(default, skip_serializing_if = "SessionInteractionState::is_empty")]
     pub interactions: SessionInteractionState,
@@ -381,6 +384,7 @@ impl Default for SessionRuntimeSummary {
         Self {
             state: SessionRuntimeState::Idle,
             plan_state: SessionPlanState::Disabled,
+            yolo: false,
             interactions: SessionInteractionState::default(),
             queued_count: 0,
             pending_immediate: None,
@@ -423,6 +427,7 @@ impl SessionRuntimeSummary {
     pub const fn is_empty(&self) -> bool {
         self.state.is_idle()
             && !self.plan_state.is_enabled()
+            && !self.yolo
             && self.interactions.is_empty()
             && self.queued_count == 0
             && self.pending_immediate.is_none()

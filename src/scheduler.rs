@@ -738,6 +738,12 @@ impl TaskRuntime {
             })
             .await
             .map_err(|error| prefixed_error("failed to create scheduled task: ", &error))?;
+        // A yolo session stores its tasks approved and enabled.
+        let model = self
+            .db
+            .grant_task_under_yolo(&normalized.session_id, model)
+            .await
+            .map_err(|error| prefixed_error("failed to approve scheduled task: ", &error))?;
         self.reload_active_tasks()
             .await
             .map_err(|e| e.to_string())?;

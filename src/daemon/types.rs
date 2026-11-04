@@ -522,6 +522,20 @@ pub struct SessionPlanStateRequest {
     pub(crate) plan_state: SessionPlanState,
 }
 
+/// `PUT /api/sessions/{id}/yolo` body.
+#[derive(Debug, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionYoloRequest {
+    pub(crate) yolo: bool,
+}
+
+/// The yolo switch after the update.
+#[derive(Debug, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionYoloResponse {
+    pub(crate) yolo: bool,
+}
+
 #[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionPlanStateResponse {
@@ -1139,6 +1153,7 @@ impl From<crate::session::SessionRuntimeSummary> for SessionRuntimeResponse {
         Self {
             state: summary.state,
             plan_state: summary.plan_state,
+            yolo: summary.yolo,
             interactions: SessionInteractionResponse {
                 browser: BrowserInteractionResponse {
                     takeover_active: summary.interactions.browser.takeover_active,
@@ -1229,6 +1244,7 @@ pub struct UiBootstrapResponse {
 pub struct SessionRuntimeResponse {
     pub(crate) state: SessionRuntimeState,
     pub(crate) plan_state: SessionPlanState,
+    pub(crate) yolo: bool,
     pub(crate) interactions: SessionInteractionResponse,
     pub(crate) queued_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1250,6 +1266,7 @@ impl Default for SessionRuntimeResponse {
         Self {
             state: SessionRuntimeState::Idle,
             plan_state: SessionPlanState::Disabled,
+            yolo: false,
             interactions: SessionInteractionResponse::default(),
             queued_count: 0,
             pending_immediate: None,

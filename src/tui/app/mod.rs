@@ -3140,6 +3140,7 @@ impl App {
             "/quit" => self.request_quit(),
             "/compact" => Some(SendAction::Compact(None)),
             "/recap" => Some(SendAction::Recap),
+            "/yolo" => Some(SendAction::ToggleYolo),
             "/context" => Some(SendAction::ContextReport),
             "/usage" => Some(SendAction::UsageReport),
             "/context dump" => Some(SendAction::ContextDump),
@@ -4136,6 +4137,8 @@ pub enum SendAction {
     EnqueuePending(PendingMessage),
     /// Ask the daemon for a catch-up recap of the session.
     Recap,
+    /// Flip the session's yolo switch.
+    ToggleYolo,
     /// Show an open question of the session in the answer modal.
     OpenQuestions,
     /// Reload the session's history, which turns this client missed
