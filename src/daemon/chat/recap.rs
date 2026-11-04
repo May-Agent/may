@@ -1,8 +1,8 @@
 //! `/recap`: one aux turn over the session's user-visible exchanges writes
 //! a persisted catch-up card — a `recap` history row that never replays
 //! into model context — and broadcasts it as a `session_recap` frame. A
-//! request posted mid-turn queues behind the run guard and summarizes the
-//! finished conversation instead.
+//! request posted mid-turn is refused with a conflict: the running turn holds
+//! the session's agent.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -76,11 +76,23 @@ pub async fn recap_session(
     State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<RecapResponse>> {
     let session_id = super::hosts::session_id_param(&params)?;
-    if !has_user_messages(&state, &session_id).await {
-        return Ok(Json(RecapResponse { started: false }));
+    begin_recap(&state, &session_id).await.map(Json)
+}
+
+/// Starts a manual recap, or refuses it while a turn runs: the turn holds
+/// the session's agent, so there is nothing to summarise with until it ends.
+async fn begin_recap(state: &Arc<DaemonState>, session_id: &str) -> SkyResult<RecapResponse> {
+    if state.runtime_service.runs().is_held(session_id) {
+        return Err(skyzen::Error::msg(
+            "a turn is running in this session; run /recap when it finishes",
+        )
+        .set_status(skyzen::StatusCode::CONFLICT));
     }
-    request_recap(&state, &session_id);
-    Ok(Json(RecapResponse { started: true }))
+    if !has_user_messages(state, session_id).await {
+        return Ok(RecapResponse { started: false });
+    }
+    request_recap(state, session_id);
+    Ok(RecapResponse { started: true })
 }
 
 /// Whether `session_id` holds a user message: an empty session has nothing
@@ -497,6 +509,32 @@ mod tests {
 
         append(&state, MessageRole::User, "one more").await;
         assert!(freshness(&state, "session").await);
+    }
+
+    #[tokio::test]
+    async fn a_recap_during_a_running_turn_is_refused_as_busy() {
+        let dir = tempfile::tempdir().expect("dir");
+        let state = state_with_session(dir.path()).await;
+        append(&state, MessageRole::User, "question").await;
+
+        let guard = state
+            .runtime_service
+            .runs()
+            .acquire("session")
+            .await
+            .expect("acquire run");
+        let refused = begin_recap(&state, "session")
+            .await
+            .expect_err("a running turn refuses the recap");
+        assert_eq!(refused.status(), skyzen::StatusCode::CONFLICT);
+        assert!(
+            !state.aux_tasks.is_current("session", 0),
+            "no generation started"
+        );
+        guard
+            .finish_idle(crate::session::RunOutcome::Completed)
+            .await
+            .expect("release run");
     }
 
     #[test]
