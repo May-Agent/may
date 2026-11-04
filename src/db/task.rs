@@ -180,6 +180,33 @@ impl ChatDb {
         Ok(())
     }
 
+    /// Store a task created by `session_id` approved and enabled when the
+    /// session is in yolo mode; otherwise return it unchanged.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn grant_task_under_yolo(
+        &self,
+        session_id: &str,
+        task: scheduled_tasks::Model,
+    ) -> Result<scheduled_tasks::Model, ChatDbError> {
+        if !self.session_yolo(session_id).await? {
+            return Ok(task);
+        }
+        self.update_scheduled_task(
+            &task.id,
+            UpdateScheduledTaskParams {
+                enabled: Some(true),
+                approved: Some(true),
+                ..Default::default()
+            },
+        )
+        .await?;
+        self.get_scheduled_task(&task.id)
+            .await?
+            .ok_or_else(|| ChatDbError::RowNotFound(format!("scheduled task {}", task.id)))
+    }
+
     /// Approve a task for execution.
     ///
     /// # Errors

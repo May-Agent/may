@@ -3,6 +3,7 @@ import type {
   SessionTasksPayload,
   SessionPlanState,
   SessionPlanStateResponse,
+  SessionYoloResponse,
 } from '../types';
 
 export function getSessionTasks(sessionId: string): Promise<SessionTasksPayload> {
@@ -28,3 +29,7 @@ export function putSessionPlanState(
     { planState },
   );
 }
+export function putSessionYolo(sessionId: string, yolo: boolean): Promise<SessionYoloResponse> {
+  return apiPut<SessionYoloResponse>(`/sessions/${encodeURIComponent(sessionId)}/yolo`, { yolo });
+}
+

@@ -246,6 +246,20 @@ impl SessionRuntimeService {
         Ok(summary)
     }
 
+    /// Persist a session's yolo switch.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] on storage failure.
+    pub async fn set_yolo(
+        &self,
+        session_id: &str,
+        enabled: bool,
+    ) -> Result<SessionRuntimeSummary, crate::db::ChatDbError> {
+        let summary = self.db.set_session_yolo(session_id, enabled).await?;
+        self.publish_ui(UiEventTopics::SESSION_RUNTIME | UiEventTopics::SESSION_RUNTIMES);
+        Ok(summary)
+    }
+
     /// Append a pending user message to a session's queue.
     ///
     /// # Errors
