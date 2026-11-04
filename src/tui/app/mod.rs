@@ -325,6 +325,11 @@ pub struct App {
     pub image_view_area: Option<ratatui::layout::Rect>,
     /// Mouse/text selection in rendered chat content
     pub selection: Option<TextSelection>,
+    /// Where the pointer last was inside the chat column (screen cell);
+    /// the link under it is underlined and its target shown.
+    pub hover: Option<(u16, u16)>,
+    /// Opens link targets; replaced in tests.
+    pub link_opener: std::sync::Arc<dyn super::ui::links::LinkOpener>,
     /// Laid-out chat transcript: the render cache, and the plain-text
     /// mirror (selection, copy, click hit-testing) of what was drawn.
     pub chat_layout: super::ui::chat_layout::ChatLayout,
@@ -650,6 +655,8 @@ impl App {
             image_regions: Vec::new(),
             image_view_area: None,
             selection: None,
+            hover: None,
+            link_opener: std::sync::Arc::new(super::ui::links::SystemOpener),
             chat_layout: super::ui::chat_layout::ChatLayout::default(),
             frame_stats: super::perf::FrameStats::default(),
             last_click: None,
@@ -2828,6 +2835,7 @@ impl App {
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) -> AppResult<Option<SendAction>> {
         const SCROLL_STEP_LINES: usize = 3;
 
+        self.hover = None;
         match &self.mode {
             AppMode::Chat => {}
             AppMode::ImageView(_) => {
@@ -2858,6 +2866,16 @@ impl App {
                 MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
             )
         {
+            return Ok(None);
+        }
+        self.hover = in_chat.then_some((mouse.column, mouse.row));
+
+        // Ctrl-click (Cmd where the terminal reports it) opens the link
+        // under the pointer instead of starting a selection.
+        let hit = self.link_at_screen(mouse.column, mouse.row);
+        if super::ui::links::dispatch_click(self.link_opener.as_ref(), &mouse, hit.as_ref()) {
+            self.selection = None;
+            self.last_click = None;
             return Ok(None);
         }
 
@@ -2949,6 +2967,21 @@ impl App {
         }
 
         Ok(None)
+    }
+
+    /// The link drawn at screen cell `(col, row)`.
+    fn link_at_screen(&self, col: u16, row: u16) -> Option<super::ui::links::LinkHit> {
+        let x = col.checked_sub(self.chat_area.x)?;
+        let y = row.checked_sub(self.chat_area.y)?;
+        let doc = (self.effective_scroll() + usize::from(y))
+            .checked_sub(self.chat_layout.top_padding())?;
+        self.chat_layout.link_at(doc, x)
+    }
+
+    /// The link under the pointer, if it is inside the chat column.
+    pub(super) fn hovered_link(&self) -> Option<super::ui::links::LinkHit> {
+        let (col, row) = self.hover?;
+        self.link_at_screen(col, row)
     }
 
     fn mouse_to_selection_point(&self, mouse: MouseEvent) -> Option<SelectionPoint> {

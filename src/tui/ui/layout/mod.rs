@@ -170,7 +170,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     let scroll = app.scroll;
     let model_display = app.model_display();
-    let status_message = app.status_text().map(str::to_string);
+    // A notice wins; otherwise the hovered link shows its full target.
+    let status_message = app
+        .status_text()
+        .map(str::to_string)
+        .or_else(|| app.hovered_link().map(|hit| hit.uri));
 
     // Render everything in a single unified scrollable area
     app.frame_stats.chat = chat::render_unified(
@@ -278,6 +282,16 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         render_image_view(frame, area, app);
     } else {
         app.image_view_area = None;
+    }
+
+    // Last, so a popup or image drawn over a link is left alone.
+    if matches!(app.mode, AppMode::Chat) {
+        let top = app.effective_scroll();
+        let runs = app
+            .chat_layout
+            .link_runs(top, chat_area.height as usize, chat_area);
+        let hovered = app.hovered_link().map(|hit| hit.id);
+        super::links::paint(frame.buffer_mut(), &runs, hovered);
     }
 
     app.frame_stats.overlay = t.elapsed();
