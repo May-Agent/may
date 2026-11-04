@@ -498,16 +498,10 @@ pub(super) async fn delete_task(
 
 async fn run_delete_task(state: Arc<DaemonState>, id: String) -> SkyResult<()> {
     state
-        .db()
-        .delete_scheduled_task(&id)
-        .await
-        .map_err(internal_error)?;
-    state
         .task_runtime
-        .reload_active_tasks()
+        .delete_task(&id)
         .await
-        .map_err(internal_error)?;
-    Ok(())
+        .map_err(super::error::internal_error_message)
 }
 
 pub(super) async fn approve_task(
