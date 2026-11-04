@@ -11,9 +11,6 @@ use unicode_width::UnicodeWidthStr;
 /// Height reserved for inline images (in terminal lines).
 pub const IMAGE_HEIGHT: usize = 8;
 
-/// Background every code-block line is painted with.
-const CODE_BG: Color = Color::Rgb(30, 30, 30);
-
 /// `HighlightLines` carries no `Debug`; this wrapper lets the renderer
 /// keep its `#[derive(Debug)]` while recording only that a block is open.
 struct CodeHighlighter(HighlightLines<'static>);
@@ -385,22 +382,10 @@ impl StreamingMarkdown {
             }
             ParseEvent::CodeBlockLine(line) => {
                 self.end_inline_line();
-                let mut spans = vec![Span::styled("│ ", Style::default().fg(Color::DarkGray))];
-                if let Some(highlighter) = &mut self.code_highlighter {
-                    spans.extend(
-                        super::highlight::line_spans(&mut highlighter.0, &line)
-                            .into_iter()
-                            .map(|span| {
-                                let style = span.style.patch(Style::default().bg(CODE_BG));
-                                span.style(style)
-                            }),
-                    );
-                } else {
-                    spans.push(Span::styled(
-                        line,
-                        Style::default().fg(Color::White).bg(CODE_BG),
-                    ));
-                }
+                let spans = match &mut self.code_highlighter {
+                    Some(highlighter) => super::highlight::line_spans(&mut highlighter.0, &line),
+                    None => vec![Span::raw(line)],
+                };
                 self.rendered.push(Line::from(spans));
             }
             ParseEvent::CodeBlockEnd => {
@@ -942,13 +927,13 @@ mod tests {
         md.flush();
         let lines = md.lines();
         let code = &lines[0];
-        // Gutter plus more than one styled region: keywords got colored.
-        assert!(code.spans.len() > 2, "not highlighted: {code:?}");
+        // More than one styled region: keywords got colored.
+        assert!(code.spans.len() > 1, "not highlighted: {code:?}");
         assert!(
             code.spans
                 .iter()
-                .all(|s| s.style.bg == Some(CODE_BG) || s.content.as_ref() == "│ "),
-            "code span lost its background: {code:?}"
+                .all(|s| s.style.bg.is_none() && s.content.as_ref() != "│ "),
+            "code line carries a gutter or a background: {code:?}"
         );
         // The `rust` fence name is not rendered as a label line.
         let text = flattened_text(lines);
@@ -961,8 +946,8 @@ mod tests {
         md.push("```notalang\nlet x = 1;\n```\n");
         md.flush();
         let code = &md.lines()[0];
-        assert_eq!(code.spans.len(), 2, "expected gutter + one span: {code:?}");
-        assert_eq!(code.spans[1].style.bg, Some(CODE_BG));
+        assert_eq!(code.spans.len(), 1, "expected one plain span: {code:?}");
+        assert_eq!(code.spans[0].style, Style::default());
     }
 
     #[test]
@@ -974,12 +959,7 @@ mod tests {
         md.push("```rust\n/* start\nend */\n```\n");
         md.flush();
         let lines = md.lines();
-        let colors: Vec<Color> = lines[1]
-            .spans
-            .iter()
-            .skip(1)
-            .filter_map(|s| s.style.fg)
-            .collect();
+        let colors: Vec<Color> = lines[1].spans.iter().filter_map(|s| s.style.fg).collect();
         assert_ne!(colors, [] as [Color; 0]);
         assert!(
             colors.iter().all(|c| *c == colors[0]),
