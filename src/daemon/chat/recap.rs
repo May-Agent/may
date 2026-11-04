@@ -22,7 +22,7 @@ const GENERATION_TIMEOUT: Duration = Duration::from_secs(30);
 /// Longest accepted model output, in Unicode scalar values.
 const MAX_OUTPUT_CHARS: usize = 1_200;
 /// Total user/assistant text the recap projection may hold, in Unicode
-/// scalar values; older exchanges drop first.
+/// scalar values; the newest exchanges are kept.
 const HISTORY_BUDGET: usize = 24_000;
 const PROMPT: &str = include_str!("../../../templates/aux/recap.md");
 
@@ -132,28 +132,74 @@ pub(super) fn request_recap(state: &Arc<DaemonState>, session_id: &str) {
     );
 }
 
+/// The conversation a recap summarises.
+struct RecapWindow<'a> {
+    /// The newest user and assistant messages that fit the budget, oldest
+    /// first.
+    conversation: Vec<(&'a MessageRole, &'a str)>,
+    /// Every user message of the session, in the window or not: what the
+    /// recap covers once it is written.
+    turns: usize,
+}
+
+/// Selects the recap input from `history` (oldest first): user and
+/// assistant rows only, newest first until `budget` Unicode scalar values
+/// are spent, restored to chronological order. Other rows never count
+/// against the budget.
+fn recap_window<'a>(
+    history: impl DoubleEndedIterator<Item = (&'a MessageRole, &'a str)> + Clone,
+    budget: usize,
+) -> RecapWindow<'a> {
+    let turns = history
+        .clone()
+        .filter(|(role, _)| **role == MessageRole::User)
+        .count();
+    let mut remaining = budget;
+    let mut conversation = Vec::new();
+    for (role, content) in history.rev() {
+        if !matches!(role, MessageRole::User | MessageRole::Assistant) {
+            continue;
+        }
+        let size = content.chars().count();
+        if size > remaining {
+            break;
+        }
+        remaining -= size;
+        conversation.push((role, content));
+    }
+    conversation.reverse();
+    RecapWindow {
+        conversation,
+        turns,
+    }
+}
+
 /// Runs the recap's aux turn over user/assistant text only — tool calls
 /// and hidden context are harness state, not conversation.
 async fn generate(state: &Arc<DaemonState>, session_id: &str) -> Option<RecapRecord> {
     let history = crate::session::load_history_from_db(&state.db(), session_id)
         .await
         .ok()?;
-    let mut budget = HISTORY_BUDGET;
-    let mut messages = Vec::new();
-    let mut turns = 0;
-    for message in history.messages() {
-        if message.content.chars().count() > budget {
-            break;
-        }
-        let replayed = match message.role {
-            MessageRole::User => aither_core::llm::Message::user(&message.content),
-            MessageRole::Assistant => aither_core::llm::Message::assistant(&message.content),
-            _ => continue,
-        };
-        turns += usize::from(message.role == MessageRole::User);
-        budget -= message.content.chars().count();
-        messages.push(replayed);
+    let window = recap_window(
+        history
+            .messages()
+            .iter()
+            .map(|message| (&message.role, message.content.as_str())),
+        HISTORY_BUDGET,
+    );
+    if window.conversation.is_empty() {
+        tracing::warn!(%session_id, "the newest message exceeds the recap budget on its own");
+        return None;
     }
+    let turns = window.turns;
+    let mut messages: Vec<_> = window
+        .conversation
+        .iter()
+        .map(|(role, content)| match role {
+            MessageRole::User => aither_core::llm::Message::user(*content),
+            _ => aither_core::llm::Message::assistant(*content),
+        })
+        .collect();
     messages.push(aither_core::llm::Message::user(PROMPT));
     let response = super::aux::run(state, session_id, messages, GENERATION_TIMEOUT)
         .await
@@ -331,6 +377,126 @@ mod tests {
         assert_eq!(parsed.summary, "landed the merge");
         assert_eq!(parsed.turns, 4);
         assert!(parsed.next_action.is_none());
+    }
+
+    fn window(history: &[(MessageRole, String)], budget: usize) -> (Vec<String>, usize) {
+        let window = recap_window(
+            history
+                .iter()
+                .map(|(role, content)| (role, content.as_str())),
+            budget,
+        );
+        (
+            window
+                .conversation
+                .iter()
+                .map(|(_, content)| (*content).to_string())
+                .collect(),
+            window.turns,
+        )
+    }
+
+    #[test]
+    fn an_over_budget_history_keeps_the_newest_messages_in_order() {
+        let history: Vec<_> = (0..6)
+            .map(|i| {
+                let role = if i % 2 == 0 {
+                    MessageRole::User
+                } else {
+                    MessageRole::Assistant
+                };
+                (role, format!("m{i}-{}", "x".repeat(8)))
+            })
+            .collect();
+        // Each message is 11 characters: three fit.
+        let (conversation, turns) = window(&history, 33);
+        assert_eq!(
+            conversation,
+            ["m3-xxxxxxxx", "m4-xxxxxxxx", "m5-xxxxxxxx"].map(str::to_string)
+        );
+        assert_eq!(turns, 3, "every user message counts, in the window or not");
+    }
+
+    #[test]
+    fn a_large_early_tool_row_neither_counts_nor_ends_the_window() {
+        let history = vec![
+            (MessageRole::User, "first".to_string()),
+            (MessageRole::Tool, "t".repeat(100_000)),
+            (MessageRole::HiddenContext, "h".repeat(100_000)),
+            (MessageRole::Assistant, "answer".to_string()),
+            (MessageRole::User, "second".to_string()),
+        ];
+        let (conversation, turns) = window(&history, 24);
+        assert_eq!(
+            conversation,
+            ["first", "answer", "second"].map(str::to_string)
+        );
+        assert_eq!(turns, 2);
+    }
+
+    async fn state_with_session(dir: &std::path::Path) -> Arc<DaemonState> {
+        let state = Arc::new(
+            DaemonState::for_test(dir, dir, crate::config::MayConfig::default())
+                .await
+                .expect("test daemon state"),
+        );
+        state
+            .db()
+            .create_session("session", Some("test"), Some("a::gpt-4o"))
+            .await
+            .expect("session");
+        state
+    }
+
+    async fn append(state: &DaemonState, role: MessageRole, content: &str) {
+        state
+            .db()
+            .append_message(
+                "session",
+                role,
+                content,
+                None,
+                crate::db::MessageMeta::default(),
+            )
+            .await
+            .expect("append");
+    }
+
+    #[tokio::test]
+    async fn a_recap_covers_the_session_until_a_new_user_message_arrives() {
+        let dir = tempfile::tempdir().expect("dir");
+        let state = state_with_session(dir.path()).await;
+        for i in 0..4 {
+            append(&state, MessageRole::User, &format!("question {i}")).await;
+            append(&state, MessageRole::Assistant, &"a".repeat(10)).await;
+        }
+        assert!(freshness(&state, "session").await);
+
+        // A window of three messages, written the way `generate` writes it.
+        let history = crate::session::load_history_from_db(&state.db(), "session")
+            .await
+            .expect("history");
+        let window = recap_window(
+            history
+                .messages()
+                .iter()
+                .map(|message| (&message.role, message.content.as_str())),
+            30,
+        );
+        assert!(window.conversation.len() < history.messages().len());
+        let record = RecapRecord {
+            summary: "so far".to_string(),
+            next_action: None,
+            turns: window.turns,
+        };
+        persist(&state, "session", &record).await.expect("persist");
+        assert!(
+            !freshness(&state, "session").await,
+            "a repeated idle arm writes no second card"
+        );
+
+        append(&state, MessageRole::User, "one more").await;
+        assert!(freshness(&state, "session").await);
     }
 
     #[test]
