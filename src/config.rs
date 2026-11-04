@@ -1054,6 +1054,15 @@ pub struct RemoteAccessConfig {
     /// owns this node, which is always accepted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_logins: Vec<String>,
+    /// Whether Tailscale Funnel exposes the webhook routes
+    /// (`/api/tasks/webhook/*`, and nothing else) to the internet.
+    #[serde(default)]
+    pub funnel: bool,
+    /// Funnel HTTPS port: 443, 8443 or 10000. It must differ from
+    /// `https_port` while remote access is enabled, because Funnel exposes
+    /// its whole port.
+    #[serde(default = "default_tailscale_https_port")]
+    pub funnel_port: u16,
 }
 
 fn default_tailscale_binary() -> String {
@@ -1072,6 +1081,8 @@ impl Default for RemoteAccessConfig {
             https_port: default_tailscale_https_port(),
             allowed_logins: Vec::new(),
             allow_local_environment: false,
+            funnel: false,
+            funnel_port: default_tailscale_https_port(),
         }
     }
 }
