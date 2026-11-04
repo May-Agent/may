@@ -62,6 +62,9 @@ pub(super) use query;
 #[derive(Debug, Clone)]
 pub struct ChatDb {
     pub(super) db: SkyDb,
+    /// Test seam: suspends a run claim or finish at its await.
+    #[cfg(test)]
+    pub(crate) run_gates: session_run::RunGates,
 }
 
 impl ChatDb {
@@ -89,7 +92,11 @@ impl ChatDb {
         Self::migrate_legacy_remote_profiles(&db).await?;
         Self::migrate_removed_waiting_terminal_input(&db).await?;
         Self::ensure_search_outbox(&db).await?;
-        Ok(Self { db })
+        Ok(Self {
+            db,
+            #[cfg(test)]
+            run_gates: session_run::RunGates::default(),
+        })
     }
 
     /// Run `sql` as given, so a test can break the storage a commit needs.
