@@ -76,8 +76,24 @@ pub async fn recap_session(
     State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<RecapResponse>> {
     let session_id = super::hosts::session_id_param(&params)?;
+    if !has_user_messages(&state, &session_id).await {
+        return Ok(Json(RecapResponse { started: false }));
+    }
     request_recap(&state, &session_id);
     Ok(Json(RecapResponse { started: true }))
+}
+
+/// Whether `session_id` holds a user message: an empty session has nothing
+/// to recap.
+async fn has_user_messages(state: &Arc<DaemonState>, session_id: &str) -> bool {
+    crate::session::load_history_from_db(&state.db(), session_id)
+        .await
+        .is_ok_and(|history| {
+            history
+                .messages()
+                .iter()
+                .any(|message| message.role == MessageRole::User)
+        })
 }
 
 /// Starts `session_id`'s recap on its aux slot, superseding whatever aux
