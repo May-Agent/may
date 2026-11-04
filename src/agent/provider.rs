@@ -102,11 +102,16 @@ where
         &self,
         mut request: LLMRequest,
     ) -> impl Stream<Item = Result<LlmEvent, Self::Error>> + Send {
-        futures_lite::stream::once_future(async move {
-            self.redactor.current().await.redact_request(&mut request);
-            self.inner.respond(request)
-        })
-        .flatten()
+        // Boxed here: `flatten` would otherwise embed the provider's
+        // multi-KB response state machine by value in every future that
+        // awaits this stream.
+        Box::pin(
+            futures_lite::stream::once_future(async move {
+                self.redactor.current().await.redact_request(&mut request);
+                self.inner.respond(request)
+            })
+            .flatten(),
+        )
     }
 
     async fn profile(&self) -> Result<ModelProfile, M::Error> {
