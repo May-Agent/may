@@ -1657,6 +1657,16 @@ where
                                             );
                                         }
                                     }
+                                    // A running turn holds the session: the
+                                    // daemon's reason is the answer.
+                                    Err(may_agent::client::DaemonClientError::Status {
+                                        status,
+                                        message,
+                                        ..
+                                    }) if status == hyper::StatusCode::CONFLICT => {
+                                        app.set_status("");
+                                        app.chat.push_notice(&message);
+                                    }
                                     Err(error) => app.chat.push_error(&error.to_string()),
                                 }
                             }
