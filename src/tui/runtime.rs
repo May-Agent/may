@@ -128,13 +128,14 @@ pub enum ResponseCommit<R> {
     Withdrawn,
 }
 
-/// Answers as `POST /api/ask-user/respond` takes them.
+/// Answers as `POST /api/ask-user/respond` takes them. A skipped answer is
+/// the user declining to give a secret.
 fn answers_json(answers: &[QuestionAnswer]) -> serde_json::Value {
     use crate::ask_user::AnswerValue;
     serde_json::Value::Array(
         answers
             .iter()
-            .filter_map(|answer| {
+            .map(|answer| {
                 let value = match &answer.answer {
                     AnswerValue::Selected(values) => {
                         serde_json::json!({ "kind": "selected", "values": values })
@@ -142,9 +143,9 @@ fn answers_json(answers: &[QuestionAnswer]) -> serde_json::Value {
                     AnswerValue::Custom(text) => {
                         serde_json::json!({ "kind": "custom", "text": text })
                     }
-                    AnswerValue::Skipped => return None,
+                    AnswerValue::Skipped => serde_json::json!({ "kind": "declined" }),
                 };
-                Some(serde_json::json!({ "section": answer.section, "answer": value }))
+                serde_json::json!({ "section": answer.section, "answer": value })
             })
             .collect(),
     )
