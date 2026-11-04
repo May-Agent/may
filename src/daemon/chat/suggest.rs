@@ -49,17 +49,16 @@ pub(super) fn maybe_suggest(state: &Arc<DaemonState>, session_id: &str) {
         session_id,
         |request_id| async move {
             let text = generate(&task_state, &task_session).await;
-            // A superseding request aborted this task before it could
-            // publish; whatever survives still owns the session's slot.
-            if task_state.aux_tasks.is_current(&task_session, request_id) {
-                match text.as_deref() {
+            // Only the task that still owns the session's slot publishes,
+            // ordered against a cancelling turn by the slot's lock.
+            task_state
+                .aux_tasks
+                .commit(&task_session, request_id, || match text.as_deref() {
                     Some(text) => {
                         publish(&task_state, &task_session, request_id, "ready", Some(text));
                     }
                     None => publish(&task_state, &task_session, request_id, "cleared", None),
-                }
-                task_state.aux_tasks.clear(&task_session, request_id);
-            }
+                });
         },
         &state.tokio_handle,
     );
@@ -68,8 +67,9 @@ pub(super) fn maybe_suggest(state: &Arc<DaemonState>, session_id: &str) {
 /// Cancels `session_id`'s in-flight suggestion, if any, and broadcasts
 /// `cleared`: every new turn supersedes whatever a composer may show.
 pub(super) fn cancel(state: &Arc<DaemonState>, session_id: &str) {
-    state.aux_tasks.cancel(session_id);
-    publish(state, session_id, 0, "cleared", None);
+    state.aux_tasks.cancel(session_id, || {
+        publish(state, session_id, 0, "cleared", None);
+    });
 }
 
 async fn generate(state: &Arc<DaemonState>, session_id: &str) -> Option<String> {

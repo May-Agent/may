@@ -61,7 +61,7 @@ async fn suggestion_runs_for_a_warm_cache_until_it_goes_cold() {
         state.aux_tasks.is_current(SESSION, 0),
         "a warm cache starts the aux request"
     );
-    state.aux_tasks.cancel(SESSION);
+    state.aux_tasks.cancel(SESSION, || {});
 
     clock.advance(HOUR);
     super::suggest::maybe_suggest(&state, SESSION);
