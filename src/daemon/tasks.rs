@@ -45,11 +45,13 @@ pub(super) struct ScheduledTaskResponse {
 }
 
 impl ScheduledTaskResponse {
-    fn from_model(m: crate::db::entity::scheduled_tasks::Model) -> Self {
+    /// `funnel_base` is the Funnel base URL while Funnel exposes webhooks.
+    fn from_model(m: crate::db::entity::scheduled_tasks::Model, funnel_base: Option<&str>) -> Self {
         let trigger = m
             .persisted_trigger()
             .expect("scheduled task trigger must remain valid")
-            .response(m.run_at.clone(), m.cron_expression.clone());
+            .response(m.run_at.clone(), m.cron_expression.clone())
+            .with_funnel_base(funnel_base);
         Self {
             id: m.id,
             profile_id: m.profile_id,
@@ -233,10 +235,11 @@ pub(super) async fn list_tasks(
         .list_scheduled_tasks(None)
         .await
         .map_err(internal_error)?;
+    let funnel = state.remote_access_manager.snapshot().funnel_url;
     Ok(Json(
         tasks
             .into_iter()
-            .map(ScheduledTaskResponse::from_model)
+            .map(|task| ScheduledTaskResponse::from_model(task, funnel.as_deref()))
             .collect(),
     ))
 }
@@ -333,7 +336,8 @@ async fn run_create_task(
         .reload_active_tasks()
         .await
         .map_err(internal_error)?;
-    Ok(ScheduledTaskResponse::from_model(model))
+    let funnel = state.remote_access_manager.snapshot().funnel_url;
+    Ok(ScheduledTaskResponse::from_model(model, funnel.as_deref()))
 }
 
 pub(super) async fn get_task(
@@ -349,7 +353,11 @@ pub(super) async fn get_task(
         .map_err(internal_error)?
         .ok_or_else(|| bad_request_error("Task not found"))?;
 
-    Ok(Json(ScheduledTaskResponse::from_model(model)))
+    let funnel = state.remote_access_manager.snapshot().funnel_url;
+    Ok(Json(ScheduledTaskResponse::from_model(
+        model,
+        funnel.as_deref(),
+    )))
 }
 
 pub(super) async fn update_task(
@@ -480,7 +488,8 @@ async fn run_update_task(
         .map_err(internal_error)?
         .ok_or_else(|| bad_request_error("Task not found"))?;
 
-    Ok(ScheduledTaskResponse::from_model(model))
+    let funnel = state.remote_access_manager.snapshot().funnel_url;
+    Ok(ScheduledTaskResponse::from_model(model, funnel.as_deref()))
 }
 
 pub(super) async fn delete_task(
