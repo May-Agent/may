@@ -4856,15 +4856,20 @@ mod tests {
 
         let (mut sink, notes) = TestSink::noting();
         // The hold comes only after the provider client's own backoff sleeps
-        // and the turn's setup, both of which stretch with host load, so no
-        // wall-clock bound stands in for the event: the test waits for the
-        // note, and fails at once if the turn ends without ever holding.
+        // and the turn's setup, both of which stretch with host load: the
+        // test waits for the note itself and fails at once if the turn ends
+        // without ever holding. The bound only catches a hang, far above the
+        // seconds this takes on a loaded host.
         let turn = run_prompt_turn(&state, &mut sink);
         tokio::pin!(turn);
-        let note = tokio::select! {
-            note = notes.recv() => note.expect("notes"),
-            result = &mut turn => panic!("the turn ended without holding for the network: {result:?}"),
-        };
+        let note = tokio::time::timeout(std::time::Duration::from_secs(300), async {
+            tokio::select! {
+                note = notes.recv() => note.expect("notes"),
+                result = &mut turn => panic!("the turn ended without holding for the network: {result:?}"),
+            }
+        })
+        .await
+        .expect("the turn holds for the network within five minutes");
         assert_eq!(note, Note::Hold(crate::client::HoldReason::Network));
         // Holding means the turn is parked: nothing else happens until the
         // network returns.
