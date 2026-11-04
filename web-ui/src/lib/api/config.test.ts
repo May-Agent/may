@@ -66,6 +66,8 @@ function makeConfig(): UiFullConfig {
       tailscaleBinary: 'tailscale',
       httpsPort: 443,
       allowLocalEnvironment: false,
+      funnel: false,
+      funnelPort: 443,
       allowedLogins: [],
     },
     sandbox: { commandPriority: 'low' },

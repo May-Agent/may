@@ -527,7 +527,7 @@ export interface WebhookSignature {
 export type TaskTriggerResponse =
   | { kind: 'time'; triggerType: TimeTriggerType; runAtUtc?: string | null; cronUtc?: string | null }
   | { kind: 'event'; eventName: string }
-  | { kind: 'webhook'; token: string; webhookPath: string; signature?: WebhookSignature | null };
+  | { kind: 'webhook'; token: string; webhookPath: string; publicUrl?: string | null; signature?: WebhookSignature | null };
 
 export interface ScheduledTaskResponse {
   id: string;
@@ -682,6 +682,8 @@ export interface RemoteAccessStatusResponse {
   state: RemoteAccessState;
   enabled: boolean;
   publicUrl?: string | null;
+  /** Internet-facing base URL of the webhook routes, while Funnel is on. */
+  funnelUrl?: string | null;
   lastError?: string | null;
   recentLogs: string[];
   /** Absent until the daemon first resolves the allow-list. */

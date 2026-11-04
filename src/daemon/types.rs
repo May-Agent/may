@@ -450,6 +450,9 @@ pub struct RemoteAccessStatusResponse {
     pub(crate) enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) public_url: Option<String>,
+    /// The internet-facing base URL of the webhook routes, while Funnel is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) funnel_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) last_error: Option<String>,
     #[serde(default)]
@@ -1527,6 +1530,16 @@ pub struct UiRemoteAccessConfig {
     /// Tailscale logins accepted for remote access besides the login owning
     /// this node, which is always accepted.
     pub(crate) allowed_logins: Vec<String>,
+    /// Whether Tailscale Funnel exposes the webhook routes to the internet.
+    #[serde(default)]
+    pub(crate) funnel: bool,
+    /// Funnel HTTPS port: 443, 8443 or 10000.
+    #[serde(default = "default_funnel_port")]
+    pub(crate) funnel_port: u16,
+}
+
+const fn default_funnel_port() -> u16 {
+    443
 }
 
 impl From<&RemoteAccessConfig> for UiRemoteAccessConfig {
@@ -1537,6 +1550,8 @@ impl From<&RemoteAccessConfig> for UiRemoteAccessConfig {
             https_port: value.https_port,
             allow_local_environment: value.allow_local_environment,
             allowed_logins: value.allowed_logins.clone(),
+            funnel: value.funnel,
+            funnel_port: value.funnel_port,
         }
     }
 }
