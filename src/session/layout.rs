@@ -101,6 +101,21 @@ impl MayHomePaths {
         self.tools_dir().join("runtimes")
     }
 
+    /// Working directory of one local task whose script is inline: its own
+    /// directory, outside [`Self::tools_dir`] and the rest of the may home's
+    /// state.
+    #[must_use]
+    pub fn inline_task_dir(&self, task_id: &str) -> PathBuf {
+        self.root.join("task-workdirs").join(task_id)
+    }
+
+    /// Working directory a scheduled task's inline script is validated in,
+    /// before any task exists.
+    #[must_use]
+    pub fn task_validation_dir(&self) -> PathBuf {
+        self.root.join("task-validation")
+    }
+
     /// Browser runtime directory.
     #[must_use]
     pub fn browser_dir(&self) -> PathBuf {
