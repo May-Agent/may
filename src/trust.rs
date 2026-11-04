@@ -273,6 +273,7 @@ pub fn question_for(
             question,
             option: options,
             multi_select: false,
+            secret: None,
         }],
     }
 }

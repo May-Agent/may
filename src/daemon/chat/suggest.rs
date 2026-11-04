@@ -47,37 +47,65 @@ pub(super) fn maybe_suggest(state: &Arc<DaemonState>, session_id: &str) {
     let task_session = session_id.to_string();
     state.aux_tasks.start(
         session_id,
+        super::aux::AuxKind::Suggestion,
         |request_id| async move {
             let text = generate(&task_state, &task_session).await;
-            // A superseding request aborted this task before it could
-            // publish; whatever survives still owns the session's slot.
-            if task_state.aux_tasks.is_current(&task_session, request_id) {
-                match text.as_deref() {
+            // Only the task that still owns the session's slot publishes,
+            // ordered against a cancelling turn by the slot's lock. The
+            // setting is read live: a suggestion never appears under a
+            // disabled setting.
+            task_state.aux_tasks.commit(&task_session, request_id, || {
+                let text = text
+                    .as_deref()
+                    .filter(|_| task_state.config.load().suggestions.enabled);
+                match text {
                     Some(text) => {
                         publish(&task_state, &task_session, request_id, "ready", Some(text));
                     }
                     None => publish(&task_state, &task_session, request_id, "cleared", None),
                 }
-                task_state.aux_tasks.clear(&task_session, request_id);
-            }
+            });
         },
         &state.tokio_handle,
     );
 }
 
+/// Applies the live `[suggestions]` setting: once disabled, every
+/// suggestion in flight is cancelled and its composer cleared.
+pub(super) fn apply_settings(state: &Arc<DaemonState>) {
+    if !state.config.load().suggestions.enabled {
+        state
+            .aux_tasks
+            .cancel_kind(super::aux::AuxKind::Suggestion, |session_id| {
+                publish(state, session_id, 0, "cleared", None);
+            });
+    }
+}
+
 /// Cancels `session_id`'s in-flight suggestion, if any, and broadcasts
 /// `cleared`: every new turn supersedes whatever a composer may show.
 pub(super) fn cancel(state: &Arc<DaemonState>, session_id: &str) {
-    state.aux_tasks.cancel(session_id);
-    publish(state, session_id, 0, "cleared", None);
+    state.aux_tasks.cancel(session_id, || {
+        publish(state, session_id, 0, "cleared", None);
+    });
 }
 
 async fn generate(state: &Arc<DaemonState>, session_id: &str) -> Option<String> {
-    let mut messages = super::aux::history_messages(state, session_id).await.ok()?;
+    let mut messages = match super::aux::context_messages(state, session_id).await {
+        Ok(messages) => messages,
+        Err(error) => {
+            tracing::warn!(%session_id, %error, "suggestion: reading the agent context failed");
+            return None;
+        }
+    };
     messages.push(aither_core::llm::Message::user(PROMPT));
-    let response = super::aux::run(state, session_id, messages, GENERATION_TIMEOUT)
-        .await
-        .ok()?;
+    let response = match super::aux::run(state, session_id, messages, GENERATION_TIMEOUT).await {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(%session_id, %error, "suggestion: the request failed");
+            return None;
+        }
+    };
     super::aux::parse_strict::<GeneratedSuggestion>(&response, SUGGESTION_MAX_CHARS)?.suggestion
 }
 

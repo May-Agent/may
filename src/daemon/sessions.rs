@@ -347,6 +347,23 @@ pub(super) async fn set_session_plan_state(
     }))
 }
 
+/// Set the session's yolo switch; it applies to the next approval request.
+pub(super) async fn set_session_yolo(
+    params: Params,
+    Json(payload): Json<super::types::SessionYoloRequest>,
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<super::types::SessionYoloResponse>> {
+    let id = params.get("id").map_err(bad_request_error)?.to_string();
+    let runtime = state
+        .runtime_service
+        .set_yolo(&id, payload.yolo)
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(super::types::SessionYoloResponse {
+        yolo: runtime.yolo,
+    }))
+}
+
 pub(super) async fn save_session_tasks(
     params: Params,
     Json(payload): Json<SessionTasksPayload>,
@@ -680,6 +697,13 @@ pub(super) async fn delete_session(
             }
         }
     }
+    // The session's own secrets go first: a keychain failure keeps the
+    // session, so the delete can be retried instead of orphaning them.
+    let secrets = crate::secrets::SecretStore::new(&state.may_dir);
+    let session_id = id.clone();
+    blocking::unblock(move || secrets.remove_session(&session_id))
+        .await
+        .map_err(internal_error)?;
     db.delete_session(&id).await.map_err(internal_error)?;
     state.parked_agents.evict(&id);
     state.runtime_service.forget_terminal_grants(&id);
@@ -729,6 +753,10 @@ pub(super) async fn delete_all_sessions(
                 .await;
         }
     }
+    let secrets = crate::secrets::SecretStore::new(&state.may_dir);
+    blocking::unblock(move || secrets.remove_all_sessions())
+        .await
+        .map_err(internal_error)?;
     db.delete_all_sessions().await.map_err(internal_error)?;
     state.runtime_service.forget_all_terminal_grants();
     state.tool_environments.evict_all();

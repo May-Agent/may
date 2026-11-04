@@ -19,6 +19,13 @@ use tokio::process::Command;
 #[cfg(target_os = "macos")]
 use zenwave::ResponseExt;
 
+/// How long a socket probe waits for the runtime to answer its ping.
+const DOCKER_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The per-request timeout of the client kept for container operations:
+/// bollard's own default.
+const DOCKER_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Error type for container operations.
 #[derive(Debug, thiserror::Error)]
 pub enum ContainerError {
@@ -314,10 +321,18 @@ impl ContainerRuntime {
             return None;
         };
         // `connect_with_socket` dials a Unix socket on Unix and a named pipe
-        // on Windows.
-        let client = Docker::connect_with_socket(endpoint, 5, bollard::API_DEFAULT_VERSION).ok()?;
+        // on Windows. bollard applies one timeout to every request, so only
+        // the probe gets the short one: creating or starting a container on
+        // a busy host can take longer.
+        let client = Docker::connect_with_socket(
+            endpoint,
+            DOCKER_REQUEST_TIMEOUT.as_secs(),
+            bollard::API_DEFAULT_VERSION,
+        )
+        .ok()?;
+        let probe = client.clone().with_timeout(DOCKER_PROBE_TIMEOUT);
 
-        match client.ping().await {
+        match probe.ping().await {
             Ok(_) => Some(Self { kind, client }),
             Err(e) => {
                 tracing::debug!(socket = %socket_path.display(), error = %e, "Runtime socket ping failed");

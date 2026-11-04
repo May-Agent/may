@@ -342,7 +342,7 @@ pub struct App {
     /// when the agent worker installs).
     pub background: Option<crate::client::background::RemoteBackground>,
     /// Model clone for `/btw` side questions (outside conversation history).
-    pub btw_llm: Option<crate::agent::RequestParameterizedModel<aither_cloud::CloudProvider>>,
+    pub btw_llm: Option<crate::agent::RequestParameterizedModel<crate::agent::ProviderLlm>>,
     /// Daemon that answers `/btw` when the agent runs there.
     pub btw_daemon: Option<crate::client::DaemonClient>,
     /// Right sidebar: task tree, linked issues (background lists come
@@ -2003,14 +2003,19 @@ impl App {
                 }
             }
             AppMode::AskUser(_) => {
-                if let AppMode::AskUser(state) = &mut self.mode
-                    && let Some(qs) = state.current_state_mut()
-                    && qs.custom_mode
-                {
-                    return Some(ActiveTextInput::Simple {
-                        input: &mut qs.custom_text,
-                        filter: PasteFilter::Any,
-                    });
+                if let AppMode::AskUser(state) = &mut self.mode {
+                    let secret = state.current_secret().is_some();
+                    if let Some(qs) = state.current_state_mut()
+                        && (qs.custom_mode || secret)
+                    {
+                        if secret {
+                            qs.declined = false;
+                        }
+                        return Some(ActiveTextInput::Simple {
+                            input: &mut qs.custom_text,
+                            filter: PasteFilter::Any,
+                        });
+                    }
                 }
             }
             // FilePicker is handled separately (has its own insert_str method)
@@ -3168,6 +3173,7 @@ impl App {
             "/quit" => self.request_quit(),
             "/compact" => Some(SendAction::Compact(None)),
             "/recap" => Some(SendAction::Recap),
+            "/yolo" => Some(SendAction::ToggleYolo),
             "/context" => Some(SendAction::ContextReport),
             "/usage" => Some(SendAction::UsageReport),
             "/context dump" => Some(SendAction::ContextDump),
@@ -4164,6 +4170,8 @@ pub enum SendAction {
     EnqueuePending(PendingMessage),
     /// Ask the daemon for a catch-up recap of the session.
     Recap,
+    /// Flip the session's yolo switch.
+    ToggleYolo,
     /// Show an open question of the session in the answer modal.
     OpenQuestions,
     /// Reload the session's history, which turns this client missed
@@ -4349,7 +4357,7 @@ fn btw_message(role: &str, content: impl Into<String>) -> crate::daemon::BtwMess
 
 /// Streams a `/btw` answer from the session's model into the overlay.
 async fn stream_btw_answer(
-    llm: crate::agent::RequestParameterizedModel<aither_cloud::CloudProvider>,
+    llm: crate::agent::RequestParameterizedModel<crate::agent::ProviderLlm>,
     messages: Vec<crate::daemon::BtwMessage>,
     tx: EventSender,
 ) {

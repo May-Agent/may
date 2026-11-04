@@ -8,14 +8,17 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use aither_agent::ask_user::{AskUserArgs, Question};
 use aither_agent::{Block, ContextSource};
 use aither_core::llm::{Tool, ToolContext, ToolResult};
 use askama::Template;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::session::{PersistedAskUserQuestion, PersistedAskUserRequest, SessionRuntimeService};
+use crate::secrets::{SecretScope, SecretStore};
+use crate::session::{
+    PersistedAskUserQuestion, PersistedAskUserRequest, PersistedSecretRequest,
+    SessionRuntimeService,
+};
 
 const ASK_USER_DESCRIPTION: &str = include_str!("../texts/ask_user_description.txt");
 const WITHDRAW_DESCRIPTION: &str = include_str!("../texts/withdraw_ask_user_description.txt");
@@ -26,6 +29,16 @@ const OPEN_QUESTIONS_TAG: &str = "open_questions";
 enum AskUserToolError {
     #[error("ask_user needs a question")]
     NoQuestion,
+    #[error("a secret needs both a name and a scope (global or session)")]
+    IncompleteSecret,
+    #[error("the secret question {question:?} is refused: {source}")]
+    BadSecret {
+        question: String,
+        #[source]
+        source: crate::secrets::SecretError,
+    },
+    #[error("the secret question {0:?} takes only the value: it has no options")]
+    SecretWithOptions(String),
     #[error("failed to persist the question: {0}")]
     Persist(#[source] crate::db::ChatDbError),
     #[error("question {0} is not open: it was already answered or withdrawn")]
@@ -70,14 +83,125 @@ impl AskUserTool {
     }
 }
 
-fn persisted_questions(questions: Vec<Question>) -> Vec<PersistedAskUserQuestion> {
+/// The secret a question collects: the user is asked only for its value.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct SecretSpec {
+    /// Environment variable name the value is stored under and injected as
+    /// into terminal commands: `[A-Za-z_][A-Za-z0-9_]*`.
+    pub name: String,
+    /// `global` reaches every session; `session` only this one and is deleted
+    /// with it.
+    pub scope: SecretScope,
+}
+
+/// A single question of an `ask_user` request.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct AskedQuestion {
+    /// Short section label for navigation.
+    #[serde(default)]
+    pub section: String,
+    /// The question text to display.
+    pub question: String,
+    /// Options to choose from.
+    #[serde(default, alias = "options")]
+    pub option: Vec<String>,
+    /// Allow selecting multiple options.
+    #[serde(default)]
+    pub multi_select: bool,
+    /// Ask for a secret value instead of a choice.
+    #[serde(default)]
+    pub secret: Option<SecretSpec>,
+}
+
+/// The arguments of `ask_user`: one question in the flat fields, or several
+/// in `questions`.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct AskUserArgs {
+    /// The question to ask (for single-question mode).
+    #[serde(default)]
+    pub question: Option<String>,
+    /// Option to choose from (use --option flag for each, repeatable).
+    #[serde(default, alias = "options", alias = "choices")]
+    pub option: Vec<String>,
+    /// Allow selecting multiple options (for single-question mode).
+    #[serde(default)]
+    pub multi_select: bool,
+    /// Single-question mode: ask for a secret stored under this environment
+    /// variable name; needs `secret_scope`.
+    #[serde(default)]
+    pub secret: Option<String>,
+    /// Single-question mode: `global` or `session`.
+    #[serde(default)]
+    pub secret_scope: Option<SecretScope>,
+    /// Multiple questions (JSON array). Overrides the single-question fields
+    /// if set.
+    #[serde(default)]
+    pub questions: Vec<AskedQuestion>,
+}
+
+impl AskUserArgs {
+    /// The questions asked, validated: a secret name is a valid environment
+    /// variable name, and a secret question has no options.
+    fn into_questions(self) -> Result<Vec<AskedQuestion>, AskUserToolError> {
+        let questions = if self.questions.is_empty() {
+            let secret = match (self.secret, self.secret_scope) {
+                (Some(name), Some(scope)) => Some(SecretSpec { name, scope }),
+                (None, None) => None,
+                _ => return Err(AskUserToolError::IncompleteSecret),
+            };
+            self.question
+                .map(|question| AskedQuestion {
+                    section: String::new(),
+                    question,
+                    option: self.option,
+                    multi_select: self.multi_select,
+                    secret,
+                })
+                .into_iter()
+                .collect()
+        } else {
+            self.questions
+        };
+        for question in &questions {
+            if let Some(secret) = &question.secret {
+                SecretStore::validate_name(&secret.name).map_err(|source| {
+                    AskUserToolError::BadSecret {
+                        question: question.question.clone(),
+                        source,
+                    }
+                })?;
+                if !question.option.is_empty() {
+                    return Err(AskUserToolError::SecretWithOptions(
+                        question.question.clone(),
+                    ));
+                }
+            }
+        }
+        Ok(questions)
+    }
+}
+
+fn persisted_questions(questions: Vec<AskedQuestion>) -> Vec<PersistedAskUserQuestion> {
     questions
         .into_iter()
-        .map(|question| PersistedAskUserQuestion {
-            section: question.section,
-            question: question.question,
-            option: question.option,
-            multi_select: question.multi_select,
+        .map(|question| {
+            let secret = question.secret.map(|secret| PersistedSecretRequest {
+                name: secret.name,
+                scope: secret.scope,
+            });
+            // Answers are matched to questions by section, so a secret
+            // question without one is told apart by its name.
+            let section = match (&secret, question.section.is_empty()) {
+                (Some(secret), true) => secret.name.clone(),
+                _ => question.section,
+            };
+            PersistedAskUserQuestion {
+                section,
+                question: question.question,
+                option: question.option,
+                multi_select: question.multi_select && secret.is_none(),
+                secret,
+            }
         })
         .collect()
 }
@@ -99,7 +223,7 @@ impl Tool for AskUserTool {
         args: Self::Arguments,
         _cx: ToolContext,
     ) -> aither_core::Result<Self::Res> {
-        let questions = args.into_questions();
+        let questions = args.into_questions()?;
         if questions.is_empty() {
             return Err(AskUserToolError::NoQuestion.into());
         }
@@ -267,5 +391,45 @@ impl ContextSource for OpenQuestionsContext {
                 .render()
                 .expect("open questions template must render"),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use aither_sandbox::ToolRegistryBuilder;
+
+    use super::{ASK_USER_DESCRIPTION, AskUserTool};
+
+    /// Every `ask_user ...` line of the description is a call the command
+    /// line accepts, parsed against the command's real argument schema.
+    #[tokio::test]
+    async fn every_example_in_the_description_is_accepted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = crate::db::ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("chat db opens");
+        db.create_session("session", None, None)
+            .await
+            .expect("session is created");
+        let runtime = Arc::new(crate::session::SessionRuntimeService::new(
+            db,
+            crate::ui_event_bus::UiEventBus::new(),
+        ));
+        let mut builder = ToolRegistryBuilder::new();
+        builder.configure_tool(AskUserTool::new(runtime, "session"));
+        let registry = builder.build(dir.path().join("outputs"));
+
+        let examples: Vec<&str> = ASK_USER_DESCRIPTION
+            .lines()
+            .filter(|line| line.starts_with("ask_user "))
+            .collect();
+        assert_eq!(examples.len(), 3, "single, several and secret questions");
+        for example in examples {
+            let words = shell_words::split(example).expect("the example is shell syntax");
+            let reply = registry.query_tool_handler("ask_user", &words[1..]).await;
+            assert!(reply.ok, "{example}: {reply:?}");
+        }
     }
 }

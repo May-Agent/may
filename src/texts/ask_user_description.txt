@@ -1,1 +1,8 @@
-Ask the user one or more questions without waiting for the answer. Returns a request_id at once; the answer arrives later as a message, possibly after this run has ended. Mark every task that depends on the answer BLOCKING <request_id> in tasks.md and keep working on the tasks it does not block; an unanswered question is no authorization, so never decide it yourself. Single question: ask_user "Which database?" --option PostgreSQL --option SQLite. Several questions: ask_user --questions '[{"section":"database","question":"Which DB?","option":["PostgreSQL","SQLite"]}]'.
+Ask the user one or more questions without waiting for the answer. Returns a request_id at once; the answer arrives later as a message, possibly after this run has ended. Mark every task that depends on the answer BLOCKING <request_id> in tasks.md and keep working on the tasks it does not block; an unanswered question is no authorization, so never decide it yourself.
+Single question:
+ask_user --question "Which database?" --option PostgreSQL --option SQLite
+Several questions:
+ask_user --questions '[{"section":"database","question":"Which DB?","option":["PostgreSQL","SQLite"]}]'
+To obtain a credential, never ask for the value as plain text: mark the question secret with its environment variable name and scope (in --questions: "secret":{"name":"DEPLOY_TOKEN","scope":"session"}):
+ask_user --question "Deploy token?" --secret DEPLOY_TOKEN --secret-scope session
+The user is asked only for the value, which is stored and reaches your terminal commands as $DEPLOY_TOKEN. Scope session keeps it to this session and deletes it with the session, global makes it available to every session. A secret question has no options; you are told only that the secret was stored or that the user declined.

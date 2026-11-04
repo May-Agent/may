@@ -1,0 +1,1 @@
+Prompt delivered to the session that created task "{{ task_name }}". It starts a turn when the session is idle, or arrives after the current turn.
