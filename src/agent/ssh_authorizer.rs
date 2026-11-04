@@ -3,6 +3,7 @@ use std::sync::Arc;
 use aither_sandbox::{SshAuthorizationError, SshSessionAuthorizer};
 use askama::Template;
 
+use crate::PermissionHistoryMode;
 use crate::ask_user::{
     AnswerValue, AskUserArgs, AskUserBroker, AskUserRequestPayload, QuestionAnswer,
 };
@@ -66,13 +67,19 @@ struct SshInstallPermission<'a> {
 pub struct MaySshAuthorizer {
     broker: AskUserBroker,
     session_id: String,
+    db: crate::db::ChatDb,
 }
 
 impl MaySshAuthorizer {
     /// Create an authorizer for `session_id` sharing `broker`.
-    pub fn new(session_id: impl Into<String>, broker: AskUserBroker) -> Arc<Self> {
+    pub fn new(
+        session_id: impl Into<String>,
+        broker: AskUserBroker,
+        db: crate::db::ChatDb,
+    ) -> Arc<Self> {
         Arc::new(Self {
             broker,
+            db,
             session_id: session_id.into(),
         })
     }
@@ -86,6 +93,19 @@ impl MaySshAuthorizer {
         let question = question
             .render()
             .map_err(|error| SshAuthorizationError::Prompt(error.to_string()))?;
+        // A yolo session grants at once and records it like a user approval.
+        if self
+            .db
+            .session_yolo(&self.session_id)
+            .await
+            .map_err(|error| SshAuthorizationError::Prompt(error.to_string()))?
+        {
+            self.db
+                .append_granted_permission(&self.session_id, PermissionHistoryMode::Ssh, &question)
+                .await
+                .map_err(|error| SshAuthorizationError::Prompt(error.to_string()))?;
+            return Ok(true);
+        }
         let choice = PermissionChoice::new(allow_label);
         let args = AskUserArgs {
             question: Some(question),

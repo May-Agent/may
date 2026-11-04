@@ -488,6 +488,13 @@ async fn run_commands(
                     Err(error) => fail(&event_tx, error.to_string()).await,
                 }
             }
+            WorkerCommand::ContextMessages { event_tx } => {
+                fail(
+                    &event_tx,
+                    "the effective context is read inside the May daemon".to_string(),
+                )
+                .await;
+            }
             WorkerCommand::Run { event_tx, .. } => {
                 fail(
                     &event_tx,

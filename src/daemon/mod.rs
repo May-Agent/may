@@ -26,6 +26,7 @@ mod error_chain;
 mod events;
 mod helpers;
 mod interaction;
+pub use interaction::ASK_USER_NOT_OPEN;
 mod local_url_mapper;
 mod message_mapping;
 mod model_resolution;
@@ -43,7 +44,13 @@ mod tunnel;
 pub(crate) mod types;
 
 #[cfg(test)]
+mod funnel_tests;
+#[cfg(test)]
 mod response_tests;
+#[cfg(test)]
+mod secret_question_tests;
+#[cfg(test)]
+mod yolo_tests;
 
 pub use chat::{
     BtwMessage, BtwRequest, BtwResponse, CompactResponse, ContextDumpResponse, RecapRecord,
@@ -353,6 +360,9 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
     let router = Arc::new(started.router);
     let remote_router = Arc::new(started.remote_router);
     let direct_router = Arc::new(started.direct_router);
+    state
+        .remote_access_manager
+        .set_webhook_router(Arc::new(started.webhook_router));
 
     let config = state.config_snapshot();
     let tcp = options.tcp.unwrap_or_else(|| {
@@ -389,6 +399,7 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
         running: HashMap::new(),
     };
     extra.reconcile(&config.daemon.listen).await;
+    chat::watch_aux_settings(&state);
     let config_state = state.clone();
     let mut config_events = state.ui_event_bus.subscribe();
     tokio::spawn(async move {

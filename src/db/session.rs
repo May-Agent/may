@@ -28,7 +28,7 @@ use super::common::{
 };
 use super::entity::{
     session_pending_permissions, session_pending_workspace, session_plans, session_runtimes,
-    sessions,
+    session_yolo, sessions,
 };
 use super::{ChatDb, ChatDbError, query};
 
@@ -39,6 +39,13 @@ struct PendingAskUserParts {
     open_questions: Vec<PersistedAskUserRequest>,
     questions: Vec<PendingAskUserQuestionRow>,
     options: Vec<PendingAskUserQuestionOptionRow>,
+}
+
+/// The per-session switch rows a runtime summary reads.
+#[derive(Clone, Copy)]
+struct SessionModeRows<'a> {
+    plan: Option<&'a session_plans::Model>,
+    yolo: Option<&'a session_yolo::Model>,
 }
 
 impl ChatDb {
@@ -230,6 +237,16 @@ impl ChatDb {
                         .map(|option| option.value)
                         .collect(),
                     multi_select: question.multi_select,
+                    secret: question.secret_name.map(|name| {
+                        let scope = question
+                            .secret_scope
+                            .as_deref()
+                            .and_then(crate::secrets::SecretScope::parse)
+                            .unwrap_or_else(|| {
+                                panic!("pending secret question {name} has no readable scope")
+                            });
+                        crate::session::PersistedSecretRequest { name, scope }
+                    }),
                 })
                 .collect(),
         }
@@ -242,7 +259,7 @@ impl ChatDb {
         permission_row: Option<session_pending_permissions::Model>,
         workspace_row: Option<session_pending_workspace::Model>,
         ask_user: PendingAskUserParts,
-        plan_row: Option<&session_plans::Model>,
+        mode_rows: SessionModeRows<'_>,
     ) -> Result<SessionRuntimeSummary, ChatDbError> {
         let mut attachments_by_message = attachment_rows.into_iter().fold(
             std::collections::BTreeMap::<i64, Vec<PendingMessageAttachmentRow>>::new(),
@@ -281,10 +298,13 @@ impl ChatDb {
                     .map_or(SessionRuntimeState::Idle.as_str(), |row| row.state.as_str()),
             )?,
             plan_state: parse_session_plan_state(
-                plan_row.map_or(SessionPlanState::Disabled.as_str(), |row| {
-                    row.plan_state.as_str()
-                }),
+                mode_rows
+                    .plan
+                    .map_or(SessionPlanState::Disabled.as_str(), |row| {
+                        row.plan_state.as_str()
+                    }),
             )?,
+            yolo: mode_rows.yolo.is_some_and(|row| row.enabled),
             interactions: SessionInteractionState {
                 browser: BrowserInteractionState {
                     takeover_active: runtime_row
@@ -420,6 +440,7 @@ impl ChatDb {
         )
         .fetch_optional::<session_plans::Model>()
         .await?;
+        let yolo_row = self.session_yolo_row(session_id).await?;
         Self::build_session_runtime_summary(
             runtime_row,
             message_rows,
@@ -432,8 +453,57 @@ impl ChatDb {
                 questions: ask_user_question_rows,
                 options: ask_user_option_rows,
             },
-            plan_row.as_ref(),
+            SessionModeRows {
+                plan: plan_row.as_ref(),
+                yolo: yolo_row.as_ref(),
+            },
         )
+    }
+
+    async fn session_yolo_row(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<session_yolo::Model>, ChatDbError> {
+        Ok(query!(
+            self.db,
+            "SELECT * FROM session_yolo WHERE session_id = ?",
+            session_id
+        )
+        .fetch_optional::<session_yolo::Model>()
+        .await?)
+    }
+
+    /// Whether the session's yolo switch is on.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn session_yolo(&self, session_id: &str) -> Result<bool, ChatDbError> {
+        Ok(self
+            .session_yolo_row(session_id)
+            .await?
+            .is_some_and(|row| row.enabled))
+    }
+
+    /// Set the session's yolo switch.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn set_session_yolo(
+        &self,
+        session_id: &str,
+        enabled: bool,
+    ) -> Result<SessionRuntimeSummary, ChatDbError> {
+        let now = jiff::Timestamp::now().to_string();
+        query!(
+            self.db,
+            "INSERT INTO session_yolo (session_id, enabled, updated_at) VALUES (?, ?, ?) ON CONFLICT(session_id) DO UPDATE SET enabled = excluded.enabled, updated_at = excluded.updated_at",
+            session_id,
+            enabled,
+            now.as_str()
+        )
+        .execute()
+        .await?;
+        self.load_session_runtime_summary(session_id).await
     }
 
     /// List session runtime summaries.
@@ -972,12 +1042,14 @@ impl ChatDb {
                 .map_err(|error| overflow_error("ask-user question ordinal", &error))?;
             query!(
                 tx,
-                "INSERT INTO session_pending_ask_user_questions_v2 (request_id, ordinal, section, question, multi_select) VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO session_pending_ask_user_questions_v2 (request_id, ordinal, section, question, multi_select, secret_name, secret_scope) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 request.id.as_str(),
                 question_ordinal,
                 question.section.as_str(),
                 question.question.as_str(),
-                question.multi_select
+                question.multi_select,
+                question.secret.as_ref().map(|secret| secret.name.as_str()),
+                question.secret.as_ref().map(|secret| secret.scope.as_str())
             )
             .execute()
             .await?;
@@ -1402,6 +1474,7 @@ mod tests {
                 question: "Pick one".to_string(),
                 option: vec!["a".to_string(), "b".to_string()],
                 multi_select: false,
+                secret: None,
             }],
         }
     }

@@ -176,6 +176,9 @@ notify = "8"
 fs_extra = "1.3"
 walkdir = "2"
 sha2 = "0.10"
+hmac = { version = "0.12", default-features = false }
+subtle = { version = "2.6", default-features = false }
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
 
 similar = "3.1.1"
 dunce = "1.0.5"

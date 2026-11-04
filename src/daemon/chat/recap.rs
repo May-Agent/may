@@ -1,8 +1,8 @@
 //! `/recap`: one aux turn over the session's user-visible exchanges writes
 //! a persisted catch-up card — a `recap` history row that never replays
 //! into model context — and broadcasts it as a `session_recap` frame. A
-//! request posted mid-turn queues behind the run guard and summarizes the
-//! finished conversation instead.
+//! request posted mid-turn is refused with a conflict: the running turn holds
+//! the session's agent.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -14,6 +14,7 @@ use skyzen::Result as SkyResult;
 use skyzen::routing::Params;
 use skyzen::utils::{Json, State};
 
+use super::aux::AuxKind;
 use crate::daemon::state::DaemonState;
 use crate::session::MessageRole;
 
@@ -76,11 +77,23 @@ pub async fn recap_session(
     State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<RecapResponse>> {
     let session_id = super::hosts::session_id_param(&params)?;
-    if !has_user_messages(&state, &session_id).await {
-        return Ok(Json(RecapResponse { started: false }));
+    begin_recap(&state, &session_id).await.map(Json)
+}
+
+/// Starts a manual recap, or refuses it while a turn runs: the turn holds
+/// the session's agent, so there is nothing to summarise with until it ends.
+async fn begin_recap(state: &Arc<DaemonState>, session_id: &str) -> SkyResult<RecapResponse> {
+    if state.runtime_service.runs().is_held(session_id) {
+        return Err(skyzen::Error::msg(
+            "a turn is running in this session; run /recap when it finishes",
+        )
+        .set_status(skyzen::StatusCode::CONFLICT));
     }
-    request_recap(&state, &session_id);
-    Ok(Json(RecapResponse { started: true }))
+    if !has_user_messages(state, session_id).await {
+        return Ok(RecapResponse { started: false });
+    }
+    request_recap(state, session_id, AuxKind::ManualRecap);
+    Ok(RecapResponse { started: true })
 }
 
 /// Whether `session_id` holds a user message: an empty session has nothing
@@ -97,36 +110,47 @@ async fn has_user_messages(state: &Arc<DaemonState>, session_id: &str) -> bool {
 }
 
 /// Starts `session_id`'s recap on its aux slot, superseding whatever aux
-/// work was in flight.
-pub(super) fn request_recap(state: &Arc<DaemonState>, session_id: &str) {
+/// work was in flight. An automatic recap is governed by `[recap] auto`,
+/// read live.
+pub(super) fn request_recap(state: &Arc<DaemonState>, session_id: &str, kind: AuxKind) {
     let task_state = Arc::clone(state);
     let task_session = session_id.to_string();
     state.aux_tasks.start(
         session_id,
+        kind,
         |request_id| async move {
             let record = generate(&task_state, &task_session).await;
-            // A superseding request aborted this task before it could
-            // publish; whatever survives still owns the session's slot.
-            if task_state.aux_tasks.is_current(&task_session, request_id) {
-                match record {
+            // The commit is atomic with a cancelling turn. A recap card is
+            // history, so once the task owns the slot, writing the card and
+            // announcing it run as one unit that no later cancellation can
+            // split.
+            let allowed = kind != AuxKind::AutoRecap || task_state.config.load().recap.auto;
+            task_state
+                .aux_tasks
+                .commit(&task_session, request_id, || match record {
+                    // Disabled while generating: nothing is written or sent.
+                    _ if !allowed => {}
                     Some(record) => {
-                        let persisted = persist(&task_state, &task_session, &record).await.is_ok();
-                        if !persisted {
-                            tracing::warn!("failed to persist the recap");
-                        }
-                        publish(
-                            &task_state,
-                            &task_session,
-                            request_id,
-                            if persisted { "ready" } else { "error" },
-                            Some(&record.summary),
-                            record.next_action.as_deref(),
-                        );
+                        let unit_state = Arc::clone(&task_state);
+                        let unit_session = task_session.clone();
+                        task_state.tokio_handle.spawn(async move {
+                            let persisted =
+                                persist(&unit_state, &unit_session, &record).await.is_ok();
+                            if !persisted {
+                                tracing::warn!("failed to persist the recap");
+                            }
+                            publish(
+                                &unit_state,
+                                &unit_session,
+                                request_id,
+                                if persisted { "ready" } else { "error" },
+                                Some(&record.summary),
+                                record.next_action.as_deref(),
+                            );
+                        });
                     }
                     None => publish(&task_state, &task_session, request_id, "error", None, None),
-                }
-                task_state.aux_tasks.clear(&task_session, request_id);
-            }
+                });
         },
         &state.tokio_handle,
     );
@@ -290,15 +314,30 @@ impl RecapSchedules {
         let task_session = session_id.to_string();
         let handle = state.tokio_handle.spawn(async move {
             if idle_with_warm_cache(&warmth, idle, aither_core::time::sleep).await
+                && task_state.config.load().recap.auto
                 && freshness(&task_state, &task_session).await
             {
-                request_recap(&task_state, &task_session);
+                request_recap(&task_state, &task_session, AuxKind::AutoRecap);
             }
             task_state.recap_schedules.schedules().remove(&task_session);
         });
         let previous = self.schedules().insert(session_id.to_string(), handle);
         if let Some(previous) = previous {
             previous.abort();
+        }
+    }
+
+    /// Whether `session_id` has an idle timer pending.
+    #[cfg(test)]
+    pub(super) fn is_armed(&self, session_id: &str) -> bool {
+        self.schedules().contains_key(session_id)
+    }
+
+    /// Drops every idle timer.
+    fn unarm_all(&self) {
+        let handles: Vec<_> = self.schedules().drain().map(|(_, handle)| handle).collect();
+        for handle in handles {
+            handle.abort();
         }
     }
 
@@ -332,6 +371,15 @@ pub(super) fn arm(state: &Arc<DaemonState>, session_id: &str) {
     }
     if let Some(warmth) = super::aux::warm_cache(state, session_id) {
         state.recap_schedules.arm(state, session_id, warmth);
+    }
+}
+
+/// Applies the live `[recap]` setting: once `auto` is off, every armed idle
+/// timer and every automatic generation in flight is dropped.
+pub(super) fn apply_settings(state: &Arc<DaemonState>) {
+    if !state.config.load().recap.auto {
+        state.recap_schedules.unarm_all();
+        state.aux_tasks.cancel_kind(AuxKind::AutoRecap, |_| {});
     }
 }
 
@@ -497,6 +545,32 @@ mod tests {
 
         append(&state, MessageRole::User, "one more").await;
         assert!(freshness(&state, "session").await);
+    }
+
+    #[tokio::test]
+    async fn a_recap_during_a_running_turn_is_refused_as_busy() {
+        let dir = tempfile::tempdir().expect("dir");
+        let state = state_with_session(dir.path()).await;
+        append(&state, MessageRole::User, "question").await;
+
+        let guard = state
+            .runtime_service
+            .runs()
+            .acquire("session")
+            .await
+            .expect("acquire run");
+        let refused = begin_recap(&state, "session")
+            .await
+            .expect_err("a running turn refuses the recap");
+        assert_eq!(refused.status(), skyzen::StatusCode::CONFLICT);
+        assert!(
+            !state.aux_tasks.is_current("session", 0),
+            "no generation started"
+        );
+        guard
+            .finish_idle(crate::session::RunOutcome::Completed)
+            .await
+            .expect("release run");
     }
 
     #[test]

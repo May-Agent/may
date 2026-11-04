@@ -19,7 +19,7 @@ use aither_core::llm::{
     Event as LlmEvent, LLMRequest,
     model::{Ability, OpenAIPromptCache, Parameters, Profile as ModelProfile, ReasoningEffort},
 };
-use futures_lite::Stream;
+use futures_lite::{Stream, StreamExt as _};
 
 use super::may::MayAgentError;
 use crate::SessionId;
@@ -28,6 +28,7 @@ use crate::config::{
 };
 use crate::copilot::clear_copilot_credentials;
 use crate::model_selector::ModelSelector;
+use crate::secrets::SecretRedactor;
 
 const ERR_NO_MODELS: &str = include_str!("../texts/agent_err_no_models.txt");
 
@@ -70,6 +71,58 @@ fn resolve_model_selector(
 
     Ok(provider_instance)
 }
+
+/// A [`LanguageModel`] that replaces every stored secret value in a request
+/// with the secret's name before the request reaches the inner model.
+///
+/// The secrets are read when each request is sent, so one added mid-session
+/// applies from its next request. Only `respond` is forwarded: every other
+/// entry point of the trait (tool-carrying and structured requests) is
+/// defined in terms of it, so no request can bypass the redaction.
+#[derive(Debug, Clone)]
+pub struct RedactedModel<M> {
+    inner: M,
+    redactor: SecretRedactor,
+}
+
+impl<M> RedactedModel<M> {
+    /// Wraps `inner`, redacting the secrets `redactor` reads.
+    pub const fn new(inner: M, redactor: SecretRedactor) -> Self {
+        Self { inner, redactor }
+    }
+}
+
+impl<M> LanguageModel for RedactedModel<M>
+where
+    M: LanguageModel,
+{
+    type Error = M::Error;
+
+    fn respond(
+        &self,
+        mut request: LLMRequest,
+    ) -> impl Stream<Item = Result<LlmEvent, Self::Error>> + Send {
+        // Boxed here: `flatten` would otherwise embed the provider's
+        // multi-KB response state machine by value in every future that
+        // awaits this stream.
+        Box::pin(
+            futures_lite::stream::once_future(async move {
+                self.redactor.current().await.redact_request(&mut request);
+                self.inner.respond(request)
+            })
+            .flatten(),
+        )
+    }
+
+    async fn profile(&self) -> Result<ModelProfile, M::Error> {
+        self.inner.profile().await
+    }
+}
+
+/// The model every provider client is built as: a [`CloudProvider`] behind
+/// secret redaction. [`build_cloud_provider_from_instance`] is the only
+/// constructor, so no request leaves May without passing it.
+pub type ProviderLlm = RedactedModel<CloudProvider>;
 
 /// Wraps a base [`LanguageModel`] so every request carries a pinned
 /// [`Parameters`] struct (temperature, max tokens, reasoning effort, ...).
@@ -267,7 +320,7 @@ pub struct ResolvedProviderRuntime {
     /// Resolved provider identifier.
     pub provider_id: String,
     /// Configured LLM client for the provider.
-    pub llm: CloudProvider,
+    pub llm: ProviderLlm,
 }
 
 /// Resolve a model selector against `may_config` into a usable provider
@@ -281,6 +334,7 @@ pub async fn resolve_provider_runtime(
     may_config: &MayConfig,
     selector: &ModelSelector,
     provider_attempt: usize,
+    redactor: &SecretRedactor,
 ) -> Result<ResolvedProviderRuntime, MayAgentError> {
     let candidates = provider_candidates(may_config, selector);
     let Some((provider_id, provider_instance)) = candidates.get(provider_attempt) else {
@@ -288,9 +342,13 @@ pub async fn resolve_provider_runtime(
             selector.model_id(),
         )));
     };
-    let llm =
-        build_cloud_provider_from_instance(provider_id, provider_instance, selector.model_id())
-            .await?;
+    let llm = build_cloud_provider_from_instance(
+        provider_id,
+        provider_instance,
+        selector.model_id(),
+        redactor,
+    )
+    .await?;
 
     Ok(ResolvedProviderRuntime {
         provider_id: provider_id.clone(),
@@ -306,11 +364,11 @@ pub async fn resolve_provider_runtime(
 #[derive(Debug, Clone, Default)]
 pub struct AskTierModels {
     /// Model for the flagship (`Advanced`) tier.
-    pub flagship: Option<RequestParameterizedModel<CloudProvider>>,
+    pub flagship: Option<RequestParameterizedModel<ProviderLlm>>,
     /// Model for the balanced tier.
-    pub balanced: Option<RequestParameterizedModel<CloudProvider>>,
+    pub balanced: Option<RequestParameterizedModel<ProviderLlm>>,
     /// Model for the fast tier.
-    pub fast: Option<RequestParameterizedModel<CloudProvider>>,
+    pub fast: Option<RequestParameterizedModel<ProviderLlm>>,
 }
 
 /// Resolves per-tier models for the `ask` command from the configured tier
@@ -326,6 +384,7 @@ pub async fn resolve_ask_tier_models(
     session_provider_id: &str,
     session_model_id: &str,
     session_id: &SessionId,
+    redactor: &SecretRedactor,
 ) -> Result<AskTierModels, MayAgentError> {
     let (flagship, balanced, fast) = futures_util::future::try_join3(
         resolve_ask_tier_model(
@@ -334,6 +393,7 @@ pub async fn resolve_ask_tier_models(
             session_provider_id,
             session_model_id,
             session_id,
+            redactor,
         ),
         resolve_ask_tier_model(
             config,
@@ -341,6 +401,7 @@ pub async fn resolve_ask_tier_models(
             session_provider_id,
             session_model_id,
             session_id,
+            redactor,
         ),
         resolve_ask_tier_model(
             config,
@@ -348,6 +409,7 @@ pub async fn resolve_ask_tier_models(
             session_provider_id,
             session_model_id,
             session_id,
+            redactor,
         ),
     )
     .await?;
@@ -368,7 +430,8 @@ async fn resolve_ask_tier_model(
     session_provider_id: &str,
     session_model_id: &str,
     session_id: &SessionId,
-) -> Result<Option<RequestParameterizedModel<CloudProvider>>, MayAgentError> {
+    redactor: &SecretRedactor,
+) -> Result<Option<RequestParameterizedModel<ProviderLlm>>, MayAgentError> {
     let Some(selector) = config.default_model_for_tier(tier) else {
         return Ok(None);
     };
@@ -382,13 +445,14 @@ async fn resolve_ask_tier_model(
              which is not configured"
         )));
     };
-    let llm = build_cloud_provider_from_instance(provider_id, instance, selector.model_id())
-        .await
-        .map_err(|error| {
-            MayAgentError::Llm(format!(
-                "failed to build ask {tier:?} tier model '{selector}': {error}"
-            ))
-        })?;
+    let llm =
+        build_cloud_provider_from_instance(provider_id, instance, selector.model_id(), redactor)
+            .await
+            .map_err(|error| {
+                MayAgentError::Llm(format!(
+                    "failed to build ask {tier:?} tier model '{selector}': {error}"
+                ))
+            })?;
     Ok(Some(RequestParameterizedModel::new(
         llm,
         request_parameters_for(
@@ -414,7 +478,8 @@ pub async fn resolve_compaction_model(
     session_provider_id: &str,
     session_model_id: &str,
     session_id: &SessionId,
-) -> Result<Option<RequestParameterizedModel<CloudProvider>>, MayAgentError> {
+    redactor: &SecretRedactor,
+) -> Result<Option<RequestParameterizedModel<ProviderLlm>>, MayAgentError> {
     let Some(selector) = config.models.compaction_model.as_ref() else {
         return Ok(None);
     };
@@ -428,13 +493,14 @@ pub async fn resolve_compaction_model(
              which is not configured"
         )));
     };
-    let llm = build_cloud_provider_from_instance(provider_id, instance, selector.model_id())
-        .await
-        .map_err(|error| {
-            MayAgentError::Llm(format!(
-                "failed to build compaction model '{selector}': {error}"
-            ))
-        })?;
+    let llm =
+        build_cloud_provider_from_instance(provider_id, instance, selector.model_id(), redactor)
+            .await
+            .map_err(|error| {
+                MayAgentError::Llm(format!(
+                    "failed to build compaction model '{selector}': {error}"
+                ))
+            })?;
     Ok(Some(RequestParameterizedModel::new(
         llm,
         request_parameters_for(
@@ -462,6 +528,7 @@ pub async fn resolve_compaction_model(
 /// earlier.
 pub async fn build_fast_provider_chain(
     config: &MayConfig,
+    redactor: &SecretRedactor,
 ) -> Result<Vec<crate::memory::MemoryExtractionProvider>, MayAgentError> {
     let mut selectors = Vec::new();
     let mut seen = HashSet::new();
@@ -492,7 +559,13 @@ pub async fn build_fast_provider_chain(
             panic!("configured model selector referenced unknown provider '{provider_id}'");
         };
 
-        match build_cloud_provider_from_instance(&provider_id, instance, selector.model_id()).await
+        match build_cloud_provider_from_instance(
+            &provider_id,
+            instance,
+            selector.model_id(),
+            redactor,
+        )
+        .await
         {
             Ok(llm) => built.push(crate::memory::MemoryExtractionProvider {
                 provider_id: provider_id.clone(),
@@ -519,12 +592,14 @@ pub async fn build_fast_provider_chain(
     Ok(built)
 }
 
-/// Build a `CloudProvider` from a `ProviderInstance` directly.
+/// Build a `CloudProvider` from a `ProviderInstance` directly, behind the
+/// secret redaction of `redactor`.
 pub(super) async fn build_cloud_provider_from_instance(
     id: &str,
     instance: &ProviderInstance,
     model: &str,
-) -> Result<CloudProvider, MayAgentError> {
+    redactor: &SecretRedactor,
+) -> Result<ProviderLlm, MayAgentError> {
     let provider_type = instance.resolve_type(id);
     let api_key = instance.api_key.as_deref().unwrap_or("");
     let base_url = instance.effective_base_url(id);
@@ -652,7 +727,7 @@ pub(super) async fn build_cloud_provider_from_instance(
         }
     };
 
-    Ok(llm)
+    Ok(RedactedModel::new(llm, redactor.clone()))
 }
 
 fn is_copilot_unauthorized(err: &crate::copilot::CopilotTokenError) -> bool {
@@ -881,6 +956,7 @@ mod tests {
             "google",
             "gemini-3-flash-preview",
             &SessionId::new(),
+            &SecretRedactor::new(std::path::Path::new("/nonexistent")),
         )
         .await
         .expect("tier models resolve");
@@ -916,6 +992,7 @@ mod tests {
             "google",
             "gemini-3-flash-preview",
             &SessionId::new(),
+            &SecretRedactor::new(std::path::Path::new("/nonexistent")),
         )
         .await
         .expect_err("an unknown tier provider must fail resolution");

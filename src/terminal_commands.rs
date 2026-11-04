@@ -259,15 +259,15 @@ where
     }
 
     if let Some(task_broker) = config.task_broker {
-        register_tool_with_description(
-            builder,
-            &mut descriptions,
-            TaskTool::new(
-                config.session_id.clone(),
-                config.task_runtime,
-                Some(task_broker),
-            ),
+        // A task belongs to the session's main agent: the prompt its runs
+        // inject wakes that agent, so a subagent cannot create one.
+        let task = TaskTool::new(
+            config.session_id.clone(),
+            config.task_runtime,
+            Some(task_broker),
         );
+        describe_tool(&mut descriptions, &task);
+        builder.main_only(|reserved| reserved.configure_tool(task));
     }
 
     if let Some(notify_broker) = config.notify_broker {
@@ -916,6 +916,55 @@ mod tests {
             .await
             .expect("waited 5s for the peer to be woken by the main agent's send")
             .expect("wake channel stays open");
+    }
+
+    #[tokio::test]
+    async fn task_is_a_main_agent_command_a_subagent_terminal_lacks() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_dir = temp.path().join("sessions/session-1");
+        let (task_broker, _queue) = crate::agent::task_tool::channel();
+        let mut builder = ToolRegistryBuilder::new();
+
+        register_shared_terminal_commands(
+            &mut builder,
+            SharedTerminalCommandConfig {
+                #[cfg(target_os = "macos")]
+                computer: None,
+                llm: MockLlm,
+                ask_flagship: None,
+                ask_balanced: None,
+                ask_fast: None,
+                session_id: "session-1".to_string(),
+                may_dir: temp.path().to_path_buf(),
+                sandbox_dir: session_dir.clone(),
+                cwd: PathBuf::from("."),
+                db: None,
+                ask_user: None,
+                imagine: None,
+                task_runtime: TaskRuntimeKind::Local,
+                task_broker: Some(task_broker),
+                notify_broker: None,
+                tunnel_broker: None,
+                browser_broker: None,
+                register_skills_broker: None,
+                workspace_request_broker: None,
+                subagent_runs: aither_agent::specialized::SubagentRuns::default(),
+                subagent_tracker: SubagentTracker::default(),
+                request_parameters: Parameters::default(),
+                issue_store: test_issue_store(temp.path()).await,
+                workspace_config: crate::workspace::WorkspaceConfig::default(),
+                agent_messaging: None,
+                acp: None,
+            },
+        )
+        .await
+        .expect("commands should register");
+        let main = builder.build(session_dir.join("outputs"));
+        let subagent = main.for_subagent(None, None);
+
+        assert!(main.is_tool_configured("task"));
+        assert!(!main.is_reserved("task"));
+        assert!(subagent.is_reserved("task"));
     }
 
     #[tokio::test]

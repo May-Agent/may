@@ -511,6 +511,9 @@ pub struct SessionRuntimeSnapshot {
     pub state: crate::session::SessionRuntimeState,
     /// Plan-mode state.
     pub plan_state: crate::session::SessionPlanState,
+    /// Yolo switch: every approval request is granted at once.
+    #[serde(default)]
+    pub yolo: bool,
     /// Interactive-resource sub-state (browser, terminal).
     pub interactions: SessionInteractionSnapshot,
     /// Messages waiting to be processed.
@@ -541,6 +544,7 @@ impl Default for SessionRuntimeSnapshot {
         Self {
             state: crate::session::SessionRuntimeState::Idle,
             plan_state: crate::session::SessionPlanState::Disabled,
+            yolo: false,
             interactions: SessionInteractionSnapshot::default(),
             queued_count: 0,
             pending_immediate: None,

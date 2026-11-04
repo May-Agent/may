@@ -34,7 +34,13 @@ async fn state_with_idle_agent(
         run_turn(&mut session.agent).await;
     }
     let clock = session.clock.clone();
-    state.parked_agents.park(&state, SESSION, session.agent, 0);
+    state.parked_agents.park(
+        &state,
+        SESSION,
+        session.agent,
+        0,
+        crate::session::RunReleased::already_released(),
+    );
     (state, clock, session.temp)
 }
 
@@ -61,7 +67,7 @@ async fn suggestion_runs_for_a_warm_cache_until_it_goes_cold() {
         state.aux_tasks.is_current(SESSION, 0),
         "a warm cache starts the aux request"
     );
-    state.aux_tasks.cancel(SESSION);
+    state.aux_tasks.cancel(SESSION, || {});
 
     clock.advance(HOUR);
     super::suggest::maybe_suggest(&state, SESSION);
@@ -69,6 +75,80 @@ async fn suggestion_runs_for_a_warm_cache_until_it_goes_cold() {
         !state.aux_tasks.is_current(SESSION, 1),
         "the cache went cold with the clock"
     );
+}
+
+#[tokio::test]
+async fn disabling_suggestions_cancels_the_one_in_flight_and_stops_new_ones() {
+    let dir = tempfile::tempdir().expect("dir");
+    let (state, _clock, _session) = state_with_idle_agent(dir.path(), true).await;
+    super::suggest::maybe_suggest(&state, SESSION);
+    assert!(state.aux_tasks.is_current(SESSION, 0));
+
+    state.update_config(|config| config.suggestions.enabled = false);
+    super::apply_aux_settings(&state);
+    assert!(!state.aux_tasks.is_current(SESSION, 0), "cancelled");
+
+    super::suggest::maybe_suggest(&state, SESSION);
+    assert!(!state.aux_tasks.is_current(SESSION, 1), "nothing starts");
+
+    // Enabling again applies at once, too: the next request id is 1.
+    state.update_config(|config| config.suggestions.enabled = true);
+    super::suggest::maybe_suggest(&state, SESSION);
+    assert!(state.aux_tasks.is_current(SESSION, 1));
+}
+
+#[tokio::test]
+async fn disabling_auto_recap_drops_timers_and_automatic_generations_only() {
+    let dir = tempfile::tempdir().expect("dir");
+    let (state, _clock, _session) = state_with_idle_agent(dir.path(), true).await;
+    let handle = tokio::runtime::Handle::current();
+    super::recap::arm(&state, SESSION);
+    assert!(state.recap_schedules.is_armed(SESSION));
+
+    state.update_config(|config| config.recap.auto = false);
+    super::apply_aux_settings(&state);
+    assert!(!state.recap_schedules.is_armed(SESSION), "timer dropped");
+    super::recap::arm(&state, SESSION);
+    assert!(!state.recap_schedules.is_armed(SESSION), "nothing re-arms");
+
+    // An automatic generation in flight is cancelled; a manual one is not.
+    state.update_config(|config| config.recap.auto = true);
+    let auto = state.aux_tasks.start(
+        SESSION,
+        super::aux::AuxKind::AutoRecap,
+        |_| std::future::pending(),
+        &handle,
+    );
+    state.update_config(|config| config.recap.auto = false);
+    super::apply_aux_settings(&state);
+    assert!(!state.aux_tasks.is_current(SESSION, auto));
+    let manual = state.aux_tasks.start(
+        SESSION,
+        super::aux::AuxKind::ManualRecap,
+        |_| std::future::pending(),
+        &handle,
+    );
+    super::apply_aux_settings(&state);
+    assert!(state.aux_tasks.is_current(SESSION, manual));
+}
+
+#[tokio::test]
+async fn a_config_change_event_applies_the_settings_to_the_running_daemon() {
+    let dir = tempfile::tempdir().expect("dir");
+    let (state, _clock, _session) = state_with_idle_agent(dir.path(), true).await;
+    super::watch_aux_settings(&state);
+    super::recap::arm(&state, SESSION);
+    assert!(state.recap_schedules.is_armed(SESSION));
+
+    state.update_config(|config| config.recap.auto = false);
+    state.notify_ui_events(crate::ui_event_bus::UiEventTopics::CONFIG);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while state.recap_schedules.is_armed(SESSION) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the change disarms the timer without a restart");
 }
 
 #[tokio::test]
