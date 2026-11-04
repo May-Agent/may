@@ -76,7 +76,9 @@ jobs:
       # cache that the tests would take for a prepared one.
       - name: Drop restored test scratch
         shell: bash
-        run: rm -rf target/tmp
+        run: |
+          chmod -R u+w target/tmp 2>/dev/null || true
+          rm -rf target/tmp
       - name: Install heel runtime
         shell: bash
         run: |
