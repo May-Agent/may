@@ -51,6 +51,8 @@ pub enum TuiEvent {
     UsageReport(crate::agent::SessionUsageReport),
     /// Assembled-context dump for `/context dump` is ready.
     ContextDump(Result<ContextDump, aither_agent::AgentError>),
+    /// The agent's effective context, read for a side request.
+    ContextMessages(Result<Vec<aither_core::llm::Message>, aither_agent::AgentError>),
     /// The daemon wrote the `/context dump` to `path`.
     ContextDumpSaved {
         /// Where the dump was written.
@@ -148,6 +150,8 @@ pub(crate) enum WorkerCommand {
     UsageReport { event_tx: Sender<TuiEvent> },
     /// Dump the assembled context for `/context dump`.
     ContextDump { event_tx: Sender<TuiEvent> },
+    /// Read the effective context as request messages.
+    ContextMessages { event_tx: Sender<TuiEvent> },
     /// Run a turn in the daemon (remote workers only).
     Send {
         turn: RemoteTurn,
@@ -307,6 +311,28 @@ impl AgentWorker {
         let (event_tx, event_rx) = unbounded();
         self.command_tx
             .try_send(WorkerCommand::ContextDump { event_tx })
+            .unwrap_or_else(|_| panic!("{}", ERR_WORKER_CHANNEL_CLOSED.trim()));
+        AgentHandle {
+            event_rx,
+            command_tx: self.command_tx.clone(),
+        }
+    }
+
+    /// Request the agent's effective context (system prefix, handoff, kept
+    /// turns) as the messages its next request would carry. Reading changes
+    /// nothing: no runtime block is reconciled and no source is consumed.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the worker command channel is already closed — the worker
+    /// task has stopped unexpectedly.
+    #[must_use]
+    pub fn context_messages(&self) -> AgentHandle {
+        const ERR_WORKER_CHANNEL_CLOSED: &str =
+            include_str!("../texts/agent_worker_channel_closed.txt");
+        let (event_tx, event_rx) = unbounded();
+        self.command_tx
+            .try_send(WorkerCommand::ContextMessages { event_tx })
             .unwrap_or_else(|_| panic!("{}", ERR_WORKER_CHANNEL_CLOSED.trim()));
         AgentHandle {
             event_rx,
@@ -624,6 +650,11 @@ async fn run_worker(
                 let _ = event_tx.send(TuiEvent::ContextDump(dump)).await;
                 let _ = event_tx.send(TuiEvent::Complete).await;
             }
+            WorkerCommand::ContextMessages { event_tx } => {
+                let messages = agent.context_messages().await;
+                let _ = event_tx.send(TuiEvent::ContextMessages(messages)).await;
+                let _ = event_tx.send(TuiEvent::Complete).await;
+            }
             WorkerCommand::Send { event_tx, .. } => {
                 let _ = event_tx
                     .send(TuiEvent::Error(ERR_SEND_IN_PROCESS.to_string()))
@@ -804,7 +835,8 @@ async fn race_against_commands<F: Future>(
                 | WorkerCommand::Release { .. }
                 | WorkerCommand::ContextReport { .. }
                 | WorkerCommand::UsageReport { .. }
-                | WorkerCommand::ContextDump { .. } => deferred.push(command),
+                | WorkerCommand::ContextDump { .. }
+                | WorkerCommand::ContextMessages { .. } => deferred.push(command),
                 WorkerCommand::Compact { event_tx, .. } => {
                     let _ = event_tx
                         .send(TuiEvent::Error(ERR_WORKER_BUSY.trim().to_string()))

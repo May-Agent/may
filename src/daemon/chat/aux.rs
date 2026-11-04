@@ -177,19 +177,26 @@ pub fn warm_cache(state: &DaemonState, session_id: &str) -> Option<aither_agent:
         .filter(aither_agent::CacheWarmth::is_warm)
 }
 
-/// The session's persisted conversation as replay messages — the same
-/// prefix an agent rebuilt from history sees, so provider prefix caches
-/// still hit.
-pub async fn history_messages(
+/// The messages the session's idle agent would send next: its system
+/// prefix, compaction handoff and kept turns. Read without changing the
+/// agent, so the request shares the main agent's cached prefix and carries
+/// nothing a compaction replaced.
+pub async fn context_messages(
     state: &Arc<DaemonState>,
     session_id: &str,
 ) -> Result<Vec<aither_core::llm::Message>, AuxError> {
-    let history = crate::session::load_history_from_db(&state.db(), session_id)
+    let worker = super::hosts::idle_agent(state, session_id)
         .await
         .map_err(|error| AuxError::Session(error.to_string()))?;
-    history
-        .to_aither_messages()
-        .map_err(|error| AuxError::Session(error.to_string()))
+    let handle = worker.context_messages();
+    while let Some(event) = handle.recv().await {
+        if let crate::agent::TuiEvent::ContextMessages(result) = event {
+            return result.map_err(|error| AuxError::Session(error.to_string()));
+        }
+    }
+    Err(AuxError::Session(
+        "the agent stopped before it gave its context".to_string(),
+    ))
 }
 
 /// Streams `messages` through the session's own model via its parked agent
