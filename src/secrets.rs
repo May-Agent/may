@@ -9,6 +9,7 @@
 //! working directory — and masked out of every transcript-facing string.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use aither_core::llm::{
@@ -39,10 +40,64 @@ pub enum SecretError {
     InvalidName(String),
 }
 
+/// Who can read a stored secret.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+    skyzen::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretScope {
+    /// Every session's terminals, like a `/secret KEY VALUE` value.
+    Global,
+    /// Only the terminals of the session that asked for it; it is deleted
+    /// with that session.
+    Session,
+}
+
+impl SecretScope {
+    /// The scope as the database stores it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Session => "session",
+        }
+    }
+
+    /// The scope stored as `value`, or `None` when it names none.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "global" => Some(Self::Global),
+            "session" => Some(Self::Session),
+            _ => None,
+        }
+    }
+}
+
+/// The names index: the global names, and the names each session holds.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Index {
+    #[serde(default)]
+    names: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    sessions: BTreeMap<String, Vec<String>>,
+}
+
 /// Keychain access plus the names index under `~/.may`.
 #[derive(Debug, Clone)]
 pub struct SecretStore {
     index_path: PathBuf,
+    /// Credentials tests keep in memory instead of the OS keychain.
+    #[cfg(test)]
+    memory: Option<std::sync::Arc<std::sync::Mutex<BTreeMap<String, String>>>>,
 }
 
 impl SecretStore {
@@ -51,6 +106,18 @@ impl SecretStore {
     pub fn new(may_dir: &Path) -> Self {
         Self {
             index_path: may_dir.join("secrets.json"),
+            #[cfg(test)]
+            memory: None,
+        }
+    }
+
+    /// Store rooted at `may_dir` whose credentials live in memory, shared by
+    /// its clones, instead of the OS keychain.
+    #[cfg(test)]
+    pub(crate) fn in_memory(may_dir: &Path) -> Self {
+        Self {
+            memory: Some(std::sync::Arc::default()),
+            ..Self::new(may_dir)
         }
     }
 
@@ -73,105 +140,225 @@ impl SecretStore {
     }
 
     /// Read the names index; an absent file means no stored secrets.
-    fn names(&self) -> Vec<String> {
-        #[derive(Deserialize)]
-        struct Index {
-            #[serde(default)]
-            names: Vec<String>,
-        }
+    fn index(&self) -> Index {
         std::fs::read_to_string(&self.index_path)
             .ok()
             .and_then(|content| serde_json::from_str::<Index>(&content).ok())
-            .map(|index| index.names)
             .unwrap_or_default()
     }
 
-    fn write_names(&self, names: &[String]) -> Result<(), SecretError> {
-        #[derive(Serialize)]
-        struct Index<'a> {
-            names: &'a [String],
-        }
+    fn write_index(&self, index: &Index) -> Result<(), SecretError> {
         if let Some(parent) = self.index_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let content = serde_json::to_string_pretty(&Index { names })?;
+        let content = serde_json::to_string_pretty(index)?;
         std::fs::write(&self.index_path, content)?;
         Ok(())
     }
 
-    fn entry(key: &str) -> Result<keyring::Entry, SecretError> {
-        Ok(keyring::Entry::new(SERVICE, key)?)
+    /// Keychain account of `key`: its own name when global, a name no
+    /// environment variable can have when held by a session.
+    fn account(session: Option<&str>, key: &str) -> String {
+        session.map_or_else(|| key.to_string(), |id| format!("session:{id}:{key}"))
     }
 
-    /// Store or update `key = value` in the keychain and index the name.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SecretError`] when the name is not env-var-safe or the
-    /// keychain/index write fails.
-    pub fn set(&self, key: &str, value: &str) -> Result<(), SecretError> {
-        Self::entry(Self::validate_name(key)?)?.set_password(value)?;
-        let mut names = self.names();
-        if !names.iter().any(|name| name == key) {
-            names.push(key.to_string());
-            names.sort();
-            self.write_names(&names)?;
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
+    fn write_credential(&self, account: &str, value: &str) -> Result<(), SecretError> {
+        #[cfg(test)]
+        if let Some(memory) = &self.memory {
+            memory
+                .lock()
+                .expect("test credential map is not poisoned")
+                .insert(account.to_string(), value.to_string());
+            return Ok(());
         }
+        keyring::Entry::new(SERVICE, account)?.set_password(value)?;
         Ok(())
     }
 
-    /// The stored value of `key`, or `None` when no such secret exists.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SecretError`] when the name is invalid or the keychain read fails.
-    pub fn get(&self, key: &str) -> Result<Option<String>, SecretError> {
-        match Self::entry(Self::validate_name(key)?)?.get_password() {
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
+    fn read_credential(&self, account: &str) -> Result<Option<String>, SecretError> {
+        #[cfg(test)]
+        if let Some(memory) = &self.memory {
+            return Ok(memory
+                .lock()
+                .expect("test credential map is not poisoned")
+                .get(account)
+                .cloned());
+        }
+        match keyring::Entry::new(SERVICE, account)?.get_password() {
             Ok(value) => Ok(Some(value)),
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(error) => Err(error.into()),
         }
     }
 
-    /// Remove `key` from the keychain and index. Returns whether it existed.
+    /// Delete the credential `account`; returns whether it existed.
+    #[cfg_attr(not(test), allow(clippy::unused_self))]
+    fn delete_credential(&self, account: &str) -> Result<bool, SecretError> {
+        #[cfg(test)]
+        if let Some(memory) = &self.memory {
+            return Ok(memory
+                .lock()
+                .expect("test credential map is not poisoned")
+                .remove(account)
+                .is_some());
+        }
+        match keyring::Entry::new(SERVICE, account)?.delete_credential() {
+            Ok(()) => Ok(true),
+            Err(keyring::Error::NoEntry) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Store or update `key = value` for `session` (global when `None`) in
+    /// the keychain and index the name.
+    fn store(&self, session: Option<&str>, key: &str, value: &str) -> Result<(), SecretError> {
+        Self::validate_name(key)?;
+        self.write_credential(&Self::account(session, key), value)?;
+        let mut index = self.index();
+        let names = match session {
+            None => &mut index.names,
+            Some(id) => index.sessions.entry(id.to_string()).or_default(),
+        };
+        if !names.iter().any(|name| name == key) {
+            names.push(key.to_string());
+            names.sort();
+            self.write_index(&index)?;
+        }
+        Ok(())
+    }
+
+    /// Store or update the global secret `key = value`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecretError`] when the name is not env-var-safe or the
+    /// keychain/index write fails.
+    pub fn set(&self, key: &str, value: &str) -> Result<(), SecretError> {
+        self.store(None, key, value)
+    }
+
+    /// Store or update `key = value` in `scope`; a session scope is held by
+    /// `session_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecretError`] when the name is not env-var-safe or the
+    /// keychain/index write fails.
+    pub fn set_scoped(
+        &self,
+        scope: SecretScope,
+        session_id: &str,
+        key: &str,
+        value: &str,
+    ) -> Result<(), SecretError> {
+        match scope {
+            SecretScope::Global => self.store(None, key, value),
+            SecretScope::Session => self.store(Some(session_id), key, value),
+        }
+    }
+
+    /// The stored value of the global secret `key`, or `None` when no such
+    /// secret exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecretError`] when the name is invalid or the keychain read fails.
+    pub fn get(&self, key: &str) -> Result<Option<String>, SecretError> {
+        self.read_credential(&Self::account(None, Self::validate_name(key)?))
+    }
+
+    /// Remove the global secret `key` from the keychain and index. Returns
+    /// whether it existed.
     ///
     /// # Errors
     ///
     /// Returns [`SecretError`] when the keychain delete or index write fails.
     pub fn remove(&self, key: &str) -> Result<bool, SecretError> {
-        let existed = match Self::entry(key)?.delete_credential() {
-            Ok(()) => true,
-            Err(keyring::Error::NoEntry) => false,
-            Err(error) => return Err(error.into()),
-        };
+        let existed = self.delete_credential(&Self::account(None, key))?;
         if existed {
-            let names: Vec<String> = self
-                .names()
-                .into_iter()
-                .filter(|name| name != key)
-                .collect();
-            self.write_names(&names)?;
+            let mut index = self.index();
+            index.names.retain(|name| name != key);
+            self.write_index(&index)?;
         }
         Ok(existed)
     }
 
-    /// All `(name, value)` pairs; names whose keychain read fails are skipped.
-    #[must_use]
-    pub fn values(&self) -> Vec<(String, String)> {
-        self.names()
+    /// `(name, value)` pairs of `names`; names whose keychain read fails are
+    /// skipped.
+    fn read_all(&self, session: Option<&str>, names: Vec<String>) -> Vec<(String, String)> {
+        names
             .into_iter()
             .filter_map(|name| {
-                let entry = Self::entry(&name).ok()?;
-                entry
-                    .get_password()
+                self.read_credential(&Self::account(session, &name))
                     .map_err(|error| {
                         tracing::warn!(secret = %name, %error, "failed to read secret from keychain");
                         error
                     })
                     .ok()
+                    .flatten()
                     .map(|value| (name, value))
             })
             .collect()
+    }
+
+    /// All global `(name, value)` pairs.
+    #[must_use]
+    pub fn values(&self) -> Vec<(String, String)> {
+        self.read_all(None, self.index().names)
+    }
+
+    /// All `(name, value)` pairs `session_id` holds alone.
+    #[must_use]
+    pub fn session_values(&self, session_id: &str) -> Vec<(String, String)> {
+        let names = self.index().sessions.remove(session_id).unwrap_or_default();
+        self.read_all(Some(session_id), names)
+    }
+
+    /// What `session_id`'s terminals see: the global secrets and the
+    /// session's own, which win a name both hold.
+    #[must_use]
+    pub fn session_env(&self, session_id: &str) -> Vec<(String, String)> {
+        let own = self.session_values(session_id);
+        let mut env: Vec<(String, String)> = self
+            .values()
+            .into_iter()
+            .filter(|(name, _)| !own.iter().any(|(own_name, _)| own_name == name))
+            .collect();
+        env.extend(own);
+        env
+    }
+
+    /// Delete every secret `session_id` holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecretError`] when a keychain delete or the index write fails.
+    pub fn remove_session(&self, session_id: &str) -> Result<(), SecretError> {
+        let mut index = self.index();
+        let Some(names) = index.sessions.remove(session_id) else {
+            return Ok(());
+        };
+        for name in &names {
+            self.delete_credential(&Self::account(Some(session_id), name))?;
+        }
+        self.write_index(&index)
+    }
+
+    /// Delete the secrets of every session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecretError`] when a keychain delete or the index write fails.
+    pub fn remove_all_sessions(&self) -> Result<(), SecretError> {
+        let mut index = self.index();
+        for (session_id, names) in std::mem::take(&mut index.sessions) {
+            for name in &names {
+                self.delete_credential(&Self::account(Some(&session_id), name))?;
+            }
+        }
+        self.write_index(&index)
     }
 }
 
@@ -220,6 +407,18 @@ impl Secrets {
             entries: store.values(),
             extra_values,
         }
+    }
+
+    /// [`Self::load`] plus the secrets `session_id` holds alone.
+    #[must_use]
+    pub fn load_for_session(
+        store: &SecretStore,
+        config: &crate::config::MayConfig,
+        session_id: &str,
+    ) -> Self {
+        let mut secrets = Self::load(store, config);
+        secrets.entries.extend(store.session_values(session_id));
+        secrets
     }
 
     /// `(name, value)` pairs safe to inject as environment variables.
@@ -310,17 +509,32 @@ const MIN_SECRET_LEN: usize = 6;
 #[derive(Debug, Clone)]
 pub struct SecretRedactor {
     store: SecretStore,
+    /// The session whose own secrets are covered besides the global ones.
+    session_id: Option<String>,
     /// Secrets tests stand in for the keychain.
     #[cfg(test)]
     fixed: Option<Vec<(String, String)>>,
 }
 
 impl SecretRedactor {
-    /// Redactor over the secrets stored under `may_dir` (`~/.may`).
+    /// Redactor over the global secrets stored under `may_dir` (`~/.may`).
     #[must_use]
     pub fn new(may_dir: &Path) -> Self {
+        Self::over(SecretStore::new(may_dir), None)
+    }
+
+    /// Redactor over the global secrets and those `session_id` holds alone.
+    #[must_use]
+    pub fn for_session(may_dir: &Path, session_id: &str) -> Self {
+        Self::over(SecretStore::new(may_dir), Some(session_id.to_string()))
+    }
+
+    /// Redactor over `store`, with the secrets of `session_id` when given.
+    #[must_use]
+    pub const fn over(store: SecretStore, session_id: Option<String>) -> Self {
         Self {
-            store: SecretStore::new(may_dir),
+            store,
+            session_id,
             #[cfg(test)]
             fixed: None,
         }
@@ -348,7 +562,17 @@ impl SecretRedactor {
             return Redactions::new(fixed.clone());
         }
         let store = self.store.clone();
-        Redactions::new(blocking::unblock(move || store.values()).await)
+        let session_id = self.session_id.clone();
+        Redactions::new(
+            blocking::unblock(move || {
+                let mut secrets = store.values();
+                if let Some(session_id) = session_id {
+                    secrets.extend(store.session_values(&session_id));
+                }
+                secrets
+            })
+            .await,
+        )
     }
 }
 
@@ -468,11 +692,29 @@ impl Redactions {
     }
 }
 
-/// Keychain secrets feed the terminal tool's env injection, re-read for
-/// every spawned command so `/secret` takes effect without a rebuild.
-impl aither_sandbox::TerminalEnvSource for SecretStore {
+/// The secrets one session's terminals see: the global ones and its own,
+/// re-read for every spawned command so a new secret takes effect without a
+/// rebuild.
+#[derive(Debug, Clone)]
+pub struct SessionEnv {
+    store: SecretStore,
+    session_id: String,
+}
+
+impl SessionEnv {
+    /// The environment of `session_id` over `store`.
+    #[must_use]
+    pub fn new(store: SecretStore, session_id: impl Into<String>) -> Self {
+        Self {
+            store,
+            session_id: session_id.into(),
+        }
+    }
+}
+
+impl aither_sandbox::TerminalEnvSource for SessionEnv {
     fn env(&self) -> Vec<(String, String)> {
-        self.values()
+        self.store.session_env(&self.session_id)
     }
 }
 

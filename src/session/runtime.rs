@@ -608,6 +608,20 @@ pub struct PersistedAskUserQuestion {
     pub option: Vec<String>,
     /// Whether multiple options may be chosen.
     pub multi_select: bool,
+    /// Set when the question asks for a secret value instead of a choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<PersistedSecretRequest>,
+}
+
+/// The secret an `ask_user` question collects: its name and who may read it.
+/// The value is never part of the question or its answer.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistedSecretRequest {
+    /// Environment variable name the secret is stored and injected under.
+    pub name: String,
+    /// Whether the secret is global or held by the asking session.
+    pub scope: crate::secrets::SecretScope,
 }
 
 /// Persisted permission request payload.
