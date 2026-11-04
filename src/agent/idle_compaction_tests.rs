@@ -176,21 +176,7 @@ pub struct SessionParts {
 
 impl SessionParts {
     pub(super) async fn new(dir: std::path::PathBuf) -> Self {
-        // The baseline tools are downloaded once into the build directory's
-        // `tmp/may-tools`, which the terminal E2E suite shares.
-        let shared_tools = std::env::current_exe()
-            .expect("test binary path")
-            .ancestors()
-            .nth(3)
-            .expect("test binary sits in the target directory")
-            .join("tmp/may-tools");
-        std::fs::create_dir_all(&shared_tools).expect("create the shared tool cache");
         std::fs::create_dir_all(dir.join(".may")).expect("create the may dir");
-        std::os::unix::fs::symlink(
-            &shared_tools,
-            crate::session::MayHomePaths::new(dir.join(".may")).tools_dir(),
-        )
-        .expect("link the shared tool cache");
         let db = crate::db::ChatDb::open(&dir.join("history.db"))
             .await
             .expect("open test db");
@@ -241,9 +227,9 @@ impl SessionParts {
             acp_host: None,
             register_skills_broker: None,
             environment: AgentEnvironment::Local,
-            tool_distribution: Arc::new(
-                crate::tools::embedded_distribution().expect("embedded distribution validates"),
-            ),
+            tool_distribution: Arc::new(crate::tools::fixture_distribution(
+                &self.dir.join(".may/tool-fixtures"),
+            )),
             tool_environments: self.tool_environments.clone(),
             provider_attempt: 0,
             subagents: None,
