@@ -183,13 +183,16 @@ async fn second_handoff_keeps_a_constraint_stated_before_the_first_compaction() 
     let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
     let stub = StubModel::spawn().await;
     let llm = RequestParameterizedModel::new(
-        aither_cloud::CloudProvider::OpenAI(
-            aither_cloud::openai::OpenAI::builder("test-key")
-                .base_url(stub.base_url.clone())
-                .model(MODEL)
-                .no_retry()
-                .build()
-                .with_chat_completions_api(),
+        crate::agent::RedactedModel::new(
+            aither_cloud::CloudProvider::OpenAI(
+                aither_cloud::openai::OpenAI::builder("test-key")
+                    .base_url(stub.base_url.clone())
+                    .model(MODEL)
+                    .no_retry()
+                    .build()
+                    .with_chat_completions_api(),
+            ),
+            crate::secrets::SecretRedactor::new(std::path::Path::new("/nonexistent")),
         ),
         aither_core::llm::model::Parameters::default(),
     );

@@ -700,7 +700,13 @@ async fn generate_pasted_text_filename(state: &DaemonState, text: &str) -> Strin
     let config = state.config_snapshot();
     let snippet: String = text.chars().take(600).collect();
 
-    let generated = Box::pin(generate_session_title(&config, &snippet, "")).await;
+    let generated = Box::pin(generate_session_title(
+        &config,
+        &snippet,
+        "",
+        &crate::secrets::SecretRedactor::new(&state.may_dir),
+    ))
+    .await;
     let base = generated
         .as_deref()
         .map(sanitize_upload_stem)

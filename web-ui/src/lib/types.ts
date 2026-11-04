@@ -515,12 +515,17 @@ export type TimeTriggerType = 'once' | 'cron';
 export type TaskTriggerRequest =
   | { kind: 'time'; triggerType: TimeTriggerType; runAtUtc?: string | null; cronUtc?: string | null }
   | { kind: 'event'; eventName: string }
-  | { kind: 'webhook' };
+  | { kind: 'webhook'; signature?: WebhookSignature | null };
+
+export interface WebhookSignature {
+  secret: string;
+  header: string;
+}
 
 export type TaskTriggerResponse =
   | { kind: 'time'; triggerType: TimeTriggerType; runAtUtc?: string | null; cronUtc?: string | null }
   | { kind: 'event'; eventName: string }
-  | { kind: 'webhook'; token: string; webhookPath: string };
+  | { kind: 'webhook'; token: string; webhookPath: string; signature?: WebhookSignature | null };
 
 export interface ScheduledTaskResponse {
   id: string;
