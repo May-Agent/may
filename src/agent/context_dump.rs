@@ -139,7 +139,7 @@ fn message_dump(index: usize, message: &LlmMessage) -> ContextMessageDump {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aither_agent::{ContextWindowMetrics, ContextWindowPhase};
+    use aither_agent::{ContextWindowMetrics, ContextWindowPhase, InstructionSlot};
 
     fn test_metrics() -> ContextWindowMetrics {
         ContextWindowMetrics {
@@ -159,8 +159,12 @@ mod tests {
     #[test]
     fn dump_renders_the_request_in_wire_order() {
         let mut context = aither_agent::Context::default();
-        context.insert_system_text("memory", "remember this");
-        context.insert_system_text("persona", "be brief");
+        context
+            .instructions_mut()
+            .insert(&InstructionSlot::BASE_SYSTEM, "remember this");
+        context
+            .instructions_mut()
+            .insert(&InstructionSlot::PERSONA, "be brief");
         context.push(LlmMessage::user("hello"));
         context.push(LlmMessage::assistant("hi there"));
         let snapshot = ContextWindowSnapshot {
@@ -185,16 +189,16 @@ mod tests {
         use aither_core::llm::{Attachment, ReasoningState, ToolCall};
 
         let mut context = aither_agent::Context::default();
-        context.insert_system_text(
-            "base_system",
+        context.instructions_mut().insert(
+            &InstructionSlot::BASE_SYSTEM,
             "You run in a terminal-first environment.\n\n<commands>\n- websearch <query>: search the web\n- browser <action>: drive the managed browser\n</commands>\n\n<skills>\n- pdf/ — read and write PDFs\n</skills>",
         );
-        context.insert_system_text(
-            "persona",
+        context.instructions_mut().insert(
+            &InstructionSlot::PERSONA,
             "You are May. Be warm, lead with the point, prefer prose over lists.",
         );
-        context.insert_system_text(
-            "permissions",
+        context.instructions_mut().insert(
+            &InstructionSlot::PERMISSIONS,
             "Read access to the entire filesystem. Write access is restricted to the session sandbox and approved workdirs. Destructive or irreversible commands require approval.",
         );
         context.push(LlmMessage::user("为什么这个函数会 panic"));
