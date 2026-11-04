@@ -61,6 +61,33 @@ A skill is a directory with `SKILL.md` (frontmatter `name`, `description`) and o
 
 `subagent start --subagent <type or path.md> --prompt-file <path> [--model advanced|balanced|fast] [--worktrees ...] [--commit-worktrees ...]` and `subagent resume --id <n> --prompt-file <path>`. The prompt is always a file you wrote first; inline prompt text is rejected (the `--prompt "<prompt>"` wording in the base system prompt is out of date). Built-in types: `explore`, `plan`, `research`, `fork`. Without `--model`, a small model reads the prompt and picks a tier. A resume id expires with the provider's prompt cache. Subagents cannot use `ask_user` or `agent`; for them `issue`, `pr` and `repo` only read. Write access beyond their own space comes only from `--worktrees` and `--commit-worktrees`, and their commits are listed in the result.
 
+## Repositories, PRs and CI
+
+Work on a git repository happens in a clone inside the session, and `pr` lands it. A session writes the user's checkout only through `pr`.
+
+### Clones
+
+- The first `pr` call in a repository creates the session's clone at `repos/<name>-<8 hex>`, recorded in `repos/repos.toml`. A local repository is cloned with `git clone --local` from the checkout (objects hardlinked, `origin` is the checkout path). A project configured with `pr.backend = "github"` is cloned from its remote URL, with the remote named `upstream`. A repository with no persisted trust decision, or with trust `local`, gets no clone: set trust with `repo trust set full|prs-only|local-branch` first.
+- With one clone in the session `pr` uses it wherever the command runs; with several, pass `--repo <repo key or clone directory name>`. Once a clone exists `pr` does not pick the repository from the current directory.
+- A clone does not persist. It is deleted when its PR merges (the directory, its entry in `repos.toml` and, for a local clone, the `refs/may/<session>` ref in the checkout) and when the session is deleted. Ignored files such as build output go with it. Persist work by committing it in the clone, or by writing it outside the clone under `artifacts/`, `outputs/`, `data/` or `tmp/`. After a merge the next `pr` call clones again from the new HEAD.
+- `pr open` and `pr merge` refuse while the clone has uncommitted changes or untracked files that are not ignored, and list them. Commit them or move them out.
+
+### PRs
+
+- `pr open [--hold] [--issue <n>] [--title <t>] [--repo <key>]` records the PR and, without `--hold`, runs `pr merge` at once and returns when that ends. `pr merge <n>` is also the retry after a failure or rejection. `pr list [--state open|merged|closed|all]`, `pr show <n>` (with the event trail), `pr close <n>` for your own unmerged PR, `pr adopt <n>` to take over a PR whose session is gone or that another session owns.
+- One open PR per session and repository. `open` needs committed work in the clone (HEAD different from the base).
+- Numbers are per repository. Every transition (opened, checks_pending, merging, queued, merged, rejected, check_failed, closed) is a `pr_events` row with the session id and time. The agent column always reads `main` and `message_id` is empty, so an event does not yet trace back to the message that caused it (May-Agent/may#319).
+- Local backend: the project's `checks` command (`[[projects]]`) runs in the clone. Then, serialised per repository, the clone's HEAD is fetched into the checkout as `refs/may/<session>`, `git merge-tree --write-tree` looks for conflicts, a file the user has modified in the checkout that the PR also touches is refused, and the merge is a `--no-ff` merge commit on the checkout's current branch. A conflict or overlap rejects the PR and lists the files: rebase in the clone and run `pr merge <n>` again.
+- GitHub backend: the clone pushes `may/<session>` to `upstream`, `gh pr create` opens the PR, `gh pr merge --auto --squash` queues it (so a merge queue enqueues it), and `pr` polls `gh pr view` every 10 seconds for up to 10 minutes. On `MERGED` it runs a best-effort `git pull --ff-only` in the checkout of the launch directory when that checkout's `origin` is the same repository, then deletes the clone. A PR closed upstream, or still open after 10 minutes, ends the call with an error. With `pr.screen = true` on the project, the fast model judges the title first and a flagged title refuses the publish.
+- Not implemented, so do not rely on it (May-Agent/may#319, #320, under #134): the GitHub backend never reads `gh pr checks`, so a red check shows only as a PR that does not merge; it is not chosen from `gh auth` and a GitHub remote, the project must name it; pushes are plain `git push` with no `--force-with-lease`; the PR body is empty and only the title is screened; pull-sync covers one checkout, not every recorded one, and there is no `pr.pull_sync` setting; `pr.auto_merge` and `pr.require_review` parse but are not applied, only `--hold` stops the merge; `--issue` records an event and does not close the issue.
+
+### Subagents and repositories
+
+- Subagents cannot push or open PRs. In the subagent command registry (`configure_role_tools` in `src/terminal_commands.rs`) `pr` accepts only `list` and `show`, and `repo` and `issue` only read. The main agent reviews a subagent's work and opens the PR itself.
+- A subagent writes only where `subagent start` granted it: `--worktrees` (writable to it, no commits) and `--commit-worktrees` (it may commit there, on a `subagent/<id>/` branch). Its commits are listed in the result; read them with `git log` and `git diff` before bringing them into the clone `pr` lands.
+- Not implemented (May-Agent/may#318): a child clone of the session clone at `subagents/<run>` for each subagent run. `SessionRepos::child_clone` in `src/repo_clone.rs` exists but nothing calls it, so grant a worktree instead.
+- Not implemented (May-Agent/aither#206): approval of a subagent's `unsafe` command by its parent. Today the request is attributed to the parent's session and goes to the user, who has 3 minutes before it is denied; the parent neither sees nor decides it. A subagent that needs host access should say so in its result so the main agent can run the command.
+
 ## Memory
 
 `~/.may/memories/MEMORY.md` is an index you maintain by editing files under that directory; link only to files inside it. Separately, a background extractor refreshes each profile's memories (`preference` and `recency`) at most every 24 hours, and they are placed in the context under `## User Preferences` and `## Recent Context`.
