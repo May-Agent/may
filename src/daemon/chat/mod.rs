@@ -947,6 +947,20 @@ async fn clear_terminal_runtime_state(
         .map(|_| ())
 }
 
+/// Dispatches the prompts task runs stored for their sessions, one wake per
+/// stored prompt, the way a message from another agent is dispatched.
+pub(super) fn spawn_task_wake_dispatcher(
+    state: Arc<DaemonState>,
+    wakes: async_channel::Receiver<String>,
+) {
+    let tokio_handle = state.tokio_handle.clone();
+    tokio_handle.spawn(async move {
+        while let Ok(session_id) = wakes.recv().await {
+            spawn_follow_up_runs(state.clone(), session_id);
+        }
+    });
+}
+
 pub(super) fn spawn_follow_up_runs(state: Arc<DaemonState>, session_id: String) {
     let tokio_handle = state.tokio_handle.clone();
     tokio_handle.spawn(async move {
