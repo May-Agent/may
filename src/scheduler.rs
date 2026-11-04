@@ -51,6 +51,8 @@ pub struct TaskRuntime {
     /// The daemon's connectivity source; task terminals record the outages
     /// their commands ran through.
     connectivity: Option<aither_connectivity::Connectivity>,
+    /// Where a run's `wake` command stores its prompt.
+    session_prompts: Option<crate::task_wake::SessionPrompts>,
 }
 
 /// Time-based wrapper that periodically asks [`TaskRuntime`] to run due tasks.
@@ -282,6 +284,14 @@ fn invalid_profile_component_error(prefix: &str, error: &impl std::fmt::Display)
     prefixed_error(prefix, error)
 }
 
+/// The task whose run a terminal serves, which gets the `wake` command.
+/// Validation runs have none.
+#[derive(Debug, Clone, Copy)]
+struct WakeScope<'a> {
+    task: &'a scheduled_tasks::Model,
+    in_container: bool,
+}
+
 #[derive(Debug, Clone)]
 struct TaskScript {
     content: String,
@@ -484,9 +494,21 @@ impl TaskRuntime {
             network_policy: Arc::new(ArcSwap::from_pointee(None)),
             active_tasks: Arc::new(ArcSwap::from_pointee(TaskCatalog::default())),
             connectivity: None,
+            session_prompts: None,
         };
         runtime.reload_active_tasks().await?;
         Ok(runtime)
+    }
+
+    /// Give task runs a `wake` command that prompts the session that created
+    /// the task through `session_prompts`.
+    #[must_use]
+    pub fn with_session_prompts(
+        mut self,
+        session_prompts: crate::task_wake::SessionPrompts,
+    ) -> Self {
+        self.session_prompts = Some(session_prompts);
+        self
     }
 
     /// Record the sleep and offline intervals commands of local tasks run
@@ -1218,6 +1240,10 @@ impl TaskRuntime {
                 NetworkAccessSource::TaskLocal,
                 script,
                 task.needs_network,
+                Some(WakeScope {
+                    task,
+                    in_container: false,
+                }),
             )
             .await?;
         run_terminal_command(
@@ -1242,6 +1268,7 @@ impl TaskRuntime {
                 NetworkAccessSource::TaskValidationLocal,
                 script,
                 false,
+                None,
             )
             .await?;
 
@@ -1268,6 +1295,7 @@ impl TaskRuntime {
         permission_handler: SchedulerPermissionHandler,
         workspace: PathBuf,
         shell_sessions: ShellSessionRegistry,
+        wake: Option<WakeScope<'_>>,
     ) -> Result<TerminalTool<SchedulerPermissionHandler, DefaultExecutor, Configured>, String> {
         let (terminal_tool, (network_audit, priority)) = futures_lite::future::try_zip(
             async {
@@ -1302,7 +1330,20 @@ impl TaskRuntime {
             ),
         )
         .await?;
-        let registry = Arc::new(ToolRegistryBuilder::new().build(workspace.join("outputs")));
+        let mut commands = ToolRegistryBuilder::new();
+        if let Some(scope) = wake {
+            commands.configure_tool(crate::task_wake::WakeTool::new(
+                self.session_prompts.clone(),
+                scope.task.id.clone(),
+                scope.task.name.clone(),
+                scope.task.session_id.clone(),
+                workspace.clone(),
+                scope
+                    .in_container
+                    .then(|| crate::container::lifecycle::workspace_mount(workspace.clone())),
+            ));
+        }
+        let registry = Arc::new(commands.build(workspace.join("outputs")));
         let terminal_tool = match &self.connectivity {
             Some(connectivity) => terminal_tool.with_connectivity(connectivity),
             None => terminal_tool,
@@ -1328,6 +1369,7 @@ impl TaskRuntime {
         source: NetworkAccessSource,
         script: &TaskScript,
         allow_network: bool,
+        wake: Option<WakeScope<'_>>,
     ) -> Result<TerminalTool<SchedulerPermissionHandler, DefaultExecutor, Configured>, String> {
         self.initialized_terminal_tool(
             SchedulerPermissionHandler {
@@ -1344,6 +1386,7 @@ impl TaskRuntime {
                 container: false,
                 ssh: false,
             }),
+            wake,
         )
         .await
     }
@@ -1356,6 +1399,7 @@ impl TaskRuntime {
         &self,
         profile: &profiles::Model,
         source: NetworkAccessSource,
+        task: Option<&scheduled_tasks::Model>,
     ) -> Result<
         (
             TerminalTool<SchedulerPermissionHandler, DefaultExecutor, Configured>,
@@ -1426,6 +1470,10 @@ impl TaskRuntime {
                     ssh: false,
                 })
                 .with_container_runtime(container_runtime),
+                task.map(|task| WakeScope {
+                    task,
+                    in_container: true,
+                }),
             )
             .await?;
         Ok((terminal_tool, container_manager, container_id))
@@ -1438,9 +1486,10 @@ impl TaskRuntime {
         command: String,
     ) -> Result<String, String> {
         let timeout = TaskTimeout::from_stored(task.timeout_secs)?;
-        let (terminal_tool, container_manager, container_id) =
-            Box::pin(self.container_terminal_tool(profile, NetworkAccessSource::TaskContainer))
-                .await?;
+        let (terminal_tool, container_manager, container_id) = Box::pin(
+            self.container_terminal_tool(profile, NetworkAccessSource::TaskContainer, Some(task)),
+        )
+        .await?;
         let result = run_terminal_command(
             &terminal_tool,
             TerminalExecutionMode::Default,
@@ -1495,10 +1544,13 @@ impl TaskRuntime {
         command: String,
         timeout: TaskTimeout,
     ) -> Result<(), String> {
-        let (terminal_tool, container_manager, container_id) = Box::pin(
-            self.container_terminal_tool(profile, NetworkAccessSource::TaskValidationContainer),
-        )
-        .await?;
+        let (terminal_tool, container_manager, container_id) =
+            Box::pin(self.container_terminal_tool(
+                profile,
+                NetworkAccessSource::TaskValidationContainer,
+                None,
+            ))
+            .await?;
         let result = run_terminal_command(
             &terminal_tool,
             TerminalExecutionMode::Default,
@@ -1829,6 +1881,7 @@ mod tests {
                     host_working_dir: may_dir.join("task"),
                 },
                 false,
+                None,
             )
             .await
             .expect_err("a distribution without native tools must fail before any exec");
@@ -1867,6 +1920,7 @@ mod tests {
                     host_working_dir: workspace,
                 },
                 false,
+                None,
             )
             .await
             .expect("terminal should initialize")
@@ -1977,5 +2031,253 @@ mod tests {
         assert!(TaskTimeout::new(cap).is_ok());
         assert!(TaskTimeout::new(cap + 1).is_err());
         assert!(TaskTimeout::from_stored(-1).is_err());
+    }
+
+    /// A daemon's `history.db` with a task runtime whose runs can `wake`.
+    struct WakeHost {
+        dir: tempfile::TempDir,
+        runtime: TaskRuntime,
+        runtime_service: Arc<crate::session::SessionRuntimeService>,
+        wakes: async_channel::Receiver<String>,
+        profile_id: String,
+    }
+
+    impl WakeHost {
+        async fn new() -> Self {
+            let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+            let dir = tempdir().expect("temp dir should be created");
+            let may_dir = dir.path().join(".may");
+            std::fs::create_dir_all(&may_dir).expect("may dir should be created");
+            let db = ChatDb::open(&dir.path().join("history.db"))
+                .await
+                .expect("db should initialize");
+            let profile_id = db
+                .ensure_default_profiles()
+                .await
+                .expect("default profiles should exist");
+            let runtime_service = Arc::new(crate::session::SessionRuntimeService::new(
+                db.clone(),
+                crate::ui_event_bus::UiEventBus::new(),
+            ));
+            let (wake_tx, wakes) = async_channel::unbounded();
+            let runtime = TaskRuntime::load(
+                db,
+                may_dir,
+                Arc::new(crate::tools::embedded_distribution().expect("embedded distribution")),
+            )
+            .await
+            .expect("task runtime should load")
+            .with_session_prompts(crate::task_wake::SessionPrompts::new(
+                runtime_service.clone(),
+                wake_tx,
+            ));
+            Self {
+                dir,
+                runtime,
+                runtime_service,
+                wakes,
+                profile_id,
+            }
+        }
+
+        async fn task(
+            &self,
+            session_id: Option<&str>,
+            trigger: &PersistedTaskTrigger,
+            script: &str,
+        ) -> crate::db::entity::scheduled_tasks::Model {
+            // The script lives beside, not inside, the managed tool directory.
+            let script_dir = self.dir.path().join("scripts");
+            std::fs::create_dir_all(&script_dir).expect("script dir");
+            let script_path = script_dir.join("task.sh");
+            std::fs::write(&script_path, script).expect("script file");
+            let db = self.runtime_service.db();
+            if let Some(session_id) = session_id {
+                db.create_session(session_id, Some("main"), None)
+                    .await
+                    .expect("session is created");
+            }
+            db.create_scheduled_task(CreateScheduledTaskParams {
+                id: "task-1",
+                profile_id: self.profile_id.as_str(),
+                session_id,
+                name: "Nightly check",
+                trigger,
+                cron_expression: None,
+                run_at: None,
+                script_path: Some(script_path.to_str().expect("utf-8 path")),
+                script_inline: None,
+                needs_network: false,
+                timeout_secs: 60,
+            })
+            .await
+            .expect("task should persist");
+            db.get_scheduled_task("task-1")
+                .await
+                .expect("task reads")
+                .expect("task exists")
+        }
+
+        /// The one prompt the task stored for `session_id`, claimed as the
+        /// session's next run would.
+        async fn stored_prompt(&self, session_id: &str) -> crate::session::PendingUserMessage {
+            self.runtime_service
+                .db()
+                .claim_next_pending_message(
+                    &crate::db::RunFence {
+                        session_id: session_id.to_string(),
+                        run_id: "run".to_string(),
+                    },
+                    session_id,
+                )
+                .await
+                .expect("queue read")
+                .expect("the prompt is stored")
+        }
+    }
+
+    const TIME_ONCE: PersistedTaskTrigger = PersistedTaskTrigger::Time {
+        trigger_type: crate::task_trigger::TimeTriggerType::Once,
+    };
+
+    /// A time-triggered task whose script runs `wake` stores a prompt in its
+    /// idle session's queue, attributed to the task, and wakes the session.
+    #[tokio::test]
+    async fn a_time_task_wakes_its_idle_session_with_a_prompt() {
+        let host = WakeHost::new().await;
+        let task = host
+            .task(
+                Some("main"),
+                &TIME_ONCE,
+                "echo 'check the backups' > \"$MAY_TASK_TRIGGER_FILE.prompt\"\nwake \"$MAY_TASK_TRIGGER_FILE.prompt\"",
+            )
+            .await;
+
+        Box::pin(host.runtime.execute_task_inner(
+            &task,
+            crate::task_trigger::TaskInvocation::Time {
+                trigger_type: crate::task_trigger::TimeTriggerType::Once,
+            },
+        ))
+        .await
+        .expect("the task run succeeds");
+
+        assert_eq!(host.wakes.recv().await.expect("a wake"), "main");
+        let prompt = host.stored_prompt("main").await;
+        assert!(prompt.content.is_empty(), "it is not the user's text");
+        let xml = prompt.hidden_context_xml.expect("task delivery");
+        assert!(xml.contains("task-1"), "the task id is named: {xml}");
+        assert!(xml.contains("Nightly check"), "the task is named: {xml}");
+        assert!(xml.contains("check the backups"), "the prompt: {xml}");
+    }
+
+    /// A busy session keeps the prompt queued for after its current turn
+    /// rather than losing it or replacing a steering message.
+    #[tokio::test]
+    async fn a_busy_session_receives_the_prompt_after_its_turn() {
+        let host = WakeHost::new().await;
+        let task = host
+            .task(
+                Some("main"),
+                &TIME_ONCE,
+                "echo 'later' > \"$MAY_TASK_TRIGGER_FILE.prompt\"\nwake \"$MAY_TASK_TRIGGER_FILE.prompt\"",
+            )
+            .await;
+        host.runtime_service
+            .set_state("main", crate::session::SessionRuntimeState::Running)
+            .await
+            .expect("state persists");
+
+        Box::pin(host.runtime.execute_task_inner(
+            &task,
+            crate::task_trigger::TaskInvocation::Time {
+                trigger_type: crate::task_trigger::TimeTriggerType::Once,
+            },
+        ))
+        .await
+        .expect("the task run succeeds");
+
+        let prompt = host.stored_prompt("main").await;
+        assert_eq!(
+            prompt.delivery_mode,
+            crate::session::PendingUserMessageMode::Queue
+        );
+        assert!(
+            prompt
+                .hidden_context_xml
+                .expect("delivery")
+                .contains("later")
+        );
+    }
+
+    /// A webhook task passes its trigger payload into the prompt.
+    #[tokio::test]
+    async fn a_webhook_task_passes_its_payload_into_the_prompt() {
+        let host = WakeHost::new().await;
+        let task = host
+            .task(
+                Some("main"),
+                &PersistedTaskTrigger::Webhook {
+                    token: "tok".to_string(),
+                },
+                "wake \"$MAY_TASK_TRIGGER_FILE\"",
+            )
+            .await;
+
+        Box::pin(host.runtime.execute_task_inner(
+            &task,
+            crate::task_trigger::TaskInvocation::Webhook {
+                token: "tok".to_string(),
+                request: crate::task_trigger::TaskWebhookRequest {
+                    method: "POST".to_string(),
+                    path: "/hook".to_string(),
+                    query: None,
+                    headers: std::collections::BTreeMap::new(),
+                    body_base64: String::new(),
+                    body_text: Some("deploy finished".to_string()),
+                    body_json: None,
+                    remote_addr: None,
+                    body_size_bytes: 15,
+                },
+            },
+        ))
+        .await
+        .expect("the task run succeeds");
+
+        let xml = host
+            .stored_prompt("main")
+            .await
+            .hidden_context_xml
+            .expect("delivery");
+        assert!(xml.contains("deploy finished"), "the payload: {xml}");
+    }
+
+    /// A task no session created has nobody to prompt: the run fails with a
+    /// clear error and nothing is stored.
+    #[tokio::test]
+    async fn a_task_without_a_session_refuses_wake() {
+        let host = WakeHost::new().await;
+        let task = host
+            .task(
+                None,
+                &TIME_ONCE,
+                "echo hi > \"$MAY_TASK_TRIGGER_FILE.p\"\nwake \"$MAY_TASK_TRIGGER_FILE.p\"",
+            )
+            .await;
+
+        let error = Box::pin(host.runtime.execute_task_inner(
+            &task,
+            crate::task_trigger::TaskInvocation::Time {
+                trigger_type: crate::task_trigger::TimeTriggerType::Once,
+            },
+        ))
+        .await
+        .expect_err("wake must fail without a creating session");
+
+        assert!(
+            error.contains("was not created by a session"),
+            "unexpected error: {error}"
+        );
+        assert!(host.wakes.is_empty());
     }
 }

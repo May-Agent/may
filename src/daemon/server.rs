@@ -230,6 +230,9 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
         .redeliver_pending()
         .await
         .map_err(|e| anyhow!(e.to_string()))?;
+    // Prompts that task runs store for their sessions; dispatched once the
+    // daemon state exists.
+    let (task_wake_tx, task_wake_rx) = async_channel::unbounded::<String>();
     let mut task_runtime = crate::scheduler::TaskRuntime::load(
         db_for_archive.clone(),
         may_dir.clone(),
@@ -241,7 +244,11 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
     .with_ui_event_bus(ui_event_bus.clone())
     .with_network_policy(&config.preferences.network_policy)
     .map_err(|error| anyhow!(error))?
-    .with_connectivity(connectivity.clone());
+    .with_connectivity(connectivity.clone())
+    .with_session_prompts(crate::task_wake::SessionPrompts::new(
+        runtime_service.clone(),
+        task_wake_tx,
+    ));
     if let Some(ref manager) = container_manager {
         task_runtime = task_runtime.with_container_manager(manager.clone());
     }
@@ -313,6 +320,7 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
     super::chat::spawn_shared_tool_dispatchers(state.clone(), tool_queues);
     super::title_generation::spawn_worker(state.clone(), title_generation_rx);
     super::chat::spawn_background_watcher(state.clone(), state.ui_event_bus.clone());
+    super::chat::spawn_task_wake_dispatcher(state.clone(), task_wake_rx);
     let scheduler = crate::scheduler::TaskScheduler::new(task_runtime);
     let _scheduler = scheduler.spawn();
     super::artifacts::spawn_artifact_watcher(&state);
