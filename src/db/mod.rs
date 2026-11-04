@@ -187,6 +187,43 @@ impl ChatDb {
             .execute()
             .await?;
         }
+        for column in ["webhook_signature_secret", "webhook_signature_header"] {
+            if !columns.iter().any(|existing| existing.name == column) {
+                let sql = format!("ALTER TABLE scheduled_tasks ADD COLUMN {column} TEXT");
+                query!(db, sql.as_str()).execute().await?;
+            }
+        }
+        Self::remint_weak_webhook_tokens(db).await
+    }
+
+    /// Webhook tokens minted before they were 256-bit random secrets are
+    /// replaced, so no weak token is accepted; the new path shows in the task.
+    async fn remint_weak_webhook_tokens(db: &SkyDb) -> Result<(), ChatDbError> {
+        let tasks = query!(
+            db,
+            "SELECT * FROM scheduled_tasks WHERE trigger_kind = ?",
+            crate::task_trigger::TRIGGER_KIND_WEBHOOK
+        )
+        .fetch_all::<entity::scheduled_tasks::Model>()
+        .await?;
+        for task in tasks {
+            if crate::task_trigger::is_strong_webhook_token(&task.trigger_type) {
+                continue;
+            }
+            let token = crate::task_trigger::new_webhook_token();
+            query!(
+                db,
+                "UPDATE scheduled_tasks SET trigger_type = ? WHERE id = ?",
+                token,
+                task.id.clone()
+            )
+            .execute()
+            .await?;
+            tracing::warn!(
+                task_id = %task.id,
+                "re-minted a weak webhook token; the task's webhook path changed"
+            );
+        }
         Ok(())
     }
 

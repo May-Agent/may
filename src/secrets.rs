@@ -51,7 +51,11 @@ impl SecretStore {
     }
 
     /// Env-var-safe secret name?
-    fn validate_name(key: &str) -> Result<&str, SecretError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecretError::InvalidName`] when `key` is not a valid name.
+    pub fn validate_name(key: &str) -> Result<&str, SecretError> {
         let valid = !key.is_empty()
             && key
                 .chars()
@@ -110,6 +114,19 @@ impl SecretStore {
             self.write_names(&names)?;
         }
         Ok(())
+    }
+
+    /// The stored value of `key`, or `None` when no such secret exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecretError`] when the name is invalid or the keychain read fails.
+    pub fn get(&self, key: &str) -> Result<Option<String>, SecretError> {
+        match Self::entry(Self::validate_name(key)?)?.get_password() {
+            Ok(value) => Ok(Some(value)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
     }
 
     /// Remove `key` from the keychain and index. Returns whether it existed.
