@@ -150,13 +150,44 @@ pub(super) async fn lookup_issues(
     Json(body): Json<serde_json::Value>,
     State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<skyzen::Response> {
-    use crate::issue::IssueStore as _;
     #[derive(serde::Deserialize)]
     struct LookupRequest {
         numbers: Vec<i64>,
     }
     let req: LookupRequest = serde_json::from_value(body).map_err(bad_request_error)?;
     let id = params.get("id").map_err(bad_request_error)?.to_string();
+    let briefs = issue_briefs(&state, &id, req.numbers).await?;
+    super::error::json_ok_response(&briefs)
+}
+
+/// The issues `session_issues` reports for `session_id`: its tasks' linked
+/// issues that the store could look up.
+pub(super) async fn linked_issue_briefs(
+    state: &DaemonState,
+    session_id: &str,
+    paths: &crate::session::SessionPaths,
+) -> SkyResult<Vec<crate::tui::sidebar::IssueBrief>> {
+    let content = paths.tasks_content().await.map_err(internal_error)?;
+    let numbers = content
+        .as_deref()
+        .map(crate::tui::sidebar::TaskTree::parse)
+        .map(|tree| tree.linked_issues())
+        .unwrap_or_default();
+    let mut briefs = issue_briefs(state, session_id, numbers).await?;
+    // A failed lookup says nothing new; the client keeps what it shows.
+    briefs.retain(|brief| brief.title.is_some());
+    Ok(briefs)
+}
+
+/// One brief per requested number from the session's issue store; a miss
+/// yields a `null` title.
+async fn issue_briefs(
+    state: &DaemonState,
+    id: &str,
+    numbers: Vec<i64>,
+) -> SkyResult<Vec<crate::tui::sidebar::IssueBrief>> {
+    use crate::issue::IssueStore as _;
+    let id = id.to_string();
     let db = state.db();
     let session = db
         .get_session(&id)
@@ -171,8 +202,8 @@ pub(super) async fn lookup_issues(
         blocking::unblock(move || crate::issue::resolve_issue_store(&cwd, &workspace_config, db))
             .await
             .map_err(internal_error)?;
-    let mut briefs = Vec::with_capacity(req.numbers.len());
-    for number in req.numbers {
+    let mut briefs = Vec::with_capacity(numbers.len());
+    for number in numbers {
         let brief = match issue_store.get(number).await {
             Ok(detail) => crate::tui::sidebar::IssueBrief {
                 number,
@@ -190,7 +221,7 @@ pub(super) async fn lookup_issues(
         };
         briefs.push(brief);
     }
-    super::error::json_ok_response(&briefs)
+    Ok(briefs)
 }
 
 pub(super) async fn get_session(
