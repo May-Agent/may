@@ -227,28 +227,18 @@ pub fn persist(
         _ => None,
     };
     let screen = (level == TrustLevel::PrsOnly).then_some(true);
-    let repository = match kind {
-        Some(RepoKind::Github { owner_repo }) if level.publishes_to_github() => Some(
-            owner_repo
-                .parse::<GitHubRepository>()
-                .map_err(|e| invalid(e.to_string()))?,
-        ),
-        _ => None,
-    };
     if let Some(entry) = config
         .projects
         .iter_mut()
         .find(|p| p.has_identity(&identity))
     {
         entry.issues = issues;
-        entry.repository = repository;
         entry.pr.backend = backend;
         entry.pr.screen = screen;
     } else {
         config.projects.push(ProjectConfig {
             path: worktree.to_path_buf(),
             issues,
-            repository,
             checks: None,
             pr: ProjectPr {
                 backend,
@@ -380,7 +370,6 @@ mod tests {
             projects: vec![ProjectConfig {
                 path: repo.to_path_buf(),
                 issues: ProjectIssues::May,
-                repository: None,
                 checks: Some("cargo test".to_string()),
                 pr: ProjectPr {
                     auto_merge: Some(false),
@@ -478,7 +467,6 @@ mod tests {
         let entry = |path: &Path| ProjectConfig {
             path: path.to_path_buf(),
             issues: ProjectIssues::May,
-            repository: None,
             checks: None,
             pr: ProjectPr::default(),
         };
@@ -503,7 +491,6 @@ mod tests {
         config.projects.push(ProjectConfig {
             path: repo.path().to_path_buf(),
             issues: ProjectIssues::May,
-            repository: None,
             checks: None,
             pr: ProjectPr {
                 backend: Some("may".to_string()),

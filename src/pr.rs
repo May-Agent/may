@@ -1242,7 +1242,6 @@ mod tests {
                 .map(|c| ProjectConfig {
                     path: self.checkout.clone(),
                     issues: ProjectIssues::default(),
-                    repository: None,
                     checks: Some(c.to_string()),
                     pr: ProjectPr::default(),
                 })
@@ -1550,29 +1549,33 @@ mod tests {
     }
 
     /// A store for session `id` whose cwd is the fixture checkout, which has
-    /// the GitHub origin `o/r` and trust `level`; no clone exists yet.
+    /// the GitHub origin `o/r` and `workspace_config`; no clone exists yet.
     fn trusted_store(
         fx: &Fixture,
         id: &str,
-        level: crate::trust::TrustLevel,
+        workspace_config: WorkspaceConfig,
         github_api: GitHubRest<PrTokenSource>,
         screen: Option<Arc<super::ScreenFn>>,
     ) -> PrStore {
-        git(
-            Some(&fx.checkout),
-            &["remote", "add", "origin", "https://github.com/o/r.git"],
-        )
-        .unwrap();
         PrStore::new(PrContext {
             db: Some(fx.db.clone()),
             session_id: id.to_string(),
             session_root: fx.session_root(id),
             scratch_root: fx.tmp.path().join("scratch"),
             cwd: fx.checkout.clone(),
-            workspace_config: crate::trust::config_at(fx.tmp.path(), &fx.checkout, level),
+            workspace_config,
             screen,
             github_api,
         })
+    }
+
+    /// Give the fixture checkout the GitHub origin `o/r`.
+    fn add_github_origin(fx: &Fixture) {
+        git(
+            Some(&fx.checkout),
+            &["remote", "add", "origin", "https://github.com/o/r.git"],
+        )
+        .unwrap();
     }
 
     #[tokio::test]
@@ -1581,10 +1584,16 @@ mod tests {
         let origin_repo = fx.tmp.path().join("origin.git");
         git(None, &["init", "--bare", &origin_repo.to_string_lossy()]).unwrap();
         let (api_base, requests) = mock_api(200).await;
+        add_github_origin(&fx);
+        let config = crate::trust::config_at(
+            fx.tmp.path(),
+            &fx.checkout,
+            crate::trust::TrustLevel::LocalBranch,
+        );
         let store = trusted_store(
             &fx,
             "s1",
-            crate::trust::TrustLevel::LocalBranch,
+            config,
             GitHubRest::with_api_base(PrTokenSource::Fixed("test-token".to_string()), &api_base),
             None,
         );
@@ -1627,10 +1636,27 @@ mod tests {
             seen.lock().unwrap().push(title.to_string());
             Box::pin(async { Ok(false) })
         });
+        add_github_origin(&fx);
+        // A `prs-only` project as existing files carry it: no `repository`
+        // key and no GitHub issue backend.
+        let config_path = fx.tmp.path().join("legacy-workspace.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[[projects]]\npath = {:?}\n\n[projects.pr]\nbackend = \"github\"\nscreen = true\n",
+                fx.checkout
+            ),
+        )
+        .unwrap();
+        let config = WorkspaceConfig::load(&config_path).unwrap();
+        assert_eq!(
+            crate::trust::trust_for(&config, &fx.repo_key, &fx.checkout),
+            Some(crate::trust::TrustLevel::PrsOnly)
+        );
         let store = trusted_store(
             &fx,
             "s1",
-            crate::trust::TrustLevel::PrsOnly,
+            config,
             PrContext::default_github_api(),
             Some(screen),
         );
