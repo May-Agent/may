@@ -815,6 +815,29 @@ mod tests {
         assert!(rest.starts_with("Error:"));
     }
 
+    #[test]
+    fn a_compaction_recovery_line_reports_the_failure_and_the_cleanup() {
+        let mut output = output();
+        output
+            .event(&Ok(timed(
+                "2024-03-01T10:00:01Z",
+                AgentEvent::CompactionRecovery {
+                    error: aither_agent::AgentError::llm_local("no handoff"),
+                    alerts_removed: 3,
+                    outputs_spilled: 2,
+                },
+            )))
+            .expect("render must succeed");
+        let line = stderr(&output);
+        assert!(line.contains("Compaction failed"), "{line}");
+        assert!(line.contains("no handoff"), "{line}");
+        assert!(
+            line.contains("3 alerts removed, 2 long outputs moved to files"),
+            "{line}"
+        );
+        assert!(line.trim_end().ends_with("compacting again"), "{line}");
+    }
+
     fn usage_line(usage: aither_core::llm::Usage) -> String {
         let mut output = output();
         output
