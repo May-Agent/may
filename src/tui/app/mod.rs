@@ -2999,7 +2999,11 @@ impl App {
                                 .chat_layout
                                 .collapse_regions()
                                 .into_iter()
-                                .find(|r| point.line >= r.start && point.line < r.end)
+                                .filter(|r| point.line >= r.start && point.line < r.end)
+                                // The innermost span wins: a click inside an
+                                // expanded "Worked for" member toggles the
+                                // member, not the group around it.
+                                .min_by_key(|r| r.end - r.start)
                         {
                             self.chat.toggle_expanded(&region.element_id);
                         }

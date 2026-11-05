@@ -349,7 +349,49 @@ pub enum ChatElement {
     UsageReport(crate::agent::SessionUsageReport),
 }
 
-impl ChatElement {}
+impl ChatElement {
+    /// Toggle the collapsible element with `id`, recursing into the
+    /// elements folded inside a "Worked for" group. Returns whether an
+    /// element toggled.
+    fn toggle_expanded(&mut self, id: &str) -> bool {
+        match self {
+            ChatElement::ToolCall {
+                id: tool_id,
+                display,
+            } if tool_id == id && display.expandable() => {
+                let open = display.body_open();
+                match display {
+                    ToolDisplay::Terminal { pinned, .. }
+                    | ToolDisplay::Action { pinned, .. }
+                    | ToolDisplay::Builtin { pinned, .. } => *pinned = Some(!open),
+                }
+                true
+            }
+            ChatElement::Thinking {
+                id: think_id,
+                expanded,
+                content,
+                ..
+            } if think_id == id && !content.is_empty() => {
+                *expanded = !*expanded;
+                true
+            }
+            ChatElement::WorkedFor {
+                id: work_id,
+                expanded,
+                elements,
+                ..
+            } => {
+                if work_id == id {
+                    *expanded = !*expanded;
+                    return true;
+                }
+                elements.iter_mut().any(|inner| inner.toggle_expanded(id))
+            }
+            _ => false,
+        }
+    }
+}
 
 /// The notice for a compaction that failed and reruns on a cleaned context.
 #[derive(askama::Template)]
@@ -998,47 +1040,14 @@ impl ChatStream {
     /// Flip the expansion of a collapsible element (tool call or thinking
     /// block). For tool calls this sets the click pin: `Some(true)` pins the
     /// body open, `Some(false)` pins it shut, overriding the automatic rule.
+    /// An element folded inside a "Worked for" group toggles on its own —
+    /// the group stays expanded.
     pub fn toggle_expanded(&mut self, id: &str) {
-        let mut touched = None;
         for (index, elem) in self.elements.iter_mut().enumerate() {
-            match elem {
-                ChatElement::ToolCall {
-                    id: tool_id,
-                    display,
-                } if tool_id == id && display.expandable() => {
-                    let open = display.body_open();
-                    match display {
-                        ToolDisplay::Terminal { pinned, .. }
-                        | ToolDisplay::Action { pinned, .. }
-                        | ToolDisplay::Builtin { pinned, .. } => *pinned = Some(!open),
-                    }
-                    touched = Some(index);
-                    break;
-                }
-                ChatElement::Thinking {
-                    id: think_id,
-                    expanded,
-                    content,
-                    ..
-                } if think_id == id && !content.is_empty() => {
-                    *expanded = !*expanded;
-                    touched = Some(index);
-                    break;
-                }
-                ChatElement::WorkedFor {
-                    id: work_id,
-                    expanded,
-                    ..
-                } if work_id == id => {
-                    *expanded = !*expanded;
-                    touched = Some(index);
-                    break;
-                }
-                _ => {}
+            if elem.toggle_expanded(id) {
+                self.touch(index);
+                return;
             }
-        }
-        if let Some(index) = touched {
-            self.touch(index);
         }
     }
 
@@ -1906,6 +1915,10 @@ impl ElementState {
 pub(super) struct ElementLines {
     pub lines: Vec<Line<'static>>,
     pub images: Vec<(String, usize, String)>,
+    /// `(id, first line index, one past the last)` of each collapsible
+    /// (sub-)element these lines contain — a click on those rows toggles
+    /// that element, not the one owning the lines around it.
+    pub regions: Vec<(String, usize, usize)>,
 }
 
 /// `52s`, `1m27s` — the worked-for row's compact duration.
@@ -2049,6 +2062,7 @@ pub(super) fn element_lines(
 ) -> ElementLines {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut images: Vec<(String, usize, String)> = Vec::new();
+    let mut regions: Vec<(String, usize, usize)> = Vec::new();
     match elem {
         ChatElement::UserMessage {
             content,
@@ -2132,7 +2146,7 @@ pub(super) fn element_lines(
         }
 
         ChatElement::ToolCall { id, display } => {
-            let _ = id;
+            let start = lines.len();
             let mut tool_lines = Vec::new();
             render_tool_inline_at(
                 &mut tool_lines,
@@ -2144,6 +2158,9 @@ pub(super) fn element_lines(
                 state.spinner_frame,
             );
             lines.extend(tool_lines.into_iter().map(line_into_static));
+            if display.expandable() {
+                regions.push((id.clone(), start, lines.len()));
+            }
         }
 
         ChatElement::TodoBlock { .. } if state.hide_todos => {}
@@ -2219,12 +2236,14 @@ pub(super) fn element_lines(
         }
 
         ChatElement::Thinking {
+            id,
             content,
             seconds,
             expanded,
             live,
             ..
         } => {
+            let start = lines.len();
             let header = if *expanded {
                 if thought_millis(*seconds) == 0 {
                     "◐ Thinking...".to_string()
@@ -2256,6 +2275,9 @@ pub(super) fn element_lines(
                 }
             }
             lines.push(Line::from(""));
+            if !content.is_empty() {
+                regions.push((id.clone(), start, lines.len()));
+            }
         }
 
         ChatElement::WorkedFor {
@@ -2271,9 +2293,21 @@ pub(super) fn element_lines(
             )));
             if *expanded {
                 for inner in elements {
-                    let sub = element_lines(inner, state, images_supported, tunnel_base, width);
+                    // Members carry their own expansion state — the group's
+                    // `state` describes the group row itself.
+                    let inner_state = ElementState {
+                        hide_todos: state.hide_todos,
+                        ..ElementState::of(inner, None, state.hide_todos, state.spinner_frame)
+                    };
+                    let sub =
+                        element_lines(inner, inner_state, images_supported, tunnel_base, width);
                     let offset = lines.len();
                     lines.extend(sub.lines);
+                    regions.extend(
+                        sub.regions
+                            .into_iter()
+                            .map(|(id, start, end)| (id, offset + start, offset + end)),
+                    );
                     images.extend(
                         sub.images
                             .into_iter()
@@ -2284,7 +2318,11 @@ pub(super) fn element_lines(
             lines.push(Line::from(""));
         }
     }
-    ElementLines { lines, images }
+    ElementLines {
+        lines,
+        images,
+        regions,
+    }
 }
 
 /// Detach a line from the data it borrows.
@@ -4971,6 +5009,93 @@ mod tests {
         chat.toggle_expanded("work-0");
         let closed = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
         assert!(!closed.iter().any(|line| line.contains("draft reply")));
+    }
+
+    /// Inside an expanded "Worked for" group a thought or command expands
+    /// and collapses on its own; the group stays expanded throughout.
+    #[test]
+    fn worked_for_members_toggle_independently() {
+        let mut chat = ChatStream::new();
+        chat.push_thinking("inner thought body");
+        chat.collapse_thinking();
+        chat.push_tool(
+            "t1".to_string(),
+            ToolDisplay::Terminal {
+                description: "run inner".to_string(),
+                command: "echo inner".to_string(),
+                mode: TerminalExecutionMode::Default,
+                status: ToolStatus::Done,
+                output: None,
+                diffs: Vec::new(),
+                pinned: None,
+            },
+        );
+        chat.push_text("done");
+        chat.fold_turn_work(3);
+        chat.toggle_expanded("work-0");
+
+        // Expanded group: both members render collapsed — the thought body
+        // and the command's body rows stay hidden behind their headlines.
+        let grouped = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
+        assert!(grouped.iter().any(|l| l.contains("Worked for 3s")));
+        assert!(grouped.iter().any(|l| l.contains("Thought for")));
+        assert!(grouped.iter().any(|l| l.contains("run inner")));
+        assert!(!grouped.iter().any(|l| l.contains("inner thought body")));
+        assert!(!grouped.iter().any(|l| l.contains("$ echo inner")));
+
+        // Expanding the nested thought shows its body while the group and
+        // the collapsed command stay as they were.
+        chat.toggle_expanded("thinking-0");
+        let thought_open =
+            build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
+        assert!(thought_open.iter().any(|l| l.contains("Worked for 3s ▾")));
+        assert!(
+            thought_open
+                .iter()
+                .any(|l| l.contains("inner thought body"))
+        );
+        assert!(!thought_open.iter().any(|l| l.contains("$ echo inner")));
+        chat.toggle_expanded("thinking-0");
+
+        // Expanding the nested command shows its body rows; the thought
+        // stays collapsed.
+        chat.toggle_expanded("t1");
+        let cmd_open = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
+        assert!(cmd_open.iter().any(|l| l.contains("Worked for 3s ▾")));
+        assert!(cmd_open.iter().any(|l| l.contains("$ echo inner")));
+        assert!(!cmd_open.iter().any(|l| l.contains("inner thought body")));
+        chat.toggle_expanded("t1");
+
+        // A click on a member's rows resolves to the member's region, not
+        // the group's — and collapsing the group folds everything away.
+        let mut regions = Vec::new();
+        let _ = build_plain_wrapped_lines_unified(
+            &chat,
+            80,
+            None,
+            None,
+            None,
+            Some(&mut regions),
+            false,
+        );
+        let member = regions
+            .iter()
+            .filter(|r| r.element_id == "thinking-0" || r.element_id == "t1")
+            .count();
+        assert_eq!(member, 2);
+        let group = regions
+            .iter()
+            .find(|r| r.element_id == "work-0")
+            .expect("the group keeps its own click region");
+        for member_id in ["thinking-0", "t1"] {
+            let member = regions.iter().find(|r| r.element_id == member_id).unwrap();
+            assert!(member.start >= group.start && member.end <= group.end);
+        }
+
+        chat.toggle_expanded("work-0");
+        let closed = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
+        assert!(closed.iter().any(|l| l.contains("Worked for 3s")));
+        assert!(!closed.iter().any(|l| l.contains("run inner")));
     }
 
     /// An expanded thinking block stays clickable — a click folds it back.
