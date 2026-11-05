@@ -121,7 +121,7 @@ impl AcpHosts {
             source.build(),
             source,
             Services {
-                executor: SandboxExecutor::new(cell.clone()),
+                executor: SandboxExecutor::new(cell.clone(), self.config.clone()),
                 permissions: ApprovalPermissions::new(cell.clone()),
             },
         )?;
@@ -192,7 +192,7 @@ pub fn trial_host(
         source.0.clone(),
         source,
         Services {
-            executor: SandboxExecutor::new(cell.clone()),
+            executor: SandboxExecutor::new(cell.clone(), Arc::default()),
             permissions: ApprovalPermissions::new(cell),
         },
     )
@@ -512,7 +512,7 @@ pub async fn probe_agent(
         SessionSandbox::scratch(scratch.path()).map_err(ProbeError::Scratch)?,
     ));
     let services = Services {
-        executor: SandboxExecutor::new(cell.clone()),
+        executor: SandboxExecutor::new(cell.clone(), Arc::default()),
         permissions: ApprovalPermissions::new(cell),
     };
     let answer = tokio::time::timeout(limit, probe_with(&launch, services))
@@ -611,6 +611,7 @@ mod tests {
             model: Some("a".to_string()),
             mode: Some("default".to_string()),
             description: "a scripted ACP agent".to_string(),
+            grants: Vec::new(),
         }
     }
 
@@ -684,12 +685,20 @@ mod tests {
         cwd: &Path,
         prompt: &str,
     ) -> String {
-        let acp = hosts(
-            may_dir,
-            BTreeMap::from([("fake".to_string(), fake_connection())]),
-        )
-        .agents("session", sandbox)
-        .expect("host");
+        fake_turn_with(fake_connection(), may_dir, sandbox, cwd, prompt).await
+    }
+
+    /// As [`fake_turn`], with the agent started as `connection` says.
+    async fn fake_turn_with(
+        connection: AcpAgentConfig,
+        may_dir: &Path,
+        sandbox: SessionSandbox,
+        cwd: &Path,
+        prompt: &str,
+    ) -> String {
+        let acp = hosts(may_dir, BTreeMap::from([("fake".to_string(), connection)]))
+            .agents("session", sandbox)
+            .expect("host");
         let mut spec = SessionSpec::new("fake", cwd);
         spec.model = Some("a".to_string());
         spec.mode = Some("default".to_string());
@@ -750,6 +759,86 @@ mod tests {
         );
         assert!(reply.contains("exit:"), "{reply}");
         assert!(!reply.contains("exit:0"), "the denied write fails: {reply}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_agent_installed_outside_the_session_keeps_its_state_in_a_granted_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        // Stands in for an install prefix and for `~/.codex`; neither is a
+        // session grant.
+        let prefix = dir.path().join("prefix");
+        let state = dir.path().join("state");
+        let outside = dir.path().join("outside");
+        for path in [&prefix, &state, &outside, &dir.path().join("work")] {
+            std::fs::create_dir_all(path).expect("dir");
+        }
+        std::fs::write(state.join("state"), "old\n").expect("state file");
+        let program = prefix.join("acp-agent");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\n\
+             cat \"$STATE_DIR/state\" > \"$STATE_DIR/seen\" || exit 7\n\
+             echo started >> \"$STATE_DIR/state\" || exit 7\n\
+             echo \"$HOME\" > \"$STATE_DIR/home\" || exit 7\n\
+             echo leaked > \"$OUTSIDE_FILE\" 2>/dev/null && echo leaked >> \"$STATE_DIR/state\"\n\
+             exec python3 \"$1\"\n",
+        )
+        .expect("agent script");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .expect("executable");
+        let outside_file = outside.join("leak.txt");
+        let connection = AcpAgentConfig {
+            command: program.to_string_lossy().into_owned(),
+            env: BTreeMap::from([
+                (
+                    "STATE_DIR".to_string(),
+                    state.to_string_lossy().into_owned(),
+                ),
+                (
+                    "OUTSIDE_FILE".to_string(),
+                    outside_file.to_string_lossy().into_owned(),
+                ),
+            ]),
+            grants: vec![state.clone()],
+            ..fake_connection()
+        };
+        let mut connection = connection;
+        connection.args = fake_connection().args;
+
+        let work = dir.path().join("work");
+        let reply = fake_turn_with(
+            connection,
+            dir.path(),
+            sandbox(&dir.path().join("session"), Vec::new(), Vec::new(), None),
+            &work,
+            "say something",
+        )
+        .await;
+
+        assert!(reply.contains("ab"), "the agent runs: {reply}");
+        assert_eq!(
+            std::fs::read_to_string(state.join("seen")).expect("the agent read its state"),
+            "old\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(state.join("state")).expect("the agent updated its state"),
+            "old\nstarted\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(state.join("home"))
+                .expect("the agent reported its home")
+                .trim_end(),
+            std::fs::canonicalize(std::env::home_dir().expect("home"))
+                .expect("home resolves")
+                .to_string_lossy(),
+            "the agent runs with the user's real home"
+        );
+        assert!(
+            !outside_file.exists(),
+            "the agent wrote outside its grants: {reply}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

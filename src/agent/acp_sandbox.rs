@@ -37,6 +37,7 @@ use heel::{
 };
 
 use crate::agent::PermissionApprover;
+use crate::config::MayConfig;
 use crate::terminal_permission_handler::TerminalPermissionHandler;
 
 /// The network policy of an ACP sandbox: the session's terminal verdicts.
@@ -131,7 +132,7 @@ impl SessionSandbox {
     async fn launch(
         &self,
         spec: &SpawnSpec,
-        pipe_stdin: bool,
+        process: &Process,
     ) -> io::Result<(heel::Child, AcpSandbox)> {
         let grants = self.grants.snapshot();
         let program = resolve_program(&spec.program);
@@ -150,9 +151,25 @@ impl SessionSandbox {
             .chain(grants.readable.iter().map(|path| (path, Access::READ)))
             .chain(program.as_ref().map(|path| (path, Access::EXEC)))
             .chain(named_files.iter().map(|path| (path, Access::READ)))
-            .map(|(path, access)| Ok(Grant::new(resolved(path)?, access)))
-            .collect::<heel::Result<Vec<_>>>()
-            .map_err(io::Error::other)?;
+            // The host toolchains the session's own commands build with.
+            .chain(
+                toolchain_homes()
+                    .iter()
+                    .map(|path| (path, Access::WRITE | Access::EXEC)),
+            )
+            // The agent's own state, which its commands do not share.
+            .chain(
+                process
+                    .state_dirs()
+                    .iter()
+                    .map(|path| (path, Access::WRITE | Access::EXEC)),
+            )
+            .map(|(path, access)| {
+                resolved(path)
+                    .map(|path| Grant::new(path, access))
+                    .map_err(|error| io::Error::other(format!("{}: {error}", path.display())))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
         let config = SandboxConfig::builder()
             .network(Audited::new(
                 SessionNetwork {
@@ -178,9 +195,10 @@ impl SessionSandbox {
         let child = sandbox
             .command(program)
             .args(&spec.args)
+            .envs(self.base_environment(process)?)
             .envs(&spec.env)
             .current_dir(cwd)
-            .stdin(if pipe_stdin {
+            .stdin(if process.pipes_stdin() {
                 StdioConfig::Piped
             } else {
                 StdioConfig::Null
@@ -192,6 +210,80 @@ impl SessionSandbox {
             .map_err(io::Error::other)?;
         Ok((child, sandbox))
     }
+}
+
+/// Which process is starting.
+enum Process {
+    /// The agent, with the directories its configuration grants it.
+    Agent { state: Vec<PathBuf> },
+    /// A command the agent runs.
+    Terminal,
+}
+
+impl Process {
+    const fn pipes_stdin(&self) -> bool {
+        matches!(self, Self::Agent { .. })
+    }
+
+    fn state_dirs(&self) -> &[PathBuf] {
+        match self {
+            Self::Agent { state } => state,
+            Self::Terminal => &[],
+        }
+    }
+}
+
+impl SessionSandbox {
+    /// The environment under the process's own: the host `PATH`, as the
+    /// session's terminal commands get it. The agent finds its own config
+    /// and login through the user's real home; its commands keep the
+    /// session directory as home, like every command of the session.
+    fn base_environment(&self, process: &Process) -> io::Result<Vec<(String, String)>> {
+        let mut environment = Vec::new();
+        if let Some(path) = std::env::var_os("PATH") {
+            environment.push(("PATH".to_string(), path.to_string_lossy().into_owned()));
+        }
+        let root = canonical(&self.root);
+        match process {
+            Process::Agent { .. } => environment.push((
+                "HOME".to_string(),
+                canonical(&real_home()?).to_string_lossy().into_owned(),
+            )),
+            Process::Terminal => environment.extend([
+                ("HOME".to_string(), root.to_string_lossy().into_owned()),
+                (
+                    "XDG_CACHE_HOME".to_string(),
+                    root.join(".cache").to_string_lossy().into_owned(),
+                ),
+                (
+                    "XDG_CONFIG_HOME".to_string(),
+                    root.join(".config").to_string_lossy().into_owned(),
+                ),
+            ]),
+        }
+        Ok(environment)
+    }
+}
+
+/// The user's home, which the daemon runs as.
+fn real_home() -> io::Result<PathBuf> {
+    std::env::home_dir().ok_or_else(|| io::Error::other("the user's home directory is unknown"))
+}
+
+/// The host toolchain homes that exist, which the session's terminal grants
+/// its commands (`CARGO_HOME` and `RUSTUP_HOME`, else `~/.cargo` and
+/// `~/.rustup`).
+fn toolchain_homes() -> Vec<PathBuf> {
+    let home = std::env::home_dir();
+    [("CARGO_HOME", ".cargo"), ("RUSTUP_HOME", ".rustup")]
+        .into_iter()
+        .filter_map(|(variable, default)| {
+            std::env::var_os(variable)
+                .map(PathBuf::from)
+                .or_else(|| home.as_ref().map(|home| home.join(default)))
+        })
+        .filter(|path| path.is_dir())
+        .collect()
 }
 
 fn canonical(path: &Path) -> PathBuf {
@@ -212,6 +304,7 @@ fn resolve_program(program: &str) -> Option<PathBuf> {
 #[derive(Debug, Clone)]
 pub struct SandboxExecutor {
     cell: Arc<ArcSwap<SessionSandbox>>,
+    config: Arc<ArcSwap<MayConfig>>,
 }
 
 /// A process started in the sandbox.
@@ -283,10 +376,27 @@ fn pipe(file: Option<File>, name: &str) -> io::Result<async_fs::File> {
 
 impl SandboxExecutor {
     /// An executor starting processes in whatever sandbox `cell` holds when
-    /// they start.
+    /// they start, giving an agent the grants `config` lists for its command
+    /// when it starts.
     #[must_use]
-    pub const fn new(cell: Arc<ArcSwap<SessionSandbox>>) -> Self {
-        Self { cell }
+    pub const fn new(cell: Arc<ArcSwap<SessionSandbox>>, config: Arc<ArcSwap<MayConfig>>) -> Self {
+        Self { cell, config }
+    }
+
+    /// The directories the connections of `spec`'s command grant their
+    /// agent: connections sharing a command and arguments are one program.
+    fn state_dirs(&self, spec: &SpawnSpec) -> io::Result<Vec<PathBuf>> {
+        let config = self.config.load();
+        let mut matching = config
+            .acp_agents
+            .values()
+            .filter(|agent| (&agent.command, &agent.args) == (&spec.program, &spec.args))
+            .peekable();
+        if matching.peek().is_none() {
+            return Ok(Vec::new());
+        }
+        let home = canonical(&real_home()?);
+        Ok(matching.flat_map(|agent| agent.grants_in(&home)).collect())
     }
 }
 
@@ -297,7 +407,10 @@ impl Executor for SandboxExecutor {
     type Stderr = async_fs::File;
 
     async fn spawn_agent(&self, spec: SpawnSpec) -> io::Result<AgentProcess<Self>> {
-        let (mut child, sandbox) = self.cell.load_full().launch(&spec, true).await?;
+        let process = Process::Agent {
+            state: self.state_dirs(&spec)?,
+        };
+        let (mut child, sandbox) = self.cell.load_full().launch(&spec, &process).await?;
         let stdin = pipe(child.take_stdin(), "stdin")?;
         let stdout = pipe(child.take_stdout(), "stdout")?;
         let stderr = pipe(child.take_stderr(), "stderr")?;
@@ -310,7 +423,11 @@ impl Executor for SandboxExecutor {
     }
 
     async fn spawn_terminal(&self, spec: SpawnSpec) -> io::Result<TerminalProcess<Self>> {
-        let (mut child, sandbox) = self.cell.load_full().launch(&spec, false).await?;
+        let (mut child, sandbox) = self
+            .cell
+            .load_full()
+            .launch(&spec, &Process::Terminal)
+            .await?;
         let stdout = pipe(child.take_stdout(), "stdout")?;
         let stderr = pipe(child.take_stderr(), "stderr")?;
         Ok(TerminalProcess {
