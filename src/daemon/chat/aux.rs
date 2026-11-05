@@ -199,6 +199,17 @@ pub async fn context_messages(
     ))
 }
 
+/// The languages `session_id`'s agent was configured with.
+pub async fn languages(
+    state: &Arc<DaemonState>,
+    session_id: &str,
+) -> Result<aither_agent::Languages, AuxError> {
+    let worker = super::hosts::idle_agent(state, session_id)
+        .await
+        .map_err(|error| AuxError::Session(error.to_string()))?;
+    worker.languages().ok_or(AuxError::NoModel)
+}
+
 /// Streams `messages` through the session's own model via its parked agent
 /// and collects the text. The call is a side request like `/btw`: nothing
 /// enters the conversation. Fails as [`AuxError::Timeout`] after `timeout`.

@@ -168,6 +168,8 @@ pub struct MayAgentConfig {
     pub profile_id: Option<String>,
     /// Maximum iterations.
     pub max_iterations: usize,
+    /// The session's communication and working languages.
+    pub languages: aither_agent::Languages,
     /// Channel for workspace access requests.
     pub workspace_request_broker: WorkspaceRequestBroker,
     /// Channel for ask user requests.
@@ -573,8 +575,10 @@ impl MayAgent {
             config.max_iterations
         };
         let terminal_grants = terminal_tool.grants();
+        let language_guard = aither_agent::LanguageGuard::new(config.languages);
         let mut builder = TerminalAgentBuilder::new(llm, terminal_tool)
             .system_layout(tag::layout())
+            .languages(language_guard.clone())
             .hook(context_snapshot_hook)
             .hook(pending_steer_hook)
             .hook(SecretRedactionHook::new(SecretRedactor::for_session(
@@ -639,6 +643,7 @@ impl MayAgent {
                 issue_store: issue_store.clone(),
                 workspace_config: workspace.config.clone(),
                 agent_messaging,
+                languages: Some(language_guard.clone()),
                 acp: config.acp.clone(),
                 #[cfg(target_os = "macos")]
                 computer: config.computer.clone(),
@@ -838,6 +843,7 @@ impl MayAgent {
             session_id,
             profile_id,
             max_iterations: may_config.max_iterations,
+            languages: may_config.language.languages(),
             workspace_request_broker,
             ask_user_broker,
             image_generator: resolve_image_generator_config(may_config),
@@ -1093,6 +1099,20 @@ impl MayAgent {
         self.btw_llm.clone()
     }
 
+    /// The language guard the agent was built with; its commands and the
+    /// session's aux requests share its languages.
+    ///
+    /// # Panics
+    ///
+    /// Never for an agent built by this module, which always attaches one.
+    #[must_use]
+    pub fn language_guard(&self) -> aither_agent::LanguageGuard {
+        self.inner
+            .languages()
+            .expect("every May agent is built with a language guard")
+            .clone()
+    }
+
     /// Tracker shared with this session's `subagent` IPC command — the TUI
     /// reads live per-run stats off it for the jobs panel and status bar.
     #[must_use]
@@ -1271,6 +1291,9 @@ pub async fn test_agent(
     let inner = Agent::builder(llm.llm.clone())
         .request_parameters(llm.parameters.clone())
         .system_layout(tag::layout())
+        .languages(aither_agent::LanguageGuard::new(
+            aither_agent::Languages::unset(),
+        ))
         .hook(ContextSnapshotHook::new(None, &session_id))
         .hook(PendingSteerHook::new(None, &session_id))
         .hook(SecretRedactionHook::new(SecretRedactor::new(

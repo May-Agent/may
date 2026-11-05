@@ -546,6 +546,7 @@ where
             .map_err(ExecError::WorkspaceConfig)?,
             // exec is no main agent: it has no turn boundary to deliver at.
             agent_messaging: None,
+            languages: None,
             acp: None,
         },
     )
