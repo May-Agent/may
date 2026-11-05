@@ -15,7 +15,7 @@ use super::{
 use crate::workspace::GitHubRepository;
 
 /// Public GitHub REST API base.
-pub const DEFAULT_API_BASE: &str = "https://api.github.com";
+const DEFAULT_API_BASE: &str = "https://api.github.com";
 
 /// Provides a GitHub API token for [`GitHubIssueStore`].
 pub trait GitHubTokenSource: Send + Sync + std::fmt::Debug {
@@ -53,55 +53,43 @@ impl GitHubTokenSource for GhCliTokenSource {
     }
 }
 
-/// GitHub issues backend for one repository.
-#[derive(Debug)]
-pub struct GitHubIssueStore<T> {
-    repository: GitHubRepository,
+/// Authenticated GitHub REST client shared by the issue and pull request
+/// backends: one API base, one token source, one request path.
+#[derive(Debug, Clone)]
+pub struct GitHubRest<T> {
     api_base: String,
     token_source: T,
 }
 
-impl<T: GitHubTokenSource + Clone> Clone for GitHubIssueStore<T> {
-    fn clone(&self) -> Self {
-        Self {
-            repository: self.repository.clone(),
-            api_base: self.api_base.clone(),
-            token_source: self.token_source.clone(),
-        }
-    }
-}
-
-impl<T: GitHubTokenSource> GitHubIssueStore<T> {
-    /// Store targeting the repository's issues on `api.github.com`.
+impl<T: GitHubTokenSource> GitHubRest<T> {
+    /// Client targeting `api.github.com`.
     #[must_use]
-    pub fn new(repository: GitHubRepository, token_source: T) -> Self {
-        Self::with_api_base(repository, token_source, DEFAULT_API_BASE)
+    pub fn new(token_source: T) -> Self {
+        Self::with_api_base(token_source, DEFAULT_API_BASE)
     }
 
-    /// Store targeting a custom API base URL (tests, GitHub Enterprise).
+    /// Client targeting a custom API base URL (tests, GitHub Enterprise).
     #[must_use]
-    pub fn with_api_base(repository: GitHubRepository, token_source: T, api_base: &str) -> Self {
+    pub fn with_api_base(token_source: T, api_base: &str) -> Self {
         Self {
-            repository,
             api_base: api_base.trim_end_matches('/').to_string(),
             token_source,
         }
     }
 
-    /// `owner/repo` of the configured repository.
+    /// The API base URL, without a trailing slash.
     #[must_use]
-    pub const fn repository(&self) -> &GitHubRepository {
-        &self.repository
+    pub fn api_base(&self) -> &str {
+        &self.api_base
     }
 
-    fn issue_url(&self, number: i64) -> String {
-        format!(
-            "{}/repos/{}/issues/{number}",
-            self.api_base, self.repository
-        )
-    }
-
-    async fn request(
+    /// Sends an authenticated request; a 404 is [`IssueError::NotFound`]
+    /// with the placeholder number `-1` for the caller to replace, any
+    /// other non-success status is [`IssueError::GitHub`].
+    ///
+    /// # Errors
+    /// Fails on token, transport or status errors.
+    pub async fn request(
         &self,
         method: Method,
         url: String,
@@ -127,7 +115,10 @@ impl<T: GitHubTokenSource> GitHubIssueStore<T> {
     /// Sends an authenticated request and returns the raw response without
     /// the status check, for endpoints where a documented error status
     /// carries meaning (label already exists).
-    async fn request_unchecked(
+    ///
+    /// # Errors
+    /// Fails on token or transport errors.
+    pub async fn request_unchecked(
         &self,
         method: Method,
         url: String,
@@ -152,6 +143,72 @@ impl<T: GitHubTokenSource> GitHubIssueStore<T> {
             Err(zenwave::Error::Http { response, .. }) => Ok(response.response),
             Err(error) => Err(IssueError::GitHub(error.to_string())),
         }
+    }
+}
+
+/// GitHub issues backend for one repository.
+#[derive(Debug)]
+pub struct GitHubIssueStore<T> {
+    repository: GitHubRepository,
+    rest: GitHubRest<T>,
+}
+
+impl<T: GitHubTokenSource + Clone> Clone for GitHubIssueStore<T> {
+    fn clone(&self) -> Self {
+        Self {
+            repository: self.repository.clone(),
+            rest: self.rest.clone(),
+        }
+    }
+}
+
+impl<T: GitHubTokenSource> GitHubIssueStore<T> {
+    /// Store targeting the repository's issues on `api.github.com`.
+    #[must_use]
+    pub fn new(repository: GitHubRepository, token_source: T) -> Self {
+        Self::with_rest(repository, GitHubRest::new(token_source))
+    }
+
+    /// Store targeting a custom API base URL (tests, GitHub Enterprise).
+    #[must_use]
+    pub fn with_api_base(repository: GitHubRepository, token_source: T, api_base: &str) -> Self {
+        Self::with_rest(
+            repository,
+            GitHubRest::with_api_base(token_source, api_base),
+        )
+    }
+
+    /// Store sharing an existing REST client.
+    #[must_use]
+    pub const fn with_rest(repository: GitHubRepository, rest: GitHubRest<T>) -> Self {
+        Self { repository, rest }
+    }
+
+    /// `owner/repo` of the configured repository.
+    #[must_use]
+    pub const fn repository(&self) -> &GitHubRepository {
+        &self.repository
+    }
+
+    fn api_base(&self) -> &str {
+        self.rest.api_base()
+    }
+
+    fn issue_url(&self, number: i64) -> String {
+        format!(
+            "{}/repos/{}/issues/{number}",
+            self.api_base(),
+            self.repository
+        )
+    }
+
+    async fn request(
+        &self,
+        method: Method,
+        url: String,
+        body: Option<serde_json::Value>,
+    ) -> Result<zenwave::Response, IssueError> {
+        self.rest.request(method, url, body).await
     }
 
     async fn get_issue(&self, number: i64) -> Result<GhIssue, IssueError> {
@@ -181,9 +238,10 @@ impl<T: GitHubTokenSource> GitHubIssueStore<T> {
 
     async fn ensure_label(&self, name: &str) -> Result<(), IssueError> {
         let response = self
+            .rest
             .request_unchecked(
                 Method::POST,
-                format!("{}/repos/{}/labels", self.api_base, self.repository),
+                format!("{}/repos/{}/labels", self.api_base(), self.repository),
                 Some(serde_json::json!({"name": name})),
             )
             .await?;
@@ -216,7 +274,7 @@ impl<T: GitHubTokenSource> IssueStore for GitHubIssueStore<T> {
     ) -> Result<Vec<IssueSummary>, IssueError> {
         let mut url = format!(
             "{}/repos/{}/issues?state=all&sort=updated&direction=asc&per_page={}",
-            self.api_base,
+            self.api_base(),
             self.repository,
             limit.clamp(1, 100)
         );
@@ -260,7 +318,7 @@ impl<T: GitHubTokenSource> IssueStore for GitHubIssueStore<T> {
         let response = self
             .request(
                 Method::POST,
-                format!("{}/repos/{}/issues", self.api_base, self.repository),
+                format!("{}/repos/{}/issues", self.api_base(), self.repository),
                 Some(serde_json::json!({
                     "title": title,
                     "body": body,
@@ -332,7 +390,7 @@ impl<T: GitHubTokenSource> IssueStore for GitHubIssueStore<T> {
     ) -> Result<Vec<IssueSummary>, IssueError> {
         let mut url = format!(
             "{}/repos/{}/issues?state={}&per_page={}",
-            self.api_base,
+            self.api_base(),
             self.repository,
             state.as_str(),
             limit.clamp(1, 100)
