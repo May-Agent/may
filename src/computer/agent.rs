@@ -7,8 +7,10 @@
 //! respawns picks up a fresh grant while the daemon itself never restarts.
 
 use std::collections::HashMap;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
@@ -28,11 +30,21 @@ struct AgentState {
     inputs: HashMap<String, Arc<Mutex<InputState>>>,
 }
 
-/// Serve requests on `<may_dir>/computer-agent.sock` until killed.
+/// How often a running helper checks that its socket is still the one in
+/// its May dir.
+const SOCKET_WATCH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Serve requests on `<may_dir>/computer-agent.sock` until killed, or
+/// until the socket in the May dir is gone or replaced.
 ///
 /// # Errors
-/// Returns a message when the socket cannot be bound.
+/// Returns a message when the socket cannot be bound or has disappeared.
 pub async fn serve(may_dir: &Path) -> Result<(), String> {
+    serve_watching(may_dir, SOCKET_WATCH_INTERVAL).await
+}
+
+/// [`serve`] with an explicit socket check interval.
+async fn serve_watching(may_dir: &Path, watch_interval: Duration) -> Result<(), String> {
     let sock = may_dir.join("computer-agent.sock");
     if sock.exists() {
         std::fs::remove_file(&sock).map_err(|e| e.to_string())?;
@@ -45,13 +57,33 @@ pub async fn serve(may_dir: &Path) -> Result<(), String> {
         may_dir.join("computer-agent.pid"),
         std::process::id().to_string(),
     );
+    let bound_inode = std::fs::metadata(&sock)
+        .map_err(|e| format!("stat {}: {e}", sock.display()))?
+        .ino();
     let state = Arc::new(Mutex::new(AgentState {
         displays: SessionDisplays::default(),
         streams: SessionStreams::default(),
         inputs: HashMap::new(),
     }));
+    let mut watch = tokio::time::interval(watch_interval);
     loop {
-        let (conn, _) = listener.accept().await.map_err(|e| e.to_string())?;
+        let conn = tokio::select! {
+            accepted = listener.accept() => accepted.map_err(|e| e.to_string())?.0,
+            _ = watch.tick() => {
+                match std::fs::metadata(&sock) {
+                    Ok(meta) if meta.ino() == bound_inode => {}
+                    Ok(_) => {
+                        tracing::error!(socket = %sock.display(), "computer-agent socket was replaced, exiting");
+                        return Err(format!("{} was replaced", sock.display()));
+                    }
+                    Err(e) => {
+                        tracing::error!(socket = %sock.display(), error = %e, "computer-agent socket is gone, exiting");
+                        return Err(format!("{} is gone: {e}", sock.display()));
+                    }
+                }
+                continue;
+            }
+        };
         let state = state.clone();
         tokio::spawn(async move {
             let (mut reader, mut writer) = conn.into_split();
@@ -288,5 +320,30 @@ async fn dispatch_inner(request: AgentRequest, state: Arc<Mutex<AgentState>>) ->
                 Err(e) => AgentResponse::Error { error: e },
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn serve_exits_once_the_may_dir_is_removed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let may_dir = dir.path().join(".may");
+        std::fs::create_dir(&may_dir).expect("may dir");
+        let server = tokio::spawn({
+            let may_dir = may_dir.clone();
+            async move { serve_watching(&may_dir, Duration::from_millis(20)).await }
+        });
+        while !may_dir.join("computer-agent.sock").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        std::fs::remove_dir_all(&may_dir).expect("remove may dir");
+        let result = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("helper keeps running after its may dir is gone")
+            .expect("serve task");
+        assert!(result.is_err_and(|e| e.contains("is gone")));
     }
 }
