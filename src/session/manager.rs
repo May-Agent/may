@@ -494,6 +494,14 @@ impl SessionManager {
         self.daemon.as_ref().ok_or(SessionError::DaemonUnavailable)
     }
 
+    /// A handle on the daemon this manager talks to.
+    ///
+    /// # Errors
+    /// Returns [`SessionError::DaemonUnavailable`] before `attach_daemon` ran.
+    pub fn daemon_handle(&self) -> Result<crate::client::DaemonClient, SessionError> {
+        self.daemon().cloned()
+    }
+
     /// Get the May directory path.
     #[must_use]
     pub fn may_dir(&self) -> &Path {
