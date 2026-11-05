@@ -38,7 +38,7 @@ aither-acp = { version = "0.19.0" }
 heel = { version = "0.8.0", default-features = false }
 
 # ACP agents as subagents (`/connect`); its CLI and second SQLite stay off.
-acpsub = { git = "https://github.com/lexoliu/acpsub", branch = "fix/sandboxed-host-fs", default-features = false }
+acpsub = { git = "https://github.com/lexoliu/acpsub", branch = "dev", default-features = false }
 
 # repo-search daemon client; its crate version is 0.0.5 inside the
 # v0.0.9 binary pinned in `src/tools/host-programs.json`. Not published
