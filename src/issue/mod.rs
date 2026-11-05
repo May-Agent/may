@@ -429,16 +429,14 @@ pub fn resolve_issue_store(
 ) -> Result<ResolvedIssueStore, IssueError> {
     let identity = repository_identity(cwd)?;
     let config = crate::workspace::WorkspaceConfig::load(workspace_config_path)?;
-    for project in &config.projects {
-        if repository_identity(&project.path)? != identity {
-            continue;
-        }
-        if let crate::workspace::ProjectIssues::Github { repository } = &project.issues {
-            return Ok(ResolvedIssueStore::GitHub(GitHubIssueStore::new(
-                repository.clone(),
-                GhCliTokenSource,
-            )));
-        }
+    if let Some(crate::workspace::ProjectIssues::Github { repository }) = config
+        .project_for_identity(&identity)
+        .map(|project| &project.issues)
+    {
+        return Ok(ResolvedIssueStore::GitHub(GitHubIssueStore::new(
+            repository.clone(),
+            GhCliTokenSource,
+        )));
     }
     Ok(ResolvedIssueStore::May(MayIssueStore::new(
         db,
