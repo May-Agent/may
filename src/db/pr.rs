@@ -280,6 +280,37 @@ impl ChatDb {
             .await?)
     }
 
+    /// Close a PR: the only transition to `closed` that abandons work, and
+    /// the one place that refuses a terminal PR. The state check and the
+    /// write share one transaction.
+    ///
+    /// # Errors
+    /// Fails with [`ChatDbError::PrTerminal`] when the PR is `merged` or
+    /// `closed`, and on database errors.
+    pub async fn close_pr(&self, id: i64) -> Result<PrRow, ChatDbError> {
+        let now = jiff::Timestamp::now().to_string();
+        let mut tx = self.db.begin().await?;
+        let row = query!(tx, "SELECT * FROM prs WHERE id = ?", id)
+            .fetch_one::<PrRow>()
+            .await?;
+        if matches!(row.state.as_str(), "merged" | "closed") {
+            return Err(ChatDbError::PrTerminal { state: row.state });
+        }
+        query!(
+            tx,
+            "UPDATE prs SET state = 'closed', updated_at = ? WHERE id = ?",
+            now,
+            id
+        )
+        .execute()
+        .await?;
+        let row = query!(tx, "SELECT * FROM prs WHERE id = ?", id)
+            .fetch_one::<PrRow>()
+            .await?;
+        tx.commit().await?;
+        Ok(row)
+    }
+
     /// Append a provenance event to a PR.
     ///
     /// # Errors

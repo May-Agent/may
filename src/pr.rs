@@ -70,6 +70,26 @@ pub struct PrContext {
     /// Outbound screen: `Ok(true)` publishes, anything else blocks. Wired
     /// to the fast model by the command registration.
     pub screen: Option<std::sync::Arc<ScreenFn>>,
+    /// GitHub REST API the GitHub backend's direct calls target.
+    pub github_api: GithubApi,
+}
+
+/// Where and how the GitHub backend calls the REST API.
+#[derive(Debug, Clone)]
+pub struct GithubApi {
+    /// API base URL (`https://api.github.com`, or a GitHub Enterprise host).
+    pub base: String,
+    /// Explicit token; `None` uses the `gh` CLI login.
+    pub token: Option<String>,
+}
+
+impl Default for GithubApi {
+    fn default() -> Self {
+        Self {
+            base: crate::issue::github::DEFAULT_API_BASE.to_string(),
+            token: None,
+        }
+    }
 }
 
 /// Screen callback signature: `(title, body)` → publish verdict.
@@ -427,9 +447,25 @@ impl PrStore {
                 "PR #{number} belongs to another session — adopt it with `pr adopt {number}`"
             )));
         }
-        self.db()?
-            .update_pr(pr.id, "closed", None, None, None)
-            .await?;
+        // A terminal PR is refused before anything leaves the machine; the
+        // transition below re-checks atomically.
+        if matches!(pr.state.as_str(), "merged" | "closed") {
+            return Err(PrError::State(format!(
+                "PR #{number} is already {}",
+                pr.state
+            )));
+        }
+        // Closing upstream first disables auto-merge; if it fails the local
+        // row stays as it was.
+        if pr.backend == "github" {
+            let owner_repo = github_owner_repo(&resolved.record.source)
+                .ok_or_else(|| PrError::Resolve("github PR without a repo".to_string()))?;
+            let external = pr
+                .external_number
+                .ok_or_else(|| PrError::State("github PR missing its number".to_string()))?;
+            self.close_github(&owner_repo, external).await?;
+        }
+        self.db()?.close_pr(pr.id).await?;
         self.event(&pr, "closed", None).await;
         if resolved.record.local {
             drop_ref(&resolved.record.source, &pr.branch).await;
@@ -782,6 +818,52 @@ impl PrStore {
                 Err(PrError::Gh(reason.clone()))
             }
         }
+    }
+
+    /// Close the upstream pull request through the REST API, authenticated
+    /// with the `gh` login's token.
+    async fn close_github(&self, owner_repo: &str, external: i64) -> Result<(), PrError> {
+        use crate::issue::github::{GhCliTokenSource, GitHubTokenSource};
+        use zenwave::header::{ACCEPT, USER_AGENT};
+        use zenwave::{Client, Method, ResponseExt};
+
+        let api = &self.context.github_api;
+        let token = match &api.token {
+            Some(token) => token.clone(),
+            None => GhCliTokenSource
+                .token()
+                .await
+                .map_err(|e| PrError::Gh(e.to_string()))?,
+        };
+        let url = format!(
+            "{}/repos/{owner_repo}/pulls/{external}",
+            api.base.trim_end_matches('/')
+        );
+        let mut client = zenwave::client();
+        let request = client
+            .method(Method::PATCH, url.as_str())
+            .map_err(|e| PrError::Gh(e.to_string()))?
+            .bearer_auth(token)
+            .header(ACCEPT, "application/vnd.github+json")
+            .and_then(|r| r.header(USER_AGENT, "may-agent"))
+            .and_then(|r| r.json_body(&serde_json::json!({ "state": "closed" })))
+            .map_err(|e| PrError::Gh(e.to_string()))?;
+        let response = match request.await {
+            Ok(response) => response,
+            Err(zenwave::Error::Http { response, .. }) => response.response,
+            Err(error) => return Err(PrError::Gh(error.to_string())),
+        };
+        if !response.status().is_success() {
+            let status = response.status();
+            let message = response.into_string().await.map_or_else(
+                |_| "<unreadable error body>".to_string(),
+                |text| text.to_string(),
+            );
+            return Err(PrError::Gh(format!(
+                "close PR #{external}: {status} from GitHub API: {message}"
+            )));
+        }
+        Ok(())
     }
 
     /// Best-effort `git pull --ff-only` on the cwd's checkout when it
@@ -1140,10 +1222,18 @@ fn git(dir: Option<&Path>, args: &[&str]) -> Result<String, crate::repo_clone::R
 
 #[cfg(test)]
 mod tests {
-    use super::{PrContext, PrStore, git, github_owner_repo};
+    use super::{GithubApi, PrContext, PrStore, git, github_owner_repo};
     use crate::repo_clone::SessionRepos;
     use crate::workspace::{ProjectConfig, ProjectIssues, ProjectPr, WorkspaceConfig};
+    use hyper::body::Bytes;
+    use hyper::header::AUTHORIZATION;
+    use hyper::server::conn::http1;
+    use hyper::service::service_fn;
+    use hyper::{Request, Response};
+    use hyper_util::rt::TokioIo;
+    use std::convert::Infallible;
     use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
 
     struct Fixture {
         tmp: tempfile::TempDir,
@@ -1205,9 +1295,129 @@ mod tests {
                     projects,
                 },
                 screen: None,
+                github_api: GithubApi::default(),
             });
             (store, clone)
         }
+
+        /// A store whose only clone is a GitHub remote clone of `o/r`, with
+        /// a GitHub-backed PR #1 (upstream #7) in `state`, and its API at `base`.
+        async fn github_store(&self, id: &str, base: &str, state: &str) -> PrStore {
+            let url = "https://github.com/o/r.git";
+            self.db
+                .insert_repo_clone(
+                    id,
+                    &crate::db::RepoCloneRow {
+                        repo_key: url.to_string(),
+                        dir: "r-00000000".to_string(),
+                        source: url.to_string(),
+                        local: false,
+                    },
+                )
+                .await
+                .unwrap();
+            let pr = self
+                .db
+                .create_pr(
+                    url,
+                    id,
+                    "t",
+                    "",
+                    "may/s",
+                    "base",
+                    "github",
+                    true,
+                    None,
+                    Some(7),
+                )
+                .await
+                .unwrap();
+            if state != "open" {
+                self.db
+                    .update_pr(pr.id, state, None, None, None)
+                    .await
+                    .unwrap();
+            }
+            PrStore::new(PrContext {
+                db: Some(self.db.clone()),
+                session_id: id.to_string(),
+                session_root: self.session_root(id),
+                scratch_root: self.tmp.path().join("scratch"),
+                cwd: self.checkout.clone(),
+                workspace_config: WorkspaceConfig {
+                    workdirs: Vec::new(),
+                    projects: Vec::new(),
+                },
+                screen: None,
+                github_api: GithubApi {
+                    base: base.to_string(),
+                    token: Some("test-token".to_string()),
+                },
+            })
+        }
+
+        async fn pr_state(&self) -> String {
+            self.db
+                .get_pr("https://github.com/o/r.git", 1)
+                .await
+                .unwrap()
+                .unwrap()
+                .state
+        }
+    }
+
+    type Requests = Arc<Mutex<Vec<(String, String, String, String)>>>;
+
+    /// A loopback GitHub API answering every request with `status`;
+    /// records `(method, path, authorization, body)`.
+    async fn mock_api(status: u16) -> (String, Requests) {
+        let requests: Requests = Arc::default();
+        let seen = requests.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let seen = seen.clone();
+                let service = service_fn(move |request: Request<hyper::body::Incoming>| {
+                    let seen = seen.clone();
+                    async move {
+                        let (parts, body) = request.into_parts();
+                        let auth = parts
+                            .headers
+                            .get(AUTHORIZATION)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("")
+                            .to_string();
+                        let body = http_body_util::BodyExt::collect(body)
+                            .await
+                            .map(http_body_util::Collected::to_bytes)
+                            .unwrap_or_default();
+                        seen.lock().unwrap().push((
+                            parts.method.to_string(),
+                            parts.uri.path().to_string(),
+                            auth,
+                            String::from_utf8_lossy(&body).to_string(),
+                        ));
+                        Ok::<_, Infallible>(
+                            Response::builder()
+                                .status(status)
+                                .header("content-type", "application/json")
+                                .body(http_body_util::Full::new(Bytes::from(
+                                    "{\"message\":\"m\"}",
+                                )))
+                                .unwrap(),
+                        )
+                    }
+                });
+                tokio::spawn(async move {
+                    let _ = http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        (format!("http://{addr}"), requests)
     }
 
     fn identify(dir: &Path) {
@@ -1307,6 +1517,72 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn closing_a_github_pr_patches_upstream_then_records_closed() {
+        let fx = Fixture::new().await;
+        let (base, requests) = mock_api(200).await;
+        let store = fx.github_store("s1", &base, "open").await;
+        store.close(1, None).await.unwrap();
+        let seen = requests.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![(
+                "PATCH".to_string(),
+                "/repos/o/r/pulls/7".to_string(),
+                "Bearer test-token".to_string(),
+                "{\"state\":\"closed\"}".to_string(),
+            )]
+        );
+        assert_eq!(fx.pr_state().await, "closed");
+    }
+
+    #[tokio::test]
+    async fn a_failed_upstream_close_leaves_the_row_unchanged() {
+        let fx = Fixture::new().await;
+        let (base, requests) = mock_api(422).await;
+        let store = fx.github_store("s1", &base, "open").await;
+        let err = store.close(1, None).await.unwrap_err();
+        assert!(err.to_string().contains("422"), "{err}");
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert_eq!(fx.pr_state().await, "open");
+    }
+
+    #[tokio::test]
+    async fn a_merged_or_closed_github_pr_cannot_be_closed_again() {
+        for state in ["merged", "closed"] {
+            let fx = Fixture::new().await;
+            let (base, requests) = mock_api(200).await;
+            let store = fx.github_store("s1", &base, state).await;
+            let err = store.close(1, None).await.unwrap_err();
+            assert!(err.to_string().contains(state), "{err}");
+            assert!(requests.lock().unwrap().is_empty());
+            assert_eq!(fx.pr_state().await, state);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_terminal_local_pr_cannot_be_closed_again() {
+        let fx = Fixture::new().await;
+        let (store, clone) = fx.store("s1", None).await;
+        commit_file(&clone, "work.txt");
+        store.open(None, "work", None, true).await.unwrap();
+        let key = fx.repo_key.to_str().unwrap();
+        let pr = fx.db.get_pr(key, 1).await.unwrap().unwrap();
+        fx.db
+            .update_pr(pr.id, "merged", None, None, None)
+            .await
+            .unwrap();
+        let err = store.close(1, None).await.unwrap_err();
+        assert!(err.to_string().contains("merged"), "{err}");
+        let pr = fx.db.get_pr(key, 1).await.unwrap().unwrap();
+        assert_eq!(pr.state, "merged");
+        // The transition itself refuses too, not just `close`.
+        assert!(matches!(
+            fx.db.close_pr(pr.id).await,
+            Err(crate::db::ChatDbError::PrTerminal { .. })
+        ));
     }
 
     #[test]
