@@ -94,6 +94,10 @@ enum MockChatScenario {
     /// The first request starts the script as a background terminal job;
     /// every later request gets a plain text reply.
     StartsBackgroundJob(&'static str),
+    /// The first request runs the script as a foreground terminal command and
+    /// the next replies with text, failing the turn when the command's result
+    /// reports a denied operation.
+    RunsScript(&'static str),
     /// A turn that runs [`COMPACTION_PROBE_STEPS`] commands over a
     /// context past the compaction start point, then replies; a turn that
     /// follows a restart is answered at once. See [`CompactionProbe`].
@@ -611,6 +615,37 @@ impl MockScenarioState {
                     Duration::from_millis(10),
                 )),
             },
+            MockChatScenario::RunsScript(script) => {
+                if self.request_index == 0 {
+                    MockHttpResponse::sse(vec![
+                        delayed_sse_frame(
+                            tool_call_chunk(
+                                "call-run-script",
+                                "terminal",
+                                &serde_json::json!({
+                                    "description": "Run the probe script",
+                                    "script": script,
+                                    "mode": "sandboxed",
+                                    "raw": true,
+                                    "timeout": 30,
+                                    "max_lines": 50
+                                }),
+                            ),
+                            Duration::from_millis(10),
+                        ),
+                        done_frame(Duration::from_millis(10)),
+                    ])
+                } else {
+                    let output = latest_tool_output(request).unwrap_or_default();
+                    if output.contains("not permitted") {
+                        return Err(format!("the probe script was denied: {output}"));
+                    }
+                    MockHttpResponse::sse(text_stream_frames(
+                        vec!["ran".to_string()],
+                        Duration::from_millis(10),
+                    ))
+                }
+            }
             MockChatScenario::StartsBackgroundJob(script) => match self.request_index {
                 0 => MockHttpResponse::sse(vec![
                     delayed_sse_frame(
@@ -1140,7 +1175,11 @@ fn sse_response(
 }
 
 struct TestHarness {
-    home: TempDir,
+    /// Owns the temporary home; dropping it removes the directory.
+    _home: TempDir,
+    /// The home's real path: May resolves its home, so every path it reports
+    /// is spelled this way (`/var` is a link to `/private/var` on macOS).
+    home_path: PathBuf,
     may_dir: PathBuf,
 }
 
@@ -1172,7 +1211,8 @@ impl TestHarness {
         context: ContextConfig,
     ) -> Self {
         let home = tempfile::tempdir().expect("test home tempdir should be created");
-        let may_dir = home.path().join(".may");
+        let home_path = dunce::canonicalize(home.path()).expect("test home should resolve");
+        let may_dir = home_path.join(".may");
         tokio::fs::create_dir_all(&may_dir)
             .await
             .expect("test may dir should be created");
@@ -1209,11 +1249,15 @@ impl TestHarness {
         seed_container_heel(&may_dir).await;
         futures_lite::future::zip(
             share_and_warm_tool_cache(&may_dir),
-            warm_may_binary(home.path()),
+            warm_may_binary(&home_path),
         )
         .await;
 
-        Self { home, may_dir }
+        Self {
+            _home: home,
+            home_path,
+            may_dir,
+        }
     }
 
     /// Tracing output a spawned server emitted, with ANSI styling stripped so
@@ -1265,7 +1309,7 @@ impl TestHarness {
     }
 
     fn home_path(&self) -> &Path {
-        self.home.path()
+        &self.home_path
     }
 
     /// The managed container heel's release state, as stored.
@@ -2273,6 +2317,52 @@ async fn exec_uses_session_directory_and_exposes_ipc_command_help() {
         String::from_utf8_lossy(&layout_output.stdout).trim(),
         "ready"
     );
+}
+
+/// A home reached through a symlink: the session directory May hands the
+/// terminal is the real one, so a `cd` into it and a write there succeed under
+/// heel's strict filesystem grants.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn a_terminal_command_runs_and_writes_in_the_session_directory_when_home_is_a_symlink() {
+    let mock = MockOpenAiServer::spawn(MockChatScenario::RunsScript(
+        "cd \"$(pwd)\" && printf written > symlink-home-probe && cat symlink-home-probe",
+    ))
+    .await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    let link_parent = tempfile::tempdir().expect("link tempdir should be created");
+    let linked_home = link_parent.path().join("linked-home");
+    std::os::unix::fs::symlink(harness.home_path(), &linked_home)
+        .expect("home symlink should be created");
+    let server = RunningDaemon::spawn(&linked_home, &[]).await;
+    let client = reqwest::Client::new();
+    let environment = ChatEnvironment::Local
+        .prepare(&harness, &client, &server)
+        .await;
+    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+    let sandbox_dir = SessionStore::new(MayHomePaths::new(harness.may_dir.clone()))
+        .sandbox_dir(&session_id, Some(environment.profile_id()));
+
+    let response = send_turn(
+        &client,
+        &server.base_url,
+        &serde_json::json!({ "sessionId": session_id, "content": "run the probe" }),
+    )
+    .await
+    .expect("chat stream request should succeed");
+    let response = expect_status(&server.log, response, StatusCode::OK).await;
+    let events = collect_turn_events(response, "the symlinked-home turn", &server.log).await;
+    assert!(
+        events.iter().any(|(kind, _)| kind == "done"),
+        "the turn should complete; events: {events:?}; server logs:\n{}",
+        server.log.contents().await
+    );
+    let written = std::fs::read_to_string(sandbox_dir.join("symlink-home-probe"))
+        .expect("the command should have written its file in the session directory");
+    assert_eq!(written, "written");
+    server.stop().await;
+    environment.release(&harness, &session_id).await;
 }
 
 /// Runs `script` through `may exec` in `mode` on `session`, in a home of its
