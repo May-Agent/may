@@ -1046,9 +1046,11 @@ mod tests {
         let mut events = bus.subscribe();
         let runtime =
             std::sync::Arc::new(crate::session::SessionRuntimeService::new(db.clone(), bus));
+        let provenance = IssueProvenance::new(db.clone(), "test".to_string());
         let store = crate::issue::MayIssueStore::new(db, "test".to_string());
         let seed = store.create("seed", "body", &[]).await.expect("seed issue");
-        let tool = IssueTool::new(store).with_changes(IssueChangeNotifier::new(runtime));
+        let tool =
+            IssueTool::new(store, provenance).with_changes(IssueChangeNotifier::new(runtime));
 
         tool.call(
             IssueArgs::View {
