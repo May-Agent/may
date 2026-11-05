@@ -1550,6 +1550,8 @@ mod tests {
             .iter()
             .map(|column| match (column.name.as_str(), column.ty.as_str()) {
                 ("session_id", _) => format!("'{session_id}'"),
+                // Timestamps are always written as ISO 8601.
+                ("created_at", _) => "'2026-01-01T00:00:00Z'".to_string(),
                 (_, "INTEGER" | "BOOLEAN") => n.to_string(),
                 (_, "BLOB") => "x'00'".to_string(),
                 _ => format!("'x{n}'"),
@@ -1707,8 +1709,8 @@ mod tests {
                 "INSERT INTO messages (session_id, role, content) VALUES (?, 'user', 'c')",
                 "INSERT INTO session_runtimes (session_id, state, browser_takeover_active, browser_takeover_alert_pending, updated_at) VALUES (?, 'idle', 0, 0, 't')",
                 "INSERT INTO session_plans (session_id, plan_state, updated_at) VALUES (?, 'none', 't')",
-                "INSERT INTO session_pending_permissions (request_id, session_id, mode, script, created_at) VALUES (?, ?, 'm', 's', 't')",
-                "INSERT INTO session_pending_workspace (request_id, session_id, path, reason, created_at) VALUES (?, ?, 'p', 'r', 't')",
+                "INSERT INTO session_pending_permissions (request_id, session_id, mode, script, created_at) VALUES (?, ?, 'm', 's', '2026-01-01T00:00:00Z')",
+                "INSERT INTO session_pending_workspace (request_id, session_id, path, reason, created_at) VALUES (?, ?, 'p', 'r', '2026-01-01T00:00:00Z')",
             ] {
                 if sql.matches('?').count() == 2 {
                     query!(raw, sql, id, id).execute().await
