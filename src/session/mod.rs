@@ -22,7 +22,7 @@ pub(crate) mod tool_result_wire;
 
 pub use context_snapshot::{
     PersistContextSnapshotError, PersistedContextSnapshot, checkpoint_from_hook,
-    load_persisted_context_snapshot, parse_persisted_context_snapshot,
+    checkpoint_watermark, load_persisted_context_snapshot, parse_persisted_context_snapshot,
     persist_agent_context_snapshot, persist_checkpoint_from_hook,
 };
 pub use history::{
