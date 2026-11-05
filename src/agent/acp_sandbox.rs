@@ -163,11 +163,11 @@ impl<N: NetworkPolicy + Clone> SessionSandbox<N> {
         // The program starts by the path `PATH` gives, so a link starts under
         // its own name (`cargo` is a link to `rustup`, which dispatches on
         // it). A grant never names a link, so its target is what the sandbox
-        // may execute. Nothing else on the command line is granted: the
-        // arguments come from the agent.
+        // may execute.
         let program = resolve_program(&spec.program, cwd)?;
         let target = canonical(&program)?;
         let links = process.link_dirs(&program)?;
+        let scripts = process.named_files(spec, cwd);
         let toolchains = toolchain_homes();
         let grants = snapshot
             .writable
@@ -176,6 +176,7 @@ impl<N: NetworkPolicy + Clone> SessionSandbox<N> {
             .chain(snapshot.readable.iter().map(|path| (path, Access::READ)))
             .chain(std::iter::once((&target, Access::EXEC)))
             .chain(links.iter().map(|path| (path, Access::READ)))
+            .chain(scripts.iter().map(|path| (path, Access::READ)))
             // The host toolchains the session's own commands build with.
             .chain(
                 toolchains
@@ -260,6 +261,21 @@ impl Process {
         match self {
             Self::Agent { state } => state,
             Self::Terminal => &[],
+        }
+    }
+
+    /// The files the agent's own command line names (an interpreter's
+    /// script), which it reads: that command is the user's configuration. A
+    /// terminal command's arguments come from the agent and grant nothing.
+    fn named_files(&self, spec: &SpawnSpec, cwd: &Path) -> Vec<PathBuf> {
+        match self {
+            Self::Agent { .. } => spec
+                .args
+                .iter()
+                .map(|arg| cwd.join(arg))
+                .filter(|path| path.is_file())
+                .collect(),
+            Self::Terminal => Vec::new(),
         }
     }
 
@@ -652,6 +668,29 @@ fn choose(options: &[PermissionOption], approved: bool) -> RequestPermissionOutc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The configured agent command's script is read; a terminal command's
+    /// argument naming the same file grants nothing.
+    #[test]
+    fn only_the_agent_command_names_files_it_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("agent.py"), "").unwrap();
+        let spec = SpawnSpec {
+            program: "python3".to_string(),
+            args: vec!["agent.py".to_string(), "--acp".to_string()],
+            env: std::collections::BTreeMap::new(),
+            cwd: dir.path().to_path_buf(),
+        };
+        let agent = Process::Agent { state: Vec::new() };
+        assert_eq!(
+            agent.named_files(&spec, dir.path()),
+            vec![dir.path().join("agent.py")]
+        );
+        assert_eq!(
+            Process::Terminal.named_files(&spec, dir.path()),
+            Vec::<PathBuf>::new()
+        );
+    }
 
     fn option(id: &str, kind: PermissionOptionKind) -> PermissionOption {
         PermissionOption {
