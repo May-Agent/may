@@ -18,13 +18,18 @@ use super::proto::{AgentRequest, AgentResponse};
 
 /// The daemon-side client for one `computer-agent` child.
 pub struct ComputerAgent {
+    /// The helper this client may launch; `None` for a detached client.
     #[cfg(target_os = "macos")]
+    helper: Option<Helper>,
+}
+
+/// The helper app under one May dir.
+#[cfg(target_os = "macos")]
+struct Helper {
     socket: PathBuf,
-    #[cfg(target_os = "macos")]
     may_dir: PathBuf,
     /// Serializes `open` launches — the helper reports liveness through
     /// its pid file, so a launch in flight must not overlap another.
-    #[cfg(target_os = "macos")]
     spawn_lock: Mutex<()>,
 }
 
@@ -41,11 +46,21 @@ impl ComputerAgent {
     pub fn new(may_dir: PathBuf) -> Self {
         Self {
             #[cfg(target_os = "macos")]
-            socket: may_dir.join("computer-agent.sock"),
+            helper: Some(Helper {
+                socket: may_dir.join("computer-agent.sock"),
+                may_dir,
+                spawn_lock: Mutex::new(()),
+            }),
+        }
+    }
+
+    /// A client with no helper to launch: every request fails and nothing
+    /// runs. Tests hold this so they never start the real app.
+    #[must_use]
+    pub const fn detached() -> Self {
+        Self {
             #[cfg(target_os = "macos")]
-            may_dir,
-            #[cfg(target_os = "macos")]
-            spawn_lock: Mutex::new(()),
+            helper: None,
         }
     }
 
@@ -56,8 +71,12 @@ impl ComputerAgent {
     /// request itself failed.
     #[cfg(target_os = "macos")]
     pub async fn request(&self, request: AgentRequest) -> Result<AgentResponse, String> {
-        self.ensure_running()?;
-        let socket = self.socket.clone();
+        let helper = self
+            .helper
+            .as_ref()
+            .ok_or_else(|| "this computer client is detached from any helper".to_owned())?;
+        helper.ensure_running()?;
+        let socket = helper.socket.clone();
         let payload = serde_json::to_vec(&request)
             .map_err(|e| e.to_string())
             .map(|mut v| {
@@ -84,7 +103,9 @@ impl ComputerAgent {
     #[cfg(target_os = "macos")]
     #[must_use]
     pub fn is_running(&self) -> bool {
-        self.helper_pid().is_some()
+        self.helper
+            .as_ref()
+            .is_some_and(|h| h.helper_pid().is_some())
     }
 
     /// There is no helper outside macOS.
@@ -98,7 +119,7 @@ impl ComputerAgent {
     /// user grants permissions, since TCC applies at process launch.
     #[cfg(target_os = "macos")]
     pub fn restart(&self) {
-        if let Some(pid) = self.helper_pid() {
+        if let Some(pid) = self.helper.as_ref().and_then(Helper::helper_pid) {
             unsafe { libc::kill(pid, libc::SIGTERM) };
         }
     }
@@ -106,7 +127,10 @@ impl ComputerAgent {
     /// Nothing to respawn outside macOS.
     #[cfg(not(target_os = "macos"))]
     pub const fn restart(&self) {}
+}
 
+#[cfg(target_os = "macos")]
+impl Helper {
     /// A stale pid file or a dead pid both mean "not running".
     #[cfg(target_os = "macos")]
     fn helper_pid(&self) -> Option<libc::pid_t> {
