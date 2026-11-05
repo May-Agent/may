@@ -1,6 +1,0 @@
-Browser automation: {% if state.enabled() %}enabled (May-managed runtime, never the user's personal browser){% else %}disabled{% endif %}
-{% if let Some(endpoint) = cdp_endpoint %}CDP endpoint: {{ endpoint }}
-{% endif %}
-{% if state.enabled() %}Lifecycle: `browser open` starts the runtime and lights up the live sidebar; `browser read <url> --detail <brief|standard|full> --screenshot <off|viewport|full-page>` returns structured text and element summaries plus an optional artifact screenshot; `browser close` when finished releases resources. Use `browser cdp-endpoint` only for raw CDP access.
-{% else %}Do not install Playwright or launch browser runtimes yourself; ask the user to enable the browser feature in settings.
-{% endif %}

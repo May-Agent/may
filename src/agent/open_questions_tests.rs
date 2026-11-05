@@ -11,6 +11,7 @@ use super::idle_compaction_tests::{SESSION_MODEL, Session, StubModel, run_turn, 
 fn question(text: &str) -> AskUserArgs {
     AskUserArgs {
         question: Some(text.to_string()),
+        positional_question: None,
         option: Vec::new(),
         multi_select: false,
         secret: None,
