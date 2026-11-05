@@ -1320,6 +1320,7 @@ impl ChatDb {
         let snapshot_result = query!(self.db, "DELETE FROM session_context_snapshots")
             .execute()
             .await?;
+        self.delete_all_repo_clones().await?;
         let session_result = query!(self.db, "DELETE FROM sessions").execute().await?;
         Ok(result.rows_written + snapshot_result.rows_written + session_result.rows_written)
     }

@@ -150,23 +150,51 @@ pub(super) async fn lookup_issues(
     Json(body): Json<serde_json::Value>,
     State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<skyzen::Response> {
-    use crate::issue::IssueStore as _;
     #[derive(serde::Deserialize)]
     struct LookupRequest {
         numbers: Vec<i64>,
     }
     let req: LookupRequest = serde_json::from_value(body).map_err(bad_request_error)?;
     let id = params.get("id").map_err(bad_request_error)?.to_string();
+    let briefs = issue_briefs(&state, &id, req.numbers).await?;
+    super::error::json_ok_response(&briefs)
+}
+
+/// The issues `session_issues` reports for `session_id`: its tasks' linked
+/// issues that the store could look up.
+pub(super) async fn linked_issue_briefs(
+    state: &DaemonState,
+    session_id: &str,
+    paths: &crate::session::SessionPaths,
+) -> SkyResult<Vec<crate::tui::sidebar::IssueBrief>> {
+    let content = paths.tasks_content().await.map_err(internal_error)?;
+    let numbers = content
+        .as_deref()
+        .map(crate::tui::sidebar::TaskTree::parse)
+        .map(|tree| tree.linked_issues())
+        .unwrap_or_default();
+    let mut briefs = issue_briefs(state, session_id, numbers).await?;
+    // A failed lookup says nothing new; the client keeps what it shows.
+    briefs.retain(|brief| brief.title.is_some());
+    Ok(briefs)
+}
+
+/// One brief per requested number from the session's issue store; a miss
+/// yields a `null` title.
+async fn issue_briefs(
+    state: &DaemonState,
+    id: &str,
+    numbers: Vec<i64>,
+) -> SkyResult<Vec<crate::tui::sidebar::IssueBrief>> {
+    use crate::issue::IssueStore as _;
+    let id = id.to_string();
     let db = state.db();
     let session = db
         .get_session(&id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| session_not_found_error(&id))?;
-    let cwd = session
-        .cwd
-        .map(std::path::PathBuf::from)
-        .ok_or_else(|| bad_request_error("session has no cwd"))?;
+    let cwd = crate::session::SessionDirectory::of(&session, &state.may_dir).into_path();
     let store = SessionStore::new(MayHomePaths::new(state.may_dir.clone()));
     let sandbox_dir = store.sandbox_dir(&id, session.profile_id.as_deref());
     let workspace_config = crate::session::SessionPaths::new(sandbox_dir).workspace_config();
@@ -174,8 +202,8 @@ pub(super) async fn lookup_issues(
         blocking::unblock(move || crate::issue::resolve_issue_store(&cwd, &workspace_config, db))
             .await
             .map_err(internal_error)?;
-    let mut briefs = Vec::with_capacity(req.numbers.len());
-    for number in req.numbers {
+    let mut briefs = Vec::with_capacity(numbers.len());
+    for number in numbers {
         let brief = match issue_store.get(number).await {
             Ok(detail) => crate::tui::sidebar::IssueBrief {
                 number,
@@ -193,7 +221,7 @@ pub(super) async fn lookup_issues(
         };
         briefs.push(brief);
     }
-    super::error::json_ok_response(&briefs)
+    Ok(briefs)
 }
 
 pub(super) async fn get_session(
@@ -283,6 +311,25 @@ pub(super) async fn get_session_tasks(
         content,
         plan_state: runtime.plan_state,
     }))
+}
+
+/// `GET /api/sessions/{id}/repo-clones`: the session's repository clones from
+/// the host's registry.
+pub(super) async fn get_session_repo_clones(
+    params: Params,
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<Vec<crate::repo_clone::CloneView>>> {
+    let id = params.get("id").map_err(bad_request_error)?.to_string();
+    let db = state.db();
+    let session = db
+        .get_session(&id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| session_not_found_error(&id))?;
+    let store = SessionStore::new(MayHomePaths::new(state.may_dir.clone()));
+    let paths = store.session_paths(&id, session.profile_id.as_deref());
+    let repos = crate::repo_clone::SessionRepos::new(paths.root(), id, db);
+    Ok(Json(repos.views().await.map_err(internal_error)?))
 }
 
 /// The session's PRs with their transition events — the sidebar's list.
@@ -529,7 +576,7 @@ pub(super) async fn create_session(
 /// `github:owner/repo` spec binds the GitHub repository itself; an
 /// existing path binds that repository's local identity; anything else
 /// fails.
-fn resolve_repo_binding(spec: Option<&str>) -> Result<Option<String>, String> {
+pub(super) fn resolve_repo_binding(spec: Option<&str>) -> Result<Option<String>, String> {
     let Some(spec) = spec.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(None);
     };
@@ -725,7 +772,7 @@ pub(super) async fn delete_session(
         .evict(&crate::session::SessionId::from_string(id.as_str()));
     let store = SessionStore::new(MayHomePaths::new(state.may_dir.clone()));
     store
-        .delete_session(&id, profile_id.as_deref())
+        .delete_session(&id, profile_id.as_deref(), &db)
         .await
         .map_err(internal_error)?;
     state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS | UiEventTopics::SESSION_RUNTIMES);
