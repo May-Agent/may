@@ -1501,11 +1501,19 @@ async fn seed_container_heel(may_dir: &Path) {
     .expect("container heel release state should be written");
 }
 
+/// Directory holding the downloads every test run shares. `MAY_TEST_CACHE`
+/// names it so CI can restore it from the Actions cache; unset, it is the
+/// build's test scratch directory.
+fn shared_download_root() -> PathBuf {
+    std::env::var_os("MAY_TEST_CACHE")
+        .map_or_else(|| PathBuf::from(env!("CARGO_TARGET_TMPDIR")), PathBuf::from)
+}
+
 /// The pinned container heel in the shared test-tmp cache, downloaded from
 /// its release on first use. Its SHA-256 is verified every time it is handed
 /// out, whether freshly downloaded or reused.
 async fn pinned_container_heel() -> PathBuf {
-    let cache_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+    let cache_dir = shared_download_root()
         .join("container-heel")
         .join(CONTAINER_HEEL_RELEASE_TAG);
     let cached = cache_dir.join(CONTAINER_HEEL_ASSET.name);
@@ -1572,7 +1580,7 @@ async fn verify_container_heel(bytes: Vec<u8>, origin: &str) -> Vec<u8> {
 /// distribution, so the first hash-verified download happens here instead of
 /// inside a server's readiness deadline. Later runs reuse the cached artifacts.
 async fn share_and_warm_tool_cache(may_dir: &Path) {
-    let shared = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("may-tools");
+    let shared = shared_download_root().join("may-tools");
     tokio::fs::create_dir_all(&shared)
         .await
         .expect("shared tool cache dir should be created");
