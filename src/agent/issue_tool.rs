@@ -8,6 +8,7 @@ use askama::Template;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+use crate::issue::provenance::{CallOrigin, IssueAction, IssueMarks, IssueProvenance};
 use crate::issue::search::{IssueHit, IssueSearch};
 use crate::issue::{
     IssueDetail, IssueError, IssueListState, IssueRelationKind, IssueState, IssueStore,
@@ -24,6 +25,10 @@ const fn default_search_limit() -> usize {
 
 const fn default_search_state() -> IssueListState {
     IssueListState::All
+}
+
+const fn default_provenance_messages() -> usize {
+    3
 }
 
 const fn default_list_limit() -> i64 {
@@ -43,6 +48,8 @@ const fn default_list_state() -> IssueListState {
 /// - `issue list [--state open|closed|all] [--labels name ...] [--limit n]`
 /// - `issue search <query> [--state open|closed|all] [--limit n]` — issues
 ///   whose title, body or comments match the described topic
+/// - `issue provenance <number> [--messages n]` — the changes may made to the
+///   issue, with the session, agent, tool call and preceding user messages
 /// - `issue edit <number> [--title t] [--body b] [--state open|closed]`
 /// - `issue comment <number> <body>`
 /// - `issue close <number>` (reopen with `edit --state open`)
@@ -81,6 +88,15 @@ pub enum IssueArgs {
         /// Maximum issues returned.
         #[serde(default = "default_list_limit")]
         limit: i64,
+    },
+    /// List the changes may made to an issue: session, agent, tool call and
+    /// the user messages that explain each.
+    Provenance {
+        /// Issue number.
+        number: i64,
+        /// User messages shown per record.
+        #[serde(default = "default_provenance_messages")]
+        messages: usize,
     },
     /// Find issues by what they are about, in natural language.
     Search {
@@ -164,6 +180,7 @@ impl IssueArgs {
             Self::View { .. } => "view",
             Self::List { .. } => "list",
             Self::Search { .. } => "search",
+            Self::Provenance { .. } => "provenance",
             Self::Edit { .. } => "edit",
             Self::Comment { .. } => "comment",
             Self::Close { .. } => "close",
@@ -177,7 +194,7 @@ impl IssueArgs {
     const fn writes(&self) -> bool {
         !matches!(
             self,
-            Self::View { .. } | Self::List { .. } | Self::Search { .. }
+            Self::View { .. } | Self::List { .. } | Self::Search { .. } | Self::Provenance { .. }
         )
     }
 
@@ -243,6 +260,7 @@ impl std::fmt::Debug for IssueChangeNotifier {
 #[derive(Debug, Clone)]
 pub struct IssueTool<S> {
     store: S,
+    provenance: IssueProvenance,
     search: Option<SessionIssueSearch>,
     languages: Option<aither_agent::LanguageGuard>,
     changes: Option<IssueChangeNotifier>,
@@ -253,15 +271,17 @@ pub struct IssueTool<S> {
 #[derive(Debug, Clone)]
 pub struct SubagentIssueTool<S> {
     store: S,
+    provenance: IssueProvenance,
     search: Option<SessionIssueSearch>,
 }
 
 impl<S: IssueStore> SubagentIssueTool<S> {
     /// Bind the read-only tool to the session's issue store.
     #[must_use]
-    pub const fn new(store: S) -> Self {
+    pub const fn new(store: S, provenance: IssueProvenance) -> Self {
         Self {
             store,
+            provenance,
             search: None,
         }
     }
@@ -285,7 +305,7 @@ impl<S: IssueStore + Clone + 'static> Tool for SubagentIssueTool<S> {
     async fn call(
         &self,
         arguments: Self::Arguments,
-        _cx: aither_core::llm::ToolContext,
+        cx: aither_core::llm::ToolContext,
     ) -> aither_core::Result<Self::Res> {
         if arguments.writes() {
             let refusal = IssueReserved {
@@ -294,18 +314,25 @@ impl<S: IssueStore + Clone + 'static> Tool for SubagentIssueTool<S> {
             .render()?;
             return Err(IssueError::Reserved(refusal).into());
         }
-        execute(&self.store, self.search.as_ref(), arguments)
-            .await
-            .map_err(Into::into)
+        execute(
+            &self.store,
+            &self.provenance,
+            &CallOrigin::from_context(&cx),
+            self.search.as_ref(),
+            arguments,
+        )
+        .await
+        .map_err(Into::into)
     }
 }
 
 impl<S: IssueStore> IssueTool<S> {
     /// Bind the tool to the session's issue store.
     #[must_use]
-    pub const fn new(store: S) -> Self {
+    pub const fn new(store: S, provenance: IssueProvenance) -> Self {
         Self {
             store,
+            provenance,
             search: None,
             languages: None,
             changes: None,
@@ -345,7 +372,7 @@ impl<S: IssueStore + Clone + 'static> Tool for IssueTool<S> {
     async fn call(
         &self,
         arguments: Self::Arguments,
-        _cx: aither_core::llm::ToolContext,
+        cx: aither_core::llm::ToolContext,
     ) -> aither_core::Result<Self::Res> {
         if let Some(guard) = &self.languages {
             for text in arguments.published_texts() {
@@ -353,7 +380,14 @@ impl<S: IssueStore + Clone + 'static> Tool for IssueTool<S> {
             }
         }
         let writes = arguments.writes();
-        let result = execute(&self.store, self.search.as_ref(), arguments).await;
+        let result = execute(
+            &self.store,
+            &self.provenance,
+            &CallOrigin::from_context(&cx),
+            self.search.as_ref(),
+            arguments,
+        )
+        .await;
         // A relation edit can fail after its first half applied, so a failed
         // write announces too.
         if writes && let Some(changes) = &self.changes {
@@ -365,9 +399,26 @@ impl<S: IssueStore + Clone + 'static> Tool for IssueTool<S> {
 
 async fn execute<S: IssueStore>(
     backend: &S,
+    provenance: &IssueProvenance,
+    origin: &CallOrigin,
     search: Option<&SessionIssueSearch>,
     args: IssueArgs,
 ) -> Result<ToolResult, IssueError> {
+    let record = |number: i64,
+                  comment_id: Option<i64>,
+                  action: IssueAction,
+                  detail: Option<String>| async move {
+        provenance
+            .record(
+                backend,
+                origin,
+                number,
+                comment_id,
+                action,
+                detail.as_deref(),
+            )
+            .await
+    };
     match args {
         IssueArgs::Create {
             title,
@@ -382,12 +433,17 @@ async fn execute<S: IssueStore>(
             let detail = backend
                 .create(title.trim(), body.as_deref().unwrap_or(""), &labels)
                 .await?;
-            Ok(ToolResult::text(render_detail(&detail)))
+            record(detail.number, None, IssueAction::Create, None).await?;
+            Ok(ToolResult::text(render_detail(&detail, None)))
         }
         IssueArgs::View { number } => {
             let detail = backend.get(number).await?;
-            Ok(ToolResult::text(render_detail(&detail)))
+            let marks = provenance.marks(backend, number).await?;
+            Ok(ToolResult::text(render_detail(&detail, Some(&marks))))
         }
+        IssueArgs::Provenance { number, messages } => Ok(ToolResult::text(
+            provenance.render(backend, number, messages).await?,
+        )),
         IssueArgs::List {
             state,
             labels,
@@ -432,7 +488,19 @@ async fn execute<S: IssueStore>(
             let detail = backend
                 .edit(number, title.as_deref(), body.as_deref(), state)
                 .await?;
-            Ok(ToolResult::text(render_detail(&detail)))
+            let touched = [("title", title.is_some()), ("body", body.is_some())]
+                .into_iter()
+                .filter_map(|(name, changed)| changed.then_some(name))
+                .collect::<Vec<_>>();
+            if !touched.is_empty() {
+                record(number, None, IssueAction::Edit, Some(touched.join(", "))).await?;
+            }
+            match state {
+                Some(IssueState::Closed) => record(number, None, IssueAction::Close, None).await?,
+                Some(IssueState::Open) => record(number, None, IssueAction::Reopen, None).await?,
+                None => {}
+            }
+            Ok(ToolResult::text(render_detail(&detail, None)))
         }
         IssueArgs::Comment { number, body } => {
             if body.trim().is_empty() {
@@ -440,14 +508,22 @@ async fn execute<S: IssueStore>(
                     "issue comment body must not be empty".to_string(),
                 ));
             }
-            let detail = backend.comment(number, &body).await?;
-            Ok(ToolResult::text(render_detail(&detail)))
+            let commented = backend.comment(number, &body).await?;
+            record(
+                number,
+                Some(commented.comment_id),
+                IssueAction::Comment,
+                None,
+            )
+            .await?;
+            Ok(ToolResult::text(render_detail(&commented.detail, None)))
         }
         IssueArgs::Close { number } => {
             let detail = backend
                 .edit(number, None, None, Some(IssueState::Closed))
                 .await?;
-            Ok(ToolResult::text(render_detail(&detail)))
+            record(number, None, IssueAction::Close, None).await?;
+            Ok(ToolResult::text(render_detail(&detail, None)))
         }
         IssueArgs::Label {
             number,
@@ -460,23 +536,54 @@ async fn execute<S: IssueStore>(
                 ));
             }
             let detail = backend.edit_labels(number, &add, &remove).await?;
-            Ok(ToolResult::text(render_detail(&detail)))
+            let changes = add
+                .iter()
+                .map(|label| format!("+{label}"))
+                .chain(remove.iter().map(|label| format!("-{label}")))
+                .collect::<Vec<_>>()
+                .join(" ");
+            record(number, None, IssueAction::Label, Some(changes)).await?;
+            Ok(ToolResult::text(render_detail(&detail, None)))
         }
         IssueArgs::BlockedBy {
             number,
             add,
             remove,
-        } => edit_relations(backend, number, IssueRelationKind::BlockedBy, &add, &remove).await,
+        } => {
+            edit_relations(
+                backend,
+                provenance,
+                origin,
+                number,
+                IssueRelationKind::BlockedBy,
+                &add,
+                &remove,
+            )
+            .await
+        }
         IssueArgs::SubIssue {
             number,
             add,
             remove,
-        } => edit_relations(backend, number, IssueRelationKind::SubIssue, &add, &remove).await,
+        } => {
+            edit_relations(
+                backend,
+                provenance,
+                origin,
+                number,
+                IssueRelationKind::SubIssue,
+                &add,
+                &remove,
+            )
+            .await
+        }
     }
 }
 
 async fn edit_relations<S: IssueStore>(
     backend: &S,
+    provenance: &IssueProvenance,
+    origin: &CallOrigin,
     number: i64,
     kind: IssueRelationKind,
     add: &[i64],
@@ -491,11 +598,33 @@ async fn edit_relations<S: IssueStore>(
     let mut detail = backend.get(number).await?;
     for target in add {
         detail = backend.edit_relation(number, kind, *target, true).await?;
+        let change = format!("{} #{target}", kind.as_str());
+        provenance
+            .record(
+                backend,
+                origin,
+                number,
+                None,
+                IssueAction::RelationAdd,
+                Some(&change),
+            )
+            .await?;
     }
     for target in remove {
         detail = backend.edit_relation(number, kind, *target, false).await?;
+        let change = format!("{} #{target}", kind.as_str());
+        provenance
+            .record(
+                backend,
+                origin,
+                number,
+                None,
+                IssueAction::RelationRemove,
+                Some(&change),
+            )
+            .await?;
     }
-    Ok(ToolResult::text(render_detail(&detail)))
+    Ok(ToolResult::text(render_detail(&detail, None)))
 }
 
 const fn render_state(state: IssueState) -> &'static str {
@@ -533,7 +662,7 @@ fn render_related(related: &[crate::issue::RelatedIssue]) -> String {
         .join(", ")
 }
 
-fn render_detail(detail: &IssueDetail) -> String {
+fn render_detail(detail: &IssueDetail, marks: Option<&IssueMarks>) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
@@ -542,6 +671,19 @@ fn render_detail(detail: &IssueDetail) -> String {
         detail.title,
         render_state(detail.state)
     );
+    if let Some(marks) = marks {
+        match &marks.created_in {
+            Some(session) => {
+                let _ = writeln!(out, "written by may: yes (session {session})");
+            }
+            None => {
+                let _ = writeln!(
+                    out,
+                    "written by may: no (not created by may on this machine)"
+                );
+            }
+        }
+    }
     if !detail.labels.is_empty() {
         let _ = writeln!(out, "labels: {}", detail.labels.join(", "));
     }
@@ -569,7 +711,18 @@ fn render_detail(detail: &IssueDetail) -> String {
                 .as_deref()
                 .map(|author| format!(" {author}"))
                 .unwrap_or_default();
-            let _ = writeln!(out, "- [{}]{} {}", comment.created_at, author, comment.body);
+            let mark = marks.map_or("", |marks| {
+                if marks.comment_ids.contains(&comment.id) {
+                    " [written by may]"
+                } else {
+                    " [not written by may]"
+                }
+            });
+            let _ = writeln!(
+                out,
+                "- [{}]{}{} {}",
+                comment.created_at, author, mark, comment.body
+            );
         }
     }
     out
@@ -662,9 +815,223 @@ pub mod subagent_checks {
     }
 }
 
+/// Shared checks of the provenance `issue` leaves, run against each backend.
+#[cfg(test)]
+pub mod provenance_checks {
+    use aither_core::llm::{AgentIdentity, CallIdentity, ToolCallId, ToolContext};
+
+    use crate::db::{ChatDb, MessageMeta};
+    use crate::session::MessageRole;
+
+    use super::*;
+
+    const SESSION: &str = "session-prov";
+
+    fn call(id: &str) -> ToolContext {
+        ToolContext::new()
+            .with_identity(CallIdentity::new(ToolCallId::new(id), AgentIdentity::Main))
+    }
+
+    pub async fn run<S: IssueStore + Clone + 'static>(
+        tool: &IssueTool<S>,
+        id: &str,
+        args: IssueArgs,
+    ) -> String {
+        let result = tool.call(args, call(id)).await.expect("issue command");
+        format!("{result:?}")
+    }
+
+    /// Create, edit, comment and close issue `number` (the first issue the
+    /// backend hands out) through `tool`, then read the provenance back.
+    /// `outside` is an issue the backend holds that `tool` never touched.
+    pub async fn assert_changes_are_recorded<S: IssueStore + Clone + 'static>(
+        db: &ChatDb,
+        store: S,
+        number: i64,
+        outside: i64,
+    ) {
+        let tool = IssueTool::new(
+            store.clone(),
+            IssueProvenance::new(db.clone(), SESSION.to_string()),
+        );
+        let steps = [
+            ("call_create", "issue create 'first'".to_string()),
+            ("call_edit", format!("issue edit {number} --title second")),
+            ("call_comment", format!("issue comment {number} hello")),
+            ("call_close", format!("issue close {number}")),
+        ];
+        db.append_message(
+            SESSION,
+            MessageRole::User,
+            "please track this bug",
+            None,
+            MessageMeta::default(),
+        )
+        .await
+        .expect("user message");
+        let calls = steps
+            .iter()
+            .map(|(id, script)| {
+                serde_json::json!({"id": id, "name": "terminal", "arguments": {"script": script}})
+            })
+            .collect::<Vec<_>>();
+        let calls = serde_json::Value::Array(calls).to_string();
+        db.append_message(
+            SESSION,
+            MessageRole::Assistant,
+            "",
+            None,
+            MessageMeta {
+                tool_calls: Some(&calls),
+                ..MessageMeta::default()
+            },
+        )
+        .await
+        .expect("assistant message");
+
+        run(
+            &tool,
+            "call_create",
+            IssueArgs::Create {
+                title: "first".to_string(),
+                body: None,
+                labels: Vec::new(),
+            },
+        )
+        .await;
+        run(
+            &tool,
+            "call_edit",
+            IssueArgs::Edit {
+                number,
+                title: Some("second".to_string()),
+                body: None,
+                state: None,
+            },
+        )
+        .await;
+        run(
+            &tool,
+            "call_comment",
+            IssueArgs::Comment {
+                number,
+                body: "hello".to_string(),
+            },
+        )
+        .await;
+        run(&tool, "call_close", IssueArgs::Close { number }).await;
+        db.append_message(
+            SESSION,
+            MessageRole::User,
+            "a later message",
+            None,
+            MessageMeta::default(),
+        )
+        .await
+        .expect("later user message");
+
+        let records = db
+            .issue_provenance(store.info().name, &store.search_key(), number)
+            .await
+            .expect("records");
+        let actions = records
+            .iter()
+            .map(|record| record.action.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(actions, ["create", "edit", "comment", "close"]);
+        for (record, (call_id, _)) in records.iter().zip(&steps) {
+            assert_eq!(record.session_id, SESSION);
+            assert_eq!(record.agent, "main");
+            assert_eq!(record.tool_call_id.as_deref(), Some(*call_id));
+            let at = record
+                .recorded_at
+                .parse::<jiff::Timestamp>()
+                .expect("UTC time");
+            assert!(record.recorded_at.ends_with('Z'), "{at}");
+        }
+        assert!(records[2].comment_id.is_some());
+
+        let report = run(
+            &tool,
+            "call_read",
+            IssueArgs::Provenance {
+                number,
+                messages: 5,
+            },
+        )
+        .await;
+        for expected in [
+            "call_create",
+            "call_close",
+            &format!("ran terminal: issue comment {number} hello"),
+            "please track this bug",
+            SESSION,
+        ] {
+            assert!(report.contains(expected), "missing {expected}: {report}");
+        }
+        assert!(
+            !report.contains("a later message"),
+            "later messages are no explanation: {report}"
+        );
+
+        let viewed = run(&tool, "call_view", IssueArgs::View { number }).await;
+        assert!(viewed.contains("written by may: yes"), "{viewed}");
+        assert!(viewed.contains("[written by may] hello"), "{viewed}");
+        let viewed = run(&tool, "call_view", IssueArgs::View { number: outside }).await;
+        assert!(viewed.contains("written by may: no"), "{viewed}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn changes_to_may_issues_are_recorded_with_their_session_agent_and_call() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = crate::db::ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("chat db should open");
+        let store = crate::issue::MayIssueStore::new(db.clone(), "test".to_string());
+        // Issue 1 exists without the tool; the tool then creates issue 2.
+        let outside = store.create("outside", "", &[]).await.expect("outside");
+        provenance_checks::assert_changes_are_recorded(
+            &db,
+            store,
+            outside.number + 1,
+            outside.number,
+        )
+        .await;
+    }
+
+    /// Marking reads the provenance records alone, whichever backend holds the
+    /// issue, so one test on the may backend covers an issue and a comment
+    /// written outside may.
+    #[tokio::test]
+    async fn an_issue_and_comment_written_outside_may_are_marked_not_written_by_may() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = crate::db::ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("chat db should open");
+        let store = crate::issue::MayIssueStore::new(db.clone(), "test".to_string());
+        let outside = store.create("outside", "", &[]).await.expect("outside");
+        store
+            .comment(outside.number, "outsider")
+            .await
+            .expect("outside comment");
+        let tool = IssueTool::new(store, IssueProvenance::new(db, "test".to_string()));
+
+        let viewed = provenance_checks::run(
+            &tool,
+            "call_view",
+            IssueArgs::View {
+                number: outside.number,
+            },
+        )
+        .await;
+        assert!(viewed.contains("written by may: no"), "{viewed}");
+        assert!(viewed.contains("[not written by may] outsider"), "{viewed}");
+    }
 
     #[tokio::test]
     async fn a_subagent_reads_issues_and_its_writes_never_reach_the_may_backend() {
@@ -672,14 +1039,17 @@ mod tests {
         let db = crate::db::ChatDb::open(&dir.path().join("history.db"))
             .await
             .expect("chat db should open");
-        let store = crate::issue::MayIssueStore::new(db, "test".to_string());
+        let store = crate::issue::MayIssueStore::new(db.clone(), "test".to_string());
         let created = store.create("seed", "body", &[]).await.expect("seed issue");
         let before = store
             .list(IssueListState::All, &[], 50)
             .await
             .expect("list");
 
-        let tool = SubagentIssueTool::new(store.clone());
+        let tool = SubagentIssueTool::new(
+            store.clone(),
+            IssueProvenance::new(db.clone(), "test".to_string()),
+        );
         subagent_checks::assert_reads_work(&tool, created.number).await;
         subagent_checks::assert_writes_refused(&tool).await;
 
@@ -705,9 +1075,11 @@ mod tests {
         let mut events = bus.subscribe();
         let runtime =
             std::sync::Arc::new(crate::session::SessionRuntimeService::new(db.clone(), bus));
+        let provenance = IssueProvenance::new(db.clone(), "test".to_string());
         let store = crate::issue::MayIssueStore::new(db, "test".to_string());
         let seed = store.create("seed", "body", &[]).await.expect("seed issue");
-        let tool = IssueTool::new(store).with_changes(IssueChangeNotifier::new(runtime));
+        let tool =
+            IssueTool::new(store, provenance).with_changes(IssueChangeNotifier::new(runtime));
 
         tool.call(
             IssueArgs::View {
