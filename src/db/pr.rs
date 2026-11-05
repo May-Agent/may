@@ -28,11 +28,12 @@ pub struct PrRow {
     /// `open`, `checks_pending`, `failed`, `rejected`, `merging`, `merged`
     /// or `closed`.
     pub state: String,
-    /// Session branch ref in the checkout (`refs/may/<session>`).
+    /// Local backend: the durable ref holding the PR's commit in the checkout
+    /// (`refs/may/pr/<number>`); GitHub: the session branch on `upstream`.
     pub branch: String,
     /// Base commit the PR was opened against.
     pub base_sha: String,
-    /// Head commit, refreshed on each merge attempt.
+    /// The commit the PR owns: pinned when opened, moved only by `pr update`.
     pub head_sha: Option<String>,
     /// `may` or `github`.
     pub backend: String,
@@ -61,7 +62,7 @@ pub struct PrEventRow {
     pub pr_id: i64,
     /// `opened`, `checks_pending`, `check_failed`, `rejected`, `queued`,
     /// `merging`, `merged`, `closed`, `issue_linked`, `rewound`,
-    /// `orphaned`, `adopted`.
+    /// `orphaned`, `adopted`, `updated`.
     pub kind: String,
     /// Session that caused the transition.
     pub session_id: String,
@@ -179,6 +180,22 @@ impl ChatDb {
         .await?)
     }
 
+    /// Name the durable ref a local PR's commit lives under.
+    ///
+    /// # Errors
+    /// Fails on database errors.
+    pub async fn set_pr_branch(&self, pr_id: i64, branch: &str) -> Result<(), ChatDbError> {
+        query!(
+            self.db,
+            "UPDATE prs SET branch = ? WHERE id = ?",
+            branch,
+            pr_id
+        )
+        .execute()
+        .await?;
+        Ok(())
+    }
+
     /// Transfer a PR to another session — the manual orphan-recovery op.
     ///
     /// # Errors
@@ -261,6 +278,37 @@ impl ChatDb {
         Ok(query!(self.db, "SELECT * FROM prs WHERE id = ?", id)
             .fetch_one::<PrRow>()
             .await?)
+    }
+
+    /// Close a PR: the only transition to `closed` that abandons work, and
+    /// the one place that refuses a terminal PR. The state check and the
+    /// write share one transaction.
+    ///
+    /// # Errors
+    /// Fails with [`ChatDbError::PrTerminal`] when the PR is `merged` or
+    /// `closed`, and on database errors.
+    pub async fn close_pr(&self, id: i64) -> Result<PrRow, ChatDbError> {
+        let now = jiff::Timestamp::now().to_string();
+        let mut tx = self.db.begin().await?;
+        let row = query!(tx, "SELECT * FROM prs WHERE id = ?", id)
+            .fetch_one::<PrRow>()
+            .await?;
+        if matches!(row.state.as_str(), "merged" | "closed") {
+            return Err(ChatDbError::PrTerminal { state: row.state });
+        }
+        query!(
+            tx,
+            "UPDATE prs SET state = 'closed', updated_at = ? WHERE id = ?",
+            now,
+            id
+        )
+        .execute()
+        .await?;
+        let row = query!(tx, "SELECT * FROM prs WHERE id = ?", id)
+            .fetch_one::<PrRow>()
+            .await?;
+        tx.commit().await?;
+        Ok(row)
     }
 
     /// Append a provenance event to a PR.

@@ -253,7 +253,7 @@ impl ContainerManager {
 
         let config = ContainerCreateBody {
             image: Some(spec.image.clone()),
-            hostname: Some(spec.name.clone()),
+            hostname: Some(container_hostname(&spec.name)),
             working_dir: Some(CONTAINER_WORKSPACE.to_string()),
             env: Some(env),
             host_config: Some(host_config),
@@ -555,6 +555,29 @@ impl ContainerManager {
     }
 }
 
+/// Longest hostname a container accepts: one DNS label. Linux refuses a
+/// `sethostname` over 64 bytes, which fails the container's start.
+const HOSTNAME_MAX: usize = 63;
+
+/// The container's hostname: its name as a DNS label of at most
+/// [`HOSTNAME_MAX`] bytes. A longer name keeps its end, which carries the
+/// session id.
+fn container_hostname(name: &str) -> String {
+    let label: Vec<u8> = name
+        .bytes()
+        .map(|byte| match byte {
+            b'a'..=b'z' | b'0'..=b'9' => byte,
+            b'A'..=b'Z' => byte.to_ascii_lowercase(),
+            _ => b'-',
+        })
+        .collect();
+    let excess = label.len().saturating_sub(HOSTNAME_MAX);
+    String::from_utf8(label.into_iter().skip(excess).collect())
+        .expect("a hostname label is ASCII")
+        .trim_matches('-')
+        .to_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use aither_sandbox::ContainerPath;
@@ -592,6 +615,24 @@ mod tests {
                 .read_only,
             Some(false)
         );
+    }
+
+    #[test]
+    fn a_container_hostname_is_one_label_ending_in_the_session_id() {
+        assert_eq!(
+            container_hostname("may-default-quick-session"),
+            "may-default-quick-session"
+        );
+
+        let session = "permissively-thunderously-fluttering-gnatcatcher";
+        let name = format!("may-0b8e6c1e-3f2a-4c55-9d0e-7a1b2c3d4e5f-{session}");
+        let hostname = container_hostname(&name);
+        assert!(hostname.len() <= HOSTNAME_MAX, "{hostname}");
+        assert!(hostname.ends_with(session), "{hostname}");
+        assert!(!hostname.starts_with('-'), "{hostname}");
+
+        let odd = container_hostname("may-Work_Profile.v2-session");
+        assert_eq!(odd, "may-work-profile-v2-session");
     }
 
     #[test]

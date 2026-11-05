@@ -244,9 +244,11 @@ pub trait IssueStore: Send + Sync + fmt::Debug {
     /// Stable name of this backend's issue set, keying its search index.
     fn search_key(&self) -> String;
 
-    /// Issues updated after `since` (every issue when `None`), oldest
-    /// update first, at most `limit`. Drives the search index's
-    /// incremental sync.
+    /// Issues updated at or after `since` (every issue when `None`), oldest
+    /// update first: the ones at `since` itself, then at least `limit`
+    /// newer ones as long as more exist, never cutting through a group of
+    /// issues sharing one update time. Drives the search index's
+    /// incremental sync, which skips what it already indexed.
     fn updated_since(
         &self,
         since: Option<&str>,
@@ -441,16 +443,14 @@ pub fn resolve_issue_store(
 ) -> Result<ResolvedIssueStore, IssueError> {
     let identity = repository_identity(cwd)?;
     let config = crate::workspace::WorkspaceConfig::load(workspace_config_path)?;
-    for project in &config.projects {
-        if repository_identity(&project.path)? != identity {
-            continue;
-        }
-        if let crate::workspace::ProjectIssues::Github { repository } = &project.issues {
-            return Ok(ResolvedIssueStore::GitHub(GitHubIssueStore::new(
-                repository.clone(),
-                GhCliTokenSource,
-            )));
-        }
+    if let Some(crate::workspace::ProjectIssues::Github { repository }) = config
+        .project_for_identity(&identity)
+        .map(|project| &project.issues)
+    {
+        return Ok(ResolvedIssueStore::GitHub(GitHubIssueStore::new(
+            repository.clone(),
+            GhCliTokenSource,
+        )));
     }
     Ok(ResolvedIssueStore::May(MayIssueStore::new(
         db,
@@ -484,5 +484,58 @@ pub fn repository_identity(dir: &Path) -> Result<PathBuf, IssueError> {
             path: dir.to_path_buf(),
             source: Box::new(error),
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ResolvedIssueStore, resolve_issue_store};
+    use crate::db::ChatDb;
+    use crate::workspace::{ProjectConfig, ProjectIssues, WorkspaceConfig};
+
+    fn github_project(path: std::path::PathBuf, repository: &str) -> ProjectConfig {
+        ProjectConfig {
+            path,
+            issues: ProjectIssues::Github {
+                repository: repository.parse().expect("owner/repo"),
+            },
+            checks: None,
+            pr: crate::workspace::ProjectPr::default(),
+        }
+    }
+
+    /// A trusted project whose directory was deleted matches nothing: the
+    /// project that still exists resolves to its GitHub store, and a
+    /// directory with no project falls back to the local store.
+    #[tokio::test]
+    async fn a_project_whose_path_is_gone_matches_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = dir.path().join("repo");
+        git2::Repository::init(&repo).expect("git init");
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).expect("elsewhere");
+        let config = WorkspaceConfig {
+            projects: vec![
+                github_project(dir.path().join("gone"), "owner/gone"),
+                github_project(repo.clone(), "owner/repo"),
+            ],
+            ..WorkspaceConfig::default()
+        };
+        let config_path = dir.path().join("workspace.toml");
+        config.save(&config_path).expect("save workspace config");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db");
+
+        let resolved =
+            resolve_issue_store(&repo, &config_path, db.clone()).expect("existing project");
+        let ResolvedIssueStore::GitHub(store) = resolved else {
+            panic!("the existing project resolves to its GitHub store");
+        };
+        assert_eq!(store.repository().to_string(), "owner/repo");
+
+        let resolved =
+            resolve_issue_store(&elsewhere, &config_path, db).expect("unconfigured directory");
+        assert!(matches!(resolved, ResolvedIssueStore::May(_)));
     }
 }
