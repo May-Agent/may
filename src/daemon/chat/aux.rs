@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 
 use crate::daemon::state::DaemonState;
@@ -162,6 +163,9 @@ pub enum AuxError {
     /// The provider call failed.
     #[error("model call failed: {0}")]
     Model(String),
+    /// The model answered, but not with an acceptable output.
+    #[error("model output rejected: {0}")]
+    Output(String),
     /// The run exceeded its timeout.
     #[error("aux run timed out")]
     Timeout,
@@ -199,101 +203,142 @@ pub async fn context_messages(
     ))
 }
 
-/// Streams `messages` through the session's own model via its parked agent
-/// and collects the text. The call is a side request like `/btw`: nothing
-/// enters the conversation. Fails as [`AuxError::Timeout`] after `timeout`.
-pub async fn run(
+/// The languages `session_id`'s agent was configured with.
+pub async fn languages(
+    state: &Arc<DaemonState>,
+    session_id: &str,
+) -> Result<aither_agent::Languages, AuxError> {
+    let worker = super::hosts::idle_agent(state, session_id)
+        .await
+        .map_err(|error| AuxError::Session(error.to_string()))?;
+    worker.languages().ok_or(AuxError::NoModel)
+}
+
+/// Generates a `T` from `messages` through the session's own model via its
+/// parked agent. The call is a side request like `/btw`: nothing enters the
+/// conversation. Fails as [`AuxError::Timeout`] after `timeout`.
+pub async fn generate<T: AuxOutput>(
     state: &Arc<DaemonState>,
     session_id: &str,
     messages: Vec<aither_core::llm::Message>,
     timeout: Duration,
-) -> Result<String, AuxError> {
-    tokio::time::timeout(timeout, Box::pin(respond(state, session_id, messages)))
+) -> Result<T, AuxError> {
+    let call = async {
+        let worker = super::hosts::idle_agent(state, session_id)
+            .await
+            .map_err(|error| AuxError::Session(error.to_string()))?;
+        let slot = worker.btw_llm().ok_or(AuxError::NoModel)?;
+        generate_unbounded(slot, messages).await
+    };
+    tokio::time::timeout(timeout, Box::pin(call))
         .await
         .unwrap_or(Err(AuxError::Timeout))
 }
 
-async fn respond(
-    state: &Arc<DaemonState>,
-    session_id: &str,
+/// [`generate`] through an explicit model slot, for tests with a mock model.
+#[cfg(test)]
+pub async fn generate_with<M: aither_core::LanguageModel, T: AuxOutput>(
+    slot: &crate::agent::ModelSlot<M>,
     messages: Vec<aither_core::llm::Message>,
-) -> Result<String, AuxError> {
-    use aither_core::llm::Event;
-    use futures_lite::StreamExt as _;
-
-    let worker = super::hosts::idle_agent(state, session_id)
+    timeout: Duration,
+) -> Result<T, AuxError> {
+    tokio::time::timeout(timeout, Box::pin(generate_unbounded(slot, messages)))
         .await
-        .map_err(|error| AuxError::Session(error.to_string()))?;
-    let llm = worker.btw_llm().cloned().ok_or(AuxError::NoModel)?;
-    let mut stream = std::pin::pin!(llm.respond(messages));
-    let mut text = String::new();
-    while let Some(event) = stream.next().await {
-        match event {
-            Ok(Event::Text(chunk)) => text.push_str(&chunk),
-            Ok(_) => {}
-            Err(error) => return Err(AuxError::Model(error.to_string())),
-        }
-    }
-    Ok(text)
+        .unwrap_or(Err(AuxError::Timeout))
 }
 
-/// Parses an aux response body: trimmed JSON of at most `max_chars`,
-/// nothing else. `T` should derive `serde::Deserialize` with
-/// `deny_unknown_fields`. Malformed output is `None` — the caller treats it
-/// as a generation failure, never a fallback.
-pub fn parse_strict<T: DeserializeOwned>(text: &str, max_chars: usize) -> Option<T> {
-    let text = text.trim();
-    if text.is_empty()
-        || text.chars().count() > max_chars
-        || text.chars().any(|ch| {
+async fn generate_unbounded<M: aither_core::LanguageModel, T: AuxOutput>(
+    slot: &crate::agent::ModelSlot<M>,
+    messages: Vec<aither_core::llm::Message>,
+) -> Result<T, AuxError> {
+    let output = slot
+        .generate::<T>(messages)
+        .await
+        .map_err(|error| match error {
+            aither_core::llm::GenerateError::Provider(error) => AuxError::Model(error.to_string()),
+            error @ aither_core::llm::GenerateError::Parse { .. } => {
+                AuxError::Output(error.to_string())
+            }
+        })?;
+    check(&output)?;
+    Ok(output)
+}
+
+/// An aux output type: the JSON schema the model fills in, and the limits
+/// of its text fields.
+pub trait AuxOutput: JsonSchema + DeserializeOwned + 'static {
+    /// Every text field with its limit in Unicode scalar values.
+    fn texts(&self) -> Vec<(&str, usize)>;
+}
+
+/// Rejects an output with a text over its limit or holding a control
+/// character other than newline and tab, or a line or paragraph separator.
+/// Nothing is truncated: such an output is a failed generation.
+fn check<T: AuxOutput>(output: &T) -> Result<(), AuxError> {
+    for (text, limit) in output.texts() {
+        if text.chars().count() > limit {
+            return Err(AuxError::Output(format!(
+                "a field exceeds {limit} characters"
+            )));
+        }
+        if text.chars().any(|ch| {
             (ch.is_control() && !matches!(ch, '\n' | '\t')) || matches!(ch, '\u{2028}' | '\u{2029}')
-        })
-    {
-        return None;
+        }) {
+            return Err(AuxError::Output(
+                "a field holds a control character".to_string(),
+            ));
+        }
     }
-    serde_json::from_str(text).ok()
+    Ok(())
+}
+
+/// A scripted model for tests: replies with its text as one event.
+#[cfg(test)]
+pub(super) mod test_support {
+    use aither_core::LanguageModel;
+    use aither_core::llm::{Event, LLMRequest, model::Profile as ModelProfile};
+    use futures_lite::Stream;
+
+    pub struct Replying(pub &'static str);
+
+    #[derive(Debug)]
+    pub struct Never;
+
+    impl std::fmt::Display for Never {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("mock error")
+        }
+    }
+
+    impl std::error::Error for Never {}
+
+    impl aither_core::llm::Classify for Never {
+        fn failure(&self) -> aither_core::llm::Failure {
+            aither_core::llm::Failure::permanent()
+        }
+    }
+
+    impl LanguageModel for Replying {
+        type Error = Never;
+
+        fn respond(
+            &self,
+            _request: LLMRequest,
+        ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+            futures_lite::stream::iter([Ok(Event::Text(self.0.to_string()))])
+        }
+
+        fn profile(&self) -> impl std::future::Future<Output = Result<ModelProfile, Never>> + Send {
+            std::future::ready(Ok(ModelProfile::new(
+                "mock", "test", "mock", "mock", 100_000,
+            )))
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde::Deserialize;
-
-    #[derive(Debug, Deserialize, PartialEq)]
-    #[serde(deny_unknown_fields)]
-    struct Answer {
-        suggestion: Option<String>,
-    }
-
-    #[test]
-    fn parse_strict_accepts_bounded_json() {
-        let answer = parse_strict::<Answer>(r#"{"suggestion":"run the tests"}"#, 240);
-        assert_eq!(
-            answer,
-            Some(Answer {
-                suggestion: Some("run the tests".to_string())
-            })
-        );
-        let null = parse_strict::<Answer>(r#"{"suggestion":null}"#, 240);
-        assert_eq!(null, Some(Answer { suggestion: None }));
-    }
-
-    #[test]
-    fn parse_strict_rejects_malformed_output() {
-        for text in [
-            r#"{"suggestion":"x","extra":1}"#, // unknown field
-            r#"{"suggestion":"x"} trailing"#,  // trailing garbage
-            "not json",
-            "",
-            "   ",
-            "{\"suggestion\":\"x\u{2028}\"}", // control char
-        ] {
-            assert_eq!(parse_strict::<Answer>(text, 240), None, "input: {text:?}");
-        }
-        assert_eq!(parse_strict::<Answer>(r#"{"suggestion":"x"}"#, 3), None);
-        // Newlines and tabs survive: structured answers may legitimately wrap.
-        assert!(parse_strict::<Answer>("{\n  \"suggestion\": null\n}", 240).is_some());
-    }
 
     #[tokio::test]
     async fn start_supersedes_and_aborts_the_previous_task() {

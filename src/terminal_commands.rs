@@ -7,13 +7,15 @@ use aither_agent::webfetch::WebFetchTool;
 use aither_core::LanguageModel;
 use aither_core::llm::{Tool, model::Parameters, tool::ToolDefinition};
 use aither_sandbox::ToolRegistryBuilder;
+use askama::Template;
+use executor_core::DefaultExecutor;
 
 use crate::agent::ask_user_tool::{AskUserTool, WithdrawAskUserTool};
 use crate::agent::browser_tool::{BrowserBroker, BrowserTool};
 use crate::agent::imagine::ImagineTool;
 use crate::agent::issue_tool::{IssueChangeNotifier, IssueTool, SubagentIssueTool};
 use crate::agent::notify_tool::{NotifyBroker, NotifyTool};
-use crate::agent::pr_tool::{PrTool, SubagentPrTool};
+use crate::agent::pr_tool::{PrArgs, PrCommand};
 use crate::agent::register_tool::{RegisterBroker, RegisterTool, Skills};
 use crate::agent::repo_tool::{RepoContext, RepoTool, SubagentRepoTool};
 use crate::agent::session_tool::SessionTool;
@@ -21,6 +23,7 @@ use crate::agent::subagent_tracker::{SubagentTracker, TrackedSubagentTool, Usage
 use crate::agent::task_tool::{TaskBroker, TaskRuntimeKind, TaskTool};
 use crate::agent::{ImageGeneratorConfig, ModelSlot};
 use crate::bundle::Bundle;
+use crate::issue::provenance::IssueProvenance;
 use crate::issue::search::IssueSearch;
 use crate::mcp::load_active_mcp_connections;
 use crate::repo_search::indexer::SearchIndexer;
@@ -56,7 +59,7 @@ pub struct SharedTerminalCommandConfig<LLM> {
     /// Host directory the session works in; `search` defaults to its worktree.
     pub cwd: PathBuf,
     /// History database, which records the worktrees `search` is used in.
-    pub db: Option<crate::db::ChatDb>,
+    pub db: crate::db::ChatDb,
     /// Runtime that holds the session's open `ask_user` questions and
     /// publishes its UI events (`issue` writes among them), when the session
     /// has one.
@@ -96,9 +99,16 @@ pub struct SharedTerminalCommandConfig<LLM> {
     /// Discovery and messaging between main agents, when the session has a
     /// persistent queue to deliver through.
     pub agent_messaging: Option<crate::agent_link::AgentMessaging>,
+    /// The session's language guard: `ask_user`, `issue`, `pr` and `agent`
+    /// refuse text outside the languages it enforces.
+    pub languages: Option<aither_agent::LanguageGuard>,
     /// Connected ACP agents, registered as subagent types; `None` outside
     /// the daemon.
     pub acp: Option<crate::agent::acp_subagent::AcpAgents>,
+    /// The host git whose configuration is the user's: it names the identity
+    /// and key commits in the sandbox are signed with, and runs every host
+    /// git `pr` needs.
+    pub git: crate::host_git::HostGit,
     /// Daemon handles for the `computer` command — present when the
     /// session may own a virtual desktop (macOS, local environment).
     #[cfg(target_os = "macos")]
@@ -108,11 +118,10 @@ pub struct SharedTerminalCommandConfig<LLM> {
 /// What [`register_shared_terminal_commands`] installed.
 #[derive(Debug, Default)]
 pub struct SharedTerminalCommands {
-    /// `(name, short description)` pairs for every registered command, in
-    /// registration order — rendered into the base-system `<commands>` index.
+    /// `(name, short description)` pairs for every command registered by
+    /// name, in registration order; the command table lists them ahead of the
+    /// MCP connections' commands, which it reads from the connections.
     pub descriptions: Vec<(String, String)>,
-    /// Names of commands backed by MCP connections.
-    pub mcp_command_names: Vec<String>,
     /// Where the main agent publishes its requests for the `subagent` command's
     /// `fork` kind; the main agent's builder must be given it.
     pub fork_source: aither_agent::ForkSource,
@@ -127,12 +136,20 @@ pub enum TerminalCommandsError {
     /// A connected ACP agent cannot be a subagent type.
     #[error(transparent)]
     Acp(#[from] crate::config::ConfigError),
+    /// The sandbox's git configuration could not be written, so its commits
+    /// would go out unsigned.
+    #[error(transparent)]
+    Signing(#[from] crate::commit_signing::SigningError),
 }
 
 /// Register every shared IPC command on the terminal tool's command registry.
 ///
 /// # Errors
 /// Returns the registry error when a command fails to register.
+///
+/// # Panics
+/// The registered sandboxed `gh` panics if its compiled-in refusal template
+/// fails to render.
 pub async fn register_shared_terminal_commands<LLM>(
     builder: &mut ToolRegistryBuilder,
     config: SharedTerminalCommandConfig<LLM>,
@@ -169,12 +186,10 @@ where
         SessionTool::new(
             config.may_dir.clone(),
             config.session_id.clone(),
-            config.db.clone().map(|db| {
-                SearchIndexer::new(
-                    db,
-                    RepoSearchCollections::new(RepoSearch::global(&config.may_dir)),
-                )
-            }),
+            Some(SearchIndexer::new(
+                config.db.clone(),
+                RepoSearchCollections::new(RepoSearch::global(&config.may_dir)),
+            )),
         ),
     );
     register_tool_with_description(
@@ -183,26 +198,68 @@ where
         CodeSearchTool::new(
             RepoSearch::global(&config.may_dir),
             config.cwd.clone(),
-            config.db.clone(),
+            Some(config.db.clone()),
+            Some(crate::repo_clone::SessionRepos::new(
+                &config.sandbox_dir,
+                config.session_id.clone(),
+                config.db.clone(),
+            )),
+            config.workspace_config.clone(),
         ),
     );
-    let issue_search = config.db.clone().map(|db| {
-        IssueSearch::new(
-            db,
-            RepoSearchCollections::new(RepoSearch::global(&config.may_dir)),
-        )
-    });
-    let mut issue_tool = IssueTool::new(config.issue_store.clone());
-    let mut subagent_issue_tool = SubagentIssueTool::new(config.issue_store);
+    let issue_search = IssueSearch::new(
+        config.db.clone(),
+        RepoSearchCollections::new(RepoSearch::global(&config.may_dir)),
+    );
+    let provenance = IssueProvenance::new(config.db.clone(), config.session_id.clone());
+    let mut issue_tool = IssueTool::new(config.issue_store.clone(), provenance.clone())
+        .with_search(issue_search.clone());
+    if let Some(guard) = &config.languages {
+        issue_tool = issue_tool.with_languages(guard.clone());
+    }
     if let Some(runtime) = config.ask_user.clone() {
         issue_tool = issue_tool.with_changes(IssueChangeNotifier::new(runtime));
     }
-    if let Some(search) = issue_search {
-        issue_tool = issue_tool.with_search(search.clone());
-        subagent_issue_tool = subagent_issue_tool.with_search(search);
+    let mut subagent_issue_tool =
+        SubagentIssueTool::new(config.issue_store, provenance).with_search(issue_search);
+    if let Some(messaging) = &config.agent_messaging {
+        let owners = crate::issue::owner::IssueOwners::new(messaging.directory.clone());
+        issue_tool = issue_tool.with_owners(owners.clone());
+        subagent_issue_tool = subagent_issue_tool.with_owners(owners);
     }
     describe_tool(&mut descriptions, &issue_tool);
     builder.configure_role_tools(issue_tool, subagent_issue_tool);
+    // Issue and PR changes reach GitHub through `issue` and `pr` alone. The command exists
+    // in sandboxed modes only, so an approved unsafe command resolves `gh` on
+    // the host's PATH and runs the real program.
+    builder.sandboxed_only(|sandboxed| {
+        sandboxed.configure_raw_handler(
+            "gh",
+            "Refused in the sandbox; use `issue` or `pr`",
+            |_call, _args| {
+                Box::pin(async {
+                    Err(GhRefused.render().expect("the gh refusal template renders"))
+                })
+            },
+        );
+    });
+
+    // Commits made in the sandbox are signed by the harness on the host: the
+    // sandbox's git configuration names this command as its signer. A
+    // container's `HOME` is its mount of the sandbox directory, so the same
+    // files serve it with the signer's in-container path. The command is
+    // registered but never described: git calls it, the model never does.
+    let signing = crate::commit_signing::CommitSigning::new(
+        config.git.clone(),
+        &config.may_dir,
+        config.session_id.clone(),
+    );
+    let container_mount = matches!(config.task_runtime, TaskRuntimeKind::Container)
+        .then(|| crate::container::lifecycle::workspace_mount(config.sandbox_dir.clone()));
+    signing
+        .install_sandbox_git(&config.sandbox_dir, container_mount.as_ref())
+        .await?;
+    builder.configure_tool(crate::commit_signing::SignCommitTool::new(signing.clone()));
 
     let screen: Arc<crate::pr::ScreenFn> = Arc::new(move |title: &str, body: &str| {
         let llm = screen_llm.clone();
@@ -210,19 +267,24 @@ where
         Box::pin(async move { crate::pr::screen_with_llm(&llm, &title, &body).await })
     });
     let pr_context = crate::pr::PrContext {
-        db: config.db.clone(),
+        db: Some(config.db.clone()),
         session_id: config.session_id.clone(),
         session_root: config.sandbox_dir.clone(),
-        scratch_root: config.may_dir.join("pr-checks"),
+        scratch_root: crate::session::MayHomePaths::new(config.may_dir.clone()).repo_staging_dir(),
         cwd: config.cwd.clone(),
         workspace_config: config.workspace_config.clone(),
         screen: Some(screen),
+        signing,
         github_api: crate::pr::PrContext::default_github_api(),
     };
-    let pr_tool = PrTool::new(pr_context.clone());
-    let subagent_pr_tool = SubagentPrTool::new(pr_context);
-    describe_tool(&mut descriptions, &pr_tool);
-    builder.configure_role_tools(pr_tool, subagent_pr_tool);
+    let mut pr_command = PrCommand::new(pr_context);
+    if let Some(guard) = &config.languages {
+        pr_command = pr_command.with_languages(guard.clone());
+    }
+    describe_arguments::<PrArgs>(&mut descriptions, "pr");
+    // Built per terminal: git inside a session clone and the project checks
+    // run on that terminal's sandbox.
+    builder.configure_terminal_bound_tool("pr", move |binding| pr_command.for_terminal(binding));
 
     let repo_context = RepoContext {
         cwd: config.cwd.clone(),
@@ -235,9 +297,15 @@ where
     builder.configure_role_tools(repo_tool, subagent_repo_tool);
 
     if let Some(runtime) = config.ask_user {
-        let ask_user = AskUserTool::new(runtime.clone(), config.session_id.clone());
+        let mut ask_user = AskUserTool::new(runtime.clone(), config.session_id.clone());
+        if let Some(guard) = &config.languages {
+            ask_user = ask_user.with_languages(guard.clone());
+        }
         describe_tool(&mut descriptions, &ask_user);
-        builder.main_only(|reserved| reserved.configure_tool(ask_user));
+        // The user's answers are decisions the summary must not paraphrase.
+        builder.kept_through_compaction(|kept| {
+            kept.main_only(|reserved| reserved.configure_tool(ask_user));
+        });
         let withdraw = WithdrawAskUserTool::new(runtime, config.session_id.clone());
         describe_tool(&mut descriptions, &withdraw);
         builder.main_only(|reserved| reserved.configure_tool(withdraw));
@@ -253,13 +321,16 @@ where
     }
 
     if let Some(messaging) = config.agent_messaging {
-        let agent = crate::agent_link::AgentTool::new(
+        let mut agent = crate::agent_link::AgentTool::new(
             messaging,
             config.session_id.clone(),
             config.sandbox_dir.clone(),
             matches!(config.task_runtime, TaskRuntimeKind::Container)
                 .then(|| crate::container::lifecycle::workspace_mount(config.sandbox_dir.clone())),
         );
+        if let Some(guard) = &config.languages {
+            agent = agent.with_languages(guard.clone());
+        }
         describe_tool(&mut descriptions, &agent);
         builder.main_only(|reserved| reserved.configure_tool(agent));
     }
@@ -362,24 +433,23 @@ where
         });
     });
 
-    let mut mcp_command_names = Vec::new();
-    for connection in load_active_mcp_connections(&config.may_dir).await? {
-        let definitions = aither_mcp::register_terminal_commands(builder, connection);
-        descriptions.extend(definitions.into_iter().map(|definition| {
-            mcp_command_names.push(definition.name().to_string());
-            (
-                definition.name().to_string(),
-                short_description(definition.description()),
-            )
-        }));
+    // An MCP server's tools are a command set: the registry reads its tool
+    // list at every lookup, so a tool the server adds mid-session runs at
+    // once, and the agent's command table announces it.
+    for connection in load_active_mcp_connections(&DefaultExecutor, &config.may_dir).await? {
+        builder.command_set(connection);
     }
 
     Ok(SharedTerminalCommands {
         descriptions,
-        mcp_command_names,
         fork_source,
     })
 }
+
+/// What the sandboxed `gh` command answers with.
+#[derive(askama::Template)]
+#[template(path = "gh_refused.txt", escape = "none")]
+struct GhRefused;
 
 fn register_tool_with_description<T>(
     builder: &mut ToolRegistryBuilder,
@@ -405,13 +475,45 @@ where
     ));
 }
 
+/// Catalog entry for a terminal-bound command `name`, which has no instance
+/// until a terminal binds it: its description is the rustdoc of its
+/// arguments, as for any command.
+fn describe_arguments<A: schemars::JsonSchema>(
+    descriptions: &mut Vec<(String, String)>,
+    name: &str,
+) {
+    let schema = schemars::schema_for!(A);
+    let description = schema
+        .get("description")
+        .and_then(serde_json::Value::as_str)
+        .expect("a command's arguments carry its description");
+    descriptions.push((name.to_string(), short_description(description)));
+}
+
+/// The first sentence of `description` on one line, for the command catalog.
+///
+/// A sentence ends at a `.` followed by whitespace or the end of the text,
+/// outside a code span, so `` `computer <action> ...` `` or a version
+/// number does not cut it short.
 pub(crate) fn short_description(description: &str) -> String {
-    description
-        .split('.')
-        .next()
-        .unwrap_or(description)
-        .trim()
-        .to_string()
+    // Both markers are ASCII, so a byte scan finds them on char boundaries.
+    let bytes = description.as_bytes();
+    let mut in_code = false;
+    let mut end = description.len();
+    for (index, byte) in bytes.iter().enumerate() {
+        match byte {
+            b'`' => in_code = !in_code,
+            b'.' if !in_code && bytes.get(index + 1).is_none_or(u8::is_ascii_whitespace) => {
+                end = index;
+                break;
+            }
+            _ => {}
+        }
+    }
+    description[..end]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]
@@ -477,6 +579,12 @@ mod tests {
         ))
     }
 
+    async fn test_db(dir: &std::path::Path) -> crate::db::ChatDb {
+        crate::db::ChatDb::open(&dir.join("history.db"))
+            .await
+            .expect("chat db should open")
+    }
+
     async fn test_issue_store(dir: &std::path::Path) -> crate::issue::ResolvedIssueStore {
         let db = crate::db::ChatDb::open(&dir.join("history.db"))
             .await
@@ -508,7 +616,7 @@ mod tests {
                 may_dir: temp.path().to_path_buf(),
                 sandbox_dir: session_dir.clone(),
                 cwd: PathBuf::from("."),
-                db: None,
+                db: test_db(temp.path()).await,
                 ask_user: Some(ask_user_runtime),
                 imagine: Some(ImagineCommandConfig {
                     generator: None,
@@ -527,7 +635,9 @@ mod tests {
                 issue_store: test_issue_store(temp.path()).await,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
+                languages: None,
                 acp: None,
+                git: crate::host_git::HostGit::from_file("/dev/null"),
             },
         )
         .await
@@ -568,7 +678,7 @@ mod tests {
                 may_dir: temp.path().to_path_buf(),
                 sandbox_dir: session_dir.clone(),
                 cwd: PathBuf::from("."),
-                db: None,
+                db: test_db(temp.path()).await,
                 ask_user: None,
                 imagine: None,
                 task_runtime: TaskRuntimeKind::Local,
@@ -584,7 +694,9 @@ mod tests {
                 issue_store: test_issue_store(temp.path()).await,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
+                languages: None,
                 acp: None,
+                git: crate::host_git::HostGit::from_file("/dev/null"),
             },
         )
         .await
@@ -625,7 +737,7 @@ mod tests {
                 may_dir: temp.path().to_path_buf(),
                 sandbox_dir: session_dir.clone(),
                 cwd: PathBuf::from("."),
-                db: None,
+                db: test_db(temp.path()).await,
                 ask_user: None,
                 imagine: None,
                 task_runtime: TaskRuntimeKind::Local,
@@ -641,7 +753,9 @@ mod tests {
                 issue_store: test_issue_store(temp.path()).await,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
+                languages: None,
                 acp: None,
+                git: crate::host_git::HostGit::from_file("/dev/null"),
             },
         )
         .await
@@ -676,7 +790,7 @@ mod tests {
                 may_dir: temp.path().to_path_buf(),
                 sandbox_dir: session_dir.clone(),
                 cwd: PathBuf::from("."),
-                db: None,
+                db: test_db(temp.path()).await,
                 ask_user: None,
                 imagine: None,
                 task_runtime: TaskRuntimeKind::Local,
@@ -692,7 +806,9 @@ mod tests {
                 issue_store: test_issue_store(temp.path()).await,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
+                languages: None,
                 acp: None,
+                git: crate::host_git::HostGit::from_file("/dev/null"),
             },
         )
         .await
@@ -723,7 +839,7 @@ mod tests {
                 may_dir: temp.path().to_path_buf(),
                 sandbox_dir: session_dir.clone(),
                 cwd: PathBuf::from("."),
-                db: None,
+                db: test_db(temp.path()).await,
                 ask_user: Some(ask_user_runtime.clone()),
                 imagine: None,
                 task_runtime: TaskRuntimeKind::Local,
@@ -739,7 +855,9 @@ mod tests {
                 issue_store: test_issue_store(temp.path()).await,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
+                languages: None,
                 acp: None,
+                git: crate::host_git::HostGit::from_file("/dev/null"),
             },
         )
         .await
@@ -884,7 +1002,7 @@ mod tests {
                 may_dir: temp.path().to_path_buf(),
                 sandbox_dir: session_dir.clone(),
                 cwd: PathBuf::from("."),
-                db: None,
+                db: test_db(temp.path()).await,
                 ask_user: None,
                 imagine: None,
                 task_runtime: TaskRuntimeKind::Local,
@@ -900,7 +1018,9 @@ mod tests {
                 issue_store,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: Some(messaging),
+                languages: None,
                 acp: None,
+                git: crate::host_git::HostGit::from_file("/dev/null"),
             },
         )
         .await
@@ -961,7 +1081,7 @@ mod tests {
                 may_dir: temp.path().to_path_buf(),
                 sandbox_dir: session_dir.clone(),
                 cwd: PathBuf::from("."),
-                db: None,
+                db: test_db(temp.path()).await,
                 ask_user: None,
                 imagine: None,
                 task_runtime: TaskRuntimeKind::Local,
@@ -977,7 +1097,9 @@ mod tests {
                 issue_store: test_issue_store(temp.path()).await,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
+                languages: None,
                 acp: None,
+                git: crate::host_git::HostGit::from_file("/dev/null"),
             },
         )
         .await
@@ -1009,7 +1131,7 @@ mod tests {
                 may_dir: temp.path().to_path_buf(),
                 sandbox_dir: session_dir.clone(),
                 cwd: PathBuf::from("."),
-                db: None,
+                db: test_db(temp.path()).await,
                 ask_user: None,
                 imagine: None,
                 task_runtime: TaskRuntimeKind::Local,
@@ -1025,7 +1147,9 @@ mod tests {
                 issue_store: test_issue_store(temp.path()).await,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
+                languages: None,
                 acp: None,
+                git: crate::host_git::HostGit::from_file("/dev/null"),
             },
         )
         .await
@@ -1037,5 +1161,162 @@ mod tests {
         assert!(registry.is_tool_configured("webfetch"));
         assert!(!descriptions.iter().any(|(name, _)| name == "websearch"));
         assert!(descriptions.iter().any(|(name, _)| name == "webfetch"));
+    }
+
+    /// Registers the shared commands for a session rooted at `session_dir`
+    /// on `runtime`, as the user `git` names.
+    async fn register_for(
+        temp: &std::path::Path,
+        session_dir: &std::path::Path,
+        runtime: TaskRuntimeKind,
+        git: crate::host_git::HostGit,
+    ) -> Result<(ToolRegistryBuilder, SharedTerminalCommands), TerminalCommandsError> {
+        let mut builder = ToolRegistryBuilder::new();
+        let commands = register_shared_terminal_commands(
+            &mut builder,
+            SharedTerminalCommandConfig {
+                #[cfg(target_os = "macos")]
+                computer: None,
+                llm: MockLlm,
+                ask_flagship: None,
+                ask_balanced: None,
+                ask_fast: None,
+                session_id: "session-1".to_string(),
+                may_dir: temp.to_path_buf(),
+                sandbox_dir: session_dir.to_path_buf(),
+                cwd: PathBuf::from("."),
+                db: test_db(temp).await,
+                ask_user: None,
+                imagine: None,
+                task_runtime: runtime,
+                task_broker: None,
+                notify_broker: None,
+                tunnel_broker: None,
+                browser_broker: None,
+                register_skills_broker: None,
+                workspace_request_broker: None,
+                subagent_runs: aither_agent::specialized::SubagentRuns::default(),
+                subagent_tracker: SubagentTracker::default(),
+                request_parameters: Parameters::default(),
+                issue_store: test_issue_store(temp).await,
+                workspace_config: crate::workspace::WorkspaceConfig::default(),
+                agent_messaging: None,
+                languages: None,
+                acp: None,
+                git,
+            },
+        )
+        .await?;
+        Ok((builder, commands))
+    }
+
+    /// git calls `sign-commit`, the model never does: it runs in the
+    /// sandbox but is not in the command table the model reads.
+    #[tokio::test]
+    async fn the_signer_command_is_registered_but_not_described_to_the_model() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_dir = temp.path().join("sessions/session-1");
+        let user = crate::commit_signing::test_user::TestUser::new(&temp.path().join("user"));
+
+        let (builder, commands) = register_for(
+            temp.path(),
+            &session_dir,
+            TaskRuntimeKind::Local,
+            user.host(),
+        )
+        .await
+        .expect("commands should register");
+
+        let registry = builder.build(session_dir.join("outputs"));
+        assert!(registry.is_tool_configured(crate::commit_signing::SIGN_COMMAND));
+        assert!(
+            !commands
+                .descriptions
+                .iter()
+                .any(|(name, _)| name == crate::commit_signing::SIGN_COMMAND)
+        );
+    }
+
+    /// A container's `HOME` is its mount of the session directory, so it
+    /// reads the same `.gitconfig`, which names the signer by the path the
+    /// container sees.
+    #[tokio::test]
+    async fn a_container_session_names_the_signer_by_its_container_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_dir = temp.path().join("sessions/session-1");
+        let user = crate::commit_signing::test_user::TestUser::new(&temp.path().join("user"));
+
+        let (builder, _) = register_for(
+            temp.path(),
+            &session_dir,
+            TaskRuntimeKind::Container,
+            user.host(),
+        )
+        .await
+        .expect("commands should register");
+
+        assert!(
+            builder
+                .build(session_dir.join("outputs"))
+                .is_tool_configured(crate::commit_signing::SIGN_COMMAND)
+        );
+        let program = std::process::Command::new("git")
+            .args(["config", "--file"])
+            .arg(session_dir.join(".gitconfig"))
+            .args(["--get", "gpg.ssh.program"])
+            .output()
+            .expect("git runs");
+        assert_eq!(
+            String::from_utf8_lossy(&program.stdout).trim(),
+            "/workspace/.config/may/ssh-sign"
+        );
+        // The script itself is on the host side of the mount.
+        assert!(session_dir.join(".config/may/ssh-sign").is_file());
+    }
+
+    /// Without the sandbox's git configuration its commits would go out
+    /// unsigned, so registration fails and the agent is not built.
+    #[tokio::test]
+    async fn a_sandbox_git_configuration_that_cannot_be_written_fails_registration() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let session_dir = temp.path().join("sessions/session-1");
+        std::fs::create_dir_all(&session_dir).expect("session dir");
+        // `.config` is a file, so the signer has no directory to live in.
+        std::fs::write(session_dir.join(".config"), "").expect("blocker");
+        let user = crate::commit_signing::test_user::TestUser::new(&temp.path().join("user"));
+
+        let Err(error) = register_for(
+            temp.path(),
+            &session_dir,
+            TaskRuntimeKind::Local,
+            user.host(),
+        )
+        .await
+        else {
+            panic!("registration succeeded");
+        };
+
+        assert!(
+            matches!(error, TerminalCommandsError::Signing(_)),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_catalog_entry_is_the_whole_first_sentence_on_one_line() {
+        assert_eq!(
+            short_description(
+                "`computer <action> ...` — the session's virtual desktop.\n\nActions follow."
+            ),
+            "`computer <action> ...` — the session's virtual desktop"
+        );
+        assert_eq!(
+            short_description("Track work as issues: create, view,\nlist and close. More."),
+            "Track work as issues: create, view, list and close"
+        );
+        assert_eq!(
+            short_description("Runs on aither 0.16.0 builds"),
+            "Runs on aither 0.16.0 builds"
+        );
     }
 }

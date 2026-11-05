@@ -8,12 +8,12 @@
 
 use std::borrow::Cow;
 use std::convert::Infallible;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use aither_agent::{Agent, AgentEvent};
 use aither_core::llm::{Tool, ToolResult};
 use bytes::Bytes;
-use futures_lite::StreamExt as _;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::header::{CONTENT_TYPE, HeaderValue};
@@ -193,15 +193,20 @@ async fn main_agent_tool_result_carries_the_name_not_the_value() {
         .build();
 
     let mut published = Vec::new();
-    {
-        let mut stream = std::pin::pin!(agent.run("print the token", std::iter::empty()));
-        while let Some(event) = stream.next().await {
-            let event = event.expect("agent event").event;
-            if let AgentEvent::ToolCallEnd { result, .. } = &event {
-                published.push(format!("{result:?}"));
-            }
-        }
-    }
+    let _ = agent
+        .run("print the token", std::iter::empty())
+        .drive(
+            &mut published,
+            std::future::pending::<()>(),
+            |published, timed| async move {
+                if let AgentEvent::ToolCallEnd { result, .. } = &timed.event {
+                    published.push(format!("{result:?}"));
+                }
+                ControlFlow::Continue(published)
+            },
+        )
+        .await
+        .expect("the run finishes");
 
     assert_eq!(published.len(), 1);
     assert!(
@@ -225,12 +230,13 @@ async fn subagent_request_carries_the_name_not_the_value() {
         .tool(LeakTool)
         .build();
 
-    {
-        let mut stream = std::pin::pin!(agent.run("print the token", std::iter::empty()));
-        while let Some(event) = stream.next().await {
-            event.expect("agent event");
-        }
-    }
+    let _ = agent
+        .run("print the token", std::iter::empty())
+        .drive((), std::future::pending::<()>(), |(), _| async {
+            ControlFlow::Continue(())
+        })
+        .await
+        .expect("the run finishes");
 
     assert_name_not_value(&provider_traffic(&requests).await);
 }

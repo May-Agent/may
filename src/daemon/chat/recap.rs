@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aither_agent::CacheWarmth;
+use askama::Template;
 use serde::{Deserialize, Serialize};
 use skyzen::Result as SkyResult;
 use skyzen::routing::Params;
@@ -20,18 +21,55 @@ use crate::session::MessageRole;
 
 /// Longest a recap generation may take.
 const GENERATION_TIMEOUT: Duration = Duration::from_secs(30);
-/// Longest accepted model output, in Unicode scalar values.
-const MAX_OUTPUT_CHARS: usize = 1_200;
+/// Longest accepted summary, in Unicode scalar values.
+const SUMMARY_MAX_CHARS: usize = 700;
+/// Longest accepted next action, in Unicode scalar values.
+const NEXT_ACTION_MAX_CHARS: usize = 200;
 /// Total user/assistant text the recap projection may hold, in Unicode
 /// scalar values; the newest exchanges are kept.
 const HISTORY_BUDGET: usize = 24_000;
-const PROMPT: &str = include_str!("../../../templates/aux/recap.md");
 
-#[derive(Debug, Deserialize)]
+/// A catch-up note for a user returning to the session.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct RecapOutput {
+    /// Plain text saying where the work stands, at most 700 characters.
     summary: String,
+    /// The agreed next step, an unanswered question, or the obvious blocker
+    /// resolution, at most 200 characters. Null when none exists.
     next_action: Option<String>,
+}
+
+impl super::aux::AuxOutput for RecapOutput {
+    fn texts(&self) -> Vec<(&str, usize)> {
+        let mut texts = vec![(self.summary.as_str(), SUMMARY_MAX_CHARS)];
+        texts.extend(
+            self.next_action
+                .as_deref()
+                .map(|text| (text, NEXT_ACTION_MAX_CHARS)),
+        );
+        texts
+    }
+}
+
+impl RecapOutput {
+    /// The record this output writes for a window covering `turns` user
+    /// messages; `None` when the summary is blank.
+    fn into_record(self, turns: usize) -> Option<RecapRecord> {
+        if self.summary.trim().is_empty() {
+            return None;
+        }
+        Some(RecapRecord {
+            summary: self.summary.trim().to_string(),
+            next_action: self
+                .next_action
+                .as_deref()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_string),
+            turns,
+        })
+    }
 }
 
 /// The recap row's `content`, persisted as JSON.
@@ -198,6 +236,33 @@ fn recap_window<'a>(
     }
 }
 
+/// The recap instruction, written in the session's communication language
+/// when one is set.
+#[derive(Template)]
+#[template(path = "aux/recap.md", escape = "none")]
+struct RecapPrompt {
+    language: Option<aither_agent::Language>,
+}
+
+/// The aux request: the windowed conversation, then the recap instruction.
+fn recap_messages(
+    conversation: &[(&MessageRole, &str)],
+    language: Option<aither_agent::Language>,
+) -> Vec<aither_core::llm::Message> {
+    let prompt = RecapPrompt { language }
+        .render()
+        .expect("recap prompt template must render");
+    let mut messages: Vec<_> = conversation
+        .iter()
+        .map(|(role, content)| match role {
+            MessageRole::User => aither_core::llm::Message::user(*content),
+            _ => aither_core::llm::Message::assistant(*content),
+        })
+        .collect();
+    messages.push(aither_core::llm::Message::user(prompt));
+    messages
+}
+
 /// Runs the recap's aux turn over user/assistant text only — tool calls
 /// and hidden context are harness state, not conversation.
 async fn generate(state: &Arc<DaemonState>, session_id: &str) -> Option<RecapRecord> {
@@ -216,32 +281,12 @@ async fn generate(state: &Arc<DaemonState>, session_id: &str) -> Option<RecapRec
         return None;
     }
     let turns = window.turns;
-    let mut messages: Vec<_> = window
-        .conversation
-        .iter()
-        .map(|(role, content)| match role {
-            MessageRole::User => aither_core::llm::Message::user(*content),
-            _ => aither_core::llm::Message::assistant(*content),
-        })
-        .collect();
-    messages.push(aither_core::llm::Message::user(PROMPT));
-    let response = super::aux::run(state, session_id, messages, GENERATION_TIMEOUT)
+    let languages = super::aux::languages(state, session_id).await.ok()?;
+    let messages = recap_messages(&window.conversation, languages.communication());
+    super::aux::generate::<RecapOutput>(state, session_id, messages, GENERATION_TIMEOUT)
         .await
-        .ok()?;
-    let output = super::aux::parse_strict::<RecapOutput>(&response, MAX_OUTPUT_CHARS)?;
-    if output.summary.trim().is_empty() {
-        return None;
-    }
-    Some(RecapRecord {
-        summary: output.summary.trim().to_string(),
-        next_action: output
-            .next_action
-            .as_deref()
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
-            .map(str::to_string),
-        turns,
-    })
+        .ok()?
+        .into_record(turns)
 }
 
 /// Writes the recap row; it indexes the session without replaying into
@@ -413,6 +458,39 @@ async fn freshness(state: &Arc<DaemonState>, session_id: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn last_message(language: Option<aither_agent::Language>) -> String {
+        let conversation = [
+            (&MessageRole::User, "ship it"),
+            (&MessageRole::Assistant, "shipped"),
+        ];
+        let messages = recap_messages(&conversation, language);
+        assert_eq!(messages.len(), 3, "the conversation, then the instruction");
+        messages[2].content().to_string()
+    }
+
+    #[test]
+    fn the_recap_request_names_the_session_communication_language() {
+        let chinese: aither_agent::Language = "Chinese".parse().unwrap();
+        let prompt = last_message(Some(chinese));
+        assert!(prompt.contains("Write in Chinese."), "{prompt}");
+        assert!(!prompt.contains("language of the user's messages"));
+    }
+
+    #[test]
+    fn an_unset_language_leaves_the_recap_in_the_users_language() {
+        let prompt = last_message(None);
+        assert!(prompt.contains("Write in the language of the user's messages."));
+        assert!(!prompt.contains("{%"), "template tags are rendered");
+    }
+
+    #[test]
+    fn the_recap_prompt_asks_for_plain_prose_without_asides() {
+        let prompt = last_message(None);
+        assert!(prompt.contains("State each open caveat once"));
+        assert!(prompt.contains("full-width （）"));
+        assert!(!prompt.contains("above all else"));
+    }
+
     #[test]
     fn recap_record_round_trips_through_json() {
         let record = RecapRecord {
@@ -573,14 +651,49 @@ mod tests {
             .expect("release run");
     }
 
-    #[test]
-    fn recap_output_rejects_unexpected_fields() {
-        assert!(
-            super::super::aux::parse_strict::<RecapOutput>(
-                r#"{"summary":"x","next_action":null,"extra":1}"#,
-                MAX_OUTPUT_CHARS,
-            )
-            .is_none()
+    async fn recap_from(reply: &'static str) -> Result<RecapOutput, super::super::aux::AuxError> {
+        let slot = crate::agent::ModelSlot::new(
+            super::super::aux::test_support::Replying(reply),
+            aither_core::llm::model::Parameters::default(),
         );
+        super::super::aux::generate_with::<_, RecapOutput>(
+            &slot,
+            recap_messages(&[(&MessageRole::User, "ship it")], None),
+            GENERATION_TIMEOUT,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_fenced_reply_yields_a_recap() {
+        let reply = "```json\n{\"summary\":\"Merged.\",\"next_action\":null}\n```";
+        let record = recap_from(reply)
+            .await
+            .expect("fenced JSON is recovered")
+            .into_record(1)
+            .expect("record");
+        assert_eq!(record.summary, "Merged.");
+        assert!(record.next_action.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_over_limit_summary_is_rejected() {
+        let reply: &'static str = Box::leak(
+            format!(
+                "{{\"summary\":\"{}\",\"next_action\":null}}",
+                "x".repeat(SUMMARY_MAX_CHARS + 1)
+            )
+            .into_boxed_str(),
+        );
+        let error = recap_from(reply).await.expect_err("over the limit");
+        assert!(
+            matches!(error, super::super::aux::AuxError::Output(_)),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn the_recap_prompt_leaves_the_output_format_to_the_schema() {
+        assert!(!last_message(None).contains("JSON"));
     }
 }

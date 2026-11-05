@@ -3,8 +3,9 @@
 //! The report mirrors Claude Code's `/context` panel: a `used/window`
 //! headline plus a per-category estimate of what the next request would
 //! carry. Everything is measured from the live [`aither_agent::Context`]
-//! — persistent system blocks, the command/skill/subagent index sections
-//! inside `base_system`, staged handoff, reminders and the recent
+//! — instruction and external system blocks, the skill/subagent index
+//! sections inside `capabilities`, the command table, staged handoff,
+//! reminders and the recent
 //! conversation — plus the `terminal` tool definition providers receive
 //! alongside the messages. Numbers are estimates at ~4 bytes per token,
 //! the same heuristic the agent uses for its own context budgeting.
@@ -21,8 +22,8 @@ use super::runtime_context::tag;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextCategory {
-    /// Persistent system blocks (persona, runtime, workspace, the tool
-    /// architecture portion of `base_system`, …).
+    /// Persistent system blocks (identity, environment, workspace, the
+    /// prose of `capabilities`, …).
     SystemPrompt,
     /// The native `terminal` tool definition sent with every request.
     SystemTools,
@@ -98,8 +99,9 @@ pub struct ContextReport {
     pub compact_tokens: usize,
 }
 
-/// Result of splitting the `base_system` block into its marked sections.
-struct BaseSystemCarve {
+/// Result of splitting the `capabilities` block, or the command table, into
+/// its marked sections.
+struct CapabilitiesCarve {
     /// Everything outside the `<native_tools>`/`<commands>`/`<skills>`/
     /// `<subagents>` spans.
     architecture_chars: usize,
@@ -127,11 +129,13 @@ struct BaseSystemCarve {
 
 impl ContextReport {
     /// Assemble a report from the agent's live context and a
-    /// [`ContextWindowMetrics`] measured on the same state.
+    /// [`ContextWindowMetrics`] measured on the same state. `named_commands`
+    /// are the commands registered by name; every other row of the command
+    /// table is an MCP connection's tool.
     pub(crate) fn assemble(
         model_id: &str,
         provider_id: &str,
-        mcp_command_names: &[String],
+        named_commands: &[String],
         context: &aither_agent::Context,
         metrics: &ContextWindowMetrics,
         phase: ContextWindowPhase,
@@ -150,10 +154,17 @@ impl ContextReport {
         let mut subagent_chars = 0usize;
         let mut subagent_count = 0usize;
 
+        for (slot, block) in context.external().iter() {
+            if *slot == tag::MEMORY || *slot == tag::PROFILE_MEMORIES {
+                memory_chars += block.content().len();
+            } else {
+                system_prompt_chars += block.content().len();
+            }
+        }
         for (slot, content) in context.instructions().iter() {
             match slot {
-                slot if *slot == InstructionSlot::BASE_SYSTEM => {
-                    let carved = carve_base_system(content, mcp_command_names);
+                slot if *slot == tag::CAPABILITIES || *slot == InstructionSlot::COMMANDS => {
+                    let carved = carve_capabilities(content, named_commands);
                     system_prompt_chars += carved.architecture_chars;
                     native_tool_chars += carved.native_tool_chars;
                     native_tool_count += carved.native_tool_count;
@@ -165,9 +176,6 @@ impl ContextReport {
                     skill_count += carved.skill_count;
                     subagent_chars += carved.subagent_chars;
                     subagent_count += carved.subagent_count;
-                }
-                slot if *slot == tag::MEMORY || *slot == tag::PROFILE_MEMORIES => {
-                    memory_chars += content.len();
                 }
                 _ => system_prompt_chars += content.len(),
             }
@@ -268,11 +276,11 @@ fn command_line_name(item: &str) -> &str {
     item.split_once(": ").map_or(item, |(name, _)| name)
 }
 
-/// Split the rendered `base_system` block into architecture text and its
-/// marked index sections, attributing `<commands>` lines to built-in
-/// commands vs MCP tools by name.
-fn carve_base_system(content: &str, mcp_command_names: &[String]) -> BaseSystemCarve {
-    let mut carved = BaseSystemCarve {
+/// Split a rendered block into its prose and its marked index sections,
+/// attributing `<commands>` lines to commands registered by name vs MCP
+/// tools.
+fn carve_capabilities(content: &str, named_commands: &[String]) -> CapabilitiesCarve {
+    let mut carved = CapabilitiesCarve {
         architecture_chars: content.len(),
         native_tool_chars: 0,
         native_tool_count: 0,
@@ -298,14 +306,14 @@ fn carve_base_system(content: &str, mcp_command_names: &[String]) -> BaseSystemC
         // index; only MCP item lines move to the MCP bucket.
         carved.command_chars = section.len();
         for item in section_items(section) {
-            if mcp_command_names
+            if named_commands
                 .iter()
                 .any(|name| name == command_line_name(item))
             {
+                carved.command_count += 1;
+            } else {
                 carved.mcp_chars += item.len();
                 carved.mcp_count += 1;
-            } else {
-                carved.command_count += 1;
             }
         }
         carved.command_chars -= carved.mcp_chars;
@@ -353,17 +361,24 @@ mod tests {
 
     fn base_system_block() -> &'static str {
         "<tool_architecture>\n<native_tools>\n- terminal: Execute terminal commands.\n- terminal_kill: Terminate a background task.\n</native_tools>\n</tool_architecture>\n\n\
-         <commands>\n\n- ask: Ask a fast model.\n- github_pr: Open a PR.\n- jira_view: View an issue.\n\n</commands>\n\n\
          <skills>\n\n- pdf: read `skills/pdf/SKILL.md` when the request matches this skill. Handle PDFs.\n\n</skills>\n\n\
          <subagents>\nInvoke with `subagent`.\n\n- researcher: Research things.\n\n</subagents>"
     }
 
+    /// The command table: `ask` is registered by name, the rest are MCP
+    /// tools.
+    const COMMAND_TABLE: &str = "<commands>\n- ask: Ask a fast model\n- github_pr: Open a PR\n- jira_view: View an issue\n</commands>";
+
     fn test_context() -> aither_agent::Context {
         let mut context = aither_agent::Context::with_layout(tag::layout());
         let instructions = context.instructions_mut();
-        instructions.insert(&InstructionSlot::BASE_SYSTEM, base_system_block());
-        instructions.insert(&tag::MEMORY, "remember this");
-        instructions.insert(&tag::TERMINAL_RUNTIME_CONTEXT, "sandbox=/tmp cwd=/tmp");
+        instructions.insert(&tag::CAPABILITIES, base_system_block());
+        instructions.insert(&InstructionSlot::COMMANDS, COMMAND_TABLE);
+        instructions.insert(&tag::ENVIRONMENT, "sandbox=/tmp cwd=/tmp");
+        context.external_mut().insert(
+            &tag::MEMORY,
+            aither_agent::ExternalContent::data("MEMORY.md", "remember this"),
+        );
         context.push(Message::user("hello"));
         context.push(Message::assistant("hi there"));
         context
@@ -397,7 +412,7 @@ mod tests {
         let report = ContextReport::assemble(
             "gpt-5",
             "openai",
-            &["github_pr".to_string(), "jira_view".to_string()],
+            &["ask".to_string()],
             &test_context(),
             &test_metrics(),
             ContextWindowPhase::Stable,

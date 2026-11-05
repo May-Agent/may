@@ -1,16 +1,12 @@
-Write a catch-up summary for a user returning to this session after time
-away.
+Write a catch-up note for the user, who is returning to this session after time away.
 
-Everything before this message is the real conversation: the user's
-requests and the assistant's replies. Summarize the state of the work, not
-the process: concrete results — what is implemented, verified, or still
-proposed. Preserve unresolved caveats above all else: anything not
-deployed, not verified, or still failing must stay visible; that matters
-more than identifiers, commit hashes, or durations.
+Everything before this message is the real conversation. Say where the work stands, as plain sentences addressed to the person coming back: what is done, what is verified, and what is still open. Describe the state of the work, not the steps taken to get there.
 
-Return JSON: {"summary": string, "next_action": string | null}.
-summary: at most 700 characters, in the user's language, plain text,
-40-80 words preferred.
-next_action: at most 200 characters — set it only when an unanswered
-question, an agreed next step, or an obvious blocker resolution exists;
-otherwise null.
+State each open caveat once, in its own sentence and in its own words: anything not deployed, not verified, or still failing. Do not attach a caveat to the claim it qualifies. Do not correct, retract or defend anything the session said earlier; report where things stand now.
+
+Every detail goes into a sentence of its own or is left out. No brackets of any kind, half-width () or full-width （）, and no dash or colon that sets off an aside. Keep figures, file names and lists only when the person needs them to act.
+{% if let Some(language) = language %}
+Write in {{ language }}.
+{% else %}
+Write in the language of the user's messages.
+{% endif %}
