@@ -252,6 +252,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn connecting_asks_for_the_model_and_mode_then_configures_the_agent() {
+        // The probe's sandbox spawns on the daemon's global executor.
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
         let dir = tempfile::tempdir().expect("temp dir");
         let state = DaemonState::for_test(dir.path(), MayConfig::default())
             .await

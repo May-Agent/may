@@ -228,7 +228,7 @@ pub struct MayAgentConfig {
     pub browser_broker: Option<BrowserBroker>,
     /// Connected ACP agents registered as subagent types, when the daemon
     /// hosts the session.
-    pub acp: Option<super::acp_subagent::AcpAgents>,
+    pub acp: Option<Arc<super::acp_subagent::AcpHosts>>,
     /// Daemon handles for the `computer` command — a session virtual
     /// desktop exists only on macOS local environments.
     #[cfg(target_os = "macos")]
@@ -300,8 +300,9 @@ pub struct MayAgentSessionInput<'a> {
     pub notify_broker: Option<crate::agent::notify_tool::NotifyBroker>,
     /// Channel for tunnel registrations.
     pub tunnel_broker: Option<crate::agent::tunnel_tool::TunnelBroker>,
-    /// The daemon's acpsub host and runtime; connected ACP agents run on it.
-    pub acp_host: Option<(acpsub::Host, tokio::runtime::Handle)>,
+    /// The daemon's ACP hosts; connected ACP agents run on them, inside the
+    /// session's sandbox.
+    pub acp_host: Option<Arc<super::acp_subagent::AcpHosts>>,
     /// Channel for browser requests.
     pub browser_broker: Option<BrowserBroker>,
     /// Daemon handles for `computer` commands (macOS local only).
@@ -433,7 +434,7 @@ impl MayAgent {
             )
             .await
             .map_err(|e| MayAgentError::Sandbox(e.to_string()))?
-            .with_network_audit_log(network_audit)
+            .with_network_audit_log(network_audit.clone())
             .with_process_priority(config.command_priority.process_priority())
             .with_readable_paths(readable)
             .with_writable_paths(writable)
@@ -619,6 +620,37 @@ impl MayAgent {
             config.max_iterations
         };
         let terminal_grants = terminal_tool.grants();
+        // Connected ACP agents start in the boundary this session's own
+        // terminal commands run in; a container session has no host sandbox
+        // to give them, so it offers none.
+        let acp = match config.acp.as_ref() {
+            Some(hosts) if !is_container => Some(
+                hosts
+                    .agents(
+                        config.session_id.as_str(),
+                        super::acp_sandbox::SessionSandbox::for_session(
+                            config.sandbox_dir.clone(),
+                            terminal_grants.clone(),
+                            TerminalPermissionHandler::for_agent(
+                                config.permission_approver.clone(),
+                                config.network_policy.clone(),
+                                config.profile_id.clone(),
+                            ),
+                            network_audit,
+                            config.command_priority.process_priority(),
+                            config.permission_approver.clone(),
+                        ),
+                    )
+                    .map_err(|e| MayAgentError::Sandbox(e.to_string()))?,
+            ),
+            Some(_) => {
+                tracing::warn!(
+                    "connected ACP agents are not offered in container sessions: they would run on the host"
+                );
+                None
+            }
+            None => None,
+        };
         let language_guard = aither_agent::LanguageGuard::new(config.languages);
         let mut builder = TerminalAgentBuilder::new(llm, terminal_tool)
             .system_layout(tag::layout())
@@ -688,7 +720,7 @@ impl MayAgent {
                 workspace_config: workspace.config.clone(),
                 agent_messaging,
                 languages: Some(language_guard.clone()),
-                acp: config.acp.clone(),
+                acp,
                 #[cfg(target_os = "macos")]
                 computer: config.computer.clone(),
             },
@@ -919,11 +951,7 @@ impl MayAgent {
             notify_broker,
             tunnel_broker,
             browser_broker,
-            acp: acp_host.map(|(host, runtime)| super::acp_subagent::AcpAgents {
-                host,
-                runtime,
-                connected: may_config.acp_agents.clone(),
-            }),
+            acp: acp_host,
             #[cfg(target_os = "macos")]
             computer,
             register_skills_broker,

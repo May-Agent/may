@@ -1,0 +1,1 @@
+A connected ACP agent working in {{ cwd.display() }} asks permission to: {{ title }}

@@ -266,8 +266,11 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
     let (search_index_wake_tx, search_index_wake) = async_channel::bounded(1);
 
     let config = Arc::new(arc_swap::ArcSwap::from_pointee(config));
-    let acp_host = crate::agent::acp_subagent::live_host(config.clone(), &may_dir)
-        .context("failed to open the ACP session registry")?;
+    let acp_host = Arc::new(crate::agent::acp_subagent::AcpHosts::new(
+        config.clone(),
+        &may_dir,
+        tokio::runtime::Handle::current(),
+    ));
 
     let state = Arc::new(DaemonState {
         acp_host,
