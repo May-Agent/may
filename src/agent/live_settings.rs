@@ -68,4 +68,18 @@ mod tests {
         config.models.compaction_model = Some("default::small".parse().expect("selector"));
         assert_ne!(lifetime_changed, AgentLiveSettings::of(&config));
     }
+
+    #[test]
+    fn a_changed_warn_distance_differs_and_reaches_the_policy() {
+        let mut config = config();
+        assert_eq!(
+            config.context.policy().warn_distance,
+            aither_agent::ContextPolicy::default().warn_distance,
+            "the default is aither's"
+        );
+        let built = AgentLiveSettings::of(&config);
+        config.context.warn_distance = 12_345;
+        assert_ne!(built, AgentLiveSettings::of(&config));
+        assert_eq!(config.context.policy().warn_distance, 12_345);
+    }
 }

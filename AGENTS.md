@@ -175,7 +175,7 @@ During streaming:
 ```
 
 # Terminal-first tool calling
-The native tools are `terminal`, `monitor`, the terminal controls (`terminal_kill`, `terminal_input`, `terminal_read`) and `compact` (by design a native tool; aither 0.14.1 does not provide it yet, May-Agent/may#127). This describes command execution capability and does not imply a specific shell implementation.
+The native tools are `terminal`, `monitor`, the terminal controls (`terminal_kill`, `terminal_input`, `terminal_read`) and `compact` (aither's `TerminalAgentBuilder` registers it and arms the one-shot pre-compaction alert; its description carries the when-to-compact rule, so May's prompt does not repeat it). This describes command execution capability and does not imply a specific shell implementation.
 
 Everything else is exposed as CLI commands through the terminal tool's IPC bridge rather than as additional native tools.
 A tool the model provider executes server-side is the exception: it is passed to the provider natively and, while enabled, replaces the corresponding terminal command. Web search is always that hosted tool (`web_search` / `google_search`); May does not register a `websearch` command or a client-side search engine. High-frequency browser work should use the May-managed `browser` command rather than ad-hoc shell recipes or direct browser installers.

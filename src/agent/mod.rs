@@ -6,6 +6,8 @@ mod agents_md;
 pub(crate) mod ask_user_tool;
 pub(crate) mod browser_tool;
 #[cfg(test)]
+mod compact_tool_tests;
+#[cfg(test)]
 mod compaction_tests;
 #[cfg(target_os = "macos")]
 pub mod computer_tool;

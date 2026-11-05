@@ -191,6 +191,11 @@ where
             RepoSearch::global(&config.may_dir),
             config.cwd.clone(),
             Some(config.db.clone()),
+            Some(crate::repo_clone::SessionRepos::new(
+                &config.sandbox_dir,
+                config.session_id.clone(),
+                config.db.clone(),
+            )),
         ),
     );
     let issue_search = IssueSearch::new(
@@ -210,7 +215,7 @@ where
         SubagentIssueTool::new(config.issue_store, provenance).with_search(issue_search);
     describe_tool(&mut descriptions, &issue_tool);
     builder.configure_role_tools(issue_tool, subagent_issue_tool);
-    // Issue changes reach GitHub through `issue` alone. The command exists
+    // Issue and PR changes reach GitHub through `issue` and `pr` alone. The command exists
     // in sandboxed modes only, so an approved unsafe command resolves `gh` on
     // the host's PATH and runs the real program.
     builder.sandboxed_only(|sandboxed| {
@@ -264,7 +269,10 @@ where
             ask_user = ask_user.with_languages(guard.clone());
         }
         describe_tool(&mut descriptions, &ask_user);
-        builder.main_only(|reserved| reserved.configure_tool(ask_user));
+        // The user's answers are decisions the summary must not paraphrase.
+        builder.kept_through_compaction(|kept| {
+            kept.main_only(|reserved| reserved.configure_tool(ask_user));
+        });
         let withdraw = WithdrawAskUserTool::new(runtime, config.session_id.clone());
         describe_tool(&mut descriptions, &withdraw);
         builder.main_only(|reserved| reserved.configure_tool(withdraw));
