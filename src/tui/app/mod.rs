@@ -242,6 +242,11 @@ pub struct App {
     pub model_select_rx: Option<Receiver<Vec<FetchedModel>>>,
     /// Per-session file-diff worker (rebuilt on session switch)
     pub file_diffs: Option<FileDiffHandle>,
+    /// The daemon's answers to clone-root requests, waiting to join tracking
+    clone_roots: (
+        async_channel::Sender<Vec<crate::file_tracker::TrackedRootSpec>>,
+        Receiver<Vec<crate::file_tracker::TrackedRootSpec>>,
+    ),
     /// Per-root session file changes shown in the sidebar's Changes
     /// section; refreshed from the diff worker's status outcomes.
     pub file_status: Vec<crate::file_tracker::RootDiff>,
@@ -342,7 +347,7 @@ pub struct App {
     /// when the agent worker installs).
     pub background: Option<crate::client::background::RemoteBackground>,
     /// Model clone for `/btw` side questions (outside conversation history).
-    pub btw_llm: Option<crate::agent::RequestParameterizedModel<crate::agent::ProviderLlm>>,
+    pub btw_llm: Option<crate::agent::ModelSlot<crate::agent::ProviderLlm>>,
     /// Daemon that answers `/btw` when the agent runs there.
     pub btw_daemon: Option<crate::client::DaemonClient>,
     /// Right sidebar: task tree, linked issues (background lists come
@@ -614,6 +619,7 @@ impl App {
             model_fetch_rx: None,
             model_select_rx: None,
             file_diffs: None,
+            clone_roots: async_channel::unbounded(),
             file_status: Vec::new(),
             sidebar_file_changes: true,
             clipboard_rx: None,
@@ -746,34 +752,76 @@ impl App {
             let key = crate::issue::repository_identity(&worktree).ok()?;
             crate::trust::trust_for(config, &key, &worktree)
         });
-        self.sidebar_file_changes = !trust.is_some_and(crate::trust::TrustLevel::clones_work);
+        let clones_work = trust.is_some_and(crate::trust::TrustLevel::clones_work);
+        self.sidebar_file_changes = !clones_work;
+        // With clones, the daemon's registry names the roots; they join
+        // tracking when its answer arrives.
         let mut roots = Vec::new();
-        if trust.is_some_and(crate::trust::TrustLevel::clones_work) {
-            roots = Self::repo_clone_specs(&session.sandbox_dir);
-        } else if let Some(config) = &config {
-            if !config.has_write_access(&self.cwd) {
+        if !clones_work {
+            if let Some(config) = &config {
+                if !config.has_write_access(&self.cwd) {
+                    roots.push(crate::file_tracker::TrackedRootSpec::checkout(
+                        self.cwd.clone(),
+                    ));
+                }
+                roots.extend(
+                    config
+                        .workdirs
+                        .iter()
+                        .filter(|dir| dir.permission == crate::workspace::Permission::ReadWrite)
+                        .map(|dir| {
+                            crate::file_tracker::TrackedRootSpec::checkout(dir.path.clone())
+                        }),
+                );
+            } else {
                 roots.push(crate::file_tracker::TrackedRootSpec::checkout(
                     self.cwd.clone(),
                 ));
             }
-            roots.extend(
-                config
-                    .workdirs
-                    .iter()
-                    .filter(|dir| dir.permission == crate::workspace::Permission::ReadWrite)
-                    .map(|dir| crate::file_tracker::TrackedRootSpec::checkout(dir.path.clone())),
-            );
-        } else {
-            roots.push(crate::file_tracker::TrackedRootSpec::checkout(
-                self.cwd.clone(),
-            ));
         }
         self.file_status.clear();
-        self.file_diffs =
-            FileDiffHandle::start(session_id, session_paths.root().join("filebase"), roots);
+        self.file_diffs = FileDiffHandle::start(
+            session_id.clone(),
+            session_paths.root().join("filebase"),
+            roots,
+        );
         if let Some(handle) = &self.file_diffs {
             handle.request_status();
         }
+        if clones_work {
+            self.request_clone_roots(&session_id);
+        }
+    }
+
+    /// Ask the daemon for the session's repo clones; its answer is applied by
+    /// [`Self::poll_file_diffs`].
+    fn request_clone_roots(&self, session_id: &str) {
+        let Ok(client) = self.session_manager.daemon_handle() else {
+            return;
+        };
+        let results = self.clone_roots.0.clone();
+        let path = format!("/api/sessions/{session_id}/repo-clones");
+        spawn(async move {
+            match client.get::<Vec<crate::repo_clone::CloneView>>(&path).await {
+                Ok(clones) => {
+                    let specs = clones
+                        .into_iter()
+                        .map(|clone| {
+                            let label = if clone.local {
+                                crate::fs_utils::display_path(std::path::Path::new(&clone.source))
+                            } else {
+                                clone.source.clone()
+                            };
+                            crate::file_tracker::TrackedRootSpec::new(clone.path.into())
+                                .label(format!("{label} (clone)"))
+                        })
+                        .collect();
+                    let _ = results.send(specs).await;
+                }
+                Err(error) => tracing::warn!(%error, "failed to list session repo clones"),
+            }
+        })
+        .detach();
     }
 
     /// Ask the diff worker to attribute pending file changes to
@@ -835,6 +883,13 @@ impl App {
     /// Apply finished file diffs and rewind results to their tool-call
     /// blocks. Called once per event-loop iteration.
     pub fn poll_file_diffs(&mut self) {
+        while let Ok(specs) = self.clone_roots.1.try_recv() {
+            if let Some(handle) = &self.file_diffs {
+                for spec in specs {
+                    handle.request_add_root(spec);
+                }
+            }
+        }
         let outcomes = match &self.file_diffs {
             Some(handle) => handle.drain(),
             None => return,
@@ -866,42 +921,9 @@ impl App {
         if refresh_status && let Some(handle) = &self.file_diffs {
             // Repo clones created since the last refresh join tracking;
             // the worker dedupes roots it already covers.
-            if let Some(session) = self
-                .session_manager
-                .current()
-                .filter(|session| session.persisted)
-            {
-                for spec in Self::repo_clone_specs(&session.sandbox_dir) {
-                    handle.request_add_root(spec);
-                }
-            }
+            self.request_clone_roots(handle.session_id());
             handle.request_status();
         }
-    }
-
-    /// Tracked-root specs for the session's repo clones: every clone under
-    /// `<sandbox>/repos/` is an embedded repository whose working tree only
-    /// diffs against a shadow repo of its own, labeled by the repository
-    /// it serves.
-    fn repo_clone_specs(
-        sandbox_dir: &std::path::Path,
-    ) -> Vec<crate::file_tracker::TrackedRootSpec> {
-        let repos = crate::repo_clone::SessionRepos::new(sandbox_dir, "");
-        let Ok(clones) = repos.clones() else {
-            return Vec::new();
-        };
-        clones
-            .iter()
-            .map(|record| {
-                let label = if record.local {
-                    crate::fs_utils::display_path(std::path::Path::new(&record.source))
-                } else {
-                    record.source.clone()
-                };
-                crate::file_tracker::TrackedRootSpec::new(repos.root().join(&record.dir))
-                    .label(format!("{label} (clone)"))
-            })
-            .collect()
     }
 
     /// Show the result of a completed code rewind in the chat stream.
@@ -4365,11 +4387,10 @@ fn btw_message(role: &str, content: impl Into<String>) -> crate::daemon::BtwMess
 
 /// Streams a `/btw` answer from the session's model into the overlay.
 async fn stream_btw_answer(
-    llm: crate::agent::RequestParameterizedModel<crate::agent::ProviderLlm>,
+    llm: crate::agent::ModelSlot<crate::agent::ProviderLlm>,
     messages: Vec<crate::daemon::BtwMessage>,
     tx: EventSender,
 ) {
-    use aither_core::LanguageModel;
     use aither_core::llm::Message;
     use futures_lite::StreamExt;
     let messages = messages
@@ -4380,8 +4401,7 @@ async fn stream_btw_answer(
             _ => Message::user(message.content),
         })
         .collect::<Vec<_>>();
-    let request = aither_core::llm::LLMRequest::new(messages);
-    let mut stream = std::pin::pin!(llm.respond(request));
+    let mut stream = std::pin::pin!(llm.respond(messages));
     while let Some(result) = stream.next().await {
         match result {
             Ok(aither_core::llm::Event::Text(text)) => {

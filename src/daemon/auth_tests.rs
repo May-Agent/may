@@ -18,7 +18,7 @@ async fn state() -> Arc<DaemonState> {
     // The home must outlive the state: `for_test` opens the database inside
     // it but does not keep the directory handle.
     let dir = tempfile::tempdir().expect("temp dir");
-    let state = DaemonState::for_test(dir.path(), dir.path(), MayConfig::default())
+    let state = DaemonState::for_test(dir.path(), MayConfig::default())
         .await
         .expect("daemon state");
     std::mem::forget(dir);
