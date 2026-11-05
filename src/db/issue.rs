@@ -278,6 +278,10 @@ impl ChatDb {
     /// Issues of `repo_key` updated after `since` (any time when `None`),
     /// oldest update first.
     ///
+    /// A page holds the first `limit` such issues plus every other issue
+    /// sharing the last one's `updated_at`, so a caller that resumes after
+    /// the newest timestamp it saw never skips the rest of a tie.
+    ///
     /// # Errors
     /// Returns [`ChatDbError`] when the query fails.
     pub async fn issues_updated_since(
@@ -289,11 +293,14 @@ impl ChatDb {
         let Some(project_id) = self.find_issue_project(repo_key).await? else {
             return Ok(Vec::new());
         };
+        let since = since.unwrap_or("");
         let rows = query!(
             self.db,
-            "SELECT * FROM issues WHERE project_id = ? AND updated_at > ? ORDER BY updated_at, number LIMIT ?",
+            "SELECT * FROM issues WHERE project_id = ? AND updated_at > ? AND updated_at <= (SELECT MAX(updated_at) FROM (SELECT updated_at FROM issues WHERE project_id = ? AND updated_at > ? ORDER BY updated_at LIMIT ?)) ORDER BY updated_at, number",
             project_id,
-            since.unwrap_or(""),
+            since,
+            project_id,
+            since,
             limit
         )
         .fetch_all::<Model>()
@@ -708,6 +715,46 @@ mod tests {
         assert_eq!(detail.title, "renamed");
         assert_eq!(detail.body, "body");
         assert_eq!(detail.state, IssueState::Closed);
+    }
+
+    /// Issues that share an `updated_at` across the page size come back in
+    /// one page, so resuming after the page's newest timestamp skips none.
+    #[tokio::test]
+    async fn a_page_keeps_an_updated_at_tie_whole() {
+        let (_dir, db) = test_db().await;
+        for title in ["a", "b", "c", "d"] {
+            db.create_issue("repo", title, "", &[])
+                .await
+                .expect("create");
+        }
+        db.execute_for_test(
+            "UPDATE issues SET updated_at = CASE number WHEN 1 THEN '2026-01-01T00:00:00Z' WHEN 4 THEN '2026-01-03T00:00:00Z' ELSE '2026-01-02T00:00:00Z' END",
+        )
+        .await
+        .expect("set timestamps");
+
+        let first = db
+            .issues_updated_since("repo", None, 2)
+            .await
+            .expect("first page");
+        let numbers: Vec<i64> = first.iter().map(|issue| issue.number).collect();
+        assert_eq!(numbers, [1, 2, 3], "the tie at the page edge stays whole");
+
+        let resume = first.last().expect("a page").updated_at.clone();
+        let second = db
+            .issues_updated_since("repo", Some(&resume), 2)
+            .await
+            .expect("second page");
+        let numbers: Vec<i64> = second.iter().map(|issue| issue.number).collect();
+        assert_eq!(numbers, [4]);
+
+        let last = second.last().expect("a page").updated_at.clone();
+        assert!(
+            db.issues_updated_since("repo", Some(&last), 2)
+                .await
+                .expect("past the end")
+                .is_empty()
+        );
     }
 
     #[tokio::test]
