@@ -25,7 +25,7 @@ Paths are relative to the May source checkout. `aither-sandbox` and `aither-agen
 - `aither-sandbox/src/terminal.rs`: `TerminalArgs`, `DEFAULT_FOREGROUND_WAIT` (10 s), `DEFAULT_TIMEOUT_CAP`, `DEFAULT_LONG_JOB_ALERT_AFTER` (40 min), session environment (`HOME`, `TMPDIR`).
 - `aither-sandbox/src/stdin_watch.rs` (stdin-blocked detection), `poll_guard.rs` (refused `sleep` and unchanged re-reads), `output.rs` (`INLINE_OUTPUT_LIMIT` 16,000 bytes), `monitor.rs`, `builtin/terminal.rs` (`terminal_read`, `terminal_input`, `terminal_kill`), `command.rs` (IPC command bridge and argument parsing).
 - `aither-agent/templates/job_alert.txt`: alert wording, including the working-directory reset reasons.
-- `src/agent/permission.rs`: approval for `unsafe` mode (30 min main, 3 min subagent); `src/terminal_permission_handler.rs`: network policy and audit log; `src/agent/runtime_context.rs` and `templates/terminal_runtime_context.txt`: what the terminal context block tells the agent.
+- `src/agent/permission.rs`: approval for `unsafe` mode (30 min main, 3 min subagent); `src/terminal_permission_handler.rs`: network policy and audit log; `src/agent/runtime_context.rs` and `templates/prompt/`: the session system prompt, one template per section (`tag::layout` orders them), external content last.
 
 ## Commands, skills, subagents
 
@@ -33,8 +33,8 @@ Paths are relative to the May source checkout. `aither-sandbox` and `aither-agen
 - Command implementations: `src/agent/ask_user_tool.rs`, `issue_tool.rs`, `pr_tool.rs` (store in `src/pr.rs`), `repo_tool.rs`, `session_tool.rs`, `task_tool.rs`, `notify_tool.rs`, `tunnel_tool.rs`, `browser_tool.rs`, `register_tool.rs`, `imagine.rs`; `src/repo_search/code_search.rs` (`search`); `src/agent_link.rs` (`agent`); `src/issue/` (May and GitHub backends).
 - `src/skill.rs`: `SkillManager` (list, install from GitHub, register local). `src/bundle/mod.rs`: bundled skills embedded with `include_dir!` from `skills/` and written to `~/.may/skills`.
 - `aither-agent/src/specialized/task.rs`: `subagent` arguments; `aither-agent/subagents/*.toml`: the bundled definitions, written to `~/.may/subagents/`.
-- `src/memory.rs`: profile memory extraction; `templates/memory_context_hint.txt`: memory directory hint.
-- `src/agent/may.rs`: builds the agent (skills, compaction model, hooks); `templates/base_system.md`: the base system prompt.
+- `src/memory.rs`: profile memory extraction; `templates/prompt/work.md`: the memory directory rule.
+- `src/agent/may.rs`: builds the agent (skills, compaction model, hooks, host load monitor); `templates/prompt/capabilities.md`: the command, skill and subagent catalog.
 
 ## Repositories, PRs and CI
 

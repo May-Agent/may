@@ -430,13 +430,30 @@ where
     ));
 }
 
+/// The first sentence of `description` on one line, for the command catalog.
+///
+/// A sentence ends at a `.` followed by whitespace or the end of the text,
+/// outside a code span, so `` `computer <action> ...` `` or a version
+/// number does not cut it short.
 pub(crate) fn short_description(description: &str) -> String {
-    description
-        .split('.')
-        .next()
-        .unwrap_or(description)
-        .trim()
-        .to_string()
+    // Both markers are ASCII, so a byte scan finds them on char boundaries.
+    let bytes = description.as_bytes();
+    let mut in_code = false;
+    let mut end = description.len();
+    for (index, byte) in bytes.iter().enumerate() {
+        match byte {
+            b'`' => in_code = !in_code,
+            b'.' if !in_code && bytes.get(index + 1).is_none_or(u8::is_ascii_whitespace) => {
+                end = index;
+                break;
+            }
+            _ => {}
+        }
+    }
+    description[..end]
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]
@@ -1070,5 +1087,23 @@ mod tests {
         assert!(registry.is_tool_configured("webfetch"));
         assert!(!descriptions.iter().any(|(name, _)| name == "websearch"));
         assert!(descriptions.iter().any(|(name, _)| name == "webfetch"));
+    }
+
+    #[test]
+    fn a_catalog_entry_is_the_whole_first_sentence_on_one_line() {
+        assert_eq!(
+            short_description(
+                "`computer <action> ...` — the session's virtual desktop.\n\nActions follow."
+            ),
+            "`computer <action> ...` — the session's virtual desktop"
+        );
+        assert_eq!(
+            short_description("Track work as issues: create, view,\nlist and close. More."),
+            "Track work as issues: create, view, list and close"
+        );
+        assert_eq!(
+            short_description("Runs on aither 0.16.0 builds"),
+            "Runs on aither 0.16.0 builds"
+        );
     }
 }

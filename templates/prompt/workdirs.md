@@ -1,3 +1,2 @@
-Approved workspace directories (read/write grants beyond the sandbox):
 {% for wd in workdirs %}- {{ wd.path }}: {{ wd.description }}
 {% endfor %}
