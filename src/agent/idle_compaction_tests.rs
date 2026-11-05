@@ -41,7 +41,7 @@ const COMPACTION_PROVIDER: &str = "compaction";
 pub const SESSION_MODEL: &str = "session-model";
 const COMPACTION_MODEL: &str = "compaction-model";
 /// Opening words of aither's compaction instruction.
-const COMPACTION_MARKER: &str = "Your context window is being compacted";
+pub const COMPACTION_MARKER: &str = "Your context window is being compacted";
 
 /// What a stub model server received.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
