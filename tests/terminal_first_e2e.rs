@@ -4683,6 +4683,93 @@ async fn oneshot_run_starts_the_daemon_and_streams_its_turn() {
     );
 }
 
+/// Whether launchd has `label` loaded in the invoking user's domain.
+#[cfg(target_os = "macos")]
+fn launchd_job_loaded(label: &str) -> bool {
+    // SAFETY: getuid cannot fail.
+    let uid = unsafe { libc::getuid() };
+    std::process::Command::new("/bin/launchctl")
+        .args(["print", &format!("user/{uid}/{label}")])
+        .output()
+        .expect("launchctl print should run")
+        .status
+        .success()
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[serial]
+async fn temp_home_daemon_leaves_no_repo_search_job_after_it_stops() {
+    use repo_search_client::launcher::launchd::labels_for;
+
+    let mock = MockOpenAiServer::spawn(MockChatScenario::SlowTextEveryTurn {
+        chunks: vec!["hi".into()],
+        delay: Duration::from_millis(10),
+    })
+    .await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    let home = harness.home_path().to_path_buf();
+    let login = dirs::home_dir().expect("login home should resolve");
+    let (daemon_label, server_label) = labels_for(&home, &login);
+    assert!(
+        !launchd_job_loaded(&daemon_label) && !launchd_job_loaded(&server_label),
+        "a fresh temp home owns no job"
+    );
+
+    let mut server = RunningDaemon::spawn(&home, &[]).await;
+    // An index-coverage poll on a git worktree reaches repo-search, which
+    // installs the home's agents.
+    let worktree = tempfile::tempdir().expect("worktree tempdir should be created");
+    git2::Repository::init(worktree.path()).expect("worktree should initialise");
+    let cwd = dunce::canonicalize(worktree.path()).expect("worktree should resolve");
+    let client = reqwest::Client::new();
+    let events = client
+        .get(format!("{}/api/events", server.base_url))
+        .query(&[
+            ("topics", "session_index"),
+            ("cwd", cwd.to_str().expect("utf-8 path")),
+        ])
+        .send()
+        .await
+        .expect("event stream should open");
+    let mut reader = SseReader::new(events);
+    let snapshot = loop {
+        let event = tokio::time::timeout(Duration::from_secs(120), reader.next_event())
+            .await
+            .expect("an index snapshot should arrive")
+            .expect("the stream should stay open");
+        if event.event == "session_index" {
+            break event.data;
+        }
+    };
+    drop(reader);
+    // A launchd that refuses the bootstrap (a port or the session already
+    // taken) leaves nothing to boot out; the check below then still holds.
+    let installed =
+        serde_json::from_str::<Value>(&snapshot).expect("snapshot is JSON")["error"].is_null();
+    if installed {
+        assert!(
+            launchd_job_loaded(&daemon_label) && launchd_job_loaded(&server_label),
+            "the temp-home daemon should have installed its repo-search agents; snapshot: {snapshot}"
+        );
+    }
+
+    client
+        .post(format!("{}/api/daemon/shutdown", server.base_url))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .expect("shutdown request should succeed");
+    tokio::time::timeout(Duration::from_secs(60), server.child.wait())
+        .await
+        .expect("the daemon should exit after a shutdown request")
+        .expect("daemon wait should succeed");
+    assert!(
+        !launchd_job_loaded(&daemon_label) && !launchd_job_loaded(&server_label),
+        "stopping the daemon should boot out the relocated home's agents"
+    );
+}
+
 /// The session's background work, as `GET /api/sessions/{id}/background`
 /// reports it.
 async fn background_of(
