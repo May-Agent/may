@@ -1,0 +1,20 @@
+{% if entries.is_empty() -%}
+No change to issue #{{ number }} was made by may on this machine.
+{%- else -%}
+Changes may made to issue #{{ number }}, oldest first:
+{% for entry in entries %}
+- {{ entry.record.recorded_at }} {{ entry.record.action }}{% if let Some(comment_id) = entry.record.comment_id %} (comment {{ comment_id }}){% endif %}{% if let Some(detail) = entry.record.detail %}: {{ detail }}{% endif %}
+  session {{ entry.record.session_id }}, agent {{ entry.record.agent }}{% if let Some(call_id) = entry.record.tool_call_id %}, tool call {{ call_id }}{% endif %}
+{%- if let Some(call) = entry.call %}
+  ran {{ call.name }}: {{ call.script }}
+{%- else if entry.record.tool_call_id.is_some() %}
+  the tool call is not in the session history
+{%- endif %}
+{%- if !entry.messages.is_empty() %}
+  user messages before it, newest first:
+{%- for message in entry.messages %}
+  - [{% if let Some(sent) = message.timestamp %}{{ sent }}{% endif %}] {{ message.content }}
+{%- endfor %}
+{%- endif %}
+{% endfor %}
+{%- endif %}
