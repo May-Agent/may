@@ -658,7 +658,14 @@ impl HomeEnvironment {
         match environment {
             AgentEnvironment::Local => Self::Local {
                 os: host_operating_system_label(),
-                host_home: dirs::home_dir().map(|home| home.display().to_string()),
+                host_home: Some(
+                    crate::config::MayConfig::home_dir()
+                        .expect(
+                            "the home directory resolved when the session directory was derived",
+                        )
+                        .display()
+                        .to_string(),
+                ),
             },
             AgentEnvironment::Container { .. } => Self::Container,
         }

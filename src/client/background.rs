@@ -186,6 +186,11 @@ pub struct SessionBackgroundSnapshot {
     pub jobs: Vec<WireJob>,
     /// Its subagent runs in flight.
     pub subagents: Vec<WireSubagentRun>,
+    /// Whether the daemon holds a background wake for the session: a
+    /// finished command whose result starts a turn of its own, or that turn
+    /// still running.
+    #[serde(default)]
+    pub resuming: bool,
 }
 
 /// Bytes as base64 text, for output that need not be UTF-8.
@@ -311,6 +316,16 @@ impl RemoteBackground {
         Ok(snapshot.into_parts())
     }
 
+    /// Whether the session will start another turn on its own.
+    ///
+    /// # Errors
+    /// Fails when the daemon is unreachable or refuses.
+    pub async fn will_resume(&self) -> Result<bool, super::DaemonClientError> {
+        let snapshot: SessionBackgroundSnapshot =
+            self.client.get(&self.path("/background")).await?;
+        Ok(snapshot.will_resume())
+    }
+
     /// Job `pid` and its buffered output.
     ///
     /// # Errors
@@ -377,6 +392,18 @@ impl RemoteBackground {
 }
 
 impl SessionBackgroundSnapshot {
+    /// Whether the session will start another turn on its own: a command or
+    /// subagent run is still going, or a wake is being served.
+    #[must_use]
+    pub fn will_resume(&self) -> bool {
+        self.resuming
+            || !self.subagents.is_empty()
+            || self
+                .jobs
+                .iter()
+                .any(|job| job.status == WireJobStatus::Running)
+    }
+
     /// The jobs and runs as the registries' own types.
     #[must_use]
     pub fn into_parts(self) -> (Vec<JobInfo>, Vec<SubagentRunSnapshot>) {
@@ -393,6 +420,31 @@ impl SessionBackgroundSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_session_resumes_while_work_runs_or_a_wake_is_served() {
+        let job = |status| WireJob {
+            pid: 1,
+            task_id: "t".into(),
+            execution_key: "k".into(),
+            script: "sleep 1".into(),
+            mode: TerminalMode::Sandboxed,
+            elapsed_ms: 0,
+            status,
+            output_path: None,
+        };
+        let mut snapshot = SessionBackgroundSnapshot::default();
+        assert!(!snapshot.will_resume());
+        snapshot
+            .jobs
+            .push(job(WireJobStatus::Completed { exit_code: 0 }));
+        assert!(!snapshot.will_resume(), "a finished job resumes nothing");
+        snapshot.jobs.push(job(WireJobStatus::Running));
+        assert!(snapshot.will_resume());
+        snapshot.jobs.clear();
+        snapshot.resuming = true;
+        assert!(snapshot.will_resume());
+    }
 
     #[test]
     fn a_job_keeps_its_age_across_the_socket() {
