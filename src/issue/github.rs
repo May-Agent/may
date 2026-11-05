@@ -478,16 +478,24 @@ impl<T: GitHubTokenSource> IssueStore for GitHubIssueStore<T> {
                 other => other,
             })?;
         } else {
-            self.request(
-                Method::DELETE,
-                format!("{}/{relation_path}/{}", self.issue_url(number), target.id),
-                None,
-            )
-            .await
-            .map_err(|error| match error {
-                IssueError::NotFound(_) => IssueError::NotFound(number),
-                other => other,
-            })?;
+            // Sub-issues are removed by `DELETE …/sub_issue` with the id in the
+            // body; blocked-by dependencies carry the id in the path.
+            let (url, body) = match kind {
+                IssueRelationKind::SubIssue => (
+                    format!("{}/sub_issue", self.issue_url(number)),
+                    Some(serde_json::json!({"sub_issue_id": target.id})),
+                ),
+                IssueRelationKind::BlockedBy => (
+                    format!("{}/{relation_path}/{}", self.issue_url(number), target.id),
+                    None,
+                ),
+            };
+            self.request(Method::DELETE, url, body)
+                .await
+                .map_err(|error| match error {
+                    IssueError::NotFound(_) => IssueError::NotFound(number),
+                    other => other,
+                })?;
         }
         self.get(number).await
     }
@@ -750,6 +758,39 @@ mod tests {
             }));
             drop(requests);
         }
+    }
+
+    #[tokio::test]
+    async fn removing_a_sub_issue_uses_githubs_sub_issue_endpoint() {
+        let (api_base, requests) = mock_api(|method, path, body| match (method, path) {
+            ("GET", "/repos/o/r/issues/1") => (200, gh_issue_json(1, "parent", "open")),
+            ("GET", "/repos/o/r/issues/2") => (200, gh_issue_json(2, "child", "open")),
+            (
+                "GET",
+                "/repos/o/r/issues/1/comments"
+                | "/repos/o/r/issues/1/sub_issues"
+                | "/repos/o/r/issues/1/dependencies/blocked_by",
+            ) => (200, serde_json::json!([])),
+            ("DELETE", "/repos/o/r/issues/1/sub_issue") => {
+                assert!(body.contains("\"sub_issue_id\":200"), "{body}");
+                (200, gh_issue_json(1, "parent", "open"))
+            }
+            _ => (404, serde_json::json!({"message": "Not Found"})),
+        })
+        .await;
+
+        store(&api_base)
+            .edit_relation(1, IssueRelationKind::SubIssue, 2, false)
+            .await
+            .expect("sub-issue removal");
+
+        let sent = requests.lock().expect("requests").clone();
+        assert!(
+            sent.iter()
+                .any(|(method, path, ..)| method == "DELETE"
+                    && path == "/repos/o/r/issues/1/sub_issue"),
+            "{sent:?}"
+        );
     }
 
     #[tokio::test]
