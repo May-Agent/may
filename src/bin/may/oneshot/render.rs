@@ -242,6 +242,7 @@ impl<O: Write, E: Write> OneShotOutput<O, E> {
             | AgentEvent::Complete { .. }
             | AgentEvent::BuiltInToolResult { .. }
             | AgentEvent::ReplyTranslated { .. }
+            | AgentEvent::CompactionRecovery { .. }
             | AgentEvent::Text(_) => Ok(()),
             AgentEvent::ToolCallStart {
                 id,
