@@ -32,7 +32,7 @@ Paths are relative to the May source checkout. `aither-sandbox` and `aither-agen
 - `src/terminal_commands.rs`: `register_shared_terminal_commands`, the list of IPC commands.
 - Command implementations: `src/agent/ask_user_tool.rs`, `issue_tool.rs`, `pr_tool.rs` (store in `src/pr.rs`), `repo_tool.rs`, `session_tool.rs`, `task_tool.rs`, `notify_tool.rs`, `tunnel_tool.rs`, `browser_tool.rs`, `register_tool.rs`, `imagine.rs`; `src/repo_search/code_search.rs` (`search`); `src/agent_link.rs` (`agent`); `src/issue/` (May and GitHub backends).
 - `src/skill.rs`: `SkillManager` (list, install from GitHub, register local). `src/bundle/mod.rs`: bundled skills embedded with `include_dir!` from `skills/` and written to `~/.may/skills`.
-- `aither-agent/src/specialized/task.rs`: `subagent` arguments and the built-in types.
+- `aither-agent/src/specialized/task.rs`: `subagent` arguments; `aither-agent/subagents/*.toml`: the bundled definitions, written to `~/.may/subagents/`.
 - `src/memory.rs`: profile memory extraction; `templates/memory_context_hint.txt`: memory directory hint.
 - `src/agent/may.rs`: builds the agent (skills, compaction model, hooks); `templates/base_system.md`: the base system prompt.
 

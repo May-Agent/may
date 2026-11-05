@@ -238,8 +238,8 @@ async fn second_handoff_keeps_a_constraint_stated_before_the_first_compaction() 
     );
     assert_eq!(
         roles_mentioning(&requests[1], CONSTRAINT),
-        ["system"],
-        "the second request sees the constraint only through the first handoff"
+        ["system", "user"],
+        "the second request sees the constraint through the first handoff and the user's own message, which a compaction keeps verbatim"
     );
 
     let checkpoint = agent
@@ -306,8 +306,11 @@ async fn context_messages_after_a_compaction_carry_the_handoff_not_the_replaced_
         "the handoff is in the context"
     );
     assert!(
-        after.iter().all(|m| !m.content().contains(REPLACED)),
-        "the replaced turns are not in the context"
+        after
+            .iter()
+            .filter(|m| m.role() != aither_core::llm::Role::User)
+            .all(|m| !m.content().contains(REPLACED)),
+        "the replaced turns are not in the context, but for the user's own words a compaction keeps verbatim"
     );
     let again = agent.context_messages().await.expect("context reads");
     let texts = |messages: &[aither_core::llm::Message]| {

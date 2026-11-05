@@ -20,9 +20,7 @@ use acpsub::{
     TurnEnd,
 };
 use aither_acp::StopReason;
-use aither_agent::specialized::{
-    ExternalSession, ExternalStart, ExternalSubagent, SubagentTool, SubagentType,
-};
+use aither_agent::specialized::{ExternalSession, ExternalStart, ExternalSubagent, SubagentTool};
 use aither_core::LanguageModel;
 use arc_swap::ArcSwap;
 use tokio::runtime::Handle;
@@ -64,10 +62,7 @@ impl AcpAgents {
                 model: connection.model.clone(),
                 mode: connection.mode.clone(),
             };
-            tool = tool.with_type(
-                name.clone(),
-                SubagentType::external(connection.description.clone(), backend),
-            );
+            tool = tool.with_external(name.clone(), connection.description.clone(), backend);
         }
         Ok(tool)
     }
@@ -449,6 +444,7 @@ mod tests {
     use aither_agent::specialized::SubagentArgs;
     use aither_core::llm::tool::{ToolContext, ToolResult};
     use aither_core::llm::{Event, LLMRequest, Tool, model::Profile};
+    use aither_sandbox::CommandUsage;
     use futures_lite::Stream;
 
     use super::*;
@@ -528,18 +524,21 @@ mod tests {
             BTreeMap::from([("fake".to_string(), fake_connection())]),
         );
         let tool = acp
-            .register(SubagentTool::new(NoLlm).with_base_dir(dir.path()))
+            .register(
+                SubagentTool::new(NoLlm, dir.path().join("subagents")).with_base_dir(dir.path()),
+            )
             .expect("the name is free");
         assert!(
-            tool.type_descriptions()
-                .contains(&("fake", "a scripted ACP agent"))
+            tool.usage().await.contains("- fake: a scripted ACP agent"),
+            "the connected agent is listed with its description"
         );
         let prompt = dir.path().join("prompt.txt");
         std::fs::write(&prompt, "say something").expect("prompt file");
-        let start = |prompt: &Path| SubagentArgs::Start {
-            subagent: "fake".to_string(),
+        let start = |prompt: &Path| SubagentArgs {
+            name: "external".to_string(),
             prompt_file: prompt.to_string_lossy().into_owned(),
-            model: None,
+            id: None,
+            agent: Some("fake".to_string()),
             worktrees: Vec::new(),
             commit_worktrees: Vec::new(),
         };
@@ -558,9 +557,13 @@ mod tests {
             Duration::from_secs(60),
             call_text(
                 &tool,
-                SubagentArgs::Resume {
-                    id,
+                SubagentArgs {
+                    name: "resume".to_string(),
                     prompt_file: prompt.to_string_lossy().into_owned(),
+                    id: Some(id),
+                    agent: None,
+                    worktrees: Vec::new(),
+                    commit_worktrees: Vec::new(),
                 },
             ),
         )
@@ -608,7 +611,7 @@ mod tests {
             BTreeMap::from([("explore".to_string(), fake_connection())]),
         );
         let error = acp
-            .register(SubagentTool::new(NoLlm).with_builtins())
+            .register(SubagentTool::new(NoLlm, dir.path().join("subagents")))
             .map(|_| ())
             .expect_err("the built-in type keeps its name");
         assert!(error.to_string().contains("built-in"), "{error}");

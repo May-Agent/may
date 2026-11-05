@@ -573,6 +573,7 @@ impl MayAgent {
         };
         let terminal_grants = terminal_tool.grants();
         let mut builder = TerminalAgentBuilder::new(llm, terminal_tool)
+            .system_layout(tag::layout())
             .hook(context_snapshot_hook)
             .hook(pending_steer_hook)
             .hook(SecretRedactionHook::new(SecretRedactor::for_session(
@@ -600,7 +601,7 @@ impl MayAgent {
             builder = builder.compaction_model(compaction_llm);
         }
         let subagent_tracker = subagents.tracker;
-        let shared_terminal_commands = register_shared_terminal_commands(
+        let shared_terminal_commands = Box::pin(register_shared_terminal_commands(
             builder.tool_registry_mut(),
             SharedTerminalCommandConfig {
                 llm: terminal_command_llm,
@@ -635,7 +636,7 @@ impl MayAgent {
                 #[cfg(target_os = "macos")]
                 computer: config.computer.clone(),
             },
-        )
+        ))
         .await?;
         for (name, description) in &shared_terminal_commands.descriptions {
             builder = builder.tool_description(name.clone(), description.clone());
@@ -668,8 +669,8 @@ impl MayAgent {
             ))
             .agent_kind(AgentKind::Chatbot)
             .persona_prompt(include_str!("../../templates/system.md"))
-            .system_text(tag::MEMORY, build_memory_context_content(&memory_content))
-            .system_text(tag::TERMINAL_RUNTIME_CONTEXT, terminal_runtime)
+            .system_text(&tag::MEMORY, build_memory_context_content(&memory_content))
+            .system_text(&tag::TERMINAL_RUNTIME_CONTEXT, terminal_runtime)
             .max_iterations(effective_max_iterations);
 
         let (builder, runtime_system_context) =
@@ -1262,6 +1263,7 @@ pub async fn test_agent(
         .expect("open test db");
     let session_id = SessionId::new();
     let inner = Agent::builder(llm.clone())
+        .system_layout(tag::layout())
         .hook(ContextSnapshotHook::new(None, &session_id))
         .hook(PendingSteerHook::new(None, &session_id))
         .hook(SecretRedactionHook::new(SecretRedactor::new(
@@ -1303,13 +1305,13 @@ fn apply_runtime_context(
 ) -> (MayBuilder, RuntimeSystemContext) {
     if let Some(voice_hint) = build_native_voice_context(config.native_voice_input) {
         runtime_system_context = runtime_system_context.with_native_voice_input(voice_hint.clone());
-        builder = builder.system_text(tag::NATIVE_VOICE_INPUT, voice_hint);
+        builder = builder.system_text(&tag::NATIVE_VOICE_INPUT, voice_hint);
     }
 
     if let Some(persona_content) = config.profile_persona.clone() {
         runtime_system_context =
             runtime_system_context.with_profile_persona(persona_content.clone());
-        builder = builder.system_text(tag::PROFILE_PERSONA, persona_content);
+        builder = builder.system_text(&tag::PROFILE_PERSONA, persona_content);
     }
 
     if let Some(ref memories) = config.profile_memories
@@ -1318,12 +1320,12 @@ fn apply_runtime_context(
         let profile_memories = memories.to_context_string();
         runtime_system_context =
             runtime_system_context.with_profile_memories(profile_memories.clone());
-        builder = builder.system_text(tag::PROFILE_MEMORIES, profile_memories);
+        builder = builder.system_text(&tag::PROFILE_MEMORIES, profile_memories);
     }
 
     if let Some(plan_mode) = build_plan_mode_context(config.plan_state) {
         runtime_system_context = runtime_system_context.with_plan_mode(plan_mode.clone());
-        builder = builder.system_text(tag::PLAN_MODE, plan_mode);
+        builder = builder.system_text(&tag::PLAN_MODE, plan_mode);
     }
 
     if let Some(network_restrictions) =
@@ -1331,13 +1333,13 @@ fn apply_runtime_context(
     {
         runtime_system_context =
             runtime_system_context.with_network_restrictions(network_restrictions.clone());
-        builder = builder.system_text(tag::NETWORK_RESTRICTIONS, network_restrictions);
+        builder = builder.system_text(&tag::NETWORK_RESTRICTIONS, network_restrictions);
     }
 
     if let Some(ref location) = config.location {
         let location_context = build_location_context(location);
         runtime_system_context = runtime_system_context.with_location(location_context.clone());
-        builder = builder.system_text(tag::LOCATION_CONTEXT, location_context);
+        builder = builder.system_text(&tag::LOCATION_CONTEXT, location_context);
     }
 
     let browser_enabled = config.browser_broker.is_some()
@@ -1376,14 +1378,14 @@ fn apply_runtime_context(
             if let Some(workdirs_context) = build_workspace_workdirs_context(workspace) {
                 runtime_system_context =
                     runtime_system_context.with_workspace_workdirs(workdirs_context.clone());
-                builder = builder.system_text(tag::WORKSPACE_WORKDIRS, workdirs_context);
+                builder = builder.system_text(&tag::WORKSPACE_WORKDIRS, workdirs_context);
             }
         }
     }
 
     let browser_context = build_browser_context(browser_enabled, browser_cdp_endpoint.as_deref());
     runtime_system_context = runtime_system_context.with_browser(browser_context.clone());
-    builder = builder.system_text(tag::BROWSER, browser_context);
+    builder = builder.system_text(&tag::BROWSER, browser_context);
     (builder, runtime_system_context)
 }
 
