@@ -249,6 +249,11 @@ mod tests {
                     cwd: root,
                     workspace_config: crate::workspace::WorkspaceConfig::default(),
                     screen: None,
+                    signing: crate::commit_signing::CommitSigning::new(
+                        crate::host_git::HostGit::inherit(),
+                        tmp.path(),
+                        "s1",
+                    ),
                     github_api: PrContext::default_github_api(),
                 },
                 terminal.sandbox(),

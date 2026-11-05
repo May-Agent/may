@@ -693,6 +693,7 @@ impl MayAgent {
                 agent_messaging,
                 languages: Some(language_guard.clone()),
                 acp: config.acp.clone(),
+                git: crate::host_git::HostGit::inherit(),
                 #[cfg(target_os = "macos")]
                 computer: config.computer.clone(),
             },

@@ -22,6 +22,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use askama::Template;
 
 use crate::db::ChatDb;
+use crate::host_git::HostGit;
 use crate::issue::IssueError;
 use crate::issue::github::{GhCliTokenSource, GitHubRest, GitHubTokenSource};
 use crate::repo_clone::{CloneRecord, CloneSandbox, SessionRepos, uncommitted_changes};
@@ -59,6 +60,12 @@ pub enum PrError {
     /// A GitHub CLI call failed.
     #[error("gh {0}")]
     Gh(String),
+    /// A commit of the PR's range is not signed by the user.
+    #[error(transparent)]
+    Signing(#[from] crate::commit_signing::SigningError),
+    /// Filesystem failure while staging.
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
     /// A subagent called an action only the main agent has.
     #[error("`pr {0}` is the main agent's; a subagent has `pr list` and `pr show`")]
     MainAgentOnly(&'static str),
@@ -83,6 +90,9 @@ pub struct PrContext {
     /// Outbound screen: `Ok(true)` publishes, anything else blocks. Wired
     /// to the fast model by the command registration.
     pub screen: Option<std::sync::Arc<ScreenFn>>,
+    /// The user's signing configuration: every commit of a PR must carry
+    /// a signature valid under its key.
+    pub signing: crate::commit_signing::CommitSigning,
     /// GitHub REST client the GitHub backend's direct calls go through.
     pub github_api: GitHubRest<PrTokenSource>,
 }
@@ -166,10 +176,10 @@ impl PrStore {
     /// clones in `sandbox`.
     #[must_use]
     pub fn new(context: PrContext, sandbox: CloneSandbox) -> Self {
-        let repos = context
-            .db
-            .clone()
-            .map(|db| SessionRepos::new(&context.session_root, context.session_id.clone(), db));
+        let repos = context.db.clone().map(|db| {
+            SessionRepos::new(&context.session_root, context.session_id.clone(), db)
+                .with_host(context.signing.host().clone())
+        });
         Self {
             context,
             repos,
@@ -313,10 +323,11 @@ impl PrStore {
                 .as_deref()
                 .ok_or_else(|| PrError::Resolve("github backend without a repo".to_string()))?;
             Some(
-                self.push_and_create(&resolved, &branch, &head_sha, title, owner_repo)
+                self.push_and_create(&resolved, &branch, &base_sha, &head_sha, title, owner_repo)
                     .await?,
             )
         } else {
+            self.verify_local(&resolved, &base_sha, &head_sha).await?;
             None
         };
         let pr = self
@@ -415,7 +426,8 @@ impl PrStore {
             let refname = pr.branch.clone();
             let sha = head_sha.clone();
             let number = pr.number;
-            move || land(&checkout, &refname, &sha, number, &lock)
+            let host = self.context.signing.host().clone();
+            move || land(&host, &checkout, &refname, &sha, number, &lock)
         })
         .await;
         let now = jiff::Timestamp::now().to_string();
@@ -481,7 +493,12 @@ impl PrStore {
         self.db()?.close_pr(pr.id).await?;
         self.event(&pr, "closed", None).await;
         if resolved.record.local {
-            drop_ref(&resolved.record.source, &pr.branch).await;
+            drop_ref(
+                self.context.signing.host(),
+                &resolved.record.source,
+                &pr.branch,
+            )
+            .await;
         }
         Ok(format!("closed PR #{number}"))
     }
@@ -518,10 +535,15 @@ impl PrStore {
                 &resolved.record.source,
                 &head_sha,
                 &pr.branch,
+                SignedRange {
+                    signing: &self.context.signing,
+                    base: &pr.base_sha,
+                },
             )
-            .await
-            .map_err(|e| PrError::Gh(e.to_string()))?;
+            .await?;
         } else {
+            self.verify_local(&resolved, &pr.base_sha, &head_sha)
+                .await?;
             self.pin(&resolved, pr.number, &head_sha).await?;
         }
         self.db()?
@@ -709,6 +731,7 @@ impl PrStore {
         &self,
         resolved: &Resolved,
         branch: &str,
+        base_sha: &str,
         head_sha: &str,
         title: &str,
         owner_repo: &str,
@@ -719,9 +742,12 @@ impl PrStore {
             &resolved.record.source,
             head_sha,
             branch,
+            SignedRange {
+                signing: &self.context.signing,
+                base: base_sha,
+            },
         )
-        .await
-        .map_err(|e| PrError::Gh(e.to_string()))?;
+        .await?;
         let url = blocking::unblock({
             let owner_repo = owner_repo.to_string();
             let branch = branch.to_string();
@@ -862,12 +888,13 @@ impl PrStore {
             return;
         };
         let owner_repo = owner_repo.to_string();
+        let host = self.context.signing.host().clone();
         let synced = blocking::unblock(move || {
-            let url = git(Some(&worktree), &["remote", "get-url", "origin"]).ok()?;
+            let url = host_git(&host, Some(&worktree), &["remote", "get-url", "origin"]).ok()?;
             if github_owner_repo(&url).as_deref() != Some(owner_repo.as_str()) {
                 return None;
             }
-            git(Some(&worktree), &["pull", "--ff-only"]).ok()
+            host_git(&host, Some(&worktree), &["pull", "--ff-only"]).ok()
         })
         .await;
         if synced.is_none() {
@@ -886,7 +913,8 @@ impl PrStore {
         if resolved.record.local {
             blocking::unblock({
                 let src = resolved.record.source.clone();
-                move || git(Some(Path::new(&src)), &["rev-parse", "HEAD"])
+                let host = self.context.signing.host().clone();
+                move || host_git(&host, Some(Path::new(&src)), &["rev-parse", "HEAD"])
             })
             .await
             .map_err(PrError::RepoClone)
@@ -909,10 +937,57 @@ impl PrStore {
                 .local
                 .then(|| resolved.record.source.clone());
             let clone = resolved.dir.to_string_lossy().into_owned();
-            move || clone_head(checkout.as_deref().map(Path::new), &clone)
+            let host = self.context.signing.host().clone();
+            move || clone_head(&host, checkout.as_deref().map(Path::new), &clone)
         })
         .await
         .map_err(PrError::RepoClone)
+    }
+
+    /// Refuse a local PR whose range holds a commit without the user's
+    /// signature. The commits are read from a scratch repository that borrows
+    /// the checkout's objects and fetches only what the clone added, so the
+    /// check reads the host's copy and runs nothing the clone configures.
+    async fn verify_local(
+        &self,
+        resolved: &Resolved,
+        base: &str,
+        head: &str,
+    ) -> Result<(), PrError> {
+        let scratch_root = self.context.scratch_root.clone();
+        let checkout = resolved.record.source.clone();
+        let clone = resolved.dir.to_string_lossy().into_owned();
+        let signing = self.context.signing.clone();
+        let (base, head) = (base.to_string(), head.to_string());
+        blocking::unblock(move || {
+            let host = signing.host();
+            std::fs::create_dir_all(&scratch_root)?;
+            let staging = tempfile::Builder::new()
+                .prefix("verify-")
+                .tempdir_in(&scratch_root)?;
+            let repo = staging.path();
+            host_git(
+                host,
+                None,
+                &["init", "--quiet", "--bare", &repo.to_string_lossy()],
+            )?;
+            let objects = host_git(
+                host,
+                Some(Path::new(&checkout)),
+                &[
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-path",
+                    "objects",
+                ],
+            )?;
+            std::fs::write(repo.join("objects/info/alternates"), format!("{objects}\n"))?;
+            fetch_from_clone(host, repo, &clone, &head)?;
+            signing
+                .verify_range_blocking(repo, &base, &head)
+                .map_err(PrError::from)
+        })
+        .await
     }
 
     /// Fetch exactly `sha` from the clone into the PR's durable ref.
@@ -921,8 +996,10 @@ impl PrStore {
             let checkout = resolved.record.source.clone();
             let clone = resolved.dir.to_string_lossy().into_owned();
             let sha = sha.to_string();
+            let host = self.context.signing.host().clone();
             move || {
                 fetch_from_clone(
+                    &host,
                     Path::new(&checkout),
                     &clone,
                     &format!("+{sha}:{}", pin_ref(number)),
@@ -1012,10 +1089,11 @@ fn pin_ref(number: i64) -> String {
 /// `git upload-pack` that serves [`fetch_from_clone`], so nothing the clone
 /// configures runs.
 fn clone_head(
+    host: &HostGit,
     checkout: Option<&Path>,
     clone: &str,
 ) -> Result<String, crate::repo_clone::RepoCloneError> {
-    let out = git(checkout, &["ls-remote", clone, "HEAD"])?;
+    let out = host_git(host, checkout, &["ls-remote", clone, "HEAD"])?;
     out.split_whitespace()
         .next()
         .map(str::to_string)
@@ -1035,26 +1113,42 @@ async fn push_pinned(
     url: &str,
     sha: &str,
     branch: &str,
-) -> Result<(), crate::repo_clone::RepoCloneError> {
+    signed: SignedRange<'_>,
+) -> Result<(), PrError> {
     let scratch_root = scratch_root.to_path_buf();
     let clone = clone.to_string_lossy().into_owned();
     let url = url.to_string();
     let sha = sha.to_string();
     let spec = format!("{sha}:refs/heads/{branch}");
+    let signing = signed.signing.clone();
+    let base = signed.base.to_string();
     blocking::unblock(move || {
         std::fs::create_dir_all(&scratch_root)?;
         let staging = tempfile::Builder::new()
             .prefix("push-")
             .tempdir_in(&scratch_root)?;
         let repo = staging.path();
-        git(
+        let host = signing.host();
+        host_git(
+            host,
             None,
             &["init", "--quiet", "--bare", &repo.to_string_lossy()],
         )?;
-        fetch_from_clone(repo, &clone, &sha)?;
-        git(Some(repo), &["push", "--quiet", &url, &spec]).map(drop)
+        fetch_from_clone(host, repo, &clone, &sha)?;
+        // What is pushed is what was verified: both read the host's copy.
+        signing.verify_range_blocking(repo, &base, &sha)?;
+        host_git(host, Some(repo), &["push", "--quiet", &url, &spec])
+            .map(drop)
+            .map_err(PrError::from)
     })
     .await
+}
+
+/// The commits of `base..head` that must carry the user's signature.
+#[derive(Clone, Copy)]
+struct SignedRange<'a> {
+    signing: &'a crate::commit_signing::CommitSigning,
+    base: &'a str,
 }
 
 /// Fetch `refspec` from the agent-writable repository `clone` into the
@@ -1064,35 +1158,45 @@ async fn push_pinned(
 /// (fsmonitor, hooks, filters, `uploadpack.packObjectsHook`, `core.sshCommand`
 /// and the like) takes part in serving a fetch.
 fn fetch_from_clone(
+    host: &HostGit,
     repo: &Path,
     clone: &str,
     refspec: &str,
 ) -> Result<String, crate::repo_clone::RepoCloneError> {
-    git(
+    host_git(
+        host,
         Some(repo),
         &["fetch", "--quiet", "--no-tags", clone, refspec],
     )
 }
 
 /// Remove a PR's durable ref once the PR is terminal.
-async fn drop_ref(checkout: &str, refname: &str) {
+async fn drop_ref(host: &HostGit, checkout: &str, refname: &str) {
+    let host = host.clone();
     let checkout = checkout.to_string();
     let refname = refname.to_string();
-    let _ =
-        blocking::unblock(move || git(Some(Path::new(&checkout)), &["update-ref", "-d", &refname]))
-            .await;
+    let _ = blocking::unblock(move || {
+        host_git(
+            &host,
+            Some(Path::new(&checkout)),
+            &["update-ref", "-d", &refname],
+        )
+    })
+    .await;
 }
 
 /// The serialized land of the PR's pinned commit `sha`: merge-tree
 /// preflight, checkout-overlap check, merge, then the ref is dropped. Runs
 /// inside `blocking::unblock` under the per-repo lock.
 fn land(
+    host: &HostGit,
     checkout: &str,
     refname: &str,
     sha: &str,
     number: i64,
     lock: &Mutex<()>,
 ) -> Result<String, String> {
+    let git = |dir: Option<&Path>, args: &[&str]| host_git(host, dir, args);
     let _guard = lock.lock().map_err(|_| "land lock poisoned".to_string())?;
     let checkout_path = Path::new(checkout);
     let pinned = git(
@@ -1248,27 +1352,28 @@ The project tracks issues and plans in an internal tool — published text must 
 'may', internal issue numbers, agent or session details, or local filesystem paths. \
 Reply with exactly ALLOW if the text is safe to publish, or BLOCK: <one-line reason>.";
 
+/// `git` on the host through `host`, with its stdout trimmed.
+fn host_git(
+    host: &HostGit,
+    dir: Option<&Path>,
+    args: &[&str],
+) -> Result<String, crate::repo_clone::RepoCloneError> {
+    Ok(host.output(dir, args)?.trim().to_string())
+}
+
+/// Test fixtures' own git, on the environment's configuration.
+#[cfg(test)]
 fn git(dir: Option<&Path>, args: &[&str]) -> Result<String, crate::repo_clone::RepoCloneError> {
-    let mut command = std::process::Command::new("git");
-    if let Some(dir) = dir {
-        command.arg("-C").arg(dir);
-    }
-    let output = command.args(args).output()?;
-    if !output.status.success() {
-        return Err(crate::repo_clone::RepoCloneError::Git {
-            args: format!("{command:?}"),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        });
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    host_git(&HostGit::inherit(), dir, args)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         GitHubRest, PrContext, PrStore, PrTokenSource, git, github_branch, github_owner_repo,
-        push_pinned,
+        host_git, push_pinned,
     };
+    use crate::commit_signing::test_user::TestUser;
     use crate::repo_clone::test_sandbox::TestTerminal;
     use crate::repo_clone::{CloneSandbox, SessionRepos};
     use crate::workspace::{ProjectConfig, ProjectIssues, ProjectPr, WorkspaceConfig};
@@ -1293,6 +1398,8 @@ mod tests {
         checkout: PathBuf,
         db: crate::db::ChatDb,
         repo_key: PathBuf,
+        /// The user the harness signs as.
+        user: TestUser,
         /// The session terminals the stores run on, alive as long as the
         /// fixture.
         terminals: Mutex<Vec<Arc<TestTerminal>>>,
@@ -1311,13 +1418,30 @@ mod tests {
                 .await
                 .unwrap();
             let repo_key = dunce::canonicalize(checkout.join(".git")).unwrap();
+            let user = TestUser::new(&tmp.path().join("user"));
             Self {
                 tmp,
                 checkout,
                 db,
                 repo_key,
+                user,
                 terminals: Mutex::default(),
             }
+        }
+
+        /// The harness of session `id`, signing as the fixture's user.
+        fn signing(&self, id: &str) -> crate::commit_signing::CommitSigning {
+            self.user.signing(&self.tmp.path().join("may"), id)
+        }
+
+        /// The sandbox of session `id` as the daemon builds it: git there
+        /// signs as the fixture's user through the harness.
+        async fn signing_sandbox(&self, id: &str) -> CloneSandbox {
+            let terminal =
+                Arc::new(TestTerminal::signing(&self.session_root(id), self.signing(id)).await);
+            let sandbox = terminal.sandbox();
+            self.terminals.lock().unwrap().push(terminal);
+            sandbox
         }
 
         fn session_root(&self, id: &str) -> PathBuf {
@@ -1343,7 +1467,7 @@ mod tests {
                 .ensure_local_clone(&self.checkout, &self.repo_key, &self.scratch_root())
                 .await
                 .unwrap();
-            identify(&clone);
+            self.user.identify(&clone);
             let projects = checks
                 .map(|c| ProjectConfig {
                     path: self.checkout.clone(),
@@ -1365,6 +1489,7 @@ mod tests {
                         projects,
                     },
                     screen: None,
+                    signing: self.signing(id),
                     github_api: PrContext::default_github_api(),
                 },
                 self.sandbox(id).await,
@@ -1422,6 +1547,7 @@ mod tests {
                         projects: Vec::new(),
                     },
                     screen: None,
+                    signing: self.signing(id),
                     github_api: GitHubRest::with_api_base(
                         PrTokenSource::Fixed("test-token".to_string()),
                         base,
@@ -1500,6 +1626,13 @@ mod tests {
         git(Some(dir), &["config", "user.name", "t"]).unwrap();
     }
 
+    fn range_of<'a>(
+        signing: &'a crate::commit_signing::CommitSigning,
+        base: &'a str,
+    ) -> super::SignedRange<'a> {
+        super::SignedRange { signing, base }
+    }
+
     fn commit_file(dir: &Path, name: &str) {
         std::fs::write(dir.join(name), name).unwrap();
         git(Some(dir), &["add", "."]).unwrap();
@@ -1552,7 +1685,7 @@ mod tests {
         let cmd = format!(
             "test -f work.txt && ! test -f late.txt && git rev-parse HEAD > {marker} && \
              echo late > {clone}/late.txt && git -C {clone} add . && \
-             git -C {clone} commit -q -m late",
+             git -C {clone} -c commit.gpgsign=false commit -q -m late",
             marker = marker.display(),
             clone = clone.display(),
         );
@@ -1684,6 +1817,7 @@ mod tests {
                 cwd: fx.checkout.clone(),
                 workspace_config,
                 screen,
+                signing: fx.signing(id),
                 github_api,
             },
             fx.sandbox(id).await,
@@ -1733,7 +1867,7 @@ mod tests {
         let resolved = store.resolve(None).await.unwrap();
         assert!(resolved.record.local);
         assert_eq!(PrStore::backend_for(&resolved.record), ("may", None));
-        identify(&resolved.dir);
+        fx.user.identify(&resolved.dir);
         commit_file(&resolved.dir, "work.txt");
         store.open(None, "work", None, true).await.unwrap();
 
@@ -1842,11 +1976,15 @@ mod tests {
             &["clone", &remote.to_string_lossy(), &clone.to_string_lossy()],
         )
         .unwrap();
-        identify(&clone);
+        let user = TestUser::new(&tmp.path().join("user"));
+        let signing = user.signing(tmp.path(), "s1");
+        user.identify(&clone);
         git(Some(&clone), &["remote", "rename", "origin", "upstream"]).unwrap();
         git(Some(&clone), &["checkout", "-b", "main"]).unwrap();
         commit_file(&clone, "base.txt");
         git(Some(&clone), &["push", "upstream", "main"]).unwrap();
+        let base = git(Some(&clone), &["rev-parse", "HEAD"]).unwrap();
+        let range = |base| range_of(&signing, base);
 
         // First PR: pushed to its own branch, then squash-merged upstream
         // (a new commit on main that is not a descendant of the PR head),
@@ -1854,7 +1992,7 @@ mod tests {
         commit_file(&clone, "one.txt");
         let first_sha = git(Some(&clone), &["rev-parse", "HEAD"]).unwrap();
         let first = github_branch("s1", &first_sha);
-        push_pinned(&scratch, &clone, &url, &first_sha, &first)
+        push_pinned(&scratch, &clone, &url, &first_sha, &first, range(&base))
             .await
             .unwrap();
         git(Some(&clone), &["checkout", "-b", "squash", "main~1"]).unwrap();
@@ -1870,11 +2008,12 @@ mod tests {
         git(Some(&clone), &["reset", "--hard", "upstream/main"]).ok();
         git(Some(&clone), &["fetch", "upstream"]).unwrap();
         git(Some(&clone), &["reset", "--hard", "upstream/main"]).unwrap();
+        let base = git(Some(&clone), &["rev-parse", "HEAD"]).unwrap();
         commit_file(&clone, "two.txt");
         let second_sha = git(Some(&clone), &["rev-parse", "HEAD"]).unwrap();
         let second = github_branch("s1", &second_sha);
         assert_ne!(first, second);
-        push_pinned(&scratch, &clone, &url, &second_sha, &second)
+        push_pinned(&scratch, &clone, &url, &second_sha, &second, range(&base))
             .await
             .unwrap();
         assert_eq!(
@@ -1887,13 +2026,13 @@ mod tests {
         );
         // The old shared name would have been rejected without a force.
         assert!(
-            push_pinned(&scratch, &clone, &url, &second_sha, &first)
+            push_pinned(&scratch, &clone, &url, &second_sha, &first, range(&base))
                 .await
                 .is_err(),
             "pushes are never forced"
         );
         // A retry of the same PR reuses its branch.
-        push_pinned(&scratch, &clone, &url, &second_sha, &second)
+        push_pinned(&scratch, &clone, &url, &second_sha, &second, range(&base))
             .await
             .unwrap();
         // Every push staged its bare repository in scratch and removed it.
@@ -1970,8 +2109,6 @@ mod tests {
             settings.push((key.to_string(), path.to_string_lossy().into_owned()));
         }
         settings.push(("filter.hostile.required".to_string(), "true".to_string()));
-        // The agent's commits are unsigned: no signing key reaches the sandbox.
-        settings.push(("commit.gpgSign".to_string(), "false".to_string()));
         for (key, value) in settings {
             git(Some(clone), &["config", &key, &value]).unwrap();
         }
@@ -1996,11 +2133,14 @@ mod tests {
     async fn a_clones_executable_config_never_runs_on_the_host() {
         let fx = Fixture::new().await;
         let (store, clone) = fx.store("s1", Some("test -f work.txt")).await;
+        // The clone carries no identity of its own: the sandbox's git
+        // configuration makes the commit the user's, signed by the harness.
+        TestUser::unidentify(&clone);
         let root = fx.session_root("s1");
         let host = arm_hostile_config(&root, &clone, fx.tmp.path());
         std::fs::write(clone.join("work.txt"), "work").unwrap();
         // The agent's own commit, from its sandbox.
-        fx.sandbox("s1")
+        fx.signing_sandbox("s1")
             .await
             .run(&clone, "git add -A && git commit -q -m work")
             .await
@@ -2011,6 +2151,8 @@ mod tests {
         assert!(landed.starts_with("merged PR #1"), "{landed}");
         assert!(fx.checkout.join("work.txt").exists());
         assert_eq!(markers(&host), Vec::<String>::new(), "ran on the host");
+        let signed = git(Some(&fx.checkout), &["cat-file", "commit", "HEAD^2"]).unwrap();
+        assert!(signed.contains("gpgsig"), "{signed}");
         // The settings did run where the agent's commands run.
         let ran = markers(&root.join("ran"));
         for name in ["core.fsmonitor", "filter.hostile.clean", "pre-commit"] {
@@ -2037,7 +2179,9 @@ mod tests {
             &["remote", "add", "upstream", "ssh://example.invalid/r.git"],
         )
         .unwrap();
-        let sha = super::clone_head(None, &clone.to_string_lossy()).unwrap();
+        let sha = super::clone_head(&fx.user.host(), None, &clone.to_string_lossy()).unwrap();
+        let base = git(Some(&fx.checkout), &["rev-parse", "HEAD"]).unwrap();
+        let signing = fx.signing("s1");
 
         push_pinned(
             &fx.scratch_root(),
@@ -2045,6 +2189,10 @@ mod tests {
             &remote.to_string_lossy(),
             &sha,
             "may/s1-work",
+            super::SignedRange {
+                signing: &signing,
+                base: &base,
+            },
         )
         .await
         .unwrap();
@@ -2054,6 +2202,162 @@ mod tests {
             sha
         );
         assert_eq!(markers(&host), Vec::<String>::new(), "ran on the host");
+    }
+
+    /// `pr open` refuses a range with a commit that has no signature, even
+    /// below signed ones, and records nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn open_refuses_a_range_with_an_unsigned_commit() {
+        let fx = Fixture::new().await;
+        let (store, clone) = fx.store("s1", None).await;
+        commit_file(&clone, "signed.txt");
+        std::fs::write(clone.join("unsigned.txt"), "x").unwrap();
+        git(Some(&clone), &["add", "."]).unwrap();
+        git(
+            Some(&clone),
+            &["-c", "commit.gpgsign=false", "commit", "-m", "unsigned"],
+        )
+        .unwrap();
+        commit_file(&clone, "signed-again.txt");
+
+        let error = store.open(None, "work", None, false).await.unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                super::PrError::Signing(crate::commit_signing::SigningError::Unsigned { .. })
+            ),
+            "{error}"
+        );
+        assert!(error.to_string().contains("no signature"), "{error}");
+        assert!(store.list(None, None).await.unwrap().contains("no PRs"));
+        assert!(!fx.checkout.join("signed.txt").exists());
+    }
+
+    /// A signed range opens and lands, and one signed by another key is
+    /// refused like an unsigned one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn open_accepts_only_the_users_signature() {
+        let fx = Fixture::new().await;
+        let (store, clone) = fx.store("s1", None).await;
+        // Signed, but by a key that is not the user's.
+        TestUser::new(&fx.tmp.path().join("stranger")).identify(&clone);
+        commit_file(&clone, "work.txt");
+        let error = store.open(None, "work", None, false).await.unwrap_err();
+        assert!(error.to_string().contains("not the user's key"), "{error}");
+
+        fx.user.identify(&clone);
+        git(Some(&clone), &["commit", "--amend", "--no-edit", "-q"]).unwrap();
+        let landed = store.open(None, "work", None, false).await.unwrap();
+        assert!(landed.starts_with("merged PR #1"), "{landed}");
+    }
+
+    /// A GitHub PR's push passes the user's global `pre-push` hook, which
+    /// refuses commits without a signature; an unsigned range never gets
+    /// that far.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_signed_range_pushes_past_a_hook_that_refuses_unsigned_commits() {
+        let fx = Fixture::new().await;
+        let (_, clone) = fx.store("s1", None).await;
+        let base = git(Some(&fx.checkout), &["rev-parse", "HEAD"]).unwrap();
+        commit_file(&clone, "work.txt");
+        let signed = git(Some(&clone), &["rev-parse", "HEAD"]).unwrap();
+        git(
+            Some(&clone),
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "unsigned",
+            ],
+        )
+        .unwrap();
+        let unsigned = git(Some(&clone), &["rev-parse", "HEAD"]).unwrap();
+        let remote = fx.tmp.path().join("remote.git");
+        git(None, &["init", "--bare", "-q", &remote.to_string_lossy()]).unwrap();
+        let signing = fx.signing("s1");
+        let range = || super::SignedRange {
+            signing: &signing,
+            base: &base,
+        };
+
+        // The user's hook, installed the way a global one reaches every
+        // repository: `core.hooksPath` in their global configuration, which
+        // only this fixture's host git reads.
+        let ran = fx.tmp.path().join("hook-ran");
+        fx.user.install_global_hook(
+            "pre-push",
+            &format!(
+                "#!/bin/sh\ntouch '{}'\nwhile read local_ref local_sha remote_ref remote_sha; do\n  \
+                 git cat-file commit \"$local_sha\" | grep -q '^gpgsig ' || {{ echo 'unsigned commit' >&2; exit 1; }}\ndone\n",
+                ran.display()
+            ),
+        );
+        let host = fx.user.host();
+
+        // Sanity: the hook does refuse an unsigned commit.
+        let staging = fx.tmp.path().join("staging.git");
+        host_git(
+            &host,
+            None,
+            &["init", "--bare", "-q", &staging.to_string_lossy()],
+        )
+        .unwrap();
+        host_git(
+            &host,
+            Some(&staging),
+            &["fetch", "-q", &clone.to_string_lossy(), &unsigned],
+        )
+        .unwrap();
+        let refused = host_git(
+            &host,
+            Some(&staging),
+            &[
+                "push",
+                "-q",
+                &remote.to_string_lossy(),
+                &format!("{unsigned}:refs/heads/x"),
+            ],
+        )
+        .unwrap_err();
+        assert!(
+            refused.to_string().contains("unsigned commit"),
+            "the hook refuses an unsigned commit: {refused}"
+        );
+        std::fs::remove_file(&ran).unwrap();
+
+        // The unsigned range is refused before any push.
+        let error = push_pinned(
+            &fx.scratch_root(),
+            &clone,
+            &remote.to_string_lossy(),
+            &unsigned,
+            "may/unsigned",
+            range(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("no signature"), "{error}");
+        assert!(!ran.exists(), "nothing was pushed");
+
+        // The signed range goes through the hook.
+        push_pinned(
+            &fx.scratch_root(),
+            &clone,
+            &remote.to_string_lossy(),
+            &signed,
+            "may/signed",
+            range(),
+        )
+        .await
+        .unwrap();
+        assert!(ran.exists(), "the hook ran");
+        assert_eq!(
+            git(Some(&remote), &["rev-parse", "refs/heads/may/signed"]).unwrap(),
+            signed
+        );
     }
 
     /// A check runs in the session's sandbox: it builds inside its checkout
