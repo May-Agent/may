@@ -123,13 +123,18 @@ async fn answer_oneshot_repo_trust(
     Ok(())
 }
 
-/// After a turn ends: the turn the daemon starts on its own from the
-/// session's background work, once the daemon says some is left, or `None`
-/// when the session will not resume. The daemon's background state decides;
+/// After a turn ends: the next turn of the session, while the daemon runs
+/// one or will start one on its own from the session's background work, or
+/// `None` when the session is idle for good. The daemon's state decides;
 /// nothing here is timed. The poll only re-reads that state.
+///
+/// A turn already running counts: after a resync the turn in progress
+/// arrives from its start, and the run follows it like a resumed one.
 async fn next_resumed_turn(
     app: &mut App,
     worker: &AgentWorker,
+    runtime_deps: &RuntimeDeps,
+    session_id: &may_agent::session::SessionId,
 ) -> anyhow::Result<Option<may_agent::agent::AgentHandle>> {
     /// How often the daemon's background state is re-read while waiting.
     const BACKGROUND_POLL: std::time::Duration = std::time::Duration::from_millis(300);
@@ -138,7 +143,13 @@ async fn next_resumed_turn(
         .background()
         .ok_or_else(|| anyhow::anyhow!("the one-shot worker has no daemon background"))?;
     loop {
-        let resumes = background.will_resume().await?;
+        let (will_resume, runtime) = futures_lite::future::zip(
+            background.will_resume(),
+            session_runtime(runtime_deps, session_id),
+        )
+        .await;
+        let resumes =
+            will_resume? || runtime?.state != may_agent::session::SessionRuntimeState::Idle;
         // A turn already announced wins over the state read above, which
         // may postdate its end.
         let announced = if resumes {
@@ -448,7 +459,9 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                         anyhow::bail!("oneshot agent run failed");
                     }
                     output.end_text_line()?;
-                    let Some(handle) = next_resumed_turn(&mut app, worker).await? else {
+                    let Some(handle) =
+                        next_resumed_turn(&mut app, worker, &runtime_deps, &session_id).await?
+                    else {
                         return Ok(());
                     };
                     assistant_response = AssistantReply::default();
@@ -474,7 +487,9 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                     )
                     .await;
                 output.end_text_line()?;
-                let Some(handle) = next_resumed_turn(&mut app, worker).await? else {
+                let Some(handle) =
+                    next_resumed_turn(&mut app, worker, &runtime_deps, &session_id).await?
+                else {
                     return Ok(());
                 };
                 assistant_response = AssistantReply::default();
