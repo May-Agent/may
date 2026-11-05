@@ -12,7 +12,7 @@ use crate::agent::ImageGeneratorConfig;
 use crate::agent::ask_user_tool::{AskUserTool, WithdrawAskUserTool};
 use crate::agent::browser_tool::{BrowserBroker, BrowserTool};
 use crate::agent::imagine::ImagineTool;
-use crate::agent::issue_tool::{IssueTool, SubagentIssueTool};
+use crate::agent::issue_tool::{IssueChangeNotifier, IssueTool, SubagentIssueTool};
 use crate::agent::notify_tool::{NotifyBroker, NotifyTool};
 use crate::agent::pr_tool::{PrTool, SubagentPrTool};
 use crate::agent::register_tool::{RegisterBroker, RegisterTool, Skills};
@@ -57,8 +57,9 @@ pub struct SharedTerminalCommandConfig<LLM> {
     pub cwd: PathBuf,
     /// History database, which records the worktrees `search` is used in.
     pub db: Option<crate::db::ChatDb>,
-    /// Runtime that holds the session's open `ask_user` questions, when the
-    /// session has one.
+    /// Runtime that holds the session's open `ask_user` questions and
+    /// publishes its UI events (`issue` writes among them), when the session
+    /// has one.
     pub ask_user: Option<Arc<crate::session::SessionRuntimeService>>,
     /// Image-generation config, when enabled.
     pub imagine: Option<ImagineCommandConfig>,
@@ -190,6 +191,9 @@ where
     });
     let mut issue_tool = IssueTool::new(config.issue_store.clone());
     let mut subagent_issue_tool = SubagentIssueTool::new(config.issue_store);
+    if let Some(runtime) = config.ask_user.clone() {
+        issue_tool = issue_tool.with_changes(IssueChangeNotifier::new(runtime));
+    }
     if let Some(search) = issue_search {
         issue_tool = issue_tool.with_search(search.clone());
         subagent_issue_tool = subagent_issue_tool.with_search(search);

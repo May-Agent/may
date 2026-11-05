@@ -490,6 +490,17 @@ pub struct SessionIndexSnapshot {
     pub error: Option<String>,
 }
 
+/// One `session_issues` event: the issues the session's tasks link, as the
+/// issue store reports them now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionIssuesFrame {
+    /// Session the issues are linked from.
+    pub session_id: String,
+    /// One brief per linked issue.
+    pub issues: Vec<crate::tui::sidebar::IssueBrief>,
+}
+
 /// How much of a worktree index carries a vector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
