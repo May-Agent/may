@@ -100,8 +100,8 @@ May is a terminal-based AI assistant built as an application layer on the **aith
 ### Module Structure
 
 **`src/agent/`** - MayAgent wrapper
-- `may.rs`: Wraps `aither_agent::Agent`: the persona prompt (`templates/system.md`, via `include_str!`), the base system prompt (`templates/base_system.md`), skill and subagent registration, compaction model, permission handling, and session context
-- `runtime_context.rs`: renders the terminal runtime context (`templates/terminal_runtime_context.txt`); `permission.rs`: `PermissionApprover` for `unsafe` mode; `*_tool.rs`: the IPC commands (`ask_user`, `issue`, `pr`, `repo`, `session`, `task`, `notify`, `tunnel`, `browser`, `computer`, `register-skills`)
+- `may.rs`: Wraps `aither_agent::Agent`: skill and subagent registration, compaction model, host load monitor, permission handling, and session context
+- `runtime_context.rs`: renders the session system prompt, one typed template per section under `templates/prompt/` in the order `tag::layout` gives, with memory, `AGENTS.md` and workdirs last as aither external-content blocks; `permission.rs`: `PermissionApprover` for `unsafe` mode; `*_tool.rs`: the IPC commands (`ask_user`, `issue`, `pr`, `repo`, `session`, `task`, `notify`, `tunnel`, `browser`, `computer`, `register-skills`)
 
 **`src/terminal_commands.rs`** - `register_shared_terminal_commands`, which registers every IPC command; `src/terminal_permission_handler.rs` applies the network policy and audit log
 
