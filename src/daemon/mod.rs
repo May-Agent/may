@@ -436,6 +436,17 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
         }
     });
 
+    // Agents of relocated homes whose runs were killed before they could
+    // retire them. A failure leaves other homes' leftovers loaded, which
+    // must not stop this daemon, so it is logged like the retire path's.
+    match blocking::unblock(crate::repo_search::sweep_if_home_relocated).await {
+        Ok(removed) => {
+            for service in removed {
+                tracing::info!(%service, "booted out a repo-search agent of a deleted relocated home");
+            }
+        }
+        Err(error) => tracing::warn!(%error, "could not sweep stale repo-search agents"),
+    }
     let repo_search = RepoSearch::global(paths.root());
     let indexer = SearchIndexer::new(
         state.db.clone(),

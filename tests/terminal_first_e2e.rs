@@ -1246,6 +1246,18 @@ struct TestHarness {
     may_dir: PathBuf,
 }
 
+impl Drop for TestHarness {
+    /// Deletes the home, then sweeps the relocated-home agents whose plists
+    /// went with it, so a run leaves none loaded.
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.home_path);
+        let swept = may_agent::repo_search::sweep_stale_relocated_agents();
+        if !std::thread::panicking() {
+            swept.expect("sweeping stale relocated-home agents should succeed");
+        }
+    }
+}
+
 const HOST_USER_NAME: &str = "E2E User";
 const HOST_USER_EMAIL: &str = "e2e.user@example.com";
 
@@ -1310,6 +1322,9 @@ impl TestHarness {
         tier_models: Option<&str>,
         context: ContextConfig,
     ) -> Self {
+        // A killed earlier run left agents of homes that no longer exist.
+        may_agent::repo_search::sweep_stale_relocated_agents()
+            .expect("sweeping stale relocated-home agents should succeed");
         let home = tempfile::tempdir().expect("test home tempdir should be created");
         let home_path = dunce::canonicalize(home.path()).expect("test home should resolve");
         let may_dir = home_path.join(".may");
@@ -5252,6 +5267,23 @@ async fn temp_home_daemon_leaves_no_repo_search_job_after_it_stops() {
     );
 
     let server = RunningDaemon::spawn(&home, &[]).await;
+    install_repo_search_agents(&server, &daemon_label, &server_label).await;
+
+    server.stop().await;
+    assert!(
+        !launchd_job_loaded(&daemon_label) && !launchd_job_loaded(&server_label),
+        "stopping the daemon should boot out the relocated home's agents"
+    );
+}
+
+/// Makes `server` install its relocated home's repo-search agents and, when
+/// launchd accepted them, asserts both are loaded. Returns whether they are.
+#[cfg(target_os = "macos")]
+async fn install_repo_search_agents(
+    server: &RunningDaemon,
+    daemon_label: &str,
+    server_label: &str,
+) -> bool {
     // An index-coverage poll on a git worktree reaches repo-search, which
     // installs the home's agents.
     let worktree = tempfile::tempdir().expect("worktree tempdir should be created");
@@ -5279,20 +5311,66 @@ async fn temp_home_daemon_leaves_no_repo_search_job_after_it_stops() {
     };
     drop(reader);
     // A launchd that refuses the bootstrap (a port or the session already
-    // taken) leaves nothing to boot out; the check below then still holds.
+    // taken) leaves nothing to boot out; the callers' checks then still hold.
     let installed =
         serde_json::from_str::<Value>(&snapshot).expect("snapshot is JSON")["error"].is_null();
     if installed {
         assert!(
-            launchd_job_loaded(&daemon_label) && launchd_job_loaded(&server_label),
+            launchd_job_loaded(daemon_label) && launchd_job_loaded(server_label),
             "the temp-home daemon should have installed its repo-search agents; snapshot: {snapshot}"
         );
     }
+    installed
+}
 
-    server.stop().await;
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[serial]
+async fn a_killed_temp_home_daemons_agents_are_swept_by_the_next_daemon_start() {
+    use repo_search_client::launcher::launchd::{LABEL, SERVER_LABEL, labels_for};
+
+    let mock = MockOpenAiServer::spawn(MockChatScenario::SlowTextEveryTurn {
+        chunks: vec!["hi".into()],
+        delay: Duration::from_millis(10),
+    })
+    .await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    let home = harness.home_path().to_path_buf();
+    let login = dirs::home_dir().expect("login home should resolve");
+    let (daemon_label, server_label) = labels_for(&home, &login);
+    let production_before = (launchd_job_loaded(LABEL), launchd_job_loaded(SERVER_LABEL));
+
+    // Built before the kill: building a harness sweeps too, which would hide
+    // the daemon's own sweep.
+    let next = TestHarness::new(&mock.base_url()).await;
+    assert_ne!(next.home_path(), home, "the next daemon has a fresh home");
+
+    // SIGKILL: no shutdown path runs, so the agents outlive the daemon.
+    let killed = RunningDaemon::spawn(&home, &[]).await;
+    let installed = install_repo_search_agents(&killed, &daemon_label, &server_label).await;
+    killed.kill().await;
+    if installed {
+        assert!(
+            launchd_job_loaded(&daemon_label) && launchd_job_loaded(&server_label),
+            "a killed daemon leaves its agents loaded"
+        );
+    }
+
+    // The home is deleted with the agents still registered.
+    std::fs::remove_dir_all(&home).expect("the killed daemon's home should be deleted");
+
+    // The next daemon, under a home of its own, sweeps the dead home's agents.
+    let successor = RunningDaemon::spawn(next.home_path(), &[]).await;
     assert!(
         !launchd_job_loaded(&daemon_label) && !launchd_job_loaded(&server_label),
-        "stopping the daemon should boot out the relocated home's agents"
+        "the next daemon start should boot out the deleted home's agents"
+    );
+    successor.stop().await;
+
+    assert_eq!(
+        production_before,
+        (launchd_job_loaded(LABEL), launchd_job_loaded(SERVER_LABEL)),
+        "production agents are untouched"
     );
 }
 
