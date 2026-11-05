@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aither_agent::CacheWarmth;
+use askama::Template;
 use serde::{Deserialize, Serialize};
 use skyzen::Result as SkyResult;
 use skyzen::routing::Params;
@@ -25,7 +26,6 @@ const MAX_OUTPUT_CHARS: usize = 1_200;
 /// Total user/assistant text the recap projection may hold, in Unicode
 /// scalar values; the newest exchanges are kept.
 const HISTORY_BUDGET: usize = 24_000;
-const PROMPT: &str = include_str!("../../../templates/aux/recap.md");
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -198,6 +198,33 @@ fn recap_window<'a>(
     }
 }
 
+/// The recap instruction, written in the session's communication language
+/// when one is set.
+#[derive(Template)]
+#[template(path = "aux/recap.md", escape = "none")]
+struct RecapPrompt {
+    language: Option<aither_agent::Language>,
+}
+
+/// The aux request: the windowed conversation, then the recap instruction.
+fn recap_messages(
+    conversation: &[(&MessageRole, &str)],
+    language: Option<aither_agent::Language>,
+) -> Vec<aither_core::llm::Message> {
+    let prompt = RecapPrompt { language }
+        .render()
+        .expect("recap prompt template must render");
+    let mut messages: Vec<_> = conversation
+        .iter()
+        .map(|(role, content)| match role {
+            MessageRole::User => aither_core::llm::Message::user(*content),
+            _ => aither_core::llm::Message::assistant(*content),
+        })
+        .collect();
+    messages.push(aither_core::llm::Message::user(prompt));
+    messages
+}
+
 /// Runs the recap's aux turn over user/assistant text only — tool calls
 /// and hidden context are harness state, not conversation.
 async fn generate(state: &Arc<DaemonState>, session_id: &str) -> Option<RecapRecord> {
@@ -216,15 +243,8 @@ async fn generate(state: &Arc<DaemonState>, session_id: &str) -> Option<RecapRec
         return None;
     }
     let turns = window.turns;
-    let mut messages: Vec<_> = window
-        .conversation
-        .iter()
-        .map(|(role, content)| match role {
-            MessageRole::User => aither_core::llm::Message::user(*content),
-            _ => aither_core::llm::Message::assistant(*content),
-        })
-        .collect();
-    messages.push(aither_core::llm::Message::user(PROMPT));
+    let languages = super::aux::languages(state, session_id).await.ok()?;
+    let messages = recap_messages(&window.conversation, languages.communication());
     let response = super::aux::run(state, session_id, messages, GENERATION_TIMEOUT)
         .await
         .ok()?;
@@ -412,6 +432,39 @@ async fn freshness(state: &Arc<DaemonState>, session_id: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn last_message(language: Option<aither_agent::Language>) -> String {
+        let conversation = [
+            (&MessageRole::User, "ship it"),
+            (&MessageRole::Assistant, "shipped"),
+        ];
+        let messages = recap_messages(&conversation, language);
+        assert_eq!(messages.len(), 3, "the conversation, then the instruction");
+        messages[2].content().to_string()
+    }
+
+    #[test]
+    fn the_recap_request_names_the_session_communication_language() {
+        let chinese: aither_agent::Language = "Chinese".parse().unwrap();
+        let prompt = last_message(Some(chinese));
+        assert!(prompt.contains("Write in Chinese."), "{prompt}");
+        assert!(!prompt.contains("language of the user's messages"));
+    }
+
+    #[test]
+    fn an_unset_language_leaves_the_recap_in_the_users_language() {
+        let prompt = last_message(None);
+        assert!(prompt.contains("Write in the language of the user's messages."));
+        assert!(!prompt.contains("{%"), "template tags are rendered");
+    }
+
+    #[test]
+    fn the_recap_prompt_asks_for_plain_prose_without_asides() {
+        let prompt = last_message(None);
+        assert!(prompt.contains("State each open caveat once"));
+        assert!(prompt.contains("do not use parentheses"));
+        assert!(!prompt.contains("above all else"));
+    }
 
     #[test]
     fn recap_record_round_trips_through_json() {

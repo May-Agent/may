@@ -166,6 +166,8 @@ pub struct MayAgentConfig {
     pub profile_id: Option<String>,
     /// Maximum iterations.
     pub max_iterations: usize,
+    /// The session's communication and working languages.
+    pub languages: aither_agent::Languages,
     /// Channel for workspace access requests.
     pub workspace_request_broker: WorkspaceRequestBroker,
     /// Channel for ask user requests.
@@ -327,6 +329,8 @@ pub struct MayAgent {
     /// Model clone reserved for `/btw` side questions.
     btw_llm: RequestParameterizedModel<ProviderLlm>,
     subagent_tracker: crate::agent::subagent_tracker::SubagentTracker,
+    /// The session's configured languages.
+    languages: aither_agent::Languages,
 }
 
 impl std::fmt::Debug for MayAgent {
@@ -572,6 +576,7 @@ impl MayAgent {
             config.max_iterations
         };
         let terminal_grants = terminal_tool.grants();
+        let language_guard = aither_agent::LanguageGuard::new(config.languages);
         let mut builder = TerminalAgentBuilder::new(llm, terminal_tool)
             .system_layout(tag::layout())
             .hook(context_snapshot_hook)
@@ -632,6 +637,7 @@ impl MayAgent {
                 issue_store: issue_store.clone(),
                 workspace_config: workspace.config.clone(),
                 agent_messaging,
+                languages: Some(language_guard.clone()),
                 acp: config.acp.clone(),
                 #[cfg(target_os = "macos")]
                 computer: config.computer.clone(),
@@ -699,6 +705,7 @@ impl MayAgent {
             subagent_runs,
             btw_llm,
             subagent_tracker,
+            languages: config.languages,
         })
     }
 
@@ -834,6 +841,7 @@ impl MayAgent {
             session_id,
             profile_id,
             max_iterations: may_config.max_iterations,
+            languages: may_config.language.languages(),
             workspace_request_broker,
             ask_user_broker,
             image_generator: resolve_image_generator_config(may_config),
@@ -1087,6 +1095,12 @@ impl MayAgent {
         self.btw_llm.clone()
     }
 
+    /// The communication and working languages this agent was configured with.
+    #[must_use]
+    pub const fn languages(&self) -> aither_agent::Languages {
+        self.languages
+    }
+
     /// Tracker shared with this session's `subagent` IPC command — the TUI
     /// reads live per-run stats off it for the jobs panel and status bar.
     #[must_use]
@@ -1290,6 +1304,7 @@ pub async fn test_agent(
                 String::new(),
             ),
             subagent_tracker: crate::agent::subagent_tracker::SubagentTracker::default(),
+            languages: aither_agent::Languages::unset(),
         },
         temp,
     )
