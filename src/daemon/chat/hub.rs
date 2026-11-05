@@ -9,11 +9,13 @@
 //! Every frame of a session carries an index, increasing for as long as the
 //! daemon runs. Each subscription reads from its own cursor, and a frame is
 //! kept until every subscription has read it, so a subscriber that falls
-//! behind receives every frame however far behind it is, across the end of
-//! its turn included. A client that reconnects names the last index it saw
-//! and receives only what came after; when the frames it missed are gone
-//! (their turn ended while it was away), the subscription says so and the
-//! client reloads the session instead.
+//! behind receives every frame, across the end of its turn included. A
+//! subscription holds back at most the turn in progress and the turn before
+//! it: one still behind that when a new turn begins is closed, which ends
+//! its client's stream. A client that reconnects names the last index it
+//! saw and receives only what came after; when the frames it missed are
+//! gone, the subscription says so and the client reloads the session
+//! instead.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -42,7 +44,10 @@ struct SessionChannel {
     replay_from: u64,
     /// Index of the newest frame published; 0 before the first.
     last_index: u64,
-    /// Index of the last frame each live subscription read, by its id.
+    /// Index of the first frame of the latest turn to begin; 0 before any.
+    turn_start: u64,
+    /// Index of the last frame each live subscription read, by its id. A
+    /// closed subscription has none.
     cursors: HashMap<u64, u64>,
     next_subscription: u64,
     /// Notified on every publish.
@@ -55,6 +60,7 @@ impl SessionChannel {
             frames: VecDeque::new(),
             replay_from: 1,
             last_index: 0,
+            turn_start: 0,
             cursors: HashMap::new(),
             next_subscription: 0,
             published: Arc::new(Event::new()),
@@ -65,6 +71,28 @@ impl SessionChannel {
     fn restart_replay(&mut self) {
         self.replay_from = self.last_index + 1;
         self.prune();
+    }
+
+    /// A new turn begins with the next frame. A subscription may hold back
+    /// at most this turn and the one before it; one with unread frames from
+    /// before the previous turn began is closed and its frames released.
+    fn begin_turn(&mut self, session_id: &str) {
+        let previous_start = self.turn_start;
+        self.turn_start = self.last_index + 1;
+        let last_index = self.last_index;
+        self.cursors.retain(|id, cursor| {
+            let keep = previous_start == 0 || *cursor + 1 >= previous_start;
+            if !keep {
+                tracing::warn!(
+                    session_id,
+                    subscription = id,
+                    unread_frames = last_index - *cursor,
+                    "closing a turn subscription two turns behind"
+                );
+            }
+            keep
+        });
+        self.restart_replay();
     }
 
     /// Drops the frames every subscription read that no late subscriber
@@ -115,26 +143,25 @@ pub struct TurnSubscription {
 
 impl TurnSubscription {
     /// The frames published since the last call, oldest first; waits until
-    /// there is at least one. Cancelling the wait loses nothing.
-    pub(crate) async fn next(&self) -> Vec<Arc<TurnFrame>> {
+    /// there is at least one. `None` once the subscription fell two turns
+    /// behind and was closed. Cancelling the wait loses nothing.
+    pub(crate) async fn next(&self) -> Option<Vec<Arc<TurnFrame>>> {
         loop {
             let published = self.published.listen();
-            let frames = self.take_unread();
+            let frames = self.take_unread()?;
             if !frames.is_empty() {
-                return frames;
+                return Some(frames);
             }
             published.await;
         }
     }
 
-    /// The frames published since the last read, without waiting.
-    pub(crate) fn take_unread(&self) -> Vec<Arc<TurnFrame>> {
+    /// The frames published since the last read, without waiting; `None`
+    /// once the subscription was closed.
+    pub(crate) fn take_unread(&self) -> Option<Vec<Arc<TurnFrame>>> {
         let id = self.id;
         self.hub.with_session(&self.session_id, |channel| {
-            let cursor = *channel
-                .cursors
-                .get(&id)
-                .expect("a live subscription has a cursor");
+            let cursor = *channel.cursors.get(&id)?;
             let first = channel.first_kept();
             assert!(
                 cursor + 1 >= first,
@@ -145,7 +172,7 @@ impl TurnSubscription {
             let frames: Vec<_> = channel.frames.iter().skip(skip).cloned().collect();
             channel.cursors.insert(id, channel.last_index);
             channel.prune();
-            frames
+            Some(frames)
         })
     }
 }
@@ -174,9 +201,14 @@ impl TurnHub {
     }
 
     /// Starts a new turn of `session_id`: late subscribers replay from its
-    /// first frame.
+    /// first frame, and subscriptions two turns behind are closed.
     pub(crate) fn begin_turn(&self, session_id: &str) {
-        self.with_session(session_id, SessionChannel::restart_replay);
+        let published = self.with_session(session_id, |channel| {
+            channel.begin_turn(session_id);
+            channel.published.clone()
+        });
+        // A closed subscription waiting for frames learns it was closed.
+        published.notify(usize::MAX);
     }
 
     /// Publishes a `kind` frame with `data` to the session's subscribers and
@@ -243,6 +275,7 @@ mod tests {
     fn read(subscription: &TurnSubscription) -> Vec<String> {
         subscription
             .take_unread()
+            .expect("the subscription is open")
             .iter()
             .map(|frame| frame.data.to_string())
             .collect()
@@ -257,7 +290,7 @@ mod tests {
         let late = hub.subscribe("s", None);
         assert_eq!(read(&late), ["start", "text-1"]);
         hub.publish("s", "session_turn", "text-2".into());
-        let next = futures_lite::future::block_on(late.next());
+        let next = futures_lite::future::block_on(late.next()).expect("the subscription is open");
         assert_eq!(&*next[0].data, "text-2");
         hub.end_turn("s");
         assert_eq!(read(&hub.subscribe("s", None)), [""; 0]);
@@ -338,5 +371,39 @@ mod tests {
         assert!(!hub.subscribe("s", Some(0)).gap, "held for the follower");
         drop(follower);
         assert!(hub.subscribe("s", Some(0)).gap, "released with it");
+    }
+
+    /// A subscriber that never reads holds back at most the turn in
+    /// progress and the one before it: at the third turn's start it is
+    /// closed and the first turn's frames are released.
+    #[test]
+    fn a_subscriber_two_turns_behind_is_closed() {
+        let hub = Arc::new(TurnHub::default());
+        let stalled = hub.subscribe("s", None);
+        let mut starts = Vec::new();
+        for turn in 0..3 {
+            hub.begin_turn("s");
+            for delta in 0..100 {
+                hub.publish("s", "session_agent", format!("turn-{turn}-{delta}").into());
+            }
+            starts.push(hub.with_session("s", |channel| channel.turn_start));
+            if turn < 2 {
+                assert!(
+                    hub.with_session("s", |channel| channel.cursors.contains_key(&stalled.id)),
+                    "open in turn {turn}"
+                );
+                hub.end_turn("s");
+            }
+        }
+        assert!(stalled.take_unread().is_none(), "closed at the third turn");
+        assert!(
+            futures_lite::future::block_on(stalled.next()).is_none(),
+            "a closed subscription ends its stream"
+        );
+        let oldest = hub.with_session("s", |channel| channel.first_kept());
+        assert!(
+            oldest >= starts[2],
+            "no frame before the turn in progress is kept: oldest {oldest}, starts {starts:?}"
+        );
     }
 }
