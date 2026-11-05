@@ -4662,12 +4662,13 @@ const COMPACTION_PROBE_FILLER_REPEATS: usize = 10_000;
 /// A `[context]` section whose auto-compact point is 40k tokens, whatever the
 /// mock model's 128k window: compaction starts at `40k - start_distance` and
 /// the run pauses for it at `40k - safe_buffer`.
-const fn compaction_probe_context(start_distance: usize, safe_buffer: usize) -> ContextConfig {
+fn compaction_probe_context(start_distance: usize, safe_buffer: usize) -> ContextConfig {
     ContextConfig {
         compact_at: 0.8,
         compact_ceiling: 40_000,
         start_distance,
         safe_buffer,
+        ..ContextConfig::default()
     }
 }
 
