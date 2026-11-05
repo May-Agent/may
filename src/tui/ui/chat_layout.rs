@@ -105,6 +105,10 @@ struct Entry {
     images: Vec<(String, usize, String)>,
     /// Collapsible id a click on this entry toggles.
     collapsible: Option<String>,
+    /// `(id, first row, one past the last)` of collapsible elements folded
+    /// inside this entry — an expanded "Worked for" group's members, whose
+    /// rows toggle themselves rather than the group.
+    sub_regions: Vec<(String, usize, usize)>,
     /// The images are markdown references the TUI fetches itself.
     markdown_images: bool,
     /// Link targets, indexed by the markers of `marked`.
@@ -141,6 +145,23 @@ impl Entry {
             })
             .collect();
         let (marked, link_targets) = links::mark_lines(&laid.lines).unzip();
+        let collapsible = collapsible_id(elem).map(str::to_string);
+        let sub_regions = laid
+            .regions
+            .iter()
+            // The element's own collapsible rows are already covered by the
+            // entry's `collapsible` — only the ids of elements folded
+            // *inside* it (an expanded "Worked for" group's members)
+            // become sub-regions.
+            .filter(|(id, _, _)| collapsible.as_ref() != Some(id))
+            // `element_lines` records a region only around lines it pushed,
+            // so `start < end <= laid.lines.len()`.
+            .map(|(id, start, end)| {
+                let last = end - 1;
+                let past = line_starts[last] + line_rows(&laid.lines[last], width);
+                (id.clone(), line_starts[*start], past)
+            })
+            .collect();
         let entry = Self {
             revision,
             state,
@@ -148,7 +169,8 @@ impl Entry {
             line_starts,
             rows,
             images,
-            collapsible: collapsible_id(elem).map(str::to_string),
+            collapsible,
+            sub_regions,
             markdown_images: matches!(elem, ChatElement::AssistantText { .. }),
             link_targets: link_targets.unwrap_or_default(),
             marked,
@@ -480,19 +502,32 @@ impl ChatLayout {
     }
 
     /// Row span of every collapsible element, for click hit-testing.
+    /// Elements inside an expanded "Worked for" group appear as their own
+    /// regions — the innermost span containing a row wins, so a click on a
+    /// member toggles the member and anywhere else toggles the group.
     #[must_use]
     pub fn collapse_regions(&self) -> Vec<ClickRegion> {
-        self.entries
-            .iter()
-            .zip(&self.offsets)
-            .filter_map(|(entry, &start)| {
-                entry.collapsible.as_ref().map(|id| ClickRegion {
+        let mut out = Vec::new();
+        for (entry, &offset) in self.entries.iter().zip(&self.offsets) {
+            if let Some(id) = &entry.collapsible {
+                out.push(ClickRegion {
                     element_id: id.clone(),
-                    start,
-                    end: start + entry.rows,
-                })
-            })
-            .collect()
+                    start: offset,
+                    end: offset + entry.rows,
+                });
+            }
+            out.extend(
+                entry
+                    .sub_regions
+                    .iter()
+                    .map(|(id, start, end)| ClickRegion {
+                        element_id: id.clone(),
+                        start: offset + start,
+                        end: offset + end,
+                    }),
+            );
+        }
+        out
     }
 
     /// URLs/paths of the images assistant messages reference — the ones
