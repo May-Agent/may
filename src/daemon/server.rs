@@ -435,6 +435,7 @@ fn api_routes() -> Route {
                     Route::new((
                         "/tasks".at(get_session_tasks),
                         "/prs".at(get_session_prs),
+                        "/repo-clones".at(super::sessions::get_session_repo_clones),
                         "/tasks".put(save_session_tasks),
                         "/tasks/plan-state".put(set_session_plan_state),
                         "/yolo".put(set_session_yolo),

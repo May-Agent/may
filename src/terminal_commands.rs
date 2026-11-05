@@ -206,6 +206,7 @@ where
         db: config.db.clone(),
         session_id: config.session_id.clone(),
         session_root: config.sandbox_dir.clone(),
+        scratch_root: config.may_dir.join("pr-checks"),
         cwd: config.cwd.clone(),
         workspace_config: config.workspace_config.clone(),
         screen: Some(screen),

@@ -282,6 +282,25 @@ pub(super) async fn get_session_tasks(
     }))
 }
 
+/// `GET /api/sessions/{id}/repo-clones`: the session's repository clones from
+/// the host's registry.
+pub(super) async fn get_session_repo_clones(
+    params: Params,
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<Vec<crate::repo_clone::CloneView>>> {
+    let id = params.get("id").map_err(bad_request_error)?.to_string();
+    let db = state.db();
+    let session = db
+        .get_session(&id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| session_not_found_error(&id))?;
+    let store = SessionStore::new(MayHomePaths::new(state.may_dir.clone()));
+    let paths = store.session_paths(&id, session.profile_id.as_deref());
+    let repos = crate::repo_clone::SessionRepos::new(paths.root(), id, db);
+    Ok(Json(repos.views().await.map_err(internal_error)?))
+}
+
 /// The session's PRs with their transition events — the sidebar's list.
 pub(super) async fn get_session_prs(
     params: Params,
@@ -722,7 +741,7 @@ pub(super) async fn delete_session(
         .evict(&crate::session::SessionId::from_string(id.as_str()));
     let store = SessionStore::new(MayHomePaths::new(state.may_dir.clone()));
     store
-        .delete_session(&id, profile_id.as_deref())
+        .delete_session(&id, profile_id.as_deref(), &db)
         .await
         .map_err(internal_error)?;
     state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS | UiEventTopics::SESSION_RUNTIMES);

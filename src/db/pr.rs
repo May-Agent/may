@@ -28,11 +28,12 @@ pub struct PrRow {
     /// `open`, `checks_pending`, `failed`, `rejected`, `merging`, `merged`
     /// or `closed`.
     pub state: String,
-    /// Session branch ref in the checkout (`refs/may/<session>`).
+    /// Local backend: the durable ref holding the PR's commit in the checkout
+    /// (`refs/may/pr/<number>`); GitHub: the session branch on `upstream`.
     pub branch: String,
     /// Base commit the PR was opened against.
     pub base_sha: String,
-    /// Head commit, refreshed on each merge attempt.
+    /// The commit the PR owns: pinned when opened, moved only by `pr update`.
     pub head_sha: Option<String>,
     /// `may` or `github`.
     pub backend: String,
@@ -61,7 +62,7 @@ pub struct PrEventRow {
     pub pr_id: i64,
     /// `opened`, `checks_pending`, `check_failed`, `rejected`, `queued`,
     /// `merging`, `merged`, `closed`, `issue_linked`, `rewound`,
-    /// `orphaned`, `adopted`.
+    /// `orphaned`, `adopted`, `updated`.
     pub kind: String,
     /// Session that caused the transition.
     pub session_id: String,
@@ -177,6 +178,22 @@ impl ChatDb {
         )
         .fetch_optional::<PrRow>()
         .await?)
+    }
+
+    /// Name the durable ref a local PR's commit lives under.
+    ///
+    /// # Errors
+    /// Fails on database errors.
+    pub async fn set_pr_branch(&self, pr_id: i64, branch: &str) -> Result<(), ChatDbError> {
+        query!(
+            self.db,
+            "UPDATE prs SET branch = ? WHERE id = ?",
+            branch,
+            pr_id
+        )
+        .execute()
+        .await?;
+        Ok(())
     }
 
     /// Transfer a PR to another session — the manual orphan-recovery op.
