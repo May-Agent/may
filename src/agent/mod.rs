@@ -5,6 +5,7 @@ pub mod acp_subagent;
 mod agents_md;
 pub(crate) mod ask_user_tool;
 pub(crate) mod browser_tool;
+pub mod cache_miss;
 #[cfg(test)]
 mod compact_tool_tests;
 #[cfg(test)]
@@ -88,5 +89,7 @@ pub use task_tool::{
 pub use tool_environment_cache::{
     HomeBackend, ToolEnvironmentCache, ToolEnvironmentCacheError, ToolEnvironmentKey,
 };
-pub use usage::{ModelUsageRow, SessionUsageReport, assemble_usage_report};
+pub use usage::{
+    CacheMissCauseRow, CacheMissRow, ModelUsageRow, SessionUsageReport, assemble_usage_report,
+};
 pub use wall_clock::{Interval, IntervalSet, WallClockSplit};
