@@ -1,0 +1,54 @@
+name: Restore test downloads
+description: Restore the pinned artifacts the terminal E2E suite and the sandbox unit tests download from GitHub releases (the managed baseline tools with their prepared runtimes, and the container heel), keyed on the pins, and export MAY_TEST_CACHE so the tests use the restored directory. The caller saves both caches after its tests with actions/cache/save and the outputs below.
+outputs:
+  tools-path:
+    description: Directory holding the baseline tool artifacts and prepared runtimes.
+    value: ${{ steps.key.outputs.tools-path }}
+  tools-key:
+    description: Cache key of the baseline tools.
+    value: ${{ steps.key.outputs.tools-key }}
+  tools-hit:
+    description: "'true' when the baseline tools were restored exactly."
+    value: ${{ steps.tools.outputs.cache-hit }}
+  heel-path:
+    description: Directory holding the pinned container heel.
+    value: ${{ steps.key.outputs.heel-path }}
+  heel-key:
+    description: Cache key of the container heel.
+    value: ${{ steps.key.outputs.heel-key }}
+  heel-hit:
+    description: "'true' when the container heel was restored exactly."
+    value: ${{ steps.heel.outputs.cache-hit }}
+runs:
+  using: composite
+  steps:
+    - id: key
+      shell: bash
+      run: |
+        set -euo pipefail
+        digest() { sha256sum "$@" 2>/dev/null || shasum -a 256 "$@"; }
+        # The manifest pins every baseline artifact and the interpreter uv
+        # installs into a prepared runtime, so its hash keys the directory.
+        tools="$(cat src/tools/tool-distribution-*.json | digest | cut -d' ' -f1)"
+        # The tag and digests pinning the container heel live in the E2E
+        # suite; the suite fails on a restored file whose digest differs.
+        heel="$(grep -E '^const CONTAINER_HEEL_RELEASE_TAG|^    sha256:' tests/terminal_first_e2e.rs | digest | cut -d' ' -f1)"
+        root="${RUNNER_TEMP}/may-test-cache"
+        mkdir -p "${root}"
+        {
+          echo "tools-key=may-tools-${RUNNER_OS}-${RUNNER_ARCH}-${tools}"
+          echo "tools-path=${root}/may-tools"
+          echo "heel-key=container-heel-${RUNNER_OS}-${RUNNER_ARCH}-${heel}"
+          echo "heel-path=${root}/container-heel"
+        } >> "${GITHUB_OUTPUT}"
+        echo "MAY_TEST_CACHE=${root}" >> "${GITHUB_ENV}"
+    - id: tools
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ steps.key.outputs.tools-path }}
+        key: ${{ steps.key.outputs.tools-key }}
+    - id: heel
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ steps.key.outputs.heel-path }}
+        key: ${{ steps.key.outputs.heel-key }}
