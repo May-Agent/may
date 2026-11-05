@@ -192,7 +192,12 @@ pub async fn run_exec(args: ExecArgs) -> Result<i32, ExecError> {
                 .job_registry()
                 .get_by_task_id(&task_id)
                 .await
-                .is_some_and(|job| job.status == aither_sandbox::job_registry::JobStatus::Killed);
+                .is_some_and(|job| {
+                    matches!(
+                        job.status,
+                        aither_sandbox::job_registry::JobStatus::Killed { .. }
+                    )
+                });
             let mut result: CommandResult = completed
                 .result
                 .map_err(|error| ExecError::TerminalCall(anyhow::anyhow!(error.to_string())))?

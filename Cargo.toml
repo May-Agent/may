@@ -20,16 +20,18 @@ gstreamer = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
 [dependencies]
 libc = "0.2.191"
 # Aither framework
-aither-core = { version = "0.17.0" }
-aither-agent = { version = "0.17.0", features = ["mcp", "webfetch", "skills", "connectivity", "languages"] }
-aither-connectivity = { version = "0.17.0" }
-aither-sandbox = { version = "0.17.0", features = ["code-folding", "connectivity"] }
-aither-cloud = { version = "0.17.0" }
-aither-copilot = { version = "0.17.0" }
-aither-codex = { version = "0.17.0" }
-aither-models = { version = "0.17.0" }
-aither-mcp = { version = "0.17.0" }
-aither-browser = { version = "0.17.0" }
+aither-core = { version = "0.18.0" }
+aither-agent = { version = "0.18.0", features = ["mcp", "webfetch", "skills", "connectivity", "languages"] }
+aither-connectivity = { version = "0.18.0" }
+aither-sandbox = { version = "0.18.0", features = ["code-folding", "connectivity"] }
+aither-cloud = { version = "0.18.0" }
+aither-copilot = { version = "0.18.0" }
+aither-codex = { version = "0.18.0" }
+aither-models = { version = "0.18.0" }
+aither-mcp = { version = "0.18.0" }
+aither-browser = { version = "0.18.0" }
+# Names acpsub's `TurnEnd::Stopped` reason, so it is the aither-acp acpsub
+# builds on.
 aither-acp = { version = "0.17.0" }
 
 # ACP agents as subagents (`/connect`); its CLI and second SQLite stay off.
@@ -180,7 +182,6 @@ hmac = { version = "0.12", default-features = false }
 subtle = { version = "2.6", default-features = false }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 
-similar = "3.1.1"
 dunce = "1.0.5"
 keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "linux-native"] }
 linkify = { version = "0.11.0", default-features = false }

@@ -17,7 +17,6 @@ use std::time::Duration;
 
 use aither_agent::ManualClock;
 use bytes::Bytes;
-use futures_lite::StreamExt;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::header::{CONTENT_TYPE, HeaderValue};
@@ -407,10 +406,13 @@ pub async fn run_turn(agent: &mut MayAgent) {
     agent.push_message(aither_core::llm::Message::assistant(
         "x".repeat(4 * aither_agent::ContextPolicy::default().compaction_floor),
     ));
-    let mut stream = agent.run("Say hello.", []);
-    while let Some(event) = stream.next().await {
-        event.expect("the turn runs");
-    }
+    let _ = agent
+        .run("Say hello.", [])
+        .drive((), std::future::pending::<()>(), |(), _| async {
+            std::ops::ControlFlow::Continue(())
+        })
+        .await
+        .expect("the turn runs");
 }
 
 /// Under the default one-hour cache lifetime an idle session compacts once,

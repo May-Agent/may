@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use futures_lite::StreamExt;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::header::{CONTENT_TYPE, HeaderValue};
@@ -259,10 +258,14 @@ async fn run(session: &mut Session, filler_chars: usize, prompt: &str) {
         .push_message(aither_core::llm::Message::assistant(
             "x".repeat(filler_chars),
         ));
-    let mut stream = session.agent.run(prompt, []);
-    while let Some(event) = stream.next().await {
-        event.expect("the turn runs");
-    }
+    let _ = session
+        .agent
+        .run(prompt, [])
+        .drive((), std::future::pending::<()>(), |(), _| async {
+            std::ops::ControlFlow::Continue(())
+        })
+        .await
+        .expect("the turn runs");
 }
 
 /// Holds the run lease the way a served run does, so checkpoints persist.
