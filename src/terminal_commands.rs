@@ -852,7 +852,6 @@ mod tests {
             directory: crate::agent_link::AgentDirectory::new(
                 runtime_service.clone(),
                 temp.path().to_path_buf(),
-                temp.path().to_path_buf(),
                 move |session_id| {
                     woken_tx
                         .try_send(session_id.to_string())

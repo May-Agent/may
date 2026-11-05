@@ -109,7 +109,7 @@ async fn oversized_webhook_bodies_are_refused_before_buffering() {
     let fake = tempfile::tempdir().expect("temp dir");
     let binary = install_fake_tailscale(fake.path());
     let state = Arc::new(
-        DaemonState::for_test(home.path(), home.path(), MayConfig::default())
+        DaemonState::for_test(home.path(), MayConfig::default())
             .await
             .expect("daemon state"),
     );
@@ -170,7 +170,7 @@ async fn funnel_serves_only_webhooks_and_turning_it_off_removes_everything() {
     let fake = tempfile::tempdir().expect("temp dir");
     let binary = install_fake_tailscale(fake.path());
     let state = Arc::new(
-        DaemonState::for_test(home.path(), home.path(), MayConfig::default())
+        DaemonState::for_test(home.path(), MayConfig::default())
             .await
             .expect("daemon state"),
     );
@@ -291,7 +291,7 @@ async fn changing_the_funnel_port_moves_the_handler() {
     let fake = tempfile::tempdir().expect("temp dir");
     let binary = install_fake_tailscale(fake.path());
     let state = Arc::new(
-        DaemonState::for_test(home.path(), home.path(), MayConfig::default())
+        DaemonState::for_test(home.path(), MayConfig::default())
             .await
             .expect("daemon state"),
     );

@@ -580,6 +580,9 @@ impl SessionManager {
         };
 
         if !already_persisted {
+            // The session works where this client runs, not where the
+            // daemon happened to be started.
+            let cwd = std::env::current_dir()?;
             // The daemon creates the session's row and directory layout.
             let _: crate::client::WireSession = self
                 .daemon()?
@@ -589,7 +592,7 @@ impl SessionManager {
                         id: Some(session_id.clone()),
                         model: model.clone(),
                         profile_id: profile_id.clone(),
-                        cwd: None,
+                        cwd: Some(cwd.display().to_string()),
                         repo: self.current.as_ref().and_then(|s| s.repo.clone()),
                     },
                 )
