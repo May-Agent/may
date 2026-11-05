@@ -1165,8 +1165,9 @@ fn sse_response(
 }
 
 struct TestHarness {
-    home: TempDir,
-    /// `home`'s real path: May resolves its home, so every path it reports
+    /// Owns the temporary home; dropping it removes the directory.
+    _home: TempDir,
+    /// The home's real path: May resolves its home, so every path it reports
     /// is spelled this way (`/var` is a link to `/private/var` on macOS).
     home_path: PathBuf,
     may_dir: PathBuf,
@@ -1243,7 +1244,7 @@ impl TestHarness {
         .await;
 
         Self {
-            home,
+            _home: home,
             home_path,
             may_dir,
         }
