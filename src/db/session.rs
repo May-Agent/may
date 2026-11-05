@@ -1481,10 +1481,11 @@ mod tests {
 
     /// Audit and history tables that name a session but outlive it, and the
     /// search outbox, whose triggers queue index removals for deleted messages.
-    const RETAINED_ON_DELETE: [&str; 8] = [
+    const RETAINED_ON_DELETE: [&str; 9] = [
         "search_outbox",
         "prs",
         "pr_events",
+        "issue_provenance",
         "request_logs",
         "network_access_logs",
         "notification_mailbox",

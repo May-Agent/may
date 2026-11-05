@@ -953,16 +953,16 @@ mod tests {
                     remote.comments.push(comment.clone());
                     (201, comment)
                 }
-                ("GET", "/repos/o/r/issues/2/comments") => {
+                ("GET", "/repos/o/r/issues/2/comments?per_page=100") => {
                     (200, serde_json::Value::Array(remote.comments.clone()))
                 }
                 (
                     "GET",
-                    "/repos/o/r/issues/1/comments"
-                    | "/repos/o/r/issues/1/sub_issues"
-                    | "/repos/o/r/issues/1/dependencies/blocked_by"
-                    | "/repos/o/r/issues/2/sub_issues"
-                    | "/repos/o/r/issues/2/dependencies/blocked_by",
+                    "/repos/o/r/issues/1/comments?per_page=100"
+                    | "/repos/o/r/issues/1/sub_issues?per_page=100"
+                    | "/repos/o/r/issues/1/dependencies/blocked_by?per_page=100"
+                    | "/repos/o/r/issues/2/sub_issues?per_page=100"
+                    | "/repos/o/r/issues/2/dependencies/blocked_by?per_page=100",
                 ) => (200, serde_json::json!([])),
                 _ => (500, serde_json::json!({"message": "unexpected request"})),
             }
@@ -1048,6 +1048,7 @@ mod tests {
     async fn comments_are_read_across_pages() {
         let comment = |body: &str| {
             serde_json::json!({
+                "id": 1,
                 "user": {"login": "someone"},
                 "body": body,
                 "created_at": "2026-10-01T00:00:00Z",
