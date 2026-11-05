@@ -2265,6 +2265,169 @@ async fn exec_uses_session_directory_and_exposes_ipc_command_help() {
     );
 }
 
+/// Runs `script` through `may exec` in `mode` on `session`, in a home of its
+/// own and with `bin` ahead of `PATH`.
+async fn exec_script(
+    harness: &TestHarness,
+    session: &TestSession,
+    mode: &str,
+    bin: &Path,
+    workdir: &Path,
+    script: &str,
+) -> std::process::Output {
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").expect("PATH is set")
+    );
+    Command::new(may_binary_path())
+        .arg("exec")
+        .arg("--session")
+        .arg(&session.id)
+        .arg("--mode")
+        .arg(mode)
+        .arg("--")
+        .arg(script)
+        .current_dir(workdir)
+        .env("HOME", harness.home_path())
+        .env("PATH", path)
+        .env("HEEL_BIN", heel_bin())
+        .output()
+        .await
+        .expect("may exec should run")
+}
+
+#[tokio::test]
+#[serial]
+async fn issue_changes_are_recorded_and_gh_credentials_are_unreadable_from_the_sandbox() {
+    let mock = MockOpenAiServer::spawn(MockChatScenario::SlowText {
+        chunks: vec!["unused".to_string()],
+        delay: Duration::from_millis(10),
+    })
+    .await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    let session = harness.create_session().await;
+    let work = tempfile::tempdir().expect("workdir");
+    let bin = session.sandbox_dir.join("tmp");
+    tokio::fs::create_dir_all(&bin).await.expect("fake bin");
+    let fake_gh = bin.join("gh");
+    let gh_marker = bin.join("gh-marker");
+    tokio::fs::write(
+        &fake_gh,
+        format!("#!/bin/sh\ntouch '{}'\necho gh-ran\n", gh_marker.display()),
+    )
+    .await
+    .expect("fake gh");
+    std::fs::set_permissions(
+        &fake_gh,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )
+    .expect("chmod fake gh");
+    let gh_config = harness.home_path().join(".config/gh");
+    tokio::fs::create_dir_all(&gh_config).await.expect("gh dir");
+    tokio::fs::write(gh_config.join("hosts.yml"), "oauth_token: SECRET-TOKEN\n")
+        .await
+        .expect("gh credentials");
+
+    let created = exec_script(
+        &harness,
+        &session,
+        "sandboxed",
+        &bin,
+        work.path(),
+        "issue create 'from exec' --body body && issue comment 1 hello && issue close 1",
+    )
+    .await;
+    assert!(
+        created.status.success(),
+        "issue changes failed: {}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+
+    let provenance = exec_script(
+        &harness,
+        &session,
+        "sandboxed",
+        &bin,
+        work.path(),
+        "issue provenance 1; issue view 1",
+    )
+    .await;
+    let text = String::from_utf8_lossy(&provenance.stdout).to_string();
+    assert!(provenance.status.success(), "{text}");
+    for expected in [
+        "create",
+        "comment",
+        "close",
+        session.id.as_str(),
+        "agent exec",
+        "written by may: yes",
+        "[written by may] hello",
+    ] {
+        assert!(text.contains(expected), "missing {expected}: {text}");
+    }
+
+    let credentials = exec_script(
+        &harness,
+        &session,
+        "sandboxed",
+        &bin,
+        work.path(),
+        "cat ~/.config/gh/hosts.yml",
+    )
+    .await;
+    assert!(
+        !credentials.status.success()
+            && !String::from_utf8_lossy(&credentials.stdout).contains("SECRET-TOKEN"),
+        "gh credentials must be unreadable in the sandbox: {}",
+        String::from_utf8_lossy(&credentials.stdout)
+    );
+
+    let sandboxed_gh = exec_script(
+        &harness,
+        &session,
+        "sandboxed",
+        &bin,
+        work.path(),
+        "gh issue create --title t",
+    )
+    .await;
+    let refusal = format!(
+        "{}{}",
+        String::from_utf8_lossy(&sandboxed_gh.stdout),
+        String::from_utf8_lossy(&sandboxed_gh.stderr)
+    );
+    assert!(
+        !sandboxed_gh.status.success()
+            && refusal.contains("not available in the sandbox")
+            && refusal.contains("`issue`")
+            && !refusal.contains("gh-ran"),
+        "a sandboxed gh is refused with a pointer to issue: {refusal}"
+    );
+    assert!(
+        !gh_marker.exists(),
+        "the fake gh must not run in the sandbox"
+    );
+
+    let unsafe_gh = exec_script(
+        &harness,
+        &session,
+        "unsafe",
+        &bin,
+        work.path(),
+        "gh --version",
+    )
+    .await;
+    let ran = String::from_utf8_lossy(&unsafe_gh.stdout);
+    assert!(
+        unsafe_gh.status.success() && ran.contains("gh-ran"),
+        "an approved unsafe command runs gh: {} {}",
+        String::from_utf8_lossy(&unsafe_gh.stdout),
+        String::from_utf8_lossy(&unsafe_gh.stderr)
+    );
+    assert!(gh_marker.exists(), "the approved unsafe gh ran the fake gh");
+}
+
 #[tokio::test]
 #[serial]
 async fn exec_large_output_is_previewed_and_saved_to_outputs_file() {
