@@ -4814,6 +4814,76 @@ async fn oneshot_run_starts_the_daemon_and_streams_its_turn() {
     );
 }
 
+/// A turn that streams far more deltas than the client reads at once, and
+/// ends right after them, reaches a one-shot run whole: the run prints every
+/// delta through the turn's end however far its event stream falls behind.
+#[tokio::test]
+#[serial]
+async fn oneshot_run_prints_a_burst_turn_through_its_end() {
+    const DELTAS: usize = 6_000;
+    let chunks = (0..DELTAS)
+        .map(|index| format!("d{index} "))
+        .collect::<Vec<_>>();
+    let expected = chunks.concat();
+    let mock = MockOpenAiServer::spawn(MockChatScenario::SlowTextEveryTurn {
+        chunks,
+        delay: Duration::ZERO,
+    })
+    .await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    prepare_oneshot_home(&harness).await;
+
+    let binary = may_binary_path();
+    let output = Command::new(&binary)
+        .arg("stream a long reply")
+        .env("HOME", harness.home_path())
+        .envs(hermetic_git_env(harness.home_path()))
+        .env("HEEL_BIN", heel_bin())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("may one-shot should spawn")
+        .wait_with_output()
+        .await
+        .expect("may one-shot should run");
+    let daemon_log = tokio::fs::read_to_string(harness.home_path().join(".may/logs/daemon.log"))
+        .await
+        .unwrap_or_default();
+    let stop = Command::new(&binary)
+        .args(["daemon", "stop"])
+        .env("HOME", harness.home_path())
+        .envs(hermetic_git_env(harness.home_path()))
+        .output()
+        .await
+        .expect("may daemon stop should run");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "one-shot run failed: {stderr}\ndaemon log:\n{daemon_log}"
+    );
+    assert!(
+        stdout.contains(&expected),
+        "stdout should carry all {DELTAS} deltas in order; it ends with {:?}\ndaemon log:\n{daemon_log}",
+        stdout
+            .char_indices()
+            .rev()
+            .nth(80)
+            .map_or(&*stdout, |(at, _)| &stdout[at..])
+    );
+    assert!(
+        !daemon_log.contains("turn stream lagged"),
+        "no subscriber should lose turn frames:\n{daemon_log}"
+    );
+    assert!(
+        String::from_utf8_lossy(&stop.stderr).contains("Stopped"),
+        "the one-shot run should leave its daemon running: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+}
+
 /// The session's background work, as `GET /api/sessions/{id}/background`
 /// reports it.
 async fn background_of(
