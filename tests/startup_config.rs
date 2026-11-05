@@ -265,16 +265,32 @@ async fn assert_rest_answers(home: &Path, context: &str) {
     }
 }
 
-/// Kills `child` and returns what it wrote to stderr.
+/// Stops `child` through its shutdown path (SIGTERM), so it retires what it
+/// installed for its relocated home, and returns what it wrote to stderr.
+///
+/// # Panics
+/// When it does not exit within [`SHUTDOWN_TIMEOUT`]: it is then killed.
 async fn stop(child: &mut Child) -> String {
-    let _ = child.kill().await;
+    if let Some(pid) = child.id() {
+        let pid = i32::try_from(pid).expect("a pid fits in i32");
+        // SAFETY: signalling a child this test spawned and has not reaped.
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+    }
+    if timeout(SHUTDOWN_TIMEOUT, child.wait()).await.is_err() {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        panic!("`may rest` did not exit within {SHUTDOWN_TIMEOUT:?} of SIGTERM");
+    }
     let mut stderr = String::new();
     if let Some(mut pipe) = child.stderr.take() {
         let _ = timeout(Duration::from_secs(5), pipe.read_to_string(&mut stderr)).await;
     }
-    let _ = child.wait().await;
     stderr
 }
+
+/// The daemon's shutdown drains runs for up to 30 s and settles cancelled
+/// ones for 5 s more.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Runs the TUI on a pseudo-terminal of its own and waits for it to enter the
 /// alternate screen, which it only does after the startup step.

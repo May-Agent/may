@@ -445,7 +445,7 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
         state.search_index_wake.clone(),
         state.search_index_status.clone(),
     ));
-    tokio::spawn(AutoIndexer::new(state.db.clone(), repo_search).run());
+    tokio::spawn(AutoIndexer::new(state.db.clone(), repo_search.clone()).run());
 
     wait_for_shutdown(&state.daemon_shutdown).await;
     tracing::info!("May daemon shutting down");
@@ -470,7 +470,7 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
     while state.runtime_service.runs().live_count() > 0 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    match blocking::unblock(crate::repo_search::retire_relocated_agents).await {
+    match repo_search.retire().await {
         Ok(removed) => {
             for service in removed {
                 tracing::info!(%service, "booted out a repo-search agent of the relocated home");
