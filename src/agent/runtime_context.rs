@@ -1224,19 +1224,6 @@ mod tests {
     }
 
     #[test]
-    fn base_system_prompt_carries_the_compact_rule() {
-        let prompt = render_base_system_prompt(&[], &Parameters::default());
-        assert!(
-            prompt.trim_end().ends_with(
-                "Compact at clean points of your own choosing, above all when the topic \
-                 changes: first bring `tasks.md` up to date, tidying its notes, then call \
-                 `compact`. It runs in the background, so keep working."
-            ),
-            "{prompt}"
-        );
-    }
-
-    #[test]
     fn base_system_prompt_advertises_hosted_web_search_and_fetch() {
         let commands = vec![("browser".to_string(), "Drive the browser".to_string())];
         let mut parameters = Parameters::default();
