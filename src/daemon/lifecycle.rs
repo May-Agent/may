@@ -254,10 +254,25 @@ fn last_error_line(log: &Path) -> String {
     }
 }
 
+/// Whether process `pid` still exists. A daemon this process spawned and
+/// that has exited is reaped first, so it does not linger as a zombie.
+fn process_alive(pid: u32) -> bool {
+    let pid = libc::pid_t::try_from(pid).expect("a pid fits in pid_t");
+    // SAFETY: `waitpid` with WNOHANG and no status pointer only reaps an
+    // exited child of this process (nothing else waits on a spawned daemon
+    // once it answered) and returns at once otherwise.
+    unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+    // SAFETY: signal 0 only checks that the process exists.
+    let signalled = unsafe { libc::kill(pid, 0) };
+    signalled == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
 async fn wait_until_gone(client: &DaemonClient, pid: u32) -> Result<(), LifecycleError> {
     let deadline = Instant::now() + STOP_TIMEOUT;
     while Instant::now() < deadline {
-        if client.health().await.is_err() {
+        // Its socket goes before its shutdown finishes; gone is when the
+        // process has exited, so nothing it still does outlives the stop.
+        if client.health().await.is_err() && !process_alive(pid) {
             return Ok(());
         }
         async_io::Timer::after(Duration::from_millis(200)).await;

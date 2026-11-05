@@ -3,19 +3,22 @@
 use std::collections::BTreeMap;
 
 use crate::cache_lifetime::CacheLifetime;
-use crate::config::{ContextConfig, MayConfig};
+use crate::config::{ContextConfig, HostLoadSettings, MayConfig, TimeConfig};
 use crate::model_selector::ModelSelector;
 
 /// The config values a running agent was built from: each provider's cache
-/// lifetime and the compaction model.
+/// lifetime, the compaction model, the context thresholds, the user's
+/// timezone and the host load thresholds.
 ///
-/// aither fixes both when the agent is built, so a worker whose settings
+/// aither fixes them when the agent is built, so a worker whose settings
 /// differ from the saved config is replaced by one built from it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentLiveSettings {
     cache_lifetimes: BTreeMap<String, CacheLifetime>,
     compaction_model: Option<ModelSelector>,
     context: ContextConfig,
+    time: TimeConfig,
+    host_load: HostLoadSettings,
 }
 
 impl AgentLiveSettings {
@@ -30,6 +33,8 @@ impl AgentLiveSettings {
                 .collect(),
             compaction_model: config.models.compaction_model.clone(),
             context: config.context,
+            time: config.time.clone(),
+            host_load: config.host_load,
         }
     }
 }
@@ -67,5 +72,58 @@ mod tests {
 
         config.models.compaction_model = Some("default::small".parse().expect("selector"));
         assert_ne!(lifetime_changed, AgentLiveSettings::of(&config));
+    }
+
+    #[test]
+    fn a_changed_timezone_or_host_load_threshold_differs() {
+        let mut config = config();
+        let built = AgentLiveSettings::of(&config);
+        config.time.timezone = Some("Asia/Shanghai".parse().expect("an IANA name"));
+        let timezone_changed = AgentLiveSettings::of(&config);
+        assert_ne!(built, timezone_changed);
+
+        config.host_load.load_threshold = 2.0;
+        assert_ne!(timezone_changed, AgentLiveSettings::of(&config));
+        assert_eq!(
+            config.host_load.monitor_config().load_threshold,
+            aither_agent::MachineLoad(2.0)
+        );
+    }
+
+    #[test]
+    fn host_load_and_time_settings_parse_from_toml() {
+        let config: MayConfig = toml::from_str(
+            "[time]\ntimezone = \"America/New_York\"\n\n[host_load]\nmemory_threshold = \"critical\"\nload_threshold = 1.5\nstart_after = \"10s\"\nhigh_load_foreground_wait = \"2m\"\n",
+        )
+        .expect("the settings parse");
+        assert_eq!(config.time.user_timezone().as_str(), "America/New_York");
+        let monitor = config.host_load.monitor_config();
+        assert_eq!(
+            monitor.memory_threshold,
+            aither_agent::MemoryPressure::Critical
+        );
+        assert_eq!(monitor.start_after, Duration::from_secs(10));
+        assert_eq!(monitor.high_load_foreground_wait, Duration::from_mins(2));
+        assert_eq!(
+            monitor.end_after,
+            aither_agent::HostLoadConfig::new().end_after,
+            "an unset duration keeps aither's default"
+        );
+
+        assert!(toml::from_str::<MayConfig>("[time]\ntimezone = \"Mars/Olympus\"\n").is_err());
+    }
+
+    #[test]
+    fn a_changed_warn_distance_differs_and_reaches_the_policy() {
+        let mut config = config();
+        assert_eq!(
+            config.context.policy().warn_distance,
+            aither_agent::ContextPolicy::default().warn_distance,
+            "the default is aither's"
+        );
+        let built = AgentLiveSettings::of(&config);
+        config.context.warn_distance = 12_345;
+        assert_ne!(built, AgentLiveSettings::of(&config));
+        assert_eq!(config.context.policy().warn_distance, 12_345);
     }
 }

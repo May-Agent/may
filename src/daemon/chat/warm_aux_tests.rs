@@ -23,7 +23,16 @@ async fn state_with_idle_agent(
     ran_turn: bool,
 ) -> (Arc<DaemonState>, ManualClock, tempfile::TempDir) {
     let stub = StubModel::spawn(SESSION_MODEL).await;
-    let config = saved_config(&stub, None);
+    state_with_idle_agent_on(dir, ran_turn, &stub).await
+}
+
+/// [`state_with_idle_agent`] against `stub`.
+async fn state_with_idle_agent_on(
+    dir: &std::path::Path,
+    ran_turn: bool,
+    stub: &StubModel,
+) -> (Arc<DaemonState>, ManualClock, tempfile::TempDir) {
+    let config = saved_config(stub, None);
     let state = Arc::new(
         DaemonState::for_test(dir, config.clone())
             .await
@@ -172,4 +181,182 @@ async fn recap_idle_deadline_skips_a_cache_that_went_cold() {
         std::future::ready(())
     };
     assert!(!super::recap::idle_with_warm_cache(&warmth, idle, slept).await);
+}
+
+const RECAP_TEXT: &str = "RECAP-SENTINEL where the work stands";
+const SUGGESTION_TEXT: &str = "SUGGESTION-SENTINEL run the tests";
+const RECAP_PROMPT: &str = "Write a catch-up note for the user";
+const SUGGESTION_PROMPT: &str = "Predict the user's next message";
+
+/// Answers the two aux prompts with valid output; any other request gets the
+/// stub's default reply.
+fn aux_replies(body: &str) -> Option<String> {
+    if body.contains(RECAP_PROMPT) {
+        Some(serde_json::json!({"summary": RECAP_TEXT, "next_action": null}).to_string())
+    } else if body.contains(SUGGESTION_PROMPT) {
+        Some(serde_json::json!({"suggestion": SUGGESTION_TEXT}).to_string())
+    } else {
+        None
+    }
+}
+
+async fn wait_until(mut done: impl AsyncFnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !done().await {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the condition held within the bound");
+}
+
+/// A suggestion and a recap generated through the session's parked agent
+/// reach neither its stored model history nor the next request it sends.
+#[tokio::test]
+async fn aux_generations_leave_the_conversation_and_the_next_request_untouched() {
+    let dir = tempfile::tempdir().expect("dir");
+    let stub = StubModel::spawn_replying(SESSION_MODEL, aux_replies).await;
+    let (state, _clock, _session) = state_with_idle_agent_on(dir.path(), true, &stub).await;
+    state
+        .db()
+        .create_session(SESSION, Some("test"), Some("a::gpt-4o"))
+        .await
+        .expect("session");
+    for (role, content) in [
+        (crate::session::MessageRole::User, "Say hello."),
+        (crate::session::MessageRole::Assistant, "Hello there."),
+    ] {
+        state
+            .db()
+            .append_message(
+                SESSION,
+                role,
+                content,
+                None,
+                crate::db::MessageMeta::default(),
+            )
+            .await
+            .expect("append");
+    }
+    let stored_before = state.db().get_messages(SESSION).await.expect("rows").len();
+
+    // The suggestion runs to its commit.
+    super::suggest::maybe_suggest(&state, SESSION);
+    wait_until(async || !state.aux_tasks.is_current(SESSION, 0)).await;
+    assert!(
+        stub.requests
+            .lock()
+            .await
+            .iter()
+            .any(|body| body.contains(SUGGESTION_PROMPT)),
+        "the suggestion asked the session model"
+    );
+
+    // The recap runs to its stored card.
+    super::recap::request_recap(&state, SESSION, super::aux::AuxKind::ManualRecap);
+    wait_until(async || {
+        state.db().get_messages(SESSION).await.expect("rows").len() > stored_before
+    })
+    .await;
+
+    // The only new row is the UI-only recap card.
+    let rows = state.db().get_messages(SESSION).await.expect("rows");
+    let roles: Vec<_> = rows.iter().map(|row| row.role.as_str()).collect();
+    assert_eq!(roles, ["user", "assistant", "recap"]);
+    assert!(
+        rows.iter()
+            .all(|row| !row.content.contains(SUGGESTION_TEXT)),
+        "a suggestion is never stored"
+    );
+
+    // Rebuilding the model history from the database skips the card.
+    let history = crate::session::load_history_from_db(&state.db(), SESSION)
+        .await
+        .expect("history");
+    let replayed = format!("{:?}", history.to_aither_messages().expect("replay"));
+    for leaked in [RECAP_TEXT, SUGGESTION_TEXT, RECAP_PROMPT, SUGGESTION_PROMPT] {
+        assert!(!replayed.contains(leaked), "model history holds {leaked:?}");
+    }
+
+    // The next real request through the same agent carries none of it.
+    let worker = state.parked_agents.get(SESSION).expect("parked agent");
+    let guard = state
+        .runtime_service
+        .runs()
+        .acquire(SESSION)
+        .await
+        .expect("acquire run");
+    let handle = worker.run(
+        "Say hello again.".to_string(),
+        None,
+        Vec::new(),
+        crate::agent::RunLease::of(&guard),
+    );
+    while let Some(event) = handle.recv().await {
+        if matches!(event, crate::agent::TuiEvent::Complete) {
+            break;
+        }
+        assert!(
+            !matches!(event, crate::agent::TuiEvent::Error(_)),
+            "the turn failed: {event:?}"
+        );
+    }
+    let requests = stub.requests.lock().await;
+    let next = requests
+        .iter()
+        .rev()
+        .find(|body| body.contains("Say hello again."))
+        .expect("the next turn reached the model");
+    for leaked in [RECAP_TEXT, SUGGESTION_TEXT, RECAP_PROMPT, SUGGESTION_PROMPT] {
+        assert!(!next.contains(leaked), "the next request holds {leaked:?}");
+    }
+    drop(requests);
+    guard
+        .finish_idle(crate::session::RunOutcome::Completed)
+        .await
+        .expect("release run");
+}
+
+/// A stored recap card is read back from a freshly opened database, as after
+/// a daemon restart, and replays to clients as a recap row.
+#[tokio::test]
+async fn a_recap_card_survives_reopening_the_database() {
+    let dir = tempfile::tempdir().expect("dir");
+    let stub = StubModel::spawn_replying(SESSION_MODEL, aux_replies).await;
+    let (state, _clock, _session) = state_with_idle_agent_on(dir.path(), true, &stub).await;
+    state
+        .db()
+        .create_session(SESSION, Some("test"), Some("a::gpt-4o"))
+        .await
+        .expect("session");
+    state
+        .db()
+        .append_message(
+            SESSION,
+            crate::session::MessageRole::User,
+            "Say hello.",
+            None,
+            crate::db::MessageMeta::default(),
+        )
+        .await
+        .expect("append");
+    super::recap::request_recap(&state, SESSION, super::aux::AuxKind::AutoRecap);
+    wait_until(async || state.db().get_messages(SESSION).await.expect("rows").len() == 2).await;
+
+    // A new connection to the same file: nothing is held in memory.
+    let reopened = crate::db::ChatDb::open(&dir.path().join("history.db"))
+        .await
+        .expect("reopen");
+    let history = crate::session::load_history_from_db(&reopened, SESSION)
+        .await
+        .expect("history");
+    let card = history
+        .messages()
+        .iter()
+        .find(|message| message.role == crate::session::MessageRole::Recap)
+        .expect("the recap row is reloaded");
+    let record: crate::daemon::RecapRecord =
+        serde_json::from_str(&card.content).expect("the row parses as a recap record");
+    assert_eq!(record.summary, RECAP_TEXT);
+    assert_eq!(record.turns, 1);
 }

@@ -44,7 +44,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use executor_core::tokio::TokioGlobal;
-use executor_core::{spawn, try_init_global_executor};
+use executor_core::{DefaultExecutor, spawn, try_init_global_executor};
 use ratatui::Terminal;
 use ratatui::backend::Backend;
 use ratatui::backend::CrosstermBackend;
@@ -81,10 +81,7 @@ fn write_bug_snapshot(
     app: &App,
     log_ring: &may_agent::log_ring::LogRingHandle,
 ) -> anyhow::Result<std::path::PathBuf> {
-    let bugs_dir = dirs::home_dir()
-        .context("Failed to determine home directory")?
-        .join(".may")
-        .join("bugs");
+    let bugs_dir = app.session_manager.may_dir().join("bugs");
     let timestamp = jiff::Timestamp::now().to_string();
     let header = BugReportHeader {
         version: env!("CARGO_PKG_VERSION"),
@@ -181,7 +178,7 @@ async fn async_main() -> anyhow::Result<()> {
     let panic_ring = log_ring.clone();
     let previous_hook = panic::take_hook();
     panic::set_hook(Box::new(move |panic_info| {
-        if let Some(bugs_dir) = dirs::home_dir().map(|home| home.join(".may").join("bugs"))
+        if let Ok(bugs_dir) = may_agent::MayConfig::may_dir().map(|dir| dir.join("bugs"))
             && let Err(error) = panic_ring.dump_to(
                 &bugs_dir.join(format!("panic-{}.log", jiff::Timestamp::now().as_second())),
                 &panic_info.to_string(),
@@ -196,7 +193,7 @@ async fn async_main() -> anyhow::Result<()> {
     // same ring to the same directory before the signal's usual outcome.
     // Forensics must not stop startup, so a failed install only warns.
     #[cfg(unix)]
-    if let Some(bugs_dir) = dirs::home_dir().map(|home| home.join(".may").join("bugs"))
+    if let Ok(bugs_dir) = may_agent::MayConfig::may_dir().map(|dir| dir.join("bugs"))
         && let Err(error) = may_agent::crash_signal::install(log_ring.clone(), bugs_dir)
     {
         tracing::warn!("fatal-signal log dump not installed: {error}");
@@ -355,7 +352,7 @@ where
 
     // Connect to all configured MCP servers
     if mcp_manager.has_servers() {
-        let results = mcp_manager.connect_all().await;
+        let results = mcp_manager.connect_all(&DefaultExecutor).await;
         for (name, result) in results {
             match result {
                 Ok(()) => tracing::info!("Connected to MCP server: {}", name),
@@ -1784,6 +1781,7 @@ where
                                         may_agent::agent::assemble_usage_report(
                                             session_id.as_str(),
                                             &[],
+                                            &may_agent::db::SessionIntervals::default(),
                                             Some(created_at.as_millisecond()),
                                             jiff::Timestamp::now().as_millisecond(),
                                         ),
@@ -1817,7 +1815,10 @@ where
                             url: None,
                             env: std::collections::HashMap::new(),
                         };
-                        match mcp_manager.add_server(&name, config).await {
+                        match mcp_manager
+                            .add_server(&DefaultExecutor, &name, config)
+                            .await
+                        {
                             Ok(()) => {
                                 app.set_status(format!("Added MCP server: {name}"));
                                 app.mcp_servers = mcp_manager.server_info();
@@ -1850,7 +1851,7 @@ where
                         }
                     }
                     Some(SendAction::McpReconnect { name }) => {
-                        match mcp_manager.reconnect(&name).await {
+                        match mcp_manager.reconnect(&DefaultExecutor, &name).await {
                             Ok(()) => {
                                 app.set_status(format!("Reconnected to MCP server: {name}"));
                                 app.mcp_servers = mcp_manager.server_info();

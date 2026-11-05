@@ -35,6 +35,20 @@ struct SessionBackground {
     subagents: SubagentHandles,
     /// Job registries of the session's agents, numbered, newest last.
     jobs: Vec<(u64, JobRegistry)>,
+    /// Background wakes being served: received from the idle agent and not
+    /// yet settled by the turn they start.
+    resuming: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// A background wake of a session being served; the session reads as
+/// resuming until this drops.
+#[must_use]
+pub struct ResumePending(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for ResumePending {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 /// Background work of every session the daemon ran.
@@ -76,6 +90,24 @@ impl SessionBackgrounds {
             .or_default()
             .jobs
             .push((id, registry));
+    }
+
+    /// Marks `session_id` as resuming until the guard drops.
+    pub(crate) fn resume_pending(&self, session_id: &str) -> ResumePending {
+        let counter = self
+            .sessions()
+            .entry(session_id.to_string())
+            .or_default()
+            .resuming
+            .clone();
+        counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        ResumePending(counter)
+    }
+
+    fn resuming(&self, session_id: &str) -> bool {
+        self.sessions()
+            .get(session_id)
+            .is_some_and(|session| session.resuming.load(std::sync::atomic::Ordering::Acquire) > 0)
     }
 
     fn registries(&self, session_id: &str) -> Vec<(u64, JobRegistry)> {
@@ -153,6 +185,7 @@ impl SessionBackgrounds {
             session_id: session_id.to_string(),
             jobs: jobs.iter().map(WireJob::from).collect(),
             subagents: subagents.iter().map(WireSubagentRun::from).collect(),
+            resuming: self.resuming(session_id),
         }
     }
 

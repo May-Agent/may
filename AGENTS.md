@@ -100,8 +100,8 @@ May is a terminal-based AI assistant built as an application layer on the **aith
 ### Module Structure
 
 **`src/agent/`** - MayAgent wrapper
-- `may.rs`: Wraps `aither_agent::Agent`: the persona prompt (`templates/system.md`, via `include_str!`), the base system prompt (`templates/base_system.md`), skill and subagent registration, compaction model, permission handling, and session context
-- `runtime_context.rs`: renders the terminal runtime context (`templates/terminal_runtime_context.txt`); `permission.rs`: `PermissionApprover` for `unsafe` mode; `*_tool.rs`: the IPC commands (`ask_user`, `issue`, `pr`, `repo`, `session`, `task`, `notify`, `tunnel`, `browser`, `computer`, `register-skills`)
+- `may.rs`: Wraps `aither_agent::Agent`: skill and subagent registration, compaction model, host load monitor, permission handling, and session context
+- `runtime_context.rs`: renders the session system prompt, one typed template per section under `templates/prompt/` in the order `tag::layout` gives, with memory, `AGENTS.md` and workdirs last as aither external-content blocks; `permission.rs`: `PermissionApprover` for `unsafe` mode; `*_tool.rs`: the IPC commands (`ask_user`, `issue`, `pr`, `repo`, `session`, `task`, `notify`, `tunnel`, `browser`, `computer`, `register-skills`)
 
 **`src/terminal_commands.rs`** - `register_shared_terminal_commands`, which registers every IPC command; `src/terminal_permission_handler.rs` applies the network policy and audit log
 
@@ -175,7 +175,7 @@ During streaming:
 ```
 
 # Terminal-first tool calling
-The native tools are `terminal`, `monitor`, the terminal controls (`terminal_kill`, `terminal_input`, `terminal_read`) and `compact` (by design a native tool; aither 0.14.1 does not provide it yet, May-Agent/may#127). This describes command execution capability and does not imply a specific shell implementation.
+The native tools are `terminal`, `monitor`, the terminal controls (`terminal_kill`, `terminal_input`, `terminal_read`) and `compact` (aither's `TerminalAgentBuilder` registers it and arms the one-shot pre-compaction alert; its description carries the when-to-compact rule, so May's prompt does not repeat it). This describes command execution capability and does not imply a specific shell implementation.
 
 Everything else is exposed as CLI commands through the terminal tool's IPC bridge rather than as additional native tools.
 A tool the model provider executes server-side is the exception: it is passed to the provider natively and, while enabled, replaces the corresponding terminal command. Web search is always that hosted tool (`web_search` / `google_search`); May does not register a `websearch` command or a client-side search engine. High-frequency browser work should use the May-managed `browser` command rather than ad-hoc shell recipes or direct browser installers.

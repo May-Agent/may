@@ -1,6 +1,7 @@
 //! `search`: code search over a git worktree through the repo-search daemon.
 
 use std::borrow::Cow;
+use std::future::Future;
 use std::path::PathBuf;
 
 use aither_core::llm::{Tool, ToolResult};
@@ -14,6 +15,8 @@ use serde::Deserialize;
 
 use super::{RepoSearch, RepoSearchError, worktree_root};
 use crate::db::ChatDb;
+use crate::repo_clone::SessionRepos;
+use crate::workspace::WorkspaceConfig;
 
 /// Default answer budget, matching the repo-search CLI.
 const DEFAULT_BUDGET: u32 = 4000;
@@ -79,25 +82,82 @@ struct IndexedView {
     total: u64,
 }
 
-/// `search` tool: finds code in the session's git worktree.
-#[derive(Debug, Clone)]
-pub struct CodeSearchTool {
-    repo_search: RepoSearch,
-    cwd: PathBuf,
-    db: Option<ChatDb>,
+/// The daemon side of `search`: answers one request. Implemented by the
+/// repo-search daemon and, in tests, by an in-memory double.
+pub trait SearchBackend: Clone + Send + Sync + 'static {
+    /// Runs `request` to its final frame.
+    fn request(
+        &self,
+        request: Request,
+    ) -> impl Future<Output = Result<Final, RepoSearchError>> + Send;
 }
 
-impl CodeSearchTool {
-    /// Searches worktrees through `repo_search`, defaulting to the one
+impl SearchBackend for RepoSearch {
+    async fn request(&self, request: Request) -> Result<Final, RepoSearchError> {
+        Ok(self
+            .client()
+            .await?
+            .request(request)
+            .await?
+            .finish()
+            .await?)
+    }
+}
+
+/// `search` tool: finds code in the session's git worktree, or in the
+/// session's clone of it.
+#[derive(Debug, Clone)]
+pub struct CodeSearchTool<B = RepoSearch> {
+    backend: B,
+    cwd: PathBuf,
+    db: Option<ChatDb>,
+    clones: Option<SessionRepos>,
+    workspace: WorkspaceConfig,
+}
+
+impl<B: SearchBackend> CodeSearchTool<B> {
+    /// Searches worktrees through `backend`, defaulting to the one
     /// containing `cwd`. Every searched worktree is recorded in `db`'s repo
-    /// usage, which keeps it on the daemon's auto-index list.
+    /// usage, which keeps it on the daemon's auto-index list. A worktree the
+    /// session holds a clone of in `clones` is searched through that clone,
+    /// where the agent's edits are; `workspace` holds the trust levels that
+    /// decide which clone that is.
     #[must_use]
-    pub const fn new(repo_search: RepoSearch, cwd: PathBuf, db: Option<ChatDb>) -> Self {
+    pub const fn new(
+        backend: B,
+        cwd: PathBuf,
+        db: Option<ChatDb>,
+        clones: Option<SessionRepos>,
+        workspace: WorkspaceConfig,
+    ) -> Self {
         Self {
-            repo_search,
+            backend,
             cwd,
             db,
+            clones,
+            workspace,
         }
+    }
+
+    /// The directory repo-search is asked about: the session's clone of
+    /// `worktree`, else `worktree` itself.
+    async fn search_root(&self, worktree: PathBuf) -> Result<PathBuf, RepoSearchError> {
+        let Some(clones) = &self.clones else {
+            return Ok(worktree);
+        };
+        let Some(clone) = clones
+            .clone_of_checkout(&worktree, &self.workspace)
+            .await
+            .map_err(|error| RepoSearchError::Io(std::io::Error::other(error)))?
+        else {
+            return Ok(worktree);
+        };
+        worktree_root(&clone).ok_or_else(|| {
+            RepoSearchError::Io(std::io::Error::other(format!(
+                "session clone {} is not a git worktree",
+                clone.display()
+            )))
+        })
     }
 
     async fn run(&self, args: CodeSearchArgs) -> Result<String, RepoSearchError> {
@@ -114,9 +174,9 @@ impl CodeSearchTool {
         {
             tracing::warn!(%error, "failed to record repo usage");
         }
-        let request = request_for(&args, worktree);
-        let client = self.repo_search.client().await?;
-        match client.request(request).await?.finish().await? {
+        let root = self.search_root(worktree).await?;
+        let request = request_for(&args, root);
+        match self.backend.request(request).await? {
             Final::Answer(answer) => Ok(answer.output),
             Final::Status(report) => {
                 let model = match &report.model {
@@ -174,7 +234,7 @@ fn request_for(args: &CodeSearchArgs, worktree: PathBuf) -> Request {
     }
 }
 
-impl Tool for CodeSearchTool {
+impl<B: SearchBackend> Tool for CodeSearchTool<B> {
     fn name(&self) -> Cow<'static, str> {
         Cow::Borrowed("search")
     }
@@ -243,6 +303,178 @@ mod tests {
             text,
             "Code search is unavailable: connection refused\nThis is an internal May error. Report a bug."
         );
+    }
+
+    use std::fmt::Write as _;
+    use std::path::Path;
+    use std::process::Command;
+    use std::sync::{Arc, Mutex};
+
+    use repo_search_client::protocol::{Answer, Final, QueryStats};
+
+    use super::{CodeSearchTool, RepoSearchError, SearchBackend};
+    use crate::db::ChatDb;
+    use crate::repo_clone::SessionRepos;
+
+    /// A daemon double: records each request's root, answers with the
+    /// matching lines of `lib.rs` under that root, and adds the daemon's
+    /// in-progress freshness line while `reconciling`.
+    #[derive(Debug, Clone, Default)]
+    struct Daemon {
+        roots: Arc<Mutex<Vec<PathBuf>>>,
+        reconciling: bool,
+    }
+
+    #[allow(clippy::unused_async_trait_impl)]
+    impl SearchBackend for Daemon {
+        async fn request(&self, request: Request) -> Result<Final, RepoSearchError> {
+            let Request::Search(search) = request else {
+                panic!("expected a search request");
+            };
+            self.roots.lock().unwrap().push(search.worktree.clone());
+            let source = std::fs::read_to_string(search.worktree.join("lib.rs")).unwrap();
+            let mut output = String::new();
+            for line in source.lines().filter(|line| line.contains(&search.query)) {
+                writeln!(
+                    output,
+                    "{}: {line}",
+                    search.worktree.join("lib.rs").display()
+                )
+                .unwrap();
+            }
+            output.push_str(if self.reconciling {
+                "-- fresh @ abc123 +0 changed files reconciled; vectors 100%; indexing in progress — files changed since they were indexed are left out\n"
+            } else {
+                "-- fresh @ abc123 +0 changed files reconciled; vectors 100%\n"
+            });
+            Ok(Final::Answer(Answer {
+                output,
+                has_results: true,
+                stats: QueryStats {
+                    barrier_us: 0,
+                    indexing_wait_us: 0,
+                    indexing_overtaken: 0,
+                    embedded_on_the_spot: 0,
+                    total_us: 0,
+                },
+            }))
+        }
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "user.email=t@t", "-c", "user.name=t"])
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    }
+
+    /// A checkout with one committed file, and a tool whose session holds
+    /// a clone of it (or none).
+    async fn fixture(
+        tmp: &Path,
+        with_clone: bool,
+        daemon: Daemon,
+    ) -> (CodeSearchTool<Daemon>, PathBuf, Option<PathBuf>) {
+        let checkout = tmp.join("checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        git(&checkout, &["init"]);
+        std::fs::write(checkout.join("lib.rs"), "fn original() {}\n").unwrap();
+        git(&checkout, &["add", "."]);
+        git(&checkout, &["commit", "-m", "init"]);
+        let checkout = crate::repo_search::worktree_root(&checkout).unwrap();
+        let db = ChatDb::open(&tmp.join("history.db")).await.unwrap();
+        let repos = SessionRepos::new(&tmp.join("session"), "s1", db.clone());
+        let clone = if with_clone {
+            let key = crate::issue::repository_identity(&checkout).unwrap();
+            Some(
+                repos
+                    .ensure_local_clone(&checkout, &key, &tmp.join("staging"))
+                    .await
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+        let config = crate::trust::config_at(tmp, &checkout, crate::trust::TrustLevel::LocalBranch);
+        let tool = CodeSearchTool::new(daemon, checkout.clone(), Some(db), Some(repos), config);
+        (tool, checkout, clone)
+    }
+
+    #[tokio::test]
+    async fn a_session_with_a_clone_searches_the_clone_and_sees_its_edit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let daemon = Daemon::default();
+        let (tool, _checkout, clone) = fixture(tmp.path(), true, daemon.clone()).await;
+        let clone = crate::repo_search::worktree_root(&clone.unwrap()).unwrap();
+        std::fs::write(
+            clone.join("lib.rs"),
+            "fn original() {}\nfn edited_in_clone() {}\n",
+        )
+        .unwrap();
+
+        let text = tool
+            .run(args(serde_json::json!({"query": "edited_in_clone"})))
+            .await
+            .unwrap();
+
+        assert_eq!(*daemon.roots.lock().unwrap(), std::slice::from_ref(&clone));
+        assert!(text.contains(&format!(
+            "{}: fn edited_in_clone",
+            clone.join("lib.rs").display()
+        )));
+        assert!(!text.contains("indexing in progress"));
+    }
+
+    #[tokio::test]
+    async fn a_search_while_the_clone_is_indexing_says_so() {
+        let tmp = tempfile::tempdir().unwrap();
+        let daemon = Daemon {
+            reconciling: true,
+            ..Daemon::default()
+        };
+        let (tool, _checkout, _clone) = fixture(tmp.path(), true, daemon).await;
+
+        let text = tool
+            .run(args(serde_json::json!({"query": "original"})))
+            .await
+            .unwrap();
+
+        assert!(text.contains("fn original"));
+        assert!(text.ends_with(
+            "-- fresh @ abc123 +0 changed files reconciled; vectors 100%; indexing in progress — files changed since they were indexed are left out\n"
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_search_while_the_clone_is_indexing_passes_the_daemon_line_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        let daemon = Daemon {
+            reconciling: true,
+            ..Daemon::default()
+        };
+        let (tool, _checkout, _clone) = fixture(tmp.path(), true, daemon).await;
+        let text = tool
+            .run(args(serde_json::json!({"query": "original"})))
+            .await
+            .unwrap();
+        assert_eq!(text.matches("indexing in progress").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_session_without_a_clone_searches_the_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let daemon = Daemon::default();
+        let (tool, checkout, _clone) = fixture(tmp.path(), false, daemon.clone()).await;
+
+        tool.run(args(serde_json::json!({"query": "original"})))
+            .await
+            .unwrap();
+
+        assert_eq!(*daemon.roots.lock().unwrap(), [checkout]);
     }
 
     #[test]

@@ -21,8 +21,8 @@ use super::cli::{BrowserCliArgs, BrowserCliCommand};
 /// Top-level errors surfaced by the `may browser` subcommand.
 #[derive(Debug, thiserror::Error)]
 pub enum BrowserCliError {
-    #[error("failed to resolve May home directory")]
-    MissingHomeDirectory,
+    #[error("failed to resolve May home directory: {0}")]
+    MissingHomeDirectory(may_agent::config::ConfigError),
     #[error("failed to load May config: {0}")]
     LoadConfig(may_agent::config::ConfigError),
     #[error("failed to serialize browser output: {0}")]
@@ -121,7 +121,7 @@ fn render_json_stdout<T: serde::Serialize>(value: &T) -> Result<(), BrowserCliEr
 }
 
 pub async fn run_browser(args: BrowserCliArgs) -> Result<i32, BrowserCliError> {
-    let may_dir = MayConfig::may_dir().map_err(|_| BrowserCliError::MissingHomeDirectory)?;
+    let may_dir = MayConfig::may_dir().map_err(BrowserCliError::MissingHomeDirectory)?;
     let config_path = may_dir.join("config.toml");
     let config = MayConfig::load_from(&config_path)
         .await
