@@ -1620,7 +1620,11 @@ mod tests {
         let first = github_branch("s1", &first_sha);
         push_pinned(&clone, &first_sha, &first).await.unwrap();
         git(Some(&clone), &["checkout", "-b", "squash", "main~1"]).unwrap();
-        commit_file(&clone, "one.txt");
+        std::fs::write(clone.join("one.txt"), "one.txt").unwrap();
+        git(Some(&clone), &["add", "."]).unwrap();
+        git(Some(&clone), &["commit", "-m", "one.txt (#1)"]).unwrap();
+        let squash_sha = git(Some(&clone), &["rev-parse", "HEAD"]).unwrap();
+        assert_ne!(squash_sha, first_sha, "a squash merge is a new commit");
         git(Some(&clone), &["push", "upstream", "squash:main"]).unwrap();
         git(Some(&clone), &["checkout", "main"]).unwrap();
 
