@@ -44,6 +44,9 @@ pub enum RepoSearchError {
     /// The daemon connection or request failed.
     #[error("repo-search request failed: {0}")]
     Client(#[from] ClientError),
+    /// The May daemon is shutting down and has retired its repo-search agents.
+    #[error("repo-search is retired: the May daemon is shutting down")]
+    Retired,
 }
 
 impl From<ConnectError> for RepoSearchError {
@@ -65,6 +68,10 @@ struct Prepared {
 struct Inner {
     cache_root: PathBuf,
     prepared: OnceCell<Prepared>,
+    /// `true` once [`RepoSearch::retire`] ran. Every launch holds it shared
+    /// while it may install agents, so a retirement waits for those in flight
+    /// and no launch installs after it.
+    retired: async_lock::RwLock<bool>,
 }
 
 /// Shared handle on the repo-search daemon.
@@ -84,6 +91,7 @@ impl RepoSearch {
             inner: Arc::new(Inner {
                 cache_root: may_dir.join("cache").join("host-programs"),
                 prepared: OnceCell::new(),
+                retired: async_lock::RwLock::new(false),
             }),
         }
     }
@@ -120,13 +128,182 @@ impl RepoSearch {
     ///
     /// # Errors
     /// Fails when the binary cannot be prepared or the daemon stays
-    /// unreachable.
+    /// unreachable, and with [`RepoSearchError::Retired`] after
+    /// [`RepoSearch::retire`].
     pub async fn client(&self) -> Result<Client, RepoSearchError> {
+        let retired = self.inner.retired.read().await;
+        if *retired {
+            return Err(RepoSearchError::Retired);
+        }
         let prepared = self.prepared().await?;
         let mut launcher = PlatformLauncher::user(prepared.program.clone())?;
         let report = launcher.prepare().await;
-        Ok(launcher::connect(&mut launcher, &prepared.hello, report, log_note).await?)
+        let client = launcher::connect(&mut launcher, &prepared.hello, report, log_note).await?;
+        // Held until here: the launch above is what installs agents.
+        drop(retired);
+        Ok(client)
     }
+
+    /// Boots out the launchd agents this process installed for a relocated
+    /// `$HOME` (see [`retire_relocated_agents`]) once every launch in flight
+    /// has finished, and refuses every later one, so none reinstalls them.
+    /// Returns the services it removed.
+    ///
+    /// # Errors
+    /// As [`retire_relocated_agents`].
+    pub async fn retire(&self) -> Result<Vec<String>, RepoSearchError> {
+        // The write lock waits out every launch in flight; once the flag is
+        // set, no later one gets past its check.
+        *self.inner.retired.write().await = true;
+        blocking::unblock(retire_relocated_agents).await
+    }
+}
+
+/// Boots out the repo-search launchd agents the client installed for this
+/// process's relocated `$HOME`, returning the services it removed.
+///
+/// A `$HOME` other than the login directory gets agents of its own, labelled
+/// with a hash of that home, which nothing else unloads once the home is
+/// gone. Under the login directory the labels are the production ones, and
+/// those are never touched.
+///
+/// # Errors
+/// Fails when the home or the launchd state cannot be read, or `launchctl`
+/// refuses a `bootout`.
+#[cfg(target_os = "macos")]
+fn retire_relocated_agents() -> Result<Vec<String>, RepoSearchError> {
+    use repo_search_client::launcher::install::SystemLaunchctl;
+    use repo_search_client::launcher::launchd::{domain, user_labels};
+
+    let labels = user_labels()?;
+    boot_out_relocated(&mut SystemLaunchctl, &domain(), labels)
+}
+
+/// Boots out the loaded agents among `labels` (daemon, server), unless they
+/// are the production labels.
+#[cfg(target_os = "macos")]
+fn boot_out_relocated(
+    launchctl: &mut impl repo_search_client::launcher::install::Launchctl,
+    domain: &str,
+    (daemon, server): (String, String),
+) -> Result<Vec<String>, RepoSearchError> {
+    use repo_search_client::launcher::launchd::{LABEL, SERVER_LABEL};
+
+    if daemon == LABEL && server == SERVER_LABEL {
+        return Ok(Vec::new());
+    }
+    let mut removed = Vec::new();
+    for label in [server, daemon] {
+        let service = format!("{domain}/{label}");
+        if launchctl
+            .service(&service)
+            .map_err(|error| RepoSearchError::Launch(error.to_string()))?
+            .is_some()
+        {
+            launchctl
+                .bootout(&service)
+                .map_err(|error| RepoSearchError::Launch(error.to_string()))?;
+            removed.push(service);
+        }
+    }
+    Ok(removed)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use std::path::Path;
+
+    use repo_search_client::launcher::install::{Launchctl, LaunchctlError, Service};
+    use repo_search_client::launcher::launchd::{LABEL, SERVER_LABEL, labels_for};
+
+    use super::boot_out_relocated;
+
+    /// A launchd holding `loaded` services, recording every `bootout`.
+    struct Fake {
+        loaded: Vec<String>,
+        booted_out: Vec<String>,
+    }
+
+    impl Launchctl for Fake {
+        fn service(&mut self, service: &str) -> Result<Option<Service>, LaunchctlError> {
+            Ok(self
+                .loaded
+                .iter()
+                .any(|loaded| loaded == service)
+                .then_some(Service { pid: None }))
+        }
+
+        fn bootout(&mut self, service: &str) -> Result<(), LaunchctlError> {
+            self.booted_out.push(service.to_owned());
+            self.loaded.retain(|loaded| loaded != service);
+            Ok(())
+        }
+
+        fn bootstrap(&mut self, _: &str, _: &Path) -> Result<(), LaunchctlError> {
+            unreachable!("retiring never bootstraps")
+        }
+    }
+
+    fn fake_with(labels: &[&str]) -> Fake {
+        Fake {
+            loaded: labels
+                .iter()
+                .map(|label| format!("user/501/{label}"))
+                .collect(),
+            booted_out: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_relocated_home_loses_both_its_agents_and_only_those() {
+        let (daemon, server) = labels_for(Path::new("/tmp/home-a"), Path::new("/Users/login"));
+        let other = labels_for(Path::new("/tmp/home-b"), Path::new("/Users/login")).0;
+        let mut launchctl = fake_with(&[&daemon, &server, &other, LABEL, SERVER_LABEL]);
+
+        let removed = boot_out_relocated(&mut launchctl, "user/501", (daemon, server))
+            .expect("boot out should succeed");
+
+        assert_eq!(removed.len(), 2);
+        assert_eq!(launchctl.booted_out, removed);
+        assert!(launchctl.loaded.contains(&format!("user/501/{other}")));
+        assert!(launchctl.loaded.contains(&format!("user/501/{LABEL}")));
+        assert!(
+            launchctl
+                .loaded
+                .contains(&format!("user/501/{SERVER_LABEL}"))
+        );
+    }
+
+    #[test]
+    fn an_agent_that_never_loaded_is_not_booted_out() {
+        let (daemon, server) = labels_for(Path::new("/tmp/home-a"), Path::new("/Users/login"));
+        let mut launchctl = fake_with(&[&daemon]);
+
+        let removed = boot_out_relocated(&mut launchctl, "user/501", (daemon, server))
+            .expect("boot out should succeed");
+
+        assert_eq!(removed.len(), 1);
+        assert_eq!(launchctl.loaded, Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_login_homes_production_agents_are_never_booted_out() {
+        let labels = labels_for(Path::new("/Users/login"), Path::new("/Users/login"));
+        let mut launchctl = fake_with(&[LABEL, SERVER_LABEL]);
+
+        let removed = boot_out_relocated(&mut launchctl, "user/501", labels)
+            .expect("boot out should succeed");
+
+        assert_eq!(removed, Vec::<String>::new());
+        assert_eq!(launchctl.booted_out, Vec::<String>::new());
+    }
+}
+
+/// No launchd agents exist off macOS.
+#[cfg(not(target_os = "macos"))]
+#[allow(clippy::unnecessary_wraps)] // the macOS variant's signature
+const fn retire_relocated_agents() -> Result<Vec<String>, RepoSearchError> {
+    Ok(Vec::new())
 }
 
 async fn log_note(line: &str) {
