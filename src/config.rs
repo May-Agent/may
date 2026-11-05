@@ -773,17 +773,16 @@ pub fn check_acp_agent_name(name: &str) -> Result<(), ConfigError> {
             reason: reason.to_string(),
         })
     };
-    if name.is_empty()
-        || !name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
-        return reject("a name holds only ASCII letters, digits, `-` and `_`");
+    match aither_agent::validate_subagent_name(name) {
+        Err(aither_agent::DefinitionError::Reserved(_)) => {
+            return reject("the name belongs to a built-in subagent type");
+        }
+        Err(_) => return reject("a name holds only ASCII letters, digits, `-` and `_`"),
+        Ok(()) => {}
     }
-    if name == "fork"
-        || aither_agent::builtin_subagents()
-            .iter()
-            .any(|def| def.id == name)
+    if aither_agent::BUNDLED_SUBAGENTS
+        .iter()
+        .any(|bundled| bundled.name == name)
     {
         return reject("the name belongs to a built-in subagent type");
     }
