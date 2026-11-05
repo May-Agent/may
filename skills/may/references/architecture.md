@@ -38,10 +38,10 @@ Paths are relative to the May source checkout. `aither-sandbox` and `aither-agen
 
 ## Repositories, PRs and CI
 
-- `src/repo_clone.rs`: `SessionRepos` (`ensure_local_clone`, `ensure_remote_clone`, `delete_clone`, `delete_all`, unused `child_clone`), `uncommitted_changes` (the dirty-clone check), the `repos/repos.toml` registry.
-- `src/pr.rs`: `PrStore` (`resolve` clone choice and trust gate, `open`, `merge`, `merge_github`, `pull_sync`, `screen_outbound`), `land` (fetch `refs/may/<session>`, `merge-tree` preflight, overlap check, `--no-ff` merge), `gh` wrapper, `screen_with_llm`.
-- `src/agent/pr_tool.rs`: `PrTool` (all subcommands) and `SubagentPrTool` (`list`, `show`); `src/agent/repo_tool.rs`: `repo trust`; `src/trust.rs`: trust levels.
-- `src/terminal_commands.rs`: `PrContext` construction and `configure_role_tools(pr_tool, subagent_pr_tool)`.
+- `src/repo_clone.rs`: `SessionRepos` (`ensure_local_clone`, `ensure_remote_clone` — cloned in host scratch, then moved into `repos/` — `delete_clone`, `delete_all`, unused `child_clone`), `CloneSandbox` (runs scripts on the session terminal's sandbox), `uncommitted_changes` (the dirty-clone check, run in that sandbox), the `repos/repos.toml` registry.
+- `src/pr.rs`: `PrStore` (`resolve` clone choice and trust gate, `open`, `merge`, `merge_github`, `pull_sync`, `screen_outbound`), `check_pinned` (the project check on a throwaway checkout in the session's `tmp/`, in the sandbox), `push_pinned` (pushes from a bare repository in host scratch that fetched the commit), `land` (fetch `refs/may/<session>`, `merge-tree` preflight, overlap check, `--no-ff` merge), `gh` wrapper, `screen_with_llm`.
+- `src/agent/pr_tool.rs`: `PrCommand`, which builds the terminal-bound `PrTool` for each terminal (all subcommands for the main agent, `list` and `show` for a subagent); `src/agent/repo_tool.rs`: `repo trust`; `src/trust.rs`: trust levels.
+- `src/terminal_commands.rs`: `PrContext` construction and `configure_terminal_bound_tool("pr", …)`.
 - `src/workspace.rs`: `ProjectConfig.checks` and `ProjectPr` (`backend`, `screen`, `auto_merge`, `require_review`).
 - `src/db/pr.rs` and `prs` / `pr_events` in `src/db/sql/chat_schema.sql`: PR rows and the event trail.
 - `src/agent/permission.rs`: `for_subagent` and `SUBAGENT_APPROVAL_TIMEOUT` (no parent-approval step). `aither-agent/src/specialized/task.rs`: `worktrees` and `commit_worktrees` grants.
