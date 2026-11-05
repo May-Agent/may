@@ -163,10 +163,7 @@ pub(super) async fn lookup_issues(
         .await
         .map_err(internal_error)?
         .ok_or_else(|| session_not_found_error(&id))?;
-    let cwd = session
-        .cwd
-        .map(std::path::PathBuf::from)
-        .ok_or_else(|| bad_request_error("session has no cwd"))?;
+    let cwd = crate::session::SessionDirectory::of(&session, &state.may_dir).into_path();
     let store = SessionStore::new(MayHomePaths::new(state.may_dir.clone()));
     let sandbox_dir = store.sandbox_dir(&id, session.profile_id.as_deref());
     let workspace_config = crate::session::SessionPaths::new(sandbox_dir).workspace_config();
@@ -529,7 +526,7 @@ pub(super) async fn create_session(
 /// `github:owner/repo` spec binds the GitHub repository itself; an
 /// existing path binds that repository's local identity; anything else
 /// fails.
-fn resolve_repo_binding(spec: Option<&str>) -> Result<Option<String>, String> {
+pub(super) fn resolve_repo_binding(spec: Option<&str>) -> Result<Option<String>, String> {
     let Some(spec) = spec.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(None);
     };

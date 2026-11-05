@@ -253,7 +253,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn connecting_asks_for_the_model_and_mode_then_configures_the_agent() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let state = DaemonState::for_test(dir.path(), dir.path(), MayConfig::default())
+        let state = DaemonState::for_test(dir.path(), MayConfig::default())
             .await
             .expect("daemon state");
 
