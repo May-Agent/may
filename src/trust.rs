@@ -55,6 +55,13 @@ impl TrustLevel {
         }
     }
 
+    /// The session clone is made from the GitHub remote and its PRs open on
+    /// GitHub; every other level keeps its clone local.
+    #[must_use]
+    pub const fn publishes_to_github(self) -> bool {
+        matches!(self, Self::Full | Self::PrsOnly)
+    }
+
     /// Work lands through a session clone and `pr`, not the launch checkout.
     #[must_use]
     pub const fn clones_work(self) -> bool {
@@ -246,6 +253,15 @@ pub fn persist(
         config.remove_workdir(worktree);
     }
     config.save(config_path)
+}
+
+/// A workspace config in which `worktree`'s repository is decided at
+/// `level`, persisted through [`persist`] into `dir`.
+#[cfg(test)]
+pub(crate) fn config_at(dir: &Path, worktree: &Path, level: TrustLevel) -> WorkspaceConfig {
+    let path = dir.join("workspace.toml");
+    persist(&path, worktree, Some(&repo_kind(worktree)), level).expect("persist trust");
+    WorkspaceConfig::load(&path).expect("load trust")
 }
 
 /// The first-contact `ask_user` request for one repository.
