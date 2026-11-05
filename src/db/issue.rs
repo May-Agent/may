@@ -332,39 +332,27 @@ impl ChatDb {
         let Some(project_id) = self.find_issue_project(repo_key).await? else {
             return Ok(Vec::new());
         };
-        let rows = match state {
-            IssueListState::All => {
-                query!(
-                    self.db,
-                    "SELECT * FROM issues WHERE project_id = ? ORDER BY number DESC LIMIT ?",
-                    project_id,
-                    limit
-                )
-                .fetch_all::<Model>()
-                .await?
-            }
-            _ => {
-                query!(
-                    self.db,
-                    "SELECT * FROM issues WHERE project_id = ? AND state = ? ORDER BY number DESC LIMIT ?",
-                    project_id,
-                    state.as_str(),
-                    limit
-                )
-                .fetch_all::<Model>()
-                .await?
-            }
-        };
+        // The label filter runs in the query so `LIMIT` counts matching rows.
+        let wanted: std::collections::BTreeSet<&str> = labels.iter().map(String::as_str).collect();
+        let wanted_json = serde_json::to_string(&wanted)
+            .map_err(|error| storage_error(format!("issue label filter rejected: {error}")))?;
+        let wanted_count = i64::try_from(wanted.len())
+            .map_err(|error| storage_error(format!("issue label filter rejected: {error}")))?;
+        let rows = query!(
+            self.db,
+            "SELECT * FROM issues WHERE project_id = ? AND (? = 'all' OR state = ?) AND (SELECT COUNT(DISTINCT label.name) FROM issue_label_assignments AS assignment INNER JOIN issue_labels AS label ON label.id = assignment.label_id WHERE assignment.issue_id = issues.id AND label.name IN (SELECT value FROM json_each(?))) = ? ORDER BY number DESC LIMIT ?",
+            project_id,
+            state.as_str(),
+            state.as_str(),
+            wanted_json,
+            wanted_count,
+            limit
+        )
+        .fetch_all::<Model>()
+        .await?;
         let mut summaries = Vec::with_capacity(rows.len());
         for row in rows {
             let issue_labels = self.issue_labels(row.id).await?;
-            if !labels.is_empty()
-                && !labels
-                    .iter()
-                    .all(|wanted| issue_labels.iter().any(|label| label == wanted))
-            {
-                continue;
-            }
             summaries.push(IssueSummary {
                 number: row.number,
                 title: row.title,
@@ -394,22 +382,24 @@ impl ChatDb {
         state: Option<IssueState>,
     ) -> Result<IssueDetail, ChatDbError> {
         let project_id = self.ensure_issue_project(repo_key).await?;
-        let row = self.require_issue(project_id, number).await?;
-        let title = title.unwrap_or(row.title.as_str()).to_string();
-        let body = body.unwrap_or(row.body.as_str()).to_string();
-        let state = state.map_or_else(|| row.state.clone(), |s| s.as_str().to_string());
         let now = jiff::Timestamp::now().to_string();
-        query!(
+        // One statement assigning only the fields present in the change, so
+        // concurrent updates of different fields cannot restore stale values.
+        let changed = query!(
             self.db,
-            "UPDATE issues SET title = ?, body = ?, state = ?, updated_at = ? WHERE id = ?",
-            title,
-            body,
-            state,
+            "UPDATE issues SET title = COALESCE(?, title), body = COALESCE(?, body), state = COALESCE(?, state), updated_at = ? WHERE project_id = ? AND number = ?",
+            title.map(str::to_owned),
+            body.map(str::to_owned),
+            state.map(|state| state.as_str().to_owned()),
             now,
-            row.id
+            project_id,
+            number
         )
         .execute()
         .await?;
+        if changed.rows_written == 0 {
+            return Err(row_not_found(format!("issue #{number}")));
+        }
         self.issue_detail(self.require_issue(project_id, number).await?)
             .await
     }
@@ -427,16 +417,27 @@ impl ChatDb {
         let project_id = self.ensure_issue_project(repo_key).await?;
         let row = self.require_issue(project_id, number).await?;
         let now = jiff::Timestamp::now().to_string();
+        let mut tx = self.db.begin().await?;
         query!(
-            self.db,
+            tx,
             "INSERT INTO issue_comments (issue_id, body, created_at) VALUES (?, ?, ?)",
             row.id,
             body,
-            now
+            now.clone()
         )
         .execute()
         .await?;
-        self.issue_detail(row).await
+        query!(
+            tx,
+            "UPDATE issues SET updated_at = ? WHERE id = ?",
+            now,
+            row.id
+        )
+        .execute()
+        .await?;
+        tx.commit().await?;
+        self.issue_detail(self.require_issue(project_id, number).await?)
+            .await
     }
 
     /// Add and/or remove labels on an issue and return the refreshed detail.
@@ -649,6 +650,88 @@ mod tests {
             .await
             .expect("sub-issue remove");
         assert!(detail.sub_issues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn label_filter_applies_before_limit() {
+        let (_dir, db) = test_db().await;
+        db.create_issue(
+            "repo",
+            "old match",
+            "",
+            &["bug".to_string(), "x".to_string()],
+        )
+        .await
+        .expect("create");
+        for n in 0..5 {
+            db.create_issue("repo", &format!("newer {n}"), "", &["x".to_string()])
+                .await
+                .expect("create");
+        }
+        let listed = db
+            .list_issues("repo", IssueListState::All, &["bug".to_string()], 2)
+            .await
+            .expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].number, 1);
+        let both = db
+            .list_issues(
+                "repo",
+                IssueListState::Open,
+                &["bug".to_string(), "x".to_string(), "bug".to_string()],
+                1,
+            )
+            .await
+            .expect("list");
+        assert_eq!(both.len(), 1);
+        assert_eq!(both[0].number, 1);
+    }
+
+    #[tokio::test]
+    async fn updates_of_different_fields_on_stale_reads_both_survive() {
+        let (_dir, db) = test_db().await;
+        db.create_issue("repo", "title", "body", &[])
+            .await
+            .expect("create");
+        // Two writers read the issue before either writes.
+        let stale_a = db.get_issue("repo", 1).await.expect("get").expect("issue");
+        let stale_b = db.get_issue("repo", 1).await.expect("get").expect("issue");
+        assert_eq!(stale_a.state, IssueState::Open);
+        assert_eq!(stale_b.title, "title");
+        db.update_issue("repo", 1, Some("renamed"), None, None)
+            .await
+            .expect("rename");
+        db.update_issue("repo", 1, None, None, Some(IssueState::Closed))
+            .await
+            .expect("close");
+        let detail = db.get_issue("repo", 1).await.expect("get").expect("issue");
+        assert_eq!(detail.title, "renamed");
+        assert_eq!(detail.body, "body");
+        assert_eq!(detail.state, IssueState::Closed);
+    }
+
+    #[tokio::test]
+    async fn comment_bumps_updated_at_for_incremental_index() {
+        let (_dir, db) = test_db().await;
+        let created = db.create_issue("repo", "t", "", &[]).await.expect("create");
+        let since = created.updated_at.clone();
+        assert!(
+            db.issues_updated_since("repo", Some(&since), 10)
+                .await
+                .expect("since")
+                .is_empty()
+        );
+        let detail = db
+            .add_issue_comment("repo", 1, "hello")
+            .await
+            .expect("comment");
+        assert!(detail.updated_at > since);
+        let seen = db
+            .issues_updated_since("repo", Some(&since), 10)
+            .await
+            .expect("since");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].number, 1);
     }
 
     #[tokio::test]

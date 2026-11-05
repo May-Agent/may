@@ -84,6 +84,20 @@ impl PublicListener {
     }
 }
 
+impl PublicListener {
+    /// Stops serving and returns once the listening socket is closed: an
+    /// abort only requests cancellation, and the socket lives until the
+    /// accept task is actually dropped.
+    async fn close(mut self) {
+        self.task.abort();
+        if let Err(error) = (&mut self.task).await
+            && !error.is_cancelled()
+        {
+            tracing::warn!(%error, "the public webhook listener ended with an error");
+        }
+    }
+}
+
 impl Drop for PublicListener {
     fn drop(&mut self) {
         self.task.abort();
@@ -357,9 +371,10 @@ async fn run_remote_access_actor(
                 if let Some(funnel) = &runtime.funnel
                     && let Err(error) = check_funnel(&funnel.spec, &funnel.listener.target()).await
                 {
-                    // Dropping the runtime stops the public listener; the
-                    // next sync sets Funnel up again.
-                    runtime.funnel = None;
+                    // The next sync sets Funnel up again.
+                    if let Some(funnel) = runtime.funnel.take() {
+                        funnel.listener.close().await;
+                    }
                     runtime.status.funnel_url = None;
                     runtime.status.state = RemoteAccessState::Error;
                     runtime.status.last_error = Some(error.clone());
@@ -444,7 +459,10 @@ async fn stop_funnel(runtime: &mut RemoteAccessRuntime) -> Result<(), String> {
         )
         .await;
         match output {
-            Ok(output) => push_log(&mut runtime.status.recent_logs, &output),
+            Ok(output) => {
+                push_log(&mut runtime.status.recent_logs, &output);
+                funnel.listener.close().await;
+            }
             Err(error) => {
                 // Funnel is still on: keep the listener so deliveries work
                 // and the removal is retried.

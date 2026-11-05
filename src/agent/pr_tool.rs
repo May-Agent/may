@@ -13,8 +13,10 @@ use crate::pr::{PrContext, PrError, PrStore};
 /// Subcommands:
 /// - `pr open [--hold] [--issue n] [--title t] [--repo key]` — open the PR;
 ///   without `--hold` it merges as soon as checks pass
-/// - `pr merge <n> [--repo key]` — run checks and merge; also the retry
-///   after a rejection
+/// - `pr merge <n> [--repo key]` — check and land the PR's pinned commit;
+///   also the retry after a rejection
+/// - `pr update <n> [--repo key]` — pin the clone's current HEAD as the
+///   PR's commit (after a rebase or new commits)
 /// - `pr list [--state open|merged|closed|all] [--repo key]`
 /// - `pr show <n> [--repo key]`
 /// - `pr close <n> [--repo key]`
@@ -36,6 +38,14 @@ pub enum PrArgs {
         /// Associate a may issue number.
         #[serde(default)]
         issue: Option<i64>,
+        /// Repo key or clone dir when several clones exist.
+        #[serde(default)]
+        repo: Option<String>,
+    },
+    /// Re-pin own PR `n` to the clone's current HEAD.
+    Update {
+        /// PR number.
+        number: i64,
         /// Repo key or clone dir when several clones exist.
         #[serde(default)]
         repo: Option<String>,
@@ -150,6 +160,7 @@ impl Tool for PrTool {
                     )
                     .await
             }
+            PrArgs::Update { number, repo } => self.store.update(number, repo.as_deref()).await,
             PrArgs::Merge { number, repo } => self.store.merge(number, repo.as_deref()).await,
             PrArgs::List { state, repo } => {
                 self.store.list(repo.as_deref(), state.as_deref()).await

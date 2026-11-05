@@ -5,6 +5,8 @@ pub const SESSION_CONTEXT_SNAPSHOT_DROP: &str = include_str!("session_context_sn
 pub const SESSION_CONTEXT_SNAPSHOT_SCHEMA: &str =
     include_str!("session_context_snapshot_schema.sql");
 
+pub const DROP_LEGACY_PENDING_TABLES: &str = include_str!("drop_legacy_pending_tables.sql");
+pub const SESSION_DELETE: &str = include_str!("session_delete.sql");
 pub const SEARCH_OUTBOX_SCHEMA: &str = include_str!("search_outbox.sql");
 pub const SEARCH_OUTBOX_BACKFILL: &str = include_str!("search_outbox_backfill.sql");
 

@@ -64,14 +64,33 @@ pub async fn load_persisted_context_snapshot(
         .map(parse_persisted_context_snapshot))
 }
 
-async fn persist_checkpoint(
-    db: &ChatDb,
-    fence: &RunFence,
+/// Highest transcript `seq` a checkpoint covers (`-1` when it covers none).
+///
+/// This is the checkpoint's own boundary, not its last item: a compaction whose
+/// handoff keeps no items leaves an empty window that still covers every seq
+/// below its fork point. A checkpoint serialized before aither recorded the
+/// fork point reads it as 0, so the last item still bounds it from below, as
+/// aither's own restore does.
+///
+/// # Panics
+///
+/// Panics when a seq exceeds `i64::MAX`, which the counter cannot reach.
+#[must_use]
+pub fn checkpoint_watermark(context: &aither_agent::ContextCheckpoint) -> i64 {
+    let after_last_item = context
+        .items()
+        .last()
+        .map_or(0, |item| item.seq().saturating_add(1));
+    let covered = context.fork_point().max(after_last_item);
+    i64::try_from(covered).expect("checkpoint seq fits in i64") - 1
+}
+
+fn snapshot_upsert(
     checkpoint: AgentCheckpoint,
-) -> Result<(), crate::db::ChatDbError> {
+) -> Result<crate::db::SessionContextSnapshotUpsert, crate::db::ChatDbError> {
     // The transcript records exactly what the agent committed: every
-    // checkpoint item with its seq. `applied_seq` is the highest committed
-    // seq, so a restore appends only items committed after the checkpoint.
+    // checkpoint item with its seq. `applied_seq` is the checkpoint's own
+    // boundary, so a restore appends only items committed after the checkpoint.
     let transcript_entries = checkpoint
         .context
         .items()
@@ -89,20 +108,21 @@ async fn persist_checkpoint(
             })
         })
         .collect::<Result<Vec<_>, crate::db::ChatDbError>>()?;
-    let applied_seq = checkpoint
-        .context
-        .items()
-        .last()
-        .map_or(0, |item| i64::try_from(item.seq()).unwrap_or(0));
-    db.upsert_session_context_snapshot_as_run(
-        fence,
-        crate::db::SessionContextSnapshotUpsert {
-            checkpoint,
-            applied_seq,
-            transcript_entries,
-        },
-    )
-    .await?;
+    let applied_seq = checkpoint_watermark(&checkpoint.context);
+    Ok(crate::db::SessionContextSnapshotUpsert {
+        checkpoint,
+        applied_seq,
+        transcript_entries,
+    })
+}
+
+async fn persist_checkpoint(
+    db: &ChatDb,
+    fence: &RunFence,
+    checkpoint: AgentCheckpoint,
+) -> Result<(), crate::db::ChatDbError> {
+    db.upsert_session_context_snapshot_as_run(fence, snapshot_upsert(checkpoint)?)
+        .await?;
     Ok(())
 }
 
@@ -137,4 +157,106 @@ pub async fn persist_agent_context_snapshot(
     let checkpoint = agent.export_checkpoint().await?;
     persist_checkpoint(db, fence, checkpoint).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use aither_agent::{
+        AgentCheckpoint, Context, ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot,
+        HandoffDocument,
+    };
+    use aither_core::llm::Message;
+
+    use super::{checkpoint_watermark, snapshot_upsert};
+    use crate::db::{ChatDb, TranscriptEntry};
+
+    fn checkpoint_of(context: &Context) -> AgentCheckpoint {
+        AgentCheckpoint {
+            context: context.checkpoint(),
+            tool_surface_hash: "tool-surface-hash".to_string(),
+            context_window: ContextWindowSnapshot {
+                phase: ContextWindowPhase::Stable,
+                metrics: ContextWindowMetrics {
+                    usage_fraction: 0.5,
+                    context_window: 200_000,
+                    estimated_tokens: 0,
+                    chars_per_token: 4.0,
+                    system_block_count: 1,
+                    recent_message_count: 0,
+                    recent_system_message_count: 0,
+                    has_handoff: true,
+                    has_staged_system_updates: false,
+                    prompt_cache_epoch: 0,
+                },
+                messages: Vec::new(),
+            },
+            has_background_tasks: false,
+        }
+    }
+
+    fn entry(seq: i64, message: &Message) -> TranscriptEntry {
+        TranscriptEntry {
+            seq,
+            message_blob: rmp_serde::to_vec_named(message).expect("message encodes"),
+            committed_at: jiff::Timestamp::now().to_string(),
+        }
+    }
+
+    /// A compaction that keeps no items leaves an empty window; the saved
+    /// watermark is still its fork point, so a restore appends only the
+    /// entries committed after the handoff.
+    #[tokio::test]
+    async fn an_empty_post_compaction_window_keeps_its_watermark() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db");
+        let session_id = "empty-window";
+        let question = Message::user("question");
+        let answer = Message::assistant("answer");
+
+        let mut context = Context::new();
+        let first = context.push(question.clone());
+        let second = context.push(answer.clone());
+        assert_eq!((first, second), (0, 1));
+        let fork_point = context.fork_point();
+        context.apply_handoff(&HandoffDocument::default(), fork_point, 0);
+        assert!(
+            context.checkpoint().items().is_empty(),
+            "the handoff covers every item"
+        );
+
+        let mut upsert = snapshot_upsert(checkpoint_of(&context)).expect("upsert builds");
+        assert_eq!(upsert.applied_seq, 1, "the watermark is the fork boundary");
+        // The transcript keeps every entry the handoff covers.
+        upsert.transcript_entries = vec![entry(0, &question), entry(1, &answer)];
+        db.upsert_session_context_snapshot(session_id, upsert)
+            .await
+            .expect("upsert");
+
+        let stored = db
+            .get_session_context_snapshot(session_id)
+            .await
+            .expect("snapshot")
+            .expect("snapshot exists");
+        assert_eq!(
+            stored.applied_seq,
+            checkpoint_watermark(&stored.checkpoint.context)
+        );
+        assert!(
+            db.transcript_entries_after(session_id, stored.applied_seq)
+                .await
+                .expect("delta")
+                .is_empty(),
+            "restore replays nothing the handoff covers"
+        );
+
+        let next = context.push(Message::user("after the handoff"));
+        assert_eq!(next, 2);
+        assert_eq!(
+            checkpoint_watermark(&context.checkpoint()),
+            2,
+            "the watermark follows later items"
+        );
+    }
 }
