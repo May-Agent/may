@@ -92,6 +92,7 @@ impl ChatDb {
         Self::ensure_session_context_snapshot_table(&db).await?;
         Self::ensure_pending_message_claim_columns(&db).await?;
         Self::ensure_session_run_layout(&db).await?;
+        Self::drop_legacy_pending_tables(&db).await?;
         Self::migrate_legacy_remote_profiles(&db).await?;
         Self::migrate_removed_waiting_terminal_input(&db).await?;
         Self::ensure_search_outbox(&db).await?;
@@ -410,6 +411,17 @@ impl ChatDb {
             )
             .execute()
             .await?;
+        }
+        Ok(())
+    }
+
+    /// Tables an older build created and the current one never reads. Their
+    /// foreign keys onto `sessions` block deleting a session, and their rows
+    /// were never carried into the tables that replaced them
+    /// (`session_pending_message_entries`, `session_pending_ask_user_*_v2`).
+    async fn drop_legacy_pending_tables(db: &SkyDb) -> Result<(), ChatDbError> {
+        for statement in db_sql::statements(db_sql::DROP_LEGACY_PENDING_TABLES) {
+            query!(db, statement).execute().await?;
         }
         Ok(())
     }
