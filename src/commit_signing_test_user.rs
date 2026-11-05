@@ -50,6 +50,8 @@ impl TestUser {
             ("user.name", name),
             ("user.email", EMAIL),
             ("user.signingkey", &key.to_string_lossy()),
+            ("gpg.format", "ssh"),
+            ("commit.gpgsign", "true"),
         ] {
             git(&[
                 "config".as_ref(),
@@ -68,6 +70,28 @@ impl TestUser {
             config,
             signers,
         }
+    }
+
+    /// Sets `setting` in the user's global git configuration.
+    pub fn set(&self, setting: &str, value: &str) {
+        git(&[
+            "config".as_ref(),
+            "--file".as_ref(),
+            self.config.as_os_str(),
+            setting.as_ref(),
+            value.as_ref(),
+        ]);
+    }
+
+    /// Removes `setting` from the user's global git configuration.
+    pub fn unset(&self, setting: &str) {
+        git(&[
+            "config".as_ref(),
+            "--file".as_ref(),
+            self.config.as_os_str(),
+            "--unset".as_ref(),
+            setting.as_ref(),
+        ]);
     }
 
     /// The user's git configuration as the host reads it.

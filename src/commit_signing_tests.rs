@@ -67,8 +67,15 @@ struct Session {
 
 impl Session {
     async fn new() -> Self {
+        Self::configured(|_| {}).await
+    }
+
+    /// A session whose user's git configuration `configure` has changed
+    /// before the sandbox is set up.
+    async fn configured(configure: impl FnOnce(&TestUser)) -> Self {
         let tmp = canonical_tempdir();
         let user = TestUser::new(&tmp.path().join("user"));
+        configure(&user);
         let signing = user.signing(&tmp.path().join("may"), "s1");
         let root = tmp.path().join("session");
         let terminal = TestTerminal::signing(&root, signing.clone()).await;
@@ -298,6 +305,62 @@ async fn a_host_that_cannot_sign_fails_the_commit() {
         s.run("git rev-list --count HEAD").await.unwrap().trim(),
         "1"
     );
+}
+
+/// A user who does not sign gets unsigned commits under their identity, and
+/// `verify_range` requires nothing of them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_user_who_does_not_sign_commits_unsigned_as_themselves() {
+    for unsigned in ["false", "unset"] {
+        let s = Session::configured(|user| {
+            if unsigned == "false" {
+                user.set("commit.gpgsign", "false");
+            } else {
+                user.unset("commit.gpgsign");
+            }
+        })
+        .await;
+        s.run("echo one > one.txt && git add . && git commit -q -m one")
+            .await
+            .unwrap();
+        assert_eq!(
+            s.run("git log -1 '--format=%G?|%an|%ae'")
+                .await
+                .unwrap()
+                .trim(),
+            format!("N|{NAME}|{EMAIL}"),
+            "gpgsign {unsigned}"
+        );
+        let sandbox_config =
+            std::fs::read_to_string(s.tmp.path().join("session/.gitconfig")).unwrap();
+        assert!(!sandbox_config.contains("gpgsign"), "{sandbox_config}");
+        s.signing
+            .verify_range(s.repo.clone(), s.base.clone(), "HEAD".to_string())
+            .await
+            .unwrap();
+    }
+}
+
+/// A user who signs in a format other than ssh cannot commit in the
+/// sandbox, and the failure names the format.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_user_who_signs_with_another_format_fails_the_commit_naming_it() {
+    let s = Session::configured(|user| user.set("gpg.format", "x509")).await;
+    let error = s
+        .run("echo one > one.txt && git add . && git commit -q -m one")
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("x509"), "{error}");
+    assert_eq!(
+        s.run("git rev-list --count HEAD").await.unwrap().trim(),
+        "1"
+    );
+    let error = s
+        .signing
+        .verify_range(s.repo.clone(), s.base.clone(), "HEAD".to_string())
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("x509"), "{error}");
 }
 
 fn commit_buffer(author: &str, committer: &str, extra: &str) -> Vec<u8> {

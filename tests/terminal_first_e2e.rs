@@ -1144,7 +1144,44 @@ struct TestHarness {
     may_dir: PathBuf,
 }
 
+const HOST_USER_NAME: &str = "E2E User";
+const HOST_USER_EMAIL: &str = "e2e.user@example.com";
+
+/// The file standing in for the host user's global git configuration, which
+/// every `may` the suite starts reads instead of the developer's own.
+fn host_gitconfig(home: &Path) -> PathBuf {
+    home.join("host-gitconfig")
+}
+
+/// The environment that gives a `may` process the hermetic host user.
+fn hermetic_git_env(home: &Path) -> [(&'static str, PathBuf); 2] {
+    [
+        ("GIT_CONFIG_GLOBAL", host_gitconfig(home)),
+        ("GIT_CONFIG_SYSTEM", PathBuf::from("/dev/null")),
+    ]
+}
+
 impl TestHarness {
+    /// Makes the host user sign their commits with a fresh ssh key.
+    fn host_user_signs(&self) {
+        let key = self.home.path().join("host-signing-key");
+        let status = std::process::Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-C", "e2e", "-f"])
+            .arg(&key)
+            .status()
+            .expect("ssh-keygen should run");
+        assert!(status.success(), "ssh-keygen should generate the host key");
+        std::fs::write(
+            host_gitconfig(self.home.path()),
+            format!(
+                "[user]\n\tname = {HOST_USER_NAME}\n\temail = {HOST_USER_EMAIL}\n\
+                 \tsigningkey = {}\n[gpg]\n\tformat = ssh\n[commit]\n\tgpgsign = true\n",
+                key.display()
+            ),
+        )
+        .expect("host gitconfig should be written");
+    }
+
     async fn new(config_base_url: &str) -> Self {
         Self::build(config_base_url, None, ContextConfig::default()).await
     }
@@ -1205,6 +1242,13 @@ impl TestHarness {
             .save_to(&may_dir.join("config.toml"))
             .await
             .expect("test config should be written");
+
+        // A typical user: an identity and no commit signing.
+        std::fs::write(
+            host_gitconfig(home.path()),
+            format!("[user]\n\tname = {HOST_USER_NAME}\n\temail = {HOST_USER_EMAIL}\n"),
+        )
+        .expect("host gitconfig should be written");
 
         seed_container_heel(&may_dir).await;
         futures_lite::future::zip(
@@ -1341,6 +1385,7 @@ impl RunningDaemon {
             .arg(port.to_string())
             .current_dir(home)
             .env("HOME", home)
+            .envs(hermetic_git_env(home))
             // Module-level directives outrank May's baked crate-level filter,
             // keeping failed assertions diagnosable from captured logs.
             .env(
@@ -2232,6 +2277,7 @@ async fn exec_uses_session_directory_and_exposes_ipc_command_help() {
         .arg("--")
         .arg("pwd")
         .env("HOME", harness.home_path())
+        .envs(hermetic_git_env(harness.home_path()))
         .env("HEEL_BIN", &heel_bin)
         .output()
         .await
@@ -2260,6 +2306,7 @@ async fn exec_uses_session_directory_and_exposes_ipc_command_help() {
             "for d in tmp data files outputs artifacts; do test -d \"$d\" || exit 10; done; test -e skills; test -e subagents; session --help >/dev/null; ask --help >/dev/null; search --help >/dev/null; webfetch --help >/dev/null; task --help >/dev/null; notify --help >/dev/null; printf ready",
         )
         .env("HOME", harness.home_path())
+        .envs(hermetic_git_env(harness.home_path()))
         .env("HEEL_BIN", &heel_bin)
         .output()
         .await
@@ -2273,6 +2320,85 @@ async fn exec_uses_session_directory_and_exposes_ipc_command_help() {
         String::from_utf8_lossy(&layout_output.stdout).trim(),
         "ready"
     );
+}
+
+/// Makes one commit in a fresh repository of the session's sandbox through
+/// `may exec` and prints the commit object.
+async fn commit_in_sandbox(harness: &TestHarness) -> std::process::Output {
+    let session = harness.create_session().await;
+    Command::new(may_binary_path())
+        .arg("exec")
+        .arg("--session")
+        .arg(&session.id)
+        .arg("--mode")
+        .arg("sandboxed")
+        .arg("--")
+        .arg(
+            "git init -q -b main repo && cd repo && echo x > f && git add f \
+             && git commit -q -m one \
+             && git cat-file commit HEAD",
+        )
+        .env("HOME", harness.home_path())
+        .envs(hermetic_git_env(harness.home_path()))
+        .env("HEEL_BIN", heel_bin())
+        .output()
+        .await
+        .expect("may exec commit should run")
+}
+
+#[tokio::test]
+#[serial]
+async fn a_user_who_does_not_sign_commits_unsigned_as_themselves_in_the_sandbox() {
+    let mock = MockOpenAiServer::spawn(MockChatScenario::SlowText {
+        chunks: vec!["unused".to_string()],
+        delay: Duration::from_millis(10),
+    })
+    .await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+
+    let output = commit_in_sandbox(&harness).await;
+
+    assert!(
+        output.status.success(),
+        "the commit failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let commit = String::from_utf8_lossy(&output.stdout);
+    let who = format!("{HOST_USER_NAME} <{HOST_USER_EMAIL}>");
+    assert!(commit.contains(&format!("author {who} ")), "{commit}");
+    assert!(commit.contains(&format!("committer {who} ")), "{commit}");
+    assert!(!commit.contains("gpgsig"), "an unsigned commit: {commit}");
+}
+
+#[tokio::test]
+#[serial]
+async fn a_user_who_signs_has_sandbox_commits_signed_through_the_harness() {
+    let mock = MockOpenAiServer::spawn(MockChatScenario::SlowText {
+        chunks: vec!["unused".to_string()],
+        delay: Duration::from_millis(10),
+    })
+    .await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    harness.host_user_signs();
+
+    let output = commit_in_sandbox(&harness).await;
+
+    assert!(
+        output.status.success(),
+        "the commit failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let commit = String::from_utf8_lossy(&output.stdout);
+    let who = format!("{HOST_USER_NAME} <{HOST_USER_EMAIL}>");
+    assert!(commit.contains(&format!("author {who} ")), "{commit}");
+    assert!(commit.contains(&format!("committer {who} ")), "{commit}");
+    assert!(
+        commit.contains("gpgsig -----BEGIN SSH SIGNATURE-----"),
+        "a signed commit: {commit}"
+    );
+    let audit = std::fs::read_to_string(harness.may_dir.join("logs/signing/commits.jsonl"))
+        .expect("the signing is in the audit log");
+    assert_eq!(audit.lines().count(), 1, "{audit}");
 }
 
 /// Runs `script` through `may exec` in `mode` on `session`, in a home of its
@@ -2300,6 +2426,7 @@ async fn exec_script(
         .arg(script)
         .current_dir(workdir)
         .env("HOME", harness.home_path())
+        .envs(hermetic_git_env(harness.home_path()))
         .env("PATH", path)
         .env("HEEL_BIN", heel_bin())
         .output()
@@ -2460,6 +2587,7 @@ async fn exec_large_output_is_previewed_and_saved_to_outputs_file() {
         .arg("--")
         .arg("perl -e 'print \"x\" x 60000'")
         .env("HOME", harness.home_path())
+        .envs(hermetic_git_env(harness.home_path()))
         .env("HEEL_BIN", &heel_bin)
         .output()
         .await
@@ -3986,6 +4114,7 @@ async fn exec_applies_local_command_priority() {
                 .arg("--")
                 .arg(&script)
                 .env("HOME", &home)
+                .envs(hermetic_git_env(&home))
                 .env("HEEL_BIN", &heel)
                 .output()
         })
@@ -4477,6 +4606,7 @@ async fn oneshot_run_starts_the_daemon_and_streams_its_turn() {
     let oneshot = Command::new(&binary)
         .arg("say hi")
         .env("HOME", harness.home_path())
+        .envs(hermetic_git_env(harness.home_path()))
         .env("HEEL_BIN", heel_bin())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -4492,6 +4622,7 @@ async fn oneshot_run_starts_the_daemon_and_streams_its_turn() {
     let stop = Command::new(&binary)
         .args(["daemon", "stop"])
         .env("HOME", harness.home_path())
+        .envs(hermetic_git_env(harness.home_path()))
         .output()
         .await
         .expect("may daemon stop should run");
