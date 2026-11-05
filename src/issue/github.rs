@@ -14,7 +14,8 @@ use super::{
 };
 use crate::workspace::GitHubRepository;
 
-const DEFAULT_API_BASE: &str = "https://api.github.com";
+/// Public GitHub REST API base.
+pub const DEFAULT_API_BASE: &str = "https://api.github.com";
 
 /// Provides a GitHub API token for [`GitHubIssueStore`].
 pub trait GitHubTokenSource: Send + Sync + std::fmt::Debug {
