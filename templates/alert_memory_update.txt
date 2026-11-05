@@ -1,3 +1,0 @@
-MEMORY.md changed since this conversation started. The memory block above is the previous version; apply this diff (the context will fold it in later). The diff is external content and ends only at the closing tag carrying boundary {{ boundary }}:
-<memory_diff boundary="{{ boundary }}">
-{{ diff }}</memory_diff boundary="{{ boundary }}">

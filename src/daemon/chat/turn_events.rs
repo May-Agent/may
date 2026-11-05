@@ -1,0 +1,455 @@
+//! What one attempt of a turn does with each event its agent run emits.
+//!
+//! [`aither_agent::Run::drive`] hands every event to [`TurnEvents::handle`]
+//! while the run keeps going, so a handler that waits on something the run
+//! holds (the database, a client) never stalls it. The handler streams the
+//! event to the clients, buffers the turn for persistence and tracks what
+//! the turn did; a [`TurnStop`] ends the run between events.
+
+use std::collections::HashMap;
+use std::ops::ControlFlow;
+use std::sync::Arc;
+use std::time::Instant;
+
+use aither_agent::{AgentEvent, TimedEvent};
+use aither_core::llm::Usage;
+
+use super::request_ledger::RequestLedger;
+use super::turn_persister::TurnPersister;
+use super::{
+    ChatSink, PendingToolStream, SinkToolEvent, check_tasks_update, clear_terminal_runtime_state,
+    closes_reasoning_phase, emit_speed, enforce_issue_ownership, is_takeover_active_for_session,
+    log_first_agent_event, log_first_text_event, log_first_visible_tool_event, mark_run_running,
+    normalize_tool_delta_for_sink, normalize_tool_start_for_sink, project_tool_summary_for_sink,
+    record_request_log, record_tool_interval, segment_emitted_at, set_terminal_runtime_state,
+};
+use crate::daemon::state::DaemonState;
+use crate::daemon::terminal_parsing::update_terminal_snapshot_from_tool_event;
+use crate::daemon::types::{TerminalStateSnapshot, ToolEventRecord};
+use crate::db::ChatDbError;
+use crate::decode_meter::DecodeMeter;
+use crate::session::{SessionId, SessionPaths, SessionRunGuard, TerminalRuntimeState};
+
+/// Why a turn's run stopped before it finished.
+#[derive(Debug)]
+pub(super) enum TurnStop {
+    /// The run was cancelled, or its client went away; the reason is logged.
+    Cancelled(&'static str),
+    /// A browser takeover paused the session.
+    TakeoverPaused,
+    /// The agent reported an error event.
+    Failed(aither_agent::AgentError),
+    /// The turn's state could not be stored.
+    Persist(ChatDbError),
+}
+
+/// What an attempt of a turn knows and has done, as its run's events arrive.
+pub(super) struct TurnEvents<'t, 's, S> {
+    pub(super) state: &'t Arc<DaemonState>,
+    pub(super) guard: &'t SessionRunGuard,
+    pub(super) sink: &'s mut S,
+    pub(super) session_id: &'t SessionId,
+    pub(super) assistant_id: &'t str,
+    pub(super) session_paths: &'t SessionPaths,
+    pub(super) started_at: Instant,
+    /// Whether the request asked the provider for reasoning text, which arms
+    /// the reasoning phase at every tool-result boundary.
+    pub(super) reasoning_display: bool,
+    /// `Some` while a model call is in its reasoning phase: the instant the
+    /// phase began, measured as user-perceived wait.
+    pub(super) reasoning_phase: Option<Instant>,
+    /// The newest request's usage: the context the window holds now.
+    pub(super) usage: Usage,
+    pub(super) ledger: RequestLedger<'t>,
+    pub(super) decode_meter: DecodeMeter,
+    pub(super) last_speed_emit: Option<Instant>,
+    /// The current text segment, flushed on tool calls.
+    pub(super) segment_text: String,
+    /// Emission time of the newest text chunk in `segment_text`.
+    pub(super) segment_at: Option<jiff::Timestamp>,
+    /// Emission time of the newest agent event.
+    pub(super) last_event_at: Option<jiff::Timestamp>,
+    /// The whole assistant text.
+    pub(super) full_text: String,
+    pub(super) reasoning_text: String,
+    pub(super) terminal_snapshot: TerminalStateSnapshot,
+    pub(super) saw_tool_activity: bool,
+    pub(super) tool_arguments_by_id: HashMap<String, String>,
+    pub(super) tool_started_at: HashMap<String, jiff::Timestamp>,
+    pub(super) pending_tool_streams: HashMap<String, PendingToolStream>,
+    pub(super) last_todo_hash: Option<u64>,
+    /// The tasks.md content the issue ownership rule accepted last.
+    pub(super) tasks_accepted: Option<String>,
+    pub(super) turn_persister: TurnPersister,
+    pub(super) first_agent_event_seen: bool,
+    pub(super) first_visible_tool_seen: bool,
+    pub(super) first_text_seen: bool,
+}
+
+/// The handler [`aither_agent::Run::drive`] calls with each event.
+pub(super) async fn step<'a, 't, 's, S: ChatSink>(
+    turn: &'a mut TurnEvents<'t, 's, S>,
+    timed: TimedEvent,
+) -> ControlFlow<TurnStop, &'a mut TurnEvents<'t, 's, S>> {
+    match turn.handle(timed).await {
+        ControlFlow::Continue(()) => ControlFlow::Continue(turn),
+        ControlFlow::Break(stop) => ControlFlow::Break(stop),
+    }
+}
+
+impl<S: ChatSink> TurnEvents<'_, '_, S> {
+    /// Handles one event of the run.
+    pub(super) async fn handle(&mut self, timed: TimedEvent) -> ControlFlow<TurnStop> {
+        let TimedEvent { at, event } = timed;
+        self.last_event_at = Some(at);
+        // The first visible output of a call closes the pending reasoning
+        // phase; its marker goes out before the event.
+        if closes_reasoning_phase(&event)
+            && let Some(started) = self.reasoning_phase.take()
+            && !self
+                .sink
+                .on_reasoning_end(started.elapsed().as_secs_f64())
+                .await
+        {
+            return ControlFlow::Break(TurnStop::Cancelled(
+                "client disconnected during reasoning end",
+            ));
+        }
+        self.sink.on_agent_event(Ok(&event));
+        match self.event(at, event).await {
+            Ok(ControlFlow::Continue(())) => {}
+            Ok(ControlFlow::Break(stop)) => return ControlFlow::Break(stop),
+            Err(error) => return ControlFlow::Break(TurnStop::Persist(error)),
+        }
+        if is_takeover_active_for_session(self.state, self.session_id).await {
+            return ControlFlow::Break(TurnStop::TakeoverPaused);
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// Ends the reasoning phase a run that failed left open, the way the
+    /// failure's own event would have.
+    pub(super) async fn close_reasoning_phase(&mut self) -> ControlFlow<TurnStop> {
+        if let Some(started) = self.reasoning_phase.take()
+            && !self
+                .sink
+                .on_reasoning_end(started.elapsed().as_secs_f64())
+                .await
+        {
+            return ControlFlow::Break(TurnStop::Cancelled(
+                "client disconnected during reasoning end",
+            ));
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn log_first_agent_event(&mut self, kind: &'static str) {
+        log_first_agent_event(
+            &mut self.first_agent_event_seen,
+            &self.started_at,
+            self.session_id.as_str(),
+            self.assistant_id,
+            kind,
+        );
+    }
+
+    fn log_first_visible_tool_event(&mut self, id: &str, name: &str, origin: &'static str) {
+        log_first_visible_tool_event(
+            &mut self.first_visible_tool_seen,
+            &self.started_at,
+            self.session_id.as_str(),
+            self.assistant_id,
+            id,
+            name,
+            origin,
+        );
+    }
+
+    /// Flushes the current text segment into the turn as an assistant
+    /// message of its own.
+    fn flush_segment(&mut self) {
+        if !self.segment_text.trim().is_empty() {
+            self.turn_persister.push_assistant(
+                std::mem::take(&mut self.segment_text),
+                segment_emitted_at(self.segment_at),
+            );
+        }
+    }
+
+    async fn emit_speed(&mut self, stopped: &'static str) -> ControlFlow<TurnStop> {
+        if emit_speed(self.sink, &self.decode_meter, &mut self.last_speed_emit).await {
+            ControlFlow::Continue(())
+        } else {
+            ControlFlow::Break(TurnStop::Cancelled(stopped))
+        }
+    }
+
+    async fn event(
+        &mut self,
+        at: jiff::Timestamp,
+        event: AgentEvent,
+    ) -> Result<ControlFlow<TurnStop>, ChatDbError> {
+        const TOOL_STREAM: &str = "client disconnected during tool stream";
+        match event {
+            AgentEvent::Reasoning(text) => {
+                self.log_first_agent_event("reasoning");
+                self.reasoning_text.push_str(&text);
+                if !self.sink.on_reasoning(&text).await {
+                    return Ok(ControlFlow::Break(TurnStop::Cancelled(
+                        "client disconnected during reasoning stream",
+                    )));
+                }
+                self.decode_meter.note_output(text.len());
+                Ok(self
+                    .emit_speed("client disconnected during reasoning stream")
+                    .await)
+            }
+            AgentEvent::Text(text) => {
+                self.log_first_agent_event("text");
+                log_first_text_event(
+                    &mut self.first_text_seen,
+                    &self.started_at,
+                    self.session_id.as_str(),
+                    self.assistant_id,
+                );
+                self.segment_text.push_str(&text);
+                self.segment_at = Some(at);
+                self.full_text.push_str(&text);
+                if !self.sink.on_text(&text).await {
+                    return Ok(ControlFlow::Break(TurnStop::Cancelled(
+                        "client disconnected during text stream",
+                    )));
+                }
+                self.decode_meter.note_output(text.len());
+                Ok(self
+                    .emit_speed("client disconnected during text stream")
+                    .await)
+            }
+            AgentEvent::Usage(usage) => {
+                self.decode_meter.note_usage(usage.completion_tokens);
+                record_request_log(self.state, self.ledger.completed(&usage, Instant::now())).await;
+                self.usage = usage;
+                Ok(ControlFlow::Continue(()))
+            }
+            AgentEvent::ToolCallDelta {
+                id,
+                name,
+                arguments_fragment,
+            } => {
+                self.log_first_agent_event("tool_delta");
+                tracing::trace!(
+                    target: "may::chat::tool_delta",
+                    id = %id,
+                    name = %name,
+                    fragment = %arguments_fragment,
+                    "incoming ToolCallDelta from aither"
+                );
+                self.decode_meter.note_output(arguments_fragment.len());
+                if let ControlFlow::Break(stop) = self.emit_speed(TOOL_STREAM).await {
+                    return Ok(ControlFlow::Break(stop));
+                }
+                let delivered = match normalize_tool_delta_for_sink(
+                    &mut self.pending_tool_streams,
+                    &id,
+                    &name,
+                    &arguments_fragment,
+                ) {
+                    SinkToolEvent::Start {
+                        id,
+                        name,
+                        arguments,
+                    } => {
+                        self.log_first_visible_tool_event(&id, &name, "synthetic_start_from_delta");
+                        let summary = project_tool_summary_for_sink(
+                            &self.pending_tool_streams,
+                            &id,
+                            &name,
+                            Some(arguments.as_str()),
+                        );
+                        self.sink
+                            .on_tool_start(&id, &name, &arguments, summary)
+                            .await
+                    }
+                    SinkToolEvent::Delta {
+                        id,
+                        name,
+                        arguments_fragment,
+                    } => {
+                        let summary = project_tool_summary_for_sink(
+                            &self.pending_tool_streams,
+                            &id,
+                            &name,
+                            None,
+                        );
+                        self.sink
+                            .on_tool_delta(&id, &name, &arguments_fragment, summary)
+                            .await
+                    }
+                };
+                Ok(if delivered {
+                    ControlFlow::Continue(())
+                } else {
+                    ControlFlow::Break(TurnStop::Cancelled(TOOL_STREAM))
+                })
+            }
+            AgentEvent::ToolCallStart {
+                id,
+                name,
+                arguments,
+            } => {
+                self.log_first_agent_event("tool_start");
+                self.saw_tool_activity = true;
+                // Args that never streamed as deltas still count as decoded
+                // output.
+                let streamed = self
+                    .pending_tool_streams
+                    .get(&id)
+                    .map_or(0, |pending| pending.buffered_arguments.len());
+                self.decode_meter
+                    .note_output(arguments.len().saturating_sub(streamed));
+                self.decode_meter.note_boundary();
+                if matches!(
+                    name.as_str(),
+                    "terminal" | "terminal_input" | "terminal_kill" | "terminal_read"
+                ) {
+                    mark_run_running(self.state, self.guard.fence()).await?;
+                }
+                // Buffer accumulated text segment before the tool call.
+                self.flush_segment();
+
+                let record = ToolEventRecord::Start {
+                    id: id.clone(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                };
+                let serialized = serde_json::to_string(&record)
+                    .map_err(|e| ChatDbError::Storage(e.to_string()))?;
+                self.turn_persister
+                    .push_tool_event(id.clone(), serialized, at);
+                update_terminal_snapshot_from_tool_event(&mut self.terminal_snapshot, &record);
+                self.tool_arguments_by_id
+                    .insert(id.clone(), arguments.clone());
+                self.tool_started_at.insert(id.clone(), at);
+                if let Some(SinkToolEvent::Start {
+                    id,
+                    name,
+                    arguments,
+                }) = normalize_tool_start_for_sink(
+                    &mut self.pending_tool_streams,
+                    &id,
+                    &name,
+                    &arguments,
+                ) {
+                    self.log_first_visible_tool_event(&id, &name, "canonical_start");
+                    let summary = project_tool_summary_for_sink(
+                        &self.pending_tool_streams,
+                        &id,
+                        &name,
+                        Some(arguments.as_str()),
+                    );
+                    if !self
+                        .sink
+                        .on_tool_start(&id, &name, &arguments, summary)
+                        .await
+                    {
+                        return Ok(ControlFlow::Break(TurnStop::Cancelled(TOOL_STREAM)));
+                    }
+                }
+                Ok(ControlFlow::Continue(()))
+            }
+            AgentEvent::ToolCallEnd { id, name, result } => {
+                self.log_first_agent_event("tool_end");
+                self.saw_tool_activity = true;
+                let record = ToolEventRecord::End {
+                    id: id.clone(),
+                    name: name.clone(),
+                    result: result.clone(),
+                };
+                let serialized = serde_json::to_string(&record)
+                    .map_err(|e| ChatDbError::Storage(e.to_string()))?;
+                self.turn_persister
+                    .push_tool_event(id.clone(), serialized, at);
+                update_terminal_snapshot_from_tool_event(&mut self.terminal_snapshot, &record);
+                if let Some(started) = self.tool_started_at.remove(&id) {
+                    record_tool_interval(self.state, self.session_id.as_str(), started, at).await;
+                }
+                let arguments = self.tool_arguments_by_id.remove(&id);
+                let summary = project_tool_summary_for_sink(
+                    &self.pending_tool_streams,
+                    &id,
+                    &name,
+                    arguments.as_deref(),
+                );
+                self.pending_tool_streams.remove(&id);
+                if !self
+                    .sink
+                    .on_tool_end(&id, &name, arguments.as_deref(), &result, summary)
+                    .await
+                {
+                    return Ok(ControlFlow::Break(TurnStop::Cancelled(TOOL_STREAM)));
+                }
+
+                // A tasks.md change that takes an issue another agent owns is
+                // reverted before anyone reads it.
+                enforce_issue_ownership(self.state, self.session_id, &mut self.tasks_accepted)
+                    .await;
+                // Check if tasks.md changed after tool execution.
+                if let Some(checklist) =
+                    check_tasks_update(self.session_paths, &mut self.last_todo_hash).await
+                    && !self.sink.on_todo_update(&checklist).await
+                {
+                    return Ok(ControlFlow::Break(TurnStop::Cancelled(
+                        "client disconnected during todo update",
+                    )));
+                }
+                // A tool result is the boundary after which the next call may
+                // reason again.
+                self.reasoning_phase = self.reasoning_display.then(Instant::now);
+                Ok(ControlFlow::Continue(()))
+            }
+            AgentEvent::BackgroundTaskStarted {
+                task_id,
+                output_preview,
+                output_file,
+            } => {
+                self.saw_tool_activity = true;
+                set_terminal_runtime_state(
+                    self.state,
+                    self.session_id.as_str(),
+                    TerminalRuntimeState {
+                        task_id: Some(task_id),
+                        output_file: Some(output_file),
+                        output_preview: Some(output_preview),
+                        input_notice: None,
+                    },
+                )
+                .await?;
+                Ok(ControlFlow::Continue(()))
+            }
+            // Delivered tool output / a resumed run arms the next call's
+            // reasoning phase.
+            AgentEvent::BuiltInToolResult { .. } | AgentEvent::RunResumed { .. } => {
+                self.reasoning_phase = self.reasoning_display.then(Instant::now);
+                Ok(ControlFlow::Continue(()))
+            }
+            // A reply without tool calls that the run follows with another
+            // reply is stored as a message of its own.
+            AgentEvent::TurnComplete {
+                has_tool_calls: false,
+                ..
+            } => {
+                self.flush_segment();
+                Ok(ControlFlow::Continue(()))
+            }
+            AgentEvent::BackgroundTaskCompleted { .. } => {
+                self.saw_tool_activity = true;
+                self.reasoning_phase = self.reasoning_display.then(Instant::now);
+                clear_terminal_runtime_state(self.state, self.session_id.as_str()).await?;
+                mark_run_running(self.state, self.guard.fence()).await?;
+                Ok(ControlFlow::Continue(()))
+            }
+            AgentEvent::Error(error) => Ok(ControlFlow::Break(TurnStop::Failed(error))),
+            _ => Ok(ControlFlow::Continue(())),
+        }
+    }
+}

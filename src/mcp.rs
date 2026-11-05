@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use aither_mcp::{McpConnection, McpError, McpServerConfig};
 use async_fs;
+use executor_core::Executor;
 use serde::{Deserialize, Serialize};
 
 /// MCP configuration error.
@@ -424,15 +425,21 @@ impl McpManager {
         self.config.save().await
     }
 
-    /// Connect to all configured MCP servers.
-    pub async fn connect_all(&mut self) -> Vec<(String, Result<(), McpError>)> {
+    /// Connect to all configured MCP servers; each connection's receive loop
+    /// runs on `executor`.
+    pub async fn connect_all(
+        &mut self,
+        executor: &impl Executor,
+    ) -> Vec<(String, Result<(), McpError>)> {
         // Collect names first to avoid borrow conflict
         let names: Vec<String> = self.config.mcp_servers.keys().cloned().collect();
         let mut results = Vec::new();
 
         for name in names {
             if let Some(server_config) = self.config.mcp_servers.get(&name).cloned() {
-                let result = self.connect_server_internal(&name, &server_config).await;
+                let result = self
+                    .connect_server_internal(executor, &name, &server_config)
+                    .await;
                 results.push((name, result));
             }
         }
@@ -443,6 +450,7 @@ impl McpManager {
     /// Connect to a specific MCP server (internal implementation).
     async fn connect_server_internal(
         &mut self,
+        executor: &impl Executor,
         name: &str,
         config: &MayMcpServerConfig,
     ) -> Result<(), McpError> {
@@ -462,7 +470,7 @@ impl McpManager {
         let mcp_config: McpServerConfig = config.into();
 
         // Attempt connection
-        match McpConnection::from_config(&mcp_config).await {
+        match McpConnection::from_config(executor, &mcp_config).await {
             Ok(conn) => {
                 tracing::info!("Connected to MCP server: {name}");
                 self.connections.insert(
@@ -484,9 +492,13 @@ impl McpManager {
     ///
     /// # Errors
     /// Returns [`McpError`] when the server is unknown or reconnecting fails.
-    pub async fn reconnect(&mut self, name: &str) -> Result<(), McpError> {
+    pub async fn reconnect(
+        &mut self,
+        executor: &impl Executor,
+        name: &str,
+    ) -> Result<(), McpError> {
         if let Some(config) = self.config.mcp_servers.get(name).cloned() {
-            self.connect_server_internal(name, &config).await
+            self.connect_server_internal(executor, name, &config).await
         } else {
             Err(McpError::InvalidConfig(format!(
                 "Server '{name}' not found in configuration"
@@ -500,6 +512,7 @@ impl McpManager {
     /// Returns [`McpError`] when the config is invalid, the connection fails, or persistence fails.
     pub async fn add_server(
         &mut self,
+        executor: &impl Executor,
         name: impl Into<String>,
         config: MayMcpServerConfig,
     ) -> Result<(), McpError> {
@@ -516,7 +529,8 @@ impl McpManager {
         self.connections
             .entry(name.clone())
             .or_insert(McpConnectionState::Disconnected);
-        self.connect_server_internal(&name, &config).await?;
+        self.connect_server_internal(executor, &name, &config)
+            .await?;
         Ok(())
     }
 
@@ -540,7 +554,7 @@ impl McpManager {
         if let Some(mut state) = self.connections.remove(name)
             && let Some(conn) = state.connection_mut()
         {
-            let _ = conn.close().await;
+            conn.close().await;
         }
 
         self.config = next_config;
@@ -650,15 +664,17 @@ impl McpManager {
     }
 }
 
-/// Load all configured MCP servers from the given May home and return live connections.
+/// Load all configured MCP servers from the given May home and return live connections,
+/// whose receive loops run on `executor`.
 ///
-/// This is the single runtime path for May's automatic MCP -> terminal-command conversion.
-/// Every connected MCP tool is expected to be exposed through the schema-driven IPC command
-/// registry rather than a bespoke native tool path.
+/// This is the single runtime path for May's automatic MCP -> terminal-command conversion:
+/// each connection is registered as a command set, so the tools it lists, now and after the
+/// server announces a change, are terminal commands.
 ///
 /// # Errors
 /// Returns [`McpConnectionLoadError`] when the config cannot be loaded or a server fails to connect.
 pub async fn load_active_mcp_connections(
+    executor: &impl Executor,
     may_dir: &Path,
 ) -> Result<Vec<McpConnection>, McpConnectionLoadError> {
     let config_path = may_dir.join("mcp.json");
@@ -668,7 +684,7 @@ pub async fn load_active_mcp_connections(
     }
 
     let mut manager = McpManager::new(config);
-    for (server, result) in manager.connect_all().await {
+    for (server, result) in manager.connect_all(executor).await {
         if let Err(source) = result {
             return Err(McpConnectionLoadError::Connect { server, source });
         }

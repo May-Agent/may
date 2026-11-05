@@ -8,6 +8,7 @@ use aither_core::LanguageModel;
 use aither_core::llm::{Tool, model::Parameters, tool::ToolDefinition};
 use aither_sandbox::ToolRegistryBuilder;
 use askama::Template;
+use executor_core::DefaultExecutor;
 
 use crate::agent::ask_user_tool::{AskUserTool, WithdrawAskUserTool};
 use crate::agent::browser_tool::{BrowserBroker, BrowserTool};
@@ -117,11 +118,10 @@ pub struct SharedTerminalCommandConfig<LLM> {
 /// What [`register_shared_terminal_commands`] installed.
 #[derive(Debug, Default)]
 pub struct SharedTerminalCommands {
-    /// `(name, short description)` pairs for every registered command, in
-    /// registration order — rendered into the base-system `<commands>` index.
+    /// `(name, short description)` pairs for every command registered by
+    /// name, in registration order; the command table lists them ahead of the
+    /// MCP connections' commands, which it reads from the connections.
     pub descriptions: Vec<(String, String)>,
-    /// Names of commands backed by MCP connections.
-    pub mcp_command_names: Vec<String>,
     /// Where the main agent publishes its requests for the `subagent` command's
     /// `fork` kind; the main agent's builder must be given it.
     pub fork_source: aither_agent::ForkSource,
@@ -433,21 +433,15 @@ where
         });
     });
 
-    let mut mcp_command_names = Vec::new();
-    for connection in load_active_mcp_connections(&config.may_dir).await? {
-        let definitions = aither_mcp::register_terminal_commands(builder, connection);
-        descriptions.extend(definitions.into_iter().map(|definition| {
-            mcp_command_names.push(definition.name().to_string());
-            (
-                definition.name().to_string(),
-                short_description(definition.description()),
-            )
-        }));
+    // An MCP server's tools are a command set: the registry reads its tool
+    // list at every lookup, so a tool the server adds mid-session runs at
+    // once, and the agent's command table announces it.
+    for connection in load_active_mcp_connections(&DefaultExecutor, &config.may_dir).await? {
+        builder.command_set(connection);
     }
 
     Ok(SharedTerminalCommands {
         descriptions,
-        mcp_command_names,
         fork_source,
     })
 }
