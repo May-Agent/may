@@ -194,6 +194,7 @@ where
                     db,
                 )
             }),
+            config.workspace_config.clone(),
         ),
     );
     let issue_search = config.db.clone().map(|db| {
