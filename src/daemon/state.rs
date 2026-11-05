@@ -1270,7 +1270,7 @@ impl DaemonState {
         Ok(Self {
             acp_host: std::sync::Arc::new(crate::agent::acp_subagent::AcpHosts::new(
                 config.clone(),
-                may_dir,
+                crate::session::MayHomePaths::new(may_dir.to_path_buf()),
                 tokio::runtime::Handle::current(),
             )),
             tokio_handle: tokio::runtime::Handle::current(),

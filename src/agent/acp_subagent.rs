@@ -16,40 +16,54 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use acpsub::{
-    AgentConfig, Config, ConfigSource, Defaults, Host, PermissionPolicy, Services, Session,
-    SessionSpec, TurnEnd, probe_with,
+    AgentConfig, Config, ConfigSource, Defaults, Executor, FileAccess, Host, PermissionHandler,
+    PermissionPolicy, Services, Session, SessionSpec, TurnEnd, probe_with,
 };
 use aither_acp::StopReason;
 use aither_agent::specialized::{ExternalSession, ExternalStart, ExternalSubagent, SubagentTool};
 use aither_core::LanguageModel;
 use arc_swap::ArcSwap;
+use async_lock::{RwLock, RwLockReadGuardArc};
+use futures_util::StreamExt as _;
+use heel::DenyAll;
 use tokio::runtime::Handle;
 
-use super::acp_sandbox::{ApprovalPermissions, SandboxExecutor, SessionSandbox};
+use super::acp_sandbox::{ApprovalPermissions, SandboxExecutor, SessionPolicy, SessionSandbox};
 use crate::config::{AcpAgentConfig, MayConfig};
-
-/// Where May keeps what acpsub stores, under the May home.
-const STORAGE_DIR: &str = "acp";
+use crate::session::MayHomePaths;
 
 /// An acpsub host whose agents and their commands run in a session sandbox
 /// and whose permission requests go to the session's approver.
-pub type SandboxedHost = Host<SandboxExecutor, ApprovalPermissions>;
+pub type SandboxedHost = Host<SandboxExecutor<SessionPolicy>, ApprovalPermissions<SessionPolicy>>;
 
 /// A session of a [`SandboxedHost`].
-pub type SandboxedSession = Session<SandboxExecutor, ApprovalPermissions>;
+pub type SandboxedSession =
+    Session<SandboxExecutor<SessionPolicy>, ApprovalPermissions<SessionPolicy>>;
+
+/// A host for a command under trial, which belongs to no session: its
+/// processes have no network and its permission requests no approver.
+pub type ScratchHost = Host<SandboxExecutor<DenyAll>, ApprovalPermissions<DenyAll>>;
+
+/// Whether a session's host is retired, which happens once, when the session
+/// is deleted. Opening and closing an agent session hold it for reading, so
+/// retiring waits for the ones in flight; after it nothing opens or closes
+/// through the host, which has ended its agent sessions and given up its
+/// storage itself.
+type Lease = Arc<RwLock<bool>>;
 
 /// A session's host and the cell holding the sandbox it starts processes in.
 #[derive(Clone)]
 struct SessionHost {
     host: SandboxedHost,
-    sandbox: Arc<ArcSwap<SessionSandbox>>,
+    sandbox: Arc<ArcSwap<SessionSandbox<SessionPolicy>>>,
+    lease: Lease,
 }
 
 /// The daemon's ACP hosts, one per session: a session's registry of resumable
 /// agent sessions is its own, and so is the sandbox its processes start in.
 pub struct AcpHosts {
     config: Arc<ArcSwap<MayConfig>>,
-    may_dir: PathBuf,
+    layout: MayHomePaths,
     runtime: Handle,
     hosts: std::sync::Mutex<BTreeMap<String, SessionHost>>,
 }
@@ -57,19 +71,23 @@ pub struct AcpHosts {
 impl std::fmt::Debug for AcpHosts {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AcpHosts")
-            .field("may_dir", &self.may_dir)
+            .field("layout", &self.layout)
             .finish_non_exhaustive()
     }
 }
 
 impl AcpHosts {
-    /// Hosts over May's live configuration; storage lives under
-    /// `<may_dir>/acp`.
+    /// Hosts over May's live configuration, storing what acpsub keeps where
+    /// `layout` says.
     #[must_use]
-    pub fn new(config: Arc<ArcSwap<MayConfig>>, may_dir: &Path, runtime: Handle) -> Self {
+    pub const fn new(
+        config: Arc<ArcSwap<MayConfig>>,
+        layout: MayHomePaths,
+        runtime: Handle,
+    ) -> Self {
         Self {
             config,
-            may_dir: may_dir.to_path_buf(),
+            layout,
             runtime,
             hosts: std::sync::Mutex::new(BTreeMap::new()),
         }
@@ -86,13 +104,14 @@ impl AcpHosts {
     pub fn agents(
         &self,
         session_id: &str,
-        sandbox: SessionSandbox,
+        sandbox: SessionSandbox<SessionPolicy>,
     ) -> Result<AcpAgents, acpsub::Error> {
-        let host = self.session_host(session_id, sandbox)?;
+        let session = self.session_host(session_id, sandbox)?;
         Ok(AcpAgents {
-            host,
+            host: session.host,
             runtime: self.runtime.clone(),
             connected: self.config.load().acp_agents.clone(),
+            lease: session.lease,
         })
     }
 
@@ -101,21 +120,17 @@ impl AcpHosts {
     fn session_host(
         &self,
         session_id: &str,
-        sandbox: SessionSandbox,
-    ) -> Result<SandboxedHost, acpsub::Error> {
+        sandbox: SessionSandbox<SessionPolicy>,
+    ) -> Result<SessionHost, acpsub::Error> {
         let mut hosts = self.hosts.lock().expect("the host table is not poisoned");
         if let Some(session) = hosts.get(session_id) {
             session.sandbox.store(Arc::new(sandbox));
-            return Ok(session.host.clone());
+            return Ok(session.clone());
         }
         let cell = Arc::new(ArcSwap::from_pointee(sandbox));
         let source = LiveConfig {
             config: self.config.clone(),
-            storage: self
-                .may_dir
-                .join(STORAGE_DIR)
-                .join("sessions")
-                .join(session_id),
+            storage: self.layout.acp_session_dir(session_id),
         };
         let host = Host::from_config_with(
             source.build(),
@@ -125,15 +140,87 @@ impl AcpHosts {
                 permissions: ApprovalPermissions::new(cell.clone()),
             },
         )?;
-        hosts.insert(
-            session_id.to_string(),
-            SessionHost {
-                host: host.clone(),
-                sandbox: cell,
-            },
-        );
+        let session = SessionHost {
+            host,
+            sandbox: cell,
+            lease: Arc::new(RwLock::new(false)),
+        };
+        hosts.insert(session_id.to_string(), session.clone());
         drop(hosts);
-        Ok(host)
+        Ok(session)
+    }
+
+    /// Retires the host of a deleted session: its agent sessions end, the
+    /// host leaves the table and what acpsub stored for the session is
+    /// removed.
+    ///
+    /// # Errors
+    /// Returns the error of removing the session's storage.
+    ///
+    /// # Panics
+    /// Panics if the host table was poisoned.
+    pub async fn remove_session(&self, session_id: &str) -> std::io::Result<()> {
+        let host = self
+            .hosts
+            .lock()
+            .expect("the host table is not poisoned")
+            .remove(session_id);
+        retire(&self.runtime, host).await;
+        remove_storage(&self.layout.acp_session_dir(session_id)).await
+    }
+
+    /// [`remove_session`](Self::remove_session) for every session at once,
+    /// including the storage of sessions this daemon never hosted.
+    ///
+    /// # Errors
+    /// Returns the error of removing the sessions' storage.
+    ///
+    /// # Panics
+    /// Panics if the host table was poisoned.
+    pub async fn remove_all_sessions(&self) -> std::io::Result<()> {
+        let hosts =
+            std::mem::take(&mut *self.hosts.lock().expect("the host table is not poisoned"));
+        retire(&self.runtime, hosts.into_values()).await;
+        remove_storage(&self.layout.acp_sessions_dir()).await
+    }
+}
+
+/// Retires `hosts`: once the agent sessions opening or closing through each
+/// one are done, it is marked retired and every agent session still live on
+/// it ends.
+async fn retire(runtime: &Handle, hosts: impl IntoIterator<Item = SessionHost>) {
+    // Ending a session kills its process tree and records the end in the
+    // registry; the work is spread like any other the daemon fans out.
+    let bound = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let retiring =
+        futures_util::stream::iter(hosts).for_each_concurrent(bound, |session| async move {
+            // Granted once the opens and closes in flight are done; every
+            // later one sees the flag and leaves the host alone.
+            *session.lease.write_arc().await = true;
+            let state = session.host.state();
+            // Out of the live table first, as acpsub's own close takes a session.
+            let live = std::mem::take(
+                &mut *state
+                    .live
+                    .lock()
+                    .expect("acpsub's live table is not poisoned"),
+            )
+            .into_values();
+            futures_util::stream::iter(live)
+                .for_each_concurrent(bound, |sub| async move {
+                    acpsub::state::end_session(state, &sub).await;
+                })
+                .await;
+        });
+    in_runtime(runtime, retiring).await;
+}
+
+/// Removes `dir` and everything under it; a session that never connected an
+/// agent has none.
+async fn remove_storage(dir: &Path) -> std::io::Result<()> {
+    match async_fs::remove_dir_all(dir).await {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        result => result,
     }
 }
 
@@ -147,6 +234,7 @@ pub struct AcpAgents {
     pub runtime: Handle,
     /// The connections to register, keyed by subagent type name.
     pub connected: BTreeMap<String, AcpAgentConfig>,
+    lease: Lease,
 }
 
 impl AcpAgents {
@@ -165,6 +253,7 @@ impl AcpAgents {
             let backend = AcpSubagent {
                 host: self.host.clone(),
                 runtime: self.runtime.clone(),
+                lease: self.lease.clone(),
                 agent: name.clone(),
                 model: connection.model.clone(),
                 mode: connection.mode.clone(),
@@ -184,8 +273,8 @@ impl AcpAgents {
 pub fn trial_host(
     agents: &BTreeMap<String, AcpAgentConfig>,
     storage: &Path,
-    sandbox: SessionSandbox,
-) -> Result<SandboxedHost, acpsub::Error> {
+    sandbox: SessionSandbox<DenyAll>,
+) -> Result<ScratchHost, acpsub::Error> {
     let source = FixedConfig(acpsub_config(agents, storage));
     let cell = Arc::new(ArcSwap::from_pointee(sandbox));
     Host::from_config_with(
@@ -206,11 +295,18 @@ fn acpsub_config(agents: &BTreeMap<String, AcpAgentConfig>, storage: &Path) -> C
     agents
         .iter()
         .fold(Config::new(defaults), |config, (name, agent)| {
-            let mut launch = AgentConfig::new(&agent.command);
-            launch.args.clone_from(&agent.args);
-            launch.env.clone_from(&agent.env);
-            config.with_agent(name, launch)
+            config.with_agent(name, launch_config(&agent.command, &agent.args, &agent.env))
         })
+}
+
+/// How acpsub starts `command`: in the sandbox, so acpsub serves it no file
+/// access of its own; the agent reads and writes from its sandboxed process.
+fn launch_config(command: &str, args: &[String], env: &BTreeMap<String, String>) -> AgentConfig {
+    let mut launch = AgentConfig::new(command);
+    launch.args = args.to_vec();
+    launch.env.clone_from(env);
+    launch.file_access = FileAccess::Off;
+    launch
 }
 
 /// The host's configuration source: the daemon's live [`MayConfig`], read on
@@ -249,6 +345,12 @@ pub enum AcpError {
         "the ACP agent `{agent}` writes only inside its own working directory, so it cannot be granted other directories to write or commit in"
     )]
     WorktreeGrant {
+        /// The subagent type.
+        agent: String,
+    },
+    /// The session this agent would run for was deleted.
+    #[error("the session was deleted, so the ACP agent `{agent}` cannot start for it")]
+    SessionDeleted {
         /// The subagent type.
         agent: String,
     },
@@ -305,6 +407,7 @@ fn finished(reply: String, end: TurnEnd) -> Result<String, AcpError> {
 pub struct AcpSubagent {
     host: SandboxedHost,
     runtime: Handle,
+    lease: Lease,
     agent: String,
     model: Option<String>,
     mode: Option<String>,
@@ -320,14 +423,23 @@ impl ExternalSubagent for AcpSubagent {
                 agent: self.agent.clone(),
             });
         }
+        // Held while the agent starts, so a retiring host ends it too.
+        let retired = self.lease.read_arc().await;
+        if *retired {
+            return Err(AcpError::SessionDeleted {
+                agent: self.agent.clone(),
+            });
+        }
         let mut spec = SessionSpec::new(&self.agent, start.working_dir);
         spec.model.clone_from(&self.model);
         spec.mode.clone_from(&self.mode);
         spec.permission = Some(PermissionPolicy::Deny);
         let session = in_runtime(&self.runtime, self.host.spawn(spec)).await?;
+        drop(retired);
         Ok(AcpSession {
             session: Some(session),
             runtime: self.runtime.clone(),
+            lease: self.lease.clone(),
         })
     }
 }
@@ -338,6 +450,7 @@ pub struct AcpSession {
     /// `None` once [`ExternalSession::close`] took it.
     session: Option<SandboxedSession>,
     runtime: Handle,
+    lease: Lease,
 }
 
 impl AcpSession {
@@ -370,7 +483,8 @@ impl ExternalSession for AcpSession {
             .session
             .take()
             .expect("a session is open until it is closed, which consumes it");
-        close_session(&self.runtime, session).await;
+        let lease = self.lease.read_arc().await;
+        close_leased(&self.runtime, session, &lease).await;
     }
 
     fn model(&self) -> Option<String> {
@@ -386,16 +500,37 @@ impl Drop for AcpSession {
     /// A session dropped without [`ExternalSession::close`] still ends: its
     /// agent process must not outlive it.
     fn drop(&mut self) {
-        if let Some(session) = self.session.take() {
-            let runtime = self.runtime.clone();
-            self.runtime.spawn(async move {
-                close_session(&runtime, session).await;
-            });
-        }
+        let Some(session) = self.session.take() else {
+            return;
+        };
+        // Taken here, before the close is spawned, so a host retiring from
+        // now on waits for the close. While one retires no read is granted;
+        // it ends this session itself.
+        let Some(lease) = self.lease.try_read_arc() else {
+            return;
+        };
+        let runtime = self.runtime.clone();
+        self.runtime.spawn(async move {
+            close_leased(&runtime, session, &lease).await;
+        });
     }
 }
 
-async fn close_session(runtime: &Handle, session: SandboxedSession) {
+/// Closes `session` unless its host retired, which ended it already.
+async fn close_leased(
+    runtime: &Handle,
+    session: SandboxedSession,
+    retired: &RwLockReadGuardArc<bool>,
+) {
+    if !**retired {
+        close_session(runtime, session).await;
+    }
+}
+
+async fn close_session<E: Executor, P: PermissionHandler>(
+    runtime: &Handle,
+    session: Session<E, P>,
+) {
     if let Err(error) = in_runtime(runtime, session.close()).await {
         tracing::warn!(%error, "closing the ACP agent's session failed");
     }
@@ -457,7 +592,7 @@ pub async fn try_connection(
     let host = trial_host(
         &BTreeMap::from([(name.to_string(), agent.clone())]),
         &scratch.path().join("acp"),
-        SessionSandbox::scratch(&work)?,
+        SessionSandbox::scratch(&work),
     )?;
     let mut spec = SessionSpec::new(name, work);
     spec.model.clone_from(&agent.model);
@@ -503,14 +638,13 @@ pub async fn probe_agent(
     args: &[String],
     limit: std::time::Duration,
 ) -> Result<AgentIdentity, ProbeError> {
-    let mut launch = AgentConfig::new(command);
-    launch.args = args.to_vec();
+    let launch = launch_config(command, args, &BTreeMap::new());
     let scratch = blocking::unblock(tempfile::tempdir)
         .await
         .map_err(ProbeError::Scratch)?;
-    let cell = Arc::new(ArcSwap::from_pointee(
-        SessionSandbox::scratch(scratch.path()).map_err(ProbeError::Scratch)?,
-    ));
+    let cell = Arc::new(ArcSwap::from_pointee(SessionSandbox::scratch(
+        scratch.path(),
+    )));
     let services = Services {
         executor: SandboxExecutor::new(cell.clone(), Arc::default()),
         permissions: ApprovalPermissions::new(cell),
@@ -626,7 +760,7 @@ mod tests {
         readable: Vec<PathBuf>,
         writable: Vec<PathBuf>,
         approver: Option<PermissionApprover>,
-    ) -> SessionSandbox {
+    ) -> SessionSandbox<SessionPolicy> {
         let grants = aither_sandbox::TerminalGrants::new();
         grants.add_readable(fixtures_dir());
         for path in readable {
@@ -657,7 +791,7 @@ mod tests {
         };
         AcpHosts::new(
             Arc::new(ArcSwap::from_pointee(config)),
-            may_dir,
+            MayHomePaths::new(may_dir.to_path_buf()),
             Handle::current(),
         )
     }
@@ -681,7 +815,7 @@ mod tests {
     /// and returns the turn's reply.
     async fn fake_turn(
         may_dir: &Path,
-        sandbox: SessionSandbox,
+        sandbox: SessionSandbox<SessionPolicy>,
         cwd: &Path,
         prompt: &str,
     ) -> String {
@@ -692,7 +826,7 @@ mod tests {
     async fn fake_turn_with(
         connection: AcpAgentConfig,
         may_dir: &Path,
-        sandbox: SessionSandbox,
+        sandbox: SessionSandbox<SessionPolicy>,
         cwd: &Path,
         prompt: &str,
     ) -> String {
@@ -869,6 +1003,212 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_command_argument_naming_a_file_outside_the_grants_grants_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let work = dir.path().join("work");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&work).expect("work dir");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        let secret = outside.join("hosts.yml");
+        std::fs::write(&secret, "oauth_token: hunter2\n").expect("secret file");
+
+        let reply = fake_turn(
+            dir.path(),
+            sandbox(
+                &dir.path().join("session"),
+                Vec::new(),
+                vec![work.clone()],
+                None,
+            ),
+            &work,
+            &format!("RUN cat {}", secret.display()),
+        )
+        .await;
+
+        assert!(
+            !reply.contains("hunter2"),
+            "the command read a file only its argument named: {reply}"
+        );
+        assert!(reply.contains("exit:"), "{reply}");
+        assert!(!reply.contains("exit:0"), "the denied read fails: {reply}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_linked_program_starts_under_its_link_name() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        // `bin/agent` is a link to `prefix/real-agent`, as `cargo` is a link
+        // to `rustup`; neither directory is a session grant.
+        let prefix = dir.path().join("prefix");
+        let bin = dir.path().join("bin");
+        let state = dir.path().join("state");
+        let work = dir.path().join("work");
+        for path in [&prefix, &bin, &state, &work] {
+            std::fs::create_dir_all(path).expect("dir");
+        }
+        let program = prefix.join("real-agent");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\n\
+             echo \"$0\" > \"$STATE_DIR/argv0\" || exit 7\n\
+             echo \"$TMPDIR\" > \"$STATE_DIR/tmpdir\" || exit 7\n\
+             exec python3 \"$1\"\n",
+        )
+        .expect("agent script");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .expect("executable");
+        let link = bin.join("agent");
+        std::os::unix::fs::symlink(&program, &link).expect("link");
+        let connection = AcpAgentConfig {
+            command: link.to_string_lossy().into_owned(),
+            env: BTreeMap::from([(
+                "STATE_DIR".to_string(),
+                state.to_string_lossy().into_owned(),
+            )]),
+            grants: vec![state.clone()],
+            ..fake_connection()
+        };
+
+        let session = dir.path().join("session");
+        let reply = fake_turn_with(
+            connection,
+            dir.path(),
+            sandbox(&session, Vec::new(), Vec::new(), None),
+            &work,
+            "say something",
+        )
+        .await;
+
+        assert!(reply.contains("ab"), "the agent runs: {reply}");
+        assert_eq!(
+            std::fs::read_to_string(state.join("argv0"))
+                .expect("the agent recorded its name")
+                .trim_end(),
+            link.to_string_lossy(),
+            "the agent starts under its link's name"
+        );
+        assert_eq!(
+            Path::new(
+                std::fs::read_to_string(state.join("tmpdir"))
+                    .expect("the agent recorded its TMPDIR")
+                    .trim_end()
+            ),
+            std::fs::canonicalize(&session)
+                .expect("session resolves")
+                .join("tmp"),
+            "temporary files go inside the sandbox"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sandboxed_agent_is_offered_no_client_file_access() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).expect("work dir");
+        let file = work.join("notes.txt");
+        std::fs::write(&file, "readable by the agent itself").expect("file");
+        let session = || {
+            sandbox(
+                &dir.path().join("session"),
+                Vec::new(),
+                vec![work.clone()],
+                None,
+            )
+        };
+
+        let caps = fake_turn(dir.path(), session(), &work, "CAPS").await;
+        assert!(
+            caps.contains("caps:read=false,write=false"),
+            "initialize advertises no fs capability: {caps}"
+        );
+        let read = fake_turn(
+            dir.path(),
+            session(),
+            &work,
+            &format!("READ {}", file.display()),
+        )
+        .await;
+        assert!(
+            read.contains("fserr:Method not found"),
+            "acpsub refuses fs/read_text_file: {read}"
+        );
+        assert!(!read.contains("readable by the agent"), "{read}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deleting_a_session_ends_its_agents_and_removes_their_storage() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).expect("work dir");
+        let hosts = hosts(
+            dir.path(),
+            BTreeMap::from([("fake".to_string(), fake_connection())]),
+        );
+        let acp = hosts
+            .agents(
+                "session",
+                sandbox(
+                    &dir.path().join("session"),
+                    Vec::new(),
+                    vec![work.clone()],
+                    None,
+                ),
+            )
+            .expect("host");
+        let backend = AcpSubagent {
+            host: acp.host.clone(),
+            runtime: acp.runtime.clone(),
+            lease: acp.lease.clone(),
+            agent: "fake".to_string(),
+            model: Some("a".to_string()),
+            mode: Some("default".to_string()),
+        };
+        let start = || ExternalStart {
+            working_dir: &work,
+            worktrees: &[],
+            commit_worktrees: &[],
+        };
+        let open = || async {
+            tokio::time::timeout(
+                Duration::from_secs(60),
+                ExternalSubagent::open(&backend, start()),
+            )
+            .await
+            .expect("the agent starts")
+            .expect("the session opens")
+        };
+        let dropped = open().await;
+        let kept = open().await;
+        let storage = MayHomePaths::new(dir.path().to_path_buf()).acp_session_dir("session");
+        assert!(storage.is_dir(), "acpsub stores the session's agents");
+
+        // The dropped session's close is in flight while the session goes.
+        drop(dropped);
+        tokio::time::timeout(Duration::from_secs(60), hosts.remove_session("session"))
+            .await
+            .expect("the session's agents end")
+            .expect("the storage is removed");
+
+        assert!(!storage.exists(), "the session's ACP storage is gone");
+        assert!(
+            acp.host.state().live.lock().expect("live table").is_empty(),
+            "every agent session of the deleted session ended"
+        );
+        // A session closed after the delete leaves nothing behind, and no new
+        // one starts for the deleted session.
+        ExternalSession::close(kept).await;
+        assert!(!storage.exists(), "a late close recreated the storage");
+        let refused = ExternalSubagent::open(&backend, start())
+            .await
+            .expect_err("nothing starts for a deleted session");
+        assert!(
+            matches!(refused, AcpError::SessionDeleted { .. }),
+            "{refused}"
+        );
+    }
+
     async fn call_text(
         tool: &SubagentTool<NoLlm>,
         args: SubagentArgs,
@@ -943,6 +1283,7 @@ mod tests {
         let backend = AcpSubagent {
             host: acp.host,
             runtime: acp.runtime,
+            lease: acp.lease,
             agent: "fake".to_string(),
             model: None,
             mode: None,

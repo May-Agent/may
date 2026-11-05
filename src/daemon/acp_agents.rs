@@ -229,16 +229,16 @@ mod tests {
 
     use super::*;
 
+    /// The fixture started as a program: the probe and trial sandboxes grant
+    /// only the program they start, never a script its arguments name.
     fn fake_agent(model: Option<&str>, mode: Option<&str>) -> ConnectAcpAgentRequest {
         ConnectAcpAgentRequest {
             name: "fake".to_string(),
-            command: "python3".to_string(),
-            args: vec![
-                Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("tests/fixtures/fake_acp_agent.py")
-                    .to_string_lossy()
-                    .into_owned(),
-            ],
+            command: Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/fake_acp_agent.py")
+                .to_string_lossy()
+                .into_owned(),
+            args: Vec::new(),
             model: model.map(str::to_string),
             mode: mode.map(str::to_string),
         }
