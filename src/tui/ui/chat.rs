@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use aither_agent::ContextWindowPhase;
 use aither_sandbox::TerminalExecutionMode;
+use askama::Template as _;
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
@@ -350,6 +351,15 @@ pub enum ChatElement {
 
 impl ChatElement {}
 
+/// The notice for a compaction that failed and reruns on a cleaned context.
+#[derive(askama::Template)]
+#[template(path = "tui_compaction_recovery.txt", escape = "none")]
+struct CompactionRecoveryNotice<'a> {
+    error: &'a aither_agent::AgentError,
+    alerts_removed: usize,
+    outputs_spilled: usize,
+}
+
 /// The chat stream containing all elements.
 #[derive(Debug, Default)]
 pub struct ChatStream {
@@ -469,6 +479,26 @@ impl ChatStream {
         self.push_element(ChatElement::Notice {
             message: message.to_string(),
         });
+    }
+
+    /// Add the notice for a failed compaction that is cleaned up and rerun.
+    ///
+    /// # Panics
+    /// When the compile-time checked notice template fails to render.
+    pub fn push_compaction_recovery(
+        &mut self,
+        error: &aither_agent::AgentError,
+        alerts_removed: usize,
+        outputs_spilled: usize,
+    ) {
+        let notice = CompactionRecoveryNotice {
+            error,
+            alerts_removed,
+            outputs_spilled,
+        }
+        .render()
+        .expect("compaction recovery template renders");
+        self.push_notice(&notice);
     }
 
     /// Add a catch-up recap card.
@@ -1297,6 +1327,8 @@ pub struct StatusContext<'a> {
     /// Token usage info (`prompt_tokens`, model `context_window`). The status
     /// bar denominator is the auto-compact window derived from the latter.
     pub usage: Option<(u64, Option<u64>)>,
+    /// Compaction thresholds the usage denominator follows.
+    pub context_policy: aither_agent::ContextPolicy,
     /// Queued message count.
     pub queue_count: usize,
     /// Questions the agent asked that wait for an answer.
@@ -1701,14 +1733,25 @@ fn context_report_lines(report: &ContextReport) -> Vec<Line<'static>> {
             value_style,
         ),
         Span::styled(
-            format!(
-                "   reserved above {:.0}%",
-                report.autocompact_trigger * 100.0
-            ),
+            format!("   reserved above {}", format_number(report.compact_tokens)),
             dim,
         ),
     ]));
-    if report.phase != ContextWindowPhase::Stable {
+    lines.push(Line::from(vec![Span::styled(
+        format!(
+            "  compaction starts at {} · pauses at {} · auto-compacts at {}",
+            format_number(report.compact_start_tokens),
+            format_number(report.compact_pause_tokens),
+            format_number(report.compact_tokens),
+        ),
+        dim,
+    )]));
+    if report.phase == ContextWindowPhase::Compacting {
+        lines.push(Line::from(Span::styled(
+            "  compaction in flight",
+            Style::default().fg(Color::Yellow),
+        )));
+    } else if report.phase != ContextWindowPhase::Stable {
         lines.push(Line::from(vec![
             Span::styled("  phase: ", dim),
             Span::styled(
@@ -2753,9 +2796,9 @@ fn render_status_line(lines: &mut Vec<Line<'_>>, ctx: &StatusContext<'_>, width:
     }
 
     // Context usage pinned to the right edge: `4.8K / 120.0K (4%)`.
-    let usage = ctx
-        .usage
-        .map(|(prompt_tokens, context_window)| format_status_usage(prompt_tokens, context_window));
+    let usage = ctx.usage.map(|(prompt_tokens, context_window)| {
+        format_status_usage(prompt_tokens, context_window, &ctx.context_policy)
+    });
 
     // The worktree index: fill bar while incomplete, `index ✓` once full,
     // red `index ✗` when repo-search is down.
@@ -2915,7 +2958,11 @@ impl StatusUsage {
 }
 
 /// Format prompt-token usage against the auto-compact window.
-fn format_status_usage(prompt_tokens: u64, context_window: Option<u64>) -> StatusUsage {
+fn format_status_usage(
+    prompt_tokens: u64,
+    context_window: Option<u64>,
+    policy: &aither_agent::ContextPolicy,
+) -> StatusUsage {
     let used = format_number(usize::try_from(prompt_tokens).unwrap_or(usize::MAX));
     let Some(window) = context_window else {
         return StatusUsage {
@@ -2923,8 +2970,7 @@ fn format_status_usage(prompt_tokens: u64, context_window: Option<u64>) -> Statu
             warn: None,
         };
     };
-    let compact =
-        crate::agent::autocompact_window_tokens(usize::try_from(window).unwrap_or(usize::MAX));
+    let compact = policy.compact_point(u32::try_from(window).unwrap_or(u32::MAX));
     if compact == 0 {
         return StatusUsage {
             usage: used,
@@ -3448,9 +3494,10 @@ mod tests {
     #[test]
     fn status_usage_is_used_over_autocompact_window() {
         let window = 200_000_u64;
-        let compact = crate::agent::autocompact_window_tokens(usize::try_from(window).unwrap());
+        let policy = aither_agent::ContextPolicy::default();
+        let compact = policy.compact_point(u32::try_from(window).unwrap());
         let used = compact / 4;
-        let line = format_status_usage(u64::try_from(used).unwrap(), Some(window));
+        let line = format_status_usage(u64::try_from(used).unwrap(), Some(window), &policy);
         #[allow(clippy::cast_precision_loss)]
         let percent = used as f64 / compact as f64 * 100.0;
         assert_eq!(
@@ -3467,32 +3514,35 @@ mod tests {
     #[test]
     fn status_usage_warns_within_ten_percent_of_autocompact() {
         let window = 200_000_u64;
-        let compact = crate::agent::autocompact_window_tokens(usize::try_from(window).unwrap());
+        let policy = aither_agent::ContextPolicy::default();
+        let compact = policy.compact_point(u32::try_from(window).unwrap());
         let used = compact - compact / 20;
-        let line = format_status_usage(u64::try_from(used).unwrap(), Some(window));
+        let line = format_status_usage(u64::try_from(used).unwrap(), Some(window), &policy);
         assert_eq!(line.warn.as_deref(), Some("5% to auto-compact"));
     }
 
     #[test]
     fn status_usage_omits_warn_at_ten_percent_remaining() {
         let window = 200_000_u64;
-        let compact = crate::agent::autocompact_window_tokens(usize::try_from(window).unwrap());
+        let policy = aither_agent::ContextPolicy::default();
+        let compact = policy.compact_point(u32::try_from(window).unwrap());
         let used = compact - compact / 10;
-        let line = format_status_usage(u64::try_from(used).unwrap(), Some(window));
+        let line = format_status_usage(u64::try_from(used).unwrap(), Some(window), &policy);
         assert!(line.warn.is_none());
     }
 
     #[test]
     fn status_usage_warns_at_zero_headroom() {
         let window = 200_000_u64;
-        let compact = crate::agent::autocompact_window_tokens(usize::try_from(window).unwrap());
-        let line = format_status_usage(u64::try_from(compact).unwrap(), Some(window));
+        let policy = aither_agent::ContextPolicy::default();
+        let compact = policy.compact_point(u32::try_from(window).unwrap());
+        let line = format_status_usage(u64::try_from(compact).unwrap(), Some(window), &policy);
         assert_eq!(line.warn.as_deref(), Some("0% to auto-compact"));
     }
 
     #[test]
     fn status_usage_falls_back_to_used_without_a_window() {
-        let line = format_status_usage(33_400, None);
+        let line = format_status_usage(33_400, None, &aither_agent::ContextPolicy::default());
         assert_eq!(line.usage, "33.4K");
         assert!(line.warn.is_none());
     }
@@ -3881,6 +3931,7 @@ mod tests {
                         status_ctx: Some(StatusContext {
                             model: "model",
                             usage: None,
+                            context_policy: aither_agent::ContextPolicy::default(),
                             queue_count: 0,
                             open_questions: 0,
                             yolo: false,
@@ -4555,6 +4606,22 @@ mod tests {
             .map(String::as_str)
             .collect();
         assert_eq!(full, ["l1", "l2", "l3", "l4", "l5", "l6", "l7", "l8"]);
+    }
+
+    #[test]
+    fn a_compaction_recovery_is_a_notice_with_the_cleanup_counts() {
+        let mut chat = ChatStream::new();
+        chat.push_compaction_recovery(&aither_agent::AgentError::llm_local("no handoff"), 3, 2);
+        let [super::ChatElement::Notice { message }] = chat.elements() else {
+            panic!("one notice expected: {:?}", chat.elements());
+        };
+        assert!(message.contains("Compaction failed"), "{message}");
+        assert!(message.contains("no handoff"), "{message}");
+        assert!(
+            message.contains("3 alerts removed, 2 long outputs moved to files"),
+            "{message}"
+        );
+        assert!(message.ends_with("Compacting again."), "{message}");
     }
 
     #[test]
