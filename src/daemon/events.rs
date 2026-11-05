@@ -549,7 +549,8 @@ async fn coverage_worktree(
 ) -> Option<std::path::PathBuf> {
     if let Some(session_id) = session_id {
         let session = state.db().get_session(session_id).await.ok()??;
-        return crate::repo_search::worktree_root(std::path::Path::new(session.cwd?.as_str()));
+        let directory = crate::session::SessionDirectory::of(&session, &state.may_dir);
+        return crate::repo_search::worktree_root(directory.checkout()?);
     }
     crate::repo_search::worktree_root(std::path::Path::new(cwd?))
 }

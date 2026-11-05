@@ -107,7 +107,6 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
     #[cfg(not(feature = "ui"))]
     mode.ensure_supported()?;
 
-    let cwd = std::env::current_dir().context("Failed to get current working directory")?;
     let may_dir = MayConfig::may_dir().context("Failed to resolve ~/.may")?;
 
     let mcp_manager = McpManager::load()
@@ -299,7 +298,6 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
         task_runtime: task_runtime.clone(),
         tool_distribution,
         tool_environments: crate::agent::ToolEnvironmentCache::spawn(),
-        cwd,
         repo_search: crate::repo_search::RepoSearch::global(&may_dir),
         may_dir,
         search_index_wake_tx,
