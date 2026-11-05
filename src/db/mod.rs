@@ -25,6 +25,7 @@ mod task;
 use std::path::Path;
 
 use skyzen_services::Db as SkyDb;
+use skyzen_services::sql::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 
 use crate::PermissionHistoryMode;
 use sql as db_sql;
@@ -70,6 +71,17 @@ pub struct ChatDb {
 }
 
 impl ChatDb {
+    /// Connect to the history database file, creating it when missing. The
+    /// file is in WAL mode, so [`SkyDb`] serves reads on read-only connections
+    /// while its one writer connection queues writes.
+    pub(super) async fn connect(db_path: &Path) -> Result<SkyDb, ChatDbError> {
+        let options = SqliteConnectOptions::new()
+            .filename(db_path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal);
+        Ok(SkyDb::connect_sqlite_with(options).await?)
+    }
+
     /// Open (or create) the chat history database at the given path.
     ///
     /// Creates the current schema if the tables don't exist.
@@ -79,8 +91,7 @@ impl ChatDb {
     /// Returns [`ChatDbError`] when connecting to the SQLite database or creating
     /// the schema fails.
     pub async fn open(db_path: &Path) -> Result<Self, ChatDbError> {
-        let url = format!("sqlite://{}?mode=rwc", db_path.display());
-        let db = SkyDb::connect_sqlite(&url).await?;
+        let db = Self::connect(db_path).await?;
         Self::initialize_schema(&db).await?;
         Self::ensure_profile_preference_columns(&db).await?;
         Self::ensure_session_columns(&db).await?;
@@ -1782,6 +1793,24 @@ mod tests {
             recovered.output.as_deref(),
             Some("May server restarted before the task run completed")
         );
+    }
+
+    #[tokio::test]
+    async fn open_puts_the_database_in_wal_mode() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db should initialize successfully");
+        let mode = query!(db.db, "PRAGMA journal_mode")
+            .fetch_one::<JournalMode>()
+            .await
+            .expect("journal mode should be readable");
+        assert_eq!(mode.journal_mode, "wal");
+    }
+
+    #[derive(Debug, serde::Deserialize, skyzen::FromRow)]
+    struct JournalMode {
+        journal_mode: String,
     }
 
     /// Concurrent dequeues of distinct sessions' pending messages on one
