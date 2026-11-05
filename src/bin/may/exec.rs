@@ -136,7 +136,7 @@ pub async fn run_exec(args: ExecArgs) -> Result<i32, ExecError> {
 
     let model = select_exec_model(&may_config);
     let shell_mode = select_exec_mode(&args, &environment);
-    let terminal_tool = build_exec_terminal_tool(
+    let terminal_tool = Box::pin(build_exec_terminal_tool(
         &context,
         &environment,
         &may_config,
@@ -144,7 +144,7 @@ pub async fn run_exec(args: ExecArgs) -> Result<i32, ExecError> {
         args.ssh_server_id.as_deref(),
         args.allow_runtime_install,
         tool_distribution,
-    )
+    ))
     .await?;
 
     // `may exec` reports the final result, so the command runs detached
@@ -474,13 +474,13 @@ async fn build_exec_terminal_tool(
         ),
     )
     .await?;
-    let registry = build_exec_registry(
+    let registry = Box::pin(build_exec_registry(
         context,
         may_config,
         resolved_provider.llm,
         &tool_dispatchers,
         environment,
-    )
+    ))
     .await?;
     let terminal_tool = terminal_tool.with_registry(registry);
     Ok(terminal_tool)
@@ -546,6 +546,7 @@ where
             .map_err(ExecError::WorkspaceConfig)?,
             // exec is no main agent: it has no turn boundary to deliver at.
             agent_messaging: None,
+            languages: None,
             acp: None,
         },
     )

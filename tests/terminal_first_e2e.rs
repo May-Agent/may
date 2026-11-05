@@ -20,7 +20,7 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use may_agent::config::CommandPriority;
-use may_agent::config::{ProviderInstance, ProviderType};
+use may_agent::config::{ContextConfig, ProviderInstance, ProviderType};
 use may_agent::db::{CreateProfileParams, ProfileEnvironmentKind};
 use may_agent::model_selector::ModelSelector;
 use may_agent::session::{
@@ -88,7 +88,35 @@ enum MockChatScenario {
     /// The first request starts the script as a background terminal job;
     /// every later request gets a plain text reply.
     StartsBackgroundJob(&'static str),
+    /// A turn that runs [`COMPACTION_PROBE_STEPS`] commands over a
+    /// context past the compaction start point, then replies; a turn that
+    /// follows a restart is answered at once. See [`CompactionProbe`].
+    CompactionProbe(CompactionProbe),
 }
+
+/// How the mock answers the compaction requests of [`MockChatScenario::CompactionProbe`].
+#[derive(Clone, Copy)]
+enum CompactionProbe {
+    /// Every compaction is answered with a valid handoff after
+    /// [`COMPACTION_PROBE_DELAY`], while the run keeps going.
+    Lands,
+    /// The compaction and the retry aither makes on a bad answer get
+    /// something that is no handoff; the rerun on the cleaned context gets a
+    /// valid one.
+    FailsThenLands,
+}
+
+/// Commands a compaction probe's turn runs before it replies.
+const COMPACTION_PROBE_STEPS: usize = 5;
+/// How long the mock takes to ask for each command.
+const COMPACTION_PROBE_STEP_DELAY: Duration = Duration::from_secs(1);
+/// How long the mock holds a landing compaction's answer back: shorter than
+/// the steps the run keeps taking meanwhile.
+const COMPACTION_PROBE_DELAY: Duration = Duration::from_secs(2);
+/// The task the probe's handoff records; only a compacted context holds it.
+const COMPACTION_PROBE_TASK: &str = "COMPACTED-PROBE-TASK-5521";
+/// The user message that follows the restart.
+const COMPACTION_PROBE_FOLLOW_UP: &str = "second turn after the restart";
 
 /// A background job that outlives every test turn.
 const BACKGROUND_JOB_SCRIPT: &str = "sleep 120";
@@ -308,6 +336,14 @@ struct MockScenarioState {
     /// Set once a probe script served its final response, so the test can
     /// wait for a turn the job's completion resumed on its own.
     probe_done: bool,
+    /// Commands a compaction probe has asked for.
+    probe_steps: usize,
+    /// Compaction requests a compaction probe received.
+    compactions: usize,
+    /// Until when a landing compaction is still unanswered.
+    compaction_open_until: Option<tokio::time::Instant>,
+    /// Agent requests served while a compaction was unanswered.
+    served_during_compaction: usize,
 }
 
 impl MockScenarioState {
@@ -317,7 +353,76 @@ impl MockScenarioState {
             request_index: 0,
             task_id: None,
             probe_done: false,
+            probe_steps: 0,
+            compactions: 0,
+            compaction_open_until: None,
+            served_during_compaction: 0,
         }
+    }
+
+    fn next_compaction_probe_response(
+        &mut self,
+        probe: CompactionProbe,
+        request: &Value,
+    ) -> MockHttpResponse {
+        self.request_index += 1;
+        if is_compaction_request(request) {
+            self.compactions += 1;
+            if matches!(probe, CompactionProbe::FailsThenLands) && self.compactions <= 2 {
+                return MockHttpResponse::sse(text_stream_frames(
+                    vec!["this is not a handoff".to_string()],
+                    Duration::ZERO,
+                ));
+            }
+            let delay = match probe {
+                CompactionProbe::Lands => COMPACTION_PROBE_DELAY,
+                CompactionProbe::FailsThenLands => Duration::ZERO,
+            };
+            self.compaction_open_until = Some(tokio::time::Instant::now() + delay);
+            return MockHttpResponse::sse(vec![
+                delayed_sse_frame(text_chunk(&compaction_probe_handoff(), None), delay),
+                delayed_sse_frame(text_chunk("", Some("stop")), Duration::ZERO),
+                done_frame(Duration::ZERO),
+            ]);
+        }
+        if self
+            .compaction_open_until
+            .is_some_and(|until| tokio::time::Instant::now() < until)
+        {
+            self.served_during_compaction += 1;
+        }
+        let follow_up = request
+            .get("messages")
+            .and_then(Value::as_array)
+            .and_then(|messages| messages.last())
+            .and_then(|message| message.get("content").and_then(Value::as_str))
+            .is_some_and(|content| content.contains(COMPACTION_PROBE_FOLLOW_UP));
+        if follow_up || self.probe_steps >= COMPACTION_PROBE_STEPS {
+            return MockHttpResponse::sse(text_stream_frames(
+                vec!["all steps done".to_string()],
+                Duration::from_millis(10),
+            ));
+        }
+        self.probe_steps += 1;
+        MockHttpResponse::sse(vec![
+            delayed_sse_frame(
+                tool_call_chunk(
+                    &format!("call-compaction-{}", self.probe_steps),
+                    "terminal",
+                    &serde_json::json!({
+                        "background": false,
+                        "description": "Take a step",
+                        "script": format!("echo COMPACTION-STEP-{}", self.probe_steps),
+                        "mode": "sandboxed",
+                        "raw": true,
+                        "timeout": 30,
+                        "max_lines": 20
+                    }),
+                ),
+                COMPACTION_PROBE_STEP_DELAY,
+            ),
+            done_frame(Duration::from_millis(10)),
+        ])
     }
 
     fn next_response(&mut self, request: &Value) -> Result<MockHttpResponse, String> {
@@ -327,12 +432,17 @@ impl MockScenarioState {
         if matches!(self.scenario, MockChatScenario::ForkProbe) {
             return self.next_fork_response(request);
         }
+        if let MockChatScenario::CompactionProbe(probe) = self.scenario {
+            return Ok(self.next_compaction_probe_response(probe, request));
+        }
         verify_native_tool_surface(request)?;
         if self.request_index == 0 {
             verify_initial_tool_contract(request)?;
         }
         let response = match &self.scenario {
-            MockChatScenario::SubagentProbe(_) | MockChatScenario::ForkProbe => {
+            MockChatScenario::SubagentProbe(_)
+            | MockChatScenario::ForkProbe
+            | MockChatScenario::CompactionProbe(_) => {
                 unreachable!("handled before the match")
             }
             MockChatScenario::OverloadedThenText { failures, text } => {
@@ -1026,17 +1136,31 @@ struct TestHarness {
 
 impl TestHarness {
     async fn new(config_base_url: &str) -> Self {
-        Self::build(config_base_url, None).await
+        Self::build(config_base_url, None, ContextConfig::default()).await
+    }
+
+    /// A harness whose `[context]` thresholds are `context`.
+    async fn new_with_context(config_base_url: &str, context: ContextConfig) -> Self {
+        Self::build(config_base_url, None, context).await
     }
 
     /// A harness whose three model tiers are three models of their own, so a
     /// request's model names the tier it ran on, and whose session runs on
     /// `session_model`.
     async fn new_with_tier_models_on(config_base_url: &str, session_model: &str) -> Self {
-        Self::build(config_base_url, Some(session_model)).await
+        Self::build(
+            config_base_url,
+            Some(session_model),
+            ContextConfig::default(),
+        )
+        .await
     }
 
-    async fn build(config_base_url: &str, tier_models: Option<&str>) -> Self {
+    async fn build(
+        config_base_url: &str,
+        tier_models: Option<&str>,
+        context: ContextConfig,
+    ) -> Self {
         let home = tempfile::tempdir().expect("test home tempdir should be created");
         let may_dir = home.path().join(".may");
         tokio::fs::create_dir_all(&may_dir)
@@ -1047,6 +1171,7 @@ impl TestHarness {
         // Aux generation would fire an unscripted request per completed
         // turn into the mock provider and starve the scripted responses.
         config.suggestions.enabled = false;
+        config.context = context;
         config.provider.insert(
             TEST_PROVIDER_ID.to_string(),
             ProviderInstance::new(ProviderType::Custom)
@@ -4645,4 +4770,213 @@ async fn a_reconnecting_client_continues_after_the_last_frame_it_saw() {
     let mut stale = agent_frames(&client, &server, &session_id, Some(frame_index(&seen[0]))).await;
     let resync = next_turn_frame(&mut stale).await;
     assert_eq!(resync.event, "session_resync", "{resync:?}");
+}
+
+/// The handoff a compaction probe's compaction answers with.
+fn compaction_probe_handoff() -> String {
+    serde_json::json!({
+        "current_task": COMPACTION_PROBE_TASK,
+        "key_decisions": [],
+        "context_files": [],
+        "errors_fixes": [],
+        "pending_work": [],
+        "recovery_hints": [],
+        "skills": [],
+    })
+    .to_string()
+}
+
+/// Characters of filler that put a compaction probe's first request at about
+/// 33k tokens: past the start point of [`compaction_probe_context`] and, with
+/// a start distance as wide as the pause point's, past that too.
+const COMPACTION_PROBE_FILLER_REPEATS: usize = 10_000;
+
+/// A `[context]` section whose auto-compact point is 40k tokens, whatever the
+/// mock model's 128k window: compaction starts at `40k - start_distance` and
+/// the run pauses for it at `40k - safe_buffer`.
+const fn compaction_probe_context(start_distance: usize, safe_buffer: usize) -> ContextConfig {
+    ContextConfig {
+        compact_at: 0.8,
+        compact_ceiling: 40_000,
+        start_distance,
+        safe_buffer,
+    }
+}
+
+/// A user turn that fills the context of a compaction probe.
+fn compaction_probe_user_turn() -> String {
+    format!(
+        "Take the steps. {}",
+        "lorem ipsum ".repeat(COMPACTION_PROBE_FILLER_REPEATS)
+    )
+}
+
+/// A compaction that starts while the run streams lands without stopping it,
+/// is persisted with the context snapshot, and is what a restarted daemon
+/// resumes from.
+#[tokio::test]
+#[serial]
+async fn a_compaction_started_mid_run_lands_and_survives_a_restart() {
+    let mock =
+        MockOpenAiServer::spawn(MockChatScenario::CompactionProbe(CompactionProbe::Lands)).await;
+    let harness =
+        TestHarness::new_with_context(&mock.base_url(), compaction_probe_context(12_000, 2_000))
+            .await;
+    let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
+    let client = reqwest::Client::new();
+    let environment = ChatEnvironment::Local
+        .prepare(&harness, &client, &server)
+        .await;
+    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+
+    let turn = send_turn(
+        &client,
+        &server.base_url,
+        &serde_json::json!({
+            "sessionId": session_id,
+            "content": compaction_probe_user_turn(),
+        }),
+    )
+    .await
+    .expect("turn request should succeed");
+    let turn = expect_status(&server.log, turn, StatusCode::OK).await;
+    let events = collect_turn_events(turn, "the compacting turn", &server.log).await;
+    assert!(
+        events.iter().any(|(kind, _)| kind == "done"),
+        "the turn should complete; events: {events:?}; server logs:\n{}",
+        server.log.contents().await
+    );
+
+    let requests = mock.agent_requests().await;
+    assert!(
+        requests.iter().any(is_compaction_request),
+        "crossing the start point forks a compaction: {} requests; server logs:\n{}",
+        requests.len(),
+        server.log.contents().await
+    );
+    assert!(
+        mock.state.lock().await.served_during_compaction >= 1,
+        "the run keeps asking the model while the compaction is in flight"
+    );
+    let before_compaction = requests
+        .iter()
+        .find(|request| !is_compaction_request(request))
+        .expect("the turn's first request")
+        .to_string()
+        .len();
+
+    // Kill the daemon: the next one has nothing but the persisted snapshot.
+    server.stop().await;
+    let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
+    let turn = send_turn(
+        &client,
+        &server.base_url,
+        &serde_json::json!({
+            "sessionId": session_id,
+            "content": COMPACTION_PROBE_FOLLOW_UP,
+        }),
+    )
+    .await
+    .expect("follow-up turn request should succeed");
+    let turn = expect_status(&server.log, turn, StatusCode::OK).await;
+    let events = collect_turn_events(turn, "the turn after the restart", &server.log).await;
+    assert!(
+        events.iter().any(|(kind, _)| kind == "done"),
+        "the follow-up should complete; events: {events:?}; server logs:\n{}",
+        server.log.contents().await
+    );
+
+    let requests = mock.agent_requests().await;
+    let resumed = requests
+        .last()
+        .expect("the follow-up's request")
+        .to_string();
+    assert!(
+        resumed.contains(COMPACTION_PROBE_TASK),
+        "the restarted session resumes from the compacted context"
+    );
+    assert!(
+        resumed.len() < before_compaction / 2,
+        "the compaction replaced the conversation: {} bytes after the restart, {before_compaction} before the compaction",
+        resumed.len()
+    );
+    server.stop().await;
+    environment.release(&harness, &session_id).await;
+}
+
+/// A compaction that fails at the pause point is cleaned up and rerun, and
+/// the run shows both in its agent frames.
+#[tokio::test]
+#[serial]
+async fn a_failed_compaction_shows_its_cleanup_and_rerun() {
+    let mock = MockOpenAiServer::spawn(MockChatScenario::CompactionProbe(
+        CompactionProbe::FailsThenLands,
+    ))
+    .await;
+    // The pause point equals the start point, so the first request boundary
+    // runs the compaction instead of forking it.
+    let harness =
+        TestHarness::new_with_context(&mock.base_url(), compaction_probe_context(12_000, 12_000))
+            .await;
+    let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
+    let client = reqwest::Client::new();
+    let environment = ChatEnvironment::Local
+        .prepare(&harness, &client, &server)
+        .await;
+    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+
+    let mut frames = agent_frames(&client, &server, &session_id, None).await;
+    let turn = send_turn(
+        &client,
+        &server.base_url,
+        &serde_json::json!({
+            "sessionId": session_id,
+            "content": compaction_probe_user_turn(),
+        }),
+    )
+    .await
+    .expect("turn request should succeed");
+    let turn = expect_status(&server.log, turn, StatusCode::OK).await;
+
+    let mut agent_events = Vec::new();
+    loop {
+        let frame = next_turn_frame(&mut frames).await;
+        let complete = frame.data.contains("\"type\":\"complete\"");
+        agent_events.push(frame.data);
+        if complete {
+            break;
+        }
+    }
+    let Some(recovery) = agent_events
+        .iter()
+        .find(|data| data.contains("\"type\":\"compaction_recovery\""))
+    else {
+        panic!(
+            "the failed compaction's cleanup should reach the transcript: {agent_events:?}; server logs:\n{}",
+            server.log.contents().await
+        );
+    };
+    let frame: Value = serde_json::from_str(recovery).expect("agent frame JSON");
+    let event = &frame["body"]["event"];
+    assert!(
+        event["alerts_removed"].is_u64() && event["outputs_spilled"].is_u64(),
+        "the recovery frame counts what the cleanup did: {frame}"
+    );
+    let events = collect_turn_events(turn, "the recovering turn", &server.log).await;
+    assert!(
+        events.iter().any(|(kind, _)| kind == "done"),
+        "the rerun compaction lets the turn finish; events: {events:?}"
+    );
+    let compactions = mock
+        .agent_requests()
+        .await
+        .iter()
+        .filter(|request| is_compaction_request(request))
+        .count();
+    assert_eq!(
+        compactions, 3,
+        "the compaction and its retry fail, the rerun lands"
+    );
+    server.stop().await;
+    environment.release(&harness, &session_id).await;
 }

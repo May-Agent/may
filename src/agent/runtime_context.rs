@@ -700,7 +700,15 @@ pub fn build_workspace_workdirs_context(workspace: &MayWorkspace) -> Option<Stri
 /// Builds the optional `repo_clones` block listing this session's private
 /// repository clones, kept as its own block so clone creation invalidates
 /// only it and not the stable prefix.
-pub fn build_repo_clones_context(clones: &[RepoCloneEntry]) -> Option<String> {
+///
+/// # Panics
+/// Panics when a clone lies outside the session directory: a container
+/// session cannot see it, so the caller broke the clone-placement invariant.
+pub fn build_repo_clones_context(
+    clones: &[RepoCloneEntry],
+    environment: &AgentEnvironment,
+    session_paths: &SessionPaths,
+) -> Option<String> {
     if clones.is_empty() {
         return None;
     }
@@ -708,7 +716,7 @@ pub fn build_repo_clones_context(clones: &[RepoCloneEntry]) -> Option<String> {
         clones: clones
             .iter()
             .map(|c| RepoCloneTemplateEntry {
-                path: c.clone_path.display().to_string(),
+                path: sandbox_visible_path(environment, session_paths, &c.clone_path),
                 source: c.source.clone(),
             })
             .collect(),
@@ -826,10 +834,36 @@ const fn home_environment_kind_label(environment: &AgentEnvironment) -> &'static
 
 /// The working directory the terminal starts in, as the shell sees it.
 fn working_directory(environment: &AgentEnvironment, session_paths: &SessionPaths) -> String {
+    sandbox_visible_path(environment, session_paths, session_paths.root())
+}
+
+/// A path under the session directory as the shell sees it: the host path
+/// natively, or the same location under the container workspace mount.
+///
+/// # Panics
+/// Panics in a container session when `host_path` is outside the session
+/// directory, which the container does not mount.
+fn sandbox_visible_path(
+    environment: &AgentEnvironment,
+    session_paths: &SessionPaths,
+    host_path: &Path,
+) -> String {
     match environment {
-        AgentEnvironment::Local => session_paths.root().display().to_string(),
+        AgentEnvironment::Local => host_path.display().to_string(),
         AgentEnvironment::Container { .. } => {
-            crate::container::lifecycle::CONTAINER_WORKSPACE.to_string()
+            let relative = host_path
+                .strip_prefix(session_paths.root())
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "{} is outside the session directory {} that the container mounts",
+                        host_path.display(),
+                        session_paths.root().display()
+                    )
+                });
+            Path::new(crate::container::lifecycle::CONTAINER_WORKSPACE)
+                .join(relative)
+                .display()
+                .to_string()
         }
     }
 }
@@ -947,6 +981,15 @@ mod tests {
         RuntimeSystemContext, build_agents_md_context, build_base_system_prompt,
         build_memory_context_content, tag,
     };
+
+    #[test]
+    fn the_system_layout_holds_the_languages_slot() {
+        assert!(
+            tag::layout()
+                .instructions()
+                .contains(&aither_agent::InstructionSlot::LANGUAGES)
+        );
+    }
 
     fn test_context() -> aither_agent::Context {
         aither_agent::Context::with_layout(tag::layout())
@@ -1231,5 +1274,89 @@ mod tests {
             commands_section.contains("- webfetch: Fetch a URL"),
             "{commands_section}"
         );
+    }
+
+    fn container_environment() -> super::AgentEnvironment {
+        use std::sync::Arc;
+
+        use aither_sandbox::{
+            AnyContainerExec, BollardContainerExec, BridgeAddress, ContainerIpcRoute,
+        };
+
+        // An HTTP client handle neither probes a socket nor dials until used;
+        // rendering never uses it.
+        let client = bollard::Docker::connect_with_http(
+            "http://127.0.0.1:1",
+            1,
+            bollard::API_DEFAULT_VERSION,
+        )
+        .expect("an HTTP Docker client handle is built without connecting");
+        super::AgentEnvironment::Container {
+            container_id: "test-container".to_string(),
+            container_ipc_route: ContainerIpcRoute::new(
+                "host.docker.internal",
+                BridgeAddress::try_from(std::net::IpAddr::from([127, 0, 0, 1]))
+                    .expect("loopback binds the bridge"),
+            ),
+            container_exec: AnyContainerExec::new(Arc::new(BollardContainerExec::new(Arc::new(
+                client,
+            )))),
+            browser_cdp_endpoint: None,
+        }
+    }
+
+    fn clone_entry(session_paths: &crate::session::SessionPaths) -> super::RepoCloneEntry {
+        super::RepoCloneEntry {
+            clone_path: session_paths.root().join("repos/may"),
+            source: "/Users/someone/may".to_string(),
+        }
+    }
+
+    #[test]
+    fn container_repo_clones_render_under_the_workspace_mount() {
+        let dir = tempdir().expect("temp dir should be created");
+        let session_paths = crate::session::SessionPaths::new(dir.path().to_path_buf());
+        let rendered = super::build_repo_clones_context(
+            &[clone_entry(&session_paths)],
+            &container_environment(),
+            &session_paths,
+        )
+        .expect("a clone renders a block");
+        let host_prefix = dir.path().display().to_string();
+        assert!(
+            rendered.contains("- /workspace/repos/may (clone of"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains(&host_prefix), "{rendered}");
+    }
+
+    #[test]
+    fn native_repo_clones_keep_the_host_path() {
+        let dir = tempdir().expect("temp dir should be created");
+        let session_paths = crate::session::SessionPaths::new(dir.path().to_path_buf());
+        let rendered = super::build_repo_clones_context(
+            &[clone_entry(&session_paths)],
+            &super::AgentEnvironment::Local,
+            &session_paths,
+        )
+        .expect("a clone renders a block");
+        let host_path = dir.path().join("repos/may").display().to_string();
+        assert!(
+            rendered.contains(&format!("- {host_path} (clone of")),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "outside the session directory")]
+    fn container_clone_outside_the_session_directory_panics() {
+        let dir = tempdir().expect("temp dir should be created");
+        let session_paths = crate::session::SessionPaths::new(dir.path().to_path_buf());
+        let stray = super::RepoCloneEntry {
+            clone_path: std::path::PathBuf::from("/elsewhere/may"),
+            source: "x".to_string(),
+        };
+        let _ =
+            super::build_repo_clones_context(&[stray], &container_environment(), &session_paths);
     }
 }
