@@ -1335,6 +1335,9 @@ pub struct ContextConfig {
     /// Tokens before the auto-compact point at which the agent pauses to
     /// finish compaction.
     pub safe_buffer: usize,
+    /// Tokens before the auto-compact point at which the agent is told once
+    /// to save its work and call `compact` itself.
+    pub warn_distance: usize,
 }
 
 impl Default for ContextConfig {
@@ -1345,6 +1348,7 @@ impl Default for ContextConfig {
             compact_ceiling: policy.compact_ceiling,
             start_distance: policy.start_distance,
             safe_buffer: policy.safe_buffer,
+            warn_distance: policy.warn_distance,
         }
     }
 }
@@ -1359,6 +1363,7 @@ impl ContextConfig {
             compact_ceiling: self.compact_ceiling,
             start_distance: self.start_distance,
             safe_buffer: self.safe_buffer,
+            warn_distance: self.warn_distance,
             ..aither_agent::ContextPolicy::default()
         }
     }
