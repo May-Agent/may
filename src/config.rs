@@ -758,6 +758,27 @@ pub struct AcpAgentConfig {
     pub mode: Option<String>,
     /// What the main agent reads to decide when to delegate to this agent.
     pub description: String,
+    /// Directories the agent process may read and write besides the
+    /// session's own, where it keeps its state and login (`~/.codex`). A
+    /// leading `~` is the user's home. Its terminal commands do not get them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schema(value_type = Vec<String>)]
+    pub grants: Vec<PathBuf>,
+}
+
+impl AcpAgentConfig {
+    /// The grants with a leading `~` expanded against `home`.
+    #[must_use]
+    pub fn grants_in(&self, home: &Path) -> Vec<PathBuf> {
+        self.grants
+            .iter()
+            .map(|grant| {
+                grant
+                    .strip_prefix("~")
+                    .map_or_else(|_| grant.clone(), |rest| home.join(rest))
+            })
+            .collect()
+    }
 }
 
 /// Whether `name` can be the subagent type of a connected ACP agent.
@@ -1980,6 +2001,21 @@ mod tests {
         assert!(config.provider["openai"].cache_lifetime.is_default());
     }
 
+    #[test]
+    fn acp_agent_grants_expand_a_leading_tilde_against_the_home() {
+        let agent = AcpAgentConfig {
+            grants: vec![PathBuf::from("~/.codex"), PathBuf::from("/opt/state")],
+            ..devin_connection()
+        };
+        assert_eq!(
+            agent.grants_in(Path::new("/Users/me")),
+            [
+                PathBuf::from("/Users/me/.codex"),
+                PathBuf::from("/opt/state")
+            ]
+        );
+    }
+
     fn devin_connection() -> AcpAgentConfig {
         AcpAgentConfig {
             command: "devin".to_string(),
@@ -1988,6 +2024,7 @@ mod tests {
             model: Some("opus".to_string()),
             mode: None,
             description: "Devin CLI".to_string(),
+            grants: Vec::new(),
         }
     }
 

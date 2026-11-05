@@ -146,6 +146,7 @@ pub(super) async fn connect(
         model: request.model,
         mode: request.mode,
         description: describe(&identity),
+        grants: Vec::new(),
     };
     match try_connection(&state.tokio_handle, &request.name, &agent).await {
         Ok(()) => {}
