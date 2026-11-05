@@ -51,6 +51,8 @@ runs:
         mkdir -p "${DIRECTORY}/bin"
         unzip -q -o -j "${archive}" "bun-${PLATFORM}/bun" -d "${DIRECTORY}/bin"
         chmod +x "${DIRECTORY}/bin/bun"
+        # The release ships bun alone; bunx is bun invoked under that name.
+        ln -sf bun "${DIRECTORY}/bin/bunx"
     - if: steps.restore.outputs.cache-hit != 'true' && inputs.save == 'true'
       uses: actions/cache/save@v4
       with:
@@ -63,3 +65,4 @@ runs:
         set -euo pipefail
         echo "${DIRECTORY}/bin" >> "${GITHUB_PATH}"
         "${DIRECTORY}/bin/bun" --version
+        "${DIRECTORY}/bin/bunx" --version
