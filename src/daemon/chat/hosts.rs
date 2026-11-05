@@ -371,7 +371,6 @@ pub async fn btw(
     Json(req): Json<BtwRequest>,
     State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<BtwResponse>> {
-    use aither_core::LanguageModel as _;
     use aither_core::llm::Message;
     use futures_lite::StreamExt as _;
 
@@ -391,7 +390,7 @@ pub async fn btw(
         .cloned()
         .ok_or_else(|| internal_error_message("the idle agent has no model"))?;
     let mut answer = String::new();
-    let mut stream = std::pin::pin!(llm.respond(aither_core::llm::LLMRequest::new(messages)));
+    let mut stream = std::pin::pin!(llm.respond(messages));
     while let Some(event) = stream.next().await {
         match event {
             Ok(aither_core::llm::Event::Text(text)) => answer.push_str(&text),

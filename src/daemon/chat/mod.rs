@@ -3651,6 +3651,13 @@ fn build_session_agent<'a>(
                 tool_distribution: state.tool_distribution.clone(),
                 tool_environments: state.tool_environments.clone(),
                 provider_attempt,
+                prompt_cache_epoch: ctx.context_snapshot.as_ref().map_or(0, |snapshot| {
+                    snapshot
+                        .checkpoint
+                        .context_window
+                        .metrics
+                        .prompt_cache_epoch
+                }),
                 subagents: Some(state.session_background.subagents(ctx.session_id.as_str())),
                 background_jobs: aither_agent::BackgroundJobPolicy::Detach,
                 connectivity: state.connectivity.clone(),

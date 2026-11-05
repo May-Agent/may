@@ -8,7 +8,6 @@ use aither_core::LanguageModel;
 use aither_core::llm::{Tool, model::Parameters, tool::ToolDefinition};
 use aither_sandbox::ToolRegistryBuilder;
 
-use crate::agent::ImageGeneratorConfig;
 use crate::agent::ask_user_tool::{AskUserTool, WithdrawAskUserTool};
 use crate::agent::browser_tool::{BrowserBroker, BrowserTool};
 use crate::agent::imagine::ImagineTool;
@@ -20,6 +19,7 @@ use crate::agent::repo_tool::{RepoContext, RepoTool, SubagentRepoTool};
 use crate::agent::session_tool::SessionTool;
 use crate::agent::subagent_tracker::{SubagentTracker, TrackedSubagentTool, UsageObservedModel};
 use crate::agent::task_tool::{TaskBroker, TaskRuntimeKind, TaskTool};
+use crate::agent::{ImageGeneratorConfig, ModelSlot};
 use crate::bundle::Bundle;
 use crate::issue::search::IssueSearch;
 use crate::mcp::load_active_mcp_connections;
@@ -42,11 +42,11 @@ pub struct SharedTerminalCommandConfig<LLM> {
     /// LLM handle used by commands that need a model.
     pub llm: LLM,
     /// Tier override for `ask --model flagship`; falls back to `llm`.
-    pub ask_flagship: Option<LLM>,
+    pub ask_flagship: Option<ModelSlot<LLM>>,
     /// Tier override for `ask --model balanced`; falls back to `llm`.
-    pub ask_balanced: Option<LLM>,
+    pub ask_balanced: Option<ModelSlot<LLM>>,
     /// Tier override for `ask --model fast` (the default tier); falls back to `llm`.
-    pub ask_fast: Option<LLM>,
+    pub ask_fast: Option<ModelSlot<LLM>>,
     /// Session the commands run on behalf of.
     pub session_id: String,
     /// `~/.may` data directory.
@@ -146,9 +146,11 @@ where
     }
     // The model of each tier; a tier nothing is configured for runs on the
     // session's model.
-    let flagship_llm = config.ask_flagship.unwrap_or_else(|| config.llm.clone());
-    let balanced_llm = config.ask_balanced.unwrap_or_else(|| config.llm.clone());
-    let fast_llm = config.ask_fast.unwrap_or_else(|| config.llm.clone());
+    let session_model = ModelSlot::new(config.llm.clone(), config.request_parameters.clone());
+    let flagship = config.ask_flagship.unwrap_or_else(|| session_model.clone());
+    let balanced = config.ask_balanced.unwrap_or_else(|| session_model.clone());
+    let fast = config.ask_fast.unwrap_or(session_model);
+    let fast_llm = fast.llm.clone();
     // The main agent is declared on the advanced tier (the terminal agent
     // builder has no setter for it) and a fork must resolve to the model the
     // main agent runs on, so the advanced slot of `subagent` is the session's
@@ -156,8 +158,9 @@ where
     let subagent_flagship = config.llm.clone();
     let screen_llm = fast_llm.clone();
     let ask_command = AskCommand::new(fast_llm.clone())
-        .with_flagship(flagship_llm.clone())
-        .with_balanced(balanced_llm.clone());
+        .with_parameters(fast.parameters.clone())
+        .with_flagship(flagship.llm, flagship.parameters)
+        .with_balanced(balanced.llm.clone(), balanced.parameters.clone());
     register_tool_with_description(builder, &mut descriptions, ask_command);
     register_tool_with_description(
         builder,
@@ -327,8 +330,9 @@ where
         UsageObservedModel::new(subagent_flagship),
         Bundle::subagents_dir(&config.may_dir),
     )
-    .with_balanced_model(UsageObservedModel::new(balanced_llm))
-    .with_fast_model(UsageObservedModel::new(fast_llm))
+    .with_request_parameters(config.request_parameters.clone())
+    .with_balanced_model(UsageObservedModel::new(balanced.llm), balanced.parameters)
+    .with_fast_model(UsageObservedModel::new(fast_llm), fast.parameters)
     .with_runs(config.subagent_runs)
     .with_base_dir(&config.sandbox_dir)
     .with_file_mounts([
