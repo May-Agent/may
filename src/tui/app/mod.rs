@@ -886,7 +886,7 @@ impl App {
     fn repo_clone_specs(
         sandbox_dir: &std::path::Path,
     ) -> Vec<crate::file_tracker::TrackedRootSpec> {
-        let repos = crate::repo_clone::SessionRepos::new(sandbox_dir, "");
+        let repos = crate::repo_clone::SessionRepos::new(sandbox_dir);
         let Ok(clones) = repos.clones() else {
             return Vec::new();
         };

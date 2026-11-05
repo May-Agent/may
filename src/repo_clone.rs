@@ -65,16 +65,14 @@ struct CloneRegistry {
 #[derive(Debug, Clone)]
 pub struct SessionRepos {
     root: PathBuf,
-    session_id: String,
 }
 
 impl SessionRepos {
     /// Manage the clone area of the session rooted at `session_root`.
     #[must_use]
-    pub fn new(session_root: &Path, session_id: impl Into<String>) -> Self {
+    pub fn new(session_root: &Path) -> Self {
         Self {
             root: session_root.join("repos"),
-            session_id: session_id.into(),
         }
     }
 
@@ -223,28 +221,15 @@ impl SessionRepos {
         Ok(child_dir.to_path_buf())
     }
 
-    /// Remove `dir` and drop this session's `refs/may/<id>` ref from the
-    /// clone's source checkout when it was a local clone.
+    /// Remove `dir`. The `refs/may/pr/*` refs in the source checkout belong
+    /// to their PRs and are left to them.
     ///
     /// # Errors
     /// Fails on filesystem errors; a missing directory is a no-op.
     pub async fn delete_clone(&self, dir: &Path) -> Result<(), RepoCloneError> {
         let mut registry = self.load_registry()?;
-        let record = registry
-            .clones
-            .iter()
-            .find(|c| self.root.join(&c.dir) == dir)
-            .cloned();
         registry.clones.retain(|c| self.root.join(&c.dir) != dir);
         self.save_registry(&registry)?;
-        if let Some(record) = record.filter(|r| r.local) {
-            let refname = format!("refs/may/{}", self.session_id);
-            let source = record.source;
-            let _ = blocking::unblock(move || {
-                git(Some(Path::new(&source)), &["update-ref", "-d", &refname])
-            })
-            .await;
-        }
         if dir.exists() {
             let dir = dir.to_path_buf();
             blocking::unblock(move || std::fs::remove_dir_all(dir)).await?;
@@ -252,8 +237,8 @@ impl SessionRepos {
         Ok(())
     }
 
-    /// Drop every clone and this session's `refs/may/*` refs in their
-    /// source checkouts. Called on session deletion.
+    /// Drop every clone; PR refs in the source checkouts stay. Called on
+    /// session deletion.
     ///
     /// # Errors
     /// Fails on filesystem errors; missing dirs are skipped.
@@ -352,7 +337,7 @@ mod tests {
         let checkout = tmp.path().join("checkout");
         init_repo(&checkout);
         let session = tmp.path().join("session");
-        let repos = SessionRepos::new(&session, "s1");
+        let repos = SessionRepos::new(&session);
 
         let clone = repos
             .ensure_local_clone(&checkout, &repo_key(&checkout))
@@ -376,7 +361,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let checkout = tmp.path().join("checkout");
         init_repo(&checkout);
-        let repos = SessionRepos::new(&tmp.path().join("session"), "s1");
+        let repos = SessionRepos::new(&tmp.path().join("session"));
         let parent = repos
             .ensure_local_clone(&checkout, &repo_key(&checkout))
             .await
@@ -402,7 +387,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let checkout = tmp.path().join("checkout");
         init_repo(&checkout);
-        let repos = SessionRepos::new(&tmp.path().join("session"), "s1");
+        let repos = SessionRepos::new(&tmp.path().join("session"));
         let clone = repos
             .ensure_local_clone(&checkout, &repo_key(&checkout))
             .await
@@ -415,16 +400,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_clone_removes_dir_and_ref() {
+    async fn delete_clone_removes_dir_and_keeps_pr_refs() {
         let tmp = tempfile::tempdir().unwrap();
         let checkout = tmp.path().join("checkout");
         init_repo(&checkout);
-        let repos = SessionRepos::new(&tmp.path().join("session"), "s1");
+        let repos = SessionRepos::new(&tmp.path().join("session"));
         let clone = repos
             .ensure_local_clone(&checkout, &repo_key(&checkout))
             .await
             .unwrap();
-        git(Some(&checkout), &["update-ref", "refs/may/s1", "HEAD"]).unwrap();
+        git(Some(&checkout), &["update-ref", "refs/may/pr/1", "HEAD"]).unwrap();
         repos.delete_clone(&clone).await.unwrap();
         assert!(!clone.exists());
         let refs = git(
@@ -432,7 +417,7 @@ mod tests {
             &["for-each-ref", "refs/may", "--format=%(refname)"],
         )
         .unwrap();
-        assert_eq!(refs.trim(), "");
+        assert_eq!(refs.trim(), "refs/may/pr/1");
         assert_eq!(repos.clones().unwrap().len(), 0);
     }
 }

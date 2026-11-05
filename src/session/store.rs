@@ -178,12 +178,11 @@ impl SessionStore {
     ) -> Result<(), StoreError> {
         let path = self.session_dir(id, profile_id);
         if path.exists() {
-            // Drop this session's `refs/may/<id>` refs in the checkouts its
-            // clones were made from before the sandbox goes away; best-effort,
-            // a session delete must not fail on an unreadable checkout.
-            let repos = crate::repo_clone::SessionRepos::new(&path, id.to_string());
+            // Drop the clones; the `refs/may/pr/*` refs of unlanded PRs stay
+            // in their checkouts so an adopter can still land them.
+            let repos = crate::repo_clone::SessionRepos::new(&path);
             if let Err(error) = repos.delete_all().await {
-                tracing::warn!(%error, "failed to drop session repo clone refs");
+                tracing::warn!(%error, "failed to drop session repo clones");
             }
             async_fs::remove_dir_all(&path).await?;
         }
