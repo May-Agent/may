@@ -201,35 +201,10 @@ impl PrStore {
                 "several session clones exist; pass --repo".to_string(),
             ));
         }
-        // No clones yet: clone the cwd's repo on demand. A project pinned
-        // to the GitHub backend binds `owner/repo` and clones the remote —
-        // the cloud is the source of truth and no checkout is required.
+        // No clones yet: clone the cwd's repo on demand, as its trust level
+        // decides (`CloneSource::of`).
         let worktree = crate::repo_search::worktree_root(&self.context.cwd)
             .ok_or_else(|| PrError::Resolve("not inside a repository".to_string()))?;
-        if self
-            .project_for_path(&worktree)
-            .and_then(|p| p.pr.backend.as_deref())
-            == Some("github")
-        {
-            let url = blocking::unblock({
-                let wt = worktree.clone();
-                move || git(Some(&wt), &["remote", "get-url", "origin"])
-            })
-            .await?;
-            let Some(owner_repo) = github_owner_repo(&url) else {
-                return Err(PrError::Resolve(format!(
-                    "pr.backend is github but origin is not GitHub: {url}"
-                )));
-            };
-            let dir = repos.ensure_remote_clone(&url, &owner_repo).await?;
-            let record = repos
-                .clones()
-                .await?
-                .into_iter()
-                .find(|c| repos.path(&c.dir) == dir)
-                .ok_or_else(|| PrError::Resolve("clone registry lost the new clone".to_string()))?;
-            return Ok(Resolved { record, dir });
-        }
         let repo_key = crate::issue::repository_identity(&worktree)
             .map_err(|e| PrError::Resolve(format!("repository identity: {e}")))?;
         // First-contact gate: no binding before a persisted trust decision.
@@ -247,7 +222,12 @@ impl PrStore {
             }
             Some(_) => {}
         }
-        let dir = repos.ensure_clone_of(&worktree).await?;
+        let dir = repos
+            .ensure_clone_of(&worktree, &self.context.workspace_config)
+            .await?
+            .ok_or_else(|| {
+                PrError::Resolve("trust binds no clone for this repository".to_string())
+            })?;
         let record = repos
             .clones()
             .await?
@@ -669,12 +649,6 @@ impl PrStore {
                         .map(|r| format!("{}/{}", r.owner(), r.repo()))
             }
         })
-    }
-
-    /// The `[[projects]]` entry covering a filesystem path.
-    fn project_for_path(&self, path: &Path) -> Option<&crate::workspace::ProjectConfig> {
-        let key = crate::issue::repository_identity(path).ok()?;
-        self.context.workspace_config.project_for_identity(&key)
     }
 
     /// Run the outbound screen when the project enables it. `Some(reason)`
@@ -1572,6 +1546,143 @@ mod tests {
             fx.db.close_pr(pr.id).await,
             Err(crate::db::ChatDbError::PrTerminal { .. })
         ));
+    }
+
+    /// A store for session `id` whose cwd is the fixture checkout, which has
+    /// the GitHub origin `o/r` and `workspace_config`; no clone exists yet.
+    fn trusted_store(
+        fx: &Fixture,
+        id: &str,
+        workspace_config: WorkspaceConfig,
+        github_api: GitHubRest<PrTokenSource>,
+        screen: Option<Arc<super::ScreenFn>>,
+    ) -> PrStore {
+        PrStore::new(PrContext {
+            db: Some(fx.db.clone()),
+            session_id: id.to_string(),
+            session_root: fx.session_root(id),
+            scratch_root: fx.tmp.path().join("scratch"),
+            cwd: fx.checkout.clone(),
+            workspace_config,
+            screen,
+            github_api,
+        })
+    }
+
+    /// Give the fixture checkout the GitHub origin `o/r`.
+    fn add_github_origin(fx: &Fixture) {
+        git(
+            Some(&fx.checkout),
+            &["remote", "add", "origin", "https://github.com/o/r.git"],
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_branch_on_a_github_checkout_keeps_its_pr_local() {
+        let fx = Fixture::new().await;
+        let origin_repo = fx.tmp.path().join("origin.git");
+        git(None, &["init", "--bare", &origin_repo.to_string_lossy()]).unwrap();
+        let (api_base, requests) = mock_api(200).await;
+        add_github_origin(&fx);
+        let config = crate::trust::config_at(
+            fx.tmp.path(),
+            &fx.checkout,
+            crate::trust::TrustLevel::LocalBranch,
+        );
+        let store = trusted_store(
+            &fx,
+            "s1",
+            config,
+            GitHubRest::with_api_base(PrTokenSource::Fixed("test-token".to_string()), &api_base),
+            None,
+        );
+        // Anything pushed to the origin would land in the bare repository.
+        git(
+            Some(&fx.checkout),
+            &[
+                "config",
+                "remote.origin.pushurl",
+                &origin_repo.to_string_lossy(),
+            ],
+        )
+        .unwrap();
+
+        let resolved = store.resolve(None).await.unwrap();
+        assert!(resolved.record.local);
+        assert_eq!(PrStore::backend_for(&resolved.record), ("may", None));
+        identify(&resolved.dir);
+        commit_file(&resolved.dir, "work.txt");
+        store.open(None, "work", None, true).await.unwrap();
+
+        let pr = fx
+            .db
+            .get_pr(resolved.record.repo_key.as_str(), 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(pr.backend, "may");
+        assert_eq!(pr.external_number, None);
+        assert_eq!(git(Some(&origin_repo), &["for-each-ref"]).unwrap(), "");
+        assert!(requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn prs_only_finds_its_project_and_screens_without_a_github_issue_backend() {
+        let fx = Fixture::new().await;
+        let screened = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = screened.clone();
+        let screen: Arc<super::ScreenFn> = Arc::new(move |title: &str, _body: &str| {
+            seen.lock().unwrap().push(title.to_string());
+            Box::pin(async { Ok(false) })
+        });
+        add_github_origin(&fx);
+        // A `prs-only` project as existing files carry it: no `repository`
+        // key and no GitHub issue backend.
+        let config_path = fx.tmp.path().join("legacy-workspace.toml");
+        std::fs::write(
+            &config_path,
+            format!(
+                "[[projects]]\npath = {:?}\n\n[projects.pr]\nbackend = \"github\"\nscreen = true\n",
+                fx.checkout
+            ),
+        )
+        .unwrap();
+        let config = WorkspaceConfig::load(&config_path).unwrap();
+        assert_eq!(
+            crate::trust::trust_for(&config, &fx.repo_key, &fx.checkout),
+            Some(crate::trust::TrustLevel::PrsOnly)
+        );
+        let store = trusted_store(
+            &fx,
+            "s1",
+            config,
+            PrContext::default_github_api(),
+            Some(screen),
+        );
+        // Stand in for the network clone: an existing directory is adopted.
+        let seeded = store
+            .repos()
+            .unwrap()
+            .path(&crate::repo_clone::CloneDir::for_repo_key("o/r"));
+        std::fs::create_dir_all(&seeded).unwrap();
+
+        let resolved = store.resolve(None).await.unwrap();
+        assert_eq!(resolved.dir, seeded);
+        assert!(!resolved.record.local);
+        assert_eq!(
+            PrStore::backend_for(&resolved.record),
+            ("github", Some("o/r".to_string()))
+        );
+        let project = store.project_for_record(&resolved.record).unwrap();
+        assert!(matches!(project.issues, ProjectIssues::May));
+        assert_eq!(project.pr.screen, Some(true));
+        let verdict = store
+            .screen_outbound(&resolved.record, "a title")
+            .await
+            .unwrap();
+        assert!(verdict.is_some(), "the screen ran and withheld the text");
+        assert_eq!(*screened.lock().unwrap(), vec!["a title".to_string()]);
     }
 
     #[test]

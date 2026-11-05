@@ -477,30 +477,23 @@ impl MayAgent {
             config.db.clone(),
         );
         let mut repo_clones = Vec::new();
-        if let Some(worktree) = crate::repo_search::worktree_root(&config.cwd)
-            && let Ok(repo_key) = crate::issue::repository_identity(&worktree)
-        {
-            // The first-contact trust decision picks the binding: GitHub
-            // and local-branch clone; `local` writes the checkout; undecided
-            // binds nothing — the launch gate asks before the session starts.
-            let trust = crate::trust::trust_for(&workspace.config, &repo_key, &worktree);
-            let clone = match trust {
-                Some(
-                    crate::trust::TrustLevel::Full
-                    | crate::trust::TrustLevel::PrsOnly
-                    | crate::trust::TrustLevel::LocalBranch,
-                ) => Some(session_repos.ensure_clone_of(&worktree).await),
-                Some(crate::trust::TrustLevel::Local) | None => None,
-            };
-            match clone {
-                Some(Ok(clone_path)) => repo_clones.push(RepoCloneEntry {
+        if let Some(worktree) = crate::repo_search::worktree_root(&config.cwd) {
+            // The first-contact trust decision picks the binding: full and
+            // prs-only clone the GitHub remote, local-branch clones the
+            // checkout locally; `local` writes the checkout; undecided binds
+            // nothing — the launch gate asks before the session starts.
+            match session_repos
+                .ensure_clone_of(&worktree, &workspace.config)
+                .await
+            {
+                Ok(Some(clone_path)) => repo_clones.push(RepoCloneEntry {
                     clone_path,
                     source: crate::fs_utils::display_path(&worktree),
                 }),
-                Some(Err(error)) => {
+                Ok(None) => {}
+                Err(error) => {
                     tracing::warn!(%error, "failed to create session repo clone");
                 }
-                None => {}
             }
         }
         runtime_system_context = runtime_system_context.with_repo_clones(

@@ -69,19 +69,32 @@ pub enum CloneSource {
 }
 
 impl CloneSource {
-    /// The source `checkout`'s clone is made from.
+    /// The source `checkout`'s clone is made from, as its repository's trust
+    /// level in `config` decides: `full` and `prs-only` clone a GitHub
+    /// `origin` from the remote, `local-branch` always clones the checkout
+    /// locally, and `local` or an undecided repository binds no clone.
     ///
     /// # Errors
-    /// Fails when a local checkout's identity cannot be read.
-    pub fn of(checkout: &Path) -> Result<Self, RepoCloneError> {
-        if let crate::trust::RepoKind::Github { owner_repo } = crate::trust::repo_kind(checkout)
-            && let Some(url) = crate::trust::remote_url(checkout)
-        {
-            return Ok(Self::Remote { url, owner_repo });
-        }
+    /// Fails when the checkout's identity cannot be read.
+    pub fn of(
+        checkout: &Path,
+        config: &crate::workspace::WorkspaceConfig,
+    ) -> Result<Option<Self>, RepoCloneError> {
         let identity = crate::issue::repository_identity(checkout)
             .map_err(|error| RepoCloneError::Io(std::io::Error::other(error)))?;
-        Ok(Self::Local { identity })
+        let Some(trust) = crate::trust::trust_for(config, &identity, checkout) else {
+            return Ok(None);
+        };
+        if !trust.clones_work() {
+            return Ok(None);
+        }
+        if trust.publishes_to_github()
+            && let crate::trust::RepoKind::Github { owner_repo } = crate::trust::repo_kind(checkout)
+            && let Some(url) = crate::trust::remote_url(checkout)
+        {
+            return Ok(Some(Self::Remote { url, owner_repo }));
+        }
+        Ok(Some(Self::Local { identity }))
     }
 
     /// The registry key of the clone.
@@ -102,7 +115,7 @@ pub struct CloneDir(String);
 impl CloneDir {
     /// The directory a clone of `repo_key` gets: `<basename>-<8hex>`,
     /// sanitized for directory use.
-    fn for_repo_key(repo_key: &str) -> Self {
+    pub(crate) fn for_repo_key(repo_key: &str) -> Self {
         let raw = Path::new(repo_key)
             .file_stem()
             .or_else(|| Path::new(repo_key).file_name())
@@ -280,23 +293,35 @@ impl SessionRepos {
     pub async fn clone_of_checkout(
         &self,
         checkout: &Path,
+        config: &crate::workspace::WorkspaceConfig,
     ) -> Result<Option<PathBuf>, RepoCloneError> {
-        self.clone_for(&CloneSource::of(checkout)?.key()).await
+        match CloneSource::of(checkout, config)? {
+            Some(source) => self.clone_for(&source.key()).await,
+            None => Ok(None),
+        }
     }
 
     /// Ensure the session's clone of `checkout`'s repository exists, made
-    /// from the source [`CloneSource::of`] picks, and return its path.
+    /// from the source [`CloneSource::of`] picks, and return its path; `None`
+    /// when the repository's trust binds no clone.
     ///
     /// # Errors
     /// Fails when the checkout's identity cannot be read, git fails, or the
     /// registry cannot be read or written.
-    pub async fn ensure_clone_of(&self, checkout: &Path) -> Result<PathBuf, RepoCloneError> {
-        match CloneSource::of(checkout)? {
-            CloneSource::Remote { url, owner_repo } => {
-                self.ensure_remote_clone(&url, &owner_repo).await
+    pub async fn ensure_clone_of(
+        &self,
+        checkout: &Path,
+        config: &crate::workspace::WorkspaceConfig,
+    ) -> Result<Option<PathBuf>, RepoCloneError> {
+        Ok(Some(match CloneSource::of(checkout, config)? {
+            None => return Ok(None),
+            Some(CloneSource::Remote { url, owner_repo }) => {
+                self.ensure_remote_clone(&url, &owner_repo).await?
             }
-            CloneSource::Local { identity } => self.ensure_local_clone(checkout, &identity).await,
-        }
+            Some(CloneSource::Local { identity }) => {
+                self.ensure_local_clone(checkout, &identity).await?
+            }
+        }))
     }
 
     /// Register `dir` as the clone serving `repo_key` from `source`.
@@ -573,6 +598,7 @@ fn git(dir: Option<&Path>, args: &[&str]) -> Result<String, RepoCloneError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::trust::TrustLevel;
 
     fn init_repo(dir: &Path) {
         git(None, &["init", &dir.to_string_lossy()]).unwrap();
@@ -631,23 +657,61 @@ mod tests {
         let seeded = repos.path(&CloneDir::for_repo_key("o/r"));
         std::fs::create_dir_all(&seeded).unwrap();
 
+        let config = crate::trust::config_at(tmp.path(), &checkout, TrustLevel::Full);
         assert_eq!(
-            CloneSource::of(&checkout).unwrap(),
-            CloneSource::Remote {
+            CloneSource::of(&checkout, &config).unwrap(),
+            Some(CloneSource::Remote {
                 url: "https://github.com/o/r.git".to_string(),
                 owner_repo: "o/r".to_string(),
-            }
+            })
         );
         // The session binding and `pr` both go through `ensure_clone_of`.
-        let bound = repos.ensure_clone_of(&checkout).await.unwrap();
-        let from_pr = repos.ensure_clone_of(&checkout).await.unwrap();
+        let bound = repos.ensure_clone_of(&checkout, &config).await.unwrap();
+        let from_pr = repos.ensure_clone_of(&checkout, &config).await.unwrap();
 
-        assert_eq!(bound, seeded);
+        assert_eq!(bound, Some(seeded));
         assert_eq!(from_pr, bound);
         assert_eq!(repos.clones().await.unwrap().len(), 1);
         assert_eq!(
-            repos.clone_of_checkout(&checkout).await.unwrap(),
-            Some(bound)
+            repos.clone_of_checkout(&checkout, &config).await.unwrap(),
+            bound
+        );
+    }
+
+    #[test]
+    fn the_trust_level_picks_the_clone_source_of_a_github_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let checkout = tmp.path().join("checkout");
+        init_repo(&checkout);
+        git(
+            Some(&checkout),
+            &["remote", "add", "origin", "https://github.com/o/r.git"],
+        )
+        .unwrap();
+        let remote = Some(CloneSource::Remote {
+            url: "https://github.com/o/r.git".to_string(),
+            owner_repo: "o/r".to_string(),
+        });
+        let local = Some(CloneSource::Local {
+            identity: repo_key(&checkout),
+        });
+        for (level, expected) in [
+            (TrustLevel::Full, remote.clone()),
+            (TrustLevel::PrsOnly, remote),
+            (TrustLevel::LocalBranch, local),
+            (TrustLevel::Local, None),
+        ] {
+            let config = crate::trust::config_at(tmp.path(), &checkout, level);
+            assert_eq!(
+                CloneSource::of(&checkout, &config).unwrap(),
+                expected,
+                "{level:?}"
+            );
+        }
+        // An undecided repository binds nothing.
+        assert_eq!(
+            CloneSource::of(&checkout, &crate::workspace::WorkspaceConfig::default()).unwrap(),
+            None
         );
     }
 
