@@ -4,7 +4,7 @@
 
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures_lite::StreamExt;
@@ -26,8 +26,9 @@ use crate::model_selector::ModelSelector;
 const COMPACTION_MARKER: &str = "Your context window is being compacted";
 /// The task the scripted handoff records.
 const HANDOFF_TASK: &str = "HANDOFF-TASK-OF-THE-SCRIPTED-COMPACTION";
-/// How long the scripted compaction stays unanswered.
-const COMPACTION_DELAY: Duration = Duration::from_millis(600);
+/// Bound on how long a held compaction waits for a turn request; past it the
+/// scripted server fails the test instead of hanging.
+const COMPACTION_HOLD_LIMIT: Duration = Duration::from_secs(60);
 /// How long the scripted model takes to answer a turn request.
 const STEP_DELAY: Duration = Duration::from_millis(150);
 
@@ -58,20 +59,33 @@ struct Traffic {
     requests: Vec<String>,
     turns: usize,
     compactions: usize,
-    compaction_open_until: Option<Instant>,
+    /// A compaction request is held unanswered.
+    compaction_open: bool,
     /// Turn requests that arrived while a compaction was unanswered.
     served_during_compaction: usize,
 }
 
 /// A scripted `OpenAI`-compatible server: `script` answers turn requests by
-/// their index, a compaction request gets a handoff after [`COMPACTION_DELAY`].
+/// their index. A server built with [`ScriptedModel::spawn_holding_compaction`]
+/// holds each compaction reply until a turn request has been served.
 struct ScriptedModel {
     base_url: String,
     traffic: Arc<tokio::sync::Mutex<Traffic>>,
 }
 
+/// Signalled by each turn request served while a compaction is held.
+type CompactionGate = Option<Arc<tokio::sync::Notify>>;
+
 impl ScriptedModel {
     async fn spawn(script: fn(usize) -> Step) -> Self {
+        Self::start(script, None).await
+    }
+
+    async fn spawn_holding_compaction(script: fn(usize) -> Step) -> Self {
+        Self::start(script, Some(Arc::new(tokio::sync::Notify::new()))).await
+    }
+
+    async fn start(script: fn(usize) -> Step, gate: CompactionGate) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind scripted model server");
@@ -81,9 +95,11 @@ impl ScriptedModel {
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let shared = shared.clone();
+                let gate = gate.clone();
                 tokio::spawn(async move {
-                    let service =
-                        service_fn(move |request| answer(request, script, shared.clone()));
+                    let service = service_fn(move |request| {
+                        answer(request, script, shared.clone(), gate.clone())
+                    });
                     let _ = http1::Builder::new()
                         .serve_connection(TokioIo::new(stream), service)
                         .await;
@@ -111,6 +127,7 @@ async fn answer(
     request: Request<Incoming>,
     script: fn(usize) -> Step,
     traffic: Arc<tokio::sync::Mutex<Traffic>>,
+    gate: CompactionGate,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     if request.method() == Method::GET && request.uri().path().ends_with("/models") {
         let models = json!({
@@ -131,6 +148,29 @@ async fn answer(
     let text = String::from_utf8(body.to_vec()).expect("request is UTF-8");
     let (delay, frames) = plan(&mut *traffic.lock().await, script, &text);
     tokio::time::sleep(delay).await;
+    if text.contains(COMPACTION_MARKER) {
+        if let Some(gate) = &gate {
+            tokio::time::timeout(COMPACTION_HOLD_LIMIT, gate.notified())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "no turn request was served within {COMPACTION_HOLD_LIMIT:?} \
+                         while the compaction was held"
+                    )
+                });
+        }
+        traffic.lock().await.compaction_open = false;
+    } else {
+        let held = {
+            let mut traffic = traffic.lock().await;
+            let held = traffic.compaction_open;
+            traffic.served_during_compaction += usize::from(held);
+            held
+        };
+        if let Some(gate) = gate.as_ref().filter(|_| held) {
+            gate.notify_one();
+        }
+    }
     let stream = [frames, vec!["data: [DONE]\n\n".to_string()]]
         .concat()
         .concat();
@@ -143,7 +183,7 @@ fn plan(traffic: &mut Traffic, script: fn(usize) -> Step, text: &str) -> (Durati
     {
         if text.contains(COMPACTION_MARKER) {
             traffic.compactions += 1;
-            traffic.compaction_open_until = Some(Instant::now() + COMPACTION_DELAY);
+            traffic.compaction_open = true;
             let handoff = json!({
                 "current_task": HANDOFF_TASK,
                 "key_decisions": [],
@@ -154,19 +194,13 @@ fn plan(traffic: &mut Traffic, script: fn(usize) -> Step, text: &str) -> (Durati
                 "skills": [],
             });
             (
-                COMPACTION_DELAY,
+                Duration::ZERO,
                 vec![
                     chunk(&json!({"content": handoff.to_string()}), None),
                     chunk(&json!({}), Some("stop")),
                 ],
             )
         } else {
-            if traffic
-                .compaction_open_until
-                .is_some_and(|until| Instant::now() < until)
-            {
-                traffic.served_during_compaction += 1;
-            }
             let index = traffic.turns;
             traffic.turns += 1;
             let frames = match script(index) {
@@ -255,7 +289,7 @@ fn compact_then_work(index: usize) -> Step {
 /// agent and in the persisted context snapshot.
 #[tokio::test]
 async fn the_compact_tool_compacts_in_the_background_and_the_handoff_is_persisted() {
-    let model = ScriptedModel::spawn(compact_then_work).await;
+    let model = ScriptedModel::spawn_holding_compaction(compact_then_work).await;
     let mut session = Box::pin(Session::start_with_runtime(&config_for(
         &model,
         ContextConfig::default(),
