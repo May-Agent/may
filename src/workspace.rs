@@ -238,8 +238,18 @@ impl WorkspaceConfig {
     fn check_projects_unique(&self) -> Result<(), WorkspaceConfigError> {
         let mut seen: Vec<(PathBuf, &ProjectConfig)> = Vec::new();
         for project in &self.projects {
-            let Ok(identity) = crate::issue::repository_identity(&project.path) else {
-                continue;
+            let identity = match crate::issue::repository_identity(&project.path) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    // Every lookup treats this entry as a non-match; this is
+                    // the one place a load reports why.
+                    tracing::warn!(
+                        path = %project.path.display(),
+                        %error,
+                        "project entry no longer resolves to a repository; it matches nothing"
+                    );
+                    continue;
+                }
             };
             let paths = seen
                 .iter()
