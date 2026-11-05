@@ -34,6 +34,8 @@ mod notifications;
 mod profiles;
 mod remote_access;
 mod server;
+#[cfg(test)]
+mod session_directory_tests;
 mod sessions;
 mod state;
 mod tasks;
@@ -45,6 +47,8 @@ pub(crate) mod types;
 
 #[cfg(test)]
 mod funnel_tests;
+#[cfg(test)]
+mod repo_clones_tests;
 #[cfg(test)]
 mod response_tests;
 #[cfg(test)]

@@ -27,6 +27,8 @@ pub(crate) mod pr_tool;
 mod provider;
 pub(crate) mod register_tool;
 pub(crate) mod repo_tool;
+#[cfg(test)]
+mod request_parameters_tests;
 pub mod runner;
 mod runtime_context;
 #[cfg(test)]
@@ -62,8 +64,8 @@ pub use permission::{
 };
 pub(crate) use provider::reasoning_text_requested;
 pub use provider::{
-    ProviderLlm, RedactedModel, RequestParameterizedModel, ResolvedProviderRuntime,
-    build_fast_provider_chain, provider_candidate_count, resolve_provider_runtime,
+    ModelSlot, ProviderLlm, RedactedModel, ResolvedProviderRuntime, build_fast_provider_chain,
+    provider_candidate_count, resolve_provider_runtime,
 };
 pub use runner::{
     AgentHandle, AgentWorker, BackgroundWakes, ForeignTurn, RemoteTurn, RunLease, TuiEvent,
