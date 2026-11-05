@@ -232,9 +232,11 @@ pub trait IssueStore: Send + Sync + fmt::Debug {
     /// Stable name of this backend's issue set, keying its search index.
     fn search_key(&self) -> String;
 
-    /// Issues updated after `since` (every issue when `None`), oldest
-    /// update first, at most `limit`. Drives the search index's
-    /// incremental sync.
+    /// Issues updated at or after `since` (every issue when `None`), oldest
+    /// update first: the ones at `since` itself, then at least `limit`
+    /// newer ones as long as more exist, never cutting through a group of
+    /// issues sharing one update time. Drives the search index's
+    /// incremental sync, which skips what it already indexed.
     fn updated_since(
         &self,
         since: Option<&str>,
@@ -429,16 +431,14 @@ pub fn resolve_issue_store(
 ) -> Result<ResolvedIssueStore, IssueError> {
     let identity = repository_identity(cwd)?;
     let config = crate::workspace::WorkspaceConfig::load(workspace_config_path)?;
-    for project in &config.projects {
-        if repository_identity(&project.path)? != identity {
-            continue;
-        }
-        if let crate::workspace::ProjectIssues::Github { repository } = &project.issues {
-            return Ok(ResolvedIssueStore::GitHub(GitHubIssueStore::new(
-                repository.clone(),
-                GhCliTokenSource,
-            )));
-        }
+    if let Some(crate::workspace::ProjectIssues::Github { repository }) = config
+        .project_for_identity(&identity)
+        .map(|project| &project.issues)
+    {
+        return Ok(ResolvedIssueStore::GitHub(GitHubIssueStore::new(
+            repository.clone(),
+            GhCliTokenSource,
+        )));
     }
     Ok(ResolvedIssueStore::May(MayIssueStore::new(
         db,

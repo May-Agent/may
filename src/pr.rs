@@ -662,7 +662,7 @@ impl PrStore {
     fn project_for_record(&self, record: &CloneRecord) -> Option<&crate::workspace::ProjectConfig> {
         self.context.workspace_config.projects.iter().find(|p| {
             if record.local {
-                crate::issue::repository_identity(&p.path).is_ok_and(|k| k == record.repo_key)
+                p.has_identity(Path::new(&record.repo_key))
             } else {
                 github_owner_repo(&record.source)
                     == p.github_repository()
@@ -674,11 +674,7 @@ impl PrStore {
     /// The `[[projects]]` entry covering a filesystem path.
     fn project_for_path(&self, path: &Path) -> Option<&crate::workspace::ProjectConfig> {
         let key = crate::issue::repository_identity(path).ok()?;
-        self.context
-            .workspace_config
-            .projects
-            .iter()
-            .find(|p| crate::issue::repository_identity(&p.path).is_ok_and(|k| k == key))
+        self.context.workspace_config.project_for_identity(&key)
     }
 
     /// Run the outbound screen when the project enables it. `Some(reason)`
@@ -875,12 +871,7 @@ impl PrStore {
     fn check_command(&self, record: &CloneRecord) -> Option<String> {
         self.context
             .workspace_config
-            .projects
-            .iter()
-            .find(|p| {
-                crate::issue::repository_identity(&p.path)
-                    .is_ok_and(|k| k.to_string_lossy() == record.repo_key)
-            })
+            .project_for_identity(Path::new(&record.repo_key))
             .and_then(|p| p.checks.clone())
     }
 
