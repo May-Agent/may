@@ -23,6 +23,7 @@ DELETE FROM session_transcript_entries WHERE ? IS NULL OR session_id = ?;
 DELETE FROM session_context_snapshots WHERE ? IS NULL OR session_id = ?;
 DELETE FROM session_repo_clones WHERE ? IS NULL OR session_id = ?;
 DELETE FROM session_intervals WHERE ? IS NULL OR session_id = ?;
+DELETE FROM prompt_cache_routes WHERE ? IS NULL OR session_id = ?;
 DELETE FROM context_debug_snapshot_headers WHERE ? IS NULL OR session_id = ?;
 DELETE FROM context_debug_snapshot_prompt_attachments WHERE ? IS NULL OR session_id = ?;
 DELETE FROM context_debug_snapshot_messages WHERE ? IS NULL OR session_id = ?;

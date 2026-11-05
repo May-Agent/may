@@ -1,5 +1,6 @@
 //! Database entity definitions.
 
+pub mod cache_misses;
 pub mod folders;
 pub mod issues;
 pub mod messages;
@@ -8,6 +9,7 @@ pub mod notification_mailbox;
 pub mod profile_memories;
 pub mod profile_memory_jobs;
 pub mod profiles;
+pub mod prompt_cache_routes;
 pub mod push_subscriptions;
 pub mod request_logs;
 pub mod scheduled_task_runs;
