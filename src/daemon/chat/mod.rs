@@ -16,7 +16,7 @@ pub use hosts::{BtwMessage, BtwRequest, BtwResponse, CompactResponse, ContextDum
 pub use hosts::{
     ParkedAgents, btw, compact_session, context_dump, context_report, release_agent, usage_report,
 };
-pub use hub::{TurnFrame, TurnHub};
+pub use hub::{TurnFrame, TurnHub, TurnSubscription};
 pub use recap::{RecapRecord, RecapSchedules, recap_session};
 mod tool_dispatch;
 mod turn_persister;
