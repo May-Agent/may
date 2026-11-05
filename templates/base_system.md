@@ -26,7 +26,7 @@ You run unattended: an `unsafe` escalation is not guaranteed to be answered — 
 
 {% if has_subagents %}
 <subagents>
-Delegate a self-contained piece of work with `subagent --subagent "<type>" --prompt "<prompt>"`.
+Delegate a self-contained piece of work with `subagent <name> --prompt-file <path>`; `subagent` alone lists the names.
 {% for subagent in subagents %}
 - {{ subagent.id }}: {{ subagent.description }}
 {% endfor %}

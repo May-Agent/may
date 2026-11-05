@@ -20,6 +20,7 @@ use crate::agent::repo_tool::{RepoContext, RepoTool, SubagentRepoTool};
 use crate::agent::session_tool::SessionTool;
 use crate::agent::subagent_tracker::{SubagentTracker, TrackedSubagentTool, UsageObservedModel};
 use crate::agent::task_tool::{TaskBroker, TaskRuntimeKind, TaskTool};
+use crate::bundle::Bundle;
 use crate::issue::search::IssueSearch;
 use crate::mcp::load_active_mcp_connections;
 use crate::repo_search::indexer::SearchIndexer;
@@ -143,13 +144,20 @@ where
     if !config.request_parameters.hosted_web_fetch() {
         register_tool_with_description(builder, &mut descriptions, WebFetchTool::new());
     }
-    let screen_llm = config
-        .ask_fast
-        .clone()
-        .unwrap_or_else(|| config.llm.clone());
-    let ask_command = AskCommand::new(config.ask_fast.unwrap_or_else(|| config.llm.clone()))
-        .with_flagship(config.ask_flagship.unwrap_or_else(|| config.llm.clone()))
-        .with_balanced(config.ask_balanced.unwrap_or_else(|| config.llm.clone()));
+    // The model of each tier; a tier nothing is configured for runs on the
+    // session's model.
+    let flagship_llm = config.ask_flagship.unwrap_or_else(|| config.llm.clone());
+    let balanced_llm = config.ask_balanced.unwrap_or_else(|| config.llm.clone());
+    let fast_llm = config.ask_fast.unwrap_or_else(|| config.llm.clone());
+    // The main agent is declared on the advanced tier (the terminal agent
+    // builder has no setter for it) and a fork must resolve to the model the
+    // main agent runs on, so the advanced slot of `subagent` is the session's
+    // own model.
+    let subagent_flagship = config.llm.clone();
+    let screen_llm = fast_llm.clone();
+    let ask_command = AskCommand::new(fast_llm.clone())
+        .with_flagship(flagship_llm.clone())
+        .with_balanced(balanced_llm.clone());
     register_tool_with_description(builder, &mut descriptions, ask_command);
     register_tool_with_description(
         builder,
@@ -313,27 +321,35 @@ where
         );
     }
 
-    let mut subagent_tool = SubagentTool::new(UsageObservedModel::new(config.llm))
-        .with_runs(config.subagent_runs)
-        .with_builtins()
-        .with_base_dir(&config.sandbox_dir)
-        .with_file_mounts([
-            SubagentFileMount::new(PathBuf::from("."), config.sandbox_dir.clone()),
-            SubagentFileMount::new(PathBuf::from("skills"), config.sandbox_dir.join("skills")),
-        ]);
+    // A subagent runs on the model of its definition's tier: the models `ask`
+    // offers.
+    let mut subagent_tool = SubagentTool::new(
+        UsageObservedModel::new(subagent_flagship),
+        Bundle::subagents_dir(&config.may_dir),
+    )
+    .with_balanced_model(UsageObservedModel::new(balanced_llm))
+    .with_fast_model(UsageObservedModel::new(fast_llm))
+    .with_runs(config.subagent_runs)
+    .with_base_dir(&config.sandbox_dir)
+    .with_file_mounts([
+        SubagentFileMount::new(PathBuf::from("."), config.sandbox_dir.clone()),
+        SubagentFileMount::new(PathBuf::from("skills"), config.sandbox_dir.join("skills")),
+    ]);
     if let Some(acp) = &config.acp {
         subagent_tool = acp.register(subagent_tool)?;
     }
     let subagent_tracker = config.subagent_tracker;
     let fork_source = subagent_tool.fork_source();
     describe_tool(&mut descriptions, &subagent_tool);
-    // Built for each terminal that serves the registry, so a subagent launches
-    // its own subagents with its own authority, never the main agent's.
-    builder.configure_terminal_bound_tool("subagent", move |binding| {
-        TrackedSubagentTool::new(
-            subagent_tool.for_terminal(binding),
-            subagent_tracker.clone(),
-        )
+    // Built for the main agent's terminal alone: a subagent has no `subagent`
+    // command.
+    builder.main_exclusive(|main| {
+        main.configure_terminal_bound_usage_tool("subagent", move |binding| {
+            TrackedSubagentTool::new(
+                subagent_tool.for_terminal(binding),
+                subagent_tracker.clone(),
+            )
+        });
     });
 
     let mut mcp_command_names = Vec::new();
@@ -721,11 +737,9 @@ mod tests {
         let main = builder.build(session_dir.join("outputs"));
         let subagent = main.for_subagent(None, None);
 
-        // `subagent` is built per terminal, so a subagent launches with its own
-        // authority; it is not reserved for the main agent.
-        assert!(!main.is_reserved("subagent"));
-        assert!(!subagent.is_reserved("subagent"));
-        assert!(subagent.is_tool_configured("subagent"));
+        // A subagent's terminal has no `subagent` command.
+        assert!(main.is_tool_configured("subagent"));
+        assert!(!subagent.is_tool_configured("subagent"));
 
         // The main agent creates an issue; the subagent can read it.
         let created = main
