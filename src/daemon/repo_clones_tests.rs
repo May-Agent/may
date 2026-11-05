@@ -33,7 +33,7 @@ fn get(uri: &str) -> Request {
 async fn the_endpoint_lists_the_registered_clones() {
     let home = tempfile::tempdir().expect("temp dir");
     let state = std::sync::Arc::new(
-        DaemonState::for_test(home.path(), home.path(), MayConfig::default())
+        DaemonState::for_test(home.path(), MayConfig::default())
             .await
             .expect("daemon state"),
     );
