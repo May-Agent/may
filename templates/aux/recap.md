@@ -10,6 +10,3 @@ Write in {{ language }}.
 {% else %}
 Write in the language of the user's messages.
 {% endif %}
-Return JSON: {"summary": string, "next_action": string | null}.
-summary: plain text, at most 700 characters.
-next_action: at most 200 characters. Set it only when an unanswered question, an agreed next step, or an obvious blocker resolution exists; otherwise null.

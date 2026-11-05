@@ -196,6 +196,7 @@ where
                 config.session_id.clone(),
                 config.db.clone(),
             )),
+            config.workspace_config.clone(),
         ),
     );
     let issue_search = IssueSearch::new(
