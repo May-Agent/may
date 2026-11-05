@@ -4010,6 +4010,14 @@ impl App {
                             self.usage = Some(u);
                         }
                     }
+                    AgentEvent::CompactionRecovery {
+                        error,
+                        alerts_removed,
+                        outputs_spilled,
+                    } => {
+                        self.chat
+                            .push_compaction_recovery(&error, alerts_removed, outputs_spilled);
+                    }
                     // Lifecycle events are used for runtime coordination, not rendered.
                     _ => {}
                 }
