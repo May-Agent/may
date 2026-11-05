@@ -1674,44 +1674,83 @@ mod tests {
         assert_eq!(count(&db, "sessions").await, 0);
     }
 
-    /// A session that ran a turn has a `session_runtimes` row; with foreign
-    /// keys onto `sessions` (as an older database carries) it still deletes.
+    /// A long-lived database made by an older build keeps its tables with
+    /// foreign keys onto `sessions` (`legacy_session_fk_schema.sql`, read from
+    /// a real history database). Opening it drops the two tables current code
+    /// no longer reads, and sessions that ran a turn then delete.
     #[tokio::test]
-    async fn delete_session_succeeds_with_foreign_keys_after_a_turn() {
+    async fn legacy_foreign_keys_do_not_block_session_delete() {
+        const LEGACY_SCHEMA: &str = include_str!("testdata/legacy_session_fk_schema.sql");
         let dir = tempdir().expect("temp dir should be created");
-        let db = ChatDb::open(&dir.path().join("history.db"))
+        let path = dir.path().join("history.db");
+        let url = format!("sqlite://{}?mode=rwc", path.display());
+        let raw = skyzen_services::Db::connect_sqlite(&url)
             .await
-            .expect("db should open");
-        db.execute_for_test("DROP TABLE session_runtimes")
-            .await
-            .expect("drop should run");
-        db.execute_for_test(
-            "CREATE TABLE session_runtimes (session_id TEXT PRIMARY KEY REFERENCES sessions(id), state TEXT NOT NULL, run_id TEXT, browser_takeover_active BOOLEAN NOT NULL, browser_takeover_alert_pending BOOLEAN NOT NULL, terminal_task_id TEXT, terminal_output_file TEXT, terminal_output_preview TEXT, terminal_input_notice TEXT, terminal_background_reason TEXT, updated_at TEXT NOT NULL)",
-        )
-        .await
-        .expect("create should run");
-        for id in ["session-a", "session-b"] {
-            db.create_session(id, Some("Session"), Some("model"))
+            .expect("raw db should connect");
+        // The legacy definitions come first, so the current schema's
+        // `CREATE TABLE IF NOT EXISTS` leaves them as they are.
+        for statement in super::super::db_sql::statements(LEGACY_SCHEMA) {
+            query!(raw, statement)
+                .execute()
                 .await
-                .expect("session should be created");
-            db.set_session_runtime_state(id, crate::session::SessionRuntimeState::Idle)
-                .await
-                .expect("runtime row should insert");
+                .expect("legacy statement should run");
         }
-
+        ChatDb::initialize_schema(&raw)
+            .await
+            .expect("schema should initialize");
+        for id in ["session-a", "session-b"] {
+            for sql in [
+                "INSERT INTO sessions (id, message_count, pinned, archived, created_at, updated_at) VALUES (?, 0, 0, 0, 't', 't')",
+                "INSERT INTO session_pending_messages (session_id, delivery_mode, content, attachments_json, created_at) VALUES (?, 'queue', 'c', '[]', 't')",
+                "INSERT INTO session_pending_ask_user (request_id, session_id, questions_json, created_at) VALUES (?, ?, '[]', 't')",
+                "INSERT INTO messages (session_id, role, content) VALUES (?, 'user', 'c')",
+                "INSERT INTO session_runtimes (session_id, state, browser_takeover_active, browser_takeover_alert_pending, updated_at) VALUES (?, 'idle', 0, 0, 't')",
+                "INSERT INTO session_plans (session_id, plan_state, updated_at) VALUES (?, 'none', 't')",
+                "INSERT INTO session_pending_permissions (request_id, session_id, mode, script, created_at) VALUES (?, ?, 'm', 's', 't')",
+                "INSERT INTO session_pending_workspace (request_id, session_id, path, reason, created_at) VALUES (?, ?, 'p', 'r', 't')",
+            ] {
+                if sql.matches('?').count() == 2 {
+                    query!(raw, sql, id, id).execute().await
+                } else {
+                    query!(raw, sql, id).execute().await
+                }
+                .expect("legacy row should insert");
+            }
+        }
         // The constraint is enforced: deleting the row alone is the reported 787.
-        db.execute_for_test("DELETE FROM sessions WHERE id = 'session-b'")
+        query!(raw, "DELETE FROM sessions WHERE id = 'session-b'")
+            .execute()
             .await
             .expect_err("a bare sessions delete must hit the foreign key");
+        drop(raw);
+
+        let db = ChatDb::open(&path).await.expect("legacy db should open");
+        for table in ["session_pending_messages", "session_pending_ask_user"] {
+            let tables = query!(
+                db.db,
+                "SELECT name AS tbl FROM sqlite_master WHERE type = 'table' AND name = ?",
+                table
+            )
+            .fetch_all::<TableRow>()
+            .await
+            .expect("tables should list");
+            assert!(tables.is_empty(), "`{table}` should be dropped on open");
+            assert!(!deleted_tables().contains(&table));
+            assert!(!RETAINED_ON_DELETE.contains(&table));
+        }
 
         db.delete_session("session-a")
             .await
             .expect("delete should succeed");
         assert_eq!(count(&db, "session_runtimes").await, 1);
-        db.delete_all_sessions()
+        assert_eq!(count(&db, "messages").await, 1);
+        let removed = db
+            .delete_all_sessions()
             .await
             .expect("delete all should succeed");
+        assert_eq!(removed, 1);
         assert_eq!(count(&db, "session_runtimes").await, 0);
+        assert_eq!(count(&db, "sessions").await, 0);
     }
 
     /// A write lock held on one pool delays registration on a second pool
