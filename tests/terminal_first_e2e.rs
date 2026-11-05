@@ -1026,17 +1026,17 @@ struct TestHarness {
 
 impl TestHarness {
     async fn new(config_base_url: &str) -> Self {
-        Self::build(config_base_url, false).await
+        Self::build(config_base_url, None).await
     }
 
-    /// A harness whose three model tiers are three models of their own,
-    /// none of them the session's, so a request's model names the tier it
-    /// ran on.
-    async fn new_with_tier_models(config_base_url: &str) -> Self {
-        Self::build(config_base_url, true).await
+    /// A harness whose three model tiers are three models of their own, so a
+    /// request's model names the tier it ran on, and whose session runs on
+    /// `session_model`.
+    async fn new_with_tier_models_on(config_base_url: &str, session_model: &str) -> Self {
+        Self::build(config_base_url, Some(session_model)).await
     }
 
-    async fn build(config_base_url: &str, tier_models: bool) -> Self {
+    async fn build(config_base_url: &str, tier_models: Option<&str>) -> Self {
         let home = tempfile::tempdir().expect("test home tempdir should be created");
         let may_dir = home.path().join(".may");
         tokio::fs::create_dir_all(&may_dir)
@@ -1053,7 +1053,7 @@ impl TestHarness {
                 .with_api_key(TEST_API_KEY)
                 .with_base_url(config_base_url),
         );
-        if tier_models {
+        if tier_models.is_some() {
             config.models.advanced =
                 vec![ModelSelector::new(TEST_PROVIDER_ID, TIER_FLAGSHIP_MODEL)];
             config.models.balanced =
@@ -1062,7 +1062,10 @@ impl TestHarness {
         } else {
             config.models.advanced = vec![ModelSelector::new(TEST_PROVIDER_ID, TEST_MODEL)];
         }
-        config.last_model = Some(ModelSelector::new(TEST_PROVIDER_ID, TEST_MODEL));
+        config.last_model = Some(ModelSelector::new(
+            TEST_PROVIDER_ID,
+            tier_models.unwrap_or(TEST_MODEL),
+        ));
         config
             .save_to(&may_dir.join("config.toml"))
             .await
@@ -2474,12 +2477,22 @@ async fn run_probe_turn(
     scenario: MockChatScenario,
     content: &str,
 ) -> (ProbeFiles, MockOpenAiServer) {
-    let tier_models = matches!(scenario, MockChatScenario::SubagentProbe(_));
+    let session_model =
+        matches!(scenario, MockChatScenario::SubagentProbe(_)).then_some(TIER_FLAGSHIP_MODEL);
+    run_probe_turn_on(scenario, content, session_model).await
+}
+
+/// `run_probe_turn` on a harness whose tiers are models of their own and whose
+/// session runs on `session_model`; `None` configures only the session model.
+async fn run_probe_turn_on(
+    scenario: MockChatScenario,
+    content: &str,
+    session_model: Option<&str>,
+) -> (ProbeFiles, MockOpenAiServer) {
     let mock = MockOpenAiServer::spawn(scenario).await;
-    let harness = if tier_models {
-        TestHarness::new_with_tier_models(&mock.base_url()).await
-    } else {
-        TestHarness::new(&mock.base_url()).await
+    let harness = match session_model {
+        Some(model) => TestHarness::new_with_tier_models_on(&mock.base_url(), model).await,
+        None => TestHarness::new(&mock.base_url()).await,
     };
     let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
     let client = reqwest::Client::new();
@@ -2627,8 +2640,38 @@ const FORK_FILLER_REPEATS: usize = 30_000;
 #[tokio::test]
 #[serial]
 async fn a_fork_continues_the_main_agents_context() {
-    let (files, mock) = run_probe_turn(MockChatScenario::ForkProbe, "Run the fork probe.").await;
+    let probe = run_probe_turn(MockChatScenario::ForkProbe, "Run the fork probe.").await;
+    assert_fork_continues(probe).await;
+}
 
+/// The session runs on the balanced tier's model, which is not the configured
+/// advanced model.
+#[tokio::test]
+#[serial]
+async fn a_fork_on_a_non_advanced_session_model_succeeds() {
+    let probe = run_probe_turn_on(
+        MockChatScenario::ForkProbe,
+        "Run the fork probe.",
+        Some(TIER_BALANCED_MODEL),
+    )
+    .await;
+    assert_fork_continues(probe).await;
+}
+
+/// The session's model belongs to none of the configured tiers.
+#[tokio::test]
+#[serial]
+async fn a_fork_on_a_model_in_no_tier_succeeds() {
+    let probe = run_probe_turn_on(
+        MockChatScenario::ForkProbe,
+        "Run the fork probe.",
+        Some(TEST_MODEL),
+    )
+    .await;
+    assert_fork_continues(probe).await;
+}
+
+async fn assert_fork_continues((files, mock): (ProbeFiles, MockOpenAiServer)) {
     let requests = mock.agent_requests().await;
     let forks: Vec<&Value> = requests.iter().filter(|r| is_fork_request(r)).collect();
     assert_eq!(
