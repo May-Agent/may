@@ -247,7 +247,7 @@ impl PrStore {
             }
             Some(_) => {}
         }
-        let dir = repos.ensure_local_clone(&worktree, &repo_key).await?;
+        let dir = repos.ensure_clone_of(&worktree).await?;
         let record = repos
             .clones()
             .await?

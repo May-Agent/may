@@ -48,6 +48,52 @@ pub enum RepoCloneError {
     Conflict(PathBuf),
 }
 
+/// What a checkout's session clone is made from, and so the registry key it
+/// is held under. The one place that decision is made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloneSource {
+    /// A checkout with a GitHub `origin`: cloned from the remote and keyed
+    /// by `owner/repo`.
+    Remote {
+        /// The `origin` URL.
+        url: String,
+        /// `owner/repo` of the GitHub remote.
+        owner_repo: String,
+    },
+    /// Any other checkout: cloned locally and keyed by the canonical git
+    /// common dir.
+    Local {
+        /// The repository identity ([`crate::issue::repository_identity`]).
+        identity: PathBuf,
+    },
+}
+
+impl CloneSource {
+    /// The source `checkout`'s clone is made from.
+    ///
+    /// # Errors
+    /// Fails when a local checkout's identity cannot be read.
+    pub fn of(checkout: &Path) -> Result<Self, RepoCloneError> {
+        if let crate::trust::RepoKind::Github { owner_repo } = crate::trust::repo_kind(checkout)
+            && let Some(url) = crate::trust::remote_url(checkout)
+        {
+            return Ok(Self::Remote { url, owner_repo });
+        }
+        let identity = crate::issue::repository_identity(checkout)
+            .map_err(|error| RepoCloneError::Io(std::io::Error::other(error)))?;
+        Ok(Self::Local { identity })
+    }
+
+    /// The registry key of the clone.
+    #[must_use]
+    pub fn key(&self) -> String {
+        match self {
+            Self::Remote { owner_repo, .. } => owner_repo.clone(),
+            Self::Local { identity } => identity.to_string_lossy().into_owned(),
+        }
+    }
+}
+
 /// A clone's directory name inside `<session>/repos/`: exactly one normal
 /// path component.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,8 +272,7 @@ impl SessionRepos {
     }
 
     /// The clone this session holds of `checkout`'s repository, when one
-    /// exists. Uses the identity the clone was registered under: the
-    /// `owner/repo` of a GitHub remote, else the canonical git common dir.
+    /// exists, under the key [`CloneSource::of`] gives the checkout.
     ///
     /// # Errors
     /// Fails when the checkout's identity cannot be read or the registry
@@ -236,18 +281,22 @@ impl SessionRepos {
         &self,
         checkout: &Path,
     ) -> Result<Option<PathBuf>, RepoCloneError> {
-        let key = match crate::trust::repo_kind(checkout) {
-            crate::trust::RepoKind::Github { owner_repo }
-                if crate::trust::remote_url(checkout).is_some() =>
-            {
-                owner_repo
+        self.clone_for(&CloneSource::of(checkout)?.key()).await
+    }
+
+    /// Ensure the session's clone of `checkout`'s repository exists, made
+    /// from the source [`CloneSource::of`] picks, and return its path.
+    ///
+    /// # Errors
+    /// Fails when the checkout's identity cannot be read, git fails, or the
+    /// registry cannot be read or written.
+    pub async fn ensure_clone_of(&self, checkout: &Path) -> Result<PathBuf, RepoCloneError> {
+        match CloneSource::of(checkout)? {
+            CloneSource::Remote { url, owner_repo } => {
+                self.ensure_remote_clone(&url, &owner_repo).await
             }
-            _ => crate::issue::repository_identity(checkout)
-                .map_err(|error| RepoCloneError::Io(std::io::Error::other(error)))?
-                .to_string_lossy()
-                .into_owned(),
-        };
-        self.clone_for(&key).await
+            CloneSource::Local { identity } => self.ensure_local_clone(checkout, &identity).await,
+        }
     }
 
     /// Register `dir` as the clone serving `repo_key` from `source`.
@@ -565,6 +614,41 @@ mod tests {
         // The checkout itself is untouched.
         let status = git(Some(&checkout), &["status", "--porcelain"]).unwrap();
         assert_eq!(status.trim(), "");
+    }
+
+    #[tokio::test]
+    async fn a_github_checkout_has_one_clone_however_it_is_reached() {
+        let tmp = tempfile::tempdir().unwrap();
+        let checkout = tmp.path().join("checkout");
+        init_repo(&checkout);
+        git(
+            Some(&checkout),
+            &["remote", "add", "origin", "https://github.com/o/r.git"],
+        )
+        .unwrap();
+        let repos = session_repos(tmp.path()).await;
+        // Stand in for the network clone: an existing directory is adopted.
+        let seeded = repos.path(&CloneDir::for_repo_key("o/r"));
+        std::fs::create_dir_all(&seeded).unwrap();
+
+        assert_eq!(
+            CloneSource::of(&checkout).unwrap(),
+            CloneSource::Remote {
+                url: "https://github.com/o/r.git".to_string(),
+                owner_repo: "o/r".to_string(),
+            }
+        );
+        // The session binding and `pr` both go through `ensure_clone_of`.
+        let bound = repos.ensure_clone_of(&checkout).await.unwrap();
+        let from_pr = repos.ensure_clone_of(&checkout).await.unwrap();
+
+        assert_eq!(bound, seeded);
+        assert_eq!(from_pr, bound);
+        assert_eq!(repos.clones().await.unwrap().len(), 1);
+        assert_eq!(
+            repos.clone_of_checkout(&checkout).await.unwrap(),
+            Some(bound)
+        );
     }
 
     /// Make every loose object file of `repo` writable and empty it, as a
