@@ -8,6 +8,7 @@ use askama::Template;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+use crate::issue::owner::{IssueOwner, IssueOwners, OwnerIndex};
 use crate::issue::provenance::{CallOrigin, IssueAction, IssueMarks, IssueProvenance};
 use crate::issue::search::{IssueHit, IssueSearch};
 use crate::issue::{
@@ -44,7 +45,9 @@ const fn default_list_state() -> IssueListState {
 ///
 /// Subcommands:
 /// - `issue create <title> [--body text] [--labels name ...]`
-/// - `issue view <number>`
+/// - `issue view <number>` — an open issue also names its owning agent
+/// - `issue owner <number>` — the agent whose `tasks.md` lists the open
+///   issue; at most one agent owns an issue
 /// - `issue list [--state open|closed|all] [--labels name ...] [--limit n]`
 /// - `issue search <query> [--state open|closed|all] [--limit n]` — issues
 ///   whose title, body or comments match the described topic
@@ -74,6 +77,12 @@ pub enum IssueArgs {
     },
     /// View one issue with its body, comments and relations.
     View {
+        /// Issue number.
+        number: i64,
+    },
+    /// Name the agent that owns an open issue: the one whose `tasks.md`
+    /// lists it.
+    Owner {
         /// Issue number.
         number: i64,
     },
@@ -178,6 +187,7 @@ impl IssueArgs {
         match self {
             Self::Create { .. } => "create",
             Self::View { .. } => "view",
+            Self::Owner { .. } => "owner",
             Self::List { .. } => "list",
             Self::Search { .. } => "search",
             Self::Provenance { .. } => "provenance",
@@ -194,7 +204,11 @@ impl IssueArgs {
     const fn writes(&self) -> bool {
         !matches!(
             self,
-            Self::View { .. } | Self::List { .. } | Self::Search { .. } | Self::Provenance { .. }
+            Self::View { .. }
+                | Self::Owner { .. }
+                | Self::List { .. }
+                | Self::Search { .. }
+                | Self::Provenance { .. }
         )
     }
 
@@ -220,6 +234,14 @@ impl IssueArgs {
 #[template(path = "issue_reserved.txt")]
 struct IssueReserved {
     subcommand: &'static str,
+}
+
+/// What the model reads for `issue owner`.
+#[derive(Template)]
+#[template(path = "issue_owner.txt", escape = "none")]
+struct IssueOwnerText<'a> {
+    number: i64,
+    owner: Option<&'a IssueOwner>,
 }
 
 /// What the model reads for `issue search`.
@@ -264,6 +286,7 @@ pub struct IssueTool<S> {
     search: Option<SessionIssueSearch>,
     languages: Option<aither_agent::LanguageGuard>,
     changes: Option<IssueChangeNotifier>,
+    owners: Option<IssueOwners>,
 }
 
 /// The `issue` tool as a subagent sees it: the read subcommands work and every
@@ -273,6 +296,7 @@ pub struct SubagentIssueTool<S> {
     store: S,
     provenance: IssueProvenance,
     search: Option<SessionIssueSearch>,
+    owners: Option<IssueOwners>,
 }
 
 impl<S: IssueStore> SubagentIssueTool<S> {
@@ -283,6 +307,7 @@ impl<S: IssueStore> SubagentIssueTool<S> {
             store,
             provenance,
             search: None,
+            owners: None,
         }
     }
 
@@ -290,6 +315,13 @@ impl<S: IssueStore> SubagentIssueTool<S> {
     #[must_use]
     pub fn with_search(mut self, search: SessionIssueSearch) -> Self {
         self.search = Some(search);
+        self
+    }
+
+    /// Name issue owners through `owners`.
+    #[must_use]
+    pub fn with_owners(mut self, owners: IssueOwners) -> Self {
+        self.owners = Some(owners);
         self
     }
 }
@@ -319,6 +351,7 @@ impl<S: IssueStore + Clone + 'static> Tool for SubagentIssueTool<S> {
             &self.provenance,
             &CallOrigin::from_context(&cx),
             self.search.as_ref(),
+            self.owners.as_ref(),
             arguments,
         )
         .await
@@ -336,7 +369,15 @@ impl<S: IssueStore> IssueTool<S> {
             search: None,
             languages: None,
             changes: None,
+            owners: None,
         }
+    }
+
+    /// Name issue owners through `owners`.
+    #[must_use]
+    pub fn with_owners(mut self, owners: IssueOwners) -> Self {
+        self.owners = Some(owners);
+        self
     }
 
     /// Refuse issue text outside the working language `guard` enforces.
@@ -385,6 +426,7 @@ impl<S: IssueStore + Clone + 'static> Tool for IssueTool<S> {
             &self.provenance,
             &CallOrigin::from_context(&cx),
             self.search.as_ref(),
+            self.owners.as_ref(),
             arguments,
         )
         .await;
@@ -402,6 +444,7 @@ async fn execute<S: IssueStore>(
     provenance: &IssueProvenance,
     origin: &CallOrigin,
     search: Option<&SessionIssueSearch>,
+    owners: Option<&IssueOwners>,
     args: IssueArgs,
 ) -> Result<ToolResult, IssueError> {
     let record = |number: i64,
@@ -434,12 +477,38 @@ async fn execute<S: IssueStore>(
                 .create(title.trim(), body.as_deref().unwrap_or(""), &labels)
                 .await?;
             record(detail.number, None, IssueAction::Create, None).await?;
-            Ok(ToolResult::text(render_detail(&detail, None)))
+            Ok(ToolResult::text(render_detail(&detail, None, None)))
         }
         IssueArgs::View { number } => {
             let detail = backend.get(number).await?;
             let marks = provenance.marks(backend, number).await?;
-            Ok(ToolResult::text(render_detail(&detail, Some(&marks))))
+            let owner = match owners {
+                Some(owners) if detail.state == IssueState::Open => {
+                    owners.owner_of(&backend.search_key(), number).await?
+                }
+                _ => None,
+            };
+            Ok(ToolResult::text(render_detail(
+                &detail,
+                Some(&marks),
+                owner.as_ref(),
+            )))
+        }
+        IssueArgs::Owner { number } => {
+            let detail = backend.get(number).await?;
+            let owner = match owners {
+                Some(owners) if detail.state == IssueState::Open => {
+                    owners.owner_of(&backend.search_key(), number).await?
+                }
+                _ => None,
+            };
+            let text = IssueOwnerText {
+                number,
+                owner: owner.as_ref(),
+            }
+            .render()
+            .map_err(|error| IssueError::Ownership(error.to_string()))?;
+            Ok(ToolResult::text(text))
         }
         IssueArgs::Provenance { number, messages } => Ok(ToolResult::text(
             provenance.render(backend, number, messages).await?,
@@ -450,7 +519,11 @@ async fn execute<S: IssueStore>(
             limit,
         } => {
             let summaries = backend.list(state, &labels, limit).await?;
-            Ok(ToolResult::text(render_list(&summaries)))
+            let index = match owners {
+                Some(owners) => Some(owners.owners_in(&backend.search_key()).await?),
+                None => None,
+            };
+            Ok(ToolResult::text(render_list(&summaries, index.as_ref())))
         }
         IssueArgs::Search {
             query,
@@ -500,7 +573,7 @@ async fn execute<S: IssueStore>(
                 Some(IssueState::Open) => record(number, None, IssueAction::Reopen, None).await?,
                 None => {}
             }
-            Ok(ToolResult::text(render_detail(&detail, None)))
+            Ok(ToolResult::text(render_detail(&detail, None, None)))
         }
         IssueArgs::Comment { number, body } => {
             if body.trim().is_empty() {
@@ -516,14 +589,18 @@ async fn execute<S: IssueStore>(
                 None,
             )
             .await?;
-            Ok(ToolResult::text(render_detail(&commented.detail, None)))
+            Ok(ToolResult::text(render_detail(
+                &commented.detail,
+                None,
+                None,
+            )))
         }
         IssueArgs::Close { number } => {
             let detail = backend
                 .edit(number, None, None, Some(IssueState::Closed))
                 .await?;
             record(number, None, IssueAction::Close, None).await?;
-            Ok(ToolResult::text(render_detail(&detail, None)))
+            Ok(ToolResult::text(render_detail(&detail, None, None)))
         }
         IssueArgs::Label {
             number,
@@ -543,7 +620,7 @@ async fn execute<S: IssueStore>(
                 .collect::<Vec<_>>()
                 .join(" ");
             record(number, None, IssueAction::Label, Some(changes)).await?;
-            Ok(ToolResult::text(render_detail(&detail, None)))
+            Ok(ToolResult::text(render_detail(&detail, None, None)))
         }
         IssueArgs::BlockedBy {
             number,
@@ -624,14 +701,14 @@ async fn edit_relations<S: IssueStore>(
             )
             .await?;
     }
-    Ok(ToolResult::text(render_detail(&detail, None)))
+    Ok(ToolResult::text(render_detail(&detail, None, None)))
 }
 
 const fn render_state(state: IssueState) -> &'static str {
     state.as_str()
 }
 
-fn render_list(summaries: &[IssueSummary]) -> String {
+fn render_list(summaries: &[IssueSummary], owners: Option<&OwnerIndex>) -> String {
     if summaries.is_empty() {
         return "no issues".to_string();
     }
@@ -642,13 +719,25 @@ fn render_list(summaries: &[IssueSummary]) -> String {
         } else {
             format!(" [{}]", summary.labels.join(", "))
         };
+        let owner = owners
+            .filter(|_| summary.state == IssueState::Open)
+            .and_then(|owners| owners.get(summary.number))
+            .map(|owner| {
+                format!(
+                    " (owner: {}, id {})",
+                    owner.display_name(),
+                    owner.session_id
+                )
+            })
+            .unwrap_or_default();
         let _ = writeln!(
             out,
-            "#{}\t{}\t{}{}",
+            "#{}\t{}\t{}{}{}",
             summary.number,
             render_state(summary.state),
             summary.title,
-            labels
+            labels,
+            owner
         );
     }
     out
@@ -662,7 +751,11 @@ fn render_related(related: &[crate::issue::RelatedIssue]) -> String {
         .join(", ")
 }
 
-fn render_detail(detail: &IssueDetail, marks: Option<&IssueMarks>) -> String {
+fn render_detail(
+    detail: &IssueDetail,
+    marks: Option<&IssueMarks>,
+    owner: Option<&IssueOwner>,
+) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
@@ -671,6 +764,14 @@ fn render_detail(detail: &IssueDetail, marks: Option<&IssueMarks>) -> String {
         detail.title,
         render_state(detail.state)
     );
+    if let Some(owner) = owner {
+        let _ = writeln!(
+            out,
+            "owner: agent \"{}\" (id {})",
+            owner.display_name(),
+            owner.session_id
+        );
+    }
     if let Some(marks) = marks {
         match &marks.created_in {
             Some(session) => {
