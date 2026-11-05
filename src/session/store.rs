@@ -175,14 +175,18 @@ impl SessionStore {
         &self,
         id: &str,
         profile_id: Option<&str>,
+        db: &crate::db::ChatDb,
     ) -> Result<(), StoreError> {
         let path = self.session_dir(id, profile_id);
         if path.exists() {
             // Drop the clones; the `refs/may/pr/*` refs of unlanded PRs stay
             // in their checkouts so an adopter can still land them.
-            let repos = crate::repo_clone::SessionRepos::new(&path);
+            let repos = crate::repo_clone::SessionRepos::new(&path, id.to_string(), db.clone());
             if let Err(error) = repos.delete_all().await {
-                tracing::warn!(%error, "failed to drop session repo clones");
+                tracing::warn!(%error, "failed to drop session repo clone refs");
+            }
+            if let Err(error) = db.delete_session_repo_clones(id).await {
+                tracing::warn!(%error, "failed to drop session repo clone rows");
             }
             async_fs::remove_dir_all(&path).await?;
         }

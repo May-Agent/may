@@ -108,7 +108,7 @@ struct Resolved {
 /// May-backend `pr` engine for one session.
 pub struct PrStore {
     context: PrContext,
-    repos: SessionRepos,
+    repos: Option<SessionRepos>,
 }
 
 impl std::fmt::Debug for PrStore {
@@ -121,8 +121,17 @@ impl PrStore {
     /// Build the engine for one session.
     #[must_use]
     pub fn new(context: PrContext) -> Self {
-        let repos = SessionRepos::new(&context.session_root);
+        let repos = context
+            .db
+            .clone()
+            .map(|db| SessionRepos::new(&context.session_root, context.session_id.clone(), db));
         Self { context, repos }
+    }
+
+    fn repos(&self) -> Result<&SessionRepos, PrError> {
+        self.repos
+            .as_ref()
+            .ok_or_else(|| PrError::Resolve("pr requires the history database".to_string()))
     }
 
     fn db(&self) -> Result<&ChatDb, PrError> {
@@ -135,14 +144,15 @@ impl PrStore {
     /// Which repo does `pr` mean: `--repo` wins, then the session's only
     /// clone, then the cwd's repository (cloned on demand).
     async fn resolve(&self, repo: Option<&str>) -> Result<Resolved, PrError> {
-        let clones = self.repos.clones()?;
+        let repos = self.repos()?;
+        let clones = repos.clones().await?;
         if let Some(name) = repo {
             if let Some(record) = clones
                 .into_iter()
-                .find(|c| c.repo_key == name || c.dir == name)
+                .find(|c| c.repo_key == name || c.dir.as_str() == name)
             {
                 return Ok(Resolved {
-                    dir: self.repos.root().join(&record.dir),
+                    dir: repos.path(&record.dir),
                     record,
                 });
             }
@@ -150,7 +160,7 @@ impl PrStore {
         }
         if let [record] = clones.as_slice() {
             return Ok(Resolved {
-                dir: self.repos.root().join(&record.dir),
+                dir: repos.path(&record.dir),
                 record: record.clone(),
             });
         }
@@ -179,12 +189,12 @@ impl PrStore {
                     "pr.backend is github but origin is not GitHub: {url}"
                 )));
             };
-            let dir = self.repos.ensure_remote_clone(&url, &owner_repo).await?;
-            let record = self
-                .repos
-                .clones()?
+            let dir = repos.ensure_remote_clone(&url, &owner_repo).await?;
+            let record = repos
+                .clones()
+                .await?
                 .into_iter()
-                .find(|c| self.repos.root().join(&c.dir) == dir)
+                .find(|c| repos.path(&c.dir) == dir)
                 .ok_or_else(|| PrError::Resolve("clone registry lost the new clone".to_string()))?;
             return Ok(Resolved { record, dir });
         }
@@ -205,12 +215,12 @@ impl PrStore {
             }
             Some(_) => {}
         }
-        let dir = self.repos.ensure_local_clone(&worktree, &repo_key).await?;
-        let record = self
-            .repos
-            .clones()?
+        let dir = repos.ensure_local_clone(&worktree, &repo_key).await?;
+        let record = repos
+            .clones()
+            .await?
             .into_iter()
-            .find(|c| self.repos.root().join(&c.dir) == dir)
+            .find(|c| repos.path(&c.dir) == dir)
             .ok_or_else(|| PrError::Resolve("clone registry lost the new clone".to_string()))?;
         Ok(Resolved { record, dir })
     }
@@ -499,7 +509,7 @@ impl PrStore {
             let resolved = self.resolve(Some(name)).await?;
             Some(resolved.record.repo_key)
         } else {
-            let clones = self.repos.clones()?;
+            let clones = self.repos()?.clones().await?;
             if clones.len() == 1 {
                 Some(clones[0].repo_key.clone())
             } else {
@@ -909,7 +919,7 @@ impl PrStore {
         let clean = uncommitted_changes(&resolved.dir).await?.is_empty();
         let same = self.head_sha(resolved).await? == landed;
         if clean && same {
-            self.repos.delete_clone(&resolved.dir).await?;
+            self.repos()?.delete_clone(&resolved.record.dir).await?;
             Ok(String::new())
         } else {
             Ok(" (the clone was kept: it holds other work)".to_string())
@@ -1170,7 +1180,7 @@ mod tests {
         /// A session's store with a clone of the checkout already made.
         async fn store(&self, id: &str, checks: Option<&str>) -> (PrStore, PathBuf) {
             let root = self.session_root(id);
-            let clone = SessionRepos::new(&root)
+            let clone = SessionRepos::new(&root, id, self.db.clone())
                 .ensure_local_clone(&self.checkout, &self.repo_key)
                 .await
                 .unwrap();
@@ -1219,7 +1229,7 @@ mod tests {
         first.open(None, "work", None, true).await.unwrap();
         let pinned = git(Some(&fx.checkout), &["rev-parse", "refs/may/pr/1"]).unwrap();
         // Session deletion drops the clone; the PR's ref survives it.
-        SessionRepos::new(&fx.session_root("s1"))
+        SessionRepos::new(&fx.session_root("s1"), "s1", fx.db.clone())
             .delete_all()
             .await
             .unwrap();

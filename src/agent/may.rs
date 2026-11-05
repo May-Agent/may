@@ -471,7 +471,11 @@ impl MayAgent {
         // Session repo clones: the writable working copy of each repository
         // the session touches lives under the sandbox; checkouts stay read
         // mounts. The launch directory's repo is cloned eagerly.
-        let session_repos = crate::repo_clone::SessionRepos::new(session_paths.root());
+        let session_repos = crate::repo_clone::SessionRepos::new(
+            session_paths.root(),
+            config.session_id.as_str(),
+            config.db.clone(),
+        );
         let mut repo_clones = Vec::new();
         if let Some(worktree) = crate::repo_search::worktree_root(&config.cwd)
             && let Ok(repo_key) = crate::issue::repository_identity(&worktree)
