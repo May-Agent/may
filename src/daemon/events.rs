@@ -232,8 +232,11 @@ pub(super) async fn stream_events(
 
 /// Sends the session's turn frames for as long as the client reads them:
 /// a resync first when the frames after the client's last one are gone,
-/// then every frame, however far behind the client falls. Returns when a
-/// send fails; never without a subscription.
+/// then every frame, however far behind the client falls within the turn
+/// in progress and the one before it. Returns when a send fails or the hub
+/// closes the subscription for falling further behind, which ends the
+/// stream: the client reconnects and reloads the session. Never returns
+/// without a subscription.
 async fn forward_turns(
     turns: Option<super::chat::TurnSubscription>,
     kinds: TurnKinds,
@@ -246,8 +249,8 @@ async fn forward_turns(
     if turns.gap && !send_resync(sender, session_id).await {
         return;
     }
-    loop {
-        for frame in turns.next().await {
+    while let Some(frames) = turns.next().await {
+        for frame in frames {
             if kinds.wants(&frame) && !send_frame(sender, &frame).await {
                 return;
             }
