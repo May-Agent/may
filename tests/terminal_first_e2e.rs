@@ -1998,23 +1998,23 @@ impl PreparedEnvironment {
         }
     }
 
-    /// The first line of the environment context May's system prompt carries
-    /// for this environment.
+    /// The sentence of May's environment section that says where commands
+    /// run for this environment.
     fn context_heading(&self) -> String {
-        let operating_system = match self {
-            Self::Local { .. } => match std::env::consts::OS {
-                "macos" => "macOS",
-                "linux" => "Linux",
-                "windows" => "Windows",
-                other => other,
-            },
-            Self::Container { .. } => "linux (managed container runtime)",
-        };
-        let kind = match self {
-            Self::Local { .. } => "local",
-            Self::Container { .. } => "container",
-        };
-        format!("Environment: {kind} ({operating_system}, POSIX sh)")
+        match self {
+            Self::Local { .. } => {
+                let operating_system = match std::env::consts::OS {
+                    "macos" => "macOS",
+                    "linux" => "Linux",
+                    "windows" => "Windows",
+                    other => other,
+                };
+                format!(
+                    "You run on the user's own {operating_system} machine; commands run in a sandbox on it, in POSIX sh."
+                )
+            }
+            Self::Container { .. } => "You run in a managed Linux container, isolated from the user's machine; commands run in POSIX sh.".to_string(),
+        }
     }
 
     /// The physical directory a session's terminal commands start in: the
