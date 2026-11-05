@@ -8,15 +8,23 @@
 //! Ownership: writes are bound to the session that opened the PR.
 //! One open PR per (session, repository) — the clone dies on merge, so a
 //! second open PR on the same clone would lose its base.
+//!
+//! The clone is agent-writable, so its git configuration, hooks and
+//! attributes are the agent's. Git that works inside it and the configured
+//! checks run in the session's terminal sandbox ([`CloneSandbox`]); host git
+//! touches only the user's checkout and host scratch repositories, and reads
+//! a clone only by fetching from it.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 
+use askama::Template;
+
 use crate::db::ChatDb;
 use crate::issue::IssueError;
 use crate::issue::github::{GhCliTokenSource, GitHubRest, GitHubTokenSource};
-use crate::repo_clone::{CloneRecord, SessionRepos, uncommitted_changes};
+use crate::repo_clone::{CloneRecord, CloneSandbox, SessionRepos, uncommitted_changes};
 
 /// Error type for `pr` operations.
 #[derive(Debug, thiserror::Error)]
@@ -51,6 +59,9 @@ pub enum PrError {
     /// A GitHub CLI call failed.
     #[error("gh {0}")]
     Gh(String),
+    /// A subagent called an action only the main agent has.
+    #[error("`pr {0}` is the main agent's; a subagent has `pr list` and `pr show`")]
+    MainAgentOnly(&'static str),
 }
 
 /// `pr`-side workspace fields the land path reads.
@@ -62,8 +73,8 @@ pub struct PrContext {
     pub session_id: String,
     /// Session sandbox root — clones live under `repos/` inside it.
     pub session_root: PathBuf,
-    /// Host-owned scratch space outside every sandbox — throwaway check
-    /// clones live here.
+    /// Host-owned scratch space outside every sandbox, on the session root's
+    /// filesystem: new clones are made and pushes staged here.
     pub scratch_root: PathBuf,
     /// Session cwd — the repo `pr` falls back to outside a clone.
     pub cwd: PathBuf,
@@ -141,6 +152,7 @@ struct Resolved {
 pub struct PrStore {
     context: PrContext,
     repos: Option<SessionRepos>,
+    sandbox: CloneSandbox,
 }
 
 impl std::fmt::Debug for PrStore {
@@ -150,14 +162,19 @@ impl std::fmt::Debug for PrStore {
 }
 
 impl PrStore {
-    /// Build the engine for one session.
+    /// Build the engine for one session, running what works inside its
+    /// clones in `sandbox`.
     #[must_use]
-    pub fn new(context: PrContext) -> Self {
+    pub fn new(context: PrContext, sandbox: CloneSandbox) -> Self {
         let repos = context
             .db
             .clone()
             .map(|db| SessionRepos::new(&context.session_root, context.session_id.clone(), db));
-        Self { context, repos }
+        Self {
+            context,
+            repos,
+            sandbox,
+        }
     }
 
     fn repos(&self) -> Result<&SessionRepos, PrError> {
@@ -223,7 +240,11 @@ impl PrStore {
             Some(_) => {}
         }
         let dir = repos
-            .ensure_clone_of(&worktree, &self.context.workspace_config)
+            .ensure_clone_of(
+                &worktree,
+                &self.context.workspace_config,
+                &self.context.scratch_root,
+            )
             .await?
             .ok_or_else(|| {
                 PrError::Resolve("trust binds no clone for this repository".to_string())
@@ -262,7 +283,7 @@ impl PrStore {
                     .to_string(),
             ));
         }
-        let dirty = uncommitted_changes(&resolved.dir).await?;
+        let dirty = uncommitted_changes(&self.sandbox, &resolved.dir).await?;
         if !dirty.is_empty() {
             return Err(PrError::DirtyClone(dirty.join(", ")));
         }
@@ -485,15 +506,21 @@ impl PrStore {
         if matches!(pr.state.as_str(), "merged" | "closed") {
             return Err(PrError::State(format!("PR #{number} is {}", pr.state)));
         }
-        let dirty = uncommitted_changes(&resolved.dir).await?;
+        let dirty = uncommitted_changes(&self.sandbox, &resolved.dir).await?;
         if !dirty.is_empty() {
             return Err(PrError::DirtyClone(dirty.join(", ")));
         }
         let head_sha = self.head_sha(&resolved).await?;
         if pr.backend == "github" {
-            push_pinned(&resolved.dir, &head_sha, &pr.branch)
-                .await
-                .map_err(|e| PrError::Gh(e.to_string()))?;
+            push_pinned(
+                &self.context.scratch_root,
+                &resolved.dir,
+                &resolved.record.source,
+                &head_sha,
+                &pr.branch,
+            )
+            .await
+            .map_err(|e| PrError::Gh(e.to_string()))?;
         } else {
             self.pin(&resolved, pr.number, &head_sha).await?;
         }
@@ -686,9 +713,15 @@ impl PrStore {
         title: &str,
         owner_repo: &str,
     ) -> Result<i64, PrError> {
-        push_pinned(&resolved.dir, head_sha, branch)
-            .await
-            .map_err(|e| PrError::Gh(e.to_string()))?;
+        push_pinned(
+            &self.context.scratch_root,
+            &resolved.dir,
+            &resolved.record.source,
+            head_sha,
+            branch,
+        )
+        .await
+        .map_err(|e| PrError::Gh(e.to_string()))?;
         let url = blocking::unblock({
             let owner_repo = owner_repo.to_string();
             let branch = branch.to_string();
@@ -858,12 +891,12 @@ impl PrStore {
             .await
             .map_err(PrError::RepoClone)
         } else {
-            blocking::unblock({
-                let dir = resolved.dir.clone();
-                move || git(Some(&dir), &["rev-parse", "upstream/HEAD"])
-            })
-            .await
-            .map_err(PrError::RepoClone)
+            Ok(self
+                .sandbox
+                .run(&resolved.dir, "git rev-parse --verify upstream/HEAD")
+                .await?
+                .trim()
+                .to_string())
         }
     }
 
@@ -889,9 +922,10 @@ impl PrStore {
             let clone = resolved.dir.to_string_lossy().into_owned();
             let sha = sha.to_string();
             move || {
-                git(
-                    Some(Path::new(&checkout)),
-                    &["fetch", &clone, &format!("+{sha}:{}", pin_ref(number))],
+                fetch_from_clone(
+                    Path::new(&checkout),
+                    &clone,
+                    &format!("+{sha}:{}", pin_ref(number)),
                 )
                 .map(drop)
             }
@@ -900,8 +934,10 @@ impl PrStore {
         .map_err(PrError::RepoClone)
     }
 
-    /// Run the check command on a detached checkout of `sha`, so what is
-    /// checked is exactly what lands whatever the clone does meanwhile.
+    /// Run the check command in the sandbox on a throwaway detached checkout
+    /// of `sha`, so what is checked is exactly the commit that lands whatever
+    /// the session clone does meanwhile. The checkout lives in the session's
+    /// `tmp/` and is removed whatever the outcome.
     async fn check_pinned(
         &self,
         resolved: &Resolved,
@@ -909,47 +945,37 @@ impl PrStore {
         sha: &str,
         cmd: &str,
     ) -> Result<(), String> {
-        // A throwaway clone sharing nothing with the user's checkout, in
-        // host scratch space outside the sandbox; the guard removes it
-        // whatever the outcome.
-        let (scratch, dir) = blocking::unblock({
-            let checkout = resolved.record.source.clone();
-            let root = self.context.scratch_root.clone();
-            let prefix = format!("{}-{}-", self.context.session_id, pr.number);
-            let sha = sha.to_string();
-            move || -> Result<_, String> {
-                std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
-                let scratch = tempfile::Builder::new()
-                    .prefix(&prefix)
-                    .tempdir_in(&root)
-                    .map_err(|e| e.to_string())?;
-                let dir = scratch.path().join("repo");
-                git(
-                    None,
-                    &[
-                        "clone",
-                        "--local",
-                        "--no-hardlinks",
-                        "--no-checkout",
-                        &checkout,
-                        &dir.to_string_lossy(),
-                    ],
-                )
-                .map_err(|e| e.to_string())?;
-                git(Some(&dir), &["checkout", "--detach", &sha]).map_err(|e| e.to_string())?;
-                Ok((scratch, dir))
-            }
-        })
-        .await?;
-        let result = run_check(&dir, cmd).await;
-        blocking::unblock(move || drop(scratch)).await;
+        let root = &self.context.session_root;
+        let target = Path::new("tmp").join(format!("pr-check-{}-{}", pr.number, crate::id::new()));
+        let prepare = CheckClone {
+            source: ShellWord::path(&SessionRepos::relative_path(&resolved.record.dir))?,
+            target: ShellWord::path(&target)?,
+            sha: ShellWord::new(sha)?,
+        }
+        .render()
+        .expect("the check clone script renders");
+        let result = match self.sandbox.run(root, &prepare).await {
+            Ok(_) => self.sandbox.run(&root.join(&target), cmd).await.map(drop),
+            Err(error) => Err(error),
+        }
+        .map_err(|e| e.to_string());
+        let remove = RemoveCheckClone {
+            target: ShellWord::path(&target)?,
+        }
+        .render()
+        .expect("the check clone removal script renders");
+        if let Err(error) = self.sandbox.run(root, &remove).await {
+            tracing::warn!(%error, "the check checkout was left in the session's tmp");
+        }
         result
     }
 
     /// After landing, delete the clone when it holds exactly the landed
     /// work; otherwise keep it and say so, so nothing newer is lost.
     async fn retire_clone(&self, resolved: &Resolved, landed: &str) -> Result<String, PrError> {
-        let clean = uncommitted_changes(&resolved.dir).await?.is_empty();
+        let clean = uncommitted_changes(&self.sandbox, &resolved.dir)
+            .await?
+            .is_empty();
         let same = self.head_sha(resolved).await? == landed;
         if clean && same {
             self.repos()?.delete_clone(&resolved.record.dir).await?;
@@ -982,7 +1008,9 @@ fn pin_ref(number: i64) -> String {
     format!("refs/may/pr/{number}")
 }
 
-/// HEAD of `clone`, resolved by `ls-remote` so no command runs inside it.
+/// HEAD of `clone`, read from its ref advertisement by `ls-remote`: the
+/// `git upload-pack` that serves [`fetch_from_clone`], so nothing the clone
+/// configures runs.
 fn clone_head(
     checkout: Option<&Path>,
     clone: &str,
@@ -997,17 +1025,53 @@ fn clone_head(
         })
 }
 
-/// Push the pinned commit to the PR's branch on `upstream`, never forced.
+/// Push the pinned commit `sha` of `clone` to the PR's branch at `url`, never
+/// forced. The push leaves from a bare repository in host scratch that
+/// fetched the commit from the clone, so neither the clone's configuration
+/// nor its remotes take part; `url` is the host's record of the remote.
 async fn push_pinned(
+    scratch_root: &Path,
     clone: &Path,
+    url: &str,
     sha: &str,
     branch: &str,
 ) -> Result<(), crate::repo_clone::RepoCloneError> {
-    let clone = clone.to_path_buf();
+    let scratch_root = scratch_root.to_path_buf();
+    let clone = clone.to_string_lossy().into_owned();
+    let url = url.to_string();
+    let sha = sha.to_string();
     let spec = format!("{sha}:refs/heads/{branch}");
-    blocking::unblock(move || git(Some(&clone), &["push", "upstream", &spec]))
-        .await
-        .map(drop)
+    blocking::unblock(move || {
+        std::fs::create_dir_all(&scratch_root)?;
+        let staging = tempfile::Builder::new()
+            .prefix("push-")
+            .tempdir_in(&scratch_root)?;
+        let repo = staging.path();
+        git(
+            None,
+            &["init", "--quiet", "--bare", &repo.to_string_lossy()],
+        )?;
+        fetch_from_clone(repo, &clone, &sha)?;
+        git(Some(repo), &["push", "--quiet", &url, &spec]).map(drop)
+    })
+    .await
+}
+
+/// Fetch `refspec` from the agent-writable repository `clone` into the
+/// trusted repository `repo`. The clone serves the fetch through
+/// `git upload-pack`, which runs on the host inside the clone, yet none of
+/// the executable configuration a repository can carry for itself
+/// (fsmonitor, hooks, filters, `uploadpack.packObjectsHook`, `core.sshCommand`
+/// and the like) takes part in serving a fetch.
+fn fetch_from_clone(
+    repo: &Path,
+    clone: &str,
+    refspec: &str,
+) -> Result<String, crate::repo_clone::RepoCloneError> {
+    git(
+        Some(repo),
+        &["fetch", "--quiet", "--no-tags", clone, refspec],
+    )
 }
 
 /// Remove a PR's durable ref once the PR is terminal.
@@ -1087,26 +1151,45 @@ fn land(
     Ok(merged)
 }
 
-async fn run_check(dir: &Path, cmd: &str) -> Result<(), String> {
-    let dir = dir.to_path_buf();
-    let cmd = cmd.to_string();
-    blocking::unblock(move || {
-        let output = std::process::Command::new("sh")
-            .args(["-c", &cmd])
-            .current_dir(&dir)
-            .output()
-            .map_err(|e| e.to_string())?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(String::from_utf8_lossy(&output.stderr)
-                .trim()
-                .chars()
-                .take(2000)
-                .collect())
-        }
-    })
-    .await
+/// One shell word: a value quoted so a POSIX shell reads it back unchanged.
+struct ShellWord(String);
+
+impl ShellWord {
+    fn new(value: &str) -> Result<Self, String> {
+        shlex::try_quote(value)
+            .map(|quoted| Self(quoted.into_owned()))
+            .map_err(|error| format!("{value:?} is no shell word: {error}"))
+    }
+
+    fn path(path: &Path) -> Result<Self, String> {
+        Self::new(
+            path.to_str()
+                .ok_or_else(|| format!("{} is not UTF-8", path.display()))?,
+        )
+    }
+}
+
+impl std::fmt::Display for ShellWord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Makes the detached checkout of a PR's commit its check runs on; run in
+/// the session root.
+#[derive(Template)]
+#[template(path = "pr_check_clone.sh", escape = "none")]
+struct CheckClone {
+    source: ShellWord,
+    target: ShellWord,
+    sha: ShellWord,
+}
+
+/// Removes a check's checkout; run in the session root.
+#[derive(Template)]
+#[template(path = "pr_check_remove.sh", escape = "none")]
+struct RemoveCheckClone {
+    target: ShellWord,
 }
 
 /// `gh` with the same error contract as [`git`].
@@ -1186,7 +1269,8 @@ mod tests {
         GitHubRest, PrContext, PrStore, PrTokenSource, git, github_branch, github_owner_repo,
         push_pinned,
     };
-    use crate::repo_clone::SessionRepos;
+    use crate::repo_clone::test_sandbox::TestTerminal;
+    use crate::repo_clone::{CloneSandbox, SessionRepos};
     use crate::workspace::{ProjectConfig, ProjectIssues, ProjectPr, WorkspaceConfig};
     use hyper::body::Bytes;
     use hyper::header::AUTHORIZATION;
@@ -1198,16 +1282,25 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
 
+    /// A temporary directory under its canonical path, as the sandbox
+    /// resolves paths.
+    fn canonical_tempdir() -> tempfile::TempDir {
+        tempfile::tempdir_in(dunce::canonicalize(std::env::temp_dir()).unwrap()).unwrap()
+    }
+
     struct Fixture {
         tmp: tempfile::TempDir,
         checkout: PathBuf,
         db: crate::db::ChatDb,
         repo_key: PathBuf,
+        /// The session terminals the stores run on, alive as long as the
+        /// fixture.
+        terminals: Mutex<Vec<Arc<TestTerminal>>>,
     }
 
     impl Fixture {
         async fn new() -> Self {
-            let tmp = tempfile::tempdir().unwrap();
+            let tmp = canonical_tempdir();
             let checkout = tmp.path().join("checkout");
             git(None, &["init", &checkout.to_string_lossy()]).unwrap();
             identify(&checkout);
@@ -1223,6 +1316,7 @@ mod tests {
                 checkout,
                 db,
                 repo_key,
+                terminals: Mutex::default(),
             }
         }
 
@@ -1230,11 +1324,23 @@ mod tests {
             self.tmp.path().join(id)
         }
 
+        fn scratch_root(&self) -> PathBuf {
+            self.tmp.path().join("scratch")
+        }
+
+        /// The sandbox of session `id`'s terminal, started on first use.
+        async fn sandbox(&self, id: &str) -> CloneSandbox {
+            let terminal = Arc::new(TestTerminal::new(&self.session_root(id)).await);
+            let sandbox = terminal.sandbox();
+            self.terminals.lock().unwrap().push(terminal);
+            sandbox
+        }
+
         /// A session's store with a clone of the checkout already made.
         async fn store(&self, id: &str, checks: Option<&str>) -> (PrStore, PathBuf) {
             let root = self.session_root(id);
             let clone = SessionRepos::new(&root, id, self.db.clone())
-                .ensure_local_clone(&self.checkout, &self.repo_key)
+                .ensure_local_clone(&self.checkout, &self.repo_key, &self.scratch_root())
                 .await
                 .unwrap();
             identify(&clone);
@@ -1247,19 +1353,22 @@ mod tests {
                 })
                 .into_iter()
                 .collect();
-            let store = PrStore::new(PrContext {
-                db: Some(self.db.clone()),
-                session_id: id.to_string(),
-                session_root: root,
-                scratch_root: self.tmp.path().join("scratch"),
-                cwd: self.checkout.clone(),
-                workspace_config: WorkspaceConfig {
-                    workdirs: Vec::new(),
-                    projects,
+            let store = PrStore::new(
+                PrContext {
+                    db: Some(self.db.clone()),
+                    session_id: id.to_string(),
+                    session_root: root,
+                    scratch_root: self.scratch_root(),
+                    cwd: self.checkout.clone(),
+                    workspace_config: WorkspaceConfig {
+                        workdirs: Vec::new(),
+                        projects,
+                    },
+                    screen: None,
+                    github_api: PrContext::default_github_api(),
                 },
-                screen: None,
-                github_api: PrContext::default_github_api(),
-            });
+                self.sandbox(id).await,
+            );
             (store, clone)
         }
 
@@ -1301,22 +1410,25 @@ mod tests {
                     .await
                     .unwrap();
             }
-            PrStore::new(PrContext {
-                db: Some(self.db.clone()),
-                session_id: id.to_string(),
-                session_root: self.session_root(id),
-                scratch_root: self.tmp.path().join("scratch"),
-                cwd: self.checkout.clone(),
-                workspace_config: WorkspaceConfig {
-                    workdirs: Vec::new(),
-                    projects: Vec::new(),
+            PrStore::new(
+                PrContext {
+                    db: Some(self.db.clone()),
+                    session_id: id.to_string(),
+                    session_root: self.session_root(id),
+                    scratch_root: self.scratch_root(),
+                    cwd: self.checkout.clone(),
+                    workspace_config: WorkspaceConfig {
+                        workdirs: Vec::new(),
+                        projects: Vec::new(),
+                    },
+                    screen: None,
+                    github_api: GitHubRest::with_api_base(
+                        PrTokenSource::Fixed("test-token".to_string()),
+                        base,
+                    ),
                 },
-                screen: None,
-                github_api: GitHubRest::with_api_base(
-                    PrTokenSource::Fixed("test-token".to_string()),
-                    base,
-                ),
-            })
+                self.sandbox(id).await,
+            )
         }
 
         async fn pr_state(&self) -> String {
@@ -1432,7 +1544,8 @@ mod tests {
     #[tokio::test]
     async fn a_commit_made_while_checks_run_does_not_land() {
         let fx = Fixture::new().await;
-        let marker = fx.tmp.path().join("checked");
+        // Inside the session: the check runs in its sandbox.
+        let marker = fx.session_root("s1").join("checked");
         let (_, clone) = fx.store("s1", None).await;
         commit_file(&clone, "work.txt");
         // The check records the tree it ran on, then commits in the clone.
@@ -1450,13 +1563,18 @@ mod tests {
         let landed = git(Some(&fx.checkout), &["rev-parse", "HEAD^2"]).unwrap();
         assert_eq!(landed, checked);
         assert!(!fx.checkout.join("late.txt").exists());
-        // The throwaway check clone is gone and the checkout has no worktrees.
-        assert_eq!(
-            std::fs::read_dir(fx.tmp.path().join("scratch"))
+        // The throwaway check clone and the staged clone are gone and the
+        // checkout has no worktrees.
+        assert!(
+            std::fs::read_dir(fx.session_root("s1").join("tmp"))
                 .unwrap()
-                .count(),
-            0
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("pr-check-"))
         );
+        assert_eq!(std::fs::read_dir(fx.scratch_root()).unwrap().count(), 0);
         assert!(
             !git(Some(&fx.checkout), &["worktree", "list"])
                 .unwrap()
@@ -1550,23 +1668,26 @@ mod tests {
 
     /// A store for session `id` whose cwd is the fixture checkout, which has
     /// the GitHub origin `o/r` and `workspace_config`; no clone exists yet.
-    fn trusted_store(
+    async fn trusted_store(
         fx: &Fixture,
         id: &str,
         workspace_config: WorkspaceConfig,
         github_api: GitHubRest<PrTokenSource>,
         screen: Option<Arc<super::ScreenFn>>,
     ) -> PrStore {
-        PrStore::new(PrContext {
-            db: Some(fx.db.clone()),
-            session_id: id.to_string(),
-            session_root: fx.session_root(id),
-            scratch_root: fx.tmp.path().join("scratch"),
-            cwd: fx.checkout.clone(),
-            workspace_config,
-            screen,
-            github_api,
-        })
+        PrStore::new(
+            PrContext {
+                db: Some(fx.db.clone()),
+                session_id: id.to_string(),
+                session_root: fx.session_root(id),
+                scratch_root: fx.scratch_root(),
+                cwd: fx.checkout.clone(),
+                workspace_config,
+                screen,
+                github_api,
+            },
+            fx.sandbox(id).await,
+        )
     }
 
     /// Give the fixture checkout the GitHub origin `o/r`.
@@ -1596,7 +1717,8 @@ mod tests {
             config,
             GitHubRest::with_api_base(PrTokenSource::Fixed("test-token".to_string()), &api_base),
             None,
-        );
+        )
+        .await;
         // Anything pushed to the origin would land in the bare repository.
         git(
             Some(&fx.checkout),
@@ -1659,7 +1781,8 @@ mod tests {
             config,
             PrContext::default_github_api(),
             Some(screen),
-        );
+        )
+        .await;
         // Stand in for the network clone: an existing directory is adopted.
         let seeded = store
             .repos()
@@ -1705,7 +1828,9 @@ mod tests {
     #[tokio::test]
     async fn a_second_github_pr_pushes_after_the_first_was_squash_merged() {
         let tmp = tempfile::tempdir().unwrap();
+        let scratch = tmp.path().join("scratch");
         let remote = tmp.path().join("remote.git");
+        let url = remote.to_string_lossy().into_owned();
         git(
             None,
             &["init", "--bare", "-b", "main", &remote.to_string_lossy()],
@@ -1729,7 +1854,9 @@ mod tests {
         commit_file(&clone, "one.txt");
         let first_sha = git(Some(&clone), &["rev-parse", "HEAD"]).unwrap();
         let first = github_branch("s1", &first_sha);
-        push_pinned(&clone, &first_sha, &first).await.unwrap();
+        push_pinned(&scratch, &clone, &url, &first_sha, &first)
+            .await
+            .unwrap();
         git(Some(&clone), &["checkout", "-b", "squash", "main~1"]).unwrap();
         std::fs::write(clone.join("one.txt"), "one.txt").unwrap();
         git(Some(&clone), &["add", "."]).unwrap();
@@ -1747,7 +1874,9 @@ mod tests {
         let second_sha = git(Some(&clone), &["rev-parse", "HEAD"]).unwrap();
         let second = github_branch("s1", &second_sha);
         assert_ne!(first, second);
-        push_pinned(&clone, &second_sha, &second).await.unwrap();
+        push_pinned(&scratch, &clone, &url, &second_sha, &second)
+            .await
+            .unwrap();
         assert_eq!(
             git(
                 Some(&remote),
@@ -1758,10 +1887,192 @@ mod tests {
         );
         // The old shared name would have been rejected without a force.
         assert!(
-            push_pinned(&clone, &second_sha, &first).await.is_err(),
+            push_pinned(&scratch, &clone, &url, &second_sha, &first)
+                .await
+                .is_err(),
             "pushes are never forced"
         );
         // A retry of the same PR reuses its branch.
-        push_pinned(&clone, &second_sha, &second).await.unwrap();
+        push_pinned(&scratch, &clone, &url, &second_sha, &second)
+            .await
+            .unwrap();
+        // Every push staged its bare repository in scratch and removed it.
+        assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
+    }
+
+    /// Every executable setting a repository can carry for itself, set in
+    /// `clone` the way an agent writing it could: each runs a script that
+    /// touches `host/<name>` (outside the sandbox) and `ran/<name>` inside
+    /// the session, so a marker in `host/` means it ran on the host. Returns
+    /// the `host/` directory.
+    fn arm_hostile_config(session_root: &Path, clone: &Path, outside: &Path) -> PathBuf {
+        let host = outside.join("host");
+        let ran = session_root.join("ran");
+        let scripts = session_root.join("hostile");
+        let hooks = scripts.join("hooks");
+        for dir in [&host, &ran, &hooks] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let script = |path: &Path, name: &str, tail: &str| {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::write(
+                path,
+                format!(
+                    "#!/bin/sh\ntouch '{}/{name}' 2>/dev/null\ntouch '{}/{name}' 2>/dev/null\n{tail}\n",
+                    host.display(),
+                    ran.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        // Repository-local hooks, both where git looks by default and under
+        // `core.hooksPath`.
+        for hook in [
+            "pre-commit",
+            "prepare-commit-msg",
+            "commit-msg",
+            "post-commit",
+            "post-checkout",
+            "post-merge",
+            "pre-push",
+            "pre-receive",
+            "update",
+            "post-update",
+            "push-to-checkout",
+            "reference-transaction",
+            "pre-auto-gc",
+            "post-index-change",
+        ] {
+            script(&hooks.join(hook), hook, "exit 0");
+            script(&clone.join(".git/hooks").join(hook), hook, "exit 0");
+        }
+        let mut settings = vec![(
+            "core.hooksPath".to_string(),
+            hooks.to_string_lossy().into_owned(),
+        )];
+        for (key, tail) in [
+            // Answers "no fsmonitor data", so git falls back to a scan.
+            ("core.fsmonitor", "exit 1"),
+            ("filter.hostile.clean", "cat"),
+            ("filter.hostile.smudge", "cat"),
+            ("uploadpack.packObjectsHook", "exec \"$@\""),
+            ("core.sshCommand", "exit 1"),
+            ("core.alternateRefsCommand", "exit 0"),
+            ("credential.helper", "exit 0"),
+            ("core.pager", "cat"),
+            ("core.editor", "exit 0"),
+            ("diff.external", "exit 0"),
+            ("gpg.program", "exit 1"),
+        ] {
+            let path = scripts.join(key);
+            script(&path, key, tail);
+            settings.push((key.to_string(), path.to_string_lossy().into_owned()));
+        }
+        settings.push(("filter.hostile.required".to_string(), "true".to_string()));
+        // The agent's commits are unsigned: no signing key reaches the sandbox.
+        settings.push(("commit.gpgSign".to_string(), "false".to_string()));
+        for (key, value) in settings {
+            git(Some(clone), &["config", &key, &value]).unwrap();
+        }
+        std::fs::write(clone.join(".gitattributes"), "* filter=hostile\n").unwrap();
+        host
+    }
+
+    /// Names of the markers in `dir`.
+    fn markers(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The agent arms its clone with every executable setting, commits in
+    /// the sandbox, and `pr` checks, pins and lands the work: what the clone
+    /// configures runs in the sandbox, never on the host.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_clones_executable_config_never_runs_on_the_host() {
+        let fx = Fixture::new().await;
+        let (store, clone) = fx.store("s1", Some("test -f work.txt")).await;
+        let root = fx.session_root("s1");
+        let host = arm_hostile_config(&root, &clone, fx.tmp.path());
+        std::fs::write(clone.join("work.txt"), "work").unwrap();
+        // The agent's own commit, from its sandbox.
+        fx.sandbox("s1")
+            .await
+            .run(&clone, "git add -A && git commit -q -m work")
+            .await
+            .unwrap();
+
+        let landed = store.open(None, "work", None, false).await.unwrap();
+
+        assert!(landed.starts_with("merged PR #1"), "{landed}");
+        assert!(fx.checkout.join("work.txt").exists());
+        assert_eq!(markers(&host), Vec::<String>::new(), "ran on the host");
+        // The settings did run where the agent's commands run.
+        let ran = markers(&root.join("ran"));
+        for name in ["core.fsmonitor", "filter.hostile.clean", "pre-commit"] {
+            assert!(ran.iter().any(|m| m == name), "{name} never ran: {ran:?}");
+        }
+    }
+
+    /// A GitHub PR's push leaves from host scratch: the clone's remotes,
+    /// hooks and transport settings take no part.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pushing_a_pr_runs_nothing_the_clone_configures() {
+        let fx = Fixture::new().await;
+        let (_, clone) = fx.store("s1", None).await;
+        // Committed before the clone is armed, so the commit carries the
+        // signature the user's own push hooks ask of it.
+        commit_file(&clone, "work.txt");
+        let root = fx.session_root("s1");
+        let host = arm_hostile_config(&root, &clone, fx.tmp.path());
+        let remote = fx.tmp.path().join("remote.git");
+        git(None, &["init", "--bare", "-q", &remote.to_string_lossy()]).unwrap();
+        // A remote the agent points elsewhere, over a hostile transport.
+        git(
+            Some(&clone),
+            &["remote", "add", "upstream", "ssh://example.invalid/r.git"],
+        )
+        .unwrap();
+        let sha = super::clone_head(None, &clone.to_string_lossy()).unwrap();
+
+        push_pinned(
+            &fx.scratch_root(),
+            &clone,
+            &remote.to_string_lossy(),
+            &sha,
+            "may/s1-work",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            git(Some(&remote), &["rev-parse", "refs/heads/may/s1-work"]).unwrap(),
+            sha
+        );
+        assert_eq!(markers(&host), Vec::<String>::new(), "ran on the host");
+    }
+
+    /// A check runs in the session's sandbox: it builds inside its checkout
+    /// and cannot write anywhere outside the session.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_check_cannot_write_outside_the_sandbox() {
+        let fx = Fixture::new().await;
+        let outside = fx.tmp.path().join("outside");
+        let cmd = format!("touch built && touch '{}'", outside.display());
+        let (store, clone) = fx.store("s1", Some(&cmd)).await;
+        commit_file(&clone, "work.txt");
+
+        let err = store.open(None, "work", None, false).await.unwrap_err();
+
+        assert!(matches!(err, super::PrError::CheckFailed(_)), "{err}");
+        assert!(!outside.exists(), "the check wrote outside the sandbox");
+        assert!(
+            !fx.checkout.join("work.txt").exists(),
+            "a failed check lands nothing"
+        );
     }
 }
