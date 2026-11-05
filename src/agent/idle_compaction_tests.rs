@@ -161,7 +161,7 @@ fn reply(status: StatusCode, content_type: &'static str, body: String) -> Respon
 pub struct SessionParts {
     dir: std::path::PathBuf,
     pub db: crate::db::ChatDb,
-    session_id: SessionId,
+    pub(super) session_id: SessionId,
     /// The runtime the session persists its interactions through, when it has one.
     pub runtime: Option<Arc<crate::session::SessionRuntimeService>>,
     workspace_broker: crate::workspace_request::WorkspaceRequestBroker,
@@ -194,7 +194,7 @@ impl SessionParts {
         }
     }
 
-    fn input(&self) -> MayAgentSessionInput<'static> {
+    pub(super) fn input(&self) -> MayAgentSessionInput<'static> {
         let cwd = self.dir.join("cwd");
         std::fs::create_dir_all(&cwd).expect("create cwd");
         MayAgentSessionInput {
@@ -210,6 +210,7 @@ impl SessionParts {
             db: self.db.clone(),
             model: "session::session-model",
             reasoning_effort: None,
+            prompt_cache_epoch: 0,
             profile_id: None,
             permission_approver: self.runtime.as_ref().map(|runtime| {
                 crate::agent::PermissionApprover::new()
