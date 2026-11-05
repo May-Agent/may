@@ -148,6 +148,16 @@ impl<M: LanguageModel> ModelSlot<M> {
         self.llm
             .respond(LLMRequest::new(messages).with_parameters(self.parameters.clone()))
     }
+
+    /// Generates a `T` from `messages` through the model's structured output,
+    /// carrying this slot's parameters.
+    pub fn generate<T: schemars::JsonSchema + serde::de::DeserializeOwned + 'static>(
+        &self,
+        messages: Vec<aither_core::llm::Message>,
+    ) -> impl Future<Output = Result<T, aither_core::llm::GenerateError<M::Error>>> + Send {
+        self.llm
+            .generate(LLMRequest::new(messages).with_parameters(self.parameters.clone()))
+    }
 }
 
 /// [`request_parameters_for`] for a session's `selector`, looking the provider
