@@ -123,6 +123,56 @@ async fn answer_oneshot_repo_trust(
     Ok(())
 }
 
+/// After a turn ends: the turn the daemon starts on its own from the
+/// session's background work, once the daemon says some is left, or `None`
+/// when the session will not resume. The daemon's background state decides;
+/// nothing here is timed. The poll only re-reads that state.
+async fn next_resumed_turn(
+    app: &mut App,
+    worker: &AgentWorker,
+) -> anyhow::Result<Option<may_agent::agent::AgentHandle>> {
+    /// How often the daemon's background state is re-read while waiting.
+    const BACKGROUND_POLL: std::time::Duration = std::time::Duration::from_millis(300);
+
+    let background = worker
+        .background()
+        .ok_or_else(|| anyhow::anyhow!("the one-shot worker has no daemon background"))?;
+    loop {
+        let resumes = background.will_resume().await?;
+        // A turn already announced wins over the state read above, which
+        // may postdate its end.
+        let announced = if resumes {
+            futures_lite::future::or(async { Some(worker.next_foreign_turn().await) }, async {
+                async_io::Timer::after(BACKGROUND_POLL).await;
+                None
+            })
+            .await
+        } else {
+            futures_lite::future::or(async { Some(worker.next_foreign_turn().await) }, async {
+                None
+            })
+            .await
+        };
+        match announced {
+            Some(Some(turn)) => {
+                let message = PendingMessage {
+                    content: turn.content.clone().unwrap_or_default(),
+                    hidden_context_xml: None,
+                    attachments: Vec::new(),
+                    queued_at: Timestamp::now(),
+                    delivery_mode: may_agent::session::PendingUserMessageMode::Queue,
+                    display: turn.content.is_none().then(String::new),
+                };
+                app.start_processing(&message);
+                return Ok(Some(turn.handle));
+            }
+            Some(None) => anyhow::bail!("the session's event stream closed"),
+            None if resumes => {}
+            None => return Ok(None),
+        }
+    }
+}
+
 pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
     enum Event {
         Agent(TuiEvent),
@@ -398,7 +448,11 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                         anyhow::bail!("oneshot agent run failed");
                     }
                     output.end_text_line()?;
-                    return Ok(());
+                    let Some(handle) = next_resumed_turn(&mut app, worker).await? else {
+                        return Ok(());
+                    };
+                    assistant_response = AssistantReply::default();
+                    agent_handle = Some(handle);
                 }
             }
             Event::Agent(TuiEvent::ReasoningEnd { seconds }) => {
@@ -420,7 +474,11 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                     )
                     .await;
                 output.end_text_line()?;
-                return Ok(());
+                let Some(handle) = next_resumed_turn(&mut app, worker).await? else {
+                    return Ok(());
+                };
+                assistant_response = AssistantReply::default();
+                agent_handle = Some(handle);
             }
             Event::Poll
             | Event::Agent(
