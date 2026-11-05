@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use aither_agent::ContextWindowPhase;
 use aither_sandbox::TerminalExecutionMode;
 use askama::Template as _;
+
+use crate::agent::cache_miss::CacheMissCause;
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
@@ -1616,8 +1618,98 @@ impl UsageWallClock {
     }
 }
 
+/// A model's cache misses under its `/usage` row.
+#[derive(askama::Template)]
+#[template(path = "usage_model_cache_misses.txt", escape = "none")]
+struct UsageModelCacheMisses {
+    misses: u64,
+    tokens: String,
+}
+
+/// Where a listed cache miss first changed the prefix.
+enum Diverged<'a> {
+    Tools,
+    Message { index: u64, kind: &'a str },
+    Nothing,
+}
+
+/// One cause's line of the `/usage` cache-miss breakdown.
+struct UsageMissCause {
+    cause: crate::agent::cache_miss::CacheMissCause,
+    misses: u64,
+    tokens: String,
+}
+
+/// One listed cache miss.
+struct UsageMissLine<'a> {
+    at: String,
+    model: &'a str,
+    cause: crate::agent::cache_miss::CacheMissCause,
+    tokens: String,
+    gap: String,
+    diverged: Diverged<'a>,
+}
+
+/// The `/usage` cache misses: count, causes and the newest misses.
+#[derive(askama::Template)]
+#[template(path = "usage_cache_misses.txt", escape = "none")]
+struct UsageCacheMisses<'a> {
+    total: u64,
+    tokens: String,
+    causes: Vec<UsageMissCause>,
+    recent: Vec<UsageMissLine<'a>>,
+}
+
+impl<'a> UsageCacheMisses<'a> {
+    /// The section for `report`, `None` when the session had no miss.
+    fn new(report: &'a crate::agent::SessionUsageReport) -> Option<Self> {
+        if report.cache_miss_causes.is_empty() {
+            return None;
+        }
+        let zone = jiff::tz::TimeZone::system();
+        Some(Self {
+            total: report.cache_miss_causes.iter().map(|row| row.misses).sum(),
+            tokens: compact_count(
+                report
+                    .cache_miss_causes
+                    .iter()
+                    .map(|row| row.missed_tokens)
+                    .sum(),
+            ),
+            causes: report
+                .cache_miss_causes
+                .iter()
+                .map(|row| UsageMissCause {
+                    cause: row.cause,
+                    misses: row.misses,
+                    tokens: compact_count(row.missed_tokens),
+                })
+                .collect(),
+            recent: report
+                .recent_cache_misses
+                .iter()
+                .map(|miss| UsageMissLine {
+                    at: miss.timestamp.parse::<jiff::Timestamp>().map_or_else(
+                        |_| miss.timestamp.clone(),
+                        |at| at.to_zoned(zone.clone()).strftime("%H:%M").to_string(),
+                    ),
+                    model: &miss.model,
+                    cause: miss.cause,
+                    tokens: compact_count(miss.missed_tokens),
+                    gap: usage_duration(miss.gap_ms),
+                    diverged: match (miss.diverged_kind.as_deref(), miss.diverged_index) {
+                        (Some("tools"), _) => Diverged::Tools,
+                        (Some(kind), Some(index)) => Diverged::Message { index, kind },
+                        _ => Diverged::Nothing,
+                    },
+                })
+                .collect(),
+        })
+    }
+}
+
 /// Styled lines for a `/usage` report block: session totals, then one row
-/// per model with its cache and cost breakdown.
+/// per model with its cache and cost breakdown, then the cache misses.
 fn usage_report_lines(report: &crate::agent::SessionUsageReport) -> Vec<Line<'static>> {
     let dim = Style::default().fg(Color::DarkGray);
     let value = Style::default().fg(Color::Cyan);
@@ -1652,6 +1744,28 @@ fn usage_report_lines(report: &crate::agent::SessionUsageReport) -> Vec<Line<'st
             ),
             dim,
         ));
+        if model.cache_misses > 0 {
+            let misses = UsageModelCacheMisses {
+                misses: model.cache_misses,
+                tokens: compact_count(model.cache_miss_tokens),
+            };
+            lines.push(Line::styled(
+                misses
+                    .render()
+                    .expect("the model cache-miss template renders"),
+                dim,
+            ));
+        }
+    }
+    if let Some(misses) = UsageCacheMisses::new(report) {
+        lines.push(Line::from(""));
+        lines.extend(
+            misses
+                .render()
+                .expect("the cache-miss template renders")
+                .lines()
+                .map(|line| Line::styled(line.to_string(), value)),
+        );
     }
     lines
 }
@@ -3509,6 +3623,8 @@ mod tests {
             },
             total_cost_usd: None,
             models: Vec::new(),
+            cache_miss_causes: Vec::new(),
+            recent_cache_misses: Vec::new(),
         };
         let rendered = super::usage_report_lines(&report)
             .iter()
@@ -3518,6 +3634,97 @@ mod tests {
         assert_eq!(
             rendered,
             "Wall clock 1m 1s\n  API        0m 4s\n  Waiting    0m 20s\n  Tools      0m 8s\n  Idle       0m 29s"
+        );
+    }
+
+    #[test]
+    fn usage_shows_cache_misses_with_their_causes() {
+        use crate::agent::cache_miss::CacheMissCause;
+        let miss =
+            |cause, missed_tokens, gap_ms, kind: Option<&str>, index| crate::agent::CacheMissRow {
+                timestamp: "not a timestamp".to_string(),
+                model: "opus".to_string(),
+                cause,
+                missed_tokens,
+                gap_ms,
+                diverged_kind: kind.map(str::to_string),
+                diverged_index: index,
+            };
+        let report = crate::agent::SessionUsageReport {
+            session_id: "s".to_string(),
+            api_ms: 0,
+            wall_ms: 0,
+            split: crate::agent::WallClockSplit {
+                api_ms: 0,
+                tools_ms: 0,
+                user_wait_ms: 0,
+                idle_ms: 0,
+            },
+            total_cost_usd: None,
+            models: vec![crate::agent::ModelUsageRow {
+                model: "opus".to_string(),
+                requests: 3,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                api_ms: 0,
+                cache_hit_rate: 0.0,
+                cache_misses: 2,
+                cache_miss_tokens: 30_000,
+                cost_usd: None,
+            }],
+            cache_miss_causes: vec![
+                crate::agent::CacheMissCauseRow {
+                    cause: CacheMissCause::Expired,
+                    misses: 1,
+                    missed_tokens: 20_000,
+                },
+                crate::agent::CacheMissCauseRow {
+                    cause: CacheMissCause::ToolsChanged,
+                    misses: 1,
+                    missed_tokens: 10_000,
+                },
+            ],
+            recent_cache_misses: vec![
+                miss(
+                    CacheMissCause::ToolsChanged,
+                    10_000,
+                    30_000,
+                    Some("tools"),
+                    None,
+                ),
+                miss(CacheMissCause::Expired, 20_000, 3_660_000, None, None),
+                miss(
+                    CacheMissCause::Compaction,
+                    5_000,
+                    1_000,
+                    Some("user"),
+                    Some(1),
+                ),
+            ],
+        };
+        let rendered = super::usage_report_lines(&report)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let misses = rendered
+            .iter()
+            .skip_while(|line| !line.starts_with("    cache misses"))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            misses,
+            "    cache misses 2  30.0k tokens not read from cache\n\
+             \n\
+             Cache misses 2  30.0k tokens not read from cache\n  \
+             cache lifetime expired  1  20.0k tokens\n  \
+             tool set changed  1  10.0k tokens\n\
+             Recent cache misses\n  \
+             not a timestamp  opus  tool set changed  10.0k tokens  changed at the tool definitions  0m 30s after the previous request\n  \
+             not a timestamp  opus  cache lifetime expired  20.0k tokens  1h 1m after the previous request\n  \
+             not a timestamp  opus  compaction  5.0k tokens  changed at message 1 (user)  0m 1s after the previous request"
         );
     }
 

@@ -247,6 +247,7 @@ impl<O: Write, E: Write> OneShotOutput<O, E> {
             | AgentEvent::Complete { .. }
             | AgentEvent::BuiltInToolResult { .. }
             | AgentEvent::ReplyTranslated { .. }
+            | AgentEvent::PromptPrefix(_)
             | AgentEvent::Text(_) => Ok(()),
             AgentEvent::ToolCallStart {
                 id,
