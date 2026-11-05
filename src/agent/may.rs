@@ -465,8 +465,11 @@ impl MayAgent {
         // Session repo clones: the writable working copy of each repository
         // the session touches lives under the sandbox; checkouts stay read
         // mounts. The launch directory's repo is cloned eagerly.
-        let session_repos =
-            crate::repo_clone::SessionRepos::new(session_paths.root(), config.session_id.as_str());
+        let session_repos = crate::repo_clone::SessionRepos::new(
+            session_paths.root(),
+            config.session_id.as_str(),
+            config.db.clone(),
+        );
         let mut repo_clones = Vec::new();
         if let Some(worktree) = crate::repo_search::worktree_root(&config.cwd)
             && let Ok(repo_key) = crate::issue::repository_identity(&worktree)
@@ -504,8 +507,9 @@ impl MayAgent {
                 None => {}
             }
         }
-        runtime_system_context =
-            runtime_system_context.with_repo_clones(build_repo_clones_context(&repo_clones));
+        runtime_system_context = runtime_system_context.with_repo_clones(
+            build_repo_clones_context(&repo_clones, &config.environment, &session_paths),
+        );
 
         // Project rules: the launch directory's AGENTS.md is loaded into
         // the stable prefix and nested AGENTS.md files are listed, so

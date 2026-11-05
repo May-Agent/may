@@ -442,7 +442,6 @@ pub struct DaemonState {
     pub(crate) tool_distribution: Arc<aither_sandbox::ToolDistribution>,
     /// Prepared tool environments reused by every agent rebuilt for a session.
     pub(crate) tool_environments: crate::agent::ToolEnvironmentCache,
-    pub(crate) cwd: PathBuf,
     pub(crate) may_dir: PathBuf,
     /// Wakes the search indexer after new messages land.
     pub(crate) search_index_wake_tx: async_channel::Sender<()>,
@@ -1215,12 +1214,10 @@ impl DaemonState {
     /// temporary may home, with background services absent.
     pub(crate) async fn for_test(
         may_dir: &std::path::Path,
-        cwd: &std::path::Path,
         config: MayConfig,
     ) -> anyhow::Result<Self> {
         Self::for_test_with_connectivity(
             may_dir,
-            cwd,
             config,
             aither_connectivity::Connectivity::manual(true).0,
         )
@@ -1230,7 +1227,6 @@ impl DaemonState {
     /// [`Self::for_test`] on a given connectivity source.
     pub(crate) async fn for_test_with_connectivity(
         may_dir: &std::path::Path,
-        cwd: &std::path::Path,
         config: MayConfig,
         connectivity: aither_connectivity::Connectivity,
     ) -> anyhow::Result<Self> {
@@ -1309,7 +1305,6 @@ impl DaemonState {
             task_runtime,
             tool_distribution,
             tool_environments: crate::agent::ToolEnvironmentCache::spawn(),
-            cwd: cwd.to_path_buf(),
             may_dir: may_dir.to_path_buf(),
             repo_search: crate::repo_search::RepoSearch::global(may_dir),
             search_index_wake_tx,
