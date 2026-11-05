@@ -16,6 +16,8 @@ mod context_report;
 mod environment;
 mod hooks;
 #[cfg(test)]
+mod host_load_tests;
+#[cfg(test)]
 pub(crate) mod idle_compaction_tests;
 pub(crate) mod imagine;
 pub(crate) mod issue_tool;
@@ -26,6 +28,8 @@ pub(crate) mod notify_tool;
 mod open_questions_tests;
 mod permission;
 pub(crate) mod pr_tool;
+#[cfg(test)]
+mod prompt_layout_tests;
 mod provider;
 pub(crate) mod register_tool;
 pub(crate) mod repo_tool;

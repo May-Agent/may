@@ -64,6 +64,7 @@ impl Fixture {
 fn which_database() -> AskUserArgs {
     AskUserArgs {
         question: Some("Which database?".to_string()),
+        positional_question: None,
         option: vec!["PostgreSQL".to_string(), "SQLite".to_string()],
         multi_select: false,
         secret: None,
@@ -75,6 +76,7 @@ fn which_database() -> AskUserArgs {
 fn two_questions() -> AskUserArgs {
     AskUserArgs {
         question: None,
+        positional_question: None,
         option: Vec::new(),
         multi_select: false,
         secret: None,

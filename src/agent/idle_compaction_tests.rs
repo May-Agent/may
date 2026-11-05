@@ -12,6 +12,7 @@
 
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use aither_agent::ManualClock;
@@ -27,7 +28,9 @@ use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
 use super::live_settings::AgentLiveSettings;
-use super::may::{AgentEnvironment, MayAgent, MayAgentConfig, MayAgentSessionInput};
+use super::may::{
+    AgentEnvironment, HostReaderSource, MayAgent, MayAgentConfig, MayAgentSessionInput,
+};
 use super::tool_environment_cache::ToolEnvironmentCache;
 use crate::config::{MayConfig, ProviderInstance, ProviderType};
 use crate::model_selector::ModelSelector;
@@ -165,6 +168,45 @@ fn reply(status: StatusCode, content_type: &'static str, body: String) -> Respon
     response
 }
 
+/// A host whose machine load the test sets; its memory pressure stays
+/// normal. Sessions built in tests read it instead of the machine running
+/// them, so a loaded test machine never alerts their agents.
+#[derive(Clone, Default)]
+pub struct ScriptedHost {
+    load_bits: Arc<AtomicU64>,
+    reads: Arc<AtomicUsize>,
+}
+
+impl ScriptedHost {
+    /// Sets the machine load later readings return.
+    pub fn set_load(&self, load: f64) {
+        self.load_bits.store(load.to_bits(), Ordering::SeqCst);
+    }
+
+    /// How many machine load readings were taken.
+    pub fn reads(&self) -> usize {
+        self.reads.load(Ordering::SeqCst)
+    }
+
+    fn source(&self) -> HostReaderSource {
+        let host = self.clone();
+        HostReaderSource::new(move || aither_agent::AnyHostReader::new(host.clone()))
+    }
+}
+
+impl aither_agent::HostReader for ScriptedHost {
+    fn memory_pressure(&mut self) -> Result<aither_agent::MemoryPressure, aither_agent::ReadError> {
+        Ok(aither_agent::MemoryPressure::Normal)
+    }
+
+    fn machine_load(&mut self) -> Result<aither_agent::MachineLoad, aither_agent::ReadError> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        Ok(aither_agent::MachineLoad(f64::from_bits(
+            self.load_bits.load(Ordering::SeqCst),
+        )))
+    }
+}
+
 /// What building a session agent needs besides the config.
 pub struct SessionParts {
     dir: std::path::PathBuf,
@@ -175,6 +217,8 @@ pub struct SessionParts {
     workspace_broker: crate::workspace_request::WorkspaceRequestBroker,
     ask_user_broker: crate::ask_user::AskUserBroker,
     tool_environments: ToolEnvironmentCache,
+    /// The host the session's load monitor reads: calm unless a test loads it.
+    pub host: ScriptedHost,
     // The brokers' receiving ends stay open for the life of the session.
     _queues: (
         crate::workspace_request::WorkspaceRequestQueue,
@@ -198,6 +242,7 @@ impl SessionParts {
             workspace_broker,
             ask_user_broker,
             tool_environments: ToolEnvironmentCache::spawn(),
+            host: ScriptedHost::default(),
             _queues: (workspace_queue, ask_user_queue),
         }
     }
@@ -323,12 +368,13 @@ impl Session {
 
     /// Builds the agent the way the TUI does: the config resolved by
     /// [`MayAgent::session_config`], then [`MayAgent::new`], with only the
-    /// clock substituted.
+    /// clock and the host the load monitor reads substituted.
     async fn build(config: &MayConfig, parts: &SessionParts, clock: &ManualClock) -> MayAgent {
         let mut agent_config: MayAgentConfig = MayAgent::session_config(config, parts.input())
             .await
             .expect("the session config resolves");
         agent_config.clock = Some(clock.clone());
+        agent_config.host_reader = Some(parts.host.source());
         Box::pin(MayAgent::new(agent_config))
             .await
             .expect("the agent is built")
@@ -336,7 +382,7 @@ impl Session {
 
     /// Replaces the agent with one built from `config`, as the TUI does when
     /// a saved change reaches the running session.
-    async fn rebuild(&mut self, config: &MayConfig) {
+    pub(super) async fn rebuild(&mut self, config: &MayConfig) {
         self.agent = Box::pin(Self::build(config, &self.parts, &self.clock)).await;
     }
 
