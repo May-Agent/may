@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use crate::db::ChatDb;
+use crate::issue::IssueError;
+use crate::issue::github::{GhCliTokenSource, GitHubRest, GitHubTokenSource};
 use crate::repo_clone::{CloneRecord, SessionRepos, uncommitted_changes};
 
 /// Error type for `pr` operations.
@@ -70,25 +72,35 @@ pub struct PrContext {
     /// Outbound screen: `Ok(true)` publishes, anything else blocks. Wired
     /// to the fast model by the command registration.
     pub screen: Option<std::sync::Arc<ScreenFn>>,
-    /// GitHub REST API the GitHub backend's direct calls target.
-    pub github_api: GithubApi,
+    /// GitHub REST client the GitHub backend's direct calls go through.
+    pub github_api: GitHubRest<PrTokenSource>,
 }
 
-/// Where and how the GitHub backend calls the REST API.
+/// Token source for the GitHub backend's REST client.
 #[derive(Debug, Clone)]
-pub struct GithubApi {
-    /// API base URL (`https://api.github.com`, or a GitHub Enterprise host).
-    pub base: String,
-    /// Explicit token; `None` uses the `gh` CLI login.
-    pub token: Option<String>,
+pub enum PrTokenSource {
+    /// The `gh` CLI login.
+    Gh(GhCliTokenSource),
+    /// A fixed token, for tests.
+    #[cfg(test)]
+    Fixed(String),
 }
 
-impl Default for GithubApi {
-    fn default() -> Self {
-        Self {
-            base: crate::issue::github::DEFAULT_API_BASE.to_string(),
-            token: None,
+impl GitHubTokenSource for PrTokenSource {
+    async fn token(&self) -> Result<String, IssueError> {
+        match self {
+            Self::Gh(source) => source.token().await,
+            #[cfg(test)]
+            Self::Fixed(token) => Ok(token.clone()),
         }
+    }
+}
+
+impl PrContext {
+    /// The production REST client: `api.github.com` with the `gh` login.
+    #[must_use]
+    pub fn default_github_api() -> GitHubRest<PrTokenSource> {
+        GitHubRest::new(PrTokenSource::Gh(GhCliTokenSource))
     }
 }
 
@@ -823,46 +835,20 @@ impl PrStore {
     /// Close the upstream pull request through the REST API, authenticated
     /// with the `gh` login's token.
     async fn close_github(&self, owner_repo: &str, external: i64) -> Result<(), PrError> {
-        use crate::issue::github::{GhCliTokenSource, GitHubTokenSource};
-        use zenwave::header::{ACCEPT, USER_AGENT};
-        use zenwave::{Client, Method, ResponseExt};
-
         let api = &self.context.github_api;
-        let token = match &api.token {
-            Some(token) => token.clone(),
-            None => GhCliTokenSource
-                .token()
-                .await
-                .map_err(|e| PrError::Gh(e.to_string()))?,
-        };
-        let url = format!(
-            "{}/repos/{owner_repo}/pulls/{external}",
-            api.base.trim_end_matches('/')
-        );
-        let mut client = zenwave::client();
-        let request = client
-            .method(Method::PATCH, url.as_str())
-            .map_err(|e| PrError::Gh(e.to_string()))?
-            .bearer_auth(token)
-            .header(ACCEPT, "application/vnd.github+json")
-            .and_then(|r| r.header(USER_AGENT, "may-agent"))
-            .and_then(|r| r.json_body(&serde_json::json!({ "state": "closed" })))
-            .map_err(|e| PrError::Gh(e.to_string()))?;
-        let response = match request.await {
-            Ok(response) => response,
-            Err(zenwave::Error::Http { response, .. }) => response.response,
-            Err(error) => return Err(PrError::Gh(error.to_string())),
-        };
-        if !response.status().is_success() {
-            let status = response.status();
-            let message = response.into_string().await.map_or_else(
-                |_| "<unreadable error body>".to_string(),
-                |text| text.to_string(),
-            );
-            return Err(PrError::Gh(format!(
-                "close PR #{external}: {status} from GitHub API: {message}"
-            )));
-        }
+        let url = format!("{}/repos/{owner_repo}/pulls/{external}", api.api_base());
+        api.request(
+            zenwave::Method::PATCH,
+            url,
+            Some(serde_json::json!({ "state": "closed" })),
+        )
+        .await
+        .map_err(|error| match error {
+            IssueError::NotFound(_) => {
+                PrError::Gh(format!("close PR #{external}: not found on {owner_repo}"))
+            }
+            other => PrError::Gh(format!("close PR #{external}: {other}")),
+        })?;
         Ok(())
     }
 
@@ -1222,7 +1208,7 @@ fn git(dir: Option<&Path>, args: &[&str]) -> Result<String, crate::repo_clone::R
 
 #[cfg(test)]
 mod tests {
-    use super::{GithubApi, PrContext, PrStore, git, github_owner_repo};
+    use super::{GitHubRest, PrContext, PrStore, PrTokenSource, git, github_owner_repo};
     use crate::repo_clone::SessionRepos;
     use crate::workspace::{ProjectConfig, ProjectIssues, ProjectPr, WorkspaceConfig};
     use hyper::body::Bytes;
@@ -1295,7 +1281,7 @@ mod tests {
                     projects,
                 },
                 screen: None,
-                github_api: GithubApi::default(),
+                github_api: PrContext::default_github_api(),
             });
             (store, clone)
         }
@@ -1349,10 +1335,10 @@ mod tests {
                     projects: Vec::new(),
                 },
                 screen: None,
-                github_api: GithubApi {
-                    base: base.to_string(),
-                    token: Some("test-token".to_string()),
-                },
+                github_api: GitHubRest::with_api_base(
+                    PrTokenSource::Fixed("test-token".to_string()),
+                    base,
+                ),
             })
         }
 
