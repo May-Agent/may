@@ -470,6 +470,14 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
     while state.runtime_service.runs().live_count() > 0 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+    match blocking::unblock(crate::repo_search::retire_relocated_agents).await {
+        Ok(removed) => {
+            for service in removed {
+                tracing::info!(%service, "booted out a repo-search agent of the relocated home");
+            }
+        }
+        Err(error) => tracing::warn!(%error, "could not boot out the repo-search agents"),
+    }
     let _ = std::fs::remove_file(paths.socket());
     Ok(())
 }
