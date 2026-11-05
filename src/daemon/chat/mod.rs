@@ -3514,7 +3514,14 @@ fn prepare_agent_for_request<'a>(
         ))
         .await?;
         let config = state.config_snapshot();
-        let build_key = agent_build_key(&config, &ctx);
+        let workspace_config = {
+            let path =
+                crate::session::SessionPaths::new(ctx.sandbox_dir.clone()).workspace_config();
+            blocking::unblock(move || crate::workspace::WorkspaceConfig::load(&path))
+                .await
+                .map_err(|error| UiChatPreparationError::BuildAgent(error.into()))?
+        };
+        let build_key = agent_build_key(&config, &workspace_config, &ctx);
         // The session's idle agent continues the conversation when it was
         // built from the same inputs; a resumed turn exists only for what
         // that agent collected, so it takes the agent whatever changed.
@@ -3706,13 +3713,21 @@ fn build_session_agent<'a>(
 /// A fingerprint of everything `ctx`'s agent is built from, so a turn can
 /// tell whether the session's idle agent still fits: the configuration, the
 /// model and its reasoning effort, the profile, its persona and memories,
-/// the plan state and where the session works.
-fn agent_build_key(config: &crate::config::MayConfig, ctx: &SessionContext) -> u64 {
+/// the plan state, where the session works and the workspace configuration
+/// (trust, workdirs) its grants, mounts, clone and PR contexts come from.
+fn agent_build_key(
+    config: &crate::config::MayConfig,
+    workspace: &crate::workspace::WorkspaceConfig,
+    ctx: &SessionContext,
+) -> u64 {
     use std::hash::{Hash, Hasher};
 
     let mut hasher = std::hash::DefaultHasher::new();
     serde_json::to_string(config)
         .unwrap_or_default()
+        .hash(&mut hasher);
+    toml::to_string(workspace)
+        .expect("a parsed workspace configuration serializes")
         .hash(&mut hasher);
     ctx.current_model.hash(&mut hasher);
     format!("{:?}", ctx.reasoning_effort).hash(&mut hasher);
@@ -4927,6 +4942,91 @@ mod tests {
                 .expect("the release resumes the session")
                 .expect("request body");
         assert!(body.contains("finished"), "the resume sees the result");
+    }
+
+    /// Lowering a project's trust in `workspace.toml` retires the session's
+    /// idle agent: the next turn builds from the new level instead of
+    /// continuing with the grants captured at build.
+    #[tokio::test]
+    async fn a_trust_change_retires_the_idle_agent() {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let provider = stub_provider(vec![sse_text("first")]).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let state = failover_state(may_dir.path(), cwd.path(), &provider, &provider).await;
+        let checkout = cwd.path().canonicalize().expect("canonical checkout");
+        let config_path =
+            crate::session::MayHomePaths::new(may_dir.path().to_path_buf()).workspace_config();
+        let set_level = |level| {
+            let current = crate::workspace::WorkspaceConfig::load(&config_path).expect("load");
+            crate::trust::persist(&current, &config_path, &checkout, None, level)
+                .expect("persist trust");
+        };
+        let writable_checkout = |agent: &crate::agent::MayAgent| {
+            agent
+                .terminal_grants()
+                .snapshot()
+                .writable
+                .iter()
+                .any(|path| path == &checkout)
+        };
+
+        // The first turn runs at the local level and leaves its agent idle.
+        set_level(crate::trust::TrustLevel::Local);
+        let mut sink = TestSink::default();
+        run_prompt_turn(&state, &mut sink)
+            .await
+            .expect("the first turn completes");
+        assert!(state.parked_agents.contains("session"));
+        let grants = state
+            .runtime_service
+            .terminal_grants("session")
+            .expect("the built agent's grants");
+        assert!(
+            grants.snapshot().writable.iter().any(|p| p == &checkout),
+            "local trust makes the checkout writable"
+        );
+
+        // Trust lowered while the agent idles: the next turn's preparation
+        // builds a fresh agent without the checkout grant.
+        set_level(crate::trust::TrustLevel::LocalBranch);
+        let req = ChatRequest {
+            session_id: "session".to_string(),
+            content: "again".to_string(),
+            attachments: Vec::new(),
+            hidden_context_xml: None,
+            delivery_mode: crate::session::PendingUserMessageMode::default(),
+            pending_entry_id: None,
+        };
+        let guard = state
+            .runtime_service
+            .runs()
+            .acquire("session")
+            .await
+            .expect("acquire run");
+        let prepared = super::prepare_agent_for_request(
+            &state,
+            &req,
+            guard.fence(),
+            true,
+            true,
+            super::TurnAttempt {
+                provider_attempt: 0,
+                turn_boundary: None,
+                retained_agent: None,
+            },
+            &TurnKind::Prompt,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("the next turn prepares: {error}"));
+        assert!(
+            !writable_checkout(&prepared.agent),
+            "the rebuilt agent no longer writes the checkout"
+        );
+        assert!(
+            !state.parked_agents.contains("session"),
+            "the old idle agent was retired, not reused"
+        );
     }
 
     /// Runs one prompt turn of "session" to completion on `sink`.
