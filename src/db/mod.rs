@@ -2,6 +2,7 @@
 //!
 //! Single global database at `~/.may/history.db` containing all sessions and messages.
 
+mod cache_misses;
 mod common;
 mod context_snapshot;
 pub mod entity;
@@ -31,6 +32,7 @@ use skyzen_services::Db as SkyDb;
 use crate::PermissionHistoryMode;
 use sql as db_sql;
 
+pub use cache_misses::PromptCacheRequest;
 pub use common::{
     AssistantCacheUsageSummary, ChatDbError, ContextDebugSnapshot, ContextDebugSnapshotMessage,
     CreateProfileParams, CreateScheduledTaskParams, MessageStatsParams, NetworkAccessLogParams,
