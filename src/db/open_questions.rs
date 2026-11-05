@@ -427,37 +427,6 @@ impl ChatDb {
         .await
     }
 
-    /// Delete every pending prompt and open question of `session_id`, and
-    /// with `None` of every session.
-    ///
-    /// # Errors
-    /// Returns [`ChatDbError`] on storage failure.
-    pub(super) async fn delete_session_ask_user_requests(
-        &self,
-        session_id: Option<&str>,
-    ) -> Result<(), ChatDbError> {
-        let mut tx = self.db.begin().await?;
-        if let Some(session_id) = session_id {
-            for sql in [
-                "DELETE FROM session_pending_ask_user_question_options_v2 WHERE request_id IN (SELECT request_id FROM session_pending_ask_user_requests_v2 WHERE session_id = ?)",
-                "DELETE FROM session_pending_ask_user_questions_v2 WHERE request_id IN (SELECT request_id FROM session_pending_ask_user_requests_v2 WHERE session_id = ?)",
-                "DELETE FROM session_pending_ask_user_requests_v2 WHERE session_id = ?",
-            ] {
-                query!(tx, sql, session_id).execute().await?;
-            }
-        } else {
-            for sql in [
-                "DELETE FROM session_pending_ask_user_question_options_v2",
-                "DELETE FROM session_pending_ask_user_questions_v2",
-                "DELETE FROM session_pending_ask_user_requests_v2",
-            ] {
-                query!(tx, sql).execute().await?;
-            }
-        }
-        tx.commit().await?;
-        Ok(())
-    }
-
     /// Clear the pending prompt `request_id` by its id, leaving any newer
     /// prompt of the session in place.
     ///
