@@ -158,24 +158,9 @@ async fn oversized_webhook_bodies_are_refused_before_buffering() {
     assert_eq!(status_of_raw(addr, &declared_again).await, 400);
 }
 
-async fn listener_is_closed(target: &str) -> bool {
-    tokio::net::TcpStream::connect(split_target(target).0)
-        .await
-        .is_err()
-}
-
-#[tokio::test]
-async fn funnel_serves_only_webhooks_and_turning_it_off_removes_everything() {
-    let home = tempfile::tempdir().expect("temp dir");
-    let fake = tempfile::tempdir().expect("temp dir");
-    let binary = install_fake_tailscale(fake.path());
-    let state = Arc::new(
-        DaemonState::for_test(home.path(), MayConfig::default())
-            .await
-            .expect("daemon state"),
-    );
-
-    // One signed webhook task: a delivery without its signature is refused.
+/// Creates a signed webhook task in `state` and returns its token. Only this
+/// state's router answers a delivery to the token with 401.
+async fn create_signed_webhook(state: &DaemonState) -> String {
     let profile_id = state
         .db()
         .ensure_default_profiles()
@@ -211,6 +196,45 @@ async fn funnel_serves_only_webhooks_and_turning_it_off_removes_everything() {
         .approve_scheduled_task("signed")
         .await
         .expect("task approved");
+    token
+}
+
+/// Whether nothing on `target` still serves the router that owns `token`.
+///
+/// Another test may bind the port once ours is released, so a refused
+/// connection is not the only way to be gone: a listener that answers but is
+/// not ours does not know the signed token, which our router refuses with 401.
+async fn listener_is_closed(target: &str, token: &str) -> bool {
+    let (addr, base) = split_target(target);
+    let Ok(mut stream) = tokio::net::TcpStream::connect(addr).await else {
+        return true;
+    };
+    let request = format!(
+        "POST {}/{token} HTTP/1.1\r\nHost: mac.ts.net\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}",
+        base.trim_end_matches('/')
+    );
+    if stream.write_all(request.as_bytes()).await.is_err() {
+        return true;
+    }
+    let mut response = Vec::new();
+    // A reset or early close is a listener that is not serving us.
+    let _ = stream.read_to_end(&mut response).await;
+    String::from_utf8_lossy(&response).split(' ').nth(1) != Some("401")
+}
+
+#[tokio::test]
+async fn funnel_serves_only_webhooks_and_turning_it_off_removes_everything() {
+    let home = tempfile::tempdir().expect("temp dir");
+    let fake = tempfile::tempdir().expect("temp dir");
+    let binary = install_fake_tailscale(fake.path());
+    let state = Arc::new(
+        DaemonState::for_test(home.path(), MayConfig::default())
+            .await
+            .expect("daemon state"),
+    );
+
+    // One signed webhook task: a delivery without its signature is refused.
+    let token = create_signed_webhook(&state).await;
 
     let manager = RemoteAccessManager::new(UiEventBus::new());
     manager.set_webhook_router(Arc::new(build_webhook_router(state)));
@@ -282,7 +306,7 @@ async fn funnel_serves_only_webhooks_and_turning_it_off_removes_everything() {
             .trim(),
         "{}"
     );
-    assert!(listener_is_closed(&target).await);
+    assert!(listener_is_closed(&target, &token).await);
 }
 
 #[tokio::test]
@@ -295,6 +319,7 @@ async fn changing_the_funnel_port_moves_the_handler() {
             .await
             .expect("daemon state"),
     );
+    let token = create_signed_webhook(&state).await;
     let manager = RemoteAccessManager::new(UiEventBus::new());
     manager.set_webhook_router(Arc::new(build_webhook_router(state)));
     let config = |port| RemoteAccessConfig {
@@ -317,7 +342,7 @@ async fn changing_the_funnel_port_moves_the_handler() {
     );
     let recorded = calls(fake.path());
     assert!(recorded.contains(&"funnel --https=443 --set-path=/api/tasks/webhook off".to_string()));
-    assert!(listener_is_closed(&first).await);
+    assert!(listener_is_closed(&first, &token).await);
 
     // A port Tailscale does not allow tears Funnel down and reports why.
     let error = manager
