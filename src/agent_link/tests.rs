@@ -28,7 +28,6 @@ impl Host {
             directory: AgentDirectory::new(
                 runtime_service.clone(),
                 may_dir.path().to_path_buf(),
-                PathBuf::from("/daemon"),
                 move |session_id| {
                     wake_tx
                         .try_send(session_id.to_string())
@@ -101,6 +100,11 @@ async fn list_shows_every_non_archived_session_with_its_state() {
     let live = host.messaging.directory.live().await.expect("list");
     let names = live.iter().map(|a| a.name.as_str()).collect::<Vec<_>>();
     assert_eq!(names, ["alpha", "beta"], "archived sessions are not live");
+    assert_eq!(
+        live[0].cwd,
+        host.session_dir("a1"),
+        "a session with no directory runs in its sandbox"
+    );
     let beta = &live[1];
     assert_eq!(beta.session_id, "b1");
     assert_eq!(beta.cwd, PathBuf::from("/work/b1"));
