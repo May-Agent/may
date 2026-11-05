@@ -487,7 +487,6 @@ mod tests {
             issues: ProjectIssues::Github {
                 repository: repository.parse().expect("owner/repo"),
             },
-            repository: None,
             checks: None,
             pr: crate::workspace::ProjectPr::default(),
         }
