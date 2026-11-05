@@ -7,6 +7,7 @@ use aither_agent::webfetch::WebFetchTool;
 use aither_core::LanguageModel;
 use aither_core::llm::{Tool, model::Parameters, tool::ToolDefinition};
 use aither_sandbox::ToolRegistryBuilder;
+use askama::Template;
 
 use crate::agent::ask_user_tool::{AskUserTool, WithdrawAskUserTool};
 use crate::agent::browser_tool::{BrowserBroker, BrowserTool};
@@ -205,6 +206,20 @@ where
         SubagentIssueTool::new(config.issue_store, provenance).with_search(issue_search);
     describe_tool(&mut descriptions, &issue_tool);
     builder.configure_role_tools(issue_tool, subagent_issue_tool);
+    // Issue changes reach GitHub through `issue` alone. The command exists
+    // in sandboxed modes only, so an approved unsafe command resolves `gh` on
+    // the host's PATH and runs the real program.
+    builder.sandboxed_only(|sandboxed| {
+        sandboxed.configure_raw_handler(
+            "gh",
+            "Refused in the sandbox; use `issue`",
+            |_call, _args| {
+                Box::pin(async {
+                    Err(GhRefused.render().unwrap_or_else(|error| error.to_string()))
+                })
+            },
+        );
+    });
 
     let screen: Arc<crate::pr::ScreenFn> = Arc::new(move |title: &str, body: &str| {
         let llm = screen_llm.clone();
@@ -391,6 +406,11 @@ where
         fork_source,
     })
 }
+
+/// What the sandboxed `gh` command answers with.
+#[derive(askama::Template)]
+#[template(path = "gh_refused.txt", escape = "none")]
+struct GhRefused;
 
 fn register_tool_with_description<T>(
     builder: &mut ToolRegistryBuilder,

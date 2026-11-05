@@ -2311,9 +2311,13 @@ async fn issue_changes_are_recorded_and_gh_credentials_are_unreadable_from_the_s
     let bin = session.sandbox_dir.join("tmp");
     tokio::fs::create_dir_all(&bin).await.expect("fake bin");
     let fake_gh = bin.join("gh");
-    tokio::fs::write(&fake_gh, "#!/bin/sh\necho gh-ran\n")
-        .await
-        .expect("fake gh");
+    let gh_marker = bin.join("gh-marker");
+    tokio::fs::write(
+        &fake_gh,
+        format!("#!/bin/sh\ntouch '{}'\necho gh-ran\n", gh_marker.display()),
+    )
+    .await
+    .expect("fake gh");
     std::fs::set_permissions(
         &fake_gh,
         std::os::unix::fs::PermissionsExt::from_mode(0o755),
@@ -2379,13 +2383,39 @@ async fn issue_changes_are_recorded_and_gh_credentials_are_unreadable_from_the_s
         String::from_utf8_lossy(&credentials.stdout)
     );
 
+    let sandboxed_gh = exec_script(
+        &harness,
+        &session,
+        "sandboxed",
+        &bin,
+        work.path(),
+        "gh issue create --title t",
+    )
+    .await;
+    let refusal = format!(
+        "{}{}",
+        String::from_utf8_lossy(&sandboxed_gh.stdout),
+        String::from_utf8_lossy(&sandboxed_gh.stderr)
+    );
+    assert!(
+        !sandboxed_gh.status.success()
+            && refusal.contains("not available in the sandbox")
+            && refusal.contains("`issue`")
+            && !refusal.contains("gh-ran"),
+        "a sandboxed gh is refused with a pointer to issue: {refusal}"
+    );
+    assert!(
+        !gh_marker.exists(),
+        "the fake gh must not run in the sandbox"
+    );
+
     let unsafe_gh = exec_script(
         &harness,
         &session,
         "unsafe",
         &bin,
         work.path(),
-        &format!("{} --version", fake_gh.display()),
+        "gh --version",
     )
     .await;
     let ran = String::from_utf8_lossy(&unsafe_gh.stdout);
@@ -2395,6 +2425,7 @@ async fn issue_changes_are_recorded_and_gh_credentials_are_unreadable_from_the_s
         String::from_utf8_lossy(&unsafe_gh.stdout),
         String::from_utf8_lossy(&unsafe_gh.stderr)
     );
+    assert!(gh_marker.exists(), "the approved unsafe gh ran the fake gh");
 }
 
 #[tokio::test]

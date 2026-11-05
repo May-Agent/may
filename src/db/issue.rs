@@ -773,7 +773,7 @@ mod tests {
                 .expect("since")
                 .is_empty()
         );
-        let detail = db
+        let (detail, _) = db
             .add_issue_comment("repo", 1, "hello")
             .await
             .expect("comment");
