@@ -102,6 +102,11 @@ enum MockChatScenario {
     /// context past the compaction start point, then replies; a turn that
     /// follows a restart is answered at once. See [`CompactionProbe`].
     CompactionProbe(CompactionProbe),
+    /// Against the fake MCP server of
+    /// `tests/fixtures/changing_tools_mcp_server.py`: the first turn runs
+    /// `probe_add`, which makes the server add `probe_greet`; the second
+    /// runs `probe_greet`; every other request gets a plain text reply.
+    AddsMcpTool,
 }
 
 /// How the mock answers the compaction requests of [`MockChatScenario::CompactionProbe`].
@@ -469,6 +474,37 @@ impl MockScenarioState {
                 verify_initial_tool_contract(request)?;
                 MockHttpResponse::sse(text_stream_frames(vec![text.clone()], Duration::ZERO))
             }
+            MockChatScenario::AddsMcpTool => match self.request_index {
+                0 | 2 => {
+                    let command = if self.request_index == 0 {
+                        "probe_add"
+                    } else {
+                        "probe_greet"
+                    };
+                    MockHttpResponse::sse(vec![
+                        delayed_sse_frame(
+                            tool_call_chunk(
+                                &format!("call-{command}"),
+                                "terminal",
+                                &serde_json::json!({
+                                    "description": "Run the MCP probe command",
+                                    "script": command,
+                                    "mode": "sandboxed",
+                                    "raw": true,
+                                    "timeout": 30,
+                                    "max_lines": 50
+                                }),
+                            ),
+                            Duration::from_millis(10),
+                        ),
+                        done_frame(Duration::from_millis(10)),
+                    ])
+                }
+                _ => MockHttpResponse::sse(text_stream_frames(
+                    vec!["probed".to_string()],
+                    Duration::from_millis(10),
+                )),
+            },
             MockChatScenario::SlowTextEveryTurn { chunks, delay } => {
                 verify_initial_tool_contract(request)?;
                 MockHttpResponse::sse(text_stream_frames(chunks.clone(), *delay))
@@ -2548,6 +2584,134 @@ async fn a_terminal_command_runs_and_writes_in_the_session_directory_when_home_i
     let written = std::fs::read_to_string(sandbox_dir.join("symlink-home-probe"))
         .expect("the command should have written its file in the session directory");
     assert_eq!(written, "written");
+    server.stop().await;
+    environment.release(&harness, &session_id).await;
+}
+
+/// The text of each message of a model request, in order.
+fn message_texts(request: &Value) -> Vec<String> {
+    request
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|message| match message.get("content") {
+            Some(Value::String(text)) => text.clone(),
+            Some(Value::Array(parts)) => parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect(),
+            _ => String::new(),
+        })
+        .collect()
+}
+
+/// The messages after a request's system prefix that announce a change to
+/// the command table.
+fn command_table_alerts(request: &Value) -> Vec<String> {
+    message_texts(request)
+        .into_iter()
+        .skip(1)
+        .filter(|text| text.contains("<commands_diff boundary="))
+        .collect()
+}
+
+/// A tool an MCP server adds mid-session is runnable in the same session at
+/// once, and the model hears of it once, as a diff, while the cached prefix
+/// stays as it was sent.
+#[tokio::test]
+#[serial]
+async fn a_tool_an_mcp_server_adds_mid_session_runs_and_is_announced_once() {
+    let mock = MockOpenAiServer::spawn(MockChatScenario::AddsMcpTool).await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    let server_script =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/changing_tools_mcp_server.py");
+    std::fs::write(
+        harness.may_dir.join("mcp.json"),
+        serde_json::json!({
+            "mcpServers": {
+                "probe": {
+                    "command": "python3",
+                    "args": [server_script.display().to_string()]
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("mcp.json should be written");
+    let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
+    let client = reqwest::Client::new();
+    let environment = ChatEnvironment::Local
+        .prepare(&harness, &client, &server)
+        .await;
+    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+
+    for content in ["add the tool", "greet", "anything new?"] {
+        let response = send_turn(
+            &client,
+            &server.base_url,
+            &serde_json::json!({ "sessionId": session_id, "content": content }),
+        )
+        .await
+        .expect("chat stream request should succeed");
+        let response = expect_status(&server.log, response, StatusCode::OK).await;
+        let events = collect_turn_events(response, content, &server.log).await;
+        assert!(
+            events.iter().any(|(kind, _)| kind == "done"),
+            "{content:?} should complete; events: {events:?}; server logs:\n{}",
+            server.log.contents().await
+        );
+        wait_for_runtime_condition(
+            &client,
+            &server,
+            &session_id,
+            Duration::from_secs(10),
+            "session runtime to settle after the turn",
+            runtime_is_idle,
+        )
+        .await;
+    }
+
+    let requests = mock.agent_requests().await;
+    assert_eq!(requests.len(), 5, "two tool turns and a text turn");
+    let prefix = &message_texts(&requests[0])[0];
+    assert!(
+        prefix.contains("- probe_add: Adds the probe_greet tool"),
+        "{prefix}"
+    );
+    assert!(!prefix.contains("probe_greet:"), "{prefix}");
+    assert!(
+        latest_tool_output(&requests[1]).is_some_and(|output| output.contains("ADDED-PROBE-GREET")),
+        "{:?}",
+        latest_tool_output(&requests[1])
+    );
+    assert!(
+        latest_tool_output(&requests[3])
+            .is_some_and(|output| output.contains("GREETED-PROBE-4417")),
+        "probe_greet should run in the same session: {:?}; server logs:\n{}",
+        latest_tool_output(&requests[3]),
+        server.log.contents().await
+    );
+    for request in &requests {
+        assert_eq!(
+            &message_texts(request)[0],
+            prefix,
+            "the cached prefix stays as sent"
+        );
+    }
+    let announced = command_table_alerts(&requests[2]);
+    assert_eq!(announced.len(), 1, "{announced:?}");
+    assert!(
+        announced[0].contains("\n+- probe_greet: Greets the probe\n"),
+        "{}",
+        announced[0]
+    );
+    assert_eq!(
+        command_table_alerts(&requests[4]),
+        announced,
+        "the change is announced once"
+    );
+
     server.stop().await;
     environment.release(&harness, &session_id).await;
 }

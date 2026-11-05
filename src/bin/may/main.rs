@@ -44,7 +44,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use executor_core::tokio::TokioGlobal;
-use executor_core::{spawn, try_init_global_executor};
+use executor_core::{DefaultExecutor, spawn, try_init_global_executor};
 use ratatui::Terminal;
 use ratatui::backend::Backend;
 use ratatui::backend::CrosstermBackend;
@@ -352,7 +352,7 @@ where
 
     // Connect to all configured MCP servers
     if mcp_manager.has_servers() {
-        let results = mcp_manager.connect_all().await;
+        let results = mcp_manager.connect_all(&DefaultExecutor).await;
         for (name, result) in results {
             match result {
                 Ok(()) => tracing::info!("Connected to MCP server: {}", name),
@@ -1815,7 +1815,10 @@ where
                             url: None,
                             env: std::collections::HashMap::new(),
                         };
-                        match mcp_manager.add_server(&name, config).await {
+                        match mcp_manager
+                            .add_server(&DefaultExecutor, &name, config)
+                            .await
+                        {
                             Ok(()) => {
                                 app.set_status(format!("Added MCP server: {name}"));
                                 app.mcp_servers = mcp_manager.server_info();
@@ -1848,7 +1851,7 @@ where
                         }
                     }
                     Some(SendAction::McpReconnect { name }) => {
-                        match mcp_manager.reconnect(&name).await {
+                        match mcp_manager.reconnect(&DefaultExecutor, &name).await {
                             Ok(()) => {
                                 app.set_status(format!("Reconnected to MCP server: {name}"));
                                 app.mcp_servers = mcp_manager.server_info();

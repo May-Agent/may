@@ -296,7 +296,7 @@ pub(super) fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
                         format_elapsed(job.started_at.elapsed().as_secs())
                     ),
                 ),
-                aither_sandbox::JobStatus::Completed { exit_code } => (
+                aither_sandbox::JobStatus::Completed { exit_code, .. } => (
                     "✓ ",
                     if *exit_code == 0 {
                         Style::default().fg(Color::Green)
@@ -308,7 +308,7 @@ pub(super) fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
                 aither_sandbox::JobStatus::Failed { .. } => {
                     ("✗ ", Style::default().fg(Color::Red), "failed".to_string())
                 }
-                aither_sandbox::JobStatus::Killed => (
+                aither_sandbox::JobStatus::Killed { .. } => (
                     "■ ",
                     Style::default().fg(Color::DarkGray),
                     "killed".to_string(),
