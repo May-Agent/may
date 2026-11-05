@@ -70,6 +70,7 @@ struct OpenQuestionsText<'a> {
 pub struct AskUserTool {
     runtime: Arc<SessionRuntimeService>,
     session_id: String,
+    languages: Option<aither_agent::LanguageGuard>,
 }
 
 impl AskUserTool {
@@ -79,7 +80,15 @@ impl AskUserTool {
         Self {
             runtime,
             session_id: session_id.into(),
+            languages: None,
         }
+    }
+
+    /// Refuse a question outside the communication language `guard` enforces.
+    #[must_use]
+    pub fn with_languages(mut self, guard: aither_agent::LanguageGuard) -> Self {
+        self.languages = Some(guard);
+        self
     }
 }
 
@@ -226,6 +235,12 @@ impl Tool for AskUserTool {
         let questions = args.into_questions()?;
         if questions.is_empty() {
             return Err(AskUserToolError::NoQuestion.into());
+        }
+        if let Some(guard) = &self.languages {
+            guard.check_question(questions.iter().flat_map(|question| {
+                std::iter::once(question.question.as_str())
+                    .chain(question.option.iter().map(String::as_str))
+            }))?;
         }
         let request = PersistedAskUserRequest {
             id: crate::id::new(),

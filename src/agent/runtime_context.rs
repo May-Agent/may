@@ -948,6 +948,15 @@ mod tests {
         build_memory_context_content, tag,
     };
 
+    #[test]
+    fn the_system_layout_holds_the_languages_slot() {
+        assert!(
+            tag::layout()
+                .instructions()
+                .contains(&aither_agent::InstructionSlot::LANGUAGES)
+        );
+    }
+
     fn test_context() -> aither_agent::Context {
         aither_agent::Context::with_layout(tag::layout())
     }

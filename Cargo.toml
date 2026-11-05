@@ -21,7 +21,7 @@ gstreamer = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
 libc = "0.2.191"
 # Aither framework
 aither-core = { version = "0.15.0" }
-aither-agent = { version = "0.15.0", features = ["mcp", "webfetch", "skills", "connectivity"] }
+aither-agent = { version = "0.15.0", features = ["mcp", "webfetch", "skills", "connectivity", "languages"] }
 aither-connectivity = { version = "0.15.0" }
 aither-sandbox = { version = "0.15.0", features = ["code-folding", "connectivity"] }
 aither-cloud = { version = "0.15.0" }
