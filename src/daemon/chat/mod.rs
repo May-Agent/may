@@ -16,9 +16,10 @@ pub use hosts::{BtwMessage, BtwRequest, BtwResponse, CompactResponse, ContextDum
 pub use hosts::{
     ParkedAgents, btw, compact_session, context_dump, context_report, release_agent, usage_report,
 };
-pub use hub::{TurnFrame, TurnHub};
+pub use hub::{TurnFrame, TurnHub, TurnSubscription};
 pub use recap::{RecapRecord, RecapSchedules, recap_session};
 mod tool_dispatch;
+mod turn_events;
 mod turn_persister;
 #[cfg(test)]
 mod warm_aux_tests;
@@ -29,12 +30,12 @@ use self::tool_dispatch::{
 };
 
 use std::future::Future;
+use std::ops::ControlFlow;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use askama::Template;
-use futures_lite::StreamExt;
 use serde::Serialize;
 use skyzen::Result as SkyResult;
 use skyzen::utils::{Json, State};
@@ -1212,6 +1213,24 @@ async fn schedule_browser_takeover_resume(
         .await
 }
 
+/// Persist a finished tool call's span for the `/usage` wall-clock split.
+async fn record_tool_interval(
+    state: &Arc<DaemonState>,
+    session_id: &str,
+    started: jiff::Timestamp,
+    ended: jiff::Timestamp,
+) {
+    let Some(interval) =
+        crate::agent::Interval::new(started.as_millisecond(), ended.as_millisecond())
+    else {
+        tracing::warn!(session_id, "tool call ended before it started");
+        return;
+    };
+    if let Err(error) = state.db().append_tool_interval(session_id, interval).await {
+        tracing::warn!(error = %error, "failed to persist tool interval");
+    }
+}
+
 async fn record_request_log(state: &Arc<DaemonState>, entry: RequestLogEntry) {
     let db = state.db();
     if let Err(error) = db
@@ -1481,6 +1500,70 @@ pub(super) fn spawn_shared_tool_dispatchers(state: Arc<DaemonState>, queues: UiT
     });
 }
 
+/// What one attempt's run starts from.
+struct TurnRun<'r> {
+    prompt: &'r str,
+    hidden_context: Option<&'r str>,
+    attachments: Vec<LlmAttachment>,
+    /// Set once a retry follows tool activity: the attempt continues the
+    /// committed transcript instead of resubmitting the prompt.
+    continue_from_transcript: bool,
+    attempt: usize,
+}
+
+/// Runs one attempt of a turn on `agent`, handing each event to `turn`
+/// while the run keeps going; `Err` is why the run stopped before it
+/// finished. The run's cancellation stops it between events.
+async fn drive_turn<S: ChatSink>(
+    turn: &mut turn_events::TurnEvents<'_, '_, S>,
+    agent: &mut MayAgent,
+    kind: &TurnKind,
+    run: TurnRun<'_>,
+) -> Result<(), turn_events::TurnStop> {
+    let guard = turn.guard;
+    let stop = async {
+        turn_events::TurnStop::Cancelled(cancellation_reason_of(&guard.cancellation().recv().await))
+    };
+    let driven = match kind {
+        TurnKind::Prompt if !run.continue_from_transcript => {
+            agent
+                .run_with_hidden_context(run.prompt, run.hidden_context, run.attachments)
+                .drive(&mut *turn, stop, turn_events::step)
+                .await
+        }
+        TurnKind::Prompt | TurnKind::Resume(_) => {
+            // The wake events reach clients with the first attempt only; a
+            // retry would show them twice.
+            if let TurnKind::Resume(wake_events) = kind
+                && run.attempt == 0
+            {
+                for timed in wake_events.iter().cloned() {
+                    if let ControlFlow::Break(stop) = turn.handle(timed).await {
+                        return Err(stop);
+                    }
+                }
+            }
+            agent
+                .resume()
+                .drive(&mut *turn, stop, turn_events::step)
+                .await
+        }
+    };
+    match driven {
+        Ok(ControlFlow::Continue(_)) => Ok(()),
+        Ok(ControlFlow::Break(stop)) => Err(stop),
+        Err(error) => {
+            // The failure closes an open reasoning phase before clients see
+            // it, like any visible output.
+            if let ControlFlow::Break(stop) = turn.close_reasoning_phase().await {
+                return Err(stop);
+            }
+            turn.sink.on_agent_event(Err(&error));
+            Err(turn_events::TurnStop::Failed(error))
+        }
+    }
+}
+
 /// Shared agent event loop used by both streaming and non-streaming chat.
 ///
 /// Handles: retry logic, agent event processing, history persistence,
@@ -1632,45 +1715,17 @@ fn run_agent_loop<'a>(
                     .and_then(aither_models::ModelEntry::max_input_tokens)
             });
 
-            // The newest request's usage: the context the window holds now.
-            let mut usage = Usage::default();
-            let mut ledger = request_ledger::RequestLedger::new(
-                session_id.as_str(),
-                &current_model,
-                &provider_id,
-                model_context_window,
-                Instant::now(),
-            );
-            let mut decode_meter = DecodeMeter::default();
-            let mut last_speed_emit: Option<Instant> = None;
-            let mut segment_text = String::new(); // current text segment, flushed on tool calls
-            // Emission time of the newest text chunk in `segment_text`.
-            let mut segment_at: Option<jiff::Timestamp> = None;
-            // Emission time of the newest agent event.
-            let mut last_event_at: Option<jiff::Timestamp> = None;
-            let mut full_text = String::new(); // accumulated full assistant text
-            let mut reasoning_text = String::new();
-            let mut terminal_snapshot = TerminalStateSnapshot::default();
-            let mut saw_tool_activity = false;
-            let mut tool_arguments_by_id: std::collections::HashMap<String, String> =
-                std::collections::HashMap::new();
-            let mut pending_tool_streams: std::collections::HashMap<String, PendingToolStream> =
-                std::collections::HashMap::new();
-            let mut last_todo_hash: Option<u64> = None;
             let session_paths =
                 session_paths_for_session(state, profile_id.as_deref(), &session_id);
-            let mut turn_persister = turn_persister::TurnPersister::new(guard.fence().clone());
-
-            let mut terminal_error: Option<aither_agent::AgentError> = None;
-            let mut cancellation_reason: Option<&'static str> = None;
-            let mut browser_takeover_paused = false;
-            let mut first_agent_event_seen = false;
-            let mut first_visible_tool_seen = false;
-            let mut first_text_seen = false;
-            // `Some` while a model call is in its reasoning phase: the instant
-            // the phase began, measured as user-perceived wait. Armed only
-            // when the request asked the provider for reasoning text, and
-            // re-armed at every tool-result boundary.
+            let tasks_accepted = match session_paths.tasks_content().await {
+                Ok(content) => content,
+                Err(error) => {
+                    tracing::warn!(%error, "failed to read session tasks.md");
+                    None
+                }
+            };
+            // The reasoning phase is armed only when the request asked the
+            // provider for reasoning text.
             let reasoning_display = crate::agent::reasoning_text_requested(
                 state
                     .config
@@ -1681,399 +1736,84 @@ fn run_agent_loop<'a>(
                 crate::model_selector::selector_model_id(&current_model),
                 reasoning_effort,
             );
-            let mut reasoning_phase = reasoning_display.then_some(started_at);
-            {
-                agent.sync_runtime_context().await;
-                let mut stream = match kind {
-                    TurnKind::Prompt if !continue_from_transcript => {
-                        futures_util::future::Either::Left(agent.run_with_hidden_context(
-                            &prompt,
-                            turn_hidden_context_xml.as_deref(),
-                            attachments,
-                        ))
-                    }
-                    _ => {
-                        // The wake events reach clients with the first
-                        // attempt only; a retry would show them twice.
-                        let wake_events = match kind {
-                            TurnKind::Resume(wake_events) if attempt == 0 => wake_events.clone(),
-                            TurnKind::Resume(_) | TurnKind::Prompt => Vec::new(),
-                        };
-                        futures_util::future::Either::Right(futures_lite::StreamExt::chain(
-                            futures_lite::stream::iter(wake_events.into_iter().map(Ok)),
-                            agent.resume(),
-                        ))
-                    }
-                };
-                loop {
-                    let next_event = tokio::select! {
-                        biased;
-                        cancel = guard.cancellation().recv() => {
-                            cancellation_reason = Some(match cancel {
-                                Ok(CancelReason::User) => "run cancelled by user",
-                                Ok(CancelReason::DaemonRestarting) => {
-                                    "run interrupted: the daemon is restarting"
-                                }
-                                Err(_) => "run cancellation channel closed unexpectedly",
-                            });
-                            None
-                        }
-                        next = stream.next() => next,
-                    };
-                    let Some(event) = next_event else {
-                        break;
-                    };
-                    let event = event.map(|timed| {
-                        last_event_at = Some(timed.at);
-                        (timed.at, timed.event)
-                    });
-                    let event_at = event.as_ref().ok().map(|(at, _)| *at);
-                    // The first visible output of a call closes the pending
-                    // reasoning phase; its marker goes out before the event.
-                    if reasoning_phase.is_some()
-                        && event
-                            .as_ref()
-                            .map_or(true, |(_, event)| closes_reasoning_phase(event))
-                        && let Some(started) = reasoning_phase.take()
-                        && !sink.on_reasoning_end(started.elapsed().as_secs_f64()).await
-                    {
-                        cancellation_reason = Some("client disconnected during reasoning end");
-                        break;
-                    }
-                    sink.on_agent_event(event.as_ref().map(|(_, event)| event));
-                    match event.map(|(_, event)| event) {
-                        Ok(aither_agent::AgentEvent::Reasoning(text)) => {
-                            log_first_agent_event(
-                                &mut first_agent_event_seen,
-                                &started_at,
-                                session_id.as_str(),
-                                assistant_id.as_str(),
-                                "reasoning",
-                            );
-                            reasoning_text.push_str(&text);
-                            if !sink.on_reasoning(&text).await {
-                                cancellation_reason =
-                                    Some("client disconnected during reasoning stream");
-                                break;
-                            }
-                            decode_meter.note_output(text.len());
-                            if !emit_speed(sink, &decode_meter, &mut last_speed_emit).await {
-                                cancellation_reason =
-                                    Some("client disconnected during reasoning stream");
-                                break;
-                            }
-                        }
-                        Ok(aither_agent::AgentEvent::Text(text)) => {
-                            log_first_agent_event(
-                                &mut first_agent_event_seen,
-                                &started_at,
-                                session_id.as_str(),
-                                assistant_id.as_str(),
-                                "text",
-                            );
-                            log_first_text_event(
-                                &mut first_text_seen,
-                                &started_at,
-                                session_id.as_str(),
-                                assistant_id.as_str(),
-                            );
-                            segment_text.push_str(&text);
-                            segment_at = event_at;
-                            full_text.push_str(&text);
-                            if !sink.on_text(&text).await {
-                                cancellation_reason =
-                                    Some("client disconnected during text stream");
-                                break;
-                            }
-                            decode_meter.note_output(text.len());
-                            if !emit_speed(sink, &decode_meter, &mut last_speed_emit).await {
-                                cancellation_reason =
-                                    Some("client disconnected during text stream");
-                                break;
-                            }
-                        }
-                        Ok(aither_agent::AgentEvent::Usage(u)) => {
-                            decode_meter.note_usage(u.completion_tokens);
-                            record_request_log(state, ledger.completed(&u, Instant::now())).await;
-                            usage = u;
-                        }
-                        Ok(aither_agent::AgentEvent::ToolCallDelta {
-                            id,
-                            name,
-                            arguments_fragment,
-                        }) => {
-                            log_first_agent_event(
-                                &mut first_agent_event_seen,
-                                &started_at,
-                                session_id.as_str(),
-                                assistant_id.as_str(),
-                                "tool_delta",
-                            );
-                            tracing::trace!(
-                                target: "may::chat::tool_delta",
-                                id = %id,
-                                name = %name,
-                                fragment = %arguments_fragment,
-                                "incoming ToolCallDelta from aither"
-                            );
-                            decode_meter.note_output(arguments_fragment.len());
-                            if !emit_speed(sink, &decode_meter, &mut last_speed_emit).await {
-                                cancellation_reason =
-                                    Some("client disconnected during tool stream");
-                                break;
-                            }
-                            match normalize_tool_delta_for_sink(
-                                &mut pending_tool_streams,
-                                &id,
-                                &name,
-                                &arguments_fragment,
-                            ) {
-                                SinkToolEvent::Start {
-                                    id,
-                                    name,
-                                    arguments,
-                                } => {
-                                    log_first_visible_tool_event(
-                                        &mut first_visible_tool_seen,
-                                        &started_at,
-                                        session_id.as_str(),
-                                        assistant_id.as_str(),
-                                        id.as_str(),
-                                        name.as_str(),
-                                        "synthetic_start_from_delta",
-                                    );
-                                    let summary = project_tool_summary_for_sink(
-                                        &pending_tool_streams,
-                                        &id,
-                                        &name,
-                                        Some(arguments.as_str()),
-                                    );
-                                    if !sink.on_tool_start(&id, &name, &arguments, summary).await {
-                                        cancellation_reason =
-                                            Some("client disconnected during tool stream");
-                                        break;
-                                    }
-                                }
-                                SinkToolEvent::Delta {
-                                    id,
-                                    name,
-                                    arguments_fragment,
-                                } => {
-                                    let summary = project_tool_summary_for_sink(
-                                        &pending_tool_streams,
-                                        &id,
-                                        &name,
-                                        None,
-                                    );
-                                    if !sink
-                                        .on_tool_delta(&id, &name, &arguments_fragment, summary)
-                                        .await
-                                    {
-                                        cancellation_reason =
-                                            Some("client disconnected during tool stream");
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        Ok(aither_agent::AgentEvent::ToolCallStart {
-                            id,
-                            name,
-                            arguments,
-                        }) => {
-                            log_first_agent_event(
-                                &mut first_agent_event_seen,
-                                &started_at,
-                                session_id.as_str(),
-                                assistant_id.as_str(),
-                                "tool_start",
-                            );
-                            saw_tool_activity = true;
-                            // Args that never streamed as deltas still count
-                            // as decoded output.
-                            let streamed = pending_tool_streams
-                                .get(&id)
-                                .map_or(0, |pending| pending.buffered_arguments.len());
-                            decode_meter.note_output(arguments.len().saturating_sub(streamed));
-                            decode_meter.note_boundary();
-                            if matches!(
-                                name.as_str(),
-                                "terminal" | "terminal_input" | "terminal_kill" | "terminal_read"
-                            ) {
-                                mark_run_running(state, guard.fence()).await?;
-                            }
-                            // Buffer accumulated text segment before the tool call.
-                            if !segment_text.trim().is_empty() {
-                                turn_persister.push_assistant(
-                                    segment_text.clone(),
-                                    segment_emitted_at(segment_at),
-                                );
-                                segment_text.clear();
-                            }
-
-                            let record = ToolEventRecord::Start {
-                                id: id.clone(),
-                                name: name.clone(),
-                                arguments: arguments.clone(),
-                            };
-                            let serialized = serde_json::to_string(&record)
-                                .map_err(|e| crate::db::ChatDbError::Storage(e.to_string()))?;
-                            turn_persister.push_tool_event(
-                                id.clone(),
-                                serialized,
-                                event_at.expect("tool events come from the agent stream"),
-                            );
-                            update_terminal_snapshot_from_tool_event(
-                                &mut terminal_snapshot,
-                                &record,
-                            );
-                            tool_arguments_by_id.insert(id.clone(), arguments.clone());
-                            if let Some(SinkToolEvent::Start {
-                                id,
-                                name,
-                                arguments,
-                            }) = normalize_tool_start_for_sink(
-                                &mut pending_tool_streams,
-                                &id,
-                                &name,
-                                &arguments,
-                            ) {
-                                log_first_visible_tool_event(
-                                    &mut first_visible_tool_seen,
-                                    &started_at,
-                                    session_id.as_str(),
-                                    assistant_id.as_str(),
-                                    id.as_str(),
-                                    name.as_str(),
-                                    "canonical_start",
-                                );
-                                let summary = project_tool_summary_for_sink(
-                                    &pending_tool_streams,
-                                    &id,
-                                    &name,
-                                    Some(arguments.as_str()),
-                                );
-                                if !sink.on_tool_start(&id, &name, &arguments, summary).await {
-                                    cancellation_reason =
-                                        Some("client disconnected during tool stream");
-                                    break;
-                                }
-                            }
-                        }
-                        Ok(aither_agent::AgentEvent::ToolCallEnd { id, name, result }) => {
-                            log_first_agent_event(
-                                &mut first_agent_event_seen,
-                                &started_at,
-                                session_id.as_str(),
-                                assistant_id.as_str(),
-                                "tool_end",
-                            );
-                            saw_tool_activity = true;
-                            let record = ToolEventRecord::End {
-                                id: id.clone(),
-                                name: name.clone(),
-                                result: result.clone(),
-                            };
-                            let serialized = serde_json::to_string(&record)
-                                .map_err(|e| crate::db::ChatDbError::Storage(e.to_string()))?;
-                            turn_persister.push_tool_event(
-                                id.clone(),
-                                serialized,
-                                event_at.expect("tool events come from the agent stream"),
-                            );
-                            update_terminal_snapshot_from_tool_event(
-                                &mut terminal_snapshot,
-                                &record,
-                            );
-                            let arguments = tool_arguments_by_id.remove(&id);
-                            let summary = project_tool_summary_for_sink(
-                                &pending_tool_streams,
-                                &id,
-                                &name,
-                                arguments.as_deref(),
-                            );
-                            pending_tool_streams.remove(&id);
-                            if !sink
-                                .on_tool_end(&id, &name, arguments.as_deref(), &result, summary)
-                                .await
-                            {
-                                cancellation_reason =
-                                    Some("client disconnected during tool stream");
-                                break;
-                            }
-
-                            // Check if tasks.md changed after tool execution.
-                            if let Some(checklist) =
-                                check_tasks_update(&session_paths, &mut last_todo_hash).await
-                                && !sink.on_todo_update(&checklist).await
-                            {
-                                cancellation_reason =
-                                    Some("client disconnected during todo update");
-                                break;
-                            }
-                            // A tool result is the boundary after which the
-                            // next call may reason again.
-                            reasoning_phase = reasoning_display.then(Instant::now);
-                        }
-                        Ok(aither_agent::AgentEvent::BackgroundTaskStarted {
-                            task_id,
-                            output_preview,
-                            output_file,
-                        }) => {
-                            saw_tool_activity = true;
-                            set_terminal_runtime_state(
-                                state,
-                                session_id.as_str(),
-                                TerminalRuntimeState {
-                                    task_id: Some(task_id),
-                                    output_file: Some(output_file),
-                                    output_preview: Some(output_preview),
-                                    input_notice: None,
-                                },
-                            )
-                            .await?;
-                        }
-                        // A reply without tool calls that the run follows
-                        // with another reply is stored as a message of its
-                        // own.
-                        Ok(
-                            aither_agent::AgentEvent::BuiltInToolResult { .. }
-                            | aither_agent::AgentEvent::RunResumed { .. },
-                        ) => {
-                            // Delivered tool output / a resumed run arms the
-                            // next call's reasoning phase.
-                            reasoning_phase = reasoning_display.then(Instant::now);
-                        }
-                        Ok(aither_agent::AgentEvent::TurnComplete {
-                            has_tool_calls: false,
-                            ..
-                        }) => {
-                            if !segment_text.trim().is_empty() {
-                                turn_persister.push_assistant(
-                                    segment_text.clone(),
-                                    segment_emitted_at(segment_at),
-                                );
-                                segment_text.clear();
-                            }
-                        }
-                        Ok(aither_agent::AgentEvent::BackgroundTaskCompleted { .. }) => {
-                            saw_tool_activity = true;
-                            reasoning_phase = reasoning_display.then(Instant::now);
-                            clear_terminal_runtime_state(state, session_id.as_str()).await?;
-                            mark_run_running(state, guard.fence()).await?;
-                        }
-                        Ok(aither_agent::AgentEvent::Error(err)) | Err(err) => {
-                            terminal_error = Some(err);
-                            break;
-                        }
-                        Ok(_) => {}
-                    }
-
-                    if is_takeover_active_for_session(state, &session_id).await {
-                        browser_takeover_paused = true;
-                        break;
-                    }
+            let mut turn = turn_events::TurnEvents {
+                state,
+                guard,
+                sink: &mut *sink,
+                session_id: &session_id,
+                assistant_id: assistant_id.as_str(),
+                session_paths: &session_paths,
+                started_at,
+                reasoning_display,
+                reasoning_phase: reasoning_display.then_some(started_at),
+                usage: Usage::default(),
+                ledger: request_ledger::RequestLedger::new(
+                    session_id.as_str(),
+                    &current_model,
+                    &provider_id,
+                    model_context_window,
+                    Instant::now(),
+                ),
+                decode_meter: DecodeMeter::default(),
+                last_speed_emit: None,
+                segment_text: String::new(),
+                segment_at: None,
+                last_event_at: None,
+                full_text: String::new(),
+                reasoning_text: String::new(),
+                terminal_snapshot: TerminalStateSnapshot::default(),
+                saw_tool_activity: false,
+                tool_arguments_by_id: std::collections::HashMap::new(),
+                tool_started_at: std::collections::HashMap::new(),
+                pending_tool_streams: std::collections::HashMap::new(),
+                last_todo_hash: None,
+                tasks_accepted,
+                turn_persister: turn_persister::TurnPersister::new(guard.fence().clone()),
+                first_agent_event_seen: false,
+                first_visible_tool_seen: false,
+                first_text_seen: false,
+            };
+            agent.sync_runtime_context().await;
+            let stopped = drive_turn(
+                &mut turn,
+                &mut agent,
+                kind,
+                TurnRun {
+                    prompt: &prompt,
+                    hidden_context: turn_hidden_context_xml.as_deref(),
+                    attachments,
+                    continue_from_transcript,
+                    attempt,
+                },
+            )
+            .await;
+            let turn_events::TurnEvents {
+                sink: _,
+                usage,
+                mut ledger,
+                mut decode_meter,
+                segment_text,
+                segment_at,
+                last_event_at,
+                full_text,
+                reasoning_text,
+                mut terminal_snapshot,
+                saw_tool_activity,
+                mut turn_persister,
+                mut reasoning_phase,
+                ..
+            } = turn;
+            let mut terminal_error: Option<aither_agent::AgentError> = None;
+            let mut cancellation_reason: Option<&'static str> = None;
+            let mut browser_takeover_paused = false;
+            match stopped {
+                Ok(()) => {}
+                Err(turn_events::TurnStop::Cancelled(reason)) => {
+                    cancellation_reason = Some(reason);
                 }
+                Err(turn_events::TurnStop::TakeoverPaused) => browser_takeover_paused = true,
+                Err(turn_events::TurnStop::Failed(error)) => terminal_error = Some(error),
+                Err(turn_events::TurnStop::Persist(error)) => return Err(error.into()),
             }
 
             // A stream that ended mid-phase still reports the reasoning wait.
@@ -3757,6 +3497,33 @@ pub enum TurnKind {
 impl TurnKind {
     const fn is_resume(&self) -> bool {
         matches!(self, Self::Resume(_))
+    }
+}
+
+/// Hold the session's `tasks.md` to the one-owner-per-open-issue rule: a
+/// change that adds an issue another agent owns is reverted, and the session
+/// is told through a steer message.
+async fn enforce_issue_ownership(
+    state: &Arc<DaemonState>,
+    session_id: &SessionId,
+    accepted: &mut Option<String>,
+) {
+    use crate::issue::owner::{IssueOwners, OwnershipError};
+
+    let directory = agent_messaging(state).directory;
+    match IssueOwners::new(directory.clone())
+        .admit(session_id.as_str(), accepted)
+        .await
+    {
+        Ok(()) => {}
+        Err(OwnershipError::Owned(owned)) => {
+            if let Err(error) = directory.deliver(session_id.as_str(), owned.notice()).await {
+                tracing::warn!(%session_id, %error, "failed to tell the session its tasks.md change was reverted");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%session_id, %error, "issue ownership of tasks.md could not be checked");
+        }
     }
 }
 

@@ -1,12 +1,11 @@
 //! May agent wrapper around aither-agent.
 
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use aither_agent::{
-    Agent, AgentError, AgentKind, AgentOptions, CompactResult, HCons, Prepared, PromptCache,
-    TerminalAgentBuilder, TimedEvent, Unprepared,
+    Agent, AgentError, AgentKind, AgentOptions, CompactResult, HCons, Prepared, PromptCache, Run,
+    TerminalAgentBuilder, Unprepared,
 };
 use aither_core::llm::{
     Attachment as LlmAttachment, Message as LlmMessage,
@@ -14,7 +13,6 @@ use aither_core::llm::{
 };
 use aither_sandbox::{AnyContainerExec, ContainerShellRuntime, SshServer, TerminalTool};
 use executor_core::DefaultExecutor;
-use futures_lite::Stream;
 
 use super::agents_md;
 use super::context_dump::ContextDump;
@@ -348,9 +346,9 @@ pub struct MayAgent {
     model_context_window: Option<u32>,
     /// The thresholds the agent compacts by; `/context` reports them.
     context_policy: aither_agent::ContextPolicy,
-    /// IPC command names backed by MCP connections — lets `/context` split
-    /// the `<commands>` index into built-in vs MCP rows.
-    mcp_command_names: Vec<String>,
+    /// The commands registered by name; `/context` counts every other row of
+    /// the command table as an MCP tool.
+    named_commands: Vec<String>,
     runtime_system_context: RuntimeSystemContext,
     job_registry: aither_sandbox::JobRegistry,
     subagent_runs: aither_agent::specialized::SubagentRuns,
@@ -537,7 +535,11 @@ impl MayAgent {
             // checkout locally; `local` writes the checkout; undecided binds
             // nothing — the launch gate asks before the session starts.
             match session_repos
-                .ensure_clone_of(&worktree, &workspace.config)
+                .ensure_clone_of(
+                    &worktree,
+                    &workspace.config,
+                    &crate::session::MayHomePaths::new(config.may_dir.clone()).repo_staging_dir(),
+                )
                 .await
             {
                 Ok(Some(clone_path)) => repo_clones.push(RepoCloneEntry {
@@ -721,6 +723,7 @@ impl MayAgent {
                 agent_messaging,
                 languages: Some(language_guard.clone()),
                 acp,
+                git: crate::host_git::HostGit::inherit(),
                 #[cfg(target_os = "macos")]
                 computer: config.computer.clone(),
             },
@@ -781,6 +784,11 @@ impl MayAgent {
             "preparing session tool environments"
         );
         let builder = Box::pin(prepare_tools(builder, &config, tool_environment_key)).await?;
+        let named_commands = builder
+            .tool_descriptions()
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect();
         let agent = builder.build();
 
         Ok(Self {
@@ -792,7 +800,7 @@ impl MayAgent {
             model_id: config.model_id,
             model_context_window: config.model_context_window,
             context_policy: config.context_policy,
-            mcp_command_names: shared_terminal_commands.mcp_command_names,
+            named_commands,
             runtime_system_context,
             job_registry,
             subagent_runs,
@@ -965,29 +973,23 @@ impl MayAgent {
         })
     }
 
-    /// Run a query and stream events.
-    ///
-    /// The run's state machine spans every agent turn and is tens of
-    /// kilobytes, so it is built on the heap here, in a frame that has
-    /// returned before the stream is first polled. A caller that pinned it in
-    /// place would carry it in its own future and, in debug builds, in the
-    /// stack frame of every poll down to the provider request.
+    /// Runs a query; [`Run::drive`] hands its events to the caller.
     pub fn run(
         &mut self,
         prompt: &str,
         attachments: impl IntoIterator<Item = LlmAttachment>,
-    ) -> Pin<Box<impl Stream<Item = Result<TimedEvent, AgentError>> + '_>> {
-        Box::pin(self.inner.run(prompt, attachments))
+    ) -> Run<impl Future<Output = Result<(), AgentError>> + '_> {
+        self.inner.run(prompt, attachments)
     }
 
-    /// Run a query and persist per-turn hidden context as a regular system
-    /// message. The stream is boxed for the reason given on [`Self::run`].
+    /// Runs a query after persisting per-turn hidden context as a regular
+    /// system message.
     pub fn run_with_hidden_context(
         &mut self,
         prompt: &str,
         hidden_context: Option<&str>,
         attachments: impl IntoIterator<Item = LlmAttachment>,
-    ) -> Pin<Box<impl Stream<Item = Result<TimedEvent, AgentError>> + '_>> {
+    ) -> Run<impl Future<Output = Result<(), AgentError>> + '_> {
         if let Some(hidden_context) = hidden_context
             .map(str::trim)
             .filter(|text| !text.is_empty())
@@ -998,10 +1000,10 @@ impl MayAgent {
     }
 
     /// Continues the conversation without a new user message, for the model
-    /// to act on what [`Self::wait_background`] recorded. Boxed like
+    /// to act on what [`Self::wait_background`] recorded. Driven like
     /// [`Self::run`].
-    pub fn resume(&mut self) -> Pin<Box<impl Stream<Item = Result<TimedEvent, AgentError>> + '_>> {
-        Box::pin(self.inner.resume())
+    pub fn resume(&mut self) -> Run<impl Future<Output = Result<(), AgentError>> + '_> {
+        self.inner.resume()
     }
 
     /// Waits, between runs, for a background command of an earlier run to
@@ -1099,7 +1101,7 @@ impl MayAgent {
         Ok(super::context_report::ContextReport::assemble(
             &self.model_id,
             &self.provider_id,
-            &self.mcp_command_names,
+            &self.named_commands,
             self.inner.context(),
             &snapshot.metrics,
             snapshot.phase,
@@ -1399,7 +1401,7 @@ pub async fn test_agent(
             model_id: model_id.to_string(),
             model_context_window: None,
             context_policy: aither_agent::ContextPolicy::default(),
-            mcp_command_names: Vec::new(),
+            named_commands: Vec::new(),
             runtime_system_context: RuntimeSystemContext::new(
                 temp.path().join("MEMORY.md"),
                 String::new(),

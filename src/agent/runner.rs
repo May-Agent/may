@@ -19,12 +19,12 @@
 //! ```
 
 use std::future::Future;
+use std::ops::ControlFlow;
 
 use aither_agent::{CompactResult, TimedEvent};
 use aither_core::llm::Attachment;
 use async_channel::{Receiver, Sender, unbounded};
 use executor_core::{Executor, Task};
-use futures_lite::StreamExt;
 
 use crate::MayAgent;
 use crate::agent::{ContextDump, ContextReport, ModelSlot};
@@ -955,40 +955,54 @@ async fn run_agent_prompt(
         lease,
     } = run;
     agent.sync_runtime_context().await;
-    let mut stream = agent.run_with_hidden_context(&prompt, hidden_context.as_deref(), attachments);
-
-    loop {
-        // Race between the next stream event, a cancel command and the lease
-        match race_against_commands(
-            until_stopped(stream.next(), &lease.cancellation),
-            command_rx,
-            command_tx,
-        )
-        .await
-        {
-            WorkOutcome::Finished(StopRace::Done(Some(result))) => {
-                if event_tx.send(TuiEvent::Agent(result)).await.is_err() {
-                    // Receiver dropped, stop processing
-                    return WorkOutcome::Cancelled;
-                }
+    let run = agent.run_with_hidden_context(&prompt, hidden_context.as_deref(), attachments);
+    // The run stops between events on the lease's cancellation; a cancel
+    // command drops it where it stands.
+    let driven = run.drive(
+        event_tx,
+        async {
+            let _ = lease.cancellation.recv().await;
+            PromptStop::Stopped
+        },
+        |event_tx, timed| async move {
+            if event_tx.send(TuiEvent::Agent(Ok(timed))).await.is_err() {
+                ControlFlow::Break(PromptStop::ReceiverGone)
+            } else {
+                ControlFlow::Continue(event_tx)
             }
-            WorkOutcome::Finished(StopRace::Done(None)) => {
-                drop(stream);
-                persist_snapshot(snapshot_db, &lease.fence, agent).await;
-                let _ = event_tx.send(TuiEvent::Complete).await;
-                return WorkOutcome::Finished(());
-            }
-            WorkOutcome::Finished(StopRace::Stopped) | WorkOutcome::Cancelled => break,
-            WorkOutcome::Shutdown => {
-                let _ = event_tx.send(TuiEvent::Complete).await;
-                return WorkOutcome::Shutdown;
-            }
+        },
+    );
+    match race_against_commands(driven, command_rx, command_tx).await {
+        WorkOutcome::Finished(Ok(ControlFlow::Continue(_))) => {}
+        WorkOutcome::Finished(Err(error)) => {
+            let _ = event_tx.send(TuiEvent::Agent(Err(error))).await;
+        }
+        // Receiver dropped: nobody is left to tell.
+        WorkOutcome::Finished(Ok(ControlFlow::Break(PromptStop::ReceiverGone))) => {
+            return WorkOutcome::Cancelled;
+        }
+        WorkOutcome::Finished(Ok(ControlFlow::Break(PromptStop::Stopped)))
+        | WorkOutcome::Cancelled => {
+            // Completion after cancel lets the TUI know processing stopped.
+            let _ = event_tx.send(TuiEvent::Complete).await;
+            return WorkOutcome::Cancelled;
+        }
+        WorkOutcome::Shutdown => {
+            let _ = event_tx.send(TuiEvent::Complete).await;
+            return WorkOutcome::Shutdown;
         }
     }
-
-    // Send completion after cancel so TUI knows processing stopped
+    persist_snapshot(snapshot_db, &lease.fence, agent).await;
     let _ = event_tx.send(TuiEvent::Complete).await;
-    WorkOutcome::Cancelled
+    WorkOutcome::Finished(())
+}
+
+/// Why a prompt's run stopped before it finished.
+enum PromptStop {
+    /// The lease's cancellation stopped it.
+    Stopped,
+    /// The TUI's event receiver is gone.
+    ReceiverGone,
 }
 
 #[cfg(test)]

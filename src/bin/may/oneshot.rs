@@ -123,6 +123,67 @@ async fn answer_oneshot_repo_trust(
     Ok(())
 }
 
+/// After a turn ends: the next turn of the session, while the daemon runs
+/// one or will start one on its own from the session's background work, or
+/// `None` when the session is idle for good. The daemon's state decides;
+/// nothing here is timed. The poll only re-reads that state.
+///
+/// A turn already running counts: after a resync the turn in progress
+/// arrives from its start, and the run follows it like a resumed one.
+async fn next_resumed_turn(
+    app: &mut App,
+    worker: &AgentWorker,
+    runtime_deps: &RuntimeDeps,
+    session_id: &may_agent::session::SessionId,
+) -> anyhow::Result<Option<may_agent::agent::AgentHandle>> {
+    /// How often the daemon's background state is re-read while waiting.
+    const BACKGROUND_POLL: std::time::Duration = std::time::Duration::from_millis(300);
+
+    let background = worker
+        .background()
+        .ok_or_else(|| anyhow::anyhow!("the one-shot worker has no daemon background"))?;
+    loop {
+        let (will_resume, runtime) = futures_lite::future::zip(
+            background.will_resume(),
+            session_runtime(runtime_deps, session_id),
+        )
+        .await;
+        let resumes =
+            will_resume? || runtime?.state != may_agent::session::SessionRuntimeState::Idle;
+        // A turn already announced wins over the state read above, which
+        // may postdate its end.
+        let announced = if resumes {
+            futures_lite::future::or(async { Some(worker.next_foreign_turn().await) }, async {
+                async_io::Timer::after(BACKGROUND_POLL).await;
+                None
+            })
+            .await
+        } else {
+            futures_lite::future::or(async { Some(worker.next_foreign_turn().await) }, async {
+                None
+            })
+            .await
+        };
+        match announced {
+            Some(Some(turn)) => {
+                let message = PendingMessage {
+                    content: turn.content.clone().unwrap_or_default(),
+                    hidden_context_xml: None,
+                    attachments: Vec::new(),
+                    queued_at: Timestamp::now(),
+                    delivery_mode: may_agent::session::PendingUserMessageMode::Queue,
+                    display: turn.content.is_none().then(String::new),
+                };
+                app.start_processing(&message);
+                return Ok(Some(turn.handle));
+            }
+            Some(None) => anyhow::bail!("the session's event stream closed"),
+            None if resumes => {}
+            None => return Ok(None),
+        }
+    }
+}
+
 pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
     enum Event {
         Agent(TuiEvent),
@@ -132,8 +193,6 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
 
     /// How often prompts the daemon holds are looked for.
     const DAEMON_PROMPT_POLL: std::time::Duration = std::time::Duration::from_millis(300);
-
-    const ONESHOT_IDLE_FINISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
     let (event_tx, _event_rx) = async_channel::unbounded();
     let mut app = App::new(event_tx, None).await?;
@@ -241,7 +300,6 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
 
     let mut pending_title_gen: Option<TitleGenContext> = None;
     let mut assistant_response = AssistantReply::default();
-    let mut active_tool_calls = std::collections::HashSet::<String>::new();
     if !runtime_deps.begin_run(&mut app)? {
         anyhow::bail!("the session is already running in another May process");
     }
@@ -260,8 +318,6 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
         &mut pending_title_gen,
     )?;
     let mut agent_handle = Some(handle);
-    // Prompt polls do not count as activity for the idle finish.
-    let mut last_agent_event = std::time::Instant::now();
 
     while let Some(handle) = agent_handle.as_ref() {
         let snapshot = session_runtime(&runtime_deps, &session_id).await?;
@@ -363,58 +419,17 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
             continue;
         }
 
-        let event_future =
+        let next =
             futures_lite::future::or(async { handle.recv().await.map(Event::Agent) }, async {
                 async_io::Timer::after(DAEMON_PROMPT_POLL).await;
                 Some(Event::Poll)
-            });
-        let next = if assistant_response.text().is_empty() || !active_tool_calls.is_empty() {
-            event_future.await
-        } else if let Ok(event) = tokio::time::timeout(
-            ONESHOT_IDLE_FINISH_TIMEOUT.saturating_sub(last_agent_event.elapsed()),
-            event_future,
-        )
-        .await
-        {
-            event
-        } else {
-            if let Some(handle) = agent_handle.take() {
-                handle.cancel();
-            }
-            runtime_deps
-                .finish_agent_task(
-                    &mut app,
-                    &mut agent_handle,
-                    &mut pending_title_gen,
-                    &assistant_response,
-                    RunOutcome::Completed,
-                )
-                .await;
-            output.end_text_line()?;
-            return Ok(());
-        };
+            })
+            .await;
         let Some(event) = next else {
             break;
         };
-        if matches!(event, Event::Agent(_)) {
-            last_agent_event = std::time::Instant::now();
-        }
         match event {
             Event::Agent(TuiEvent::Agent(result)) => {
-                if let Ok(TimedEvent {
-                    event: AgentEvent::ToolCallStart { id, .. },
-                    ..
-                }) = &result
-                {
-                    active_tool_calls.insert(id.clone());
-                }
-                if let Ok(TimedEvent {
-                    event: AgentEvent::ToolCallEnd { id, .. },
-                    ..
-                }) = &result
-                {
-                    active_tool_calls.remove(id);
-                }
                 if let Ok(TimedEvent {
                     at,
                     event: AgentEvent::Text(ref text),
@@ -444,7 +459,13 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                         anyhow::bail!("oneshot agent run failed");
                     }
                     output.end_text_line()?;
-                    return Ok(());
+                    let Some(handle) =
+                        next_resumed_turn(&mut app, worker, &runtime_deps, &session_id).await?
+                    else {
+                        return Ok(());
+                    };
+                    assistant_response = AssistantReply::default();
+                    agent_handle = Some(handle);
                 }
             }
             Event::Agent(TuiEvent::ReasoningEnd { seconds }) => {
@@ -466,7 +487,13 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                     )
                     .await;
                 output.end_text_line()?;
-                return Ok(());
+                let Some(handle) =
+                    next_resumed_turn(&mut app, worker, &runtime_deps, &session_id).await?
+                else {
+                    return Ok(());
+                };
+                assistant_response = AssistantReply::default();
+                agent_handle = Some(handle);
             }
             Event::Poll
             | Event::Agent(

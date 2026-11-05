@@ -66,6 +66,12 @@ enum MockChatScenario {
     /// Answers every agent turn with the same text, so one session can run
     /// several turns against one mock server.
     TextEveryTurn(String),
+    /// Answers every agent turn with `chunks`, each streamed `delay` after
+    /// the one before.
+    SlowTextEveryTurn {
+        chunks: Vec<String>,
+        delay: Duration,
+    },
     /// The first `failures` agent requests are refused with an overloaded
     /// (529) status; every later one gets `text`.
     OverloadedThenText {
@@ -88,10 +94,19 @@ enum MockChatScenario {
     /// The first request starts the script as a background terminal job;
     /// every later request gets a plain text reply.
     StartsBackgroundJob(&'static str),
+    /// The first request runs the script as a foreground terminal command and
+    /// the next replies with text, failing the turn when the command's result
+    /// reports a denied operation.
+    RunsScript(&'static str),
     /// A turn that runs [`COMPACTION_PROBE_STEPS`] commands over a
     /// context past the compaction start point, then replies; a turn that
     /// follows a restart is answered at once. See [`CompactionProbe`].
     CompactionProbe(CompactionProbe),
+    /// Against the fake MCP server of
+    /// `tests/fixtures/changing_tools_mcp_server.py`: the first turn runs
+    /// `probe_add`, which makes the server add `probe_greet`; the second
+    /// runs `probe_greet`; every other request gets a plain text reply.
+    AddsMcpTool,
 }
 
 /// How the mock answers the compaction requests of [`MockChatScenario::CompactionProbe`].
@@ -459,6 +474,41 @@ impl MockScenarioState {
                 verify_initial_tool_contract(request)?;
                 MockHttpResponse::sse(text_stream_frames(vec![text.clone()], Duration::ZERO))
             }
+            MockChatScenario::AddsMcpTool => match self.request_index {
+                0 | 2 => {
+                    let command = if self.request_index == 0 {
+                        "probe_add"
+                    } else {
+                        "probe_greet"
+                    };
+                    MockHttpResponse::sse(vec![
+                        delayed_sse_frame(
+                            tool_call_chunk(
+                                &format!("call-{command}"),
+                                "terminal",
+                                &serde_json::json!({
+                                    "description": "Run the MCP probe command",
+                                    "script": command,
+                                    "mode": "sandboxed",
+                                    "raw": true,
+                                    "timeout": 30,
+                                    "max_lines": 50
+                                }),
+                            ),
+                            Duration::from_millis(10),
+                        ),
+                        done_frame(Duration::from_millis(10)),
+                    ])
+                }
+                _ => MockHttpResponse::sse(text_stream_frames(
+                    vec!["probed".to_string()],
+                    Duration::from_millis(10),
+                )),
+            },
+            MockChatScenario::SlowTextEveryTurn { chunks, delay } => {
+                verify_initial_tool_contract(request)?;
+                MockHttpResponse::sse(text_stream_frames(chunks.clone(), *delay))
+            }
             MockChatScenario::SlowText { chunks, delay } => {
                 if self.request_index != 0 {
                     return Err(format!(
@@ -601,6 +651,37 @@ impl MockScenarioState {
                     Duration::from_millis(10),
                 )),
             },
+            MockChatScenario::RunsScript(script) => {
+                if self.request_index == 0 {
+                    MockHttpResponse::sse(vec![
+                        delayed_sse_frame(
+                            tool_call_chunk(
+                                "call-run-script",
+                                "terminal",
+                                &serde_json::json!({
+                                    "description": "Run the probe script",
+                                    "script": script,
+                                    "mode": "sandboxed",
+                                    "raw": true,
+                                    "timeout": 30,
+                                    "max_lines": 50
+                                }),
+                            ),
+                            Duration::from_millis(10),
+                        ),
+                        done_frame(Duration::from_millis(10)),
+                    ])
+                } else {
+                    let output = latest_tool_output(request).unwrap_or_default();
+                    if output.contains("not permitted") {
+                        return Err(format!("the probe script was denied: {output}"));
+                    }
+                    MockHttpResponse::sse(text_stream_frames(
+                        vec!["ran".to_string()],
+                        Duration::from_millis(10),
+                    ))
+                }
+            }
             MockChatScenario::StartsBackgroundJob(script) => match self.request_index {
                 0 => MockHttpResponse::sse(vec![
                     delayed_sse_frame(
@@ -1130,11 +1211,52 @@ fn sse_response(
 }
 
 struct TestHarness {
-    home: TempDir,
+    /// Owns the temporary home; dropping it removes the directory.
+    _home: TempDir,
+    /// The home's real path: May resolves its home, so every path it reports
+    /// is spelled this way (`/var` is a link to `/private/var` on macOS).
+    home_path: PathBuf,
     may_dir: PathBuf,
 }
 
+const HOST_USER_NAME: &str = "E2E User";
+const HOST_USER_EMAIL: &str = "e2e.user@example.com";
+
+/// The file standing in for the host user's global git configuration, which
+/// every `may` the suite starts reads instead of the developer's own.
+fn host_gitconfig(home: &Path) -> PathBuf {
+    home.join("host-gitconfig")
+}
+
+/// The environment that gives a `may` process the hermetic host user.
+fn hermetic_git_env(home: &Path) -> [(&'static str, PathBuf); 2] {
+    [
+        ("GIT_CONFIG_GLOBAL", host_gitconfig(home)),
+        ("GIT_CONFIG_SYSTEM", PathBuf::from("/dev/null")),
+    ]
+}
+
 impl TestHarness {
+    /// Makes the host user sign their commits with a fresh ssh key.
+    fn host_user_signs(&self) {
+        let key = self.home_path().join("host-signing-key");
+        let status = std::process::Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-C", "e2e", "-f"])
+            .arg(&key)
+            .status()
+            .expect("ssh-keygen should run");
+        assert!(status.success(), "ssh-keygen should generate the host key");
+        std::fs::write(
+            host_gitconfig(self.home_path()),
+            format!(
+                "[user]\n\tname = {HOST_USER_NAME}\n\temail = {HOST_USER_EMAIL}\n\
+                 \tsigningkey = {}\n[gpg]\n\tformat = ssh\n[commit]\n\tgpgsign = true\n",
+                key.display()
+            ),
+        )
+        .expect("host gitconfig should be written");
+    }
+
     async fn new(config_base_url: &str) -> Self {
         Self::build(config_base_url, None, ContextConfig::default()).await
     }
@@ -1162,7 +1284,8 @@ impl TestHarness {
         context: ContextConfig,
     ) -> Self {
         let home = tempfile::tempdir().expect("test home tempdir should be created");
-        let may_dir = home.path().join(".may");
+        let home_path = dunce::canonicalize(home.path()).expect("test home should resolve");
+        let may_dir = home_path.join(".may");
         tokio::fs::create_dir_all(&may_dir)
             .await
             .expect("test may dir should be created");
@@ -1196,14 +1319,25 @@ impl TestHarness {
             .await
             .expect("test config should be written");
 
+        // A typical user: an identity and no commit signing.
+        std::fs::write(
+            host_gitconfig(home.path()),
+            format!("[user]\n\tname = {HOST_USER_NAME}\n\temail = {HOST_USER_EMAIL}\n"),
+        )
+        .expect("host gitconfig should be written");
+
         seed_container_heel(&may_dir).await;
         futures_lite::future::zip(
             share_and_warm_tool_cache(&may_dir),
-            warm_may_binary(home.path()),
+            warm_may_binary(&home_path),
         )
         .await;
 
-        Self { home, may_dir }
+        Self {
+            _home: home,
+            home_path,
+            may_dir,
+        }
     }
 
     /// Tracing output a spawned server emitted, with ANSI styling stripped so
@@ -1255,7 +1389,7 @@ impl TestHarness {
     }
 
     fn home_path(&self) -> &Path {
-        self.home.path()
+        &self.home_path
     }
 
     /// The managed container heel's release state, as stored.
@@ -1331,6 +1465,7 @@ impl RunningDaemon {
             .arg(port.to_string())
             .current_dir(home)
             .env("HOME", home)
+            .envs(hermetic_git_env(home))
             // Module-level directives outrank May's baked crate-level filter,
             // keeping failed assertions diagnosable from captured logs.
             .env(
@@ -1384,9 +1519,39 @@ impl RunningDaemon {
         }
     }
 
-    async fn stop(mut self) {
+    /// Kills the daemon outright, as a crash would: no shutdown path runs.
+    /// For tests whose point is surviving an abrupt death; it leaves a
+    /// relocated home's launchd agents loaded.
+    async fn kill(mut self) {
         let _ = self.child.kill().await;
         let _ = self.child.wait().await;
+    }
+
+    /// Stops the daemon through its shutdown path, so it retires what it
+    /// installed for its relocated home, and waits for the process to exit.
+    ///
+    /// # Panics
+    /// When the daemon ignores the shutdown: it is then killed and the test
+    /// fails.
+    async fn stop(mut self) {
+        let requested = reqwest::Client::new()
+            .post(format!("{}/api/daemon/shutdown", self.base_url))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success());
+        let exited = requested
+            && tokio::time::timeout(DAEMON_SHUTDOWN_TIMEOUT, self.child.wait())
+                .await
+                .is_ok();
+        if !exited {
+            let _ = self.child.kill().await;
+            let _ = self.child.wait().await;
+            panic!(
+                "daemon did not exit within {DAEMON_SHUTDOWN_TIMEOUT:?} of a shutdown request (accepted: {requested}); server logs:\n{}",
+                self.log.contents().await
+            );
+        }
     }
 }
 
@@ -1491,11 +1656,19 @@ async fn seed_container_heel(may_dir: &Path) {
     .expect("container heel release state should be written");
 }
 
+/// Directory holding the downloads every test run shares. `MAY_TEST_CACHE`
+/// names it so CI can restore it from the Actions cache; unset, it is the
+/// build's test scratch directory.
+fn shared_download_root() -> PathBuf {
+    std::env::var_os("MAY_TEST_CACHE")
+        .map_or_else(|| PathBuf::from(env!("CARGO_TARGET_TMPDIR")), PathBuf::from)
+}
+
 /// The pinned container heel in the shared test-tmp cache, downloaded from
 /// its release on first use. Its SHA-256 is verified every time it is handed
 /// out, whether freshly downloaded or reused.
 async fn pinned_container_heel() -> PathBuf {
-    let cache_dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+    let cache_dir = shared_download_root()
         .join("container-heel")
         .join(CONTAINER_HEEL_RELEASE_TAG);
     let cached = cache_dir.join(CONTAINER_HEEL_ASSET.name);
@@ -1562,7 +1735,7 @@ async fn verify_container_heel(bytes: Vec<u8>, origin: &str) -> Vec<u8> {
 /// distribution, so the first hash-verified download happens here instead of
 /// inside a server's readiness deadline. Later runs reuse the cached artifacts.
 async fn share_and_warm_tool_cache(may_dir: &Path) {
-    let shared = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("may-tools");
+    let shared = shared_download_root().join("may-tools");
     tokio::fs::create_dir_all(&shared)
         .await
         .expect("shared tool cache dir should be created");
@@ -1602,9 +1775,32 @@ fn heel_bin() -> String {
     path
 }
 
+/// The daemon's shutdown drains runs for up to 30 s and settles cancelled
+/// ones for 5 s more.
+const DAEMON_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(60);
+
 impl Drop for RunningDaemon {
+    /// A test that failed before `stop` still lets the daemon shut down in
+    /// order: SIGTERM runs the same path as the shutdown request, and the drop
+    /// blocks until the process exits (SIGKILL after the shutdown timeout), so
+    /// the test's home outlives it. Reaping goes through tokio's own
+    /// `try_wait`, so the child is never reaped behind its back.
     fn drop(&mut self) {
-        let _ = self.child.start_kill();
+        let Some(pid) = self.child.id() else {
+            return; // already reaped by `stop` or `kill`
+        };
+        let pid = i32::try_from(pid).expect("a pid fits in i32");
+        // SAFETY: signalling a child this value spawned and has not reaped.
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+        let deadline = std::time::Instant::now() + DAEMON_SHUTDOWN_TIMEOUT;
+        while matches!(self.child.try_wait(), Ok(None)) {
+            if std::time::Instant::now() >= deadline {
+                let _ = self.child.start_kill();
+                let _ = self.child.try_wait();
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 
@@ -2222,6 +2418,7 @@ async fn exec_uses_session_directory_and_exposes_ipc_command_help() {
         .arg("--")
         .arg("pwd")
         .env("HOME", harness.home_path())
+        .envs(hermetic_git_env(harness.home_path()))
         .env("HEEL_BIN", &heel_bin)
         .output()
         .await
@@ -2250,6 +2447,7 @@ async fn exec_uses_session_directory_and_exposes_ipc_command_help() {
             "for d in tmp data files outputs artifacts; do test -d \"$d\" || exit 10; done; test -e skills; test -e subagents; session --help >/dev/null; ask --help >/dev/null; search --help >/dev/null; webfetch --help >/dev/null; task --help >/dev/null; notify --help >/dev/null; printf ready",
         )
         .env("HOME", harness.home_path())
+        .envs(hermetic_git_env(harness.home_path()))
         .env("HEEL_BIN", &heel_bin)
         .output()
         .await
@@ -2263,6 +2461,259 @@ async fn exec_uses_session_directory_and_exposes_ipc_command_help() {
         String::from_utf8_lossy(&layout_output.stdout).trim(),
         "ready"
     );
+}
+
+/// Makes one commit in a fresh repository of the session's sandbox through
+/// `may exec` and prints the commit object.
+async fn commit_in_sandbox(harness: &TestHarness) -> std::process::Output {
+    let session = harness.create_session().await;
+    Command::new(may_binary_path())
+        .arg("exec")
+        .arg("--session")
+        .arg(&session.id)
+        .arg("--mode")
+        .arg("sandboxed")
+        .arg("--")
+        .arg(
+            "git init -q -b main repo && cd repo && echo x > f && git add f \
+             && git commit -q -m one \
+             && git cat-file commit HEAD",
+        )
+        .env("HOME", harness.home_path())
+        .envs(hermetic_git_env(harness.home_path()))
+        .env("HEEL_BIN", heel_bin())
+        .output()
+        .await
+        .expect("may exec commit should run")
+}
+
+#[tokio::test]
+#[serial]
+async fn a_user_who_does_not_sign_commits_unsigned_as_themselves_in_the_sandbox() {
+    let mock = MockOpenAiServer::spawn(MockChatScenario::SlowText {
+        chunks: vec!["unused".to_string()],
+        delay: Duration::from_millis(10),
+    })
+    .await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+
+    let output = commit_in_sandbox(&harness).await;
+
+    assert!(
+        output.status.success(),
+        "the commit failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let commit = String::from_utf8_lossy(&output.stdout);
+    let who = format!("{HOST_USER_NAME} <{HOST_USER_EMAIL}>");
+    assert!(commit.contains(&format!("author {who} ")), "{commit}");
+    assert!(commit.contains(&format!("committer {who} ")), "{commit}");
+    assert!(!commit.contains("gpgsig"), "an unsigned commit: {commit}");
+}
+
+#[tokio::test]
+#[serial]
+async fn a_user_who_signs_has_sandbox_commits_signed_through_the_harness() {
+    let mock = MockOpenAiServer::spawn(MockChatScenario::SlowText {
+        chunks: vec!["unused".to_string()],
+        delay: Duration::from_millis(10),
+    })
+    .await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    harness.host_user_signs();
+
+    let output = commit_in_sandbox(&harness).await;
+
+    assert!(
+        output.status.success(),
+        "the commit failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let commit = String::from_utf8_lossy(&output.stdout);
+    let who = format!("{HOST_USER_NAME} <{HOST_USER_EMAIL}>");
+    assert!(commit.contains(&format!("author {who} ")), "{commit}");
+    assert!(commit.contains(&format!("committer {who} ")), "{commit}");
+    assert!(
+        commit.contains("gpgsig -----BEGIN SSH SIGNATURE-----"),
+        "a signed commit: {commit}"
+    );
+    let audit = std::fs::read_to_string(harness.may_dir.join("logs/signing/commits.jsonl"))
+        .expect("the signing is in the audit log");
+    assert_eq!(audit.lines().count(), 1, "{audit}");
+}
+
+/// A home reached through a symlink: the session directory May hands the
+/// terminal is the real one, so a `cd` into it and a write there succeed under
+/// heel's strict filesystem grants.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn a_terminal_command_runs_and_writes_in_the_session_directory_when_home_is_a_symlink() {
+    let mock = MockOpenAiServer::spawn(MockChatScenario::RunsScript(
+        "cd \"$(pwd)\" && printf written > symlink-home-probe && cat symlink-home-probe",
+    ))
+    .await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    let link_parent = tempfile::tempdir().expect("link tempdir should be created");
+    let linked_home = link_parent.path().join("linked-home");
+    std::os::unix::fs::symlink(harness.home_path(), &linked_home)
+        .expect("home symlink should be created");
+    let server = RunningDaemon::spawn(&linked_home, &[]).await;
+    let client = reqwest::Client::new();
+    let environment = ChatEnvironment::Local
+        .prepare(&harness, &client, &server)
+        .await;
+    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+    let sandbox_dir = SessionStore::new(MayHomePaths::new(harness.may_dir.clone()))
+        .sandbox_dir(&session_id, Some(environment.profile_id()));
+
+    let response = send_turn(
+        &client,
+        &server.base_url,
+        &serde_json::json!({ "sessionId": session_id, "content": "run the probe" }),
+    )
+    .await
+    .expect("chat stream request should succeed");
+    let response = expect_status(&server.log, response, StatusCode::OK).await;
+    let events = collect_turn_events(response, "the symlinked-home turn", &server.log).await;
+    assert!(
+        events.iter().any(|(kind, _)| kind == "done"),
+        "the turn should complete; events: {events:?}; server logs:\n{}",
+        server.log.contents().await
+    );
+    let written = std::fs::read_to_string(sandbox_dir.join("symlink-home-probe"))
+        .expect("the command should have written its file in the session directory");
+    assert_eq!(written, "written");
+    server.stop().await;
+    environment.release(&harness, &session_id).await;
+}
+
+/// The text of each message of a model request, in order.
+fn message_texts(request: &Value) -> Vec<String> {
+    request
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|message| match message.get("content") {
+            Some(Value::String(text)) => text.clone(),
+            Some(Value::Array(parts)) => parts
+                .iter()
+                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                .collect(),
+            _ => String::new(),
+        })
+        .collect()
+}
+
+/// The messages after a request's system prefix that announce a change to
+/// the command table.
+fn command_table_alerts(request: &Value) -> Vec<String> {
+    message_texts(request)
+        .into_iter()
+        .skip(1)
+        .filter(|text| text.contains("<commands_diff boundary="))
+        .collect()
+}
+
+/// A tool an MCP server adds mid-session is runnable in the same session at
+/// once, and the model hears of it once, as a diff, while the cached prefix
+/// stays as it was sent.
+#[tokio::test]
+#[serial]
+async fn a_tool_an_mcp_server_adds_mid_session_runs_and_is_announced_once() {
+    let mock = MockOpenAiServer::spawn(MockChatScenario::AddsMcpTool).await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    let server_script =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/changing_tools_mcp_server.py");
+    std::fs::write(
+        harness.may_dir.join("mcp.json"),
+        serde_json::json!({
+            "mcpServers": {
+                "probe": {
+                    "command": "python3",
+                    "args": [server_script.display().to_string()]
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("mcp.json should be written");
+    let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
+    let client = reqwest::Client::new();
+    let environment = ChatEnvironment::Local
+        .prepare(&harness, &client, &server)
+        .await;
+    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+
+    for content in ["add the tool", "greet", "anything new?"] {
+        let response = send_turn(
+            &client,
+            &server.base_url,
+            &serde_json::json!({ "sessionId": session_id, "content": content }),
+        )
+        .await
+        .expect("chat stream request should succeed");
+        let response = expect_status(&server.log, response, StatusCode::OK).await;
+        let events = collect_turn_events(response, content, &server.log).await;
+        assert!(
+            events.iter().any(|(kind, _)| kind == "done"),
+            "{content:?} should complete; events: {events:?}; server logs:\n{}",
+            server.log.contents().await
+        );
+        wait_for_runtime_condition(
+            &client,
+            &server,
+            &session_id,
+            Duration::from_secs(10),
+            "session runtime to settle after the turn",
+            runtime_is_idle,
+        )
+        .await;
+    }
+
+    let requests = mock.agent_requests().await;
+    assert_eq!(requests.len(), 5, "two tool turns and a text turn");
+    let prefix = &message_texts(&requests[0])[0];
+    assert!(
+        prefix.contains("- probe_add: Adds the probe_greet tool"),
+        "{prefix}"
+    );
+    assert!(!prefix.contains("probe_greet:"), "{prefix}");
+    assert!(
+        latest_tool_output(&requests[1]).is_some_and(|output| output.contains("ADDED-PROBE-GREET")),
+        "{:?}",
+        latest_tool_output(&requests[1])
+    );
+    assert!(
+        latest_tool_output(&requests[3])
+            .is_some_and(|output| output.contains("GREETED-PROBE-4417")),
+        "probe_greet should run in the same session: {:?}; server logs:\n{}",
+        latest_tool_output(&requests[3]),
+        server.log.contents().await
+    );
+    for request in &requests {
+        assert_eq!(
+            &message_texts(request)[0],
+            prefix,
+            "the cached prefix stays as sent"
+        );
+    }
+    let announced = command_table_alerts(&requests[2]);
+    assert_eq!(announced.len(), 1, "{announced:?}");
+    assert!(
+        announced[0].contains("\n+- probe_greet: Greets the probe\n"),
+        "{}",
+        announced[0]
+    );
+    assert_eq!(
+        command_table_alerts(&requests[4]),
+        announced,
+        "the change is announced once"
+    );
+
+    server.stop().await;
+    environment.release(&harness, &session_id).await;
 }
 
 /// Runs `script` through `may exec` in `mode` on `session`, in a home of its
@@ -2290,6 +2741,7 @@ async fn exec_script(
         .arg(script)
         .current_dir(workdir)
         .env("HOME", harness.home_path())
+        .envs(hermetic_git_env(harness.home_path()))
         .env("PATH", path)
         .env("HEEL_BIN", heel_bin())
         .output()
@@ -2450,6 +2902,7 @@ async fn exec_large_output_is_previewed_and_saved_to_outputs_file() {
         .arg("--")
         .arg("perl -e 'print \"x\" x 60000'")
         .env("HOME", harness.home_path())
+        .envs(hermetic_git_env(harness.home_path()))
         .env("HEEL_BIN", &heel_bin)
         .output()
         .await
@@ -3976,6 +4429,7 @@ async fn exec_applies_local_command_priority() {
                 .arg("--")
                 .arg(&script)
                 .env("HOME", &home)
+                .envs(hermetic_git_env(&home))
                 .env("HEEL_BIN", &heel)
                 .output()
         })
@@ -4404,14 +4858,9 @@ async fn ask_user_answered_mid_run_reaches_the_next_request_of_that_run() {
     server.stop().await;
 }
 
-#[tokio::test]
-#[serial]
-async fn oneshot_run_starts_the_daemon_and_streams_its_turn() {
-    let mock = MockOpenAiServer::spawn(MockChatScenario::TextEveryTurn(
-        "hello from the daemon".into(),
-    ))
-    .await;
-    let harness = TestHarness::new(&mock.base_url()).await;
+/// Gives the harness home a daemon port of its own and a local default
+/// profile, so a one-shot run starts a daemon that meets no other.
+async fn prepare_oneshot_home(harness: &TestHarness) {
     // A port of its own, so the daemon this run starts never meets another.
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .and_then(|listener| listener.local_addr())
@@ -4459,11 +4908,92 @@ async fn oneshot_run_starts_the_daemon_and_streams_its_turn() {
     .await
     .expect("default profile should switch to local");
     drop(db);
+}
+
+/// A one-shot run whose turn ends on a detached command stays attached,
+/// streams the turn that command's result starts, and exits only after it.
+#[tokio::test]
+#[serial]
+async fn oneshot_run_follows_the_turn_a_background_command_resumes() {
+    let mock =
+        MockOpenAiServer::spawn(MockChatScenario::StartsBackgroundJob(FINISHING_JOB_SCRIPT)).await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    prepare_oneshot_home(&harness).await;
+
+    let binary = may_binary_path();
+    let output = Command::new(&binary)
+        .arg("start the job")
+        .env("HOME", harness.home_path())
+        .env("HEEL_BIN", heel_bin())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("may one-shot should spawn")
+        .wait_with_output()
+        .await
+        .expect("may one-shot should run");
+    let daemon_log = tokio::fs::read_to_string(harness.home_path().join(".may/logs/daemon.log"))
+        .await
+        .unwrap_or_default();
+    // The daemon outlives the run so that the check above reads its log
+    // before anything stops it.
+    let stop = Command::new(&binary)
+        .args(["daemon", "stop"])
+        .env("HOME", harness.home_path())
+        .output()
+        .await
+        .expect("may daemon stop should run");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "one-shot run failed: {stderr}\ndaemon log:\n{daemon_log}"
+    );
+    // The mock answers the first turn and the resumed one with the same
+    // text, so a run that left before the resume carries it once.
+    assert_eq!(
+        stdout.matches("started").count(),
+        2,
+        "stdout should carry the first turn's text and the resumed turn's; stdout: {stdout}; stderr: {stderr}\ndaemon log:\n{daemon_log}"
+    );
+    let requests = mock.agent_requests().await;
+    assert!(
+        requests
+            .last()
+            .is_some_and(|request| request.to_string().contains(FINISHING_JOB_MARKER)),
+        "the resumed turn should have seen the job's output before the run exited"
+    );
+    assert!(
+        !daemon_log.contains("received session stop request"),
+        "nothing should stop the session before the run exits:\n{daemon_log}"
+    );
+    assert!(
+        String::from_utf8_lossy(&stop.stderr).contains("Stopped"),
+        "the run should leave its daemon running: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn oneshot_run_starts_the_daemon_and_streams_its_turn() {
+    // The reply pauses longer than a model's typical think after its first
+    // text; the run still ends only when the turn does.
+    let mock = MockOpenAiServer::spawn(MockChatScenario::SlowTextEveryTurn {
+        chunks: vec!["hello from ".into(), "the daemon".into()],
+        delay: Duration::from_secs(3),
+    })
+    .await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    prepare_oneshot_home(&harness).await;
 
     let binary = may_binary_path();
     let oneshot = Command::new(&binary)
         .arg("say hi")
         .env("HOME", harness.home_path())
+        .envs(hermetic_git_env(harness.home_path()))
         .env("HEEL_BIN", heel_bin())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -4479,6 +5009,7 @@ async fn oneshot_run_starts_the_daemon_and_streams_its_turn() {
     let stop = Command::new(&binary)
         .args(["daemon", "stop"])
         .env("HOME", harness.home_path())
+        .envs(hermetic_git_env(harness.home_path()))
         .output()
         .await
         .expect("may daemon stop should run");
@@ -4497,6 +5028,154 @@ async fn oneshot_run_starts_the_daemon_and_streams_its_turn() {
         String::from_utf8_lossy(&stop.stderr).contains("Stopped"),
         "the one-shot run should leave its daemon running: {}",
         String::from_utf8_lossy(&stop.stderr)
+    );
+}
+
+/// A turn that streams far more deltas than the client reads at once, and
+/// ends right after them, reaches a one-shot run whole: the run prints every
+/// delta through the turn's end however far its event stream falls behind.
+#[tokio::test]
+#[serial]
+async fn oneshot_run_prints_a_burst_turn_through_its_end() {
+    const DELTAS: usize = 6_000;
+    let chunks = (0..DELTAS)
+        .map(|index| format!("d{index} "))
+        .collect::<Vec<_>>();
+    let expected = chunks.concat();
+    let mock = MockOpenAiServer::spawn(MockChatScenario::SlowTextEveryTurn {
+        chunks,
+        delay: Duration::ZERO,
+    })
+    .await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    prepare_oneshot_home(&harness).await;
+
+    let binary = may_binary_path();
+    let output = Command::new(&binary)
+        .arg("stream a long reply")
+        .env("HOME", harness.home_path())
+        .envs(hermetic_git_env(harness.home_path()))
+        .env("HEEL_BIN", heel_bin())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("may one-shot should spawn")
+        .wait_with_output()
+        .await
+        .expect("may one-shot should run");
+    let daemon_log = tokio::fs::read_to_string(harness.home_path().join(".may/logs/daemon.log"))
+        .await
+        .unwrap_or_default();
+    let stop = Command::new(&binary)
+        .args(["daemon", "stop"])
+        .env("HOME", harness.home_path())
+        .envs(hermetic_git_env(harness.home_path()))
+        .output()
+        .await
+        .expect("may daemon stop should run");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "one-shot run failed: {stderr}\ndaemon log:\n{daemon_log}"
+    );
+    assert!(
+        stdout.contains(&expected),
+        "stdout should carry all {DELTAS} deltas in order; it ends with {:?}\ndaemon log:\n{daemon_log}",
+        stdout
+            .char_indices()
+            .rev()
+            .nth(80)
+            .map_or(&*stdout, |(at, _)| &stdout[at..])
+    );
+    assert!(
+        !daemon_log.contains("turn stream lagged"),
+        "no subscriber should lose turn frames:\n{daemon_log}"
+    );
+    assert!(
+        String::from_utf8_lossy(&stop.stderr).contains("Stopped"),
+        "the one-shot run should leave its daemon running: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+}
+
+/// Whether launchd has `label` loaded in the invoking user's domain.
+#[cfg(target_os = "macos")]
+fn launchd_job_loaded(label: &str) -> bool {
+    // SAFETY: getuid cannot fail.
+    let uid = unsafe { libc::getuid() };
+    std::process::Command::new("/bin/launchctl")
+        .args(["print", &format!("user/{uid}/{label}")])
+        .output()
+        .expect("launchctl print should run")
+        .status
+        .success()
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[serial]
+async fn temp_home_daemon_leaves_no_repo_search_job_after_it_stops() {
+    use repo_search_client::launcher::launchd::labels_for;
+
+    let mock = MockOpenAiServer::spawn(MockChatScenario::SlowTextEveryTurn {
+        chunks: vec!["hi".into()],
+        delay: Duration::from_millis(10),
+    })
+    .await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    let home = harness.home_path().to_path_buf();
+    let login = dirs::home_dir().expect("login home should resolve");
+    let (daemon_label, server_label) = labels_for(&home, &login);
+    assert!(
+        !launchd_job_loaded(&daemon_label) && !launchd_job_loaded(&server_label),
+        "a fresh temp home owns no job"
+    );
+
+    let server = RunningDaemon::spawn(&home, &[]).await;
+    // An index-coverage poll on a git worktree reaches repo-search, which
+    // installs the home's agents.
+    let worktree = tempfile::tempdir().expect("worktree tempdir should be created");
+    git2::Repository::init(worktree.path()).expect("worktree should initialise");
+    let cwd = dunce::canonicalize(worktree.path()).expect("worktree should resolve");
+    let client = reqwest::Client::new();
+    let events = client
+        .get(format!("{}/api/events", server.base_url))
+        .query(&[
+            ("topics", "session_index"),
+            ("cwd", cwd.to_str().expect("utf-8 path")),
+        ])
+        .send()
+        .await
+        .expect("event stream should open");
+    let mut reader = SseReader::new(events);
+    let snapshot = loop {
+        let event = tokio::time::timeout(Duration::from_secs(120), reader.next_event())
+            .await
+            .expect("an index snapshot should arrive")
+            .expect("the stream should stay open");
+        if event.event == "session_index" {
+            break event.data;
+        }
+    };
+    drop(reader);
+    // A launchd that refuses the bootstrap (a port or the session already
+    // taken) leaves nothing to boot out; the check below then still holds.
+    let installed =
+        serde_json::from_str::<Value>(&snapshot).expect("snapshot is JSON")["error"].is_null();
+    if installed {
+        assert!(
+            launchd_job_loaded(&daemon_label) && launchd_job_loaded(&server_label),
+            "the temp-home daemon should have installed its repo-search agents; snapshot: {snapshot}"
+        );
+    }
+
+    server.stop().await;
+    assert!(
+        !launchd_job_loaded(&daemon_label) && !launchd_job_loaded(&server_label),
+        "stopping the daemon should boot out the relocated home's agents"
     );
 }
 
@@ -4620,6 +5299,7 @@ async fn a_background_job_is_listed_pushed_and_killable_over_the_api() {
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+    server.stop().await;
 }
 
 /// A background job that finishes after its turn ended starts a turn of its
@@ -4696,6 +5376,7 @@ async fn a_background_job_finishing_after_its_turn_resumes_the_session() {
         resumed_request.contains(FINISHING_JOB_MARKER),
         "the model sees the job's output: {resumed_request}"
     );
+    server.stop().await;
 }
 
 /// Opens the session's `session_agent` stream, continuing after frame
@@ -4801,6 +5482,7 @@ async fn a_reconnecting_client_continues_after_the_last_frame_it_saw() {
     let mut stale = agent_frames(&client, &server, &session_id, Some(frame_index(&seen[0]))).await;
     let resync = next_turn_frame(&mut stale).await;
     assert_eq!(resync.event, "session_resync", "{resync:?}");
+    server.stop().await;
 }
 
 /// The handoff a compaction probe's compaction answers with.
@@ -4897,8 +5579,8 @@ async fn a_compaction_started_mid_run_lands_and_survives_a_restart() {
         .to_string()
         .len();
 
-    // Kill the daemon: the next one has nothing but the persisted snapshot.
-    server.stop().await;
+    // Crash the daemon: the next one has nothing but the persisted snapshot.
+    server.kill().await;
     let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
     let turn = send_turn(
         &client,

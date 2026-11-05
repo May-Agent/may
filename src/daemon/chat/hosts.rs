@@ -85,6 +85,10 @@ impl ParkedAgents {
         let session_id = session_id.to_string();
         state.tokio_handle.spawn(async move {
             while let Ok(wake) = wake_rx.recv().await {
+                // The session reads as resuming through the whole turn, so a
+                // client never sees the gap between the command finishing
+                // and the turn it starts.
+                let _resuming = wake_state.session_background.resume_pending(&session_id);
                 super::start_background_turn(&wake_state, &session_id, wake).await;
             }
         });
@@ -279,6 +283,12 @@ pub async fn usage_report(
         .request_logs_for_session(&session_id)
         .await
         .map_err(internal_error)?;
+    let intervals = state
+        .runtime_service
+        .db()
+        .session_intervals(&session_id)
+        .await
+        .map_err(internal_error)?;
     let created_at_ms = state
         .runtime_service
         .db()
@@ -296,6 +306,7 @@ pub async fn usage_report(
     json_ok_response(&crate::agent::assemble_usage_report(
         &session_id,
         &rows,
+        &intervals,
         created_at_ms,
         now_ms,
     ))
