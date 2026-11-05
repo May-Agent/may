@@ -116,6 +116,14 @@ impl MayHomePaths {
         self.root.join("task-validation")
     }
 
+    /// Host scratch space outside every sandbox: session repository clones
+    /// are made and their pushes staged here before anything reaches or
+    /// leaves agent-writable space.
+    #[must_use]
+    pub fn repo_staging_dir(&self) -> PathBuf {
+        self.root.join("repo-staging")
+    }
+
     /// Browser runtime directory.
     #[must_use]
     pub fn browser_dir(&self) -> PathBuf {

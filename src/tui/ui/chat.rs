@@ -1593,21 +1593,40 @@ fn usage_duration(ms: u64) -> String {
     parts.join(" ")
 }
 
+/// The `/usage` wall clock and where it went.
+#[derive(askama::Template)]
+#[template(path = "usage_wall_clock.txt", escape = "none")]
+struct UsageWallClock {
+    wall: String,
+    api: String,
+    tools: String,
+    waiting: String,
+    idle: String,
+}
+
+impl UsageWallClock {
+    fn new(report: &crate::agent::SessionUsageReport) -> Self {
+        Self {
+            wall: usage_duration(report.wall_ms),
+            api: usage_duration(report.split.api_ms),
+            tools: usage_duration(report.split.tools_ms),
+            waiting: usage_duration(report.split.user_wait_ms),
+            idle: usage_duration(report.split.idle_ms),
+        }
+    }
+}
+
 /// Styled lines for a `/usage` report block: session totals, then one row
 /// per model with its cache and cost breakdown.
 fn usage_report_lines(report: &crate::agent::SessionUsageReport) -> Vec<Line<'static>> {
     let dim = Style::default().fg(Color::DarkGray);
     let value = Style::default().fg(Color::Cyan);
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled("API time   ", dim),
-            Span::styled(usage_duration(report.api_ms), value),
-        ]),
-        Line::from(vec![
-            Span::styled("Wall clock ", dim),
-            Span::styled(usage_duration(report.wall_ms), value),
-        ]),
-    ];
+    let mut lines: Vec<Line<'static>> = UsageWallClock::new(report)
+        .render()
+        .expect("the wall-clock template renders")
+        .lines()
+        .map(|line| Line::styled(line.to_string(), value))
+        .collect();
     if let Some(cost) = report.total_cost_usd {
         lines.push(Line::from(vec![
             Span::styled("Total cost ", dim),
@@ -3475,6 +3494,32 @@ mod tests {
         terminal_mode_marker,
     };
     use crate::tui::queue::Attachment;
+
+    #[test]
+    fn usage_shows_the_wall_clock_split() {
+        let report = crate::agent::SessionUsageReport {
+            session_id: "s".to_string(),
+            api_ms: 4_000,
+            wall_ms: 61_000,
+            split: crate::agent::WallClockSplit {
+                api_ms: 4_000,
+                tools_ms: 8_000,
+                user_wait_ms: 20_000,
+                idle_ms: 29_000,
+            },
+            total_cost_usd: None,
+            models: Vec::new(),
+        };
+        let rendered = super::usage_report_lines(&report)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            rendered,
+            "Wall clock 1m 1s\n  API        0m 4s\n  Waiting    0m 20s\n  Tools      0m 8s\n  Idle       0m 29s"
+        );
+    }
 
     #[test]
     fn cost_formatting_keeps_sub_cent_precision() {

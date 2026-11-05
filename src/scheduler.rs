@@ -1822,7 +1822,7 @@ async fn run_terminal_command(
         .job_registry()
         .get_by_task_id(&task_id)
         .await
-        .is_some_and(|job| job.status == JobStatus::Killed);
+        .is_some_and(|job| matches!(job.status, JobStatus::Killed { .. }));
     if killed {
         return Err(format!(
             "task timed out after {} seconds and was killed",

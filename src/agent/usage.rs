@@ -1,6 +1,8 @@
 //! Per-session provider-usage aggregation for `/usage`: one row per model
 //! plus session-level API time, wall-clock duration and cost totals.
 
+use super::wall_clock::{Interval, IntervalSet, WallClockSplit};
+use crate::db::SessionIntervals;
 use crate::db::entity::request_logs;
 
 /// One model's aggregated usage inside a session.
@@ -38,6 +40,8 @@ pub struct SessionUsageReport {
     pub api_ms: u64,
     /// Session age, milliseconds since it was created.
     pub wall_ms: u64,
+    /// Where the wall clock went; its parts sum to `wall_ms`.
+    pub split: WallClockSplit,
     /// Total known cost in USD; `None` when no model's pricing is known.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_cost_usd: Option<f64>,
@@ -50,6 +54,7 @@ pub struct SessionUsageReport {
 pub fn assemble_usage_report(
     session_id: &str,
     rows: &[request_logs::Model],
+    intervals: &SessionIntervals,
     created_at_ms: Option<i64>,
     now_ms: i64,
 ) -> SessionUsageReport {
@@ -103,22 +108,34 @@ pub fn assemble_usage_report(
 
     // The session clock starts at creation; without a creation time it
     // starts at the first request.
-    let start_ms = created_at_ms.or_else(|| {
-        rows.iter()
-            .filter_map(|row| {
-                row.timestamp
-                    .parse::<jiff::Timestamp>()
-                    .ok()
-                    .map(jiff::Timestamp::as_millisecond)
-            })
-            .min()
-    });
-    let wall_ms = start_ms.map_or(0, |start| (now_ms - start).max(0).cast_unsigned());
+    // A request is logged when it ends, so it ran for `elapsed_ms` before.
+    let requests: Vec<Interval> = rows
+        .iter()
+        .filter_map(|row| {
+            let end = row.timestamp.parse::<jiff::Timestamp>().ok()?;
+            Some(Interval::ending_at(
+                end.as_millisecond(),
+                row.elapsed_ms.max(0).cast_unsigned(),
+            ))
+        })
+        .collect();
+    let start_ms = created_at_ms.or_else(|| requests.iter().map(|span| span.start_ms()).min());
+    let wall = start_ms.map_or_else(
+        || Interval::ending_at(now_ms, 0),
+        |start| Interval::clamped(start, now_ms),
+    );
+    let split = WallClockSplit::attribute(
+        wall,
+        &IntervalSet::new(requests),
+        &intervals.tools,
+        &intervals.user_waits,
+    );
 
     SessionUsageReport {
         session_id: session_id.to_string(),
         api_ms,
-        wall_ms,
+        wall_ms: wall.len_ms(),
+        split,
         total_cost_usd: total_cost,
         models,
     }
