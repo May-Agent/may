@@ -537,7 +537,7 @@ mod tests {
 
     async fn state_with_session(dir: &std::path::Path) -> Arc<DaemonState> {
         let state = Arc::new(
-            DaemonState::for_test(dir, dir, crate::config::MayConfig::default())
+            DaemonState::for_test(dir, crate::config::MayConfig::default())
                 .await
                 .expect("test daemon state"),
         );

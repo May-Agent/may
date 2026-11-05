@@ -45,6 +45,8 @@ pub enum UiEventTopic {
     SessionSuggestion = 1 << 16,
     /// A session's recap card was generated.
     SessionRecap = 1 << 17,
+    /// An issue a session may link changed.
+    SessionIssues = 1 << 18,
 }
 
 impl UiEventTopic {
@@ -74,6 +76,7 @@ impl UiEventTopic {
             Self::SessionIndex => "session_index",
             Self::SessionSuggestion => "session_suggestion",
             Self::SessionRecap => "session_recap",
+            Self::SessionIssues => "session_issues",
         }
     }
 }
@@ -101,6 +104,7 @@ impl FromStr for UiEventTopic {
             "session_index" => Ok(Self::SessionIndex),
             "session_suggestion" => Ok(Self::SessionSuggestion),
             "session_recap" => Ok(Self::SessionRecap),
+            "session_issues" => Ok(Self::SessionIssues),
             _ => Err(UnknownUiEventTopic(value.to_string())),
         }
     }
@@ -149,6 +153,8 @@ impl UiEventTopics {
     pub const SESSION_SUGGESTION: Self = Self(UiEventTopic::SessionSuggestion.bit());
     /// `session_recap` topic bit.
     pub const SESSION_RECAP: Self = Self(UiEventTopic::SessionRecap.bit());
+    /// `session_issues` topic bit.
+    pub const SESSION_ISSUES: Self = Self(UiEventTopic::SessionIssues.bit());
     /// Every topic.
     pub const ALL: Self = Self(
         Self::CONFIG.0
@@ -166,7 +172,8 @@ impl UiEventTopics {
             | Self::SESSION_BACKGROUND.0
             | Self::SESSION_ARTIFACTS.0
             | Self::SESSION_INDEX.0
-            | Self::SESSION_RECAP.0,
+            | Self::SESSION_RECAP.0
+            | Self::SESSION_ISSUES.0,
     );
 
     /// Whether no topics are set.

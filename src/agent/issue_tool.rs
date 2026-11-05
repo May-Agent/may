@@ -214,12 +214,38 @@ struct IssueSearchText<'a> {
     hits: &'a [IssueHit],
 }
 
+/// Tells connected clients that an issue changed, so the issues they show
+/// are looked up again.
+#[derive(Clone)]
+pub struct IssueChangeNotifier(std::sync::Arc<crate::session::SessionRuntimeService>);
+
+impl IssueChangeNotifier {
+    /// Publish through the daemon's runtime service.
+    #[must_use]
+    pub const fn new(runtime: std::sync::Arc<crate::session::SessionRuntimeService>) -> Self {
+        Self(runtime)
+    }
+
+    fn notify(&self) {
+        self.0
+            .publish_ui_events(crate::ui_event_bus::UiEventTopics::SESSION_ISSUES);
+    }
+}
+
+impl std::fmt::Debug for IssueChangeNotifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IssueChangeNotifier")
+            .finish_non_exhaustive()
+    }
+}
+
 /// `issue` tool: unified issue tracker over the resolved backend.
 #[derive(Debug, Clone)]
 pub struct IssueTool<S> {
     store: S,
     search: Option<SessionIssueSearch>,
     languages: Option<aither_agent::LanguageGuard>,
+    changes: Option<IssueChangeNotifier>,
 }
 
 /// The `issue` tool as a subagent sees it: the read subcommands work and every
@@ -282,6 +308,7 @@ impl<S: IssueStore> IssueTool<S> {
             store,
             search: None,
             languages: None,
+            changes: None,
         }
     }
 
@@ -289,6 +316,13 @@ impl<S: IssueStore> IssueTool<S> {
     #[must_use]
     pub fn with_languages(mut self, guard: aither_agent::LanguageGuard) -> Self {
         self.languages = Some(guard);
+        self
+    }
+
+    /// Announce every successful write through `changes`.
+    #[must_use]
+    pub fn with_changes(mut self, changes: IssueChangeNotifier) -> Self {
+        self.changes = Some(changes);
         self
     }
 
@@ -318,9 +352,14 @@ impl<S: IssueStore + Clone + 'static> Tool for IssueTool<S> {
                 guard.check_working(text, aither_agent::WorkingText::Public)?;
             }
         }
-        execute(&self.store, self.search.as_ref(), arguments)
-            .await
-            .map_err(Into::into)
+        let writes = arguments.writes();
+        let result = execute(&self.store, self.search.as_ref(), arguments).await;
+        // A relation edit can fail after its first half applied, so a failed
+        // write announces too.
+        if writes && let Some(changes) = &self.changes {
+            changes.notify();
+        }
+        result.map_err(Into::into)
     }
 }
 
@@ -652,6 +691,49 @@ mod tests {
         let detail = store.get(created.number).await.expect("view");
         assert_eq!(detail.title, "seed");
         assert!(detail.comments.is_empty() && detail.labels.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_write_announces_an_issue_change_and_a_read_does_not() {
+        use aither_core::llm::ToolContext;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = crate::db::ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("chat db should open");
+        let bus = crate::ui_event_bus::UiEventBus::new();
+        let mut events = bus.subscribe();
+        let runtime =
+            std::sync::Arc::new(crate::session::SessionRuntimeService::new(db.clone(), bus));
+        let store = crate::issue::MayIssueStore::new(db, "test".to_string());
+        let seed = store.create("seed", "body", &[]).await.expect("seed issue");
+        let tool = IssueTool::new(store).with_changes(IssueChangeNotifier::new(runtime));
+
+        tool.call(
+            IssueArgs::View {
+                number: seed.number,
+            },
+            ToolContext::new(),
+        )
+        .await
+        .expect("view");
+        assert!(events.try_recv().is_err(), "a read announces nothing");
+
+        tool.call(
+            IssueArgs::Edit {
+                number: seed.number,
+                title: Some("renamed".to_string()),
+                body: None,
+                state: None,
+            },
+            ToolContext::new(),
+        )
+        .await
+        .expect("rename");
+        assert_eq!(
+            events.try_recv().expect("the rename is announced"),
+            crate::ui_event_bus::UiEventTopics::SESSION_ISSUES
+        );
     }
 
     #[test]

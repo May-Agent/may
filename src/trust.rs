@@ -171,9 +171,7 @@ pub fn trust_for(
     repo_key: &Path,
     _worktree: &Path,
 ) -> Option<TrustLevel> {
-    let project = config.projects.iter().find(|p| {
-        crate::issue::repository_identity(&p.path).is_ok_and(|k| k.as_path() == repo_key)
-    })?;
+    let project = config.project_for_identity(repo_key)?;
     Some(match (project.pr.backend.as_deref(), &project.issues) {
         (Some("checkout"), _) => TrustLevel::Local,
         (Some("github"), ProjectIssues::Github { .. }) => TrustLevel::Full,
@@ -184,47 +182,64 @@ pub fn trust_for(
 
 /// Persist a trust decision to `workspace.toml`.
 ///
+/// The file is read afresh and the entry for the worktree's repository
+/// identity is updated in place: only the fields trust owns (issue backend,
+/// `pr.backend`, `pr.screen`) change; `checks` and the rest of the entry
+/// stay. A repository without an entry gets one at `worktree`.
+///
 /// # Errors
-/// Fails when the config cannot be written.
+/// Fails when the config cannot be read, parsed or written, or the
+/// repository identity cannot be resolved.
 pub fn persist(
-    config: &WorkspaceConfig,
     config_path: &Path,
     worktree: &Path,
     kind: Option<&RepoKind>,
     level: TrustLevel,
 ) -> Result<(), WorkspaceConfigError> {
-    let mut config = config.clone();
-    let entry = ProjectConfig {
-        path: worktree.to_path_buf(),
-        issues: match (kind, level) {
-            (Some(RepoKind::Github { owner_repo }), TrustLevel::Full) => ProjectIssues::Github {
-                repository: owner_repo.parse::<GitHubRepository>().map_err(|e| {
-                    WorkspaceConfigError::Read(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        e.to_string(),
-                    ))
-                })?,
-            },
-            _ => ProjectIssues::May,
-        },
-        checks: None,
-        pr: ProjectPr {
-            backend: match (kind, level) {
-                (_, TrustLevel::Local) => Some("checkout".to_string()),
-                (Some(RepoKind::Github { .. }), TrustLevel::LocalBranch) => Some("may".to_string()),
-                (Some(RepoKind::Github { .. }), _) => Some("github".to_string()),
-                _ => None,
-            },
-            screen: match level {
-                TrustLevel::PrsOnly => Some(true),
-                _ => None,
-            },
-            auto_merge: None,
-            require_review: None,
-        },
+    let invalid = |message: String| {
+        WorkspaceConfigError::Read(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            message,
+        ))
     };
-    config.projects.retain(|p| p.path != worktree);
-    config.projects.push(entry);
+    let mut config = WorkspaceConfig::load(config_path)?;
+    let identity = crate::issue::repository_identity(worktree)
+        .map_err(|e| invalid(format!("repository identity: {e}")))?;
+    let issues = match (kind, level) {
+        (Some(RepoKind::Github { owner_repo }), TrustLevel::Full) => ProjectIssues::Github {
+            repository: owner_repo
+                .parse::<GitHubRepository>()
+                .map_err(|e| invalid(e.to_string()))?,
+        },
+        _ => ProjectIssues::May,
+    };
+    let backend = match (kind, level) {
+        (_, TrustLevel::Local) => Some("checkout".to_string()),
+        (Some(RepoKind::Github { .. }), TrustLevel::LocalBranch) => Some("may".to_string()),
+        (Some(RepoKind::Github { .. }), _) => Some("github".to_string()),
+        _ => None,
+    };
+    let screen = (level == TrustLevel::PrsOnly).then_some(true);
+    if let Some(entry) = config
+        .projects
+        .iter_mut()
+        .find(|p| p.has_identity(&identity))
+    {
+        entry.issues = issues;
+        entry.pr.backend = backend;
+        entry.pr.screen = screen;
+    } else {
+        config.projects.push(ProjectConfig {
+            path: worktree.to_path_buf(),
+            issues,
+            checks: None,
+            pr: ProjectPr {
+                backend,
+                screen,
+                ..ProjectPr::default()
+            },
+        });
+    }
     if level == TrustLevel::Local {
         config.add_workdir(worktree.to_path_buf(), Some("direct checkout".to_string()));
     } else {
@@ -304,30 +319,16 @@ mod tests {
         let repo = git_repo();
         let worktree = repo.path();
         let config_path = repo.path().join("workspace.toml");
-        let config = WorkspaceConfig::default();
         let kind = RepoKind::Github {
             owner_repo: "acme/app".to_string(),
         };
-        persist(
-            &config,
-            &config_path,
-            worktree,
-            Some(&kind),
-            TrustLevel::Full,
-        )
-        .expect("full");
+        persist(&config_path, worktree, Some(&kind), TrustLevel::Full).expect("full");
         let loaded = WorkspaceConfig::load(&config_path).expect("load");
         let key = identity(worktree);
         assert_eq!(trust_for(&loaded, &key, worktree), Some(TrustLevel::Full));
 
-        persist(
-            &loaded,
-            &config_path,
-            worktree,
-            Some(&kind),
-            TrustLevel::LocalBranch,
-        )
-        .expect("local-branch");
+        persist(&config_path, worktree, Some(&kind), TrustLevel::LocalBranch)
+            .expect("local-branch");
         let loaded = WorkspaceConfig::load(&config_path).expect("load");
         assert_eq!(
             trust_for(&loaded, &key, worktree),
@@ -335,18 +336,136 @@ mod tests {
         );
         assert!(!loaded.has_write_access(worktree));
 
-        persist(
-            &loaded,
-            &config_path,
-            worktree,
-            Some(&kind),
-            TrustLevel::Local,
-        )
-        .expect("local");
+        persist(&config_path, worktree, Some(&kind), TrustLevel::Local).expect("local");
         let loaded = WorkspaceConfig::load(&config_path).expect("load");
         assert_eq!(trust_for(&loaded, &key, worktree), Some(TrustLevel::Local));
         assert!(loaded.has_write_access(worktree));
         assert_eq!(loaded.projects[0].pr.backend.as_deref(), Some("checkout"));
+    }
+
+    fn github() -> RepoKind {
+        RepoKind::Github {
+            owner_repo: "acme/app".to_string(),
+        }
+    }
+
+    fn seed_project(config_path: &Path, repo: &Path) {
+        let config = WorkspaceConfig {
+            projects: vec![ProjectConfig {
+                path: repo.to_path_buf(),
+                issues: ProjectIssues::May,
+                checks: Some("cargo test".to_string()),
+                pr: ProjectPr {
+                    auto_merge: Some(false),
+                    require_review: Some(true),
+                    ..ProjectPr::default()
+                },
+            }],
+            ..WorkspaceConfig::default()
+        };
+        config.save(config_path).expect("seed");
+    }
+
+    #[test]
+    fn re_setting_trust_keeps_checks_and_pr_policy() {
+        let repo = git_repo();
+        let config_path = repo.path().join("workspace.toml");
+        seed_project(&config_path, repo.path());
+        for level in [TrustLevel::Full, TrustLevel::Full, TrustLevel::PrsOnly] {
+            persist(&config_path, repo.path(), Some(&github()), level).expect("persist");
+            let loaded = WorkspaceConfig::load(&config_path).expect("load");
+            assert_eq!(loaded.projects.len(), 1);
+            let project = &loaded.projects[0];
+            assert_eq!(project.checks.as_deref(), Some("cargo test"));
+            assert_eq!(project.pr.auto_merge, Some(false));
+            assert_eq!(project.pr.require_review, Some(true));
+            assert_eq!(
+                trust_for(&loaded, &identity(repo.path()), repo.path()),
+                Some(level)
+            );
+        }
+    }
+
+    #[test]
+    fn trust_set_from_a_linked_worktree_covers_the_main_checkout() {
+        let repo = git_repo();
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .expect("git");
+            assert!(status.success());
+        };
+        git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+        let linked_parent = tempfile::tempdir().expect("tempdir");
+        let linked = linked_parent.path().join("linked");
+        git(&["worktree", "add", "-q", linked.to_str().expect("utf8")]);
+        let config_path = repo.path().join("workspace.toml");
+        seed_project(&config_path, repo.path());
+
+        persist(
+            &config_path,
+            &linked,
+            Some(&github()),
+            TrustLevel::LocalBranch,
+        )
+        .expect("persist");
+        let loaded = WorkspaceConfig::load(&config_path).expect("load");
+        assert_eq!(loaded.projects.len(), 1);
+        assert_eq!(loaded.projects[0].checks.as_deref(), Some("cargo test"));
+        for dir in [repo.path(), linked.as_path()] {
+            assert_eq!(
+                trust_for(&loaded, &identity(dir), dir),
+                Some(TrustLevel::LocalBranch)
+            );
+        }
+    }
+
+    #[test]
+    fn persist_keeps_fields_changed_in_the_file_since_the_caller_loaded() {
+        let repo = git_repo();
+        let config_path = repo.path().join("workspace.toml");
+        persist(&config_path, repo.path(), Some(&github()), TrustLevel::Full).expect("first");
+        let mut newer = WorkspaceConfig::load(&config_path).expect("load");
+        newer.projects[0].checks = Some("cargo clippy".to_string());
+        newer.save(&config_path).expect("save");
+        persist(
+            &config_path,
+            repo.path(),
+            Some(&github()),
+            TrustLevel::PrsOnly,
+        )
+        .expect("second");
+        let loaded = WorkspaceConfig::load(&config_path).expect("load");
+        assert_eq!(loaded.projects[0].checks.as_deref(), Some("cargo clippy"));
+    }
+
+    #[test]
+    fn several_entries_for_one_repository_fail_to_load() {
+        let repo = git_repo();
+        let config_path = repo.path().join("workspace.toml");
+        let sub = repo.path().join("sub");
+        std::fs::create_dir(&sub).expect("mkdir");
+        let entry = |path: &Path| ProjectConfig {
+            path: path.to_path_buf(),
+            issues: ProjectIssues::May,
+            checks: None,
+            pr: ProjectPr::default(),
+        };
+        WorkspaceConfig {
+            projects: vec![entry(repo.path()), entry(&sub)],
+            ..WorkspaceConfig::default()
+        }
+        .save(&config_path)
+        .expect("save");
+        let error = WorkspaceConfig::load(&config_path).expect_err("duplicate");
+        assert!(matches!(
+            error,
+            WorkspaceConfigError::DuplicateProject { .. }
+        ));
+        assert!(error.to_string().contains("sub"), "{error}");
     }
 
     #[test]

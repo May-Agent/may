@@ -5,8 +5,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use aither_agent::{
-    Agent, AgentError, AgentKind, CompactResult, HCons, Prepared, TerminalAgentBuilder, TimedEvent,
-    Unprepared,
+    Agent, AgentError, AgentKind, AgentOptions, CompactResult, HCons, Prepared, PromptCache,
+    TerminalAgentBuilder, TimedEvent, Unprepared,
 };
 use aither_core::llm::{
     Attachment as LlmAttachment, Message as LlmMessage,
@@ -21,7 +21,7 @@ use super::context_dump::ContextDump;
 use super::hooks::{ContextSnapshotHook, PendingSteerHook, SecretRedactionHook};
 use super::imagine::{ImageGeneratorConfig, resolve_image_generator_config};
 use super::permission::PermissionApprover;
-use super::provider::{ProviderLlm, RequestParameterizedModel, resolve_provider_runtime};
+use super::provider::{ModelSlot, ProviderLlm, resolve_provider_runtime};
 use super::runtime_context::{
     RepoCloneEntry, RuntimeSystemContext, build_agents_md_context, build_base_system_prompt,
     build_browser_context, build_location_context, build_memory_context_content,
@@ -148,7 +148,7 @@ pub struct MayAgentConfig {
     /// Tier-resolved models for the `ask` terminal command.
     pub ask_models: super::provider::AskTierModels,
     /// Model compaction runs on; `None` compacts on the session model.
-    pub compaction_llm: Option<RequestParameterizedModel<ProviderLlm>>,
+    pub compaction_llm: Option<ModelSlot<ProviderLlm>>,
     /// How long the session provider keeps the conversation cached; idle
     /// compaction and reassembly follow it.
     pub cache_lifetime: crate::cache_lifetime::CacheLifetime,
@@ -216,6 +216,8 @@ pub struct MayAgentConfig {
     pub model_context_window: Option<u32>,
     /// Request-level parameters applied to each LLM call for this agent.
     pub request_parameters: Parameters,
+    /// Prompt-cache epoch of the agent this one replaces; 0 for a first build.
+    pub prompt_cache_epoch: u32,
     /// Database handle for runtime memory/state lookups.
     pub db: crate::db::ChatDb,
     /// Keychain secrets snapshot: injected into the session env file and
@@ -244,6 +246,8 @@ pub struct MayAgentSessionInput<'a> {
     pub model: &'a str,
     /// Reasoning effort override, if any.
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// Prompt-cache epoch of the agent this one replaces; 0 for a first build.
+    pub prompt_cache_epoch: u32,
     /// Profile this session belongs to.
     pub profile_id: Option<String>,
     /// Optional permission approver handling interactive approval.
@@ -292,22 +296,12 @@ pub struct MayAgentSessionInput<'a> {
     pub connectivity: aither_connectivity::Connectivity,
 }
 
-type MayAgentInner = Agent<
-    RequestParameterizedModel<ProviderLlm>,
-    RequestParameterizedModel<ProviderLlm>,
-    RequestParameterizedModel<ProviderLlm>,
-    MayHooks,
->;
+type MayAgentInner = Agent<ProviderLlm, ProviderLlm, ProviderLlm, MayHooks>;
 
 type MayHooks = HCons<SecretRedactionHook, HCons<PendingSteerHook, HCons<ContextSnapshotHook, ()>>>;
 
-type MayBuilder<S = Unprepared> = TerminalAgentBuilder<
-    RequestParameterizedModel<ProviderLlm>,
-    TerminalPermissionHandler,
-    DefaultExecutor,
-    MayHooks,
-    S,
->;
+type MayBuilder<S = Unprepared> =
+    TerminalAgentBuilder<ProviderLlm, TerminalPermissionHandler, DefaultExecutor, MayHooks, S>;
 
 /// The May agent.
 pub struct MayAgent {
@@ -327,10 +321,8 @@ pub struct MayAgent {
     job_registry: aither_sandbox::JobRegistry,
     subagent_runs: aither_agent::specialized::SubagentRuns,
     /// Model clone reserved for `/btw` side questions.
-    btw_llm: RequestParameterizedModel<ProviderLlm>,
+    btw_llm: ModelSlot<ProviderLlm>,
     subagent_tracker: crate::agent::subagent_tracker::SubagentTracker,
-    /// The session's configured languages.
-    languages: aither_agent::Languages,
 }
 
 impl std::fmt::Debug for MayAgent {
@@ -475,8 +467,11 @@ impl MayAgent {
         // Session repo clones: the writable working copy of each repository
         // the session touches lives under the sandbox; checkouts stay read
         // mounts. The launch directory's repo is cloned eagerly.
-        let session_repos =
-            crate::repo_clone::SessionRepos::new(session_paths.root(), config.session_id.as_str());
+        let session_repos = crate::repo_clone::SessionRepos::new(
+            session_paths.root(),
+            config.session_id.as_str(),
+            config.db.clone(),
+        );
         let mut repo_clones = Vec::new();
         if let Some(worktree) = crate::repo_search::worktree_root(&config.cwd)
             && let Ok(repo_key) = crate::issue::repository_identity(&worktree)
@@ -514,8 +509,9 @@ impl MayAgent {
                 None => {}
             }
         }
-        runtime_system_context =
-            runtime_system_context.with_repo_clones(build_repo_clones_context(&repo_clones));
+        runtime_system_context = runtime_system_context.with_repo_clones(
+            build_repo_clones_context(&repo_clones, &config.environment, &session_paths),
+        );
 
         // Project rules: the launch directory's AGENTS.md is loaded into
         // the stable prefix and nested AGENTS.md files are listed, so
@@ -526,16 +522,15 @@ impl MayAgent {
             .with_agents_source(config.cwd.clone(), agents_label.clone())
             .with_agents_md(build_agents_md_context(&agents_index, agents_label, &[]));
 
-        let llm =
-            RequestParameterizedModel::new(config.llm.clone(), config.request_parameters.clone());
+        let llm = config.llm.clone();
 
         // Clone LLM for terminal IPC commands before moving it into the builder.
         let terminal_command_llm = llm.clone();
         // `/btw` side questions run through this clone — separate from the
         // agent's own model so a side query never joins the agent's history.
-        let btw_llm = llm.clone();
-        // Ask-tier models arrive already wrapped in the parameters of their
-        // own provider instances.
+        let btw_llm = ModelSlot::new(llm.clone(), config.request_parameters.clone());
+        // Ask-tier models arrive paired with the parameters of their own
+        // provider instances.
         let ask_flagship = config.ask_models.flagship.clone();
         let ask_balanced = config.ask_models.balanced.clone();
         let ask_fast = config.ask_models.fast.clone();
@@ -579,13 +574,19 @@ impl MayAgent {
         let language_guard = aither_agent::LanguageGuard::new(config.languages);
         let mut builder = TerminalAgentBuilder::new(llm, terminal_tool)
             .system_layout(tag::layout())
+            .languages(language_guard.clone())
             .hook(context_snapshot_hook)
             .hook(pending_steer_hook)
             .hook(SecretRedactionHook::new(SecretRedactor::for_session(
                 &config.may_dir,
                 config.session_id.as_str(),
             )))
-            .cache_lifetime(config.cache_lifetime.into())
+            .request_parameters(config.request_parameters.clone())
+            .prompt_cache(
+                PromptCache::new(config.session_id.as_str())
+                    .with_epoch(config.prompt_cache_epoch)
+                    .with_lifetime(config.cache_lifetime.into()),
+            )
             .background_jobs(config.background_jobs)
             .connectivity(config.connectivity.clone());
         if let Some(runtime) = hook_runtime.clone() {
@@ -602,8 +603,8 @@ impl MayAgent {
         if let Some(clock) = config.clock.clone() {
             builder = builder.clock(clock);
         }
-        if let Some(compaction_llm) = config.compaction_llm.clone() {
-            builder = builder.compaction_model(compaction_llm);
+        if let Some(compaction) = config.compaction_llm.clone() {
+            builder = builder.compaction_model(compaction.llm, compaction.parameters);
         }
         let subagent_tracker = subagents.tracker;
         let shared_terminal_commands = Box::pin(register_shared_terminal_commands(
@@ -663,7 +664,7 @@ impl MayAgent {
         )
         .await?;
         builder = builder
-            .system_prompt_raw(base_system_prompt)
+            .system_prompt(base_system_prompt)
             // Shell runtime depends on the home environment. SSH remains a
             // per-command routing capability on top of it.
             .shell_runtime_availability(tool_environment_key.availability())
@@ -705,7 +706,6 @@ impl MayAgent {
             subagent_runs,
             btw_llm,
             subagent_tracker,
-            languages: config.languages,
         })
     }
 
@@ -745,6 +745,7 @@ impl MayAgent {
             db,
             model,
             reasoning_effort,
+            prompt_cache_epoch,
             profile_id,
             permission_approver,
             agent_messaging,
@@ -775,12 +776,8 @@ impl MayAgent {
         let provider_id = resolved_provider.provider_id;
         let llm = resolved_provider.llm;
         let model_info = aither_models::lookup(selector.model_id());
-        let request_parameters = super::provider::session_request_parameters(
-            may_config,
-            &selector,
-            reasoning_effort,
-            &session_id,
-        );
+        let request_parameters =
+            super::provider::session_request_parameters(may_config, &selector, reasoning_effort);
 
         let ssh_servers = crate::profile::resolve_attached_ssh_servers(
             &db,
@@ -798,7 +795,6 @@ impl MayAgent {
             may_config,
             &provider_id,
             selector.model_id(),
-            &session_id,
             &redactor,
         )
         .await?;
@@ -806,7 +802,6 @@ impl MayAgent {
             may_config,
             &provider_id,
             selector.model_id(),
-            &session_id,
             &redactor,
         )
         .await?;
@@ -875,6 +870,7 @@ impl MayAgent {
                 .is_some_and(|info| info.has_ability(aither_core::llm::model::Ability::Audio)),
             model_context_window: model_info.and_then(aither_models::ModelEntry::max_input_tokens),
             request_parameters,
+            prompt_cache_epoch,
             db,
         })
     }
@@ -1091,14 +1087,22 @@ impl MayAgent {
     /// Model clone for `/btw` side questions — shares the agent's provider
     /// but runs outside the agent, so answers never enter its history.
     #[must_use]
-    pub fn btw_llm(&self) -> RequestParameterizedModel<ProviderLlm> {
+    pub fn btw_llm(&self) -> ModelSlot<ProviderLlm> {
         self.btw_llm.clone()
     }
 
-    /// The communication and working languages this agent was configured with.
+    /// The language guard the agent was built with; its commands and the
+    /// session's aux requests share its languages.
+    ///
+    /// # Panics
+    ///
+    /// Never for an agent built by this module, which always attaches one.
     #[must_use]
-    pub const fn languages(&self) -> aither_agent::Languages {
-        self.languages
+    pub fn language_guard(&self) -> aither_agent::LanguageGuard {
+        self.inner
+            .languages()
+            .expect("every May agent is built with a language guard")
+            .clone()
     }
 
     /// Tracker shared with this session's `subagent` IPC command — the TUI
@@ -1267,7 +1271,7 @@ fn truncate_at_char_boundary(input: &str, max_chars: usize) -> &str {
 /// constructed without a live database, which makes them no-ops.
 #[cfg(test)]
 pub async fn test_agent(
-    llm: RequestParameterizedModel<ProviderLlm>,
+    llm: ModelSlot<ProviderLlm>,
     provider_id: &str,
     model_id: &str,
 ) -> (MayAgent, tempfile::TempDir) {
@@ -1276,8 +1280,12 @@ pub async fn test_agent(
         .await
         .expect("open test db");
     let session_id = SessionId::new();
-    let inner = Agent::builder(llm.clone())
+    let inner = Agent::builder(llm.llm.clone())
+        .request_parameters(llm.parameters.clone())
         .system_layout(tag::layout())
+        .languages(aither_agent::LanguageGuard::new(
+            aither_agent::Languages::unset(),
+        ))
         .hook(ContextSnapshotHook::new(None, &session_id))
         .hook(PendingSteerHook::new(None, &session_id))
         .hook(SecretRedactionHook::new(SecretRedactor::new(
@@ -1304,7 +1312,6 @@ pub async fn test_agent(
                 String::new(),
             ),
             subagent_tracker: crate::agent::subagent_tracker::SubagentTracker::default(),
-            languages: aither_agent::Languages::unset(),
         },
         temp,
     )
@@ -1460,8 +1467,8 @@ mod tests {
 
     /// A `Codex` provider — its `profile()` is a static `aither-models`
     /// lookup, so initialization never touches the network.
-    fn codex_llm() -> RequestParameterizedModel<ProviderLlm> {
-        RequestParameterizedModel::new(
+    fn codex_llm() -> ModelSlot<ProviderLlm> {
+        ModelSlot::new(
             RedactedModel::new(
                 CloudProvider::Codex(aither_cloud::codex::Codex::new(
                     aither_cloud::codex::auth::CodexCredentials::new("test-access", "test-refresh"),
