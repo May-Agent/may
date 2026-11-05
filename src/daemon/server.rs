@@ -268,7 +268,7 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
     let config = Arc::new(arc_swap::ArcSwap::from_pointee(config));
     let acp_host = Arc::new(crate::agent::acp_subagent::AcpHosts::new(
         config.clone(),
-        &may_dir,
+        crate::session::MayHomePaths::new(may_dir.clone()),
         tokio::runtime::Handle::current(),
     ));
 
