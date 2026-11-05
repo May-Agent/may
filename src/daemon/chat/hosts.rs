@@ -122,7 +122,7 @@ impl ParkedAgents {
         self.get(session_id)?.cache_warmth().cloned()
     }
 
-    fn get(&self, session_id: &str) -> Option<Arc<AgentWorker>> {
+    pub(super) fn get(&self, session_id: &str) -> Option<Arc<AgentWorker>> {
         self.workers()
             .get(session_id)
             .map(|parked| parked.worker.clone())

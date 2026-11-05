@@ -461,6 +461,14 @@ impl SessionManager {
     /// Returns [`SessionError::NoHomeDir`] when no home directory exists, or [`SessionError`] when storage setup fails.
     pub async fn new() -> Result<Self, SessionError> {
         let may_dir = MayConfig::may_dir().map_err(|_| SessionError::NoHomeDir)?;
+        Self::at(may_dir).await
+    }
+
+    /// Create a `SessionManager` over the May directory `may_dir`.
+    ///
+    /// # Errors
+    /// Returns [`SessionError`] when storage setup fails.
+    pub async fn at(may_dir: PathBuf) -> Result<Self, SessionError> {
         let store = initialize_session_dirs(&may_dir).await?;
 
         let manager = Self {
