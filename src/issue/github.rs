@@ -9,8 +9,8 @@ use zenwave::header::{ACCEPT, USER_AGENT};
 use zenwave::{Client, Method, ResponseExt};
 
 use super::{
-    IssueBackendInfo, IssueComment, IssueDetail, IssueError, IssueListState, IssueRelationKind,
-    IssueState, IssueStore, IssueSummary, RelatedIssue,
+    CommentedIssue, IssueBackendInfo, IssueComment, IssueDetail, IssueError, IssueListState,
+    IssueRelationKind, IssueState, IssueStore, IssueSummary, RelatedIssue,
 };
 use crate::workspace::GitHubRepository;
 
@@ -305,6 +305,7 @@ impl<T: GitHubTokenSource> IssueStore for GitHubIssueStore<T> {
             comments: comments
                 .into_iter()
                 .map(|comment: GhComment| IssueComment {
+                    id: comment.id,
                     author: comment.user.map(|user| user.login),
                     body: comment.body,
                     created_at: comment.created_at,
@@ -395,18 +396,25 @@ impl<T: GitHubTokenSource> IssueStore for GitHubIssueStore<T> {
         self.get(number).await
     }
 
-    async fn comment(&self, number: i64, body: &str) -> Result<IssueDetail, IssueError> {
-        self.request(
-            Method::POST,
-            format!("{}/comments", self.issue_url(number)),
-            Some(serde_json::json!({"body": body})),
-        )
-        .await
-        .map_err(|error| match error {
-            IssueError::NotFound(_) => IssueError::NotFound(number),
-            other => other,
-        })?;
-        self.get(number).await
+    async fn comment(&self, number: i64, body: &str) -> Result<CommentedIssue, IssueError> {
+        let created = self
+            .request(
+                Method::POST,
+                format!("{}/comments", self.issue_url(number)),
+                Some(serde_json::json!({"body": body})),
+            )
+            .await
+            .map_err(|error| match error {
+                IssueError::NotFound(_) => IssueError::NotFound(number),
+                other => other,
+            })?
+            .into_json::<GhComment>()
+            .await
+            .map_err(|error| IssueError::GitHub(error.to_string()))?;
+        Ok(CommentedIssue {
+            detail: self.get(number).await?,
+            comment_id: created.id,
+        })
     }
 
     async fn edit_labels(
@@ -522,6 +530,7 @@ struct GhUser {
 
 #[derive(Debug, serde::Deserialize)]
 struct GhComment {
+    id: i64,
     body: String,
     created_at: String,
     user: Option<GhUser>,
@@ -685,7 +694,14 @@ mod tests {
             _ => (500, serde_json::json!({"message": "unexpected request"})),
         })
         .await;
-        let tool = SubagentIssueTool::new(store(&api_base));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = crate::db::ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("chat db should open");
+        let tool = SubagentIssueTool::new(
+            store(&api_base),
+            crate::issue::provenance::IssueProvenance::new(db, "test".to_string()),
+        );
 
         subagent_checks::assert_reads_work(&tool, 1).await;
         let reads = requests.lock().expect("requests").len();
@@ -750,6 +766,75 @@ mod tests {
             }));
             drop(requests);
         }
+    }
+
+    #[tokio::test]
+    async fn changes_to_github_issues_are_recorded_with_their_session_agent_and_call() {
+        #[derive(Default)]
+        struct Remote {
+            title: String,
+            state: String,
+            comments: Vec<serde_json::Value>,
+        }
+        let remote = Arc::new(Mutex::new(Remote::default()));
+        let handler_remote = remote.clone();
+        let (api_base, _requests) = mock_api(move |method, path, body| {
+            let mut remote = handler_remote.lock().expect("remote");
+            let issue = |remote: &Remote| gh_issue_json(2, &remote.title, &remote.state);
+            match (method, path) {
+                ("POST", "/repos/o/r/issues") => {
+                    remote.title = "first".to_string();
+                    remote.state = "open".to_string();
+                    (201, issue(&remote))
+                }
+                ("PATCH", "/repos/o/r/issues/2") => {
+                    let patch: serde_json::Value = serde_json::from_str(body).expect("patch");
+                    if let Some(title) = patch["title"].as_str() {
+                        remote.title = title.to_string();
+                    }
+                    if let Some(state) = patch["state"].as_str() {
+                        remote.state = state.to_string();
+                    }
+                    (200, issue(&remote))
+                }
+                ("GET", "/repos/o/r/issues/2") => (200, issue(&remote)),
+                ("GET", "/repos/o/r/issues/1") => (200, gh_issue_json(1, "outside", "open")),
+                ("POST", "/repos/o/r/issues/2/comments") => {
+                    let comment = serde_json::json!({
+                        "id": 7001,
+                        "body": "hello",
+                        "created_at": "2026-10-03T00:00:00Z",
+                        "user": null,
+                    });
+                    remote.comments.push(comment.clone());
+                    (201, comment)
+                }
+                ("GET", "/repos/o/r/issues/2/comments") => {
+                    (200, serde_json::Value::Array(remote.comments.clone()))
+                }
+                (
+                    "GET",
+                    "/repos/o/r/issues/1/comments"
+                    | "/repos/o/r/issues/1/sub_issues"
+                    | "/repos/o/r/issues/1/dependencies/blocked_by"
+                    | "/repos/o/r/issues/2/sub_issues"
+                    | "/repos/o/r/issues/2/dependencies/blocked_by",
+                ) => (200, serde_json::json!([])),
+                _ => (500, serde_json::json!({"message": "unexpected request"})),
+            }
+        })
+        .await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = crate::db::ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("chat db should open");
+        crate::agent::issue_tool::provenance_checks::assert_changes_are_recorded(
+            &db,
+            store(&api_base),
+            2,
+            1,
+        )
+        .await;
     }
 
     #[tokio::test]

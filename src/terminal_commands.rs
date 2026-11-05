@@ -21,6 +21,7 @@ use crate::agent::session_tool::SessionTool;
 use crate::agent::subagent_tracker::{SubagentTracker, TrackedSubagentTool, UsageObservedModel};
 use crate::agent::task_tool::{TaskBroker, TaskRuntimeKind, TaskTool};
 use crate::bundle::Bundle;
+use crate::issue::provenance::IssueProvenance;
 use crate::issue::search::IssueSearch;
 use crate::mcp::load_active_mcp_connections;
 use crate::repo_search::indexer::SearchIndexer;
@@ -56,7 +57,7 @@ pub struct SharedTerminalCommandConfig<LLM> {
     /// Host directory the session works in; `search` defaults to its worktree.
     pub cwd: PathBuf,
     /// History database, which records the worktrees `search` is used in.
-    pub db: Option<crate::db::ChatDb>,
+    pub db: crate::db::ChatDb,
     /// Runtime that holds the session's open `ask_user` questions, when the
     /// session has one.
     pub ask_user: Option<Arc<crate::session::SessionRuntimeService>>,
@@ -165,12 +166,10 @@ where
         SessionTool::new(
             config.may_dir.clone(),
             config.session_id.clone(),
-            config.db.clone().map(|db| {
-                SearchIndexer::new(
-                    db,
-                    RepoSearchCollections::new(RepoSearch::global(&config.may_dir)),
-                )
-            }),
+            Some(SearchIndexer::new(
+                config.db.clone(),
+                RepoSearchCollections::new(RepoSearch::global(&config.may_dir)),
+            )),
         ),
     );
     register_tool_with_description(
@@ -179,21 +178,18 @@ where
         CodeSearchTool::new(
             RepoSearch::global(&config.may_dir),
             config.cwd.clone(),
-            config.db.clone(),
+            Some(config.db.clone()),
         ),
     );
-    let issue_search = config.db.clone().map(|db| {
-        IssueSearch::new(
-            db,
-            RepoSearchCollections::new(RepoSearch::global(&config.may_dir)),
-        )
-    });
-    let mut issue_tool = IssueTool::new(config.issue_store.clone());
-    let mut subagent_issue_tool = SubagentIssueTool::new(config.issue_store);
-    if let Some(search) = issue_search {
-        issue_tool = issue_tool.with_search(search.clone());
-        subagent_issue_tool = subagent_issue_tool.with_search(search);
-    }
+    let issue_search = IssueSearch::new(
+        config.db.clone(),
+        RepoSearchCollections::new(RepoSearch::global(&config.may_dir)),
+    );
+    let provenance = IssueProvenance::new(config.db.clone(), config.session_id.clone());
+    let issue_tool = IssueTool::new(config.issue_store.clone(), provenance.clone())
+        .with_search(issue_search.clone());
+    let subagent_issue_tool =
+        SubagentIssueTool::new(config.issue_store, provenance).with_search(issue_search);
     describe_tool(&mut descriptions, &issue_tool);
     builder.configure_role_tools(issue_tool, subagent_issue_tool);
 
@@ -203,7 +199,7 @@ where
         Box::pin(async move { crate::pr::screen_with_llm(&llm, &title, &body).await })
     });
     let pr_context = crate::pr::PrContext {
-        db: config.db.clone(),
+        db: Some(config.db.clone()),
         session_id: config.session_id.clone(),
         session_root: config.sandbox_dir.clone(),
         cwd: config.cwd.clone(),
@@ -467,6 +463,12 @@ mod tests {
         ))
     }
 
+    async fn test_db(dir: &std::path::Path) -> crate::db::ChatDb {
+        crate::db::ChatDb::open(&dir.join("history.db"))
+            .await
+            .expect("chat db should open")
+    }
+
     async fn test_issue_store(dir: &std::path::Path) -> crate::issue::ResolvedIssueStore {
         let db = crate::db::ChatDb::open(&dir.join("history.db"))
             .await
@@ -498,7 +500,7 @@ mod tests {
                 may_dir: temp.path().to_path_buf(),
                 sandbox_dir: session_dir.clone(),
                 cwd: PathBuf::from("."),
-                db: None,
+                db: test_db(temp.path()).await,
                 ask_user: Some(ask_user_runtime),
                 imagine: Some(ImagineCommandConfig {
                     generator: None,
@@ -558,7 +560,7 @@ mod tests {
                 may_dir: temp.path().to_path_buf(),
                 sandbox_dir: session_dir.clone(),
                 cwd: PathBuf::from("."),
-                db: None,
+                db: test_db(temp.path()).await,
                 ask_user: None,
                 imagine: None,
                 task_runtime: TaskRuntimeKind::Local,
@@ -615,7 +617,7 @@ mod tests {
                 may_dir: temp.path().to_path_buf(),
                 sandbox_dir: session_dir.clone(),
                 cwd: PathBuf::from("."),
-                db: None,
+                db: test_db(temp.path()).await,
                 ask_user: None,
                 imagine: None,
                 task_runtime: TaskRuntimeKind::Local,
@@ -666,7 +668,7 @@ mod tests {
                 may_dir: temp.path().to_path_buf(),
                 sandbox_dir: session_dir.clone(),
                 cwd: PathBuf::from("."),
-                db: None,
+                db: test_db(temp.path()).await,
                 ask_user: None,
                 imagine: None,
                 task_runtime: TaskRuntimeKind::Local,
@@ -713,7 +715,7 @@ mod tests {
                 may_dir: temp.path().to_path_buf(),
                 sandbox_dir: session_dir.clone(),
                 cwd: PathBuf::from("."),
-                db: None,
+                db: test_db(temp.path()).await,
                 ask_user: Some(ask_user_runtime.clone()),
                 imagine: None,
                 task_runtime: TaskRuntimeKind::Local,
@@ -875,7 +877,7 @@ mod tests {
                 may_dir: temp.path().to_path_buf(),
                 sandbox_dir: session_dir.clone(),
                 cwd: PathBuf::from("."),
-                db: None,
+                db: test_db(temp.path()).await,
                 ask_user: None,
                 imagine: None,
                 task_runtime: TaskRuntimeKind::Local,
@@ -952,7 +954,7 @@ mod tests {
                 may_dir: temp.path().to_path_buf(),
                 sandbox_dir: session_dir.clone(),
                 cwd: PathBuf::from("."),
-                db: None,
+                db: test_db(temp.path()).await,
                 ask_user: None,
                 imagine: None,
                 task_runtime: TaskRuntimeKind::Local,
@@ -1000,7 +1002,7 @@ mod tests {
                 may_dir: temp.path().to_path_buf(),
                 sandbox_dir: session_dir.clone(),
                 cwd: PathBuf::from("."),
-                db: None,
+                db: test_db(temp.path()).await,
                 ask_user: None,
                 imagine: None,
                 task_runtime: TaskRuntimeKind::Local,
