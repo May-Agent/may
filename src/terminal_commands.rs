@@ -14,7 +14,7 @@ use crate::agent::browser_tool::{BrowserBroker, BrowserTool};
 use crate::agent::imagine::ImagineTool;
 use crate::agent::issue_tool::{IssueChangeNotifier, IssueTool, SubagentIssueTool};
 use crate::agent::notify_tool::{NotifyBroker, NotifyTool};
-use crate::agent::pr_tool::{PrTool, SubagentPrTool};
+use crate::agent::pr_tool::{PrArgs, PrCommand};
 use crate::agent::register_tool::{RegisterBroker, RegisterTool, Skills};
 use crate::agent::repo_tool::{RepoContext, RepoTool, SubagentRepoTool};
 use crate::agent::session_tool::SessionTool;
@@ -240,19 +240,20 @@ where
         db: Some(config.db.clone()),
         session_id: config.session_id.clone(),
         session_root: config.sandbox_dir.clone(),
-        scratch_root: config.may_dir.join("pr-checks"),
+        scratch_root: crate::session::MayHomePaths::new(config.may_dir.clone()).repo_staging_dir(),
         cwd: config.cwd.clone(),
         workspace_config: config.workspace_config.clone(),
         screen: Some(screen),
         github_api: crate::pr::PrContext::default_github_api(),
     };
-    let mut pr_tool = PrTool::new(pr_context.clone());
+    let mut pr_command = PrCommand::new(pr_context);
     if let Some(guard) = &config.languages {
-        pr_tool = pr_tool.with_languages(guard.clone());
+        pr_command = pr_command.with_languages(guard.clone());
     }
-    let subagent_pr_tool = SubagentPrTool::new(pr_context);
-    describe_tool(&mut descriptions, &pr_tool);
-    builder.configure_role_tools(pr_tool, subagent_pr_tool);
+    describe_arguments::<PrArgs>(&mut descriptions, "pr");
+    // Built per terminal: git inside a session clone and the project checks
+    // run on that terminal's sandbox.
+    builder.configure_terminal_bound_tool("pr", move |binding| pr_command.for_terminal(binding));
 
     let repo_context = RepoContext {
         cwd: config.cwd.clone(),
@@ -447,6 +448,21 @@ where
         definition.name().to_string(),
         short_description(definition.description()),
     ));
+}
+
+/// Catalog entry for a terminal-bound command `name`, which has no instance
+/// until a terminal binds it: its description is the rustdoc of its
+/// arguments, as for any command.
+fn describe_arguments<A: schemars::JsonSchema>(
+    descriptions: &mut Vec<(String, String)>,
+    name: &str,
+) {
+    let schema = schemars::schema_for!(A);
+    let description = schema
+        .get("description")
+        .and_then(serde_json::Value::as_str)
+        .expect("a command's arguments carry its description");
+    descriptions.push((name.to_string(), short_description(description)));
 }
 
 /// The first sentence of `description` on one line, for the command catalog.

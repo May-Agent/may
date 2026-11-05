@@ -58,7 +58,11 @@ async fn the_endpoint_lists_the_registered_clones() {
     let repos = SessionRepos::new(&root, "s1", db);
     let key = dunce::canonicalize(checkout.join(".git")).expect("git dir");
     let clone = repos
-        .ensure_local_clone(&checkout, &key)
+        .ensure_local_clone(
+            &checkout,
+            &key,
+            &MayHomePaths::new(home.path().to_path_buf()).repo_staging_dir(),
+        )
         .await
         .expect("clone");
 
