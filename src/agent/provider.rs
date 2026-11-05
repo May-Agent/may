@@ -4,10 +4,8 @@
 //! concrete provider instance, then builds the `CloudProvider` client
 //! with the right base URL, API key, and per-provider quirks
 //! (`OpenRouter`, `DeepSeek`, Ollama, `LMStudio`, Copilot, custom
-//! OpenAI-compatible proxies, etc.). Also exposes the thin
-//! [`RequestParameterizedModel`] wrapper that pins a [`Parameters`]
-//! struct onto every inference request routed through the wrapped
-//! model.
+//! OpenAI-compatible proxies, etc.). Also exposes [`ModelSlot`], a model
+//! paired with the [`Parameters`] aither sends its requests with.
 
 use std::collections::HashSet;
 
@@ -17,12 +15,11 @@ use aither_cloud::{
 use aither_core::LanguageModel;
 use aither_core::llm::{
     Event as LlmEvent, LLMRequest,
-    model::{Ability, OpenAIPromptCache, Parameters, Profile as ModelProfile, ReasoningEffort},
+    model::{Ability, Parameters, Profile as ModelProfile, ReasoningEffort},
 };
 use futures_lite::{Stream, StreamExt as _};
 
 use super::may::MayAgentError;
-use crate::SessionId;
 use crate::config::{
     MayConfig, ModelTier, NativeToolsConfig, ProviderApi, ProviderInstance, ProviderType,
 };
@@ -124,24 +121,32 @@ where
 /// constructor, so no request leaves May without passing it.
 pub type ProviderLlm = RedactedModel<CloudProvider>;
 
-/// Wraps a base [`LanguageModel`] so every request carries a pinned
-/// [`Parameters`] struct (temperature, max tokens, reasoning effort, ...).
+/// A model and the [`Parameters`] of the requests sent to it. aither takes
+/// the parameters next to the model and adds the fields it owns on top.
 #[derive(Debug, Clone)]
-pub struct RequestParameterizedModel<M> {
-    inner: M,
-    parameters: Parameters,
+pub struct ModelSlot<M> {
+    /// The model.
+    pub llm: M,
+    /// The parameters its requests carry.
+    pub parameters: Parameters,
 }
 
-impl<M> RequestParameterizedModel<M> {
-    /// Wraps `inner`, pinning `parameters` onto every request it serves.
-    pub const fn new(inner: M, parameters: Parameters) -> Self {
-        Self { inner, parameters }
+impl<M> ModelSlot<M> {
+    /// Pairs `llm` with the `parameters` of its requests.
+    pub const fn new(llm: M, parameters: Parameters) -> Self {
+        Self { llm, parameters }
     }
+}
 
-    /// The [`Parameters`] pinned onto every request routed through this model.
-    #[cfg(test)]
-    const fn parameters(&self) -> &Parameters {
-        &self.parameters
+impl<M: LanguageModel> ModelSlot<M> {
+    /// Streams the model's answer to a standalone request over `messages`
+    /// (a side question outside any agent) carrying this slot's parameters.
+    pub fn respond(
+        &self,
+        messages: Vec<aither_core::llm::Message>,
+    ) -> impl Stream<Item = Result<LlmEvent, M::Error>> + Send {
+        self.llm
+            .respond(LLMRequest::new(messages).with_parameters(self.parameters.clone()))
     }
 }
 
@@ -151,7 +156,6 @@ pub(super) fn session_request_parameters(
     config: &MayConfig,
     selector: &ModelSelector,
     reasoning_effort: Option<ReasoningEffort>,
-    session_id: &SessionId,
 ) -> Parameters {
     let provider_id = selector.provider_id();
     let provider_type = config
@@ -163,7 +167,6 @@ pub(super) fn session_request_parameters(
         config.provider.get(provider_id),
         selector.model_id(),
         reasoning_effort,
-        session_id,
     );
     if reasoning_text_requested(provider_type, selector.model_id(), reasoning_effort) {
         parameters = parameters.include_reasoning(true);
@@ -197,9 +200,7 @@ pub fn reasoning_text_requested(
 /// for the provider type `provider_id` resolves to, gated by the model's own
 /// abilities.
 ///
-/// Requests to OpenAI-API provider types also carry `session_id` as the
-/// `prompt_cache_key`, so a provider grouping prompt caching by key sees all
-/// calls of one session (subagent sessions have their own id) as related.
+/// The prompt cache is aither's: it sets the key and breakpoints itself.
 ///
 /// `instance` is `None` when `provider_id` is absent from the config.
 pub(super) fn request_parameters_for(
@@ -207,7 +208,6 @@ pub(super) fn request_parameters_for(
     instance: Option<&ProviderInstance>,
     model_id: &str,
     reasoning_effort: Option<ReasoningEffort>,
-    session_id: &SessionId,
 ) -> Parameters {
     let mut request_parameters = Parameters::default();
     if let Some(reasoning_effort) = reasoning_effort {
@@ -249,35 +249,7 @@ pub(super) fn request_parameters_for(
         }
         _ => {}
     }
-    if matches!(
-        provider_type,
-        Some(ProviderType::OpenAI | ProviderType::Chatgpt | ProviderType::Custom)
-    ) {
-        request_parameters.cache.openai = Some(OpenAIPromptCache {
-            key: Some(session_id.as_str().to_string()),
-            ..OpenAIPromptCache::default()
-        });
-    }
     request_parameters
-}
-
-impl<M> LanguageModel for RequestParameterizedModel<M>
-where
-    M: LanguageModel + Clone,
-{
-    type Error = M::Error;
-
-    fn respond(
-        &self,
-        request: LLMRequest,
-    ) -> impl Stream<Item = Result<LlmEvent, Self::Error>> + Send {
-        self.inner
-            .respond(request.with_parameters(self.parameters.clone()))
-    }
-
-    async fn profile(&self) -> Result<ModelProfile, M::Error> {
-        self.inner.profile().await
-    }
 }
 
 /// Provider candidates for `selector` in failover order: the provider the
@@ -364,11 +336,11 @@ pub async fn resolve_provider_runtime(
 #[derive(Debug, Clone, Default)]
 pub struct AskTierModels {
     /// Model for the flagship (`Advanced`) tier.
-    pub flagship: Option<RequestParameterizedModel<ProviderLlm>>,
+    pub flagship: Option<ModelSlot<ProviderLlm>>,
     /// Model for the balanced tier.
-    pub balanced: Option<RequestParameterizedModel<ProviderLlm>>,
+    pub balanced: Option<ModelSlot<ProviderLlm>>,
     /// Model for the fast tier.
-    pub fast: Option<RequestParameterizedModel<ProviderLlm>>,
+    pub fast: Option<ModelSlot<ProviderLlm>>,
 }
 
 /// Resolves per-tier models for the `ask` command from the configured tier
@@ -383,7 +355,6 @@ pub async fn resolve_ask_tier_models(
     config: &MayConfig,
     session_provider_id: &str,
     session_model_id: &str,
-    session_id: &SessionId,
     redactor: &SecretRedactor,
 ) -> Result<AskTierModels, MayAgentError> {
     let (flagship, balanced, fast) = futures_util::future::try_join3(
@@ -392,7 +363,6 @@ pub async fn resolve_ask_tier_models(
             ModelTier::Advanced,
             session_provider_id,
             session_model_id,
-            session_id,
             redactor,
         ),
         resolve_ask_tier_model(
@@ -400,7 +370,6 @@ pub async fn resolve_ask_tier_models(
             ModelTier::Balanced,
             session_provider_id,
             session_model_id,
-            session_id,
             redactor,
         ),
         resolve_ask_tier_model(
@@ -408,7 +377,6 @@ pub async fn resolve_ask_tier_models(
             ModelTier::Fast,
             session_provider_id,
             session_model_id,
-            session_id,
             redactor,
         ),
     )
@@ -429,9 +397,8 @@ async fn resolve_ask_tier_model(
     tier: ModelTier,
     session_provider_id: &str,
     session_model_id: &str,
-    session_id: &SessionId,
     redactor: &SecretRedactor,
-) -> Result<Option<RequestParameterizedModel<ProviderLlm>>, MayAgentError> {
+) -> Result<Option<ModelSlot<ProviderLlm>>, MayAgentError> {
     let Some(selector) = config.default_model_for_tier(tier) else {
         return Ok(None);
     };
@@ -453,15 +420,9 @@ async fn resolve_ask_tier_model(
                     "failed to build ask {tier:?} tier model '{selector}': {error}"
                 ))
             })?;
-    Ok(Some(RequestParameterizedModel::new(
+    Ok(Some(ModelSlot::new(
         llm,
-        request_parameters_for(
-            provider_id,
-            Some(instance),
-            selector.model_id(),
-            None,
-            session_id,
-        ),
+        request_parameters_for(provider_id, Some(instance), selector.model_id(), None),
     )))
 }
 
@@ -477,9 +438,8 @@ pub async fn resolve_compaction_model(
     config: &MayConfig,
     session_provider_id: &str,
     session_model_id: &str,
-    session_id: &SessionId,
     redactor: &SecretRedactor,
-) -> Result<Option<RequestParameterizedModel<ProviderLlm>>, MayAgentError> {
+) -> Result<Option<ModelSlot<ProviderLlm>>, MayAgentError> {
     let Some(selector) = config.models.compaction_model.as_ref() else {
         return Ok(None);
     };
@@ -501,15 +461,9 @@ pub async fn resolve_compaction_model(
                     "failed to build compaction model '{selector}': {error}"
                 ))
             })?;
-    Ok(Some(RequestParameterizedModel::new(
+    Ok(Some(ModelSlot::new(
         llm,
-        request_parameters_for(
-            provider_id,
-            Some(instance),
-            selector.model_id(),
-            None,
-            session_id,
-        ),
+        request_parameters_for(provider_id, Some(instance), selector.model_id(), None),
     )))
 }
 
@@ -756,7 +710,6 @@ mod tests {
             Some(&instance),
             "gemini-3-flash-preview",
             Some(ReasoningEffort::High),
-            &SessionId::new(),
         );
 
         assert!(parameters.websearch);
@@ -804,19 +757,12 @@ mod tests {
     #[test]
     fn request_parameters_for_chatgpt_defaults_web_search_on() {
         let instance = ProviderInstance::new(ProviderType::Chatgpt);
-        let parameters =
-            request_parameters_for("chatgpt", Some(&instance), "gpt-5", None, &SessionId::new());
+        let parameters = request_parameters_for("chatgpt", Some(&instance), "gpt-5", None);
         assert!(parameters.websearch);
 
         let mut fetch_only = ProviderInstance::new(ProviderType::Chatgpt);
         fetch_only.native_tools.web_fetch = true;
-        let parameters = request_parameters_for(
-            "chatgpt",
-            Some(&fetch_only),
-            "gpt-5",
-            None,
-            &SessionId::new(),
-        );
+        let parameters = request_parameters_for("chatgpt", Some(&fetch_only), "gpt-5", None);
         assert!(parameters.websearch);
     }
 
@@ -825,49 +771,25 @@ mod tests {
         let mut instance =
             ProviderInstance::new(ProviderType::Custom).with_base_url("http://127.0.0.1:8787/v1");
         instance.api = Some(ProviderApi::Responses);
-        let parameters = request_parameters_for(
-            "swe2",
-            Some(&instance),
-            "swe-2-high",
-            None,
-            &SessionId::new(),
-        );
+        let parameters = request_parameters_for("swe2", Some(&instance), "swe-2-high", None);
         assert!(!parameters.websearch);
 
         instance.native_tools.web_search = true;
-        let parameters = request_parameters_for(
-            "swe2",
-            Some(&instance),
-            "swe-2-high",
-            None,
-            &SessionId::new(),
-        );
+        let parameters = request_parameters_for("swe2", Some(&instance), "swe-2-high", None);
         assert!(parameters.websearch);
     }
 
     #[test]
-    fn request_parameters_carry_session_id_as_prompt_cache_key() {
-        let key = |provider_id: &str, instance: &ProviderInstance, session: &SessionId| {
-            request_parameters_for(provider_id, Some(instance), "gpt-5", None, session)
-                .cache
-                .openai
-                .and_then(|cache| cache.key)
-        };
-        let first = SessionId::new();
-        let second = SessionId::new();
-        assert_ne!(first, second);
-
-        let swe2 = ProviderInstance::new(ProviderType::Custom);
-        let chatgpt = ProviderInstance::new(ProviderType::Chatgpt);
-        let openai = ProviderInstance::new(ProviderType::OpenAI);
-        for (id, instance) in [("swe2", &swe2), ("chatgpt", &chatgpt), ("openai", &openai)] {
-            assert_eq!(key(id, instance, &first).as_deref(), Some(first.as_str()));
-            assert_eq!(key(id, instance, &second).as_deref(), Some(second.as_str()));
+    fn request_parameters_set_no_prompt_cache_key() {
+        for (id, provider_type) in [
+            ("swe2", ProviderType::Custom),
+            ("chatgpt", ProviderType::Chatgpt),
+            ("openai", ProviderType::OpenAI),
+        ] {
+            let instance = ProviderInstance::new(provider_type);
+            let parameters = request_parameters_for(id, Some(&instance), "gpt-5", None);
+            assert!(parameters.cache.openai.is_none(), "{id}");
         }
-
-        // Non-OpenAI provider types carry no OpenAI cache key.
-        let anthropic = ProviderInstance::new(ProviderType::Anthropic);
-        assert_eq!(key("anthropic", &anthropic, &first), None);
     }
 
     #[test]
@@ -896,7 +818,6 @@ mod tests {
             Some(&instance),
             "claude-sonnet-4-5-20250929",
             None,
-            &SessionId::new(),
         );
         assert!(parameters.native_tools.claude.web_search);
         assert!(parameters.native_tools.claude.web_fetch);
@@ -908,7 +829,6 @@ mod tests {
             Some(&instance),
             "claude-haiku-4-5-20251001",
             None,
-            &SessionId::new(),
         );
         assert!(!parameters.native_tools.claude.web_search);
         assert!(parameters.native_tools.claude.web_fetch);
@@ -921,7 +841,7 @@ mod tests {
         config.provider.insert("google".to_string(), instance);
 
         let selector = parse_model_selector("google::gemini-3-flash-preview").unwrap();
-        let parameters = session_request_parameters(&config, &selector, None, &SessionId::new());
+        let parameters = session_request_parameters(&config, &selector, None);
         assert!(parameters.websearch);
         assert!(aither_models::lookup(selector.model_id()).is_some());
     }
@@ -955,14 +875,13 @@ mod tests {
             &config,
             "google",
             "gemini-3-flash-preview",
-            &SessionId::new(),
             &SecretRedactor::new(std::path::Path::new("/nonexistent")),
         )
         .await
         .expect("tier models resolve");
 
         let fast = models.fast.expect("fast tier model is built");
-        let parameters = fast.parameters();
+        let parameters = &fast.parameters;
         // None of the Google session's flags reach the Claude tier model: it
         // carries only Claude's own `native_tools` for its instance, and no
         // reasoning effort.
@@ -991,7 +910,6 @@ mod tests {
             &config,
             "google",
             "gemini-3-flash-preview",
-            &SessionId::new(),
             &SecretRedactor::new(std::path::Path::new("/nonexistent")),
         )
         .await

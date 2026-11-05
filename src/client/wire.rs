@@ -211,6 +211,16 @@ pub enum WireAgentEvent {
         /// Turns taken.
         turns: usize,
     },
+    /// A compaction failed at the pause point, so the context was cleaned and
+    /// the compaction reruns on it.
+    CompactionRecovery {
+        /// Why the compaction failed.
+        error: WireAgentError,
+        /// System alerts and reminders the cleanup removed.
+        alerts_removed: usize,
+        /// Long tool outputs the cleanup moved to files.
+        outputs_spilled: usize,
+    },
     /// The agent failed.
     Error {
         /// The failure.
@@ -280,6 +290,15 @@ impl WireAgentEvent {
                 final_text: final_text.clone(),
                 turns: *turns,
             },
+            AgentEvent::CompactionRecovery {
+                error,
+                alerts_removed,
+                outputs_spilled,
+            } => Self::CompactionRecovery {
+                error: error.into(),
+                alerts_removed: *alerts_removed,
+                outputs_spilled: *outputs_spilled,
+            },
             AgentEvent::Error(error) => Self::Error {
                 error: error.into(),
             },
@@ -329,6 +348,15 @@ impl WireAgentEvent {
                 has_tool_calls,
             },
             Self::Complete { final_text, turns } => AgentEvent::Complete { final_text, turns },
+            Self::CompactionRecovery {
+                error,
+                alerts_removed,
+                outputs_spilled,
+            } => AgentEvent::CompactionRecovery {
+                error: error.into(),
+                alerts_removed,
+                outputs_spilled,
+            },
             Self::Error { error } => return Err(error.into()),
         };
         Ok(TimedEvent { at, event })
@@ -754,6 +782,30 @@ mod tests {
         assert!(matches!(
             timed.event,
             AgentEvent::ToolCallEnd { ref id, ref result, .. } if id == "t1" && *result == ToolResult::text("done")
+        ));
+    }
+
+    #[test]
+    fn compaction_recovery_survives_the_round_trip() {
+        let event = AgentEvent::CompactionRecovery {
+            error: AgentError::Llm {
+                message: "too long".to_string(),
+                failure: aither_core::llm::Failure::transient(),
+            },
+            alerts_removed: 2,
+            outputs_spilled: 3,
+        };
+        let wire = WireAgentEvent::from_agent(Ok(&event)).expect("rendered event");
+        let json = serde_json::to_string(&wire).expect("serialize");
+        let back: WireAgentEvent = serde_json::from_str(&json).expect("deserialize");
+        let timed = back.into_timed(jiff::Timestamp::UNIX_EPOCH).expect("event");
+        assert!(matches!(
+            timed.event,
+            AgentEvent::CompactionRecovery {
+                error: AgentError::Llm { ref message, .. },
+                alerts_removed: 2,
+                outputs_spilled: 3,
+            } if message == "too long"
         ));
     }
 
