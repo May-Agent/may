@@ -81,10 +81,7 @@ fn write_bug_snapshot(
     app: &App,
     log_ring: &may_agent::log_ring::LogRingHandle,
 ) -> anyhow::Result<std::path::PathBuf> {
-    let bugs_dir = dirs::home_dir()
-        .context("Failed to determine home directory")?
-        .join(".may")
-        .join("bugs");
+    let bugs_dir = app.session_manager.may_dir().join("bugs");
     let timestamp = jiff::Timestamp::now().to_string();
     let header = BugReportHeader {
         version: env!("CARGO_PKG_VERSION"),
@@ -181,7 +178,7 @@ async fn async_main() -> anyhow::Result<()> {
     let panic_ring = log_ring.clone();
     let previous_hook = panic::take_hook();
     panic::set_hook(Box::new(move |panic_info| {
-        if let Some(bugs_dir) = dirs::home_dir().map(|home| home.join(".may").join("bugs"))
+        if let Ok(bugs_dir) = may_agent::MayConfig::may_dir().map(|dir| dir.join("bugs"))
             && let Err(error) = panic_ring.dump_to(
                 &bugs_dir.join(format!("panic-{}.log", jiff::Timestamp::now().as_second())),
                 &panic_info.to_string(),
@@ -196,7 +193,7 @@ async fn async_main() -> anyhow::Result<()> {
     // same ring to the same directory before the signal's usual outcome.
     // Forensics must not stop startup, so a failed install only warns.
     #[cfg(unix)]
-    if let Some(bugs_dir) = dirs::home_dir().map(|home| home.join(".may").join("bugs"))
+    if let Ok(bugs_dir) = may_agent::MayConfig::may_dir().map(|dir| dir.join("bugs"))
         && let Err(error) = may_agent::crash_signal::install(log_ring.clone(), bugs_dir)
     {
         tracing::warn!("fatal-signal log dump not installed: {error}");
