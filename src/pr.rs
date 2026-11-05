@@ -277,7 +277,7 @@ impl PrStore {
     pub async fn open(
         &self,
         repo: Option<&str>,
-        title: &str,
+        title: Option<&str>,
         issue_number: Option<i64>,
         hold: bool,
     ) -> Result<String, PrError> {
@@ -303,6 +303,17 @@ impl PrStore {
             return Err(PrError::State("no committed work in the clone".to_string()));
         }
         let (backend, github_repo) = Self::backend_for(&resolved.record);
+        let subjects = self
+            .commit_subjects(&resolved, &base_sha, &head_sha)
+            .await?;
+        // Only a GitHub issue is linked in published text: a May issue
+        // number is internal and never leaves the machine.
+        let github_issue = issue_number.filter(|_| {
+            self.project_for_record(&resolved.record)
+                .is_some_and(|p| p.github_repository().is_some())
+        });
+        let text = pr_text(title, &subjects, github_issue)?;
+        let (title, body) = (text.title.as_str(), text.body.as_str());
         // A local PR's branch is its durable ref, named once its number is known.
         let branch = if resolved.record.local {
             String::new()
@@ -312,7 +323,7 @@ impl PrStore {
         // The outbound screen vets every published text before it leaves —
         // the "PRs only" trust mode's guard.
         if backend == "github"
-            && let Some(reason) = self.screen_outbound(&resolved.record, title).await?
+            && let Some(reason) = self.screen_outbound(&resolved.record, title, body).await?
         {
             return Err(PrError::Screened(reason));
         }
@@ -323,7 +334,7 @@ impl PrStore {
                 .as_deref()
                 .ok_or_else(|| PrError::Resolve("github backend without a repo".to_string()))?;
             Some(
-                self.push_and_create(&resolved, &branch, &base_sha, &head_sha, title, owner_repo)
+                self.push_and_create(&resolved, &branch, &base_sha, &head_sha, &text, owner_repo)
                     .await?,
             )
         } else {
@@ -336,7 +347,7 @@ impl PrStore {
                 &resolved.record.repo_key,
                 &self.context.session_id,
                 title,
-                "",
+                body,
                 &branch,
                 &base_sha,
                 backend,
@@ -701,12 +712,30 @@ impl PrStore {
         })
     }
 
+    /// Subjects of the commits `base..head`, oldest first.
+    async fn commit_subjects(
+        &self,
+        resolved: &Resolved,
+        base: &str,
+        head: &str,
+    ) -> Result<Vec<String>, PrError> {
+        let script = CommitSubjects {
+            base: ShellWord::new(base).map_err(PrError::State)?,
+            head: ShellWord::new(head).map_err(PrError::State)?,
+        }
+        .render()
+        .expect("the commit subjects script renders");
+        let log = self.sandbox.run(&resolved.dir, &script).await?;
+        Ok(log.lines().map(str::to_string).collect())
+    }
+
     /// Run the outbound screen when the project enables it. `Some(reason)`
     /// means the published text was blocked.
     async fn screen_outbound(
         &self,
         record: &CloneRecord,
         title: &str,
+        body: &str,
     ) -> Result<Option<String>, PrError> {
         if !self
             .project_for_record(record)
@@ -719,7 +748,7 @@ impl PrStore {
             tracing::warn!("pr.screen is set but no screen is wired");
             return Ok(None);
         };
-        Ok(match screen(title, "").await {
+        Ok(match screen(title, body).await {
             Ok(true) => None,
             Ok(false) => Some("withheld by the outbound screen".to_string()),
             Err(reason) => Some(reason),
@@ -734,7 +763,7 @@ impl PrStore {
         branch: &str,
         base_sha: &str,
         head_sha: &str,
-        title: &str,
+        text: &PrText,
         owner_repo: &str,
     ) -> Result<i64, PrError> {
         push_pinned(
@@ -753,7 +782,8 @@ impl PrStore {
         let url = blocking::unblock({
             let owner_repo = owner_repo.to_string();
             let branch = branch.to_string();
-            let title = title.to_string();
+            let title = text.title.clone();
+            let body = text.body.clone();
             move || {
                 gh(&[
                     "pr",
@@ -765,7 +795,7 @@ impl PrStore {
                     "--title",
                     &title,
                     "--body",
-                    "",
+                    &body,
                 ])
             }
         })
@@ -1320,6 +1350,42 @@ impl std::fmt::Display for ShellWord {
     }
 }
 
+/// The body of a PR opened by `pr open`: its commit subjects and, for a
+/// GitHub-backed project, the issue it closes.
+#[derive(Template)]
+#[template(path = "pr_body.md", escape = "none")]
+struct PrBody<'a> {
+    subjects: &'a [String],
+    github_issue: Option<i64>,
+}
+
+/// The title and body of a PR: the given title, else the first commit's
+/// subject (the only commit's when there is one).
+fn pr_text(
+    title: Option<&str>,
+    subjects: &[String],
+    github_issue: Option<i64>,
+) -> Result<PrText, PrError> {
+    let title = match (title, subjects.first()) {
+        (Some(title), _) => title.to_string(),
+        (None, Some(first)) => first.clone(),
+        (None, None) => return Err(PrError::State("no commits to title the PR".to_string())),
+    };
+    let body = PrBody {
+        subjects,
+        github_issue,
+    }
+    .render()
+    .map_err(|e| PrError::State(e.to_string()))?;
+    Ok(PrText { title, body })
+}
+
+/// The published text of a PR.
+struct PrText {
+    title: String,
+    body: String,
+}
+
 /// Makes the detached checkout of a PR's commit its check runs on; run in
 /// the session root.
 #[derive(Template)]
@@ -1328,6 +1394,15 @@ struct CheckClone {
     source: ShellWord,
     target: ShellWord,
     sha: ShellWord,
+}
+
+/// Prints the subjects of the commits `base..head`, oldest first; run in
+/// the session clone.
+#[derive(Template)]
+#[template(path = "pr_commit_subjects.sh", escape = "none")]
+struct CommitSubjects {
+    base: ShellWord,
+    head: ShellWord,
 }
 
 /// Removes a check's checkout; run in the session root.
@@ -1707,12 +1782,74 @@ mod tests {
         git(Some(dir), &["commit", "-m", name]).unwrap();
     }
 
+    /// Without `--title`, a single commit titles the PR and is its body.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn open_without_a_title_takes_the_only_commits_subject() {
+        let fx = Fixture::new().await;
+        let (store, clone) = fx.store("s1", None).await;
+        commit_file(&clone, "only.txt");
+
+        store.open(None, None, None, true).await.unwrap();
+
+        let key = fx.repo_key.to_str().unwrap();
+        let pr = fx.db.get_pr(key, 1).await.unwrap().unwrap();
+        assert_eq!(pr.title, "only.txt");
+        assert_eq!(pr.body, "- only.txt\n");
+    }
+
+    /// Without `--title`, several commits title the PR with the first one's
+    /// subject and the body lists them all, oldest first.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn open_without_a_title_takes_the_first_commits_subject() {
+        let fx = Fixture::new().await;
+        let (store, clone) = fx.store("s1", None).await;
+        commit_file(&clone, "first.txt");
+        commit_file(&clone, "second.txt");
+        commit_file(&clone, "third.txt");
+
+        store.open(None, None, None, true).await.unwrap();
+
+        let key = fx.repo_key.to_str().unwrap();
+        let pr = fx.db.get_pr(key, 1).await.unwrap().unwrap();
+        assert_eq!(pr.title, "first.txt");
+        assert_eq!(pr.body, "- first.txt\n- second.txt\n- third.txt\n");
+    }
+
+    /// A May issue number is internal: it is recorded, never published in
+    /// the body.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_may_issue_is_not_linked_in_the_body() {
+        let fx = Fixture::new().await;
+        let (store, clone) = fx.store("s1", None).await;
+        commit_file(&clone, "a.txt");
+
+        store.open(None, None, Some(5), true).await.unwrap();
+
+        let key = fx.repo_key.to_str().unwrap();
+        let pr = fx.db.get_pr(key, 1).await.unwrap().unwrap();
+        assert_eq!(pr.body, "- a.txt\n");
+    }
+
+    /// A GitHub-issue session's body closes the issue; an explicit title wins.
+    #[test]
+    fn a_github_issue_is_closed_by_the_body() {
+        let subjects = vec!["fix(pr): title".to_string(), "test".to_string()];
+
+        let text = super::pr_text(None, &subjects, Some(653)).unwrap();
+        assert_eq!(text.title, "fix(pr): title");
+        assert_eq!(text.body, "- fix(pr): title\n- test\n\nCloses #653\n");
+
+        let text = super::pr_text(Some("chosen"), &subjects, None).unwrap();
+        assert_eq!(text.title, "chosen");
+        assert!(super::pr_text(None, &[], None).is_err());
+    }
+
     #[tokio::test]
     async fn adopted_pr_lands_after_the_original_session_is_deleted() {
         let fx = Fixture::new().await;
         let (first, clone) = fx.store("s1", None).await;
         commit_file(&clone, "work.txt");
-        first.open(None, "work", None, true).await.unwrap();
+        first.open(None, Some("work"), None, true).await.unwrap();
         let pinned = git(Some(&fx.checkout), &["rev-parse", "refs/may/pr/1"]).unwrap();
         // Session deletion drops the clone; the PR's ref survives it.
         SessionRepos::new(&fx.session_root("s1"), "s1", fx.db.clone())
@@ -1759,7 +1896,7 @@ mod tests {
         );
         // Same session and clone, now with the check configured.
         let (store, _) = fx.store("s1", Some(&cmd)).await;
-        store.open(None, "work", None, false).await.unwrap();
+        store.open(None, Some("work"), None, false).await.unwrap();
         let checked = std::fs::read_to_string(&marker).unwrap().trim().to_string();
         let landed = git(Some(&fx.checkout), &["rev-parse", "HEAD^2"]).unwrap();
         assert_eq!(landed, checked);
@@ -1790,7 +1927,7 @@ mod tests {
         let fx = Fixture::new().await;
         let (store, clone) = fx.store("s1", None).await;
         commit_file(&clone, "work.txt");
-        store.open(None, "work", None, true).await.unwrap();
+        store.open(None, Some("work"), None, true).await.unwrap();
         store.close(1, None).await.unwrap();
         assert!(
             git(
@@ -1849,7 +1986,7 @@ mod tests {
         let fx = Fixture::new().await;
         let (store, clone) = fx.store("s1", None).await;
         commit_file(&clone, "work.txt");
-        store.open(None, "work", None, true).await.unwrap();
+        store.open(None, Some("work"), None, true).await.unwrap();
         let key = fx.repo_key.to_str().unwrap();
         let pr = fx.db.get_pr(key, 1).await.unwrap().unwrap();
         fx.db
@@ -1937,7 +2074,7 @@ mod tests {
         assert_eq!(PrStore::backend_for(&resolved.record), ("may", None));
         fx.user.identify(&resolved.dir);
         commit_file(&resolved.dir, "work.txt");
-        store.open(None, "work", None, true).await.unwrap();
+        store.open(None, Some("work"), None, true).await.unwrap();
 
         let pr = fx
             .db
@@ -1956,8 +2093,9 @@ mod tests {
         let fx = Fixture::new().await;
         let screened = Arc::new(Mutex::new(Vec::<String>::new()));
         let seen = screened.clone();
-        let screen: Arc<super::ScreenFn> = Arc::new(move |title: &str, _body: &str| {
+        let screen: Arc<super::ScreenFn> = Arc::new(move |title: &str, body: &str| {
             seen.lock().unwrap().push(title.to_string());
+            seen.lock().unwrap().push(body.to_string());
             Box::pin(async { Ok(false) })
         });
         add_github_origin(&fx);
@@ -2003,11 +2141,14 @@ mod tests {
         assert!(matches!(project.issues, ProjectIssues::May));
         assert_eq!(project.pr.screen, Some(true));
         let verdict = store
-            .screen_outbound(&resolved.record, "a title")
+            .screen_outbound(&resolved.record, "a title", "- a subject\n")
             .await
             .unwrap();
         assert!(verdict.is_some(), "the screen ran and withheld the text");
-        assert_eq!(*screened.lock().unwrap(), vec!["a title".to_string()]);
+        assert_eq!(
+            *screened.lock().unwrap(),
+            vec!["a title".to_string(), "- a subject\n".to_string()]
+        );
     }
 
     #[test]
@@ -2246,7 +2387,7 @@ mod tests {
             .await
             .unwrap();
 
-        let landed = store.open(None, "work", None, false).await.unwrap();
+        let landed = store.open(None, Some("work"), None, false).await.unwrap();
 
         assert!(landed.starts_with("merged PR #1"), "{landed}");
         assert!(fx.checkout.join("work.txt").exists());
@@ -2321,7 +2462,10 @@ mod tests {
         .unwrap();
         commit_file(&clone, "signed-again.txt");
 
-        let error = store.open(None, "work", None, false).await.unwrap_err();
+        let error = store
+            .open(None, Some("work"), None, false)
+            .await
+            .unwrap_err();
 
         assert!(
             matches!(
@@ -2344,12 +2488,15 @@ mod tests {
         // Signed, but by a key that is not the user's.
         TestUser::new(&fx.tmp.path().join("stranger")).identify(&clone);
         commit_file(&clone, "work.txt");
-        let error = store.open(None, "work", None, false).await.unwrap_err();
+        let error = store
+            .open(None, Some("work"), None, false)
+            .await
+            .unwrap_err();
         assert!(error.to_string().contains("not the user's key"), "{error}");
 
         fx.user.identify(&clone);
         git(Some(&clone), &["commit", "--amend", "--no-edit", "-q"]).unwrap();
-        let landed = store.open(None, "work", None, false).await.unwrap();
+        let landed = store.open(None, Some("work"), None, false).await.unwrap();
         assert!(landed.starts_with("merged PR #1"), "{landed}");
     }
 
@@ -2554,7 +2701,10 @@ mod tests {
         let (store, clone) = fx.store("s1", Some(&cmd)).await;
         commit_file(&clone, "work.txt");
 
-        let err = store.open(None, "work", None, false).await.unwrap_err();
+        let err = store
+            .open(None, Some("work"), None, false)
+            .await
+            .unwrap_err();
 
         assert!(matches!(err, super::PrError::CheckFailed(_)), "{err}");
         assert!(!outside.exists(), "the check wrote outside the sandbox");
