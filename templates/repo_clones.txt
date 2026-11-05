@@ -1,5 +1,0 @@
-Repository clones — the session's private writable copies; edit and commit work here, the source checkout is read-only:
-{% for clone in clones -%}
-- {{ clone.path }} (clone of {{ clone.source }})
-{% endfor -%}
-A clone is deleted when its work lands: untracked files do not survive it. Commit finished work; keep durable outputs in artifacts/, outputs/, data/ or files/.
