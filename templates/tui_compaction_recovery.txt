@@ -1,0 +1,1 @@
+Compaction failed ({{ error }}). Cleaned the context: {{ alerts_removed }} alerts removed, {{ outputs_spilled }} long outputs moved to files. Compacting again.

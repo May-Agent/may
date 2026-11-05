@@ -5,8 +5,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use aither_agent::{
-    Agent, AgentError, AgentKind, CompactResult, HCons, Prepared, TerminalAgentBuilder, TimedEvent,
-    Unprepared,
+    Agent, AgentError, AgentKind, AgentOptions, CompactResult, HCons, Prepared,
+    TerminalAgentBuilder, TimedEvent, Unprepared,
 };
 use aither_core::llm::{
     Attachment as LlmAttachment, Message as LlmMessage,
@@ -152,6 +152,8 @@ pub struct MayAgentConfig {
     /// How long the session provider keeps the conversation cached; idle
     /// compaction and reassembly follow it.
     pub cache_lifetime: crate::cache_lifetime::CacheLifetime,
+    /// When the conversation is compacted.
+    pub context_policy: aither_agent::ContextPolicy,
     /// Time source for idle timing; `None` reads the system clock. Tests set it.
     pub clock: Option<aither_agent::ManualClock>,
     /// Session sandbox directory (`TerminalTool` creates working dir inside).
@@ -318,6 +320,8 @@ pub struct MayAgent {
     provider_id: String,
     model_id: String,
     model_context_window: Option<u32>,
+    /// The thresholds the agent compacts by; `/context` reports them.
+    context_policy: aither_agent::ContextPolicy,
     /// IPC command names backed by MCP connections — lets `/context` split
     /// the `<commands>` index into built-in vs MCP rows.
     mcp_command_names: Vec<String>,
@@ -581,6 +585,7 @@ impl MayAgent {
                 config.session_id.as_str(),
             )))
             .cache_lifetime(config.cache_lifetime.into())
+            .context_policy(config.context_policy)
             .background_jobs(config.background_jobs)
             .connectivity(config.connectivity.clone());
         if let Some(runtime) = hook_runtime.clone() {
@@ -598,7 +603,7 @@ impl MayAgent {
             builder = builder.clock(clock);
         }
         if let Some(compaction_llm) = config.compaction_llm.clone() {
-            builder = builder.compaction_model(compaction_llm);
+            builder = builder.compaction_model(compaction_llm, Parameters::default());
         }
         let subagent_tracker = subagents.tracker;
         let shared_terminal_commands = Box::pin(register_shared_terminal_commands(
@@ -657,7 +662,7 @@ impl MayAgent {
         )
         .await?;
         builder = builder
-            .system_prompt_raw(base_system_prompt)
+            .system_prompt(base_system_prompt)
             // Shell runtime depends on the home environment. SSH remains a
             // per-command routing capability on top of it.
             .shell_runtime_availability(tool_environment_key.availability())
@@ -693,6 +698,7 @@ impl MayAgent {
             provider_id: config.provider_id,
             model_id: config.model_id,
             model_context_window: config.model_context_window,
+            context_policy: config.context_policy,
             mcp_command_names: shared_terminal_commands.mcp_command_names,
             runtime_system_context,
             job_registry,
@@ -827,6 +833,7 @@ impl MayAgent {
             ask_models,
             compaction_llm,
             cache_lifetime,
+            context_policy: may_config.context.policy(),
             clock: None,
             sandbox_dir,
             may_dir,
@@ -1009,6 +1016,7 @@ impl MayAgent {
             self.inner.context(),
             &snapshot.metrics,
             snapshot.phase,
+            &self.context_policy,
         ))
     }
 
@@ -1284,6 +1292,7 @@ pub async fn test_agent(
             provider_id: provider_id.to_string(),
             model_id: model_id.to_string(),
             model_context_window: None,
+            context_policy: aither_agent::ContextPolicy::default(),
             mcp_command_names: Vec::new(),
             runtime_system_context: RuntimeSystemContext::new(
                 temp.path().join("MEMORY.md"),

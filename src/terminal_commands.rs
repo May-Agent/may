@@ -156,8 +156,8 @@ where
     let subagent_flagship = config.llm.clone();
     let screen_llm = fast_llm.clone();
     let ask_command = AskCommand::new(fast_llm.clone())
-        .with_flagship(flagship_llm.clone())
-        .with_balanced(balanced_llm.clone());
+        .with_flagship(flagship_llm.clone(), config.request_parameters.clone())
+        .with_balanced(balanced_llm.clone(), config.request_parameters.clone());
     register_tool_with_description(builder, &mut descriptions, ask_command);
     register_tool_with_description(
         builder,
@@ -327,8 +327,14 @@ where
         UsageObservedModel::new(subagent_flagship),
         Bundle::subagents_dir(&config.may_dir),
     )
-    .with_balanced_model(UsageObservedModel::new(balanced_llm))
-    .with_fast_model(UsageObservedModel::new(fast_llm))
+    .with_balanced_model(
+        UsageObservedModel::new(balanced_llm),
+        config.request_parameters.clone(),
+    )
+    .with_fast_model(
+        UsageObservedModel::new(fast_llm),
+        config.request_parameters.clone(),
+    )
     .with_runs(config.subagent_runs)
     .with_base_dir(&config.sandbox_dir)
     .with_file_mounts([
