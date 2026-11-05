@@ -1274,8 +1274,14 @@ mod tests {
             AnyContainerExec, BollardContainerExec, BridgeAddress, ContainerIpcRoute,
         };
 
-        let client = bollard::Docker::connect_with_local_defaults()
-            .expect("a Docker client handle is built without connecting");
+        // An HTTP client handle neither probes a socket nor dials until used;
+        // rendering never uses it.
+        let client = bollard::Docker::connect_with_http(
+            "http://127.0.0.1:1",
+            1,
+            bollard::API_DEFAULT_VERSION,
+        )
+        .expect("an HTTP Docker client handle is built without connecting");
         super::AgentEnvironment::Container {
             container_id: "test-container".to_string(),
             container_ipc_route: ContainerIpcRoute::new(
