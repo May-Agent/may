@@ -179,6 +179,9 @@ pub struct AgentWorker {
     /// Model clone for `/btw` side questions; `None` when the agent runs in
     /// the daemon, which answers `/btw` itself.
     btw_llm: Option<RequestParameterizedModel<crate::agent::ProviderLlm>>,
+    /// The agent's configured languages; `None` when the agent runs in the
+    /// daemon.
+    languages: Option<aither_agent::Languages>,
     /// The agent's prompt-cache entry; `None` when the agent runs in the
     /// daemon.
     warmth: Option<aither_agent::CacheWarmth>,
@@ -405,6 +408,13 @@ impl AgentWorker {
         self.btw_llm.as_ref()
     }
 
+    /// The communication and working languages the agent was configured
+    /// with.
+    #[must_use]
+    pub const fn languages(&self) -> Option<aither_agent::Languages> {
+        self.languages
+    }
+
     /// The agent's prompt-cache entry, which keeps tracking the agent's
     /// later requests.
     #[must_use]
@@ -423,6 +433,7 @@ impl AgentWorker {
             job_registry: None,
             subagent_runs: None,
             btw_llm: None,
+            languages: None,
             warmth: None,
             subagent_tracker: crate::agent::SubagentTracker::default(),
             foreign_turns: Some(foreign_turns),
@@ -528,6 +539,7 @@ pub fn spawn_idle_worker<E: Executor + 'static>(
     let job_registry = agent.job_registry();
     let subagent_runs = agent.subagent_runs();
     let btw_llm = agent.btw_llm();
+    let languages = agent.languages();
     let warmth = agent.cache_warmth();
     let subagent_tracker = agent.subagent_tracker();
 
@@ -547,6 +559,7 @@ pub fn spawn_idle_worker<E: Executor + 'static>(
         job_registry: Some(job_registry),
         subagent_runs: Some(subagent_runs),
         btw_llm: Some(btw_llm),
+        languages: Some(languages),
         warmth: Some(warmth),
         subagent_tracker,
         foreign_turns: None,

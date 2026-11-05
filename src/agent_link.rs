@@ -375,6 +375,7 @@ pub struct AgentTool {
     sandbox_dir: PathBuf,
     /// Where the sandbox appears inside the session's container, if it has one.
     workspace_mount: Option<aither_sandbox::MountRoot>,
+    languages: Option<aither_agent::LanguageGuard>,
 }
 
 /// The host file behind a path as the session's terminal spells it. In a
@@ -420,7 +421,15 @@ impl AgentTool {
             session_id,
             sandbox_dir,
             workspace_mount,
+            languages: None,
         }
+    }
+
+    /// Refuse a message outside the working language `guard` enforces.
+    #[must_use]
+    pub fn with_languages(mut self, guard: aither_agent::LanguageGuard) -> Self {
+        self.languages = Some(guard);
+        self
     }
 }
 
@@ -469,6 +478,9 @@ impl Tool for AgentTool {
                 })?;
                 if body.trim().is_empty() {
                     return Err(AgentLinkError::EmptyMessage(path).into());
+                }
+                if let Some(guard) = &self.languages {
+                    guard.check_working(body.trim(), aither_agent::WorkingText::Internal)?;
                 }
                 let recipient = self
                     .messaging
