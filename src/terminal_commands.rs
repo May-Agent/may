@@ -184,6 +184,13 @@ where
             RepoSearch::global(&config.may_dir),
             config.cwd.clone(),
             config.db.clone(),
+            config.db.clone().map(|db| {
+                crate::repo_clone::SessionRepos::new(
+                    &config.sandbox_dir,
+                    config.session_id.clone(),
+                    db,
+                )
+            }),
         ),
     );
     let issue_search = config.db.clone().map(|db| {
