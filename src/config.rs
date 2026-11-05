@@ -1211,6 +1211,12 @@ pub struct MayConfig {
     /// Recap settings.
     #[serde(default)]
     pub recap: RecapConfig,
+    /// Communication and working languages.
+    #[serde(default)]
+    pub language: LanguageConfig,
+    /// Context compaction thresholds.
+    #[serde(default)]
+    pub context: ContextConfig,
     /// Last model selected via /model command (used as default for new sessions).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_model: Option<ModelSelector>,
@@ -1260,6 +1266,104 @@ impl Default for RecapConfig {
     }
 }
 
+/// A language named in `config.toml`: an English name (`Chinese`), a native
+/// name or an ISO 639-3 code, rejected at load when unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ConfiguredLanguage(pub aither_agent::Language);
+
+impl TryFrom<String> for ConfiguredLanguage {
+    type Error = String;
+
+    fn try_from(name: String) -> Result<Self, String> {
+        name.parse::<aither_agent::Language>()
+            .map(Self)
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl From<ConfiguredLanguage> for String {
+    fn from(language: ConfiguredLanguage) -> Self {
+        language.0.name().to_string()
+    }
+}
+
+/// `[language]` section: what the agent talks to the user in, and what it
+/// writes in for others to read (issue and PR text, messages to other agents).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct LanguageConfig {
+    /// The language replies, questions and recaps are written in; unset
+    /// leaves the agent to follow the user's own messages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub communication: Option<ConfiguredLanguage>,
+    /// The language written for others; English when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub working: Option<ConfiguredLanguage>,
+}
+
+impl LanguageConfig {
+    /// The languages the session's agent is held to.
+    #[must_use]
+    pub fn languages(&self) -> aither_agent::Languages {
+        let languages = self
+            .communication
+            .map_or_else(aither_agent::Languages::unset, |language| {
+                aither_agent::Languages::new(language.0)
+            });
+        self.working
+            .map_or(languages, |working| languages.with_working(working.0))
+    }
+}
+
+/// `[context]` section: when a session's conversation is compacted.
+///
+/// The auto-compact point is `min(window * compact_at, compact_ceiling)`
+/// tokens; the distances are token counts before it. aither applies them, and
+/// a change reaches running sessions at their next turn.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ContextConfig {
+    /// Fraction of the model window at which the conversation is compacted.
+    pub compact_at: f32,
+    /// Most tokens the conversation may hold before it is compacted,
+    /// whatever the window.
+    pub compact_ceiling: usize,
+    /// Tokens before the auto-compact point at which compaction starts in
+    /// the background while the run keeps streaming.
+    pub start_distance: usize,
+    /// Tokens before the auto-compact point at which the agent pauses to
+    /// finish compaction.
+    pub safe_buffer: usize,
+}
+
+impl Default for ContextConfig {
+    fn default() -> Self {
+        let policy = aither_agent::ContextPolicy::default();
+        Self {
+            compact_at: policy.compact_at,
+            compact_ceiling: policy.compact_ceiling,
+            start_distance: policy.start_distance,
+            safe_buffer: policy.safe_buffer,
+        }
+    }
+}
+
+impl ContextConfig {
+    /// The aither policy these thresholds configure; every other threshold
+    /// keeps aither's default.
+    #[must_use]
+    pub fn policy(&self) -> aither_agent::ContextPolicy {
+        aither_agent::ContextPolicy {
+            compact_at: self.compact_at,
+            compact_ceiling: self.compact_ceiling,
+            start_distance: self.start_distance,
+            safe_buffer: self.safe_buffer,
+            ..aither_agent::ContextPolicy::default()
+        }
+    }
+}
+
 /// Where the May daemon listens besides its unix socket.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct DaemonConfig {
@@ -1293,6 +1397,8 @@ impl Default for MayConfig {
             daemon: DaemonConfig::default(),
             suggestions: SuggestionsConfig::default(),
             recap: RecapConfig::default(),
+            language: LanguageConfig::default(),
+            context: ContextConfig::default(),
             last_model: None,
             last_effort: None,
             ssh_servers: Vec::new(),
@@ -1608,6 +1714,25 @@ pub struct AvailableModel {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn the_language_section_names_the_communication_language() {
+        let config: MayConfig = toml::from_str("[language]\ncommunication = \"zh\"\n").unwrap();
+        let languages = config.language.languages();
+        assert_eq!(languages.communication().unwrap().name(), "Chinese");
+        assert_eq!(languages.working().name(), "English");
+        assert!(languages.enforced());
+        let saved = toml::to_string(&config).unwrap();
+        assert!(saved.contains("communication = \"Chinese\""), "{saved}");
+        assert!(!MayConfig::default().language.languages().enforced());
+    }
+
+    #[test]
+    fn an_unknown_language_is_rejected_at_load() {
+        let error = toml::from_str::<MayConfig>("[language]\nworking = \"Klingonese\"\n")
+            .expect_err("unknown language");
+        assert!(error.to_string().contains("Klingonese"), "{error}");
+    }
 
     #[tokio::test]
     async fn cache_lifetime_and_compaction_model_survive_a_saved_config() {

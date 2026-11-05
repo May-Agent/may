@@ -21,7 +21,7 @@ use serde_json::Value;
 use tokio::net::TcpListener;
 
 use super::may::test_agent;
-use super::provider::RequestParameterizedModel;
+use super::provider::ModelSlot;
 
 /// A constraint the user states once, before the first compaction, and never
 /// repeats.
@@ -182,7 +182,7 @@ fn roles_mentioning(request: &Value, needle: &str) -> Vec<String> {
 async fn second_handoff_keeps_a_constraint_stated_before_the_first_compaction() {
     let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
     let stub = StubModel::spawn().await;
-    let llm = RequestParameterizedModel::new(
+    let llm = ModelSlot::new(
         crate::agent::RedactedModel::new(
             aither_cloud::CloudProvider::OpenAI(
                 aither_cloud::openai::OpenAI::builder("test-key")
@@ -257,7 +257,7 @@ async fn second_handoff_keeps_a_constraint_stated_before_the_first_compaction() 
 /// Builds the agent of the context-reading tests against `stub`.
 async fn agent_on(stub: &StubModel) -> (super::may::MayAgent, tempfile::TempDir) {
     let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
-    let llm = RequestParameterizedModel::new(
+    let llm = ModelSlot::new(
         crate::agent::RedactedModel::new(
             aither_cloud::CloudProvider::OpenAI(
                 aither_cloud::openai::OpenAI::builder("test-key")

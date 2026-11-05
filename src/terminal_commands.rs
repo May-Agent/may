@@ -8,11 +8,10 @@ use aither_core::LanguageModel;
 use aither_core::llm::{Tool, model::Parameters, tool::ToolDefinition};
 use aither_sandbox::ToolRegistryBuilder;
 
-use crate::agent::ImageGeneratorConfig;
 use crate::agent::ask_user_tool::{AskUserTool, WithdrawAskUserTool};
 use crate::agent::browser_tool::{BrowserBroker, BrowserTool};
 use crate::agent::imagine::ImagineTool;
-use crate::agent::issue_tool::{IssueTool, SubagentIssueTool};
+use crate::agent::issue_tool::{IssueChangeNotifier, IssueTool, SubagentIssueTool};
 use crate::agent::notify_tool::{NotifyBroker, NotifyTool};
 use crate::agent::pr_tool::{PrTool, SubagentPrTool};
 use crate::agent::register_tool::{RegisterBroker, RegisterTool, Skills};
@@ -20,6 +19,7 @@ use crate::agent::repo_tool::{RepoContext, RepoTool, SubagentRepoTool};
 use crate::agent::session_tool::SessionTool;
 use crate::agent::subagent_tracker::{SubagentTracker, TrackedSubagentTool, UsageObservedModel};
 use crate::agent::task_tool::{TaskBroker, TaskRuntimeKind, TaskTool};
+use crate::agent::{ImageGeneratorConfig, ModelSlot};
 use crate::bundle::Bundle;
 use crate::issue::provenance::IssueProvenance;
 use crate::issue::search::IssueSearch;
@@ -43,11 +43,11 @@ pub struct SharedTerminalCommandConfig<LLM> {
     /// LLM handle used by commands that need a model.
     pub llm: LLM,
     /// Tier override for `ask --model flagship`; falls back to `llm`.
-    pub ask_flagship: Option<LLM>,
+    pub ask_flagship: Option<ModelSlot<LLM>>,
     /// Tier override for `ask --model balanced`; falls back to `llm`.
-    pub ask_balanced: Option<LLM>,
+    pub ask_balanced: Option<ModelSlot<LLM>>,
     /// Tier override for `ask --model fast` (the default tier); falls back to `llm`.
-    pub ask_fast: Option<LLM>,
+    pub ask_fast: Option<ModelSlot<LLM>>,
     /// Session the commands run on behalf of.
     pub session_id: String,
     /// `~/.may` data directory.
@@ -58,8 +58,9 @@ pub struct SharedTerminalCommandConfig<LLM> {
     pub cwd: PathBuf,
     /// History database, which records the worktrees `search` is used in.
     pub db: crate::db::ChatDb,
-    /// Runtime that holds the session's open `ask_user` questions, when the
-    /// session has one.
+    /// Runtime that holds the session's open `ask_user` questions and
+    /// publishes its UI events (`issue` writes among them), when the session
+    /// has one.
     pub ask_user: Option<Arc<crate::session::SessionRuntimeService>>,
     /// Image-generation config, when enabled.
     pub imagine: Option<ImagineCommandConfig>,
@@ -96,6 +97,9 @@ pub struct SharedTerminalCommandConfig<LLM> {
     /// Discovery and messaging between main agents, when the session has a
     /// persistent queue to deliver through.
     pub agent_messaging: Option<crate::agent_link::AgentMessaging>,
+    /// The session's language guard: `ask_user`, `issue`, `pr` and `agent`
+    /// refuse text outside the languages it enforces.
+    pub languages: Option<aither_agent::LanguageGuard>,
     /// Connected ACP agents, registered as subagent types; `None` outside
     /// the daemon.
     pub acp: Option<crate::agent::acp_subagent::AcpAgents>,
@@ -147,9 +151,11 @@ where
     }
     // The model of each tier; a tier nothing is configured for runs on the
     // session's model.
-    let flagship_llm = config.ask_flagship.unwrap_or_else(|| config.llm.clone());
-    let balanced_llm = config.ask_balanced.unwrap_or_else(|| config.llm.clone());
-    let fast_llm = config.ask_fast.unwrap_or_else(|| config.llm.clone());
+    let session_model = ModelSlot::new(config.llm.clone(), config.request_parameters.clone());
+    let flagship = config.ask_flagship.unwrap_or_else(|| session_model.clone());
+    let balanced = config.ask_balanced.unwrap_or_else(|| session_model.clone());
+    let fast = config.ask_fast.unwrap_or(session_model);
+    let fast_llm = fast.llm.clone();
     // The main agent is declared on the advanced tier (the terminal agent
     // builder has no setter for it) and a fork must resolve to the model the
     // main agent runs on, so the advanced slot of `subagent` is the session's
@@ -157,8 +163,9 @@ where
     let subagent_flagship = config.llm.clone();
     let screen_llm = fast_llm.clone();
     let ask_command = AskCommand::new(fast_llm.clone())
-        .with_flagship(flagship_llm.clone())
-        .with_balanced(balanced_llm.clone());
+        .with_parameters(fast.parameters.clone())
+        .with_flagship(flagship.llm, flagship.parameters)
+        .with_balanced(balanced.llm.clone(), balanced.parameters.clone());
     register_tool_with_description(builder, &mut descriptions, ask_command);
     register_tool_with_description(
         builder,
@@ -186,8 +193,14 @@ where
         RepoSearchCollections::new(RepoSearch::global(&config.may_dir)),
     );
     let provenance = IssueProvenance::new(config.db.clone(), config.session_id.clone());
-    let issue_tool = IssueTool::new(config.issue_store.clone(), provenance.clone())
+    let mut issue_tool = IssueTool::new(config.issue_store.clone(), provenance.clone())
         .with_search(issue_search.clone());
+    if let Some(guard) = &config.languages {
+        issue_tool = issue_tool.with_languages(guard.clone());
+    }
+    if let Some(runtime) = config.ask_user.clone() {
+        issue_tool = issue_tool.with_changes(IssueChangeNotifier::new(runtime));
+    }
     let subagent_issue_tool =
         SubagentIssueTool::new(config.issue_store, provenance).with_search(issue_search);
     describe_tool(&mut descriptions, &issue_tool);
@@ -202,11 +215,16 @@ where
         db: Some(config.db.clone()),
         session_id: config.session_id.clone(),
         session_root: config.sandbox_dir.clone(),
+        scratch_root: config.may_dir.join("pr-checks"),
         cwd: config.cwd.clone(),
         workspace_config: config.workspace_config.clone(),
         screen: Some(screen),
+        github_api: crate::pr::PrContext::default_github_api(),
     };
-    let pr_tool = PrTool::new(pr_context.clone());
+    let mut pr_tool = PrTool::new(pr_context.clone());
+    if let Some(guard) = &config.languages {
+        pr_tool = pr_tool.with_languages(guard.clone());
+    }
     let subagent_pr_tool = SubagentPrTool::new(pr_context);
     describe_tool(&mut descriptions, &pr_tool);
     builder.configure_role_tools(pr_tool, subagent_pr_tool);
@@ -222,7 +240,10 @@ where
     builder.configure_role_tools(repo_tool, subagent_repo_tool);
 
     if let Some(runtime) = config.ask_user {
-        let ask_user = AskUserTool::new(runtime.clone(), config.session_id.clone());
+        let mut ask_user = AskUserTool::new(runtime.clone(), config.session_id.clone());
+        if let Some(guard) = &config.languages {
+            ask_user = ask_user.with_languages(guard.clone());
+        }
         describe_tool(&mut descriptions, &ask_user);
         builder.main_only(|reserved| reserved.configure_tool(ask_user));
         let withdraw = WithdrawAskUserTool::new(runtime, config.session_id.clone());
@@ -240,13 +261,16 @@ where
     }
 
     if let Some(messaging) = config.agent_messaging {
-        let agent = crate::agent_link::AgentTool::new(
+        let mut agent = crate::agent_link::AgentTool::new(
             messaging,
             config.session_id.clone(),
             config.sandbox_dir.clone(),
             matches!(config.task_runtime, TaskRuntimeKind::Container)
                 .then(|| crate::container::lifecycle::workspace_mount(config.sandbox_dir.clone())),
         );
+        if let Some(guard) = &config.languages {
+            agent = agent.with_languages(guard.clone());
+        }
         describe_tool(&mut descriptions, &agent);
         builder.main_only(|reserved| reserved.configure_tool(agent));
     }
@@ -323,8 +347,9 @@ where
         UsageObservedModel::new(subagent_flagship),
         Bundle::subagents_dir(&config.may_dir),
     )
-    .with_balanced_model(UsageObservedModel::new(balanced_llm))
-    .with_fast_model(UsageObservedModel::new(fast_llm))
+    .with_request_parameters(config.request_parameters.clone())
+    .with_balanced_model(UsageObservedModel::new(balanced.llm), balanced.parameters)
+    .with_fast_model(UsageObservedModel::new(fast_llm), fast.parameters)
     .with_runs(config.subagent_runs)
     .with_base_dir(&config.sandbox_dir)
     .with_file_mounts([
@@ -519,6 +544,7 @@ mod tests {
                 issue_store: test_issue_store(temp.path()).await,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
+                languages: None,
                 acp: None,
             },
         )
@@ -576,6 +602,7 @@ mod tests {
                 issue_store: test_issue_store(temp.path()).await,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
+                languages: None,
                 acp: None,
             },
         )
@@ -633,6 +660,7 @@ mod tests {
                 issue_store: test_issue_store(temp.path()).await,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
+                languages: None,
                 acp: None,
             },
         )
@@ -684,6 +712,7 @@ mod tests {
                 issue_store: test_issue_store(temp.path()).await,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
+                languages: None,
                 acp: None,
             },
         )
@@ -731,6 +760,7 @@ mod tests {
                 issue_store: test_issue_store(temp.path()).await,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
+                languages: None,
                 acp: None,
             },
         )
@@ -853,7 +883,6 @@ mod tests {
             directory: crate::agent_link::AgentDirectory::new(
                 runtime_service.clone(),
                 temp.path().to_path_buf(),
-                temp.path().to_path_buf(),
                 move |session_id| {
                     woken_tx
                         .try_send(session_id.to_string())
@@ -893,6 +922,7 @@ mod tests {
                 issue_store,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: Some(messaging),
+                languages: None,
                 acp: None,
             },
         )
@@ -970,6 +1000,7 @@ mod tests {
                 issue_store: test_issue_store(temp.path()).await,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
+                languages: None,
                 acp: None,
             },
         )
@@ -1018,6 +1049,7 @@ mod tests {
                 issue_store: test_issue_store(temp.path()).await,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
+                languages: None,
                 acp: None,
             },
         )

@@ -279,6 +279,10 @@ impl ChatDb {
     /// Issues of `repo_key` updated after `since` (any time when `None`),
     /// oldest update first.
     ///
+    /// A page holds the first `limit` such issues plus every other issue
+    /// sharing the last one's `updated_at`, so a caller that resumes after
+    /// the newest timestamp it saw never skips the rest of a tie.
+    ///
     /// # Errors
     /// Returns [`ChatDbError`] when the query fails.
     pub async fn issues_updated_since(
@@ -290,11 +294,14 @@ impl ChatDb {
         let Some(project_id) = self.find_issue_project(repo_key).await? else {
             return Ok(Vec::new());
         };
+        let since = since.unwrap_or("");
         let rows = query!(
             self.db,
-            "SELECT * FROM issues WHERE project_id = ? AND updated_at > ? ORDER BY updated_at, number LIMIT ?",
+            "SELECT * FROM issues WHERE project_id = ? AND updated_at > ? AND updated_at <= (SELECT MAX(updated_at) FROM (SELECT updated_at FROM issues WHERE project_id = ? AND updated_at > ? ORDER BY updated_at LIMIT ?)) ORDER BY updated_at, number",
             project_id,
-            since.unwrap_or(""),
+            since,
+            project_id,
+            since,
             limit
         )
         .fetch_all::<Model>()
@@ -333,39 +340,27 @@ impl ChatDb {
         let Some(project_id) = self.find_issue_project(repo_key).await? else {
             return Ok(Vec::new());
         };
-        let rows = match state {
-            IssueListState::All => {
-                query!(
-                    self.db,
-                    "SELECT * FROM issues WHERE project_id = ? ORDER BY number DESC LIMIT ?",
-                    project_id,
-                    limit
-                )
-                .fetch_all::<Model>()
-                .await?
-            }
-            _ => {
-                query!(
-                    self.db,
-                    "SELECT * FROM issues WHERE project_id = ? AND state = ? ORDER BY number DESC LIMIT ?",
-                    project_id,
-                    state.as_str(),
-                    limit
-                )
-                .fetch_all::<Model>()
-                .await?
-            }
-        };
+        // The label filter runs in the query so `LIMIT` counts matching rows.
+        let wanted: std::collections::BTreeSet<&str> = labels.iter().map(String::as_str).collect();
+        let wanted_json = serde_json::to_string(&wanted)
+            .map_err(|error| storage_error(format!("issue label filter rejected: {error}")))?;
+        let wanted_count = i64::try_from(wanted.len())
+            .map_err(|error| storage_error(format!("issue label filter rejected: {error}")))?;
+        let rows = query!(
+            self.db,
+            "SELECT * FROM issues WHERE project_id = ? AND (? = 'all' OR state = ?) AND (SELECT COUNT(DISTINCT label.name) FROM issue_label_assignments AS assignment INNER JOIN issue_labels AS label ON label.id = assignment.label_id WHERE assignment.issue_id = issues.id AND label.name IN (SELECT value FROM json_each(?))) = ? ORDER BY number DESC LIMIT ?",
+            project_id,
+            state.as_str(),
+            state.as_str(),
+            wanted_json,
+            wanted_count,
+            limit
+        )
+        .fetch_all::<Model>()
+        .await?;
         let mut summaries = Vec::with_capacity(rows.len());
         for row in rows {
             let issue_labels = self.issue_labels(row.id).await?;
-            if !labels.is_empty()
-                && !labels
-                    .iter()
-                    .all(|wanted| issue_labels.iter().any(|label| label == wanted))
-            {
-                continue;
-            }
             summaries.push(IssueSummary {
                 number: row.number,
                 title: row.title,
@@ -395,22 +390,24 @@ impl ChatDb {
         state: Option<IssueState>,
     ) -> Result<IssueDetail, ChatDbError> {
         let project_id = self.ensure_issue_project(repo_key).await?;
-        let row = self.require_issue(project_id, number).await?;
-        let title = title.unwrap_or(row.title.as_str()).to_string();
-        let body = body.unwrap_or(row.body.as_str()).to_string();
-        let state = state.map_or_else(|| row.state.clone(), |s| s.as_str().to_string());
         let now = jiff::Timestamp::now().to_string();
-        query!(
+        // One statement assigning only the fields present in the change, so
+        // concurrent updates of different fields cannot restore stale values.
+        let changed = query!(
             self.db,
-            "UPDATE issues SET title = ?, body = ?, state = ?, updated_at = ? WHERE id = ?",
-            title,
-            body,
-            state,
+            "UPDATE issues SET title = COALESCE(?, title), body = COALESCE(?, body), state = COALESCE(?, state), updated_at = ? WHERE project_id = ? AND number = ?",
+            title.map(str::to_owned),
+            body.map(str::to_owned),
+            state.map(|state| state.as_str().to_owned()),
             now,
-            row.id
+            project_id,
+            number
         )
         .execute()
         .await?;
+        if changed.rows_written == 0 {
+            return Err(row_not_found(format!("issue #{number}")));
+        }
         self.issue_detail(self.require_issue(project_id, number).await?)
             .await
     }
@@ -428,17 +425,30 @@ impl ChatDb {
         let project_id = self.ensure_issue_project(repo_key).await?;
         let row = self.require_issue(project_id, number).await?;
         let now = jiff::Timestamp::now().to_string();
+        let mut tx = self.db.begin().await?;
         let comment_id = query!(
-            self.db,
+            tx,
             "INSERT INTO issue_comments (issue_id, body, created_at) VALUES (?, ?, ?) RETURNING id AS value",
             row.id,
             body,
-            now
+            now.clone()
         )
         .fetch_one::<I64ValueRow>()
         .await?
         .value;
-        Ok((self.issue_detail(row).await?, comment_id))
+        query!(
+            tx,
+            "UPDATE issues SET updated_at = ? WHERE id = ?",
+            now,
+            row.id
+        )
+        .execute()
+        .await?;
+        tx.commit().await?;
+        let detail = self
+            .issue_detail(self.require_issue(project_id, number).await?)
+            .await?;
+        Ok((detail, comment_id))
     }
 
     /// Add and/or remove labels on an issue and return the refreshed detail.
@@ -652,6 +662,128 @@ mod tests {
             .await
             .expect("sub-issue remove");
         assert!(detail.sub_issues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn label_filter_applies_before_limit() {
+        let (_dir, db) = test_db().await;
+        db.create_issue(
+            "repo",
+            "old match",
+            "",
+            &["bug".to_string(), "x".to_string()],
+        )
+        .await
+        .expect("create");
+        for n in 0..5 {
+            db.create_issue("repo", &format!("newer {n}"), "", &["x".to_string()])
+                .await
+                .expect("create");
+        }
+        let listed = db
+            .list_issues("repo", IssueListState::All, &["bug".to_string()], 2)
+            .await
+            .expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].number, 1);
+        let both = db
+            .list_issues(
+                "repo",
+                IssueListState::Open,
+                &["bug".to_string(), "x".to_string(), "bug".to_string()],
+                1,
+            )
+            .await
+            .expect("list");
+        assert_eq!(both.len(), 1);
+        assert_eq!(both[0].number, 1);
+    }
+
+    #[tokio::test]
+    async fn updates_of_different_fields_on_stale_reads_both_survive() {
+        let (_dir, db) = test_db().await;
+        db.create_issue("repo", "title", "body", &[])
+            .await
+            .expect("create");
+        // Two writers read the issue before either writes.
+        let stale_a = db.get_issue("repo", 1).await.expect("get").expect("issue");
+        let stale_b = db.get_issue("repo", 1).await.expect("get").expect("issue");
+        assert_eq!(stale_a.state, IssueState::Open);
+        assert_eq!(stale_b.title, "title");
+        db.update_issue("repo", 1, Some("renamed"), None, None)
+            .await
+            .expect("rename");
+        db.update_issue("repo", 1, None, None, Some(IssueState::Closed))
+            .await
+            .expect("close");
+        let detail = db.get_issue("repo", 1).await.expect("get").expect("issue");
+        assert_eq!(detail.title, "renamed");
+        assert_eq!(detail.body, "body");
+        assert_eq!(detail.state, IssueState::Closed);
+    }
+
+    /// Issues that share an `updated_at` across the page size come back in
+    /// one page, so resuming after the page's newest timestamp skips none.
+    #[tokio::test]
+    async fn a_page_keeps_an_updated_at_tie_whole() {
+        let (_dir, db) = test_db().await;
+        for title in ["a", "b", "c", "d"] {
+            db.create_issue("repo", title, "", &[])
+                .await
+                .expect("create");
+        }
+        db.execute_for_test(
+            "UPDATE issues SET updated_at = CASE number WHEN 1 THEN '2026-01-01T00:00:00Z' WHEN 4 THEN '2026-01-03T00:00:00Z' ELSE '2026-01-02T00:00:00Z' END",
+        )
+        .await
+        .expect("set timestamps");
+
+        let first = db
+            .issues_updated_since("repo", None, 2)
+            .await
+            .expect("first page");
+        let numbers: Vec<i64> = first.iter().map(|issue| issue.number).collect();
+        assert_eq!(numbers, [1, 2, 3], "the tie at the page edge stays whole");
+
+        let resume = first.last().expect("a page").updated_at.clone();
+        let second = db
+            .issues_updated_since("repo", Some(&resume), 2)
+            .await
+            .expect("second page");
+        let numbers: Vec<i64> = second.iter().map(|issue| issue.number).collect();
+        assert_eq!(numbers, [4]);
+
+        let last = second.last().expect("a page").updated_at.clone();
+        assert!(
+            db.issues_updated_since("repo", Some(&last), 2)
+                .await
+                .expect("past the end")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn comment_bumps_updated_at_for_incremental_index() {
+        let (_dir, db) = test_db().await;
+        let created = db.create_issue("repo", "t", "", &[]).await.expect("create");
+        let since = created.updated_at.clone();
+        assert!(
+            db.issues_updated_since("repo", Some(&since), 10)
+                .await
+                .expect("since")
+                .is_empty()
+        );
+        let detail = db
+            .add_issue_comment("repo", 1, "hello")
+            .await
+            .expect("comment");
+        assert!(detail.updated_at > since);
+        let seen = db
+            .issues_updated_since("repo", Some(&since), 10)
+            .await
+            .expect("since");
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].number, 1);
     }
 
     #[tokio::test]

@@ -15,6 +15,7 @@ mod notification;
 mod open_questions;
 mod pr;
 mod profile;
+mod repo_clone;
 mod repo_usage;
 mod search_outbox;
 mod session;
@@ -42,6 +43,7 @@ pub use issue_search::IssueSearchDoc;
 pub use message::MessageMeta;
 pub use open_questions::{CommittedAskUserAnswer, PendingAskUserQuestion};
 pub use pr::{PrEventRow, PrRow};
+pub use repo_clone::RepoCloneRow;
 pub use repo_usage::RepoUsage;
 pub use search_outbox::{IndexedMessageRow, SearchOutboxEntry};
 pub use session_run::RunFence;
@@ -92,6 +94,7 @@ impl ChatDb {
         Self::ensure_session_context_snapshot_table(&db).await?;
         Self::ensure_pending_message_claim_columns(&db).await?;
         Self::ensure_session_run_layout(&db).await?;
+        Self::drop_legacy_pending_tables(&db).await?;
         Self::migrate_legacy_remote_profiles(&db).await?;
         Self::migrate_removed_waiting_terminal_input(&db).await?;
         Self::ensure_search_outbox(&db).await?;
@@ -414,6 +417,17 @@ impl ChatDb {
         Ok(())
     }
 
+    /// Tables an older build created and the current one never reads. Their
+    /// foreign keys onto `sessions` block deleting a session, and their rows
+    /// were never carried into the tables that replaced them
+    /// (`session_pending_message_entries`, `session_pending_ask_user_*_v2`).
+    async fn drop_legacy_pending_tables(db: &SkyDb) -> Result<(), ChatDbError> {
+        for statement in db_sql::statements(db_sql::DROP_LEGACY_PENDING_TABLES) {
+            query!(db, statement).execute().await?;
+        }
+        Ok(())
+    }
+
     async fn ensure_session_run_layout(db: &SkyDb) -> Result<(), ChatDbError> {
         query!(db, "DROP TABLE IF EXISTS session_run_leases")
             .execute()
@@ -482,11 +496,7 @@ impl ChatDb {
                             row.session_id
                         ))
                     })?;
-                let applied_seq = checkpoint
-                    .context
-                    .items()
-                    .last()
-                    .map_or(0, |item| i64::try_from(item.seq()).unwrap_or(0));
+                let applied_seq = crate::session::checkpoint_watermark(&checkpoint.context);
                 for item in checkpoint.context.items() {
                     let blob = rmp_serde::to_vec_named(item.message()).map_err(|e| {
                         storage_error(format!("transcript message encode failed: {e}"))

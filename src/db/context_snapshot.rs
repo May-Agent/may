@@ -414,24 +414,6 @@ impl ChatDb {
         tx.commit().await?;
         Ok(())
     }
-
-    /// Delete a persisted context snapshot for a session.
-    ///
-    /// # Errors
-    /// Returns [`ChatDbError`] on storage failure.
-    pub async fn delete_session_context_snapshot(
-        &self,
-        session_id: &str,
-    ) -> Result<(), ChatDbError> {
-        query!(
-            self.db,
-            "DELETE FROM session_context_snapshots WHERE session_id = ?",
-            session_id
-        )
-        .execute()
-        .await?;
-        Ok(())
-    }
 }
 
 #[cfg(test)]
