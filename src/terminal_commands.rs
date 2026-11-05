@@ -237,7 +237,10 @@ where
     if let Some(runtime) = config.ask_user {
         let ask_user = AskUserTool::new(runtime.clone(), config.session_id.clone());
         describe_tool(&mut descriptions, &ask_user);
-        builder.main_only(|reserved| reserved.configure_tool(ask_user));
+        // The user's answers are decisions the summary must not paraphrase.
+        builder.kept_through_compaction(|kept| {
+            kept.main_only(|reserved| reserved.configure_tool(ask_user));
+        });
         let withdraw = WithdrawAskUserTool::new(runtime, config.session_id.clone());
         describe_tool(&mut descriptions, &withdraw);
         builder.main_only(|reserved| reserved.configure_tool(withdraw));
