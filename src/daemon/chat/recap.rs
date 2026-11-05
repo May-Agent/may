@@ -462,7 +462,7 @@ mod tests {
     fn the_recap_prompt_asks_for_plain_prose_without_asides() {
         let prompt = last_message(None);
         assert!(prompt.contains("State each open caveat once"));
-        assert!(prompt.contains("do not use parentheses"));
+        assert!(prompt.contains("full-width （）"));
         assert!(!prompt.contains("above all else"));
     }
 
