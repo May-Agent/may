@@ -548,6 +548,7 @@ where
             agent_messaging: None,
             languages: None,
             acp: None,
+            git: may_agent::host_git::HostGit::inherit(),
         },
     )
     .await

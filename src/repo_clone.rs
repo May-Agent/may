@@ -22,7 +22,6 @@
 //! their base is always a commit, so a run's work is `git diff base..head`.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use aither_core::llm::{CommandOutcome, CommandStream};
 use aither_sandbox::{TerminalRunner, TerminalScript};
@@ -30,6 +29,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::db::{ChatDb, ChatDbError, RepoCloneRow};
+use crate::host_git::{HostGit, HostGitError};
 
 /// Error type for repository clone operations.
 #[derive(Debug, thiserror::Error)]
@@ -281,6 +281,8 @@ pub struct SessionRepos {
     root: PathBuf,
     session_id: String,
     db: ChatDb,
+    /// The git that makes clones.
+    host: HostGit,
 }
 
 impl SessionRepos {
@@ -292,7 +294,15 @@ impl SessionRepos {
             root: session_root.join("repos"),
             session_id: session_id.into(),
             db,
+            host: HostGit::inherit(),
         }
+    }
+
+    /// Makes clones with `host` instead of the environment's git.
+    #[must_use]
+    pub fn with_host(mut self, host: HostGit) -> Self {
+        self.host = host;
+        self
     }
 
     /// The directory all clones live under.
@@ -421,6 +431,7 @@ impl SessionRepos {
         let staging = staging.to_path_buf();
         let session_root = self.session_root.clone();
         let dir = dir.clone();
+        let host = self.host.clone();
         blocking::unblock(move || {
             std::fs::create_dir_all(&staging)?;
             let scratch = tempfile::Builder::new()
@@ -431,7 +442,7 @@ impl SessionRepos {
             command.extend(args.iter().map(String::as_str));
             let staged_arg = staged.to_string_lossy();
             command.push(&staged_arg);
-            git(None, &command)?;
+            host.output(None, &command)?;
             std::fs::create_dir_all(&session_root)?;
             confined::install_clone(&session_root, &staged, &dir)?;
             Ok(())
@@ -569,7 +580,7 @@ impl SessionRepos {
         if let Some(parent_dir) = child_dir.parent() {
             std::fs::create_dir_all(parent_dir)?;
         }
-        local_clone(parent, child_dir).await?;
+        local_clone(&self.host, parent, child_dir).await?;
         Ok(child_dir.to_path_buf())
     }
 
@@ -706,11 +717,12 @@ mod confined {
 /// Clone `source` into `target` copying its objects: the sandbox runs as the
 /// user's uid, so a hardlinked object made writable would change the source's
 /// inode too.
-async fn local_clone(source: &Path, target: &Path) -> Result<(), RepoCloneError> {
+async fn local_clone(host: &HostGit, source: &Path, target: &Path) -> Result<(), RepoCloneError> {
+    let host = host.clone();
     let source = source.to_string_lossy().into_owned();
     let target = target.to_string_lossy().into_owned();
     blocking::unblock(move || {
-        git(
+        host.output(
             None,
             &["clone", "--local", "--no-hardlinks", &source, &target],
         )
@@ -740,20 +752,19 @@ pub async fn uncommitted_changes(
         .collect())
 }
 
-/// Run `git` (optionally `-C dir`) with `args`; return stdout on success.
+impl From<HostGitError> for RepoCloneError {
+    fn from(error: HostGitError) -> Self {
+        match error {
+            HostGitError::Io(error) => Self::Io(error),
+            HostGitError::Failed { args, stderr } => Self::Git { args, stderr },
+        }
+    }
+}
+
+/// Test fixtures' own git, on the environment's configuration.
+#[cfg(test)]
 fn git(dir: Option<&Path>, args: &[&str]) -> Result<String, RepoCloneError> {
-    let mut command = Command::new("git");
-    if let Some(dir) = dir {
-        command.arg("-C").arg(dir);
-    }
-    let output = command.args(args).output()?;
-    if !output.status.success() {
-        return Err(RepoCloneError::Git {
-            args: format!("{command:?}"),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        });
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    Ok(HostGit::inherit().output(dir, args)?)
 }
 
 /// A real session terminal for tests: what `pr` runs in a clone runs on it.
@@ -799,6 +810,27 @@ pub(crate) mod test_sandbox {
 
     impl TestTerminal {
         pub async fn new(session_root: &Path) -> Self {
+            Self::with_registry(session_root, ToolRegistryBuilder::new()).await
+        }
+
+        /// A terminal as the daemon builds one for a session that signs: the
+        /// sandbox's git configuration is installed and `sign-commit` is
+        /// served by `signing`.
+        pub async fn signing(
+            session_root: &Path,
+            signing: crate::commit_signing::CommitSigning,
+        ) -> Self {
+            std::fs::create_dir_all(session_root).unwrap();
+            signing
+                .install_sandbox_git(session_root, None)
+                .await
+                .unwrap();
+            let mut builder = ToolRegistryBuilder::new();
+            builder.configure_tool(crate::commit_signing::SignCommitTool::new(signing));
+            Self::with_registry(session_root, builder).await
+        }
+
+        async fn with_registry(session_root: &Path, builder: ToolRegistryBuilder) -> Self {
             let distribution =
                 crate::tools::embedded_distribution().expect("embedded distribution validates");
             let cache = tool_cache();
@@ -810,7 +842,7 @@ pub(crate) mod test_sandbox {
                 .await
                 .expect("the baseline tools prepare")
                 .with_registry(std::sync::Arc::new(
-                    ToolRegistryBuilder::new().build(session_root.join("outputs")),
+                    builder.build(session_root.join("outputs")),
                 ));
             Self { terminal }
         }
