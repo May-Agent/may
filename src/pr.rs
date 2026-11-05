@@ -323,7 +323,7 @@ impl PrStore {
         // The outbound screen vets every published text before it leaves —
         // the "PRs only" trust mode's guard.
         if backend == "github"
-            && let Some(reason) = self.screen_outbound(&resolved.record, title).await?
+            && let Some(reason) = self.screen_outbound(&resolved.record, title, body).await?
         {
             return Err(PrError::Screened(reason));
         }
@@ -719,13 +719,13 @@ impl PrStore {
         base: &str,
         head: &str,
     ) -> Result<Vec<String>, PrError> {
-        let log = self
-            .sandbox
-            .run(
-                &resolved.dir,
-                &format!("git log --reverse --format=%s {base}..{head}"),
-            )
-            .await?;
+        let script = CommitSubjects {
+            base: ShellWord::new(base).map_err(PrError::State)?,
+            head: ShellWord::new(head).map_err(PrError::State)?,
+        }
+        .render()
+        .expect("the commit subjects script renders");
+        let log = self.sandbox.run(&resolved.dir, &script).await?;
         Ok(log.lines().map(str::to_string).collect())
     }
 
@@ -735,6 +735,7 @@ impl PrStore {
         &self,
         record: &CloneRecord,
         title: &str,
+        body: &str,
     ) -> Result<Option<String>, PrError> {
         if !self
             .project_for_record(record)
@@ -747,7 +748,7 @@ impl PrStore {
             tracing::warn!("pr.screen is set but no screen is wired");
             return Ok(None);
         };
-        Ok(match screen(title, "").await {
+        Ok(match screen(title, body).await {
             Ok(true) => None,
             Ok(false) => Some("withheld by the outbound screen".to_string()),
             Err(reason) => Some(reason),
@@ -1393,6 +1394,15 @@ struct CheckClone {
     source: ShellWord,
     target: ShellWord,
     sha: ShellWord,
+}
+
+/// Prints the subjects of the commits `base..head`, oldest first; run in
+/// the session clone.
+#[derive(Template)]
+#[template(path = "pr_commit_subjects.sh", escape = "none")]
+struct CommitSubjects {
+    base: ShellWord,
+    head: ShellWord,
 }
 
 /// Removes a check's checkout; run in the session root.
@@ -2083,8 +2093,9 @@ mod tests {
         let fx = Fixture::new().await;
         let screened = Arc::new(Mutex::new(Vec::<String>::new()));
         let seen = screened.clone();
-        let screen: Arc<super::ScreenFn> = Arc::new(move |title: &str, _body: &str| {
+        let screen: Arc<super::ScreenFn> = Arc::new(move |title: &str, body: &str| {
             seen.lock().unwrap().push(title.to_string());
+            seen.lock().unwrap().push(body.to_string());
             Box::pin(async { Ok(false) })
         });
         add_github_origin(&fx);
@@ -2130,11 +2141,14 @@ mod tests {
         assert!(matches!(project.issues, ProjectIssues::May));
         assert_eq!(project.pr.screen, Some(true));
         let verdict = store
-            .screen_outbound(&resolved.record, "a title")
+            .screen_outbound(&resolved.record, "a title", "- a subject\n")
             .await
             .unwrap();
         assert!(verdict.is_some(), "the screen ran and withheld the text");
-        assert_eq!(*screened.lock().unwrap(), vec!["a title".to_string()]);
+        assert_eq!(
+            *screened.lock().unwrap(),
+            vec!["a title".to_string(), "- a subject\n".to_string()]
+        );
     }
 
     #[test]
