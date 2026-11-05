@@ -202,8 +202,10 @@ async fn create_signed_webhook(state: &DaemonState) -> String {
 /// Whether nothing on `target` still serves the router that owns `token`.
 ///
 /// Another test may bind the port once ours is released, so a refused
-/// connection is not the only way to be gone: a listener that answers but is
-/// not ours does not know the signed token, which our router refuses with 401.
+/// connection is not the only way to be gone: only the router that owns the
+/// signed `token` refuses its unsigned delivery with a 401 naming the
+/// signature. Another daemon's router does not know the token, and its
+/// identity-layered routers refuse every request with a different 401.
 async fn listener_is_closed(target: &str, token: &str) -> bool {
     let (addr, base) = split_target(target);
     let Ok(mut stream) = tokio::net::TcpStream::connect(addr).await else {
@@ -219,7 +221,10 @@ async fn listener_is_closed(target: &str, token: &str) -> bool {
     let mut response = Vec::new();
     // A reset or early close is a listener that is not serving us.
     let _ = stream.read_to_end(&mut response).await;
-    String::from_utf8_lossy(&response).split(' ').nth(1) != Some("401")
+    let response = String::from_utf8_lossy(&response);
+    let ours = response.split(' ').nth(1) == Some("401")
+        && response.contains("Webhook signature missing or invalid");
+    !ours
 }
 
 #[tokio::test]
