@@ -535,6 +535,7 @@ impl PrStore {
                 &resolved.record.source,
                 &head_sha,
                 &pr.branch,
+                BranchState::Pushed,
                 SignedRange {
                     signing: &self.context.signing,
                     base: &pr.base_sha,
@@ -742,6 +743,7 @@ impl PrStore {
             &resolved.record.source,
             head_sha,
             branch,
+            BranchState::New,
             SignedRange {
                 signing: &self.context.signing,
                 base: base_sha,
@@ -1106,13 +1108,17 @@ fn clone_head(
 /// Push the pinned commit `sha` of `clone` to the PR's branch at `url`, never
 /// forced. The push leaves from a bare repository in host scratch that
 /// fetched the commit from the clone, so neither the clone's configuration
-/// nor its remotes take part; `url` is the host's record of the remote.
+/// nor its remotes take part; `url` is the host's record of the remote. The
+/// staging repository also holds the remote's own state as remote-tracking
+/// refs, so a `pre-push` hook that scans what is not yet on a remote sees
+/// only the PR's commits.
 async fn push_pinned(
     scratch_root: &Path,
     clone: &Path,
     url: &str,
     sha: &str,
     branch: &str,
+    branch_state: BranchState,
     signed: SignedRange<'_>,
 ) -> Result<(), PrError> {
     let scratch_root = scratch_root.to_path_buf();
@@ -1120,6 +1126,7 @@ async fn push_pinned(
     let url = url.to_string();
     let sha = sha.to_string();
     let spec = format!("{sha}:refs/heads/{branch}");
+    let branch = branch.to_string();
     let signing = signed.signing.clone();
     let base = signed.base.to_string();
     blocking::unblock(move || {
@@ -1135,6 +1142,7 @@ async fn push_pinned(
             &["init", "--quiet", "--bare", &repo.to_string_lossy()],
         )?;
         fetch_from_clone(host, repo, &clone, &sha)?;
+        fetch_upstream(host, repo, &url, branch_state, &branch)?;
         // What is pushed is what was verified: both read the host's copy.
         signing.verify_range_blocking(repo, &base, &sha)?;
         host_git(host, Some(repo), &["push", "--quiet", &url, &spec])
@@ -1142,6 +1150,39 @@ async fn push_pinned(
             .map_err(PrError::from)
     })
     .await
+}
+
+/// Whether a PR's branch is already on the remote.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BranchState {
+    /// The first push of the branch.
+    New,
+    /// An update of a branch an earlier push created.
+    Pushed,
+}
+
+/// Fetch the remote's real state from `url` itself, never from the agent's
+/// clone, into the remote-tracking refs of the staging repository `repo`:
+/// its default branch, and the PR's branch when it was pushed before.
+fn fetch_upstream(
+    host: &HostGit,
+    repo: &Path,
+    url: &str,
+    state: BranchState,
+    branch: &str,
+) -> Result<(), crate::repo_clone::RepoCloneError> {
+    let pushed = format!("refs/heads/{branch}:refs/remotes/origin/{branch}");
+    let mut args = vec![
+        "fetch",
+        "--quiet",
+        "--no-tags",
+        url,
+        "HEAD:refs/remotes/origin/default",
+    ];
+    if state == BranchState::Pushed {
+        args.push(&pushed);
+    }
+    host_git(host, Some(repo), &args).map(drop)
 }
 
 /// The commits of `base..head` that must carry the user's signature.
@@ -1370,8 +1411,8 @@ fn git(dir: Option<&Path>, args: &[&str]) -> Result<String, crate::repo_clone::R
 #[cfg(test)]
 mod tests {
     use super::{
-        GitHubRest, PrContext, PrStore, PrTokenSource, git, github_branch, github_owner_repo,
-        host_git, push_pinned,
+        BranchState, GitHubRest, PrContext, PrStore, PrTokenSource, git, github_branch,
+        github_owner_repo, host_git, push_pinned,
     };
     use crate::commit_signing::test_user::TestUser;
     use crate::repo_clone::test_sandbox::TestTerminal;
@@ -1631,6 +1672,33 @@ mod tests {
         base: &'a str,
     ) -> super::SignedRange<'a> {
         super::SignedRange { signing, base }
+    }
+
+    /// A bare remote whose default branch `main` holds `base`, fetched from
+    /// `from`, as a hosted repository always has a default branch.
+    fn seed_remote(remote: &Path, from: &Path, base: &str) {
+        git(
+            None,
+            &[
+                "init",
+                "--bare",
+                "-q",
+                "-b",
+                "main",
+                &remote.to_string_lossy(),
+            ],
+        )
+        .unwrap();
+        git(
+            Some(remote),
+            &[
+                "fetch",
+                "-q",
+                &from.to_string_lossy(),
+                &format!("{base}:refs/heads/main"),
+            ],
+        )
+        .unwrap();
     }
 
     fn commit_file(dir: &Path, name: &str) {
@@ -1992,9 +2060,17 @@ mod tests {
         commit_file(&clone, "one.txt");
         let first_sha = git(Some(&clone), &["rev-parse", "HEAD"]).unwrap();
         let first = github_branch("s1", &first_sha);
-        push_pinned(&scratch, &clone, &url, &first_sha, &first, range(&base))
-            .await
-            .unwrap();
+        push_pinned(
+            &scratch,
+            &clone,
+            &url,
+            &first_sha,
+            &first,
+            BranchState::New,
+            range(&base),
+        )
+        .await
+        .unwrap();
         git(Some(&clone), &["checkout", "-b", "squash", "main~1"]).unwrap();
         std::fs::write(clone.join("one.txt"), "one.txt").unwrap();
         git(Some(&clone), &["add", "."]).unwrap();
@@ -2013,9 +2089,17 @@ mod tests {
         let second_sha = git(Some(&clone), &["rev-parse", "HEAD"]).unwrap();
         let second = github_branch("s1", &second_sha);
         assert_ne!(first, second);
-        push_pinned(&scratch, &clone, &url, &second_sha, &second, range(&base))
-            .await
-            .unwrap();
+        push_pinned(
+            &scratch,
+            &clone,
+            &url,
+            &second_sha,
+            &second,
+            BranchState::New,
+            range(&base),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             git(
                 Some(&remote),
@@ -2026,15 +2110,31 @@ mod tests {
         );
         // The old shared name would have been rejected without a force.
         assert!(
-            push_pinned(&scratch, &clone, &url, &second_sha, &first, range(&base))
-                .await
-                .is_err(),
+            push_pinned(
+                &scratch,
+                &clone,
+                &url,
+                &second_sha,
+                &first,
+                BranchState::Pushed,
+                range(&base)
+            )
+            .await
+            .is_err(),
             "pushes are never forced"
         );
         // A retry of the same PR reuses its branch.
-        push_pinned(&scratch, &clone, &url, &second_sha, &second, range(&base))
-            .await
-            .unwrap();
+        push_pinned(
+            &scratch,
+            &clone,
+            &url,
+            &second_sha,
+            &second,
+            BranchState::Pushed,
+            range(&base),
+        )
+        .await
+        .unwrap();
         // Every push staged its bare repository in scratch and removed it.
         assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
     }
@@ -2170,9 +2270,10 @@ mod tests {
         // signature the user's own push hooks ask of it.
         commit_file(&clone, "work.txt");
         let root = fx.session_root("s1");
-        let host = arm_hostile_config(&root, &clone, fx.tmp.path());
         let remote = fx.tmp.path().join("remote.git");
-        git(None, &["init", "--bare", "-q", &remote.to_string_lossy()]).unwrap();
+        let base = git(Some(&fx.checkout), &["rev-parse", "HEAD"]).unwrap();
+        seed_remote(&remote, &fx.checkout, &base);
+        let host = arm_hostile_config(&root, &clone, fx.tmp.path());
         // A remote the agent points elsewhere, over a hostile transport.
         git(
             Some(&clone),
@@ -2180,7 +2281,6 @@ mod tests {
         )
         .unwrap();
         let sha = super::clone_head(&fx.user.host(), None, &clone.to_string_lossy()).unwrap();
-        let base = git(Some(&fx.checkout), &["rev-parse", "HEAD"]).unwrap();
         let signing = fx.signing("s1");
 
         push_pinned(
@@ -2189,6 +2289,7 @@ mod tests {
             &remote.to_string_lossy(),
             &sha,
             "may/s1-work",
+            BranchState::New,
             super::SignedRange {
                 signing: &signing,
                 base: &base,
@@ -2276,7 +2377,7 @@ mod tests {
         .unwrap();
         let unsigned = git(Some(&clone), &["rev-parse", "HEAD"]).unwrap();
         let remote = fx.tmp.path().join("remote.git");
-        git(None, &["init", "--bare", "-q", &remote.to_string_lossy()]).unwrap();
+        seed_remote(&remote, &fx.checkout, &base);
         let signing = fx.signing("s1");
         let range = || super::SignedRange {
             signing: &signing,
@@ -2335,6 +2436,7 @@ mod tests {
             &remote.to_string_lossy(),
             &unsigned,
             "may/unsigned",
+            BranchState::New,
             range(),
         )
         .await
@@ -2349,6 +2451,7 @@ mod tests {
             &remote.to_string_lossy(),
             &signed,
             "may/signed",
+            BranchState::New,
             range(),
         )
         .await
@@ -2357,6 +2460,87 @@ mod tests {
         assert_eq!(
             git(Some(&remote), &["rev-parse", "refs/heads/may/signed"]).unwrap(),
             signed
+        );
+    }
+
+    /// The user's `pre-push` hook as a global one scans a push: per ref,
+    /// the commits not on any remote-tracking ref, refused when one is not in
+    /// the `allowed` list. A new branch scans `local_sha`, an existing one
+    /// `local_sha ^remote_sha`.
+    fn install_scanning_hook(user: &TestUser, allowed: &Path) {
+        user.install_global_hook(
+            "pre-push",
+            &format!(
+                "#!/bin/sh\nzero=0000000000000000000000000000000000000000\n\
+                 while read local_ref local_sha remote_ref remote_sha; do\n  \
+                 if [ \"$remote_sha\" = \"$zero\" ]; then range=\"$local_sha\"; \
+                 else range=\"$local_sha ^$remote_sha\"; fi\n  \
+                 revs=$(git rev-list $range --not --remotes) || exit 1\n  \
+                 for c in $revs; do\n    \
+                 grep -q \"^$c\\$\" '{}' || {{ echo \"refused $c\" >&2; exit 1; }}\n  done\n\
+                 done\n",
+                allowed.display()
+            ),
+        );
+    }
+
+    /// Staging repositories hold no remote-tracking refs of their own, yet a
+    /// hook that scans what is not on a remote still passes: the push first
+    /// fetches the remote's real state, for a new branch and for an update.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scanning_pre_push_hook_sees_only_the_prs_commits() {
+        let fx = Fixture::new().await;
+        let (_, clone) = fx.store("s1", None).await;
+        // Upstream history the hook would refuse if it were scanned: the
+        // initial commit is not in the allowed list.
+        let base = git(Some(&fx.checkout), &["rev-parse", "HEAD"]).unwrap();
+        let remote = fx.tmp.path().join("remote.git");
+        seed_remote(&remote, &fx.checkout, &base);
+        let allowed = fx.tmp.path().join("allowed");
+        install_scanning_hook(&fx.user, &allowed);
+        let signing = fx.signing("s1");
+        let range = || super::SignedRange {
+            signing: &signing,
+            base: &base,
+        };
+
+        commit_file(&clone, "one.txt");
+        let one = git(Some(&clone), &["rev-parse", "HEAD"]).unwrap();
+        std::fs::write(&allowed, format!("{one}\n")).unwrap();
+        let url = remote.to_string_lossy().into_owned();
+        push_pinned(
+            &fx.scratch_root(),
+            &clone,
+            &url,
+            &one,
+            "may/s1-work",
+            BranchState::New,
+            range(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            git(Some(&remote), &["rev-parse", "refs/heads/may/s1-work"]).unwrap(),
+            one
+        );
+
+        commit_file(&clone, "two.txt");
+        let two = git(Some(&clone), &["rev-parse", "HEAD"]).unwrap();
+        std::fs::write(&allowed, format!("{two}\n")).unwrap();
+        push_pinned(
+            &fx.scratch_root(),
+            &clone,
+            &url,
+            &two,
+            "may/s1-work",
+            BranchState::Pushed,
+            range(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            git(Some(&remote), &["rev-parse", "refs/heads/may/s1-work"]).unwrap(),
+            two
         );
     }
 
