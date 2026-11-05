@@ -296,7 +296,7 @@ impl PrStore {
         let branch = if resolved.record.local {
             String::new()
         } else {
-            format!("may/{}", self.context.session_id)
+            github_branch(&self.context.session_id, &head_sha)
         };
         // The outbound screen vets every published text before it leaves —
         // the "PRs only" trust mode's guard.
@@ -994,6 +994,15 @@ impl PrStore {
     }
 }
 
+/// The remote branch of a GitHub PR, named from its session and the commit it
+/// is first opened at, so two PRs of one session never share a branch and a
+/// retried open of the same work reuses its branch. The name is stored in the
+/// PR row; `update`, close and adoption read it from there.
+fn github_branch(session_id: &str, head_sha: &str) -> String {
+    let short = head_sha.get(..12).unwrap_or(head_sha);
+    format!("may/{session_id}-{short}")
+}
+
 /// The durable ref in the source checkout that holds PR `number`'s commit.
 fn pin_ref(number: i64) -> String {
     format!("refs/may/pr/{number}")
@@ -1014,14 +1023,14 @@ fn clone_head(
         })
 }
 
-/// Push the pinned commit to the session branch on `upstream`.
+/// Push the pinned commit to the PR's branch on `upstream`, never forced.
 async fn push_pinned(
     clone: &Path,
     sha: &str,
     branch: &str,
 ) -> Result<(), crate::repo_clone::RepoCloneError> {
     let clone = clone.to_path_buf();
-    let spec = format!("+{sha}:refs/heads/{branch}");
+    let spec = format!("{sha}:refs/heads/{branch}");
     blocking::unblock(move || git(Some(&clone), &["push", "upstream", &spec]))
         .await
         .map(drop)
@@ -1199,7 +1208,10 @@ fn git(dir: Option<&Path>, args: &[&str]) -> Result<String, crate::repo_clone::R
 
 #[cfg(test)]
 mod tests {
-    use super::{GitHubRest, PrContext, PrStore, PrTokenSource, git, github_owner_repo};
+    use super::{
+        GitHubRest, PrContext, PrStore, PrTokenSource, git, github_branch, github_owner_repo,
+        push_pinned,
+    };
     use crate::repo_clone::SessionRepos;
     use crate::workspace::{ProjectConfig, ProjectIssues, ProjectPr, WorkspaceConfig};
     use hyper::body::Bytes;
@@ -1577,5 +1589,68 @@ mod tests {
             Some("May-Agent/may")
         );
         assert!(github_owner_repo("https://gitlab.com/a/b.git").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_second_github_pr_pushes_after_the_first_was_squash_merged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = tmp.path().join("remote.git");
+        git(
+            None,
+            &["init", "--bare", "-b", "main", &remote.to_string_lossy()],
+        )
+        .unwrap();
+        let clone = tmp.path().join("clone");
+        git(
+            None,
+            &["clone", &remote.to_string_lossy(), &clone.to_string_lossy()],
+        )
+        .unwrap();
+        identify(&clone);
+        git(Some(&clone), &["remote", "rename", "origin", "upstream"]).unwrap();
+        git(Some(&clone), &["checkout", "-b", "main"]).unwrap();
+        commit_file(&clone, "base.txt");
+        git(Some(&clone), &["push", "upstream", "main"]).unwrap();
+
+        // First PR: pushed to its own branch, then squash-merged upstream
+        // (a new commit on main that is not a descendant of the PR head),
+        // its branch left on the remote.
+        commit_file(&clone, "one.txt");
+        let first_sha = git(Some(&clone), &["rev-parse", "HEAD"]).unwrap();
+        let first = github_branch("s1", &first_sha);
+        push_pinned(&clone, &first_sha, &first).await.unwrap();
+        git(Some(&clone), &["checkout", "-b", "squash", "main~1"]).unwrap();
+        std::fs::write(clone.join("one.txt"), "one.txt").unwrap();
+        git(Some(&clone), &["add", "."]).unwrap();
+        git(Some(&clone), &["commit", "-m", "one.txt (#1)"]).unwrap();
+        let squash_sha = git(Some(&clone), &["rev-parse", "HEAD"]).unwrap();
+        assert_ne!(squash_sha, first_sha, "a squash merge is a new commit");
+        git(Some(&clone), &["push", "upstream", "squash:main"]).unwrap();
+        git(Some(&clone), &["checkout", "main"]).unwrap();
+
+        // Second PR from the same session: different work, different branch.
+        git(Some(&clone), &["reset", "--hard", "upstream/main"]).ok();
+        git(Some(&clone), &["fetch", "upstream"]).unwrap();
+        git(Some(&clone), &["reset", "--hard", "upstream/main"]).unwrap();
+        commit_file(&clone, "two.txt");
+        let second_sha = git(Some(&clone), &["rev-parse", "HEAD"]).unwrap();
+        let second = github_branch("s1", &second_sha);
+        assert_ne!(first, second);
+        push_pinned(&clone, &second_sha, &second).await.unwrap();
+        assert_eq!(
+            git(
+                Some(&remote),
+                &["rev-parse", &format!("refs/heads/{second}")]
+            )
+            .unwrap(),
+            second_sha
+        );
+        // The old shared name would have been rejected without a force.
+        assert!(
+            push_pinned(&clone, &second_sha, &first).await.is_err(),
+            "pushes are never forced"
+        );
+        // A retry of the same PR reuses its branch.
+        push_pinned(&clone, &second_sha, &second).await.unwrap();
     }
 }
