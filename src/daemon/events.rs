@@ -62,6 +62,7 @@ struct EventSignatures {
     session_background: String,
     session_artifacts: String,
     session_index: String,
+    session_issues: String,
 }
 
 pub(super) async fn stream_events(
@@ -443,6 +444,56 @@ async fn emit_topics_if_changed(
         .await
     {
         return false;
+    }
+    if topics.contains(UiEventTopics::SESSION_ISSUES)
+        && !emit_session_issues_if_changed(
+            state,
+            sender,
+            session_filter,
+            &mut signatures.session_issues,
+        )
+        .await
+    {
+        return false;
+    }
+    true
+}
+
+/// The issues the filtered session's tasks link, as their store reports
+/// them now: a rename, close or reopen reaches the sidebar through this.
+async fn emit_session_issues_if_changed(
+    state: &Arc<DaemonState>,
+    sender: &skyzen::responder::sse::Sender,
+    session_filter: Option<&str>,
+    last_sig: &mut String,
+) -> bool {
+    let Some(session_id) = session_filter else {
+        return true;
+    };
+    let paths = match super::helpers::load_session_paths(state, session_id).await {
+        Ok(paths) => paths,
+        Err(error) => {
+            tracing::debug!(session_id, %error, "no session paths for linked issues");
+            return true;
+        }
+    };
+    let issues = match super::sessions::linked_issue_briefs(state, session_id, &paths).await {
+        Ok(issues) => issues,
+        Err(error) => {
+            tracing::warn!(session_id, %error, "failed to look up linked issues");
+            return true;
+        }
+    };
+    let frame = crate::client::SessionIssuesFrame {
+        session_id: session_id.to_string(),
+        issues,
+    };
+    let sig = serde_json::to_string(&frame).expect("issues frame serializes");
+    if sig != *last_sig {
+        if !send_event(sender, "session_issues", &frame).await {
+            return false;
+        }
+        *last_sig = sig;
     }
     true
 }
