@@ -181,10 +181,13 @@ mod tests {
                 .expect("git init")
                 .success()
         );
-        let session = tempfile::tempdir().expect("tempdir");
+        // The workspace file lives in the profile, two levels above a session.
+        let profile = tempfile::tempdir().expect("tempdir");
+        let session_root = profile.path().join("sessions").join("s1");
+        std::fs::create_dir_all(&session_root).expect("session dir");
         let context = RepoContext {
             cwd: repo.path().to_path_buf(),
-            session_root: session.path().to_path_buf(),
+            session_root,
             workspace_config: WorkspaceConfig::default(),
         };
         let config_path = config_path(&context);
@@ -193,9 +196,11 @@ mod tests {
             set: Some(level.to_string()),
         };
 
-        tool.call(set("local-branch"), ToolContext::new())
+        let first = tool
+            .call(set("local-branch"), ToolContext::new())
             .await
             .expect("first set");
+        assert_eq!(first.as_text(), Some("trust set: local-branch"));
         let mut newer = WorkspaceConfig::load(&config_path).expect("load");
         newer.projects[0].checks = Some("cargo test".to_string());
         newer.save(&config_path).expect("save");
