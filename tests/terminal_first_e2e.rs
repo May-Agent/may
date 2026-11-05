@@ -66,6 +66,11 @@ enum MockChatScenario {
     /// Answers every agent turn with the same text, so one session can run
     /// several turns against one mock server.
     TextEveryTurn(String),
+    /// Answers agent request `n` with a text reply whose usage reports
+    /// `cached[n]` prompt tokens read from cache (the last entry repeats).
+    CachedTextEveryTurn {
+        cached: Vec<u32>,
+    },
     /// Answers every agent turn with `chunks`, each streamed `delay` after
     /// the one before.
     SlowTextEveryTurn {
@@ -505,6 +510,28 @@ impl MockScenarioState {
                     Duration::from_millis(10),
                 )),
             },
+            MockChatScenario::CachedTextEveryTurn { cached } => {
+                let read = cached
+                    .get(self.request_index)
+                    .or_else(|| cached.last())
+                    .copied()
+                    .unwrap_or_default();
+                let usage = serde_json::json!({
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": read + 1_000,
+                        "completion_tokens": 5,
+                        "total_tokens": read + 1_005,
+                        "prompt_tokens_details": { "cached_tokens": read }
+                    }
+                });
+                let mut frames = text_stream_frames(vec!["cached".to_string()], Duration::ZERO);
+                frames.insert(
+                    frames.len() - 1,
+                    delayed_sse_frame(format!("data: {usage}\n\n"), Duration::ZERO),
+                );
+                MockHttpResponse::sse(frames)
+            }
             MockChatScenario::SlowTextEveryTurn { chunks, delay } => {
                 verify_initial_tool_contract(request)?;
                 MockHttpResponse::sse(text_stream_frames(chunks.clone(), *delay))
@@ -4089,6 +4116,96 @@ async fn terminal_and_terminal_input_round_trip(environment: ChatEnvironment) {
         terminal_output.lines().any(|line| line == expected_line),
         "terminal commands should start in {expected_workdir}; terminal output: {terminal_output:?}"
     );
+
+    server.stop().await;
+    environment.release(&harness, &session_id).await;
+}
+
+/// A turn sent after the provider's cache lifetime that reads nothing of
+/// what the previous turn cached is recorded as one expired-cache miss, and
+/// `/usage` reports it; the warm turns before it record none.
+#[tokio::test]
+#[serial]
+async fn an_expired_prompt_cache_is_recorded_and_reported_by_usage() {
+    const LIFETIME: Duration = Duration::from_secs(2);
+    let mock = MockOpenAiServer::spawn(MockChatScenario::CachedTextEveryTurn {
+        cached: vec![0, 3_000, 0],
+    })
+    .await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    let config_path = harness.may_dir.join("config.toml");
+    let mut config = MayConfig::load_from(&config_path)
+        .await
+        .expect("harness config should load");
+    config
+        .set_provider_cache_lifetime(TEST_PROVIDER_ID, "2s")
+        .expect("the lifetime parses");
+    config
+        .save_to(&config_path)
+        .await
+        .expect("harness config should save");
+    let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
+    let client = reqwest::Client::new();
+    let environment = ChatEnvironment::Local
+        .prepare(&harness, &client, &server)
+        .await;
+    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+
+    for (turn, content) in ["First turn.", "Second turn.", "After the lifetime."]
+        .into_iter()
+        .enumerate()
+    {
+        if turn == 2 {
+            sleep(LIFETIME + Duration::from_millis(500)).await;
+        }
+        let response = send_turn(
+            &client,
+            &server.base_url,
+            &serde_json::json!({ "sessionId": session_id, "content": content }),
+        )
+        .await
+        .expect("chat stream request should succeed");
+        let response = expect_status(&server.log, response, StatusCode::OK).await;
+        let events = tokio::time::timeout(Duration::from_secs(60), collect_sse_events(response))
+            .await
+            .expect("chat stream should finish before timeout");
+        assert!(
+            events.iter().any(|(kind, _)| kind == "done"),
+            "{content:?} should complete; events: {events:?}; server logs:\n{}",
+            server.log.contents().await
+        );
+        wait_for_runtime_condition(
+            &client,
+            &server,
+            &session_id,
+            Duration::from_secs(10),
+            "session runtime to settle after the turn",
+            runtime_is_idle,
+        )
+        .await;
+    }
+
+    let response = client
+        .get(format!(
+            "{}/api/sessions/{session_id}/usage",
+            server.base_url
+        ))
+        .send()
+        .await
+        .expect("usage request should succeed");
+    let usage: Value = expect_status(&server.log, response, StatusCode::OK)
+        .await
+        .json()
+        .await
+        .expect("usage should be JSON");
+    assert_eq!(
+        usage["cacheMissCauses"],
+        serde_json::json!([{ "cause": "expired", "misses": 1, "missedTokens": 3_000 }]),
+        "usage: {usage}; server logs:\n{}",
+        server.log.contents().await
+    );
+    assert_eq!(usage["recentCacheMisses"][0]["cause"], "expired");
+    assert_eq!(usage["models"][0]["cacheMisses"], 1);
 
     server.stop().await;
     environment.release(&harness, &session_id).await;

@@ -1746,6 +1746,9 @@ fn run_agent_loop<'a>(
                 started_at,
                 reasoning_display,
                 reasoning_phase: reasoning_display.then_some(started_at),
+                provider_id: &provider_id,
+                model: &current_model,
+                request_prefix: None,
                 usage: Usage::default(),
                 ledger: request_ledger::RequestLedger::new(
                     session_id.as_str(),
