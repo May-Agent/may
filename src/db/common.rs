@@ -46,6 +46,12 @@ pub enum ChatDbError {
         /// Number of items already pinned.
         current: i64,
     },
+    /// A PR in a terminal state (`merged` or `closed`) cannot be closed.
+    #[error("PR is already {state}")]
+    PrTerminal {
+        /// The terminal state the PR is in.
+        state: String,
+    },
 }
 
 impl From<SkyDbError> for ChatDbError {

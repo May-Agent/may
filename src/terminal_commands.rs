@@ -223,6 +223,7 @@ where
         cwd: config.cwd.clone(),
         workspace_config: config.workspace_config.clone(),
         screen: Some(screen),
+        github_api: crate::pr::PrContext::default_github_api(),
     };
     let mut pr_tool = PrTool::new(pr_context.clone());
     if let Some(guard) = &config.languages {
