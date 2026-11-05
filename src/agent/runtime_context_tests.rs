@@ -416,12 +416,11 @@ fn the_environment_names_paths_relative_to_the_session_and_the_real_home() {
     );
     assert!(environment.contains("\n- tmp/: "), "{environment}");
     assert!(!environment.contains("- /tmp"), "{environment}");
-    if let Some(home) = dirs::home_dir() {
-        assert!(
-            environment.contains(&format!("the user's home is {}", home.display())),
-            "{environment}"
-        );
-    }
+    let home = crate::config::MayConfig::home_dir().expect("home should resolve");
+    assert!(
+        environment.contains(&format!("the user's home is {}", home.display())),
+        "{environment}"
+    );
     let terminal = super::build_terminal(&AgentEnvironment::Local, &paths);
     assert!(
         terminal.contains(&format!("means {}/outputs/", dir.path().display())),
