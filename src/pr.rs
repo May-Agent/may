@@ -105,7 +105,7 @@ struct Resolved {
 /// May-backend `pr` engine for one session.
 pub struct PrStore {
     context: PrContext,
-    repos: SessionRepos,
+    repos: Option<SessionRepos>,
 }
 
 impl std::fmt::Debug for PrStore {
@@ -118,8 +118,17 @@ impl PrStore {
     /// Build the engine for one session.
     #[must_use]
     pub fn new(context: PrContext) -> Self {
-        let repos = SessionRepos::new(&context.session_root, context.session_id.clone());
+        let repos = context
+            .db
+            .clone()
+            .map(|db| SessionRepos::new(&context.session_root, context.session_id.clone(), db));
         Self { context, repos }
+    }
+
+    fn repos(&self) -> Result<&SessionRepos, PrError> {
+        self.repos
+            .as_ref()
+            .ok_or_else(|| PrError::Resolve("pr requires the history database".to_string()))
     }
 
     fn db(&self) -> Result<&ChatDb, PrError> {
@@ -132,14 +141,15 @@ impl PrStore {
     /// Which repo does `pr` mean: `--repo` wins, then the session's only
     /// clone, then the cwd's repository (cloned on demand).
     async fn resolve(&self, repo: Option<&str>) -> Result<Resolved, PrError> {
-        let clones = self.repos.clones()?;
+        let repos = self.repos()?;
+        let clones = repos.clones().await?;
         if let Some(name) = repo {
             if let Some(record) = clones
                 .into_iter()
-                .find(|c| c.repo_key == name || c.dir == name)
+                .find(|c| c.repo_key == name || c.dir.as_str() == name)
             {
                 return Ok(Resolved {
-                    dir: self.repos.root().join(&record.dir),
+                    dir: repos.path(&record.dir),
                     record,
                 });
             }
@@ -147,7 +157,7 @@ impl PrStore {
         }
         if let [record] = clones.as_slice() {
             return Ok(Resolved {
-                dir: self.repos.root().join(&record.dir),
+                dir: repos.path(&record.dir),
                 record: record.clone(),
             });
         }
@@ -176,12 +186,12 @@ impl PrStore {
                     "pr.backend is github but origin is not GitHub: {url}"
                 )));
             };
-            let dir = self.repos.ensure_remote_clone(&url, &owner_repo).await?;
-            let record = self
-                .repos
-                .clones()?
+            let dir = repos.ensure_remote_clone(&url, &owner_repo).await?;
+            let record = repos
+                .clones()
+                .await?
                 .into_iter()
-                .find(|c| self.repos.root().join(&c.dir) == dir)
+                .find(|c| repos.path(&c.dir) == dir)
                 .ok_or_else(|| PrError::Resolve("clone registry lost the new clone".to_string()))?;
             return Ok(Resolved { record, dir });
         }
@@ -202,12 +212,12 @@ impl PrStore {
             }
             Some(_) => {}
         }
-        let dir = self.repos.ensure_local_clone(&worktree, &repo_key).await?;
-        let record = self
-            .repos
-            .clones()?
+        let dir = repos.ensure_local_clone(&worktree, &repo_key).await?;
+        let record = repos
+            .clones()
+            .await?
             .into_iter()
-            .find(|c| self.repos.root().join(&c.dir) == dir)
+            .find(|c| repos.path(&c.dir) == dir)
             .ok_or_else(|| PrError::Resolve("clone registry lost the new clone".to_string()))?;
         Ok(Resolved { record, dir })
     }
@@ -373,7 +383,7 @@ impl PrStore {
                     )
                     .await?;
                 self.event(&pr, "merged", Some(&merge_sha)).await;
-                self.repos.delete_clone(&resolved.dir).await?;
+                self.repos()?.delete_clone(&resolved.record.dir).await?;
                 Ok(format!("merged PR #{number} as {merge_sha}"))
             }
             Err(reason) => {
@@ -442,7 +452,7 @@ impl PrStore {
             let resolved = self.resolve(Some(name)).await?;
             Some(resolved.record.repo_key)
         } else {
-            let clones = self.repos.clones()?;
+            let clones = self.repos()?.clones().await?;
             if clones.len() == 1 {
                 Some(clones[0].repo_key.clone())
             } else {
@@ -711,7 +721,7 @@ impl PrStore {
                     .await?;
                 self.event(pr, "merged", Some(head_sha)).await;
                 self.pull_sync(&owner_repo).await;
-                self.repos.delete_clone(&resolved.dir).await?;
+                self.repos()?.delete_clone(&resolved.record.dir).await?;
                 Ok(format!("merged PR #{} upstream", pr.number))
             }
             Ok(other) => {
