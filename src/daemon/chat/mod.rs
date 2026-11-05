@@ -4947,9 +4947,7 @@ mod tests {
         let config_path =
             crate::session::MayHomePaths::new(may_dir.path().to_path_buf()).workspace_config();
         let set_level = |level| {
-            let current = crate::workspace::WorkspaceConfig::load(&config_path).expect("load");
-            crate::trust::persist(&current, &config_path, &checkout, None, level)
-                .expect("persist trust");
+            crate::trust::persist(&config_path, &checkout, None, level).expect("persist trust");
         };
         let writable_checkout = |agent: &crate::agent::MayAgent| {
             agent
