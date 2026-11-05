@@ -49,7 +49,9 @@
 use async_fs;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::cache_lifetime::CacheLifetime;
 use crate::model_selector::ModelSelector;
@@ -1217,6 +1219,12 @@ pub struct MayConfig {
     /// Context compaction thresholds.
     #[serde(default)]
     pub context: ContextConfig,
+    /// The user's timezone.
+    #[serde(default)]
+    pub time: TimeConfig,
+    /// When host memory pressure and machine load count as high.
+    #[serde(default)]
+    pub host_load: HostLoadSettings,
     /// Last model selected via /model command (used as default for new sessions).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_model: Option<ModelSelector>,
@@ -1369,6 +1377,168 @@ impl ContextConfig {
     }
 }
 
+/// `[time]` section: the timezone the agent talks to the user in.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct TimeConfig {
+    /// IANA name of the user's timezone (`"Asia/Shanghai"`); unset follows
+    /// the host's system timezone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<TimeZoneName>,
+}
+
+impl TimeConfig {
+    /// The user's timezone: the configured one, else the host's.
+    #[must_use]
+    pub fn user_timezone(&self) -> TimeZoneName {
+        self.timezone.clone().unwrap_or_else(TimeZoneName::system)
+    }
+}
+
+/// The name of a timezone the agent states to the model: an IANA name, or a
+/// UTC offset for a host whose system timezone has none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct TimeZoneName(String);
+
+/// A configured timezone that is not in the timezone database.
+#[derive(Debug, thiserror::Error)]
+#[error("unknown timezone '{name}': expected an IANA name such as 'Asia/Shanghai'")]
+pub struct TimeZoneNameError {
+    name: String,
+}
+
+impl TimeZoneName {
+    /// The host's system timezone.
+    #[must_use]
+    pub fn system() -> Self {
+        let zone = jiff::tz::TimeZone::system();
+        Self(zone.iana_name().map_or_else(
+            || format!("UTC{}", zone.to_offset(jiff::Timestamp::now())),
+            str::to_string,
+        ))
+    }
+
+    /// The name as written.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::str::FromStr for TimeZoneName {
+    type Err = TimeZoneNameError;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        let name = name.trim();
+        jiff::tz::TimeZone::get(name)
+            .map(|_| Self(name.to_string()))
+            .map_err(|_| TimeZoneNameError {
+                name: name.to_string(),
+            })
+    }
+}
+
+impl<'de> Deserialize<'de> for TimeZoneName {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        name.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+impl fmt::Display for TimeZoneName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Memory pressure at which the host counts as pressed.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryPressureThreshold {
+    /// The host is reclaiming memory (`kern.memorystatus_vm_pressure_level`
+    /// warn on macOS).
+    #[default]
+    Warning,
+    /// The host is thrashing.
+    Critical,
+}
+
+/// `[host_load]` section: when the session agent is told the host is under
+/// memory pressure or high load, and how long the terminal's foreground
+/// window grows meanwhile. Durations are written as `"30s"`, `"1m"`.
+///
+/// A change reaches a running session at its next turn.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct HostLoadSettings {
+    /// Memory pressure at or above which the host counts as pressed.
+    pub memory_threshold: MemoryPressureThreshold,
+    /// Machine load at or above which the host counts as loaded: on macOS
+    /// the load average per core, on Linux the share of the last ten
+    /// seconds runnable tasks waited for a CPU.
+    pub load_threshold: f64,
+    /// How long a condition must hold before the agent is told it started.
+    #[serde(with = "duration_text")]
+    pub start_after: Duration,
+    /// How long a condition must be gone before the agent is told it ended.
+    #[serde(with = "duration_text")]
+    pub end_after: Duration,
+    /// How often the host is read.
+    #[serde(with = "duration_text")]
+    pub poll_interval: Duration,
+    /// The terminal's foreground window while high load lasts.
+    #[serde(with = "duration_text")]
+    pub high_load_foreground_wait: Duration,
+}
+
+impl Default for HostLoadSettings {
+    fn default() -> Self {
+        let defaults = aither_agent::HostLoadConfig::new();
+        Self {
+            memory_threshold: MemoryPressureThreshold::Warning,
+            load_threshold: defaults.load_threshold.0,
+            start_after: defaults.start_after,
+            end_after: defaults.end_after,
+            poll_interval: defaults.poll_interval,
+            high_load_foreground_wait: defaults.high_load_foreground_wait,
+        }
+    }
+}
+
+impl HostLoadSettings {
+    /// The aither monitor configuration these settings describe.
+    #[must_use]
+    pub const fn monitor_config(&self) -> aither_agent::HostLoadConfig {
+        aither_agent::HostLoadConfig::new()
+            .memory_threshold(match self.memory_threshold {
+                MemoryPressureThreshold::Warning => aither_agent::MemoryPressure::Warning,
+                MemoryPressureThreshold::Critical => aither_agent::MemoryPressure::Critical,
+            })
+            .load_threshold(aither_agent::MachineLoad(self.load_threshold))
+            .start_after(self.start_after)
+            .end_after(self.end_after)
+            .poll_interval(self.poll_interval)
+            .high_load_foreground_wait(self.high_load_foreground_wait)
+    }
+}
+
+/// Serde for a [`Duration`] written as human text (`"30s"`, `"2m"`).
+mod duration_text {
+    use std::time::Duration;
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &Duration, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(&humantime::format_duration(*value))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Duration, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        humantime::parse_duration(text.trim()).map_err(serde::de::Error::custom)
+    }
+}
+
 /// Where the May daemon listens besides its unix socket.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct DaemonConfig {
@@ -1404,6 +1574,8 @@ impl Default for MayConfig {
             recap: RecapConfig::default(),
             language: LanguageConfig::default(),
             context: ContextConfig::default(),
+            time: TimeConfig::default(),
+            host_load: HostLoadSettings::default(),
             last_model: None,
             last_effort: None,
             ssh_servers: Vec::new(),

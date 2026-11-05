@@ -29,6 +29,10 @@ const OPEN_QUESTIONS_TAG: &str = "open_questions";
 enum AskUserToolError {
     #[error("ask_user needs a question")]
     NoQuestion,
+    #[error(
+        "the question is given both as the positional argument and as --question; give it once"
+    )]
+    QuestionTwice,
     #[error("a secret needs both a name and a scope (global or session)")]
     IncompleteSecret,
     #[error("the secret question {question:?} is refused: {source}")]
@@ -129,6 +133,11 @@ pub struct AskUserArgs {
     /// The question to ask (for single-question mode).
     #[serde(default)]
     pub question: Option<String>,
+    /// The question given as the positional argument
+    /// (`ask_user "Which database?" --option PostgreSQL`). The command line
+    /// binds free positional words to the field named `command`.
+    #[serde(default, rename = "command")]
+    pub positional_question: Option<String>,
     /// Option to choose from (use --option flag for each, repeatable).
     #[serde(default, alias = "options", alias = "choices")]
     pub option: Vec<String>,
@@ -158,7 +167,11 @@ impl AskUserArgs {
                 (None, None) => None,
                 _ => return Err(AskUserToolError::IncompleteSecret),
             };
-            self.question
+            let question = match (self.question, self.positional_question) {
+                (Some(_), Some(_)) => return Err(AskUserToolError::QuestionTwice),
+                (question, None) | (None, question) => question,
+            };
+            question
                 .map(|question| AskedQuestion {
                     section: String::new(),
                     question,
@@ -417,11 +430,10 @@ mod tests {
 
     use super::{ASK_USER_DESCRIPTION, AskUserTool};
 
-    /// Every `ask_user ...` line of the description is a call the command
-    /// line accepts, parsed against the command's real argument schema.
-    #[tokio::test]
-    async fn every_example_in_the_description_is_accepted() {
-        let dir = tempfile::tempdir().expect("tempdir");
+    /// The `ask_user` command on a fresh session's database, and that database.
+    async fn ask_user_registry(
+        dir: &tempfile::TempDir,
+    ) -> (aither_sandbox::ToolRegistry, crate::db::ChatDb) {
         let db = crate::db::ChatDb::open(&dir.path().join("history.db"))
             .await
             .expect("chat db opens");
@@ -429,12 +441,48 @@ mod tests {
             .await
             .expect("session is created");
         let runtime = Arc::new(crate::session::SessionRuntimeService::new(
-            db,
+            db.clone(),
             crate::ui_event_bus::UiEventBus::new(),
         ));
         let mut builder = ToolRegistryBuilder::new();
         builder.configure_tool(AskUserTool::new(runtime, "session"));
-        let registry = builder.build(dir.path().join("outputs"));
+        (builder.build(dir.path().join("outputs")), db)
+    }
+
+    /// The single-question form takes the question as its positional
+    /// argument, and the call opens that question with its options.
+    #[tokio::test]
+    async fn the_positional_question_opens_a_question() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (registry, db) = ask_user_registry(&dir).await;
+        let words = shell_words::split(r#""Which database?" --option PostgreSQL --option SQLite"#)
+            .expect("shell syntax");
+        let reply = registry.query_tool_handler("ask_user", &words).await;
+        assert!(reply.ok, "{reply:?}");
+
+        let open = db
+            .open_ask_user_questions("session")
+            .await
+            .expect("open questions load");
+        assert_eq!(open.len(), 1, "{open:?}");
+        let [question] = open[0].questions.as_slice() else {
+            panic!("one question: {open:?}");
+        };
+        assert_eq!(question.question, "Which database?");
+        assert_eq!(question.option, ["PostgreSQL", "SQLite"]);
+
+        let twice = shell_words::split(r#""Which database?" --question "Which DB?""#)
+            .expect("shell syntax");
+        let reply = registry.query_tool_handler("ask_user", &twice).await;
+        assert!(!reply.ok, "a question given twice is refused: {reply:?}");
+    }
+
+    /// Every `ask_user ...` line of the description is a call the command
+    /// line accepts, parsed against the command's real argument schema.
+    #[tokio::test]
+    async fn every_example_in_the_description_is_accepted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (registry, _db) = ask_user_registry(&dir).await;
 
         let examples: Vec<&str> = ASK_USER_DESCRIPTION
             .lines()
