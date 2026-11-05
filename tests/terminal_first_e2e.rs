@@ -1166,6 +1166,9 @@ fn sse_response(
 
 struct TestHarness {
     home: TempDir,
+    /// `home`'s real path: May resolves its home, so every path it reports
+    /// is spelled this way (`/var` is a link to `/private/var` on macOS).
+    home_path: PathBuf,
     may_dir: PathBuf,
 }
 
@@ -1197,7 +1200,8 @@ impl TestHarness {
         context: ContextConfig,
     ) -> Self {
         let home = tempfile::tempdir().expect("test home tempdir should be created");
-        let may_dir = home.path().join(".may");
+        let home_path = dunce::canonicalize(home.path()).expect("test home should resolve");
+        let may_dir = home_path.join(".may");
         tokio::fs::create_dir_all(&may_dir)
             .await
             .expect("test may dir should be created");
@@ -1234,11 +1238,15 @@ impl TestHarness {
         seed_container_heel(&may_dir).await;
         futures_lite::future::zip(
             share_and_warm_tool_cache(&may_dir),
-            warm_may_binary(home.path()),
+            warm_may_binary(&home_path),
         )
         .await;
 
-        Self { home, may_dir }
+        Self {
+            home,
+            home_path,
+            may_dir,
+        }
     }
 
     /// Tracing output a spawned server emitted, with ANSI styling stripped so
@@ -1290,7 +1298,7 @@ impl TestHarness {
     }
 
     fn home_path(&self) -> &Path {
-        self.home.path()
+        &self.home_path
     }
 
     /// The managed container heel's release state, as stored.
