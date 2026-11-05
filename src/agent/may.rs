@@ -510,8 +510,9 @@ impl MayAgent {
                 None => {}
             }
         }
-        runtime_system_context =
-            runtime_system_context.with_repo_clones(build_repo_clones_context(&repo_clones));
+        runtime_system_context = runtime_system_context.with_repo_clones(
+            build_repo_clones_context(&repo_clones, &config.environment, &session_paths),
+        );
 
         // Project rules: the launch directory's AGENTS.md is loaded into
         // the stable prefix and nested AGENTS.md files are listed, so
