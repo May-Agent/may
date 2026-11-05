@@ -149,6 +149,11 @@ where
     let flagship_llm = config.ask_flagship.unwrap_or_else(|| config.llm.clone());
     let balanced_llm = config.ask_balanced.unwrap_or_else(|| config.llm.clone());
     let fast_llm = config.ask_fast.unwrap_or_else(|| config.llm.clone());
+    // The main agent is declared on the advanced tier (the terminal agent
+    // builder has no setter for it) and a fork must resolve to the model the
+    // main agent runs on, so the advanced slot of `subagent` is the session's
+    // own model.
+    let subagent_flagship = config.llm.clone();
     let screen_llm = fast_llm.clone();
     let ask_command = AskCommand::new(fast_llm.clone())
         .with_flagship(flagship_llm.clone())
@@ -319,7 +324,7 @@ where
     // A subagent runs on the model of its definition's tier: the models `ask`
     // offers.
     let mut subagent_tool = SubagentTool::new(
-        UsageObservedModel::new(flagship_llm),
+        UsageObservedModel::new(subagent_flagship),
         Bundle::subagents_dir(&config.may_dir),
     )
     .with_balanced_model(UsageObservedModel::new(balanced_llm))
