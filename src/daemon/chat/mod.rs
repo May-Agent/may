@@ -4842,6 +4842,13 @@ mod tests {
     /// once the release happens.
     #[tokio::test]
     async fn a_job_finishing_before_the_release_resumes_the_session_after_it() {
+        // The test's two waits on the command's side. A command's `timeout`
+        // runs from its start, so it spans the turn and then the wait for
+        // `done`; the command is bounded by their sum and outlives the test
+        // however slow the runner is, because a test that waits longer has
+        // already failed.
+        const TURN_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+        const DONE_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
         let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
         let may_dir = tempfile::tempdir().expect("may dir");
         // The session's `files/` is what the sandboxed command can write and
@@ -4858,7 +4865,7 @@ mod tests {
             ),
             "description": "finishes after the turn ends",
             "background": true,
-            "timeout": 30
+            "timeout": (TURN_WAIT + DONE_WAIT).as_secs()
         })
         .to_string();
         let provider_a = stub_provider(vec![
@@ -4886,16 +4893,20 @@ mod tests {
             .await
             .expect("acquire run");
         let mut sink = TestSink::default();
-        run_agent_loop(
-            &state,
-            &req,
-            &mut sink,
-            &guard,
-            true,
-            true,
-            &TurnKind::Prompt,
+        tokio::time::timeout(
+            TURN_WAIT,
+            run_agent_loop(
+                &state,
+                &req,
+                &mut sink,
+                &guard,
+                true,
+                true,
+                &TurnKind::Prompt,
+            ),
         )
         .await
+        .expect("the turn finishes within its wait")
         .expect("the turn completes");
         assert!(state.parked_agents.contains("session"));
 
@@ -4905,7 +4916,7 @@ mod tests {
         // records completions, and that wait starts only after the release.
         // The command reports through a file instead.
         std::fs::write(&gate, "").expect("open the gate");
-        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        tokio::time::timeout(DONE_WAIT, async {
             while !done.exists() {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
