@@ -3,48 +3,48 @@
   "host_programs": [
     {
       "tool": "repo_search",
-      "version": "0.0.10",
+      "version": "0.0.12",
       "target": {
         "os": "macos",
         "arch": "aarch64"
       },
-      "url": "https://github.com/May-Agent/repo-search/releases/download/v0.0.10/repo-search-aarch64-apple-darwin.tar.xz",
-      "sha256": "a3c5a563a32c05f3a0b7ea864d4dcf47558642f7b18b51b7904c1b0f37f0a691",
+      "url": "https://github.com/May-Agent/repo-search/releases/download/v0.0.12/repo-search-aarch64-apple-darwin.tar.xz",
+      "sha256": "e86f7979c882131fc1e650c14d798784a32f376d5d992bf8d5f464857ac64e48",
       "encoding": {
         "format": "tar_xz",
         "executable": "repo-search-aarch64-apple-darwin/search"
       },
-      "executable_sha256": "8e0f208a3ac5bdb55444c26d79ea08ba9fd7fefede61a94f31e4b9559a1450d4"
+      "executable_sha256": "c4aed794ad9fc19a23b8c80ac767faf11b577a6afdb53d00b9bc1bb69613cfc4"
     },
     {
       "tool": "repo_search",
-      "version": "0.0.10",
+      "version": "0.0.12",
       "target": {
         "os": "linux",
         "arch": "aarch64"
       },
-      "url": "https://github.com/May-Agent/repo-search/releases/download/v0.0.10/repo-search-aarch64-unknown-linux-gnu.tar.xz",
-      "sha256": "409e7428b9aaed53549a1cf8319e236626de7fc9512dc54874ba6d83fc617186",
+      "url": "https://github.com/May-Agent/repo-search/releases/download/v0.0.12/repo-search-aarch64-unknown-linux-gnu.tar.xz",
+      "sha256": "47b2d9f28263cd0e7c7cf4fa5422bfccbd21b33cc61338d379682df6835c5e6b",
       "encoding": {
         "format": "tar_xz",
         "executable": "repo-search-aarch64-unknown-linux-gnu/search"
       },
-      "executable_sha256": "3ae42c145c6cafc53c8e988d5b27875855dec5e79cf36e535d0f66c9f62fcbfb"
+      "executable_sha256": "ad46d20332ddeb4eb69fc62ca3ef43b6f76a821c16cdb37c85f16d49cd6d5c27"
     },
     {
       "tool": "repo_search",
-      "version": "0.0.10",
+      "version": "0.0.12",
       "target": {
         "os": "linux",
         "arch": "x86_64"
       },
-      "url": "https://github.com/May-Agent/repo-search/releases/download/v0.0.10/repo-search-x86_64-unknown-linux-gnu.tar.xz",
-      "sha256": "cc80664072a8533d8aaa38734f424b6359354a5c29cf766ca4487a5e4bc50005",
+      "url": "https://github.com/May-Agent/repo-search/releases/download/v0.0.12/repo-search-x86_64-unknown-linux-gnu.tar.xz",
+      "sha256": "045b40cc581a341cda676520ceb986c76c43c9a05706938fd787102f4bd6073a",
       "encoding": {
         "format": "tar_xz",
         "executable": "repo-search-x86_64-unknown-linux-gnu/search"
       },
-      "executable_sha256": "32a0378fd10fde70cdb098a9ff0c98e537d9b6951936f2878cccc4e0d0c16df0"
+      "executable_sha256": "031f400d85a1f2f34c242a92f8e388e1e55fecb4aebb93070b3cc05799642e00"
     }
   ]
 }
