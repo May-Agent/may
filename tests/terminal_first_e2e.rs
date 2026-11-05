@@ -4414,17 +4414,9 @@ async fn ask_user_answered_mid_run_reaches_the_next_request_of_that_run() {
     server.stop().await;
 }
 
-#[tokio::test]
-#[serial]
-async fn oneshot_run_starts_the_daemon_and_streams_its_turn() {
-    // The reply pauses longer than a model's typical think after its first
-    // text; the run still ends only when the turn does.
-    let mock = MockOpenAiServer::spawn(MockChatScenario::SlowTextEveryTurn {
-        chunks: vec!["hello from ".into(), "the daemon".into()],
-        delay: Duration::from_secs(3),
-    })
-    .await;
-    let harness = TestHarness::new(&mock.base_url()).await;
+/// Gives the harness home a daemon port of its own and a local default
+/// profile, so a one-shot run starts a daemon that meets no other.
+async fn prepare_oneshot_home(harness: &TestHarness) {
     // A port of its own, so the daemon this run starts never meets another.
     let port = std::net::TcpListener::bind("127.0.0.1:0")
         .and_then(|listener| listener.local_addr())
@@ -4472,6 +4464,86 @@ async fn oneshot_run_starts_the_daemon_and_streams_its_turn() {
     .await
     .expect("default profile should switch to local");
     drop(db);
+}
+
+/// A one-shot run whose turn ends on a detached command stays attached,
+/// streams the turn that command's result starts, and exits only after it.
+#[tokio::test]
+#[serial]
+async fn oneshot_run_follows_the_turn_a_background_command_resumes() {
+    let mock =
+        MockOpenAiServer::spawn(MockChatScenario::StartsBackgroundJob(FINISHING_JOB_SCRIPT)).await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    prepare_oneshot_home(&harness).await;
+
+    let binary = may_binary_path();
+    let output = Command::new(&binary)
+        .arg("start the job")
+        .env("HOME", harness.home_path())
+        .env("HEEL_BIN", heel_bin())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("may one-shot should spawn")
+        .wait_with_output()
+        .await
+        .expect("may one-shot should run");
+    let daemon_log = tokio::fs::read_to_string(harness.home_path().join(".may/logs/daemon.log"))
+        .await
+        .unwrap_or_default();
+    // The daemon outlives the run so that the check above reads its log
+    // before anything stops it.
+    let stop = Command::new(&binary)
+        .args(["daemon", "stop"])
+        .env("HOME", harness.home_path())
+        .output()
+        .await
+        .expect("may daemon stop should run");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "one-shot run failed: {stderr}\ndaemon log:\n{daemon_log}"
+    );
+    // The mock answers the first turn and the resumed one with the same
+    // text, so a run that left before the resume carries it once.
+    assert_eq!(
+        stdout.matches("started").count(),
+        2,
+        "stdout should carry the first turn's text and the resumed turn's; stdout: {stdout}; stderr: {stderr}\ndaemon log:\n{daemon_log}"
+    );
+    let requests = mock.agent_requests().await;
+    assert!(
+        requests
+            .last()
+            .is_some_and(|request| request.to_string().contains(FINISHING_JOB_MARKER)),
+        "the resumed turn should have seen the job's output before the run exited"
+    );
+    assert!(
+        !daemon_log.contains("received session stop request"),
+        "nothing should stop the session before the run exits:\n{daemon_log}"
+    );
+    assert!(
+        String::from_utf8_lossy(&stop.stderr).contains("Stopped"),
+        "the run should leave its daemon running: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn oneshot_run_starts_the_daemon_and_streams_its_turn() {
+    // The reply pauses longer than a model's typical think after its first
+    // text; the run still ends only when the turn does.
+    let mock = MockOpenAiServer::spawn(MockChatScenario::SlowTextEveryTurn {
+        chunks: vec!["hello from ".into(), "the daemon".into()],
+        delay: Duration::from_secs(3),
+    })
+    .await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    prepare_oneshot_home(&harness).await;
 
     let binary = may_binary_path();
     let oneshot = Command::new(&binary)
