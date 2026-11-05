@@ -399,13 +399,20 @@ impl Session {
     }
 }
 
-/// Runs one user turn to completion.
+/// Runs one user turn to completion on top of history above the policy's
+/// compaction floor, so the turn starts a compaction.
 pub async fn run_turn(agent: &mut MayAgent) {
     // A context under the policy's compaction floor is left alone, so the
     // turn runs on top of history above it.
     agent.push_message(aither_core::llm::Message::assistant(
         "x".repeat(4 * aither_agent::ContextPolicy::default().compaction_floor),
     ));
+    run_short_turn(agent).await;
+}
+
+/// Runs one user turn to completion on the history as it is: a short session
+/// stays under the compaction floor, so nothing it was told is compacted away.
+pub async fn run_short_turn(agent: &mut MayAgent) {
     let _ = agent
         .run("Say hello.", [])
         .drive((), std::future::pending::<()>(), |(), _| async {
