@@ -180,6 +180,22 @@ impl IssueArgs {
             Self::View { .. } | Self::List { .. } | Self::Search { .. }
         )
     }
+
+    /// The prose the subcommand publishes to the issue backend.
+    fn published_texts(&self) -> Vec<&str> {
+        match self {
+            Self::Create { title, body, .. } => std::iter::once(title.as_str())
+                .chain(body.as_deref())
+                .collect(),
+            Self::Edit { title, body, .. } => title
+                .as_deref()
+                .into_iter()
+                .chain(body.as_deref())
+                .collect(),
+            Self::Comment { body, .. } => vec![body.as_str()],
+            _ => Vec::new(),
+        }
+    }
 }
 
 /// Refusal of a write subcommand to a subagent.
@@ -228,6 +244,7 @@ impl std::fmt::Debug for IssueChangeNotifier {
 pub struct IssueTool<S> {
     store: S,
     search: Option<SessionIssueSearch>,
+    languages: Option<aither_agent::LanguageGuard>,
     changes: Option<IssueChangeNotifier>,
 }
 
@@ -290,8 +307,16 @@ impl<S: IssueStore> IssueTool<S> {
         Self {
             store,
             search: None,
+            languages: None,
             changes: None,
         }
+    }
+
+    /// Refuse issue text outside the working language `guard` enforces.
+    #[must_use]
+    pub fn with_languages(mut self, guard: aither_agent::LanguageGuard) -> Self {
+        self.languages = Some(guard);
+        self
     }
 
     /// Announce every successful write through `changes`.
@@ -322,6 +347,11 @@ impl<S: IssueStore + Clone + 'static> Tool for IssueTool<S> {
         arguments: Self::Arguments,
         _cx: aither_core::llm::ToolContext,
     ) -> aither_core::Result<Self::Res> {
+        if let Some(guard) = &self.languages {
+            for text in arguments.published_texts() {
+                guard.check_working(text, aither_agent::WorkingText::Public)?;
+            }
+        }
         let writes = arguments.writes();
         let result = execute(&self.store, self.search.as_ref(), arguments).await;
         // A relation edit can fail after its first half applied, so a failed
