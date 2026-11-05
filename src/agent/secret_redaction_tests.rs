@@ -26,7 +26,7 @@ use serde_json::Value;
 use tokio::net::TcpListener;
 
 use super::hooks::SecretRedactionHook;
-use super::provider::{ProviderLlm, RedactedModel, RequestParameterizedModel};
+use super::provider::{ProviderLlm, RedactedModel};
 use crate::secrets::SecretRedactor;
 
 const MODEL: &str = "test-model";
@@ -142,20 +142,17 @@ fn reply(content_type: &'static str, body: String) -> Response<Full<Bytes>> {
     response
 }
 
-fn model(base_url: &str, redactor: SecretRedactor) -> RequestParameterizedModel<ProviderLlm> {
-    RequestParameterizedModel::new(
-        RedactedModel::new(
-            aither_cloud::CloudProvider::OpenAI(
-                aither_cloud::openai::OpenAI::builder("test-key")
-                    .base_url(base_url)
-                    .model(MODEL)
-                    .no_retry()
-                    .build()
-                    .with_chat_completions_api(),
-            ),
-            redactor,
+fn model(base_url: &str, redactor: SecretRedactor) -> ProviderLlm {
+    RedactedModel::new(
+        aither_cloud::CloudProvider::OpenAI(
+            aither_cloud::openai::OpenAI::builder("test-key")
+                .base_url(base_url)
+                .model(MODEL)
+                .no_retry()
+                .build()
+                .with_chat_completions_api(),
         ),
-        aither_core::llm::model::Parameters::default(),
+        redactor,
     )
 }
 
