@@ -11,6 +11,7 @@
 
 pub mod github;
 pub mod may;
+pub mod owner;
 pub mod provenance;
 pub mod search;
 
@@ -205,6 +206,9 @@ pub enum IssueError {
     /// The search index could not be reached or refreshed.
     #[error("issue search is unavailable: {0}")]
     Search(String),
+    /// Issue ownership could not be decided.
+    #[error("issue ownership is unavailable: {0}")]
+    Ownership(String),
     /// The operation is reserved for the main agent; the text is rendered from
     /// the refusal template.
     #[error("{0}")]

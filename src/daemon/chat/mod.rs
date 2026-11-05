@@ -1659,6 +1659,14 @@ fn run_agent_loop<'a>(
             let mut last_todo_hash: Option<u64> = None;
             let session_paths =
                 session_paths_for_session(state, profile_id.as_deref(), &session_id);
+            // The tasks.md content the issue ownership rule accepted last.
+            let mut tasks_accepted = match session_paths.tasks_content().await {
+                Ok(content) => content,
+                Err(error) => {
+                    tracing::warn!(%error, "failed to read session tasks.md");
+                    None
+                }
+            };
             let mut turn_persister = turn_persister::TurnPersister::new(guard.fence().clone());
 
             let mut terminal_error: Option<aither_agent::AgentError> = None;
@@ -2002,6 +2010,9 @@ fn run_agent_loop<'a>(
                                 break;
                             }
 
+                            // A tasks.md change that takes an issue another
+                            // agent owns is reverted before anyone reads it.
+                            enforce_issue_ownership(state, &session_id, &mut tasks_accepted).await;
                             // Check if tasks.md changed after tool execution.
                             if let Some(checklist) =
                                 check_tasks_update(&session_paths, &mut last_todo_hash).await
@@ -3757,6 +3768,33 @@ pub enum TurnKind {
 impl TurnKind {
     const fn is_resume(&self) -> bool {
         matches!(self, Self::Resume(_))
+    }
+}
+
+/// Hold the session's `tasks.md` to the one-owner-per-open-issue rule: a
+/// change that adds an issue another agent owns is reverted, and the session
+/// is told through a steer message.
+async fn enforce_issue_ownership(
+    state: &Arc<DaemonState>,
+    session_id: &SessionId,
+    accepted: &mut Option<String>,
+) {
+    use crate::issue::owner::{IssueOwners, OwnershipError};
+
+    let directory = agent_messaging(state).directory;
+    match IssueOwners::new(directory.clone())
+        .admit(session_id.as_str(), accepted)
+        .await
+    {
+        Ok(()) => {}
+        Err(OwnershipError::Owned(owned)) => {
+            if let Err(error) = directory.deliver(session_id.as_str(), owned.notice()).await {
+                tracing::warn!(%session_id, %error, "failed to tell the session its tasks.md change was reverted");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%session_id, %error, "issue ownership of tasks.md could not be checked");
+        }
     }
 }
 
