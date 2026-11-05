@@ -98,7 +98,6 @@ impl Tool for RepoTool {
                             |level| {
                                 let kind = trust::repo_kind(&worktree);
                                 match trust::persist(
-                                    &self.context.workspace_config,
                                     &config_path(&self.context),
                                     &worktree,
                                     Some(&kind),
@@ -162,5 +161,52 @@ impl Tool for SubagentRepoTool {
                 )
             }
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workspace::WorkspaceConfig;
+    use aither_core::llm::ToolContext;
+
+    #[tokio::test]
+    async fn trust_set_keeps_a_field_changed_after_the_agent_was_built() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q", "-b", "main"])
+                .current_dir(repo.path())
+                .status()
+                .expect("git init")
+                .success()
+        );
+        let session = tempfile::tempdir().expect("tempdir");
+        let context = RepoContext {
+            cwd: repo.path().to_path_buf(),
+            session_root: session.path().to_path_buf(),
+            workspace_config: WorkspaceConfig::default(),
+        };
+        let config_path = config_path(&context);
+        let tool = RepoTool::new(context);
+        let set = |level: &str| RepoArgs::Trust {
+            set: Some(level.to_string()),
+        };
+
+        tool.call(set("local-branch"), ToolContext::new())
+            .await
+            .expect("first set");
+        let mut newer = WorkspaceConfig::load(&config_path).expect("load");
+        newer.projects[0].checks = Some("cargo test".to_string());
+        newer.save(&config_path).expect("save");
+
+        let result = tool
+            .call(set("prs-only"), ToolContext::new())
+            .await
+            .expect("second set");
+        assert_eq!(result.as_text(), Some("trust set: prs-only"));
+        let loaded = WorkspaceConfig::load(&config_path).expect("load");
+        assert_eq!(loaded.projects.len(), 1);
+        assert_eq!(loaded.projects[0].checks.as_deref(), Some("cargo test"));
     }
 }
