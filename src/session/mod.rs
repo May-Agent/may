@@ -3,6 +3,7 @@
 //! Each session has its own sandbox directory and chat history.
 
 mod context_snapshot;
+mod directory;
 pub(crate) mod history;
 pub mod import;
 pub mod layout;
@@ -25,6 +26,7 @@ pub use context_snapshot::{
     checkpoint_watermark, load_persisted_context_snapshot, parse_persisted_context_snapshot,
     persist_agent_context_snapshot, persist_checkpoint_from_hook,
 };
+pub use directory::SessionDirectory;
 pub use history::{
     ChatHistory, ChatMessage, ChatMessageStats, HistoryReplayError, MessageRole, SessionMetadata,
     ToolEventRecord,

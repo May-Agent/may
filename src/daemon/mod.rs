@@ -34,6 +34,8 @@ mod notifications;
 mod profiles;
 mod remote_access;
 mod server;
+#[cfg(test)]
+mod session_directory_tests;
 mod sessions;
 mod state;
 mod tasks;
