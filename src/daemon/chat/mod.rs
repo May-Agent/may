@@ -4937,8 +4937,13 @@ mod tests {
         let provider = stub_provider(vec![sse_text("first")]).await;
         let may_dir = tempfile::tempdir().expect("may dir");
         let cwd = tempfile::tempdir().expect("cwd");
-        let state = failover_state(may_dir.path(), cwd.path(), &provider, &provider).await;
+        let state = failover_state(may_dir.path(), &provider, &provider).await;
         let checkout = cwd.path().canonicalize().expect("canonical checkout");
+        state
+            .db()
+            .set_session_cwd("session", &checkout.to_string_lossy())
+            .await
+            .expect("session cwd");
         let config_path =
             crate::session::MayHomePaths::new(may_dir.path().to_path_buf()).workspace_config();
         let set_level = |level| {
