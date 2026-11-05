@@ -342,7 +342,7 @@ pub struct App {
     /// when the agent worker installs).
     pub background: Option<crate::client::background::RemoteBackground>,
     /// Model clone for `/btw` side questions (outside conversation history).
-    pub btw_llm: Option<crate::agent::RequestParameterizedModel<crate::agent::ProviderLlm>>,
+    pub btw_llm: Option<crate::agent::ModelSlot<crate::agent::ProviderLlm>>,
     /// Daemon that answers `/btw` when the agent runs there.
     pub btw_daemon: Option<crate::client::DaemonClient>,
     /// Right sidebar: task tree, linked issues (background lists come
@@ -4357,11 +4357,10 @@ fn btw_message(role: &str, content: impl Into<String>) -> crate::daemon::BtwMess
 
 /// Streams a `/btw` answer from the session's model into the overlay.
 async fn stream_btw_answer(
-    llm: crate::agent::RequestParameterizedModel<crate::agent::ProviderLlm>,
+    llm: crate::agent::ModelSlot<crate::agent::ProviderLlm>,
     messages: Vec<crate::daemon::BtwMessage>,
     tx: EventSender,
 ) {
-    use aither_core::LanguageModel;
     use aither_core::llm::Message;
     use futures_lite::StreamExt;
     let messages = messages
@@ -4372,8 +4371,7 @@ async fn stream_btw_answer(
             _ => Message::user(message.content),
         })
         .collect::<Vec<_>>();
-    let request = aither_core::llm::LLMRequest::new(messages);
-    let mut stream = std::pin::pin!(llm.respond(request));
+    let mut stream = std::pin::pin!(llm.respond(messages));
     while let Some(result) = stream.next().await {
         match result {
             Ok(aither_core::llm::Event::Text(text)) => {
