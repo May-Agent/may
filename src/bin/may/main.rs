@@ -1948,16 +1948,12 @@ where
                     }) => {
                         let deferred = startup_gate.take().is_some();
                         if let Some(level) = level {
-                            let result = may_agent::workspace::WorkspaceConfig::load(&config_path)
-                                .and_then(|config| {
-                                    may_agent::trust::persist(
-                                        &config,
-                                        &config_path,
-                                        &worktree,
-                                        Some(&kind),
-                                        level,
-                                    )
-                                });
+                            let result = may_agent::trust::persist(
+                                &config_path,
+                                &worktree,
+                                Some(&kind),
+                                level,
+                            );
                             match result {
                                 Ok(()) => app.chat.push_notice(&format!(
                                     "Repository trust for {} is now {}",

@@ -75,30 +75,4 @@ impl ChatDb {
         .await?;
         Ok(())
     }
-
-    /// Forget every clone of `session_id`.
-    ///
-    /// # Errors
-    /// Fails on database errors.
-    pub async fn delete_session_repo_clones(&self, session_id: &str) -> Result<(), ChatDbError> {
-        query!(
-            self.db,
-            "DELETE FROM session_repo_clones WHERE session_id = ?",
-            session_id
-        )
-        .execute()
-        .await?;
-        Ok(())
-    }
-
-    /// Forget every session's clones.
-    ///
-    /// # Errors
-    /// Fails on database errors.
-    pub async fn delete_all_repo_clones(&self) -> Result<(), ChatDbError> {
-        query!(self.db, "DELETE FROM session_repo_clones")
-            .execute()
-            .await?;
-        Ok(())
-    }
 }
