@@ -1091,8 +1091,7 @@ impl ChatDb {
 
     /// Register a blocking ask-user request atomically: the session's
     /// previous blocking rows are replaced by `request` and the request
-    /// joins the message history, all in one transaction. Retried a bounded
-    /// number of times on `SQLITE_BUSY` contention.
+    /// joins the message history, all in one transaction.
     ///
     /// # Errors
     /// Returns [`ChatDbError`] on storage failure.
@@ -1101,24 +1100,20 @@ impl ChatDb {
         session_id: &str,
         request: &PersistedAskUserRequest,
     ) -> Result<SessionRuntimeSummary, ChatDbError> {
-        super::common::with_busy_retry(|| async {
-            let mut tx = self.db.begin().await?;
-            self.delete_blocking_ask_user_in_tx(&mut tx, session_id)
-                .await?;
-            self.insert_pending_ask_user_in_tx(&mut tx, session_id, request, true)
-                .await?;
-            self.append_ask_user_request_message_in_tx(
-                &mut tx,
-                session_id,
-                request.id.as_str(),
-                &super::open_questions::history_questions(&request.questions),
-                None,
-            )
+        let mut tx = self.db.begin().await?;
+        self.delete_blocking_ask_user_in_tx(&mut tx, session_id)
             .await?;
-            tx.commit().await?;
-            Ok(())
-        })
+        self.insert_pending_ask_user_in_tx(&mut tx, session_id, request, true)
+            .await?;
+        self.append_ask_user_request_message_in_tx(
+            &mut tx,
+            session_id,
+            request.id.as_str(),
+            &super::open_questions::history_questions(&request.questions),
+            None,
+        )
         .await?;
+        tx.commit().await?;
         self.load_session_runtime_summary(session_id).await
     }
 
@@ -1687,10 +1682,7 @@ mod tests {
         const LEGACY_SCHEMA: &str = include_str!("testdata/legacy_session_fk_schema.sql");
         let dir = tempdir().expect("temp dir should be created");
         let path = dir.path().join("history.db");
-        let url = format!("sqlite://{}?mode=rwc", path.display());
-        let raw = skyzen_services::Db::connect_sqlite(&url)
-            .await
-            .expect("raw db should connect");
+        let raw = ChatDb::connect(&path).await.expect("raw db should connect");
         // The legacy definitions come first, so the current schema's
         // `CREATE TABLE IF NOT EXISTS` leaves them as they are.
         for statement in super::super::db_sql::statements(LEGACY_SCHEMA) {
