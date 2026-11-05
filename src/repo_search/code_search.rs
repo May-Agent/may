@@ -390,7 +390,12 @@ mod tests {
         let repos = SessionRepos::new(&tmp.join("session"), "s1", db.clone());
         let clone = if with_clone {
             let key = crate::issue::repository_identity(&checkout).unwrap();
-            Some(repos.ensure_local_clone(&checkout, &key).await.unwrap())
+            Some(
+                repos
+                    .ensure_local_clone(&checkout, &key, &tmp.join("staging"))
+                    .await
+                    .unwrap(),
+            )
         } else {
             None
         };
