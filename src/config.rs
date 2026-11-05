@@ -75,6 +75,14 @@ pub enum ConfigError {
     /// Home directory not found.
     #[error("Home directory not found")]
     NoHomeDir,
+    /// The home directory does not resolve to a real path.
+    #[error("Home directory {} does not resolve: {source}", home.display())]
+    HomeUnresolvable {
+        /// The home directory as the environment names it.
+        home: PathBuf,
+        /// The resolution failure.
+        source: std::io::Error,
+    },
     /// Failed to read config.
     #[error("Failed to read config: {0}")]
     Read(#[from] std::io::Error),
@@ -1611,9 +1619,25 @@ impl MayConfig {
     /// # Errors
     /// Returns [`ConfigError`] when no home directory can be determined.
     pub fn may_dir() -> Result<PathBuf, ConfigError> {
-        dirs::home_dir()
-            .map(|h| h.join(".may"))
-            .ok_or(ConfigError::NoHomeDir)
+        Ok(Self::home_dir()?.join(".may"))
+    }
+
+    /// The user's home directory with every symlink resolved.
+    ///
+    /// The sandbox grants only real paths and never follows an ungranted
+    /// link, so every path May renders or hands to a command derives from
+    /// this one spelling.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError`] when no home directory can be determined or it
+    /// does not resolve.
+    pub fn home_dir() -> Result<PathBuf, ConfigError> {
+        Self::resolve_home(dirs::home_dir().ok_or(ConfigError::NoHomeDir)?)
+    }
+
+    /// `home` with every symlink resolved.
+    pub(crate) fn resolve_home(home: PathBuf) -> Result<PathBuf, ConfigError> {
+        dunce::canonicalize(&home).map_err(|source| ConfigError::HomeUnresolvable { home, source })
     }
 
     /// Get the config file path (~/.may/config.toml).
@@ -2413,5 +2437,32 @@ mod tests {
         assert!(toml.contains("[provider.anthropic]"));
         assert!(toml.contains("[models]"));
         assert!(toml.contains("anthropic::claude-sonnet-4"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_home_reached_through_a_symlink_resolves_to_the_real_path() {
+        let real = tempfile::tempdir().unwrap();
+        let links = tempfile::tempdir().unwrap();
+        let linked = links.path().join("home");
+        std::os::unix::fs::symlink(real.path(), &linked).unwrap();
+
+        let resolved = MayConfig::resolve_home(linked).unwrap();
+
+        assert_eq!(resolved, dunce::canonicalize(real.path()).unwrap());
+        assert_eq!(
+            resolved.join(".may"),
+            dunce::canonicalize(real.path()).unwrap().join(".may")
+        );
+    }
+
+    #[test]
+    fn a_home_that_does_not_resolve_is_an_error() {
+        let missing = tempfile::tempdir().unwrap().path().join("gone");
+
+        assert!(matches!(
+            MayConfig::resolve_home(missing),
+            Err(ConfigError::HomeUnresolvable { .. })
+        ));
     }
 }

@@ -19,6 +19,7 @@ mod repo_clone;
 mod repo_usage;
 mod search_outbox;
 mod session;
+mod session_intervals;
 mod session_run;
 mod sql;
 mod task;
@@ -46,6 +47,7 @@ pub use pr::{PrEventRow, PrRow};
 pub use repo_clone::RepoCloneRow;
 pub use repo_usage::RepoUsage;
 pub use search_outbox::{IndexedMessageRow, SearchOutboxEntry};
+pub use session_intervals::SessionIntervals;
 pub use session_run::RunFence;
 
 use common::{
@@ -98,6 +100,7 @@ impl ChatDb {
         Self::migrate_legacy_remote_profiles(&db).await?;
         Self::migrate_removed_waiting_terminal_input(&db).await?;
         Self::ensure_search_outbox(&db).await?;
+        Self::ensure_session_interval_triggers(&db).await?;
         Ok(Self {
             db,
             #[cfg(test)]

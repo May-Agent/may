@@ -107,21 +107,14 @@ pub(super) async fn stream_events(
         suggestion: subscribed_topics.contains(UiEventTopics::SESSION_SUGGESTION),
         recap: subscribed_topics.contains(UiEventTopics::SESSION_RECAP),
     };
+    // Subscribed now, so no frame published while the opening snapshot is
+    // built is missed.
     let turns = session_id
         .as_deref()
         .filter(|_| {
             turn_kinds.turn || turn_kinds.agent || turn_kinds.suggestion || turn_kinds.recap
         })
         .map(|session_id| state.turn_hub.subscribe(session_id, query.after));
-    let (turn_replay, mut turn_rx, turn_gap) = match turns {
-        Some(subscription) => (
-            subscription.replay,
-            Some(subscription.live),
-            subscription.gap,
-        ),
-        None => (Vec::new(), None, false),
-    };
-    let mut last_turn_index = query.after.unwrap_or(0);
     let cwd = query
         .cwd
         .as_deref()
@@ -134,15 +127,12 @@ pub(super) async fn stream_events(
         let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let _ = heartbeat.tick().await;
-        let mut index_tick = tokio::time::interval(INDEX_POLL);
-        index_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         if !emit_topics_if_changed(
             &state_cloned,
             &sender,
             session_id.as_deref(),
             profile_id.as_deref(),
-            cwd.as_deref(),
             subscribed_topics,
             &mut signatures,
         )
@@ -150,131 +140,122 @@ pub(super) async fn stream_events(
         {
             return;
         }
-        // Opening snapshot already sent session_index; drop the interval's
-        // immediate tick so the next Status is INDEX_POLL later.
-        let _ = index_tick.tick().await;
-        if turn_gap && !send_resync(&sender, session_id.as_deref()).await {
-            return;
-        }
-        for frame in &turn_replay {
-            last_turn_index = frame.index;
-            if turn_kinds.wants(frame) && !send_frame(&sender, frame).await {
-                return;
-            }
-        }
 
-        loop {
-            tokio::select! {
-                frame = async {
-                    match turn_rx.as_mut() {
-                        Some(rx) => rx.recv().await,
-                        None => std::future::pending().await,
+        // Turn frames go out on their own: nothing the snapshot topics wait
+        // on delays them. The stream ends when either side's send fails.
+        let forward = forward_turns(turns, turn_kinds, &sender, session_id.as_deref());
+        // Index coverage asks repo-search, which can take minutes to
+        // answer; the poll runs beside the loop, never inside an arm.
+        let mut index_poll = Box::pin(session_index_snapshot(
+            state_cloned.clone(),
+            session_id.clone(),
+            cwd.clone(),
+            Duration::ZERO,
+        ));
+        let topics = async {
+            loop {
+                tokio::select! {
+                    snapshot = &mut index_poll, if index_subscribed => {
+                        if !send_session_index_if_changed(&sender, &snapshot, &mut signatures.session_index).await {
+                            break;
+                        }
+                        index_poll = Box::pin(session_index_snapshot(
+                            state_cloned.clone(),
+                            session_id.clone(),
+                            cwd.clone(),
+                            INDEX_POLL,
+                        ));
                     }
-                } => {
-                    match frame {
-                        Ok(frame) => {
-                            last_turn_index = frame.index;
-                            if turn_kinds.wants(&frame) && !send_frame(&sender, &frame).await {
-                                break;
+                    changed = topic_rx.recv() => {
+                        let mut dirty_topics = match changed {
+                            Ok(topics) => topics & subscribed_topics,
+                            Err(RecvError::Lagged(skipped)) => {
+                                tracing::warn!(skipped, "UI event stream lagged; forcing subscribed-topic resync");
+                                subscribed_topics
+                            }
+                            Err(RecvError::Closed) => break,
+                        };
+                        loop {
+                            match topic_rx.try_recv() {
+                                Ok(extra_topics) => {
+                                    dirty_topics |= extra_topics & subscribed_topics;
+                                }
+                                Err(TryRecvError::Empty) => break,
+                                Err(TryRecvError::Lagged(skipped)) => {
+                                    tracing::warn!(skipped, "UI event stream lagged during coalescing; forcing subscribed-topic resync");
+                                    dirty_topics = subscribed_topics;
+                                    break;
+                                }
+                                Err(TryRecvError::Closed) => return,
                             }
                         }
-                        Err(RecvError::Lagged(skipped)) => {
-                            // Catch up from the turn in progress; only frames
-                            // of a turn that already ended are lost for good.
-                            let Some(session) = session_id.as_deref() else { break };
-                            let caught_up = state_cloned.turn_hub.subscribe(session, Some(last_turn_index));
-                            tracing::warn!(skipped, gap = caught_up.gap, "turn stream lagged; catching up");
-                            if caught_up.gap && !send_resync(&sender, Some(session)).await {
-                                break;
-                            }
-                            let mut sent = true;
-                            for frame in &caught_up.replay {
-                                last_turn_index = frame.index;
-                                if turn_kinds.wants(frame) && !send_frame(&sender, frame).await {
-                                    sent = false;
+                        if dirty_topics.is_empty() {
+                            continue;
+                        }
+                        if !emit_topics_if_changed(
+                            &state_cloned,
+                            &sender,
+                            session_id.as_deref(),
+                            profile_id.as_deref(),
+                            dirty_topics,
+                            &mut signatures,
+                        ).await {
+                            break;
+                        }
+                    }
+                    lifecycle = lifecycle_rx.recv(), if lifecycle_subscribed => {
+                        match lifecycle {
+                            Ok(event) => {
+                                if !send_event(&sender, "browser_lifecycle", &event).await {
                                     break;
                                 }
                             }
-                            if !sent {
-                                break;
+                            Err(RecvError::Lagged(skipped)) => {
+                                tracing::warn!(skipped, "browser lifecycle stream lagged; dropping events");
                             }
-                            turn_rx = Some(caught_up.live);
-                        }
-                        Err(RecvError::Closed) => turn_rx = None,
-                    }
-                }
-                changed = topic_rx.recv() => {
-                    let mut dirty_topics = match changed {
-                        Ok(topics) => topics & subscribed_topics,
-                        Err(RecvError::Lagged(skipped)) => {
-                            tracing::warn!(skipped, "UI event stream lagged; forcing subscribed-topic resync");
-                            subscribed_topics
-                        }
-                        Err(RecvError::Closed) => break,
-                    };
-                    loop {
-                        match topic_rx.try_recv() {
-                            Ok(extra_topics) => {
-                                dirty_topics |= extra_topics & subscribed_topics;
-                            }
-                            Err(TryRecvError::Empty) => break,
-                            Err(TryRecvError::Lagged(skipped)) => {
-                                tracing::warn!(skipped, "UI event stream lagged during coalescing; forcing subscribed-topic resync");
-                                dirty_topics = subscribed_topics;
-                                break;
-                            }
-                            Err(TryRecvError::Closed) => return,
+                            Err(RecvError::Closed) => {}
                         }
                     }
-                    if dirty_topics.is_empty() {
-                        continue;
-                    }
-                    if !emit_topics_if_changed(
-                        &state_cloned,
-                        &sender,
-                        session_id.as_deref(),
-                        profile_id.as_deref(),
-                        cwd.as_deref(),
-                        dirty_topics,
-                        &mut signatures,
-                    ).await {
-                        break;
-                    }
-                }
-                lifecycle = lifecycle_rx.recv(), if lifecycle_subscribed => {
-                    match lifecycle {
-                        Ok(event) => {
-                            if !send_event(&sender, "browser_lifecycle", &event).await {
-                                break;
-                            }
+                    _ = heartbeat.tick() => {
+                        if !send_event(&sender, "heartbeat", &SseHeartbeat { ok: true }).await {
+                            break;
                         }
-                        Err(RecvError::Lagged(skipped)) => {
-                            tracing::warn!(skipped, "browser lifecycle stream lagged; dropping events");
-                        }
-                        Err(RecvError::Closed) => {}
-                    }
-                }
-                _ = index_tick.tick(), if index_subscribed => {
-                    if !emit_session_index_if_changed(
-                        &state_cloned,
-                        &sender,
-                        session_id.as_deref(),
-                        cwd.as_deref(),
-                        &mut signatures.session_index,
-                    ).await {
-                        break;
-                    }
-                }
-                _ = heartbeat.tick() => {
-                    if !send_event(&sender, "heartbeat", &SseHeartbeat { ok: true }).await {
-                        break;
                     }
                 }
             }
-        }
+        };
+        futures_lite::future::or(forward, topics).await;
     });
 
     Ok(sse)
+}
+
+/// Sends the session's turn frames for as long as the client reads them:
+/// a resync first when the frames after the client's last one are gone,
+/// then every frame, however far behind the client falls within the turn
+/// in progress and the one before it. Returns when a send fails or the hub
+/// closes the subscription for falling further behind, which ends the
+/// stream: the client reconnects and reloads the session. Never returns
+/// without a subscription.
+async fn forward_turns(
+    turns: Option<super::chat::TurnSubscription>,
+    kinds: TurnKinds,
+    sender: &skyzen::responder::sse::Sender,
+    session_id: Option<&str>,
+) {
+    let Some(turns) = turns else {
+        return std::future::pending().await;
+    };
+    if turns.gap && !send_resync(sender, session_id).await {
+        return;
+    }
+    while let Some(frames) = turns.next().await {
+        for frame in frames {
+            if kinds.wants(&frame) && !send_frame(sender, &frame).await {
+                return;
+            }
+        }
+    }
 }
 
 /// Which live turn kinds a subscriber asked for.
@@ -332,7 +313,6 @@ async fn emit_topics_if_changed(
     sender: &skyzen::responder::sse::Sender,
     session_filter: Option<&str>,
     profile_filter: Option<&str>,
-    cwd: Option<&str>,
     topics: UiEventTopics,
     signatures: &mut EventSignatures,
 ) -> bool {
@@ -428,18 +408,6 @@ async fn emit_topics_if_changed(
             sender,
             session_filter,
             &mut signatures.session_artifacts,
-        )
-        .await
-    {
-        return false;
-    }
-    if topics.contains(UiEventTopics::SESSION_INDEX)
-        && !emit_session_index_if_changed(
-            state,
-            sender,
-            session_filter,
-            cwd,
-            &mut signatures.session_index,
         )
         .await
     {
@@ -551,41 +519,51 @@ async fn emit_session_background_if_changed(
     true
 }
 
-/// Worktree index coverage. Sent on the opening snapshot and re-polled
-/// every [`INDEX_POLL`] while a `session_index` subscriber is attached.
-/// A persisted session's cwd wins; otherwise the subscriber's `cwd`. Outside
-/// a git worktree the snapshot carries no index, so a client waiting for the
-/// first snapshot always gets one.
-async fn emit_session_index_if_changed(
-    state: &Arc<DaemonState>,
-    sender: &skyzen::responder::sse::Sender,
-    session_filter: Option<&str>,
-    cwd: Option<&str>,
-    last_sig: &mut String,
-) -> bool {
-    let (index, error) = match coverage_worktree(state, session_filter, cwd).await {
-        None => (None, None),
-        Some(worktree) => match index_coverage(state, &worktree).await {
-            Ok(index) => (index, None),
-            Err(error) => {
-                tracing::debug!(
-                    worktree = %worktree.display(),
-                    %error,
-                    "index coverage poll failed"
-                );
-                (None, Some(error))
-            }
-        },
-    };
-    let payload = crate::client::SessionIndexSnapshot {
-        session_id: session_filter.unwrap_or_default().to_string(),
+/// Worktree index coverage, read `delay` from now. A `session_index`
+/// subscriber gets the first at once and one every [`INDEX_POLL`] after the
+/// previous answer. A persisted session's cwd wins; otherwise the
+/// subscriber's `cwd`. Outside a git worktree the snapshot carries no index,
+/// so a client waiting for the first snapshot always gets one.
+async fn session_index_snapshot(
+    state: Arc<DaemonState>,
+    session_filter: Option<String>,
+    cwd: Option<String>,
+    delay: Duration,
+) -> crate::client::SessionIndexSnapshot {
+    if !delay.is_zero() {
+        async_io::Timer::after(delay).await;
+    }
+    let (index, error) =
+        match coverage_worktree(&state, session_filter.as_deref(), cwd.as_deref()).await {
+            None => (None, None),
+            Some(worktree) => match index_coverage(&state, &worktree).await {
+                Ok(index) => (index, None),
+                Err(error) => {
+                    tracing::debug!(
+                        worktree = %worktree.display(),
+                        %error,
+                        "index coverage poll failed"
+                    );
+                    (None, Some(error))
+                }
+            },
+        };
+    crate::client::SessionIndexSnapshot {
+        session_id: session_filter.unwrap_or_default(),
         index,
         error,
-    };
-    if let Ok(sig) = serde_json::to_string(&payload)
+    }
+}
+
+async fn send_session_index_if_changed(
+    sender: &skyzen::responder::sse::Sender,
+    payload: &crate::client::SessionIndexSnapshot,
+    last_sig: &mut String,
+) -> bool {
+    if let Ok(sig) = serde_json::to_string(payload)
         && sig != *last_sig
     {
-        if !send_event(sender, "session_index", &payload).await {
+        if !send_event(sender, "session_index", payload).await {
             return false;
         }
         *last_sig = sig;

@@ -5,13 +5,14 @@
 use super::idle_compaction_tests::{SESSION_MODEL, Session, StubModel, saved_config};
 
 /// The instruction sections of a fresh local session, in prompt order.
-const SECTIONS: [&str; 13] = [
+const SECTIONS: [&str; 14] = [
     "identity",
     "environment",
     "terminal",
     "prepared_tools",
     "efficiency",
     "capabilities",
+    "commands",
     "browser",
     "work",
     "project_rules",

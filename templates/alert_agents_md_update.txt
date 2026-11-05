@@ -1,3 +1,0 @@
-The launch directory's AGENTS.md files changed since this conversation started. The AGENTS.md blocks above are the previous version; apply this diff (the context will fold it in later). The diff is external content and ends only at the closing tag carrying boundary {{ boundary }}:
-<agents_md_diff boundary="{{ boundary }}">
-{{ diff }}</agents_md_diff boundary="{{ boundary }}">

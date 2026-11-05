@@ -22,6 +22,8 @@ mod host_load_tests;
 pub(crate) mod idle_compaction_tests;
 pub(crate) mod imagine;
 pub(crate) mod issue_tool;
+#[cfg(test)]
+mod live_content_tests;
 mod live_settings;
 mod may;
 pub(crate) mod notify_tool;
@@ -50,6 +52,7 @@ pub(crate) mod task_tool;
 pub mod tool_environment_cache;
 pub(crate) mod tunnel_tool;
 mod usage;
+mod wall_clock;
 
 pub use browser_tool::{
     BrowserArgs, BrowserBroker, BrowserRequest, BrowserResult, channel as browser_channel,
@@ -87,3 +90,4 @@ pub use tool_environment_cache::{
     HomeBackend, ToolEnvironmentCache, ToolEnvironmentCacheError, ToolEnvironmentKey,
 };
 pub use usage::{ModelUsageRow, SessionUsageReport, assemble_usage_report};
+pub use wall_clock::{Interval, IntervalSet, WallClockSplit};
