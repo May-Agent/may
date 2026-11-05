@@ -212,10 +212,10 @@ where
     builder.sandboxed_only(|sandboxed| {
         sandboxed.configure_raw_handler(
             "gh",
-            "Refused in the sandbox; use `issue`",
+            "Refused in the sandbox; use `issue` or `pr`",
             |_call, _args| {
                 Box::pin(async {
-                    Err(GhRefused.render().unwrap_or_else(|error| error.to_string()))
+                    Err(GhRefused.render().expect("the gh refusal template renders"))
                 })
             },
         );
