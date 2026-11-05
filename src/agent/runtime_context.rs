@@ -1,243 +1,272 @@
-//! Stable-per-session runtime system prefix assembled by `MayAgent`.
+//! The session system prompt May assembles on aither's layout.
 //!
-//! Everything in this module feeds into the KV-cache-stable portion of
-//! the agent's prompt — workspace descriptions, environment hints,
-//! browser status, terminal runtime rules, etc. [`RuntimeSystemContext`]
-//! stores each slot as pre-rendered raw text and reconciles the slots
-//! into an [`aither_agent::Context`] as raw instruction blocks, so the
-//! final prompt is plain prose rather than serde-derived XML.
+//! Instruction blocks come first, one per concern, each rendered from its own
+//! typed template under `templates/prompt/` and wrapped in a tag named after
+//! its slot. External content (memory, a repository's `AGENTS.md`, the
+//! approved workspace directories) comes last, in aither's provenance-labelled
+//! blocks whose boundary their content cannot close.
 //!
-//! Each slot is keyed by a short `snake_case` tag (see the [`tag`]
-//! submodule) so swapping one slot does not invalidate the whole
-//! cacheable prefix: e.g. a runtime workspace-grant approval changes
-//! only the [`tag::WORKSPACE_WORKDIRS`] block while the rest of the
-//! workspace prefix stays cached.
+//! [`RuntimeSystemContext`] holds every block May writes and reconciles them
+//! into an [`aither_agent::Context`] each turn. Memory and `AGENTS.md` change
+//! while the session runs, so they are aither live content
+//! ([`aither_agent::Context::update_live`]): a change is announced as a diff
+//! while the cached prefix stays warm, and reassembly folds the clean version
+//! in.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use aither_agent::InstructionSlot;
+use aither_agent::context::LiveContent;
+use aither_agent::{AgentOptions, ExternalContent, InstructionSlot};
 use aither_core::llm::model::{Ability, Parameters};
 use askama::Template;
 use async_fs;
 
-use super::may::{AgentEnvironment, MayAgentConfig, MayAgentError};
+use super::may::{AgentEnvironment, MayAgentError};
 use crate::agent::agents_md::{self, AgentsIndex, HandoffAgentDoc};
+use crate::config::{SshServerConfig, TimeZoneName};
 use crate::network_policy::{CompiledNetworkPolicy, NetworkPolicyMode};
 use crate::session::{SessionPaths, SessionPlanState};
 use crate::skill::SkillManager;
 use crate::workspace::{Workspace as MayWorkspace, WorkspaceDir as MayWorkspaceDir};
 
-const MEMORY_CONTEXT_HINT: &str = include_str!("../texts/memory_context_hint.txt");
-const NATIVE_VOICE_AVAILABLE_HINT: &str = "Native voice input is available in this session. You may treat spoken input as first-class user messages.";
-const PLAN_MODE_DRAFT_HINT: &str = include_str!("../texts/plan_mode_draft.txt");
-const PLAN_MODE_APPROVED_HINT: &str = include_str!("../texts/plan_mode_approved.txt");
-
-/// Instruction slots of the stable system blocks managed by
-/// [`RuntimeSystemContext`]. Each slot holds raw text content, with no XML
-/// wrapping, and renders at its position in [`layout`] as a stable KV-cache
-/// prefix segment.
+/// The slots of the blocks May writes, and the order of the whole prompt.
 pub mod tag {
-    use aither_agent::{InstructionSlot, SystemLayout};
+    use aither_agent::{ExternalSlot, InstructionSlot, SystemLayout};
 
-    pub const MEMORY: InstructionSlot = InstructionSlot::new("memory");
-    pub const TERMINAL_RUNTIME_CONTEXT: InstructionSlot =
-        InstructionSlot::new("terminal_runtime_context");
-    pub const WORKSPACE_WORKDIRS: InstructionSlot = InstructionSlot::new("workspace_workdirs");
-    pub const REPO_CLONES: InstructionSlot = InstructionSlot::new("repo_clones");
-    pub const AGENTS_MD: InstructionSlot = InstructionSlot::new("agents_md");
-    pub const BROWSER: InstructionSlot = InstructionSlot::new("browser");
+    pub const IDENTITY: InstructionSlot = InstructionSlot::new("identity");
     pub const PROFILE_PERSONA: InstructionSlot = InstructionSlot::new("profile_persona");
-    pub const PROFILE_MEMORIES: InstructionSlot = InstructionSlot::new("profile_memories");
+    pub const ENVIRONMENT: InstructionSlot = InstructionSlot::new("environment");
+    pub const REPO_CLONES: InstructionSlot = InstructionSlot::new("repo_clones");
+    pub const TERMINAL: InstructionSlot = InstructionSlot::new("terminal");
+    pub const EFFICIENCY: InstructionSlot = InstructionSlot::new("efficiency");
+    pub const CAPABILITIES: InstructionSlot = InstructionSlot::new("capabilities");
+    pub const BROWSER: InstructionSlot = InstructionSlot::new("browser");
+    pub const WORK: InstructionSlot = InstructionSlot::new("work");
+    pub const PROJECT_RULES: InstructionSlot = InstructionSlot::new("project_rules");
     pub const PLAN_MODE: InstructionSlot = InstructionSlot::new("plan_mode");
-    pub const NETWORK_RESTRICTIONS: InstructionSlot = InstructionSlot::new("network_restrictions");
-    pub const LOCATION_CONTEXT: InstructionSlot = InstructionSlot::new("location_context");
-    pub const NATIVE_VOICE_INPUT: InstructionSlot = InstructionSlot::new("native_voice_input");
+    /// aither's built-in permissions slot, holding May's text.
+    pub const PERMISSIONS: InstructionSlot = InstructionSlot::PERMISSIONS;
+    pub const HARNESS: InstructionSlot = InstructionSlot::new("harness");
+    pub const EVIDENCE: InstructionSlot = InstructionSlot::new("evidence");
+    /// aither's built-in knowledge-and-time slot, holding May's text.
+    pub const TIME: InstructionSlot = InstructionSlot::KNOWLEDGE_AND_TIME;
 
-    /// The system prompt's order: aither's own blocks, then May's.
+    pub const MEMORY: ExternalSlot = ExternalSlot::new("memory");
+    pub const PROFILE_MEMORIES: ExternalSlot = ExternalSlot::new("profile_memories");
+    pub const AGENTS_MD: ExternalSlot = ExternalSlot::new("agents_md");
+    pub const HANDOFF_AGENTS_MD: ExternalSlot = ExternalSlot::new("handoff_agents_md");
+    pub const WORKSPACE_WORKDIRS: ExternalSlot = ExternalSlot::new("workspace_workdirs");
+
+    /// The instruction slots May writes, in prompt order. aither's
+    /// `prepared_tools`, `commands` and `languages` blocks sit between them
+    /// in [`layout`].
+    pub const MAY_INSTRUCTIONS: [InstructionSlot; 15] = [
+        IDENTITY,
+        PROFILE_PERSONA,
+        ENVIRONMENT,
+        REPO_CLONES,
+        TERMINAL,
+        EFFICIENCY,
+        CAPABILITIES,
+        BROWSER,
+        WORK,
+        PROJECT_RULES,
+        PLAN_MODE,
+        PERMISSIONS,
+        HARNESS,
+        EVIDENCE,
+        TIME,
+    ];
+
+    /// The system prompt's order: identity, environment, terminal,
+    /// efficiency, capabilities and the command table, work, permissions,
+    /// harness, evidence, time and languages; then the external content.
     #[must_use]
     pub fn layout() -> SystemLayout {
         SystemLayout::new(
-            InstructionSlot::BUILTIN.into_iter().chain([
-                MEMORY,
-                TERMINAL_RUNTIME_CONTEXT,
-                WORKSPACE_WORKDIRS,
-                REPO_CLONES,
-                AGENTS_MD,
-                BROWSER,
+            [
+                IDENTITY,
                 PROFILE_PERSONA,
-                PROFILE_MEMORIES,
+                ENVIRONMENT,
+                REPO_CLONES,
+                TERMINAL,
+                InstructionSlot::PREPARED_TOOLS,
+                EFFICIENCY,
+                CAPABILITIES,
+                InstructionSlot::COMMANDS,
+                BROWSER,
+                WORK,
+                PROJECT_RULES,
                 PLAN_MODE,
-                NETWORK_RESTRICTIONS,
-                LOCATION_CONTEXT,
-                NATIVE_VOICE_INPUT,
-            ]),
-            [],
+                PERMISSIONS,
+                HARNESS,
+                EVIDENCE,
+                TIME,
+                InstructionSlot::LANGUAGES,
+            ],
+            [
+                MEMORY,
+                PROFILE_MEMORIES,
+                AGENTS_MD,
+                HANDOFF_AGENTS_MD,
+                WORKSPACE_WORKDIRS,
+            ],
         )
     }
 }
 
-/// Stable per-session system prefix managed by [`MayAgent`].
-///
-/// Each slot holds a pre-rendered string that is reconciled into the
-/// underlying [`aither_agent::Context`] as a raw-text persistent system
-/// block (see `reconcile_text_block`). Keeping the slots as pre-rendered
-/// strings means reconcile is a cheap set/unset operation with no
-/// additional templating cost and no XML wrapping.
+/// Where memory lives as the shell sees it, the source label of its block.
+const MEMORY_SOURCE: &str = "~/.may/memories/MEMORY.md";
+const PROFILE_MEMORIES_SOURCE: &str = "profile memories extracted from past sessions";
+const WORKDIRS_SOURCE: &str = "approved workspace directories";
+const HANDOFF_AGENTS_SOURCE: &str = "AGENTS.md files linked from the compaction handoff";
+
+/// Every block May writes into a session's system prompt, and the sources it
+/// re-reads each turn.
 #[derive(Clone)]
 pub struct RuntimeSystemContext {
+    /// Instruction blocks fixed when the agent is built.
+    instructions: BTreeMap<InstructionSlot, String>,
+    profile_memories: Option<ExternalContent>,
+    workdirs: Option<ExternalContent>,
     memory_path: PathBuf,
     /// Snapshot of every file under the memories directory; `None` until the
     /// first scan establishes a silent baseline.
     memories_snapshot: Option<HashMap<String, String>>,
     last_memory_content: String,
-    terminal_runtime: Option<String>,
-    workspace_workdirs: Option<String>,
-    repo_clones: Option<String>,
     agents_workdir: Option<PathBuf>,
-    agents_workdir_label: Option<String>,
-    agents_md: Option<String>,
+    agents_root_source: String,
+    agents: AgentsMdBlocks,
     handoff_agents: Vec<HandoffAgentDoc>,
     last_handoff: Option<String>,
-    browser: Option<String>,
-    profile_persona: Option<String>,
-    profile_memories: Option<String>,
-    plan_mode: Option<String>,
-    network_restrictions: Option<String>,
-    location: Option<String>,
-    native_voice_input: Option<String>,
 }
 
 impl RuntimeSystemContext {
-    pub(crate) const fn new(memory_path: PathBuf, memory_content: String) -> Self {
+    pub(crate) fn new(memory_path: PathBuf, memory_content: String) -> Self {
         Self {
+            instructions: BTreeMap::new(),
+            profile_memories: None,
+            workdirs: None,
             memory_path,
             memories_snapshot: None,
             last_memory_content: memory_content,
-            terminal_runtime: None,
-            workspace_workdirs: None,
-            repo_clones: None,
             agents_workdir: None,
-            agents_workdir_label: None,
-            agents_md: None,
+            agents_root_source: agents_md_source(None),
+            agents: AgentsMdBlocks::default(),
             handoff_agents: Vec::new(),
             last_handoff: None,
-            browser: None,
-            profile_persona: None,
-            profile_memories: None,
-            plan_mode: None,
-            network_restrictions: None,
-            location: None,
-            native_voice_input: None,
         }
     }
 
-    pub(crate) fn with_terminal_runtime(mut self, terminal_runtime: String) -> Self {
-        self.terminal_runtime = Some(terminal_runtime);
+    /// Sets the instruction block in `slot`, one of [`tag::MAY_INSTRUCTIONS`]
+    /// other than `project_rules`.
+    ///
+    /// # Panics
+    /// Panics on a slot May does not write this way: a mistake in the caller.
+    pub(crate) fn with_instruction(mut self, slot: InstructionSlot, text: String) -> Self {
+        assert!(
+            tag::MAY_INSTRUCTIONS.contains(&slot) && slot != tag::PROJECT_RULES,
+            "`{}` is not an instruction block May renders at build",
+            slot.name()
+        );
+        self.instructions.insert(slot, text);
         self
     }
 
-    pub(crate) fn with_workspace_workdirs(mut self, workdirs: String) -> Self {
-        self.workspace_workdirs = Some(workdirs);
+    pub(crate) fn with_profile_memories(mut self, memories: Option<ExternalContent>) -> Self {
+        self.profile_memories = memories;
         self
     }
 
-    pub(crate) fn with_repo_clones(mut self, repo_clones: Option<String>) -> Self {
-        self.repo_clones = repo_clones;
+    pub(crate) fn with_workdirs(mut self, workdirs: Option<ExternalContent>) -> Self {
+        self.workdirs = workdirs;
         self
     }
 
-    pub(crate) fn with_agents_md(mut self, agents_md: Option<String>) -> Self {
-        self.agents_md = agents_md;
+    pub(crate) fn with_agents_md(mut self, agents: AgentsMdBlocks) -> Self {
+        self.agents = agents;
         self
     }
 
-    /// Marks the launch directory `agents_md` content is discovered from,
-    /// so [`Self::sync_agents_md`] can rescan it every turn.
-    pub(crate) fn with_agents_source(
-        mut self,
-        workdir: PathBuf,
-        workdir_label: Option<String>,
-    ) -> Self {
+    /// Marks the launch directory `AGENTS.md` is discovered from, so
+    /// [`Self::sync_agents_md`] can rescan it every turn. `label` is the
+    /// launch directory as the model sees it, when it sees the host path.
+    pub(crate) fn with_agents_source(mut self, workdir: PathBuf, label: Option<&str>) -> Self {
         self.agents_workdir = Some(workdir);
-        self.agents_workdir_label = workdir_label;
+        self.agents_root_source = agents_md_source(label);
         self
     }
 
-    pub(crate) fn with_browser(mut self, browser: String) -> Self {
-        self.browser = Some(browser);
-        self
+    /// The source label of the launch directory's `AGENTS.md` block.
+    pub(crate) fn agents_root_source(&self) -> &str {
+        &self.agents_root_source
     }
 
-    pub(crate) fn with_profile_persona(mut self, profile_persona: String) -> Self {
-        self.profile_persona = Some(profile_persona);
-        self
+    fn memory_block(&self) -> ExternalContent {
+        ExternalContent::data(MEMORY_SOURCE, self.last_memory_content.as_str())
     }
 
-    pub(crate) fn with_profile_memories(mut self, profile_memories: String) -> Self {
-        self.profile_memories = Some(profile_memories);
-        self
-    }
-
-    pub(crate) fn with_plan_mode(mut self, plan_mode: String) -> Self {
-        self.plan_mode = Some(plan_mode);
-        self
-    }
-
-    pub(crate) fn with_network_restrictions(mut self, network_restrictions: String) -> Self {
-        self.network_restrictions = Some(network_restrictions);
-        self
-    }
-
-    pub(crate) fn with_location(mut self, location: String) -> Self {
-        self.location = Some(location);
-        self
-    }
-
-    pub(crate) fn with_native_voice_input(mut self, native_voice_input: String) -> Self {
-        self.native_voice_input = Some(native_voice_input);
-        self
+    /// Hands every block to the agent builder, so the first request carries
+    /// them before any reconcile.
+    pub(crate) fn install<B: AgentOptions>(&self, mut builder: B) -> B {
+        for (slot, text) in &self.instructions {
+            builder = builder.system_text(slot, text.clone());
+        }
+        if let Some(rules) = &self.agents.rules {
+            builder = builder.system_text(&tag::PROJECT_RULES, rules.clone());
+        }
+        builder = builder.external_content(&tag::MEMORY, self.memory_block());
+        for (slot, block) in [
+            (&tag::PROFILE_MEMORIES, &self.profile_memories),
+            (&tag::AGENTS_MD, &self.agents.root),
+            (&tag::HANDOFF_AGENTS_MD, &self.agents.handoff),
+            (&tag::WORKSPACE_WORKDIRS, &self.workdirs),
+        ] {
+            if let Some(block) = block {
+                builder = builder.external_content(slot, block.clone());
+            }
+        }
+        builder
     }
 
     pub(crate) fn reconcile(&self, context: &mut aither_agent::Context) {
-        reconcile_memory_block(
-            context,
-            build_memory_context_content(&self.last_memory_content),
-        );
-        reconcile_text_block(
-            context,
-            &tag::TERMINAL_RUNTIME_CONTEXT,
-            self.terminal_runtime.clone(),
-        );
-        reconcile_text_block(
-            context,
-            &tag::WORKSPACE_WORKDIRS,
-            self.workspace_workdirs.clone(),
-        );
-        reconcile_text_block(context, &tag::REPO_CLONES, self.repo_clones.clone());
-        reconcile_agents_md_block(context, self.agents_md.clone());
-        reconcile_text_block(context, &tag::BROWSER, self.browser.clone());
-        reconcile_text_block(context, &tag::PROFILE_PERSONA, self.profile_persona.clone());
-        reconcile_text_block(
-            context,
-            &tag::PROFILE_MEMORIES,
-            self.profile_memories.clone(),
-        );
-        reconcile_text_block(context, &tag::PLAN_MODE, self.plan_mode.clone());
-        reconcile_text_block(
-            context,
-            &tag::NETWORK_RESTRICTIONS,
-            self.network_restrictions.clone(),
-        );
-        reconcile_text_block(context, &tag::LOCATION_CONTEXT, self.location.clone());
-        reconcile_text_block(
-            context,
-            &tag::NATIVE_VOICE_INPUT,
-            self.native_voice_input.clone(),
-        );
+        let instructions = context.instructions_mut();
+        for slot in &tag::MAY_INSTRUCTIONS {
+            if *slot == tag::PROJECT_RULES {
+                continue;
+            }
+            match self.instructions.get(slot) {
+                Some(text) => instructions.insert(slot, text.clone()),
+                None => {
+                    instructions.remove(slot);
+                }
+            }
+        }
+        context.update_live(&MEMORY_CONTENT, |update| {
+            update.external(&tag::MEMORY, Some(self.memory_block()));
+        });
+        context.update_live(&AGENTS_MD_CONTENT, |update| {
+            update
+                .instruction(&tag::PROJECT_RULES, self.agents.rules.clone())
+                .external(&tag::AGENTS_MD, self.agents.root.clone())
+                .external(&tag::HANDOFF_AGENTS_MD, self.agents.handoff.clone());
+        });
+        let external = context.external_mut();
+        for (slot, block) in [
+            (&tag::PROFILE_MEMORIES, &self.profile_memories),
+            (&tag::WORKSPACE_WORKDIRS, &self.workdirs),
+        ] {
+            match block {
+                Some(block) => external.insert(slot, block.clone()),
+                None => {
+                    external.remove(slot);
+                }
+            }
+        }
     }
 
-    /// Refreshes the `agents_md` slot: rescans the launch directory and,
+    /// Refreshes the `AGENTS.md` blocks: rescans the launch directory and,
     /// when the active handoff changed, reloads the `AGENTS.md` files it
     /// links to. The reconcile stages any difference with a diff alert,
     /// so the cached prefix stays warm until reassembly folds it in.
@@ -264,11 +293,8 @@ impl RuntimeSystemContext {
             self.last_handoff = handoff.map(str::to_string);
             self.handoff_agents = docs;
         }
-        self.agents_md = build_agents_md_context(
-            &index,
-            self.agents_workdir_label.clone(),
-            &self.handoff_agents,
-        );
+        self.agents =
+            build_agents_md_blocks(&index, &self.agents_root_source, &self.handoff_agents);
     }
 
     /// Re-read the memory index and watch the whole memories directory,
@@ -360,26 +386,6 @@ fn collect_memory_paths(text: &str, out: &mut HashSet<String>) {
     }
 }
 
-fn reconcile_text_block(
-    context: &mut aither_agent::Context,
-    slot: &InstructionSlot,
-    value: Option<String>,
-) {
-    match value {
-        Some(text) => context.instructions_mut().insert(slot, text),
-        None => {
-            context.instructions_mut().remove(slot);
-        }
-    }
-}
-
-/// Reminder surfaced to the model when MEMORY.md changed mid-session.
-#[derive(Template)]
-#[template(path = "alert_memory_update.txt", escape = "none")]
-struct MemoryUpdate {
-    diff: String,
-}
-
 /// Durable alert listing which files under `~/.may/memories/` changed.
 #[derive(Template)]
 #[template(path = "alert_memories_changes.txt", escape = "none")]
@@ -387,79 +393,83 @@ struct MemoriesChanges {
     files: Vec<String>,
 }
 
-/// Reminder surfaced when the launch directory's `AGENTS.md` index
-/// changed mid-session.
+/// The memory index, announced by name when it changes mid-session.
+const MEMORY_CONTENT: LiveContent = LiveContent::new("MEMORY.md", "memory_diff");
+
+/// The `AGENTS.md` blocks (the rules on how to treat them, the launch
+/// directory's own file and the files the handoff linked), announced
+/// together when any of them changes mid-session.
+const AGENTS_MD_CONTENT: LiveContent =
+    LiveContent::new("The launch directory's AGENTS.md files", "agents_md_diff");
+
+/// The blocks a launch directory's `AGENTS.md` files produce.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AgentsMdBlocks {
+    /// How to treat the files: the nested list, a cut root, handoff links.
+    rules: Option<String>,
+    /// The launch directory's own `AGENTS.md`.
+    root: Option<ExternalContent>,
+    /// The `AGENTS.md` files the compaction handoff linked.
+    handoff: Option<ExternalContent>,
+}
+
+/// The source label of the launch directory's `AGENTS.md` block.
+fn agents_md_source(launch_dir: Option<&str>) -> String {
+    launch_dir.map_or_else(
+        || "AGENTS.md of the launch directory".to_string(),
+        |dir| Path::new(dir).join("AGENTS.md").display().to_string(),
+    )
+}
+
 #[derive(Template)]
-#[template(path = "alert_agents_md_update.txt", escape = "none")]
-struct AgentsMdUpdate {
-    diff: String,
+#[template(path = "prompt/project_rules.md", escape = "none")]
+struct ProjectRulesTemplate<'a> {
+    truncated_root: Option<&'a str>,
+    nested: &'a [String],
+    extra_nested: usize,
 }
 
-/// Reconciles the `agents_md` block like the memory block: a change is
-/// staged rather than rewritten, and surfaced as a durable diff alert,
-/// so the cached prefix stays warm until reassembly folds the update in.
-fn reconcile_agents_md_block(context: &mut aither_agent::Context, desired: Option<String>) {
-    let Some(desired) = desired else {
-        context.instructions_mut().remove(&tag::AGENTS_MD);
-        return;
-    };
-    let instructions = context.instructions_mut();
-    if !instructions.contains(&tag::AGENTS_MD) {
-        instructions.insert(&tag::AGENTS_MD, desired);
-        return;
-    }
-    if instructions.staged(&tag::AGENTS_MD) == Some(&desired) {
-        return;
-    }
-    let current = instructions
-        .get(&tag::AGENTS_MD)
-        .cloned()
-        .unwrap_or_default();
-    if current == desired {
-        return;
-    }
-    if instructions.stage(&tag::AGENTS_MD, desired.clone()) {
-        let diff = similar::TextDiff::from_lines(&current, &desired)
-            .unified_diff()
-            .context_radius(2)
-            .to_string();
-        context.push_alert(&AgentsMdUpdate { diff });
-    }
+#[derive(Template)]
+#[template(path = "prompt/handoff_agents.md", escape = "none")]
+struct HandoffAgentsTemplate<'a> {
+    documents: &'a [HandoffAgentDoc],
 }
 
-/// Reconciles the MEMORY block without invalidating the KV-cache prefix.
-///
-/// Mid-session memory changes are staged into the context (applied on the
-/// next reassembly, when the cache is invalidated anyway) and surfaced to
-/// the model as an appended diff alert instead of a block rewrite.
-fn reconcile_memory_block(context: &mut aither_agent::Context, desired: String) {
-    let instructions = context.instructions_mut();
-    if !instructions.contains(&tag::MEMORY) {
-        instructions.insert(&tag::MEMORY, desired);
-        return;
+/// Builds the `AGENTS.md` blocks from the launch-directory scan and the
+/// documents the active compaction handoff linked; `root_source` labels the
+/// launch directory's own file.
+pub fn build_agents_md_blocks(
+    index: &AgentsIndex,
+    root_source: &str,
+    handoff_documents: &[HandoffAgentDoc],
+) -> AgentsMdBlocks {
+    if index.root_document.is_none() && index.nested.is_empty() && handoff_documents.is_empty() {
+        return AgentsMdBlocks::default();
     }
-    if instructions.staged(&tag::MEMORY) == Some(&desired) {
-        return;
+    let rules = ProjectRulesTemplate {
+        truncated_root: (index.root_document.is_some() && index.root_truncated)
+            .then_some(root_source),
+        nested: &index.nested,
+        extra_nested: index.extra_nested,
     }
-    let current = instructions.get(&tag::MEMORY).cloned().unwrap_or_default();
-    if instructions.stage(&tag::MEMORY, desired.clone()) {
-        let diff = similar::TextDiff::from_lines(&current, &desired)
-            .unified_diff()
-            .context_radius(2)
-            .to_string();
-        // Reminders are cleared on every request's populate pass, so a
-        // reminder inserted here would be dropped before ever reaching the
-        // model. A durable alert survives until reassembly folds the staged
-        // memory block in.
-        context.push_alert(&MemoryUpdate { diff });
+    .render()
+    .unwrap_or_else(|error| panic!("failed to render project rules: {error}"));
+    let handoff = (!handoff_documents.is_empty()).then(|| {
+        let content = HandoffAgentsTemplate {
+            documents: handoff_documents,
+        }
+        .render()
+        .unwrap_or_else(|error| panic!("failed to render handoff AGENTS.md: {error}"));
+        ExternalContent::repository_instructions(HANDOFF_AGENTS_SOURCE, content)
+    });
+    AgentsMdBlocks {
+        rules: Some(rules),
+        root: index
+            .root_document
+            .as_ref()
+            .map(|document| ExternalContent::repository_instructions(root_source, document)),
+        handoff,
     }
-}
-
-#[derive(Clone, Template)]
-#[template(path = "browser_context.txt", escape = "none")]
-struct BrowserTemplate {
-    state: BrowserContextState,
-    cdp_endpoint: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -474,67 +484,397 @@ impl BrowserContextState {
     }
 }
 
-#[derive(Clone, Template)]
-#[template(path = "terminal_runtime_context.txt", escape = "none")]
-struct TerminalRuntimeContextTemplate {
-    model_id: String,
-    home_environment_kind: String,
-    operating_system: String,
-    shell_dialect: &'static str,
-    working_directory: String,
-    home_note: &'static str,
-    host_launch_directory: Option<String>,
-    home_layout: Vec<String>,
-    session_layout: Vec<String>,
-    command_rules: Vec<String>,
-    environment_rules: Vec<String>,
-    modality_support: Vec<String>,
-    attached_remote_servers: Vec<crate::config::SshServerConfig>,
-    secret_names: Vec<String>,
+#[derive(Template)]
+#[template(path = "prompt/browser.md", escape = "none")]
+struct BrowserTemplate {
+    state: BrowserContextState,
+    cdp_endpoint: Option<String>,
 }
 
-#[derive(Clone, Template)]
-#[template(path = "workspace_workdirs.txt", escape = "none")]
+pub fn build_browser_context(enabled: bool, cdp_endpoint: Option<&str>) -> String {
+    let state = if enabled {
+        BrowserContextState::Enabled
+    } else {
+        BrowserContextState::Disabled
+    };
+    BrowserTemplate {
+        state,
+        cdp_endpoint: cdp_endpoint.map(str::to_string),
+    }
+    .render()
+    .unwrap_or_else(|error| panic!("failed to render browser context: {error}"))
+}
+
+#[derive(Template)]
+#[template(path = "prompt/identity.md", escape = "none")]
+struct IdentityTemplate;
+
+/// The identity section: who the agent is, the operating mode, and the rule
+/// that questions go through `ask_user`.
+pub fn build_identity() -> String {
+    IdentityTemplate
+        .render()
+        .unwrap_or_else(|error| panic!("failed to render identity: {error}"))
+}
+
+#[derive(Template)]
+#[template(path = "prompt/profile_persona.md", escape = "none")]
+struct ProfilePersonaTemplate<'a> {
+    persona: &'a str,
+}
+
+/// The profile's own persona, which the user wrote.
+pub fn build_profile_persona(persona: &str) -> String {
+    ProfilePersonaTemplate { persona }
+        .render()
+        .unwrap_or_else(|error| panic!("failed to render profile persona: {error}"))
+}
+
+/// The home environment as the environment and permissions sections state it.
+enum HomeEnvironment {
+    /// The user's own machine, under the sandbox.
+    Local {
+        os: &'static str,
+        /// The user's home directory, which `~` does not point to.
+        host_home: Option<String>,
+    },
+    /// A managed container.
+    Container,
+}
+
+impl HomeEnvironment {
+    fn of(environment: &AgentEnvironment) -> Self {
+        match environment {
+            AgentEnvironment::Local => Self::Local {
+                os: host_operating_system_label(),
+                host_home: Some(
+                    crate::config::MayConfig::home_dir()
+                        .expect(
+                            "the home directory resolved when the session directory was derived",
+                        )
+                        .display()
+                        .to_string(),
+                ),
+            },
+            AgentEnvironment::Container { .. } => Self::Container,
+        }
+    }
+
+    const fn is_local(&self) -> bool {
+        matches!(self, Self::Local { .. })
+    }
+}
+
+/// The remote hosts attached to the session; never empty, so the
+/// multi-environment text renders only while one is connected.
+struct RemoteHosts(Vec<SshServerConfig>);
+
+impl RemoteHosts {
+    fn connected(hosts: Vec<SshServerConfig>) -> Option<Self> {
+        (!hosts.is_empty()).then_some(Self(hosts))
+    }
+
+    fn hosts(&self) -> &[SshServerConfig] {
+        &self.0
+    }
+}
+
+#[derive(Template)]
+#[template(path = "prompt/environment.md", escape = "none")]
+struct EnvironmentTemplate<'a> {
+    model_id: &'a str,
+    home: HomeEnvironment,
+    session_dir: String,
+    launch_dir: Option<String>,
+    modalities: Vec<&'static str>,
+    remote: Option<RemoteHosts>,
+}
+
+/// The inputs a model takes natively, as the environment section names them.
+fn native_inputs(model_info: Option<&aither_models::ModelEntry>) -> Vec<&'static str> {
+    let Some(info) = model_info else {
+        return Vec::new();
+    };
+    [
+        (Ability::Vision, "images"),
+        (Ability::Audio, "audio"),
+        (Ability::Video, "video"),
+        (Ability::Pdf, "PDFs"),
+    ]
+    .into_iter()
+    .filter(|(ability, _)| info.has_ability(*ability))
+    .map(|(_, name)| name)
+    .collect()
+}
+
+/// The environment section: where the agent runs, the session directory and
+/// its layout, and the remote hosts while any is connected.
+pub fn build_environment(
+    model_id: &str,
+    environment: &AgentEnvironment,
+    session_paths: &SessionPaths,
+    model_info: Option<&aither_models::ModelEntry>,
+    remote_hosts: Vec<SshServerConfig>,
+    launch_dir: Option<String>,
+) -> String {
+    EnvironmentTemplate {
+        model_id,
+        home: HomeEnvironment::of(environment),
+        session_dir: sandbox_visible_path(environment, session_paths, session_paths.root()),
+        launch_dir,
+        modalities: native_inputs(model_info),
+        remote: RemoteHosts::connected(remote_hosts),
+    }
+    .render()
+    .unwrap_or_else(|error| panic!("failed to render environment: {error}"))
+}
+
+#[derive(Template)]
+#[template(path = "prompt/terminal.md", escape = "none")]
+struct TerminalTemplate {
+    session_dir: String,
+}
+
+/// The terminal section: how to run commands.
+pub fn build_terminal(environment: &AgentEnvironment, session_paths: &SessionPaths) -> String {
+    TerminalTemplate {
+        session_dir: sandbox_visible_path(environment, session_paths, session_paths.root()),
+    }
+    .render()
+    .unwrap_or_else(|error| panic!("failed to render terminal: {error}"))
+}
+
+#[derive(Template)]
+#[template(path = "prompt/efficiency.md", escape = "none")]
+struct EfficiencyTemplate {
+    has_search_command: bool,
+}
+
+/// The efficiency section: concurrent calls, the cheapest search, `explore`.
+pub fn build_efficiency(commands: &[(String, String)]) -> String {
+    EfficiencyTemplate {
+        has_search_command: commands.iter().any(|(name, _)| name == "search"),
+    }
+    .render()
+    .unwrap_or_else(|error| panic!("failed to render efficiency: {error}"))
+}
+
+struct CatalogSkill {
+    dir_name: String,
+    name: String,
+    description: String,
+}
+
+struct CatalogSubagent {
+    id: String,
+    description: String,
+}
+
+#[derive(Template)]
+#[template(path = "prompt/capabilities.md", escape = "none")]
+struct CapabilitiesTemplate {
+    has_hosted_web_search: bool,
+    has_hosted_web_fetch: bool,
+    has_browser_command: bool,
+    skills: Vec<CatalogSkill>,
+    subagents: Vec<CatalogSubagent>,
+}
+
+/// The capabilities section: how commands run, the skills and the
+/// subagents. aither lists the commands themselves in its live command
+/// table; `commands` are the ones registered by name, which decide what the
+/// section says about them.
+///
+/// # Errors
+/// Fails when the skills directory cannot be read.
+pub async fn build_capabilities(
+    commands: &[(String, String)],
+    request_parameters: &Parameters,
+    skills_dir: &Path,
+) -> Result<String, MayAgentError> {
+    let has_browser_command = commands.iter().any(|(name, _)| name == "browser");
+
+    let skills = SkillManager::from_skills_dir(skills_dir.to_path_buf())
+        .list_skills()
+        .await
+        .map_err(|error| {
+            MayAgentError::Sandbox(format!("failed to load skill prompt metadata: {error}"))
+        })?
+        .into_iter()
+        .map(|skill| CatalogSkill {
+            dir_name: skill.dir_name,
+            name: skill.name,
+            description: skill.description,
+        })
+        .collect::<Vec<_>>();
+
+    let mut subagents: Vec<CatalogSubagent> = aither_agent::BUNDLED_SUBAGENTS
+        .iter()
+        .map(|bundled| {
+            let definition = bundled.definition();
+            CatalogSubagent {
+                id: definition.name,
+                description: definition.description,
+            }
+        })
+        .collect();
+    subagents.push(CatalogSubagent {
+        id: "fork".to_string(),
+        description: "Continues your own context on your model; use it for work that depends on what you have read and decided".to_string(),
+    });
+    subagents.sort_by(|left, right| left.id.cmp(&right.id));
+
+    CapabilitiesTemplate {
+        has_hosted_web_search: request_parameters.hosted_web_search(),
+        has_hosted_web_fetch: request_parameters.hosted_web_fetch(),
+        has_browser_command,
+        skills,
+        subagents,
+    }
+    .render()
+    .map_err(|error| MayAgentError::Sandbox(format!("failed to render capabilities: {error}")))
+}
+
+#[derive(Template)]
+#[template(path = "prompt/work.md", escape = "none")]
+struct WorkTemplate<'a> {
+    issue_backend_name: &'a str,
+    issue_repository: Option<&'a str>,
+}
+
+/// The work section: issues, PRs, `tasks.md`, artifacts and memory.
+pub fn build_work(issue_backend: &crate::issue::IssueBackendInfo) -> String {
+    WorkTemplate {
+        issue_backend_name: issue_backend.name,
+        issue_repository: issue_backend.repository.as_deref(),
+    }
+    .render()
+    .unwrap_or_else(|error| panic!("failed to render work: {error}"))
+}
+
+/// A network policy as the permissions section states it.
+enum NetworkRestriction {
+    Offline,
+    Only(Vec<String>),
+    Except(Vec<String>),
+}
+
+impl NetworkRestriction {
+    fn of(policy: &CompiledNetworkPolicy) -> Option<Self> {
+        let hosts = || policy.hosts().to_vec();
+        match policy.mode() {
+            NetworkPolicyMode::Disabled => None,
+            NetworkPolicyMode::Restricted => Some(Self::Offline),
+            NetworkPolicyMode::AllowList => Some(Self::Only(hosts())),
+            NetworkPolicyMode::DenyList => Some(Self::Except(hosts())),
+        }
+    }
+}
+
+#[derive(Template)]
+#[template(path = "prompt/permissions.md", escape = "none")]
+struct PermissionsTemplate<'a> {
+    home: HomeEnvironment,
+    secret_names: Vec<&'a str>,
+    network: Option<NetworkRestriction>,
+}
+
+/// The permissions and safety section: what the agent may write, escalation,
+/// untrusted text and stored secrets.
+pub fn build_permissions(
+    environment: &AgentEnvironment,
+    secret_names: Vec<&str>,
+    network_policy: Option<&CompiledNetworkPolicy>,
+) -> String {
+    PermissionsTemplate {
+        home: HomeEnvironment::of(environment),
+        secret_names,
+        network: network_policy.and_then(NetworkRestriction::of),
+    }
+    .render()
+    .unwrap_or_else(|error| panic!("failed to render permissions: {error}"))
+}
+
+#[derive(Template)]
+#[template(path = "prompt/harness.md", escape = "none")]
+struct HarnessTemplate;
+
+/// The harness section: each mechanism and how to work with it.
+pub fn build_harness() -> String {
+    HarnessTemplate
+        .render()
+        .unwrap_or_else(|error| panic!("failed to render harness: {error}"))
+}
+
+#[derive(Template)]
+#[template(path = "prompt/evidence.md", escape = "none")]
+struct EvidenceTemplate;
+
+/// The evidence section: alerts as facts, causes with their output.
+pub fn build_evidence() -> String {
+    EvidenceTemplate
+        .render()
+        .unwrap_or_else(|error| panic!("failed to render evidence: {error}"))
+}
+
+#[derive(Template)]
+#[template(path = "prompt/time.md", escape = "none")]
+struct TimeTemplate<'a> {
+    has_hosted_web_search: bool,
+    timezone: &'a TimeZoneName,
+    location: Option<&'a crate::location::LocationInfo>,
+}
+
+/// The time section: the knowledge cutoff, the user's timezone and, for a
+/// location-aware profile, where the user probably is.
+pub fn build_time(
+    request_parameters: &Parameters,
+    timezone: &TimeZoneName,
+    location: Option<&crate::location::LocationInfo>,
+) -> String {
+    TimeTemplate {
+        has_hosted_web_search: request_parameters.hosted_web_search(),
+        timezone,
+        location,
+    }
+    .render()
+    .unwrap_or_else(|error| panic!("failed to render time: {error}"))
+}
+
+/// A planning phase that adds a section.
+enum PlanPhase {
+    Draft,
+    Approved,
+}
+
+#[derive(Template)]
+#[template(path = "prompt/plan_mode.md", escape = "none")]
+struct PlanModeTemplate {
+    phase: PlanPhase,
+}
+
+pub fn build_plan_mode_context(plan_state: SessionPlanState) -> Option<String> {
+    let phase = match plan_state {
+        SessionPlanState::Disabled => return None,
+        SessionPlanState::Draft => PlanPhase::Draft,
+        SessionPlanState::Approved => PlanPhase::Approved,
+    };
+    Some(
+        PlanModeTemplate { phase }
+            .render()
+            .unwrap_or_else(|error| panic!("failed to render plan mode: {error}")),
+    )
+}
+
+#[derive(Template)]
+#[template(path = "prompt/workdirs.md", escape = "none")]
 struct WorkspaceWorkdirsTemplate {
     workdirs: Vec<WorkspaceDirEntry>,
 }
 
-#[derive(Clone)]
 struct WorkspaceDirEntry {
     path: String,
     description: String,
-}
-
-/// One session repository clone shown in runtime context.
-#[derive(Clone)]
-pub struct RepoCloneEntry {
-    /// Clone path inside the session sandbox.
-    pub clone_path: PathBuf,
-    /// Checkout or remote the clone came from.
-    pub source: String,
-}
-
-#[derive(Clone, Template)]
-#[template(path = "repo_clones.txt", escape = "none")]
-struct RepoClonesTemplate {
-    clones: Vec<RepoCloneTemplateEntry>,
-}
-
-#[derive(Clone)]
-struct RepoCloneTemplateEntry {
-    path: String,
-    source: String,
-}
-
-#[derive(Clone, Template)]
-#[template(path = "agents_md.txt", escape = "none")]
-struct AgentsMdTemplate {
-    workdir: Option<String>,
-    root_document: Option<String>,
-    root_truncated: bool,
-    nested: Vec<String>,
-    extra_nested: usize,
-    handoff_documents: Vec<HandoffAgentDoc>,
 }
 
 impl From<&MayWorkspaceDir> for WorkspaceDirEntry {
@@ -549,137 +889,9 @@ impl From<&MayWorkspaceDir> for WorkspaceDirEntry {
     }
 }
 
-#[derive(Clone)]
-struct BaseSystemCommand {
-    name: String,
-    description: String,
-}
-
-#[derive(Clone)]
-struct BaseSystemSkill {
-    dir_name: String,
-    name: String,
-    description: String,
-}
-
-#[derive(Clone)]
-struct BaseSystemSubagent {
-    id: String,
-    description: String,
-}
-
-#[derive(Clone, Template)]
-#[template(path = "base_system.md", escape = "none")]
-struct BaseSystemTemplate {
-    has_hosted_web_search: bool,
-    has_hosted_web_fetch: bool,
-    has_browser_command: bool,
-    has_commands: bool,
-    commands: Vec<BaseSystemCommand>,
-    has_skills: bool,
-    skills: Vec<BaseSystemSkill>,
-    has_subagents: bool,
-    subagents: Vec<BaseSystemSubagent>,
-    issue_backend_name: &'static str,
-    issue_repository: Option<String>,
-}
-
-pub fn build_browser_context(enabled: bool, cdp_endpoint: Option<&str>) -> String {
-    let state = if enabled {
-        BrowserContextState::Enabled
-    } else {
-        BrowserContextState::Disabled
-    };
-    let template = BrowserTemplate {
-        state,
-        cdp_endpoint: cdp_endpoint.map(str::to_string),
-    };
-    template
-        .render()
-        .unwrap_or_else(|error| panic!("failed to render browser context: {error}"))
-}
-
-pub fn build_terminal_runtime_context(
-    config: &MayAgentConfig,
-    session_paths: &SessionPaths,
-    model_info: Option<&aither_models::ModelEntry>,
-    attached_remote_servers: Vec<crate::config::SshServerConfig>,
-    host_launch_directory: Option<String>,
-) -> String {
-    let mut modality_support = Vec::new();
-    if let Some(info) = model_info {
-        if info.has_ability(Ability::Vision) {
-            modality_support.push("Image input is supported natively.".to_string());
-        }
-        if info.has_ability(Ability::Audio) {
-            modality_support.push("Audio input is supported natively.".to_string());
-        }
-        if info.has_ability(Ability::AudioOutput) {
-            modality_support.push("Audio output is supported natively.".to_string());
-        }
-        if info.has_ability(Ability::Video) {
-            modality_support.push("Video input is supported natively.".to_string());
-        }
-        if info.has_ability(Ability::Pdf) {
-            modality_support.push("PDF/document input is supported natively.".to_string());
-        }
-        if info.has_ability(Ability::ComputerUse) {
-            modality_support.push(
-                "Computer-use capable runtime interactions are supported by the model.".to_string(),
-            );
-        }
-    }
-    if modality_support.is_empty() {
-        modality_support.push(
-            "No additional multimodal abilities were resolved for this model; rely on persisted files and CLI tools when media cannot be viewed directly.".to_string(),
-        );
-    }
-
-    let template = TerminalRuntimeContextTemplate {
-        model_id: config.model_id.clone(),
-        home_environment_kind: home_environment_kind_label(&config.environment).to_string(),
-        operating_system: operating_system_hint(&config.environment).to_string(),
-        shell_dialect: "POSIX sh",
-        working_directory: working_directory(&config.environment, session_paths),
-        home_note: home_note(&config.environment),
-        host_launch_directory,
-        home_layout: home_layout(&config.environment),
-        session_layout: vec![
-            "/tmp - disposable temporary files".to_string(),
-            "/artifacts - durable user-facing outputs; put deliverables here".to_string(),
-            "/files - durable uploaded or recalled files".to_string(),
-            "/outputs - durable overflow and full command outputs".to_string(),
-            "/data - durable session-owned state".to_string(),
-            "/skills, /subagents - read-only profile mounts".to_string(),
-            "tasks.md - canonical task/plan document for long-running work; keep its checklist in sync with progress. An item waiting on an open ask_user question or on anything else the run cannot resolve is marked `BLOCKING <request_id or reason>` — it waits for what it names instead of holding the turn open; a mark naming a request that is no longer open does not hold".to_string(),
-        ],
-        command_rules: vec![
-            "Issue at most one tool call per assistant turn; compose multiple operations inside one terminal command with shell control flow, pipelines, or background jobs.".to_string(),
-            "Commands run in the current session home environment unless you explicitly target another. IPC-backed commands only work inside this profile's home environment; if a system-reminder reports a call to a non-existent direct tool, retry it through `terminal` as the CLI command.".to_string(),
-            "Read a selected skill completely before acting on it; the terminal call that reads the skill must finish before any task command that depends on it.".to_string(),
-            "Inline command results are previews May may clean, fold, or compress; the filesystem is durable. After compaction, restart, or long runs, recover prior results from outputs/, data/, files/, artifacts/, or tasks.md - read the slice you need with `head`, `tail`, `rg`, `jq`, or `ask`.".to_string(),
-            "Surface a user-facing file by writing it under artifacts/ and emitting an artifact tag on its own line: `<artifact url=\"path/inside/artifacts\" />`; a Slidev deck adds the `slidev` attribute.".to_string(),
-            "Ids surfaced by tool results and reminders — sessions, tasks, questions, runs, agents, requests — are internal handles: pass them to commands and reference them in tasks.md, but never quote them to the user.".to_string(),
-        ],
-        environment_rules: environment_runtime_rules(&config.environment),
-        modality_support,
-        attached_remote_servers,
-        secret_names: config
-            .secrets
-            .names()
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
-    };
-    template
-        .render()
-        .unwrap_or_else(|error| panic!("failed to render terminal runtime context: {error}"))
-}
-
-/// Builds the optional `workspace_workdirs` block from currently approved
-/// workspace grants. Kept as its own block so that runtime workdir approvals
-/// can invalidate only this block and leave the stable prefix cached.
-pub fn build_workspace_workdirs_context(workspace: &MayWorkspace) -> Option<String> {
+/// The approved workspace directories as an external block; `None` while
+/// none is approved.
+pub fn build_workspace_workdirs_context(workspace: &MayWorkspace) -> Option<ExternalContent> {
     let workdirs: Vec<WorkspaceDirEntry> = workspace
         .config
         .workdirs
@@ -689,17 +901,43 @@ pub fn build_workspace_workdirs_context(workspace: &MayWorkspace) -> Option<Stri
     if workdirs.is_empty() {
         return None;
     }
-    let template = WorkspaceWorkdirsTemplate { workdirs };
-    Some(
-        template
-            .render()
-            .unwrap_or_else(|error| panic!("failed to render workspace workdirs context: {error}")),
-    )
+    let content = WorkspaceWorkdirsTemplate { workdirs }
+        .render()
+        .unwrap_or_else(|error| panic!("failed to render workspace workdirs: {error}"));
+    Some(ExternalContent::data(WORKDIRS_SOURCE, content))
+}
+
+/// The profile's extracted memories as an external block; `None` when there
+/// are none.
+pub fn build_profile_memories(
+    memories: &crate::memory::ProfileMemories,
+) -> Option<ExternalContent> {
+    (!memories.is_empty())
+        .then(|| ExternalContent::data(PROFILE_MEMORIES_SOURCE, memories.to_context_string()))
+}
+
+/// One session repository clone shown in runtime context.
+#[derive(Clone)]
+pub struct RepoCloneEntry {
+    /// Clone path inside the session sandbox.
+    pub clone_path: PathBuf,
+    /// Checkout or remote the clone came from.
+    pub source: String,
+}
+
+#[derive(Template)]
+#[template(path = "prompt/repo_clones.md", escape = "none")]
+struct RepoClonesTemplate {
+    clones: Vec<RepoCloneTemplateEntry>,
+}
+
+struct RepoCloneTemplateEntry {
+    path: String,
+    source: String,
 }
 
 /// Builds the optional `repo_clones` block listing this session's private
-/// repository clones, kept as its own block so clone creation invalidates
-/// only it and not the stable prefix.
+/// repository clones.
 ///
 /// # Panics
 /// Panics when a clone lies outside the session directory: a container
@@ -726,115 +964,6 @@ pub fn build_repo_clones_context(
             .render()
             .unwrap_or_else(|error| panic!("failed to render repo clones context: {error}")),
     )
-}
-
-/// Builds the `agents_md` block from the launch-directory scan: the
-/// loaded root `AGENTS.md`, the relative paths of nested `AGENTS.md`
-/// files the agent must read before working in their subtree, and the
-/// `AGENTS.md` documents the active compaction handoff referenced.
-/// `workdir` is the launch directory as the model sees it — present only
-/// when the home environment exposes the host path (local sessions).
-/// `None` when there is nothing to say.
-pub fn build_agents_md_context(
-    index: &AgentsIndex,
-    workdir: Option<String>,
-    handoff_documents: &[HandoffAgentDoc],
-) -> Option<String> {
-    if index.root_document.is_none() && index.nested.is_empty() && handoff_documents.is_empty() {
-        return None;
-    }
-    let template = AgentsMdTemplate {
-        workdir,
-        root_document: index.root_document.clone(),
-        root_truncated: index.root_truncated,
-        nested: index.nested.clone(),
-        extra_nested: index.extra_nested,
-        handoff_documents: handoff_documents.to_vec(),
-    };
-    Some(
-        template
-            .render()
-            .unwrap_or_else(|error| panic!("failed to render agents_md context: {error}")),
-    )
-}
-
-pub async fn build_base_system_prompt(
-    shared_terminal_commands: &[(String, String)],
-    request_parameters: &Parameters,
-    skills_dir: &std::path::Path,
-    issue_backend: &crate::issue::IssueBackendInfo,
-) -> Result<String, MayAgentError> {
-    let mut commands = shared_terminal_commands
-        .iter()
-        .map(|(name, description)| BaseSystemCommand {
-            name: name.clone(),
-            description: description.clone(),
-        })
-        .collect::<Vec<_>>();
-    commands.sort_by(|left, right| left.name.cmp(&right.name));
-
-    let has_hosted_web_search = request_parameters.hosted_web_search();
-    let has_hosted_web_fetch = request_parameters.hosted_web_fetch();
-    let has_browser_command = commands.iter().any(|command| command.name == "browser");
-
-    let skills = SkillManager::from_skills_dir(skills_dir.to_path_buf())
-        .list_skills()
-        .await
-        .map_err(|error| {
-            MayAgentError::Sandbox(format!("failed to load skill prompt metadata: {error}"))
-        })?
-        .into_iter()
-        .map(|skill| BaseSystemSkill {
-            dir_name: skill.dir_name,
-            name: skill.name,
-            description: skill.description,
-        })
-        .collect::<Vec<_>>();
-
-    let mut subagents: Vec<BaseSystemSubagent> = aither_agent::BUNDLED_SUBAGENTS
-        .iter()
-        .map(|bundled| {
-            let definition = bundled.definition();
-            BaseSystemSubagent {
-                id: definition.name,
-                description: definition.description,
-            }
-        })
-        .collect();
-    subagents.push(BaseSystemSubagent {
-        id: "fork".to_string(),
-        description: "Continues your own context on your model; use it for work that depends on what you have read and decided".to_string(),
-    });
-    subagents.sort_by(|left, right| left.id.cmp(&right.id));
-
-    let template = BaseSystemTemplate {
-        has_hosted_web_search,
-        has_hosted_web_fetch,
-        has_browser_command,
-        has_commands: !commands.is_empty(),
-        commands,
-        has_skills: !skills.is_empty(),
-        skills,
-        has_subagents: !subagents.is_empty(),
-        subagents,
-        issue_backend_name: issue_backend.name,
-        issue_repository: issue_backend.repository.clone(),
-    };
-    template.render().map_err(|error| {
-        MayAgentError::Sandbox(format!("failed to render base system prompt: {error}"))
-    })
-}
-
-const fn home_environment_kind_label(environment: &AgentEnvironment) -> &'static str {
-    match environment {
-        AgentEnvironment::Local => "local",
-        AgentEnvironment::Container { .. } => "container",
-    }
-}
-
-/// The working directory the terminal starts in, as the shell sees it.
-fn working_directory(environment: &AgentEnvironment, session_paths: &SessionPaths) -> String {
-    sandbox_visible_path(environment, session_paths, session_paths.root())
 }
 
 /// A path under the session directory as the shell sees it: the host path
@@ -868,39 +997,6 @@ fn sandbox_visible_path(
     }
 }
 
-/// What `~`/`$HOME` expands to inside the shell.
-const fn home_note(environment: &AgentEnvironment) -> &'static str {
-    match environment {
-        AgentEnvironment::Local => {
-            "`~` and `$HOME` expand to the current working directory in every terminal mode, unsafe escalations included; use absolute paths for host locations."
-        }
-        AgentEnvironment::Container { .. } => {
-            "`~` and `$HOME` expand to the current working directory; storage outside /workspace is ephemeral to the container."
-        }
-    }
-}
-
-/// Layout of the profile home environment, empty where it has no meaningful
-/// anchor inside the session (containers mount its pieces under /root/.may).
-fn home_layout(environment: &AgentEnvironment) -> Vec<String> {
-    match environment {
-        AgentEnvironment::Local => vec![
-            "/sessions - per-session sandboxes under this home environment".to_string(),
-            "/skills, /subagents - profile-scoped, mounted read-only inside the session"
-                .to_string(),
-            "workspace.toml - May-managed workspace grants for this home environment".to_string(),
-        ],
-        AgentEnvironment::Container { .. } => Vec::new(),
-    }
-}
-
-fn operating_system_hint(environment: &AgentEnvironment) -> &'static str {
-    match environment {
-        AgentEnvironment::Local => host_operating_system_label(),
-        AgentEnvironment::Container { .. } => "linux (managed container runtime)",
-    }
-}
-
 fn host_operating_system_label() -> &'static str {
     match std::env::consts::OS {
         "macos" => "macOS",
@@ -910,444 +1006,6 @@ fn host_operating_system_label() -> &'static str {
     }
 }
 
-fn environment_runtime_rules(environment: &AgentEnvironment) -> Vec<String> {
-    match environment {
-        AgentEnvironment::Local => vec![
-            "This home environment is the user's real machine: prefer inspection over mutation outside the sandbox and approved workdirs, and request approval before destructive or irreversible commands.".to_string(),
-        ],
-        AgentEnvironment::Container { .. } => vec![
-            "This home environment is a managed container isolated from the user's host machine; the filesystem is writable unless a command says otherwise, but avoid needless destructive commands.".to_string(),
-            "Container-global state may be ephemeral; persist anything important into durable session directories (data/, outputs/, files/, artifacts/). Host-specific and desktop automation tools do not exist inside the container unless verified.".to_string(),
-        ],
-    }
-}
-
-pub fn build_location_context(location: &crate::location::LocationInfo) -> String {
-    format!(
-        "Location hint (inferred):\nCity: {}\nRegion: {}\nCountry: {}\nTimezone: {}",
-        location.city, location.region, location.country, location.timezone,
-    )
-}
-
-pub fn build_memory_context_content(memory: &str) -> String {
-    let mut out = String::with_capacity(MEMORY_CONTEXT_HINT.len() + memory.len() + 2);
-    out.push_str(MEMORY_CONTEXT_HINT.trim());
-    out.push_str("\n\n");
-    out.push_str(memory);
-    out
-}
-
-pub fn build_native_voice_context(native_voice_input: bool) -> Option<String> {
-    native_voice_input.then(|| NATIVE_VOICE_AVAILABLE_HINT.to_string())
-}
-
-pub fn build_plan_mode_context(plan_state: SessionPlanState) -> Option<String> {
-    match plan_state {
-        SessionPlanState::Disabled => None,
-        SessionPlanState::Draft => Some(PLAN_MODE_DRAFT_HINT.to_string()),
-        SessionPlanState::Approved => Some(PLAN_MODE_APPROVED_HINT.to_string()),
-    }
-}
-
-pub fn build_network_restrictions_context(
-    policy: Option<&CompiledNetworkPolicy>,
-) -> Option<String> {
-    let policy = policy?;
-    if matches!(policy.mode(), NetworkPolicyMode::Disabled) {
-        return None;
-    }
-    let mut out = format!(
-        "Network restrictions active for this session.\nMode: {}\n",
-        policy.mode().as_str(),
-    );
-    if !policy.hosts().is_empty() {
-        out.push_str("Hosts:\n");
-        for host in policy.hosts() {
-            out.push_str("- ");
-            out.push_str(host);
-            out.push('\n');
-        }
-    }
-    Some(out)
-}
-
 #[cfg(test)]
-mod tests {
-    use tempfile::tempdir;
-
-    use aither_core::llm::model::Parameters;
-
-    use super::{
-        RuntimeSystemContext, build_agents_md_context, build_base_system_prompt,
-        build_memory_context_content, tag,
-    };
-
-    fn test_context() -> aither_agent::Context {
-        aither_agent::Context::with_layout(tag::layout())
-    }
-
-    fn test_memory_file() -> (tempfile::TempDir, std::path::PathBuf) {
-        let dir = tempdir().expect("temp dir should be created");
-        let path = dir.path().join("MEMORY.md");
-        (dir, path)
-    }
-
-    /// Durable system alerts pushed with `Context::push_alert`.
-    ///
-    /// Alerts enter the conversation stream as `system` messages rather than
-    /// as ephemeral reminders, which are dropped by every request's reminder
-    /// repopulation pass.
-    fn system_alerts(context: &aither_agent::Context) -> Vec<String> {
-        context
-            .conversation_messages()
-            .into_iter()
-            .filter(|message| message.role() == aither_core::llm::Role::System)
-            .map(|message| message.content().to_string())
-            .collect()
-    }
-
-    #[test]
-    fn runtime_system_context_reinstates_memory_and_prunes_absent_blocks() {
-        let (_dir, memory_path) = test_memory_file();
-        let runtime_context = RuntimeSystemContext::new(memory_path, "remember this".to_string());
-        let mut context = test_context();
-        context
-            .instructions_mut()
-            .insert(&tag::PROFILE_PERSONA, "stale persona");
-        context
-            .instructions_mut()
-            .insert(&tag::REPO_CLONES, "stale clones");
-
-        runtime_context.reconcile(&mut context);
-
-        assert!(context.instructions().contains(&tag::MEMORY));
-        let memory = context
-            .instructions()
-            .get(&tag::MEMORY)
-            .expect("memory block should be present");
-        assert_eq!(memory, &build_memory_context_content("remember this"));
-        assert!(!context.instructions().contains(&tag::PROFILE_PERSONA));
-        assert!(!context.instructions().contains(&tag::REPO_CLONES));
-    }
-
-    #[test]
-    fn runtime_system_context_stages_memory_updates_with_diff_alert() {
-        let (_dir, memory_path) = test_memory_file();
-        std::fs::write(&memory_path, "before").expect("write initial memory");
-
-        let mut runtime_context =
-            RuntimeSystemContext::new(memory_path.clone(), "before".to_string());
-        let mut context = test_context();
-        runtime_context.reconcile(&mut context);
-
-        std::fs::write(&memory_path, "after").expect("update memory");
-        tokio_test::block_on(runtime_context.sync_memory_content(&mut context));
-        runtime_context.reconcile(&mut context);
-
-        // Cache-friendly: the live block still holds the old content; the
-        // change is staged and surfaced as an appended diff alert.
-        let memory = context
-            .instructions()
-            .get(&tag::MEMORY)
-            .expect("memory block should be present");
-        assert_eq!(memory, &build_memory_context_content("before"));
-        assert_eq!(
-            context.instructions().staged(&tag::MEMORY),
-            Some(&build_memory_context_content("after"))
-        );
-        let alerts = system_alerts(&context);
-        assert_eq!(alerts.len(), 1);
-        assert_eq!(
-            alerts[0],
-            format!(
-                "MEMORY.md changed since this conversation started. The memory block above is the previous version; apply this diff mentally (the context will fold it in later):\n<memory_diff>\n{}</memory_diff>",
-                similar::TextDiff::from_lines(
-                    build_memory_context_content("before"),
-                    build_memory_context_content("after"),
-                )
-                .unified_diff()
-                .context_radius(2)
-            )
-        );
-
-        // Repeated reconciles with the same staged content stay quiet.
-        runtime_context.reconcile(&mut context);
-        assert_eq!(system_alerts(&context).len(), 1);
-
-        // Reassembly folds the staged update in and clears the alert.
-        let report = context.reassemble();
-        assert_eq!(report.staged_updates_applied, 1);
-        let memory = context
-            .instructions()
-            .get(&tag::MEMORY)
-            .expect("memory block should be present");
-        assert_eq!(memory, &build_memory_context_content("after"));
-        assert_eq!(system_alerts(&context), [] as [std::string::String; 0]);
-    }
-
-    #[test]
-    fn terminal_runtime_context_is_reconciled_as_system_block() {
-        let (_dir, memory_path) = test_memory_file();
-        let runtime_context = RuntimeSystemContext::new(memory_path, "remember this".to_string())
-            .with_terminal_runtime("Model: demo-model\nHome environment kind: local".to_string());
-        let mut context = test_context();
-        runtime_context.reconcile(&mut context);
-
-        let terminal_runtime = context
-            .instructions()
-            .get(&tag::TERMINAL_RUNTIME_CONTEXT)
-            .expect("terminal runtime block should be present");
-        assert!(
-            terminal_runtime.contains("demo-model"),
-            "unexpected terminal runtime block: {terminal_runtime}"
-        );
-        assert!(
-            !terminal_runtime.contains('<'),
-            "raw-text block must not contain XML tags: {terminal_runtime}"
-        );
-    }
-
-    #[test]
-    fn workdirs_are_reconciled_independently() {
-        let (_dir, memory_path) = test_memory_file();
-        let mut runtime_context = RuntimeSystemContext::new(memory_path, String::new())
-            .with_terminal_runtime("Model: demo-model".to_string());
-        let mut context = test_context();
-        runtime_context.reconcile(&mut context);
-        let without_workdirs_fingerprint = context.stable_prefix_fingerprint();
-
-        runtime_context = runtime_context
-            .with_workspace_workdirs("Approved workspace directories:\n- /foo".to_string());
-        runtime_context.reconcile(&mut context);
-
-        assert!(context.instructions().contains(&tag::WORKSPACE_WORKDIRS));
-        assert_ne!(
-            without_workdirs_fingerprint,
-            context.stable_prefix_fingerprint(),
-            "adding workdirs block must change the fingerprint",
-        );
-    }
-
-    #[test]
-    fn agents_md_block_is_reconciled_and_pruned() {
-        let (_dir, memory_path) = test_memory_file();
-        let mut runtime_context = RuntimeSystemContext::new(memory_path, String::new());
-        let mut context = test_context();
-        runtime_context.reconcile(&mut context);
-        assert!(!context.instructions().contains(&tag::AGENTS_MD));
-
-        runtime_context = runtime_context.with_agents_md(Some("project rules".to_string()));
-        runtime_context.reconcile(&mut context);
-        assert_eq!(
-            context.instructions().get(&tag::AGENTS_MD),
-            Some(&"project rules".to_string())
-        );
-
-        runtime_context = runtime_context.with_agents_md(None);
-        runtime_context.reconcile(&mut context);
-        assert!(!context.instructions().contains(&tag::AGENTS_MD));
-    }
-
-    #[test]
-    fn agents_md_context_renders_document_and_nested_list() {
-        let index = crate::agent::agents_md::AgentsIndex {
-            root_document: Some("do the thing".to_string()),
-            root_truncated: false,
-            nested: vec!["crates/foo/AGENTS.md".to_string()],
-            extra_nested: 2,
-        };
-        let block = build_agents_md_context(&index, Some("/launch".to_string()), &[])
-            .expect("block renders");
-        assert!(block.contains("/launch"), "{block}");
-        assert!(block.contains("do the thing"), "{block}");
-        assert!(block.contains("crates/foo/AGENTS.md"), "{block}");
-        assert!(block.contains("2 more"), "{block}");
-
-        let empty = crate::agent::agents_md::AgentsIndex::default();
-        assert!(build_agents_md_context(&empty, None, &[]).is_none());
-    }
-
-    fn render_base_system_prompt(
-        commands: &[(String, String)],
-        request_parameters: &Parameters,
-    ) -> String {
-        render_base_system_prompt_with_backend(
-            commands,
-            request_parameters,
-            &crate::issue::IssueBackendInfo {
-                name: "may",
-                repository: None,
-            },
-        )
-    }
-
-    fn render_base_system_prompt_with_backend(
-        commands: &[(String, String)],
-        request_parameters: &Parameters,
-        issue_backend: &crate::issue::IssueBackendInfo,
-    ) -> String {
-        let dir = tempdir().expect("temp dir should be created");
-        tokio_test::block_on(build_base_system_prompt(
-            commands,
-            request_parameters,
-            dir.path(),
-            issue_backend,
-        ))
-        .expect("base system prompt should render")
-    }
-
-    #[test]
-    fn base_system_prompt_names_the_issue_backend() {
-        let prompt = render_base_system_prompt(&[], &Parameters::default());
-        assert!(prompt.contains("`issue` command (may backend)"), "{prompt}");
-
-        let prompt = render_base_system_prompt_with_backend(
-            &[],
-            &Parameters::default(),
-            &crate::issue::IssueBackendInfo {
-                name: "github",
-                repository: Some("May-Agent/may".to_string()),
-            },
-        );
-        assert!(
-            prompt.contains("`issue` command (github backend: May-Agent/may)"),
-            "{prompt}"
-        );
-    }
-
-    #[test]
-    fn base_system_prompt_has_no_native_tool_listing() {
-        // Native tool usage lives in the injected tool schemas; the system
-        // prompt only names CLI commands, skills and subagents.
-        let prompt = render_base_system_prompt(&[], &Parameters::default());
-        assert!(!prompt.contains("<native_tools>"), "{prompt}");
-    }
-
-    #[test]
-    fn base_system_prompt_advertises_hosted_web_search_and_fetch() {
-        let commands = vec![("browser".to_string(), "Drive the browser".to_string())];
-        let mut parameters = Parameters::default();
-        parameters.native_tools.claude.web_search = true;
-        parameters.native_tools.claude.web_fetch = true;
-
-        let prompt = render_base_system_prompt(&commands, &parameters);
-
-        assert!(prompt.contains("Use `web_search` to look up current information"));
-        assert!(prompt.contains("Use `web_fetch` to read a known URL"));
-        assert!(prompt.contains(
-            "The `browser` command is for interacting with pages or reaching what search and fetch cannot"
-        ));
-    }
-
-    #[test]
-    fn base_system_prompt_keeps_webfetch_when_hosted_fetch_off() {
-        let commands = vec![
-            ("browser".to_string(), "Drive the browser".to_string()),
-            ("webfetch".to_string(), "Fetch a URL".to_string()),
-        ];
-
-        let prompt = render_base_system_prompt(&commands, &Parameters::default());
-
-        assert!(!prompt.contains("web_search"), "{prompt}");
-        assert!(!prompt.contains("look up current information"));
-        let commands_section = prompt
-            // The tool architecture mentions `<commands>` inline, so match the
-            // tag on its own line.
-            .split("\n<commands>\n")
-            .nth(1)
-            .and_then(|rest| rest.split("</commands>").next())
-            .expect("commands section should render");
-        assert!(
-            !commands_section.contains("websearch"),
-            "{commands_section}"
-        );
-        assert!(
-            commands_section.contains("- webfetch: Fetch a URL"),
-            "{commands_section}"
-        );
-    }
-
-    fn container_environment() -> super::AgentEnvironment {
-        use std::sync::Arc;
-
-        use aither_sandbox::{
-            AnyContainerExec, BollardContainerExec, BridgeAddress, ContainerIpcRoute,
-        };
-
-        // An HTTP client handle neither probes a socket nor dials until used;
-        // rendering never uses it.
-        let client = bollard::Docker::connect_with_http(
-            "http://127.0.0.1:1",
-            1,
-            bollard::API_DEFAULT_VERSION,
-        )
-        .expect("an HTTP Docker client handle is built without connecting");
-        super::AgentEnvironment::Container {
-            container_id: "test-container".to_string(),
-            container_ipc_route: ContainerIpcRoute::new(
-                "host.docker.internal",
-                BridgeAddress::try_from(std::net::IpAddr::from([127, 0, 0, 1]))
-                    .expect("loopback binds the bridge"),
-            ),
-            container_exec: AnyContainerExec::new(Arc::new(BollardContainerExec::new(Arc::new(
-                client,
-            )))),
-            browser_cdp_endpoint: None,
-        }
-    }
-
-    fn clone_entry(session_paths: &crate::session::SessionPaths) -> super::RepoCloneEntry {
-        super::RepoCloneEntry {
-            clone_path: session_paths.root().join("repos/may"),
-            source: "/Users/someone/may".to_string(),
-        }
-    }
-
-    #[test]
-    fn container_repo_clones_render_under_the_workspace_mount() {
-        let dir = tempdir().expect("temp dir should be created");
-        let session_paths = crate::session::SessionPaths::new(dir.path().to_path_buf());
-        let rendered = super::build_repo_clones_context(
-            &[clone_entry(&session_paths)],
-            &container_environment(),
-            &session_paths,
-        )
-        .expect("a clone renders a block");
-        let host_prefix = dir.path().display().to_string();
-        assert!(
-            rendered.contains("- /workspace/repos/may (clone of"),
-            "{rendered}"
-        );
-        assert!(!rendered.contains(&host_prefix), "{rendered}");
-    }
-
-    #[test]
-    fn native_repo_clones_keep_the_host_path() {
-        let dir = tempdir().expect("temp dir should be created");
-        let session_paths = crate::session::SessionPaths::new(dir.path().to_path_buf());
-        let rendered = super::build_repo_clones_context(
-            &[clone_entry(&session_paths)],
-            &super::AgentEnvironment::Local,
-            &session_paths,
-        )
-        .expect("a clone renders a block");
-        let host_path = dir.path().join("repos/may").display().to_string();
-        assert!(
-            rendered.contains(&format!("- {host_path} (clone of")),
-            "{rendered}"
-        );
-    }
-
-    #[test]
-    #[should_panic(expected = "outside the session directory")]
-    fn container_clone_outside_the_session_directory_panics() {
-        let dir = tempdir().expect("temp dir should be created");
-        let session_paths = crate::session::SessionPaths::new(dir.path().to_path_buf());
-        let stray = super::RepoCloneEntry {
-            clone_path: std::path::PathBuf::from("/elsewhere/may"),
-            source: "x".to_string(),
-        };
-        let _ =
-            super::build_repo_clones_context(&[stray], &container_environment(), &session_paths);
-    }
-}
+#[path = "runtime_context_tests.rs"]
+mod tests;

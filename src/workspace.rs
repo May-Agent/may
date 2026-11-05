@@ -70,12 +70,18 @@ impl ProjectConfig {
         crate::issue::repository_identity(&self.path).is_ok_and(|k| k == identity)
     }
 
-    /// The GitHub repository this project is bound to, when its issue
-    /// backend names one.
+    /// The GitHub repository this project publishes to, independent of its
+    /// issue backend: the GitHub `origin` of its path, else the repository a
+    /// GitHub issue backend names (a project whose origin is not GitHub).
     #[must_use]
-    pub const fn github_repository(&self) -> Option<&GitHubRepository> {
+    pub fn github_repository(&self) -> Option<GitHubRepository> {
+        if let crate::trust::RepoKind::Github { owner_repo } = crate::trust::repo_kind(&self.path)
+            && let Ok(repository) = owner_repo.parse()
+        {
+            return Some(repository);
+        }
         match &self.issues {
-            ProjectIssues::Github { repository } => Some(repository),
+            ProjectIssues::Github { repository } => Some(repository.clone()),
             ProjectIssues::May => None,
         }
     }

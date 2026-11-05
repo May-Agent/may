@@ -1133,13 +1133,13 @@ fn render_jobs_panel(frame: &mut Frame, area: Rect, app: &App) {
                 JobRow::Job(job) => {
                     let (icon, status) = match &job.status {
                         aither_sandbox::JobStatus::Running => ("●", "running".to_string()),
-                        aither_sandbox::JobStatus::Completed { exit_code } => {
+                        aither_sandbox::JobStatus::Completed { exit_code, .. } => {
                             ("✓", format!("exit {exit_code}"))
                         }
-                        aither_sandbox::JobStatus::Failed { error } => {
+                        aither_sandbox::JobStatus::Failed { error, .. } => {
                             ("✗", format!("failed: {error}"))
                         }
-                        aither_sandbox::JobStatus::Killed => ("■", "killed".to_string()),
+                        aither_sandbox::JobStatus::Killed { .. } => ("■", "killed".to_string()),
                     };
                     let first_line = job.script.lines().next().unwrap_or("");
                     let cmd: String = first_line.chars().take(60).collect();
@@ -1186,11 +1186,13 @@ fn render_job_detail(frame: &mut Frame, area: Rect, state: &JobDetailState) {
                             "running · {}",
                             chat::format_elapsed(job.started_at.elapsed().as_secs())
                         ),
-                        aither_sandbox::JobStatus::Completed { exit_code } => {
+                        aither_sandbox::JobStatus::Completed { exit_code, .. } => {
                             format!("exit {exit_code}")
                         }
-                        aither_sandbox::JobStatus::Failed { error } => format!("failed: {error}"),
-                        aither_sandbox::JobStatus::Killed => "killed".to_string(),
+                        aither_sandbox::JobStatus::Failed { error, .. } => {
+                            format!("failed: {error}")
+                        }
+                        aither_sandbox::JobStatus::Killed { .. } => "killed".to_string(),
                     };
                     format!(
                         "job {} · {} — {status}",

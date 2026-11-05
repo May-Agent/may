@@ -11,6 +11,8 @@
 
 pub mod github;
 pub mod may;
+pub mod owner;
+pub mod provenance;
 pub mod search;
 
 use std::fmt;
@@ -128,12 +130,23 @@ pub struct IssueSummary {
 /// One comment on an issue.
 #[derive(Debug, Clone)]
 pub struct IssueComment {
+    /// Comment id on its backend.
+    pub id: i64,
     /// Author handle; `None` for may issues (they have no authors).
     pub author: Option<String>,
     /// Comment body (markdown).
     pub body: String,
     /// Creation timestamp (ISO 8601).
     pub created_at: String,
+}
+
+/// An issue after a comment was added to it.
+#[derive(Debug, Clone)]
+pub struct CommentedIssue {
+    /// The refreshed issue.
+    pub detail: IssueDetail,
+    /// Id of the comment that was added.
+    pub comment_id: i64,
 }
 
 /// A related issue in compact form.
@@ -193,6 +206,9 @@ pub enum IssueError {
     /// The search index could not be reached or refreshed.
     #[error("issue search is unavailable: {0}")]
     Search(String),
+    /// Issue ownership could not be decided.
+    #[error("issue ownership is unavailable: {0}")]
+    Ownership(String),
     /// The operation is reserved for the main agent; the text is rendered from
     /// the refusal template.
     #[error("{0}")]
@@ -271,12 +287,12 @@ pub trait IssueStore: Send + Sync + fmt::Debug {
         state: Option<IssueState>,
     ) -> impl Future<Output = Result<IssueDetail, IssueError>> + Send;
 
-    /// Add a comment; returns the refreshed detail.
+    /// Add a comment; returns the refreshed detail and the comment's id.
     fn comment(
         &self,
         number: i64,
         body: &str,
-    ) -> impl Future<Output = Result<IssueDetail, IssueError>> + Send;
+    ) -> impl Future<Output = Result<CommentedIssue, IssueError>> + Send;
 
     /// Add and/or remove labels; returns the refreshed detail.
     fn edit_labels(
@@ -379,7 +395,7 @@ impl IssueStore for ResolvedIssueStore {
         }
     }
 
-    async fn comment(&self, number: i64, body: &str) -> Result<IssueDetail, IssueError> {
+    async fn comment(&self, number: i64, body: &str) -> Result<CommentedIssue, IssueError> {
         match self {
             Self::May(store) => store.comment(number, body).await,
             Self::GitHub(store) => store.comment(number, body).await,
