@@ -58,6 +58,12 @@ pub(super) struct TurnEvents<'t, 's, S> {
     /// `Some` while a model call is in its reasoning phase: the instant the
     /// phase began, measured as user-perceived wait.
     pub(super) reasoning_phase: Option<Instant>,
+    /// The provider and model the turn's requests go to.
+    pub(super) provider_id: &'t str,
+    pub(super) model: &'t str,
+    /// The prompt prefix of the request in flight, until its usage arrives
+    /// and the two are measured against the route's cache.
+    pub(super) request_prefix: Option<aither_agent::context::PromptPrefix>,
     /// The newest request's usage: the context the window holds now.
     pub(super) usage: Usage,
     pub(super) ledger: RequestLedger<'t>,
@@ -84,6 +90,45 @@ pub(super) struct TurnEvents<'t, 's, S> {
     pub(super) first_agent_event_seen: bool,
     pub(super) first_visible_tool_seen: bool,
     pub(super) first_text_seen: bool,
+}
+
+/// How long `provider_id` keeps the conversation's prompt cache warm.
+fn provider_cache_lifetime(
+    state: &Arc<DaemonState>,
+    provider_id: &str,
+) -> crate::cache_lifetime::CacheLifetime {
+    state
+        .config
+        .load()
+        .provider
+        .get(provider_id)
+        .map(|instance| instance.cache_lifetime)
+        .unwrap_or_default()
+}
+
+/// Measure a request against its route's prompt cache; a miss is logged and
+/// persisted with its cause.
+async fn record_prompt_cache(state: &Arc<DaemonState>, request: crate::db::PromptCacheRequest<'_>) {
+    let (session_id, provider_id, model) = (request.session_id, request.provider_id, request.model);
+    match state.db().observe_prompt_cache(request).await {
+        Ok(Some(miss)) => tracing::warn!(
+            session_id,
+            provider_id,
+            model,
+            cause = %miss.cause,
+            missed_tokens = miss.missed_tokens,
+            read_tokens = miss.read_tokens,
+            gap_ms = u64::try_from(miss.gap.as_millis()).unwrap_or(u64::MAX),
+            diverged = ?miss.diverged,
+            compacted = miss.since.rewrites.compacted,
+            reassembled = miss.since.rewrites.reassembled,
+            agent_rebuilt = miss.since.agent_rebuilt,
+            model_switched = miss.since.model_switched,
+            "prompt cache miss"
+        ),
+        Ok(None) => {}
+        Err(error) => tracing::warn!(error = %error, "failed to record the prompt cache"),
+    }
 }
 
 /// The handler [`aither_agent::Run::drive`] calls with each event.
@@ -225,9 +270,28 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                     .emit_speed("client disconnected during text stream")
                     .await)
             }
+            AgentEvent::PromptPrefix(prefix) => {
+                self.request_prefix = Some(prefix);
+                Ok(ControlFlow::Continue(()))
+            }
             AgentEvent::Usage(usage) => {
                 self.decode_meter.note_usage(usage.completion_tokens);
                 record_request_log(self.state, self.ledger.completed(&usage, Instant::now())).await;
+                if let Some(prefix) = self.request_prefix.take() {
+                    record_prompt_cache(
+                        self.state,
+                        crate::db::PromptCacheRequest {
+                            session_id: self.session_id.as_str(),
+                            provider_id: self.provider_id,
+                            model: self.model,
+                            at: jiff::Timestamp::now(),
+                            usage: &usage,
+                            prefix,
+                            lifetime: provider_cache_lifetime(self.state, self.provider_id),
+                        },
+                    )
+                    .await;
+                }
                 self.usage = usage;
                 Ok(ControlFlow::Continue(()))
             }
