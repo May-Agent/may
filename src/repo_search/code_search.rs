@@ -16,6 +16,7 @@ use serde::Deserialize;
 use super::{RepoSearch, RepoSearchError, worktree_root};
 use crate::db::ChatDb;
 use crate::repo_clone::SessionRepos;
+use crate::workspace::WorkspaceConfig;
 
 /// Default answer budget, matching the repo-search CLI.
 const DEFAULT_BUDGET: u32 = 4000;
@@ -111,6 +112,7 @@ pub struct CodeSearchTool<B = RepoSearch> {
     cwd: PathBuf,
     db: Option<ChatDb>,
     clones: Option<SessionRepos>,
+    workspace: WorkspaceConfig,
 }
 
 impl<B: SearchBackend> CodeSearchTool<B> {
@@ -118,19 +120,22 @@ impl<B: SearchBackend> CodeSearchTool<B> {
     /// containing `cwd`. Every searched worktree is recorded in `db`'s repo
     /// usage, which keeps it on the daemon's auto-index list. A worktree the
     /// session holds a clone of in `clones` is searched through that clone,
-    /// where the agent's edits are.
+    /// where the agent's edits are; `workspace` holds the trust levels that
+    /// decide which clone that is.
     #[must_use]
     pub const fn new(
         backend: B,
         cwd: PathBuf,
         db: Option<ChatDb>,
         clones: Option<SessionRepos>,
+        workspace: WorkspaceConfig,
     ) -> Self {
         Self {
             backend,
             cwd,
             db,
             clones,
+            workspace,
         }
     }
 
@@ -141,7 +146,7 @@ impl<B: SearchBackend> CodeSearchTool<B> {
             return Ok(worktree);
         };
         let Some(clone) = clones
-            .clone_of_checkout(&worktree)
+            .clone_of_checkout(&worktree, &self.workspace)
             .await
             .map_err(|error| RepoSearchError::Io(std::io::Error::other(error)))?
         else {
@@ -389,7 +394,8 @@ mod tests {
         } else {
             None
         };
-        let tool = CodeSearchTool::new(daemon, checkout.clone(), Some(db), Some(repos));
+        let config = crate::trust::config_at(tmp, &checkout, crate::trust::TrustLevel::LocalBranch);
+        let tool = CodeSearchTool::new(daemon, checkout.clone(), Some(db), Some(repos), config);
         (tool, checkout, clone)
     }
 
