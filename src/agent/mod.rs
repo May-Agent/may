@@ -21,6 +21,8 @@ mod host_load_tests;
 pub(crate) mod idle_compaction_tests;
 pub(crate) mod imagine;
 pub(crate) mod issue_tool;
+#[cfg(test)]
+mod live_content_tests;
 mod live_settings;
 mod may;
 pub(crate) mod notify_tool;

@@ -5,7 +5,7 @@
 use std::time::{Duration, Instant};
 
 use super::idle_compaction_tests::{
-    COMPACTION_MARKER, SESSION_MODEL, Session, StubModel, run_turn, saved_config,
+    COMPACTION_MARKER, SESSION_MODEL, Session, StubModel, run_short_turn, saved_config,
 };
 
 const LOAD_HIGH: &str = "The machine load is high";
@@ -22,18 +22,21 @@ async fn settle(session: &Session) {
     }
 }
 
-/// How often `text` occurs in the last turn request the model received. A
-/// compaction request is not a turn's: the background compaction a turn
-/// starts reaches the model on its own schedule, after the next turn's
-/// request when the host is slow, and carries the context as it was when it
-/// started.
+/// How often `text` occurs in the last request the model received.
+///
+/// The session stays under the compaction floor: a compaction landing
+/// between two turns would fold the alerts the model already saw into its
+/// summary, and whether one lands before the next request is timing.
 async fn mentions(stub: &StubModel, text: &str) -> usize {
-    stub.requests
-        .lock()
-        .await
-        .iter()
-        .rev()
-        .find(|request| !request.contains(COMPACTION_MARKER))
+    let requests = stub.requests.lock().await;
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.contains(COMPACTION_MARKER)),
+        "the session never compacts"
+    );
+    requests
+        .last()
         .expect("a turn request")
         .matches(text)
         .count()
@@ -51,12 +54,12 @@ async fn the_load_alert_fires_once_on_entering_and_once_on_leaving_high_load() {
     let mut session = Box::pin(Session::start(&config)).await;
 
     settle(&session).await;
-    run_turn(&mut session.agent).await;
+    run_short_turn(&mut session.agent).await;
     assert_eq!(mentions(&stub, LOAD_HIGH).await, 0, "a calm host is quiet");
 
     session.parts.host.set_load(2.5);
     settle(&session).await;
-    run_turn(&mut session.agent).await;
+    run_short_turn(&mut session.agent).await;
     assert_eq!(mentions(&stub, LOAD_HIGH).await, 1);
     assert_eq!(
         mentions(&stub, "waits up to 75s for a command in the foreground").await,
@@ -66,16 +69,16 @@ async fn the_load_alert_fires_once_on_entering_and_once_on_leaving_high_load() {
 
     // The load persists: the alert is not restated.
     settle(&session).await;
-    run_turn(&mut session.agent).await;
+    run_short_turn(&mut session.agent).await;
     assert_eq!(mentions(&stub, LOAD_HIGH).await, 1);
 
     session.parts.host.set_load(0.1);
     settle(&session).await;
-    run_turn(&mut session.agent).await;
+    run_short_turn(&mut session.agent).await;
     assert_eq!(mentions(&stub, LOAD_ENDED).await, 1);
     assert_eq!(mentions(&stub, LOAD_HIGH).await, 1);
 
     settle(&session).await;
-    run_turn(&mut session.agent).await;
+    run_short_turn(&mut session.agent).await;
     assert_eq!(mentions(&stub, LOAD_ENDED).await, 1);
 }
