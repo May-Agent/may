@@ -489,17 +489,7 @@ impl MayAgent {
                     crate::trust::TrustLevel::Full
                     | crate::trust::TrustLevel::PrsOnly
                     | crate::trust::TrustLevel::LocalBranch,
-                ) => Some(match crate::trust::repo_kind(&worktree) {
-                    crate::trust::RepoKind::Github { owner_repo } => {
-                        match crate::trust::remote_url(&worktree) {
-                            Some(url) => session_repos.ensure_remote_clone(&url, &owner_repo).await,
-                            None => session_repos.ensure_local_clone(&worktree, &repo_key).await,
-                        }
-                    }
-                    crate::trust::RepoKind::Git => {
-                        session_repos.ensure_local_clone(&worktree, &repo_key).await
-                    }
-                }),
+                ) => Some(session_repos.ensure_clone_of(&worktree).await),
                 Some(crate::trust::TrustLevel::Local) | None => None,
             };
             match clone {
