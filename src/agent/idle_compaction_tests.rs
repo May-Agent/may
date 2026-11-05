@@ -55,6 +55,12 @@ pub struct StubModel {
 
 impl StubModel {
     pub async fn spawn(model: &'static str) -> Self {
+        Self::spawn_replying(model, |_| None).await
+    }
+
+    /// Like [`Self::spawn`], but `reply` may answer a request body with its
+    /// own text; `None` leaves the default.
+    pub async fn spawn_replying(model: &'static str, reply: fn(&str) -> Option<String>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind stub model server");
@@ -65,7 +71,8 @@ impl StubModel {
             while let Ok((stream, _)) = listener.accept().await {
                 let served = served.clone();
                 tokio::spawn(async move {
-                    let service = service_fn(move |request| answer(request, model, served.clone()));
+                    let service =
+                        service_fn(move |request| answer(request, model, reply, served.clone()));
                     let _ = http1::Builder::new()
                         .serve_connection(TokioIo::new(stream), service)
                         .await;
@@ -94,6 +101,7 @@ impl StubModel {
 async fn answer(
     request: Request<Incoming>,
     model: &'static str,
+    reply_to: fn(&str) -> Option<String>,
     requests: Arc<tokio::sync::Mutex<Vec<String>>>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     if request.method() == Method::GET && request.uri().path().ends_with("/models") {
@@ -127,7 +135,7 @@ async fn answer(
         })
         .to_string()
     } else {
-        "Hello there.".to_string()
+        reply_to(&text).unwrap_or_else(|| "Hello there.".to_string())
     };
     requests.lock().await.push(text);
     let chunk = |delta: &serde_json::Value, finish: serde_json::Value| {
