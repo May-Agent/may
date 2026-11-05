@@ -152,6 +152,8 @@ pub struct MayAgentConfig {
     /// How long the session provider keeps the conversation cached; idle
     /// compaction and reassembly follow it.
     pub cache_lifetime: crate::cache_lifetime::CacheLifetime,
+    /// When the conversation is compacted.
+    pub context_policy: aither_agent::ContextPolicy,
     /// Time source for idle timing; `None` reads the system clock. Tests set it.
     pub clock: Option<aither_agent::ManualClock>,
     /// Session sandbox directory (`TerminalTool` creates working dir inside).
@@ -314,6 +316,8 @@ pub struct MayAgent {
     provider_id: String,
     model_id: String,
     model_context_window: Option<u32>,
+    /// The thresholds the agent compacts by; `/context` reports them.
+    context_policy: aither_agent::ContextPolicy,
     /// IPC command names backed by MCP connections — lets `/context` split
     /// the `<commands>` index into built-in vs MCP rows.
     mcp_command_names: Vec<String>,
@@ -587,6 +591,7 @@ impl MayAgent {
                     .with_epoch(config.prompt_cache_epoch)
                     .with_lifetime(config.cache_lifetime.into()),
             )
+            .context_policy(config.context_policy)
             .background_jobs(config.background_jobs)
             .connectivity(config.connectivity.clone());
         if let Some(runtime) = hook_runtime.clone() {
@@ -700,6 +705,7 @@ impl MayAgent {
             provider_id: config.provider_id,
             model_id: config.model_id,
             model_context_window: config.model_context_window,
+            context_policy: config.context_policy,
             mcp_command_names: shared_terminal_commands.mcp_command_names,
             runtime_system_context,
             job_registry,
@@ -829,6 +835,7 @@ impl MayAgent {
             ask_models,
             compaction_llm,
             cache_lifetime,
+            context_policy: may_config.context.policy(),
             clock: None,
             sandbox_dir,
             may_dir,
@@ -1013,6 +1020,7 @@ impl MayAgent {
             self.inner.context(),
             &snapshot.metrics,
             snapshot.phase,
+            &self.context_policy,
         ))
     }
 
@@ -1306,6 +1314,7 @@ pub async fn test_agent(
             provider_id: provider_id.to_string(),
             model_id: model_id.to_string(),
             model_context_window: None,
+            context_policy: aither_agent::ContextPolicy::default(),
             mcp_command_names: Vec::new(),
             runtime_system_context: RuntimeSystemContext::new(
                 temp.path().join("MEMORY.md"),
