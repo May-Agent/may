@@ -25,7 +25,7 @@ async fn state_with_idle_agent(
     let stub = StubModel::spawn(SESSION_MODEL).await;
     let config = saved_config(&stub, None);
     let state = Arc::new(
-        DaemonState::for_test(dir, dir, config.clone())
+        DaemonState::for_test(dir, config.clone())
             .await
             .expect("test daemon state"),
     );
