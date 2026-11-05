@@ -1483,9 +1483,39 @@ impl RunningDaemon {
         }
     }
 
-    async fn stop(mut self) {
+    /// Kills the daemon outright, as a crash would: no shutdown path runs.
+    /// For tests whose point is surviving an abrupt death; it leaves a
+    /// relocated home's launchd agents loaded.
+    async fn kill(mut self) {
         let _ = self.child.kill().await;
         let _ = self.child.wait().await;
+    }
+
+    /// Stops the daemon through its shutdown path, so it retires what it
+    /// installed for its relocated home, and waits for the process to exit.
+    ///
+    /// # Panics
+    /// When the daemon ignores the shutdown: it is then killed and the test
+    /// fails.
+    async fn stop(mut self) {
+        let requested = reqwest::Client::new()
+            .post(format!("{}/api/daemon/shutdown", self.base_url))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success());
+        let exited = requested
+            && tokio::time::timeout(DAEMON_SHUTDOWN_TIMEOUT, self.child.wait())
+                .await
+                .is_ok();
+        if !exited {
+            let _ = self.child.kill().await;
+            let _ = self.child.wait().await;
+            panic!(
+                "daemon did not exit within {DAEMON_SHUTDOWN_TIMEOUT:?} of a shutdown request (accepted: {requested}); server logs:\n{}",
+                self.log.contents().await
+            );
+        }
     }
 }
 
@@ -1709,9 +1739,32 @@ fn heel_bin() -> String {
     path
 }
 
+/// The daemon's shutdown drains runs for up to 30 s and settles cancelled
+/// ones for 5 s more.
+const DAEMON_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(60);
+
 impl Drop for RunningDaemon {
+    /// A test that failed before `stop` still lets the daemon shut down in
+    /// order: SIGTERM runs the same path as the shutdown request, and the drop
+    /// blocks until the process exits (SIGKILL after the shutdown timeout), so
+    /// the test's home outlives it. Reaping goes through tokio's own
+    /// `try_wait`, so the child is never reaped behind its back.
     fn drop(&mut self) {
-        let _ = self.child.start_kill();
+        let Some(pid) = self.child.id() else {
+            return; // already reaped by `stop` or `kill`
+        };
+        let pid = i32::try_from(pid).expect("a pid fits in i32");
+        // SAFETY: signalling a child this value spawned and has not reaped.
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+        let deadline = std::time::Instant::now() + DAEMON_SHUTDOWN_TIMEOUT;
+        while matches!(self.child.try_wait(), Ok(None)) {
+            if std::time::Instant::now() >= deadline {
+                let _ = self.child.start_kill();
+                let _ = self.child.try_wait();
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 
@@ -4884,6 +4937,84 @@ async fn oneshot_run_prints_a_burst_turn_through_its_end() {
     );
 }
 
+/// Whether launchd has `label` loaded in the invoking user's domain.
+#[cfg(target_os = "macos")]
+fn launchd_job_loaded(label: &str) -> bool {
+    // SAFETY: getuid cannot fail.
+    let uid = unsafe { libc::getuid() };
+    std::process::Command::new("/bin/launchctl")
+        .args(["print", &format!("user/{uid}/{label}")])
+        .output()
+        .expect("launchctl print should run")
+        .status
+        .success()
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[serial]
+async fn temp_home_daemon_leaves_no_repo_search_job_after_it_stops() {
+    use repo_search_client::launcher::launchd::labels_for;
+
+    let mock = MockOpenAiServer::spawn(MockChatScenario::SlowTextEveryTurn {
+        chunks: vec!["hi".into()],
+        delay: Duration::from_millis(10),
+    })
+    .await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    let home = harness.home_path().to_path_buf();
+    let login = dirs::home_dir().expect("login home should resolve");
+    let (daemon_label, server_label) = labels_for(&home, &login);
+    assert!(
+        !launchd_job_loaded(&daemon_label) && !launchd_job_loaded(&server_label),
+        "a fresh temp home owns no job"
+    );
+
+    let server = RunningDaemon::spawn(&home, &[]).await;
+    // An index-coverage poll on a git worktree reaches repo-search, which
+    // installs the home's agents.
+    let worktree = tempfile::tempdir().expect("worktree tempdir should be created");
+    git2::Repository::init(worktree.path()).expect("worktree should initialise");
+    let cwd = dunce::canonicalize(worktree.path()).expect("worktree should resolve");
+    let client = reqwest::Client::new();
+    let events = client
+        .get(format!("{}/api/events", server.base_url))
+        .query(&[
+            ("topics", "session_index"),
+            ("cwd", cwd.to_str().expect("utf-8 path")),
+        ])
+        .send()
+        .await
+        .expect("event stream should open");
+    let mut reader = SseReader::new(events);
+    let snapshot = loop {
+        let event = tokio::time::timeout(Duration::from_secs(120), reader.next_event())
+            .await
+            .expect("an index snapshot should arrive")
+            .expect("the stream should stay open");
+        if event.event == "session_index" {
+            break event.data;
+        }
+    };
+    drop(reader);
+    // A launchd that refuses the bootstrap (a port or the session already
+    // taken) leaves nothing to boot out; the check below then still holds.
+    let installed =
+        serde_json::from_str::<Value>(&snapshot).expect("snapshot is JSON")["error"].is_null();
+    if installed {
+        assert!(
+            launchd_job_loaded(&daemon_label) && launchd_job_loaded(&server_label),
+            "the temp-home daemon should have installed its repo-search agents; snapshot: {snapshot}"
+        );
+    }
+
+    server.stop().await;
+    assert!(
+        !launchd_job_loaded(&daemon_label) && !launchd_job_loaded(&server_label),
+        "stopping the daemon should boot out the relocated home's agents"
+    );
+}
+
 /// The session's background work, as `GET /api/sessions/{id}/background`
 /// reports it.
 async fn background_of(
@@ -5004,6 +5135,7 @@ async fn a_background_job_is_listed_pushed_and_killable_over_the_api() {
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
+    server.stop().await;
 }
 
 /// A background job that finishes after its turn ended starts a turn of its
@@ -5080,6 +5212,7 @@ async fn a_background_job_finishing_after_its_turn_resumes_the_session() {
         resumed_request.contains(FINISHING_JOB_MARKER),
         "the model sees the job's output: {resumed_request}"
     );
+    server.stop().await;
 }
 
 /// Opens the session's `session_agent` stream, continuing after frame
@@ -5185,6 +5318,7 @@ async fn a_reconnecting_client_continues_after_the_last_frame_it_saw() {
     let mut stale = agent_frames(&client, &server, &session_id, Some(frame_index(&seen[0]))).await;
     let resync = next_turn_frame(&mut stale).await;
     assert_eq!(resync.event, "session_resync", "{resync:?}");
+    server.stop().await;
 }
 
 /// The handoff a compaction probe's compaction answers with.
@@ -5281,8 +5415,8 @@ async fn a_compaction_started_mid_run_lands_and_survives_a_restart() {
         .to_string()
         .len();
 
-    // Kill the daemon: the next one has nothing but the persisted snapshot.
-    server.stop().await;
+    // Crash the daemon: the next one has nothing but the persisted snapshot.
+    server.kill().await;
     let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
     let turn = send_turn(
         &client,
