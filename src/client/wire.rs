@@ -211,7 +211,7 @@ pub enum WireAgentEvent {
         /// Turns taken.
         turns: usize,
     },
-    /// A compaction failed at the pause point; the context was cleaned and
+    /// A compaction failed at the pause point, so the context was cleaned and
     /// the compaction reruns on it.
     CompactionRecovery {
         /// Why the compaction failed.
@@ -518,6 +518,17 @@ pub struct SessionIndexSnapshot {
     pub error: Option<String>,
 }
 
+/// One `session_issues` event: the issues the session's tasks link, as the
+/// issue store reports them now.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionIssuesFrame {
+    /// Session the issues are linked from.
+    pub session_id: String,
+    /// One brief per linked issue.
+    pub issues: Vec<crate::tui::sidebar::IssueBrief>,
+}
+
 /// How much of a worktree index carries a vector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -775,24 +786,26 @@ mod tests {
     }
 
     #[test]
-    fn a_compaction_recovery_survives_the_wire() {
+    fn compaction_recovery_survives_the_round_trip() {
         let event = AgentEvent::CompactionRecovery {
-            error: AgentError::llm_local("no handoff"),
-            alerts_removed: 3,
-            outputs_spilled: 2,
+            error: AgentError::Llm {
+                message: "too long".to_string(),
+                failure: aither_core::llm::Failure::transient(),
+            },
+            alerts_removed: 2,
+            outputs_spilled: 3,
         };
         let wire = WireAgentEvent::from_agent(Ok(&event)).expect("rendered event");
         let json = serde_json::to_string(&wire).expect("serialize");
-        assert!(json.contains("\"type\":\"compaction_recovery\""), "{json}");
         let back: WireAgentEvent = serde_json::from_str(&json).expect("deserialize");
         let timed = back.into_timed(jiff::Timestamp::UNIX_EPOCH).expect("event");
         assert!(matches!(
             timed.event,
             AgentEvent::CompactionRecovery {
-                alerts_removed: 3,
-                outputs_spilled: 2,
-                ..
-            }
+                error: AgentError::Llm { ref message, .. },
+                alerts_removed: 2,
+                outputs_spilled: 3,
+            } if message == "too long"
         ));
     }
 

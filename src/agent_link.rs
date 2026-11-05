@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::db::ChatDbError;
 use crate::session::{
     MayHomePaths, PendingMessageState, PendingUserMessage, PendingUserMessageMode,
-    SessionRuntimeService,
+    SessionDirectory, SessionRuntimeService,
 };
 use crate::xml::{XmlBlock, XmlBlockError};
 
@@ -103,9 +103,6 @@ pub struct AgentDirectory {
     runtime_service: Arc<SessionRuntimeService>,
     /// `~/.may`.
     may_dir: PathBuf,
-    /// Directory the daemon was started in, for sessions that never recorded
-    /// one.
-    cwd: PathBuf,
     /// Nudges the daemon to dispatch a session's stored pending work.
     wake: Arc<dyn Fn(&str) + Send + Sync>,
 }
@@ -123,13 +120,11 @@ impl AgentDirectory {
     pub fn new(
         runtime_service: Arc<SessionRuntimeService>,
         may_dir: PathBuf,
-        cwd: PathBuf,
         wake: impl Fn(&str) + Send + Sync + 'static,
     ) -> Self {
         Self {
             runtime_service,
             may_dir,
-            cwd,
             wake: Arc::new(wake),
         }
     }
@@ -154,10 +149,7 @@ impl AgentDirectory {
             live.push(AgentStatus {
                 name: session.title.clone().unwrap_or_else(|| session.id.clone()),
                 session_id: session.id.clone(),
-                cwd: session
-                    .cwd
-                    .clone()
-                    .map_or_else(|| self.cwd.clone(), PathBuf::from),
+                cwd: SessionDirectory::of(&session, &self.may_dir).into_path(),
                 activity: if state.is_idle() {
                     Activity::Idle
                 } else {
