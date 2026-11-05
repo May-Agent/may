@@ -86,6 +86,29 @@ impl HostGit {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
+    /// The boolean `key` in the host's configuration the way git reads it
+    /// (`true`, `yes`, `on`, `1`, ...), `None` when unset.
+    ///
+    /// # Errors
+    /// Fails when git cannot read its configuration or the value is not a
+    /// boolean.
+    pub fn config_bool(&self, key: &str) -> Result<Option<bool>, HostGitError> {
+        let output = self
+            .command()
+            .args(["config", "--type=bool", "--get", key])
+            .output()?;
+        match output.status.code() {
+            Some(0) => Ok(Some(
+                String::from_utf8_lossy(&output.stdout).trim() == "true",
+            )),
+            Some(1) => Ok(None),
+            _ => Err(HostGitError::Failed {
+                args: format!("config --type=bool --get {key}"),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            }),
+        }
+    }
+
     /// The value of `key` in the host's configuration, `None` when unset.
     ///
     /// # Errors

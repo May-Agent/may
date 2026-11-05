@@ -2,9 +2,10 @@
 //!
 //! The sandbox's `HOME` is the session directory, so git there sees none of
 //! the user's configuration. May writes the git configuration the sandbox
-//! reads ([`CommitSigning::install_sandbox_git`]): the user's identity,
-//! `commit.gpgsign`, and a `gpg.ssh.program` that hands every buffer git wants
-//! signed to the [`SignCommitTool`] IPC command. The harness signs it on the
+//! reads ([`CommitSigning::install_sandbox_git`]): the user's identity and,
+//! only when the user signs their own commits, `commit.gpgsign` and a
+//! `gpg.ssh.program` that hands every buffer git wants signed to the
+//! [`SignCommitTool`] IPC command. The harness signs it on the
 //! host with the user's own signing configuration, so the key never enters the
 //! sandbox and nothing is rewritten after the fact.
 //!
@@ -62,6 +63,12 @@ pub enum SigningError {
     /// The host's git configuration lacks what signing as the user needs.
     #[error("the host's git configuration has no `{0}`, so a commit cannot be made as the user")]
     MissingConfig(&'static str),
+    /// The user signs with a `gpg.format` the harness cannot sign in.
+    #[error(
+        "the host's git signs commits with gpg.format `{0}`, which the sandbox cannot sign; \
+         only `ssh` is supported"
+    )]
+    UnsupportedFormat(String),
     /// The harness signs commits authored as the user and nothing else.
     #[error("refusing to sign: {0}")]
     Refused(String),
@@ -128,6 +135,40 @@ fn required(host: &HostGit, key: &'static str) -> Result<String, SigningError> {
 struct Identity {
     name: String,
     email: String,
+}
+
+impl Identity {
+    fn read(host: &HostGit) -> Result<Self, SigningError> {
+        Ok(Self {
+            name: required(host, "user.name")?,
+            email: required(host, "user.email")?,
+        })
+    }
+}
+
+/// Whether and how the user signs their commits, from the host's
+/// `commit.gpgsign` and `gpg.format`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SigningPolicy {
+    /// `commit.gpgsign` is false or unset.
+    Off,
+    /// The user signs with ssh keys.
+    Ssh,
+    /// The user signs in another `gpg.format`, which the harness cannot do.
+    Unsupported(String),
+}
+
+impl SigningPolicy {
+    fn read(host: &HostGit) -> Result<Self, SigningError> {
+        if !host.config_bool("commit.gpgsign")?.unwrap_or(false) {
+            return Ok(Self::Off);
+        }
+        match host.config_value("gpg.format")?.as_deref() {
+            Some("ssh") => Ok(Self::Ssh),
+            Some(other) if !other.is_empty() => Ok(Self::Unsupported(other.to_string())),
+            _ => Ok(Self::Unsupported("openpgp".to_string())),
+        }
+    }
 }
 
 /// The key the user's signing configuration names.
@@ -215,10 +256,7 @@ struct HostSigner {
 impl HostSigner {
     fn read(host: &HostGit) -> Result<Self, SigningError> {
         Ok(Self {
-            identity: Identity {
-                name: required(host, "user.name")?,
-                email: required(host, "user.email")?,
-            },
+            identity: Identity::read(host)?,
             program: host
                 .config_value("gpg.ssh.program")?
                 .filter(|program| !program.is_empty())
@@ -420,8 +458,14 @@ struct AuditRecord<'a> {
 struct SandboxGitConfig {
     /// The user's identity, when the host has one.
     identity: Option<Identity>,
+    /// Present when the user signs their commits.
+    signing: Option<SandboxSigning>,
+}
+
+/// What a sandbox needs to have its commits signed by the harness.
+struct SandboxSigning {
     /// `key::<public key>`, the key the harness signs with.
-    signing_key: String,
+    key: String,
     /// The signer program, as the sandbox spells its path.
     program: String,
 }
@@ -507,6 +551,9 @@ impl CommitSigning {
         let text = std::str::from_utf8(buffer)
             .map_err(|_| SigningError::Refused("not a commit object: it is not UTF-8".into()))?;
         let commit = CommitObject::parse(text)?;
+        if let SigningPolicy::Unsupported(format) = SigningPolicy::read(&self.host)? {
+            return Err(SigningError::UnsupportedFormat(format));
+        }
         let signer = HostSigner::read(&self.host)?;
         for (role, who) in [("author", &commit.author), ("committer", &commit.committer)] {
             if *who != signer.identity {
@@ -549,9 +596,10 @@ impl CommitSigning {
 
     /// Writes the git configuration and signer program the sandbox rooted at
     /// `sandbox_dir` (its `HOME`) reads, from the user's current host
-    /// configuration. Without a usable host identity or key the configuration
-    /// still demands signing, so a commit fails with the harness's reason
-    /// instead of going out unsigned.
+    /// configuration: the identity always, and signing only when the host's
+    /// `commit.gpgsign` is on. A user who signs but has no usable key or
+    /// supported format still gets signing, so a commit fails with the
+    /// harness's reason instead of going out unsigned.
     ///
     /// # Errors
     /// Fails when the files cannot be written, or when a container's mount
@@ -596,27 +644,38 @@ impl CommitSigning {
     /// the signer at `program`.
     async fn sandbox_git_config(&self, program: &str) -> Result<String, SigningError> {
         let host = self.host.clone();
-        let (identity, signing_key) = blocking::unblock(move || {
-            let signer = HostSigner::read(&host);
-            match signer.and_then(|s| Ok((s.key.public()?, s.identity))) {
-                Ok((public, identity)) => (Some(identity), format!("key::{public}")),
-                Err(error) => {
-                    tracing::warn!(%error, "no usable git signing configuration on the host");
-                    (None, "key::".to_string())
+        let program = program.to_string();
+        let (identity, signing) = blocking::unblock(move || {
+            let identity = Identity::read(&host)
+                .inspect_err(|error| tracing::warn!(%error, "no git identity on the host"))
+                .ok();
+            let signing = match SigningPolicy::read(&host)? {
+                SigningPolicy::Off => None,
+                // An unsupported format still gets the signer, which refuses
+                // the commit naming the format.
+                SigningPolicy::Ssh | SigningPolicy::Unsupported(_) => {
+                    let key = required(&host, "user.signingkey")
+                        .and_then(|value| SigningKey::parse(&value)?.public())
+                        .map_or_else(
+                            |error| {
+                                tracing::warn!(%error, "no usable git signing key on the host");
+                                "key::".to_string()
+                            },
+                            |public| format!("key::{public}"),
+                        );
+                    Some(SandboxSigning { key, program })
                 }
-            }
+            };
+            Ok::<_, SigningError>((identity, signing))
         })
-        .await;
-        Ok(SandboxGitConfig {
-            identity,
-            signing_key,
-            program: program.to_string(),
-        }
-        .render()?)
+        .await?;
+        Ok(SandboxGitConfig { identity, signing }.render()?)
     }
 
-    /// Checks that every commit of `base..head` in `repo`, a repository the
-    /// host trusts, carries a signature valid under the user's key.
+    /// When the user signs their commits (`commit.gpgsign`), checks that
+    /// every commit of `base..head` in `repo`, a repository the host trusts,
+    /// carries a signature valid under the user's key. A user who does not
+    /// sign requires nothing.
     ///
     /// # Errors
     /// Fails on the first commit without one, or when the user's key cannot
@@ -641,6 +700,13 @@ impl CommitSigning {
         base: &str,
         head: &str,
     ) -> Result<(), SigningError> {
+        match SigningPolicy::read(&self.host)? {
+            SigningPolicy::Off => return Ok(()),
+            SigningPolicy::Unsupported(format) => {
+                return Err(SigningError::UnsupportedFormat(format));
+            }
+            SigningPolicy::Ssh => {}
+        }
         let signer = HostSigner::read(&self.host)?;
         let dir = tempfile::Builder::new().prefix("may-signers-").tempdir()?;
         let signers = dir.path().join("allowed_signers");
