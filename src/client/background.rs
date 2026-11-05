@@ -9,7 +9,7 @@
 
 use std::time::{Duration, Instant};
 
-use aither_sandbox::{JobInfo, JobStatus, TerminalMode};
+use aither_sandbox::{Delivery, JobInfo, JobStatus, TerminalMode};
 use serde::{Deserialize, Serialize};
 
 use crate::agent::SubagentRunSnapshot;
@@ -24,27 +24,69 @@ pub enum WireJobStatus {
     Completed {
         /// Exit code.
         exit_code: i32,
+        /// Whether the agent has taken the completion.
+        delivery: WireDelivery,
     },
     /// Failed to run.
     Failed {
         /// Why.
         error: String,
+        /// Whether the agent has taken the completion.
+        delivery: WireDelivery,
     },
     /// Killed by the user.
-    Killed,
+    Killed {
+        /// Whether the agent has taken the completion.
+        delivery: WireDelivery,
+    },
+}
+
+/// Whether a finished job's completion has reached its agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WireDelivery {
+    /// On its way to the agent, which owes the session a turn for it.
+    Pending,
+    /// Taken by the agent.
+    Taken,
+}
+
+impl From<Delivery> for WireDelivery {
+    fn from(delivery: Delivery) -> Self {
+        match delivery {
+            Delivery::Pending => Self::Pending,
+            Delivery::Taken => Self::Taken,
+        }
+    }
+}
+
+impl From<WireDelivery> for Delivery {
+    fn from(delivery: WireDelivery) -> Self {
+        match delivery {
+            WireDelivery::Pending => Self::Pending,
+            WireDelivery::Taken => Self::Taken,
+        }
+    }
 }
 
 impl From<&JobStatus> for WireJobStatus {
     fn from(status: &JobStatus) -> Self {
         match status {
             JobStatus::Running => Self::Running,
-            JobStatus::Completed { exit_code } => Self::Completed {
+            JobStatus::Completed {
+                exit_code,
+                delivery,
+            } => Self::Completed {
                 exit_code: *exit_code,
+                delivery: (*delivery).into(),
             },
-            JobStatus::Failed { error } => Self::Failed {
+            JobStatus::Failed { error, delivery } => Self::Failed {
                 error: error.clone(),
+                delivery: (*delivery).into(),
             },
-            JobStatus::Killed => Self::Killed,
+            JobStatus::Killed { delivery } => Self::Killed {
+                delivery: (*delivery).into(),
+            },
         }
     }
 }
@@ -53,9 +95,20 @@ impl From<WireJobStatus> for JobStatus {
     fn from(status: WireJobStatus) -> Self {
         match status {
             WireJobStatus::Running => Self::Running,
-            WireJobStatus::Completed { exit_code } => Self::Completed { exit_code },
-            WireJobStatus::Failed { error } => Self::Failed { error },
-            WireJobStatus::Killed => Self::Killed,
+            WireJobStatus::Completed {
+                exit_code,
+                delivery,
+            } => Self::Completed {
+                exit_code,
+                delivery: delivery.into(),
+            },
+            WireJobStatus::Failed { error, delivery } => Self::Failed {
+                error,
+                delivery: delivery.into(),
+            },
+            WireJobStatus::Killed { delivery } => Self::Killed {
+                delivery: delivery.into(),
+            },
         }
     }
 }
@@ -435,9 +488,10 @@ mod tests {
         };
         let mut snapshot = SessionBackgroundSnapshot::default();
         assert!(!snapshot.will_resume());
-        snapshot
-            .jobs
-            .push(job(WireJobStatus::Completed { exit_code: 0 }));
+        snapshot.jobs.push(job(WireJobStatus::Completed {
+            exit_code: 0,
+            delivery: WireDelivery::Taken,
+        }));
         assert!(!snapshot.will_resume(), "a finished job resumes nothing");
         snapshot.jobs.push(job(WireJobStatus::Running));
         assert!(snapshot.will_resume());
@@ -457,7 +511,10 @@ mod tests {
             started_at: Instant::now()
                 .checked_sub(Duration::from_secs(5))
                 .expect("clock"),
-            status: JobStatus::Completed { exit_code: 3 },
+            status: JobStatus::Completed {
+                exit_code: 3,
+                delivery: Delivery::Pending,
+            },
             output_path: None,
         };
         let wire: WireJob =
@@ -465,7 +522,7 @@ mod tests {
                 .expect("parses");
         let back = JobInfo::from(wire);
         assert_eq!(back.pid, 7);
-        assert_eq!(back.status, JobStatus::Completed { exit_code: 3 });
+        assert_eq!(back.status, job.status);
         let age = back.started_at.elapsed().as_secs();
         assert!((5..7).contains(&age), "age {age}");
     }

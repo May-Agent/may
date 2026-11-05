@@ -17,7 +17,6 @@ use std::time::Duration;
 
 use aither_agent::ManualClock;
 use bytes::Bytes;
-use futures_lite::StreamExt;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::header::{CONTENT_TYPE, HeaderValue};
@@ -400,17 +399,27 @@ impl Session {
     }
 }
 
-/// Runs one user turn to completion.
+/// Runs one user turn to completion on top of history above the policy's
+/// compaction floor, so the turn starts a compaction.
 pub async fn run_turn(agent: &mut MayAgent) {
     // A context under the policy's compaction floor is left alone, so the
     // turn runs on top of history above it.
     agent.push_message(aither_core::llm::Message::assistant(
         "x".repeat(4 * aither_agent::ContextPolicy::default().compaction_floor),
     ));
-    let mut stream = agent.run("Say hello.", []);
-    while let Some(event) = stream.next().await {
-        event.expect("the turn runs");
-    }
+    run_short_turn(agent).await;
+}
+
+/// Runs one user turn to completion on the history as it is: a short session
+/// stays under the compaction floor, so nothing it was told is compacted away.
+pub async fn run_short_turn(agent: &mut MayAgent) {
+    let _ = agent
+        .run("Say hello.", [])
+        .drive((), std::future::pending::<()>(), |(), _| async {
+            std::ops::ControlFlow::Continue(())
+        })
+        .await
+        .expect("the turn runs");
 }
 
 /// Under the default one-hour cache lifetime an idle session compacts once,

@@ -134,9 +134,9 @@ pub struct AskUserArgs {
     #[serde(default)]
     pub question: Option<String>,
     /// The question given as the positional argument
-    /// (`ask_user "Which database?" --option PostgreSQL`). The command line
-    /// binds free positional words to the field named `command`.
-    #[serde(default, rename = "command")]
+    /// (`ask_user "Which database?" --option PostgreSQL`).
+    #[serde(default)]
+    #[schemars(extend("x-positional" = true))]
     pub positional_question: Option<String>,
     /// Option to choose from (use --option flag for each, repeatable).
     #[serde(default, alias = "options", alias = "choices")]

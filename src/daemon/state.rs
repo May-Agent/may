@@ -317,10 +317,11 @@ impl McpService {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let has_servers = manager.has_servers();
         tokio::spawn(async move {
+            let executor = executor_core::DefaultExecutor;
             // Eagerly start connection but don't block the command loop.
             // The first few commands may see unconnected servers.
             if has_servers {
-                let results = manager.connect_all().await;
+                let results = manager.connect_all(&executor).await;
                 for (name, result) in results {
                     if let Err(e) = result {
                         tracing::warn!(server = %name, error = %e, "background MCP server connection failed");
@@ -337,13 +338,13 @@ impl McpService {
                         config,
                         reply,
                     } => {
-                        let _ = reply.send(manager.add_server(name, config).await);
+                        let _ = reply.send(manager.add_server(&executor, name, config).await);
                     }
                     McpCommand::RemoveServer { name, reply } => {
                         let _ = reply.send(manager.remove_server(&name).await);
                     }
                     McpCommand::Reconnect { name, reply } => {
-                        let _ = reply.send(manager.reconnect(&name).await);
+                        let _ = reply.send(manager.reconnect(&executor, &name).await);
                     }
                 }
             }

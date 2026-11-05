@@ -7,20 +7,20 @@
 //! blocks whose boundary their content cannot close.
 //!
 //! [`RuntimeSystemContext`] holds every block May writes and reconciles them
-//! into an [`aither_agent::Context`] each turn. A block that changes while the
-//! session runs (memory, `AGENTS.md`) is staged rather than rewritten and
-//! surfaced as a diff alert, so the cached prefix stays warm until
-//! reassembly folds the change in.
+//! into an [`aither_agent::Context`] each turn. Memory and `AGENTS.md` change
+//! while the session runs, so they are aither live content
+//! ([`aither_agent::Context::update_live`]): a change is announced as a diff
+//! while the cached prefix stays warm, and reassembly folds the clean version
+//! in.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use aither_agent::context::{BlockKind, Slot, SystemRegion};
+use aither_agent::context::LiveContent;
 use aither_agent::{AgentOptions, ExternalContent, InstructionSlot};
 use aither_core::llm::model::{Ability, Parameters};
 use askama::Template;
 use async_fs;
-use sha2::{Digest, Sha256};
 
 use super::may::{AgentEnvironment, MayAgentError};
 use crate::agent::agents_md::{self, AgentsIndex, HandoffAgentDoc};
@@ -59,8 +59,8 @@ pub mod tag {
     pub const WORKSPACE_WORKDIRS: ExternalSlot = ExternalSlot::new("workspace_workdirs");
 
     /// The instruction slots May writes, in prompt order. aither's
-    /// `prepared_tools` and `languages` blocks sit between them in
-    /// [`layout`].
+    /// `prepared_tools`, `commands` and `languages` blocks sit between them
+    /// in [`layout`].
     pub const MAY_INSTRUCTIONS: [InstructionSlot; 15] = [
         IDENTITY,
         PROFILE_PERSONA,
@@ -80,8 +80,8 @@ pub mod tag {
     ];
 
     /// The system prompt's order: identity, environment, terminal,
-    /// efficiency, capabilities, work, permissions, harness, evidence, time
-    /// and languages; then the external content.
+    /// efficiency, capabilities and the command table, work, permissions,
+    /// harness, evidence, time and languages; then the external content.
     #[must_use]
     pub fn layout() -> SystemLayout {
         SystemLayout::new(
@@ -94,6 +94,7 @@ pub mod tag {
                 InstructionSlot::PREPARED_TOOLS,
                 EFFICIENCY,
                 CAPABILITIES,
+                InstructionSlot::COMMANDS,
                 BROWSER,
                 WORK,
                 PROJECT_RULES,
@@ -242,8 +243,15 @@ impl RuntimeSystemContext {
                 }
             }
         }
-        reconcile_memory_block(context, self.memory_block());
-        reconcile_agents_md(context, &self.agents);
+        context.update_live(&MEMORY_CONTENT, |update| {
+            update.external(&tag::MEMORY, Some(self.memory_block()));
+        });
+        context.update_live(&AGENTS_MD_CONTENT, |update| {
+            update
+                .instruction(&tag::PROJECT_RULES, self.agents.rules.clone())
+                .external(&tag::AGENTS_MD, self.agents.root.clone())
+                .external(&tag::HANDOFF_AGENTS_MD, self.agents.handoff.clone());
+        });
         let external = context.external_mut();
         for (slot, block) in [
             (&tag::PROFILE_MEMORIES, &self.profile_memories),
@@ -378,35 +386,6 @@ fn collect_memory_paths(text: &str, out: &mut HashSet<String>) {
     }
 }
 
-/// A boundary that does not occur in `text`: hex of a hash of the text,
-/// rehashed until it is absent, so the same text always gets the same one.
-///
-/// aither bounds its external-content blocks the same way but does not
-/// expose the boundary, so the diff alerts carrying external content derive
-/// their own.
-fn boundary(text: &str) -> String {
-    let mut attempt: u64 = 0;
-    loop {
-        let digest = Sha256::new()
-            .chain_update(text)
-            .chain_update(attempt.to_le_bytes())
-            .finalize();
-        let candidate = hex::encode(&digest[..8]);
-        if !text.contains(&candidate) {
-            return candidate;
-        }
-        attempt += 1;
-    }
-}
-
-/// Reminder surfaced to the model when MEMORY.md changed mid-session.
-#[derive(Template)]
-#[template(path = "alert_memory_update.txt", escape = "none")]
-struct MemoryUpdate {
-    boundary: String,
-    diff: String,
-}
-
 /// Durable alert listing which files under `~/.may/memories/` changed.
 #[derive(Template)]
 #[template(path = "alert_memories_changes.txt", escape = "none")]
@@ -414,104 +393,14 @@ struct MemoriesChanges {
     files: Vec<String>,
 }
 
-/// Reminder surfaced when the launch directory's `AGENTS.md` files changed
-/// mid-session.
-#[derive(Template)]
-#[template(path = "alert_agents_md_update.txt", escape = "none")]
-struct AgentsMdUpdate {
-    boundary: String,
-    diff: String,
-}
+/// The memory index, announced by name when it changes mid-session.
+const MEMORY_CONTENT: LiveContent = LiveContent::new("MEMORY.md", "memory_diff");
 
-/// The unified diff from `before` to `after`.
-fn unified_diff(before: &str, after: &str) -> String {
-    similar::TextDiff::from_lines(before, after)
-        .unified_diff()
-        .context_radius(2)
-        .to_string()
-}
-
-/// Stages `desired` into `slot` of `region` the cache-friendly way: a block
-/// that is absent is inserted at once and a `None` removes the block, while a
-/// replacement is staged for reassembly. Returns the text before and after
-/// when a replacement was staged, so the caller can alert the model.
-fn stage_block<K: BlockKind>(
-    region: &mut SystemRegion<K>,
-    slot: &Slot<K>,
-    desired: Option<K::Content>,
-    text: impl Fn(&K::Content) -> &str,
-) -> Option<(String, String)> {
-    let Some(desired) = desired else {
-        region.remove(slot);
-        return None;
-    };
-    if region.staged(slot) == Some(&desired) {
-        return None;
-    }
-    let before = region.get(slot).map(|current| text(current).to_string());
-    let after = text(&desired).to_string();
-    region
-        .stage(slot, desired)
-        .then(|| (before.unwrap_or_default(), after))
-}
-
-/// Reconciles the `AGENTS.md` blocks like the memory block: a change is
-/// staged rather than rewritten, and surfaced as one durable diff alert.
-fn reconcile_agents_md(context: &mut aither_agent::Context, desired: &AgentsMdBlocks) {
-    let mut changes = Vec::new();
-    changes.extend(stage_block(
-        context.instructions_mut(),
-        &tag::PROJECT_RULES,
-        desired.rules.clone(),
-        String::as_str,
-    ));
-    for (slot, block) in [
-        (&tag::AGENTS_MD, &desired.root),
-        (&tag::HANDOFF_AGENTS_MD, &desired.handoff),
-    ] {
-        changes.extend(stage_block(
-            context.external_mut(),
-            slot,
-            block.clone(),
-            ExternalContent::content,
-        ));
-    }
-    if changes.is_empty() {
-        return;
-    }
-    let diff = changes
-        .iter()
-        .map(|(before, after)| unified_diff(before, after))
-        .collect::<String>();
-    context.push_alert(&AgentsMdUpdate {
-        boundary: boundary(&diff),
-        diff,
-    });
-}
-
-/// Reconciles the memory block without invalidating the KV-cache prefix.
-///
-/// Mid-session memory changes are staged into the context (applied on the
-/// next reassembly, when the cache is invalidated anyway) and surfaced to
-/// the model as an appended diff alert instead of a block rewrite.
-fn reconcile_memory_block(context: &mut aither_agent::Context, desired: ExternalContent) {
-    // Reminders are cleared on every request's populate pass, so a
-    // reminder inserted here would be dropped before ever reaching the
-    // model. A durable alert survives until reassembly folds the staged
-    // memory block in.
-    if let Some((before, after)) = stage_block(
-        context.external_mut(),
-        &tag::MEMORY,
-        Some(desired),
-        ExternalContent::content,
-    ) {
-        let diff = unified_diff(&before, &after);
-        context.push_alert(&MemoryUpdate {
-            boundary: boundary(&diff),
-            diff,
-        });
-    }
-}
+/// The `AGENTS.md` blocks (the rules on how to treat them, the launch
+/// directory's own file and the files the handoff linked), announced
+/// together when any of them changes mid-session.
+const AGENTS_MD_CONTENT: LiveContent =
+    LiveContent::new("The launch directory's AGENTS.md files", "agents_md_diff");
 
 /// The blocks a launch directory's `AGENTS.md` files produce.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -770,11 +659,6 @@ pub fn build_efficiency(commands: &[(String, String)]) -> String {
     .unwrap_or_else(|error| panic!("failed to render efficiency: {error}"))
 }
 
-struct CatalogCommand {
-    name: String,
-    description: String,
-}
-
 struct CatalogSkill {
     dir_name: String,
     name: String,
@@ -792,30 +676,23 @@ struct CapabilitiesTemplate {
     has_hosted_web_search: bool,
     has_hosted_web_fetch: bool,
     has_browser_command: bool,
-    commands: Vec<CatalogCommand>,
     skills: Vec<CatalogSkill>,
     subagents: Vec<CatalogSubagent>,
 }
 
-/// The capabilities section: the command catalog, the skills and the
-/// subagents.
+/// The capabilities section: how commands run, the skills and the
+/// subagents. aither lists the commands themselves in its live command
+/// table; `commands` are the ones registered by name, which decide what the
+/// section says about them.
 ///
 /// # Errors
 /// Fails when the skills directory cannot be read.
 pub async fn build_capabilities(
-    shared_terminal_commands: &[(String, String)],
+    commands: &[(String, String)],
     request_parameters: &Parameters,
     skills_dir: &Path,
 ) -> Result<String, MayAgentError> {
-    let mut commands = shared_terminal_commands
-        .iter()
-        .map(|(name, description)| CatalogCommand {
-            name: name.clone(),
-            description: description.clone(),
-        })
-        .collect::<Vec<_>>();
-    commands.sort_by(|left, right| left.name.cmp(&right.name));
-    let has_browser_command = commands.iter().any(|command| command.name == "browser");
+    let has_browser_command = commands.iter().any(|(name, _)| name == "browser");
 
     let skills = SkillManager::from_skills_dir(skills_dir.to_path_buf())
         .list_skills()
@@ -851,7 +728,6 @@ pub async fn build_capabilities(
         has_hosted_web_search: request_parameters.hosted_web_search(),
         has_hosted_web_fetch: request_parameters.hosted_web_fetch(),
         has_browser_command,
-        commands,
         skills,
         subagents,
     }
