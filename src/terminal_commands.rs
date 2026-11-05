@@ -96,6 +96,9 @@ pub struct SharedTerminalCommandConfig<LLM> {
     /// Discovery and messaging between main agents, when the session has a
     /// persistent queue to deliver through.
     pub agent_messaging: Option<crate::agent_link::AgentMessaging>,
+    /// The session's language guard: `ask_user`, `issue`, `pr` and `agent`
+    /// refuse text outside the languages it enforces.
+    pub languages: Option<aither_agent::LanguageGuard>,
     /// Connected ACP agents, registered as subagent types; `None` outside
     /// the daemon.
     pub acp: Option<crate::agent::acp_subagent::AcpAgents>,
@@ -193,6 +196,9 @@ where
         )
     });
     let mut issue_tool = IssueTool::new(config.issue_store.clone());
+    if let Some(guard) = &config.languages {
+        issue_tool = issue_tool.with_languages(guard.clone());
+    }
     let mut subagent_issue_tool = SubagentIssueTool::new(config.issue_store);
     if let Some(runtime) = config.ask_user.clone() {
         issue_tool = issue_tool.with_changes(IssueChangeNotifier::new(runtime));
@@ -219,7 +225,10 @@ where
         screen: Some(screen),
         github_api: crate::pr::PrContext::default_github_api(),
     };
-    let pr_tool = PrTool::new(pr_context.clone());
+    let mut pr_tool = PrTool::new(pr_context.clone());
+    if let Some(guard) = &config.languages {
+        pr_tool = pr_tool.with_languages(guard.clone());
+    }
     let subagent_pr_tool = SubagentPrTool::new(pr_context);
     describe_tool(&mut descriptions, &pr_tool);
     builder.configure_role_tools(pr_tool, subagent_pr_tool);
@@ -235,7 +244,10 @@ where
     builder.configure_role_tools(repo_tool, subagent_repo_tool);
 
     if let Some(runtime) = config.ask_user {
-        let ask_user = AskUserTool::new(runtime.clone(), config.session_id.clone());
+        let mut ask_user = AskUserTool::new(runtime.clone(), config.session_id.clone());
+        if let Some(guard) = &config.languages {
+            ask_user = ask_user.with_languages(guard.clone());
+        }
         describe_tool(&mut descriptions, &ask_user);
         builder.main_only(|reserved| reserved.configure_tool(ask_user));
         let withdraw = WithdrawAskUserTool::new(runtime, config.session_id.clone());
@@ -253,13 +265,16 @@ where
     }
 
     if let Some(messaging) = config.agent_messaging {
-        let agent = crate::agent_link::AgentTool::new(
+        let mut agent = crate::agent_link::AgentTool::new(
             messaging,
             config.session_id.clone(),
             config.sandbox_dir.clone(),
             matches!(config.task_runtime, TaskRuntimeKind::Container)
                 .then(|| crate::container::lifecycle::workspace_mount(config.sandbox_dir.clone())),
         );
+        if let Some(guard) = &config.languages {
+            agent = agent.with_languages(guard.clone());
+        }
         describe_tool(&mut descriptions, &agent);
         builder.main_only(|reserved| reserved.configure_tool(agent));
     }
@@ -527,6 +542,7 @@ mod tests {
                 issue_store: test_issue_store(temp.path()).await,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
+                languages: None,
                 acp: None,
             },
         )
@@ -584,6 +600,7 @@ mod tests {
                 issue_store: test_issue_store(temp.path()).await,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
+                languages: None,
                 acp: None,
             },
         )
@@ -641,6 +658,7 @@ mod tests {
                 issue_store: test_issue_store(temp.path()).await,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
+                languages: None,
                 acp: None,
             },
         )
@@ -692,6 +710,7 @@ mod tests {
                 issue_store: test_issue_store(temp.path()).await,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
+                languages: None,
                 acp: None,
             },
         )
@@ -739,6 +758,7 @@ mod tests {
                 issue_store: test_issue_store(temp.path()).await,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
+                languages: None,
                 acp: None,
             },
         )
@@ -900,6 +920,7 @@ mod tests {
                 issue_store,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: Some(messaging),
+                languages: None,
                 acp: None,
             },
         )
@@ -977,6 +998,7 @@ mod tests {
                 issue_store: test_issue_store(temp.path()).await,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
+                languages: None,
                 acp: None,
             },
         )
@@ -1025,6 +1047,7 @@ mod tests {
                 issue_store: test_issue_store(temp.path()).await,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
+                languages: None,
                 acp: None,
             },
         )

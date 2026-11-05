@@ -95,6 +95,7 @@ pub enum PrArgs {
 /// The main agent's `pr` command — full read/write on own-session PRs.
 pub struct PrTool {
     store: PrStore,
+    languages: Option<aither_agent::LanguageGuard>,
 }
 
 impl std::fmt::Debug for PrTool {
@@ -109,7 +110,15 @@ impl PrTool {
     pub fn new(context: PrContext) -> Self {
         Self {
             store: PrStore::new(context),
+            languages: None,
         }
+    }
+
+    /// Refuse a PR title outside the working language `guard` enforces.
+    #[must_use]
+    pub fn with_languages(mut self, guard: aither_agent::LanguageGuard) -> Self {
+        self.languages = Some(guard);
+        self
     }
 }
 
@@ -126,6 +135,15 @@ impl Tool for PrTool {
         args: Self::Arguments,
         _cx: aither_core::llm::ToolContext,
     ) -> aither_core::Result<Self::Res> {
+        if let (
+            Some(guard),
+            PrArgs::Open {
+                title: Some(title), ..
+            },
+        ) = (&self.languages, &args)
+        {
+            guard.check_working(title, aither_agent::WorkingText::Public)?;
+        }
         let result = match args {
             PrArgs::Open {
                 title,
