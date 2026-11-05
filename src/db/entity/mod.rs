@@ -12,6 +12,7 @@ pub mod push_subscriptions;
 pub mod request_logs;
 pub mod scheduled_task_runs;
 pub mod scheduled_tasks;
+pub mod session_intervals;
 pub mod session_pending_permissions;
 pub mod session_pending_workspace;
 pub mod session_plans;
