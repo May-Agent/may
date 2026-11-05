@@ -832,7 +832,7 @@ pub mod provenance_checks {
             .with_identity(CallIdentity::new(ToolCallId::new(id), AgentIdentity::Main))
     }
 
-    async fn run<S: IssueStore + Clone + 'static>(
+    pub async fn run<S: IssueStore + Clone + 'static>(
         tool: &IssueTool<S>,
         id: &str,
         args: IssueArgs,
@@ -1002,6 +1002,35 @@ mod tests {
             outside.number,
         )
         .await;
+    }
+
+    /// Marking reads the provenance records alone, whichever backend holds the
+    /// issue, so one test on the may backend covers an issue and a comment
+    /// written outside may.
+    #[tokio::test]
+    async fn an_issue_and_comment_written_outside_may_are_marked_not_written_by_may() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = crate::db::ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("chat db should open");
+        let store = crate::issue::MayIssueStore::new(db.clone(), "test".to_string());
+        let outside = store.create("outside", "", &[]).await.expect("outside");
+        store
+            .comment(outside.number, "outsider")
+            .await
+            .expect("outside comment");
+        let tool = IssueTool::new(store, IssueProvenance::new(db, "test".to_string()));
+
+        let viewed = provenance_checks::run(
+            &tool,
+            "call_view",
+            IssueArgs::View {
+                number: outside.number,
+            },
+        )
+        .await;
+        assert!(viewed.contains("written by may: no"), "{viewed}");
+        assert!(viewed.contains("[not written by may] outsider"), "{viewed}");
     }
 
     #[tokio::test]
