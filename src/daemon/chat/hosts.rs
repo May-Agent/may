@@ -289,6 +289,12 @@ pub async fn usage_report(
         .session_intervals(&session_id)
         .await
         .map_err(internal_error)?;
+    let misses = state
+        .runtime_service
+        .db()
+        .cache_misses_for_session(&session_id)
+        .await
+        .map_err(internal_error)?;
     let created_at_ms = state
         .runtime_service
         .db()
@@ -306,6 +312,7 @@ pub async fn usage_report(
     json_ok_response(&crate::agent::assemble_usage_report(
         &session_id,
         &rows,
+        &misses,
         &intervals,
         created_at_ms,
         now_ms,
