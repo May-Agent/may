@@ -302,7 +302,7 @@ mod tests {
 /// No launchd agents exist off macOS.
 #[cfg(not(target_os = "macos"))]
 #[allow(clippy::unnecessary_wraps)] // the macOS variant's signature
-fn retire_relocated_agents() -> Result<Vec<String>, RepoSearchError> {
+const fn retire_relocated_agents() -> Result<Vec<String>, RepoSearchError> {
     Ok(Vec::new())
 }
 
