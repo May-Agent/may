@@ -480,11 +480,7 @@ impl ChatDb {
                             row.session_id
                         ))
                     })?;
-                let applied_seq = checkpoint
-                    .context
-                    .items()
-                    .last()
-                    .map_or(0, |item| i64::try_from(item.seq()).unwrap_or(0));
+                let applied_seq = crate::session::checkpoint_watermark(&checkpoint.context);
                 for item in checkpoint.context.items() {
                     let blob = rmp_serde::to_vec_named(item.message()).map_err(|e| {
                         storage_error(format!("transcript message encode failed: {e}"))
