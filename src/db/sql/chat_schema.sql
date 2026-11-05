@@ -88,4 +88,6 @@ CREATE INDEX IF NOT EXISTS idx_prs_session ON prs(session_id);
 CREATE INDEX IF NOT EXISTS idx_prs_project_state ON prs(project_id, state);
 CREATE TABLE IF NOT EXISTS pr_events (id INTEGER PRIMARY KEY AUTOINCREMENT, pr_id INTEGER NOT NULL, kind TEXT NOT NULL, session_id TEXT NOT NULL, agent_id TEXT NOT NULL, message_id INTEGER, detail TEXT, created_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_pr_events_pr ON pr_events(pr_id);
+CREATE TABLE IF NOT EXISTS issue_provenance (id INTEGER PRIMARY KEY AUTOINCREMENT, backend TEXT NOT NULL, repository TEXT NOT NULL, issue_number INTEGER NOT NULL, comment_id INTEGER, action TEXT NOT NULL, detail TEXT, session_id TEXT NOT NULL, agent TEXT NOT NULL, tool_call_id TEXT, recorded_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_issue_provenance_issue ON issue_provenance(backend, repository, issue_number);
 CREATE TABLE IF NOT EXISTS session_repo_clones (session_id TEXT NOT NULL, repo_key TEXT NOT NULL, dir TEXT NOT NULL, source TEXT NOT NULL, local BOOLEAN NOT NULL, PRIMARY KEY (session_id, repo_key));

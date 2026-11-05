@@ -6,6 +6,7 @@ mod common;
 mod context_snapshot;
 pub mod entity;
 mod issue;
+mod issue_provenance;
 mod issue_search;
 mod logs;
 mod memory;
@@ -37,6 +38,7 @@ pub use common::{
     StoredSessionContextSnapshot, TranscriptEntry, UpdateProfileParams, UpdateScheduledTaskParams,
 };
 pub use context_snapshot::ContextDebugSnapshotWrite;
+pub use issue_provenance::{IssueProvenanceRecord, NewIssueProvenance, UserMessageAt};
 pub use issue_search::IssueSearchDoc;
 pub use message::MessageMeta;
 pub use open_questions::{CommittedAskUserAnswer, PendingAskUserQuestion};

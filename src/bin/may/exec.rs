@@ -519,7 +519,7 @@ where
             may_dir: context.may_dir.clone(),
             sandbox_dir: context.sandbox_dir.clone(),
             cwd: cwd.clone(),
-            db: Some(context.db.clone()),
+            db: context.db.clone(),
             ask_user: None,
             imagine: None,
             task_runtime: match environment {
