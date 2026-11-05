@@ -185,9 +185,6 @@ impl SessionStore {
             if let Err(error) = repos.delete_all().await {
                 tracing::warn!(%error, "failed to drop session repo clone refs");
             }
-            if let Err(error) = db.delete_session_repo_clones(id).await {
-                tracing::warn!(%error, "failed to drop session repo clone rows");
-            }
             async_fs::remove_dir_all(&path).await?;
         }
         Ok(())
