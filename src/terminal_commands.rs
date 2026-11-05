@@ -214,7 +214,7 @@ where
         cwd: config.cwd.clone(),
         workspace_config: config.workspace_config.clone(),
         screen: Some(screen),
-        github_api: crate::pr::GithubApi::default(),
+        github_api: crate::pr::PrContext::default_github_api(),
     };
     let pr_tool = PrTool::new(pr_context.clone());
     let subagent_pr_tool = SubagentPrTool::new(pr_context);
