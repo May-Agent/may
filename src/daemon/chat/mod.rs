@@ -1212,6 +1212,24 @@ async fn schedule_browser_takeover_resume(
         .await
 }
 
+/// Persist a finished tool call's span for the `/usage` wall-clock split.
+async fn record_tool_interval(
+    state: &Arc<DaemonState>,
+    session_id: &str,
+    started: jiff::Timestamp,
+    ended: jiff::Timestamp,
+) {
+    let Some(interval) =
+        crate::agent::Interval::new(started.as_millisecond(), ended.as_millisecond())
+    else {
+        tracing::warn!(session_id, "tool call ended before it started");
+        return;
+    };
+    if let Err(error) = state.db().append_tool_interval(session_id, interval).await {
+        tracing::warn!(error = %error, "failed to persist tool interval");
+    }
+}
+
 async fn record_request_log(state: &Arc<DaemonState>, entry: RequestLogEntry) {
     let db = state.db();
     if let Err(error) = db
@@ -1654,6 +1672,8 @@ fn run_agent_loop<'a>(
             let mut saw_tool_activity = false;
             let mut tool_arguments_by_id: std::collections::HashMap<String, String> =
                 std::collections::HashMap::new();
+            let mut tool_started_at: std::collections::HashMap<String, jiff::Timestamp> =
+                std::collections::HashMap::new();
             let mut pending_tool_streams: std::collections::HashMap<String, PendingToolStream> =
                 std::collections::HashMap::new();
             let mut last_todo_hash: Option<u64> = None;
@@ -1928,6 +1948,10 @@ fn run_agent_loop<'a>(
                                 &record,
                             );
                             tool_arguments_by_id.insert(id.clone(), arguments.clone());
+                            tool_started_at.insert(
+                                id.clone(),
+                                event_at.expect("tool events come from the agent stream"),
+                            );
                             if let Some(SinkToolEvent::Start {
                                 id,
                                 name,
@@ -1985,6 +2009,15 @@ fn run_agent_loop<'a>(
                                 &mut terminal_snapshot,
                                 &record,
                             );
+                            if let Some(started) = tool_started_at.remove(&id) {
+                                record_tool_interval(
+                                    state,
+                                    session_id.as_str(),
+                                    started,
+                                    event_at.expect("tool events come from the agent stream"),
+                                )
+                                .await;
+                            }
                             let arguments = tool_arguments_by_id.remove(&id);
                             let summary = project_tool_summary_for_sink(
                                 &pending_tool_streams,
