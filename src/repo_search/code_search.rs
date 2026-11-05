@@ -81,18 +81,6 @@ struct IndexedView {
     total: u64,
 }
 
-#[derive(Template)]
-#[template(path = "code_search_answer.txt")]
-struct AnswerView<'a> {
-    reconciling: bool,
-    output: &'a str,
-}
-
-/// The phrase of the daemon's text freshness line that marks an answer
-/// served while indexing is still in progress; the wire answer carries the
-/// flag only inside its rendered output.
-const RECONCILING_MARKER: &str = "indexing in progress";
-
 /// The daemon side of `search`: answers one request. Implemented by the
 /// repo-search daemon and, in tests, by an in-memory double.
 pub trait SearchBackend: Clone + Send + Sync + 'static {
@@ -184,12 +172,7 @@ impl<B: SearchBackend> CodeSearchTool<B> {
         let root = self.search_root(worktree).await?;
         let request = request_for(&args, root);
         match self.backend.request(request).await? {
-            Final::Answer(answer) => AnswerView {
-                reconciling: answer.output.contains(RECONCILING_MARKER),
-                output: &answer.output,
-            }
-            .render()
-            .map_err(render_error),
+            Final::Answer(answer) => Ok(answer.output),
             Final::Status(report) => {
                 let model = match &report.model {
                     ModelStatus::Ready { .. } => "ready".to_string(),
@@ -432,7 +415,7 @@ mod tests {
             "{}: fn edited_in_clone",
             clone.join("lib.rs").display()
         )));
-        assert!(!text.contains("Indexing is still in progress"));
+        assert!(!text.contains("indexing in progress"));
     }
 
     #[tokio::test]
@@ -449,10 +432,25 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(text.starts_with(
-            "Indexing is still in progress: files that changed may be missing from these results.\n\n"
-        ));
         assert!(text.contains("fn original"));
+        assert!(text.ends_with(
+            "-- fresh @ abc123 +0 changed files reconciled; vectors 100%; indexing in progress — files changed since they were indexed are left out\n"
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_search_while_the_clone_is_indexing_passes_the_daemon_line_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        let daemon = Daemon {
+            reconciling: true,
+            ..Daemon::default()
+        };
+        let (tool, _checkout, _clone) = fixture(tmp.path(), true, daemon).await;
+        let text = tool
+            .run(args(serde_json::json!({"query": "original"})))
+            .await
+            .unwrap();
+        assert_eq!(text.matches("indexing in progress").count(), 1);
     }
 
     #[tokio::test]
