@@ -26,8 +26,8 @@ use super::cli::ExecArgs;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExecError {
-    #[error("failed to resolve May home directory")]
-    MissingHomeDirectory,
+    #[error("failed to resolve May home directory: {0}")]
+    MissingHomeDirectory(may_agent::config::ConfigError),
     #[error("failed to initialize session persistence: {0}")]
     InitializeSession(may_agent::session::SessionError),
     #[error("session '{0}' was not found")]
@@ -212,8 +212,7 @@ pub async fn run_exec(args: ExecArgs) -> Result<i32, ExecError> {
 }
 
 async fn load_exec_session_context(session_id: &str) -> Result<ExecSessionContext, ExecError> {
-    let home_dir = dirs::home_dir().ok_or(ExecError::MissingHomeDirectory)?;
-    let may_dir = home_dir.join(".may");
+    let may_dir = MayConfig::may_dir().map_err(ExecError::MissingHomeDirectory)?;
     let (store, db, _default_profile_id) = initialize_session_persistence(&may_dir)
         .await
         .map_err(ExecError::InitializeSession)?;
