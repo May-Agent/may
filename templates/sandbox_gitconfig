@@ -1,0 +1,10 @@
+[user]
+{% if let Some(identity) = identity %}	name = {{ identity.name|git_quoted }}
+	email = {{ identity.email|git_quoted }}
+{% endif %}	signingkey = {{ signing_key|git_quoted }}
+[gpg]
+	format = ssh
+[gpg "ssh"]
+	program = {{ program|git_quoted }}
+[commit]
+	gpgsign = true
