@@ -106,6 +106,7 @@ impl ChatDb {
         .await?
         .into_iter()
         .map(|row| IssueComment {
+            id: row.id,
             author: None,
             body: row.body,
             created_at: row.created_at,
@@ -420,20 +421,21 @@ impl ChatDb {
         repo_key: &str,
         number: i64,
         body: &str,
-    ) -> Result<IssueDetail, ChatDbError> {
+    ) -> Result<(IssueDetail, i64), ChatDbError> {
         let project_id = self.ensure_issue_project(repo_key).await?;
         let row = self.require_issue(project_id, number).await?;
         let now = jiff::Timestamp::now().to_string();
         let mut tx = self.db.begin().await?;
-        query!(
+        let comment_id = query!(
             tx,
-            "INSERT INTO issue_comments (issue_id, body, created_at) VALUES (?, ?, ?)",
+            "INSERT INTO issue_comments (issue_id, body, created_at) VALUES (?, ?, ?) RETURNING id AS value",
             row.id,
             body,
             now.clone()
         )
-        .execute()
-        .await?;
+        .fetch_one::<I64ValueRow>()
+        .await?
+        .value;
         query!(
             tx,
             "UPDATE issues SET updated_at = ? WHERE id = ?",
@@ -443,8 +445,10 @@ impl ChatDb {
         .execute()
         .await?;
         tx.commit().await?;
-        self.issue_detail(self.require_issue(project_id, number).await?)
-            .await
+        let detail = self
+            .issue_detail(self.require_issue(project_id, number).await?)
+            .await?;
+        Ok((detail, comment_id))
     }
 
     /// Add and/or remove labels on an issue and return the refreshed detail.
@@ -626,10 +630,11 @@ mod tests {
             .expect("label add");
         assert_eq!(detail.labels, ["area:x".to_string()]);
 
-        let detail = db
+        let (detail, comment_id) = db
             .add_issue_comment("repo", 1, "a comment")
             .await
             .expect("comment");
+        assert_eq!(detail.comments[0].id, comment_id);
         assert_eq!(detail.comments.len(), 1);
         assert_eq!(detail.comments[0].body, "a comment");
 
@@ -768,7 +773,7 @@ mod tests {
                 .expect("since")
                 .is_empty()
         );
-        let detail = db
+        let (detail, _) = db
             .add_issue_comment("repo", 1, "hello")
             .await
             .expect("comment");

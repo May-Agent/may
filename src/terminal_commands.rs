@@ -7,6 +7,7 @@ use aither_agent::webfetch::WebFetchTool;
 use aither_core::LanguageModel;
 use aither_core::llm::{Tool, model::Parameters, tool::ToolDefinition};
 use aither_sandbox::ToolRegistryBuilder;
+use askama::Template;
 
 use crate::agent::ask_user_tool::{AskUserTool, WithdrawAskUserTool};
 use crate::agent::browser_tool::{BrowserBroker, BrowserTool};
@@ -21,6 +22,7 @@ use crate::agent::subagent_tracker::{SubagentTracker, TrackedSubagentTool, Usage
 use crate::agent::task_tool::{TaskBroker, TaskRuntimeKind, TaskTool};
 use crate::agent::{ImageGeneratorConfig, ModelSlot};
 use crate::bundle::Bundle;
+use crate::issue::provenance::IssueProvenance;
 use crate::issue::search::IssueSearch;
 use crate::mcp::load_active_mcp_connections;
 use crate::repo_search::indexer::SearchIndexer;
@@ -56,7 +58,7 @@ pub struct SharedTerminalCommandConfig<LLM> {
     /// Host directory the session works in; `search` defaults to its worktree.
     pub cwd: PathBuf,
     /// History database, which records the worktrees `search` is used in.
-    pub db: Option<crate::db::ChatDb>,
+    pub db: crate::db::ChatDb,
     /// Runtime that holds the session's open `ask_user` questions and
     /// publishes its UI events (`issue` writes among them), when the session
     /// has one.
@@ -136,6 +138,10 @@ pub enum TerminalCommandsError {
 ///
 /// # Errors
 /// Returns the registry error when a command fails to register.
+///
+/// # Panics
+/// The registered sandboxed `gh` panics if its compiled-in refusal template
+/// fails to render.
 pub async fn register_shared_terminal_commands<LLM>(
     builder: &mut ToolRegistryBuilder,
     config: SharedTerminalCommandConfig<LLM>,
@@ -172,12 +178,10 @@ where
         SessionTool::new(
             config.may_dir.clone(),
             config.session_id.clone(),
-            config.db.clone().map(|db| {
-                SearchIndexer::new(
-                    db,
-                    RepoSearchCollections::new(RepoSearch::global(&config.may_dir)),
-                )
-            }),
+            Some(SearchIndexer::new(
+                config.db.clone(),
+                RepoSearchCollections::new(RepoSearch::global(&config.may_dir)),
+            )),
         ),
     );
     register_tool_with_description(
@@ -186,37 +190,46 @@ where
         CodeSearchTool::new(
             RepoSearch::global(&config.may_dir),
             config.cwd.clone(),
-            config.db.clone(),
-            config.db.clone().map(|db| {
-                crate::repo_clone::SessionRepos::new(
-                    &config.sandbox_dir,
-                    config.session_id.clone(),
-                    db,
-                )
-            }),
+            Some(config.db.clone()),
+            Some(crate::repo_clone::SessionRepos::new(
+                &config.sandbox_dir,
+                config.session_id.clone(),
+                config.db.clone(),
+            )),
             config.workspace_config.clone(),
         ),
     );
-    let issue_search = config.db.clone().map(|db| {
-        IssueSearch::new(
-            db,
-            RepoSearchCollections::new(RepoSearch::global(&config.may_dir)),
-        )
-    });
-    let mut issue_tool = IssueTool::new(config.issue_store.clone());
+    let issue_search = IssueSearch::new(
+        config.db.clone(),
+        RepoSearchCollections::new(RepoSearch::global(&config.may_dir)),
+    );
+    let provenance = IssueProvenance::new(config.db.clone(), config.session_id.clone());
+    let mut issue_tool = IssueTool::new(config.issue_store.clone(), provenance.clone())
+        .with_search(issue_search.clone());
     if let Some(guard) = &config.languages {
         issue_tool = issue_tool.with_languages(guard.clone());
     }
-    let mut subagent_issue_tool = SubagentIssueTool::new(config.issue_store);
     if let Some(runtime) = config.ask_user.clone() {
         issue_tool = issue_tool.with_changes(IssueChangeNotifier::new(runtime));
     }
-    if let Some(search) = issue_search {
-        issue_tool = issue_tool.with_search(search.clone());
-        subagent_issue_tool = subagent_issue_tool.with_search(search);
-    }
+    let subagent_issue_tool =
+        SubagentIssueTool::new(config.issue_store, provenance).with_search(issue_search);
     describe_tool(&mut descriptions, &issue_tool);
     builder.configure_role_tools(issue_tool, subagent_issue_tool);
+    // Issue and PR changes reach GitHub through `issue` and `pr` alone. The command exists
+    // in sandboxed modes only, so an approved unsafe command resolves `gh` on
+    // the host's PATH and runs the real program.
+    builder.sandboxed_only(|sandboxed| {
+        sandboxed.configure_raw_handler(
+            "gh",
+            "Refused in the sandbox; use `issue` or `pr`",
+            |_call, _args| {
+                Box::pin(async {
+                    Err(GhRefused.render().expect("the gh refusal template renders"))
+                })
+            },
+        );
+    });
 
     let screen: Arc<crate::pr::ScreenFn> = Arc::new(move |title: &str, body: &str| {
         let llm = screen_llm.clone();
@@ -224,7 +237,7 @@ where
         Box::pin(async move { crate::pr::screen_with_llm(&llm, &title, &body).await })
     });
     let pr_context = crate::pr::PrContext {
-        db: config.db.clone(),
+        db: Some(config.db.clone()),
         session_id: config.session_id.clone(),
         session_root: config.sandbox_dir.clone(),
         scratch_root: config.may_dir.join("pr-checks"),
@@ -407,6 +420,11 @@ where
     })
 }
 
+/// What the sandboxed `gh` command answers with.
+#[derive(askama::Template)]
+#[template(path = "gh_refused.txt", escape = "none")]
+struct GhRefused;
+
 fn register_tool_with_description<T>(
     builder: &mut ToolRegistryBuilder,
     descriptions: &mut Vec<(String, String)>,
@@ -520,6 +538,12 @@ mod tests {
         ))
     }
 
+    async fn test_db(dir: &std::path::Path) -> crate::db::ChatDb {
+        crate::db::ChatDb::open(&dir.join("history.db"))
+            .await
+            .expect("chat db should open")
+    }
+
     async fn test_issue_store(dir: &std::path::Path) -> crate::issue::ResolvedIssueStore {
         let db = crate::db::ChatDb::open(&dir.join("history.db"))
             .await
@@ -551,7 +575,7 @@ mod tests {
                 may_dir: temp.path().to_path_buf(),
                 sandbox_dir: session_dir.clone(),
                 cwd: PathBuf::from("."),
-                db: None,
+                db: test_db(temp.path()).await,
                 ask_user: Some(ask_user_runtime),
                 imagine: Some(ImagineCommandConfig {
                     generator: None,
@@ -612,7 +636,7 @@ mod tests {
                 may_dir: temp.path().to_path_buf(),
                 sandbox_dir: session_dir.clone(),
                 cwd: PathBuf::from("."),
-                db: None,
+                db: test_db(temp.path()).await,
                 ask_user: None,
                 imagine: None,
                 task_runtime: TaskRuntimeKind::Local,
@@ -670,7 +694,7 @@ mod tests {
                 may_dir: temp.path().to_path_buf(),
                 sandbox_dir: session_dir.clone(),
                 cwd: PathBuf::from("."),
-                db: None,
+                db: test_db(temp.path()).await,
                 ask_user: None,
                 imagine: None,
                 task_runtime: TaskRuntimeKind::Local,
@@ -722,7 +746,7 @@ mod tests {
                 may_dir: temp.path().to_path_buf(),
                 sandbox_dir: session_dir.clone(),
                 cwd: PathBuf::from("."),
-                db: None,
+                db: test_db(temp.path()).await,
                 ask_user: None,
                 imagine: None,
                 task_runtime: TaskRuntimeKind::Local,
@@ -770,7 +794,7 @@ mod tests {
                 may_dir: temp.path().to_path_buf(),
                 sandbox_dir: session_dir.clone(),
                 cwd: PathBuf::from("."),
-                db: None,
+                db: test_db(temp.path()).await,
                 ask_user: Some(ask_user_runtime.clone()),
                 imagine: None,
                 task_runtime: TaskRuntimeKind::Local,
@@ -932,7 +956,7 @@ mod tests {
                 may_dir: temp.path().to_path_buf(),
                 sandbox_dir: session_dir.clone(),
                 cwd: PathBuf::from("."),
-                db: None,
+                db: test_db(temp.path()).await,
                 ask_user: None,
                 imagine: None,
                 task_runtime: TaskRuntimeKind::Local,
@@ -1010,7 +1034,7 @@ mod tests {
                 may_dir: temp.path().to_path_buf(),
                 sandbox_dir: session_dir.clone(),
                 cwd: PathBuf::from("."),
-                db: None,
+                db: test_db(temp.path()).await,
                 ask_user: None,
                 imagine: None,
                 task_runtime: TaskRuntimeKind::Local,
@@ -1059,7 +1083,7 @@ mod tests {
                 may_dir: temp.path().to_path_buf(),
                 sandbox_dir: session_dir.clone(),
                 cwd: PathBuf::from("."),
-                db: None,
+                db: test_db(temp.path()).await,
                 ask_user: None,
                 imagine: None,
                 task_runtime: TaskRuntimeKind::Local,
