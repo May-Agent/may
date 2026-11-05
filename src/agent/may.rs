@@ -536,7 +536,11 @@ impl MayAgent {
             // checkout locally; `local` writes the checkout; undecided binds
             // nothing — the launch gate asks before the session starts.
             match session_repos
-                .ensure_clone_of(&worktree, &workspace.config)
+                .ensure_clone_of(
+                    &worktree,
+                    &workspace.config,
+                    &crate::session::MayHomePaths::new(config.may_dir.clone()).repo_staging_dir(),
+                )
                 .await
             {
                 Ok(Some(clone_path)) => repo_clones.push(RepoCloneEntry {
