@@ -126,6 +126,35 @@ pub(super) enum WebhookInvocationRequestError {
     InvalidBody,
     #[error("webhook request contains a non-UTF8 header value")]
     InvalidHeaderValue,
+    #[error("webhook request body exceeds the {limit} byte limit", status = StatusCode::PAYLOAD_TOO_LARGE)]
+    BodyTooLarge { limit: u64 },
+    #[error("webhook request needs the daemon state", status = StatusCode::INTERNAL_SERVER_ERROR)]
+    MissingState,
+}
+
+/// Reads `body` into memory, refusing it once it passes `limit` bytes: a
+/// declared length over the limit is refused without reading anything, and
+/// an undeclared or understated one stops being read at the limit.
+async fn read_bounded_body(
+    mut body: Body,
+    declared_length: Option<u64>,
+    limit: u64,
+) -> Result<Vec<u8>, WebhookInvocationRequestError> {
+    use futures_lite::StreamExt as _;
+
+    let too_large = || WebhookInvocationRequestError::BodyTooLarge { limit };
+    if declared_length.is_some_and(|length| length > limit) {
+        return Err(too_large());
+    }
+    let mut buffer = Vec::new();
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|_| WebhookInvocationRequestError::InvalidBody)?;
+        if (buffer.len() as u64).saturating_add(chunk.len() as u64) > limit {
+            return Err(too_large());
+        }
+        buffer.extend_from_slice(&chunk);
+    }
+    Ok(buffer)
 }
 
 impl skyzen::extract::Extractor for WebhookInvocationRequest {
@@ -152,27 +181,36 @@ impl skyzen::extract::Extractor for WebhookInvocationRequest {
                 .push(value);
         }
 
+        let limit = request
+            .extensions()
+            .get::<State<Arc<DaemonState>>>()
+            .ok_or(WebhookInvocationRequestError::MissingState)?
+            .config_snapshot()
+            .remote_access
+            .webhook_max_body_bytes;
+        let declared_length = request
+            .headers()
+            .get(skyzen::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok());
         let body = mem::replace(request.body_mut(), Body::empty());
-        let body = body
-            .into_bytes()
-            .await
-            .map_err(|_| WebhookInvocationRequestError::InvalidBody)?;
+        let body = read_bounded_body(body, declared_length, limit).await?;
         let body_size_bytes = body.len();
-        let body_text = std::str::from_utf8(body.as_ref())
+        let body_text = std::str::from_utf8(body.as_slice())
             .ok()
             .map(ToOwned::to_owned);
         let body_json = headers
             .get(skyzen::header::CONTENT_TYPE.as_str())
             .and_then(|values| values.first())
             .filter(|value| value.starts_with("application/json"))
-            .and_then(|_| serde_json::from_slice(body.as_ref()).ok());
+            .and_then(|_| serde_json::from_slice(body.as_slice()).ok());
 
         Ok(Self(TaskWebhookRequest {
             method,
             path,
             query,
             headers,
-            body_base64: base64::engine::general_purpose::STANDARD.encode(body.as_ref()),
+            body_base64: base64::engine::general_purpose::STANDARD.encode(body.as_slice()),
             body_text,
             body_json,
             remote_addr,
