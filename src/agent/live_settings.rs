@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use crate::cache_lifetime::CacheLifetime;
-use crate::config::MayConfig;
+use crate::config::{ContextConfig, MayConfig};
 use crate::model_selector::ModelSelector;
 
 /// The config values a running agent was built from: each provider's cache
@@ -11,10 +11,11 @@ use crate::model_selector::ModelSelector;
 ///
 /// aither fixes both when the agent is built, so a worker whose settings
 /// differ from the saved config is replaced by one built from it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AgentLiveSettings {
     cache_lifetimes: BTreeMap<String, CacheLifetime>,
     compaction_model: Option<ModelSelector>,
+    context: ContextConfig,
 }
 
 impl AgentLiveSettings {
@@ -28,6 +29,7 @@ impl AgentLiveSettings {
                 .map(|(id, instance)| (id.clone(), instance.cache_lifetime))
                 .collect(),
             compaction_model: config.models.compaction_model.clone(),
+            context: config.context,
         }
     }
 }

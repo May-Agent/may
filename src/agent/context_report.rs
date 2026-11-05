@@ -89,8 +89,13 @@ pub struct ContextReport {
     pub free_tokens: usize,
     /// Window share kept in reserve above the auto-compaction trigger.
     pub autocompact_buffer_tokens: usize,
-    /// Usage fraction of `window_tokens` at which auto-compaction starts.
-    pub autocompact_trigger: f32,
+    /// Tokens at which a background compaction starts.
+    pub compact_start_tokens: usize,
+    /// Tokens at which the agent pauses to finish the compaction.
+    pub compact_pause_tokens: usize,
+    /// Tokens at which the conversation is auto-compacted:
+    /// `min(window * compact_at, compact_ceiling)`.
+    pub compact_tokens: usize,
 }
 
 /// Result of splitting the `base_system` block into its marked sections.
@@ -120,27 +125,6 @@ struct BaseSystemCarve {
     subagent_count: usize,
 }
 
-/// Usage fraction of the calibrated window at which auto-compaction forks.
-#[must_use]
-pub fn autocompact_trigger() -> f32 {
-    ContextPolicy::default().compact_at
-}
-
-/// Token count at which auto-compaction forks, floored from
-/// [`autocompact_trigger`] × `window`.
-#[must_use]
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-pub fn autocompact_window_tokens(window: usize) -> usize {
-    let trigger = f64::from(autocompact_trigger());
-    (trigger * window as f64) as usize
-}
-
-/// Tokens reserved above the auto-compaction trigger.
-#[must_use]
-pub fn autocompact_buffer_tokens(window: usize) -> usize {
-    window.saturating_sub(autocompact_window_tokens(window))
-}
-
 impl ContextReport {
     /// Assemble a report from the agent's live context and a
     /// [`ContextWindowMetrics`] measured on the same state.
@@ -151,6 +135,7 @@ impl ContextReport {
         context: &aither_agent::Context,
         metrics: &ContextWindowMetrics,
         phase: ContextWindowPhase,
+        policy: &ContextPolicy,
     ) -> Self {
         let mut system_prompt_chars = 0usize;
         let mut memory_chars = 0usize;
@@ -242,11 +227,10 @@ impl ContextReport {
 
         let used_tokens = categories.iter().map(|row| row.tokens).sum();
         let window = usize::try_from(metrics.context_window).expect("a u32 window fits usize");
-        // May keeps aither's default context policy: a compaction is forked at
-        // `compact_at`, so everything above it is the autocompact buffer from
-        // the user's perspective.
-        let trigger = autocompact_trigger();
-        let autocompact_buffer = autocompact_buffer_tokens(window);
+        // Everything above the auto-compact point is the autocompact buffer
+        // from the user's perspective.
+        let compact_tokens = policy.compact_point(metrics.context_window);
+        let autocompact_buffer = window.saturating_sub(compact_tokens);
 
         Self {
             model_id: model_id.to_string(),
@@ -257,7 +241,9 @@ impl ContextReport {
             categories,
             free_tokens: window.saturating_sub(used_tokens + autocompact_buffer),
             autocompact_buffer_tokens: autocompact_buffer,
-            autocompact_trigger: trigger,
+            compact_start_tokens: policy.start_point(metrics.context_window),
+            compact_pause_tokens: policy.pause_point(metrics.context_window),
+            compact_tokens,
         }
     }
 }
@@ -415,6 +401,7 @@ mod tests {
             &test_context(),
             &test_metrics(),
             ContextWindowPhase::Stable,
+            &ContextPolicy::default(),
         );
 
         let commands = report
@@ -486,6 +473,7 @@ mod tests {
             &test_context(),
             &test_metrics(),
             ContextWindowPhase::Stable,
+            &ContextPolicy::default(),
         );
         let summed: usize = report.categories.iter().map(|row| row.tokens).sum();
         assert_eq!(summed, report.used_tokens);
@@ -493,12 +481,53 @@ mod tests {
             report.used_tokens + report.free_tokens + report.autocompact_buffer_tokens,
             report.window_tokens
         );
-        // Default context policy: compaction triggers at 0.8 of the window.
-        assert_eq!(report.autocompact_buffer_tokens, report.window_tokens / 5);
-        assert_eq!(autocompact_window_tokens(200_000), 160_000);
-        assert_eq!(
-            autocompact_window_tokens(200_000) + autocompact_buffer_tokens(200_000),
-            200_000
+        // Default policy on a 200k window: 0.8 of it, below the 400k ceiling.
+        assert_eq!(report.compact_tokens, 160_000);
+        assert_eq!(report.autocompact_buffer_tokens, 40_000);
+        assert_eq!(report.compact_start_tokens, 110_000);
+        assert_eq!(report.compact_pause_tokens, 155_000);
+    }
+
+    #[test]
+    fn a_million_token_window_compacts_at_the_ceiling() {
+        let mut metrics = test_metrics();
+        metrics.context_window = 1_000_000;
+        let report = ContextReport::assemble(
+            "gpt-5",
+            "openai",
+            &[],
+            &test_context(),
+            &metrics,
+            ContextWindowPhase::Stable,
+            &ContextPolicy::default(),
         );
+        assert_eq!(report.compact_tokens, 400_000);
+        assert_eq!(report.compact_start_tokens, 350_000);
+        assert_eq!(report.compact_pause_tokens, 395_000);
+        assert_eq!(report.autocompact_buffer_tokens, 600_000);
+    }
+
+    #[test]
+    fn the_report_follows_the_configured_policy() {
+        let policy = crate::config::ContextConfig {
+            compact_ceiling: 100_000,
+            start_distance: 20_000,
+            safe_buffer: 1_000,
+            ..crate::config::ContextConfig::default()
+        }
+        .policy();
+        let report = ContextReport::assemble(
+            "gpt-5",
+            "openai",
+            &[],
+            &test_context(),
+            &test_metrics(),
+            ContextWindowPhase::Compacting,
+            &policy,
+        );
+        assert_eq!(report.compact_tokens, 100_000);
+        assert_eq!(report.compact_start_tokens, 80_000);
+        assert_eq!(report.compact_pause_tokens, 99_000);
+        assert_eq!(report.phase, ContextWindowPhase::Compacting);
     }
 }
