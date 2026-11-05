@@ -44,6 +44,9 @@ pub enum RepoSearchError {
     /// The daemon connection or request failed.
     #[error("repo-search request failed: {0}")]
     Client(#[from] ClientError),
+    /// The May daemon is shutting down and has retired its repo-search agents.
+    #[error("repo-search is retired: the May daemon is shutting down")]
+    Retired,
 }
 
 impl From<ConnectError> for RepoSearchError {
@@ -65,6 +68,10 @@ struct Prepared {
 struct Inner {
     cache_root: PathBuf,
     prepared: OnceCell<Prepared>,
+    /// `true` once [`RepoSearch::retire`] ran. Every launch holds it shared
+    /// while it may install agents, so a retirement waits for those in flight
+    /// and no launch installs after it.
+    retired: async_lock::RwLock<bool>,
 }
 
 /// Shared handle on the repo-search daemon.
@@ -84,6 +91,7 @@ impl RepoSearch {
             inner: Arc::new(Inner {
                 cache_root: may_dir.join("cache").join("host-programs"),
                 prepared: OnceCell::new(),
+                retired: async_lock::RwLock::new(false),
             }),
         }
     }
@@ -120,12 +128,34 @@ impl RepoSearch {
     ///
     /// # Errors
     /// Fails when the binary cannot be prepared or the daemon stays
-    /// unreachable.
+    /// unreachable, and with [`RepoSearchError::Retired`] after
+    /// [`RepoSearch::retire`].
     pub async fn client(&self) -> Result<Client, RepoSearchError> {
+        let retired = self.inner.retired.read().await;
+        if *retired {
+            return Err(RepoSearchError::Retired);
+        }
         let prepared = self.prepared().await?;
         let mut launcher = PlatformLauncher::user(prepared.program.clone())?;
         let report = launcher.prepare().await;
-        Ok(launcher::connect(&mut launcher, &prepared.hello, report, log_note).await?)
+        let client = launcher::connect(&mut launcher, &prepared.hello, report, log_note).await?;
+        // Held until here: the launch above is what installs agents.
+        drop(retired);
+        Ok(client)
+    }
+
+    /// Boots out the launchd agents this process installed for a relocated
+    /// `$HOME` (see [`retire_relocated_agents`]) once every launch in flight
+    /// has finished, and refuses every later one, so none reinstalls them.
+    /// Returns the services it removed.
+    ///
+    /// # Errors
+    /// As [`retire_relocated_agents`].
+    pub async fn retire(&self) -> Result<Vec<String>, RepoSearchError> {
+        // The write lock waits out every launch in flight; once the flag is
+        // set, no later one gets past its check.
+        *self.inner.retired.write().await = true;
+        blocking::unblock(retire_relocated_agents).await
     }
 }
 
@@ -141,7 +171,7 @@ impl RepoSearch {
 /// Fails when the home or the launchd state cannot be read, or `launchctl`
 /// refuses a `bootout`.
 #[cfg(target_os = "macos")]
-pub fn retire_relocated_agents() -> Result<Vec<String>, RepoSearchError> {
+fn retire_relocated_agents() -> Result<Vec<String>, RepoSearchError> {
     use repo_search_client::launcher::install::SystemLaunchctl;
     use repo_search_client::launcher::launchd::{domain, user_labels};
 
@@ -271,7 +301,8 @@ mod tests {
 
 /// No launchd agents exist off macOS.
 #[cfg(not(target_os = "macos"))]
-pub fn retire_relocated_agents() -> Result<Vec<String>, RepoSearchError> {
+#[allow(clippy::unnecessary_wraps)] // the macOS variant's signature
+fn retire_relocated_agents() -> Result<Vec<String>, RepoSearchError> {
     Ok(Vec::new())
 }
 
