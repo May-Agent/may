@@ -14,9 +14,9 @@ use serde::{Deserialize, Serialize};
 /// MCP configuration error.
 #[derive(Debug, thiserror::Error)]
 pub enum McpConfigError {
-    /// Home directory not found.
-    #[error("Home directory not found")]
-    NoHomeDir,
+    /// The home directory is missing or does not resolve.
+    #[error("{0}")]
+    Home(#[from] crate::config::ConfigError),
     /// Failed to read MCP config.
     #[error("Failed to read MCP config: {0}")]
     Read(#[from] std::io::Error),
@@ -159,9 +159,7 @@ impl McpConfig {
     /// # Errors
     /// Returns [`McpConfigError`] when no home directory can be determined.
     pub fn config_path() -> Result<PathBuf, McpConfigError> {
-        dirs::home_dir()
-            .map(|h| h.join(".may").join("mcp.json"))
-            .ok_or(McpConfigError::NoHomeDir)
+        Ok(crate::config::MayConfig::may_dir()?.join("mcp.json"))
     }
 
     /// Load MCP configuration from `~/.may/mcp.json` or use defaults.
