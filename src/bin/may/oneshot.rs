@@ -133,8 +133,6 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
     /// How often prompts the daemon holds are looked for.
     const DAEMON_PROMPT_POLL: std::time::Duration = std::time::Duration::from_millis(300);
 
-    const ONESHOT_IDLE_FINISH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-
     let (event_tx, _event_rx) = async_channel::unbounded();
     let mut app = App::new(event_tx, None).await?;
     if !app.is_configured() {
@@ -241,7 +239,6 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
 
     let mut pending_title_gen: Option<TitleGenContext> = None;
     let mut assistant_response = AssistantReply::default();
-    let mut active_tool_calls = std::collections::HashSet::<String>::new();
     if !runtime_deps.begin_run(&mut app)? {
         anyhow::bail!("the session is already running in another May process");
     }
@@ -260,8 +257,6 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
         &mut pending_title_gen,
     )?;
     let mut agent_handle = Some(handle);
-    // Prompt polls do not count as activity for the idle finish.
-    let mut last_agent_event = std::time::Instant::now();
 
     while let Some(handle) = agent_handle.as_ref() {
         let snapshot = session_runtime(&runtime_deps, &session_id).await?;
@@ -363,58 +358,17 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
             continue;
         }
 
-        let event_future =
+        let next =
             futures_lite::future::or(async { handle.recv().await.map(Event::Agent) }, async {
                 async_io::Timer::after(DAEMON_PROMPT_POLL).await;
                 Some(Event::Poll)
-            });
-        let next = if assistant_response.text().is_empty() || !active_tool_calls.is_empty() {
-            event_future.await
-        } else if let Ok(event) = tokio::time::timeout(
-            ONESHOT_IDLE_FINISH_TIMEOUT.saturating_sub(last_agent_event.elapsed()),
-            event_future,
-        )
-        .await
-        {
-            event
-        } else {
-            if let Some(handle) = agent_handle.take() {
-                handle.cancel();
-            }
-            runtime_deps
-                .finish_agent_task(
-                    &mut app,
-                    &mut agent_handle,
-                    &mut pending_title_gen,
-                    &assistant_response,
-                    RunOutcome::Completed,
-                )
-                .await;
-            output.end_text_line()?;
-            return Ok(());
-        };
+            })
+            .await;
         let Some(event) = next else {
             break;
         };
-        if matches!(event, Event::Agent(_)) {
-            last_agent_event = std::time::Instant::now();
-        }
         match event {
             Event::Agent(TuiEvent::Agent(result)) => {
-                if let Ok(TimedEvent {
-                    event: AgentEvent::ToolCallStart { id, .. },
-                    ..
-                }) = &result
-                {
-                    active_tool_calls.insert(id.clone());
-                }
-                if let Ok(TimedEvent {
-                    event: AgentEvent::ToolCallEnd { id, .. },
-                    ..
-                }) = &result
-                {
-                    active_tool_calls.remove(id);
-                }
                 if let Ok(TimedEvent {
                     at,
                     event: AgentEvent::Text(ref text),

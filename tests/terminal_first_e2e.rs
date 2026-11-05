@@ -66,6 +66,12 @@ enum MockChatScenario {
     /// Answers every agent turn with the same text, so one session can run
     /// several turns against one mock server.
     TextEveryTurn(String),
+    /// Answers every agent turn with `chunks`, each streamed `delay` after
+    /// the one before.
+    SlowTextEveryTurn {
+        chunks: Vec<String>,
+        delay: Duration,
+    },
     /// The first `failures` agent requests are refused with an overloaded
     /// (529) status; every later one gets `text`.
     OverloadedThenText {
@@ -458,6 +464,10 @@ impl MockScenarioState {
                 // whether it prepared them or adopted them.
                 verify_initial_tool_contract(request)?;
                 MockHttpResponse::sse(text_stream_frames(vec![text.clone()], Duration::ZERO))
+            }
+            MockChatScenario::SlowTextEveryTurn { chunks, delay } => {
+                verify_initial_tool_contract(request)?;
+                MockHttpResponse::sse(text_stream_frames(chunks.clone(), *delay))
             }
             MockChatScenario::SlowText { chunks, delay } => {
                 if self.request_index != 0 {
@@ -4407,9 +4417,12 @@ async fn ask_user_answered_mid_run_reaches_the_next_request_of_that_run() {
 #[tokio::test]
 #[serial]
 async fn oneshot_run_starts_the_daemon_and_streams_its_turn() {
-    let mock = MockOpenAiServer::spawn(MockChatScenario::TextEveryTurn(
-        "hello from the daemon".into(),
-    ))
+    // The reply pauses longer than a model's typical think after its first
+    // text; the run still ends only when the turn does.
+    let mock = MockOpenAiServer::spawn(MockChatScenario::SlowTextEveryTurn {
+        chunks: vec!["hello from ".into(), "the daemon".into()],
+        delay: Duration::from_secs(3),
+    })
     .await;
     let harness = TestHarness::new(&mock.base_url()).await;
     // A port of its own, so the daemon this run starts never meets another.
