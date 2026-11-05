@@ -1,0 +1,5 @@
+{% if reconciling -%}
+Indexing is still in progress: files that changed may be missing from these results.
+
+{% endif -%}
+{{ output }}
