@@ -54,6 +54,11 @@ pub struct ProjectConfig {
     /// Issue backend for this project; absent means local may issues.
     #[serde(default)]
     pub issues: ProjectIssues,
+    /// The GitHub repository the project publishes PRs to, bound
+    /// independently of the issue backend. Absent falls back to the
+    /// repository the GitHub issue backend names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<GitHubRepository>,
     /// Local check command run inside the session clone before a `pr`
     /// merge, e.g. `checks = "cargo test"`.
     #[serde(default)]
@@ -70,13 +75,15 @@ impl ProjectConfig {
         crate::issue::repository_identity(&self.path).is_ok_and(|k| k == identity)
     }
 
-    /// The GitHub repository this project is bound to, when its issue
-    /// backend names one.
+    /// The GitHub repository this project is bound to: its own binding, else
+    /// the one its GitHub issue backend names.
     #[must_use]
     pub const fn github_repository(&self) -> Option<&GitHubRepository> {
-        match &self.issues {
-            ProjectIssues::Github { repository } => Some(repository),
-            ProjectIssues::May => None,
+        match (&self.repository, &self.issues) {
+            (Some(repository), _) | (None, ProjectIssues::Github { repository }) => {
+                Some(repository)
+            }
+            (None, ProjectIssues::May) => None,
         }
     }
 }
