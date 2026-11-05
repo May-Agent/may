@@ -514,6 +514,39 @@ impl App {
             }
         }
 
+        // Build status message for env-detected providers
+        let status = if env_providers_added.is_empty() {
+            None
+        } else {
+            let names: Vec<_> = env_providers_added
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect();
+            Some(StatusNotice::transient(
+                format!("Auto-configured from env: {}", names.join(", ")),
+                STATUS_NOTICE_TTL,
+            ))
+        };
+
+        Ok(Self::with_parts(
+            config,
+            session_manager,
+            event_tx,
+            image_support,
+            status,
+        ))
+    }
+
+    /// Builds the application state around an already loaded configuration
+    /// and session manager; the part of [`Self::new`] that touches neither
+    /// the home directory nor the environment.
+    fn with_parts(
+        config: MayConfig,
+        session_manager: SessionManager,
+        event_tx: EventSender,
+        image_support: Option<super::ui::image::TerminalImageSupport>,
+        status: Option<StatusNotice>,
+    ) -> Self {
         let needs_setup = !config.is_configured();
         let tunnel_base = tunnel_base(&config);
         // Always start in Chat mode - show inline message if not configured
@@ -536,26 +569,12 @@ impl App {
         // Get current working directory
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-        // Build status message for env-detected providers
-        let status = if env_providers_added.is_empty() {
-            None
-        } else {
-            let names: Vec<_> = env_providers_added
-                .iter()
-                .map(|(id, _)| id.as_str())
-                .collect();
-            Some(StatusNotice::transient(
-                format!("Auto-configured from env: {}", names.join(", ")),
-                STATUS_NOTICE_TTL,
-            ))
-        };
-
         let secrets = crate::secrets::Secrets::load(
             &crate::secrets::SecretStore::new(session_manager.may_dir()),
             &config,
         );
 
-        Ok(Self {
+        Self {
             session_manager,
             worker_settings: crate::agent::AgentLiveSettings::of(&config),
             config,
@@ -687,7 +706,7 @@ impl App {
             index_loading: false,
             question_cursor: 0,
             parked_question: None,
-        })
+        }
     }
 
     fn persist_config_background(&self) {
@@ -4422,6 +4441,145 @@ async fn stream_btw_answer(
 #[cfg(test)]
 mod tests {
     use super::utf8_complete_len;
+    use super::{App, AppEvent, KeyCode, KeyModifiers, MayConfig, MessageRole, SendAction};
+    use crate::session::SessionManager;
+    use crate::tui::ui::chat::ChatElement;
+
+    /// An app over a scratch May directory with one attached session,
+    /// returning the session id. The directory must outlive the app.
+    async fn app_with_session(dir: &std::path::Path) -> (App, String) {
+        let mut sessions = SessionManager::at(dir.to_path_buf())
+            .await
+            .expect("session manager");
+        let id = sessions
+            .create_session_in_profile(None, None)
+            .expect("session")
+            .id
+            .as_str()
+            .to_string();
+        let (tx, _rx) = async_channel::unbounded();
+        let app = App::with_parts(MayConfig::default(), sessions, tx, None, None);
+        (app, id)
+    }
+
+    fn suggest(app: &mut App, session_id: &str, text: &str) {
+        app.handle_event(AppEvent::PromptSuggestion {
+            request_id: 1,
+            session_id: session_id.to_string(),
+            text: Some(text.to_string()),
+        })
+        .expect("suggestion event");
+    }
+
+    fn press(app: &mut App, code: KeyCode) -> Option<SendAction> {
+        app.handle_key(code, KeyModifiers::NONE).expect("key")
+    }
+
+    #[tokio::test]
+    async fn a_suggestion_frame_shows_for_the_attached_session_only() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, id) = app_with_session(dir.path()).await;
+        suggest(&mut app, "another-session", "not mine");
+        assert_eq!(app.own_visible_suggestion(), None);
+        suggest(&mut app, &id, "run the tests");
+        assert_eq!(app.own_visible_suggestion(), Some("run the tests"));
+        app.handle_event(AppEvent::PromptSuggestion {
+            request_id: 2,
+            session_id: id,
+            text: None,
+        })
+        .expect("clear");
+        assert_eq!(
+            app.own_visible_suggestion(),
+            None,
+            "a cleared frame hides it"
+        );
+    }
+
+    #[tokio::test]
+    async fn tab_lifts_the_suggestion_into_the_draft_without_sending() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, id) = app_with_session(dir.path()).await;
+        suggest(&mut app, &id, "run the tests");
+        let action = press(&mut app, KeyCode::Tab);
+        assert!(action.is_none(), "accepting never submits");
+        assert_eq!(app.input, "run the tests");
+        assert_eq!(app.cursor, app.input_char_count);
+        assert!(app.prompt_suggestion.is_none(), "consumed");
+        press(&mut app, KeyCode::Char('!'));
+        assert_eq!(app.input, "run the tests!", "the lifted text is editable");
+    }
+
+    #[tokio::test]
+    async fn esc_dismisses_the_suggestion_and_leaves_the_draft_empty() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, id) = app_with_session(dir.path()).await;
+        suggest(&mut app, &id, "run the tests");
+        assert!(press(&mut app, KeyCode::Esc).is_none());
+        assert!(app.prompt_suggestion.is_none());
+        assert_eq!(app.input, "");
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.input, "", "nothing left to accept");
+    }
+
+    #[tokio::test]
+    async fn typing_hides_the_suggestion() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, id) = app_with_session(dir.path()).await;
+        suggest(&mut app, &id, "run the tests");
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(app.input, "h");
+        assert_eq!(app.own_visible_suggestion(), None, "hidden while typing");
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.input, "h", "Tab never overwrites a typed draft");
+    }
+
+    #[tokio::test]
+    async fn recap_command_asks_the_daemon_and_the_frame_adds_a_card() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, id) = app_with_session(dir.path()).await;
+        for c in "/recap".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        let mut action = press(&mut app, KeyCode::Enter);
+        if action.is_none() {
+            action = press(&mut app, KeyCode::Enter);
+        }
+        assert!(matches!(action, Some(SendAction::Recap)));
+
+        app.handle_event(AppEvent::Recap {
+            session_id: id,
+            state: "ready".to_string(),
+            summary: Some("Tests pass.".to_string()),
+            next_action: Some("Merge it.".to_string()),
+        })
+        .expect("recap frame");
+        assert!(matches!(
+            app.chat.elements().last(),
+            Some(ChatElement::Recap { summary, next_action })
+                if summary == "Tests pass." && next_action.as_deref() == Some("Merge it.")
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_stored_recap_row_is_restored_as_a_card_when_history_reloads() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        let record = crate::daemon::RecapRecord {
+            summary: "Where it stands.".to_string(),
+            next_action: None,
+            turns: 1,
+        };
+        let mut row = crate::ChatMessage::user("");
+        row.role = MessageRole::Recap;
+        row.content = serde_json::to_string(&record).expect("record");
+        app.render_history(&[crate::ChatMessage::user("hi"), row])
+            .await;
+        assert!(matches!(
+            app.chat.elements().last(),
+            Some(ChatElement::Recap { summary, next_action: None }) if summary == "Where it stands."
+        ));
+    }
 
     #[test]
     fn utf8_complete_len_holds_only_incomplete_trailing_sequence() {
