@@ -232,9 +232,11 @@ pub trait IssueStore: Send + Sync + fmt::Debug {
     /// Stable name of this backend's issue set, keying its search index.
     fn search_key(&self) -> String;
 
-    /// Issues updated after `since` (every issue when `None`), oldest
-    /// update first, at most `limit`. Drives the search index's
-    /// incremental sync.
+    /// Issues updated at or after `since` (every issue when `None`), oldest
+    /// update first: the ones at `since` itself, then at least `limit`
+    /// newer ones as long as more exist, never cutting through a group of
+    /// issues sharing one update time. Drives the search index's
+    /// incremental sync, which skips what it already indexed.
     fn updated_since(
         &self,
         since: Option<&str>,

@@ -66,7 +66,17 @@ impl<B: CollectionBackend> IssueSearch<B> {
         let collection = collection_name(&store.search_key());
         for _ in 0..SYNC_PAGES_PER_QUERY {
             let since = self.db.issue_search_watermark(&collection).await?;
-            let updated = store.updated_since(since.as_deref(), SYNC_PAGE).await?;
+            let fetched = store.updated_since(since.as_deref(), SYNC_PAGE).await?;
+            let mut updated = Vec::with_capacity(fetched.len());
+            for summary in fetched {
+                let indexed = self
+                    .db
+                    .issue_search_doc(&collection, summary.number)
+                    .await?;
+                if indexed.is_none_or(|doc| doc.updated_at != summary.updated_at) {
+                    updated.push(summary);
+                }
+            }
             if updated.is_empty() {
                 return Ok(());
             }
