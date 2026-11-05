@@ -220,8 +220,13 @@ where
     if let Some(runtime) = config.ask_user.clone() {
         issue_tool = issue_tool.with_changes(IssueChangeNotifier::new(runtime));
     }
-    let subagent_issue_tool =
+    let mut subagent_issue_tool =
         SubagentIssueTool::new(config.issue_store, provenance).with_search(issue_search);
+    if let Some(messaging) = &config.agent_messaging {
+        let owners = crate::issue::owner::IssueOwners::new(messaging.directory.clone());
+        issue_tool = issue_tool.with_owners(owners.clone());
+        subagent_issue_tool = subagent_issue_tool.with_owners(owners);
+    }
     describe_tool(&mut descriptions, &issue_tool);
     builder.configure_role_tools(issue_tool, subagent_issue_tool);
     // Issue and PR changes reach GitHub through `issue` and `pr` alone. The command exists
