@@ -225,6 +225,31 @@ impl SessionRepos {
             .map(|c| self.path(&c.dir)))
     }
 
+    /// The clone this session holds of `checkout`'s repository, when one
+    /// exists. Uses the identity the clone was registered under: the
+    /// `owner/repo` of a GitHub remote, else the canonical git common dir.
+    ///
+    /// # Errors
+    /// Fails when the checkout's identity cannot be read or the registry
+    /// cannot be read.
+    pub async fn clone_of_checkout(
+        &self,
+        checkout: &Path,
+    ) -> Result<Option<PathBuf>, RepoCloneError> {
+        let key = match crate::trust::repo_kind(checkout) {
+            crate::trust::RepoKind::Github { owner_repo }
+                if crate::trust::remote_url(checkout).is_some() =>
+            {
+                owner_repo
+            }
+            _ => crate::issue::repository_identity(checkout)
+                .map_err(|error| RepoCloneError::Io(std::io::Error::other(error)))?
+                .to_string_lossy()
+                .into_owned(),
+        };
+        self.clone_for(&key).await
+    }
+
     /// Register `dir` as the clone serving `repo_key` from `source`.
     async fn register(
         &self,
