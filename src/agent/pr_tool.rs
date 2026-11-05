@@ -31,13 +31,13 @@ use crate::repo_clone::CloneSandbox;
 pub enum PrArgs {
     /// Open a PR for this repo's session clone.
     Open {
-        /// PR title.
+        /// PR title; defaults to the subject of the first commit.
         #[serde(default)]
         title: Option<String>,
         /// Open only; merge later with `pr merge`.
         #[serde(default)]
         hold: bool,
-        /// Associate a may issue number.
+        /// The project's issue number: a GitHub project's PR body closes it.
         #[serde(default)]
         issue: Option<i64>,
         /// Repo key or clone dir when several clones exist.
@@ -197,12 +197,7 @@ impl Tool for PrTool {
                 repo,
             } => {
                 self.store
-                    .open(
-                        repo.as_deref(),
-                        title.as_deref().unwrap_or("session work"),
-                        issue,
-                        hold,
-                    )
+                    .open(repo.as_deref(), title.as_deref(), issue, hold)
                     .await
             }
             PrArgs::Update { number, repo } => self.store.update(number, repo.as_deref()).await,
