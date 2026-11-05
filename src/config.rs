@@ -1615,7 +1615,7 @@ impl MayConfig {
     }
 
     /// `home` with every symlink resolved.
-    fn resolve_home(home: PathBuf) -> Result<PathBuf, ConfigError> {
+    pub(crate) fn resolve_home(home: PathBuf) -> Result<PathBuf, ConfigError> {
         dunce::canonicalize(&home).map_err(|source| ConfigError::HomeUnresolvable { home, source })
     }
 

@@ -48,6 +48,8 @@ pub(crate) mod types;
 #[cfg(test)]
 mod funnel_tests;
 #[cfg(test)]
+mod paths_tests;
+#[cfg(test)]
 mod repo_clones_tests;
 #[cfg(test)]
 mod response_tests;
@@ -124,29 +126,43 @@ async fn release_pending_interactions(state: &crate::daemon::state::DaemonState)
 #[derive(Debug, Clone)]
 pub struct DaemonPaths {
     root: PathBuf,
+    socket: PathBuf,
 }
 
 impl DaemonPaths {
     /// Paths under `may_dir`.
     #[must_use]
-    pub const fn new(may_dir: PathBuf) -> Self {
-        Self { root: may_dir }
+    pub fn new(may_dir: PathBuf) -> Self {
+        Self {
+            socket: may_dir.join("daemon.sock"),
+            root: may_dir,
+        }
     }
 
     /// Paths under the user's `~/.may`.
     ///
     /// # Errors
-    /// Fails when the home directory cannot be determined.
+    /// Fails when the home directory cannot be determined or resolved.
     pub fn user() -> anyhow::Result<Self> {
-        Ok(Self::new(
-            MayConfig::may_dir().context("failed to resolve ~/.may")?,
-        ))
+        Self::for_home(dirs::home_dir().context("no home directory")?)
+    }
+
+    /// Paths under `home`'s `.may`. Files live at the resolved home, which
+    /// is what the sandbox grants; the socket keeps `home`'s own spelling,
+    /// since a unix socket path is limited to about 104 bytes and the
+    /// resolved spelling of a home reached through a link can exceed it.
+    fn for_home(home: PathBuf) -> anyhow::Result<Self> {
+        let socket = home.join(".may").join("daemon.sock");
+        let root = MayConfig::resolve_home(home)
+            .context("failed to resolve ~/.may")?
+            .join(".may");
+        Ok(Self { root, socket })
     }
 
     /// The unix socket clients connect to.
     #[must_use]
     pub fn socket(&self) -> PathBuf {
-        self.root.join("daemon.sock")
+        self.socket.clone()
     }
 
     /// The single-instance lock.
