@@ -14,6 +14,7 @@
 //! running agent keeps the grants it started with, as a running terminal
 //! command does.
 
+use std::ffi::OsString;
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -24,7 +25,7 @@ use acpsub::{
     AgentProcess, Executor, PermissionHandler, PermissionRequest, ProcessControl, SpawnSpec,
     TerminalProcess,
 };
-use aither_acp::{PermissionOptionKind, RequestPermissionOutcome};
+use aither_acp::{PermissionOption, PermissionOptionKind, RequestPermissionOutcome};
 use aither_sandbox::permission::PermissionHandler as TerminalPermissions;
 use aither_sandbox::{ProcessPriority, TerminalGrants, TerminalMode};
 use arc_swap::ArcSwap;
@@ -32,18 +33,24 @@ use askama::Template;
 use event_listener::Event;
 use executor_core::DefaultExecutor;
 use heel::{
-    Access, Audited, DomainRequest, Grant, NetworkAuditLog, NetworkPolicy, ResolvedPath, Sandbox,
-    SandboxConfig, SecurityConfig, StdioConfig,
+    Access, Audited, DenyAll, DomainRequest, Grant, NetworkAuditLog, NetworkPolicy, ResolvedPath,
+    Sandbox, SandboxConfig, SecurityConfig, StdioConfig,
 };
 
 use crate::agent::PermissionApprover;
 use crate::config::MayConfig;
 use crate::terminal_permission_handler::TerminalPermissionHandler;
 
-/// The network policy of an ACP sandbox: the session's terminal verdicts.
+/// Judges a session's ACP connections like its terminal commands' own.
 #[derive(Clone)]
-struct SessionNetwork {
+pub struct SessionNetwork {
     handler: Arc<TerminalPermissionHandler>,
+}
+
+impl std::fmt::Debug for SessionNetwork {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionNetwork").finish_non_exhaustive()
+    }
 }
 
 impl NetworkPolicy for SessionNetwork {
@@ -54,29 +61,29 @@ impl NetworkPolicy for SessionNetwork {
     }
 }
 
-type AcpSandbox = Sandbox<Audited<SessionNetwork>>;
+/// The network policy of a session's ACP sandbox: the session's terminal
+/// verdicts, recorded in its network audit log.
+pub type SessionPolicy = Audited<SessionNetwork>;
 
-/// The boundary of one session's ACP processes.
+/// The boundary of one session's ACP processes; `N` decides their network.
 #[derive(Clone)]
-pub struct SessionSandbox {
+pub struct SessionSandbox<N> {
     /// The sandbox's working directory, granted in full: the session
-    /// directory, or a scratch directory for a trial.
+    /// directory, or a scratch directory for a probe or trial.
     root: PathBuf,
     /// Overrides the working directory a process asks for, when the caller
     /// has none of its own to give (a probe starts in the daemon's).
     launch_dir: Option<PathBuf>,
     /// The session terminal's live grants.
     grants: TerminalGrants,
-    /// Judges outbound connections like the session's terminal commands.
-    network: Arc<TerminalPermissionHandler>,
-    audit: NetworkAuditLog,
+    network: N,
     priority: ProcessPriority,
     /// Asks the user about the agent's permission requests; without it every
     /// request is refused.
     approver: Option<PermissionApprover>,
 }
 
-impl std::fmt::Debug for SessionSandbox {
+impl<N> std::fmt::Debug for SessionSandbox<N> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SessionSandbox")
             .field("root", &self.root)
@@ -85,7 +92,7 @@ impl std::fmt::Debug for SessionSandbox {
     }
 }
 
-impl SessionSandbox {
+impl SessionSandbox<SessionPolicy> {
     /// The sandbox of a session whose terminal has `grants`.
     #[must_use]
     pub fn for_session(
@@ -100,62 +107,80 @@ impl SessionSandbox {
             root,
             launch_dir: None,
             grants,
-            network: Arc::new(network),
-            audit,
+            network: Audited::new(
+                SessionNetwork {
+                    handler: Arc::new(network),
+                },
+                audit,
+            ),
             priority,
             approver,
         }
     }
+}
 
+impl SessionSandbox<DenyAll> {
     /// A sandbox granting nothing but `root`, which every process starts in,
-    /// and answering no permission request: a connection under trial belongs
-    /// to no session.
-    ///
-    /// # Errors
-    /// Returns the error of opening the network audit log under `root`.
-    pub fn scratch(root: &Path) -> io::Result<Self> {
-        let audit = NetworkAuditLog::rolling_daily(root.join("network-audit"), 1)
-            .map_err(io::Error::other)?;
-        Ok(Self {
+    /// with no network and answering no permission request: a command under
+    /// probe or trial belongs to no session.
+    #[must_use]
+    pub fn scratch(root: &Path) -> Self {
+        Self {
             root: root.to_path_buf(),
             launch_dir: Some(root.to_path_buf()),
             grants: TerminalGrants::new(),
-            network: Arc::new(TerminalPermissionHandler::for_agent(None, None, None)),
-            audit,
+            network: DenyAll,
             priority: ProcessPriority::default(),
             approver: None,
-        })
+        }
     }
+}
 
+/// A process started in an ACP sandbox. On Linux it runs under heel's
+/// supervisor, which owns its whole tree whatever session or group a
+/// descendant moves to.
+#[cfg(target_os = "linux")]
+type AcpChild = heel::supervisor::SupervisedChild<heel::supervisor::Foreground>;
+#[cfg(not(target_os = "linux"))]
+type AcpChild = heel::Child;
+
+/// The budget a supervised tree's teardown gets to see its processes exit,
+/// as aither gives May's own commands.
+#[cfg(target_os = "linux")]
+const SUPERVISED_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+impl<N: NetworkPolicy + Clone> SessionSandbox<N> {
     /// The sandbox a process of `spec` starts in, with the grants of this
     /// moment.
     async fn launch(
         &self,
         spec: &SpawnSpec,
         process: &Process,
-    ) -> io::Result<(heel::Child, AcpSandbox)> {
-        let grants = self.grants.snapshot();
-        let program = resolve_program(&spec.program);
-        // The command line names what the process runs: the program, and the
-        // files among its arguments (an interpreter's script).
-        let named_files: Vec<PathBuf> = spec
-            .args
-            .iter()
-            .map(|arg| spec.cwd.join(arg))
-            .filter(|path| path.is_file())
-            .collect();
-        let grants = grants
+    ) -> io::Result<(AcpChild, Sandbox<N>)> {
+        let snapshot = self.grants.snapshot();
+        let root = canonical(&self.root)?;
+        let cwd = self.launch_dir.as_deref().unwrap_or(&spec.cwd);
+        // The program starts by the path `PATH` gives, so a link starts under
+        // its own name (`cargo` is a link to `rustup`, which dispatches on
+        // it). A grant never names a link, so its target is what the sandbox
+        // may execute. Nothing else on the command line is granted: the
+        // arguments come from the agent.
+        let program = resolve_program(&spec.program, cwd)?;
+        let target = canonical(&program)?;
+        let links = process.link_dirs(&program)?;
+        let toolchains = toolchain_homes();
+        let grants = snapshot
             .writable
             .iter()
             .map(|path| (path, Access::WRITE | Access::EXEC))
-            .chain(grants.readable.iter().map(|path| (path, Access::READ)))
-            .chain(program.as_ref().map(|path| (path, Access::EXEC)))
-            .chain(named_files.iter().map(|path| (path, Access::READ)))
+            .chain(snapshot.readable.iter().map(|path| (path, Access::READ)))
+            .chain(std::iter::once((&target, Access::EXEC)))
+            .chain(links.iter().map(|path| (path, Access::READ)))
             // The host toolchains the session's own commands build with.
             .chain(
-                toolchain_homes()
+                toolchains
                     .iter()
-                    .map(|path| (path, Access::WRITE | Access::EXEC)),
+                    .map(|(_, path)| (path, Access::WRITE | Access::EXEC)),
             )
             // The agent's own state, which its commands do not share.
             .chain(
@@ -170,32 +195,32 @@ impl SessionSandbox {
                     .map_err(|error| io::Error::other(format!("{}: {error}", path.display())))
             })
             .collect::<io::Result<Vec<_>>>()?;
+        let tmp = root.join("tmp");
+        async_fs::create_dir_all(&tmp).await?;
+        let environment = base_environment(&root, &tmp, &toolchains, process)?;
         let config = SandboxConfig::builder()
-            .network(Audited::new(
-                SessionNetwork {
-                    handler: self.network.clone(),
-                },
-                self.audit.clone(),
-            ))
-            .working_dir(canonical(&self.root))
+            .network(self.network.clone())
+            .working_dir(root)
             .grants(grants)
             .security(SecurityConfig::interactive())
             // The session's own commands run their build outputs.
             .executable_working_dir(true)
-            .priority(self.priority)
-            .build();
-        let sandbox: AcpSandbox = Sandbox::with_config_and_executor(config, DefaultExecutor)
+            .priority(self.priority);
+        #[cfg(target_os = "linux")]
+        let config = config.supervised_spawn(true);
+        let sandbox = Sandbox::with_config_and_executor(config.build(), DefaultExecutor)
             .await
             .map_err(io::Error::other)?;
-        let cwd = self.launch_dir.as_deref().unwrap_or(&spec.cwd);
-        let program = program.map_or_else(
-            || spec.program.clone(),
-            |path| path.to_string_lossy().into_owned(),
-        );
-        let child = sandbox
+        let program = program.into_os_string().into_string().map_err(|program| {
+            io::Error::other(format!(
+                "the program path is not UTF-8: {}",
+                program.to_string_lossy()
+            ))
+        })?;
+        let command = sandbox
             .command(program)
             .args(&spec.args)
-            .envs(self.base_environment(process)?)
+            .envs(environment)
             .envs(&spec.env)
             .current_dir(cwd)
             .stdin(if process.pipes_stdin() {
@@ -204,10 +229,16 @@ impl SessionSandbox {
                 StdioConfig::Null
             })
             .stdout(StdioConfig::Piped)
-            .stderr(StdioConfig::Piped)
-            .spawn()
-            .await
-            .map_err(io::Error::other)?;
+            .stderr(StdioConfig::Piped);
+        #[cfg(target_os = "linux")]
+        let child = command
+            .spawn_supervised(heel::supervisor::Foreground {
+                reap_timeout: SUPERVISED_REAP_TIMEOUT,
+            })
+            .await;
+        #[cfg(not(target_os = "linux"))]
+        let child = command.spawn().await;
+        let child = child.map_err(io::Error::other)?;
         Ok((child, sandbox))
     }
 }
@@ -231,38 +262,81 @@ impl Process {
             Self::Terminal => &[],
         }
     }
+
+    /// The directories holding the links `program` starts through, which
+    /// the sandbox reads to follow them: a grant cannot name a link itself.
+    /// The agent's command is the user's configuration; a terminal command's
+    /// comes from the agent and opens nothing beyond its target, so one
+    /// started through a link the sandbox cannot read fails to start.
+    fn link_dirs(&self, program: &Path) -> io::Result<Vec<PathBuf>> {
+        match self {
+            Self::Agent { .. } => link_dirs(program),
+            Self::Terminal => Ok(Vec::new()),
+        }
+    }
 }
 
-impl SessionSandbox {
-    /// The environment under the process's own: the host `PATH`, as the
-    /// session's terminal commands get it. The agent finds its own config
-    /// and login through the user's real home; its commands keep the
-    /// session directory as home, like every command of the session.
-    fn base_environment(&self, process: &Process) -> io::Result<Vec<(String, String)>> {
-        let mut environment = Vec::new();
-        if let Some(path) = std::env::var_os("PATH") {
-            environment.push(("PATH".to_string(), path.to_string_lossy().into_owned()));
-        }
-        let root = canonical(&self.root);
-        match process {
-            Process::Agent { .. } => environment.push((
-                "HOME".to_string(),
-                canonical(&real_home()?).to_string_lossy().into_owned(),
-            )),
-            Process::Terminal => environment.extend([
-                ("HOME".to_string(), root.to_string_lossy().into_owned()),
-                (
-                    "XDG_CACHE_HOME".to_string(),
-                    root.join(".cache").to_string_lossy().into_owned(),
-                ),
-                (
-                    "XDG_CONFIG_HOME".to_string(),
-                    root.join(".config").to_string_lossy().into_owned(),
-                ),
-            ]),
-        }
-        Ok(environment)
+/// The resolved directory of every link on the way from `program` to the
+/// file it names. `program` resolves, so the chain ends.
+fn link_dirs(program: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut dirs = Vec::new();
+    let mut path = program.to_path_buf();
+    while std::fs::symlink_metadata(&path)?.file_type().is_symlink() {
+        let dir = path
+            .parent()
+            .expect("a link is an entry of a directory")
+            .to_path_buf();
+        let target = std::fs::read_link(&path)?;
+        dirs.push(canonical(&dir)?);
+        path = dir.join(target);
     }
+    Ok(dirs)
+}
+
+/// The environment under the process's own: the host `PATH`, the host
+/// toolchain homes and a temporary directory inside the sandbox, as the
+/// session's terminal commands get them. The agent finds its own config and
+/// login through the user's real home; its commands keep the sandbox root
+/// (`root`, resolved) as home, like every command of the session.
+fn base_environment(
+    root: &Path,
+    tmp: &Path,
+    toolchains: &[(&'static str, PathBuf)],
+    process: &Process,
+) -> io::Result<Vec<(&'static str, String)>> {
+    let homes: Vec<(&'static str, OsString)> = match process {
+        Process::Agent { .. } => vec![("HOME", canonical(&real_home()?)?.into_os_string())],
+        Process::Terminal => vec![
+            ("HOME", root.as_os_str().to_owned()),
+            ("XDG_CACHE_HOME", root.join(".cache").into_os_string()),
+            ("XDG_CONFIG_HOME", root.join(".config").into_os_string()),
+        ],
+    };
+    std::env::var_os("PATH")
+        .map(|path| ("PATH", path))
+        .into_iter()
+        .chain(
+            ["TMPDIR", "TMP", "TEMP"]
+                .into_iter()
+                .map(|name| (name, tmp.as_os_str().to_owned())),
+        )
+        // Cargo and rustup find the homes the grants cover, not ones under
+        // a remapped `HOME`.
+        .chain(
+            toolchains
+                .iter()
+                .map(|(name, path)| (*name, path.as_os_str().to_owned())),
+        )
+        .chain(homes)
+        .map(|(name, value)| {
+            value
+                .into_string()
+                .map(|value| (name, value))
+                .map_err(|value| {
+                    io::Error::other(format!("{name} is not UTF-8: {}", value.to_string_lossy()))
+                })
+        })
+        .collect()
 }
 
 /// The user's home, which the daemon runs as.
@@ -270,10 +344,10 @@ fn real_home() -> io::Result<PathBuf> {
     std::env::home_dir().ok_or_else(|| io::Error::other("the user's home directory is unknown"))
 }
 
-/// The host toolchain homes that exist, which the session's terminal grants
-/// its commands (`CARGO_HOME` and `RUSTUP_HOME`, else `~/.cargo` and
-/// `~/.rustup`).
-fn toolchain_homes() -> Vec<PathBuf> {
+/// The host toolchain homes that exist, by the variable that names each:
+/// `CARGO_HOME` and `RUSTUP_HOME`, else `~/.cargo` and `~/.rustup`, as
+/// aither-sandbox grants and sets them for the session's own commands.
+fn toolchain_homes() -> Vec<(&'static str, PathBuf)> {
     let home = std::env::home_dir();
     [("CARGO_HOME", ".cargo"), ("RUSTUP_HOME", ".rustup")]
         .into_iter()
@@ -281,35 +355,53 @@ fn toolchain_homes() -> Vec<PathBuf> {
             std::env::var_os(variable)
                 .map(PathBuf::from)
                 .or_else(|| home.as_ref().map(|home| home.join(default)))
+                .map(|path| (variable, path))
         })
-        .filter(|path| path.is_dir())
+        .filter(|(_, path)| path.is_dir())
         .collect()
 }
 
-fn canonical(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+/// `path` with every link resolved; a path that cannot be resolved is an
+/// error naming it.
+fn canonical(path: &Path) -> io::Result<PathBuf> {
+    std::fs::canonicalize(path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("cannot resolve {}: {error}", path.display()),
+        )
+    })
 }
 
-fn resolved(path: &Path) -> heel::Result<ResolvedPath> {
-    ResolvedPath::new(canonical(path))
+fn resolved(path: &Path) -> io::Result<ResolvedPath> {
+    ResolvedPath::new(canonical(path)?).map_err(io::Error::other)
 }
 
-/// The file a command name starts, so the sandbox may execute it: the host
-/// finds it on `PATH`, where the sandbox's own search path would not.
-fn resolve_program(program: &str) -> Option<PathBuf> {
-    which::which(program).ok().map(|path| canonical(&path))
+/// The file a command name starts, as the host's `PATH` finds it from `cwd`,
+/// where the sandbox's own search path would not. A link stays a link.
+fn resolve_program(program: &str, cwd: &Path) -> io::Result<PathBuf> {
+    which::which_in(program, std::env::var_os("PATH"), cwd).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("cannot find the program `{program}`: {error}"),
+        )
+    })
 }
 
 /// Starts ACP processes in the sandbox of the session installed in `cell`.
 #[derive(Debug, Clone)]
-pub struct SandboxExecutor {
-    cell: Arc<ArcSwap<SessionSandbox>>,
+pub struct SandboxExecutor<N> {
+    cell: Arc<ArcSwap<SessionSandbox<N>>>,
     config: Arc<ArcSwap<MayConfig>>,
 }
 
 /// A process started in the sandbox.
 #[derive(Debug)]
 pub struct SandboxProcess {
+    /// Ends the whole tree under heel's supervisor.
+    #[cfg(target_os = "linux")]
+    tree: heel::supervisor::TreeControl,
+    /// The process group the process leads.
+    #[cfg(not(target_os = "linux"))]
     pid: u32,
     exit: Arc<Exit>,
 }
@@ -323,26 +415,63 @@ struct Exit {
 impl SandboxProcess {
     /// Reaps `child` on the blocking pool and publishes its status. The
     /// sandbox ends its processes when dropped, so it lives until then.
-    fn reap(mut child: heel::Child, sandbox: AcpSandbox) -> Self {
+    fn reap<N: NetworkPolicy>(mut child: AcpChild, sandbox: Sandbox<N>) -> Self {
+        #[cfg(target_os = "linux")]
+        let tree = child.tree_control();
+        #[cfg(not(target_os = "linux"))]
         let pid = child.id();
         let exit = Arc::new(Exit::default());
         let published = exit.clone();
         blocking::unblock(move || {
             let _sandbox = sandbox;
-            let status = futures_lite::future::block_on(child.wait()).map_err(|e| e.to_string());
+            let status = futures_lite::future::block_on(exit_status(&mut child));
             let _ = published.status.set(status);
             published.changed.notify(usize::MAX);
         })
         .detach();
-        Self { pid, exit }
+        Self {
+            #[cfg(target_os = "linux")]
+            tree,
+            #[cfg(not(target_os = "linux"))]
+            pid,
+            exit,
+        }
     }
 }
 
+/// The exit status of the command under the supervisor.
+#[cfg(target_os = "linux")]
+async fn exit_status(child: &mut AcpChild) -> Result<ExitStatus, String> {
+    child
+        .wait()
+        .await
+        .map(|exit| exit.status)
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn exit_status(child: &mut AcpChild) -> Result<ExitStatus, String> {
+    child.wait().await.map_err(|error| error.to_string())
+}
+
 impl ProcessControl for SandboxProcess {
+    #[cfg(target_os = "linux")]
+    fn kill(&self) {
+        // The supervisor freezes, kills and reaps the whole tree; a tree
+        // already gone reports nothing left to kill.
+        let tree = self.tree.clone();
+        blocking::unblock(move || {
+            if let Err(error) = futures_lite::future::block_on(tree.kill()) {
+                tracing::warn!(%error, "an ACP process tree outlived its kill");
+            }
+        })
+        .detach();
+    }
+
+    #[cfg(not(target_os = "linux"))]
     fn kill(&self) {
         // The process leads its own group, which keeps the descendants it
         // orphaned; a group that is gone is not an error.
-        #[cfg(unix)]
         if self.pid != 0 {
             // SAFETY: kill(2) only delivers a signal to a group this process
             // started; a group already gone answers ESRCH.
@@ -374,12 +503,15 @@ fn pipe(file: Option<File>, name: &str) -> io::Result<async_fs::File> {
         .ok_or_else(|| io::Error::other(format!("{name} was not piped")))
 }
 
-impl SandboxExecutor {
+impl<N> SandboxExecutor<N> {
     /// An executor starting processes in whatever sandbox `cell` holds when
     /// they start, giving an agent the grants `config` lists for its command
     /// when it starts.
     #[must_use]
-    pub const fn new(cell: Arc<ArcSwap<SessionSandbox>>, config: Arc<ArcSwap<MayConfig>>) -> Self {
+    pub const fn new(
+        cell: Arc<ArcSwap<SessionSandbox<N>>>,
+        config: Arc<ArcSwap<MayConfig>>,
+    ) -> Self {
         Self { cell, config }
     }
 
@@ -395,12 +527,12 @@ impl SandboxExecutor {
         if matching.peek().is_none() {
             return Ok(Vec::new());
         }
-        let home = canonical(&real_home()?);
+        let home = canonical(&real_home()?)?;
         Ok(matching.flat_map(|agent| agent.grants_in(&home)).collect())
     }
 }
 
-impl Executor for SandboxExecutor {
+impl<N: NetworkPolicy + Clone> Executor for SandboxExecutor<N> {
     type Process = SandboxProcess;
     type Stdin = async_fs::File;
     type Stdout = async_fs::File;
@@ -450,19 +582,19 @@ struct PermissionText<'a> {
 /// the request the user sees, the history it is recorded in and the yolo
 /// switch are those of an `unsafe` terminal request.
 #[derive(Debug, Clone)]
-pub struct ApprovalPermissions {
-    cell: Arc<ArcSwap<SessionSandbox>>,
+pub struct ApprovalPermissions<N> {
+    cell: Arc<ArcSwap<SessionSandbox<N>>>,
 }
 
-impl ApprovalPermissions {
+impl<N> ApprovalPermissions<N> {
     /// A handler asking the approver of whatever sandbox `cell` holds.
     #[must_use]
-    pub const fn new(cell: Arc<ArcSwap<SessionSandbox>>) -> Self {
+    pub const fn new(cell: Arc<ArcSwap<SessionSandbox<N>>>) -> Self {
         Self { cell }
     }
 }
 
-impl PermissionHandler for ApprovalPermissions {
+impl<N: Send + Sync + 'static> PermissionHandler for ApprovalPermissions<N> {
     async fn decide(&self, request: PermissionRequest) -> RequestPermissionOutcome {
         let sandbox = self.cell.load_full();
         let approved = match &sandbox.approver {
@@ -488,26 +620,76 @@ impl PermissionHandler for ApprovalPermissions {
             }
             None => false,
         };
-        let kinds = if approved {
-            [
-                PermissionOptionKind::AllowOnce,
-                PermissionOptionKind::AllowAlways,
-            ]
-        } else {
-            [
-                PermissionOptionKind::RejectOnce,
-                PermissionOptionKind::RejectAlways,
-            ]
-        };
-        request
-            .params
-            .options
-            .iter()
-            .find(|option| kinds.contains(&option.kind))
-            .map_or(RequestPermissionOutcome::Cancelled, |option| {
-                RequestPermissionOutcome::Selected {
-                    option_id: option.option_id.clone(),
-                }
-            })
+        choose(&request.params.options, approved)
+    }
+}
+
+/// The option answering one request: the user approved or refused this one
+/// call, so a "once" option wins over an "always" one wherever the agent
+/// lists it, and "always" is taken only when "once" is not offered.
+fn choose(options: &[PermissionOption], approved: bool) -> RequestPermissionOutcome {
+    let preference = if approved {
+        [
+            PermissionOptionKind::AllowOnce,
+            PermissionOptionKind::AllowAlways,
+        ]
+    } else {
+        [
+            PermissionOptionKind::RejectOnce,
+            PermissionOptionKind::RejectAlways,
+        ]
+    };
+    preference
+        .iter()
+        .find_map(|kind| options.iter().find(|option| option.kind == *kind))
+        .map_or(RequestPermissionOutcome::Cancelled, |option| {
+            RequestPermissionOutcome::Selected {
+                option_id: option.option_id.clone(),
+            }
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn option(id: &str, kind: PermissionOptionKind) -> PermissionOption {
+        PermissionOption {
+            option_id: id.to_string(),
+            name: id.to_string(),
+            kind,
+            meta: None,
+        }
+    }
+
+    fn selected(outcome: &RequestPermissionOutcome) -> Option<&str> {
+        match outcome {
+            RequestPermissionOutcome::Selected { option_id } => Some(option_id),
+            RequestPermissionOutcome::Cancelled => None,
+        }
+    }
+
+    #[test]
+    fn an_answer_selects_the_once_option_even_when_always_comes_first() {
+        let options = [
+            option("allow-always", PermissionOptionKind::AllowAlways),
+            option("reject-always", PermissionOptionKind::RejectAlways),
+            option("allow-once", PermissionOptionKind::AllowOnce),
+            option("reject-once", PermissionOptionKind::RejectOnce),
+        ];
+        assert_eq!(selected(&choose(&options, true)), Some("allow-once"));
+        assert_eq!(selected(&choose(&options, false)), Some("reject-once"));
+    }
+
+    #[test]
+    fn an_answer_selects_always_only_when_once_is_not_offered() {
+        let options = [
+            option("allow-always", PermissionOptionKind::AllowAlways),
+            option("reject-always", PermissionOptionKind::RejectAlways),
+        ];
+        assert_eq!(selected(&choose(&options, true)), Some("allow-always"));
+        assert_eq!(selected(&choose(&options, false)), Some("reject-always"));
+        let allow_only = [option("allow-once", PermissionOptionKind::AllowOnce)];
+        assert_eq!(selected(&choose(&allow_only, false)), None);
     }
 }
