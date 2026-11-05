@@ -154,16 +154,12 @@ impl Entry {
             // *inside* it (an expanded "Worked for" group's members)
             // become sub-regions.
             .filter(|(id, _, _)| collapsible.as_ref() != Some(id))
+            // `element_lines` records a region only around lines it pushed,
+            // so `start < end <= laid.lines.len()`.
             .map(|(id, start, end)| {
-                let first = line_starts.get(*start).copied().unwrap_or(0);
-                let last = end
-                    .checked_sub(1)
-                    .and_then(|last| line_starts.get(last))
-                    .copied()
-                    .map_or(rows, |start| {
-                        start + laid.lines.get(*end - 1).map_or(0, |l| line_rows(l, width))
-                    });
-                (id.clone(), first, last.max(first))
+                let last = end - 1;
+                let past = line_starts[last] + line_rows(&laid.lines[last], width);
+                (id.clone(), line_starts[*start], past)
             })
             .collect();
         let entry = Self {

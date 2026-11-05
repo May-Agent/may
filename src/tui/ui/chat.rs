@@ -355,7 +355,7 @@ impl ChatElement {
     /// element toggled.
     fn toggle_expanded(&mut self, id: &str) -> bool {
         match self {
-            ChatElement::ToolCall {
+            Self::ToolCall {
                 id: tool_id,
                 display,
             } if tool_id == id && display.expandable() => {
@@ -367,7 +367,7 @@ impl ChatElement {
                 }
                 true
             }
-            ChatElement::Thinking {
+            Self::Thinking {
                 id: think_id,
                 expanded,
                 content,
@@ -376,7 +376,7 @@ impl ChatElement {
                 *expanded = !*expanded;
                 true
             }
-            ChatElement::WorkedFor {
+            Self::WorkedFor {
                 id: work_id,
                 expanded,
                 elements,
@@ -2295,10 +2295,8 @@ pub(super) fn element_lines(
                 for inner in elements {
                     // Members carry their own expansion state — the group's
                     // `state` describes the group row itself.
-                    let inner_state = ElementState {
-                        hide_todos: state.hide_todos,
-                        ..ElementState::of(inner, None, state.hide_todos, state.spinner_frame)
-                    };
+                    let inner_state =
+                        ElementState::of(inner, None, state.hide_todos, state.spinner_frame);
                     let sub =
                         element_lines(inner, inner_state, images_supported, tunnel_base, width);
                     let offset = lines.len();
