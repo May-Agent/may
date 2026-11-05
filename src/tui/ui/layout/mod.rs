@@ -210,6 +210,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             status_ctx: Some(StatusContext {
                 model: &model_display,
                 usage: usage_info,
+                context_policy: app.config.context.policy(),
                 queue_count: app.queue.len(),
                 open_questions: app.open_question_count,
                 yolo: app.session_runtime.yolo,
