@@ -996,7 +996,6 @@ fn finalize_rows_with_total(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures_lite::future::block_on;
     use tempfile::tempdir;
 
     fn base_args() -> SessionArgs {
@@ -1156,49 +1155,45 @@ mod tests {
         assert_eq!(request.session_id, "abc123");
     }
 
-    #[test]
-    fn single_token_query_becomes_implicit_inspect_when_session_exists() {
-        block_on(async {
-            let temp = tempdir().expect("tempdir");
-            let db_path = temp.path().join("history.db");
-            let db = ChatDb::open(&db_path).await.expect("db should open");
-            db.create_session("abc123", Some("session"), Some("gpt-5"))
-                .await
-                .expect("session should be created");
+    #[tokio::test]
+    async fn single_token_query_becomes_implicit_inspect_when_session_exists() {
+        let temp = tempdir().expect("tempdir");
+        let db_path = temp.path().join("history.db");
+        let db = ChatDb::open(&db_path).await.expect("db should open");
+        db.create_session("abc123", Some("session"), Some("gpt-5"))
+            .await
+            .expect("session should be created");
 
-            let mut args = base_args();
-            args.query = "abc123".to_string();
+        let mut args = base_args();
+        args.query = "abc123".to_string();
 
-            let plan = resolve_implicit_session_lookup(db_path, SessionExecutionPlan::Search(args))
-                .await
-                .expect("implicit inspect should resolve");
+        let plan = resolve_implicit_session_lookup(db_path, SessionExecutionPlan::Search(args))
+            .await
+            .expect("implicit inspect should resolve");
 
-            let SessionExecutionPlan::Inspect(request) = plan else {
-                panic!("expected inspect plan");
-            };
-            assert_eq!(request.session_id, "abc123");
-        });
+        let SessionExecutionPlan::Inspect(request) = plan else {
+            panic!("expected inspect plan");
+        };
+        assert_eq!(request.session_id, "abc123");
     }
 
-    #[test]
-    fn single_token_query_stays_search_when_session_missing() {
-        block_on(async {
-            let temp = tempdir().expect("tempdir");
-            let db_path = temp.path().join("history.db");
-            let _db = ChatDb::open(&db_path).await.expect("db should open");
+    #[tokio::test]
+    async fn single_token_query_stays_search_when_session_missing() {
+        let temp = tempdir().expect("tempdir");
+        let db_path = temp.path().join("history.db");
+        let _db = ChatDb::open(&db_path).await.expect("db should open");
 
-            let mut args = base_args();
-            args.query = "abc123".to_string();
+        let mut args = base_args();
+        args.query = "abc123".to_string();
 
-            let plan = resolve_implicit_session_lookup(db_path, SessionExecutionPlan::Search(args))
-                .await
-                .expect("search should remain valid");
+        let plan = resolve_implicit_session_lookup(db_path, SessionExecutionPlan::Search(args))
+            .await
+            .expect("search should remain valid");
 
-            let SessionExecutionPlan::Search(args) = plan else {
-                panic!("expected search plan");
-            };
-            assert_eq!(args.query, "abc123");
-        });
+        let SessionExecutionPlan::Search(args) = plan else {
+            panic!("expected search plan");
+        };
+        assert_eq!(args.query, "abc123");
     }
 
     fn match_row(session_id: &str, message_id: i64, content: &str) -> SessionMatchRow {
