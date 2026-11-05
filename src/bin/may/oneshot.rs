@@ -119,14 +119,7 @@ async fn answer_oneshot_repo_trust(
     let Some(level) = answers.first().and_then(may_agent::trust::level_for_answer) else {
         return Ok(());
     };
-    let config = may_agent::workspace::WorkspaceConfig::load(&config_path)?;
-    may_agent::trust::persist(
-        &config,
-        &config_path,
-        &pending.worktree,
-        Some(&pending.kind),
-        level,
-    )?;
+    may_agent::trust::persist(&config_path, &pending.worktree, Some(&pending.kind), level)?;
     Ok(())
 }
 

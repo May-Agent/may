@@ -218,15 +218,14 @@ async fn respond(
     session_id: &str,
     messages: Vec<aither_core::llm::Message>,
 ) -> Result<String, AuxError> {
-    use aither_core::LanguageModel as _;
-    use aither_core::llm::{Event, LLMRequest};
+    use aither_core::llm::Event;
     use futures_lite::StreamExt as _;
 
     let worker = super::hosts::idle_agent(state, session_id)
         .await
         .map_err(|error| AuxError::Session(error.to_string()))?;
     let llm = worker.btw_llm().cloned().ok_or(AuxError::NoModel)?;
-    let mut stream = std::pin::pin!(llm.respond(LLMRequest::new(messages)));
+    let mut stream = std::pin::pin!(llm.respond(messages));
     let mut text = String::new();
     while let Some(event) = stream.next().await {
         match event {
