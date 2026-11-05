@@ -4464,6 +4464,38 @@ mod tests {
     }
 
     #[test]
+    fn suggestion_is_dimmed_ghost_text_after_the_empty_prompt() {
+        let ctx = InputContext {
+            input: "",
+            cursor: 0,
+            attachments: &[],
+            suggestion: Some("run the tests"),
+        };
+        let mut lines: Vec<Line> = Vec::new();
+        render_input_line(&mut lines, &ctx, 80, false, None);
+        let ghost = lines
+            .last()
+            .and_then(|line| line.spans.last())
+            .expect("ghost span");
+        assert!(ghost.content.starts_with("run the tests"));
+        assert_eq!(ghost.style.fg, Some(Color::DarkGray), "dimmed");
+
+        let hidden = InputContext {
+            input: "h",
+            cursor: 1,
+            suggestion: None,
+            ..ctx
+        };
+        let mut lines: Vec<Line> = Vec::new();
+        render_input_line(&mut lines, &hidden, 80, false, None);
+        let rendered: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect();
+        assert!(!rendered.contains("run the tests"));
+    }
+
+    #[test]
     fn bash_input_shows_mode_hint_and_styled_bang() {
         let ctx = InputContext {
             input: "!ls -la",
