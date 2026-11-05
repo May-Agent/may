@@ -418,7 +418,6 @@ impl ChatDb {
 
 #[cfg(test)]
 mod tests {
-    use skyzen_services::Db as SkyDb;
     use tempfile::tempdir;
 
     use super::{CONTEXT_SNAPSHOT_FORMAT, ChatDb};
@@ -562,8 +561,7 @@ mod tests {
 
         // Seed a database whose snapshot table predates format versioning,
         // holding a pre-0.7-style blob (current shape plus `todo_items`).
-        let url = format!("sqlite://{}?mode=rwc", db_path.display());
-        let raw = SkyDb::connect_sqlite(&url)
+        let raw = ChatDb::connect(&db_path)
             .await
             .expect("raw db should connect");
         raw.query("CREATE TABLE session_context_snapshots (session_id TEXT PRIMARY KEY, checkpoint_blob BLOB NOT NULL, applied_seq INTEGER NOT NULL, updated_at TEXT NOT NULL)")
@@ -816,8 +814,7 @@ mod tests {
     async fn an_old_layout_snapshot_migrates_keeping_its_checkpoint() {
         let dir = tempdir().expect("temp dir should be created");
         let db_path = dir.path().join("history.db");
-        let url = format!("sqlite://{}?mode=rwc", db_path.display());
-        let raw = SkyDb::connect_sqlite(&url).await.expect("raw db");
+        let raw = ChatDb::connect(&db_path).await.expect("raw db");
         raw.query(
             "CREATE TABLE session_context_snapshots (session_id TEXT PRIMARY KEY, checkpoint_blob BLOB NOT NULL, last_message_db_id INTEGER, updated_at TEXT NOT NULL, format_version INTEGER NOT NULL)",
         )
