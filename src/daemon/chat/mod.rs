@@ -1402,9 +1402,7 @@ pub(super) async fn run_bash(
         .await
         .map_err(internal_error)?
         .ok_or_else(|| super::error::bad_request_error("session not found"))?;
-    let cwd = session
-        .cwd
-        .map_or_else(|| state.cwd.clone(), std::path::PathBuf::from);
+    let cwd = crate::session::SessionDirectory::of(&session, &state.may_dir).into_path();
     let secrets = crate::secrets::Secrets::load(
         &crate::secrets::SecretStore::new(&state.may_dir),
         state.config.load().as_ref(),
@@ -3194,10 +3192,7 @@ async fn resolve_session_context(
         .to_string();
     let reasoning_effort = parse_reasoning_effort_token(&reasoning_effort);
 
-    let cwd = session
-        .cwd
-        .clone()
-        .map_or_else(|| state.cwd.clone(), std::path::PathBuf::from);
+    let cwd = crate::session::SessionDirectory::of(&session, &state.may_dir).into_path();
 
     Ok(SessionContext {
         user_message_id,
@@ -3470,7 +3465,6 @@ fn agent_messaging(state: &Arc<DaemonState>) -> crate::agent_link::AgentMessagin
         directory: crate::agent_link::AgentDirectory::new(
             state.runtime_service.clone(),
             state.may_dir.clone(),
-            state.cwd.clone(),
             {
                 let state = state.clone();
                 move |session_id: &str| spawn_follow_up_runs(state.clone(), session_id.to_string())
@@ -4491,14 +4485,12 @@ mod tests {
     /// `second`, both scripted `custom` providers.
     async fn failover_state(
         may_dir: &std::path::Path,
-        cwd: &std::path::Path,
         first: &StubProvider,
         second: &StubProvider,
     ) -> std::sync::Arc<DaemonState> {
         failover_state_on(
             aither_connectivity::Connectivity::manual(true).0,
             may_dir,
-            cwd,
             first,
             second,
         )
@@ -4509,7 +4501,6 @@ mod tests {
     async fn failover_state_on(
         connectivity: aither_connectivity::Connectivity,
         may_dir: &std::path::Path,
-        cwd: &std::path::Path,
         first: &StubProvider,
         second: &StubProvider,
     ) -> std::sync::Arc<DaemonState> {
@@ -4522,7 +4513,7 @@ mod tests {
             config.provider.insert(id.to_string(), instance);
         }
         let state = std::sync::Arc::new(
-            DaemonState::for_test_with_connectivity(may_dir, cwd, config, connectivity)
+            DaemonState::for_test_with_connectivity(may_dir, config, connectivity)
                 .await
                 .expect("test daemon state"),
         );
@@ -4547,8 +4538,7 @@ mod tests {
         let provider_a = stub_provider(script).await;
         let provider_b = stub_provider(Vec::new()).await;
         let may_dir = tempfile::tempdir().expect("may dir");
-        let cwd = tempfile::tempdir().expect("cwd");
-        let state = failover_state(may_dir.path(), cwd.path(), &provider_a, &provider_b).await;
+        let state = failover_state(may_dir.path(), &provider_a, &provider_b).await;
 
         let req = ChatRequest {
             session_id: "session".to_string(),
@@ -4611,7 +4601,6 @@ mod tests {
     async fn a_failure_after_a_tool_call_continues_without_replaying_it() {
         let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
         let may_dir = tempfile::tempdir().expect("may dir");
-        let cwd = tempfile::tempdir().expect("cwd");
         // Session-scoped `files/` is the writable side of the workspace.
         let session_files = may_dir.path().join("sessions/session/files");
         let marker = session_files.join("count");
@@ -4631,7 +4620,7 @@ mod tests {
         script.push(sse_text("done"));
         let provider_a = stub_provider(script).await;
         let provider_b = stub_provider(Vec::new()).await;
-        let state = failover_state(may_dir.path(), cwd.path(), &provider_a, &provider_b).await;
+        let state = failover_state(may_dir.path(), &provider_a, &provider_b).await;
 
         let req = ChatRequest {
             session_id: "session".to_string(),
@@ -4712,8 +4701,7 @@ mod tests {
         let provider_a = stub_provider(vec![sse_text("one"), sse_text("two")]).await;
         let provider_b = stub_provider(Vec::new()).await;
         let may_dir = tempfile::tempdir().expect("may dir");
-        let cwd = tempfile::tempdir().expect("cwd");
-        let state = failover_state(may_dir.path(), cwd.path(), &provider_a, &provider_b).await;
+        let state = failover_state(may_dir.path(), &provider_a, &provider_b).await;
 
         run_prompt_turn(&state, &mut TestSink::default())
             .await
@@ -4735,8 +4723,7 @@ mod tests {
         let provider_a = stub_provider(vec![sse_text("one"), sse_text("two")]).await;
         let provider_b = stub_provider(Vec::new()).await;
         let may_dir = tempfile::tempdir().expect("may dir");
-        let cwd = tempfile::tempdir().expect("cwd");
-        let state = failover_state(may_dir.path(), cwd.path(), &provider_a, &provider_b).await;
+        let state = failover_state(may_dir.path(), &provider_a, &provider_b).await;
         queue_messages(&state, &["first", "second"]).await;
 
         let guard = state
@@ -4762,8 +4749,7 @@ mod tests {
         let provider_a = stub_provider(vec![sse_text("answer")]).await;
         let provider_b = stub_provider(Vec::new()).await;
         let may_dir = tempfile::tempdir().expect("may dir");
-        let cwd = tempfile::tempdir().expect("cwd");
-        let state = failover_state(may_dir.path(), cwd.path(), &provider_a, &provider_b).await;
+        let state = failover_state(may_dir.path(), &provider_a, &provider_b).await;
 
         let req = ChatRequest {
             session_id: "session".to_string(),
@@ -4801,8 +4787,7 @@ mod tests {
         let provider_a = stub_provider(script).await;
         let provider_b = stub_provider(Vec::new()).await;
         let may_dir = tempfile::tempdir().expect("may dir");
-        let cwd = tempfile::tempdir().expect("cwd");
-        let state = failover_state(may_dir.path(), cwd.path(), &provider_a, &provider_b).await;
+        let state = failover_state(may_dir.path(), &provider_a, &provider_b).await;
 
         // A first turn leaves the session's idle agent behind.
         let mut sink = TestSink::default();
@@ -4876,8 +4861,7 @@ mod tests {
         ])
         .await;
         let provider_b = stub_provider(Vec::new()).await;
-        let cwd = tempfile::tempdir().expect("cwd");
-        let state = failover_state(may_dir.path(), cwd.path(), &provider_a, &provider_b).await;
+        let state = failover_state(may_dir.path(), &provider_a, &provider_b).await;
 
         let req = ChatRequest {
             session_id: "session".to_string(),
@@ -5079,16 +5063,8 @@ mod tests {
         let provider_a = stub_provider(script).await;
         let provider_b = stub_provider(vec![sse_text("wrong provider")]).await;
         let may_dir = tempfile::tempdir().expect("may dir");
-        let cwd = tempfile::tempdir().expect("cwd");
         let (connectivity, controller) = aither_connectivity::Connectivity::manual(false);
-        let state = failover_state_on(
-            connectivity,
-            may_dir.path(),
-            cwd.path(),
-            &provider_a,
-            &provider_b,
-        )
-        .await;
+        let state = failover_state_on(connectivity, may_dir.path(), &provider_a, &provider_b).await;
 
         let (mut sink, notes) = TestSink::noting();
         // The hold comes only after the provider client's own backoff sleeps
@@ -5140,16 +5116,8 @@ mod tests {
             stub_provider(vec![format!("stall:{partial}"), sse_text("whole answer")]).await;
         let provider_b = stub_provider(vec![sse_text("wrong provider")]).await;
         let may_dir = tempfile::tempdir().expect("may dir");
-        let cwd = tempfile::tempdir().expect("cwd");
         let (connectivity, controller) = aither_connectivity::Connectivity::manual(true);
-        let state = failover_state_on(
-            connectivity,
-            may_dir.path(),
-            cwd.path(),
-            &provider_a,
-            &provider_b,
-        )
-        .await;
+        let state = failover_state_on(connectivity, may_dir.path(), &provider_a, &provider_b).await;
 
         let (mut sink, notes) = TestSink::noting();
         let machine_wakes = async {
@@ -5190,8 +5158,7 @@ mod tests {
         let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
         let provider = stub_provider(vec![sse_text("the answer")]).await;
         let may_dir = tempfile::tempdir().expect("may dir");
-        let cwd = tempfile::tempdir().expect("cwd");
-        let state = failover_state(may_dir.path(), cwd.path(), &provider, &provider).await;
+        let state = failover_state(may_dir.path(), &provider, &provider).await;
         let req = ChatRequest {
             session_id: "session".to_string(),
             content: "hello".to_string(),
@@ -5248,8 +5215,7 @@ mod tests {
         let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
         let provider = stub_provider(vec![]).await;
         let may_dir = tempfile::tempdir().expect("may dir");
-        let cwd = tempfile::tempdir().expect("cwd");
-        let state = failover_state(may_dir.path(), cwd.path(), &provider, &provider).await;
+        let state = failover_state(may_dir.path(), &provider, &provider).await;
         let guard = state
             .runtime_service
             .runs()
