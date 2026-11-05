@@ -138,6 +138,10 @@ pub enum TerminalCommandsError {
 ///
 /// # Errors
 /// Returns the registry error when a command fails to register.
+///
+/// # Panics
+/// The registered sandboxed `gh` panics if its compiled-in refusal template
+/// fails to render.
 pub async fn register_shared_terminal_commands<LLM>(
     builder: &mut ToolRegistryBuilder,
     config: SharedTerminalCommandConfig<LLM>,
