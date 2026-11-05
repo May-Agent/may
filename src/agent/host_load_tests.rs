@@ -4,7 +4,9 @@
 
 use std::time::{Duration, Instant};
 
-use super::idle_compaction_tests::{SESSION_MODEL, Session, StubModel, run_turn, saved_config};
+use super::idle_compaction_tests::{
+    COMPACTION_MARKER, SESSION_MODEL, Session, StubModel, run_turn, saved_config,
+};
 
 const LOAD_HIGH: &str = "The machine load is high";
 const LOAD_ENDED: &str = "The machine load has ended";
@@ -20,13 +22,19 @@ async fn settle(session: &Session) {
     }
 }
 
-/// How often `text` occurs in the last request the model received.
+/// How often `text` occurs in the last turn request the model received. A
+/// compaction request is not a turn's: the background compaction a turn
+/// starts reaches the model on its own schedule, after the next turn's
+/// request when the host is slow, and carries the context as it was when it
+/// started.
 async fn mentions(stub: &StubModel, text: &str) -> usize {
     stub.requests
         .lock()
         .await
-        .last()
-        .expect("a request")
+        .iter()
+        .rev()
+        .find(|request| !request.contains(COMPACTION_MARKER))
+        .expect("a turn request")
         .matches(text)
         .count()
 }
