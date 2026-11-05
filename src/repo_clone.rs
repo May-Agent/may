@@ -3,7 +3,8 @@
 //! A session's only writable view of a repository is a private clone under
 //! `<session>/repos/<dir>`: the user's checkout stays a read mount and the
 //! host `.git` is never mounted writable. Local-bound repos clone with
-//! `git clone --local` (hardlinked objects); GitHub-bound repos clone from
+//! `git clone --local --no-hardlinks` (objects are copied, so the clone shares
+//! no writable file with its source); GitHub-bound repos clone from
 //! the remote URL. The host's clone registry lives in the history database
 //! (`session_repo_clones`), never in the agent-writable session directory:
 //! it records which repository identity each clone serves so clones are
@@ -249,7 +250,7 @@ impl SessionRepos {
     /// Ensure a local clone of `checkout` exists and return its path.
     ///
     /// `repo_key` is the repository identity (canonicalized git common dir);
-    /// `git clone --local` hardlinks objects and no network credential is
+    /// objects are copied, never hardlinked, and no network credential is
     /// reachable inside the clone.
     ///
     /// # Errors
@@ -278,9 +279,7 @@ impl SessionRepos {
             .await?;
             return Ok(dir);
         }
-        let source = checkout.to_string_lossy().into_owned();
-        let target = dir.to_string_lossy().into_owned();
-        blocking::unblock(move || git(None, &["clone", "--local", &source, &target])).await?;
+        local_clone(checkout, &dir).await?;
         self.register(
             key,
             &clone_dir,
@@ -321,8 +320,8 @@ impl SessionRepos {
         Ok(dir)
     }
 
-    /// Clone `parent` into `child_dir` for a subagent run: a `git clone
-    /// --local` of the session clone, so the run's base is always a commit
+    /// Clone `parent` into `child_dir` for a subagent run: a local clone
+    /// of the session clone that shares no file with it, so the run's base is always a commit
     /// and its work is `git diff base..head`. Not registered — the parent
     /// session owns it and removes it with the run directory.
     ///
@@ -336,9 +335,7 @@ impl SessionRepos {
         if let Some(parent_dir) = child_dir.parent() {
             std::fs::create_dir_all(parent_dir)?;
         }
-        let source = parent.to_string_lossy().into_owned();
-        let target = child_dir.to_string_lossy().into_owned();
-        blocking::unblock(move || git(None, &["clone", "--local", &source, &target])).await?;
+        local_clone(parent, child_dir).await?;
         Ok(child_dir.to_path_buf())
     }
 
@@ -455,6 +452,22 @@ mod confined {
     }
 }
 
+/// Clone `source` into `target` copying its objects: the sandbox runs as the
+/// user's uid, so a hardlinked object made writable would change the source's
+/// inode too.
+async fn local_clone(source: &Path, target: &Path) -> Result<(), RepoCloneError> {
+    let source = source.to_string_lossy().into_owned();
+    let target = target.to_string_lossy().into_owned();
+    blocking::unblock(move || {
+        git(
+            None,
+            &["clone", "--local", "--no-hardlinks", &source, &target],
+        )
+    })
+    .await?;
+    Ok(())
+}
+
 /// Uncommitted changes and non-ignored untracked files in `clone`.
 ///
 /// Paths come from `git status --porcelain`. `pr` refuses to merge a clone
@@ -537,6 +550,58 @@ mod tests {
         // The checkout itself is untouched.
         let status = git(Some(&checkout), &["status", "--porcelain"]).unwrap();
         assert_eq!(status.trim(), "");
+    }
+
+    /// Make every loose object file of `repo` writable and empty it, as a
+    /// sandboxed command running as the user could.
+    fn corrupt_objects(repo: &Path) -> usize {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut corrupted = 0;
+        let mut stack = vec![repo.join(".git/objects")];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+                    perms.set_mode(0o644);
+                    std::fs::set_permissions(&path, perms).unwrap();
+                    std::fs::write(&path, b"").unwrap();
+                    corrupted += 1;
+                }
+            }
+        }
+        corrupted
+    }
+
+    #[tokio::test]
+    async fn corrupting_a_clone_leaves_its_source_intact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let checkout = tmp.path().join("checkout");
+        init_repo(&checkout);
+        let repos = session_repos(tmp.path()).await;
+        let clone = repos
+            .ensure_local_clone(&checkout, &repo_key(&checkout))
+            .await
+            .unwrap();
+        assert!(corrupt_objects(&clone) > 0);
+        git(Some(&checkout), &["fsck", "--strict"]).unwrap();
+
+        // A subagent's child clone shares nothing with the session clone.
+        let fresh = tmp.path().join("fresh");
+        init_repo(&fresh);
+        let parent = repos
+            .ensure_local_clone(&fresh, &repo_key(&fresh))
+            .await
+            .unwrap();
+        let child = repos
+            .child_clone(&parent, &tmp.path().join("session/subagents/runs/1/repo"))
+            .await
+            .unwrap();
+        assert!(corrupt_objects(&child) > 0);
+        git(Some(&parent), &["fsck", "--strict"]).unwrap();
+        git(Some(&fresh), &["fsck", "--strict"]).unwrap();
     }
 
     #[tokio::test]
