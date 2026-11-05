@@ -207,7 +207,8 @@ mod tests {
 
         let rows = db.request_logs_for_session(session).await.expect("logs");
         let intervals = db.session_intervals(session).await.expect("intervals");
-        let report = assemble_usage_report(session, &rows, &intervals, Some(created), now + 1_000);
+        let report =
+            assemble_usage_report(session, &rows, &[], &intervals, Some(created), now + 1_000);
         let split = report.split;
 
         assert_eq!(report.wall_ms, 61_000);
