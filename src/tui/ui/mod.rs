@@ -7,6 +7,7 @@ pub(super) mod highlight;
 pub mod image;
 mod kitty_diacritics;
 mod layout;
+pub mod links;
 pub mod markdown;
 pub mod streaming_markdown;
 #[cfg(test)]
