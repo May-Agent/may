@@ -283,7 +283,7 @@ impl ChatDb {
             .map(|column| column.name.as_str())
             .collect::<std::collections::BTreeSet<_>>();
 
-        for column in ["attachments", "reasoning", "tool_calls"] {
+        for column in ["attachments", "reasoning", "tool_calls", "translation"] {
             if !existing.contains(column) {
                 let sql = format!("ALTER TABLE messages ADD COLUMN {column} TEXT");
                 query!(db, sql.as_str()).execute().await?;
