@@ -1397,12 +1397,20 @@ where
                         restore_code,
                     }) => {
                         if agent_handle.is_none() {
-                            worker_build = Some(WorkerBuild {
-                                purpose: WorkerBuildPurpose::Session,
-                                build: runtime_deps
-                                    .rewind_conversation(app, worker, history_index, restore_code)
-                                    .await?,
-                            });
+                            match runtime_deps
+                                .rewind_conversation(app, worker, history_index, restore_code)
+                                .await
+                            {
+                                Ok(build) => {
+                                    worker_build = Some(WorkerBuild {
+                                        purpose: WorkerBuildPurpose::Session,
+                                        build,
+                                    });
+                                }
+                                Err(error) => {
+                                    app.chat.push_error(&format!("Rewind failed: {error}"));
+                                }
+                            }
                         } else {
                             app.chat.push_notice(
                                 "Wait for the current turn to finish before rewinding",
