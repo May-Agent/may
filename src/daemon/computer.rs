@@ -31,6 +31,8 @@ pub(super) struct ComputerStatus {
 pub(super) struct ComputerPermissions {
     pub screen_recording: bool,
     pub accessibility: bool,
+    /// macOS 15+ one-time consent to capture without the system picker.
+    pub direct_capture: bool,
 }
 
 #[derive(serde::Deserialize, skyzen::ToSchema)]
@@ -167,11 +169,15 @@ async fn needs_permissions(state: &DaemonState) -> SkyResult<Option<ComputerPerm
         AgentResponse::Permissions {
             screen_recording,
             accessibility,
+            direct_capture,
         } => Ok(
-            (!screen_recording || !accessibility).then_some(ComputerPermissions {
-                screen_recording,
-                accessibility,
-            }),
+            (!screen_recording || !accessibility || !direct_capture).then_some(
+                ComputerPermissions {
+                    screen_recording,
+                    accessibility,
+                    direct_capture,
+                },
+            ),
         ),
         AgentResponse::Error { error } => {
             Err(skyzen::Error::msg(error).set_status(StatusCode::INTERNAL_SERVER_ERROR))

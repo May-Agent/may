@@ -379,7 +379,7 @@ fn needs_rebuild(
 fn sign_bundle(app: &std::path::Path, identity: Option<&str>) -> Result<(), String> {
     let output = std::process::Command::new("codesign")
         .args(["--force", "--sign", identity.unwrap_or("-")])
-        .args(["--identifier", "ai.may.computer-agent"])
+        .args(["--identifier", super::permissions::HELPER_BUNDLE_ID])
         .arg(app)
         .output()
         .map_err(|e| format!("run codesign: {e}"))?;
