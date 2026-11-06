@@ -455,8 +455,14 @@ mod tests {
 
     #[test]
     fn same_model_matches_across_effort_rungs_on_one_provider() {
-        assert!(same_selectable_model("relay::o4-mini-high", "relay::o4-mini"));
-        assert!(same_selectable_model("relay::o4-mini", "relay::o4-mini-max"));
+        assert!(same_selectable_model(
+            "relay::o4-mini-high",
+            "relay::o4-mini"
+        ));
+        assert!(same_selectable_model(
+            "relay::o4-mini",
+            "relay::o4-mini-max"
+        ));
         assert!(same_selectable_model(
             "relay::o4-mini-high-lightning",
             "relay::o4-mini-lightning"
@@ -466,7 +472,10 @@ mod tests {
     #[test]
     fn same_model_requires_the_same_provider_and_family() {
         assert!(!same_selectable_model("google::o4-mini", "relay::o4-mini"));
-        assert!(!same_selectable_model("relay::o4-mini-high", "relay::o5-mini"));
+        assert!(!same_selectable_model(
+            "relay::o4-mini-high",
+            "relay::o5-mini"
+        ));
     }
 
     #[test]
