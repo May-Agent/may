@@ -18,7 +18,7 @@ pub struct ModelUsageRow {
     pub model: String,
     /// Requests made to the model.
     pub requests: u64,
-    /// Uncached prompt tokens.
+    /// Input tokens, cached ones included.
     pub prompt_tokens: u64,
     /// Completion tokens.
     pub completion_tokens: u64,
@@ -201,9 +201,8 @@ pub fn assemble_usage_report(
     let mut total_cost: Option<f64> = None;
     for entry in &mut models {
         api_ms += entry.api_ms;
-        let input = entry.prompt_tokens + entry.cache_read_tokens;
-        entry.cache_hit_rate = if input > 0 {
-            entry.cache_read_tokens as f64 / input as f64
+        entry.cache_hit_rate = if entry.prompt_tokens > 0 {
+            entry.cache_read_tokens as f64 / entry.prompt_tokens as f64
         } else {
             0.0
         };
@@ -212,7 +211,7 @@ pub fn assemble_usage_report(
             total_cost = Some(total_cost.unwrap_or(0.0) + cost);
         }
     }
-    models.sort_by_key(|model| std::cmp::Reverse(model.prompt_tokens + model.cache_read_tokens));
+    models.sort_by_key(|model| std::cmp::Reverse(model.prompt_tokens));
 
     // The session clock starts at creation; without a creation time it
     // starts at the first request.
@@ -258,15 +257,69 @@ fn cost_usd(row: &ModelUsageRow) -> Option<f64> {
     // the catalog keys on the bare model id.
     let bare = row.model.rsplit("::").next().unwrap_or(&row.model);
     let pricing = aither_models::lookup(bare).map(aither_models::ModelEntry::pricing)?;
-    let mut cost = (row.completion_tokens as f64).mul_add(
-        pricing.output_per_token(),
-        row.prompt_tokens as f64 * pricing.input_per_token(),
-    );
+    // The prompt counts every input token, cached ones included; a cached
+    // token is billed at its cache rate when the model has one, otherwise as
+    // plain input.
+    let mut uncached = row.prompt_tokens;
+    let mut cost = (row.completion_tokens as f64) * pricing.output_per_token();
     if let Some(rate) = pricing.cache_read_per_token() {
+        uncached = uncached.saturating_sub(row.cache_read_tokens);
         cost = (row.cache_read_tokens as f64).mul_add(rate, cost);
     }
     if let Some(rate) = pricing.cache_write_per_token() {
+        uncached = uncached.saturating_sub(row.cache_write_tokens);
         cost = (row.cache_write_tokens as f64).mul_add(rate, cost);
     }
-    Some(cost)
+    Some((uncached as f64).mul_add(pricing.input_per_token(), cost))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MODEL: &str = "gpt-5";
+
+    fn log(prompt: i32, cache_read: i32, cache_write: i32) -> request_logs::Model {
+        request_logs::Model {
+            id: 0,
+            session_id: "s".to_string(),
+            timestamp: "2026-11-06T00:00:00Z".to_string(),
+            model: MODEL.to_string(),
+            provider_id: "openai".to_string(),
+            prompt_tokens: Some(prompt),
+            completion_tokens: Some(0),
+            total_tokens: Some(prompt),
+            cache_read_tokens: Some(cache_read),
+            cache_write_tokens: Some(cache_write),
+            context_window: None,
+            elapsed_ms: 1,
+            ok: true,
+            error: None,
+        }
+    }
+
+    fn report(rows: &[request_logs::Model]) -> ModelUsageRow {
+        let mut report =
+            assemble_usage_report("s", rows, &[], &SessionIntervals::default(), None, 1_000);
+        report.models.remove(0)
+    }
+
+    #[test]
+    fn hit_rate_is_cache_read_over_the_whole_prompt() {
+        let row = report(&[log(92_946, 82_176, 0)]);
+        assert!((row.cache_hit_rate - 82_176.0 / 92_946.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cost_bills_the_cached_part_of_the_prompt_once() {
+        let pricing = aither_models::lookup(MODEL)
+            .map(aither_models::ModelEntry::pricing)
+            .expect("the catalog prices the test model");
+        let cache_rate = pricing
+            .cache_read_per_token()
+            .expect("the test model has a cache-read rate");
+        let row = report(&[log(1_000, 800, 0)]);
+        let expected = 800.0_f64.mul_add(cache_rate, 200.0 * pricing.input_per_token());
+        assert!((row.cost_usd.expect("priced") - expected).abs() < 1e-12);
+    }
 }
