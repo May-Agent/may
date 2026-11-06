@@ -516,6 +516,7 @@ where
         SharedTerminalCommandConfig {
             #[cfg(target_os = "macos")]
             computer: None,
+            rules_import: None,
             llm,
             ask_flagship: None,
             ask_balanced: None,

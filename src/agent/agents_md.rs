@@ -1,6 +1,8 @@
-//! `AGENTS.md` discovery under the session's launch directory.
+//! `AGENTS.md` discovery: the global rules file and the session's launch
+//! directory.
 //!
-//! The launch directory's root `AGENTS.md` is loaded into the agent's
+//! The global `~/.may/AGENTS.md` and the launch directory's root
+//! `AGENTS.md` are loaded into the agent's
 //! stable system context; every other `AGENTS.md` in the tree is listed
 //! by path relative to the launch directory so the agent reads the file
 //! governing a subtree before working in it.
@@ -55,20 +57,44 @@ pub async fn discover(workdir: &Path) -> AgentsIndex {
     blocking::unblock(move || discover_sync(&workdir)).await
 }
 
+/// A rules file loaded whole into the context.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RulesDocument {
+    /// File content, capped at [`ROOT_DOCUMENT_CAP`].
+    pub content: String,
+    /// Whether `content` was truncated.
+    pub truncated: bool,
+}
+
+/// Load the global rules file (`~/.may/AGENTS.md`) off the event loop;
+/// `None` when it is absent, empty or unreadable.
+pub async fn load_global(path: &Path) -> Option<RulesDocument> {
+    let path = path.to_path_buf();
+    blocking::unblock(move || read_document(&path)).await
+}
+
+/// `path` capped to [`ROOT_DOCUMENT_CAP`]; `None` when absent or blank. A
+/// read error other than absence is logged and treated as absent.
+fn read_document(path: &Path) -> Option<RulesDocument> {
+    match std::fs::read_to_string(path) {
+        Ok(content) if !content.trim().is_empty() => {
+            let (content, truncated) = cap_document(&content);
+            Some(RulesDocument { content, truncated })
+        }
+        Ok(_) => None,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "failed to read AGENTS.md");
+            None
+        }
+    }
+}
+
 fn discover_sync(workdir: &Path) -> AgentsIndex {
     let mut index = AgentsIndex::default();
-    let root_path = workdir.join(AGENTS_FILE_NAME);
-    match std::fs::read_to_string(&root_path) {
-        Ok(content) if !content.trim().is_empty() => {
-            let (document, truncated) = cap_document(&content);
-            index.root_document = Some(document);
-            index.root_truncated = truncated;
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            tracing::warn!(path = %root_path.display(), %error, "failed to read AGENTS.md");
-        }
+    if let Some(root) = read_document(&workdir.join(AGENTS_FILE_NAME)) {
+        index.root_document = Some(root.content);
+        index.root_truncated = root.truncated;
     }
 
     let walker = ignore::WalkBuilder::new(workdir)

@@ -255,6 +255,9 @@ pub struct MayAgentConfig {
     /// Keychain secrets snapshot: injected into the session env file and
     /// listed by name in the terminal runtime context.
     pub secrets: crate::secrets::Secrets,
+    /// The rules this session imports, for a session `/import-claude` or
+    /// `/import-codex` opened.
+    pub rules_import: Option<crate::rules_import::RulesImport>,
 }
 
 /// Session-scoped inputs for [`MayAgent::from_config_with_model_and_permissions`].
@@ -329,6 +332,9 @@ pub struct MayAgentSessionInput<'a> {
     pub background_jobs: aither_agent::BackgroundJobPolicy,
     /// The daemon's connectivity source.
     pub connectivity: aither_connectivity::Connectivity,
+    /// The rules this session imports, for a session `/import-claude` or
+    /// `/import-codex` opened.
+    pub rules_import: Option<crate::rules_import::RulesImport>,
 }
 
 type MayAgentInner = Agent<ProviderLlm, ProviderLlm, ProviderLlm, MayHooks>;
@@ -574,14 +580,22 @@ impl MayAgent {
                 runtime_system_context.with_instruction(tag::REPO_CLONES, repo_clones);
         }
 
-        // Project rules: the launch directory's AGENTS.md is loaded into
-        // the stable prefix and nested AGENTS.md files are listed, so
-        // the agent never has to find them itself.
-        let agents_index = agents_md::discover(&config.cwd).await;
+        // Rules: the global `~/.may/AGENTS.md` and the launch directory's
+        // AGENTS.md are loaded into the stable prefix and nested AGENTS.md
+        // files are listed, so the agent never has to find them itself.
+        let global_agents_path =
+            crate::session::MayHomePaths::new(config.may_dir.clone()).global_agents_md();
+        let (global_agents, agents_index) = futures_lite::future::zip(
+            agents_md::load_global(&global_agents_path),
+            agents_md::discover(&config.cwd),
+        )
+        .await;
         let agents_label = (!is_container).then(|| config.cwd.display().to_string());
-        runtime_system_context =
-            runtime_system_context.with_agents_source(config.cwd.clone(), agents_label.as_deref());
+        runtime_system_context = runtime_system_context
+            .with_global_agents_source(global_agents_path)
+            .with_agents_source(config.cwd.clone(), agents_label.as_deref());
         let agents_blocks = build_agents_md_blocks(
+            global_agents.as_ref(),
             &agents_index,
             runtime_system_context.agents_root_source(),
             &[],
@@ -746,6 +760,7 @@ impl MayAgent {
                 git: crate::host_git::HostGit::inherit(),
                 #[cfg(target_os = "macos")]
                 computer: config.computer.clone(),
+                rules_import: config.rules_import.clone(),
             },
         ))
         .await?;
@@ -891,6 +906,7 @@ impl MayAgent {
             subagents,
             background_jobs,
             connectivity,
+            rules_import,
         } = input;
         let selector = super::provider::parse_model_selector(model)?;
         let redactor = crate::secrets::SecretRedactor::for_session(&may_dir, session_id.as_str());
@@ -994,6 +1010,7 @@ impl MayAgent {
             request_parameters,
             prompt_cache_epoch,
             db,
+            rules_import,
         })
     }
 
