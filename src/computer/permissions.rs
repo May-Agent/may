@@ -11,6 +11,7 @@ use std::ffi::c_void;
 unsafe extern "C" {
     fn CGPreflightScreenCaptureAccess() -> bool;
     fn CGRequestScreenCaptureAccess() -> bool;
+    fn CGMainDisplayID() -> u32;
 }
 
 #[link(name = "ApplicationServices", kind = "framework")]
@@ -119,10 +120,19 @@ pub struct Grants {
 }
 
 /// The probe process's side: optionally raise the prompts, then report.
+///
+/// With Screen Recording granted, a request also captures the main display
+/// once: from macOS 15 the first capture that bypasses the system window
+/// picker is what makes `replayd` ask for that one-time consent, and the
+/// request instance is where the user expects system prompts.
 #[must_use]
 pub fn probe(request: bool) -> Grants {
     if request {
         request_permissions();
+        if screen_recording_granted() {
+            // Only the consent prompt matters; the still is discarded.
+            let _ = super::screenshot::screenshot_png(unsafe { CGMainDisplayID() });
+        }
     }
     Grants {
         screen_recording: screen_recording_granted(),
