@@ -2446,7 +2446,7 @@ pub(super) fn element_lines(
             ..
         } => {
             let start = lines.len();
-            let header = if *expanded {
+            let header = if *live {
                 if thought_millis(*seconds) == 0 {
                     "◐ Thinking...".to_string()
                 } else {
@@ -2454,7 +2454,11 @@ pub(super) fn element_lines(
                 }
             } else {
                 // An empty block is a timing marker only: no expand affordance.
-                let arrow = if content.is_empty() { "" } else { " ▸" };
+                let arrow = match (content.is_empty(), *expanded) {
+                    (true, _) => "",
+                    (false, true) => " ▾",
+                    (false, false) => " ▸",
+                };
                 format!("◐ Thought for {}{arrow}", thought_duration_label(*seconds))
             };
             lines.push(Line::from(Span::styled(
@@ -5163,6 +5167,7 @@ mod tests {
         chat.toggle_expanded("thinking-0");
         let reopened = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
         assert_eq!(reopened.len(), 4);
+        assert_eq!(reopened[0], "◐ Thought for 3s ▾");
         assert!(reopened[1].contains("step one"));
     }
 
