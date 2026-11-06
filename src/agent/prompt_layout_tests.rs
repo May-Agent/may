@@ -171,6 +171,48 @@ async fn a_fresh_session_prompt_has_one_section_per_concern_and_external_content
     assert!(prefix.contains("\n- ask_user: "), "{prefix}");
 }
 
+/// The global `~/.may/AGENTS.md` reaches a fresh session's prompt, after
+/// memory and before the launch directory's own rules.
+#[tokio::test]
+async fn global_rules_reach_a_fresh_session_before_the_project_rules() {
+    let stub = StubModel::spawn(SESSION_MODEL).await;
+    let config = saved_config(&stub, None);
+    let mut session = Box::pin(Session::start_with_runtime(&config)).await;
+    let global = "# Global rules\nAnswer in the user's language.\n";
+    let agents_md = "# Project rules\nRun `cargo test` before committing.\n";
+    let home = crate::session::MayHomePaths::new(session.temp.path().join(".may"));
+    std::fs::create_dir_all(home.root()).expect("may home");
+    std::fs::write(home.global_agents_md(), global).expect("write global AGENTS.md");
+    std::fs::write(session.temp.path().join("cwd/AGENTS.md"), agents_md).expect("write AGENTS.md");
+    Box::pin(session.rebuild(&config)).await;
+    let messages = session
+        .agent
+        .preview_request_messages("Say hello.", [])
+        .await
+        .expect("the request previews");
+    let prefix = messages.first().expect("a system message").content();
+
+    let external = assert_sections(prefix);
+    let blocks = external_blocks(external);
+    let sources: Vec<&str> = blocks.iter().map(|block| block.source.as_str()).collect();
+    assert_eq!(
+        sources,
+        [
+            "~/.may/memories/MEMORY.md",
+            "~/.may/AGENTS.md",
+            agents_md_source(&session).as_str(),
+        ]
+    );
+    assert_eq!(
+        blocks[1],
+        ExternalBlock {
+            kind: "repository-instructions".to_string(),
+            source: "~/.may/AGENTS.md".to_string(),
+            content: global.to_string(),
+        }
+    );
+}
+
 /// An `AGENTS.md` and a memory index that try to close their block and pose
 /// as instructions stay inside their block, byte for byte.
 #[tokio::test]
