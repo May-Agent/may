@@ -53,7 +53,6 @@ pub enum AgentResponse {
     Permissions {
         screen_recording: bool,
         accessibility: bool,
-        direct_capture: bool,
     },
     /// `ensure_display` result.
     Display {
