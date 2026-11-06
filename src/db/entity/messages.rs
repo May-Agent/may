@@ -42,4 +42,7 @@ pub struct Model {
     /// JSON-serialized display translation of an assistant reply that was
     /// not in the communication language (`MessageTranslation`).
     pub translation: Option<String>,
+    /// The reasoning text the model streamed before this assistant message,
+    /// as shown to the user (provider state lives in `reasoning`).
+    pub thinking: Option<String>,
 }

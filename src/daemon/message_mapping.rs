@@ -87,7 +87,7 @@ pub(super) fn map_db_messages(
                     content: msg.content.clone(),
                     timestamp,
                     attachments: Vec::new(),
-                    thinking: None,
+                    thinking: msg.thinking.clone(),
                     is_streaming: Some(false),
                     is_thinking: Some(false),
                     tool_event,
