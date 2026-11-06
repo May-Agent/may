@@ -351,6 +351,7 @@ async fn forward_agent_frame(
                     handle: AgentHandle::new(rx, command_tx.clone()),
                     content,
                     message_id,
+                    started_at: frame.at,
                 });
                 events
             });
