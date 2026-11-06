@@ -81,6 +81,9 @@ mod quota;
 pub mod repo_clone;
 /// repo-search daemon: code, session and issue search.
 pub mod repo_search;
+/// `/import-claude` and `/import-codex`: another agent's global rules and
+/// skills brought into May.
+pub mod rules_import;
 /// Scheduled task execution.
 pub mod scheduler;
 /// Repository trust: the first-contact decision, resolved per repo.

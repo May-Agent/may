@@ -1,0 +1,1 @@
+Refused: nothing in this session's ask_user questions has been answered yet, so no change to the rules is approved. Ask the user about each change and end your turn; run `global-rules write` once they have answered, or `global-rules keep` if no rule needs a change.

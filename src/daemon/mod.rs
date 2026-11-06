@@ -33,6 +33,7 @@ mod model_resolution;
 mod notifications;
 mod profiles;
 mod remote_access;
+mod rules_import;
 mod server;
 #[cfg(test)]
 mod session_directory_tests;

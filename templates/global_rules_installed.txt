@@ -1,0 +1,1 @@
+{% if unchanged %}Installed {{ source }} unchanged as {{ destination }}.{% else %}Installed {{ written }} as {{ destination }}.{% endif %} The global rules are now loaded into every session.

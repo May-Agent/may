@@ -113,6 +113,9 @@ pub struct SharedTerminalCommandConfig<LLM> {
     /// session may own a virtual desktop (macOS, local environment).
     #[cfg(target_os = "macos")]
     pub computer: Option<crate::agent::computer_tool::ComputerHandles>,
+    /// The rules this session imports, for a session `/import-claude` or
+    /// `/import-codex` opened: it alone gets `global-rules`.
+    pub rules_import: Option<crate::rules_import::RulesImport>,
 }
 
 /// What [`register_shared_terminal_commands`] installed.
@@ -309,6 +312,18 @@ where
         let withdraw = WithdrawAskUserTool::new(runtime, config.session_id.clone());
         describe_tool(&mut descriptions, &withdraw);
         builder.main_only(|reserved| reserved.configure_tool(withdraw));
+    }
+
+    if let Some(import) = config.rules_import {
+        let global_rules = crate::rules_import::GlobalRulesTool::new(
+            import,
+            config.session_id.clone(),
+            config.db.clone(),
+            config.sandbox_dir.clone(),
+            container_mount.clone(),
+        );
+        describe_tool(&mut descriptions, &global_rules);
+        builder.main_only(|reserved| reserved.configure_tool(global_rules));
     }
 
     #[cfg(target_os = "macos")]
@@ -608,6 +623,7 @@ mod tests {
             SharedTerminalCommandConfig {
                 #[cfg(target_os = "macos")]
                 computer: None,
+                rules_import: None,
                 llm: MockLlm,
                 ask_flagship: None,
                 ask_balanced: None,
@@ -670,6 +686,7 @@ mod tests {
             SharedTerminalCommandConfig {
                 #[cfg(target_os = "macos")]
                 computer: None,
+                rules_import: None,
                 llm: MockLlm,
                 ask_flagship: None,
                 ask_balanced: None,
@@ -729,6 +746,7 @@ mod tests {
             SharedTerminalCommandConfig {
                 #[cfg(target_os = "macos")]
                 computer: None,
+                rules_import: None,
                 llm: MockLlm,
                 ask_flagship: None,
                 ask_balanced: None,
@@ -782,6 +800,7 @@ mod tests {
             SharedTerminalCommandConfig {
                 #[cfg(target_os = "macos")]
                 computer: None,
+                rules_import: None,
                 llm: MockLlm,
                 ask_flagship: None,
                 ask_balanced: None,
@@ -831,6 +850,7 @@ mod tests {
             SharedTerminalCommandConfig {
                 #[cfg(target_os = "macos")]
                 computer: None,
+                rules_import: None,
                 llm: MockLlm,
                 ask_flagship: None,
                 ask_balanced: None,
@@ -994,6 +1014,7 @@ mod tests {
             SharedTerminalCommandConfig {
                 #[cfg(target_os = "macos")]
                 computer: None,
+                rules_import: None,
                 llm: MockLlm,
                 ask_flagship: None,
                 ask_balanced: None,
@@ -1073,6 +1094,7 @@ mod tests {
             SharedTerminalCommandConfig {
                 #[cfg(target_os = "macos")]
                 computer: None,
+                rules_import: None,
                 llm: MockLlm,
                 ask_flagship: None,
                 ask_balanced: None,
@@ -1123,6 +1145,7 @@ mod tests {
             SharedTerminalCommandConfig {
                 #[cfg(target_os = "macos")]
                 computer: None,
+                rules_import: None,
                 llm: MockLlm,
                 ask_flagship: None,
                 ask_balanced: None,
@@ -1177,6 +1200,7 @@ mod tests {
             SharedTerminalCommandConfig {
                 #[cfg(target_os = "macos")]
                 computer: None,
+                rules_import: None,
                 llm: MockLlm,
                 ask_flagship: None,
                 ask_balanced: None,
