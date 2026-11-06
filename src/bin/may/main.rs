@@ -335,6 +335,13 @@ async fn async_main() -> anyhow::Result<()> {
     }
 }
 
+/// Whether the main loop goes on after an event was handled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopFlow {
+    Continue,
+    Quit,
+}
+
 /// What the exited TUI leaves the user at the shell: the session to resume
 /// and whether its agent is still running in the daemon.
 struct ExitSummary {
@@ -1113,7 +1120,8 @@ where
                 // sent behind it now queues after it.
                 if let Some(held) = held_turn.take_if(|held| held.turn.is_none()) {
                     for message in &held.behind {
-                        runtime_deps.post_enqueue(app, message).await?;
+                        let posted = runtime_deps.post_enqueue(app, message).await;
+                        app.settle(posted);
                     }
                 }
                 match tui_event {
@@ -1341,10 +1349,14 @@ where
 
                 // Handle normal terminal events
                 let ev_start = std::time::Instant::now();
+                // The handler boundary: a failed request or session operation
+                // while handling this event is reported in the chat by
+                // `App::settle`; it never leaves the loop.
+                let dispatched = async {
                 match app.handle_event(*terminal_event)? {
                     Some(SendAction::Quit) => {
                         agent_left_running = agent_handle.is_some() || app.agent_busy();
-                        break;
+                        return Ok(LoopFlow::Quit);
                     }
                     Some(SendAction::StopAgentAndQuit) => {
                         if let (Some(client), Some(session)) =
@@ -1362,7 +1374,7 @@ where
                         } else if let Some(handle) = agent_handle.take() {
                             handle.cancel();
                         }
-                        break;
+                        return Ok(LoopFlow::Quit);
                     }
                     Some(SendAction::NewSession) => {
                         held_turn = None;
@@ -2136,6 +2148,12 @@ where
                     // SubmitOpenrouterCode is consumed inside
                     // `run_openrouter_manual`'s own event loop.
                     Some(SendAction::SubmitOpenrouterCode { .. }) | None => {}
+                }
+                Ok::<LoopFlow, anyhow::Error>(LoopFlow::Continue)
+                }
+                .await;
+                if app.settle(dispatched) == Some(LoopFlow::Quit) {
+                    break;
                 }
                 phases.event = ev_start.elapsed();
             }
