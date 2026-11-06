@@ -14,6 +14,7 @@ pub mod may;
 pub mod owner;
 pub mod provenance;
 pub mod search;
+pub mod target;
 
 use std::fmt;
 use std::path::{Path, PathBuf};

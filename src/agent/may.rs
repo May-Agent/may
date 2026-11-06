@@ -349,12 +349,22 @@ pub struct MayAgent {
     /// The commands registered by name; `/context` counts every other row of
     /// the command table as an MCP tool.
     named_commands: Vec<String>,
+    /// The native tool definitions the agent sends with every request;
+    /// `/context` sizes them.
+    native_tools: Vec<aither_core::llm::tool::ToolDefinition>,
     runtime_system_context: RuntimeSystemContext,
     job_registry: aither_sandbox::JobRegistry,
     subagent_runs: aither_agent::specialized::SubagentRuns,
     /// Model clone reserved for `/btw` side questions.
     btw_llm: ModelSlot<ProviderLlm>,
     subagent_tracker: crate::agent::subagent_tracker::SubagentTracker,
+}
+
+/// The prompt cache of `session_id`'s agent resumed at `epoch`: the one
+/// identity both the agent's requests and its side requests take their key
+/// from.
+fn session_prompt_cache(session_id: &str, epoch: u32) -> PromptCache {
+    PromptCache::new(session_id).with_epoch(epoch)
 }
 
 impl std::fmt::Debug for MayAgent {
@@ -665,8 +675,7 @@ impl MayAgent {
             )))
             .request_parameters(config.request_parameters.clone())
             .prompt_cache(
-                PromptCache::new(config.session_id.as_str())
-                    .with_epoch(config.prompt_cache_epoch)
+                session_prompt_cache(config.session_id.as_str(), config.prompt_cache_epoch)
                     .with_lifetime(config.cache_lifetime.into()),
             )
             .context_policy(config.context_policy)
@@ -808,6 +817,7 @@ impl MayAgent {
             .iter()
             .map(|(name, _)| name.clone())
             .collect();
+        let native_tools = builder.native_tool_definitions();
         let agent = builder.build();
 
         Ok(Self {
@@ -820,6 +830,7 @@ impl MayAgent {
             model_context_window: config.model_context_window,
             context_policy: config.context_policy,
             named_commands,
+            native_tools,
             runtime_system_context,
             job_registry,
             subagent_runs,
@@ -1120,7 +1131,10 @@ impl MayAgent {
         Ok(super::context_report::ContextReport::assemble(
             &self.model_id,
             &self.provider_id,
-            &self.named_commands,
+            &super::context_report::ToolInventory {
+                named_commands: &self.named_commands,
+                native_tools: &self.native_tools,
+            },
             self.inner.context(),
             &snapshot.metrics,
             snapshot.phase,
@@ -1196,11 +1210,27 @@ impl MayAgent {
         self.subagent_runs.clone()
     }
 
-    /// Model clone for `/btw` side questions — shares the agent's provider
-    /// but runs outside the agent, so answers never enter its history.
-    #[must_use]
-    pub fn btw_llm(&self) -> ModelSlot<ProviderLlm> {
-        self.btw_llm.clone()
+    /// The model for side requests (`/btw`, prompt suggestions, recaps):
+    /// the agent's provider, running outside the agent so answers never
+    /// enter its history, under the prompt-cache key the agent's next
+    /// request carries so the provider places both on the same cache shard.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError`] when the model profiles cannot be fetched
+    /// during initialization.
+    pub async fn side_model(&mut self) -> Result<ModelSlot<ProviderLlm>, AgentError> {
+        let epoch = self
+            .inner
+            .snapshot_context_window()
+            .await?
+            .metrics
+            .prompt_cache_epoch;
+        let mut slot = self.btw_llm.clone();
+        slot.parameters = slot
+            .parameters
+            .prompt_cache_key(session_prompt_cache(self.session_id.as_str(), epoch).key());
+        Ok(slot)
     }
 
     /// The language guard the agent was built with; its commands and the
@@ -1421,6 +1451,7 @@ pub async fn test_agent(
             model_context_window: None,
             context_policy: aither_agent::ContextPolicy::default(),
             named_commands: Vec::new(),
+            native_tools: Vec::new(),
             runtime_system_context: RuntimeSystemContext::new(
                 temp.path().join("MEMORY.md"),
                 String::new(),
