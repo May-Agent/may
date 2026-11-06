@@ -250,9 +250,7 @@ async fn async_main() -> anyhow::Result<()> {
             #[cfg(target_os = "macos")]
             {
                 use std::io::Write;
-                let grants =
-                    may_agent::computer::permissions::probe(request).map_err(anyhow::Error::msg)?;
-                let report = serde_json::to_vec(&grants)?;
+                let report = serde_json::to_vec(&may_agent::computer::permissions::probe(request))?;
                 std::io::stdout().write_all(&report)?;
                 return Ok(());
             }

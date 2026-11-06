@@ -11,7 +11,6 @@ use std::ffi::c_void;
 unsafe extern "C" {
     fn CGPreflightScreenCaptureAccess() -> bool;
     fn CGRequestScreenCaptureAccess() -> bool;
-    fn CGMainDisplayID() -> u32;
 }
 
 #[link(name = "ApplicationServices", kind = "framework")]
@@ -110,96 +109,25 @@ pub const PROBE_COMMAND: &str = "computer-agent-probe";
 /// Probe flag that raises the prompts for missing grants before reporting.
 pub const PROBE_REQUEST_FLAG: &str = "--request";
 
-/// The helper bundle's identifier, the TCC and `replayd` subject.
-pub const HELPER_BUNDLE_ID: &str = "ai.may.computer-agent";
-
-/// Where `replayd` records each app's direct screen-capture consent,
-/// relative to the home directory.
-const CAPTURE_APPROVALS: &str =
-    "Library/Group Containers/group.com.apple.replayd/ScreenCaptureApprovals.plist";
-
-/// The first macOS release that asks for direct screen-capture consent.
-const DIRECT_CAPTURE_CONSENT_SINCE: isize = 15;
-
-/// Every grant as one process sees them.
+/// Both grants as one process sees them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Grants {
     /// Screen Recording: capture and stills.
     pub screen_recording: bool,
     /// Accessibility: event injection.
     pub accessibility: bool,
-    /// `replayd`'s one-time consent to capture without the system window
-    /// picker; without it, capture fails even with Screen Recording.
-    pub direct_capture: bool,
 }
 
 /// The probe process's side: optionally raise the prompts, then report.
-///
-/// A request also captures the main display once when Screen Recording is
-/// granted and direct-capture consent is not: the first direct capture is
-/// what makes `replayd` ask for that consent.
-///
-/// # Errors
-/// Returns a message when the consent record cannot be read.
-pub fn probe(request: bool) -> Result<Grants, String> {
+#[must_use]
+pub fn probe(request: bool) -> Grants {
     if request {
         request_permissions();
-        if screen_recording_granted() && !direct_capture_consented()? {
-            // The still itself is not needed; capturing raises the consent.
-            let _ = super::screenshot::screenshot_png(unsafe { CGMainDisplayID() });
-        }
     }
-    Ok(Grants {
+    Grants {
         screen_recording: screen_recording_granted(),
         accessibility: accessibility_granted(),
-        direct_capture: direct_capture_consented()?,
-    })
-}
-
-/// Whether `replayd` holds this app's direct screen-capture consent. It
-/// keys an approval by the app bundle's file URL or by its bundle
-/// identifier; systems before macOS 15 have no such consent.
-///
-/// # Errors
-/// Returns a message when the approvals file exists but cannot be read.
-pub fn direct_capture_consented() -> Result<bool, String> {
-    let version = objc2_foundation::NSProcessInfo::processInfo().operatingSystemVersion();
-    if version.majorVersion < DIRECT_CAPTURE_CONSENT_SINCE {
-        return Ok(true);
     }
-    let home = dirs::home_dir().ok_or("no home directory")?;
-    let path = home.join(CAPTURE_APPROVALS);
-    let approvals = match plist::Value::from_file(&path) {
-        Ok(approvals) => approvals,
-        Err(error)
-            if error
-                .as_io()
-                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) =>
-        {
-            return Ok(false);
-        }
-        Err(error) => return Err(format!("read {}: {error}", path.display())),
-    };
-    let approvals = approvals
-        .as_dictionary()
-        .ok_or_else(|| format!("{} is not a dictionary", path.display()))?;
-    Ok(approvals.contains_key(HELPER_BUNDLE_ID)
-        || own_bundle_url()?.is_some_and(|url| approvals.contains_key(&url)))
-}
-
-/// The file URL of the app bundle this executable runs from, in the form
-/// `replayd` keys approvals by; `None` for a bare binary.
-fn own_bundle_url() -> Result<Option<String>, String> {
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let Some(bundle) = exe
-        .ancestors()
-        .find(|dir| dir.extension().is_some_and(|ext| ext == "app"))
-    else {
-        return Ok(None);
-    };
-    let path = objc2_foundation::NSString::from_str(&bundle.to_string_lossy());
-    let url = objc2_foundation::NSURL::fileURLWithPath_isDirectory(&path, true);
-    Ok(url.absoluteString().map(|url| url.to_string()))
 }
 
 /// Read the grants in a fresh copy of this executable.

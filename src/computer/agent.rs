@@ -134,7 +134,6 @@ async fn dispatch_inner(request: AgentRequest, state: Arc<Mutex<AgentState>>) ->
             Ok(grants) => AgentResponse::Permissions {
                 screen_recording: grants.screen_recording,
                 accessibility: grants.accessibility,
-                direct_capture: grants.direct_capture,
             },
             Err(error) => AgentResponse::Error { error },
         },
