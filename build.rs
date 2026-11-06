@@ -35,6 +35,18 @@ fn main() {
     );
 
     let status = Command::new("bun")
+        .arg("install")
+        .arg("--frozen-lockfile")
+        .current_dir("web-ui")
+        .status()
+        .unwrap_or_else(|err| panic!("failed to run bun install for web-ui: {err}"));
+
+    assert!(
+        status.success(),
+        "bun install --frozen-lockfile failed in web-ui; cannot install frontend dependencies"
+    );
+
+    let status = Command::new("bun")
         .arg("run")
         .arg("build")
         .current_dir("web-ui")
