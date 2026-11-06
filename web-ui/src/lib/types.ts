@@ -75,10 +75,22 @@ export interface RequestStats {
   elapsedMs?: number | null;
 }
 
+/** A reply translated into the communication language for display. */
+export interface ReplyTranslation {
+  text: string;
+  /** ISO 639-3 code of the communication language. */
+  language: string;
+  /** Display name of the communication language. */
+  languageName: string;
+}
+
 export interface ApiMessage {
   id: string;
   role: MessageRole;
+  /** The reply as the model wrote it; the original behind `translation`. */
   content: string;
+  /** Present when the reply was not in the communication language. */
+  translation?: ReplyTranslation | null;
   timestamp: string;
   attachments?: ApiAttachment[];
   thinking?: string | null;
@@ -214,6 +226,17 @@ export interface SseReasoning {
   seq: number;
   turnId: string;
   chunk: string;
+}
+
+/**
+ * The reply just streamed was not in the communication language: show this
+ * translation of it, marked as translated, with the streamed original one
+ * toggle away.
+ */
+export interface SseTranslated extends ReplyTranslation {
+  kind: 'translated';
+  seq: number;
+  turnId: string;
 }
 
 /**
@@ -367,6 +390,7 @@ export type ChatStreamEvent =
   | SseStart
   | SseText
   | SseReasoning
+  | SseTranslated
   | SseReasoningEnd
   | SseToolStart
   | SseToolDelta

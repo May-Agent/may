@@ -247,7 +247,8 @@ async fn async_main() -> anyhow::Result<()> {
             #[cfg(target_os = "macos")]
             {
                 use std::io::Write;
-                let report = serde_json::to_vec(&may_agent::computer::permissions::probe(request))?;
+                let report =
+                    serde_json::to_vec(&may_agent::computer::permissions::probe(request).await)?;
                 std::io::stdout().write_all(&report)?;
                 return Ok(());
             }
@@ -333,6 +334,13 @@ async fn async_main() -> anyhow::Result<()> {
         Ok(None) => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+/// Whether the main loop goes on after an event was handled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopFlow {
+    Continue,
+    Quit,
 }
 
 /// What the exited TUI leaves the user at the shell: the session to resume
@@ -447,33 +455,23 @@ where
     // and the session starts once the prompt is answered. A resumed
     // session loads regardless: it carries its own model.
     let mut worker_build = None;
+    // The gate decides for the profile the session will run in: the resumed
+    // session's own, which `resume_into_session` adopts only after the gate.
     let mut startup_gate = if app.is_configured() {
-        startup_gate_check(&app)?
+        let profile_id = match &pending_resume {
+            Some(id) => app
+                .session_manager
+                .session_profile(id)
+                .await
+                .with_context(|| format!("cannot resume session {}", id.as_str()))?,
+            None => app.session_manager.current_profile_id().map(str::to_owned),
+        };
+        startup_gate_check(&app, profile_id.as_deref())?
     } else {
         None
     };
-    match &startup_gate {
-        Some(StartupGate::RepoTrust(trust)) => {
-            app.mode = may_agent::tui::AppMode::RepoTrust(may_agent::tui::state::RepoTrustState {
-                ask: may_agent::tui::AskUserState::for_open_question(
-                    may_agent::trust::question_for(&trust.kind, &trust.worktree, true),
-                ),
-                worktree: trust.worktree.clone(),
-                kind: trust.kind.clone(),
-                config_path: trust.config_path.clone(),
-                redecide: false,
-            });
-        }
-        Some(StartupGate::LaunchGrant(grant)) => {
-            app.mode =
-                may_agent::tui::AppMode::LaunchGrant(may_agent::tui::state::LaunchGrantState {
-                    path: grant.dir.clone(),
-                    config_path: grant.config_path.clone(),
-                    redecide: false,
-                    selected: 0,
-                });
-        }
-        None => {}
+    if let Some(gate) = &startup_gate {
+        enter_startup_gate(&mut app, gate);
     }
     if startup_gate.is_none() {
         if let Some(session_id) = pending_resume.take() {
@@ -549,6 +547,32 @@ async fn resume_into_session(
     Ok(build)
 }
 
+/// Opens the prompt that asks `gate`'s first-contact decision.
+fn enter_startup_gate(app: &mut App, gate: &StartupGate) {
+    match gate {
+        StartupGate::RepoTrust(trust) => {
+            app.mode = may_agent::tui::AppMode::RepoTrust(may_agent::tui::state::RepoTrustState {
+                ask: may_agent::tui::AskUserState::for_open_question(
+                    may_agent::trust::question_for(&trust.kind, &trust.worktree, true),
+                ),
+                worktree: trust.worktree.clone(),
+                kind: trust.kind.clone(),
+                config_path: trust.config_path.clone(),
+                redecide: false,
+            });
+        }
+        StartupGate::LaunchGrant(grant) => {
+            app.mode =
+                may_agent::tui::AppMode::LaunchGrant(may_agent::tui::state::LaunchGrantState {
+                    path: grant.dir.clone(),
+                    config_path: grant.config_path.clone(),
+                    redecide: false,
+                    selected: 0,
+                });
+        }
+    }
+}
+
 /// The first-contact decision the TUI asks before the session starts.
 enum StartupGate {
     /// The launch directory is a repository with undecided trust.
@@ -567,32 +591,50 @@ struct RepoTrust {
     config_path: std::path::PathBuf,
 }
 
-/// The launch gate: a repository launch asks for its trust level, any
-/// other launch asks for the write-grant.
+/// The launch gate for a session that will run in `profile_id`: a repository
+/// launch asks for its trust level, any other launch asks for the
+/// write-grant. Both read and persist that profile's `workspace.toml`.
 fn startup_gate_check(
     app: &App,
+    profile_id: Option<&str>,
 ) -> Result<Option<StartupGate>, may_agent::workspace::WorkspaceConfigError> {
-    if let Some(trust) = repo_trust_check(app)? {
+    gate_check(
+        app.session_manager.may_dir(),
+        &app.cwd,
+        profile_id,
+        &app.profiles,
+    )
+}
+
+fn gate_check(
+    may_dir: &std::path::Path,
+    cwd: &std::path::Path,
+    profile_id: Option<&str>,
+    profiles: &[may_agent::profile::ProfileInfo],
+) -> Result<Option<StartupGate>, may_agent::workspace::WorkspaceConfigError> {
+    if let Some(trust) = repo_trust_check(may_dir, cwd, profile_id)? {
         return Ok(Some(StartupGate::RepoTrust(trust)));
     }
-    Ok(launch_grant_check(app)?.map(StartupGate::LaunchGrant))
+    Ok(launch_grant_check(may_dir, cwd, profile_id, profiles)?.map(StartupGate::LaunchGrant))
 }
 
 /// Whether the launch directory's repository has no persisted trust level.
 /// Repositories are decided here — never through the write-grant, since
 /// the session works in a clone and the checkout stays a read mount.
 fn repo_trust_check(
-    app: &App,
+    may_dir: &std::path::Path,
+    cwd: &std::path::Path,
+    profile_id: Option<&str>,
 ) -> Result<Option<RepoTrust>, may_agent::workspace::WorkspaceConfigError> {
     use may_agent::session::MayHomePaths;
 
-    let home = MayHomePaths::new(app.session_manager.may_dir().to_path_buf());
-    let config_path = app.session_manager.current_profile_id().map_or_else(
+    let home = MayHomePaths::new(may_dir.to_path_buf());
+    let config_path = profile_id.map_or_else(
         || home.workspace_config(),
         |profile_id| home.profile_home(profile_id).workspace_config(),
     );
     Ok(
-        may_agent::trust::pending_decision(&app.cwd, &config_path)?.map(|pending| RepoTrust {
+        may_agent::trust::pending_decision(cwd, &config_path)?.map(|pending| RepoTrust {
             worktree: pending.worktree,
             kind: pending.kind,
             config_path,
@@ -612,15 +654,17 @@ struct LaunchGrant {
 /// profile is local (workspace grants do not map into containers) and its
 /// `workspace.toml` does not already cover the directory read/write.
 fn launch_grant_check(
-    app: &App,
+    may_dir: &std::path::Path,
+    cwd: &std::path::Path,
+    profile_id: Option<&str>,
+    profiles: &[may_agent::profile::ProfileInfo],
 ) -> Result<Option<LaunchGrant>, may_agent::workspace::WorkspaceConfigError> {
     use may_agent::session::MayHomePaths;
 
-    let home = MayHomePaths::new(app.session_manager.may_dir().to_path_buf());
-    let config_path = match app.session_manager.current_profile_id() {
+    let home = MayHomePaths::new(may_dir.to_path_buf());
+    let config_path = match profile_id {
         Some(profile_id) => {
-            let container = app
-                .profiles
+            let container = profiles
                 .iter()
                 .find(|profile| profile.id.as_str() == profile_id)
                 .is_some_and(|profile| {
@@ -639,17 +683,17 @@ fn launch_grant_check(
     // A repository's first-contact decision is the repo-trust gate, never
     // this write-grant — the session works in a clone and the checkout
     // stays a read mount.
-    if may_agent::repo_search::worktree_root(&app.cwd).is_some() {
+    if may_agent::repo_search::worktree_root(cwd).is_some() {
         return Ok(None);
     }
     let config = may_agent::workspace::WorkspaceConfig::load(&config_path)?;
     // A covering entry of any permission is a decided directory — a
     // recorded denial is as final as a grant.
-    if config.covers(&app.cwd) {
+    if config.covers(cwd) {
         return Ok(None);
     }
     Ok(Some(LaunchGrant {
-        dir: app.cwd.clone(),
+        dir: cwd.to_path_buf(),
         config_path,
     }))
 }
@@ -852,16 +896,7 @@ where
         phases.step("paste_results", step_start.elapsed());
 
         let step_start = std::time::Instant::now();
-        if matches!(app.mode, may_agent::tui::AppMode::Chat)
-            && let Some(request) = &app.session_runtime.waiting_permission
-        {
-            app.mode = may_agent::tui::AppMode::PermissionConfirm(
-                may_agent::tui::state::PermissionConfirmState {
-                    request_id: request.id.clone(),
-                    request: request.request.clone(),
-                },
-            );
-        }
+        app.open_waiting_permission();
         // A daemon run waits on its prompts in the daemon; they show here
         // from the session's runtime state and are answered over REST.
         if matches!(app.mode, may_agent::tui::AppMode::Chat) {
@@ -1082,13 +1117,9 @@ where
                 // After a reload the turn's own message is already in the
                 // history: it is not shown a second time.
                 let stored = turn.message_id.is_some_and(|id| {
-                    app.session_manager.current().is_some_and(|session| {
-                        session
-                            .history
-                            .messages()
-                            .iter()
-                            .any(|message| message.id == Some(id))
-                    })
+                    app.session_manager
+                        .current()
+                        .is_some_and(|session| session.holds_message(id))
                 });
                 let content = turn.content.filter(|_| !stored);
                 let message = may_agent::tui::queue::PendingMessage {
@@ -1104,6 +1135,7 @@ where
                         .record_unpersisted(may_agent::session::ChatMessage::user(content));
                 }
                 app.start_processing(&message);
+                app.set_turn_started_at(turn.started_at);
                 assistant_response.clear();
                 agent_handle = Some(turn.handle);
             }
@@ -1113,7 +1145,8 @@ where
                 // sent behind it now queues after it.
                 if let Some(held) = held_turn.take_if(|held| held.turn.is_none()) {
                     for message in &held.behind {
-                        runtime_deps.post_enqueue(app, message).await?;
+                        let posted = runtime_deps.post_enqueue(app, message).await;
+                        app.settle(posted);
                     }
                 }
                 match tui_event {
@@ -1341,10 +1374,14 @@ where
 
                 // Handle normal terminal events
                 let ev_start = std::time::Instant::now();
+                // The handler boundary: a failed request or session operation
+                // while handling this event is reported in the chat by
+                // `App::settle`; it never leaves the loop.
+                let dispatched = async {
                 match app.handle_event(*terminal_event)? {
                     Some(SendAction::Quit) => {
                         agent_left_running = agent_handle.is_some() || app.agent_busy();
-                        break;
+                        return Ok(LoopFlow::Quit);
                     }
                     Some(SendAction::StopAgentAndQuit) => {
                         if let (Some(client), Some(session)) =
@@ -1362,11 +1399,23 @@ where
                         } else if let Some(handle) = agent_handle.take() {
                             handle.cancel();
                         }
-                        break;
+                        return Ok(LoopFlow::Quit);
                     }
                     Some(SendAction::NewSession) => {
                         held_turn = None;
-                        runtime_deps.begin_new_session(app, worker).await?;
+                        // A profile switched to in the TUI has its own trust
+                        // decisions; the new session waits on them.
+                        let gate = if app.is_configured() {
+                            startup_gate_check(app, app.session_manager.current_profile_id())?
+                        } else {
+                            None
+                        };
+                        if let Some(gate) = gate {
+                            enter_startup_gate(app, &gate);
+                            startup_gate = Some(gate);
+                        } else {
+                            runtime_deps.begin_new_session(app, worker).await?;
+                        }
                     }
                     Some(SendAction::LoadSession(id)) => {
                         held_turn = None;
@@ -1396,12 +1445,20 @@ where
                         restore_code,
                     }) => {
                         if agent_handle.is_none() {
-                            worker_build = Some(WorkerBuild {
-                                purpose: WorkerBuildPurpose::Session,
-                                build: runtime_deps
-                                    .rewind_conversation(app, worker, history_index, restore_code)
-                                    .await?,
-                            });
+                            match runtime_deps
+                                .rewind_conversation(app, worker, history_index, restore_code)
+                                .await
+                            {
+                                Ok(build) => {
+                                    worker_build = Some(WorkerBuild {
+                                        purpose: WorkerBuildPurpose::Session,
+                                        build,
+                                    });
+                                }
+                                Err(error) => {
+                                    app.chat.push_error(&format!("Rewind failed: {error}"));
+                                }
+                            }
                         } else {
                             app.chat.push_notice(
                                 "Wait for the current turn to finish before rewinding",
@@ -2136,6 +2193,12 @@ where
                     // SubmitOpenrouterCode is consumed inside
                     // `run_openrouter_manual`'s own event loop.
                     Some(SendAction::SubmitOpenrouterCode { .. }) | None => {}
+                }
+                Ok::<LoopFlow, anyhow::Error>(LoopFlow::Continue)
+                }
+                .await;
+                if app.settle(dispatched) == Some(LoopFlow::Quit) {
+                    break;
                 }
                 phases.event = ev_start.elapsed();
             }
@@ -2930,6 +2993,82 @@ async fn run_daemon_command(command: cli::DaemonCommand) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn repo(dir: &std::path::Path) {
+        git2::Repository::init(dir).expect("git init");
+    }
+
+    /// A May home whose `build` and `other` profile directories exist.
+    fn may_home() -> tempfile::TempDir {
+        let home = tempfile::tempdir().expect("home");
+        for profile in ["build", "other"] {
+            std::fs::create_dir_all(home.path().join("profiles").join(profile))
+                .expect("profile dir");
+        }
+        home
+    }
+
+    fn pending_trust(gate: Option<StartupGate>) -> RepoTrust {
+        match gate {
+            Some(StartupGate::RepoTrust(trust)) => trust,
+            _ => panic!("expected a repository trust gate"),
+        }
+    }
+
+    /// `may resume <id>`: the gate runs for the resumed session's profile, so
+    /// trust decided in the startup profile does not satisfy it, and the
+    /// decision is written to the session's profile.
+    #[test]
+    fn resumed_session_is_gated_against_its_own_profile() {
+        let home = may_home();
+        let cwd = tempfile::tempdir().expect("repo");
+        repo(cwd.path());
+        let startup =
+            pending_trust(gate_check(home.path(), cwd.path(), Some("build"), &[]).expect("gate"));
+        may_agent::trust::persist(
+            &startup.config_path,
+            &startup.worktree,
+            Some(&startup.kind),
+            may_agent::trust::TrustLevel::Local,
+        )
+        .expect("persist");
+        assert!(
+            gate_check(home.path(), cwd.path(), Some("build"), &[])
+                .expect("gate")
+                .is_none()
+        );
+
+        let resumed =
+            pending_trust(gate_check(home.path(), cwd.path(), Some("other"), &[]).expect("gate"));
+        assert_eq!(
+            resumed.config_path,
+            may_agent::session::MayHomePaths::new(home.path().to_path_buf())
+                .profile_home("other")
+                .workspace_config()
+        );
+    }
+
+    /// A new session after a profile switch is gated by the switched-to
+    /// profile's decisions, for repositories and plain directories alike.
+    #[test]
+    fn new_session_after_profile_switch_is_gated_against_the_new_profile() {
+        let home = may_home();
+        let plain = tempfile::tempdir().expect("dir");
+        let grant =
+            |profile| gate_check(home.path(), plain.path(), Some(profile), &[]).expect("gate");
+        let Some(StartupGate::LaunchGrant(first)) = grant("build") else {
+            panic!("expected a launch grant gate");
+        };
+        let mut config =
+            may_agent::workspace::WorkspaceConfig::load(&first.config_path).expect("load");
+        config.add_workdir(first.dir.clone(), None);
+        config.save(&first.config_path).expect("save");
+        assert!(grant("build").is_none());
+        let Some(StartupGate::LaunchGrant(switched)) = grant("other") else {
+            panic!("the switched-to profile must be gated");
+        };
+        assert!(switched.config_path.to_string_lossy().contains("other"));
+    }
 
     /// Terminal-bound tool chains poll deep enough that the pthread default
     /// (512 KiB on macOS) aborts them; workers must carry the configured stack.

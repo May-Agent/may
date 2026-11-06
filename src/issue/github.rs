@@ -948,6 +948,108 @@ mod tests {
         assert!(sent.iter().all(|(method, ..)| method == "GET"));
     }
 
+    /// `--repo OWNER/REPO` reads another GitHub repository's issues while the
+    /// session's own backend (a may store) is untouched, and a write ignores it.
+    #[tokio::test]
+    async fn view_and_list_read_another_github_repository_through_repo() {
+        use crate::agent::issue_tool::{IssueArgs, IssueTool};
+        use crate::issue::target::IssueTargets;
+        use aither_core::llm::{Tool, ToolContext};
+
+        let (api_base, requests) = mock_api(|method, path, _body| match (method, path) {
+            ("GET", "/repos/x/y/issues/7") => (200, gh_issue_json(7, "elsewhere", "open")),
+            ("GET", path) if path.starts_with("/repos/x/y/issues?") => (
+                200,
+                serde_json::json!([gh_issue_json(7, "elsewhere", "open")]),
+            ),
+            (
+                "GET",
+                "/repos/x/y/issues/7/comments?per_page=100"
+                | "/repos/x/y/issues/7/sub_issues?per_page=100"
+                | "/repos/x/y/issues/7/dependencies/blocked_by?per_page=100",
+            ) => (200, serde_json::json!([])),
+            _ => (500, serde_json::json!({"message": "unexpected request"})),
+        })
+        .await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = crate::db::ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("chat db should open");
+        let session_store = crate::issue::MayIssueStore::new(db.clone(), "session".to_string());
+        session_store
+            .create("local only", "", &[])
+            .await
+            .expect("local issue");
+        let targets = IssueTargets::new(
+            db.clone(),
+            dir.path().to_path_buf(),
+            GitHubRest::with_api_base(StaticToken, &api_base),
+        );
+        let tool = IssueTool::new(
+            session_store,
+            crate::issue::provenance::IssueProvenance::new(db, "test".to_string()),
+        )
+        .with_targets(targets);
+
+        let viewed = tool
+            .call(
+                IssueArgs::View {
+                    number: 7,
+                    repo: Some("x/y".to_string()),
+                },
+                ToolContext::new(),
+            )
+            .await
+            .expect("view another repository's issue");
+        assert!(format!("{viewed:?}").contains("elsewhere"), "{viewed:?}");
+        let listed = tool
+            .call(
+                IssueArgs::List {
+                    state: IssueListState::Open,
+                    labels: Vec::new(),
+                    limit: 10,
+                    repo: Some("x/y".to_string()),
+                },
+                ToolContext::new(),
+            )
+            .await
+            .expect("list another repository's issues");
+        let listed = format!("{listed:?}");
+        assert!(listed.contains("elsewhere") && !listed.contains("local only"));
+        let local = tool
+            .call(
+                IssueArgs::List {
+                    state: IssueListState::Open,
+                    labels: Vec::new(),
+                    limit: 10,
+                    repo: None,
+                },
+                ToolContext::new(),
+            )
+            .await
+            .expect("list the session's issues");
+        let local = format!("{local:?}");
+        assert!(local.contains("local only") && !local.contains("elsewhere"));
+        let sent = requests.lock().expect("requests").clone();
+        assert!(sent.iter().all(|(method, ..)| method == "GET"));
+        assert!(
+            sent.iter()
+                .all(|(_, path, ..)| path.starts_with("/repos/x/y/"))
+        );
+
+        let error = tool
+            .call(
+                IssueArgs::View {
+                    number: 7,
+                    repo: Some("not a repository".to_string()),
+                },
+                ToolContext::new(),
+            )
+            .await
+            .expect_err("a malformed target is refused");
+        assert!(error.to_string().contains("--repo"), "{error}");
+    }
+
     #[tokio::test]
     async fn create_get_and_relations_hit_github_api() {
         let (api_base, requests) = mock_api(|method, path, body| match (method, path) {

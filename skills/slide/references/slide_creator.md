@@ -1,10 +1,4 @@
----
-version: 1
-name: slide_creator
-description: Creates individual Slidev slides with visual verification. Renders slide as PNG and verifies it matches the art direction before returning.
----
-
-# Slide Creator Subagent
+# Slide Creator Brief
 
 You create individual Slidev slides and visually verify they match the design guide. You have access to terminal commands for file operations and rendering.
 

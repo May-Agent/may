@@ -215,8 +215,16 @@ where
         RepoSearchCollections::new(RepoSearch::global(&config.may_dir)),
     );
     let provenance = IssueProvenance::new(config.db.clone(), config.session_id.clone());
-    let mut issue_tool = IssueTool::new(config.issue_store.clone(), provenance.clone())
+    let issue_tool = IssueTool::new(config.issue_store.clone(), provenance.clone())
         .with_search(issue_search.clone());
+    let issue_targets = || {
+        crate::issue::target::IssueTargets::new(
+            config.db.clone(),
+            config.cwd.clone(),
+            crate::issue::github::GitHubRest::new(crate::issue::GhCliTokenSource),
+        )
+    };
+    let mut issue_tool = issue_tool.with_targets(issue_targets());
     if let Some(gate) = &config.publish_gate {
         issue_tool = issue_tool.with_publish_gate(gate.clone());
     }
@@ -226,8 +234,9 @@ where
     if let Some(runtime) = config.ask_user.clone() {
         issue_tool = issue_tool.with_changes(IssueChangeNotifier::new(runtime));
     }
-    let mut subagent_issue_tool =
-        SubagentIssueTool::new(config.issue_store, provenance).with_search(issue_search);
+    let mut subagent_issue_tool = SubagentIssueTool::new(config.issue_store, provenance)
+        .with_search(issue_search)
+        .with_targets(issue_targets());
     if let Some(messaging) = &config.agent_messaging {
         let owners = crate::issue::owner::IssueOwners::new(messaging.directory.clone());
         issue_tool = issue_tool.with_owners(owners.clone());
@@ -297,6 +306,11 @@ where
         cwd: config.cwd.clone(),
         session_root: config.sandbox_dir.clone(),
         workspace_config: config.workspace_config.clone(),
+        db: config.db.clone(),
+        session_id: config.session_id.clone(),
+        scratch_root: crate::session::MayHomePaths::new(config.may_dir.clone()).repo_staging_dir(),
+        host: config.git.clone(),
+        host_paths: !matches!(config.task_runtime, TaskRuntimeKind::Container),
     };
     let repo_tool = RepoTool::new(repo_context.clone());
     let subagent_repo_tool = SubagentRepoTool::new(repo_context);
@@ -423,6 +437,9 @@ where
         SubagentFileMount::new(PathBuf::from("."), config.sandbox_dir.clone()),
         SubagentFileMount::new(PathBuf::from("skills"), config.sandbox_dir.join("skills")),
     ]);
+    if let Some(guard) = &config.languages {
+        subagent_tool = subagent_tool.with_languages(guard.clone());
+    }
     if let Some(acp) = &config.acp {
         subagent_tool = acp.register(subagent_tool)?;
     }
