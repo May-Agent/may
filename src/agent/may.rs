@@ -349,6 +349,9 @@ pub struct MayAgent {
     /// The commands registered by name; `/context` counts every other row of
     /// the command table as an MCP tool.
     named_commands: Vec<String>,
+    /// The native tool definitions the agent sends with every request;
+    /// `/context` sizes them.
+    native_tools: Vec<aither_core::llm::tool::ToolDefinition>,
     runtime_system_context: RuntimeSystemContext,
     job_registry: aither_sandbox::JobRegistry,
     subagent_runs: aither_agent::specialized::SubagentRuns,
@@ -795,6 +798,7 @@ impl MayAgent {
             .iter()
             .map(|(name, _)| name.clone())
             .collect();
+        let native_tools = builder.native_tool_definitions();
         let agent = builder.build();
 
         Ok(Self {
@@ -807,6 +811,7 @@ impl MayAgent {
             model_context_window: config.model_context_window,
             context_policy: config.context_policy,
             named_commands,
+            native_tools,
             runtime_system_context,
             job_registry,
             subagent_runs,
@@ -1107,7 +1112,10 @@ impl MayAgent {
         Ok(super::context_report::ContextReport::assemble(
             &self.model_id,
             &self.provider_id,
-            &self.named_commands,
+            &super::context_report::ToolInventory {
+                named_commands: &self.named_commands,
+                native_tools: &self.native_tools,
+            },
             self.inner.context(),
             &snapshot.metrics,
             snapshot.phase,
@@ -1429,6 +1437,7 @@ pub async fn test_agent(
             model_context_window: None,
             context_policy: aither_agent::ContextPolicy::default(),
             named_commands: Vec::new(),
+            native_tools: Vec::new(),
             runtime_system_context: RuntimeSystemContext::new(
                 temp.path().join("MEMORY.md"),
                 String::new(),

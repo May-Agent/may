@@ -12,8 +12,8 @@ mod wire;
 
 pub use sse::{ServerEvent, SseParser};
 pub use wire::{
-    CreateSessionRequest, HoldReason, IndexCoverage, RecapFrame, RewindRequest, RunEnd,
-    SessionAgentBody, SessionAgentFrame, SessionIndexSnapshot, SessionIssuesFrame,
+    CreateSessionRequest, HoldReason, IndexCoverage, PermissionPollItem, RecapFrame, RewindRequest,
+    RunEnd, SessionAgentBody, SessionAgentFrame, SessionIndexSnapshot, SessionIssuesFrame,
     SessionRuntimeEvent, SessionRuntimeSnapshot, SuggestionFrame, UpdateSessionRequest,
     WireAgentError, WireAgentEvent, WirePr, WireSession,
 };

@@ -39,4 +39,7 @@ pub struct Model {
     /// JSON-serialized tool calls carried by an assistant message
     /// (`Vec<aither_core::llm::ToolCall>`).
     pub tool_calls: Option<String>,
+    /// JSON-serialized display translation of an assistant reply that was
+    /// not in the communication language (`MessageTranslation`).
+    pub translation: Option<String>,
 }
