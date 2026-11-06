@@ -1,6 +1,6 @@
 import { AlertCircle } from 'lucide-react';
 import type { TurnState } from '@/lib/stream/reducer';
-import { MessageText } from './MessageText';
+import { TranslatedText } from './TranslatedText';
 import { ReasoningBlock } from './ReasoningBlock';
 import { ToolCard } from './ToolCard';
 import { BrowserCard } from './BrowserCard';
@@ -63,9 +63,10 @@ export function AssistantTurn({
         if (segment.kind === 'text') {
           const isTail = idx === lastTextIdx;
           return (
-            <MessageText
+            <TranslatedText
               key={`t-${idx}-${segment.seq}`}
               text={segment.text}
+              translation={segment.translation}
               streaming={streaming && isTail}
               sessionId={turn.sessionId}
             />

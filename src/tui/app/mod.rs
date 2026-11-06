@@ -1687,6 +1687,10 @@ impl App {
                 MessageRole::Assistant => {
                     self.chat.push_text(&msg.content);
                     self.chat.end_text();
+                    if let Some(translation) = &msg.translation {
+                        self.chat
+                            .set_translation(translation.text.clone(), &translation.language);
+                    }
                 }
                 MessageRole::Recap => {
                     if let Ok(record) =
@@ -3886,6 +3890,9 @@ impl App {
                         self.decode_meter.note_output(chunk.len());
                         self.chat.push_text(&chunk);
                         self.input_visible = true;
+                    }
+                    AgentEvent::ReplyTranslated { text, language } => {
+                        self.chat.set_translation(text, &language);
                     }
                     AgentEvent::Reasoning(chunk) => {
                         self.activity_phase = crate::tui::ui::chat::ActivityPhase::Thinking;
