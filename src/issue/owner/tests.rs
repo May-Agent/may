@@ -53,6 +53,7 @@ impl Host {
         let targets = IssueTargets::new(
             db.clone(),
             work.path().to_path_buf(),
+            may_dir.path().join("workspace.toml"),
             GitHubRest::new(GhCliTokenSource),
         );
         let tool = IssueTool::new(store, IssueProvenance::new(db.clone(), "a1".to_string()))

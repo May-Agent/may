@@ -224,6 +224,7 @@ where
         crate::issue::target::IssueTargets::new(
             config.db.clone(),
             config.cwd.clone(),
+            crate::session::SessionPaths::new(config.sandbox_dir.clone()).workspace_config(),
             crate::issue::github::GitHubRest::new(crate::issue::GhCliTokenSource),
         )
     };

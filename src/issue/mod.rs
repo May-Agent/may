@@ -499,13 +499,9 @@ pub fn resolve_issue_store(
     db: ChatDb,
 ) -> Result<ResolvedIssueStore, IssueError> {
     let identity = repository_identity(cwd)?;
-    let config = crate::workspace::WorkspaceConfig::load(workspace_config_path)?;
-    if let Some(crate::workspace::ProjectIssues::Github { repository }) = config
-        .project_for_identity(&identity)
-        .map(|project| &project.issues)
-    {
+    if let Some(repository) = project_github_repository(&identity, workspace_config_path)? {
         return Ok(ResolvedIssueStore::GitHub(GitHubIssueStore::new(
-            repository.clone(),
+            repository,
             GhCliTokenSource,
         )));
     }
@@ -513,6 +509,31 @@ pub fn resolve_issue_store(
         db,
         identity.display().to_string(),
     )))
+}
+
+/// The GitHub repository the workspace config assigns the project with
+/// `identity`, or `None` when the project has no entry or keeps its issues
+/// locally.
+///
+/// # Errors
+/// Returns [`IssueError::WorkspaceConfig`] when the workspace config cannot
+/// be loaded.
+pub(crate) fn project_github_repository(
+    identity: &Path,
+    workspace_config_path: &Path,
+) -> Result<Option<crate::workspace::GitHubRepository>, IssueError> {
+    let config = crate::workspace::WorkspaceConfig::load(workspace_config_path)?;
+    Ok(
+        match config
+            .project_for_identity(identity)
+            .map(|project| &project.issues)
+        {
+            Some(crate::workspace::ProjectIssues::Github { repository }) => {
+                Some(repository.clone())
+            }
+            _ => None,
+        },
+    )
 }
 
 /// The repository identity an issue namespace is keyed by.
