@@ -290,6 +290,16 @@ pub async fn load_history_from_db(
                 source,
             })?
             .unwrap_or_default();
+        let translation = msg
+            .translation
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|source| PersistedMessageError::InvalidAttachments {
+                session_id: msg.session_id.clone(),
+                message_id: msg.id,
+                source,
+            })?;
 
         history.push(ChatMessage {
             id: Some(msg.id),
@@ -301,6 +311,7 @@ pub async fn load_history_from_db(
             stats,
             reasoning,
             tool_calls,
+            translation,
         });
     }
 

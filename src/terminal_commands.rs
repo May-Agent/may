@@ -416,6 +416,9 @@ where
         SubagentFileMount::new(PathBuf::from("."), config.sandbox_dir.clone()),
         SubagentFileMount::new(PathBuf::from("skills"), config.sandbox_dir.join("skills")),
     ]);
+    if let Some(guard) = &config.languages {
+        subagent_tool = subagent_tool.with_languages(guard.clone());
+    }
     if let Some(acp) = &config.acp {
         subagent_tool = acp.register(subagent_tool)?;
     }
