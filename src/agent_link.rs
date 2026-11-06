@@ -318,6 +318,7 @@ impl std::fmt::Display for AttributeText<'_> {
 #[template(path = "agent_message.txt", escape = "none")]
 struct AgentMessageText<'a> {
     sender: AttributeText<'a>,
+    sender_id: AttributeText<'a>,
     body: UntrustedText<'a>,
 }
 
@@ -370,6 +371,7 @@ impl AgentMessaging {
         let sender = status_name(&self.runtime_service, sender_session_id).await?;
         let text = AgentMessageText {
             sender: AttributeText(&sender),
+            sender_id: AttributeText(sender_session_id),
             body: UntrustedText(body),
         }
         .render()
