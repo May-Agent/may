@@ -380,6 +380,9 @@ pub struct App {
     /// The session's blocking state as the daemon last reported it on the
     /// `session_runtime` stream.
     pub session_runtime: crate::client::SessionRuntimeSnapshot,
+    /// Permission requests whose dialog was already opened, so a snapshot
+    /// that still lists an answered request does not reopen it.
+    shown_permission_requests: std::collections::HashSet<String>,
     /// Coverage of the session's worktree index, as the `session_index`
     /// stream last reported it; `None` until the first report or when the
     /// session is not in an indexed worktree.
@@ -733,6 +736,7 @@ impl App {
             secrets,
             open_question_count: 0,
             session_runtime: crate::client::SessionRuntimeSnapshot::default(),
+            shown_permission_requests: std::collections::HashSet::new(),
             index_coverage: None,
             index_failed: false,
             index_loading: false,
@@ -1896,6 +1900,39 @@ impl App {
             &mut self.parked_question,
             prompt,
         );
+    }
+
+    /// Open the dialog for the permission request the session waits on, once
+    /// per request: the runtime snapshot keeps listing a request until the
+    /// daemon's next report, so an answered one must not reopen.
+    pub fn open_waiting_permission(&mut self) {
+        if !matches!(self.mode, AppMode::Chat) {
+            return;
+        }
+        let Some(request) = &self.session_runtime.waiting_permission else {
+            return;
+        };
+        if !self.shown_permission_requests.insert(request.id.clone()) {
+            return;
+        }
+        self.mode = AppMode::PermissionConfirm(crate::tui::state::PermissionConfirmState {
+            request_id: request.id.clone(),
+            request: request.request.clone(),
+        });
+    }
+
+    /// Close the permission dialog once its request is no longer the one the
+    /// session waits on: another client answered it, or it was withdrawn.
+    pub fn close_resolved_permission(&mut self) {
+        if let AppMode::PermissionConfirm(state) = &self.mode
+            && self
+                .session_runtime
+                .waiting_permission
+                .as_ref()
+                .is_none_or(|request| request.id != state.request_id)
+        {
+            self.mode = AppMode::Chat;
+        }
     }
 
     /// `/permission` re-asks the launch directory's access decision — the
@@ -4860,5 +4897,73 @@ mod tests {
         // trailing incomplete sequence shortens the prefix.
         let buf = [b"ok".as_slice(), &[0xff], b"!", &emoji[..2]].concat();
         assert_eq!(utf8_complete_len(&buf), 4);
+    }
+
+    fn waiting_permission_snapshot(id: Option<&str>) -> AppEvent {
+        let runtime = crate::client::SessionRuntimeSnapshot {
+            waiting_permission: id.map(|id| crate::client::PermissionPollItem {
+                id: id.to_string(),
+                request: crate::session::PersistedPermissionRequestPayload {
+                    mode: crate::PermissionRequestMode::Unsafe,
+                    script: "rm -rf build".to_string(),
+                    session_id: None,
+                    agent_id: None,
+                },
+            }),
+            ..Default::default()
+        };
+        AppEvent::SessionRuntime(Box::new(crate::client::SessionRuntimeEvent {
+            session_id: "s".to_string(),
+            runtime,
+        }))
+    }
+
+    #[tokio::test]
+    async fn an_answered_permission_request_does_not_reopen_the_dialog() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _) = app_with_session(dir.path()).await;
+        app.handle_event(waiting_permission_snapshot(Some("p1")))
+            .expect("snapshot");
+        app.open_waiting_permission();
+        assert!(matches!(
+            app.mode,
+            crate::tui::AppMode::PermissionConfirm(_)
+        ));
+        let action = press(&mut app, KeyCode::Enter);
+        assert!(matches!(
+            action,
+            Some(SendAction::RespondPermission { approved: true, .. })
+        ));
+        assert!(matches!(app.mode, crate::tui::AppMode::Chat));
+        // The daemon has not reported the resolution yet: same snapshot.
+        app.open_waiting_permission();
+        assert!(
+            matches!(app.mode, crate::tui::AppMode::Chat),
+            "the stale snapshot must not reopen the answered request"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_resolved_elsewhere_closes_the_dialog() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _) = app_with_session(dir.path()).await;
+        app.handle_event(waiting_permission_snapshot(Some("p1")))
+            .expect("snapshot");
+        app.open_waiting_permission();
+        assert!(matches!(
+            app.mode,
+            crate::tui::AppMode::PermissionConfirm(_)
+        ));
+        app.handle_event(waiting_permission_snapshot(None))
+            .expect("resolved snapshot");
+        assert!(matches!(app.mode, crate::tui::AppMode::Chat));
+        // A later, different request still opens its own dialog.
+        app.handle_event(waiting_permission_snapshot(Some("p2")))
+            .expect("next snapshot");
+        app.open_waiting_permission();
+        assert!(matches!(
+            app.mode,
+            crate::tui::AppMode::PermissionConfirm(_)
+        ));
     }
 }
