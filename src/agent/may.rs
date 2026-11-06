@@ -690,6 +690,7 @@ impl MayAgent {
             builder = builder.compaction_model(compaction.llm, compaction.parameters);
         }
         let subagent_tracker = subagents.tracker;
+        let task_events = aither_agent::TaskEvents::new();
         let shared_terminal_commands = Box::pin(register_shared_terminal_commands(
             builder.tool_registry_mut(),
             SharedTerminalCommandConfig {
@@ -719,6 +720,7 @@ impl MayAgent {
                     .then_some(config.workspace_request_broker.clone()),
                 subagent_runs: subagent_runs.clone(),
                 issue_store: issue_store.clone(),
+                task_events: task_events.clone(),
                 workspace_config: workspace.config.clone(),
                 agent_messaging,
                 languages: Some(language_guard.clone()),
@@ -732,7 +734,18 @@ impl MayAgent {
         for (name, description) in &shared_terminal_commands.descriptions {
             builder = builder.tool_description(name.clone(), description.clone());
         }
-        builder = builder.fork_source(shared_terminal_commands.fork_source.clone());
+        builder = builder
+            .fork_source(shared_terminal_commands.fork_source.clone())
+            // `tasks.md` follows what the commands above record, and reads
+            // the state of the issues and PRs its rows name.
+            .task_events(task_events)
+            .work_tracker(super::work_tracker::MayWorkTracker::new(
+                issue_store.clone(),
+                config.db.clone(),
+                &config.sandbox_dir,
+                config.session_id.as_str(),
+                config.cwd.clone(),
+            ));
         if is_container {
             builder = Box::pin(builder.with_skills_readable_only(&skills_dir)).await?;
         } else {

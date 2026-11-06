@@ -95,6 +95,9 @@ pub struct PrContext {
     pub signing: crate::commit_signing::CommitSigning,
     /// GitHub REST client the GitHub backend's direct calls go through.
     pub github_api: GitHubRest<PrTokenSource>,
+    /// The main agent's `tasks.md` inbox: told when a PR opens, merges, is
+    /// rejected or closes.
+    pub task_events: Option<aither_agent::TaskEvents>,
 }
 
 /// Token source for the GitHub backend's REST client.
@@ -367,6 +370,7 @@ impl PrStore {
             .await?;
         self.event(&pr, "opened", Some(&format!("base {base_sha}")))
             .await;
+        self.task_event(&pr, aither_agent::TaskEvent::PullRequestOpened);
         if let Some(n) = external_number {
             self.event(&pr, "opened", Some(&format!("github PR #{n}")))
                 .await;
@@ -454,6 +458,7 @@ impl PrStore {
                     )
                     .await?;
                 self.event(&pr, "merged", Some(&merge_sha)).await;
+                self.task_event(&pr, aither_agent::TaskEvent::PullRequestMerged);
                 let note = self.retire_clone(&resolved, &head_sha).await?;
                 Ok(format!("merged PR #{number} as {merge_sha}{note}"))
             }
@@ -462,6 +467,7 @@ impl PrStore {
                     .update_pr(pr.id, "rejected", Some(&head_sha), None, None)
                     .await?;
                 self.event(&pr, "rejected", Some(&reason)).await;
+                self.task_event(&pr, aither_agent::TaskEvent::PullRequestRejected);
                 Err(PrError::Rejected(reason))
             }
         }
@@ -503,6 +509,7 @@ impl PrStore {
         }
         self.db()?.close_pr(pr.id).await?;
         self.event(&pr, "closed", None).await;
+        self.task_event(&pr, aither_agent::TaskEvent::PullRequestClosed);
         if resolved.record.local {
             drop_ref(
                 self.context.signing.host(),
@@ -872,6 +879,7 @@ impl PrStore {
                     .update_pr(pr.id, "merged", Some(head_sha), None, Some(now.as_str()))
                     .await?;
                 self.event(pr, "merged", Some(head_sha)).await;
+                self.task_event(pr, aither_agent::TaskEvent::PullRequestMerged);
                 self.pull_sync(&owner_repo).await;
                 let note = self.retire_clone(resolved, head_sha).await?;
                 Ok(format!("merged PR #{} upstream{note}", pr.number))
@@ -881,6 +889,7 @@ impl PrStore {
                     .update_pr(pr.id, "closed", Some(head_sha), None, None)
                     .await?;
                 self.event(pr, "closed", Some(other)).await;
+                self.task_event(pr, aither_agent::TaskEvent::PullRequestClosed);
                 Err(PrError::State(format!("upstream PR {other}")))
             }
             Err(reason) => {
@@ -1091,6 +1100,20 @@ impl PrStore {
             Ok(String::new())
         } else {
             Ok(" (the clone was kept: it holds other work)".to_string())
+        }
+    }
+
+    /// Records on the `tasks.md` inbox that `pr` changed state as `change`
+    /// says.
+    fn task_event(
+        &self,
+        pr: &crate::db::PrRow,
+        change: fn(aither_agent::WorkRef) -> aither_agent::TaskEvent,
+    ) {
+        if let Some(events) = &self.context.task_events
+            && let Ok(number) = u64::try_from(pr.number)
+        {
+            events.record(change(aither_agent::WorkRef::pull_request(number)));
         }
     }
 
@@ -1607,6 +1630,7 @@ mod tests {
                     screen: None,
                     signing: self.signing(id),
                     github_api: PrContext::default_github_api(),
+                    task_events: None,
                 },
                 self.sandbox(id).await,
             );
@@ -1668,6 +1692,7 @@ mod tests {
                         PrTokenSource::Fixed("test-token".to_string()),
                         base,
                     ),
+                    task_events: None,
                 },
                 self.sandbox(id).await,
             )
@@ -1922,6 +1947,36 @@ mod tests {
         assert!(clone.join("late.txt").exists());
     }
 
+    /// A PR the session opens and closes reaches its `tasks.md` inbox, and
+    /// the row naming it is told of each change once.
+    #[tokio::test]
+    async fn an_opened_and_closed_pr_reaches_the_tasks_inbox() {
+        use aither_agent::ContextSource;
+
+        let fx = Fixture::new().await;
+        let (mut store, clone) = fx.store("s1", None).await;
+        let events = aither_agent::TaskEvents::new();
+        store.context.task_events = Some(events.clone());
+        let sandbox = tempfile::tempdir().unwrap();
+        std::fs::write(
+            sandbox.path().join("tasks.md"),
+            "## Doing\n- #3 work, PR #1 open\n",
+        )
+        .unwrap();
+        let mut tasks = aither_agent::TasksDocument::new(sandbox.path(), 60, events);
+        tasks.on_request(false).await;
+
+        commit_file(&clone, "work.txt");
+        store.open(None, Some("work"), None, true).await.unwrap();
+        store.close(1, None).await.unwrap();
+
+        tasks.on_request(false).await;
+        let alert = tasks.on_tool_turn_end().await.expect("the row is told");
+        let text = alert.content();
+        assert_eq!(text.matches("PR #1 was opened").count(), 1, "{text}");
+        assert_eq!(text.matches("PR #1 was closed").count(), 1, "{text}");
+    }
+
     #[tokio::test]
     async fn close_drops_the_ref() {
         let fx = Fixture::new().await;
@@ -2024,6 +2079,7 @@ mod tests {
                 screen,
                 signing: fx.signing(id),
                 github_api,
+                task_events: None,
             },
             fx.sandbox(id).await,
         )
