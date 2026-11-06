@@ -475,6 +475,7 @@ export type UiEvent =
   | { kind: 'session_runtimes'; payload: SessionRuntimesPayload }
   | { kind: 'container_prepare'; payload: unknown }
   | { kind: 'remote_access'; payload: { status: RemoteAccessStatusResponse } }
+  | { kind: 'sleep'; payload: SleepStatus }
   | { kind: 'request_logs'; payload: RequestLogsResponse }
   | { kind: 'notification_mailbox'; payload: unknown }
   | { kind: 'network_access_logs'; payload: NetworkAccessLogsResponse }
@@ -705,6 +706,15 @@ export type OwnerLogin =
 export interface AcceptedLogins {
   owner: OwnerLogin;
   listed: string[];
+}
+
+/** The user's global sleep state, from the `sleep` event. */
+export interface SleepStatus {
+  asleep: boolean;
+  /** The session `/sleep` ran in, while asleep. */
+  origin: string | null;
+  /** Health reminders the daemon has raised; a client shows one when it grows. */
+  reminders: number;
 }
 
 export interface RemoteAccessStatusResponse {

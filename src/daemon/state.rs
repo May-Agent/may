@@ -433,6 +433,8 @@ pub struct DaemonState {
     /// (display, stream, input) lives in that respawnable process.
     pub(crate) computer: Arc<crate::computer::ComputerAgent>,
     pub(crate) remote_access_manager: Arc<super::remote_access::RemoteAccessManager>,
+    /// Whether the user is asleep, for every session and client.
+    pub(crate) sleep: Arc<crate::sleep::SleepState>,
     pub(crate) notification_service: Arc<crate::notification::NotificationService>,
     pub(crate) memory_processor: Option<crate::memory::MemoryProcessor>,
     pub(crate) local_url_port_mapper: Arc<LocalUrlPortMapper>,
@@ -1274,6 +1276,11 @@ impl DaemonState {
                 tokio::runtime::Handle::current(),
             )),
             tokio_handle: tokio::runtime::Handle::current(),
+            sleep: std::sync::Arc::new(crate::sleep::SleepState::load(
+                may_dir,
+                ui_event_bus.clone(),
+                db.clone(),
+            )),
             db,
             default_profile_id: "test".to_string(),
             mcp_service: McpService::spawn(crate::mcp::McpManager::new(

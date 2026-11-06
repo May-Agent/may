@@ -1,5 +1,5 @@
 import { Fragment, useCallback, useEffect, useRef, useState } from 'react';
-import { AlertCircle, AlertTriangle, ArrowDown, Loader2, RotateCw, X } from 'lucide-react';
+import { AlertCircle, AlertTriangle, ArrowDown, Loader2, Moon, RotateCw, X } from 'lucide-react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { toast } from 'sonner';
 import { isDraftSessionId, useSessionsStore } from '@/lib/stores/sessions';
@@ -21,6 +21,8 @@ import type { ApiAttachment, ApiMessage } from '@/lib/types';
 import { enqueueMessage } from '@/lib/api/chat';
 import { bashTranscript, runBash } from '@/lib/api/bash';
 import { isConfigUsable } from '@/lib/api/config';
+import { endSleep, parseSleepCommand, startSleep } from '@/lib/api/sleep';
+import { useRuntimeStore } from '@/lib/stores/runtime';
 import { cn } from '@/lib/utils';
 import { formatGroupTime, startsGroup } from '@/lib/chat/time';
 
@@ -45,6 +47,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   const watchTurns = useTurnStore((s) => s.watch);
   const config = useConfigStore((s) => s.config);
   const configLoaded = config !== null;
+  const asleep = useRuntimeStore((s) => s.sleep?.asleep ?? false);
   const navigate = useNavigate();
   const { t } = useTranslation();
 
@@ -143,6 +146,21 @@ export function ChatView({ sessionId }: { sessionId: string }) {
       const pid = profileId ?? created.profileId;
       if (pid) navigate(profileSessionPath(pid, sid), { replace: true });
     }
+    // `/sleep` and `/sleep off` are commands for the daemon, not messages:
+    // the daemon starts the good-night turn itself, and every client hears
+    // the state on the `sleep` event.
+    const sleepCommand = parseSleepCommand(content);
+    if (sleepCommand) {
+      try {
+        if (sleepCommand === 'sleep') await startSleep(sid);
+        else await endSleep();
+      } catch (err) {
+        toast.error(
+          t('sleep.failed', { message: err instanceof Error ? err.message : String(err) }),
+        );
+      }
+      return;
+    }
     // `!` prefix: bash mode — the daemon runs the command on the user's
     // behalf and returns a masked outcome; the transcript goes to the
     // agent as the next user message, like the TUI's bash mode.
@@ -223,6 +241,12 @@ export function ChatView({ sessionId }: { sessionId: string }) {
         <YoloToggle sessionId={active.id} yolo={active.runtime?.yolo ?? false} />
       )}
       <BrowserTakeoverBanner session={active} />
+      {asleep && (
+        <div className="text-muted-foreground flex items-center gap-2 px-4 py-1 text-xs sm:px-6">
+          <Moon className="size-3.5" aria-hidden />
+          {t('sleep.asleep')}
+        </div>
+      )}
       <ScrollArea
         ref={scrollerRef}
         onScroll={handleScroll}

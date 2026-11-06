@@ -566,6 +566,12 @@ export const ja: Messages = {
     stopping: '停止中…',
     loadFailed: '読み込めませんでした：{message}',
   },
+  sleep: {
+    asleep: '就寝中です。エージェントは作業を続け、質問をためておきます。/sleep off で終了します。',
+    awake: '起きています',
+    reminder: 'いつも就寝する時間です。/sleep を実行して休みましょう。',
+    failed: '就寝状態を変更できませんでした: {message}',
+  },
   yolo: {
     label: 'Yolo',
     description: 'このチャットの承認リクエストをすべて確認なしで許可する',
