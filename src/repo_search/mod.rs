@@ -209,6 +209,104 @@ fn boot_out_relocated(
     Ok(removed)
 }
 
+/// Boots out every relocated-home repo-search agent whose plist no longer
+/// exists, returning the services it removed.
+///
+/// A run killed before its daemon stopped leaves its relocated home's agents
+/// loaded after the home is deleted. Production agents are never touched.
+///
+/// # Errors
+/// Fails when the launchd state cannot be read, or `launchctl` refuses a
+/// `bootout`.
+#[cfg(target_os = "macos")]
+pub fn sweep_stale_relocated_agents() -> Result<Vec<String>, RepoSearchError> {
+    use repo_search_client::launcher::install::SystemLaunchctl;
+    use repo_search_client::launcher::launchd::domain;
+
+    sweep_stale(&mut SystemLaunchctl, &domain())
+}
+
+/// [`sweep_stale_relocated_agents`] when this process runs under a relocated
+/// `$HOME`; under the login directory nothing is swept.
+///
+/// # Errors
+/// As [`sweep_stale_relocated_agents`], or when the home cannot be read.
+#[cfg(target_os = "macos")]
+pub fn sweep_if_home_relocated() -> Result<Vec<String>, RepoSearchError> {
+    use repo_search_client::launcher::launchd::{LABEL, user_labels};
+
+    if user_labels()?.0 == LABEL {
+        return Ok(Vec::new());
+    }
+    sweep_stale_relocated_agents()
+}
+
+/// No launchd agents exist off macOS.
+///
+/// # Errors
+/// Never; the signature is the macOS variant's.
+#[cfg(not(target_os = "macos"))]
+#[allow(clippy::unnecessary_wraps)] // the macOS variant's signature
+pub const fn sweep_if_home_relocated() -> Result<Vec<String>, RepoSearchError> {
+    Ok(Vec::new())
+}
+
+/// No launchd agents exist off macOS.
+///
+/// # Errors
+/// Never; the signature is the macOS variant's.
+#[cfg(not(target_os = "macos"))]
+#[allow(clippy::unnecessary_wraps)] // the macOS variant's signature
+pub const fn sweep_stale_relocated_agents() -> Result<Vec<String>, RepoSearchError> {
+    Ok(Vec::new())
+}
+
+/// Whether `label` is a relocated home's repo-search agent: the production
+/// daemon or server label followed by `.h-` and the home's hash.
+#[cfg(target_os = "macos")]
+fn is_relocated_label(label: &str) -> bool {
+    use repo_search_client::launcher::launchd::{LABEL, SERVER_LABEL};
+
+    [LABEL, SERVER_LABEL].iter().any(|production| {
+        label
+            .strip_prefix(production)
+            .is_some_and(|rest| rest.starts_with(".h-"))
+    })
+}
+
+/// Boots out the relocated-home agents loaded in `domain` whose plist is gone.
+///
+/// An agent launchd reports no plist for is kept: nothing proves its home
+/// gone, and a live home's agent must never be removed.
+#[cfg(target_os = "macos")]
+fn sweep_stale(
+    launchctl: &mut impl repo_search_client::launcher::install::Launchctl,
+    domain: &str,
+) -> Result<Vec<String>, RepoSearchError> {
+    let launch = |error: repo_search_client::launcher::install::LaunchctlError| {
+        RepoSearchError::Launch(error.to_string())
+    };
+    let mut removed = Vec::new();
+    for label in launchctl.labels(domain).map_err(launch)? {
+        if !is_relocated_label(&label) {
+            continue;
+        }
+        let service = format!("{domain}/{label}");
+        let Some(plist) = launchctl
+            .service(&service)
+            .map_err(launch)?
+            .and_then(|loaded| loaded.path)
+        else {
+            continue;
+        };
+        if !plist.try_exists()? {
+            launchctl.bootout(&service).map_err(launch)?;
+            removed.push(service);
+        }
+    }
+    Ok(removed)
+}
+
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use std::path::Path;
@@ -216,12 +314,14 @@ mod tests {
     use repo_search_client::launcher::install::{Launchctl, LaunchctlError, Service};
     use repo_search_client::launcher::launchd::{LABEL, SERVER_LABEL, labels_for};
 
-    use super::boot_out_relocated;
+    use super::{boot_out_relocated, sweep_stale};
 
     /// A launchd holding `loaded` services, recording every `bootout`.
+    /// `plists` gives the plist launchd reports for a service, by label.
     struct Fake {
         loaded: Vec<String>,
         booted_out: Vec<String>,
+        plists: Vec<(String, std::path::PathBuf)>,
     }
 
     impl Launchctl for Fake {
@@ -230,7 +330,23 @@ mod tests {
                 .loaded
                 .iter()
                 .any(|loaded| loaded == service)
-                .then_some(Service { pid: None }))
+                .then(|| Service {
+                    pid: None,
+                    path: self
+                        .plists
+                        .iter()
+                        .find(|(label, _)| service.ends_with(label.as_str()))
+                        .map(|(_, path)| path.clone()),
+                }))
+        }
+
+        fn labels(&mut self, domain: &str) -> Result<Vec<String>, LaunchctlError> {
+            let prefix = format!("{domain}/");
+            Ok(self
+                .loaded
+                .iter()
+                .filter_map(|service| service.strip_prefix(&prefix).map(str::to_owned))
+                .collect())
         }
 
         fn bootout(&mut self, service: &str) -> Result<(), LaunchctlError> {
@@ -251,7 +367,55 @@ mod tests {
                 .map(|label| format!("user/501/{label}"))
                 .collect(),
             booted_out: Vec::new(),
+            plists: Vec::new(),
         }
+    }
+
+    #[test]
+    fn the_sweep_boots_out_only_relocated_agents_whose_plist_is_gone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let live_plist = dir.path().join("live.plist");
+        std::fs::write(&live_plist, "").expect("plist written");
+        let login = Path::new("/Users/login");
+        let (stale, stale_server) = labels_for(Path::new("/tmp/gone-home"), login);
+        let (live, _) = labels_for(Path::new("/tmp/live-home"), login);
+        let (unknown, _) = labels_for(Path::new("/tmp/unknown-home"), login);
+        let mut launchctl = fake_with(&[
+            &stale,
+            &stale_server,
+            &live,
+            &unknown,
+            LABEL,
+            SERVER_LABEL,
+            "com.example.other",
+        ]);
+        let gone = dir.path().join("gone.plist");
+        launchctl.plists = vec![
+            (stale.clone(), gone.clone()),
+            (stale_server.clone(), gone),
+            (live.clone(), live_plist),
+            // Production plists are absent too: still never touched.
+            (LABEL.to_owned(), dir.path().join("absent.plist")),
+            (SERVER_LABEL.to_owned(), dir.path().join("absent.plist")),
+        ];
+
+        let removed = sweep_stale(&mut launchctl, "user/501").expect("sweep should succeed");
+
+        assert_eq!(removed.len(), 2);
+        assert_eq!(launchctl.booted_out, removed);
+        assert!(removed.contains(&format!("user/501/{stale}")));
+        assert!(removed.contains(&format!("user/501/{stale_server}")));
+        for kept in [live.as_str(), unknown.as_str(), LABEL, SERVER_LABEL] {
+            assert!(
+                launchctl.loaded.contains(&format!("user/501/{kept}")),
+                "{kept} should stay loaded"
+            );
+        }
+        assert!(
+            launchctl
+                .loaded
+                .contains(&"user/501/com.example.other".to_owned())
+        );
     }
 
     #[test]

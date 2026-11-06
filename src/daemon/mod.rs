@@ -375,6 +375,19 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
     crate::configure_heel_binary().await;
     remove_legacy_search_index(paths.root());
 
+    // Agents of relocated homes whose runs were killed before they could
+    // retire them, swept before the daemon answers so a client never sees
+    // them. A failure leaves other homes' leftovers loaded, which must not
+    // stop this daemon, so it is logged like the retire path's.
+    match blocking::unblock(crate::repo_search::sweep_if_home_relocated).await {
+        Ok(removed) => {
+            for service in removed {
+                tracing::info!(%service, "booted out a repo-search agent of a deleted relocated home");
+            }
+        }
+        Err(error) => tracing::warn!(%error, "could not sweep stale repo-search agents"),
+    }
+
     let started = crate::daemon::start(options.mode).await?;
     let state = started.state;
     let router = Arc::new(started.router);
