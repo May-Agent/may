@@ -26,6 +26,40 @@ pub struct RunFence {
     pub run_id: String,
 }
 
+/// One-shot test gate: the next caller of [`hit`](Self::hit) reports that it
+/// arrived and then suspends forever, so a test can drop the future there.
+#[cfg(test)]
+#[derive(Debug, Clone, Default)]
+pub struct RunGate(std::sync::Arc<std::sync::Mutex<Option<async_channel::Sender<()>>>>);
+
+#[cfg(test)]
+impl RunGate {
+    /// Arm the gate; the receiver yields once a caller is suspended in it.
+    pub fn arm(&self) -> async_channel::Receiver<()> {
+        let (tx, rx) = async_channel::bounded(1);
+        *self.0.lock().expect("gate lock") = Some(tx);
+        rx
+    }
+
+    async fn hit(&self) {
+        let armed = self.0.lock().expect("gate lock").take();
+        if let Some(tx) = armed {
+            tx.send(()).await.expect("gate receiver");
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// Gates on the two awaits a dropped handler can interrupt.
+#[cfg(test)]
+#[derive(Debug, Clone, Default)]
+pub struct RunGates {
+    /// Passed after the claim is written, before its result is returned.
+    pub claim: RunGate,
+    /// Passed before the finish transaction starts.
+    pub finish: RunGate,
+}
+
 impl ChatDb {
     /// Stamp `fence`'s run id on the session's runtime row and mark it
     /// `Running`, creating the row when missing. The stamp is conditional
@@ -46,6 +80,8 @@ impl ChatDb {
         )
         .execute()
         .await?;
+        #[cfg(test)]
+        self.run_gates.claim.hit().await;
         Ok(claimed.rows_written > 0)
     }
 
@@ -88,6 +124,8 @@ impl ChatDb {
     /// # Errors
     /// Returns [`ChatDbError`] on storage failure.
     pub async fn finish_session_run(&self, fence: &RunFence) -> Result<bool, ChatDbError> {
+        #[cfg(test)]
+        self.run_gates.finish.hit().await;
         let mut tx = match self.begin_fenced(fence).await {
             Ok(tx) => tx,
             Err(ChatDbError::RunLost { .. }) => return Ok(false),

@@ -19,15 +19,15 @@
 //! ```
 
 use std::future::Future;
+use std::ops::ControlFlow;
 
 use aither_agent::{CompactResult, TimedEvent};
 use aither_core::llm::Attachment;
 use async_channel::{Receiver, Sender, unbounded};
 use executor_core::{Executor, Task};
-use futures_lite::StreamExt;
 
 use crate::MayAgent;
-use crate::agent::{ContextDump, ContextReport, RequestParameterizedModel};
+use crate::agent::{ContextDump, ContextReport, ModelSlot};
 use crate::db::{ChatDb, RunFence};
 use crate::session::{CancelReason, RunOutcome, SessionRunGuard, SessionRuns};
 
@@ -51,6 +51,8 @@ pub enum TuiEvent {
     UsageReport(crate::agent::SessionUsageReport),
     /// Assembled-context dump for `/context dump` is ready.
     ContextDump(Result<ContextDump, aither_agent::AgentError>),
+    /// The agent's effective context, read for a side request.
+    ContextMessages(Result<Vec<aither_core::llm::Message>, aither_agent::AgentError>),
     /// The daemon wrote the `/context dump` to `path`.
     ContextDumpSaved {
         /// Where the dump was written.
@@ -148,6 +150,8 @@ pub(crate) enum WorkerCommand {
     UsageReport { event_tx: Sender<TuiEvent> },
     /// Dump the assembled context for `/context dump`.
     ContextDump { event_tx: Sender<TuiEvent> },
+    /// Read the effective context as request messages.
+    ContextMessages { event_tx: Sender<TuiEvent> },
     /// Run a turn in the daemon (remote workers only).
     Send {
         turn: RemoteTurn,
@@ -174,7 +178,10 @@ pub struct AgentWorker {
     subagent_runs: Option<aither_agent::specialized::SubagentRuns>,
     /// Model clone for `/btw` side questions; `None` when the agent runs in
     /// the daemon, which answers `/btw` itself.
-    btw_llm: Option<RequestParameterizedModel<aither_cloud::CloudProvider>>,
+    btw_llm: Option<ModelSlot<crate::agent::ProviderLlm>>,
+    /// The agent's own language guard; `None` when the agent runs in the
+    /// daemon.
+    languages: Option<aither_agent::LanguageGuard>,
     /// The agent's prompt-cache entry; `None` when the agent runs in the
     /// daemon.
     warmth: Option<aither_agent::CacheWarmth>,
@@ -314,6 +321,28 @@ impl AgentWorker {
         }
     }
 
+    /// Request the agent's effective context (system prefix, handoff, kept
+    /// turns) as the messages its next request would carry. Reading changes
+    /// nothing: no runtime block is reconciled and no source is consumed.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the worker command channel is already closed — the worker
+    /// task has stopped unexpectedly.
+    #[must_use]
+    pub fn context_messages(&self) -> AgentHandle {
+        const ERR_WORKER_CHANNEL_CLOSED: &str =
+            include_str!("../texts/agent_worker_channel_closed.txt");
+        let (event_tx, event_rx) = unbounded();
+        self.command_tx
+            .try_send(WorkerCommand::ContextMessages { event_tx })
+            .unwrap_or_else(|_| panic!("{}", ERR_WORKER_CHANNEL_CLOSED.trim()));
+        AgentHandle {
+            event_rx,
+            command_tx: self.command_tx.clone(),
+        }
+    }
+
     /// Run `turn` in the daemon; only a worker from
     /// [`crate::tui::remote::spawn_remote_worker`] accepts it.
     ///
@@ -375,8 +404,15 @@ impl AgentWorker {
 
     /// Model clone for `/btw` side questions.
     #[must_use]
-    pub const fn btw_llm(&self) -> Option<&RequestParameterizedModel<aither_cloud::CloudProvider>> {
+    pub const fn btw_llm(&self) -> Option<&ModelSlot<crate::agent::ProviderLlm>> {
         self.btw_llm.as_ref()
+    }
+
+    /// The communication and working languages the agent was configured
+    /// with.
+    #[must_use]
+    pub fn languages(&self) -> Option<aither_agent::Languages> {
+        self.languages.as_ref().map(|guard| *guard.languages())
     }
 
     /// The agent's prompt-cache entry, which keeps tracking the agent's
@@ -397,6 +433,7 @@ impl AgentWorker {
             job_registry: None,
             subagent_runs: None,
             btw_llm: None,
+            languages: None,
             warmth: None,
             subagent_tracker: crate::agent::SubagentTracker::default(),
             foreign_turns: Some(foreign_turns),
@@ -478,6 +515,16 @@ pub fn spawn_worker<E: Executor + 'static>(
     spawn_idle_worker(executor, agent, snapshot_db, runs, None)
 }
 
+/// Where an idle worker reports the background commands its earlier runs
+/// detached.
+#[derive(Debug)]
+pub struct BackgroundWakes {
+    /// Receives each wake that needs the model.
+    pub wakes: Sender<aither_agent::BackgroundWake>,
+    /// The worker starts waiting on background commands once this fires.
+    pub released: crate::session::RunReleased,
+}
+
 /// Spawns a worker like [`spawn_worker`] whose idle agent also waits on the
 /// background commands its earlier runs detached; each wake that needs the
 /// model is sent on `background_wakes`.
@@ -486,12 +533,13 @@ pub fn spawn_idle_worker<E: Executor + 'static>(
     agent: MayAgent,
     snapshot_db: ChatDb,
     runs: SessionRuns,
-    background_wakes: Option<Sender<aither_agent::BackgroundWake>>,
+    background_wakes: Option<BackgroundWakes>,
 ) -> AgentWorker {
     let (command_tx, command_rx) = unbounded::<WorkerCommand>();
     let job_registry = agent.job_registry();
     let subagent_runs = agent.subagent_runs();
     let btw_llm = agent.btw_llm();
+    let languages = agent.language_guard();
     let warmth = agent.cache_warmth();
     let subagent_tracker = agent.subagent_tracker();
 
@@ -511,6 +559,7 @@ pub fn spawn_idle_worker<E: Executor + 'static>(
         job_registry: Some(job_registry),
         subagent_runs: Some(subagent_runs),
         btw_llm: Some(btw_llm),
+        languages: Some(languages),
         warmth: Some(warmth),
         subagent_tracker,
         foreign_turns: None,
@@ -525,7 +574,7 @@ async fn run_worker(
     command_tx: Sender<WorkerCommand>,
     snapshot_db: ChatDb,
     runs: SessionRuns,
-    background_wakes: Option<Sender<aither_agent::BackgroundWake>>,
+    background_wakes: Option<BackgroundWakes>,
 ) {
     loop {
         // Wait for a command; an idle session is compacted on the way, and
@@ -624,6 +673,11 @@ async fn run_worker(
                 let _ = event_tx.send(TuiEvent::ContextDump(dump)).await;
                 let _ = event_tx.send(TuiEvent::Complete).await;
             }
+            WorkerCommand::ContextMessages { event_tx } => {
+                let messages = agent.context_messages().await;
+                let _ = event_tx.send(TuiEvent::ContextMessages(messages)).await;
+                let _ = event_tx.send(TuiEvent::Complete).await;
+            }
             WorkerCommand::Send { event_tx, .. } => {
                 let _ = event_tx
                     .send(TuiEvent::Error(ERR_SEND_IN_PROCESS.to_string()))
@@ -657,7 +711,7 @@ async fn next_command(
     command_rx: &Receiver<WorkerCommand>,
     snapshot_db: &ChatDb,
     runs: &SessionRuns,
-    background_wakes: Option<&Sender<aither_agent::BackgroundWake>>,
+    background_wakes: Option<&BackgroundWakes>,
 ) -> Option<WorkerCommand> {
     loop {
         let compaction_due_in = agent.idle_compaction_due_in();
@@ -675,7 +729,13 @@ async fn next_command(
                 },
                 async {
                     match background_wakes {
-                        Some(_) => IdleStep::Background(agent.wait_background().await),
+                        Some(background) => {
+                            // A job finishing before the run that parked the
+                            // agent released the session would wake a host
+                            // that finds the session held.
+                            background.released.wait().await;
+                            IdleStep::Background(agent.wait_background().await)
+                        }
                         None => std::future::pending().await,
                     }
                 },
@@ -688,9 +748,9 @@ async fn next_command(
                 // The wake is recorded in the agent's context; a wake that
                 // needs the model asks the host for a run.
                 if wake.needs_model
-                    && let Some(wakes) = background_wakes
+                    && let Some(background) = background_wakes
                 {
-                    let _ = wakes.try_send(wake);
+                    let _ = background.wakes.try_send(wake);
                 }
             }
             IdleStep::Compact => {
@@ -804,7 +864,8 @@ async fn race_against_commands<F: Future>(
                 | WorkerCommand::Release { .. }
                 | WorkerCommand::ContextReport { .. }
                 | WorkerCommand::UsageReport { .. }
-                | WorkerCommand::ContextDump { .. } => deferred.push(command),
+                | WorkerCommand::ContextDump { .. }
+                | WorkerCommand::ContextMessages { .. } => deferred.push(command),
                 WorkerCommand::Compact { event_tx, .. } => {
                     let _ = event_tx
                         .send(TuiEvent::Error(ERR_WORKER_BUSY.trim().to_string()))
@@ -894,40 +955,54 @@ async fn run_agent_prompt(
         lease,
     } = run;
     agent.sync_runtime_context().await;
-    let mut stream = agent.run_with_hidden_context(&prompt, hidden_context.as_deref(), attachments);
-
-    loop {
-        // Race between the next stream event, a cancel command and the lease
-        match race_against_commands(
-            until_stopped(stream.next(), &lease.cancellation),
-            command_rx,
-            command_tx,
-        )
-        .await
-        {
-            WorkOutcome::Finished(StopRace::Done(Some(result))) => {
-                if event_tx.send(TuiEvent::Agent(result)).await.is_err() {
-                    // Receiver dropped, stop processing
-                    return WorkOutcome::Cancelled;
-                }
+    let run = agent.run_with_hidden_context(&prompt, hidden_context.as_deref(), attachments);
+    // The run stops between events on the lease's cancellation; a cancel
+    // command drops it where it stands.
+    let driven = run.drive(
+        event_tx,
+        async {
+            let _ = lease.cancellation.recv().await;
+            PromptStop::Stopped
+        },
+        |event_tx, timed| async move {
+            if event_tx.send(TuiEvent::Agent(Ok(timed))).await.is_err() {
+                ControlFlow::Break(PromptStop::ReceiverGone)
+            } else {
+                ControlFlow::Continue(event_tx)
             }
-            WorkOutcome::Finished(StopRace::Done(None)) => {
-                drop(stream);
-                persist_snapshot(snapshot_db, &lease.fence, agent).await;
-                let _ = event_tx.send(TuiEvent::Complete).await;
-                return WorkOutcome::Finished(());
-            }
-            WorkOutcome::Finished(StopRace::Stopped) | WorkOutcome::Cancelled => break,
-            WorkOutcome::Shutdown => {
-                let _ = event_tx.send(TuiEvent::Complete).await;
-                return WorkOutcome::Shutdown;
-            }
+        },
+    );
+    match race_against_commands(driven, command_rx, command_tx).await {
+        WorkOutcome::Finished(Ok(ControlFlow::Continue(_))) => {}
+        WorkOutcome::Finished(Err(error)) => {
+            let _ = event_tx.send(TuiEvent::Agent(Err(error))).await;
+        }
+        // Receiver dropped: nobody is left to tell.
+        WorkOutcome::Finished(Ok(ControlFlow::Break(PromptStop::ReceiverGone))) => {
+            return WorkOutcome::Cancelled;
+        }
+        WorkOutcome::Finished(Ok(ControlFlow::Break(PromptStop::Stopped)))
+        | WorkOutcome::Cancelled => {
+            // Completion after cancel lets the TUI know processing stopped.
+            let _ = event_tx.send(TuiEvent::Complete).await;
+            return WorkOutcome::Cancelled;
+        }
+        WorkOutcome::Shutdown => {
+            let _ = event_tx.send(TuiEvent::Complete).await;
+            return WorkOutcome::Shutdown;
         }
     }
-
-    // Send completion after cancel so TUI knows processing stopped
+    persist_snapshot(snapshot_db, &lease.fence, agent).await;
     let _ = event_tx.send(TuiEvent::Complete).await;
-    WorkOutcome::Cancelled
+    WorkOutcome::Finished(())
+}
+
+/// Why a prompt's run stopped before it finished.
+enum PromptStop {
+    /// The lease's cancellation stopped it.
+    Stopped,
+    /// The TUI's event receiver is gone.
+    ReceiverGone,
 }
 
 #[cfg(test)]
@@ -992,13 +1067,16 @@ mod tests {
             }
         });
 
-        let llm = crate::agent::RequestParameterizedModel::new(
-            aither_cloud::CloudProvider::OpenAI(
-                aither_cloud::openai::OpenAI::builder("test-key")
-                    .base_url(format!("http://{addr}"))
-                    .model("gpt-5")
-                    .no_retry()
-                    .build(),
+        let llm = crate::agent::ModelSlot::new(
+            crate::agent::RedactedModel::new(
+                aither_cloud::CloudProvider::OpenAI(
+                    aither_cloud::openai::OpenAI::builder("test-key")
+                        .base_url(format!("http://{addr}"))
+                        .model("gpt-5")
+                        .no_retry()
+                        .build(),
+                ),
+                crate::secrets::SecretRedactor::new(std::path::Path::new("/nonexistent")),
             ),
             aither_core::llm::model::Parameters::default(),
         );

@@ -16,9 +16,10 @@ pub use hosts::{BtwMessage, BtwRequest, BtwResponse, CompactResponse, ContextDum
 pub use hosts::{
     ParkedAgents, btw, compact_session, context_dump, context_report, release_agent, usage_report,
 };
-pub use hub::{TurnFrame, TurnHub};
+pub use hub::{TurnFrame, TurnHub, TurnSubscription};
 pub use recap::{RecapRecord, RecapSchedules, recap_session};
 mod tool_dispatch;
+mod turn_events;
 mod turn_persister;
 #[cfg(test)]
 mod warm_aux_tests;
@@ -29,12 +30,12 @@ use self::tool_dispatch::{
 };
 
 use std::future::Future;
+use std::ops::ControlFlow;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use askama::Template;
-use futures_lite::StreamExt;
 use serde::Serialize;
 use skyzen::Result as SkyResult;
 use skyzen::utils::{Json, State};
@@ -947,6 +948,20 @@ async fn clear_terminal_runtime_state(
         .map(|_| ())
 }
 
+/// Dispatches the prompts task runs stored for their sessions, one wake per
+/// stored prompt, the way a message from another agent is dispatched.
+pub(super) fn spawn_task_wake_dispatcher(
+    state: Arc<DaemonState>,
+    wakes: async_channel::Receiver<String>,
+) {
+    let tokio_handle = state.tokio_handle.clone();
+    tokio_handle.spawn(async move {
+        while let Ok(session_id) = wakes.recv().await {
+            spawn_follow_up_runs(state.clone(), session_id);
+        }
+    });
+}
+
 pub(super) fn spawn_follow_up_runs(state: Arc<DaemonState>, session_id: String) {
     let tokio_handle = state.tokio_handle.clone();
     tokio_handle.spawn(async move {
@@ -974,6 +989,9 @@ fn spawn_continued_run(state: Arc<DaemonState>, guard: SessionRunGuard) {
 /// until the queue is empty and finishing the guard finds no new work.
 async fn dispatch_follow_ups(state: Arc<DaemonState>, mut guard: SessionRunGuard) {
     let session_id = guard.session_id().to_string();
+    // Whether the newest turn ran to completion, so the session is idle
+    // once the queue drains.
+    let mut last_turn_completed = false;
     loop {
         let next = match state
             .runtime_service
@@ -993,7 +1011,12 @@ async fn dispatch_follow_ups(state: Arc<DaemonState>, mut guard: SessionRunGuard
                     guard = continued;
                     continue;
                 }
-                Ok(None) => return,
+                Ok(None) => {
+                    if last_turn_completed {
+                        session_became_idle(&state, &session_id);
+                    }
+                    return;
+                }
                 Err(error) => {
                     tracing::error!(session_id = %session_id, error = %error, "failed to release session run after follow-up dispatch");
                     return;
@@ -1009,7 +1032,7 @@ async fn dispatch_follow_ups(state: Arc<DaemonState>, mut guard: SessionRunGuard
             delivery_mode: next.delivery_mode,
             pending_entry_id: next.id,
         };
-        if let Err(error) = Box::pin(run_chat_collect_with_receiver(
+        match Box::pin(run_chat_collect_with_receiver(
             state.clone(),
             request,
             true,
@@ -1018,9 +1041,12 @@ async fn dispatch_follow_ups(state: Arc<DaemonState>, mut guard: SessionRunGuard
         ))
         .await
         {
-            tracing::warn!(session_id = %session_id, error = %error, "follow-up run failed");
-            finish_failed_run(guard).await;
-            return;
+            Ok(end) => last_turn_completed = end == TurnEnd::Completed,
+            Err(error) => {
+                tracing::warn!(session_id = %session_id, error = %error, "follow-up run failed");
+                finish_failed_run(guard).await;
+                return;
+            }
         }
     }
 }
@@ -1185,6 +1211,24 @@ async fn schedule_browser_takeover_resume(
             crate::session::PendingUserMessageMode::Steer,
         )
         .await
+}
+
+/// Persist a finished tool call's span for the `/usage` wall-clock split.
+async fn record_tool_interval(
+    state: &Arc<DaemonState>,
+    session_id: &str,
+    started: jiff::Timestamp,
+    ended: jiff::Timestamp,
+) {
+    let Some(interval) =
+        crate::agent::Interval::new(started.as_millisecond(), ended.as_millisecond())
+    else {
+        tracing::warn!(session_id, "tool call ended before it started");
+        return;
+    };
+    if let Err(error) = state.db().append_tool_interval(session_id, interval).await {
+        tracing::warn!(error = %error, "failed to persist tool interval");
+    }
 }
 
 async fn record_request_log(state: &Arc<DaemonState>, entry: RequestLogEntry) {
@@ -1377,9 +1421,7 @@ pub(super) async fn run_bash(
         .await
         .map_err(internal_error)?
         .ok_or_else(|| super::error::bad_request_error("session not found"))?;
-    let cwd = session
-        .cwd
-        .map_or_else(|| state.cwd.clone(), std::path::PathBuf::from);
+    let cwd = crate::session::SessionDirectory::of(&session, &state.may_dir).into_path();
     let secrets = crate::secrets::Secrets::load(
         &crate::secrets::SecretStore::new(&state.may_dir),
         state.config.load().as_ref(),
@@ -1458,6 +1500,70 @@ pub(super) fn spawn_shared_tool_dispatchers(state: Arc<DaemonState>, queues: UiT
     });
 }
 
+/// What one attempt's run starts from.
+struct TurnRun<'r> {
+    prompt: &'r str,
+    hidden_context: Option<&'r str>,
+    attachments: Vec<LlmAttachment>,
+    /// Set once a retry follows tool activity: the attempt continues the
+    /// committed transcript instead of resubmitting the prompt.
+    continue_from_transcript: bool,
+    attempt: usize,
+}
+
+/// Runs one attempt of a turn on `agent`, handing each event to `turn`
+/// while the run keeps going; `Err` is why the run stopped before it
+/// finished. The run's cancellation stops it between events.
+async fn drive_turn<S: ChatSink>(
+    turn: &mut turn_events::TurnEvents<'_, '_, S>,
+    agent: &mut MayAgent,
+    kind: &TurnKind,
+    run: TurnRun<'_>,
+) -> Result<(), turn_events::TurnStop> {
+    let guard = turn.guard;
+    let stop = async {
+        turn_events::TurnStop::Cancelled(cancellation_reason_of(&guard.cancellation().recv().await))
+    };
+    let driven = match kind {
+        TurnKind::Prompt if !run.continue_from_transcript => {
+            agent
+                .run_with_hidden_context(run.prompt, run.hidden_context, run.attachments)
+                .drive(&mut *turn, stop, turn_events::step)
+                .await
+        }
+        TurnKind::Prompt | TurnKind::Resume(_) => {
+            // The wake events reach clients with the first attempt only; a
+            // retry would show them twice.
+            if let TurnKind::Resume(wake_events) = kind
+                && run.attempt == 0
+            {
+                for timed in wake_events.iter().cloned() {
+                    if let ControlFlow::Break(stop) = turn.handle(timed).await {
+                        return Err(stop);
+                    }
+                }
+            }
+            agent
+                .resume()
+                .drive(&mut *turn, stop, turn_events::step)
+                .await
+        }
+    };
+    match driven {
+        Ok(ControlFlow::Continue(_)) => Ok(()),
+        Ok(ControlFlow::Break(stop)) => Err(stop),
+        Err(error) => {
+            // The failure closes an open reasoning phase before clients see
+            // it, like any visible output.
+            if let ControlFlow::Break(stop) = turn.close_reasoning_phase().await {
+                return Err(stop);
+            }
+            turn.sink.on_agent_event(Err(&error));
+            Err(turn_events::TurnStop::Failed(error))
+        }
+    }
+}
+
 /// Shared agent event loop used by both streaming and non-streaming chat.
 ///
 /// Handles: retry logic, agent event processing, history persistence,
@@ -1477,6 +1583,10 @@ fn run_agent_loop<'a>(
     kind: &'a TurnKind,
 ) -> Pin<Box<impl Future<Output = Result<AgentRunResult, AgentLoopError>> + 'a>> {
     Box::pin(async move {
+        // Whatever path started the turn, it supersedes the on-screen
+        // suggestion and the idle-recap timer.
+        suggest::cancel(state, &req.session_id);
+        recap::unarm(state, &req.session_id);
         let mut attempt = 0usize;
         // The provider candidate the next attempt builds on, how many
         // candidates there are, and how many retries the current one had.
@@ -1506,6 +1616,10 @@ fn run_agent_loop<'a>(
         // the committed transcript with `resume` instead of resubmitting
         // the prompt.
         let mut continue_from_transcript = false;
+        // A resumed turn exists only for what the agent it took collected,
+        // and it never fails over (it has one provider candidate): a retry
+        // waits and continues with that same agent.
+        let mut retained_agent: Option<MayAgent> = None;
 
         loop {
             let assistant_id = format!("assistant-{}", crate::id::new());
@@ -1551,6 +1665,7 @@ fn run_agent_loop<'a>(
                     } else {
                         Some(turn_boundary)
                     },
+                    retained_agent: retained_agent.take(),
                 },
                 kind,
             )
@@ -1600,45 +1715,17 @@ fn run_agent_loop<'a>(
                     .and_then(aither_models::ModelEntry::max_input_tokens)
             });
 
-            // The newest request's usage: the context the window holds now.
-            let mut usage = Usage::default();
-            let mut ledger = request_ledger::RequestLedger::new(
-                session_id.as_str(),
-                &current_model,
-                &provider_id,
-                model_context_window,
-                Instant::now(),
-            );
-            let mut decode_meter = DecodeMeter::default();
-            let mut last_speed_emit: Option<Instant> = None;
-            let mut segment_text = String::new(); // current text segment, flushed on tool calls
-            // Emission time of the newest text chunk in `segment_text`.
-            let mut segment_at: Option<jiff::Timestamp> = None;
-            // Emission time of the newest agent event.
-            let mut last_event_at: Option<jiff::Timestamp> = None;
-            let mut full_text = String::new(); // accumulated full assistant text
-            let mut reasoning_text = String::new();
-            let mut terminal_snapshot = TerminalStateSnapshot::default();
-            let mut saw_tool_activity = false;
-            let mut tool_arguments_by_id: std::collections::HashMap<String, String> =
-                std::collections::HashMap::new();
-            let mut pending_tool_streams: std::collections::HashMap<String, PendingToolStream> =
-                std::collections::HashMap::new();
-            let mut last_todo_hash: Option<u64> = None;
             let session_paths =
                 session_paths_for_session(state, profile_id.as_deref(), &session_id);
-            let mut turn_persister = turn_persister::TurnPersister::new(guard.fence().clone());
-
-            let mut terminal_error: Option<aither_agent::AgentError> = None;
-            let mut cancellation_reason: Option<&'static str> = None;
-            let mut browser_takeover_paused = false;
-            let mut first_agent_event_seen = false;
-            let mut first_visible_tool_seen = false;
-            let mut first_text_seen = false;
-            // `Some` while a model call is in its reasoning phase: the instant
-            // the phase began, measured as user-perceived wait. Armed only
-            // when the request asked the provider for reasoning text, and
-            // re-armed at every tool-result boundary.
+            let tasks_accepted = match session_paths.tasks_content().await {
+                Ok(content) => content,
+                Err(error) => {
+                    tracing::warn!(%error, "failed to read session tasks.md");
+                    None
+                }
+            };
+            // The reasoning phase is armed only when the request asked the
+            // provider for reasoning text.
             let reasoning_display = crate::agent::reasoning_text_requested(
                 state
                     .config
@@ -1649,397 +1736,87 @@ fn run_agent_loop<'a>(
                 crate::model_selector::selector_model_id(&current_model),
                 reasoning_effort,
             );
-            let mut reasoning_phase = reasoning_display.then_some(started_at);
-            {
-                agent.sync_runtime_context().await;
-                let mut stream = match kind {
-                    TurnKind::Prompt if !continue_from_transcript => {
-                        futures_util::future::Either::Left(agent.run_with_hidden_context(
-                            &prompt,
-                            turn_hidden_context_xml.as_deref(),
-                            attachments,
-                        ))
-                    }
-                    _ => {
-                        let wake_events = match kind {
-                            TurnKind::Resume(wake_events) => wake_events.clone(),
-                            TurnKind::Prompt => Vec::new(),
-                        };
-                        futures_util::future::Either::Right(futures_lite::StreamExt::chain(
-                            futures_lite::stream::iter(wake_events.into_iter().map(Ok)),
-                            agent.resume(),
-                        ))
-                    }
-                };
-                loop {
-                    let next_event = tokio::select! {
-                        biased;
-                        cancel = guard.cancellation().recv() => {
-                            cancellation_reason = Some(match cancel {
-                                Ok(CancelReason::User) => "run cancelled by user",
-                                Ok(CancelReason::DaemonRestarting) => {
-                                    "run interrupted: the daemon is restarting"
-                                }
-                                Err(_) => "run cancellation channel closed unexpectedly",
-                            });
-                            None
-                        }
-                        next = stream.next() => next,
-                    };
-                    let Some(event) = next_event else {
-                        break;
-                    };
-                    let event = event.map(|timed| {
-                        last_event_at = Some(timed.at);
-                        (timed.at, timed.event)
-                    });
-                    let event_at = event.as_ref().ok().map(|(at, _)| *at);
-                    // The first visible output of a call closes the pending
-                    // reasoning phase; its marker goes out before the event.
-                    if reasoning_phase.is_some()
-                        && event
-                            .as_ref()
-                            .map_or(true, |(_, event)| closes_reasoning_phase(event))
-                        && let Some(started) = reasoning_phase.take()
-                        && !sink.on_reasoning_end(started.elapsed().as_secs_f64()).await
-                    {
-                        cancellation_reason = Some("client disconnected during reasoning end");
-                        break;
-                    }
-                    sink.on_agent_event(event.as_ref().map(|(_, event)| event));
-                    match event.map(|(_, event)| event) {
-                        Ok(aither_agent::AgentEvent::Reasoning(text)) => {
-                            log_first_agent_event(
-                                &mut first_agent_event_seen,
-                                &started_at,
-                                session_id.as_str(),
-                                assistant_id.as_str(),
-                                "reasoning",
-                            );
-                            reasoning_text.push_str(&text);
-                            if !sink.on_reasoning(&text).await {
-                                cancellation_reason =
-                                    Some("client disconnected during reasoning stream");
-                                break;
-                            }
-                            decode_meter.note_output(text.len());
-                            if !emit_speed(sink, &decode_meter, &mut last_speed_emit).await {
-                                cancellation_reason =
-                                    Some("client disconnected during reasoning stream");
-                                break;
-                            }
-                        }
-                        Ok(aither_agent::AgentEvent::Text(text)) => {
-                            log_first_agent_event(
-                                &mut first_agent_event_seen,
-                                &started_at,
-                                session_id.as_str(),
-                                assistant_id.as_str(),
-                                "text",
-                            );
-                            log_first_text_event(
-                                &mut first_text_seen,
-                                &started_at,
-                                session_id.as_str(),
-                                assistant_id.as_str(),
-                            );
-                            segment_text.push_str(&text);
-                            segment_at = event_at;
-                            full_text.push_str(&text);
-                            if !sink.on_text(&text).await {
-                                cancellation_reason =
-                                    Some("client disconnected during text stream");
-                                break;
-                            }
-                            decode_meter.note_output(text.len());
-                            if !emit_speed(sink, &decode_meter, &mut last_speed_emit).await {
-                                cancellation_reason =
-                                    Some("client disconnected during text stream");
-                                break;
-                            }
-                        }
-                        Ok(aither_agent::AgentEvent::Usage(u)) => {
-                            decode_meter.note_usage(u.completion_tokens);
-                            record_request_log(state, ledger.completed(&u, Instant::now())).await;
-                            usage = u;
-                        }
-                        Ok(aither_agent::AgentEvent::ToolCallDelta {
-                            id,
-                            name,
-                            arguments_fragment,
-                        }) => {
-                            log_first_agent_event(
-                                &mut first_agent_event_seen,
-                                &started_at,
-                                session_id.as_str(),
-                                assistant_id.as_str(),
-                                "tool_delta",
-                            );
-                            tracing::trace!(
-                                target: "may::chat::tool_delta",
-                                id = %id,
-                                name = %name,
-                                fragment = %arguments_fragment,
-                                "incoming ToolCallDelta from aither"
-                            );
-                            decode_meter.note_output(arguments_fragment.len());
-                            if !emit_speed(sink, &decode_meter, &mut last_speed_emit).await {
-                                cancellation_reason =
-                                    Some("client disconnected during tool stream");
-                                break;
-                            }
-                            match normalize_tool_delta_for_sink(
-                                &mut pending_tool_streams,
-                                &id,
-                                &name,
-                                &arguments_fragment,
-                            ) {
-                                SinkToolEvent::Start {
-                                    id,
-                                    name,
-                                    arguments,
-                                } => {
-                                    log_first_visible_tool_event(
-                                        &mut first_visible_tool_seen,
-                                        &started_at,
-                                        session_id.as_str(),
-                                        assistant_id.as_str(),
-                                        id.as_str(),
-                                        name.as_str(),
-                                        "synthetic_start_from_delta",
-                                    );
-                                    let summary = project_tool_summary_for_sink(
-                                        &pending_tool_streams,
-                                        &id,
-                                        &name,
-                                        Some(arguments.as_str()),
-                                    );
-                                    if !sink.on_tool_start(&id, &name, &arguments, summary).await {
-                                        cancellation_reason =
-                                            Some("client disconnected during tool stream");
-                                        break;
-                                    }
-                                }
-                                SinkToolEvent::Delta {
-                                    id,
-                                    name,
-                                    arguments_fragment,
-                                } => {
-                                    let summary = project_tool_summary_for_sink(
-                                        &pending_tool_streams,
-                                        &id,
-                                        &name,
-                                        None,
-                                    );
-                                    if !sink
-                                        .on_tool_delta(&id, &name, &arguments_fragment, summary)
-                                        .await
-                                    {
-                                        cancellation_reason =
-                                            Some("client disconnected during tool stream");
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        Ok(aither_agent::AgentEvent::ToolCallStart {
-                            id,
-                            name,
-                            arguments,
-                        }) => {
-                            log_first_agent_event(
-                                &mut first_agent_event_seen,
-                                &started_at,
-                                session_id.as_str(),
-                                assistant_id.as_str(),
-                                "tool_start",
-                            );
-                            saw_tool_activity = true;
-                            // Args that never streamed as deltas still count
-                            // as decoded output.
-                            let streamed = pending_tool_streams
-                                .get(&id)
-                                .map_or(0, |pending| pending.buffered_arguments.len());
-                            decode_meter.note_output(arguments.len().saturating_sub(streamed));
-                            decode_meter.note_boundary();
-                            if matches!(
-                                name.as_str(),
-                                "terminal" | "terminal_input" | "terminal_kill" | "terminal_read"
-                            ) {
-                                mark_run_running(state, guard.fence()).await?;
-                            }
-                            // Buffer accumulated text segment before the tool call.
-                            if !segment_text.trim().is_empty() {
-                                turn_persister.push_assistant(
-                                    segment_text.clone(),
-                                    segment_emitted_at(segment_at),
-                                );
-                                segment_text.clear();
-                            }
-
-                            let record = ToolEventRecord::Start {
-                                id: id.clone(),
-                                name: name.clone(),
-                                arguments: arguments.clone(),
-                            };
-                            let serialized = serde_json::to_string(&record)
-                                .map_err(|e| crate::db::ChatDbError::Storage(e.to_string()))?;
-                            turn_persister.push_tool_event(
-                                id.clone(),
-                                serialized,
-                                event_at.expect("tool events come from the agent stream"),
-                            );
-                            update_terminal_snapshot_from_tool_event(
-                                &mut terminal_snapshot,
-                                &record,
-                            );
-                            tool_arguments_by_id.insert(id.clone(), arguments.clone());
-                            if let Some(SinkToolEvent::Start {
-                                id,
-                                name,
-                                arguments,
-                            }) = normalize_tool_start_for_sink(
-                                &mut pending_tool_streams,
-                                &id,
-                                &name,
-                                &arguments,
-                            ) {
-                                log_first_visible_tool_event(
-                                    &mut first_visible_tool_seen,
-                                    &started_at,
-                                    session_id.as_str(),
-                                    assistant_id.as_str(),
-                                    id.as_str(),
-                                    name.as_str(),
-                                    "canonical_start",
-                                );
-                                let summary = project_tool_summary_for_sink(
-                                    &pending_tool_streams,
-                                    &id,
-                                    &name,
-                                    Some(arguments.as_str()),
-                                );
-                                if !sink.on_tool_start(&id, &name, &arguments, summary).await {
-                                    cancellation_reason =
-                                        Some("client disconnected during tool stream");
-                                    break;
-                                }
-                            }
-                        }
-                        Ok(aither_agent::AgentEvent::ToolCallEnd { id, name, result }) => {
-                            log_first_agent_event(
-                                &mut first_agent_event_seen,
-                                &started_at,
-                                session_id.as_str(),
-                                assistant_id.as_str(),
-                                "tool_end",
-                            );
-                            saw_tool_activity = true;
-                            let record = ToolEventRecord::End {
-                                id: id.clone(),
-                                name: name.clone(),
-                                result: result.clone(),
-                            };
-                            let serialized = serde_json::to_string(&record)
-                                .map_err(|e| crate::db::ChatDbError::Storage(e.to_string()))?;
-                            turn_persister.push_tool_event(
-                                id.clone(),
-                                serialized,
-                                event_at.expect("tool events come from the agent stream"),
-                            );
-                            update_terminal_snapshot_from_tool_event(
-                                &mut terminal_snapshot,
-                                &record,
-                            );
-                            let arguments = tool_arguments_by_id.remove(&id);
-                            let summary = project_tool_summary_for_sink(
-                                &pending_tool_streams,
-                                &id,
-                                &name,
-                                arguments.as_deref(),
-                            );
-                            pending_tool_streams.remove(&id);
-                            if !sink
-                                .on_tool_end(&id, &name, arguments.as_deref(), &result, summary)
-                                .await
-                            {
-                                cancellation_reason =
-                                    Some("client disconnected during tool stream");
-                                break;
-                            }
-
-                            // Check if tasks.md changed after tool execution.
-                            if let Some(checklist) =
-                                check_tasks_update(&session_paths, &mut last_todo_hash).await
-                                && !sink.on_todo_update(&checklist).await
-                            {
-                                cancellation_reason =
-                                    Some("client disconnected during todo update");
-                                break;
-                            }
-                            // A tool result is the boundary after which the
-                            // next call may reason again.
-                            reasoning_phase = reasoning_display.then(Instant::now);
-                        }
-                        Ok(aither_agent::AgentEvent::BackgroundTaskStarted {
-                            task_id,
-                            output_preview,
-                            output_file,
-                        }) => {
-                            saw_tool_activity = true;
-                            set_terminal_runtime_state(
-                                state,
-                                session_id.as_str(),
-                                TerminalRuntimeState {
-                                    task_id: Some(task_id),
-                                    output_file: Some(output_file),
-                                    output_preview: Some(output_preview),
-                                    input_notice: None,
-                                },
-                            )
-                            .await?;
-                        }
-                        // A reply without tool calls that the run follows
-                        // with another reply is stored as a message of its
-                        // own.
-                        Ok(
-                            aither_agent::AgentEvent::BuiltInToolResult { .. }
-                            | aither_agent::AgentEvent::RunResumed { .. },
-                        ) => {
-                            // Delivered tool output / a resumed run arms the
-                            // next call's reasoning phase.
-                            reasoning_phase = reasoning_display.then(Instant::now);
-                        }
-                        Ok(aither_agent::AgentEvent::TurnComplete {
-                            has_tool_calls: false,
-                            ..
-                        }) => {
-                            if !segment_text.trim().is_empty() {
-                                turn_persister.push_assistant(
-                                    segment_text.clone(),
-                                    segment_emitted_at(segment_at),
-                                );
-                                segment_text.clear();
-                            }
-                        }
-                        Ok(aither_agent::AgentEvent::BackgroundTaskCompleted { .. }) => {
-                            saw_tool_activity = true;
-                            reasoning_phase = reasoning_display.then(Instant::now);
-                            clear_terminal_runtime_state(state, session_id.as_str()).await?;
-                            mark_run_running(state, guard.fence()).await?;
-                        }
-                        Ok(aither_agent::AgentEvent::Error(err)) | Err(err) => {
-                            terminal_error = Some(err);
-                            break;
-                        }
-                        Ok(_) => {}
-                    }
-
-                    if is_takeover_active_for_session(state, &session_id).await {
-                        browser_takeover_paused = true;
-                        break;
-                    }
+            let mut turn = turn_events::TurnEvents {
+                state,
+                guard,
+                sink: &mut *sink,
+                session_id: &session_id,
+                assistant_id: assistant_id.as_str(),
+                session_paths: &session_paths,
+                started_at,
+                reasoning_display,
+                reasoning_phase: reasoning_display.then_some(started_at),
+                provider_id: &provider_id,
+                model: &current_model,
+                request_prefix: None,
+                usage: Usage::default(),
+                ledger: request_ledger::RequestLedger::new(
+                    session_id.as_str(),
+                    &current_model,
+                    &provider_id,
+                    model_context_window,
+                    Instant::now(),
+                ),
+                decode_meter: DecodeMeter::default(),
+                last_speed_emit: None,
+                segment_text: String::new(),
+                segment_at: None,
+                last_event_at: None,
+                full_text: String::new(),
+                reasoning_text: String::new(),
+                terminal_snapshot: TerminalStateSnapshot::default(),
+                saw_tool_activity: false,
+                tool_arguments_by_id: std::collections::HashMap::new(),
+                tool_started_at: std::collections::HashMap::new(),
+                pending_tool_streams: std::collections::HashMap::new(),
+                last_todo_hash: None,
+                tasks_accepted,
+                turn_persister: turn_persister::TurnPersister::new(guard.fence().clone()),
+                first_agent_event_seen: false,
+                first_visible_tool_seen: false,
+                first_text_seen: false,
+            };
+            agent.sync_runtime_context().await;
+            let stopped = drive_turn(
+                &mut turn,
+                &mut agent,
+                kind,
+                TurnRun {
+                    prompt: &prompt,
+                    hidden_context: turn_hidden_context_xml.as_deref(),
+                    attachments,
+                    continue_from_transcript,
+                    attempt,
+                },
+            )
+            .await;
+            let turn_events::TurnEvents {
+                sink: _,
+                usage,
+                mut ledger,
+                mut decode_meter,
+                segment_text,
+                segment_at,
+                last_event_at,
+                full_text,
+                reasoning_text,
+                mut terminal_snapshot,
+                saw_tool_activity,
+                mut turn_persister,
+                mut reasoning_phase,
+                ..
+            } = turn;
+            let mut terminal_error: Option<aither_agent::AgentError> = None;
+            let mut cancellation_reason: Option<&'static str> = None;
+            let mut browser_takeover_paused = false;
+            match stopped {
+                Ok(()) => {}
+                Err(turn_events::TurnStop::Cancelled(reason)) => {
+                    cancellation_reason = Some(reason);
                 }
+                Err(turn_events::TurnStop::TakeoverPaused) => browser_takeover_paused = true,
+                Err(turn_events::TurnStop::Failed(error)) => terminal_error = Some(error),
+                Err(turn_events::TurnStop::Persist(error)) => return Err(error.into()),
             }
 
             // A stream that ended mid-phase still reports the reasoning wait.
@@ -2154,6 +1931,7 @@ fn run_agent_loop<'a>(
                         .map(RetryWait::QuotaReset),
                 };
                 if let Some(wait) = retry_wait {
+                    let turn_is_resume = kind.is_resume();
                     let kind = retry_kind;
                     record_request_log(state, ledger.interrupted(Instant::now(), &err_msg)).await;
                     // Text of a cut stream is discarded with the attempt;
@@ -2222,6 +2000,9 @@ fn run_agent_loop<'a>(
                             }
                             turn_persister.flush(&state.db()).await?;
                             continue_from_transcript = true;
+                        }
+                        if turn_is_resume {
+                            retained_agent = Some(agent);
                         }
                         attempt += 1;
                         continue;
@@ -2326,10 +2107,16 @@ fn run_agent_loop<'a>(
             enqueue_event_triggered_tasks(state, &session_id, profile_id.as_deref());
             // The turn's messages are in the search outbox now.
             let _ = state.search_index_wake_tx.try_send(());
-            // The agent stays as the session's idle agent until the next turn.
-            state
-                .parked_agents
-                .park(state, session_id.as_str(), agent, build_key);
+            // The agent stays as the session's idle agent until the next turn;
+            // it waits on background commands once this run releases the
+            // session.
+            state.parked_agents.park(
+                state,
+                session_id.as_str(),
+                agent,
+                build_key,
+                guard.released(),
+            );
 
             return Ok(AgentRunResult {
                 assistant_id,
@@ -2372,8 +2159,10 @@ const fn closes_reasoning_phase(event: &aither_agent::AgentEvent) -> bool {
 /// Runs one turn under `guard`, publishing it to the session's clients, and
 /// settles the guard: a continued guard (more queued work) runs next.
 /// Starts a turn for `session_id` whose idle agent collected background
-/// commands that need the model (`wake`). Nothing runs when the session is
-/// busy: the turn holding it continues with the same agent and sees them.
+/// commands that need the model (`wake`). An idle agent waits on background
+/// commands only after the run that parked it released the session, so the
+/// only thing that can hold the session here is a new turn, which takes the
+/// parked agent and sees the results; nothing runs then.
 pub(super) async fn start_background_turn(
     state: &Arc<DaemonState>,
     session_id: &str,
@@ -2385,7 +2174,7 @@ pub(super) async fn start_background_turn(
     let guard = match state.runtime_service.runs().acquire(session_id).await {
         Ok(guard) => guard,
         Err(error) => {
-            tracing::info!(%session_id, %error, "a running turn will see the background results");
+            tracing::info!(%session_id, %error, "a new turn holds the session and takes the parked agent, which sees the background results");
             return;
         }
     };
@@ -2410,14 +2199,50 @@ pub(super) async fn start_background_turn(
     }
 }
 
+/// Applies the current `[suggestions]` and `[recap]` settings to work
+/// already scheduled: a setting turned off cancels its armed timers and
+/// in-flight generations.
+fn apply_aux_settings(state: &Arc<DaemonState>) {
+    suggest::apply_settings(state);
+    recap::apply_settings(state);
+}
+
+/// Applies the aux settings whenever the configuration changes, for the
+/// daemon's lifetime.
+pub(super) fn watch_aux_settings(state: &Arc<DaemonState>) {
+    let mut events = state.ui_event_bus.subscribe();
+    let state = Arc::clone(state);
+    let handle = state.tokio_handle.clone();
+    handle.spawn(async move {
+        loop {
+            match events.recv().await {
+                Ok(topics) if topics.contains(UiEventTopics::CONFIG) => apply_aux_settings(&state),
+                // A lagged receiver may have missed the change.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    apply_aux_settings(&state);
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+}
+
+/// A completed turn left `session_id` idle with nothing pending: it gets one
+/// suggested next prompt and an armed idle-recap timer. Every path that ends
+/// a session's turns calls this, so a published, queued or background turn
+/// leaves the same state behind.
+fn session_became_idle(state: &Arc<DaemonState>, session_id: &str) {
+    suggest::maybe_suggest(state, session_id);
+    recap::arm(state, session_id);
+}
+
 async fn run_published_turn(
     state: Arc<DaemonState>,
     req: ChatRequest,
     guard: SessionRunGuard,
     kind: TurnKind,
 ) -> Result<(), crate::db::ChatDbError> {
-    suggest::cancel(&state, &req.session_id);
-    recap::unarm(&state, &req.session_id);
     let mut sink = HubSink::new(&state, &req);
     let result = run_agent_loop(&state, &req, &mut sink, &guard, true, true, &kind).await;
     let response_session_id = req.session_id.clone();
@@ -2441,8 +2266,7 @@ async fn run_published_turn(
             if let Some(continued) = continued {
                 spawn_continued_run(state.clone(), continued);
             } else {
-                suggest::maybe_suggest(&state, &response_session_id);
-                recap::arm(&state, &response_session_id);
+                session_became_idle(&state, &response_session_id);
             }
         }
         Err(AgentLoopError::BrowserTakeoverPaused(result)) => {
@@ -2471,6 +2295,15 @@ async fn run_published_turn(
     Ok(())
 }
 
+/// How a turn driven by [`run_chat_collect_with_receiver`] ended without
+/// failing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TurnEnd {
+    Completed,
+    /// A browser takeover paused the turn; the session is not idle.
+    Paused,
+}
+
 /// Drive a chat turn without an attached SSE client — used by the follow-up
 /// queue to dispatch server-side enqueued messages. All assistant text and
 /// tool events are still persisted by the main loop; the sink only
@@ -2482,7 +2315,7 @@ async fn run_chat_collect_with_receiver(
     persist_user_message: bool,
     use_persisted_context_snapshot: bool,
     guard: &SessionRunGuard,
-) -> Result<(), ChatCollectError> {
+) -> Result<TurnEnd, ChatCollectError> {
     let mut sink = HubSink::new(&state, &req);
     let result = run_agent_loop(
         &state,
@@ -2497,11 +2330,11 @@ async fn run_chat_collect_with_receiver(
     match result {
         Ok(_) => {
             sink.finish(None, crate::client::RunEnd::Completed);
-            Ok(())
+            Ok(TurnEnd::Completed)
         }
         Err(AgentLoopError::BrowserTakeoverPaused(_)) => {
             sink.finish(None, crate::client::RunEnd::Paused);
-            Ok(())
+            Ok(TurnEnd::Paused)
         }
         Err(AgentLoopError::Preparation(error)) => {
             sink.finish(None, crate::client::RunEnd::Failed);
@@ -3102,10 +2935,7 @@ async fn resolve_session_context(
         .to_string();
     let reasoning_effort = parse_reasoning_effort_token(&reasoning_effort);
 
-    let cwd = session
-        .cwd
-        .clone()
-        .map_or_else(|| state.cwd.clone(), std::path::PathBuf::from);
+    let cwd = crate::session::SessionDirectory::of(&session, &state.may_dir).into_path();
 
     Ok(SessionContext {
         user_message_id,
@@ -3378,7 +3208,6 @@ fn agent_messaging(state: &Arc<DaemonState>) -> crate::agent_link::AgentMessagin
         directory: crate::agent_link::AgentDirectory::new(
             state.runtime_service.clone(),
             state.may_dir.clone(),
-            state.cwd.clone(),
             {
                 let state = state.clone();
                 move |session_id: &str| spawn_follow_up_runs(state.clone(), session_id.to_string())
@@ -3391,10 +3220,12 @@ fn agent_messaging(state: &Arc<DaemonState>) -> crate::agent_link::AgentMessagin
 /// One attempt of a turn: the provider candidate it builds on, and the
 /// history row boundary it rebuilds context up to when it resubmits the
 /// prompt (`None` replays the committed transcript in full).
-#[derive(Clone, Copy)]
 struct TurnAttempt {
     provider_attempt: usize,
     turn_boundary: Option<i32>,
+    /// The agent a retry on the same provider continues with: the one the
+    /// failed attempt took, which holds what a resumed turn exists for.
+    retained_agent: Option<MayAgent>,
 }
 
 /// Resolves the session context and builds the agent for one chat turn.
@@ -3420,11 +3251,20 @@ fn prepare_agent_for_request<'a>(
         ))
         .await?;
         let config = state.config_snapshot();
-        let build_key = agent_build_key(&config, &ctx);
+        let workspace_config = {
+            let path =
+                crate::session::SessionPaths::new(ctx.sandbox_dir.clone()).workspace_config();
+            blocking::unblock(move || crate::workspace::WorkspaceConfig::load(&path))
+                .await
+                .map_err(|error| UiChatPreparationError::BuildAgent(error.into()))?
+        };
+        let build_key = agent_build_key(&config, &workspace_config, &ctx);
         // The session's idle agent continues the conversation when it was
         // built from the same inputs; a resumed turn exists only for what
         // that agent collected, so it takes the agent whatever changed.
-        let reused = if attempt.provider_attempt == 0 {
+        let reused = if let Some(agent) = attempt.retained_agent {
+            Some(agent)
+        } else if attempt.provider_attempt == 0 {
             let fits = (!kind.is_resume()).then_some(build_key);
             state
                 .parked_agents
@@ -3541,7 +3381,7 @@ fn build_session_agent<'a>(
                 notify_broker: Some(brokers.notify),
                 tunnel_broker: Some(brokers.tunnel),
                 browser_broker: state.browser_manager().map(|_| brokers.browser),
-                acp_host: Some((state.acp_host.clone(), state.tokio_handle.clone())),
+                acp_host: Some(state.acp_host.clone()),
                 #[cfg(target_os = "macos")]
                 computer: (!matches!(
                     environment,
@@ -3555,6 +3395,13 @@ fn build_session_agent<'a>(
                 tool_distribution: state.tool_distribution.clone(),
                 tool_environments: state.tool_environments.clone(),
                 provider_attempt,
+                prompt_cache_epoch: ctx.context_snapshot.as_ref().map_or(0, |snapshot| {
+                    snapshot
+                        .checkpoint
+                        .context_window
+                        .metrics
+                        .prompt_cache_epoch
+                }),
                 subagents: Some(state.session_background.subagents(ctx.session_id.as_str())),
                 background_jobs: aither_agent::BackgroundJobPolicy::Detach,
                 connectivity: state.connectivity.clone(),
@@ -3610,13 +3457,21 @@ fn build_session_agent<'a>(
 /// A fingerprint of everything `ctx`'s agent is built from, so a turn can
 /// tell whether the session's idle agent still fits: the configuration, the
 /// model and its reasoning effort, the profile, its persona and memories,
-/// the plan state and where the session works.
-fn agent_build_key(config: &crate::config::MayConfig, ctx: &SessionContext) -> u64 {
+/// the plan state, where the session works and the workspace configuration
+/// (trust, workdirs) its grants, mounts, clone and PR contexts come from.
+fn agent_build_key(
+    config: &crate::config::MayConfig,
+    workspace: &crate::workspace::WorkspaceConfig,
+    ctx: &SessionContext,
+) -> u64 {
     use std::hash::{Hash, Hasher};
 
     let mut hasher = std::hash::DefaultHasher::new();
     serde_json::to_string(config)
         .unwrap_or_default()
+        .hash(&mut hasher);
+    toml::to_string(workspace)
+        .expect("a parsed workspace configuration serializes")
         .hash(&mut hasher);
     ctx.current_model.hash(&mut hasher);
     format!("{:?}", ctx.reasoning_effort).hash(&mut hasher);
@@ -3645,6 +3500,33 @@ pub enum TurnKind {
 impl TurnKind {
     const fn is_resume(&self) -> bool {
         matches!(self, Self::Resume(_))
+    }
+}
+
+/// Hold the session's `tasks.md` to the one-owner-per-open-issue rule: a
+/// change that adds an issue another agent owns is reverted, and the session
+/// is told through a steer message.
+async fn enforce_issue_ownership(
+    state: &Arc<DaemonState>,
+    session_id: &SessionId,
+    accepted: &mut Option<String>,
+) {
+    use crate::issue::owner::{IssueOwners, OwnershipError};
+
+    let directory = agent_messaging(state).directory;
+    match IssueOwners::new(directory.clone())
+        .admit(session_id.as_str(), accepted)
+        .await
+    {
+        Ok(()) => {}
+        Err(OwnershipError::Owned(owned)) => {
+            if let Err(error) = directory.deliver(session_id.as_str(), owned.notice()).await {
+                tracing::warn!(%session_id, %error, "failed to tell the session its tasks.md change was reverted");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%session_id, %error, "issue ownership of tasks.md could not be checked");
+        }
     }
 }
 
@@ -4093,12 +3975,23 @@ mod tests {
     #[derive(Default)]
     struct TestSink {
         notes: Option<async_channel::Sender<Note>>,
+        /// How many times the run showed the text `WAKE_TEXT` as an agent event.
+        wake_texts: usize,
     }
+
+    /// The text of the background event a test resume turn opens with.
+    const WAKE_TEXT: &str = "background command finished";
 
     impl TestSink {
         fn noting() -> (Self, async_channel::Receiver<Note>) {
             let (tx, rx) = async_channel::unbounded();
-            (Self { notes: Some(tx) }, rx)
+            (
+                Self {
+                    notes: Some(tx),
+                    ..Self::default()
+                },
+                rx,
+            )
         }
 
         fn note(&self, note: Note) {
@@ -4109,6 +4002,14 @@ mod tests {
     }
 
     impl super::ChatSink for TestSink {
+        fn on_agent_event(
+            &mut self,
+            event: Result<&aither_agent::AgentEvent, &aither_agent::AgentError>,
+        ) {
+            if matches!(event, Ok(aither_agent::AgentEvent::Text(text)) if text == WAKE_TEXT) {
+                self.wake_texts += 1;
+            }
+        }
         fn on_start(&mut self, _s: &str, _a: &str) -> impl Future<Output = bool> + Send {
             std::future::ready(true)
         }
@@ -4361,14 +4262,12 @@ mod tests {
     /// `second`, both scripted `custom` providers.
     async fn failover_state(
         may_dir: &std::path::Path,
-        cwd: &std::path::Path,
         first: &StubProvider,
         second: &StubProvider,
     ) -> std::sync::Arc<DaemonState> {
         failover_state_on(
             aither_connectivity::Connectivity::manual(true).0,
             may_dir,
-            cwd,
             first,
             second,
         )
@@ -4379,7 +4278,6 @@ mod tests {
     async fn failover_state_on(
         connectivity: aither_connectivity::Connectivity,
         may_dir: &std::path::Path,
-        cwd: &std::path::Path,
         first: &StubProvider,
         second: &StubProvider,
     ) -> std::sync::Arc<DaemonState> {
@@ -4392,7 +4290,7 @@ mod tests {
             config.provider.insert(id.to_string(), instance);
         }
         let state = std::sync::Arc::new(
-            DaemonState::for_test_with_connectivity(may_dir, cwd, config, connectivity)
+            DaemonState::for_test_with_connectivity(may_dir, config, connectivity)
                 .await
                 .expect("test daemon state"),
         );
@@ -4417,8 +4315,7 @@ mod tests {
         let provider_a = stub_provider(script).await;
         let provider_b = stub_provider(Vec::new()).await;
         let may_dir = tempfile::tempdir().expect("may dir");
-        let cwd = tempfile::tempdir().expect("cwd");
-        let state = failover_state(may_dir.path(), cwd.path(), &provider_a, &provider_b).await;
+        let state = failover_state(may_dir.path(), &provider_a, &provider_b).await;
 
         let req = ChatRequest {
             session_id: "session".to_string(),
@@ -4481,7 +4378,6 @@ mod tests {
     async fn a_failure_after_a_tool_call_continues_without_replaying_it() {
         let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
         let may_dir = tempfile::tempdir().expect("may dir");
-        let cwd = tempfile::tempdir().expect("cwd");
         // Session-scoped `files/` is the writable side of the workspace.
         let session_files = may_dir.path().join("sessions/session/files");
         let marker = session_files.join("count");
@@ -4501,7 +4397,7 @@ mod tests {
         script.push(sse_text("done"));
         let provider_a = stub_provider(script).await;
         let provider_b = stub_provider(Vec::new()).await;
-        let state = failover_state(may_dir.path(), cwd.path(), &provider_a, &provider_b).await;
+        let state = failover_state(may_dir.path(), &provider_a, &provider_b).await;
 
         let req = ChatRequest {
             session_id: "session".to_string(),
@@ -4551,6 +4447,363 @@ mod tests {
         );
     }
 
+    /// Queues `contents` as pending messages of "session".
+    async fn queue_messages(state: &std::sync::Arc<DaemonState>, contents: &[&str]) {
+        for content in contents {
+            let req = ChatRequest {
+                session_id: "session".to_string(),
+                content: (*content).to_string(),
+                attachments: Vec::new(),
+                hidden_context_xml: None,
+                delivery_mode: crate::session::PendingUserMessageMode::Queue,
+                pending_entry_id: None,
+            };
+            state
+                .runtime_service
+                .enqueue(
+                    "session",
+                    super::pending_user_message_from_request(req),
+                    crate::session::PendingUserMessageMode::Queue,
+                )
+                .await
+                .expect("enqueue");
+        }
+    }
+
+    /// Every turn clears the idle-recap timer when it starts, whatever path
+    /// started it.
+    #[tokio::test]
+    async fn a_turn_unarms_the_recap_timer_when_it_starts() {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let provider_a = stub_provider(vec![sse_text("one"), sse_text("two")]).await;
+        let provider_b = stub_provider(Vec::new()).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let state = failover_state(may_dir.path(), &provider_a, &provider_b).await;
+
+        run_prompt_turn(&state, &mut TestSink::default())
+            .await
+            .expect("first turn");
+        super::recap::arm(&state, "session");
+        assert!(state.recap_schedules.is_armed("session"), "idle session");
+
+        run_prompt_turn(&state, &mut TestSink::default())
+            .await
+            .expect("second turn");
+        assert!(!state.recap_schedules.is_armed("session"));
+    }
+
+    /// A queue of two turns draining leaves the session idle with its recap
+    /// timer armed, as a published turn does.
+    #[tokio::test]
+    async fn a_drained_queue_arms_the_recap_timer() {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let provider_a = stub_provider(vec![sse_text("one"), sse_text("two")]).await;
+        let provider_b = stub_provider(Vec::new()).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let state = failover_state(may_dir.path(), &provider_a, &provider_b).await;
+        queue_messages(&state, &["first", "second"]).await;
+
+        let guard = state
+            .runtime_service
+            .runs()
+            .acquire("session")
+            .await
+            .expect("acquire run");
+        super::dispatch_follow_ups(state.clone(), guard).await;
+
+        assert_eq!(stored_assistant_texts(&state).await, ["one", "two"]);
+        assert!(
+            state.recap_schedules.is_armed("session"),
+            "the drained queue left the session idle"
+        );
+    }
+
+    /// A message enqueued on an idle session starts a turn that ends with the
+    /// session idle and its recap timer armed.
+    #[tokio::test]
+    async fn an_enqueue_on_an_idle_session_arms_the_recap_timer() {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let provider_a = stub_provider(vec![sse_text("answer")]).await;
+        let provider_b = stub_provider(Vec::new()).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let state = failover_state(may_dir.path(), &provider_a, &provider_b).await;
+
+        let req = ChatRequest {
+            session_id: "session".to_string(),
+            content: "hello".to_string(),
+            attachments: Vec::new(),
+            hidden_context_xml: None,
+            delivery_mode: crate::session::PendingUserMessageMode::Queue,
+            pending_entry_id: None,
+        };
+        super::enqueue_chat(
+            skyzen::utils::Json(req),
+            skyzen::utils::State(state.clone()),
+        )
+        .await
+        .expect("enqueue");
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while !state.recap_schedules.is_armed("session") {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the enqueued turn leaves the session idle with its timer armed");
+        assert_eq!(stored_assistant_texts(&state).await, ["answer"]);
+    }
+
+    /// A resumed turn whose provider call fails and is retried on the same
+    /// provider continues with the agent it took, and clients see its
+    /// background events once.
+    #[tokio::test]
+    async fn a_resume_turn_retries_with_the_agent_it_took() {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let mut script = vec![sse_text("first")];
+        script.extend(vec!["500".to_string(); OPENAI_CLIENT_ATTEMPTS]);
+        script.push(sse_text("resumed"));
+        let provider_a = stub_provider(script).await;
+        let provider_b = stub_provider(Vec::new()).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let state = failover_state(may_dir.path(), &provider_a, &provider_b).await;
+
+        // A first turn leaves the session's idle agent behind.
+        let mut sink = TestSink::default();
+        run_prompt_turn(&state, &mut sink)
+            .await
+            .expect("the first turn completes");
+        assert!(state.parked_agents.contains("session"));
+
+        let req = ChatRequest {
+            session_id: "session".to_string(),
+            content: String::new(),
+            attachments: Vec::new(),
+            hidden_context_xml: None,
+            delivery_mode: crate::session::PendingUserMessageMode::default(),
+            pending_entry_id: None,
+        };
+        let guard = state
+            .runtime_service
+            .runs()
+            .acquire("session")
+            .await
+            .expect("acquire run");
+        let wake = vec![aither_agent::TimedEvent {
+            at: jiff::Timestamp::now(),
+            event: aither_agent::AgentEvent::Text(WAKE_TEXT.to_string()),
+        }];
+        let mut sink = TestSink::default();
+        let result = run_agent_loop(
+            &state,
+            &req,
+            &mut sink,
+            &guard,
+            false,
+            true,
+            &TurnKind::Resume(wake),
+        )
+        .await;
+        let result = result.expect("the retried resume completes");
+        assert_eq!(result.full_text, "resumed");
+        assert_eq!(sink.wake_texts, 1, "the background events are shown once");
+    }
+
+    /// A background command that finishes after the turn parked its agent but
+    /// before the turn's run released the session still resumes the session
+    /// once the release happens.
+    #[tokio::test]
+    async fn a_job_finishing_before_the_release_resumes_the_session_after_it() {
+        // The test's two waits on the command's side. A command's `timeout`
+        // runs from its start, so it spans the turn and then the wait for
+        // `done`; the command is bounded by their sum and outlives the test
+        // however slow the runner is, because a test that waits longer has
+        // already failed.
+        const TURN_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+        const DONE_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let may_dir = tempfile::tempdir().expect("may dir");
+        // The session's `files/` is what the sandboxed command can write and
+        // read.
+        let session_files = may_dir.path().join("sessions/session/files");
+        std::fs::create_dir_all(&session_files).expect("session files");
+        let gate = session_files.join("go");
+        let done = session_files.join("done");
+        let arguments = serde_json::json!({
+            "script": format!(
+                "while [ ! -e {} ]; do sleep 0.05; done; echo finished; touch {}",
+                gate.display(),
+                done.display()
+            ),
+            "description": "finishes after the turn ends",
+            "background": true,
+            "timeout": (TURN_WAIT + DONE_WAIT).as_secs()
+        })
+        .to_string();
+        let provider_a = stub_provider(vec![
+            sse_tool_call("call_1", "terminal", &arguments),
+            sse_text("started"),
+            sse_text("resumed"),
+        ])
+        .await;
+        let provider_b = stub_provider(Vec::new()).await;
+        let state = failover_state(may_dir.path(), &provider_a, &provider_b).await;
+
+        let req = ChatRequest {
+            session_id: "session".to_string(),
+            content: "start it".to_string(),
+            attachments: Vec::new(),
+            hidden_context_xml: None,
+            delivery_mode: crate::session::PendingUserMessageMode::default(),
+            pending_entry_id: None,
+        };
+        // The run keeps the session while its agent is already parked.
+        let guard = state
+            .runtime_service
+            .runs()
+            .acquire("session")
+            .await
+            .expect("acquire run");
+        let mut sink = TestSink::default();
+        tokio::time::timeout(
+            TURN_WAIT,
+            run_agent_loop(
+                &state,
+                &req,
+                &mut sink,
+                &guard,
+                true,
+                true,
+                &TurnKind::Prompt,
+            ),
+        )
+        .await
+        .expect("the turn finishes within its wait")
+        .expect("the turn completes");
+        assert!(state.parked_agents.contains("session"));
+
+        // The command ends only now, while the run still holds the session;
+        // the idle agent's worker is observed through its job registry.
+        // The registry cannot show it: the agent's own background wait
+        // records completions, and that wait starts only after the release.
+        // The command reports through a file instead.
+        std::fs::write(&gate, "").expect("open the gate");
+        tokio::time::timeout(DONE_WAIT, async {
+            while !done.exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the command finishes");
+        // The process exits right after writing the file.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert!(
+            provider_a.bodies.try_recv().is_ok() && provider_a.bodies.try_recv().is_ok(),
+            "the turn made two requests"
+        );
+        assert!(
+            provider_a.bodies.try_recv().is_err(),
+            "nothing resumed the session while it was held"
+        );
+
+        guard
+            .finish_idle(crate::session::RunOutcome::Completed)
+            .await
+            .expect("release the run");
+        let body =
+            tokio::time::timeout(std::time::Duration::from_secs(20), provider_a.bodies.recv())
+                .await
+                .expect("the release resumes the session")
+                .expect("request body");
+        assert!(body.contains("finished"), "the resume sees the result");
+    }
+
+    /// Lowering a project's trust in `workspace.toml` retires the session's
+    /// idle agent: the next turn builds from the new level instead of
+    /// continuing with the grants captured at build.
+    #[tokio::test]
+    async fn a_trust_change_retires_the_idle_agent() {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let provider = stub_provider(vec![sse_text("first")]).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let state = failover_state(may_dir.path(), &provider, &provider).await;
+        let checkout = cwd.path().canonicalize().expect("canonical checkout");
+        state
+            .db()
+            .set_session_cwd("session", &checkout.to_string_lossy())
+            .await
+            .expect("session cwd");
+        let config_path =
+            crate::session::MayHomePaths::new(may_dir.path().to_path_buf()).workspace_config();
+        let set_level = |level| {
+            crate::trust::persist(&config_path, &checkout, None, level).expect("persist trust");
+        };
+        let writable_checkout = |agent: &crate::agent::MayAgent| {
+            agent
+                .terminal_grants()
+                .snapshot()
+                .writable
+                .iter()
+                .any(|path| path == &checkout)
+        };
+
+        // The first turn runs at the local level and leaves its agent idle.
+        set_level(crate::trust::TrustLevel::Local);
+        let mut sink = TestSink::default();
+        run_prompt_turn(&state, &mut sink)
+            .await
+            .expect("the first turn completes");
+        assert!(state.parked_agents.contains("session"));
+        let grants = state
+            .runtime_service
+            .terminal_grants("session")
+            .expect("the built agent's grants");
+        assert!(
+            grants.snapshot().writable.iter().any(|p| p == &checkout),
+            "local trust makes the checkout writable"
+        );
+
+        // Trust lowered while the agent idles: the next turn's preparation
+        // builds a fresh agent without the checkout grant.
+        set_level(crate::trust::TrustLevel::LocalBranch);
+        let req = ChatRequest {
+            session_id: "session".to_string(),
+            content: "again".to_string(),
+            attachments: Vec::new(),
+            hidden_context_xml: None,
+            delivery_mode: crate::session::PendingUserMessageMode::default(),
+            pending_entry_id: None,
+        };
+        let guard = state
+            .runtime_service
+            .runs()
+            .acquire("session")
+            .await
+            .expect("acquire run");
+        let prepared = super::prepare_agent_for_request(
+            &state,
+            &req,
+            guard.fence(),
+            true,
+            true,
+            super::TurnAttempt {
+                provider_attempt: 0,
+                turn_boundary: None,
+                retained_agent: None,
+            },
+            &TurnKind::Prompt,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("the next turn prepares: {error}"));
+        assert!(
+            !writable_checkout(&prepared.agent),
+            "the rebuilt agent no longer writes the checkout"
+        );
+        assert!(
+            !state.parked_agents.contains("session"),
+            "the old idle agent was retired, not reused"
+        );
+    }
+
     /// Runs one prompt turn of "session" to completion on `sink`.
     async fn run_prompt_turn(
         state: &std::sync::Arc<DaemonState>,
@@ -4570,7 +4823,12 @@ mod tests {
             .acquire("session")
             .await
             .expect("acquire run");
-        run_agent_loop(state, &req, sink, &guard, true, true, &TurnKind::Prompt).await
+        let result = run_agent_loop(state, &req, sink, &guard, true, true, &TurnKind::Prompt).await;
+        guard
+            .finish_idle(crate::session::RunOutcome::Completed)
+            .await
+            .expect("release the run");
+        result
     }
 
     /// The assistant answers the history holds, in order.
@@ -4596,30 +4854,31 @@ mod tests {
         let provider_a = stub_provider(script).await;
         let provider_b = stub_provider(vec![sse_text("wrong provider")]).await;
         let may_dir = tempfile::tempdir().expect("may dir");
-        let cwd = tempfile::tempdir().expect("cwd");
         let (connectivity, controller) = aither_connectivity::Connectivity::manual(false);
-        let state = failover_state_on(
-            connectivity,
-            may_dir.path(),
-            cwd.path(),
-            &provider_a,
-            &provider_b,
-        )
-        .await;
+        let state = failover_state_on(connectivity, may_dir.path(), &provider_a, &provider_b).await;
 
         let (mut sink, notes) = TestSink::noting();
-        let network_returns = async {
-            let note = tokio::time::timeout(std::time::Duration::from_secs(60), notes.recv())
-                .await
-                .expect("the turn announces its wait")
-                .expect("notes");
-            assert_eq!(note, Note::Hold(crate::client::HoldReason::Network));
-            // Holding means the turn is parked: nothing else happens until
-            // the network returns.
-            assert!(notes.try_recv().is_err());
-            controller.set_online(true);
-        };
-        let (result, ()) = tokio::join!(run_prompt_turn(&state, &mut sink), network_returns);
+        // The hold comes only after the provider client's own backoff sleeps
+        // and the turn's setup, both of which stretch with host load: the
+        // test waits for the note itself and fails at once if the turn ends
+        // without ever holding. The bound only catches a hang, far above the
+        // seconds this takes on a loaded host.
+        let turn = run_prompt_turn(&state, &mut sink);
+        tokio::pin!(turn);
+        let note = tokio::time::timeout(std::time::Duration::from_secs(300), async {
+            tokio::select! {
+                note = notes.recv() => note.expect("notes"),
+                result = &mut turn => panic!("the turn ended without holding for the network: {result:?}"),
+            }
+        })
+        .await
+        .expect("the turn holds for the network within five minutes");
+        assert_eq!(note, Note::Hold(crate::client::HoldReason::Network));
+        // Holding means the turn is parked: nothing else happens until the
+        // network returns.
+        assert!(notes.try_recv().is_err());
+        controller.set_online(true);
+        let result = turn.await;
         assert!(result.is_ok(), "the turn must complete: {result:?}");
 
         assert_eq!(
@@ -4648,16 +4907,8 @@ mod tests {
             stub_provider(vec![format!("stall:{partial}"), sse_text("whole answer")]).await;
         let provider_b = stub_provider(vec![sse_text("wrong provider")]).await;
         let may_dir = tempfile::tempdir().expect("may dir");
-        let cwd = tempfile::tempdir().expect("cwd");
         let (connectivity, controller) = aither_connectivity::Connectivity::manual(true);
-        let state = failover_state_on(
-            connectivity,
-            may_dir.path(),
-            cwd.path(),
-            &provider_a,
-            &provider_b,
-        )
-        .await;
+        let state = failover_state_on(connectivity, may_dir.path(), &provider_a, &provider_b).await;
 
         let (mut sink, notes) = TestSink::noting();
         let machine_wakes = async {
@@ -4698,8 +4949,7 @@ mod tests {
         let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
         let provider = stub_provider(vec![sse_text("the answer")]).await;
         let may_dir = tempfile::tempdir().expect("may dir");
-        let cwd = tempfile::tempdir().expect("cwd");
-        let state = failover_state(may_dir.path(), cwd.path(), &provider, &provider).await;
+        let state = failover_state(may_dir.path(), &provider, &provider).await;
         let req = ChatRequest {
             session_id: "session".to_string(),
             content: "hello".to_string(),
@@ -4756,8 +5006,7 @@ mod tests {
         let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
         let provider = stub_provider(vec![]).await;
         let may_dir = tempfile::tempdir().expect("may dir");
-        let cwd = tempfile::tempdir().expect("cwd");
-        let state = failover_state(may_dir.path(), cwd.path(), &provider, &provider).await;
+        let state = failover_state(may_dir.path(), &provider, &provider).await;
         let guard = state
             .runtime_service
             .runs()

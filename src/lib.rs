@@ -43,6 +43,8 @@ mod fs_utils;
 /// xAI Grok subscription OAuth flow.
 pub mod grok;
 mod heel;
+/// The one way git runs on the host.
+pub mod host_git;
 mod id;
 /// Issue tracking: may issues by default, GitHub when configured.
 pub mod issue;
@@ -59,6 +61,8 @@ pub mod model_selector;
 /// Model listing and metadata.
 pub mod models;
 pub use aither_sandbox::network_policy;
+/// Signing of the commits agents make in their sandbox.
+pub mod commit_signing;
 /// Web-push notification delivery and mailbox.
 pub mod notification;
 /// `OpenRouter` OAuth login flow.
@@ -91,6 +95,8 @@ pub mod skill;
 pub mod startup;
 /// Scheduled-task trigger definitions.
 pub mod task_trigger;
+/// The command a scheduled task's run uses to prompt its session.
+pub mod task_wake;
 /// Background task types and execution.
 pub mod tasks;
 /// Terminal commands exposed to the agent.

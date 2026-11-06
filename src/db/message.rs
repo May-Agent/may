@@ -246,6 +246,25 @@ impl ChatDb {
         Ok(message)
     }
 
+    /// Record a request granted without asking (a yolo session): the request
+    /// and its approval, as a user approval leaves them.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn append_granted_permission(
+        &self,
+        session_id: &str,
+        mode: PermissionHistoryMode,
+        script: &str,
+    ) -> Result<(), ChatDbError> {
+        let request_id = crate::id::new();
+        self.append_permission_request_message(session_id, &request_id, mode, script, None)
+            .await?;
+        self.append_permission_response_message(session_id, &request_id, true, None)
+            .await?;
+        Ok(())
+    }
+
     /// Append a permission-response message for a session.
     ///
     /// # Errors

@@ -15,7 +15,7 @@ use fs_extra::dir::CopyOptions;
 /// outside the home render unchanged.
 #[must_use]
 pub fn display_path(path: &Path) -> String {
-    let Some(home) = dirs::home_dir() else {
+    let Ok(home) = crate::config::MayConfig::home_dir() else {
         return path.display().to_string();
     };
     match path.strip_prefix(&home) {

@@ -10,7 +10,9 @@ export function respondWorkspace(id: string, approved: boolean): Promise<void> {
 
 export type AskUserAnswer =
   | { kind: 'selected'; values: string[] }
-  | { kind: 'custom'; text: string };
+  | { kind: 'custom'; text: string }
+  /** Refuses to give the secret a secret question asks for. */
+  | { kind: 'declined' };
 
 export interface AskUserAnswerEntry {
   section: string;

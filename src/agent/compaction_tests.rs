@@ -21,7 +21,7 @@ use serde_json::Value;
 use tokio::net::TcpListener;
 
 use super::may::test_agent;
-use super::provider::RequestParameterizedModel;
+use super::provider::ModelSlot;
 
 /// A constraint the user states once, before the first compaction, and never
 /// repeats.
@@ -182,14 +182,17 @@ fn roles_mentioning(request: &Value, needle: &str) -> Vec<String> {
 async fn second_handoff_keeps_a_constraint_stated_before_the_first_compaction() {
     let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
     let stub = StubModel::spawn().await;
-    let llm = RequestParameterizedModel::new(
-        aither_cloud::CloudProvider::OpenAI(
-            aither_cloud::openai::OpenAI::builder("test-key")
-                .base_url(stub.base_url.clone())
-                .model(MODEL)
-                .no_retry()
-                .build()
-                .with_chat_completions_api(),
+    let llm = ModelSlot::new(
+        crate::agent::RedactedModel::new(
+            aither_cloud::CloudProvider::OpenAI(
+                aither_cloud::openai::OpenAI::builder("test-key")
+                    .base_url(stub.base_url.clone())
+                    .model(MODEL)
+                    .no_retry()
+                    .build()
+                    .with_chat_completions_api(),
+            ),
+            crate::secrets::SecretRedactor::new(std::path::Path::new("/nonexistent")),
         ),
         aither_core::llm::model::Parameters::default(),
     );
@@ -235,8 +238,8 @@ async fn second_handoff_keeps_a_constraint_stated_before_the_first_compaction() 
     );
     assert_eq!(
         roles_mentioning(&requests[1], CONSTRAINT),
-        ["system"],
-        "the second request sees the constraint only through the first handoff"
+        ["system", "user"],
+        "the second request sees the constraint through the first handoff and the user's own message, which a compaction keeps verbatim"
     );
 
     let checkpoint = agent
@@ -249,4 +252,107 @@ async fn second_handoff_keeps_a_constraint_stated_before_the_first_compaction() 
         .expect("the compacted session holds a handoff")
         .render();
     assert!(handoff.contains(CONSTRAINT), "stored handoff: {handoff}");
+}
+
+/// Builds the agent of the context-reading tests against `stub`.
+async fn agent_on(stub: &StubModel) -> (super::may::MayAgent, tempfile::TempDir) {
+    let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+    let llm = ModelSlot::new(
+        crate::agent::RedactedModel::new(
+            aither_cloud::CloudProvider::OpenAI(
+                aither_cloud::openai::OpenAI::builder("test-key")
+                    .base_url(stub.base_url.clone())
+                    .model(MODEL)
+                    .no_retry()
+                    .build()
+                    .with_chat_completions_api(),
+            ),
+            crate::secrets::SecretRedactor::new(std::path::Path::new("/nonexistent")),
+        ),
+        aither_core::llm::model::Parameters::default(),
+    );
+    test_agent(llm, "openai", MODEL).await
+}
+
+/// After a compaction, the context a side request reads carries the handoff
+/// and not the turns the handoff replaced; reading it twice changes nothing.
+#[tokio::test]
+async fn context_messages_after_a_compaction_carry_the_handoff_not_the_replaced_turns() {
+    const REPLACED: &str = "replaced-turn-4417";
+    let stub = StubModel::spawn().await;
+    let (mut agent, _temp) = agent_on(&stub).await;
+    agent.push_message(aither_core::llm::Message::user(format!(
+        "Port the parser to the new lexer ({REPLACED}). Never edit files under vendor/ ({CONSTRAINT})."
+    )));
+    agent.push_message(aither_core::llm::Message::assistant(format!(
+        "Starting with the token definitions ({REPLACED})."
+    )));
+
+    let before = agent.context_messages().await.expect("context reads");
+    assert!(
+        before.iter().any(|m| m.content().contains(REPLACED)),
+        "the turns are in the context before the compaction"
+    );
+
+    agent
+        .compact(None)
+        .await
+        .expect("compaction succeeds")
+        .expect("there was a conversation to compact");
+
+    let after = agent.context_messages().await.expect("context reads");
+    assert!(
+        after.iter().any(|m| m.content().contains(CONSTRAINT)),
+        "the handoff is in the context"
+    );
+    assert!(
+        after
+            .iter()
+            .filter(|m| m.role() != aither_core::llm::Role::User)
+            .all(|m| !m.content().contains(REPLACED)),
+        "the replaced turns are not in the context, but for the user's own words a compaction keeps verbatim"
+    );
+    let again = agent.context_messages().await.expect("context reads");
+    let texts = |messages: &[aither_core::llm::Message]| {
+        messages
+            .iter()
+            .map(|m| m.content().to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(texts(&after), texts(&again), "reading changes nothing");
+}
+
+/// A history several times the model's window yields, after the compaction
+/// that keeps the agent inside it, a context within the window.
+#[tokio::test]
+async fn context_messages_of_a_history_larger_than_the_window_fit_the_window() {
+    // The stub's window, at the agent's ~4 bytes per token.
+    const WINDOW_BYTES: usize = 128_000 * 4;
+    let stub = StubModel::spawn().await;
+    let (mut agent, _temp) = agent_on(&stub).await;
+    let filler = "x".repeat(20_000);
+    for _ in 0..40 {
+        agent.push_message(aither_core::llm::Message::user(filler.clone()));
+        agent.push_message(aither_core::llm::Message::assistant(filler.clone()));
+    }
+    let size = |messages: &[aither_core::llm::Message]| {
+        messages.iter().map(|m| m.content().len()).sum::<usize>()
+    };
+    let before = agent.context_messages().await.expect("context reads");
+    assert!(
+        size(&before) > WINDOW_BYTES,
+        "the history exceeds the window"
+    );
+
+    agent
+        .compact(None)
+        .await
+        .expect("compaction succeeds")
+        .expect("there was a conversation to compact");
+    let after = agent.context_messages().await.expect("context reads");
+    assert!(
+        size(&after) < WINDOW_BYTES,
+        "the context holds {} bytes, over the {WINDOW_BYTES}-byte window",
+        size(&after)
+    );
 }

@@ -5,16 +5,19 @@
 //! as an `Authorization` header — it is never logged or put in model
 //! context.
 
-use zenwave::header::{ACCEPT, USER_AGENT};
+use zenwave::header::{ACCEPT, LINK, USER_AGENT};
 use zenwave::{Client, Method, ResponseExt};
 
 use super::{
-    IssueBackendInfo, IssueComment, IssueDetail, IssueError, IssueListState, IssueRelationKind,
-    IssueState, IssueStore, IssueSummary, RelatedIssue,
+    CommentedIssue, IssueBackendInfo, IssueComment, IssueDetail, IssueError, IssueListState,
+    IssueRelationKind, IssueState, IssueStore, IssueSummary, RelatedIssue,
 };
 use crate::workspace::GitHubRepository;
 
+/// Public GitHub REST API base.
 const DEFAULT_API_BASE: &str = "https://api.github.com";
+/// GitHub's maximum `per_page`.
+const PAGE_SIZE: usize = 100;
 
 /// Provides a GitHub API token for [`GitHubIssueStore`].
 pub trait GitHubTokenSource: Send + Sync + std::fmt::Debug {
@@ -52,55 +55,43 @@ impl GitHubTokenSource for GhCliTokenSource {
     }
 }
 
-/// GitHub issues backend for one repository.
-#[derive(Debug)]
-pub struct GitHubIssueStore<T> {
-    repository: GitHubRepository,
+/// Authenticated GitHub REST client shared by the issue and pull request
+/// backends: one API base, one token source, one request path.
+#[derive(Debug, Clone)]
+pub struct GitHubRest<T> {
     api_base: String,
     token_source: T,
 }
 
-impl<T: GitHubTokenSource + Clone> Clone for GitHubIssueStore<T> {
-    fn clone(&self) -> Self {
-        Self {
-            repository: self.repository.clone(),
-            api_base: self.api_base.clone(),
-            token_source: self.token_source.clone(),
-        }
-    }
-}
-
-impl<T: GitHubTokenSource> GitHubIssueStore<T> {
-    /// Store targeting the repository's issues on `api.github.com`.
+impl<T: GitHubTokenSource> GitHubRest<T> {
+    /// Client targeting `api.github.com`.
     #[must_use]
-    pub fn new(repository: GitHubRepository, token_source: T) -> Self {
-        Self::with_api_base(repository, token_source, DEFAULT_API_BASE)
+    pub fn new(token_source: T) -> Self {
+        Self::with_api_base(token_source, DEFAULT_API_BASE)
     }
 
-    /// Store targeting a custom API base URL (tests, GitHub Enterprise).
+    /// Client targeting a custom API base URL (tests, GitHub Enterprise).
     #[must_use]
-    pub fn with_api_base(repository: GitHubRepository, token_source: T, api_base: &str) -> Self {
+    pub fn with_api_base(token_source: T, api_base: &str) -> Self {
         Self {
-            repository,
             api_base: api_base.trim_end_matches('/').to_string(),
             token_source,
         }
     }
 
-    /// `owner/repo` of the configured repository.
+    /// The API base URL, without a trailing slash.
     #[must_use]
-    pub const fn repository(&self) -> &GitHubRepository {
-        &self.repository
+    pub fn api_base(&self) -> &str {
+        &self.api_base
     }
 
-    fn issue_url(&self, number: i64) -> String {
-        format!(
-            "{}/repos/{}/issues/{number}",
-            self.api_base, self.repository
-        )
-    }
-
-    async fn request(
+    /// Sends an authenticated request; a 404 is [`IssueError::NotFound`]
+    /// with the placeholder number `-1` for the caller to replace, any
+    /// other non-success status is [`IssueError::GitHub`].
+    ///
+    /// # Errors
+    /// Fails on token, transport or status errors.
+    pub async fn request(
         &self,
         method: Method,
         url: String,
@@ -126,7 +117,10 @@ impl<T: GitHubTokenSource> GitHubIssueStore<T> {
     /// Sends an authenticated request and returns the raw response without
     /// the status check, for endpoints where a documented error status
     /// carries meaning (label already exists).
-    async fn request_unchecked(
+    ///
+    /// # Errors
+    /// Fails on token or transport errors.
+    pub async fn request_unchecked(
         &self,
         method: Method,
         url: String,
@@ -152,6 +146,72 @@ impl<T: GitHubTokenSource> GitHubIssueStore<T> {
             Err(error) => Err(IssueError::GitHub(error.to_string())),
         }
     }
+}
+
+/// GitHub issues backend for one repository.
+#[derive(Debug)]
+pub struct GitHubIssueStore<T> {
+    repository: GitHubRepository,
+    rest: GitHubRest<T>,
+}
+
+impl<T: GitHubTokenSource + Clone> Clone for GitHubIssueStore<T> {
+    fn clone(&self) -> Self {
+        Self {
+            repository: self.repository.clone(),
+            rest: self.rest.clone(),
+        }
+    }
+}
+
+impl<T: GitHubTokenSource> GitHubIssueStore<T> {
+    /// Store targeting the repository's issues on `api.github.com`.
+    #[must_use]
+    pub fn new(repository: GitHubRepository, token_source: T) -> Self {
+        Self::with_rest(repository, GitHubRest::new(token_source))
+    }
+
+    /// Store targeting a custom API base URL (tests, GitHub Enterprise).
+    #[must_use]
+    pub fn with_api_base(repository: GitHubRepository, token_source: T, api_base: &str) -> Self {
+        Self::with_rest(
+            repository,
+            GitHubRest::with_api_base(token_source, api_base),
+        )
+    }
+
+    /// Store sharing an existing REST client.
+    #[must_use]
+    pub const fn with_rest(repository: GitHubRepository, rest: GitHubRest<T>) -> Self {
+        Self { repository, rest }
+    }
+
+    /// `owner/repo` of the configured repository.
+    #[must_use]
+    pub const fn repository(&self) -> &GitHubRepository {
+        &self.repository
+    }
+
+    fn api_base(&self) -> &str {
+        self.rest.api_base()
+    }
+
+    fn issue_url(&self, number: i64) -> String {
+        format!(
+            "{}/repos/{}/issues/{number}",
+            self.api_base(),
+            self.repository
+        )
+    }
+
+    async fn request(
+        &self,
+        method: Method,
+        url: String,
+        body: Option<serde_json::Value>,
+    ) -> Result<zenwave::Response, IssueError> {
+        self.rest.request(method, url, body).await
+    }
 
     async fn get_issue(&self, number: i64) -> Result<GhIssue, IssueError> {
         let response = self
@@ -167,22 +227,46 @@ impl<T: GitHubTokenSource> GitHubIssueStore<T> {
             .map_err(|error| IssueError::GitHub(error.to_string()))
     }
 
+    /// One page of a list endpoint and the URL of the next page, if any.
+    async fn request_page<R: serde::de::DeserializeOwned>(
+        &self,
+        url: String,
+    ) -> Result<(Vec<R>, Option<String>), IssueError> {
+        let response = self.request(Method::GET, url, None).await?;
+        let next = response
+            .headers()
+            .get_all(LINK)
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .find_map(next_page_url);
+        let items = response
+            .into_json::<Vec<R>>()
+            .await
+            .map_err(|error| IssueError::GitHub(error.to_string()))?;
+        Ok((items, next))
+    }
+
+    /// Every item of a list endpoint, following `Link: rel="next"` to the end.
     async fn request_json_list<R: serde::de::DeserializeOwned>(
         &self,
         url: String,
     ) -> Result<Vec<R>, IssueError> {
-        let response = self.request(Method::GET, url, None).await?;
-        response
-            .into_json::<Vec<R>>()
-            .await
-            .map_err(|error| IssueError::GitHub(error.to_string()))
+        let mut items = Vec::new();
+        let mut next = Some(with_page_size(&url));
+        while let Some(url) = next {
+            let (page, following) = self.request_page::<R>(url).await?;
+            items.extend(page);
+            next = following;
+        }
+        Ok(items)
     }
 
     async fn ensure_label(&self, name: &str) -> Result<(), IssueError> {
         let response = self
+            .rest
             .request_unchecked(
                 Method::POST,
-                format!("{}/repos/{}/labels", self.api_base, self.repository),
+                format!("{}/repos/{}/labels", self.api_base(), self.repository),
                 Some(serde_json::json!({"name": name})),
             )
             .await?;
@@ -214,26 +298,44 @@ impl<T: GitHubTokenSource> IssueStore for GitHubIssueStore<T> {
         limit: i64,
     ) -> Result<Vec<IssueSummary>, IssueError> {
         let mut url = format!(
-            "{}/repos/{}/issues?state=all&sort=updated&direction=asc&per_page={}",
-            self.api_base,
+            "{}/repos/{}/issues?state=all&sort=updated&direction=asc&per_page={PAGE_SIZE}",
+            self.api_base(),
             self.repository,
-            limit.clamp(1, 100)
         );
         if let Some(since) = since {
             url.push_str("&since=");
             url.push_str(since);
         }
-        let response = self.request(Method::GET, url, None).await?;
-        let issues = response
-            .into_json::<Vec<GhIssue>>()
-            .await
-            .map_err(|error| IssueError::GitHub(error.to_string()))?;
+        let limit = usize::try_from(limit).unwrap_or(0);
+        let mut issues: Vec<GhIssue> = Vec::new();
+        let mut newer = 0_usize;
+        let mut next = Some(url);
+        // Pages are followed past pull requests until `limit` issues newer
+        // than `since` are held; the last timestamp group is completed so a
+        // tie never straddles the cut. GitHub's `since` is inclusive, so the
+        // issues at the watermark come back too.
+        'pages: while let Some(url) = next {
+            let (page, following) = self.request_page::<GhIssue>(url).await?;
+            for issue in page {
+                if issue.pull_request.is_some() {
+                    continue;
+                }
+                if newer >= limit
+                    && issues
+                        .last()
+                        .is_none_or(|last| last.updated_at != issue.updated_at)
+                {
+                    break 'pages;
+                }
+                if since.is_none_or(|since| issue.updated_at.as_str() > since) {
+                    newer += 1;
+                }
+                issues.push(issue);
+            }
+            next = following;
+        }
         issues
             .into_iter()
-            .filter(|issue| issue.pull_request.is_none())
-            // GitHub's `since` is inclusive; the issue at the watermark is
-            // already indexed.
-            .filter(|issue| since.is_none_or(|since| issue.updated_at.as_str() > since))
             .map(|issue| {
                 let labels = issue.label_names();
                 Ok(IssueSummary {
@@ -259,7 +361,7 @@ impl<T: GitHubTokenSource> IssueStore for GitHubIssueStore<T> {
         let response = self
             .request(
                 Method::POST,
-                format!("{}/repos/{}/issues", self.api_base, self.repository),
+                format!("{}/repos/{}/issues", self.api_base(), self.repository),
                 Some(serde_json::json!({
                     "title": title,
                     "body": body,
@@ -305,6 +407,7 @@ impl<T: GitHubTokenSource> IssueStore for GitHubIssueStore<T> {
             comments: comments
                 .into_iter()
                 .map(|comment: GhComment| IssueComment {
+                    id: comment.id,
                     author: comment.user.map(|user| user.login),
                     body: comment.body,
                     created_at: comment.created_at,
@@ -331,7 +434,7 @@ impl<T: GitHubTokenSource> IssueStore for GitHubIssueStore<T> {
     ) -> Result<Vec<IssueSummary>, IssueError> {
         let mut url = format!(
             "{}/repos/{}/issues?state={}&per_page={}",
-            self.api_base,
+            self.api_base(),
             self.repository,
             state.as_str(),
             limit.clamp(1, 100)
@@ -395,18 +498,25 @@ impl<T: GitHubTokenSource> IssueStore for GitHubIssueStore<T> {
         self.get(number).await
     }
 
-    async fn comment(&self, number: i64, body: &str) -> Result<IssueDetail, IssueError> {
-        self.request(
-            Method::POST,
-            format!("{}/comments", self.issue_url(number)),
-            Some(serde_json::json!({"body": body})),
-        )
-        .await
-        .map_err(|error| match error {
-            IssueError::NotFound(_) => IssueError::NotFound(number),
-            other => other,
-        })?;
-        self.get(number).await
+    async fn comment(&self, number: i64, body: &str) -> Result<CommentedIssue, IssueError> {
+        let created = self
+            .request(
+                Method::POST,
+                format!("{}/comments", self.issue_url(number)),
+                Some(serde_json::json!({"body": body})),
+            )
+            .await
+            .map_err(|error| match error {
+                IssueError::NotFound(_) => IssueError::NotFound(number),
+                other => other,
+            })?
+            .into_json::<GhComment>()
+            .await
+            .map_err(|error| IssueError::GitHub(error.to_string()))?;
+        Ok(CommentedIssue {
+            detail: self.get(number).await?,
+            comment_id: created.id,
+        })
     }
 
     async fn edit_labels(
@@ -478,19 +588,41 @@ impl<T: GitHubTokenSource> IssueStore for GitHubIssueStore<T> {
                 other => other,
             })?;
         } else {
-            self.request(
-                Method::DELETE,
-                format!("{}/{relation_path}/{}", self.issue_url(number), target.id),
-                None,
-            )
-            .await
-            .map_err(|error| match error {
-                IssueError::NotFound(_) => IssueError::NotFound(number),
-                other => other,
-            })?;
+            // Sub-issues are removed by `DELETE …/sub_issue` with the id in the
+            // body; blocked-by dependencies carry the id in the path.
+            let (url, body) = match kind {
+                IssueRelationKind::SubIssue => (
+                    format!("{}/sub_issue", self.issue_url(number)),
+                    Some(serde_json::json!({"sub_issue_id": target.id})),
+                ),
+                IssueRelationKind::BlockedBy => (
+                    format!("{}/{relation_path}/{}", self.issue_url(number), target.id),
+                    None,
+                ),
+            };
+            self.request(Method::DELETE, url, body)
+                .await
+                .map_err(|error| match error {
+                    IssueError::NotFound(_) => IssueError::NotFound(number),
+                    other => other,
+                })?;
         }
         self.get(number).await
     }
+}
+
+/// `url` asking for GitHub's maximum page size.
+fn with_page_size(url: &str) -> String {
+    let separator = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{separator}per_page={PAGE_SIZE}")
+}
+
+/// The `rel="next"` target of an RFC 8288 `Link` header value.
+fn next_page_url(link: &str) -> Option<String> {
+    link.split('<').skip(1).find_map(|entry| {
+        let (target, params) = entry.split_once('>')?;
+        params.contains("rel=\"next\"").then(|| target.to_string())
+    })
 }
 
 fn related_issue(issue: GhIssueRef) -> Result<RelatedIssue, IssueError> {
@@ -522,6 +654,7 @@ struct GhUser {
 
 #[derive(Debug, serde::Deserialize)]
 struct GhComment {
+    id: i64,
     body: String,
     created_at: String,
     user: Option<GhUser>,
@@ -590,6 +723,21 @@ mod tests {
     async fn mock_api(
         handler: impl Fn(&str, &str, &str) -> (u16, serde_json::Value) + Send + Sync + 'static,
     ) -> (String, Requests) {
+        mock_paged_api(move |method, path, body| {
+            let (status, json) = handler(method, path, body);
+            (status, json, None)
+        })
+        .await
+    }
+
+    /// Like [`mock_api`]; the handler may also name the path of the next
+    /// page, sent as a `Link: <…>; rel="next"` header.
+    async fn mock_paged_api(
+        handler: impl Fn(&str, &str, &str) -> (u16, serde_json::Value, Option<String>)
+        + Send
+        + Sync
+        + 'static,
+    ) -> (String, Requests) {
         let handler = Arc::new(handler);
         let requests: Requests = Arc::new(Mutex::new(Vec::new()));
         let requests_in = requests.clone();
@@ -630,11 +778,16 @@ mod tests {
                             auth,
                             body.clone(),
                         ));
-                        let (status, json) = handler(&method, &path, &body);
+                        let (status, json, next) = handler(&method, &path, &body);
+                        let mut response = Response::builder()
+                            .status(status)
+                            .header("content-type", "application/json");
+                        if let Some(next) = next {
+                            response = response
+                                .header("link", format!("<http://{addr}{next}>; rel=\"next\""));
+                        }
                         Ok::<_, Infallible>(
-                            Response::builder()
-                                .status(status)
-                                .header("content-type", "application/json")
+                            response
                                 .body(http_body_util::Full::new(Bytes::from(json.to_string())))
                                 .expect("response"),
                         )
@@ -678,14 +831,21 @@ mod tests {
             }
             (
                 "GET",
-                "/repos/o/r/issues/1/comments"
-                | "/repos/o/r/issues/1/sub_issues"
-                | "/repos/o/r/issues/1/dependencies/blocked_by",
+                "/repos/o/r/issues/1/comments?per_page=100"
+                | "/repos/o/r/issues/1/sub_issues?per_page=100"
+                | "/repos/o/r/issues/1/dependencies/blocked_by?per_page=100",
             ) => (200, serde_json::json!([])),
             _ => (500, serde_json::json!({"message": "unexpected request"})),
         })
         .await;
-        let tool = SubagentIssueTool::new(store(&api_base));
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = crate::db::ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("chat db should open");
+        let tool = SubagentIssueTool::new(
+            store(&api_base),
+            crate::issue::provenance::IssueProvenance::new(db, "test".to_string()),
+        );
 
         subagent_checks::assert_reads_work(&tool, 1).await;
         let reads = requests.lock().expect("requests").len();
@@ -706,9 +866,9 @@ mod tests {
             ("GET", "/repos/o/r/issues/2") => (200, gh_issue_json(2, "blocker", "open")),
             (
                 "GET",
-                "/repos/o/r/issues/1/comments"
-                | "/repos/o/r/issues/1/sub_issues"
-                | "/repos/o/r/issues/1/dependencies/blocked_by",
+                "/repos/o/r/issues/1/comments?per_page=100"
+                | "/repos/o/r/issues/1/sub_issues?per_page=100"
+                | "/repos/o/r/issues/1/dependencies/blocked_by?per_page=100",
             ) => (200, serde_json::json!([])),
             ("POST", "/repos/o/r/issues/1/dependencies/blocked_by") => {
                 assert!(body.contains("\"issue_id\":200"), "{body}");
@@ -753,6 +913,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn changes_to_github_issues_are_recorded_with_their_session_agent_and_call() {
+        #[derive(Default)]
+        struct Remote {
+            title: String,
+            state: String,
+            comments: Vec<serde_json::Value>,
+        }
+        let remote = Arc::new(Mutex::new(Remote::default()));
+        let handler_remote = remote.clone();
+        let (api_base, _requests) = mock_api(move |method, path, body| {
+            let mut remote = handler_remote.lock().expect("remote");
+            let issue = |remote: &Remote| gh_issue_json(2, &remote.title, &remote.state);
+            match (method, path) {
+                ("POST", "/repos/o/r/issues") => {
+                    remote.title = "first".to_string();
+                    remote.state = "open".to_string();
+                    (201, issue(&remote))
+                }
+                ("PATCH", "/repos/o/r/issues/2") => {
+                    let patch: serde_json::Value = serde_json::from_str(body).expect("patch");
+                    if let Some(title) = patch["title"].as_str() {
+                        remote.title = title.to_string();
+                    }
+                    if let Some(state) = patch["state"].as_str() {
+                        remote.state = state.to_string();
+                    }
+                    (200, issue(&remote))
+                }
+                ("GET", "/repos/o/r/issues/2") => (200, issue(&remote)),
+                ("GET", "/repos/o/r/issues/1") => (200, gh_issue_json(1, "outside", "open")),
+                ("POST", "/repos/o/r/issues/2/comments") => {
+                    let comment = serde_json::json!({
+                        "id": 7001,
+                        "body": "hello",
+                        "created_at": "2026-10-03T00:00:00Z",
+                        "user": null,
+                    });
+                    remote.comments.push(comment.clone());
+                    (201, comment)
+                }
+                ("GET", "/repos/o/r/issues/2/comments?per_page=100") => {
+                    (200, serde_json::Value::Array(remote.comments.clone()))
+                }
+                (
+                    "GET",
+                    "/repos/o/r/issues/1/comments?per_page=100"
+                    | "/repos/o/r/issues/1/sub_issues?per_page=100"
+                    | "/repos/o/r/issues/1/dependencies/blocked_by?per_page=100"
+                    | "/repos/o/r/issues/2/sub_issues?per_page=100"
+                    | "/repos/o/r/issues/2/dependencies/blocked_by?per_page=100",
+                ) => (200, serde_json::json!([])),
+                _ => (500, serde_json::json!({"message": "unexpected request"})),
+            }
+        })
+        .await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = crate::db::ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("chat db should open");
+        crate::agent::issue_tool::provenance_checks::assert_changes_are_recorded(
+            &db,
+            store(&api_base),
+            2,
+            1,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn removing_a_sub_issue_uses_githubs_sub_issue_endpoint() {
+        let (api_base, requests) = mock_api(|method, path, body| match (method, path) {
+            ("GET", "/repos/o/r/issues/1") => (200, gh_issue_json(1, "parent", "open")),
+            ("GET", "/repos/o/r/issues/2") => (200, gh_issue_json(2, "child", "open")),
+            (
+                "GET",
+                "/repos/o/r/issues/1/comments?per_page=100"
+                | "/repos/o/r/issues/1/sub_issues?per_page=100"
+                | "/repos/o/r/issues/1/dependencies/blocked_by?per_page=100",
+            ) => (200, serde_json::json!([])),
+            ("DELETE", "/repos/o/r/issues/1/sub_issue") => {
+                assert!(body.contains("\"sub_issue_id\":200"), "{body}");
+                (200, gh_issue_json(1, "parent", "open"))
+            }
+            _ => (404, serde_json::json!({"message": "Not Found"})),
+        })
+        .await;
+
+        store(&api_base)
+            .edit_relation(1, IssueRelationKind::SubIssue, 2, false)
+            .await
+            .expect("sub-issue removal");
+
+        let sent = requests.lock().expect("requests").clone();
+        assert!(
+            sent.iter()
+                .any(|(method, path, ..)| method == "DELETE"
+                    && path == "/repos/o/r/issues/1/sub_issue"),
+            "{sent:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn list_filters_pull_requests() {
         let mut pr = gh_issue_json(4, "a pr", "open");
         pr["pull_request"] = serde_json::json!({"url": "https://example/pr"});
@@ -768,6 +1030,178 @@ mod tests {
             .expect("list");
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].number, 3);
+    }
+
+    fn issue_at(number: i64, updated_at: &str) -> serde_json::Value {
+        let mut issue = gh_issue_json(number, &format!("issue {number}"), "open");
+        issue["updated_at"] = serde_json::json!(updated_at);
+        issue
+    }
+
+    fn pull_request_at(number: i64, updated_at: &str) -> serde_json::Value {
+        let mut pr = issue_at(number, updated_at);
+        pr["pull_request"] = serde_json::json!({"url": "https://example/pr"});
+        pr
+    }
+
+    #[tokio::test]
+    async fn comments_are_read_across_pages() {
+        let comment = |body: &str| {
+            serde_json::json!({
+                "id": 1,
+                "user": {"login": "someone"},
+                "body": body,
+                "created_at": "2026-10-01T00:00:00Z",
+            })
+        };
+        let (api_base, requests) =
+            mock_paged_api(move |method, path, _body| match (method, path) {
+                ("GET", "/repos/o/r/issues/1") => (200, gh_issue_json(1, "seed", "open"), None),
+                ("GET", "/repos/o/r/issues/1/comments?per_page=100") => (
+                    200,
+                    serde_json::json!([comment("first"), comment("second")]),
+                    Some("/comments-2".to_string()),
+                ),
+                ("GET", "/comments-2") => (200, serde_json::json!([comment("third")]), None),
+                (
+                    "GET",
+                    "/repos/o/r/issues/1/sub_issues?per_page=100"
+                    | "/repos/o/r/issues/1/dependencies/blocked_by?per_page=100",
+                ) => (200, serde_json::json!([]), None),
+                _ => panic!("unexpected request {method} {path}"),
+            })
+            .await;
+
+        let detail = store(&api_base).get(1).await.expect("get");
+
+        let bodies: Vec<_> = detail.comments.iter().map(|c| c.body.as_str()).collect();
+        assert_eq!(bodies, ["first", "second", "third"]);
+        let paths: Vec<_> = requests
+            .lock()
+            .expect("requests")
+            .iter()
+            .map(|(_, path, ..)| path.clone())
+            .collect();
+        assert!(paths.contains(&"/comments-2".to_string()), "{paths:?}");
+    }
+
+    /// Pages of `/issues` as the sync sees them: a page of only pull
+    /// requests, then two issues sharing an update time, then a later one.
+    fn sync_pages(path: &str) -> (u16, serde_json::Value, Option<String>) {
+        const T1: &str = "2026-10-01T00:00:00Z";
+        const T2: &str = "2026-10-02T00:00:00Z";
+        const T3: &str = "2026-10-03T00:00:00Z";
+        if path.starts_with("/repos/o/r/issues?") {
+            (
+                200,
+                serde_json::json!([pull_request_at(10, T1), pull_request_at(11, T1)]),
+                Some("/page-2".to_string()),
+            )
+        } else if path == "/page-2" {
+            (
+                200,
+                serde_json::json!([issue_at(1, T2), issue_at(2, T2)]),
+                Some("/page-3".to_string()),
+            )
+        } else if path == "/page-3" {
+            (200, serde_json::json!([issue_at(3, T3)]), None)
+        } else {
+            (404, serde_json::json!({"message": "Not Found"}), None)
+        }
+    }
+
+    #[tokio::test]
+    async fn the_sync_listing_follows_pages_past_pull_requests_and_keeps_ties_whole() {
+        let (api_base, _requests) = mock_paged_api(|_method, path, _body| sync_pages(path)).await;
+
+        let updated = store(&api_base)
+            .updated_since(None, 1)
+            .await
+            .expect("updated_since");
+
+        // The pull-request-only first page is passed over, and issue 2 comes
+        // with issue 1 although the limit of 1 is reached at issue 1.
+        let numbers: Vec<_> = updated.iter().map(|issue| issue.number).collect();
+        assert_eq!(numbers, [1, 2]);
+    }
+
+    #[tokio::test]
+    async fn the_search_sync_indexes_issues_behind_a_pull_request_page() {
+        use crate::db::ChatDb;
+        use crate::issue::search::{IssueSearch, collection_name};
+        use crate::repo_search::backend::testing::MemoryCollections;
+
+        let (api_base, _requests) = mock_paged_api(|method, path, _body| {
+            if let Some(number) = path
+                .strip_prefix("/repos/o/r/issues/")
+                .and_then(|rest| rest.parse::<i64>().ok())
+            {
+                let updated_at = match number {
+                    1 | 2 => "2026-10-02T00:00:00Z",
+                    _ => "2026-10-03T00:00:00Z",
+                };
+                return (200, issue_at(number, updated_at), None);
+            }
+            if path.contains("/comments")
+                || path.contains("/sub_issues")
+                || path.contains("/blocked_by")
+            {
+                return (200, serde_json::json!([]), None);
+            }
+            assert_eq!(method, "GET");
+            if path.contains("since=") {
+                // Inclusive: the newest issue comes back and is skipped.
+                return (
+                    200,
+                    serde_json::json!([issue_at(3, "2026-10-03T00:00:00Z")]),
+                    None,
+                );
+            }
+            sync_pages(path)
+        })
+        .await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("open db");
+        let store = store(&api_base);
+        let search = IssueSearch::new(db.clone(), MemoryCollections::default());
+
+        search.sync(&store).await.expect("sync");
+
+        let collection = collection_name(&store.search_key());
+        for number in [1, 2, 3] {
+            assert!(
+                db.issue_search_doc(&collection, number)
+                    .await
+                    .expect("doc")
+                    .is_some(),
+                "issue {number} is indexed"
+            );
+        }
+        assert_eq!(
+            db.issue_search_watermark(&collection)
+                .await
+                .expect("watermark")
+                .as_deref(),
+            Some("2026-10-03T00:00:00Z")
+        );
+
+        search.sync(&store).await.expect("second sync");
+    }
+
+    #[test]
+    fn the_next_page_is_read_from_the_link_header() {
+        let link = "<https://api.github.com/x?labels=a,b&page=2>; rel=\"next\", \
+                    <https://api.github.com/x?page=9>; rel=\"last\"";
+        assert_eq!(
+            next_page_url(link).as_deref(),
+            Some("https://api.github.com/x?labels=a,b&page=2")
+        );
+        assert_eq!(
+            next_page_url("<https://api.github.com/x?page=1>; rel=\"prev\""),
+            None
+        );
     }
 
     #[tokio::test]

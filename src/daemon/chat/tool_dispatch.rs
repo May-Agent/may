@@ -25,10 +25,13 @@ pub(super) async fn handle_task_request(
     state: &Arc<DaemonState>,
     request: crate::agent::task_tool::TaskCreateRequest,
 ) -> Result<crate::agent::task_tool::TaskCreateResult, String> {
-    state
+    let mut result = state
         .task_runtime
         .create_task_from_tool_request(request)
-        .await
+        .await?;
+    let funnel = state.remote_access_manager.snapshot().funnel_url;
+    result.trigger = result.trigger.with_funnel_base(funnel.as_deref());
+    Ok(result)
 }
 
 pub(super) async fn handle_notify_request(
@@ -176,7 +179,8 @@ where
     F: FnOnce(std::path::PathBuf, std::path::PathBuf) -> Fut,
     Fut: std::future::Future<Output = Result<Vec<String>, String>>,
 {
-    let source = resolve_registration_source_path(state, &request.path).await?;
+    let source =
+        resolve_registration_source_path(state, request.session_id.as_str(), &request.path).await?;
     let session_root = resolve_session_root(state, request.session_id.as_str()).await?;
     let target_dir = session_root.join(target_dir_name);
     let approval_message = build_registration_approval_message(
@@ -233,17 +237,25 @@ async fn resolve_session_root(
 
 async fn resolve_registration_source_path(
     state: &DaemonState,
+    session_id: &str,
     raw_path: &str,
 ) -> Result<std::path::PathBuf, String> {
     let path = raw_path.trim();
     if path.is_empty() {
         return Err("registration path must not be empty".to_string());
     }
+    let session = state
+        .db()
+        .get_session(session_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("session {session_id} not found"))?;
+    let session_dir = crate::session::SessionDirectory::of(&session, &state.may_dir).into_path();
 
     let candidate = if std::path::Path::new(path).is_absolute() {
         std::path::PathBuf::from(path)
     } else {
-        state.cwd.join(path)
+        session_dir.join(path)
     };
 
     let canonical = tokio::fs::canonicalize(&candidate).await.map_err(|error| {
@@ -252,12 +264,14 @@ async fn resolve_registration_source_path(
             candidate.display()
         )
     })?;
-    let project_root = tokio::fs::canonicalize(&state.cwd).await.map_err(|error| {
-        format!(
-            "failed to resolve project root {}: {error}",
-            state.cwd.display()
-        )
-    })?;
+    let project_root = tokio::fs::canonicalize(&session_dir)
+        .await
+        .map_err(|error| {
+            format!(
+                "failed to resolve project root {}: {error}",
+                session_dir.display()
+            )
+        })?;
 
     if !canonical.starts_with(&project_root) {
         return Err(format!(

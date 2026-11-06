@@ -109,6 +109,10 @@ export interface UiRemoteAccessConfig {
   tailscaleBinary: string;
   httpsPort: number;
   allowLocalEnvironment: boolean;
+  funnel: boolean;
+  funnelPort: number;
+  /** Largest webhook delivery body in bytes; larger deliveries get 413. */
+  webhookMaxBodyBytes: number;
   /** Tailscale logins accepted besides the login owning this node, which is always accepted. */
   allowedLogins: string[];
 }
@@ -125,6 +129,15 @@ export interface UiStreamConfig {
   codec: StreamCodec;
 }
 
+export interface UiSuggestionsConfig {
+  enabled: boolean;
+}
+
+export interface UiRecapConfig {
+  auto: boolean;
+  idleMinutes: number;
+}
+
 export interface UiFullConfig {
   providers: UiProviderConfig[];
   models: UiModelsConfig;
@@ -136,6 +149,9 @@ export interface UiFullConfig {
   remoteAccess: UiRemoteAccessConfig;
   sandbox: UiSandboxConfig;
   stream: UiStreamConfig;
+  /** Omitted from a save, the setting is left as it is. */
+  suggestions?: UiSuggestionsConfig;
+  recap?: UiRecapConfig;
 }
 
 export interface UiSshServerConfig {

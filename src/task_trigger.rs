@@ -19,9 +19,113 @@ pub const TRIGGER_TYPE_CRON: &str = "cron";
 /// Event name emitted when a chat turn finishes.
 pub const EVENT_CHAT_TURN_COMPLETED: &str = "chat.turn.completed";
 const WEBHOOK_ROUTE_PREFIX: &str = "/api/tasks/webhook/";
+/// The path every webhook route lives under, without the trailing slash: what
+/// Tailscale Funnel mounts.
+pub const WEBHOOK_MOUNT: &str = "/api/tasks/webhook";
+/// The webhook route with its token replaced, for records that must not hold the token.
+pub const WEBHOOK_ROUTE_REDACTED: &str = "/api/tasks/webhook/{token}";
 
 fn prefixed_error(prefix: &str, error: &impl std::fmt::Display) -> String {
     format!("{prefix}{error}")
+}
+
+/// Random bytes in a webhook token (256 bits).
+const WEBHOOK_TOKEN_BYTES: usize = 32;
+/// Prefix GitHub-style senders put before the hex digest.
+const SIGNATURE_PREFIX: &str = "sha256=";
+
+/// A signed-delivery requirement on a webhook trigger.
+///
+/// The HMAC-SHA256 of the request body, keyed by the stored secret `secret`,
+/// must arrive hex-encoded (optionally prefixed `sha256=`) in `header`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, skyzen::ToSchema)]
+pub struct WebhookSignature {
+    /// Name of a secret stored through `/secret`.
+    pub secret: String,
+    /// Request header the sender puts the signature in, such as `X-Hub-Signature-256`.
+    pub header: String,
+}
+
+/// Why a delivery's signature was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum WebhookSignatureError {
+    /// The signature header is absent or repeated.
+    #[error("the signature header is missing")]
+    Missing,
+    /// The header value is not a hex SHA-256 digest.
+    #[error("the signature header is malformed")]
+    Malformed,
+    /// The digest does not match the body.
+    #[error("the signature does not match the body")]
+    Mismatch,
+}
+
+impl WebhookSignature {
+    /// Validate the secret name and header name, lowercasing the header.
+    ///
+    /// # Errors
+    /// Returns a message when the secret name is not env-var-safe or the header is not a valid HTTP header name.
+    pub fn normalized(&self) -> Result<Self, String> {
+        let secret = crate::secrets::SecretStore::validate_name(self.secret.trim())
+            .map_err(|error| error.to_string())?
+            .to_string();
+        let header = skyzen::header::HeaderName::from_bytes(self.header.trim().as_bytes())
+            .map_err(|_| format!("'{}' is not a valid HTTP header name", self.header))?;
+        Ok(Self {
+            secret,
+            header: header.as_str().to_string(),
+        })
+    }
+
+    /// Check the request's signature header against HMAC-SHA256 of its body keyed by `secret`.
+    ///
+    /// # Errors
+    /// Returns [`WebhookSignatureError`] when the header is missing, malformed or does not match.
+    ///
+    /// # Panics
+    /// Never in practice: HMAC accepts keys of any length.
+    pub fn verify(
+        &self,
+        secret: &str,
+        request: &TaskWebhookRequest,
+    ) -> Result<(), WebhookSignatureError> {
+        use hmac::{Hmac, Mac};
+
+        let values = request
+            .headers
+            .get(&self.header)
+            .ok_or(WebhookSignatureError::Missing)?;
+        let [value] = values.as_slice() else {
+            return Err(WebhookSignatureError::Missing);
+        };
+        let digest = value.trim();
+        let digest = digest.strip_prefix(SIGNATURE_PREFIX).unwrap_or(digest);
+        let digest = hex::decode(digest).map_err(|_| WebhookSignatureError::Malformed)?;
+        let body = request
+            .body_bytes()
+            .map_err(|_| WebhookSignatureError::Malformed)?;
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes())
+            .expect("HMAC accepts keys of any length");
+        mac.update(&body);
+        mac.verify_slice(&digest)
+            .map_err(|_| WebhookSignatureError::Mismatch)
+    }
+}
+
+/// Whether `token` has the shape [`new_webhook_token`] produces: 256 bits, URL-safe base64.
+#[must_use]
+pub fn is_strong_webhook_token(token: &str) -> bool {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(token)
+        .is_ok_and(|bytes| bytes.len() == WEBHOOK_TOKEN_BYTES)
+}
+
+/// Whether two webhook tokens are equal, in time independent of where they differ.
+#[must_use]
+pub fn webhook_tokens_match(stored: &str, presented: &str) -> bool {
+    use subtle::ConstantTimeEq as _;
+    stored.as_bytes().ct_eq(presented.as_bytes()).into()
 }
 
 /// How a task run is initiated.
@@ -142,7 +246,11 @@ pub enum TaskTriggerRequest {
         event_name: String,
     },
     /// Fired by an HTTP call to the minted webhook path.
-    Webhook,
+    Webhook {
+        /// Require deliveries to carry an HMAC-SHA256 signature of the body.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<WebhookSignature>,
+    },
 }
 
 impl TaskTriggerRequest {
@@ -164,13 +272,20 @@ impl TaskTriggerRequest {
             Self::Event { event_name } => {
                 normalize_event_trigger(None, None, None, Some(event_name.as_str()))
             }
-            Self::Webhook => normalize_trigger(&TaskTriggerInput {
-                kind: TaskTriggerKind::Webhook.as_str(),
-                trigger_type: None,
-                run_at_utc: None,
-                cron_utc: None,
-                event_name: None,
-            }),
+            Self::Webhook { signature } => {
+                let mut normalized = normalize_trigger(&TaskTriggerInput {
+                    kind: TaskTriggerKind::Webhook.as_str(),
+                    trigger_type: None,
+                    run_at_utc: None,
+                    cron_utc: None,
+                    event_name: None,
+                })?;
+                normalized.signature = signature
+                    .as_ref()
+                    .map(WebhookSignature::normalized)
+                    .transpose()?;
+                Ok(normalized)
+            }
         }
     }
 }
@@ -193,15 +308,22 @@ pub enum PersistedTaskTrigger {
     Webhook {
         /// Secret token embedded in the webhook path.
         token: String,
+        /// Signed-delivery requirement, when the task has one.
+        signature: Option<WebhookSignature>,
     },
 }
 
 impl PersistedTaskTrigger {
-    /// Reconstruct a persisted trigger from the `(kind, trigger_type)` pair stored in the database.
+    /// Reconstruct a persisted trigger from the `(kind, trigger_type)` pair stored in the database
+    /// and the webhook `signature` columns.
     ///
     /// # Errors
     /// Returns a message when `kind` or `trigger_type` is not recognized or fails per-kind validation.
-    pub fn from_storage(kind: &str, trigger_type: &str) -> Result<Self, String> {
+    pub fn from_storage(
+        kind: &str,
+        trigger_type: &str,
+        signature: Option<WebhookSignature>,
+    ) -> Result<Self, String> {
         match TaskTriggerKind::from_str(kind)? {
             TaskTriggerKind::Time => Ok(Self::Time {
                 trigger_type: TimeTriggerType::from_str(trigger_type)?,
@@ -211,6 +333,7 @@ impl PersistedTaskTrigger {
             }),
             TaskTriggerKind::Webhook => Ok(Self::Webhook {
                 token: trigger_type.to_string(),
+                signature,
             }),
         }
     }
@@ -231,7 +354,16 @@ impl PersistedTaskTrigger {
         match self {
             Self::Time { trigger_type } => trigger_type.as_str(),
             Self::Event { event_name } => event_name.as_str(),
-            Self::Webhook { token } => token.as_str(),
+            Self::Webhook { token, .. } => token.as_str(),
+        }
+    }
+
+    /// Signed-delivery requirement for webhook triggers that have one.
+    #[must_use]
+    pub const fn webhook_signature(&self) -> Option<&WebhookSignature> {
+        match self {
+            Self::Webhook { signature, .. } => signature.as_ref(),
+            Self::Time { .. } | Self::Event { .. } => None,
         }
     }
 
@@ -239,7 +371,7 @@ impl PersistedTaskTrigger {
     #[must_use]
     pub fn webhook_path(&self) -> Option<String> {
         match self {
-            Self::Webhook { token } => Some(webhook_path(token.as_str())),
+            Self::Webhook { token, .. } => Some(webhook_path(token.as_str())),
             Self::Time { .. } | Self::Event { .. } => None,
         }
     }
@@ -260,9 +392,11 @@ impl PersistedTaskTrigger {
             Self::Event { event_name } => TaskTriggerResponse::Event {
                 event_name: event_name.clone(),
             },
-            Self::Webhook { token } => TaskTriggerResponse::Webhook {
+            Self::Webhook { token, signature } => TaskTriggerResponse::Webhook {
                 token: token.clone(),
                 webhook_path: webhook_path(token.as_str()),
+                public_url: None,
+                signature: signature.clone(),
             },
         }
     }
@@ -276,6 +410,7 @@ pub struct NormalizedTaskTrigger {
     event_name: Option<String>,
     run_at: Option<String>,
     cron_expression: Option<String>,
+    signature: Option<WebhookSignature>,
 }
 
 impl NormalizedTaskTrigger {
@@ -336,6 +471,7 @@ impl NormalizedTaskTrigger {
             }
             (TaskTriggerKind::Webhook, None, None) => PersistedTaskTrigger::Webhook {
                 token: new_webhook_token(),
+                signature: self.signature,
             },
             _ => panic!("invalid normalized task trigger invariant"),
         }
@@ -351,7 +487,7 @@ pub struct TaskWebhookRequest {
     pub path: String,
     /// Raw query string, when present.
     pub query: Option<String>,
-    /// Request headers, multi-valued per name.
+    /// Request headers, multi-valued per name; names are lowercase.
     pub headers: BTreeMap<String, Vec<String>>,
     /// Raw request body, base64-encoded.
     pub body_base64: String,
@@ -365,6 +501,17 @@ pub struct TaskWebhookRequest {
     pub remote_addr: Option<String>,
     /// Raw body length in bytes.
     pub body_size_bytes: usize,
+}
+
+impl TaskWebhookRequest {
+    /// The raw request body.
+    ///
+    /// # Errors
+    /// Returns the decode error when `body_base64` is not valid base64.
+    pub fn body_bytes(&self) -> Result<Vec<u8>, base64::DecodeError> {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD.decode(&self.body_base64)
+    }
 }
 
 /// A recorded task run and what triggered it, serialized tagged by `kind`.
@@ -391,8 +538,6 @@ pub enum TaskInvocation {
     },
     /// Fired by an HTTP webhook call.
     Webhook {
-        /// Token the call authenticated with.
-        token: String,
         /// Captured HTTP request data.
         request: TaskWebhookRequest,
     },
@@ -429,13 +574,45 @@ pub enum TaskTriggerResponse {
         /// Computed public webhook path.
         #[serde(rename = "webhookPath")]
         webhook_path: String,
+        /// Full internet-facing URL, while Tailscale Funnel exposes webhooks.
+        #[serde(default, rename = "publicUrl", skip_serializing_if = "Option::is_none")]
+        public_url: Option<String>,
+        /// Signed-delivery requirement, when the task has one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<WebhookSignature>,
     },
 }
 
-/// Generate a fresh random webhook token.
+impl TaskTriggerResponse {
+    /// Adds the public URL of a webhook trigger, given the Funnel base URL
+    /// (`https://host[:port]`); other kinds are unchanged.
+    #[must_use]
+    pub fn with_funnel_base(mut self, base: Option<&str>) -> Self {
+        if let (
+            Self::Webhook {
+                webhook_path,
+                public_url,
+                ..
+            },
+            Some(base),
+        ) = (&mut self, base)
+        {
+            *public_url = Some(format!("{base}{webhook_path}"));
+        }
+        self
+    }
+}
+
+/// Generate a fresh webhook token: 256 bits from the OS CSPRNG, URL-safe base64.
+///
+/// # Panics
+/// Panics when the operating system has no secure random source.
 #[must_use]
 pub fn new_webhook_token() -> String {
-    crate::id::new_long()
+    use base64::Engine as _;
+    let mut bytes = [0_u8; WEBHOOK_TOKEN_BYTES];
+    getrandom::fill(&mut bytes).expect("secure random source unavailable");
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
 /// URL path a webhook trigger with `token` listens on.
@@ -477,6 +654,7 @@ pub fn normalize_trigger(input: &TaskTriggerInput<'_>) -> Result<NormalizedTaskT
                 event_name: None,
                 run_at: None,
                 cron_expression: None,
+                signature: None,
             })
         }
     }
@@ -572,6 +750,7 @@ fn normalize_time_trigger(
                 event_name: None,
                 run_at: Some(normalize_utc_timestamp(run_at)?),
                 cron_expression: None,
+                signature: None,
             })
         }
         TimeTriggerType::Cron => {
@@ -586,6 +765,7 @@ fn normalize_time_trigger(
                 event_name: None,
                 run_at: None,
                 cron_expression: Some(normalize_cron_expression(cron_expression)?),
+                signature: None,
             })
         }
     }
@@ -610,6 +790,7 @@ fn normalize_event_trigger(
         event_name: Some(normalize_event_name(event_name)?),
         run_at: None,
         cron_expression: None,
+        signature: None,
     })
 }
 
@@ -729,21 +910,163 @@ mod tests {
     }
 
     #[test]
+    fn webhook_mount_is_the_route_prefix() {
+        assert_eq!(
+            format!("{}/", super::WEBHOOK_MOUNT),
+            super::WEBHOOK_ROUTE_PREFIX
+        );
+    }
+
+    #[test]
+    fn funnel_base_gives_a_webhook_its_public_url() {
+        let trigger = PersistedTaskTrigger::Webhook {
+            token: "abc123".to_string(),
+            signature: None,
+        };
+        let response = trigger
+            .response(None, None)
+            .with_funnel_base(Some("https://mac.ts.net:8443"));
+        match response {
+            super::TaskTriggerResponse::Webhook { public_url, .. } => assert_eq!(
+                public_url.as_deref(),
+                Some("https://mac.ts.net:8443/api/tasks/webhook/abc123")
+            ),
+            other => panic!("unexpected response: {other:?}"),
+        }
+        let off = trigger.response(None, None).with_funnel_base(None);
+        assert!(matches!(
+            off,
+            super::TaskTriggerResponse::Webhook {
+                public_url: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn persisted_webhook_trigger_builds_api_response() {
         let trigger = PersistedTaskTrigger::Webhook {
             token: "abc123".to_string(),
+            signature: None,
         };
         let response = trigger.response(None, None);
         match response {
             super::TaskTriggerResponse::Webhook {
                 token,
                 webhook_path,
+                ..
             } => {
                 assert_eq!(token, "abc123");
                 assert_eq!(webhook_path, "/api/tasks/webhook/abc123");
             }
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    #[test]
+    fn webhook_tokens_are_256_bit_random_secrets() {
+        let first = super::new_webhook_token();
+        let second = super::new_webhook_token();
+        assert_ne!(first, second);
+        assert!(super::is_strong_webhook_token(&first));
+        assert_eq!(first.len(), 43);
+        assert!(!super::is_strong_webhook_token("quiet-brave-mint-otter"));
+        assert!(!super::is_strong_webhook_token(""));
+    }
+
+    #[test]
+    fn webhook_token_comparison_requires_equality() {
+        let token = super::new_webhook_token();
+        assert!(super::webhook_tokens_match(&token, &token));
+        assert!(!super::webhook_tokens_match(
+            &token,
+            &super::new_webhook_token()
+        ));
+        assert!(!super::webhook_tokens_match(&token, &token[..10]));
+    }
+
+    fn signed_request(
+        header: &str,
+        signature: Option<String>,
+        body: &[u8],
+    ) -> super::TaskWebhookRequest {
+        use base64::Engine as _;
+        let mut headers = std::collections::BTreeMap::new();
+        if let Some(signature) = signature {
+            headers.insert(header.to_string(), vec![signature]);
+        }
+        super::TaskWebhookRequest {
+            method: "POST".to_string(),
+            path: "/hook".to_string(),
+            query: None,
+            headers,
+            body_base64: base64::engine::general_purpose::STANDARD.encode(body),
+            body_text: None,
+            body_json: None,
+            remote_addr: None,
+            body_size_bytes: body.len(),
+        }
+    }
+
+    fn sign(secret: &str, body: &[u8]) -> String {
+        use hmac::{Hmac, Mac};
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).expect("key");
+        mac.update(body);
+        format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+    }
+
+    #[test]
+    fn signature_accepts_a_correct_digest_and_refuses_the_rest() {
+        let requirement = super::WebhookSignature {
+            secret: "HOOK_SECRET".to_string(),
+            header: "X-Hub-Signature-256".to_string(),
+        }
+        .normalized()
+        .expect("signature requirement is valid");
+        assert_eq!(requirement.header, "x-hub-signature-256");
+        let body = br#"{"a":1}"#;
+        let good = sign("s3cret", body);
+        let verify = |signature: Option<String>, body: &[u8]| {
+            requirement.verify(
+                "s3cret",
+                &signed_request("x-hub-signature-256", signature, body),
+            )
+        };
+        assert_eq!(verify(Some(good.clone()), body), Ok(()));
+        assert_eq!(
+            verify(Some(good.trim_start_matches("sha256=").to_string()), body),
+            Ok(())
+        );
+        assert_eq!(
+            verify(None, body),
+            Err(super::WebhookSignatureError::Missing)
+        );
+        assert_eq!(
+            verify(Some(sign("other", body)), body),
+            Err(super::WebhookSignatureError::Mismatch)
+        );
+        assert_eq!(
+            verify(Some(good), b"tampered"),
+            Err(super::WebhookSignatureError::Mismatch)
+        );
+        assert_eq!(
+            verify(Some("sha256=zz".to_string()), body),
+            Err(super::WebhookSignatureError::Malformed)
+        );
+    }
+
+    #[test]
+    fn signature_requirement_rejects_bad_names() {
+        let bad_secret = super::WebhookSignature {
+            secret: "not a name".to_string(),
+            header: "x-sig".to_string(),
+        };
+        assert!(bad_secret.normalized().is_err());
+        let bad_header = super::WebhookSignature {
+            secret: "OK".to_string(),
+            header: "bad header".to_string(),
+        };
+        assert!(bad_header.normalized().is_err());
     }
 
     #[test]

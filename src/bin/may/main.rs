@@ -44,7 +44,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use executor_core::tokio::TokioGlobal;
-use executor_core::{spawn, try_init_global_executor};
+use executor_core::{DefaultExecutor, spawn, try_init_global_executor};
 use ratatui::Terminal;
 use ratatui::backend::Backend;
 use ratatui::backend::CrosstermBackend;
@@ -81,10 +81,7 @@ fn write_bug_snapshot(
     app: &App,
     log_ring: &may_agent::log_ring::LogRingHandle,
 ) -> anyhow::Result<std::path::PathBuf> {
-    let bugs_dir = dirs::home_dir()
-        .context("Failed to determine home directory")?
-        .join(".may")
-        .join("bugs");
+    let bugs_dir = app.session_manager.may_dir().join("bugs");
     let timestamp = jiff::Timestamp::now().to_string();
     let header = BugReportHeader {
         version: env!("CARGO_PKG_VERSION"),
@@ -181,7 +178,7 @@ async fn async_main() -> anyhow::Result<()> {
     let panic_ring = log_ring.clone();
     let previous_hook = panic::take_hook();
     panic::set_hook(Box::new(move |panic_info| {
-        if let Some(bugs_dir) = dirs::home_dir().map(|home| home.join(".may").join("bugs"))
+        if let Ok(bugs_dir) = may_agent::MayConfig::may_dir().map(|dir| dir.join("bugs"))
             && let Err(error) = panic_ring.dump_to(
                 &bugs_dir.join(format!("panic-{}.log", jiff::Timestamp::now().as_second())),
                 &panic_info.to_string(),
@@ -196,7 +193,7 @@ async fn async_main() -> anyhow::Result<()> {
     // same ring to the same directory before the signal's usual outcome.
     // Forensics must not stop startup, so a failed install only warns.
     #[cfg(unix)]
-    if let Some(bugs_dir) = dirs::home_dir().map(|home| home.join(".may").join("bugs"))
+    if let Ok(bugs_dir) = may_agent::MayConfig::may_dir().map(|dir| dir.join("bugs"))
         && let Err(error) = may_agent::crash_signal::install(log_ring.clone(), bugs_dir)
     {
         tracing::warn!("fatal-signal log dump not installed: {error}");
@@ -369,7 +366,7 @@ where
 
     // Connect to all configured MCP servers
     if mcp_manager.has_servers() {
-        let results = mcp_manager.connect_all().await;
+        let results = mcp_manager.connect_all(&DefaultExecutor).await;
         for (name, result) in results {
             match result {
                 Ok(()) => tracing::info!("Connected to MCP server: {}", name),
@@ -1147,6 +1144,7 @@ where
                     TuiEvent::ContextReport(_)
                     | TuiEvent::UsageReport(_)
                     | TuiEvent::ContextDump(_)
+                    | TuiEvent::ContextMessages(_)
                     | TuiEvent::ContextDumpSaved { .. } => {
                         // Reports arrive on the context channel; the agent
                         // channel only carries them if the channels raced.
@@ -1504,13 +1502,32 @@ where
                                     "That prompt was withdrawn; your answer was not sent",
                                 ),
                             }
-                        } else if !runtime_deps
-                            .answer_open_question(&request_id, &answers)
-                            .await?
-                        {
-                            app.chat.push_notice(
-                                "That question is no longer open; your answer was not sent",
-                            );
+                        } else {
+                            match runtime_deps
+                                .answer_open_question(&request_id, &answers)
+                                .await
+                            {
+                                Ok(true) => {}
+                                Ok(false) => app.chat.push_notice(
+                                    "That question is no longer open; your answer was not sent",
+                                ),
+                                Err(error) => {
+                                    app.chat.push_notice(&format!(
+                                        "Your answer was not sent and the question is still open: {error}"
+                                    ));
+                                    if let Some(open) = app
+                                        .session_runtime
+                                        .open_questions
+                                        .iter()
+                                        .find(|open| open.id == request_id)
+                                        .cloned()
+                                    {
+                                        app.mode = may_agent::tui::AppMode::AskUser(
+                                            may_agent::tui::AskUserState::for_open_question(open),
+                                        );
+                                    }
+                                }
+                            }
                         }
                     }
                     Some(SendAction::ReloadHistory) => {
@@ -1645,6 +1662,35 @@ where
                             .chat
                             .push_error(&format!("Failed to save bug snapshot: {error}")),
                     },
+                    Some(SendAction::ToggleYolo) => {
+                        let session_id = app
+                            .session_manager
+                            .current()
+                            .map(|session| session.id.clone());
+                        match (runtime_deps.daemon(), session_id) {
+                            (Some(client), Some(session_id)) => {
+                                let enable = !app.session_runtime.yolo;
+                                let put = client
+                                    .put::<_, serde_json::Value>(
+                                        &may_agent::client::session_path(
+                                            session_id.as_str(),
+                                            "/yolo",
+                                        ),
+                                        &serde_json::json!({ "yolo": enable }),
+                                    )
+                                    .await;
+                                match put {
+                                    Ok(_) => app.chat.push_notice(if enable {
+                                        "Yolo on: every approval request in this session is granted"
+                                    } else {
+                                        "Yolo off: approval requests ask again"
+                                    }),
+                                    Err(error) => app.chat.push_error(&error.to_string()),
+                                }
+                            }
+                            _ => app.chat.push_notice("No session is attached"),
+                        }
+                    }
                     Some(SendAction::Recap) => {
                         let session_id = app
                             .session_manager
@@ -1662,8 +1708,26 @@ where
                                         &serde_json::json!({}),
                                     )
                                     .await;
-                                if let Err(error) = posted {
-                                    app.chat.push_error(&error.to_string());
+                                match posted {
+                                    Ok(response) => {
+                                        if response["started"] == false {
+                                            app.set_status("");
+                                            app.chat.push_notice(
+                                                "This session is empty — nothing to recap",
+                                            );
+                                        }
+                                    }
+                                    // A running turn holds the session: the
+                                    // daemon's reason is the answer.
+                                    Err(may_agent::client::DaemonClientError::Status {
+                                        status,
+                                        message,
+                                        ..
+                                    }) if status == hyper::StatusCode::CONFLICT => {
+                                        app.set_status("");
+                                        app.chat.push_notice(&message);
+                                    }
+                                    Err(error) => app.chat.push_error(&error.to_string()),
                                 }
                             }
                             _ => app
@@ -1731,6 +1795,8 @@ where
                                         may_agent::agent::assemble_usage_report(
                                             session_id.as_str(),
                                             &[],
+                                            &[],
+                                            &may_agent::db::SessionIntervals::default(),
                                             Some(created_at.as_millisecond()),
                                             jiff::Timestamp::now().as_millisecond(),
                                         ),
@@ -1764,7 +1830,10 @@ where
                             url: None,
                             env: std::collections::HashMap::new(),
                         };
-                        match mcp_manager.add_server(&name, config).await {
+                        match mcp_manager
+                            .add_server(&DefaultExecutor, &name, config)
+                            .await
+                        {
                             Ok(()) => {
                                 app.set_status(format!("Added MCP server: {name}"));
                                 app.mcp_servers = mcp_manager.server_info();
@@ -1797,7 +1866,7 @@ where
                         }
                     }
                     Some(SendAction::McpReconnect { name }) => {
-                        match mcp_manager.reconnect(&name).await {
+                        match mcp_manager.reconnect(&DefaultExecutor, &name).await {
                             Ok(()) => {
                                 app.set_status(format!("Reconnected to MCP server: {name}"));
                                 app.mcp_servers = mcp_manager.server_info();
@@ -1895,16 +1964,12 @@ where
                     }) => {
                         let deferred = startup_gate.take().is_some();
                         if let Some(level) = level {
-                            let result = may_agent::workspace::WorkspaceConfig::load(&config_path)
-                                .and_then(|config| {
-                                    may_agent::trust::persist(
-                                        &config,
-                                        &config_path,
-                                        &worktree,
-                                        Some(&kind),
-                                        level,
-                                    )
-                                });
+                            let result = may_agent::trust::persist(
+                                &config_path,
+                                &worktree,
+                                Some(&kind),
+                                level,
+                            );
                             match result {
                                 Ok(()) => app.chat.push_notice(&format!(
                                     "Repository trust for {} is now {}",

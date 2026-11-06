@@ -19,7 +19,8 @@ Ask: **"Will you edit this in Keynote/PowerPoint later?"**
 If the topic needs research, use the builtin research subagent:
 
 ```bash
-subagent --subagent "research" --prompt "Research [TOPIC] for a presentation. Find key concepts, recent statistics, and expert insights."
+echo "Research [TOPIC] for a presentation. Find key concepts, recent statistics, and expert insights." > tmp/research.md
+subagent research --prompt-file tmp/research.md
 ```
 
 If the user asks for current, recent, or externally grounded material, research is required.
@@ -37,7 +38,8 @@ Gather from user:
 Launch art direction subagent to create design guide and outline:
 
 ```bash
-subagent --subagent "skills/slide/subagents/art_direction.md" --prompt "Create design guide for: [TOPIC]. Audience: [AUDIENCE]. Style: [STYLE]. Slide count: [N]."
+echo "Follow skills/slide/subagents/art_direction.md. Create design guide for: [TOPIC]. Audience: [AUDIENCE]. Style: [STYLE]. Slide count: [N]." > tmp/art_direction.md
+subagent general --prompt-file tmp/art_direction.md
 ```
 
 The subagent returns a YAML design guide containing:
@@ -94,11 +96,14 @@ Launch one slide_creator subagent per slide **in parallel**:
 
 ```bash
 pids=""
-subagent --subagent "skills/slide/subagents/slide_creator.md" --prompt "Slide 1: [SPEC]. Design: [DESIGN_GUIDE]" | jq -er '.result' > artifacts/temp/slide_1.result.md &
+echo "Follow skills/slide/subagents/slide_creator.md. Slide 1: [SPEC]. Design: [DESIGN_GUIDE]" > tmp/slide_1.md
+subagent general --prompt-file tmp/slide_1.md | jq -er '.result' > artifacts/temp/slide_1.result.md &
 pids="$pids $!"
-subagent --subagent "skills/slide/subagents/slide_creator.md" --prompt "Slide 2: [SPEC]. Design: [DESIGN_GUIDE]" | jq -er '.result' > artifacts/temp/slide_2.result.md &
+echo "Follow skills/slide/subagents/slide_creator.md. Slide 2: [SPEC]. Design: [DESIGN_GUIDE]" > tmp/slide_2.md
+subagent general --prompt-file tmp/slide_2.md | jq -er '.result' > artifacts/temp/slide_2.result.md &
 pids="$pids $!"
-subagent --subagent "skills/slide/subagents/slide_creator.md" --prompt "Slide 3: [SPEC]. Design: [DESIGN_GUIDE]" | jq -er '.result' > artifacts/temp/slide_3.result.md &
+echo "Follow skills/slide/subagents/slide_creator.md. Slide 3: [SPEC]. Design: [DESIGN_GUIDE]" > tmp/slide_3.md
+subagent general --prompt-file tmp/slide_3.md | jq -er '.result' > artifacts/temp/slide_3.result.md &
 pids="$pids $!"
 # ... one per slide
 for pid in $pids; do

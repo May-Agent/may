@@ -22,9 +22,11 @@ use crate::config::MayConfig;
 use crate::daemon::types::BrowserLifecycleEvent;
 use crate::live_response::LiveResponseRegistry;
 use crate::mcp::{MayMcpServerConfig, McpManager, McpServerInfo};
-use crate::session::{PersistedAskUserQuestion, PersistedAskUserRequest};
+use crate::secrets::{SecretScope, SecretStore};
+use crate::session::{PersistedAskUserQuestion, PersistedAskUserRequest, PersistedSecretRequest};
 use crate::ui_event_bus::{UiEventBus, UiEventTopics};
 use crate::workspace_request::RequestWorkspaceArgs;
+use askama::Template;
 
 #[derive(Debug, Clone, Copy, serde::Serialize, PartialEq, Eq, skyzen::ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -315,10 +317,11 @@ impl McpService {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let has_servers = manager.has_servers();
         tokio::spawn(async move {
+            let executor = executor_core::DefaultExecutor;
             // Eagerly start connection but don't block the command loop.
             // The first few commands may see unconnected servers.
             if has_servers {
-                let results = manager.connect_all().await;
+                let results = manager.connect_all(&executor).await;
                 for (name, result) in results {
                     if let Err(e) = result {
                         tracing::warn!(server = %name, error = %e, "background MCP server connection failed");
@@ -335,13 +338,13 @@ impl McpService {
                         config,
                         reply,
                     } => {
-                        let _ = reply.send(manager.add_server(name, config).await);
+                        let _ = reply.send(manager.add_server(&executor, name, config).await);
                     }
                     McpCommand::RemoveServer { name, reply } => {
                         let _ = reply.send(manager.remove_server(&name).await);
                     }
                     McpCommand::Reconnect { name, reply } => {
-                        let _ = reply.send(manager.reconnect(&name).await);
+                        let _ = reply.send(manager.reconnect(&executor, &name).await);
                     }
                 }
             }
@@ -405,8 +408,9 @@ impl McpService {
 }
 
 pub struct DaemonState {
-    /// Runs the connected ACP agents; reads the live config on every spawn.
-    pub(crate) acp_host: acpsub::Host,
+    /// Runs the connected ACP agents, one host per session; reads the live
+    /// config on every spawn.
+    pub(crate) acp_host: Arc<crate::agent::acp_subagent::AcpHosts>,
     pub(crate) tokio_handle: tokio::runtime::Handle,
     pub(crate) db: crate::db::ChatDb,
     pub(crate) default_profile_id: String,
@@ -440,7 +444,6 @@ pub struct DaemonState {
     pub(crate) tool_distribution: Arc<aither_sandbox::ToolDistribution>,
     /// Prepared tool environments reused by every agent rebuilt for a session.
     pub(crate) tool_environments: crate::agent::ToolEnvironmentCache,
-    pub(crate) cwd: PathBuf,
     pub(crate) may_dir: PathBuf,
     /// Wakes the search indexer after new messages land.
     pub(crate) search_index_wake_tx: async_channel::Sender<()>,
@@ -522,11 +525,25 @@ impl DaemonState {
     }
 }
 
-#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
+/// What a client sends for one question. For a secret question `custom`
+/// carries the secret value and `declined` refuses to give it; neither value
+/// nor request body is ever printed.
+#[derive(serde::Deserialize, skyzen::ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum UiAnswerInput {
     Selected { values: Vec<String> },
     Custom { text: String },
+    Declined,
+}
+
+impl std::fmt::Debug for UiAnswerInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Selected { .. } => "UiAnswerInput::Selected",
+            Self::Custom { .. } => "UiAnswerInput::Custom",
+            Self::Declined => "UiAnswerInput::Declined",
+        })
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -537,6 +554,10 @@ pub enum UiAnswerInputError {
     BlankSelectedOption,
     #[error("ask-user custom answer must not be empty")]
     BlankCustom,
+    #[error("only a secret question can be declined")]
+    DeclinedPlainQuestion,
+    #[error("a secret question takes the value as text, not a selection")]
+    SelectedSecret,
 }
 
 impl TryFrom<UiAnswerInput> for AnswerValue {
@@ -560,8 +581,45 @@ impl TryFrom<UiAnswerInput> for AnswerValue {
                 }
                 Ok(Self::Custom(trimmed.to_string()))
             }
+            UiAnswerInput::Declined => Err(UiAnswerInputError::DeclinedPlainQuestion),
         }
     }
+}
+
+#[derive(Template)]
+#[template(path = "ask_user_secret_stored.txt", escape = "none")]
+struct SecretStoredText<'a> {
+    name: &'a str,
+    scope: SecretScope,
+}
+
+#[derive(Template)]
+#[template(path = "ask_user_secret_declined.txt", escape = "none")]
+struct SecretDeclinedText<'a> {
+    name: &'a str,
+}
+
+/// Why the answers to a question could not be resolved.
+#[derive(Debug, thiserror::Error)]
+pub enum AskUserRespondError {
+    /// The client's answer does not fit its question.
+    #[error(transparent)]
+    Input(#[from] UiAnswerInputError),
+    /// The answers do not fit the question, or the commit failed.
+    #[error(transparent)]
+    Answer(#[from] crate::session::AnswerError),
+    /// The question could not be read.
+    #[error("failed to read the question: {0}")]
+    Lookup(#[source] crate::db::ChatDbError),
+    /// The secret could not be stored; the question stays open.
+    #[error("failed to store secret {name}: {source}")]
+    Store {
+        /// The secret's name.
+        name: String,
+        /// Why the keychain or index refused it.
+        #[source]
+        source: crate::secrets::SecretError,
+    },
 }
 
 #[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
@@ -618,6 +676,8 @@ fn answers_allow(request: &PersistedAskUserRequest, answers: &[QuestionAnswer]) 
 pub struct AskUserApprover {
     live_responses: Arc<LiveResponseRegistry<Vec<QuestionAnswer>>>,
     runtime_service: Option<Arc<crate::session::SessionRuntimeService>>,
+    /// Where the value a secret question collects is stored.
+    secrets: Option<SecretStore>,
 }
 
 #[derive(Debug, Clone)]
@@ -635,6 +695,10 @@ pub enum WorkspaceApprovalError {
     PersistHistory(#[source] crate::db::ChatDbError),
     #[error("workspace request interrupted")]
     Interrupted,
+    #[error("failed to read the session's yolo switch: {0}")]
+    Yolo(#[source] crate::db::ChatDbError),
+    #[error("failed to grant the workspace request under yolo: {0}")]
+    YoloGrant(#[source] Box<WorkspaceResolveError>),
 }
 
 /// Why a workspace response could not be resolved.
@@ -666,7 +730,113 @@ impl AskUserApprover {
         Self {
             live_responses: Arc::new(LiveResponseRegistry::new()),
             runtime_service: None,
+            secrets: None,
         }
+    }
+
+    #[must_use]
+    pub(crate) fn with_secret_store(mut self, secrets: SecretStore) -> Self {
+        self.secrets = Some(secrets);
+        self
+    }
+
+    /// Resolve the pending question `request_id` with the client's `inputs`.
+    /// The value a secret question collects goes into the secret store here,
+    /// before the commit, and what is committed, persisted and delivered to
+    /// the agent is only the text that the secret was stored or declined;
+    /// the value goes no further. Otherwise as [`Self::resolve`].
+    ///
+    /// # Errors
+    /// Returns [`AskUserRespondError`] when an input does not fit its
+    /// question, the secret cannot be stored or the commit fails; nothing is
+    /// committed then.
+    ///
+    /// # Panics
+    /// Panics if the approver has no runtime service, or no secret store when
+    /// a secret question is answered.
+    pub(crate) async fn respond(
+        &self,
+        request_id: &str,
+        inputs: Vec<UiQuestionAnswer>,
+    ) -> Result<Option<AskUserResolved>, AskUserRespondError> {
+        let runtime = self
+            .runtime_service
+            .as_ref()
+            .expect("resolving an ask-user question needs the runtime service");
+        let Some(pending) = runtime
+            .db()
+            .pending_ask_user_request(request_id)
+            .await
+            .map_err(AskUserRespondError::Lookup)?
+        else {
+            // Answered before, or never pending: no input is stored.
+            return Ok(self.resolve(request_id, Vec::new()).await?);
+        };
+        let questions = &pending.request.questions;
+        if questions.len() != inputs.len() {
+            return Err(crate::session::AnswerError::Mismatch(
+                crate::session::open_questions::AnswerMismatch::Count {
+                    questions: questions.len(),
+                    answers: inputs.len(),
+                },
+            )
+            .into());
+        }
+        let mut answers = Vec::with_capacity(inputs.len());
+        for (question, input) in questions.iter().zip(inputs) {
+            let answer = match &question.secret {
+                None => input.answer.try_into()?,
+                Some(secret) => {
+                    self.take_secret(secret, &pending.session_id, input.answer)
+                        .await?
+                }
+            };
+            answers.push(QuestionAnswer {
+                section: input.section,
+                answer,
+            });
+        }
+        Ok(self.resolve(request_id, answers).await?)
+    }
+
+    /// Store the value `input` carries as `secret` of `session_id` and
+    /// return the answer the agent is told instead of it.
+    async fn take_secret(
+        &self,
+        secret: &PersistedSecretRequest,
+        session_id: &str,
+        input: UiAnswerInput,
+    ) -> Result<AnswerValue, AskUserRespondError> {
+        let text = match input {
+            UiAnswerInput::Custom { text } => {
+                let value = text.trim().to_string();
+                if value.is_empty() {
+                    return Err(UiAnswerInputError::BlankCustom.into());
+                }
+                let store = self
+                    .secrets
+                    .clone()
+                    .expect("answering a secret question needs the secret store");
+                let (scope, name, session) =
+                    (secret.scope, secret.name.clone(), session_id.to_string());
+                blocking::unblock(move || store.set_scoped(scope, &session, &name, &value))
+                    .await
+                    .map_err(|source| AskUserRespondError::Store {
+                        name: secret.name.clone(),
+                        source,
+                    })?;
+                SecretStoredText {
+                    name: &secret.name,
+                    scope: secret.scope,
+                }
+                .render()
+            }
+            UiAnswerInput::Declined => SecretDeclinedText { name: &secret.name }.render(),
+            UiAnswerInput::Selected { .. } => return Err(UiAnswerInputError::SelectedSecret.into()),
+        };
+        Ok(AnswerValue::Custom(
+            text.expect("secret answer template must render"),
+        ))
     }
 
     #[must_use]
@@ -686,6 +856,7 @@ impl AskUserApprover {
                 question: question.question.clone(),
                 option: question.option.clone(),
                 multi_select: question.multi_select,
+                secret: None,
             })
             .collect()
     }
@@ -869,6 +1040,19 @@ impl WorkspaceApprover {
                 )
                 .await
                 .map_err(WorkspaceApprovalError::PersistHistory)?;
+
+            // A yolo session grants at once, through the same commit a user
+            // approval takes.
+            if runtime_service
+                .db()
+                .session_yolo(session_id)
+                .await
+                .map_err(WorkspaceApprovalError::Yolo)?
+            {
+                self.resolve(&request_id, true)
+                    .await
+                    .map_err(|error| WorkspaceApprovalError::YoloGrant(Box::new(error)))?;
+            }
         }
 
         rx.recv()
@@ -1032,12 +1216,10 @@ impl DaemonState {
     /// temporary may home, with background services absent.
     pub(crate) async fn for_test(
         may_dir: &std::path::Path,
-        cwd: &std::path::Path,
         config: MayConfig,
     ) -> anyhow::Result<Self> {
         Self::for_test_with_connectivity(
             may_dir,
-            cwd,
             config,
             aither_connectivity::Connectivity::manual(true).0,
         )
@@ -1047,7 +1229,6 @@ impl DaemonState {
     /// [`Self::for_test`] on a given connectivity source.
     pub(crate) async fn for_test_with_connectivity(
         may_dir: &std::path::Path,
-        cwd: &std::path::Path,
         config: MayConfig,
         connectivity: aither_connectivity::Connectivity,
     ) -> anyhow::Result<Self> {
@@ -1062,7 +1243,9 @@ impl DaemonState {
         );
         let (title_generation_queue, _rx) = TitleGenerationQueue::new();
         let (tool_dispatchers, _queues) = tool_dispatch_channels();
-        let tool_distribution = std::sync::Arc::new(crate::tools::embedded_distribution()?);
+        let tool_distribution = std::sync::Arc::new(crate::tools::fixture_distribution(
+            &may_dir.join("tool-fixtures"),
+        ));
         let (search_index_wake_tx, search_index_wake) = async_channel::bounded(1);
         let (browser_lifecycle_tx, _) = tokio::sync::broadcast::channel(4);
         let notification_manager = std::sync::Arc::new(
@@ -1080,11 +1263,16 @@ impl DaemonState {
                 may_dir.to_path_buf(),
                 tool_distribution.clone(),
             )
-            .await?,
+            .await?
+            .with_secret_store(SecretStore::in_memory(may_dir)),
         );
         let config = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(config));
         Ok(Self {
-            acp_host: crate::agent::acp_subagent::live_host(config.clone(), may_dir)?,
+            acp_host: std::sync::Arc::new(crate::agent::acp_subagent::AcpHosts::new(
+                config.clone(),
+                crate::session::MayHomePaths::new(may_dir.to_path_buf()),
+                tokio::runtime::Handle::current(),
+            )),
             tokio_handle: tokio::runtime::Handle::current(),
             db,
             default_profile_id: "test".to_string(),
@@ -1099,17 +1287,14 @@ impl DaemonState {
             ask_user_approver: AskUserApprover::new().with_runtime_service(runtime_service.clone()),
             tool_dispatchers,
             fetched_models_cache: RefreshableCache::new(Duration::from_secs(20)),
-            config: config.clone(),
+            config,
             ui_event_bus: ui_event_bus.clone(),
             container_prepare: ContainerPrepareTracker::new(ui_event_bus.clone()),
             container_manager: None,
             browser_manager: arc_swap::ArcSwapOption::empty(),
             browser_owner_session_id: arc_swap::ArcSwapOption::empty(),
             browser_lifecycle_tx,
-            computer: std::sync::Arc::new(crate::computer::ComputerAgent::new(
-                may_dir.to_path_buf(),
-                config,
-            )),
+            computer: std::sync::Arc::new(crate::computer::ComputerAgent::detached()),
             remote_access_manager: std::sync::Arc::new(
                 super::remote_access::RemoteAccessManager::new(ui_event_bus.clone()),
             ),
@@ -1124,7 +1309,6 @@ impl DaemonState {
             task_runtime,
             tool_distribution,
             tool_environments: crate::agent::ToolEnvironmentCache::spawn(),
-            cwd: cwd.to_path_buf(),
             may_dir: may_dir.to_path_buf(),
             repo_search: crate::repo_search::RepoSearch::global(may_dir),
             search_index_wake_tx,

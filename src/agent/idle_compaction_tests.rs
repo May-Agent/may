@@ -12,11 +12,11 @@
 
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use aither_agent::ManualClock;
 use bytes::Bytes;
-use futures_lite::StreamExt;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::header::{CONTENT_TYPE, HeaderValue};
@@ -27,7 +27,9 @@ use hyper_util::rt::TokioIo;
 use tokio::net::TcpListener;
 
 use super::live_settings::AgentLiveSettings;
-use super::may::{AgentEnvironment, MayAgent, MayAgentConfig, MayAgentSessionInput};
+use super::may::{
+    AgentEnvironment, HostReaderSource, MayAgent, MayAgentConfig, MayAgentSessionInput,
+};
 use super::tool_environment_cache::ToolEnvironmentCache;
 use crate::config::{MayConfig, ProviderInstance, ProviderType};
 use crate::model_selector::ModelSelector;
@@ -38,7 +40,7 @@ const COMPACTION_PROVIDER: &str = "compaction";
 pub const SESSION_MODEL: &str = "session-model";
 const COMPACTION_MODEL: &str = "compaction-model";
 /// Opening words of aither's compaction instruction.
-const COMPACTION_MARKER: &str = "Your context window is being compacted";
+pub const COMPACTION_MARKER: &str = "Your context window is being compacted";
 
 /// What a stub model server received.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,6 +57,12 @@ pub struct StubModel {
 
 impl StubModel {
     pub async fn spawn(model: &'static str) -> Self {
+        Self::spawn_replying(model, |_| None).await
+    }
+
+    /// Like [`Self::spawn`], but `reply` may answer a request body with its
+    /// own text; `None` leaves the default.
+    pub async fn spawn_replying(model: &'static str, reply: fn(&str) -> Option<String>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind stub model server");
@@ -65,7 +73,8 @@ impl StubModel {
             while let Ok((stream, _)) = listener.accept().await {
                 let served = served.clone();
                 tokio::spawn(async move {
-                    let service = service_fn(move |request| answer(request, model, served.clone()));
+                    let service =
+                        service_fn(move |request| answer(request, model, reply, served.clone()));
                     let _ = http1::Builder::new()
                         .serve_connection(TokioIo::new(stream), service)
                         .await;
@@ -94,6 +103,7 @@ impl StubModel {
 async fn answer(
     request: Request<Incoming>,
     model: &'static str,
+    reply_to: fn(&str) -> Option<String>,
     requests: Arc<tokio::sync::Mutex<Vec<String>>>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     if request.method() == Method::GET && request.uri().path().ends_with("/models") {
@@ -127,7 +137,7 @@ async fn answer(
         })
         .to_string()
     } else {
-        "Hello there.".to_string()
+        reply_to(&text).unwrap_or_else(|| "Hello there.".to_string())
     };
     requests.lock().await.push(text);
     let chunk = |delta: &serde_json::Value, finish: serde_json::Value| {
@@ -157,16 +167,57 @@ fn reply(status: StatusCode, content_type: &'static str, body: String) -> Respon
     response
 }
 
+/// A host whose machine load the test sets; its memory pressure stays
+/// normal. Sessions built in tests read it instead of the machine running
+/// them, so a loaded test machine never alerts their agents.
+#[derive(Clone, Default)]
+pub struct ScriptedHost {
+    load_bits: Arc<AtomicU64>,
+    reads: Arc<AtomicUsize>,
+}
+
+impl ScriptedHost {
+    /// Sets the machine load later readings return.
+    pub fn set_load(&self, load: f64) {
+        self.load_bits.store(load.to_bits(), Ordering::SeqCst);
+    }
+
+    /// How many machine load readings were taken.
+    pub fn reads(&self) -> usize {
+        self.reads.load(Ordering::SeqCst)
+    }
+
+    fn source(&self) -> HostReaderSource {
+        let host = self.clone();
+        HostReaderSource::new(move || aither_agent::AnyHostReader::new(host.clone()))
+    }
+}
+
+impl aither_agent::HostReader for ScriptedHost {
+    fn memory_pressure(&mut self) -> Result<aither_agent::MemoryPressure, aither_agent::ReadError> {
+        Ok(aither_agent::MemoryPressure::Normal)
+    }
+
+    fn machine_load(&mut self) -> Result<aither_agent::MachineLoad, aither_agent::ReadError> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        Ok(aither_agent::MachineLoad(f64::from_bits(
+            self.load_bits.load(Ordering::SeqCst),
+        )))
+    }
+}
+
 /// What building a session agent needs besides the config.
 pub struct SessionParts {
     dir: std::path::PathBuf,
     pub db: crate::db::ChatDb,
-    session_id: SessionId,
+    pub(super) session_id: SessionId,
     /// The runtime the session persists its interactions through, when it has one.
     pub runtime: Option<Arc<crate::session::SessionRuntimeService>>,
     workspace_broker: crate::workspace_request::WorkspaceRequestBroker,
     ask_user_broker: crate::ask_user::AskUserBroker,
     tool_environments: ToolEnvironmentCache,
+    /// The host the session's load monitor reads: calm unless a test loads it.
+    pub host: ScriptedHost,
     // The brokers' receiving ends stay open for the life of the session.
     _queues: (
         crate::workspace_request::WorkspaceRequestQueue,
@@ -176,21 +227,7 @@ pub struct SessionParts {
 
 impl SessionParts {
     pub(super) async fn new(dir: std::path::PathBuf) -> Self {
-        // The baseline tools are downloaded once into the build directory's
-        // `tmp/may-tools`, which the terminal E2E suite shares.
-        let shared_tools = std::env::current_exe()
-            .expect("test binary path")
-            .ancestors()
-            .nth(3)
-            .expect("test binary sits in the target directory")
-            .join("tmp/may-tools");
-        std::fs::create_dir_all(&shared_tools).expect("create the shared tool cache");
         std::fs::create_dir_all(dir.join(".may")).expect("create the may dir");
-        std::os::unix::fs::symlink(
-            &shared_tools,
-            crate::session::MayHomePaths::new(dir.join(".may")).tools_dir(),
-        )
-        .expect("link the shared tool cache");
         let db = crate::db::ChatDb::open(&dir.join("history.db"))
             .await
             .expect("open test db");
@@ -204,11 +241,12 @@ impl SessionParts {
             workspace_broker,
             ask_user_broker,
             tool_environments: ToolEnvironmentCache::spawn(),
+            host: ScriptedHost::default(),
             _queues: (workspace_queue, ask_user_queue),
         }
     }
 
-    fn input(&self) -> MayAgentSessionInput<'static> {
+    pub(super) fn input(&self) -> MayAgentSessionInput<'static> {
         let cwd = self.dir.join("cwd");
         std::fs::create_dir_all(&cwd).expect("create cwd");
         MayAgentSessionInput {
@@ -224,6 +262,7 @@ impl SessionParts {
             db: self.db.clone(),
             model: "session::session-model",
             reasoning_effort: None,
+            prompt_cache_epoch: 0,
             profile_id: None,
             permission_approver: self.runtime.as_ref().map(|runtime| {
                 crate::agent::PermissionApprover::new()
@@ -241,9 +280,9 @@ impl SessionParts {
             acp_host: None,
             register_skills_broker: None,
             environment: AgentEnvironment::Local,
-            tool_distribution: Arc::new(
-                crate::tools::embedded_distribution().expect("embedded distribution validates"),
-            ),
+            tool_distribution: Arc::new(crate::tools::fixture_distribution(
+                &self.dir.join(".may/tool-fixtures"),
+            )),
             tool_environments: self.tool_environments.clone(),
             provider_attempt: 0,
             subagents: None,
@@ -328,12 +367,13 @@ impl Session {
 
     /// Builds the agent the way the TUI does: the config resolved by
     /// [`MayAgent::session_config`], then [`MayAgent::new`], with only the
-    /// clock substituted.
+    /// clock and the host the load monitor reads substituted.
     async fn build(config: &MayConfig, parts: &SessionParts, clock: &ManualClock) -> MayAgent {
         let mut agent_config: MayAgentConfig = MayAgent::session_config(config, parts.input())
             .await
             .expect("the session config resolves");
         agent_config.clock = Some(clock.clone());
+        agent_config.host_reader = Some(parts.host.source());
         Box::pin(MayAgent::new(agent_config))
             .await
             .expect("the agent is built")
@@ -341,7 +381,7 @@ impl Session {
 
     /// Replaces the agent with one built from `config`, as the TUI does when
     /// a saved change reaches the running session.
-    async fn rebuild(&mut self, config: &MayConfig) {
+    pub(super) async fn rebuild(&mut self, config: &MayConfig) {
         self.agent = Box::pin(Self::build(config, &self.parts, &self.clock)).await;
     }
 
@@ -359,12 +399,27 @@ impl Session {
     }
 }
 
-/// Runs one user turn to completion.
+/// Runs one user turn to completion on top of history above the policy's
+/// compaction floor, so the turn starts a compaction.
 pub async fn run_turn(agent: &mut MayAgent) {
-    let mut stream = agent.run("Say hello.", []);
-    while let Some(event) = stream.next().await {
-        event.expect("the turn runs");
-    }
+    // A context under the policy's compaction floor is left alone, so the
+    // turn runs on top of history above it.
+    agent.push_message(aither_core::llm::Message::assistant(
+        "x".repeat(4 * aither_agent::ContextPolicy::default().compaction_floor),
+    ));
+    run_short_turn(agent).await;
+}
+
+/// Runs one user turn to completion on the history as it is: a short session
+/// stays under the compaction floor, so nothing it was told is compacted away.
+pub async fn run_short_turn(agent: &mut MayAgent) {
+    let _ = agent
+        .run("Say hello.", [])
+        .drive((), std::future::pending::<()>(), |(), _| async {
+            std::ops::ControlFlow::Continue(())
+        })
+        .await
+        .expect("the turn runs");
 }
 
 /// Under the default one-hour cache lifetime an idle session compacts once,

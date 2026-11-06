@@ -351,6 +351,39 @@ mod tests {
     }
 
     #[test]
+    fn a_session_issues_event_renames_and_closes_a_shown_issue() {
+        let mut state = SidebarState::default();
+        state.set_tasks("s", Some("- [ ] a #1\n- [ ] b #2\n"));
+        state.set_issues(
+            "s",
+            vec![
+                IssueBrief {
+                    number: 1,
+                    title: Some("Old".to_string()),
+                    closed: false,
+                },
+                IssueBrief {
+                    number: 2,
+                    title: Some("Other".to_string()),
+                    closed: false,
+                },
+            ],
+        );
+
+        // The frame the daemon sends after #1 is renamed and closed.
+        let frame: crate::client::SessionIssuesFrame = serde_json::from_str(
+            r#"{"sessionId":"s","issues":[{"number":1,"title":"New","closed":true}]}"#,
+        )
+        .expect("frame parses");
+        state.set_issues(&frame.session_id, frame.issues);
+
+        assert_eq!(state.issues[0].title.as_deref(), Some("New"));
+        assert!(state.issues[0].closed);
+        assert_eq!(state.issues[1].title.as_deref(), Some("Other"));
+        assert!(!state.issues[1].closed);
+    }
+
+    #[test]
     fn visibility_needs_width_and_toggle() {
         let mut state = SidebarState::default();
         assert!(state.visible_at(120));

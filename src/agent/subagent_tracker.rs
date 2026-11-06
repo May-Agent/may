@@ -28,6 +28,7 @@ use aither_core::LanguageModel;
 use aither_core::llm::model::Profile;
 use aither_core::llm::tool::ToolContext;
 use aither_core::llm::{Event, LLMRequest, LLMRequestWithTools, Tool, ToolResult};
+use aither_sandbox::CommandUsage;
 use dashmap::DashMap;
 use futures_lite::{Stream, StreamExt};
 
@@ -299,20 +300,27 @@ where
     async fn call(&self, args: Self::Arguments, cx: ToolContext) -> aither_core::Result<Self::Res> {
         // `prompt_file` carries the task text now; read it for the run's
         // display label, falling back to the path itself if it is gone.
-        let (subagent, prompt_file) = match &args {
-            SubagentArgs::Start {
-                subagent,
-                prompt_file,
-                ..
-            } => (subagent.clone(), prompt_file.clone()),
-            SubagentArgs::Resume { id, prompt_file } => {
-                (format!("resume #{id}"), prompt_file.clone())
-            }
-        };
+        let subagent = args.subagent().map_or_else(
+            || {
+                args.id
+                    .map_or_else(|| "resume".to_string(), |id| format!("resume #{id}"))
+            },
+            ToString::to_string,
+        );
+        let prompt_file = args.prompt_file().to_string();
         let prompt = async_fs::read_to_string(&prompt_file)
             .await
             .unwrap_or(prompt_file);
         let (run, _guard) = self.tracker.begin(&subagent, &prompt);
         ACTIVE_RUN.scope(run, self.inner.call(args, cx)).await
+    }
+}
+
+impl<T> CommandUsage for TrackedSubagentTool<T>
+where
+    T: CommandUsage<Arguments = SubagentArgs, Res = ToolResult> + Send + Sync + 'static,
+{
+    fn usage(&self) -> impl Future<Output = String> + Send {
+        self.inner.usage()
     }
 }

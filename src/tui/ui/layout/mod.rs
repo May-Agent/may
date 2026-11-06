@@ -170,7 +170,11 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     let scroll = app.scroll;
     let model_display = app.model_display();
-    let status_message = app.status_text().map(str::to_string);
+    // A notice wins; otherwise the hovered link shows its full target.
+    let status_message = app
+        .status_text()
+        .map(str::to_string)
+        .or_else(|| app.hovered_link().map(|hit| hit.uri));
 
     // Render everything in a single unified scrollable area
     app.frame_stats.chat = chat::render_unified(
@@ -206,8 +210,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             status_ctx: Some(StatusContext {
                 model: &model_display,
                 usage: usage_info,
+                context_policy: app.config.context.policy(),
                 queue_count: app.queue.len(),
                 open_questions: app.open_question_count,
+                yolo: app.session_runtime.yolo,
                 shells: running_shells,
                 subagents: app.subagents.len(),
                 decode_rate,
@@ -278,6 +284,16 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         render_image_view(frame, area, app);
     } else {
         app.image_view_area = None;
+    }
+
+    // Last, so a popup or image drawn over a link is left alone.
+    if matches!(app.mode, AppMode::Chat) {
+        let top = app.effective_scroll();
+        let runs = app
+            .chat_layout
+            .link_runs(top, chat_area.height as usize, chat_area);
+        let hovered = app.hovered_link().map(|hit| hit.id);
+        super::links::paint(frame.buffer_mut(), &runs, hovered);
     }
 
     app.frame_stats.overlay = t.elapsed();
@@ -1117,13 +1133,13 @@ fn render_jobs_panel(frame: &mut Frame, area: Rect, app: &App) {
                 JobRow::Job(job) => {
                     let (icon, status) = match &job.status {
                         aither_sandbox::JobStatus::Running => ("●", "running".to_string()),
-                        aither_sandbox::JobStatus::Completed { exit_code } => {
+                        aither_sandbox::JobStatus::Completed { exit_code, .. } => {
                             ("✓", format!("exit {exit_code}"))
                         }
-                        aither_sandbox::JobStatus::Failed { error } => {
+                        aither_sandbox::JobStatus::Failed { error, .. } => {
                             ("✗", format!("failed: {error}"))
                         }
-                        aither_sandbox::JobStatus::Killed => ("■", "killed".to_string()),
+                        aither_sandbox::JobStatus::Killed { .. } => ("■", "killed".to_string()),
                     };
                     let first_line = job.script.lines().next().unwrap_or("");
                     let cmd: String = first_line.chars().take(60).collect();
@@ -1170,11 +1186,13 @@ fn render_job_detail(frame: &mut Frame, area: Rect, state: &JobDetailState) {
                             "running · {}",
                             chat::format_elapsed(job.started_at.elapsed().as_secs())
                         ),
-                        aither_sandbox::JobStatus::Completed { exit_code } => {
+                        aither_sandbox::JobStatus::Completed { exit_code, .. } => {
                             format!("exit {exit_code}")
                         }
-                        aither_sandbox::JobStatus::Failed { error } => format!("failed: {error}"),
-                        aither_sandbox::JobStatus::Killed => "killed".to_string(),
+                        aither_sandbox::JobStatus::Failed { error, .. } => {
+                            format!("failed: {error}")
+                        }
+                        aither_sandbox::JobStatus::Killed { .. } => "killed".to_string(),
                     };
                     format!(
                         "job {} · {} — {status}",
@@ -2262,11 +2280,103 @@ fn ask_user_rows(state: &AskUserState, width: u16) -> u16 {
     let (Some(question), Some(qs)) = (state.current(), state.current_state()) else {
         return 3;
     };
+    if state.current_secret().is_some() {
+        // question, the masked field, a status line, help and borders
+        return ask_question_rows(&question.question, width).saturating_add(3 + 2);
+    }
     let items = u16::try_from(question.option.len() + 1).unwrap_or(u16::MAX);
     ask_question_rows(&question.question, width)
         .saturating_add(items)
         .saturating_add(u16::from(qs.custom_mode))
         .saturating_add(1 + 2)
+}
+
+/// Render a secret question: the typed value shows only as one bullet per
+/// character, never as text.
+fn render_secret_question(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AskUserState,
+    question: &crate::ask_user::Question,
+    qs: &crate::tui::state::AskUserQuestionState,
+    secret: &crate::session::PersistedSecretRequest,
+) {
+    let scope = match secret.scope {
+        crate::secrets::SecretScope::Global => "global",
+        crate::secrets::SecretScope::Session => "this session",
+    };
+    let title = if state.is_multi() {
+        format!(
+            " Secret {} ({}/{}) ",
+            secret.name,
+            state.current_question + 1,
+            state.questions.len()
+        )
+    } else {
+        format!(" Secret {} ", secret.name)
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(title)
+        .title_alignment(Alignment::Center);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(ask_question_rows(&question.question, area.width)),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            &question.question,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )))
+        .wrap(ratatui::widgets::Wrap { trim: false }),
+        chunks[0],
+    );
+    let columns = UnicodeWidthStr::width(qs.custom_text.as_str());
+    let masked = "\u{2022}".repeat(columns);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("  > ", Style::default().fg(Color::Cyan)),
+            Span::styled(masked, Style::default().fg(Color::White)),
+        ])),
+        chunks[1],
+    );
+    let shown = u16::try_from(columns).unwrap_or(u16::MAX);
+    frame.set_cursor_position((
+        (chunks[1].x + 4)
+            .saturating_add(shown)
+            .min(chunks[1].right().saturating_sub(1)),
+        chunks[1].y,
+    ));
+    let status = if qs.declined {
+        "declined".to_string()
+    } else {
+        format!("Stored as ${} for {scope}", secret.name)
+    };
+    frame.render_widget(
+        Paragraph::new(status).style(Style::default().fg(Color::Magenta)),
+        chunks[2],
+    );
+    let close = if state.request.is_none() {
+        " | Esc: close (stays open)"
+    } else {
+        ""
+    };
+    frame.render_widget(
+        Paragraph::new(format!("Enter: store | Del: decline{close}"))
+            .style(Style::default().fg(Color::DarkGray))
+            .alignment(Alignment::Center),
+        chunks[3],
+    );
 }
 
 /// Render the `AskUser` dialog as a bottom sheet.
@@ -2277,6 +2387,10 @@ fn render_ask_user(frame: &mut Frame, area: Rect, state: &AskUserState) {
     let Some(qs) = state.current_state() else {
         return;
     };
+    if let Some(secret) = state.current_secret() {
+        render_secret_question(frame, area, state, question, qs, secret);
+        return;
+    }
 
     // Item count: options + Custom answer
     let opt_count = question.option.len();
@@ -2642,6 +2756,58 @@ mod tests {
     use ratatui::layout::Rect;
     use ratatui_image::picker::{Picker, ProtocolType};
     use std::path::PathBuf;
+
+    /// A link in a user message, drawn as the chat column draws it, is
+    /// painted (underlined when hovered) on the cells the frame shows.
+    #[test]
+    fn hovered_link_in_user_message_is_painted() {
+        let mut chat = ChatStream::new();
+        chat.push_user("see https://example.com/docs and /etc/hosts", Vec::new(), 0);
+        let mut layout = ChatLayout::default();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 20)).unwrap();
+        let mut painted = None;
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_unified(
+                    frame,
+                    area,
+                    &chat,
+                    &mut layout,
+                    usize::MAX,
+                    UnifiedRenderContext {
+                        selected_tool: None,
+                        content_height_out: None,
+                        view_height_out: None,
+                        input_ctx: None,
+                        input_caret_active: false,
+                        queue_ctx: None,
+                        status_ctx: None,
+                        images_supported: true,
+                        hide_todos: false,
+                        image_positions_out: None,
+                        spinner_frame: 0,
+                    },
+                );
+                let runs = layout.link_runs(0, usize::from(area.height), area);
+                assert!(!runs.is_empty(), "the user message has link runs");
+                let hovered = runs[0].hit.id;
+                super::super::links::paint(frame.buffer_mut(), &runs, Some(hovered));
+                painted = Some((frame.buffer_mut().clone(), runs));
+            })
+            .unwrap();
+        let (buf, runs) = painted.expect("drawn");
+        let first = &runs[0];
+        assert!(
+            buf[(first.x, first.y)]
+                .modifier
+                .contains(ratatui::style::Modifier::UNDERLINED),
+            "hovered run at ({}, {}) not underlined; screen: {:#?}",
+            first.x,
+            first.y,
+            buffer_screen(&buf)
+        );
+    }
 
     #[allow(deprecated)] // a fixed font size keeps the test off the real terminal
     fn image_state(protocol: ProtocolType) -> ImageState {
