@@ -1634,7 +1634,7 @@ mod tests {
         github_owner_repo, host_git, push_pinned,
     };
     use crate::commit_signing::test_user::TestUser;
-    use crate::repo_clone::test_sandbox::TestTerminal;
+    use crate::repo_clone::test_sandbox::{TestTerminal, arm_hostile_config, markers};
     use crate::repo_clone::{CloneSandbox, SessionRepos};
     use crate::workspace::{ProjectConfig, ProjectIssues, ProjectPr, WorkspaceConfig};
     use hyper::body::Bytes;
@@ -2456,93 +2456,6 @@ mod tests {
         .unwrap();
         // Every push staged its bare repository in scratch and removed it.
         assert_eq!(std::fs::read_dir(&scratch).unwrap().count(), 0);
-    }
-
-    /// Every executable setting a repository can carry for itself, set in
-    /// `clone` the way an agent writing it could: each runs a script that
-    /// touches `host/<name>` (outside the sandbox) and `ran/<name>` inside
-    /// the session, so a marker in `host/` means it ran on the host. Returns
-    /// the `host/` directory.
-    fn arm_hostile_config(session_root: &Path, clone: &Path, outside: &Path) -> PathBuf {
-        let host = outside.join("host");
-        let ran = session_root.join("ran");
-        let scripts = session_root.join("hostile");
-        let hooks = scripts.join("hooks");
-        for dir in [&host, &ran, &hooks] {
-            std::fs::create_dir_all(dir).unwrap();
-        }
-        let script = |path: &Path, name: &str, tail: &str| {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::write(
-                path,
-                format!(
-                    "#!/bin/sh\ntouch '{}/{name}' 2>/dev/null\ntouch '{}/{name}' 2>/dev/null\n{tail}\n",
-                    host.display(),
-                    ran.display()
-                ),
-            )
-            .unwrap();
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        };
-        // Repository-local hooks, both where git looks by default and under
-        // `core.hooksPath`.
-        for hook in [
-            "pre-commit",
-            "prepare-commit-msg",
-            "commit-msg",
-            "post-commit",
-            "post-checkout",
-            "post-merge",
-            "pre-push",
-            "pre-receive",
-            "update",
-            "post-update",
-            "push-to-checkout",
-            "reference-transaction",
-            "pre-auto-gc",
-            "post-index-change",
-        ] {
-            script(&hooks.join(hook), hook, "exit 0");
-            script(&clone.join(".git/hooks").join(hook), hook, "exit 0");
-        }
-        let mut settings = vec![(
-            "core.hooksPath".to_string(),
-            hooks.to_string_lossy().into_owned(),
-        )];
-        for (key, tail) in [
-            // Answers "no fsmonitor data", so git falls back to a scan.
-            ("core.fsmonitor", "exit 1"),
-            ("filter.hostile.clean", "cat"),
-            ("filter.hostile.smudge", "cat"),
-            ("uploadpack.packObjectsHook", "exec \"$@\""),
-            ("core.sshCommand", "exit 1"),
-            ("core.alternateRefsCommand", "exit 0"),
-            ("credential.helper", "exit 0"),
-            ("core.pager", "cat"),
-            ("core.editor", "exit 0"),
-            ("diff.external", "exit 0"),
-            ("gpg.program", "exit 1"),
-        ] {
-            let path = scripts.join(key);
-            script(&path, key, tail);
-            settings.push((key.to_string(), path.to_string_lossy().into_owned()));
-        }
-        settings.push(("filter.hostile.required".to_string(), "true".to_string()));
-        for (key, value) in settings {
-            git(Some(clone), &["config", &key, &value]).unwrap();
-        }
-        std::fs::write(clone.join(".gitattributes"), "* filter=hostile\n").unwrap();
-        host
-    }
-
-    /// Names of the markers in `dir`.
-    fn markers(dir: &Path) -> Vec<String> {
-        let mut names: Vec<String> = std::fs::read_dir(dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        names.sort();
-        names
     }
 
     /// The agent arms its clone with every executable setting, commits in
