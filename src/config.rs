@@ -1254,6 +1254,9 @@ pub struct MayConfig {
     /// When host memory pressure and machine load count as high.
     #[serde(default)]
     pub host_load: HostLoadSettings,
+    /// How long `/connect` waits on a candidate ACP agent.
+    #[serde(default)]
+    pub acp: AcpSettings,
     /// Last model selected via /model command (used as default for new sessions).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_model: Option<ModelSelector>,
@@ -1493,6 +1496,27 @@ pub enum MemoryPressureThreshold {
     Critical,
 }
 
+/// `[acp]` section: the bounds `/connect` puts on a candidate ACP agent.
+/// Durations are written as `"30s"`, `"1m"`. A change applies to the next
+/// `/connect`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct AcpSettings {
+    /// How long the trial session's handshake (`initialize`, `session/new`,
+    /// the mode and model) may take before the agent is killed and the
+    /// connection refused.
+    #[serde(with = "duration_text")]
+    pub trial_limit: Duration,
+}
+
+impl Default for AcpSettings {
+    fn default() -> Self {
+        Self {
+            trial_limit: Duration::from_secs(60),
+        }
+    }
+}
+
 /// `[host_load]` section: when the session agent is told the host is under
 /// memory pressure or high load, and how long the terminal's foreground
 /// window grows meanwhile. Durations are written as `"30s"`, `"1m"`.
@@ -1605,6 +1629,7 @@ impl Default for MayConfig {
             context: ContextConfig::default(),
             time: TimeConfig::default(),
             host_load: HostLoadSettings::default(),
+            acp: AcpSettings::default(),
             last_model: None,
             last_effort: None,
             ssh_servers: Vec::new(),

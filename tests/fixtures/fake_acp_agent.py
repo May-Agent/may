@@ -29,6 +29,9 @@ plan, message chunks, and a tool_call with tool_call_update updates, then:
 - "fail" -> the prompt's request returns a JSON-RPC error; the process
   stays alive (a dropped model stream, a backend error).
 
+The argument --silent-after-initialize makes the agent answer initialize and
+then never answer session/new.
+
 FAKE_RATE_LIMIT=<secs> makes the agent's provider rate-limit it: a
 prompt containing "ratelimit" starts a per-user window of that length,
 and every prompt while the window is open answers a -32010 error whose
@@ -692,6 +695,9 @@ for line in sys.stdin:
                     "agentInfo": {"name": "fake-agent-py", "version": "0.1.0"},
                 },
             )
+        elif method == "session/new" and "--silent-after-initialize" in sys.argv[1:]:
+            # Opt-in by argument: answers initialize, then never session/new.
+            pass
         elif method == "session/new":
             session_count += 1
             session_id = f"sess-{os.getpid()}-{session_count}"
