@@ -7,13 +7,16 @@
 use jiff::Timestamp;
 
 use crate::db::{ChatDb, RunFence};
-use crate::session::history::{ChatMessage, MessageRole};
+use crate::session::history::{ChatMessage, MessageRole, MessageTranslation};
 
 /// A buffered message to be persisted at the end of the turn.
 struct PendingMessage {
     role: MessageRole,
     content: String,
     tool_call_id: Option<String>,
+    /// The reply's display translation, when it drifted from the
+    /// communication language.
+    translation: Option<MessageTranslation>,
     /// When the event happened, as stamped at its emission.
     at: Timestamp,
 }
@@ -38,8 +41,22 @@ impl TurnPersister {
             role: MessageRole::Assistant,
             content,
             tool_call_id: None,
+            translation: None,
             at,
         });
+    }
+
+    /// Attach `translation` to the assistant message buffered last.
+    ///
+    /// # Panics
+    /// When the last buffered message is not an assistant message.
+    pub fn translate_last(&mut self, translation: MessageTranslation) {
+        let last = self
+            .pending
+            .last_mut()
+            .filter(|message| message.role == MessageRole::Assistant)
+            .expect("a translation belongs to the assistant message just buffered");
+        last.translation = Some(translation);
     }
 
     /// Buffer a tool event (start or end) with its serialized record, emitted at `at`.
@@ -48,6 +65,7 @@ impl TurnPersister {
             role: MessageRole::Tool,
             content: serialized,
             tool_call_id: Some(tool_call_id),
+            translation: None,
             at,
         });
     }
@@ -74,6 +92,7 @@ impl TurnPersister {
                 stats: None,
                 reasoning: Vec::new(),
                 tool_calls: Vec::new(),
+                translation: msg.translation.clone(),
             };
             let row = db
                 .append_chat_message_as_run(&self.fence, &chat_msg)
@@ -94,6 +113,65 @@ mod tests {
     use crate::db::ChatDb;
     use crate::session::history::ChatMessage;
     use crate::session::load_history_from_db;
+
+    #[tokio::test]
+    async fn a_reply_translation_is_stored_beside_the_original_and_reaches_clients() {
+        use crate::session::MessageTranslation;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db should open");
+        let session_id = "session-translated";
+        db.create_session(session_id, None, None)
+            .await
+            .expect("session should be created");
+        let fence = crate::db::RunFence {
+            session_id: session_id.to_string(),
+            run_id: "run-1".to_string(),
+        };
+        assert!(
+            db.claim_session_run(&fence)
+                .await
+                .expect("run claim should succeed")
+        );
+        let mut persister = TurnPersister::new(fence);
+        persister.push_assistant("All done.".to_string(), Timestamp::now());
+        persister.translate_last(MessageTranslation {
+            text: "全部完成。".to_string(),
+            language: "cmn".to_string(),
+        });
+        persister.push_assistant("Plain reply.".to_string(), Timestamp::now());
+        persister.flush(&db).await.expect("turn should flush");
+
+        // The model's history keeps the original; the translation rides beside it.
+        let history = load_history_from_db(&db, session_id)
+            .await
+            .expect("history should load");
+        let messages = history.messages();
+        assert_eq!(messages[0].content, "All done.");
+        assert_eq!(
+            messages[0].translation,
+            Some(MessageTranslation {
+                text: "全部完成。".to_string(),
+                language: "cmn".to_string(),
+            })
+        );
+        assert_eq!(messages[1].translation, None);
+
+        // A reloaded session shows it through the API message mapping.
+        let rows = db.get_messages(session_id).await.expect("rows load");
+        let api = crate::daemon::message_mapping::map_db_messages(&rows).expect("rows map");
+        let translation = api[0]
+            .translation
+            .as_ref()
+            .expect("translation reaches the API");
+        assert_eq!(translation.text, "全部完成。");
+        assert_eq!(translation.language, "cmn");
+        assert_eq!(translation.language_name, "Chinese");
+        assert_eq!(api[0].content, "All done.");
+        assert!(api[1].translation.is_none());
+    }
 
     #[tokio::test]
     async fn restored_entries_keep_their_emission_times() {
