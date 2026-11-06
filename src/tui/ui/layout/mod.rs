@@ -1080,6 +1080,21 @@ fn prompt_preview(content: &str) -> String {
     }
 }
 
+/// Second line of a job row. Only a running job shows how long it has been
+/// going: the registry records no end time, so a finished job's time since
+/// start would keep growing for as long as the row is on screen.
+fn job_row_detail(job: &aither_sandbox::JobInfo, status: &str) -> String {
+    if matches!(job.status, aither_sandbox::JobStatus::Running) {
+        format!(
+            "    {status} · {} · task {}",
+            chat::format_elapsed(job.started_at.elapsed().as_secs()),
+            job.task_id
+        )
+    } else {
+        format!("    {status} · task {}", job.task_id)
+    }
+}
+
 /// Jobs panel: bottom-anchored drawer listing running subagents and
 /// background terminal jobs.
 fn render_jobs_panel(frame: &mut Frame, area: Rect, app: &App) {
@@ -1145,11 +1160,7 @@ fn render_jobs_panel(frame: &mut Frame, area: Rect, app: &App) {
                     let cmd: String = first_line.chars().take(60).collect();
                     (
                         format!("{prefix}{icon} pid {} · {cmd}", job.pid),
-                        format!(
-                            "    {status} · {} · task {}",
-                            chat::format_elapsed(job.started_at.elapsed().as_secs()),
-                            job.task_id
-                        ),
+                        job_row_detail(job, &status),
                     )
                 }
             };
@@ -2748,7 +2759,7 @@ mod tests {
     use super::super::chat_layout::ChatLayout;
     use super::super::image::{ImageState, render_image};
     use super::super::test_screen::{IMAGE_MARK, ScreenBackend, buffer_screen};
-    use super::render_inline_images;
+    use super::{job_row_detail, render_inline_images};
     use crate::tui::app::ImageRegion;
     use crate::tui::state::{AppMode, AskUserState, LaunchGrantState, RepoTrustState};
     use ratatui::Terminal;
@@ -2756,6 +2767,37 @@ mod tests {
     use ratatui::layout::Rect;
     use ratatui_image::picker::{Picker, ProtocolType};
     use std::path::PathBuf;
+
+    fn job(status: aither_sandbox::JobStatus, age_secs: u64) -> aither_sandbox::JobInfo {
+        aither_sandbox::JobInfo {
+            pid: 1,
+            task_id: "amber".to_string(),
+            execution_key: String::new(),
+            script: "true".to_string(),
+            mode: aither_sandbox::TerminalMode::default(),
+            started_at: std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(age_secs))
+                .expect("instant in range"),
+            status,
+            output_path: None,
+        }
+    }
+
+    /// A finished job's row carries no elapsed time, so it is the same on
+    /// every refresh; a running job's row still does.
+    #[test]
+    fn only_a_running_job_row_shows_elapsed_time() {
+        let done = job(
+            aither_sandbox::JobStatus::Completed {
+                exit_code: 0,
+                delivery: aither_sandbox::Delivery::Taken,
+            },
+            135,
+        );
+        assert_eq!(job_row_detail(&done, "exit 0"), "    exit 0 · task amber");
+        let running = job(aither_sandbox::JobStatus::Running, 135);
+        assert!(job_row_detail(&running, "running").contains("2m"));
+    }
 
     /// A link in a user message, drawn as the chat column draws it, is
     /// painted (underlined when hovered) on the cells the frame shows.
