@@ -3592,11 +3592,13 @@ const CHILD_COMMIT: &str = "cd ../../wt && echo x > f.txt && echo WROTE_FILE && 
 #[tokio::test]
 #[serial]
 async fn subagent_cannot_write_tasks_md_but_the_main_agent_can() {
+    // The fixture is well-formed free text under `## Notes`: the run loop
+    // holds the turn open while tasks.md breaks its format or has open rows.
     let (files, mock) = run_subagent_probe(SubagentProbe {
-        setup: "printf -- '- [x] original\\n' > tasks.md",
+        setup: "printf -- '## Notes\\noriginal\\n' > tasks.md",
         launch: "subagent explore --prompt-file prompt.md",
-        child_script: "printf -- '- [x] hacked\\n' >> ../../tasks.md; echo CHILD_RC=$?",
-        final_script: "cp tasks.md tasks.before; printf -- '- [x] original\\n- [x] main wrote\\n' > tasks.md; echo MAIN_FINAL",
+        child_script: "printf -- 'hacked\\n' >> ../../tasks.md; echo CHILD_RC=$?",
+        final_script: "cp tasks.md tasks.before; printf -- '## Notes\\noriginal\\nmain wrote\\n' > tasks.md; echo MAIN_FINAL",
     })
     .await;
 
@@ -3608,12 +3610,12 @@ async fn subagent_cannot_write_tasks_md_but_the_main_agent_can() {
     );
     assert_eq!(
         files.get("tasks.before"),
-        "- [x] original\n",
+        "## Notes\noriginal\n",
         "tasks.md changed while only the subagent had run"
     );
     assert_eq!(
         files.get("tasks.md"),
-        "- [x] original\n- [x] main wrote\n",
+        "## Notes\noriginal\nmain wrote\n",
         "the main agent's write in the same session must succeed"
     );
 }
