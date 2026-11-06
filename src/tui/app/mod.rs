@@ -384,6 +384,12 @@ pub struct App {
     /// stream last reported it; `None` until the first report or when the
     /// session is not in an indexed worktree.
     pub index_coverage: Option<crate::client::IndexCoverage>,
+    /// Whether the user is asleep, as the daemon last reported on the
+    /// `sleep` stream.
+    pub asleep: bool,
+    /// Health reminders the daemon had raised when last reported; `None`
+    /// until the first report.
+    pub sleep_reminders: Option<u64>,
     /// Set when the last `session_index` report said repo-search could not
     /// be reached. The status bar shows a red cross instead of coverage.
     pub index_failed: bool,
@@ -699,6 +705,8 @@ impl App {
             open_question_count: 0,
             session_runtime: crate::client::SessionRuntimeSnapshot::default(),
             index_coverage: None,
+            asleep: false,
+            sleep_reminders: None,
             index_failed: false,
             index_loading: false,
             question_cursor: 0,
@@ -3229,6 +3237,8 @@ impl App {
             "/compact" => Some(SendAction::Compact(None)),
             "/recap" => Some(SendAction::Recap),
             "/yolo" => Some(SendAction::ToggleYolo),
+            "/sleep" => Some(SendAction::Sleep),
+            "/sleep off" => Some(SendAction::Wake),
             "/context" => Some(SendAction::ContextReport),
             "/usage" => Some(SendAction::UsageReport),
             "/context dump" => Some(SendAction::ContextDump),
@@ -4235,6 +4245,11 @@ pub enum SendAction {
     Recap,
     /// Flip the session's yolo switch.
     ToggleYolo,
+    /// Mark the user asleep for every session; this session's agent says
+    /// good night.
+    Sleep,
+    /// End the user's sleep state (`/sleep off`).
+    Wake,
     /// Show an open question of the session in the answer modal.
     OpenQuestions,
     /// Reload the session's history, which turns this client missed

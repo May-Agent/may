@@ -151,7 +151,7 @@ fn events_query(session_id: &str, after: Option<&str>) -> String {
     query
         .append_pair(
             "topics",
-            "session_agent,session_turn,session_background,session_runtime,session_index,session_suggestion,session_recap,session_issues",
+            "session_agent,session_turn,session_background,session_runtime,session_index,session_suggestion,session_recap,session_issues,sleep",
         )
         .append_pair("sessionId", session_id);
     if let Some(after) = after {
@@ -230,6 +230,13 @@ async fn follow_session(
                                 next_action: frame.next_action,
                             })
                             .await;
+                    }
+                }
+                "sleep" => {
+                    if let Ok(status) =
+                        serde_json::from_str::<crate::sleep::SleepStatus>(&event.data)
+                    {
+                        let _ = forwarding.app_events.send(AppEvent::Sleep(status)).await;
                     }
                 }
                 "session_runtime" => {

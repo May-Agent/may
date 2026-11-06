@@ -59,6 +59,7 @@ struct EventSignatures {
     session_runtimes: String,
     profile_sessions: String,
     remote_access: String,
+    sleep: String,
     session_background: String,
     session_artifacts: String,
     session_index: String,
@@ -388,6 +389,11 @@ async fn emit_topics_if_changed(
     }
     if topics.contains(UiEventTopics::REMOTE_ACCESS)
         && !emit_remote_access_if_changed(state, sender, &mut signatures.remote_access).await
+    {
+        return false;
+    }
+    if topics.contains(UiEventTopics::SLEEP)
+        && !emit_sleep_if_changed(state, sender, &mut signatures.sleep).await
     {
         return false;
     }
@@ -868,6 +874,23 @@ async fn emit_remote_access_if_changed(
         && sig != *last_sig
     {
         if !send_event(sender, "remote_access", &payload).await {
+            return false;
+        }
+        *last_sig = sig;
+    }
+    true
+}
+
+async fn emit_sleep_if_changed(
+    state: &Arc<DaemonState>,
+    sender: &skyzen::responder::sse::Sender,
+    last_sig: &mut String,
+) -> bool {
+    let payload = state.sleep.status().await;
+    if let Ok(sig) = serde_json::to_string(&payload)
+        && sig != *last_sig
+    {
+        if !send_event(sender, "sleep", &payload).await {
             return false;
         }
         *last_sig = sig;
