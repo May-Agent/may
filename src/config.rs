@@ -1192,6 +1192,20 @@ pub struct StreamConfig {
     pub codec: StreamCodec,
 }
 
+/// `[computer]` section: the macOS desktop helper (`MayComputerAgent.app`).
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComputerConfig {
+    /// `codesign` identity (SHA-1 hash or name, e.g. an Apple Development
+    /// certificate) that signs the helper bundle. macOS only credits an
+    /// Accessibility grant to a bundle whose designated requirement is an
+    /// identifier plus certificate, and keeps the grant across rebuilds
+    /// only when the certificate stays the same. Unset signs ad hoc, which
+    /// leaves the requirement a bare cdhash. Changing it re-signs the
+    /// bundle and restarts a running helper on the next request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signing_identity: Option<String>,
+}
+
 /// Local and container command sandboxing settings.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct SandboxConfig {
@@ -1230,6 +1244,9 @@ pub struct MayConfig {
     /// Settings shared by the browser and desktop streams.
     #[serde(default)]
     pub stream: StreamConfig,
+    /// macOS desktop helper settings.
+    #[serde(default)]
+    pub computer: ComputerConfig,
     /// Remote access settings.
     #[serde(default)]
     pub remote_access: RemoteAccessConfig,
@@ -1621,6 +1638,7 @@ impl Default for MayConfig {
             appearance: Appearance::default(),
             browser: BrowserConfig::default(),
             stream: StreamConfig::default(),
+            computer: ComputerConfig::default(),
             remote_access: RemoteAccessConfig::default(),
             daemon: DaemonConfig::default(),
             suggestions: SuggestionsConfig::default(),

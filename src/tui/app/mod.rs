@@ -346,8 +346,6 @@ pub struct App {
     /// The session's background jobs and subagent runs in the daemon (set
     /// when the agent worker installs).
     pub background: Option<crate::client::background::RemoteBackground>,
-    /// Model clone for `/btw` side questions (outside conversation history).
-    pub btw_llm: Option<crate::agent::ModelSlot<crate::agent::ProviderLlm>>,
     /// Daemon that answers `/btw` when the agent runs there.
     pub btw_daemon: Option<crate::client::DaemonClient>,
     /// Right sidebar: task tree, linked issues (background lists come
@@ -686,7 +684,6 @@ impl App {
             frame_stats: super::perf::FrameStats::default(),
             last_click: None,
             background: None,
-            btw_llm: None,
             btw_daemon: None,
             sidebar: super::sidebar::SidebarState::default(),
             chat_area: ratatui::layout::Rect::default(),
@@ -1046,7 +1043,7 @@ impl App {
 
     /// Open the `/btw` side-question overlay.
     pub fn open_btw(&mut self) {
-        if self.btw_llm.is_none() && self.btw_daemon.is_none() {
+        if self.btw_daemon.is_none() {
             self.chat
                 .push_notice("No model available for /btw — start a session first");
             return;
@@ -1066,13 +1063,6 @@ impl App {
         }
         let messages = self.btw_messages(&question);
         let tx = self.event_tx.clone();
-        if let Some(llm) = self.btw_llm.clone() {
-            if let AppMode::Btw(state) = &mut self.mode {
-                state.loading = true;
-            }
-            spawn(stream_btw_answer(llm, messages, tx)).detach();
-            return;
-        }
         let (Some(client), Some(session)) = (
             self.btw_daemon.clone(),
             self.session_manager
@@ -4406,40 +4396,6 @@ fn btw_message(role: &str, content: impl Into<String>) -> crate::daemon::BtwMess
         role: role.to_string(),
         content: content.into(),
     }
-}
-
-/// Streams a `/btw` answer from the session's model into the overlay.
-async fn stream_btw_answer(
-    llm: crate::agent::ModelSlot<crate::agent::ProviderLlm>,
-    messages: Vec<crate::daemon::BtwMessage>,
-    tx: EventSender,
-) {
-    use aither_core::llm::Message;
-    use futures_lite::StreamExt;
-    let messages = messages
-        .into_iter()
-        .map(|message| match message.role.as_str() {
-            "system" => Message::system(message.content),
-            "assistant" => Message::assistant(message.content),
-            _ => Message::user(message.content),
-        })
-        .collect::<Vec<_>>();
-    let mut stream = std::pin::pin!(llm.respond(messages));
-    while let Some(result) = stream.next().await {
-        match result {
-            Ok(aither_core::llm::Event::Text(text)) => {
-                if tx.send(AppEvent::BtwDelta(text)).await.is_err() {
-                    return;
-                }
-            }
-            Ok(_) => {}
-            Err(error) => {
-                let _ = tx.send(AppEvent::BtwFailed(error.to_string())).await;
-                return;
-            }
-        }
-    }
-    let _ = tx.send(AppEvent::BtwFinished).await;
 }
 
 #[cfg(test)]

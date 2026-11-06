@@ -502,6 +502,7 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                 | TuiEvent::UsageReport(_)
                 | TuiEvent::ContextDump(_)
                 | TuiEvent::ContextMessages(_)
+                | TuiEvent::SideModel(_)
                 | TuiEvent::ContextDumpSaved { .. },
             ) => {}
             Event::Agent(TuiEvent::Hold {
