@@ -142,6 +142,19 @@ impl MayHomePaths {
         self.browser_dir().join("profile")
     }
 
+    /// What acpsub stores for the connected ACP agents of every session.
+    #[must_use]
+    pub fn acp_sessions_dir(&self) -> PathBuf {
+        self.root.join("acp").join("sessions")
+    }
+
+    /// What acpsub stores for one session's connected ACP agents: their
+    /// registry of resumable agent sessions and their transcripts.
+    #[must_use]
+    pub fn acp_session_dir(&self, session_id: &str) -> PathBuf {
+        self.acp_sessions_dir().join(session_id)
+    }
+
     /// Path layout for one session.
     #[must_use]
     pub fn session_paths(&self, session_id: &str) -> SessionPaths {
