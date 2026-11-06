@@ -710,11 +710,22 @@ mod tests {
         }
     }
 
-    /// Starts the fake agent, closes its stdin so it exits, and returns what
-    /// the executor reports for its exit.
-    async fn exit_after_stdin_closes<N: NetworkPolicy + Clone>(
+    /// How a test ends the fake agent.
+    #[derive(Debug, Clone, Copy)]
+    enum Ending {
+        /// Its stdin closes, so it exits by itself.
+        StdinCloses,
+        /// It is killed while it still reads stdin, as acpsub ends an agent
+        /// whose handshake failed.
+        Killed,
+    }
+
+    /// Starts the fake agent, ends it as `ending` says, and returns what the
+    /// executor reports for its exit.
+    async fn exit_status_after<N: NetworkPolicy + Clone>(
         sandbox: SessionSandbox<N>,
         cwd: &Path,
+        ending: Ending,
     ) -> Result<ExitStatus, String> {
         // The sandbox spawns on the daemon's global executor.
         let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
@@ -735,38 +746,77 @@ mod tests {
             stderr: _stderr,
             control,
         } = agent;
-        drop(stdin);
+        let _stdin = match ending {
+            Ending::StdinCloses => {
+                drop(stdin);
+                None
+            }
+            Ending::Killed => {
+                control.kill();
+                Some(stdin)
+            }
+        };
         tokio::time::timeout(std::time::Duration::from_secs(30), control.wait())
             .await
-            .map_err(|_| "the agent did not exit within 30s of its stdin closing".to_string())?
+            .map_err(|_| format!("the agent did not exit within 30s ({ending:?})"))?
             .map_err(|error| format!("waiting for the agent failed: {error} ({error:?})"))
+    }
+
+    fn session_sandbox(root: &Path) -> SessionSandbox<SessionPolicy> {
+        let grants = TerminalGrants::new();
+        grants.add_readable(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures"));
+        std::fs::create_dir_all(root).expect("session dir");
+        SessionSandbox::for_session(
+            root.to_path_buf(),
+            grants,
+            TerminalPermissionHandler::for_agent(None, None, None),
+            NetworkAuditLog::rolling_daily(root.join("audit"), 1).expect("audit log"),
+            ProcessPriority::default(),
+            None,
+        )
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_scratch_sandbox_agent_reports_its_exit_status() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let status = exit_after_stdin_closes(SessionSandbox::scratch(dir.path()), dir.path())
+        let sandbox = SessionSandbox::scratch(dir.path());
+        let status = exit_status_after(sandbox, dir.path(), Ending::StdinCloses)
             .await
             .unwrap_or_else(|error| panic!("scratch sandbox: {error}"));
         assert!(status.success(), "scratch sandbox exit status: {status:?}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_killed_scratch_sandbox_agent_reports_its_exit_status() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let sandbox = SessionSandbox::scratch(dir.path());
+        let status = exit_status_after(sandbox, dir.path(), Ending::Killed)
+            .await
+            .unwrap_or_else(|error| panic!("killed in the scratch sandbox: {error}"));
+        assert!(
+            !status.success(),
+            "a killed agent did not succeed: {status:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_killed_session_sandbox_agent_reports_its_exit_status() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().join("session");
+        let status = exit_status_after(session_sandbox(&root), &root, Ending::Killed)
+            .await
+            .unwrap_or_else(|error| panic!("killed in a session sandbox: {error}"));
+        assert!(
+            !status.success(),
+            "a killed agent did not succeed: {status:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_session_sandbox_agent_reports_its_exit_status() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let grants = TerminalGrants::new();
-        grants.add_readable(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures"));
         let root = dir.path().join("session");
-        std::fs::create_dir_all(&root).expect("session dir");
-        let sandbox = SessionSandbox::for_session(
-            root.clone(),
-            grants,
-            TerminalPermissionHandler::for_agent(None, None, None),
-            NetworkAuditLog::rolling_daily(root.join("audit"), 1).expect("audit log"),
-            ProcessPriority::default(),
-            None,
-        );
-        let status = exit_after_stdin_closes(sandbox, &root)
+        let status = exit_status_after(session_sandbox(&root), &root, Ending::StdinCloses)
             .await
             .unwrap_or_else(|error| panic!("session sandbox: {error}"));
         assert!(status.success(), "session sandbox exit status: {status:?}");
