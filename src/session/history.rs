@@ -271,6 +271,28 @@ pub struct ChatMessage {
     /// Tool calls carried by an assistant message.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<aither_core::llm::ToolCall>,
+    /// The display translation of an assistant reply that drifted from the
+    /// communication language. Never part of the model's context: the
+    /// content above stays the original.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub translation: Option<MessageTranslation>,
+}
+
+/// A reply translated into the communication language for display.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageTranslation {
+    /// The reply translated by the fast model.
+    pub text: String,
+    /// The communication language's ISO 639-3 code.
+    pub language: String,
+}
+
+/// The display name of the language with ISO 639-3 `code`; the code itself
+/// when the detector does not know it.
+#[must_use]
+pub fn language_display_name(code: &str) -> String {
+    code.parse::<aither_agent::Language>()
+        .map_or_else(|_| code.to_string(), |language| language.name().to_string())
 }
 
 impl ChatMessage {
@@ -294,6 +316,7 @@ impl ChatMessage {
             stats: None,
             reasoning: Vec::new(),
             tool_calls: Vec::new(),
+            translation: None,
         }
     }
 
@@ -309,6 +332,7 @@ impl ChatMessage {
             stats: None,
             reasoning: Vec::new(),
             tool_calls: Vec::new(),
+            translation: None,
         }
     }
 
@@ -328,6 +352,7 @@ impl ChatMessage {
             stats: Some(stats),
             reasoning: Vec::new(),
             tool_calls: Vec::new(),
+            translation: None,
         }
     }
 
@@ -343,6 +368,7 @@ impl ChatMessage {
             stats: None,
             reasoning: Vec::new(),
             tool_calls: Vec::new(),
+            translation: None,
         }
     }
 
@@ -362,6 +388,7 @@ impl ChatMessage {
             stats: None,
             reasoning: Vec::new(),
             tool_calls: Vec::new(),
+            translation: None,
         }
     }
 
@@ -380,6 +407,7 @@ impl ChatMessage {
             stats: None,
             reasoning: Vec::new(),
             tool_calls: Vec::new(),
+            translation: None,
         }
     }
 }

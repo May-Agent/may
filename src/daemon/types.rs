@@ -813,6 +813,21 @@ pub struct ApiMessage {
     pub(crate) terminal_executions: Vec<ApiTerminalExecution>,
     #[serde(default)]
     pub(crate) stats: Option<RequestStats>,
+    /// The display translation of `content`, when the reply was not in the
+    /// communication language; `content` stays the original.
+    #[serde(default)]
+    pub(crate) translation: Option<ApiTranslation>,
+}
+
+/// A reply translated into the communication language for display.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiTranslation {
+    pub(crate) text: String,
+    /// The communication language's ISO 639-3 code.
+    pub(crate) language: String,
+    /// The communication language's display name.
+    pub(crate) language_name: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
