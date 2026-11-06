@@ -28,8 +28,8 @@ pub use context_snapshot::{
 };
 pub use directory::SessionDirectory;
 pub use history::{
-    ChatHistory, ChatMessage, ChatMessageStats, HistoryReplayError, MessageRole, SessionMetadata,
-    ToolEventRecord,
+    ChatHistory, ChatMessage, ChatMessageStats, HistoryReplayError, MessageRole,
+    MessageTranslation, SessionMetadata, ToolEventRecord, language_display_name,
 };
 pub use layout::{MayHomePaths, ProfileHomePaths, SessionPaths};
 pub use manager::{
