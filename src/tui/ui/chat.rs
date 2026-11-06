@@ -267,6 +267,32 @@ impl ToolDisplay {
     }
 }
 
+/// A reply translated into the communication language for display. The
+/// translation is shown, marked as translated; a click on the marker swaps
+/// in the original.
+#[derive(Debug, Clone)]
+pub struct ReplyTranslation {
+    /// Stable ID for click hit-testing of the marker row.
+    id: String,
+    /// The reply translated by the fast model.
+    text: String,
+    /// Display name of the communication language.
+    language: String,
+    /// Whether the original is shown instead of the translation.
+    show_original: bool,
+}
+
+impl ReplyTranslation {
+    /// The marker row's text.
+    fn marker(&self) -> String {
+        if self.show_original {
+            format!("⇄ Original reply (translated to {}) ▾", self.language)
+        } else {
+            format!("⇄ Translated to {} ▸ show original", self.language)
+        }
+    }
+}
+
 /// An element in the chat stream.
 #[derive(Debug, Clone)]
 pub enum ChatElement {
@@ -283,10 +309,13 @@ pub enum ChatElement {
     },
     /// Assistant text (streaming or complete)
     AssistantText {
-        /// Message text.
+        /// Message text: the original the model wrote.
         content: String,
         /// Whether tokens are still arriving.
         streaming: bool,
+        /// The display translation of `content`, when the reply was not in
+        /// the communication language.
+        translation: Option<ReplyTranslation>,
     },
     /// Tool call
     ToolCall {
@@ -378,6 +407,13 @@ impl ChatElement {
                 *expanded = !*expanded;
                 true
             }
+            Self::AssistantText {
+                translation: Some(translation),
+                ..
+            } if translation.id == id => {
+                translation.show_original = !translation.show_original;
+                true
+            }
             Self::WorkedFor {
                 id: work_id,
                 expanded,
@@ -418,6 +454,8 @@ pub struct ChatStream {
     next_thinking_id: usize,
     /// Counter generating worked-for row IDs.
     next_worked_id: usize,
+    /// Counter generating translation-marker IDs.
+    next_translation_id: usize,
     /// Elements before this index belong to already-folded turns and are
     /// never folded again.
     fold_cursor: usize,
@@ -849,7 +887,32 @@ impl ChatStream {
         self.push_element(ChatElement::AssistantText {
             content: String::new(),
             streaming: true,
+            translation: None,
         });
+    }
+
+    /// Attach the display translation of the reply streamed last: the
+    /// translation is shown, marked as translated, with the original one
+    /// click away. `language` is the communication language's ISO 639-3 code.
+    pub fn set_translation(&mut self, text: String, language: &str) {
+        let Some(index) = self
+            .elements
+            .iter()
+            .rposition(|e| matches!(e, ChatElement::AssistantText { .. }))
+        else {
+            return;
+        };
+        let id = format!("translation-{}", self.next_translation_id);
+        self.next_translation_id += 1;
+        if let ChatElement::AssistantText { translation, .. } = &mut self.elements[index] {
+            *translation = Some(ReplyTranslation {
+                id,
+                text,
+                language: crate::session::language_display_name(language),
+                show_original: false,
+            });
+        }
+        self.touch(index);
     }
 
     /// Append text to the current streaming element.
@@ -857,6 +920,7 @@ impl ChatStream {
         if let Some(ChatElement::AssistantText {
             content,
             streaming: true,
+            ..
         }) = self.elements.last_mut()
         {
             content.push_str(chunk);
@@ -866,6 +930,7 @@ impl ChatStream {
             self.push_element(ChatElement::AssistantText {
                 content: chunk.to_string(),
                 streaming: true,
+                translation: None,
             });
         }
     }
@@ -2105,6 +2170,10 @@ pub(super) fn collapsible_id(elem: &ChatElement) -> Option<&str> {
     match elem {
         ChatElement::ToolCall { id, display } if display.expandable() => Some(id.as_str()),
         ChatElement::Thinking { id, content, .. } if !content.is_empty() => Some(id.as_str()),
+        ChatElement::AssistantText {
+            translation: Some(translation),
+            ..
+        } => Some(translation.id.as_str()),
         ChatElement::WorkedFor { id, .. } => Some(id.as_str()),
         _ => None,
     }
@@ -2204,7 +2273,26 @@ pub(super) fn element_lines(
             lines.push(Line::from(""));
         }
 
-        ChatElement::AssistantText { content, streaming } => {
+        ChatElement::AssistantText {
+            content,
+            streaming,
+            translation,
+        } => {
+            // A translated reply shows the translation under a clickable
+            // marker; the marker swaps in the original.
+            let content = translation.as_ref().map_or(content, |translation| {
+                let start = lines.len();
+                lines.push(Line::from(Span::styled(
+                    translation.marker(),
+                    Style::default().fg(Color::DarkGray),
+                )));
+                regions.push((translation.id.clone(), start, lines.len()));
+                if translation.show_original {
+                    content
+                } else {
+                    &translation.text
+                }
+            });
             // Track current line offset before adding markdown
             let line_offset = lines.len();
 
@@ -4977,6 +5065,59 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn a_translated_reply_shows_the_translation_under_a_marker_and_reveals_the_original() {
+        let mut chat = ChatStream::new();
+        chat.push_text("All done, the migration passes.");
+        chat.set_translation("全部完成，迁移已通过。".to_string(), "cmn");
+        chat.end_text();
+
+        let mut regions = Vec::new();
+        let shown = build_plain_wrapped_lines_unified(
+            &chat,
+            80,
+            None,
+            None,
+            None,
+            Some(&mut regions),
+            false,
+        );
+        assert_eq!(shown[0], "⇄ Translated to Chinese ▸ show original");
+        assert!(shown.iter().any(|l| l.contains("全部完成")));
+        assert!(!shown.iter().any(|l| l.contains("migration passes")));
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].element_id, "translation-0");
+
+        chat.toggle_expanded("translation-0");
+        let original = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
+        assert!(original[0].starts_with("⇄ Original reply"));
+        assert!(original.iter().any(|l| l.contains("migration passes")));
+        assert!(!original.iter().any(|l| l.contains("全部完成")));
+
+        chat.toggle_expanded("translation-0");
+        let again = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
+        assert_eq!(again, shown);
+    }
+
+    #[test]
+    fn an_untranslated_reply_has_no_marker_or_click_region() {
+        let mut chat = ChatStream::new();
+        chat.push_text("hello");
+        chat.end_text();
+        let mut regions = Vec::new();
+        let lines = build_plain_wrapped_lines_unified(
+            &chat,
+            80,
+            None,
+            None,
+            None,
+            Some(&mut regions),
+            false,
+        );
+        assert_eq!(lines[0], "hello");
+        assert!(regions.is_empty());
     }
 
     #[test]
