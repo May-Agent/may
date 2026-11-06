@@ -12,6 +12,8 @@ unsafe extern "C" {
     fn CGPreflightScreenCaptureAccess() -> bool;
     fn CGRequestScreenCaptureAccess() -> bool;
     fn CGMainDisplayID() -> u32;
+    fn CGDisplayPixelsWide(display: u32) -> usize;
+    fn CGDisplayPixelsHigh(display: u32) -> usize;
 }
 
 #[link(name = "ApplicationServices", kind = "framework")]
@@ -125,13 +127,28 @@ pub struct Grants {
 /// once: from macOS 15 the first capture that bypasses the system window
 /// picker is what makes `replayd` ask for that one-time consent, and the
 /// request instance is where the user expects system prompts.
-#[must_use]
-pub fn probe(request: bool) -> Grants {
+///
+/// # Panics
+/// Panics when the main display reports an extent beyond `u32`.
+pub async fn probe(request: bool) -> Grants {
     if request {
         request_permissions();
         if screen_recording_granted() {
+            // SAFETY: plain CoreGraphics queries on the main display.
+            let (display, size) = unsafe {
+                let display = CGMainDisplayID();
+                let extent =
+                    |pixels: usize| u32::try_from(pixels).expect("display extent fits u32");
+                (
+                    display,
+                    (
+                        extent(CGDisplayPixelsWide(display)),
+                        extent(CGDisplayPixelsHigh(display)),
+                    ),
+                )
+            };
             // Only the consent prompt matters; the still is discarded.
-            let _ = super::screenshot::screenshot_png(unsafe { CGMainDisplayID() });
+            let _ = super::screenshot::screenshot_png(display, size).await;
         }
     }
     Grants {
