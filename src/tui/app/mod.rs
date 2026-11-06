@@ -1816,7 +1816,8 @@ impl App {
 
     /// `/permission` re-asks the launch directory's access decision — the
     /// repo-trust sheet inside a worktree, the write-grant outside one.
-    /// The answer overwrites the persisted decision.
+    /// The repo-trust sheet opens on the persisted level, so it shows what
+    /// is in force; the answer overwrites it.
     fn open_permission_gate(&mut self) {
         let home = crate::session::MayHomePaths::new(self.session_manager.may_dir().to_path_buf());
         let config_path = self.session_manager.current_profile_id().map_or_else(
@@ -1824,11 +1825,30 @@ impl App {
             |id| home.profile_home(id).workspace_config(),
         );
         if let Some(worktree) = crate::repo_search::worktree_root(&self.cwd) {
+            let current = match crate::trust::persisted_level(&worktree, &config_path) {
+                Ok(current) => current,
+                Err(error) => {
+                    self.chat.push_error(&format!(
+                        "Cannot read repository trust from {}: {error}",
+                        config_path.display()
+                    ));
+                    return;
+                }
+            };
             let kind = crate::trust::repo_kind(&worktree);
+            let mut ask = AskUserState::for_open_question(crate::trust::question_for(
+                &kind, &worktree, false,
+            ));
+            if let Some(cursor) = current.and_then(|level| {
+                ask.questions[0]
+                    .option
+                    .iter()
+                    .position(|option| crate::trust::option_level(option) == Some(level))
+            }) {
+                ask.question_states[0].cursor = cursor;
+            }
             self.mode = AppMode::RepoTrust(crate::tui::state::RepoTrustState {
-                ask: AskUserState::for_open_question(crate::trust::question_for(
-                    &kind, &worktree, false,
-                )),
+                ask,
                 worktree,
                 kind,
                 config_path,
@@ -4463,6 +4483,44 @@ mod tests {
         let session = app.session_manager.current().expect("session");
         assert!(session.holds_message(7));
         assert!(!session.holds_message(8));
+    }
+
+    #[tokio::test]
+    async fn permission_sheet_opens_on_the_persisted_trust_level() {
+        use crate::trust::{RepoKind, TrustLevel};
+
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        let repo = tempfile::tempdir().expect("repo");
+        let status = std::process::Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .current_dir(repo.path())
+            .status()
+            .expect("git init");
+        assert!(status.success());
+        app.cwd = repo.path().to_path_buf();
+        let home = crate::session::MayHomePaths::new(dir.path().to_path_buf());
+        let config_path = app.session_manager.current_profile_id().map_or_else(
+            || home.workspace_config(),
+            |id| home.profile_home(id).workspace_config(),
+        );
+        std::fs::create_dir_all(config_path.parent().expect("parent")).expect("profile dir");
+        let kind = RepoKind::Github {
+            owner_repo: "acme/app".to_string(),
+        };
+        crate::trust::persist(&config_path, repo.path(), Some(&kind), TrustLevel::Local)
+            .expect("persist");
+
+        app.open_permission_gate();
+        let super::AppMode::RepoTrust(state) = &app.mode else {
+            panic!("/permission inside a repository opens the repo-trust sheet");
+        };
+        let cursor = state.ask.question_states[0].cursor;
+        assert_eq!(
+            crate::trust::option_level(&state.ask.questions[0].option[cursor]),
+            Some(TrustLevel::Local),
+            "the sheet highlights the level in force, not the first option"
+        );
     }
 
     #[tokio::test]

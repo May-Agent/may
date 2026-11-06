@@ -11,8 +11,6 @@ use crate::config::StreamCodec;
 pub enum AgentRequest {
     /// TCC grant state of the agent process.
     Preflight,
-    /// Raise the macOS permission prompts (Screen Recording + Accessibility).
-    RequestPermissions,
     /// Create the session's display if needed; report its id and size.
     EnsureDisplay { session_id: String },
     /// Destroy the session's display (session ended).
