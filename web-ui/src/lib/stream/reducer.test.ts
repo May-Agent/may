@@ -392,6 +392,40 @@ describe('reducer', () => {
     expect(t.hold).toMatchObject({ reason: 'retry', retry: 2 });
   });
 
+  test('a retried response keeps the finished ones and drops its own thinking, text and tool', () => {
+    const summary = {};
+    const t = stream([
+      { kind: 'start', seq: 1, turnId: 't1', sessionId: 's1', assistantId: 'a1' },
+      { kind: 'reasoning', seq: 2, turnId: 't1', chunk: 'first thought ' },
+      { kind: 'text', seq: 3, turnId: 't1', chunk: 'Looking.' },
+      { kind: 'tool_start', seq: 4, turnId: 't1', id: 'c1', name: 'terminal', variant: 'terminal', arguments: '{}', summary },
+      { kind: 'tool_end', seq: 5, turnId: 't1', id: 'c1', name: 'terminal', variant: 'terminal', result: 'ok', summary },
+      { kind: 'reasoning', seq: 6, turnId: 't1', chunk: '考え中 ' },
+      { kind: 'text', seq: 7, turnId: 't1', chunk: 'half an ans' },
+      { kind: 'tool_delta', seq: 8, turnId: 't1', id: 'c2', name: 'terminal', variant: 'terminal', argumentsFragment: '{"c', summary },
+      { kind: 'retract', seq: 9, turnId: 't1' },
+      {
+        kind: 'hold',
+        seq: 10,
+        turnId: 't1',
+        reason: 'retry',
+        until: '2026-11-04T05:40:00Z',
+        message: 'stream broke',
+        retry: 1,
+      },
+    ] as ChatStreamEvent[]);
+    expect(t.text).toBe('Looking.');
+    expect(t.reasoning).toBe('first thought ');
+    expect(t.tools.map((tool) => tool.id)).toEqual(['c1']);
+    expect(t.segments.map((s) => s.kind)).toEqual(['text', 'tool']);
+    expect(t.hold).toMatchObject({ reason: 'retry', retry: 1 });
+
+    // The replacement streaming ends the wait.
+    const next = applyEvent(t, { kind: 'text', seq: 11, turnId: 't1', chunk: 'whole' });
+    expect(next.hold).toBeNull();
+    expect(next.text).toBe('Looking.whole');
+  });
+
   test('a network hold carries no instant', () => {
     const t = stream([
       { kind: 'start', seq: 1, turnId: 't1', sessionId: 's1', assistantId: 'a1' },

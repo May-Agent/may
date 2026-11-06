@@ -459,6 +459,10 @@ pub struct ChatStream {
     /// Elements before this index belong to already-folded turns and are
     /// never folded again.
     fold_cursor: usize,
+    /// Elements before this index belong to model responses that finished.
+    /// The elements from it on are the response in flight, which a retry
+    /// discards.
+    response_floor: usize,
     /// Base `http://host/tunnel` URL `<tunnel id>` tags resolve against.
     tunnel_base: String,
 }
@@ -546,6 +550,7 @@ impl ChatStream {
             attachments,
             history_index,
         });
+        self.seal_response();
     }
 
     /// Add an error message.
@@ -935,17 +940,30 @@ impl ChatStream {
         }
     }
 
-    /// Drop the text of the attempt being retried: the streaming text block
-    /// at the end of the stream, when there is one.
-    pub fn retract_text(&mut self) {
-        if matches!(
-            self.elements.last(),
-            Some(ChatElement::AssistantText {
-                streaming: true,
-                ..
-            })
-        ) {
-            self.pop_last();
+    /// Everything shown so far belongs to model responses that finished: a
+    /// retry discards only what streams after this.
+    pub const fn seal_response(&mut self) {
+        self.response_floor = self.elements.len();
+    }
+
+    /// Drop what the attempt being retried streamed: its text, its thinking
+    /// and the tool calls it began to stream or that the provider ran for
+    /// it. Tool calls that ran, and everything before the response in
+    /// flight, stay.
+    pub fn retract_response(&mut self) {
+        let floor = self.response_floor.min(self.elements.len());
+        let belongs_to_attempt = |element: &ChatElement| match element {
+            ChatElement::Thinking { .. } | ChatElement::AssistantText { .. } => true,
+            ChatElement::ToolCall { display, .. } => {
+                matches!(display, ToolDisplay::Builtin { .. }) || !display.is_complete()
+            }
+            _ => false,
+        };
+        for index in (floor..self.elements.len()).rev() {
+            if belongs_to_attempt(&self.elements[index]) {
+                self.elements.remove(index);
+                self.revisions.remove(index);
+            }
         }
     }
 
@@ -4089,6 +4107,56 @@ mod tests {
         };
         assert_eq!(command, "echo hi");
         assert!(matches!(status, ToolStatus::Done));
+    }
+
+    /// A retried response leaves nothing of its broken attempt: its thinking,
+    /// text and streamed tool call go, while the finished response before it
+    /// stays.
+    #[test]
+    fn a_retracted_response_keeps_only_the_finished_ones() {
+        fn terminal(command: &str) -> ToolDisplay {
+            ToolDisplay::Terminal {
+                description: String::new(),
+                command: command.to_string(),
+                mode: TerminalExecutionMode::Default,
+                status: ToolStatus::Running,
+                output: None,
+                diffs: Vec::new(),
+                pinned: None,
+            }
+        }
+
+        let mut stream = ChatStream::new();
+        stream.push_user("go", Vec::new(), 0);
+        stream.push_text("first reply");
+        stream.upsert_tool_display("call-1".to_string(), terminal("ls"));
+        stream.update_tool_with_output("call-1", ToolStatus::Done, Some("a"));
+        stream.seal_response();
+
+        stream.push_thinking("考え中 생각 中");
+        stream.push_text("half an ans");
+        stream.upsert_tool_display("call-2".to_string(), terminal("ec"));
+        stream.retract_response();
+
+        let kinds: Vec<_> = stream
+            .elements()
+            .iter()
+            .map(|element| match element {
+                ChatElement::UserMessage { .. } => "user",
+                ChatElement::AssistantText { .. } => "text",
+                ChatElement::ToolCall { id, .. } => id.as_str(),
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, ["user", "text", "call-1"]);
+        assert_eq!(stream.elements().len(), stream.revisions.len());
+
+        // The replacement streams as if the attempt had never been.
+        stream.push_text("whole answer");
+        assert!(matches!(
+            stream.elements().last(),
+            Some(ChatElement::AssistantText { content, .. }) if content == "whole answer"
+        ));
     }
 
     /// The user's expansion pin and any attached diffs survive a display
