@@ -687,7 +687,6 @@ impl RuntimeDeps {
         app.set_current_model(build.model());
         app.worker_settings = build.settings().clone();
         app.background = new_worker.background().cloned();
-        app.btw_llm = new_worker.btw_llm().cloned();
         app.refresh_jobs();
         *worker = Some(new_worker);
     }
