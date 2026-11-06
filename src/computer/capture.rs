@@ -1,17 +1,11 @@
-//! Display capture for a session's virtual desktop: `CGDisplayStream`
-//! delivers `IOSurface`s holding the display's latest BGRA pixels.
-//!
-//! `CGDisplayStream` is deprecated in favour of `ScreenCaptureKit`, and
-//! it is still the lighter mechanism: one C call plus a frame block,
-//! against five `ObjC` classes, delegates and completion handlers. The
-//! captured display is the daemon's own virtual display, so the
-//! `ScreenRecording` permission path `SCKit` forces does not apply here.
+//! Display capture for a session's virtual desktop: waterkit's
+//! `DisplayStream` (`ScreenCaptureKit`) delivers `IOSurface`-backed pixel
+//! buffers holding the display's latest BGRA pixels.
 
-use std::ffi::c_void;
+use std::num::NonZeroU32;
 
-use block2::RcBlock;
-use objc2_core_foundation::{CFDictionary, CFNumber, CFString};
-use objc2_io_surface::IOSurfaceRef as Surface;
+use futures_lite::StreamExt;
+use waterkit_screen::{DisplayStream, DisplayStreamConfig, PixelFormat};
 
 use super::DisplayError;
 use crate::video::PixelBuffer;
@@ -26,65 +20,16 @@ pub struct CapturedFrame {
 /// Frames as the stream hands them off, newest last.
 pub type FrameSender = tokio::sync::mpsc::Sender<CapturedFrame>;
 
-// CGDisplayStream + IOSurface, declared directly: both are plain C
-// APIs and no maintained crate binds the stream surface without
-// dragging in the full framework.
-type CGDisplayStreamRef = *mut c_void;
-type IOSurfaceRef = *mut c_void;
-type DispatchQueue = *mut c_void;
-
-/// `CGDisplayStreamFrameStatus`, an `int32_t` enum in `CGDisplayStream.h`.
-type CGDisplayStreamFrameStatus = i32;
-/// `kCGDisplayStreamFrameStatusFrameComplete`: the Window Server generated a
-/// new frame, and only then does the handler receive a surface to encode.
-const K_CG_DISPLAY_STREAM_FRAME_STATUS_FRAME_COMPLETE: CGDisplayStreamFrameStatus = 0;
-const K_CG_BASE_BYTE_ORDER_32_LITTLE: u32 = 0x4247_5241; // 'BGRA'
-// Surfaces the stream may have out at once. Each captured frame keeps its
-// surface in use until the encoder drops it, and the stream stops delivering
-// when none is free, so the depth covers the encoder queue and the frame
-// being encoded. 8 is the largest depth `CGDisplayStream` accepts.
-const DISPLAY_STREAM_QUEUE_DEPTH: i32 = 8;
-
-#[link(name = "CoreGraphics", kind = "framework")]
-unsafe extern "C" {
-    fn CGDisplayStreamCreateWithDispatchQueue(
-        display_id: u32,
-        queue: DispatchQueue,
-        output_width: usize,
-        output_height: usize,
-        pixel_format: u32,
-        properties: *const c_void,
-        handler: *mut c_void,
-    ) -> CGDisplayStreamRef;
-    fn CGDisplayStreamStart(stream: CGDisplayStreamRef) -> i32;
-    fn CGDisplayStreamStop(stream: CGDisplayStreamRef);
-}
-
-#[link(name = "CoreGraphics", kind = "framework")]
-unsafe extern "C" {
-    static kCGDisplayStreamQueueDepth: &'static CFString;
-}
-
-#[link(name = "CoreFoundation", kind = "framework")]
-unsafe extern "C" {
-    fn CFRelease(cf: *const c_void);
-}
-
-unsafe extern "C" {
-    fn dispatch_queue_create(label: *const i8, attr: *const c_void) -> DispatchQueue;
-}
+/// The most frames per second a desktop stream captures.
+const CAPTURE_FRAME_RATE: NonZeroU32 = NonZeroU32::new(60).expect("60 is non-zero");
 
 /// A running capture on one virtual display. Dropping it stops the
-/// stream and frees the display-stream object.
+/// stream and its forwarding task.
 pub struct DisplayCapture {
-    stream: CGDisplayStreamRef,
-    queue: DispatchQueue,
-    // Whether the stream is started: it is created stopped and runs only
-    // while the desktop stream has viewers.
-    running: bool,
-    // The block must outlive the stream: it fires on `queue` until
-    // `CGDisplayStreamStop` returns.
-    _handler: RcBlock<dyn Fn(CGDisplayStreamFrameStatus, u64, IOSurfaceRef, *mut c_void)>,
+    // Created paused: it runs only while the desktop stream has viewers.
+    stream: DisplayStream,
+    // Dropping the task cancels the forwarding.
+    _forwarder: executor_core::AnyExecutorTask<()>,
 }
 
 impl std::fmt::Debug for DisplayCapture {
@@ -93,112 +38,72 @@ impl std::fmt::Debug for DisplayCapture {
     }
 }
 
-// The stream delivers frames on its own dispatch queue; the handle is
-// only used to start/stop and carries no thread affinity of its own.
-#[allow(clippy::non_send_fields_in_send_ty)]
-unsafe impl Send for DisplayCapture {}
-
 impl DisplayCapture {
-    /// Creates a stopped capture of `display_id` at `size`; once
+    /// Creates a paused capture of `display_id` at `size`; once
     /// [resumed](Self::resume) it hands each delivered frame to `frames`.
     ///
     /// # Errors
     /// Returns [`DisplayError`] when the stream cannot be created.
-    pub fn new(
+    pub async fn new(
         display_id: u32,
         size: (u32, u32),
         frames: FrameSender,
     ) -> Result<Self, DisplayError> {
-        let (width, height) = (size.0 as usize, size.1 as usize);
-        let handler = RcBlock::new(
-            move |status: CGDisplayStreamFrameStatus,
-                  _display_time: u64,
-                  surface: IOSurfaceRef,
-                  _update: *mut c_void| {
-                if status != K_CG_DISPLAY_STREAM_FRAME_STATUS_FRAME_COMPLETE || surface.is_null() {
-                    return;
-                }
-                // SAFETY: the stream hands the handler a live `IOSurfaceRef`.
-                let surface = unsafe { &*surface.cast::<Surface>() };
-                let frame = match PixelBuffer::from_io_surface(surface) {
+        let config = DisplayStreamConfig::new(non_zero(size.0)?, non_zero(size.1)?)
+            .frame_rate(CAPTURE_FRAME_RATE)
+            .pixel_format(PixelFormat::Bgra8);
+        let stream = DisplayStream::new(display_id, config)
+            .await
+            .map_err(|e| DisplayError(format!("create the display stream: {e}")))?;
+        let mut delivered = Box::pin(stream.frames());
+        let forwarder = executor_core::spawn(async move {
+            while let Some(buffer) = delivered.next().await {
+                let frame = match PixelBuffer::from_io_surface(buffer.io_surface()) {
                     Ok(surface) => CapturedFrame { surface },
                     Err(error) => {
                         tracing::warn!(%error, "dropping a captured frame");
-                        return;
+                        continue;
                     }
                 };
                 match frames.try_send(frame) {
-                    Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                         tracing::debug!("computer capture queue saturated, dropping frame");
                     }
                 }
-            },
-        );
-        // SAFETY: `kCGDisplayStreamQueueDepth` is a constant CoreGraphics exports.
-        let properties = CFDictionary::<CFString, CFNumber>::from_slices(
-            &[unsafe { kCGDisplayStreamQueueDepth }],
-            &[&*CFNumber::new_i32(DISPLAY_STREAM_QUEUE_DEPTH)],
-        );
-        // SAFETY: the stream is created on a queue we own and stopped
-        // before the handler block is released.
-        unsafe {
-            let label = c"may.computer.capture".as_ptr();
-            let queue = dispatch_queue_create(label, std::ptr::null());
-            let stream = CGDisplayStreamCreateWithDispatchQueue(
-                display_id,
-                queue,
-                width,
-                height,
-                K_CG_BASE_BYTE_ORDER_32_LITTLE,
-                (&raw const *properties).cast::<c_void>(),
-                RcBlock::as_ptr(&handler).cast::<c_void>(),
-            );
-            if stream.is_null() {
-                return Err(DisplayError("CGDisplayStream refused the display".into()));
             }
-            Ok(Self {
-                stream,
-                queue,
-                running: false,
-                _handler: handler,
-            })
-        }
+        });
+        Ok(Self {
+            stream,
+            _forwarder: forwarder,
+        })
     }
 
     /// Starts delivering frames; the first frame follows at once.
     ///
     /// # Errors
     /// Returns [`DisplayError`] when the stream cannot be started.
-    pub fn resume(&mut self) -> Result<(), DisplayError> {
-        if self.running {
-            return Ok(());
-        }
-        // SAFETY: `stream` is the live stream this capture created.
-        if unsafe { CGDisplayStreamStart(self.stream) } != 0 {
-            return Err(DisplayError("CGDisplayStream failed to start".into()));
-        }
-        self.running = true;
-        Ok(())
+    pub async fn resume(&mut self) -> Result<(), DisplayError> {
+        self.stream
+            .resume()
+            .await
+            .map_err(|e| DisplayError(format!("start the display stream: {e}")))
     }
 
     /// Stops delivering frames; the display is no longer captured until
     /// [`Self::resume`].
-    pub fn pause(&mut self) {
-        if self.running {
-            // SAFETY: `stream` is the live stream this capture created.
-            unsafe { CGDisplayStreamStop(self.stream) };
-            self.running = false;
-        }
+    ///
+    /// # Errors
+    /// Returns [`DisplayError`] when the stream cannot be stopped.
+    pub async fn pause(&mut self) -> Result<(), DisplayError> {
+        self.stream
+            .pause()
+            .await
+            .map_err(|e| DisplayError(format!("stop the display stream: {e}")))
     }
 }
 
-impl Drop for DisplayCapture {
-    fn drop(&mut self) {
-        self.pause();
-        unsafe {
-            CFRelease(self.stream);
-            CFRelease(self.queue);
-        }
-    }
+fn non_zero(extent: u32) -> Result<NonZeroU32, DisplayError> {
+    NonZeroU32::new(extent).ok_or_else(|| DisplayError("the display has no area".to_owned()))
 }

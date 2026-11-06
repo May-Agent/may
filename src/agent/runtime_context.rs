@@ -422,6 +422,36 @@ struct MemoriesChanges {
     files: Vec<String>,
 }
 
+/// Durable alert telling the agent the user fell asleep; `greet` is set in
+/// the session that ran `/sleep`.
+#[derive(Template)]
+#[template(path = "alert_sleep.txt", escape = "none")]
+pub struct SleepAlert {
+    greet: bool,
+}
+
+/// Durable alert telling the agent the user woke.
+#[derive(Template)]
+#[template(path = "alert_wake.txt", escape = "none")]
+pub struct WakeAlert;
+
+impl RuntimeSystemContext {
+    /// Records what the user's sleep state changed to as a durable alert.
+    pub(crate) fn push_sleep_notice(
+        context: &mut aither_agent::Context,
+        notice: crate::sleep::SleepNotice,
+    ) {
+        match notice {
+            crate::sleep::SleepNotice::Asleep { greet } => {
+                context.push_alert(&SleepAlert { greet });
+            }
+            crate::sleep::SleepNotice::Woke => {
+                context.push_alert(&WakeAlert);
+            }
+        }
+    }
+}
+
 /// The memory index, announced by name when it changes mid-session.
 const MEMORY_CONTENT: LiveContent = LiveContent::new("MEMORY.md", "memory_diff");
 

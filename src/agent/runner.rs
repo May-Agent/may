@@ -129,6 +129,8 @@ pub struct ForeignTurn {
     /// Row id of that message in the session history, when the daemon
     /// stored it.
     pub message_id: Option<i32>,
+    /// When the daemon started the turn.
+    pub started_at: jiff::Timestamp,
 }
 
 /// Command sent from main thread to agent worker.

@@ -47,6 +47,8 @@ pub enum UiEventTopic {
     SessionRecap = 1 << 17,
     /// An issue a session may link changed.
     SessionIssues = 1 << 18,
+    /// The user's sleep state changed.
+    Sleep = 1 << 19,
 }
 
 impl UiEventTopic {
@@ -77,6 +79,7 @@ impl UiEventTopic {
             Self::SessionSuggestion => "session_suggestion",
             Self::SessionRecap => "session_recap",
             Self::SessionIssues => "session_issues",
+            Self::Sleep => "sleep",
         }
     }
 }
@@ -105,6 +108,7 @@ impl FromStr for UiEventTopic {
             "session_suggestion" => Ok(Self::SessionSuggestion),
             "session_recap" => Ok(Self::SessionRecap),
             "session_issues" => Ok(Self::SessionIssues),
+            "sleep" => Ok(Self::Sleep),
             _ => Err(UnknownUiEventTopic(value.to_string())),
         }
     }
@@ -155,6 +159,8 @@ impl UiEventTopics {
     pub const SESSION_RECAP: Self = Self(UiEventTopic::SessionRecap.bit());
     /// `session_issues` topic bit.
     pub const SESSION_ISSUES: Self = Self(UiEventTopic::SessionIssues.bit());
+    /// `sleep` topic bit.
+    pub const SLEEP: Self = Self(UiEventTopic::Sleep.bit());
     /// Every topic.
     pub const ALL: Self = Self(
         Self::CONFIG.0
@@ -173,7 +179,8 @@ impl UiEventTopics {
             | Self::SESSION_ARTIFACTS.0
             | Self::SESSION_INDEX.0
             | Self::SESSION_RECAP.0
-            | Self::SESSION_ISSUES.0,
+            | Self::SESSION_ISSUES.0
+            | Self::SLEEP.0,
     );
 
     /// Whether no topics are set.
