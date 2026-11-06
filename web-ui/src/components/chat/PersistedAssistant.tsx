@@ -1,6 +1,6 @@
 import type { ApiMessage, ToolSummary, ToolVariant } from '@/lib/types';
 import type { TurnToolState } from '@/lib/stream/reducer';
-import { MessageText } from './MessageText';
+import { TranslatedText } from './TranslatedText';
 import { ReasoningBlock } from './ReasoningBlock';
 import { ToolCard } from './ToolCard';
 import { BrowserCard } from './BrowserCard';
@@ -67,7 +67,13 @@ export function PersistedAssistant({
           <ToolCard key={group.item.id} tool={group.item} />
         ),
       )}
-      {message.content.length > 0 && <MessageText text={message.content} sessionId={sessionId} />}
+      {message.content.length > 0 && (
+        <TranslatedText
+          text={message.content}
+          translation={message.translation}
+          sessionId={sessionId}
+        />
+      )}
       <MessageActions text={message.content} className="-ml-1" />
     </div>
   );
