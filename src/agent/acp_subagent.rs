@@ -16,8 +16,9 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use acpsub::{
-    AgentConfig, Config, ConfigSource, Defaults, Executor, FileAccess, Host, PermissionHandler,
-    PermissionPolicy, Services, Session, SessionSpec, TurnEnd, probe_with,
+    AgentConfig, AgentProcess, Config, ConfigSource, Defaults, Executor, FileAccess, Host,
+    PermissionHandler, PermissionPolicy, ProcessControl, Services, Session, SessionSpec, SpawnSpec,
+    TerminalProcess, TurnEnd, probe_with,
 };
 use aither_acp::StopReason;
 use aither_agent::specialized::{ExternalSession, ExternalStart, ExternalSubagent, SubagentTool};
@@ -28,7 +29,9 @@ use futures_util::StreamExt as _;
 use heel::DenyAll;
 use tokio::runtime::Handle;
 
-use super::acp_sandbox::{ApprovalPermissions, SandboxExecutor, SessionPolicy, SessionSandbox};
+use super::acp_sandbox::{
+    ApprovalPermissions, SandboxExecutor, SandboxProcess, SessionPolicy, SessionSandbox,
+};
 use crate::config::{AcpAgentConfig, MayConfig};
 use crate::session::MayHomePaths;
 
@@ -42,7 +45,80 @@ pub type SandboxedSession =
 
 /// A host for a command under trial, which belongs to no session: its
 /// processes have no network and its permission requests no approver.
-pub type ScratchHost = Host<SandboxExecutor<DenyAll>, ApprovalPermissions<DenyAll>>;
+pub type ScratchHost = Host<TrialExecutor, ApprovalPermissions<DenyAll>>;
+
+/// Starts the trial's processes like a [`SandboxExecutor`] and remembers them.
+///
+/// acpsub ends a process only when its handshake fails: a handshake future
+/// dropped midway leaves the agent running, held by acpsub's own connection
+/// tasks.
+#[derive(Debug, Clone)]
+pub struct TrialExecutor {
+    inner: SandboxExecutor<DenyAll>,
+    started: Arc<std::sync::Mutex<Vec<Arc<SandboxProcess>>>>,
+}
+
+impl TrialExecutor {
+    /// Kills every process this executor started, and their descendants.
+    ///
+    /// # Panics
+    /// Panics when the process list's lock is poisoned.
+    pub fn kill_all(&self) {
+        for process in self.started.lock().expect("trial processes").iter() {
+            process.kill();
+        }
+    }
+
+    fn track(&self, process: SandboxProcess) -> TrialProcess {
+        let process = Arc::new(process);
+        self.started
+            .lock()
+            .expect("trial processes")
+            .push(process.clone());
+        TrialProcess(process)
+    }
+}
+
+/// A process of the trial, shared with [`TrialExecutor`] so it can be killed
+/// from outside acpsub.
+#[derive(Debug)]
+pub struct TrialProcess(Arc<SandboxProcess>);
+
+impl ProcessControl for TrialProcess {
+    fn kill(&self) {
+        self.0.kill();
+    }
+
+    fn wait(&self) -> impl Future<Output = std::io::Result<std::process::ExitStatus>> + Send {
+        self.0.wait()
+    }
+}
+
+impl Executor for TrialExecutor {
+    type Process = TrialProcess;
+    type Stdin = <SandboxExecutor<DenyAll> as Executor>::Stdin;
+    type Stdout = <SandboxExecutor<DenyAll> as Executor>::Stdout;
+    type Stderr = <SandboxExecutor<DenyAll> as Executor>::Stderr;
+
+    async fn spawn_agent(&self, spec: SpawnSpec) -> std::io::Result<AgentProcess<Self>> {
+        let process = self.inner.spawn_agent(spec).await?;
+        Ok(AgentProcess {
+            stdin: process.stdin,
+            stdout: process.stdout,
+            stderr: process.stderr,
+            control: self.track(process.control),
+        })
+    }
+
+    async fn spawn_terminal(&self, spec: SpawnSpec) -> std::io::Result<TerminalProcess<Self>> {
+        let process = self.inner.spawn_terminal(spec).await?;
+        Ok(TerminalProcess {
+            stdout: process.stdout,
+            stderr: process.stderr,
+            control: self.track(process.control),
+        })
+    }
+}
 
 /// Whether a session's host is retired, which happens once, when the session
 /// is deleted. Opening and closing an agent session hold it for reading, so
@@ -274,17 +350,22 @@ pub fn trial_host(
     agents: &BTreeMap<String, AcpAgentConfig>,
     storage: &Path,
     sandbox: SessionSandbox<DenyAll>,
-) -> Result<ScratchHost, acpsub::Error> {
+) -> Result<(ScratchHost, TrialExecutor), acpsub::Error> {
     let source = FixedConfig(acpsub_config(agents, storage));
     let cell = Arc::new(ArcSwap::from_pointee(sandbox));
-    Host::from_config_with(
+    let executor = TrialExecutor {
+        inner: SandboxExecutor::new(cell.clone(), Arc::default()),
+        started: Arc::default(),
+    };
+    let host = Host::from_config_with(
         source.0.clone(),
         source,
         Services {
-            executor: SandboxExecutor::new(cell.clone(), Arc::default()),
+            executor: executor.clone(),
             permissions: ApprovalPermissions::new(cell),
         },
-    )
+    )?;
+    Ok((host, executor))
 }
 
 /// What a connection looks like to acpsub. Its permission policy answers
@@ -569,6 +650,9 @@ pub enum TrialError {
     /// checks.
     #[error(transparent)]
     Acpsub(#[from] acpsub::Error),
+    /// The agent stopped answering the handshake; its process was killed.
+    #[error("the agent did not open a trial session within {0:?}")]
+    TimedOut(std::time::Duration),
 }
 
 /// Opens a session with `agent` in a fresh temporary directory and closes it,
@@ -581,15 +665,18 @@ pub enum TrialError {
 /// # Errors
 /// Returns [`TrialError`]; [`acpsub::Error::ModelRequired`] and
 /// [`acpsub::Error::ModeRequired`] carry the ids the agent advertises.
+/// [`TrialError::TimedOut`] follows a handshake still unfinished after
+/// `limit`, with the agent's process tree killed.
 pub async fn try_connection(
     runtime: &Handle,
     name: &str,
     agent: &AcpAgentConfig,
+    limit: std::time::Duration,
 ) -> Result<(), TrialError> {
     let scratch = blocking::unblock(tempfile::tempdir).await?;
     let work = scratch.path().join("work");
     async_fs::create_dir_all(&work).await?;
-    let host = trial_host(
+    let (host, processes) = trial_host(
         &BTreeMap::from([(name.to_string(), agent.clone())]),
         &scratch.path().join("acp"),
         SessionSandbox::scratch(&work),
@@ -598,7 +685,18 @@ pub async fn try_connection(
     spec.model.clone_from(&agent.model);
     spec.mode.clone_from(&agent.mode);
     spec.permission = Some(PermissionPolicy::Deny);
-    let session = in_runtime(runtime, host.spawn(spec)).await?;
+    // The timer is built inside the runtime's context. Dropping the timed-out
+    // handshake does not end the agent (acpsub's connection tasks hold it), so
+    // the trial executor kills what it started.
+    let spawned = in_runtime(runtime, async {
+        tokio::time::timeout(limit, host.spawn(spec)).await
+    })
+    .await;
+    let Ok(session) = spawned else {
+        processes.kill_all();
+        return Err(TrialError::TimedOut(limit));
+    };
+    let session = session?;
     close_session(runtime, session).await;
     Ok(())
 }
