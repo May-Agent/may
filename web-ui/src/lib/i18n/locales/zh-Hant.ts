@@ -562,6 +562,12 @@ export const zhHant: Messages = {
     stopping: '正在停止…',
     loadFailed: '無法載入：{message}',
   },
+  sleep: {
+    asleep: '你正在睡覺：代理會繼續工作並累積問題。傳送 /sleep off 結束。',
+    awake: '你已醒來',
+    reminder: '差不多是你平常睡覺的時間了。執行 /sleep 並好好休息。',
+    failed: '無法變更睡眠狀態：{message}',
+  },
   yolo: {
     label: 'Yolo',
     description: '自動允許此對話中的所有核准請求，不再詢問',
