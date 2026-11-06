@@ -146,6 +146,7 @@ pub(super) async fn connect(
         model: request.model,
         mode: request.mode,
         description: describe(&identity),
+        grants: Vec::new(),
     };
     match try_connection(&state.tokio_handle, &request.name, &agent).await {
         Ok(()) => {}
@@ -228,16 +229,16 @@ mod tests {
 
     use super::*;
 
+    /// The fixture started as a program: the probe and trial sandboxes grant
+    /// only the program they start, never a script its arguments name.
     fn fake_agent(model: Option<&str>, mode: Option<&str>) -> ConnectAcpAgentRequest {
         ConnectAcpAgentRequest {
             name: "fake".to_string(),
-            command: "python3".to_string(),
-            args: vec![
-                Path::new(env!("CARGO_MANIFEST_DIR"))
-                    .join("tests/fixtures/fake_acp_agent.py")
-                    .to_string_lossy()
-                    .into_owned(),
-            ],
+            command: Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/fake_acp_agent.py")
+                .to_string_lossy()
+                .into_owned(),
+            args: Vec::new(),
             model: model.map(str::to_string),
             mode: mode.map(str::to_string),
         }
@@ -252,6 +253,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn connecting_asks_for_the_model_and_mode_then_configures_the_agent() {
+        // The probe's sandbox spawns on the daemon's global executor.
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
         let dir = tempfile::tempdir().expect("temp dir");
         let state = DaemonState::for_test(dir.path(), MayConfig::default())
             .await
