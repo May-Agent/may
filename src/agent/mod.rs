@@ -54,6 +54,7 @@ pub mod tool_environment_cache;
 pub(crate) mod tunnel_tool;
 mod usage;
 mod wall_clock;
+pub mod work_tracker;
 
 pub use browser_tool::{
     BrowserArgs, BrowserBroker, BrowserRequest, BrowserResult, channel as browser_channel,
