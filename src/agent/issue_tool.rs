@@ -8,11 +8,12 @@ use askama::Template;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+use crate::agent::publish_approval::PublishGate;
 use crate::issue::owner::{IssueOwner, IssueOwners, OwnerIndex};
 use crate::issue::provenance::{CallOrigin, IssueAction, IssueMarks, IssueProvenance};
 use crate::issue::search::{IssueHit, IssueSearch};
 use crate::issue::{
-    IssueDetail, IssueError, IssueListState, IssueRelationKind, IssueState, IssueStore,
+    IssueDetail, IssueError, IssueKind, IssueListState, IssueRelationKind, IssueState, IssueStore,
     IssueSummary,
 };
 use crate::repo_search::RepoSearchCollections;
@@ -44,7 +45,9 @@ const fn default_list_state() -> IssueListState {
 /// blocked-by and sub-issue on the session's issue backend.
 ///
 /// Subcommands:
-/// - `issue create <title> [--body text] [--labels name ...]`
+/// - `issue create <kind> <title> [--body text] [--labels name ...]` — `kind`
+///   is `bug`, `feature` or `performance`; some kinds, and any issue on a
+///   repository the user does not own, wait for the user's approval
 /// - `issue view <number>` — an open issue also names its owning agent
 /// - `issue owner <number>` — the agent whose `tasks.md` lists the open
 ///   issue; at most one agent owns an issue
@@ -54,7 +57,8 @@ const fn default_list_state() -> IssueListState {
 /// - `issue provenance <number> [--messages n]` — the changes may made to the
 ///   issue, with the session, agent, tool call and preceding user messages
 /// - `issue edit <number> [--title t] [--body b] [--state open|closed]`
-/// - `issue comment <number> <body>`
+/// - `issue comment <number> <body>` — on a repository the user does not own,
+///   waits for the user's approval unless the user opened the issue
 /// - `issue close <number>` (reopen with `edit --state open`)
 /// - `issue label <number> [--add name ...] [--remove name ...]`
 /// - `issue blocked-by <number> [--add n ...] [--remove n ...]` — the issue
@@ -66,6 +70,8 @@ const fn default_list_state() -> IssueListState {
 pub enum IssueArgs {
     /// Create an issue.
     Create {
+        /// What the issue is about: `bug`, `feature` or `performance`.
+        kind: IssueKind,
         /// Issue title.
         title: String,
         /// Issue body (markdown).
@@ -287,6 +293,7 @@ pub struct IssueTool<S> {
     languages: Option<aither_agent::LanguageGuard>,
     changes: Option<IssueChangeNotifier>,
     owners: Option<IssueOwners>,
+    publish: Option<PublishGate>,
 }
 
 /// The `issue` tool as a subagent sees it: the read subcommands work and every
@@ -370,7 +377,15 @@ impl<S: IssueStore> IssueTool<S> {
             languages: None,
             changes: None,
             owners: None,
+            publish: None,
         }
+    }
+
+    /// Ask the user before publishing, as `gate` decides.
+    #[must_use]
+    pub fn with_publish_gate(mut self, gate: PublishGate) -> Self {
+        self.publish = Some(gate);
+        self
     }
 
     /// Name issue owners through `owners`.
@@ -420,6 +435,29 @@ impl<S: IssueStore + Clone + 'static> Tool for IssueTool<S> {
                 guard.check_working(text, aither_agent::WorkingText::Public)?;
             }
         }
+        if let Some(gate) = &self.publish {
+            match &arguments {
+                IssueArgs::Create {
+                    kind,
+                    title,
+                    body,
+                    labels,
+                } => {
+                    gate.approve_issue(
+                        &self.store,
+                        *kind,
+                        title.trim(),
+                        labels,
+                        body.as_deref().unwrap_or(""),
+                    )
+                    .await?;
+                }
+                IssueArgs::Comment { number, body } => {
+                    gate.approve_comment(&self.store, *number, body).await?;
+                }
+                _ => {}
+            }
+        }
         let writes = arguments.writes();
         let result = execute(
             &self.store,
@@ -464,6 +502,7 @@ async fn execute<S: IssueStore>(
     };
     match args {
         IssueArgs::Create {
+            kind: _,
             title,
             body,
             labels,
@@ -840,6 +879,7 @@ pub mod subagent_checks {
     pub fn write_args() -> Vec<IssueArgs> {
         vec![
             IssueArgs::Create {
+                kind: IssueKind::Bug,
                 title: "t".to_string(),
                 body: None,
                 labels: Vec::new(),
@@ -994,6 +1034,7 @@ pub mod provenance_checks {
             &tool,
             "call_create",
             IssueArgs::Create {
+                kind: IssueKind::Bug,
                 title: "first".to_string(),
                 body: None,
                 labels: Vec::new(),
@@ -1242,6 +1283,7 @@ mod tests {
     fn subcommands_deserialize_from_wire_json() {
         match serde_json::from_value::<IssueArgs>(serde_json::json!({
             "action": "create",
+            "kind": "performance",
             "title": "a title",
             "body": "text",
             "labels": ["bug"],
@@ -1249,10 +1291,12 @@ mod tests {
         .expect("create")
         {
             IssueArgs::Create {
+                kind,
                 title,
                 body,
                 labels,
             } => {
+                assert_eq!(kind, IssueKind::Performance);
                 assert_eq!(title, "a title");
                 assert_eq!(body.as_deref(), Some("text"));
                 assert_eq!(labels, ["bug".to_string()]);

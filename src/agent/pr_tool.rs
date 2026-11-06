@@ -250,6 +250,7 @@ mod tests {
                         "s1",
                     ),
                     github_api: PrContext::default_github_api(),
+                    publish: None,
                 },
                 terminal.sandbox(),
             ),

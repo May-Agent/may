@@ -94,6 +94,9 @@ pub struct SharedTerminalCommandConfig<LLM> {
     /// Issue store for the `issue` command, resolved from the session
     /// workspace and its per-project configuration.
     pub issue_store: crate::issue::ResolvedIssueStore,
+    /// Asks the user before an issue, PR or comment is published, when the
+    /// session can ask; `None` publishes without asking.
+    pub publish_gate: Option<crate::agent::publish_approval::PublishGate>,
     /// Per-project workspace config — `pr` reads `[[projects]] checks` off it.
     pub workspace_config: crate::workspace::WorkspaceConfig,
     /// Discovery and messaging between main agents, when the session has a
@@ -214,6 +217,9 @@ where
     let provenance = IssueProvenance::new(config.db.clone(), config.session_id.clone());
     let mut issue_tool = IssueTool::new(config.issue_store.clone(), provenance.clone())
         .with_search(issue_search.clone());
+    if let Some(gate) = &config.publish_gate {
+        issue_tool = issue_tool.with_publish_gate(gate.clone());
+    }
     if let Some(guard) = &config.languages {
         issue_tool = issue_tool.with_languages(guard.clone());
     }
@@ -276,6 +282,7 @@ where
         screen: Some(screen),
         signing,
         github_api: crate::pr::PrContext::default_github_api(),
+        publish: config.publish_gate.clone(),
     };
     let mut pr_command = PrCommand::new(pr_context);
     if let Some(guard) = &config.languages {
@@ -633,6 +640,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
+                publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
                 languages: None,
@@ -692,6 +700,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
+                publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
                 languages: None,
@@ -751,6 +760,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
+                publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
                 languages: None,
@@ -804,6 +814,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters,
                 issue_store: test_issue_store(temp.path()).await,
+                publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
                 languages: None,
@@ -853,6 +864,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
+                publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
                 languages: None,
@@ -871,7 +883,10 @@ mod tests {
 
         // The main agent creates an issue; the subagent can read it.
         let created = main
-            .query_tool_handler("issue", &["create".to_string(), "seed".to_string()])
+            .query_tool_handler(
+                "issue",
+                &["create".to_string(), "bug".to_string(), "seed".to_string()],
+            )
             .await;
         assert!(created.ok, "{created:?}");
         let viewed = subagent
@@ -885,7 +900,7 @@ mod tests {
 
         // Every write subcommand is refused from the subagent registry.
         for args in [
-            vec!["create", "x"],
+            vec!["create", "bug", "x"],
             vec!["edit", "1", "--title", "x"],
             vec!["comment", "1", "x"],
             vec!["close", "1"],
@@ -1016,6 +1031,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store,
+                publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: Some(messaging),
                 languages: None,
@@ -1095,6 +1111,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
+                publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
                 languages: None,
@@ -1145,6 +1162,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
+                publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
                 languages: None,
@@ -1199,6 +1217,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp).await,
+                publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
                 languages: None,

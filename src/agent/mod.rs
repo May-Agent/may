@@ -30,11 +30,13 @@ mod may;
 pub(crate) mod notify_tool;
 #[cfg(test)]
 mod open_questions_tests;
-mod permission;
+pub(crate) mod permission;
 pub(crate) mod pr_tool;
 #[cfg(test)]
 mod prompt_layout_tests;
 mod provider;
+/// Approval of the issues, pull requests and comments the agent publishes.
+pub mod publish_approval;
 pub(crate) mod register_tool;
 pub(crate) mod repo_tool;
 #[cfg(test)]
@@ -69,8 +71,8 @@ pub use may::{
 };
 pub use notify_tool::{NotifyArgs, NotifyBroker, NotifyResult, channel as notify_channel};
 pub use permission::{
-    PermissionApprover, PermissionHistoryMode, PermissionHistoryModeParseError, PermissionRequest,
-    PermissionRequestMode, PermissionRequestModeParseError,
+    OnTimeout, PermissionApprover, PermissionHistoryMode, PermissionHistoryModeParseError,
+    PermissionRequest, PermissionRequestMode, PermissionRequestModeParseError,
 };
 pub(crate) use provider::reasoning_text_requested;
 pub use provider::{
