@@ -7,7 +7,7 @@ use skyzen::Result as SkyResult;
 use skyzen::utils::{Json, State};
 use tokio::time::MissedTickBehavior;
 
-use super::chat::start_prompt_turn;
+use super::chat::deliver_user_message;
 use super::error::{bad_request_error, internal_error};
 use super::state::DaemonState;
 use super::types::ChatRequest;
@@ -38,8 +38,9 @@ pub(super) async fn get_sleep(State(state): State<Arc<DaemonState>>) -> Json<Sle
 }
 
 /// `POST /api/sleep`: records the run, marks the user asleep for every
-/// session and starts a turn in the session the command ran in, whose agent
-/// wishes the user good night. Running it while asleep only records it.
+/// session and delivers `/sleep` to the session the command ran in, whose
+/// agent wishes the user good night: a busy session takes it as its running
+/// turn can. Running it while asleep only records it.
 pub(super) async fn start_sleep(
     Json(request): Json<SleepRequest>,
     State(state): State<Arc<DaemonState>>,
@@ -56,7 +57,7 @@ pub(super) async fn start_sleep(
         .await
         .map_err(internal_error)?;
     if changed {
-        start_prompt_turn(
+        deliver_user_message(
             &state,
             ChatRequest {
                 session_id: request.session_id,
