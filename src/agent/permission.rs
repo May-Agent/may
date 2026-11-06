@@ -43,6 +43,8 @@ pub enum PermissionRequestMode {
     Unsafe,
     /// Permission scoped to an SSH server.
     Ssh,
+    /// Publishing an issue, pull request or comment.
+    Publish,
 }
 
 impl PermissionRequestMode {
@@ -53,6 +55,7 @@ impl PermissionRequestMode {
             Self::Default => "default",
             Self::Unsafe => "unsafe",
             Self::Ssh => "ssh",
+            Self::Publish => "publish",
         }
     }
 }
@@ -71,6 +74,7 @@ impl core::str::FromStr for PermissionRequestMode {
             "default" => Ok(Self::Default),
             "unsafe" => Ok(Self::Unsafe),
             "ssh" => Ok(Self::Ssh),
+            "publish" => Ok(Self::Publish),
             other => Err(PermissionRequestModeParseError {
                 value: other.to_string(),
             }),
@@ -98,6 +102,8 @@ pub enum PermissionHistoryMode {
     Unsafe,
     /// SSH-scoped approval history.
     Ssh,
+    /// Approval history of published issues, pull requests and comments.
+    Publish,
 }
 
 impl PermissionHistoryMode {
@@ -108,6 +114,7 @@ impl PermissionHistoryMode {
             Self::Sandboxed => "sandboxed",
             Self::Unsafe => "unsafe",
             Self::Ssh => "ssh",
+            Self::Publish => "publish",
         }
     }
 }
@@ -133,6 +140,7 @@ impl core::str::FromStr for PermissionHistoryMode {
             "sandboxed" => Ok(Self::Sandboxed),
             "unsafe" => Ok(Self::Unsafe),
             "ssh" => Ok(Self::Ssh),
+            "publish" => Ok(Self::Publish),
             other => Err(PermissionHistoryModeParseError {
                 value: other.to_string(),
             }),
@@ -164,6 +172,15 @@ pub struct PermissionRequest {
     /// subagents, each with an instance-unique `word-word-word` id.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
+}
+
+/// What an approval request nobody answers resolves to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnTimeout {
+    /// Denied, as an `unsafe` escalation is.
+    Deny,
+    /// Approved.
+    Approve,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -299,19 +316,13 @@ impl PermissionApprover {
         db: &crate::db::ChatDb,
         session_id: &str,
         request_id: &str,
-        mode: TerminalMode,
+        mode: PermissionHistoryMode,
         script: &str,
     ) -> Result<(), PermissionError> {
-        db.append_permission_request_message(
-            session_id,
-            request_id,
-            PermissionHistoryMode::from(mode),
-            script,
-            None,
-        )
-        .await
-        .map_err(anyhow::Error::from)
-        .map_err(PermissionError::Internal)?;
+        db.append_permission_request_message(session_id, request_id, mode, script, None)
+            .await
+            .map_err(anyhow::Error::from)
+            .map_err(PermissionError::Internal)?;
         Ok(())
     }
 
@@ -333,7 +344,7 @@ impl PermissionApprover {
     /// Record a yolo grant in the session history like a user approval.
     async fn record_yolo_grant(
         &self,
-        mode: TerminalMode,
+        mode: PermissionHistoryMode,
         script: &str,
     ) -> Result<(), PermissionError> {
         let (Some(runtime_service), Some(session_id)) = (&self.runtime_service, &self.session_id)
@@ -342,7 +353,7 @@ impl PermissionApprover {
         };
         runtime_service
             .db()
-            .append_granted_permission(session_id, PermissionHistoryMode::from(mode), script)
+            .append_granted_permission(session_id, mode, script)
             .await
             .map_err(anyhow::Error::from)
             .map_err(PermissionError::Internal)?;
@@ -359,13 +370,68 @@ impl PermissionApprover {
         script: String,
     ) -> Result<bool, PermissionError> {
         if self.yolo().await? {
-            self.record_yolo_grant(mode, &script).await?;
+            self.record_yolo_grant(mode.into(), &script).await?;
             return Ok(true);
         }
         if let ApprovalMode::Unavailable { context } = self.approval_mode {
             return Err(Self::unavailable_error(mode, context));
         }
+        self.wait(
+            mode.into(),
+            mode.into(),
+            &format!("{} mode", mode.description()),
+            script,
+            OnTimeout::Deny,
+        )
+        .await
+    }
 
+    /// Ask the user to approve publishing `text` (an issue, pull request or
+    /// comment) and wait for the decision. Where an unanswered `unsafe`
+    /// request is denied, `on_timeout` decides: [`OnTimeout::Approve`]
+    /// approves it. A yolo session approves at once; an approver that
+    /// cannot prompt behaves as if nobody answered.
+    ///
+    /// # Errors
+    /// Returns [`PermissionError`] when the request cannot be delivered, the
+    /// wait is interrupted, or an unanswered request is denied.
+    pub async fn request_publication(
+        &self,
+        text: String,
+        on_timeout: OnTimeout,
+    ) -> Result<bool, PermissionError> {
+        if self.yolo().await? {
+            self.record_yolo_grant(PermissionHistoryMode::Publish, &text)
+                .await?;
+            return Ok(true);
+        }
+        if let ApprovalMode::Unavailable { context } = self.approval_mode {
+            return match on_timeout {
+                OnTimeout::Approve => Ok(true),
+                OnTimeout::Deny => Err(PermissionError::Denied(format!(
+                    "publishing needs the user's approval, which is unavailable in {context}"
+                ))),
+            };
+        }
+        self.wait(
+            PermissionRequestMode::Publish,
+            PermissionHistoryMode::Publish,
+            "publishing",
+            text,
+            on_timeout,
+        )
+        .await
+    }
+
+    /// Persist the request, surface it to the UI and wait for the answer.
+    async fn wait(
+        &self,
+        mode: PermissionRequestMode,
+        history: PermissionHistoryMode,
+        what: &str,
+        script: String,
+        on_timeout: OnTimeout,
+    ) -> Result<bool, PermissionError> {
         let Some(session_id) = self.session_id.clone() else {
             return Err(PermissionError::Internal(anyhow::anyhow!(
                 "permission approval requires a bound session id"
@@ -373,7 +439,7 @@ impl PermissionApprover {
         };
 
         let payload = PermissionRequest {
-            mode: mode.into(),
+            mode,
             script,
             session_id: Some(session_id.clone()),
             agent_id: Some(self.agent_id.clone()),
@@ -391,7 +457,7 @@ impl PermissionApprover {
                 .map_err(anyhow::Error::from)
                 .map_err(PermissionError::Internal)?;
             let db = runtime_service.db();
-            Self::append_request_history(&db, &session_id, &request_id, mode, &payload.script)
+            Self::append_request_history(&db, &session_id, &request_id, history, &payload.script)
                 .await?;
         }
 
@@ -399,20 +465,23 @@ impl PermissionApprover {
             return decision.map_err(|_| PermissionError::Interrupted);
         }
         // The operator never answered: resolve the pending request as
-        // denied so it stops blocking the UI and the history records the
-        // decision, then refuse the escalation. The waiter is this run
-        // itself — there is nothing to wake.
+        // the timeout outcome so it stops blocking the UI and the history
+        // records the decision. The waiter is this run itself — there is
+        // nothing to wake.
+        let approved = on_timeout == OnTimeout::Approve;
         self.live_responses.take(&request_id);
         if let Some(runtime_service) = &self.runtime_service
             && let Err(error) = runtime_service
-                .commit_permission_response(&request_id, false)
+                .commit_permission_response(&request_id, approved)
                 .await
         {
-            tracing::warn!(%error, "failed to persist a timed-out permission denial");
+            tracing::warn!(%error, "failed to persist a timed-out permission decision");
+        }
+        if approved {
+            return Ok(true);
         }
         Err(PermissionError::Denied(format!(
-            "{} mode approval was not answered within {} minutes and was denied",
-            mode.description(),
+            "{what} approval was not answered within {} minutes and was denied",
             self.timeout.as_secs() / 60
         )))
     }
@@ -445,6 +514,12 @@ impl PermissionApprover {
         };
         let woke = self.respond(request_id, approved);
         Ok(Some(crate::session::ResolvedRequest { session_id, woke }))
+    }
+
+    /// The requests awaiting an answer.
+    #[cfg(test)]
+    pub(crate) fn pending_request_ids(&self) -> Vec<String> {
+        self.live_responses.pending_ids()
     }
 
     /// Deliver a decision for `request_id`; returns false if no matching pending request exists.

@@ -201,6 +201,9 @@ pub struct MayAgentConfig {
     pub ssh_servers: Vec<crate::config::SshServerConfig>,
     /// Optional web UI permission approver.
     pub permission_approver: Option<PermissionApprover>,
+    /// The daemon's live configuration, read when the agent publishes: the
+    /// `[issue_approval]` settings apply as they are saved.
+    pub live_config: Option<Arc<arc_swap::ArcSwap<MayConfig>>>,
     /// Discovery and messaging between main agents, when the daemon hosts
     /// the session.
     pub agent_messaging: Option<crate::agent_link::AgentMessaging>,
@@ -281,6 +284,8 @@ pub struct MayAgentSessionInput<'a> {
     pub profile_id: Option<String>,
     /// Optional permission approver handling interactive approval.
     pub permission_approver: Option<PermissionApprover>,
+    /// The daemon's live configuration, when the session has one.
+    pub live_config: Option<Arc<arc_swap::ArcSwap<MayConfig>>>,
     /// Discovery and messaging between main agents, when the daemon hosts
     /// the session.
     pub agent_messaging: Option<crate::agent_link::AgentMessaging>,
@@ -598,6 +603,11 @@ impl MayAgent {
             &session_paths.workspace_config(),
             config.db.clone(),
         )?;
+        let publish_gate = config
+            .live_config
+            .clone()
+            .zip(config.permission_approver.clone())
+            .map(|(live, approver)| super::publish_approval::PublishGate::new(live, approver));
         let ssh_authorizer_broker = config.ask_user_broker.clone();
         let imagine_config = ImagineCommandConfig {
             generator: config.image_generator.clone(),
@@ -725,6 +735,7 @@ impl MayAgent {
                     .then_some(config.workspace_request_broker.clone()),
                 subagent_runs: subagent_runs.clone(),
                 issue_store: issue_store.clone(),
+                publish_gate,
                 workspace_config: workspace.config.clone(),
                 agent_messaging,
                 languages: Some(language_guard.clone()),
@@ -854,6 +865,7 @@ impl MayAgent {
             prompt_cache_epoch,
             profile_id,
             permission_approver,
+            live_config,
             agent_messaging,
             profile_persona,
             profile_memories,
@@ -949,6 +961,7 @@ impl MayAgent {
             image_generator: resolve_image_generator_config(may_config),
             ssh_servers,
             permission_approver,
+            live_config,
             agent_messaging,
             environment,
             profile_persona,
