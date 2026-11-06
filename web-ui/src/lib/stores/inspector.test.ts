@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 import type { BackgroundJob, SessionBackground, SubagentRun } from '../api/background';
 import { useInspectorStore, EMPTY_INSPECTOR_ENTRY } from './inspector';
 import { useTurnStore } from './turn';
+import type { TaskRow } from '../types';
 import {
   formatElapsed,
   formatTokens,
@@ -117,18 +118,24 @@ describe('inspector model', () => {
 });
 
 describe('inspector store', () => {
-  test('tasks load into a tree without the notes', async () => {
+  test('tasks load with the rows the daemon parsed', async () => {
+    const rows: TaskRow[] = [
+      {
+        section: 'doing',
+        text: 'Two (#4)',
+        blocking: null,
+        references: [{ repository: null, number: 4, pullRequest: false }],
+      },
+    ];
     installFetch((url) => {
       expect(url).toBe('/api/sessions/A/tasks');
-      return json({ content: '# Plan\nSome notes.\n- [x] One\n  - [ ] Two (#4)\n', planState: 'approved' });
+      return json({ content: '## Doing\n- Two (#4)\n', planState: 'approved', rows });
     });
     await useInspectorStore.getState().loadTasks('A');
     const entry = useInspectorStore.getState().sessions.A;
     expect(entry.tasksLoading).toBe(false);
     expect(entry.tasks?.planState).toBe('approved');
-    expect(entry.tasks?.tree.total).toBe(2);
-    expect(entry.tasks?.tree.groups[0].tasks[0].children[0].issues[0].label).toBe('#4');
-    expect(JSON.stringify(entry.tasks?.tree)).not.toContain('Some notes');
+    expect(entry.tasks?.rows).toEqual(rows);
   });
 
   test('overlapping task loads coalesce into one follow-up fetch', async () => {
@@ -138,7 +145,11 @@ describe('inspector store', () => {
     const calls = installFetch(async () => {
       served += 1;
       if (served === 1) await gate;
-      return json({ content: `- [ ] v${served}`, planState: 'draft' });
+      return json({
+        content: `## Doing\n- v${served}\n`,
+        planState: 'draft',
+        rows: [{ section: 'doing', text: `v${served}`, blocking: null, references: [] }],
+      });
     });
     const first = useInspectorStore.getState().loadTasks('A');
     void useInspectorStore.getState().loadTasks('A');
@@ -147,15 +158,15 @@ describe('inspector store', () => {
     release();
     await first;
     expect(calls.urls).toHaveLength(2);
-    expect(useInspectorStore.getState().sessions.A.tasks?.tree.groups[0].tasks[0].text).toBe('v2');
+    expect(useInspectorStore.getState().sessions.A.tasks?.rows[0].text).toBe('v2');
   });
 
   test('a failed tasks load keeps the last document and reports the error', async () => {
-    useInspectorStore.getState().setTasks('A', '- [ ] kept', 'draft');
+    useInspectorStore.getState().setTasks('A', { content: '## Doing\n- kept\n' }, 'draft');
     installFetch(() => new Response('{"message":"nope"}', { status: 500 }));
     await useInspectorStore.getState().loadTasks('A');
     const entry = useInspectorStore.getState().sessions.A;
-    expect(entry.tasks?.content).toBe('- [ ] kept');
+    expect(entry.tasks?.content).toBe('## Doing\n- kept\n');
     expect(entry.tasksError).toBe('nope');
   });
 

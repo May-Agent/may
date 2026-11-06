@@ -26,7 +26,8 @@ import type { BackgroundJob, SubagentRun } from '@/lib/api/background';
 import type { ApiSession, SessionPlanState } from '@/lib/types';
 import { shortcutAria, shortcutLabel } from '@/lib/shortcuts';
 import { cn } from '@/lib/utils';
-import { IssueLabel, TaskTreeView } from './TaskTreeView';
+import { openCount, rootReferences } from '@/lib/tasks/rows';
+import { ReferenceLabel, TaskRowsView } from './TaskRowsView';
 import { PlanEditorSheet } from './PlanEditorSheet';
 import { LibraryPanel } from './LibraryPanel';
 
@@ -199,7 +200,7 @@ function DetailsPanel({ session }: { session: ApiSession }) {
 
       <Section
         title={t('inspector.tasks')}
-        meta={tasks && tasks.tree.total > 0 ? `${tasks.tree.completed}/${tasks.tree.total}` : undefined}
+        meta={tasks && openCount(tasks.rows) > 0 ? String(openCount(tasks.rows)) : undefined}
         busy={entry.tasksLoading && tasks !== null}
         accessory={
           tasks && (tasks.content.trim().length > 0 || planState !== 'disabled') ? (
@@ -215,18 +216,21 @@ function DetailsPanel({ session }: { session: ApiSession }) {
           )
         ) : (
           <>
-            {tasks.tree.roots.length > 0 && (
+            {rootReferences(tasks.rows).length > 0 && (
               <p className="mb-2 flex flex-wrap items-baseline gap-x-2 text-xs text-muted-foreground">
                 <span>{t('inspector.linkedIssues')}</span>
-                {tasks.tree.roots.map((issue) => (
-                  <IssueLabel key={issue.label} issue={issue} />
+                {rootReferences(tasks.rows).map((reference) => (
+                  <ReferenceLabel
+                    key={`${reference.repository ?? ''}#${reference.number}${reference.pullRequest}`}
+                    reference={reference}
+                  />
                 ))}
               </p>
             )}
-            {tasks.tree.total === 0 ? (
+            {openCount(tasks.rows) === 0 ? (
               <Empty>{t('inspector.tasksEmpty')}</Empty>
             ) : (
-              <TaskTreeView tree={tasks.tree} />
+              <TaskRowsView rows={tasks.rows} />
             )}
           </>
         )}

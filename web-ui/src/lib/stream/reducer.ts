@@ -5,7 +5,7 @@ import type {
   ReplyTranslation,
   ToolSummary,
   ToolVariant,
-  SseTodoItem,
+  TaskRow,
 } from '../types';
 
 export interface TurnToolState {
@@ -57,7 +57,7 @@ export interface TurnState {
    * narration visually between the tool it introduces and the one after.
    */
   segments: TurnSegment[];
-  todo: { items: SseTodoItem[]; total: number; completed: number } | null;
+  todo: { rows: TaskRow[] } | null;
   error: TurnErrorState | null;
   status: 'streaming' | 'done';
   /** Latest decode-rate sample reported by the backend, in tokens/second. */
@@ -272,7 +272,7 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
     case 'todo_update':
       return {
         ...state,
-        todo: { items: event.items, total: event.total, completed: event.completed },
+        todo: { rows: event.rows },
         lastSeq: event.seq,
       };
 

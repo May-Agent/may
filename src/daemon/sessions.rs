@@ -170,8 +170,7 @@ pub(super) async fn linked_issue_briefs(
     let content = paths.tasks_content().await.map_err(internal_error)?;
     let numbers = content
         .as_deref()
-        .map(crate::tui::sidebar::TaskTree::parse)
-        .map(|tree| tree.linked_issues())
+        .map(|content| crate::tui::sidebar::linked_issues(&crate::task_rows::task_rows(content)))
         .unwrap_or_default();
     let mut briefs = issue_briefs(state, session_id, numbers).await?;
     // A failed lookup says nothing new; the client keeps what it shows.
@@ -308,6 +307,7 @@ pub(super) async fn get_session_tasks(
         .map_err(internal_error)?
         .unwrap_or_default();
     Ok(Json(SessionTasksPayload {
+        rows: crate::task_rows::task_rows(&content),
         content,
         plan_state: runtime.plan_state,
     }))
@@ -427,6 +427,7 @@ pub(super) async fn save_session_tasks(
         .await
         .map_err(internal_error)?;
     Ok(Json(SessionTasksPayload {
+        rows: crate::task_rows::task_rows(&payload.content),
         content: payload.content,
         plan_state: runtime.plan_state,
     }))

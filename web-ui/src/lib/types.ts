@@ -300,18 +300,33 @@ export interface SseToolEnd {
   summary?: ToolSummary;
 }
 
-export interface SseTodoItem {
+/** A section of `tasks.md` that holds rows. */
+export type TaskSection = 'roots' | 'doing' | 'queued';
+
+/** An issue or pull request a row names. */
+export interface TaskReference {
+  /** `owner/repo` when the row writes one. */
+  repository: string | null;
+  number: number;
+  pullRequest: boolean;
+}
+
+/** One row of `Roots`, `Doing` or `Queued`, parsed by the daemon. */
+export interface TaskRow {
+  section: TaskSection;
+  /** Row text; continuation lines are joined by newlines. */
   text: string;
-  checked: boolean;
+  /** Payload of the row's `BLOCKING <what>` mark. */
+  blocking: string | null;
+  references: TaskReference[];
 }
 
 export interface SseTodoUpdate {
   kind: 'todo_update';
   seq: number;
   turnId: string;
-  items: SseTodoItem[];
-  total: number;
-  completed: number;
+  /** All rows of the document; empty once every row is deleted. */
+  rows: TaskRow[];
 }
 
 export interface SseError {
@@ -513,6 +528,8 @@ export interface ArtifactDiagnosticsResponse {
 export interface SessionTasksPayload {
   content: string;
   planState: SessionPlanState;
+  /** Parsed rows of `content`; set by the daemon, ignored when saving. */
+  rows?: TaskRow[];
 }
 
 export interface SessionPlanStateRequest {

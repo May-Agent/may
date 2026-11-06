@@ -770,21 +770,27 @@ impl MockScenarioState {
             },
             MockChatScenario::WritesTasksFile => {
                 // The run loop keeps the model going while `tasks.md` has
-                // unchecked items, and the model side sees the file once per
-                // change (whole at session start, a diff afterwards), so the
-                // mock finishes the checklist whenever the newest injection
-                // adds an unchecked item and replies with plain text once
-                // everything is checked.
+                // open rows (`Doing`, `Queued`), so the mock writes two rows,
+                // finishes the work by deleting them on the next request and
+                // replies with plain text once nothing is open.
                 if self.request_index >= TASKS_SCENARIO_MAX_REQUESTS {
                     return Err(format!(
                         "tasks scenario still looping after {} requests: the run loop keeps objecting to tasks.md",
                         self.request_index
                     ));
                 }
-                let script = match tasks_injection(request) {
-                    None if self.request_index == 0 => Some(TASKS_PARTIAL_SCRIPT),
-                    Some(tasks) if injection_adds_unchecked_item(tasks) => Some(TASKS_DONE_SCRIPT),
-                    _ => None,
+                let objected = request
+                    .get("messages")
+                    .and_then(Value::as_array)
+                    .and_then(|messages| messages.last())
+                    .and_then(|message| message.get("content").and_then(Value::as_str))
+                    .is_some_and(|content| content.contains("tasks.md still has rows"));
+                let script = if self.request_index == 0 {
+                    Some(TASKS_OPEN_SCRIPT)
+                } else if objected {
+                    Some(TASKS_DONE_SCRIPT)
+                } else {
+                    None
                 };
                 match script {
                     Some(script) => MockHttpResponse::sse(vec![
@@ -973,24 +979,13 @@ impl MockScenarioState {
     }
 }
 
-const TASKS_PARTIAL_SCRIPT: &str = "printf -- '- [x] write report\\n- [ ] ship it\\n' > tasks.md";
-const TASKS_DONE_SCRIPT: &str = "printf -- '- [x] write report\\n- [x] ship it\\n' > tasks.md";
+const TASKS_OPEN_SCRIPT: &str =
+    "printf -- '## Doing\\n- write report\\n\\n## Queued\\n- ship it\\n' > tasks.md";
+const TASKS_DONE_SCRIPT: &str = "printf -- '## Notes\\nreport shipped\\n' > tasks.md";
 
 /// Requests the tasks scenario may serve before the harness fails it, so a
 /// run loop that never settles ends the test with a message instead of hanging.
 const TASKS_SCENARIO_MAX_REQUESTS: usize = 8;
-
-/// Whether a `<tasks_document>` injection leaves an unchecked item open: the
-/// whole document at session start, or a diff whose added (`+ `) lines carry
-/// one. Removed lines of a diff say nothing about the current file.
-fn injection_adds_unchecked_item(injection: &str) -> bool {
-    injection.lines().any(|line| {
-        line.starts_with("- [ ]")
-            || line
-                .strip_prefix("+ ")
-                .is_some_and(|added| added.starts_with("- [ ]"))
-    })
-}
 
 /// How long a chat turn in the tasks test may take before the test fails.
 const TASKS_TURN_TIMEOUT: Duration = Duration::from_secs(60);
@@ -3150,8 +3145,8 @@ async fn ui_session_crud_round_trip_matches_api_contract() {
 #[tokio::test]
 #[serial]
 async fn ui_chat_tasks_file_is_the_canonical_todo_document() {
-    const MODEL_WRITTEN: &str = "- [x] write report\n- [x] ship it\n";
-    const REWRITTEN: &str = "- [ ] rewritten plan\n";
+    const MODEL_WRITTEN: &str = "## Notes\nreport shipped\n";
+    const REWRITTEN: &str = "## Doing\n- rewritten plan\n";
 
     let mock = MockOpenAiServer::spawn(MockChatScenario::WritesTasksFile).await;
     let harness = TestHarness::new(&mock.base_url()).await;
@@ -3183,18 +3178,32 @@ async fn ui_chat_tasks_file_is_the_canonical_todo_document() {
     );
 
     // The tool-end tasks check parsed the freshly written file and pushed
-    // its checklist down the stream.
-    let todo_update = events
+    // its rows down the stream; deleting them later pushes an empty list.
+    let updates: Vec<&Value> = events
         .iter()
-        .find(|(kind, _)| kind == "todo_update")
-        .expect("a tool call writing tasks.md should emit todo_update");
+        .filter(|(kind, _)| kind == "todo_update")
+        .map(|(_, payload)| payload)
+        .collect();
     assert_eq!(
-        todo_update.1.get("items"),
-        Some(&serde_json::json!([
-            { "text": "write report", "checked": true },
-            { "text": "ship it", "checked": false },
+        updates.len(),
+        2,
+        "each tasks.md write should emit one todo_update: {events:?}"
+    );
+    let rows = |update: &Value| update.get("rows").cloned();
+    assert_eq!(
+        rows(updates[0]),
+        Some(serde_json::json!([
+            { "section": "doing", "text": "write report", "blocking": null, "references": [] },
+            { "section": "queued", "text": "ship it", "blocking": null, "references": [] },
         ])),
-        "todo_update should carry the parsed tasks.md items: {todo_update:?}"
+        "todo_update should carry the parsed tasks.md rows: {:?}",
+        updates[0]
+    );
+    assert_eq!(
+        rows(updates[1]),
+        Some(serde_json::json!([])),
+        "finishing the work deletes its rows: {:?}",
+        updates[1]
     );
 
     // GET serves the file the model wrote.

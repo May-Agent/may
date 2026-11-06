@@ -496,9 +496,9 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                 enforce_issue_ownership(self.state, self.session_id, &mut self.tasks_accepted)
                     .await;
                 // Check if tasks.md changed after tool execution.
-                if let Some(checklist) =
+                if let Some(rows) =
                     check_tasks_update(self.session_paths, &mut self.last_todo_hash).await
-                    && !self.sink.on_todo_update(&checklist).await
+                    && !self.sink.on_todo_update(rows).await
                 {
                     return Ok(ControlFlow::Break(TurnStop::Cancelled(
                         "client disconnected during todo update",

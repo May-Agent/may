@@ -3825,10 +3825,9 @@ impl App {
             .session_paths(session.id.as_str(), session.profile_id.as_deref());
         match paths.tasks_content().await {
             Ok(content) => {
-                let checklist = crate::todo_parser::TodoChecklist::parse(
+                self.chat.set_todos(crate::task_rows::task_rows(
                     content.as_deref().unwrap_or_default(),
-                );
-                self.chat.set_todos(checklist.items);
+                ));
             }
             Err(error) => {
                 tracing::warn!(error = %error, "failed to read session tasks.md");

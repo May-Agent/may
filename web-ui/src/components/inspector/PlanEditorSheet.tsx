@@ -44,10 +44,10 @@ function OpenPlanEditorSheet({ sessionId, open, onOpenChange, content }: PlanEdi
       if (isDraftSessionId(sessionId)) {
         // The session does not exist yet; the plan goes with its first send.
         useSessionsStore.getState().saveDraftPlan(sessionId, draft, 'draft');
-        setTasks(sessionId, draft, 'draft');
+        setTasks(sessionId, { content: draft }, 'draft');
       } else {
         const res = await putSessionTasks(sessionId, { content: draft, planState: 'draft' });
-        setTasks(sessionId, res.content, 'draft');
+        setTasks(sessionId, res, 'draft');
         updateRuntime(sessionId, { planState: 'draft' });
       }
       onOpenChange(false);

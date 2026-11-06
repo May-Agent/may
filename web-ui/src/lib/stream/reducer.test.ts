@@ -174,17 +174,31 @@ describe('reducer', () => {
         kind: 'todo_update',
         seq: 2,
         turnId: 't1',
-        items: [
-          { text: 'step 1', checked: true },
-          { text: 'step 2', checked: false },
+        rows: [
+          { section: 'doing', text: 'step 1', blocking: null, references: [] },
+          { section: 'queued', text: 'step 2', blocking: 'q1', references: [] },
         ],
-        total: 2,
-        completed: 1,
+      },
+      { kind: 'todo_update', seq: 3, turnId: 't1', rows: [] },
+    ]);
+    expect(t.todo?.rows).toEqual([]);
+  });
+
+  test('todo_update carries rows with their section and blocking mark', () => {
+    const t = stream([
+      { kind: 'start', seq: 1, turnId: 't1', sessionId: 's1', assistantId: 'a1' },
+      {
+        kind: 'todo_update',
+        seq: 2,
+        turnId: 't1',
+        rows: [
+          { section: 'doing', text: 'step 1', blocking: null, references: [] },
+          { section: 'queued', text: 'step 2', blocking: 'q1', references: [] },
+        ],
       },
     ]);
-    expect(t.todo?.total).toBe(2);
-    expect(t.todo?.completed).toBe(1);
-    expect(t.todo?.items[0]?.checked).toBe(true);
+    expect(t.todo?.rows.map((row) => row.section)).toEqual(['doing', 'queued']);
+    expect(t.todo?.rows[1]?.blocking).toBe('q1');
   });
 
   test('error marks turn done and preserves retryable flag', () => {

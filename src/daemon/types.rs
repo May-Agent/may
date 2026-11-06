@@ -200,42 +200,8 @@ pub struct SseHoldEvent<'a> {
 pub struct SseTodoUpdateEvent {
     pub(crate) seq: u64,
     pub(crate) turn_id: String,
-    pub(crate) items: Vec<SseTodoItem>,
-    pub(crate) total: usize,
-    pub(crate) completed: usize,
-}
-
-#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
-pub struct SseTodoItem {
-    pub(crate) text: String,
-    pub(crate) checked: bool,
-}
-
-impl SseTodoUpdateEvent {
-    /// Build a todo-update payload with the given seq/turn context.
-    /// `From<&TodoChecklist>` was removed because the stream envelope
-    /// now carries ordering metadata that the checklist itself doesn't know.
-    #[must_use]
-    pub fn from_checklist(
-        checklist: &crate::todo_parser::TodoChecklist,
-        seq: u64,
-        turn_id: String,
-    ) -> Self {
-        Self {
-            seq,
-            turn_id,
-            items: checklist
-                .items
-                .iter()
-                .map(|item| SseTodoItem {
-                    text: item.text.clone(),
-                    checked: item.checked,
-                })
-                .collect(),
-            total: checklist.total(),
-            completed: checklist.completed(),
-        }
-    }
+    /// The rows of `tasks.md`'s row sections; empty once every row is gone.
+    pub(crate) rows: Vec<crate::task_rows::TaskRow>,
 }
 
 // ── Tool Event Records (stored in DB history) ───────────────
@@ -474,6 +440,9 @@ pub struct SessionTasksPayload {
     pub(crate) content: String,
     #[serde(default)]
     pub(crate) plan_state: SessionPlanState,
+    /// The parsed rows of `content`; set by the daemon, ignored on save.
+    #[serde(default)]
+    pub(crate) rows: Vec<crate::task_rows::TaskRow>,
 }
 
 /// One `prs` row over the wire — the session's PR list entry.

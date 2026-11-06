@@ -22,7 +22,7 @@ use super::chat_layout::{self, ChatLayout};
 use super::markdown;
 use super::streaming_markdown::IMAGE_HEIGHT;
 use crate::agent::ContextReport;
-use crate::todo_parser::TodoChecklistItem;
+use crate::task_rows::{TaskRow, TaskSection};
 
 /// Status of a tool call.
 #[derive(Debug, Clone)]
@@ -326,8 +326,8 @@ pub enum ChatElement {
     },
     /// Todo block
     TodoBlock {
-        /// Todo items.
-        items: Vec<TodoChecklistItem>,
+        /// The rows of `tasks.md`.
+        rows: Vec<TaskRow>,
     },
     /// Daemon-written catch-up card (persisted `recap` history row).
     Recap {
@@ -1265,7 +1265,7 @@ impl ChatStream {
     }
 
     /// Set the todo block (replaces previous).
-    pub fn set_todos(&mut self, items: Vec<TodoChecklistItem>) {
+    pub fn set_todos(&mut self, rows: Vec<TaskRow>) {
         // Remove existing todo block
         let mut kept_revisions = Vec::with_capacity(self.revisions.len());
         for (elem, revision) in self.elements.iter().zip(&self.revisions) {
@@ -1277,8 +1277,8 @@ impl ChatStream {
             .retain(|e| !matches!(e, ChatElement::TodoBlock { .. }));
         self.revisions = kept_revisions;
         // Add new one at end
-        if !items.is_empty() {
-            self.push_element(ChatElement::TodoBlock { items });
+        if !rows.is_empty() {
+            self.push_element(ChatElement::TodoBlock { rows });
         }
     }
 
@@ -2398,22 +2398,53 @@ pub(super) fn element_lines(
         }
 
         ChatElement::TodoBlock { .. } if state.hide_todos => {}
-        ChatElement::TodoBlock { items } => {
+        ChatElement::TodoBlock { rows } => {
             lines.push(Line::from(Span::styled(
                 "[todo] ────────────────────────────",
                 Style::default().fg(Color::Green),
             )));
 
-            for item in items {
-                let (marker, style) = if item.checked {
-                    ("[x]", Style::default().fg(Color::DarkGray))
-                } else {
-                    ("[ ]", Style::default())
-                };
+            // Roots, compactly: the issues the session serves, on one line.
+            let roots: Vec<&str> = rows
+                .iter()
+                .filter(|row| row.section == TaskSection::Roots)
+                .filter_map(|row| row.text.lines().next())
+                .collect();
+            if !roots.is_empty() {
                 lines.push(Line::from(vec![
-                    Span::styled(format!("  {marker} "), style),
-                    Span::styled(item.text.clone(), style),
+                    Span::styled("  Roots ", Style::default().fg(Color::DarkGray)),
+                    Span::raw(roots.join(", ")),
                 ]));
+            }
+            for (section, title) in [
+                (TaskSection::Doing, "Doing"),
+                (TaskSection::Queued, "Queued"),
+            ] {
+                let mut section_rows = rows.iter().filter(|row| row.section == section).peekable();
+                if section_rows.peek().is_none() {
+                    continue;
+                }
+                lines.push(Line::from(Span::styled(
+                    format!("  {title}"),
+                    Style::default().fg(Color::DarkGray),
+                )));
+                for row in section_rows {
+                    let text = row.text.split_whitespace().collect::<Vec<_>>().join(" ");
+                    match &row.blocking {
+                        Some(what) => lines.push(Line::from(vec![
+                            Span::styled("    ⏸ ", Style::default().fg(Color::Red)),
+                            Span::raw(text),
+                            Span::styled(
+                                format!(" (blocked: {what})"),
+                                Style::default().fg(Color::Red),
+                            ),
+                        ])),
+                        None => lines.push(Line::from(vec![
+                            Span::styled("    ○ ", Style::default().fg(Color::Yellow)),
+                            Span::raw(text),
+                        ])),
+                    }
+                }
             }
 
             lines.push(Line::from(Span::styled(
@@ -5415,27 +5446,27 @@ mod tests {
         assert!(matches!(display.status(), ToolStatus::Failed(_)));
     }
 
-    /// A tasks.md document parsed into a checklist feeds the todo block —
-    /// the same path `refresh_todos` uses after tool calls and on session
-    /// load.
+    /// The rows of a tasks.md document feed the todo block — the same path
+    /// `refresh_todos` uses after tool calls and on session load.
     #[test]
-    fn set_todos_renders_parsed_session_checklist() {
-        let checklist =
-            crate::todo_parser::TodoChecklist::parse("- [x] write report\n- [ ] ship it\n");
+    fn set_todos_renders_parsed_session_rows() {
+        let rows = crate::task_rows::task_rows(
+            "## Doing\n- write report\n\n## Queued\n- ship it BLOCKING q1\n",
+        );
         let mut chat = ChatStream::new();
         chat.push_text("earlier content");
         chat.end_text();
-        chat.set_todos(checklist.items.clone());
+        chat.set_todos(rows.clone());
 
-        let items = chat
+        let shown = chat
             .elements()
             .iter()
             .find_map(|element| match element {
-                ChatElement::TodoBlock { items } => Some(items),
+                ChatElement::TodoBlock { rows } => Some(rows),
                 _ => None,
             })
-            .expect("a non-empty checklist should produce a todo block");
-        assert_eq!(items, &checklist.items);
+            .expect("a non-empty document should produce a todo block");
+        assert_eq!(shown, &rows);
 
         // A subsequent parse replaces the previous block rather than
         // stacking a second one.
