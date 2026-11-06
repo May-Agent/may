@@ -141,6 +141,15 @@ pub enum WireAgentEvent {
         /// The chunk.
         text: String,
     },
+    /// The reply just streamed was not in the communication language: show
+    /// this translation of it, marked as translated, and keep the original
+    /// reachable.
+    ReplyTranslated {
+        /// The reply translated into the communication language.
+        text: String,
+        /// The communication language's ISO 639-3 code.
+        language: String,
+    },
     /// Reasoning chunk.
     Reasoning {
         /// The chunk.
@@ -242,6 +251,10 @@ impl WireAgentEvent {
         };
         Some(match event {
             AgentEvent::Text(text) => Self::Text { text: text.clone() },
+            AgentEvent::ReplyTranslated { text, language } => Self::ReplyTranslated {
+                text: text.clone(),
+                language: language.clone(),
+            },
             AgentEvent::Reasoning(text) => Self::Reasoning { text: text.clone() },
             AgentEvent::ToolCallDelta {
                 id,
@@ -313,6 +326,9 @@ impl WireAgentEvent {
     pub fn into_timed(self, at: jiff::Timestamp) -> Result<TimedEvent, AgentError> {
         let event = match self {
             Self::Text { text } => AgentEvent::Text(text),
+            Self::ReplyTranslated { text, language } => {
+                AgentEvent::ReplyTranslated { text, language }
+            }
             Self::Reasoning { text } => AgentEvent::Reasoning(text),
             Self::ToolCallDelta {
                 id,
@@ -782,6 +798,24 @@ mod tests {
         assert!(matches!(
             timed.event,
             AgentEvent::ToolCallEnd { ref id, ref result, .. } if id == "t1" && *result == ToolResult::text("done")
+        ));
+    }
+
+    #[test]
+    fn a_reply_translation_survives_the_round_trip() {
+        let event = AgentEvent::ReplyTranslated {
+            text: "全部完成。".to_string(),
+            language: "cmn".to_string(),
+        };
+        let wire = WireAgentEvent::from_agent(Ok(&event)).expect("rendered event");
+        let json = serde_json::to_string(&wire).expect("serialize");
+        assert!(json.contains("\"type\":\"reply_translated\""), "{json}");
+        let back: WireAgentEvent = serde_json::from_str(&json).expect("deserialize");
+        let timed = back.into_timed(jiff::Timestamp::UNIX_EPOCH).expect("event");
+        assert!(matches!(
+            timed.event,
+            AgentEvent::ReplyTranslated { ref text, ref language }
+                if text == "全部完成。" && language == "cmn"
         ));
     }
 
