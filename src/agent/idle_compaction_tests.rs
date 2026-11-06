@@ -269,6 +269,7 @@ impl SessionParts {
                     .with_runtime_service(runtime.clone())
                     .for_session(self.session_id.as_str())
             }),
+            live_config: None,
             profile_persona: None,
             profile_memories: None,
             plan_state: SessionPlanState::default(),

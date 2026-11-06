@@ -1,0 +1,12 @@
+{%- if let Some(kind) = kind -%}{{ kind }} {% endif -%}
+{{ action }}{% if let Some(number) = number %} #{{ number }}{% endif %} on {{ repository }}
+{%- if let Some(title) = title %}
+
+Title: {{ title }}
+{%- endif %}
+{%- if !labels.is_empty() %}
+
+Labels: {{ labels.join(", ") }}
+{%- endif %}
+
+{{ body }}
