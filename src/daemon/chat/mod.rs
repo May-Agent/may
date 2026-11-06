@@ -3502,6 +3502,7 @@ fn build_session_agent<'a>(
                         approver
                     }
                 }),
+                live_config: Some(state.config.clone()),
                 agent_messaging: Some(agent_messaging(state)),
                 profile_persona: ctx.profile_persona.clone(),
                 profile_memories: ctx.profile_memories.clone(),
