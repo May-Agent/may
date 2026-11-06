@@ -1082,13 +1082,9 @@ where
                 // After a reload the turn's own message is already in the
                 // history: it is not shown a second time.
                 let stored = turn.message_id.is_some_and(|id| {
-                    app.session_manager.current().is_some_and(|session| {
-                        session
-                            .history
-                            .messages()
-                            .iter()
-                            .any(|message| message.id == Some(id))
-                    })
+                    app.session_manager
+                        .current()
+                        .is_some_and(|session| session.holds_message(id))
                 });
                 let content = turn.content.filter(|_| !stored);
                 let message = may_agent::tui::queue::PendingMessage {
@@ -1104,6 +1100,7 @@ where
                         .record_unpersisted(may_agent::session::ChatMessage::user(content));
                 }
                 app.start_processing(&message);
+                app.set_turn_started_at(turn.started_at);
                 assistant_response.clear();
                 agent_handle = Some(turn.handle);
             }
