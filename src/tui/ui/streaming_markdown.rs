@@ -4,6 +4,7 @@
 //! new lines as they arrive, maintaining parser state between chunks.
 
 use ratatui::prelude::*;
+use ratatui::text::StyledGrapheme;
 use streamdown_parser::{InlineElement, InlineParser, ParseEvent, Parser};
 use syntect::easy::HighlightLines;
 use unicode_width::UnicodeWidthStr;
@@ -58,6 +59,9 @@ pub struct StreamingMarkdown {
     table_header_rows: usize,
     /// Whether `TableSeparator` has arrived for the open table.
     table_has_separator: bool,
+    /// Display columns a table may span; its cells wrap to fit.
+    /// `usize::MAX` when the output has no width bound.
+    max_width: usize,
     /// Highlighter of the open fenced code block; `None` for a fence with
     /// no language or one syntect doesn't know. Holds parse state across
     /// streamed `CodeBlockLine`s.
@@ -91,6 +95,7 @@ impl StreamingMarkdown {
             table_rows: Vec::new(),
             table_header_rows: 0,
             table_has_separator: false,
+            max_width: usize::MAX,
             code_highlighter: None,
         }
     }
@@ -99,23 +104,17 @@ impl StreamingMarkdown {
     #[must_use]
     pub fn with_image_support(images_supported: bool) -> Self {
         Self {
-            parser: Parser::new(),
-            inline_parser: InlineParser::new(),
-            content: String::new(),
-            parsed_line_count: 0,
-            rendered: Vec::new(),
-            images: Vec::new(),
-            image_positions: Vec::new(),
-            pending_line: String::new(),
-            inline_open: false,
             images_supported,
-            table_start: None,
-            table_line_count: 0,
-            table_rows: Vec::new(),
-            table_header_rows: 0,
-            table_has_separator: false,
-            code_highlighter: None,
+            ..Self::new()
         }
+    }
+
+    /// Bound tables to `width` display columns: a wider table wraps
+    /// inside its cells, so no table line is wider than `width`.
+    #[must_use]
+    pub const fn with_width(mut self, width: usize) -> Self {
+        self.max_width = width;
+        self
     }
 
     /// Set whether images are supported (can be used to update after creation).
@@ -509,27 +508,22 @@ impl StreamingMarkdown {
         }
     }
 
-    /// Re-render the open table's lines in place: every column is padded
-    /// to the widest cell seen so far, so a wider row arriving later
-    /// re-aligns the rows already emitted.
+    /// Re-render the open table's lines in place, laid out to `max_width`:
+    /// column widths are recomputed from every row seen so far, so a wider
+    /// row arriving later re-aligns the rows already emitted, and a cell
+    /// that does not fit its column wraps inside it.
     fn rebuild_table(&mut self) {
         let Some(start) = self.table_start else {
             return;
         };
-        let col_count = self.table_rows.iter().map(Vec::len).max().unwrap_or(0);
-        let mut widths = vec![0usize; col_count];
-        for row in &self.table_rows {
-            for (col, cell) in row.iter().enumerate() {
-                widths[col] = widths[col].max(cell_width(cell));
-            }
-        }
+        let widths = column_widths(&self.table_rows, self.max_width);
 
         let mut lines = Vec::with_capacity(self.table_rows.len() + 1);
         for (index, row) in self.table_rows.iter().enumerate() {
             if self.table_has_separator && index == self.table_header_rows {
                 lines.push(table_separator_line(&widths));
             }
-            lines.push(table_row_line(row, &widths));
+            lines.extend(table_row_lines(row, &widths));
         }
         if self.table_has_separator && self.table_rows.len() == self.table_header_rows {
             lines.push(table_separator_line(&widths));
@@ -548,24 +542,158 @@ fn cell_width(cell: &[Span<'static>]) -> usize {
         .sum()
 }
 
-/// One table row line: `│ cell │ cell │`, cells padded to `widths`.
-fn table_row_line(cells: &[Vec<Span<'static>>], widths: &[usize]) -> Line<'static> {
-    let border = Style::default().fg(Color::DarkGray);
-    let mut spans = vec![Span::styled("│ ", border)];
-    for (col, width) in widths.iter().enumerate() {
-        if col > 0 {
-            spans.push(Span::styled(" │ ", border));
-        }
-        let filled = cells.get(col).map_or(0, |cell| {
-            spans.extend(cell.iter().cloned());
-            cell_width(cell)
-        });
-        if filled < *width {
-            spans.push(Span::raw(" ".repeat(width - filled)));
+/// Content width of each column of a table laid out to `max_width`
+/// display columns.
+///
+/// Columns get their widest cell when the whole table fits. Otherwise the
+/// space left after the borders is shared out narrowest column first: a
+/// column whose cells fit its fair share keeps its natural width and the
+/// rest is split among the wider ones, whose cells then wrap. A column is
+/// never narrower than its widest grapheme, so only an area too narrow
+/// for the borders and one glyph per column can exceed `max_width`.
+fn column_widths(rows: &[Vec<Vec<Span<'static>>>], max_width: usize) -> Vec<usize> {
+    let col_count = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let mut natural = vec![0usize; col_count];
+    let mut floor = vec![1usize; col_count];
+    for row in rows {
+        for (col, cell) in row.iter().enumerate() {
+            natural[col] = natural[col].max(cell_width(cell));
+            let widest = cell
+                .iter()
+                .flat_map(|span| span.styled_graphemes(Style::default()))
+                .map(|g| g.symbol.width())
+                .max()
+                .unwrap_or(0);
+            floor[col] = floor[col].max(widest);
         }
     }
-    spans.push(Span::styled(" │", border));
-    Line::from(spans)
+    // `│ ` + ` │ ` between columns + ` │`.
+    let frame = 3 * col_count + 1;
+    let available = max_width.saturating_sub(frame);
+    if natural.iter().sum::<usize>() <= available {
+        return natural;
+    }
+    let mut order: Vec<usize> = (0..col_count).collect();
+    order.sort_by_key(|&col| natural[col]);
+    let mut widths = vec![0usize; col_count];
+    let mut remaining = available;
+    for (placed, col) in order.into_iter().enumerate() {
+        let share = remaining / (col_count - placed);
+        let width = natural[col].min(share).max(floor[col]);
+        widths[col] = width;
+        remaining = remaining.saturating_sub(width);
+    }
+    widths
+}
+
+/// `cell` wrapped to `width` display columns, one span list per row.
+///
+/// Breaks at whitespace, which is dropped at a break; between wide
+/// (CJK) graphemes, each of which is its own break opportunity; and
+/// inside a run of narrow graphemes only when the run is wider than the
+/// column. Always yields at least one row.
+fn wrap_cell(cell: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
+    let graphemes: Vec<StyledGrapheme<'_>> = cell
+        .iter()
+        .flat_map(|span| span.styled_graphemes(Style::default()))
+        .collect();
+    let is_space = |g: &StyledGrapheme<'_>| g.symbol.trim().is_empty();
+    let mut rows: Vec<Vec<&StyledGrapheme<'_>>> = Vec::new();
+    let mut current: Vec<&StyledGrapheme<'_>> = Vec::new();
+    let mut row_width = 0usize;
+    let mut i = 0;
+    while i < graphemes.len() {
+        let g = &graphemes[i];
+        let g_width = g.symbol.width();
+        if is_space(g) {
+            if row_width + g_width > width {
+                rows.push(std::mem::take(&mut current));
+                row_width = 0;
+            } else if row_width > 0 {
+                current.push(g);
+                row_width += g_width;
+            }
+            i += 1;
+            continue;
+        }
+        // One unbreakable token: a single wide grapheme, or a run of
+        // narrow non-space graphemes.
+        let end = if g_width > 1 {
+            i + 1
+        } else {
+            graphemes[i..]
+                .iter()
+                .position(|g| is_space(g) || g.symbol.width() > 1)
+                .map_or(graphemes.len(), |len| i + len)
+        };
+        let token_width: usize = graphemes[i..end].iter().map(|g| g.symbol.width()).sum();
+        if row_width > 0 && row_width + token_width > width && token_width <= width {
+            rows.push(std::mem::take(&mut current));
+            row_width = 0;
+        }
+        for g in &graphemes[i..end] {
+            let w = g.symbol.width();
+            if row_width > 0 && row_width + w > width {
+                rows.push(std::mem::take(&mut current));
+                row_width = 0;
+            }
+            current.push(g);
+            row_width += w;
+        }
+        i = end;
+    }
+    rows.push(current);
+    rows.into_iter()
+        .map(|mut row| {
+            while row.last().is_some_and(|g| is_space(g)) {
+                row.pop();
+            }
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            for g in row {
+                match spans.last_mut() {
+                    Some(last) if last.style == g.style => last.content.to_mut().push_str(g.symbol),
+                    _ => spans.push(Span::styled(g.symbol.to_string(), g.style)),
+                }
+            }
+            spans
+        })
+        .collect()
+}
+
+/// The display lines of one table row: `│ cell │ cell │`, every cell
+/// wrapped to and padded to its column's width, so a row too wide for
+/// the area becomes several lines whose borders stay aligned.
+fn table_row_lines(cells: &[Vec<Span<'static>>], widths: &[usize]) -> Vec<Line<'static>> {
+    let border = Style::default().fg(Color::DarkGray);
+    let wrapped: Vec<Vec<Vec<Span<'static>>>> = widths
+        .iter()
+        .enumerate()
+        .map(|(col, &width)| {
+            cells
+                .get(col)
+                .map_or_else(Vec::new, |cell| wrap_cell(cell, width))
+        })
+        .collect();
+    let height = wrapped.iter().map(Vec::len).max().unwrap_or(0).max(1);
+    (0..height)
+        .map(|row| {
+            let mut spans = vec![Span::styled("│ ", border)];
+            for (col, width) in widths.iter().enumerate() {
+                if col > 0 {
+                    spans.push(Span::styled(" │ ", border));
+                }
+                let filled = wrapped[col].get(row).map_or(0, |part| {
+                    spans.extend(part.iter().cloned());
+                    cell_width(part)
+                });
+                if filled < *width {
+                    spans.push(Span::raw(" ".repeat(width - filled)));
+                }
+            }
+            spans.push(Span::styled(" │", border));
+            Line::from(spans)
+        })
+        .collect()
 }
 
 /// The separator under the header, spanning the full table width:
@@ -888,6 +1016,158 @@ mod tests {
         assert_eq!(rows[1], "├─────────────┼───┤");
         assert_eq!(rows[2], "│ c           │ d │");
         assert_eq!(rows[3], "│ much longer │ x │");
+    }
+
+    /// A three-column table of CJK cells and a long inline code span, the
+    /// shape that overflowed the chat column.
+    const WIDE_TABLE: &str = "| 项目 | 说明 | 命令 |\n|---|---|---|\n| 构建 | 编译整个工作区并运行所有单元测试，确认没有回归 | `cargo test --workspace --all-features --locked` |\n| 格式化 | 检查代码风格 | `cargo fmt --all -- --check` |\n";
+
+    /// Display column of every border glyph on `line`.
+    fn border_columns(line: &Line<'static>) -> Vec<usize> {
+        let mut columns = Vec::new();
+        let mut x = 0;
+        for g in line
+            .spans
+            .iter()
+            .flat_map(|s| s.styled_graphemes(Style::default()))
+        {
+            if matches!(g.symbol, "│" | "├" | "┼" | "┤") {
+                columns.push(x);
+            }
+            x += g.symbol.width();
+        }
+        columns
+    }
+
+    /// Every line of the table `lines` fits `width`, puts its borders at
+    /// the header's columns, and exactly one separator rule is drawn.
+    fn assert_table_layout(lines: &[Line<'static>], width: usize) {
+        assert_open_table_layout(lines, width, 1);
+    }
+
+    /// [`assert_table_layout`] for a table that may still be streaming:
+    /// `rules` separator rules are expected.
+    fn assert_open_table_layout(lines: &[Line<'static>], width: usize, rules: usize) {
+        let table: Vec<&Line<'static>> = lines
+            .iter()
+            .filter(|l| !border_columns(l).is_empty())
+            .collect();
+        assert!(!table.is_empty(), "no table lines in {lines:?}");
+        let header = border_columns(table[0]);
+        for line in &table {
+            assert!(
+                line.width() <= width,
+                "line wider than {width}: {} ({line:?})",
+                line.width()
+            );
+            assert_eq!(border_columns(line), header, "misaligned: {line:?}");
+        }
+        let drawn = table
+            .iter()
+            .filter(|l| l.spans.first().is_some_and(|s| s.content.starts_with('├')))
+            .count();
+        assert_eq!(drawn, rules, "separator rules in {lines:?}");
+    }
+
+    /// Text of each column of the table `lines`, its wrapped pieces
+    /// joined, rows in order.
+    fn column_text(lines: &[Line<'static>], col: usize) -> String {
+        lines
+            .iter()
+            .filter(|l| l.spans.first().is_some_and(|s| s.content.starts_with('│')))
+            .map(|l| {
+                let text: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+                text.split('│')
+                    .nth(col + 1)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string()
+            })
+            .collect::<String>()
+            .replace(' ', "")
+    }
+
+    #[test]
+    fn test_table_wraps_cells_to_width() {
+        for width in [40, 56, 72] {
+            let mut md = StreamingMarkdown::new().with_width(width);
+            md.push(WIDE_TABLE);
+            md.flush();
+            let lines = md.lines().to_vec();
+            assert_table_layout(&lines, width);
+            // Rows wrapped into several lines: more lines than rows + rule.
+            assert!(lines.iter().filter(|l| l.width() > 0).count() > 4);
+            // No cell text is lost or spilled outside its column.
+            assert_eq!(column_text(&lines, 0), "项目构建格式化");
+            assert_eq!(
+                column_text(&lines, 1),
+                "说明编译整个工作区并运行所有单元测试，确认没有回归检查代码风格"
+            );
+            assert_eq!(
+                column_text(&lines, 2),
+                "命令cargotest--workspace--all-features--lockedcargofmt--all----check"
+            );
+        }
+    }
+
+    #[test]
+    fn test_table_wider_area_keeps_one_line_rows() {
+        let mut md = StreamingMarkdown::new().with_width(200);
+        md.push(WIDE_TABLE);
+        md.flush();
+        let lines: Vec<Line<'static>> = md
+            .lines()
+            .iter()
+            .filter(|l| l.width() > 0)
+            .cloned()
+            .collect();
+        assert_table_layout(&lines, 200);
+        // Header, rule, two rows: nothing wrapped.
+        assert_eq!(lines.len(), 4, "{lines:?}");
+        let natural = lines[0].width();
+        assert!(natural < 200);
+        assert!(lines.iter().all(|l| l.width() == natural));
+    }
+
+    #[test]
+    fn test_table_cell_wraps_at_whitespace_and_between_cjk() {
+        let spans = vec![
+            Span::raw("宽字符"),
+            Span::styled("ab cd", Style::default().add_modifier(Modifier::BOLD)),
+        ];
+        let rows: Vec<String> = wrap_cell(&spans, 4)
+            .iter()
+            .map(|row| row.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(rows, ["宽字", "符ab", "cd"]);
+        let long = vec![Span::raw("abcdefghij")];
+        let rows: Vec<String> = wrap_cell(&long, 4)
+            .iter()
+            .map(|row| row.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(rows, ["abcd", "efgh", "ij"]);
+    }
+
+    #[test]
+    fn test_streaming_table_relayouts_open_table() {
+        // Each arriving row re-lays-out the whole open table to the width.
+        let width = 48;
+        let mut md = StreamingMarkdown::new().with_width(width);
+        let mut lines_seen = 0;
+        for (index, line) in WIDE_TABLE.split_inclusive('\n').enumerate() {
+            md.push(line);
+            if md.lines().is_empty() {
+                continue;
+            }
+            assert_open_table_layout(md.lines(), width, usize::from(index > 0));
+            assert!(md.lines().len() >= lines_seen);
+            lines_seen = md.lines().len();
+        }
+        md.push("\nafter\n");
+        md.flush();
+        assert_table_layout(md.lines(), width);
+        let text = flattened_text(md.lines());
+        assert!(text.ends_with("after"), "{text}");
     }
 
     #[test]
