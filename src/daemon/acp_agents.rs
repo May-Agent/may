@@ -48,6 +48,8 @@ pub(super) enum ConnectError {
     },
     #[error("the agent refused a trial session: {0}")]
     Trial(acpsub::Error),
+    #[error("the agent answered `initialize` but did not open a trial session within {0:?}")]
+    TrialTimedOut(Duration),
     #[error("the trial session could not be prepared: {0}")]
     Scratch(std::io::Error),
     #[error("the connection could not be saved: {0}")]
@@ -148,8 +150,10 @@ pub(super) async fn connect(
         description: describe(&identity),
         grants: Vec::new(),
     };
-    match try_connection(&state.tokio_handle, &request.name, &agent).await {
+    let trial_limit = state.config_snapshot().acp.trial_limit;
+    match try_connection(&state.tokio_handle, &request.name, &agent, trial_limit).await {
         Ok(()) => {}
+        Err(TrialError::TimedOut(limit)) => return Err(ConnectError::TrialTimedOut(limit)),
         Err(TrialError::Scratch(error)) => return Err(ConnectError::Scratch(error)),
         Err(TrialError::Acpsub(error)) => {
             return Err(match error {
@@ -242,6 +246,28 @@ mod tests {
             model: model.map(str::to_string),
             mode: mode.map(str::to_string),
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connecting_an_agent_that_goes_silent_after_initialize_times_out() {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let mut config = MayConfig::default();
+        config.acp.trial_limit = Duration::from_millis(1500);
+        let state = DaemonState::for_test(dir.path(), config)
+            .await
+            .expect("daemon state");
+
+        let mut silent = fake_agent(Some("a"), Some("default"));
+        silent.args = vec!["--silent-after-initialize".to_string()];
+        let started = std::time::Instant::now();
+        let error = connect(&state, silent).await.expect_err("times out");
+        assert!(
+            matches!(error, ConnectError::TrialTimedOut(limit) if limit == Duration::from_millis(1500)),
+            "{error}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(8));
+        assert!(state.config_snapshot().acp_agents.is_empty());
     }
 
     fn choice(error: ConnectError) -> (AcpChoice, Vec<String>) {
