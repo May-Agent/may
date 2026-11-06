@@ -1436,8 +1436,8 @@ async fn wake_on_user_message(state: &DaemonState) -> SkyResult<()> {
         .map_err(internal_error)
 }
 
-/// Starts a turn on `req` in its session and returns at once; the turn runs
-/// in the daemon.
+/// Starts the turn `req` asks for in its session and returns at once, with
+/// the session's runtime as it stands then.
 pub(super) async fn start_prompt_turn(
     state: &Arc<DaemonState>,
     req: ChatRequest,
@@ -2595,6 +2595,9 @@ struct SessionContext {
     cwd: std::path::PathBuf,
     /// Whether nobody answers this session's prompts.
     non_interactive: bool,
+    /// The rules this session imports, for a session `/import-claude` or
+    /// `/import-codex` opened.
+    rules_import: Option<crate::rules_import::RulesImport>,
     /// Model transcript entries as `(seq, message)`: exactly what was
     /// committed to the model context, never UI history.
     transcript: Vec<(i64, LlmMessage)>,
@@ -3057,6 +3060,13 @@ async fn resolve_session_context(
     let reasoning_effort = parse_reasoning_effort_token(&reasoning_effort);
 
     let cwd = crate::session::SessionDirectory::of(&session, &state.may_dir).into_path();
+    let rules_import = session.rules_import.as_deref().map(|label| {
+        let source = crate::session::import::ForeignAgent::from_label(label)
+            .unwrap_or_else(|| panic!("session {session_id} imports rules from unknown `{label}`"));
+        let home = crate::config::MayConfig::home_dir()
+            .expect("the home directory resolved when the May directory was derived");
+        crate::rules_import::RulesImport::new(source, &home, &state.may_dir)
+    });
 
     Ok(SessionContext {
         user_message_id,
@@ -3066,6 +3076,7 @@ async fn resolve_session_context(
         sandbox_dir,
         cwd,
         non_interactive: session.non_interactive,
+        rules_import,
         transcript,
         seed_messages,
         context_snapshot,
@@ -3502,6 +3513,7 @@ fn build_session_agent<'a>(
                         approver
                     }
                 }),
+                live_config: Some(state.config.clone()),
                 agent_messaging: Some(agent_messaging(state)),
                 profile_persona: ctx.profile_persona.clone(),
                 profile_memories: ctx.profile_memories.clone(),
@@ -3535,6 +3547,7 @@ fn build_session_agent<'a>(
                 subagents: Some(state.session_background.subagents(ctx.session_id.as_str())),
                 background_jobs: aither_agent::BackgroundJobPolicy::Detach,
                 connectivity: state.connectivity.clone(),
+                rules_import: ctx.rules_import.clone(),
             },
         )
         .await
@@ -3613,6 +3626,7 @@ fn agent_build_key(
     format!("{:?}", ctx.plan_state).hash(&mut hasher);
     ctx.cwd.hash(&mut hasher);
     ctx.non_interactive.hash(&mut hasher);
+    ctx.rules_import.hash(&mut hasher);
     hasher.finish()
 }
 

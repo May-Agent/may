@@ -147,7 +147,7 @@ async fn an_agents_md_change_mid_session_is_one_diff_then_the_clean_version() {
     let alerts = diff_alerts(second, "agents_md_diff");
     assert_eq!(alerts.len(), 1, "{second:?}");
     assert!(
-        alerts[0].starts_with("The launch directory's AGENTS.md files changed."),
+        alerts[0].starts_with("The AGENTS.md files changed."),
         "{}",
         alerts[0]
     );

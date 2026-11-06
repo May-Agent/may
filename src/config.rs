@@ -1291,6 +1291,58 @@ pub struct MayConfig {
     /// Example: `[acp_agents.devin]`
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub acp_agents: BTreeMap<String, AcpAgentConfig>,
+    /// When the agent's issues, pull requests and comments need approval.
+    #[serde(default)]
+    pub issue_approval: IssueApprovalConfig,
+}
+
+/// What publishing one kind of text asks of the user.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalPolicy {
+    /// No prompt.
+    None,
+    /// A prompt that is approved when nobody answers it.
+    Auto,
+    /// A prompt that needs an explicit approval; unanswered, it is denied.
+    Required,
+}
+
+/// `[issue_approval]` section: the approval each kind of publishing needs.
+///
+/// An issue on an external repository (one the user neither owns nor has
+/// admin permission on) is held to the stricter of `external_issue` and its
+/// kind's entry. Anything on an owned repository, and a comment on an issue
+/// or pull request the user or the agent opened, is approved without a
+/// prompt and has no entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IssueApprovalConfig {
+    /// Creating an issue on an external repository.
+    pub external_issue: ApprovalPolicy,
+    /// Opening a pull request on an external repository.
+    pub external_pull_request: ApprovalPolicy,
+    /// Commenting on an external repository.
+    pub external_comment: ApprovalPolicy,
+    /// A bug issue.
+    pub bug: ApprovalPolicy,
+    /// A feature issue.
+    pub feature: ApprovalPolicy,
+    /// A performance issue.
+    pub performance: ApprovalPolicy,
+}
+
+impl Default for IssueApprovalConfig {
+    fn default() -> Self {
+        Self {
+            external_issue: ApprovalPolicy::Required,
+            external_pull_request: ApprovalPolicy::Required,
+            external_comment: ApprovalPolicy::Required,
+            bug: ApprovalPolicy::None,
+            feature: ApprovalPolicy::Auto,
+            performance: ApprovalPolicy::None,
+        }
+    }
 }
 
 /// `[suggestions]` section: the generated next-prompt ghost text.
@@ -1671,6 +1723,7 @@ impl Default for MayConfig {
             last_effort: None,
             ssh_servers: Vec::new(),
             acp_agents: BTreeMap::new(),
+            issue_approval: IssueApprovalConfig::default(),
         }
     }
 }

@@ -97,6 +97,7 @@ mod tests {
             cwd: cwd.map(Into::into),
             repo: repo.map(Into::into),
             non_interactive: false,
+            rules_import: None,
         }
     }
 

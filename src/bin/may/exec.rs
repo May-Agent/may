@@ -516,6 +516,7 @@ where
         SharedTerminalCommandConfig {
             #[cfg(target_os = "macos")]
             computer: None,
+            rules_import: None,
             llm,
             ask_flagship: None,
             ask_balanced: None,
@@ -544,6 +545,8 @@ where
             // exec has no UI reader; the tracker still records harmlessly.
             subagent_tracker: may_agent::agent::SubagentTracker::default(),
             issue_store,
+            // `may exec` runs the user's own script: nobody to ask.
+            publish_gate: None,
             workspace_config: may_agent::workspace::WorkspaceConfig::load(
                 &session_paths.workspace_config(),
             )

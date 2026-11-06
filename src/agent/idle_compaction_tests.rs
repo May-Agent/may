@@ -218,6 +218,8 @@ pub struct SessionParts {
     tool_environments: ToolEnvironmentCache,
     /// The host the session's load monitor reads: calm unless a test loads it.
     pub host: ScriptedHost,
+    /// The rules the session imports, when a test makes it an import session.
+    pub rules_import: Option<crate::rules_import::RulesImport>,
     // The brokers' receiving ends stay open for the life of the session.
     _queues: (
         crate::workspace_request::WorkspaceRequestQueue,
@@ -242,6 +244,7 @@ impl SessionParts {
             ask_user_broker,
             tool_environments: ToolEnvironmentCache::spawn(),
             host: ScriptedHost::default(),
+            rules_import: None,
             _queues: (workspace_queue, ask_user_queue),
         }
     }
@@ -269,6 +272,7 @@ impl SessionParts {
                     .with_runtime_service(runtime.clone())
                     .for_session(self.session_id.as_str())
             }),
+            live_config: None,
             profile_persona: None,
             profile_memories: None,
             plan_state: SessionPlanState::default(),
@@ -288,6 +292,7 @@ impl SessionParts {
             subagents: None,
             background_jobs: aither_agent::BackgroundJobPolicy::Await,
             connectivity: aither_connectivity::Connectivity::manual(true).0,
+            rules_import: self.rules_import.clone(),
         }
     }
 }

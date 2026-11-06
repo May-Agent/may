@@ -547,6 +547,7 @@ fn api_routes() -> Route {
                 "/install".post(install_skill),
                 "/{dir}".delete(delete_skill),
             ))),
+            "/rules/import".post(super::rules_import::import_rules),
             "/tasks".route(Route::new((
                 "".at(list_tasks),
                 "".post(create_task),
