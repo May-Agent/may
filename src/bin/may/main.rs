@@ -1131,6 +1131,7 @@ where
                     | TuiEvent::UsageReport(_)
                     | TuiEvent::ContextDump(_)
                     | TuiEvent::ContextMessages(_)
+                    | TuiEvent::SideModel(_)
                     | TuiEvent::ContextDumpSaved { .. } => {
                         // Reports arrive on the context channel; the agent
                         // channel only carries them if the channels raced.

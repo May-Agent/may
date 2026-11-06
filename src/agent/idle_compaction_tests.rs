@@ -356,7 +356,7 @@ impl Session {
             )));
         }
         let clock = ManualClock::new();
-        let agent = Box::pin(Self::build(config, &parts, &clock)).await;
+        let agent = Box::pin(Self::build(config, &parts, &clock, 0)).await;
         Self {
             agent,
             clock,
@@ -368,8 +368,15 @@ impl Session {
     /// Builds the agent the way the TUI does: the config resolved by
     /// [`MayAgent::session_config`], then [`MayAgent::new`], with only the
     /// clock and the host the load monitor reads substituted.
-    async fn build(config: &MayConfig, parts: &SessionParts, clock: &ManualClock) -> MayAgent {
-        let mut agent_config: MayAgentConfig = MayAgent::session_config(config, parts.input())
+    async fn build(
+        config: &MayConfig,
+        parts: &SessionParts,
+        clock: &ManualClock,
+        prompt_cache_epoch: u32,
+    ) -> MayAgent {
+        let mut input = parts.input();
+        input.prompt_cache_epoch = prompt_cache_epoch;
+        let mut agent_config: MayAgentConfig = MayAgent::session_config(config, input)
             .await
             .expect("the session config resolves");
         agent_config.clock = Some(clock.clone());
@@ -382,7 +389,13 @@ impl Session {
     /// Replaces the agent with one built from `config`, as the TUI does when
     /// a saved change reaches the running session.
     pub(super) async fn rebuild(&mut self, config: &MayConfig) {
-        self.agent = Box::pin(Self::build(config, &self.parts, &self.clock)).await;
+        self.agent = Box::pin(Self::build(config, &self.parts, &self.clock, 0)).await;
+    }
+
+    /// Replaces the agent with one that continues the prompt-cache epoch of
+    /// the agent it replaces, which had reached `epoch`.
+    pub(crate) async fn rebuild_at_epoch(&mut self, config: &MayConfig, epoch: u32) {
+        self.agent = Box::pin(Self::build(config, &self.parts, &self.clock, epoch)).await;
     }
 
     /// Sleeps out the idle timer the way the worker does, then compacts if
