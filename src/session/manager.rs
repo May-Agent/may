@@ -691,6 +691,19 @@ impl SessionManager {
         Ok(self.current.as_ref().expect("just assigned"))
     }
 
+    /// The profile a persisted session belongs to, read from the daemon
+    /// without loading the session.
+    ///
+    /// # Errors
+    /// Returns [`SessionError`] when the daemon is unavailable or does not know the session.
+    pub async fn session_profile(&self, id: &SessionId) -> Result<Option<String>, SessionError> {
+        let api = self
+            .daemon()?
+            .get::<crate::client::WireSession>(&format!("/api/sessions/{}", id.as_str()))
+            .await?;
+        Ok(api.profile_id)
+    }
+
     /// Force reconcile container mount-point layout for one persisted session.
     ///
     /// # Errors
