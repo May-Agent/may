@@ -508,6 +508,13 @@ async fn run_commands(
                 )
                 .await;
             }
+            WorkerCommand::SideModel { event_tx } => {
+                fail(
+                    &event_tx,
+                    "side requests run inside the May daemon".to_string(),
+                )
+                .await;
+            }
             WorkerCommand::Run { event_tx, .. } => {
                 fail(
                     &event_tx,
