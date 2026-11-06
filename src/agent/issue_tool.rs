@@ -409,9 +409,11 @@ where
             self.targets.as_ref(),
             &self.provenance,
             &CallOrigin::from_context(&cx),
-            self.search.as_ref(),
-            self.owners.as_ref(),
-            None,
+            SessionServices {
+                search: self.search.as_ref(),
+                owners: self.owners.as_ref(),
+                events: None,
+            },
             arguments,
         )
         .await
@@ -448,6 +450,7 @@ impl<S: IssueStore, T> IssueTool<S, T> {
             languages: self.languages,
             changes: self.changes,
             owners: self.owners,
+            task_events: self.task_events,
         }
     }
 
@@ -516,9 +519,11 @@ where
             self.targets.as_ref(),
             &self.provenance,
             &CallOrigin::from_context(&cx),
-            self.search.as_ref(),
-            self.owners.as_ref(),
-            self.task_events.as_ref(),
+            SessionServices {
+                search: self.search.as_ref(),
+                owners: self.owners.as_ref(),
+                events: self.task_events.as_ref(),
+            },
             arguments,
         )
         .await;
@@ -531,18 +536,41 @@ where
     }
 }
 
+/// What the session adds to a call on top of its store.
+#[derive(Clone, Copy)]
+struct SessionServices<'a> {
+    search: Option<&'a SessionIssueSearch>,
+    owners: Option<&'a IssueOwners>,
+    /// The `tasks.md` inbox that hears of issues the session creates or
+    /// closes.
+    events: Option<&'a aither_agent::TaskEvents>,
+}
+
 /// Run `args` on the session's store, or on the project its `--repo` names.
 async fn execute_in_target<S: IssueStore, T: GitHubTokenSource + Clone>(
     session_store: &S,
     targets: Option<&IssueTargets<T>>,
     provenance: &IssueProvenance,
     origin: &CallOrigin,
-    search: Option<&SessionIssueSearch>,
-    owners: Option<&IssueOwners>,
+    services: SessionServices<'_>,
     args: IssueArgs,
 ) -> Result<ToolResult, IssueError> {
+    let SessionServices {
+        search,
+        owners,
+        events,
+    } = services;
     let Some(target) = args.repo().map(str::to_owned) else {
-        return execute(session_store, provenance, origin, search, owners, args).await;
+        return execute(
+            session_store,
+            provenance,
+            origin,
+            search,
+            owners,
+            events,
+            args,
+        )
+        .await;
     };
     let Some(targets) = targets else {
         return Err(IssueError::Invalid(
@@ -550,9 +578,12 @@ async fn execute_in_target<S: IssueStore, T: GitHubTokenSource + Clone>(
         ));
     };
     match targets.resolve(&target).await? {
-        TargetStore::May(store) => execute(&store, provenance, origin, search, owners, args).await,
+        // Another project's issues are not rows of this session's `tasks.md`.
+        TargetStore::May(store) => {
+            execute(&store, provenance, origin, search, owners, None, args).await
+        }
         TargetStore::GitHub(store) => {
-            execute(&store, provenance, origin, search, owners, args).await
+            execute(&store, provenance, origin, search, owners, None, args).await
         }
     }
 }
@@ -1343,9 +1374,15 @@ mod tests {
         tool.call(IssueArgs::Close { number: 1 }, ToolContext::new())
             .await
             .expect("close");
-        tool.call(IssueArgs::View { number: 1 }, ToolContext::new())
-            .await
-            .expect("view");
+        tool.call(
+            IssueArgs::View {
+                number: 1,
+                repo: None,
+            },
+            ToolContext::new(),
+        )
+        .await
+        .expect("view");
 
         tasks.on_request(false).await;
         let alert = tasks.on_tool_turn_end().await.expect("the row is told");
