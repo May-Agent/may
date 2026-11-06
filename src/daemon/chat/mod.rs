@@ -1266,6 +1266,15 @@ pub(super) async fn enqueue_chat(
     State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<SessionRuntimeResponse>> {
     wake_on_user_message(&state).await?;
+    enqueue_pending(&state, req).await.map(Json)
+}
+
+/// Hands `req` to the session as a pending message: the running turn takes
+/// it as `req.delivery_mode` says, and an idle session starts a turn for it.
+async fn enqueue_pending(
+    state: &Arc<DaemonState>,
+    req: ChatRequest,
+) -> SkyResult<SessionRuntimeResponse> {
     let pending = pending_user_message_from_request(req.clone());
     let runtime = state
         .runtime_service
@@ -1275,8 +1284,25 @@ pub(super) async fn enqueue_chat(
     if runtime.can_dispatch_follow_up() {
         spawn_follow_up_runs(state.clone(), req.session_id.clone());
     }
+    Ok(runtime.into())
+}
 
-    Ok(Json(runtime.into()))
+/// Delivers a message from the user the way a client does: a turn for an
+/// idle session, a pending message for a busy one.
+pub(super) async fn deliver_user_message(
+    state: &Arc<DaemonState>,
+    req: ChatRequest,
+) -> SkyResult<SessionRuntimeResponse> {
+    let runtime = state
+        .runtime_service
+        .get(&req.session_id)
+        .await
+        .map_err(internal_error)?;
+    if runtime.admits_new_request() {
+        start_prompt_turn(state, req).await
+    } else {
+        enqueue_pending(state, req).await
+    }
 }
 
 pub(super) async fn remove_pending_message(
@@ -4873,6 +4899,60 @@ mod tests {
         );
     }
 
+    /// The three things the sleep alert requires of the session `/sleep` ran in.
+    fn assert_greeting_requirements(body: &str) {
+        for required in [
+            "wish them good night",
+            "what you are working on now",
+            "what you will keep pushing forward",
+            "through ask_user now, all in one go",
+            "need a few answers first",
+        ] {
+            assert!(body.contains(required), "the alert asks: {required}");
+        }
+    }
+
+    /// `/sleep` on a session whose turn is running succeeds and is taken by
+    /// the session's next request, carrying the same requirements.
+    #[tokio::test]
+    async fn sleep_on_a_busy_session_reaches_its_next_request() {
+        use crate::daemon::sleep::{SleepRequest, start_sleep};
+        use skyzen::utils::{Json, State};
+
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let provider = stub_provider(vec![sse_text("Good night")]).await;
+        let unused = stub_provider(vec![sse_text("unused")]).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let state = failover_state(may_dir.path(), &provider, &unused).await;
+
+        // A turn holds the session.
+        let guard = state
+            .runtime_service
+            .runs()
+            .acquire("session")
+            .await
+            .expect("acquire run");
+        let runtime = state.runtime_service.get("session").await.expect("runtime");
+        assert!(!runtime.admits_new_request(), "the session is busy");
+
+        let Json(status) = start_sleep(
+            Json(SleepRequest {
+                session_id: "session".to_string(),
+            }),
+            State(state.clone()),
+        )
+        .await
+        .expect("/sleep succeeds on a busy session");
+        assert!(status.asleep);
+        let runtime = state.runtime_service.get("session").await.expect("runtime");
+        assert!(runtime.has_pending_messages(), "/sleep waits for the turn");
+
+        // The running turn ends and the session takes the pending message.
+        tokio::spawn(super::dispatch_follow_ups(state.clone(), guard));
+        let body = body_containing(&provider, "/sleep").await;
+        assert_greeting_requirements(&body);
+    }
+
     /// `/sleep` starts a turn in the session it ran in, whose request carries
     /// the sleep alert with the three things the agent must do; another
     /// session is told only that the user sleeps, once, at its next turn,
@@ -4916,15 +4996,7 @@ mod tests {
 
         // The turn started by the command carries the alert.
         let body = last_body(&provider, 1).await.to_lowercase();
-        for required in [
-            "wish them good night",
-            "what you are working on now",
-            "what you will keep pushing forward",
-            "through ask_user now, all in one go",
-            "need a few answers first",
-        ] {
-            assert!(body.contains(required), "the alert asks: {required}");
-        }
+        assert_greeting_requirements(&body);
         assert!(body.contains("/sleep"), "the user's command opens the turn");
 
         // Another session hears of it at its next turn, without the greeting.
