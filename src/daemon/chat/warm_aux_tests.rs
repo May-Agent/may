@@ -317,6 +317,84 @@ async fn aux_generations_leave_the_conversation_and_the_next_request_untouched()
         .expect("release run");
 }
 
+const BTW_QUESTION: &str = "BTW-SENTINEL what is going on";
+
+/// The `prompt_cache_key` of the stub's request containing `needle`.
+async fn cache_key_of(stub: &StubModel, needle: &str) -> serde_json::Value {
+    let requests = stub.requests.lock().await;
+    let body = requests
+        .iter()
+        .rev()
+        .find(|body| body.contains(needle))
+        .unwrap_or_else(|| panic!("no request carried {needle:?}"));
+    let body: serde_json::Value = serde_json::from_str(body).expect("a JSON request");
+    drop(requests);
+    body["prompt_cache_key"].clone()
+}
+
+/// A suggestion, a recap and a `/btw` question ask the provider under the key
+/// the session agent's own requests carry, including when the agent was
+/// rebuilt to continue the cache epoch of the one it replaced.
+#[tokio::test]
+async fn side_requests_carry_the_session_agents_prompt_cache_key() {
+    let dir = tempfile::tempdir().expect("dir");
+    let stub = StubModel::spawn_replying(SESSION_MODEL, aux_replies).await;
+    let config = saved_config(&stub, None);
+    let state = Arc::new(
+        DaemonState::for_test(dir.path(), config.clone())
+            .await
+            .expect("test daemon state"),
+    );
+    let mut session = Box::pin(Session::start(&config)).await;
+    session.rebuild_at_epoch(&config, 3).await;
+    run_turn(&mut session.agent).await;
+    let expected = serde_json::json!(format!("{}:3", session.agent.session_id().as_str()));
+    assert_eq!(
+        cache_key_of(&stub, "Say hello.").await,
+        expected,
+        "the agent's own request continues the epoch"
+    );
+    state
+        .db()
+        .create_session(SESSION, Some("test"), Some("a::gpt-4o"))
+        .await
+        .expect("session");
+    state
+        .db()
+        .append_message(
+            SESSION,
+            crate::session::MessageRole::User,
+            "Say hello.",
+            None,
+            crate::db::MessageMeta::default(),
+        )
+        .await
+        .expect("append");
+    state.parked_agents.park(
+        &state,
+        SESSION,
+        session.agent,
+        0,
+        crate::session::RunReleased::already_released(),
+    );
+
+    super::suggest::maybe_suggest(&state, SESSION);
+    wait_until(async || !state.aux_tasks.is_current(SESSION, 0)).await;
+    assert_eq!(cache_key_of(&stub, SUGGESTION_PROMPT).await, expected);
+
+    super::recap::request_recap(&state, SESSION, super::aux::AuxKind::ManualRecap);
+    wait_until(async || state.db().get_messages(SESSION).await.expect("rows").len() > 1).await;
+    assert_eq!(cache_key_of(&stub, RECAP_PROMPT).await, expected);
+
+    // `/btw` takes its model from the same worker call.
+    let worker = state.parked_agents.get(SESSION).expect("parked agent");
+    let slot = worker.side_model().await.expect("the side model");
+    let mut answer =
+        std::pin::pin!(slot.respond(vec![aither_core::llm::Message::user(BTW_QUESTION)]));
+    while futures_lite::StreamExt::next(&mut answer).await.is_some() {}
+    assert_eq!(cache_key_of(&stub, BTW_QUESTION).await, expected);
+}
+
 /// A stored recap card is read back from a freshly opened database, as after
 /// a daemon restart, and replays to clients as a recap row.
 #[tokio::test]
