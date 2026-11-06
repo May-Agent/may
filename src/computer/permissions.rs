@@ -1,8 +1,9 @@
-//! macOS privacy grants the agent needs: Screen Recording (capture and
-//! stills) and Accessibility (event injection). Both are TCC entries
-//! evaluated per process at launch — which is exactly why this whole
-//! stack lives in a respawnable helper: the daemon never has to exit
-//! for a grant to take effect.
+//! macOS privacy grants the agent needs.
+//!
+//! Screen Recording (capture and stills) and Accessibility (event
+//! injection) are TCC entries; the helper reads and requests them only
+//! through fresh probe processes, so a grant applies without restarting
+//! the daemon.
 
 use std::ffi::c_void;
 
@@ -101,4 +102,61 @@ pub fn request_permissions() {
 
 const fn true_u8() -> u8 {
     1
+}
+
+/// The subcommand a fresh probe process runs: `may computer-agent-probe`.
+pub const PROBE_COMMAND: &str = "computer-agent-probe";
+/// Probe flag that raises the prompts for missing grants before reporting.
+pub const PROBE_REQUEST_FLAG: &str = "--request";
+
+/// Both grants as one process sees them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Grants {
+    /// Screen Recording: capture and stills.
+    pub screen_recording: bool,
+    /// Accessibility: event injection.
+    pub accessibility: bool,
+}
+
+/// The probe process's side: optionally raise the prompts, then report.
+#[must_use]
+pub fn probe(request: bool) -> Grants {
+    if request {
+        request_permissions();
+    }
+    Grants {
+        screen_recording: screen_recording_granted(),
+        accessibility: accessibility_granted(),
+    }
+}
+
+/// Read — or, with `request`, ask for — the grants in a fresh copy of
+/// this executable.
+///
+/// macOS caches a negative answer in the process that asked, and a
+/// request from a process holding that cached answer never reaches the
+/// TCC daemon, so the serving helper never asks itself. The probe is its
+/// child, so TCC attributes it to the helper's bundle.
+///
+/// # Errors
+/// Returns a message when the probe cannot run, fails, or prints
+/// something other than its report.
+pub fn fresh_grants(request: bool) -> Result<Grants, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let mut command = std::process::Command::new(exe);
+    command.arg(PROBE_COMMAND);
+    if request {
+        command.arg(PROBE_REQUEST_FLAG);
+    }
+    let output = command
+        .output()
+        .map_err(|e| format!("run permission probe: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "permission probe exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    serde_json::from_slice(&output.stdout).map_err(|e| format!("bad permission probe report: {e}"))
 }
