@@ -436,11 +436,15 @@ impl SandboxProcess {
         let tree = child.tree_control();
         #[cfg(not(target_os = "linux"))]
         let pid = child.id();
+        let described = format!("pid {}", child.id());
         let exit = Arc::new(Exit::default());
         let published = exit.clone();
         blocking::unblock(move || {
             let _sandbox = sandbox;
             let status = futures_lite::future::block_on(exit_status(&mut child));
+            if let Err(error) = &status {
+                tracing::error!(%error, process = %described, "waiting for an ACP process failed");
+            }
             let _ = published.status.set(status);
             published.changed.notify(usize::MAX);
         })
@@ -690,6 +694,82 @@ mod tests {
             Process::Terminal.named_files(&spec, dir.path()),
             Vec::<PathBuf>::new()
         );
+    }
+
+    fn fake_agent_spec(cwd: &Path) -> SpawnSpec {
+        SpawnSpec {
+            program: "python3".to_string(),
+            args: vec![
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/fake_acp_agent.py")
+                    .to_string_lossy()
+                    .into_owned(),
+            ],
+            env: std::collections::BTreeMap::new(),
+            cwd: cwd.to_path_buf(),
+        }
+    }
+
+    /// Starts the fake agent, closes its stdin so it exits, and returns what
+    /// the executor reports for its exit.
+    async fn exit_after_stdin_closes<N: NetworkPolicy + Clone>(
+        sandbox: SessionSandbox<N>,
+        cwd: &Path,
+    ) -> Result<ExitStatus, String> {
+        // The sandbox spawns on the daemon's global executor.
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let executor = SandboxExecutor::new(
+            Arc::new(ArcSwap::from_pointee(sandbox)),
+            Arc::<ArcSwap<MayConfig>>::default(),
+        );
+        let agent = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            executor.spawn_agent(fake_agent_spec(cwd)),
+        )
+        .await
+        .map_err(|_| "the agent did not start within 60s".to_string())?
+        .map_err(|error| format!("the agent did not start: {error}"))?;
+        let AgentProcess {
+            stdin,
+            stdout: _stdout,
+            stderr: _stderr,
+            control,
+        } = agent;
+        drop(stdin);
+        tokio::time::timeout(std::time::Duration::from_secs(30), control.wait())
+            .await
+            .map_err(|_| "the agent did not exit within 30s of its stdin closing".to_string())?
+            .map_err(|error| format!("waiting for the agent failed: {error} ({error:?})"))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scratch_sandbox_agent_reports_its_exit_status() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let status = exit_after_stdin_closes(SessionSandbox::scratch(dir.path()), dir.path())
+            .await
+            .unwrap_or_else(|error| panic!("scratch sandbox: {error}"));
+        assert!(status.success(), "scratch sandbox exit status: {status:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_sandbox_agent_reports_its_exit_status() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let grants = TerminalGrants::new();
+        grants.add_readable(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures"));
+        let root = dir.path().join("session");
+        std::fs::create_dir_all(&root).expect("session dir");
+        let sandbox = SessionSandbox::for_session(
+            root.clone(),
+            grants,
+            TerminalPermissionHandler::for_agent(None, None, None),
+            NetworkAuditLog::rolling_daily(root.join("audit"), 1).expect("audit log"),
+            ProcessPriority::default(),
+            None,
+        );
+        let status = exit_after_stdin_closes(sandbox, &root)
+            .await
+            .unwrap_or_else(|error| panic!("session sandbox: {error}"));
+        assert!(status.success(), "session sandbox exit status: {status:?}");
     }
 
     fn option(id: &str, kind: PermissionOptionKind) -> PermissionOption {
