@@ -14,6 +14,7 @@ pub mod markdown;
 pub mod streaming_markdown;
 #[cfg(test)]
 pub(crate) mod test_screen;
+pub mod wrap;
 
 use ratatui::Frame;
 
