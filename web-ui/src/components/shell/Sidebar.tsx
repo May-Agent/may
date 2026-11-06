@@ -21,7 +21,7 @@ import { useActiveProfile } from '@/lib/profile/active';
 import { useNewChat } from '@/lib/useNewChat';
 import { shortcutAria, shortcutLabel } from '@/lib/shortcuts';
 import { FolderNode, SessionNode } from './SessionNode';
-import { repoLabel } from '@/lib/repo';
+import { githubBinding, repoLabel } from '@/lib/repo';
 import { NewChatRepoDialog } from './NewChatRepoDialog';
 import { ProfileSwitcher } from './ProfileSwitcher';
 import { NotificationBell } from './NotificationBell';
@@ -59,27 +59,6 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
   const [archiveOpen, setArchiveOpen] = useState(false);
   const [repoDialogOpen, setRepoDialogOpen] = useState(false);
   const settingsActive = location.pathname.startsWith('/settings');
-
-  // GitHub repos already bound to sessions, offered as quick picks in the
-  // "new chat in repo" dialog.
-  const knownGithubRepos = useMemo(() => {
-    const seen = new Set<string>();
-    const collect = (repo: string | null | undefined) => {
-      if (repo?.startsWith('github:')) seen.add(repo.slice(7));
-    };
-    for (const item of [
-      ...(scoped?.pinned ?? []),
-      ...(scoped?.regular ?? []),
-      ...(scoped?.archived ?? []),
-    ]) {
-      if ('sessions' in item) {
-        for (const child of item.sessions) collect(child.repo);
-      } else {
-        collect(item.repo);
-      }
-    }
-    return [...seen].sort();
-  }, [scoped]);
 
   // Sessions bound to a repository cluster under a collapsible group
   // header; repo-less sessions stay flat above the groups.
@@ -192,11 +171,10 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
       <NewChatRepoDialog
         open={repoDialogOpen}
         onOpenChange={setRepoDialogOpen}
-        knownRepos={knownGithubRepos}
         busy={creating}
-        onSubmit={(repo) => {
+        onPick={(repo) => {
           setRepoDialogOpen(false);
-          void startNewChat({ repo: `github:${repo}` });
+          void startNewChat({ repo: githubBinding(repo) });
         }}
       />
 

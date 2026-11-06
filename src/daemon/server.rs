@@ -276,6 +276,7 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
         acp_host,
         tokio_handle: tokio::runtime::Handle::current(),
         db: db_for_archive.clone(),
+        github_api: crate::pr::PrContext::default_github_api(),
         default_profile_id,
         mcp_service: super::state::McpService::spawn(mcp_manager),
         permission_approver,
@@ -425,6 +426,7 @@ fn api_routes() -> Route {
                 "".at(models),
                 "/by-provider".at(models_by_provider),
             ))),
+            "/github/repos".at(super::github_repos::list_github_repos),
             "/events".at(stream_events),
             "/logs".route(Route::new(("/requests".at(get_request_logs),))),
             "/sessions".route(Route::new((
