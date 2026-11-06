@@ -287,6 +287,7 @@ pub struct IssueTool<S> {
     languages: Option<aither_agent::LanguageGuard>,
     changes: Option<IssueChangeNotifier>,
     owners: Option<IssueOwners>,
+    task_events: Option<aither_agent::TaskEvents>,
 }
 
 /// The `issue` tool as a subagent sees it: the read subcommands work and every
@@ -352,6 +353,7 @@ impl<S: IssueStore + Clone + 'static> Tool for SubagentIssueTool<S> {
             &CallOrigin::from_context(&cx),
             self.search.as_ref(),
             self.owners.as_ref(),
+            None,
             arguments,
         )
         .await
@@ -370,7 +372,16 @@ impl<S: IssueStore> IssueTool<S> {
             languages: None,
             changes: None,
             owners: None,
+            task_events: None,
         }
+    }
+
+    /// Record every issue created or closed on `events`, the main agent's
+    /// `tasks.md` inbox.
+    #[must_use]
+    pub fn with_task_events(mut self, events: aither_agent::TaskEvents) -> Self {
+        self.task_events = Some(events);
+        self
     }
 
     /// Name issue owners through `owners`.
@@ -427,6 +438,7 @@ impl<S: IssueStore + Clone + 'static> Tool for IssueTool<S> {
             &CallOrigin::from_context(&cx),
             self.search.as_ref(),
             self.owners.as_ref(),
+            self.task_events.as_ref(),
             arguments,
         )
         .await;
@@ -445,6 +457,7 @@ async fn execute<S: IssueStore>(
     origin: &CallOrigin,
     search: Option<&SessionIssueSearch>,
     owners: Option<&IssueOwners>,
+    events: Option<&aither_agent::TaskEvents>,
     args: IssueArgs,
 ) -> Result<ToolResult, IssueError> {
     let record = |number: i64,
@@ -460,7 +473,19 @@ async fn execute<S: IssueStore>(
                 action,
                 detail.as_deref(),
             )
-            .await
+            .await?;
+        // A created or closed issue changes what `tasks.md` rows say.
+        if let Some(events) = events
+            && let Ok(number) = u64::try_from(number)
+        {
+            let issue = aither_agent::WorkRef::issue(number);
+            match action {
+                IssueAction::Create => events.record(aither_agent::TaskEvent::IssueCreated(issue)),
+                IssueAction::Close => events.record(aither_agent::TaskEvent::IssueClosed(issue)),
+                _ => {}
+            }
+        }
+        Ok::<(), IssueError>(())
     };
     match args {
         IssueArgs::Create {
@@ -1162,6 +1187,54 @@ mod tests {
         let detail = store.get(created.number).await.expect("view");
         assert_eq!(detail.title, "seed");
         assert!(detail.comments.is_empty() && detail.labels.is_empty());
+    }
+
+    /// An issue the main agent creates and closes reaches its `tasks.md`
+    /// inbox: the row naming it is told, once each.
+    #[tokio::test]
+    async fn created_and_closed_issues_reach_the_tasks_inbox() {
+        use aither_agent::ContextSource;
+        use aither_core::llm::ToolContext;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = crate::db::ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("chat db should open");
+        let store = crate::issue::MayIssueStore::new(db.clone(), "test".to_string());
+        let events = aither_agent::TaskEvents::new();
+        let tool = IssueTool::new(store, IssueProvenance::new(db, "test".to_string()))
+            .with_task_events(events.clone());
+        let sandbox = dir.path().join("sandbox");
+        std::fs::create_dir_all(&sandbox).expect("sandbox");
+        std::fs::write(sandbox.join("tasks.md"), "## Doing\n- #1 the login bug\n")
+            .expect("tasks.md");
+        let mut tasks = aither_agent::TasksDocument::new(&sandbox, 60, events);
+        tasks.on_request(false).await;
+
+        let created = tool
+            .call(
+                IssueArgs::Create {
+                    title: "login bug".to_string(),
+                    body: None,
+                    labels: Vec::new(),
+                },
+                ToolContext::new(),
+            )
+            .await;
+        created.expect("create");
+        tool.call(IssueArgs::Close { number: 1 }, ToolContext::new())
+            .await
+            .expect("close");
+        tool.call(IssueArgs::View { number: 1 }, ToolContext::new())
+            .await
+            .expect("view");
+
+        tasks.on_request(false).await;
+        let alert = tasks.on_tool_turn_end().await.expect("the row is told");
+        let text = alert.content();
+        assert_eq!(text.matches("Issue #1 was created").count(), 1, "{text}");
+        assert_eq!(text.matches("Issue #1 was closed").count(), 1, "{text}");
+        assert!(text.contains("\"#1 the login bug\""), "{text}");
     }
 
     #[tokio::test]
