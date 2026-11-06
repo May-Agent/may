@@ -1772,6 +1772,33 @@ where
                             _ => app.chat.push_notice("No session is attached"),
                         }
                     }
+                    Some(action @ (SendAction::Sleep | SendAction::Wake)) => {
+                        let session_id = app
+                            .session_manager
+                            .current()
+                            .map(|session| session.id.clone());
+                        match (runtime_deps.daemon(), session_id) {
+                            (Some(client), Some(session_id)) => {
+                                // The `sleep` event updates the screen; the
+                                // turn `/sleep` starts follows as any
+                                // other client's turn.
+                                let posted = if matches!(action, SendAction::Sleep) {
+                                    client
+                                        .post::<_, serde_json::Value>(
+                                            "/api/sleep",
+                                            &serde_json::json!({ "sessionId": session_id.as_str() }),
+                                        )
+                                        .await
+                                } else {
+                                    client.delete::<serde_json::Value>("/api/sleep").await
+                                };
+                                if let Err(error) = posted {
+                                    app.chat.push_error(&error.to_string());
+                                }
+                            }
+                            _ => app.chat.push_notice("No session is attached"),
+                        }
+                    }
                     Some(SendAction::Recap) => {
                         let session_id = app
                             .session_manager

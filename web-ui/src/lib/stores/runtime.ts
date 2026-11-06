@@ -7,9 +7,11 @@ import type {
   RemoteAccessStatusResponse,
   RequestLogsResponse,
   SessionRuntimeSummary,
+  SleepStatus,
   UiEvent,
 } from '../types';
 import { openUiEventStream } from '../api/events';
+import { applyReminderReport } from '../api/sleep';
 import { useSessionsStore } from './sessions';
 import { useModelsStore } from './models';
 import { useConfigStore } from './config';
@@ -52,6 +54,10 @@ interface RuntimeState {
   networkAccess: NetworkAccessLogsResponse | null;
   requestLogs: RequestLogsResponse | null;
   remoteAccess: RemoteAccessStatusResponse | null;
+  /** The user's sleep state; `null` until the first report. */
+  sleep: SleepStatus | null;
+  /** Health reminders to show, counted since this client attached. */
+  sleepReminders: number;
   abort: (() => void) | null;
 
   connect: (profileId?: string | null) => Promise<void>;
@@ -68,6 +74,7 @@ const SUBSCRIBED_TOPICS = [
   'session_runtime',
   'session_runtimes',
   'remote_access',
+  'sleep',
   'notification_mailbox',
   'network_access_logs',
   'request_logs',
@@ -160,6 +167,8 @@ export const useRuntimeStore = create<RuntimeState>((set, get) => ({
   networkAccess: null,
   requestLogs: null,
   remoteAccess: null,
+  sleep: null,
+  sleepReminders: 0,
   abort: null,
 
   async connect(profileId = null) {
@@ -243,6 +252,17 @@ export const useRuntimeStore = create<RuntimeState>((set, get) => ({
             case 'remote_access':
               set({ remoteAccess: evt.payload.status });
               break;
+            case 'sleep': {
+              const { remind } = applyReminderReport(
+                { seen: get().sleep?.reminders ?? null },
+                evt.payload.reminders,
+              );
+              set((state) => ({
+                sleep: evt.payload,
+                sleepReminders: state.sleepReminders + (remind ? 1 : 0),
+              }));
+              break;
+            }
             default:
               break;
           }

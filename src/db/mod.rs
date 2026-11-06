@@ -22,6 +22,7 @@ mod search_outbox;
 mod session;
 mod session_intervals;
 mod session_run;
+mod sleep_log;
 mod sql;
 mod task;
 
