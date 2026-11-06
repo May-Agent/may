@@ -2318,7 +2318,8 @@ pub(super) fn element_lines(
             };
             let display = artifact_tag_text(content);
             let content = resolve_tunnel_tags(&display, tunnel_base);
-            let md_result = markdown::render_markdown_with_positions(&content, image_mode);
+            let md_result =
+                markdown::render_markdown_with_positions(&content, image_mode, usize::from(width));
             let mut md_lines = md_result.lines;
             // Strip trailing empties from the markdown renderer so a message
             // does not end in a run of blank rows — but never into the rows
@@ -2343,8 +2344,14 @@ pub(super) fn element_lines(
             }
 
             if *streaming {
-                // Append cursor to the last line of text (inline)
-                if let Some(last_line) = md_lines.last_mut() {
+                // Append cursor to the last line of text (inline), unless
+                // that line exactly fills the width — a full-width table
+                // row would wrap its closing border away — then on a line
+                // of its own.
+                if let Some(last_line) = md_lines
+                    .last_mut()
+                    .filter(|line| line.width() != usize::from(width))
+                {
                     last_line
                         .spans
                         .push(Span::styled("_", Style::default().fg(Color::DarkGray)));
@@ -4381,7 +4388,70 @@ mod tests {
         assert_eq!(streamed_screen, whole_screen);
     }
 
+    /// A three-column table of CJK cells and a long inline code span,
+    /// wider than the chat column, then a fenced block and a paragraph.
     const TABLE_REPLY: &str = "对比如下：\n\n| 项目 | 说明 | 命令 |\n|---|---|---|\n| 构建 | 编译整个工作区并运行所有单元测试，确认没有回归 | `cargo test --workspace --all-features --locked` |\n| 格式化 | 检查代码风格 | `cargo fmt --all -- --check` |\n\n```sh\ncargo test --workspace\n```\n\n以上命令都需要在仓库根目录运行，结果会写入目标目录。";
+
+    /// Display columns of the table border glyphs on a screen row.
+    fn screen_border_columns(row: &str) -> Vec<usize> {
+        let mut columns = Vec::new();
+        let mut x = 0;
+        for ch in row.chars() {
+            if matches!(ch, '│' | '├' | '┼' | '┤') {
+                columns.push(x);
+            }
+            x += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        }
+        columns
+    }
+
+    /// A table wider than the chat column is laid out inside it: streamed
+    /// or whole, every table row on screen has its borders at the
+    /// header's columns, one rule is drawn, and no cell text spills onto
+    /// a row outside the table.
+    #[test]
+    fn wide_table_reply_stays_aligned_on_screen() {
+        use crate::tui::ui::test_screen::ScreenBackend as TestBackend;
+        use ratatui::Terminal;
+
+        let width = 48;
+        let mut chat = ChatStream::new();
+        chat.push_user("对比", Vec::new(), 0);
+        let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
+        let mut layout = super::ChatLayout::default();
+        let mut rest = TABLE_REPLY;
+        while !rest.is_empty() {
+            let split = rest.char_indices().nth(9).map_or(rest.len(), |(i, _)| i);
+            let (chunk, tail) = rest.split_at(split);
+            chat.push_text(chunk);
+            draw_unified(&mut terminal, &chat, &mut layout, usize::MAX);
+            rest = tail;
+        }
+        chat.end_text();
+        let screen = draw_unified(&mut terminal, &chat, &mut layout, usize::MAX);
+        let rows = crate::tui::ui::test_screen::buffer_screen(&screen);
+        let first = rows
+            .iter()
+            .position(|r| r.starts_with('│'))
+            .expect("table on screen");
+        let last = rows
+            .iter()
+            .rposition(|r| r.starts_with('│'))
+            .expect("table on screen");
+        let header = screen_border_columns(&rows[first]);
+        assert_eq!(header.len(), 4, "{rows:#?}");
+        for row in &rows[first..=last] {
+            assert_eq!(screen_border_columns(row), header, "{rows:#?}");
+        }
+        assert_eq!(
+            rows.iter().filter(|r| r.starts_with('├')).count(),
+            1,
+            "{rows:#?}"
+        );
+        // The rows around the table are the text before it and a blank.
+        assert_eq!(rows[first - 2], "对比如下：");
+        assert_eq!(rows[last + 1], "");
+    }
 
     /// A reply holding a table wider than the chat column and a fenced
     /// block, streamed with a frame per chunk and followed by more frames,
