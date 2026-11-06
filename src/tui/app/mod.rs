@@ -2370,6 +2370,14 @@ impl App {
             self.status = None;
         }
 
+        // The per-mode handlers see the key code alone, so a modified
+        // character with no binding above must not reach them as text.
+        if matches!(code, KeyCode::Char(_))
+            && modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+        {
+            return Ok(None);
+        }
+
         match &self.mode {
             AppMode::Chat => Ok(self.handle_chat_key(code)),
             AppMode::SessionSelect => Ok(super::reducer::navigation::handle_session_select_key(
@@ -4593,6 +4601,31 @@ mod tests {
 
     fn press(app: &mut App, code: KeyCode) -> Option<SendAction> {
         app.handle_key(code, KeyModifiers::NONE).expect("key")
+    }
+
+    #[tokio::test]
+    async fn an_unbound_modified_character_is_not_text() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        for modifier in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::SUPER,
+        ] {
+            for c in ['a', 'k', 'u'] {
+                assert!(
+                    app.handle_key(KeyCode::Char(c), modifier)
+                        .expect("key")
+                        .is_none()
+                );
+            }
+        }
+        assert_eq!(app.input, "", "no modified key types its letter");
+
+        app.handle_key(KeyCode::Char('A'), KeyModifiers::SHIFT)
+            .expect("key");
+        press(&mut app, KeyCode::Char('b'));
+        assert_eq!(app.input, "Ab", "plain and shifted characters still type");
     }
 
     #[tokio::test]
