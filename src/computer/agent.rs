@@ -122,14 +122,13 @@ fn input_state_mut(state: &mut AgentState, session_id: &str) -> Arc<Mutex<InputS
 #[allow(clippy::significant_drop_tightening)]
 async fn dispatch_inner(request: AgentRequest, state: Arc<Mutex<AgentState>>) -> AgentResponse {
     match request {
-        AgentRequest::Preflight => AgentResponse::Permissions {
-            screen_recording: permissions::screen_recording_granted(),
-            accessibility: permissions::accessibility_granted(),
+        AgentRequest::Preflight => match blocking::unblock(permissions::fresh_grants).await {
+            Ok(grants) => AgentResponse::Permissions {
+                screen_recording: grants.screen_recording,
+                accessibility: grants.accessibility,
+            },
+            Err(error) => AgentResponse::Error { error },
         },
-        AgentRequest::RequestPermissions => {
-            permissions::request_permissions();
-            AgentResponse::Ok
-        }
         AgentRequest::EnsureDisplay { session_id } => {
             let result = {
                 let mut state = state

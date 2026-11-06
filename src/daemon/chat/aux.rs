@@ -227,8 +227,8 @@ pub async fn generate<T: AuxOutput>(
         let worker = super::hosts::idle_agent(state, session_id)
             .await
             .map_err(|error| AuxError::Session(error.to_string()))?;
-        let slot = worker.btw_llm().ok_or(AuxError::NoModel)?;
-        generate_unbounded(slot, messages).await
+        let slot = worker.side_model().await.map_err(AuxError::Session)?;
+        generate_unbounded(&slot, messages).await
     };
     tokio::time::timeout(timeout, Box::pin(call))
         .await
