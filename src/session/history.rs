@@ -277,6 +277,11 @@ pub struct ChatMessage {
     /// content above stays the original.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub translation: Option<MessageTranslation>,
+    /// The reasoning text streamed before an assistant message, kept for
+    /// display. Never part of the model's context: provider reasoning state
+    /// lives in `reasoning`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
 }
 
 /// A reply translated into the communication language for display.
@@ -318,6 +323,7 @@ impl ChatMessage {
             reasoning: Vec::new(),
             tool_calls: Vec::new(),
             translation: None,
+            thinking: None,
         }
     }
 
@@ -334,6 +340,7 @@ impl ChatMessage {
             reasoning: Vec::new(),
             tool_calls: Vec::new(),
             translation: None,
+            thinking: None,
         }
     }
 
@@ -354,6 +361,7 @@ impl ChatMessage {
             reasoning: Vec::new(),
             tool_calls: Vec::new(),
             translation: None,
+            thinking: None,
         }
     }
 
@@ -370,6 +378,7 @@ impl ChatMessage {
             reasoning: Vec::new(),
             tool_calls: Vec::new(),
             translation: None,
+            thinking: None,
         }
     }
 
@@ -390,6 +399,7 @@ impl ChatMessage {
             reasoning: Vec::new(),
             tool_calls: Vec::new(),
             translation: None,
+            thinking: None,
         }
     }
 
@@ -409,6 +419,7 @@ impl ChatMessage {
             reasoning: Vec::new(),
             tool_calls: Vec::new(),
             translation: None,
+            thinking: None,
         }
     }
 }
