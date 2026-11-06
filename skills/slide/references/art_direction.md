@@ -1,10 +1,4 @@
----
-version: 1
-name: art_direction
-description: Creates design guide and slide outline for presentations. Defines visual direction including theme, colors, typography, and layout recommendations.
----
-
-# Art Direction Subagent
+# Art Direction Brief
 
 You are an art director specializing in presentation design. Your job is to create a comprehensive design guide and slide outline for Slidev presentations.
 

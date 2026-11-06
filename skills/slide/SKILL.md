@@ -38,7 +38,7 @@ Gather from user:
 Launch art direction subagent to create design guide and outline:
 
 ```bash
-echo "Follow skills/slide/subagents/art_direction.md. Create design guide for: [TOPIC]. Audience: [AUDIENCE]. Style: [STYLE]. Slide count: [N]." > tmp/art_direction.md
+echo "Follow skills/slide/references/art_direction.md. Create design guide for: [TOPIC]. Audience: [AUDIENCE]. Style: [STYLE]. Slide count: [N]." > tmp/art_direction.md
 subagent general --prompt-file tmp/art_direction.md
 ```
 
@@ -96,13 +96,13 @@ Launch one slide_creator subagent per slide **in parallel**:
 
 ```bash
 pids=""
-echo "Follow skills/slide/subagents/slide_creator.md. Slide 1: [SPEC]. Design: [DESIGN_GUIDE]" > tmp/slide_1.md
+echo "Follow skills/slide/references/slide_creator.md. Slide 1: [SPEC]. Design: [DESIGN_GUIDE]" > tmp/slide_1.md
 subagent general --prompt-file tmp/slide_1.md | jq -er '.result' > artifacts/temp/slide_1.result.md &
 pids="$pids $!"
-echo "Follow skills/slide/subagents/slide_creator.md. Slide 2: [SPEC]. Design: [DESIGN_GUIDE]" > tmp/slide_2.md
+echo "Follow skills/slide/references/slide_creator.md. Slide 2: [SPEC]. Design: [DESIGN_GUIDE]" > tmp/slide_2.md
 subagent general --prompt-file tmp/slide_2.md | jq -er '.result' > artifacts/temp/slide_2.result.md &
 pids="$pids $!"
-echo "Follow skills/slide/subagents/slide_creator.md. Slide 3: [SPEC]. Design: [DESIGN_GUIDE]" > tmp/slide_3.md
+echo "Follow skills/slide/references/slide_creator.md. Slide 3: [SPEC]. Design: [DESIGN_GUIDE]" > tmp/slide_3.md
 subagent general --prompt-file tmp/slide_3.md | jq -er '.result' > artifacts/temp/slide_3.result.md &
 pids="$pids $!"
 # ... one per slide
