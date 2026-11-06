@@ -384,24 +384,27 @@ impl AskUserBlockerResolver {
 }
 
 impl aither_agent::TaskBlockerResolver for AskUserBlockerResolver {
-    async fn is_open(&self, mark: &str) -> bool {
+    async fn is_open(&self, mark: &str) -> Result<bool, aither_agent::TaskBlockerError> {
+        let unavailable =
+            |error: crate::db::ChatDbError| aither_agent::TaskBlockerError::Unavailable {
+                mark: mark.to_string(),
+                reason: error.to_string(),
+            };
         let db = self.runtime.db();
-        match db
+        // A payload no question of this session carries is free text the
+        // harness cannot check, and holds.
+        if !db
             .session_ask_user_request_exists(&self.session_id, mark)
             .await
+            .map_err(unavailable)?
         {
-            Ok(true) => db
-                .pending_ask_user_request(mark)
-                .await
-                .is_ok_and(|pending| {
-                    pending.is_some_and(|pending| pending.session_id == self.session_id)
-                }),
-            Ok(false) => true,
-            Err(error) => {
-                tracing::error!(session_id = %self.session_id, %error, "failed to resolve a BLOCKING mark");
-                false
-            }
+            return Ok(true);
         }
+        Ok(db
+            .pending_ask_user_request(mark)
+            .await
+            .map_err(unavailable)?
+            .is_some_and(|pending| pending.session_id == self.session_id))
     }
 }
 

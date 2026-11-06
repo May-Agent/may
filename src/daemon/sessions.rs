@@ -762,6 +762,7 @@ pub(super) async fn delete_session(
         .await
         .map_err(internal_error)?;
     state.runtime_service.forget_terminal_grants(&id);
+    state.runtime_service.forget_task_events(&id);
     state.tunnels.remove_session(&id);
     #[cfg(target_os = "macos")]
     #[cfg(target_os = "macos")]
@@ -819,6 +820,7 @@ pub(super) async fn delete_all_sessions(
         .await
         .map_err(internal_error)?;
     state.runtime_service.forget_all_terminal_grants();
+    state.runtime_service.forget_all_task_events();
     state.tool_environments.evict_all();
     #[cfg(target_os = "macos")]
     #[cfg(target_os = "macos")]

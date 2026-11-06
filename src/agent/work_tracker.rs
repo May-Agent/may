@@ -2,25 +2,26 @@
 //! and PR backends, which `tasks.md` reads its rows' state and its roots'
 //! trees through.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use aither_agent::tasks::{RelatedWork, WorkComment, WorkKind};
+use aither_agent::tasks::{RelatedWork, WorkComment, WorkKind, WorkStatus};
 use aither_agent::{WorkItem, WorkRef, WorkState, WorkTrackerError};
 
 use crate::db::{ChatDb, PrRow};
 use crate::issue::{
-    IssueDetail, IssueError, IssueState, IssueStore, RelatedIssue, ResolvedIssueStore,
+    IssueDetail, IssueError, IssueState, IssueStatus, IssueStore, RelatedIssue, ResolvedIssueStore,
 };
 use crate::repo_clone::SessionRepos;
 
-/// Reads issues from the session's issue store and PRs from its PR records.
+/// Reads issues from the session's issue store and PRs from May's PR
+/// records, numbered as the `pr` command numbers them.
 #[derive(Debug, Clone)]
 pub struct MayWorkTracker {
     issues: ResolvedIssueStore,
     db: ChatDb,
     repos: SessionRepos,
     /// The session's working directory: the repository an unqualified PR
-    /// reference means when no clone of the session has it.
+    /// reference means when the session has no clone.
     cwd: PathBuf,
 }
 
@@ -30,7 +31,7 @@ impl MayWorkTracker {
     pub fn new(
         issues: ResolvedIssueStore,
         db: ChatDb,
-        session_root: &std::path::Path,
+        session_root: &Path,
         session_id: impl Into<String>,
         cwd: PathBuf,
     ) -> Self {
@@ -42,82 +43,199 @@ impl MayWorkTracker {
         }
     }
 
-    async fn issue(&self, reference: &WorkRef, number: i64) -> Result<WorkItem, WorkTrackerError> {
-        if let Some(repository) = reference.repository() {
-            let ours = self.issues.info().repository;
-            if ours.as_deref() != Some(repository) {
-                return Err(unavailable(
-                    reference,
-                    "it is not this session's repository",
-                ));
-            }
-        }
-        match self.issues.get(number).await {
-            Ok(detail) => Ok(issue_item(reference, detail)),
-            Err(IssueError::NotFound(_)) => Err(WorkTrackerError::NotFound(reference.clone())),
-            Err(error) => Err(unavailable(reference, &error.to_string())),
-        }
+    /// The issue store's own repository, when it names one.
+    fn our_repository(&self) -> Option<String> {
+        self.issues.info().repository
     }
 
-    async fn pull_request(
-        &self,
-        reference: &WorkRef,
-        number: i64,
-    ) -> Result<WorkItem, WorkTrackerError> {
-        if reference.repository().is_some() {
+    /// Refuses a reference qualified by a repository other than the issue
+    /// store's own; owner and repository names compare without case.
+    fn issue_number(&self, reference: &WorkRef) -> Result<i64, WorkTrackerError> {
+        if let Some(repository) = reference.repository()
+            && !self
+                .our_repository()
+                .is_some_and(|ours| ours.eq_ignore_ascii_case(repository))
+        {
             return Err(unavailable(
                 reference,
-                "PRs are read by number within this session's repositories",
+                "it is not this session's issue repository",
             ));
         }
-        let mut keys: Vec<String> = match self.repos.clones().await {
-            Ok(clones) => clones.into_iter().map(|clone| clone.repo_key).collect(),
-            Err(error) => return Err(unavailable(reference, &error.to_string())),
-        };
-        if let Ok(identity) = crate::issue::repository_identity(&self.cwd) {
-            let identity = identity.display().to_string();
-            if !keys.contains(&identity) {
-                keys.push(identity);
+        number(reference)
+    }
+
+    async fn issue(&self, reference: &WorkRef) -> Result<WorkItem, WorkTrackerError> {
+        let number = self.issue_number(reference)?;
+        let detail = self
+            .issues
+            .get(number)
+            .await
+            .map_err(|error| issue_error(reference, &error))?;
+        issue_item(reference, self.our_repository().as_deref(), detail)
+    }
+
+    async fn issue_status(&self, reference: &WorkRef) -> Result<WorkStatus, WorkTrackerError> {
+        let number = self.issue_number(reference)?;
+        let IssueStatus { state, blocked_by } = self
+            .issues
+            .status(number)
+            .await
+            .map_err(|error| issue_error(reference, &error))?;
+        let ours = self.our_repository();
+        Ok(WorkStatus {
+            reference: reference.clone(),
+            state: issue_state(state),
+            blocked_by: related_all(reference, ours.as_deref(), blocked_by)?,
+        })
+    }
+
+    /// The PR record `reference` names.
+    ///
+    /// A qualified `PR owner/repo#N` is read in each of the session's clones
+    /// of that repository, and in the working directory's repository when it
+    /// is that one. An unqualified one is read as `pr` reads it: in the
+    /// session's clones, or the working directory's repository when it has
+    /// none; a number several of them hold must be qualified.
+    async fn pull_request(&self, reference: &WorkRef) -> Result<PrRow, WorkTrackerError> {
+        let number = number(reference)?;
+        let clones = self
+            .repos
+            .clones()
+            .await
+            .map_err(|error| unavailable(reference, &error.to_string()))?;
+        let keys: Vec<String> = match reference.repository() {
+            Some(repository) => {
+                // Which GitHub repository each local clone, and the working
+                // directory, comes from is read from git, off the executor.
+                let local: Vec<(String, PathBuf)> = clones
+                    .iter()
+                    .filter(|clone| clone.local)
+                    .map(|clone| (clone.repo_key.clone(), PathBuf::from(&clone.source)))
+                    .collect();
+                let cwd = self.cwd.clone();
+                let (local, cwd) = blocking::unblock(move || {
+                    let local: Vec<(String, Option<String>)> = local
+                        .into_iter()
+                        .map(|(key, source)| (key, github_repository(&source)))
+                        .collect();
+                    let cwd = crate::repo_search::worktree_root(&cwd)
+                        .and_then(|worktree| github_repository(&worktree));
+                    (local, cwd)
+                })
+                .await;
+                let mut keys: Vec<String> = clones
+                    .iter()
+                    .filter(|clone| !clone.local && clone.repo_key.eq_ignore_ascii_case(repository))
+                    .map(|clone| clone.repo_key.clone())
+                    .chain(
+                        local
+                            .into_iter()
+                            .filter(|(_, github)| {
+                                github
+                                    .as_deref()
+                                    .is_some_and(|github| github.eq_ignore_ascii_case(repository))
+                            })
+                            .map(|(key, _)| key),
+                    )
+                    .collect();
+                // Uncloned, the working directory's PRs are recorded under
+                // the key its clone would get: the remote's or its identity.
+                if let Some(github) = cwd.filter(|github| github.eq_ignore_ascii_case(repository)) {
+                    keys.push(github);
+                    keys.push(self.cwd_identity(reference)?);
+                }
+                keys
             }
-        }
+            None if clones.is_empty() => vec![self.cwd_identity(reference)?],
+            None => clones.into_iter().map(|clone| clone.repo_key).collect(),
+        };
         let found =
             futures_util::future::join_all(keys.iter().map(|key| self.db.get_pr(key, number)))
                 .await;
-        let mut rows = Vec::new();
+        let mut rows: Vec<PrRow> = Vec::new();
         for row in found {
             match row {
-                Ok(Some(row)) => rows.push(row),
-                Ok(None) => {}
+                Ok(Some(row)) if !rows.iter().any(|known| known.id == row.id) => rows.push(row),
+                Ok(_) => {}
                 Err(error) => return Err(unavailable(reference, &error.to_string())),
             }
         }
-        match rows.as_slice() {
-            [] => Err(WorkTrackerError::NotFound(reference.clone())),
-            [row] => Ok(pr_item(reference, row)),
-            _ => Err(unavailable(
+        match <[PrRow; 1]>::try_from(rows) {
+            Ok([row]) => Ok(row),
+            Err(rows) if rows.is_empty() => Err(WorkTrackerError::NotFound(reference.clone())),
+            Err(_) => Err(unavailable(
                 reference,
-                "several of this session's repositories have a PR with that number",
+                "several of this session's repositories have a PR with that number; write it as PR owner/repo#N",
             )),
         }
+    }
+
+    /// The working directory's repository identity, the key `pr` records
+    /// its PRs under when it is cloned locally.
+    fn cwd_identity(&self, reference: &WorkRef) -> Result<String, WorkTrackerError> {
+        crate::issue::repository_identity(&self.cwd)
+            .map(|identity| identity.display().to_string())
+            .map_err(|error| unavailable(reference, &error.to_string()))
     }
 }
 
 impl aither_agent::WorkTracker for MayWorkTracker {
     async fn item(&self, reference: &WorkRef) -> Result<WorkItem, WorkTrackerError> {
-        let Ok(number) = i64::try_from(reference.number()) else {
-            return Err(WorkTrackerError::NotFound(reference.clone()));
-        };
         match reference.kind() {
-            WorkKind::Issue => self.issue(reference, number).await,
-            WorkKind::PullRequest => self.pull_request(reference, number).await,
+            WorkKind::Issue => self.issue(reference).await,
+            WorkKind::PullRequest => {
+                let row = self.pull_request(reference).await?;
+                Ok(WorkItem {
+                    reference: reference.clone(),
+                    title: row.title,
+                    state: pr_state(reference, &row.state)?,
+                    body: row.body,
+                    comments: Vec::new(),
+                    sub_issues: Vec::new(),
+                    blocked_by: Vec::new(),
+                })
+            }
         }
     }
+
+    async fn status(&self, reference: &WorkRef) -> Result<WorkStatus, WorkTrackerError> {
+        match reference.kind() {
+            WorkKind::Issue => self.issue_status(reference).await,
+            WorkKind::PullRequest => {
+                let row = self.pull_request(reference).await?;
+                Ok(WorkStatus {
+                    reference: reference.clone(),
+                    state: pr_state(reference, &row.state)?,
+                    blocked_by: Vec::new(),
+                })
+            }
+        }
+    }
+}
+
+/// `owner/repo` of the GitHub `origin` of the checkout at `dir`.
+fn github_repository(dir: &Path) -> Option<String> {
+    match crate::trust::repo_kind(dir) {
+        crate::trust::RepoKind::Github { owner_repo } => Some(owner_repo),
+        crate::trust::RepoKind::Git => None,
+    }
+}
+
+fn number(reference: &WorkRef) -> Result<i64, WorkTrackerError> {
+    i64::try_from(reference.number()).map_err(|_| WorkTrackerError::NotFound(reference.clone()))
 }
 
 fn unavailable(reference: &WorkRef, reason: &str) -> WorkTrackerError {
     WorkTrackerError::Unavailable {
         reference: reference.clone(),
         reason: reason.to_string(),
+    }
+}
+
+fn issue_error(reference: &WorkRef, error: &IssueError) -> WorkTrackerError {
+    match error {
+        IssueError::NotFound(_) => WorkTrackerError::NotFound(reference.clone()),
+        error => unavailable(reference, &error.to_string()),
     }
 }
 
@@ -128,21 +246,71 @@ const fn issue_state(state: IssueState) -> WorkState {
     }
 }
 
-/// A related issue, qualified like the reference it was reached from.
-fn related(reference: &WorkRef, issue: RelatedIssue) -> RelatedWork {
-    let mut related = WorkRef::issue(u64::try_from(issue.number).unwrap_or_default());
-    if let Some(repository) = reference.repository() {
-        related = related.in_repository(repository);
-    }
-    RelatedWork {
-        reference: related,
-        title: issue.title,
-        state: issue_state(issue.state),
+/// A PR record's state; one this tracker does not know is an error, never
+/// taken for open.
+fn pr_state(reference: &WorkRef, state: &str) -> Result<WorkState, WorkTrackerError> {
+    match state {
+        "open" | "checks_pending" | "failed" | "rejected" | "merging" => Ok(WorkState::Open),
+        "merged" => Ok(WorkState::Merged),
+        "closed" => Ok(WorkState::Closed),
+        other => Err(unavailable(
+            reference,
+            &format!("its PR record has the unknown state {other}"),
+        )),
     }
 }
 
-fn issue_item(reference: &WorkRef, detail: IssueDetail) -> WorkItem {
-    WorkItem {
+/// A related issue reached from `reference`. One in the issue store's own
+/// repository is written as `reference` is; one a GitHub relation takes into
+/// another repository is qualified by it.
+fn related(
+    reference: &WorkRef,
+    ours: Option<&str>,
+    issue: RelatedIssue,
+) -> Result<RelatedWork, WorkTrackerError> {
+    let number = u64::try_from(issue.number).map_err(|_| {
+        unavailable(
+            reference,
+            &format!(
+                "the backend relates it to issue number {}, which is no issue number",
+                issue.number
+            ),
+        )
+    })?;
+    let related = WorkRef::issue(number);
+    let related = match issue.repository {
+        Some(repository) if !ours.is_some_and(|ours| ours.eq_ignore_ascii_case(&repository)) => {
+            related.in_repository(repository)
+        }
+        _ => match reference.repository() {
+            Some(repository) => related.in_repository(repository),
+            None => related,
+        },
+    };
+    Ok(RelatedWork {
+        reference: related,
+        title: issue.title,
+        state: issue_state(issue.state),
+    })
+}
+
+fn related_all(
+    reference: &WorkRef,
+    ours: Option<&str>,
+    issues: Vec<RelatedIssue>,
+) -> Result<Vec<RelatedWork>, WorkTrackerError> {
+    issues
+        .into_iter()
+        .map(|issue| related(reference, ours, issue))
+        .collect()
+}
+
+fn issue_item(
+    reference: &WorkRef,
+    ours: Option<&str>,
+    detail: IssueDetail,
+) -> Result<WorkItem, WorkTrackerError> {
+    Ok(WorkItem {
         reference: reference.clone(),
         title: detail.title,
         state: issue_state(detail.state),
@@ -155,150 +323,11 @@ fn issue_item(reference: &WorkRef, detail: IssueDetail) -> WorkItem {
                 body: comment.body,
             })
             .collect(),
-        sub_issues: detail
-            .sub_issues
-            .into_iter()
-            .map(|issue| related(reference, issue))
-            .collect(),
-        blocked_by: detail
-            .blocked_by
-            .into_iter()
-            .map(|issue| related(reference, issue))
-            .collect(),
-    }
-}
-
-fn pr_item(reference: &WorkRef, row: &PrRow) -> WorkItem {
-    let state = match row.state.as_str() {
-        "merged" => WorkState::Merged,
-        "closed" => WorkState::Closed,
-        _ => WorkState::Open,
-    };
-    WorkItem {
-        reference: reference.clone(),
-        title: row.title.clone(),
-        state,
-        body: row.body.clone(),
-        comments: Vec::new(),
-        sub_issues: Vec::new(),
-        blocked_by: Vec::new(),
-    }
+        sub_issues: related_all(reference, ours, detail.sub_issues)?,
+        blocked_by: related_all(reference, ours, detail.blocked_by)?,
+    })
 }
 
 #[cfg(test)]
-mod tests {
-    use aither_agent::WorkTracker;
-
-    use super::*;
-    use crate::issue::{IssueRelationKind, MayIssueStore};
-
-    async fn tracker(dir: &std::path::Path) -> (MayWorkTracker, MayIssueStore, ChatDb) {
-        let db = ChatDb::open(&dir.join("history.db")).await.expect("db");
-        let repo = dir.join("repo");
-        std::fs::create_dir_all(&repo).expect("repo dir");
-        let identity = crate::issue::repository_identity(&repo)
-            .expect("identity")
-            .display()
-            .to_string();
-        let store = MayIssueStore::new(db.clone(), identity);
-        let tracker = MayWorkTracker::new(
-            ResolvedIssueStore::May(store.clone()),
-            db.clone(),
-            &dir.join("session"),
-            "session",
-            repo,
-        );
-        (tracker, store, db)
-    }
-
-    /// A may issue reads with its state, comments and both relation kinds.
-    #[tokio::test]
-    async fn a_may_issue_reads_in_full() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let (tracker, store, _db) = tracker(dir.path()).await;
-        let root = store.create("search", "the plan", &[]).await.expect("root");
-        let child = store.create("index", "", &[]).await.expect("child");
-        let blocker = store.create("schema", "", &[]).await.expect("blocker");
-        store
-            .edit_relation(root.number, IssueRelationKind::SubIssue, child.number, true)
-            .await
-            .expect("sub-issue");
-        store
-            .edit_relation(
-                root.number,
-                IssueRelationKind::BlockedBy,
-                blocker.number,
-                true,
-            )
-            .await
-            .expect("blocked by");
-        store
-            .comment(root.number, "decided: sqlite")
-            .await
-            .expect("comment");
-        store
-            .edit(blocker.number, None, None, Some(IssueState::Closed))
-            .await
-            .expect("close");
-
-        let reference = WorkRef::issue(u64::try_from(root.number).expect("number"));
-        let item = tracker.item(&reference).await.expect("root reads");
-        assert_eq!(item.title, "search");
-        assert_eq!(item.body, "the plan");
-        assert_eq!(item.state, WorkState::Open);
-        assert_eq!(item.comments[0].body, "decided: sqlite");
-        assert_eq!(item.sub_issues[0].title, "index");
-        assert_eq!(item.blocked_by[0].state, WorkState::Closed);
-        assert!(!item.is_blocked());
-
-        assert_eq!(
-            tracker.item(&WorkRef::issue(999)).await,
-            Err(WorkTrackerError::NotFound(WorkRef::issue(999)))
-        );
-        assert!(matches!(
-            tracker.item(&WorkRef::issue(1).in_repository("o/r")).await,
-            Err(WorkTrackerError::Unavailable { .. })
-        ));
-    }
-
-    /// A PR of the session's repository reads with its landing state.
-    #[tokio::test]
-    async fn a_pr_reads_its_state_from_its_record() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let (tracker, _store, db) = tracker(dir.path()).await;
-        let repo_key = crate::issue::repository_identity(&dir.path().join("repo"))
-            .expect("identity")
-            .display()
-            .to_string();
-        let pr = db
-            .create_pr(
-                &repo_key,
-                "session",
-                "land search",
-                "body",
-                "refs/may/pr/1",
-                "base",
-                "may",
-                false,
-                None,
-                None,
-            )
-            .await
-            .expect("pr");
-        let reference = WorkRef::pull_request(u64::try_from(pr.number).expect("number"));
-        assert_eq!(
-            tracker.item(&reference).await.expect("open").state,
-            WorkState::Open
-        );
-        db.update_pr(pr.id, "merged", Some("head"), Some("merge"), Some("now"))
-            .await
-            .expect("merge");
-        let item = tracker.item(&reference).await.expect("merged");
-        assert_eq!(item.state, WorkState::Merged);
-        assert_eq!(item.title, "land search");
-        assert_eq!(
-            tracker.item(&WorkRef::pull_request(77)).await,
-            Err(WorkTrackerError::NotFound(WorkRef::pull_request(77)))
-        );
-    }
-}
+#[path = "work_tracker_tests.rs"]
+mod tests;

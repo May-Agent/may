@@ -70,6 +70,15 @@ impl IssueStore for MayIssueStore {
             .ok_or(IssueError::NotFound(number))
     }
 
+    /// One local read of the issue: the database holds no cheaper view.
+    async fn status(&self, number: i64) -> Result<super::IssueStatus, IssueError> {
+        let detail = self.get(number).await?;
+        Ok(super::IssueStatus {
+            state: detail.state,
+            blocked_by: detail.blocked_by,
+        })
+    }
+
     async fn list(
         &self,
         state: IssueListState,
