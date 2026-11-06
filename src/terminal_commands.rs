@@ -290,6 +290,11 @@ where
         cwd: config.cwd.clone(),
         session_root: config.sandbox_dir.clone(),
         workspace_config: config.workspace_config.clone(),
+        db: config.db.clone(),
+        session_id: config.session_id.clone(),
+        scratch_root: crate::session::MayHomePaths::new(config.may_dir.clone()).repo_staging_dir(),
+        host: config.git.clone(),
+        host_paths: !matches!(config.task_runtime, TaskRuntimeKind::Container),
     };
     let repo_tool = RepoTool::new(repo_context.clone());
     let subagent_repo_tool = SubagentRepoTool::new(repo_context);
