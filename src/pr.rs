@@ -385,7 +385,10 @@ impl PrStore {
     /// the retry path after a rejection.
     ///
     /// # Errors
-    /// Fails on ownership, state, checks, or a rejected merge.
+    /// Fails on ownership, state, a dirty clone, checks, or a rejected merge.
+    ///
+    /// # Panics
+    /// Never: the merge report renders for every input.
     pub async fn merge(&self, number: i64, repo: Option<&str>) -> Result<String, PrError> {
         let resolved = self.resolve(repo).await?;
         let pr = self
@@ -403,6 +406,12 @@ impl PrStore {
                 return Err(PrError::State(format!("PR #{number} is {}", pr.state)));
             }
             _ => {}
+        }
+        // Merging deletes the clone: work it holds outside a commit would
+        // go with it, so it refuses and names the files.
+        let dirty = uncommitted_changes(&self.sandbox, &resolved.dir).await?;
+        if !dirty.is_empty() {
+            return Err(PrError::DirtyClone(dirty.join(", ")));
         }
         // The commit the PR pinned when it was opened or last updated; the
         // clone may have moved on, and what lands is exactly this one.
@@ -454,8 +463,16 @@ impl PrStore {
                     )
                     .await?;
                 self.event(&pr, "merged", Some(&merge_sha)).await;
-                let note = self.retire_clone(&resolved, &head_sha).await?;
-                Ok(format!("merged PR #{number} as {merge_sha}{note}"))
+                let clone = self.retire_clone(&resolved, &head_sha).await?;
+                Ok(PrMerged {
+                    number,
+                    merge_sha: Some(&merge_sha),
+                    clone_dir: resolved.record.dir.as_str(),
+                    clone,
+                    remote_branch: RemoteBranch::Local,
+                }
+                .render()
+                .expect("the merge result renders"))
             }
             Err(reason) => {
                 self.db()?
@@ -873,8 +890,17 @@ impl PrStore {
                     .await?;
                 self.event(pr, "merged", Some(head_sha)).await;
                 self.pull_sync(&owner_repo).await;
-                let note = self.retire_clone(resolved, head_sha).await?;
-                Ok(format!("merged PR #{} upstream{note}", pr.number))
+                let clone = self.retire_clone(resolved, head_sha).await?;
+                let remote_branch = self.delete_remote_branch(&owner_repo, &pr.branch).await;
+                Ok(PrMerged {
+                    number: pr.number,
+                    merge_sha: None,
+                    clone_dir: resolved.record.dir.as_str(),
+                    clone,
+                    remote_branch,
+                }
+                .render()
+                .expect("the merge result renders"))
             }
             Ok(other) => {
                 self.db()?
@@ -911,6 +937,40 @@ impl PrStore {
             other => PrError::Gh(format!("close PR #{external}: {other}")),
         })?;
         Ok(())
+    }
+
+    /// Delete a merged PR's `may/*` branch on GitHub. A branch already gone
+    /// (the repository deletes head branches on merge) counts as deleted;
+    /// any other failure is reported, since the merge itself has landed.
+    async fn delete_remote_branch(&self, owner_repo: &str, branch: &str) -> RemoteBranch {
+        if !branch.starts_with("may/") {
+            return RemoteBranch::NotDeleted(
+                branch.to_string(),
+                "only may/* branches are the session's to delete".to_string(),
+            );
+        }
+        let api = &self.context.github_api;
+        let url = format!(
+            "{}/repos/{owner_repo}/git/refs/heads/{branch}",
+            api.api_base()
+        );
+        match api
+            .request_unchecked(zenwave::Method::DELETE, url, None)
+            .await
+        {
+            // 404 and 422 ("Reference does not exist"): already deleted.
+            Ok(response) if response.status().is_success() => {
+                RemoteBranch::Deleted(branch.to_string())
+            }
+            Ok(response) if matches!(response.status().as_u16(), 404 | 422) => {
+                RemoteBranch::Deleted(branch.to_string())
+            }
+            Ok(response) => RemoteBranch::NotDeleted(
+                branch.to_string(),
+                format!("GitHub answered {}", response.status()),
+            ),
+            Err(error) => RemoteBranch::NotDeleted(branch.to_string(), error.to_string()),
+        }
     }
 
     /// Best-effort `git pull --ff-only` on the cwd's checkout when it
@@ -1081,16 +1141,16 @@ impl PrStore {
 
     /// After landing, delete the clone when it holds exactly the landed
     /// work; otherwise keep it and say so, so nothing newer is lost.
-    async fn retire_clone(&self, resolved: &Resolved, landed: &str) -> Result<String, PrError> {
+    async fn retire_clone(&self, resolved: &Resolved, landed: &str) -> Result<CloneFate, PrError> {
         let clean = uncommitted_changes(&self.sandbox, &resolved.dir)
             .await?
             .is_empty();
         let same = self.head_sha(resolved).await? == landed;
         if clean && same {
             self.repos()?.delete_clone(&resolved.record.dir).await?;
-            Ok(String::new())
+            Ok(CloneFate::Deleted)
         } else {
-            Ok(" (the clone was kept: it holds other work)".to_string())
+            Ok(CloneFate::Kept)
         }
     }
 
@@ -1357,6 +1417,39 @@ impl std::fmt::Display for ShellWord {
 struct PrBody<'a> {
     subjects: &'a [String],
     github_issue: Option<i64>,
+}
+
+/// What `pr merge` reports once a PR has landed: where it landed, and what
+/// became of the session clone and of the PR's remote branch.
+#[derive(Template)]
+#[template(path = "pr_merged.txt", escape = "none")]
+struct PrMerged<'a> {
+    number: i64,
+    /// The merge commit in the checkout; `None` for a PR merged upstream.
+    merge_sha: Option<&'a str>,
+    clone_dir: &'a str,
+    clone: CloneFate,
+    remote_branch: RemoteBranch,
+}
+
+/// What became of the session clone a PR landed from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloneFate {
+    /// It held exactly the landed work and was deleted.
+    Deleted,
+    /// It holds work the PR did not land and was kept.
+    Kept,
+}
+
+/// What became of a merged PR's branch on the remote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RemoteBranch {
+    /// A local PR has no remote branch.
+    Local,
+    /// The branch is gone from the remote.
+    Deleted(String),
+    /// The branch could not be deleted, and why.
+    NotDeleted(String, String),
 }
 
 /// The title and body of a PR: the given title, else the first commit's
@@ -2711,6 +2804,126 @@ mod tests {
         assert!(
             !fx.checkout.join("work.txt").exists(),
             "a failed check lands nothing"
+        );
+    }
+
+    /// Merging deletes the clone, so a clone with uncommitted changes or
+    /// untracked files refuses to merge and names them; once they are gone
+    /// the merge lands and the clone with it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dirty_clone_refuses_to_merge_and_lists_the_files() {
+        let fx = Fixture::new().await;
+        let (store, clone) = fx.store("s1", None).await;
+        commit_file(&clone, "work.txt");
+        store.open(None, Some("work"), None, true).await.unwrap();
+        std::fs::write(clone.join("work.txt"), "edited").unwrap();
+        std::fs::write(clone.join("notes.txt"), "scratch").unwrap();
+
+        let err = store.merge(1, None).await.unwrap_err();
+
+        assert!(matches!(err, super::PrError::DirtyClone(_)), "{err}");
+        let message = err.to_string();
+        assert!(
+            message.contains("work.txt") && message.contains("notes.txt"),
+            "{message}"
+        );
+        assert!(!fx.checkout.join("work.txt").exists(), "nothing landed");
+        assert!(clone.join("notes.txt").exists(), "nothing was deleted");
+        let key = fx.repo_key.to_str().unwrap();
+        assert_eq!(fx.db.get_pr(key, 1).await.unwrap().unwrap().state, "open");
+
+        git(Some(&clone), &["checkout", "--", "work.txt"]).unwrap();
+        std::fs::remove_file(clone.join("notes.txt")).unwrap();
+        let landed = store.merge(1, None).await.unwrap();
+
+        assert!(landed.starts_with("merged PR #1 as "), "{landed}");
+        assert!(landed.contains("was deleted"), "{landed}");
+        assert!(fx.checkout.join("work.txt").exists());
+        assert!(!clone.exists());
+        assert!(fx.db.list_repo_clones("s1").await.unwrap().is_empty());
+    }
+
+    /// A merged PR's `may/*` branch is deleted through the API; one the
+    /// repository already deleted counts as deleted, any other failure is
+    /// reported, and a branch outside `may/*` is never touched.
+    #[tokio::test]
+    async fn a_merged_prs_remote_branch_is_deleted() {
+        for (status, expected) in [
+            (204, super::RemoteBranch::Deleted("may/s".to_string())),
+            (422, super::RemoteBranch::Deleted("may/s".to_string())),
+            (
+                500,
+                super::RemoteBranch::NotDeleted(
+                    "may/s".to_string(),
+                    "GitHub answered 500 Internal Server Error".to_string(),
+                ),
+            ),
+        ] {
+            let fx = Fixture::new().await;
+            let (base, requests) = mock_api(status).await;
+            let store = fx.github_store("s1", &base, "merged").await;
+
+            assert_eq!(store.delete_remote_branch("o/r", "may/s").await, expected);
+            assert_eq!(
+                requests.lock().unwrap().clone(),
+                vec![(
+                    "DELETE".to_string(),
+                    "/repos/o/r/git/refs/heads/may/s".to_string(),
+                    "Bearer test-token".to_string(),
+                    String::new(),
+                )]
+            );
+
+            let refused = store.delete_remote_branch("o/r", "main").await;
+            assert!(
+                matches!(refused, super::RemoteBranch::NotDeleted(ref b, _) if b == "main"),
+                "{refused:?}"
+            );
+            assert_eq!(requests.lock().unwrap().len(), 1);
+        }
+    }
+
+    /// What `pr merge` reports of the clone and the remote branch.
+    #[test]
+    fn the_merge_report_says_what_was_deleted() {
+        use askama::Template as _;
+        let render = |merge_sha, clone, remote_branch| {
+            super::PrMerged {
+                number: 3,
+                merge_sha,
+                clone_dir: "r-1a2b3c4d",
+                clone,
+                remote_branch,
+            }
+            .render()
+            .unwrap()
+        };
+        assert_eq!(
+            render(
+                Some("abc"),
+                super::CloneFate::Deleted,
+                super::RemoteBranch::Local
+            ),
+            "merged PR #3 as abc\nThe session clone repos/r-1a2b3c4d was deleted, ignored files \
+             included; the next `repo clone` or `pr open` for this repository clones it again at \
+             the new HEAD.\n"
+        );
+        assert_eq!(
+            render(
+                None,
+                super::CloneFate::Kept,
+                super::RemoteBranch::NotDeleted("may/s".to_string(), "boom".to_string())
+            ),
+            "merged PR #3 upstream\nThe session clone repos/r-1a2b3c4d was kept: it holds commits \
+             or changes this PR did not land.\nThe remote branch may/s was not deleted: boom\n"
+        );
+        assert!(
+            render(
+                None,
+                super::CloneFate::Deleted,
+                super::RemoteBranch::Deleted("may/s".to_string())
+            )
+            .ends_with("The remote branch may/s was deleted.\n")
         );
     }
 }
