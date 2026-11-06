@@ -905,7 +905,8 @@ mod tests {
         let relay = providers.get("relay").expect("provider survives a save");
         assert_eq!(relay.api, Some(crate::config::ProviderApi::Responses));
         assert!(relay.native_tools.web_search);
-        relay.validate("relay")
+        relay
+            .validate("relay")
             .expect("the saved provider stays valid");
     }
 
