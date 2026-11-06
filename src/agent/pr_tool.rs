@@ -25,6 +25,13 @@ use crate::repo_clone::CloneSandbox;
 /// - `pr adopt <n> [--repo key]` — take over a PR whose session is gone
 ///   (or still another's) so this session may merge or close it
 ///
+/// Run inside a session clone, `pr` acts on that clone's repository;
+/// elsewhere `--repo` names it, else the session's only clone is meant.
+/// Merging deletes the clone, ignored files included: `merge` refuses while
+/// it holds uncommitted changes or untracked files that are not ignored,
+/// and lists them. Keep what must survive committed, or under `artifacts/`,
+/// `outputs/`, `data/` or `tmp/`.
+///
 /// Writes are bound to this session's own PRs; reads are open.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(tag = "action", rename_all = "snake_case")]
@@ -160,6 +167,19 @@ impl PrArgs {
             Self::List { .. } | Self::Show { .. } => None,
         }
     }
+
+    /// The repository the call names.
+    const fn repo_mut(&mut self) -> &mut Option<String> {
+        match self {
+            Self::Open { repo, .. }
+            | Self::Update { repo, .. }
+            | Self::Merge { repo, .. }
+            | Self::List { repo, .. }
+            | Self::Show { repo, .. }
+            | Self::Adopt { repo, .. }
+            | Self::Close { repo, .. } => repo,
+        }
+    }
 }
 
 impl Tool for PrTool {
@@ -172,13 +192,23 @@ impl Tool for PrTool {
 
     async fn call(
         &self,
-        args: Self::Arguments,
-        _cx: aither_core::llm::ToolContext,
+        mut args: Self::Arguments,
+        cx: aither_core::llm::ToolContext,
     ) -> aither_core::Result<Self::Res> {
         if self.role == CommandRole::Subagent
             && let Some(action) = args.write_action()
         {
             return Ok(ToolResult::text(PrError::MainAgentOnly(action).to_string()));
+        }
+        // A call made inside a session clone means that clone's repository.
+        let repo = args.repo_mut();
+        if repo.is_none()
+            && let Some(dir) = cx.working_dir()
+        {
+            match self.store.clone_containing(std::path::Path::new(dir)).await {
+                Ok(found) => *repo = found,
+                Err(error) => return Ok(ToolResult::text(error.to_string())),
+            }
         }
         if let (
             Some(guard),
@@ -299,5 +329,104 @@ mod tests {
                 "{refused}"
             );
         }
+    }
+
+    /// One session clones two repositories with `repo clone`, commits in
+    /// each, and lands a PR in each with `pr open` run inside its clone:
+    /// each checkout changes only when its own PR lands, and each merge
+    /// deletes only its own clone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_lands_a_pr_in_each_of_two_repositories() {
+        use crate::agent::repo_tool::{RepoArgs, RepoTool, tests::context};
+        use crate::commit_signing::test_user::TestUser;
+        use std::path::Path;
+
+        let git = |dir: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        let at = |dir: &Path| ToolContext::new().with_working_dir(dir.to_string_lossy());
+        let tmp = tempfile::tempdir().unwrap();
+        let tmp = dunce::canonicalize(tmp.path()).unwrap();
+        let user = TestUser::new(&tmp.join("user"));
+        let checkouts = [tmp.join("aither"), tmp.join("may")];
+        for checkout in &checkouts {
+            std::fs::create_dir_all(checkout).unwrap();
+            git(checkout, &["init", "-q", "-b", "main"]);
+            user.identify(checkout);
+            std::fs::write(checkout.join("README"), "base").unwrap();
+            git(checkout, &["add", "."]);
+            git(checkout, &["commit", "-q", "-m", "init"]);
+        }
+        let session_root = tmp.join("profile/sessions/s1");
+        let repo_context = context(&checkouts[1], &session_root, &tmp).await;
+        let db = repo_context.db.clone();
+        let repo = RepoTool::new(repo_context);
+        let terminal = TestTerminal::new(&session_root).await;
+        let pr = PrTool {
+            store: PrStore::new(
+                PrContext {
+                    db: Some(db.clone()),
+                    session_id: "s1".to_string(),
+                    session_root: session_root.clone(),
+                    scratch_root: tmp.join("staging"),
+                    cwd: checkouts[1].clone(),
+                    workspace_config: crate::workspace::WorkspaceConfig::default(),
+                    screen: None,
+                    signing: user.signing(&tmp.join("may-home"), "s1"),
+                    github_api: PrContext::default_github_api(),
+                },
+                terminal.sandbox(),
+            ),
+            languages: None,
+            role: CommandRole::Main,
+        };
+
+        let mut work = Vec::new();
+        for (checkout, file) in checkouts.iter().zip(["aither.txt", "may.txt"]) {
+            let trust = RepoArgs::Trust {
+                set: Some("local-branch".to_string()),
+            };
+            repo.call(trust, at(checkout)).await.unwrap();
+            let report = repo
+                .call(RepoArgs::Clone { path: None }, at(checkout))
+                .await
+                .unwrap();
+            let report = report.as_text().unwrap();
+            let clone = Path::new(report.split(' ').next().unwrap()).to_path_buf();
+            assert!(clone.starts_with(session_root.join("repos")), "{report}");
+            user.identify(&clone);
+            std::fs::write(clone.join(file), file).unwrap();
+            git(&clone, &["add", "."]);
+            git(&clone, &["commit", "-q", "-m", file]);
+            work.push((clone, file));
+        }
+        assert_eq!(db.list_repo_clones("s1").await.unwrap().len(), 2);
+        for (checkout, (_, file)) in checkouts.iter().zip(&work) {
+            assert!(!checkout.join(file).exists(), "edits stay in the clone");
+        }
+
+        for (index, (clone, file)) in work.iter().enumerate() {
+            let open = PrArgs::Open {
+                title: None,
+                hold: false,
+                issue: None,
+                repo: None,
+            };
+            let landed = text(&pr.call(open, at(clone)).await.unwrap());
+            assert!(landed.contains("merged PR #1 as "), "{landed}");
+            assert!(checkouts[index].join(file).exists(), "{landed}");
+            assert!(!clone.exists(), "the merge deletes its own clone");
+            for (other, (other_clone, other_file)) in checkouts.iter().zip(&work).skip(index + 1) {
+                assert!(other_clone.exists(), "another repository's clone stays");
+                assert!(!other.join(other_file).exists(), "nor does it land");
+            }
+        }
+        assert!(db.list_repo_clones("s1").await.unwrap().is_empty());
     }
 }
