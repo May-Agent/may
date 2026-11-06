@@ -1295,6 +1295,11 @@ impl MayAgent {
         self.inner.clear_history();
     }
 
+    /// Tells the agent the user's sleep state changed; one alert per change.
+    pub(crate) fn tell_sleep_notice(&mut self, notice: crate::sleep::SleepNotice) {
+        RuntimeSystemContext::push_sleep_notice(self.inner.context_mut(), notice);
+    }
+
     pub(crate) async fn sync_runtime_context(&mut self) {
         self.runtime_system_context
             .sync_memory_content(self.inner.context_mut())

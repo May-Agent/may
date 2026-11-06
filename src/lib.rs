@@ -91,6 +91,8 @@ pub mod secrets;
 pub mod session;
 /// Agent skill discovery and management.
 pub mod skill;
+/// The user's global sleep state.
+pub mod sleep;
 /// Startup validation of configuration files.
 pub mod startup;
 /// Scheduled-task trigger definitions.
