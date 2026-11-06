@@ -212,16 +212,25 @@ where
         RepoSearchCollections::new(RepoSearch::global(&config.may_dir)),
     );
     let provenance = IssueProvenance::new(config.db.clone(), config.session_id.clone());
-    let mut issue_tool = IssueTool::new(config.issue_store.clone(), provenance.clone())
+    let issue_tool = IssueTool::new(config.issue_store.clone(), provenance.clone())
         .with_search(issue_search.clone());
+    let issue_targets = || {
+        crate::issue::target::IssueTargets::new(
+            config.db.clone(),
+            config.cwd.clone(),
+            crate::issue::github::GitHubRest::new(crate::issue::GhCliTokenSource),
+        )
+    };
+    let mut issue_tool = issue_tool.with_targets(issue_targets());
     if let Some(guard) = &config.languages {
         issue_tool = issue_tool.with_languages(guard.clone());
     }
     if let Some(runtime) = config.ask_user.clone() {
         issue_tool = issue_tool.with_changes(IssueChangeNotifier::new(runtime));
     }
-    let mut subagent_issue_tool =
-        SubagentIssueTool::new(config.issue_store, provenance).with_search(issue_search);
+    let mut subagent_issue_tool = SubagentIssueTool::new(config.issue_store, provenance)
+        .with_search(issue_search)
+        .with_targets(issue_targets());
     if let Some(messaging) = &config.agent_messaging {
         let owners = crate::issue::owner::IssueOwners::new(messaging.directory.clone());
         issue_tool = issue_tool.with_owners(owners.clone());
