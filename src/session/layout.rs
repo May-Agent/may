@@ -57,6 +57,12 @@ impl MayHomePaths {
         self.root.join("skills")
     }
 
+    /// Global rules file loaded into every session's context.
+    #[must_use]
+    pub fn global_agents_md(&self) -> PathBuf {
+        self.root.join("AGENTS.md")
+    }
+
     /// Global memories directory shared by every session.
     #[must_use]
     pub fn memories_dir(&self) -> PathBuf {
