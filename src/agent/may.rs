@@ -252,6 +252,9 @@ pub struct MayAgentConfig {
     /// Keychain secrets snapshot: injected into the session env file and
     /// listed by name in the terminal runtime context.
     pub secrets: crate::secrets::Secrets,
+    /// The rules this session imports, for a session `/import-claude` or
+    /// `/import-codex` opened.
+    pub rules_import: Option<crate::rules_import::RulesImport>,
 }
 
 /// Session-scoped inputs for [`MayAgent::from_config_with_model_and_permissions`].
@@ -324,6 +327,9 @@ pub struct MayAgentSessionInput<'a> {
     pub background_jobs: aither_agent::BackgroundJobPolicy,
     /// The daemon's connectivity source.
     pub connectivity: aither_connectivity::Connectivity,
+    /// The rules this session imports, for a session `/import-claude` or
+    /// `/import-codex` opened.
+    pub rules_import: Option<crate::rules_import::RulesImport>,
 }
 
 type MayAgentInner = Agent<ProviderLlm, ProviderLlm, ProviderLlm, MayHooks>;
@@ -740,6 +746,7 @@ impl MayAgent {
                 git: crate::host_git::HostGit::inherit(),
                 #[cfg(target_os = "macos")]
                 computer: config.computer.clone(),
+                rules_import: config.rules_import.clone(),
             },
         ))
         .await?;
@@ -882,6 +889,7 @@ impl MayAgent {
             subagents,
             background_jobs,
             connectivity,
+            rules_import,
         } = input;
         let selector = super::provider::parse_model_selector(model)?;
         let redactor = crate::secrets::SecretRedactor::for_session(&may_dir, session_id.as_str());
@@ -984,6 +992,7 @@ impl MayAgent {
             request_parameters,
             prompt_cache_epoch,
             db,
+            rules_import,
         })
     }
 

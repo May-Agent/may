@@ -3208,6 +3208,12 @@ impl App {
                 self.open_resume_picker();
                 None
             }
+            "/import-claude" => Some(SendAction::RulesImport(
+                crate::session::import::ForeignAgent::Claude,
+            )),
+            "/import-codex" => Some(SendAction::RulesImport(
+                crate::session::import::ForeignAgent::Codex,
+            )),
             "/connect" => {
                 self.open_connect_picker();
                 None
@@ -3534,6 +3540,16 @@ impl App {
                 return Some(SendAction::Compact(None));
             }
             return Some(SendAction::Compact(Some(focus.to_string())));
+        }
+        if attachments.is_empty()
+            && let Some(source) = [
+                crate::session::import::ForeignAgent::Claude,
+                crate::session::import::ForeignAgent::Codex,
+            ]
+            .into_iter()
+            .find(|source| trimmed == source.rules_command())
+        {
+            return Some(SendAction::RulesImport(source));
         }
         for (cmd, source) in [
             ("/resume-codex", crate::session::import::ForeignAgent::Codex),
@@ -4380,6 +4396,9 @@ pub enum SendAction {
         /// Directory name of the skill to delete.
         dir_name: String,
     },
+    /// Import a Codex/Claude agent's global rules and skills: copy the
+    /// skills and open the session that rewrites the rules.
+    RulesImport(crate::session::import::ForeignAgent),
     /// Import a Codex/Claude transcript into a new session.
     ResumeImport {
         /// Which agent's transcript to parse.

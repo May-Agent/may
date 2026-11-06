@@ -15,7 +15,7 @@ use jiff::Timestamp;
 use super::{ChatMessage, MessageRole};
 
 /// The foreign agent whose transcript is being imported.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ForeignAgent {
     /// `~/.codex/sessions/**/rollout-*.jsonl`.
     Codex,
@@ -39,6 +39,50 @@ impl ForeignAgent {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+        }
+    }
+
+    /// The source named by [`Self::label`].
+    #[must_use]
+    pub fn from_label(label: &str) -> Option<Self> {
+        [Self::Codex, Self::Claude]
+            .into_iter()
+            .find(|agent| agent.label() == label)
+    }
+
+    /// Slash command that imports this agent's global rules and skills.
+    #[must_use]
+    pub const fn rules_command(&self) -> &'static str {
+        match self {
+            Self::Codex => "/import-codex",
+            Self::Claude => "/import-claude",
+        }
+    }
+
+    /// The agent's product name, as the user knows it.
+    #[must_use]
+    pub const fn product_name(&self) -> &'static str {
+        match self {
+            Self::Codex => "Codex",
+            Self::Claude => "Claude Code",
+        }
+    }
+
+    /// The agent's global rules file under the user's home `home`.
+    #[must_use]
+    pub fn rules_file(&self, home: &Path) -> PathBuf {
+        match self {
+            Self::Codex => home.join(".codex/AGENTS.md"),
+            Self::Claude => home.join(".claude/CLAUDE.md"),
+        }
+    }
+
+    /// The agent's skills directory under the user's home `home`.
+    #[must_use]
+    pub fn skills_dir(&self, home: &Path) -> PathBuf {
+        match self {
+            Self::Codex => home.join(".codex/skills"),
+            Self::Claude => home.join(".claude/skills"),
         }
     }
 }

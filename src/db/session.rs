@@ -126,6 +126,27 @@ impl ChatDb {
         Ok(())
     }
 
+    /// Marks `id` as the session importing `source`'s global rules (its
+    /// [`crate::session::import::ForeignAgent::label`]).
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] when the update fails.
+    pub async fn set_session_rules_import(
+        &self,
+        id: &str,
+        source: crate::session::import::ForeignAgent,
+    ) -> Result<(), ChatDbError> {
+        query!(
+            self.db,
+            "UPDATE sessions SET rules_import = ? WHERE id = ?",
+            source.label(),
+            id
+        )
+        .execute()
+        .await?;
+        Ok(())
+    }
+
     /// Marks `id` as a session nobody answers prompts for.
     ///
     /// # Errors

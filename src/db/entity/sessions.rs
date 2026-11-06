@@ -42,4 +42,8 @@ pub struct Model {
     /// one-shot run): permission requests are refused instead of asked.
     #[serde(default)]
     pub non_interactive: bool,
+    /// The agent whose global rules this session imports (`claude` or
+    /// `codex`), for a session `/import-claude` or `/import-codex` opened.
+    #[serde(default)]
+    pub rules_import: Option<String>,
 }
