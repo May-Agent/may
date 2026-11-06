@@ -2,10 +2,12 @@
 //!
 //! Single global database at `~/.may/history.db` containing all sessions and messages.
 
+mod cache_misses;
 mod common;
 mod context_snapshot;
 pub mod entity;
 mod issue;
+mod issue_provenance;
 mod issue_search;
 mod logs;
 mod memory;
@@ -14,9 +16,11 @@ mod notification;
 mod open_questions;
 mod pr;
 mod profile;
+mod repo_clone;
 mod repo_usage;
 mod search_outbox;
 mod session;
+mod session_intervals;
 mod session_run;
 mod sql;
 mod task;
@@ -24,10 +28,12 @@ mod task;
 use std::path::Path;
 
 use skyzen_services::Db as SkyDb;
+use skyzen_services::sql::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 
 use crate::PermissionHistoryMode;
 use sql as db_sql;
 
+pub use cache_misses::PromptCacheRequest;
 pub use common::{
     AssistantCacheUsageSummary, ChatDbError, ContextDebugSnapshot, ContextDebugSnapshotMessage,
     CreateProfileParams, CreateScheduledTaskParams, MessageStatsParams, NetworkAccessLogParams,
@@ -36,12 +42,15 @@ pub use common::{
     StoredSessionContextSnapshot, TranscriptEntry, UpdateProfileParams, UpdateScheduledTaskParams,
 };
 pub use context_snapshot::ContextDebugSnapshotWrite;
+pub use issue_provenance::{IssueProvenanceRecord, NewIssueProvenance, UserMessageAt};
 pub use issue_search::IssueSearchDoc;
 pub use message::MessageMeta;
 pub use open_questions::{CommittedAskUserAnswer, PendingAskUserQuestion};
 pub use pr::{PrEventRow, PrRow};
+pub use repo_clone::RepoCloneRow;
 pub use repo_usage::RepoUsage;
 pub use search_outbox::{IndexedMessageRow, SearchOutboxEntry};
+pub use session_intervals::SessionIntervals;
 pub use session_run::RunFence;
 
 use common::{
@@ -62,9 +71,23 @@ pub(super) use query;
 #[derive(Debug, Clone)]
 pub struct ChatDb {
     pub(super) db: SkyDb,
+    /// Test seam: suspends a run claim or finish at its await.
+    #[cfg(test)]
+    pub(crate) run_gates: session_run::RunGates,
 }
 
 impl ChatDb {
+    /// Connect to the history database file, creating it when missing. The
+    /// file is in WAL mode, so [`SkyDb`] serves reads on read-only connections
+    /// while its one writer connection queues writes.
+    pub(super) async fn connect(db_path: &Path) -> Result<SkyDb, ChatDbError> {
+        let options = SqliteConnectOptions::new()
+            .filename(db_path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal);
+        Ok(SkyDb::connect_sqlite_with(options).await?)
+    }
+
     /// Open (or create) the chat history database at the given path.
     ///
     /// Creates the current schema if the tables don't exist.
@@ -74,22 +97,28 @@ impl ChatDb {
     /// Returns [`ChatDbError`] when connecting to the SQLite database or creating
     /// the schema fails.
     pub async fn open(db_path: &Path) -> Result<Self, ChatDbError> {
-        let url = format!("sqlite://{}?mode=rwc", db_path.display());
-        let db = SkyDb::connect_sqlite(&url).await?;
+        let db = Self::connect(db_path).await?;
         Self::initialize_schema(&db).await?;
         Self::ensure_profile_preference_columns(&db).await?;
         Self::ensure_session_columns(&db).await?;
         Self::ensure_message_columns(&db).await?;
         Self::ensure_ask_user_blocking_column(&db).await?;
+        Self::ensure_ask_user_secret_columns(&db).await?;
         Self::ensure_pending_permission_agent_id_column(&db).await?;
         Self::ensure_scheduled_task_columns(&db).await?;
         Self::ensure_session_context_snapshot_table(&db).await?;
         Self::ensure_pending_message_claim_columns(&db).await?;
         Self::ensure_session_run_layout(&db).await?;
+        Self::drop_legacy_pending_tables(&db).await?;
         Self::migrate_legacy_remote_profiles(&db).await?;
         Self::migrate_removed_waiting_terminal_input(&db).await?;
         Self::ensure_search_outbox(&db).await?;
-        Ok(Self { db })
+        Self::ensure_session_interval_triggers(&db).await?;
+        Ok(Self {
+            db,
+            #[cfg(test)]
+            run_gates: session_run::RunGates::default(),
+        })
     }
 
     /// Run `sql` as given, so a test can break the storage a commit needs.
@@ -154,6 +183,24 @@ impl ChatDb {
         Ok(())
     }
 
+    async fn ensure_ask_user_secret_columns(db: &SkyDb) -> Result<(), ChatDbError> {
+        let columns = query!(
+            db,
+            "PRAGMA table_info(session_pending_ask_user_questions_v2)"
+        )
+        .fetch_all::<SqliteTableInfoRow>()
+        .await?;
+        for column in ["secret_name", "secret_scope"] {
+            if !columns.iter().any(|existing| existing.name == column) {
+                let sql = format!(
+                    "ALTER TABLE session_pending_ask_user_questions_v2 ADD COLUMN {column} TEXT"
+                );
+                query!(db, sql.as_str()).execute().await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn ensure_pending_permission_agent_id_column(db: &SkyDb) -> Result<(), ChatDbError> {
         let columns = query!(
             db,
@@ -186,6 +233,43 @@ impl ChatDb {
             )
             .execute()
             .await?;
+        }
+        for column in ["webhook_signature_secret", "webhook_signature_header"] {
+            if !columns.iter().any(|existing| existing.name == column) {
+                let sql = format!("ALTER TABLE scheduled_tasks ADD COLUMN {column} TEXT");
+                query!(db, sql.as_str()).execute().await?;
+            }
+        }
+        Self::remint_weak_webhook_tokens(db).await
+    }
+
+    /// Webhook tokens minted before they were 256-bit random secrets are
+    /// replaced, so no weak token is accepted; the new path shows in the task.
+    async fn remint_weak_webhook_tokens(db: &SkyDb) -> Result<(), ChatDbError> {
+        let tasks = query!(
+            db,
+            "SELECT * FROM scheduled_tasks WHERE trigger_kind = ?",
+            crate::task_trigger::TRIGGER_KIND_WEBHOOK
+        )
+        .fetch_all::<entity::scheduled_tasks::Model>()
+        .await?;
+        for task in tasks {
+            if crate::task_trigger::is_strong_webhook_token(&task.trigger_type) {
+                continue;
+            }
+            let token = crate::task_trigger::new_webhook_token();
+            query!(
+                db,
+                "UPDATE scheduled_tasks SET trigger_type = ? WHERE id = ?",
+                token,
+                task.id.clone()
+            )
+            .execute()
+            .await?;
+            tracing::warn!(
+                task_id = %task.id,
+                "re-minted a weak webhook token; the task's webhook path changed"
+            );
         }
         Ok(())
     }
@@ -349,6 +433,17 @@ impl ChatDb {
         Ok(())
     }
 
+    /// Tables an older build created and the current one never reads. Their
+    /// foreign keys onto `sessions` block deleting a session, and their rows
+    /// were never carried into the tables that replaced them
+    /// (`session_pending_message_entries`, `session_pending_ask_user_*_v2`).
+    async fn drop_legacy_pending_tables(db: &SkyDb) -> Result<(), ChatDbError> {
+        for statement in db_sql::statements(db_sql::DROP_LEGACY_PENDING_TABLES) {
+            query!(db, statement).execute().await?;
+        }
+        Ok(())
+    }
+
     async fn ensure_session_run_layout(db: &SkyDb) -> Result<(), ChatDbError> {
         query!(db, "DROP TABLE IF EXISTS session_run_leases")
             .execute()
@@ -417,11 +512,7 @@ impl ChatDb {
                             row.session_id
                         ))
                     })?;
-                let applied_seq = checkpoint
-                    .context
-                    .items()
-                    .last()
-                    .map_or(0, |item| i64::try_from(item.seq()).unwrap_or(0));
+                let applied_seq = crate::session::checkpoint_watermark(&checkpoint.context);
                 for item in checkpoint.context.items() {
                     let blob = rmp_serde::to_vec_named(item.message()).map_err(|e| {
                         storage_error(format!("transcript message encode failed: {e}"))
@@ -1465,6 +1556,7 @@ mod tests {
                     question: "Proceed?".to_string(),
                     option: vec!["yes".to_string()],
                     multi_select: false,
+                    secret: None,
                 }],
             }),
         )
@@ -1708,6 +1800,24 @@ mod tests {
             recovered.output.as_deref(),
             Some("May server restarted before the task run completed")
         );
+    }
+
+    #[tokio::test]
+    async fn open_puts_the_database_in_wal_mode() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db should initialize successfully");
+        let mode = query!(db.db, "PRAGMA journal_mode")
+            .fetch_one::<JournalMode>()
+            .await
+            .expect("journal mode should be readable");
+        assert_eq!(mode.journal_mode, "wal");
+    }
+
+    #[derive(Debug, serde::Deserialize, skyzen::FromRow)]
+    struct JournalMode {
+        journal_mode: String,
     }
 
     /// Concurrent dequeues of distinct sessions' pending messages on one

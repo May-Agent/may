@@ -12,7 +12,7 @@ use skyzen::utils::{Json, State};
 use skyzen::{Body, Request, Result as SkyResult, StatusCode};
 
 use crate::db::{CreateScheduledTaskParams, UpdateScheduledTaskParams};
-use crate::scheduler::TaskRunStatus;
+use crate::scheduler::{TaskRunStatus, WebhookOutcome};
 use crate::task_trigger::{
     NormalizedTaskTrigger, PersistedTaskTrigger, TaskTriggerKind, TaskTriggerRequest,
     TaskTriggerResponse, TaskWebhookRequest,
@@ -45,11 +45,13 @@ pub(super) struct ScheduledTaskResponse {
 }
 
 impl ScheduledTaskResponse {
-    fn from_model(m: crate::db::entity::scheduled_tasks::Model) -> Self {
-        let trigger =
-            PersistedTaskTrigger::from_storage(m.trigger_kind.as_str(), m.trigger_type.as_str())
-                .expect("scheduled task trigger must remain valid")
-                .response(m.run_at.clone(), m.cron_expression.clone());
+    /// `funnel_base` is the Funnel base URL while Funnel exposes webhooks.
+    fn from_model(m: crate::db::entity::scheduled_tasks::Model, funnel_base: Option<&str>) -> Self {
+        let trigger = m
+            .persisted_trigger()
+            .expect("scheduled task trigger must remain valid")
+            .response(m.run_at.clone(), m.cron_expression.clone())
+            .with_funnel_base(funnel_base);
         Self {
             id: m.id,
             profile_id: m.profile_id,
@@ -124,6 +126,35 @@ pub(super) enum WebhookInvocationRequestError {
     InvalidBody,
     #[error("webhook request contains a non-UTF8 header value")]
     InvalidHeaderValue,
+    #[error("webhook request body exceeds the {limit} byte limit", status = StatusCode::PAYLOAD_TOO_LARGE)]
+    BodyTooLarge { limit: u64 },
+    #[error("webhook request needs the daemon state", status = StatusCode::INTERNAL_SERVER_ERROR)]
+    MissingState,
+}
+
+/// Reads `body` into memory, refusing it once it passes `limit` bytes: a
+/// declared length over the limit is refused without reading anything, and
+/// an undeclared or understated one stops being read at the limit.
+async fn read_bounded_body(
+    mut body: Body,
+    declared_length: Option<u64>,
+    limit: u64,
+) -> Result<Vec<u8>, WebhookInvocationRequestError> {
+    use futures_lite::StreamExt as _;
+
+    let too_large = || WebhookInvocationRequestError::BodyTooLarge { limit };
+    if declared_length.is_some_and(|length| length > limit) {
+        return Err(too_large());
+    }
+    let mut buffer = Vec::new();
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|_| WebhookInvocationRequestError::InvalidBody)?;
+        if (buffer.len() as u64).saturating_add(chunk.len() as u64) > limit {
+            return Err(too_large());
+        }
+        buffer.extend_from_slice(&chunk);
+    }
+    Ok(buffer)
 }
 
 impl skyzen::extract::Extractor for WebhookInvocationRequest {
@@ -150,27 +181,36 @@ impl skyzen::extract::Extractor for WebhookInvocationRequest {
                 .push(value);
         }
 
+        let limit = request
+            .extensions()
+            .get::<State<Arc<DaemonState>>>()
+            .ok_or(WebhookInvocationRequestError::MissingState)?
+            .config_snapshot()
+            .remote_access
+            .webhook_max_body_bytes;
+        let declared_length = request
+            .headers()
+            .get(skyzen::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok());
         let body = mem::replace(request.body_mut(), Body::empty());
-        let body = body
-            .into_bytes()
-            .await
-            .map_err(|_| WebhookInvocationRequestError::InvalidBody)?;
+        let body = read_bounded_body(body, declared_length, limit).await?;
         let body_size_bytes = body.len();
-        let body_text = std::str::from_utf8(body.as_ref())
+        let body_text = std::str::from_utf8(body.as_slice())
             .ok()
             .map(ToOwned::to_owned);
         let body_json = headers
             .get(skyzen::header::CONTENT_TYPE.as_str())
             .and_then(|values| values.first())
             .filter(|value| value.starts_with("application/json"))
-            .and_then(|_| serde_json::from_slice(body.as_ref()).ok());
+            .and_then(|_| serde_json::from_slice(body.as_slice()).ok());
 
         Ok(Self(TaskWebhookRequest {
             method,
             path,
             query,
             headers,
-            body_base64: base64::engine::general_purpose::STANDARD.encode(body.as_ref()),
+            body_base64: base64::engine::general_purpose::STANDARD.encode(body.as_slice()),
             body_text,
             body_json,
             remote_addr,
@@ -188,11 +228,7 @@ fn validate_existing_trigger(
     next_cron: Option<&str>,
     next_run_at: Option<&str>,
 ) -> SkyResult<TaskTriggerKind> {
-    let trigger = PersistedTaskTrigger::from_storage(
-        current.trigger_kind.as_str(),
-        current.trigger_type.as_str(),
-    )
-    .map_err(bad_request_error)?;
+    let trigger = current.persisted_trigger().map_err(bad_request_error)?;
     match trigger {
         PersistedTaskTrigger::Time { trigger_type } => {
             TaskTriggerRequest::Time {
@@ -237,10 +273,11 @@ pub(super) async fn list_tasks(
         .list_scheduled_tasks(None)
         .await
         .map_err(internal_error)?;
+    let funnel = state.remote_access_manager.snapshot().funnel_url;
     Ok(Json(
         tasks
             .into_iter()
-            .map(ScheduledTaskResponse::from_model)
+            .map(|task| ScheduledTaskResponse::from_model(task, funnel.as_deref()))
             .collect(),
     ))
 }
@@ -337,7 +374,8 @@ async fn run_create_task(
         .reload_active_tasks()
         .await
         .map_err(internal_error)?;
-    Ok(ScheduledTaskResponse::from_model(model))
+    let funnel = state.remote_access_manager.snapshot().funnel_url;
+    Ok(ScheduledTaskResponse::from_model(model, funnel.as_deref()))
 }
 
 pub(super) async fn get_task(
@@ -353,7 +391,11 @@ pub(super) async fn get_task(
         .map_err(internal_error)?
         .ok_or_else(|| bad_request_error("Task not found"))?;
 
-    Ok(Json(ScheduledTaskResponse::from_model(model)))
+    let funnel = state.remote_access_manager.snapshot().funnel_url;
+    Ok(Json(ScheduledTaskResponse::from_model(
+        model,
+        funnel.as_deref(),
+    )))
 }
 
 pub(super) async fn update_task(
@@ -484,7 +526,8 @@ async fn run_update_task(
         .map_err(internal_error)?
         .ok_or_else(|| bad_request_error("Task not found"))?;
 
-    Ok(ScheduledTaskResponse::from_model(model))
+    let funnel = state.remote_access_manager.snapshot().funnel_url;
+    Ok(ScheduledTaskResponse::from_model(model, funnel.as_deref()))
 }
 
 pub(super) async fn delete_task(
@@ -502,16 +545,10 @@ pub(super) async fn delete_task(
 
 async fn run_delete_task(state: Arc<DaemonState>, id: String) -> SkyResult<()> {
     state
-        .db()
-        .delete_scheduled_task(&id)
-        .await
-        .map_err(internal_error)?;
-    state
         .task_runtime
-        .reload_active_tasks()
+        .delete_task(&id)
         .await
-        .map_err(internal_error)?;
-    Ok(())
+        .map_err(super::error::internal_error_message)
 }
 
 pub(super) async fn approve_task(
@@ -597,14 +634,19 @@ async fn run_invoke_webhook_task(
     token: String,
     webhook_request: TaskWebhookRequest,
 ) -> SkyResult<super::types::TaskTriggerResponse> {
-    let triggered = state
+    let triggered = match state
         .task_runtime
-        .dispatch_webhook(token, webhook_request)
+        .dispatch_webhook(&token, webhook_request)
         .await
-        .map_err(internal_error)?;
-    if triggered == 0 {
-        return Err(bad_request_error("Webhook task not found"));
-    }
+        .map_err(internal_error)?
+    {
+        WebhookOutcome::NotFound => return Err(bad_request_error("Webhook task not found")),
+        WebhookOutcome::SignatureRefused => {
+            return Err(skyzen::Error::msg("Webhook signature missing or invalid")
+                .set_status(StatusCode::UNAUTHORIZED));
+        }
+        WebhookOutcome::Triggered(triggered) => triggered,
+    };
 
     Ok(super::types::TaskTriggerResponse {
         ok: true,

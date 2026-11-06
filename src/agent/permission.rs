@@ -96,6 +96,8 @@ pub enum PermissionHistoryMode {
     Sandboxed,
     /// Unsafe-mode approval history.
     Unsafe,
+    /// SSH-scoped approval history.
+    Ssh,
 }
 
 impl PermissionHistoryMode {
@@ -105,6 +107,7 @@ impl PermissionHistoryMode {
         match self {
             Self::Sandboxed => "sandboxed",
             Self::Unsafe => "unsafe",
+            Self::Ssh => "ssh",
         }
     }
 }
@@ -129,6 +132,7 @@ impl core::str::FromStr for PermissionHistoryMode {
         match value {
             "sandboxed" => Ok(Self::Sandboxed),
             "unsafe" => Ok(Self::Unsafe),
+            "ssh" => Ok(Self::Ssh),
             other => Err(PermissionHistoryModeParseError {
                 value: other.to_string(),
             }),
@@ -311,6 +315,40 @@ impl PermissionApprover {
         Ok(())
     }
 
+    /// Whether the session's yolo switch is on; read per request so a
+    /// change applies at once.
+    async fn yolo(&self) -> Result<bool, PermissionError> {
+        let (Some(runtime_service), Some(session_id)) = (&self.runtime_service, &self.session_id)
+        else {
+            return Ok(false);
+        };
+        runtime_service
+            .db()
+            .session_yolo(session_id)
+            .await
+            .map_err(anyhow::Error::from)
+            .map_err(PermissionError::Internal)
+    }
+
+    /// Record a yolo grant in the session history like a user approval.
+    async fn record_yolo_grant(
+        &self,
+        mode: TerminalMode,
+        script: &str,
+    ) -> Result<(), PermissionError> {
+        let (Some(runtime_service), Some(session_id)) = (&self.runtime_service, &self.session_id)
+        else {
+            return Ok(());
+        };
+        runtime_service
+            .db()
+            .append_granted_permission(session_id, PermissionHistoryMode::from(mode), script)
+            .await
+            .map_err(anyhow::Error::from)
+            .map_err(PermissionError::Internal)?;
+        Ok(())
+    }
+
     /// Ask the user for permission and wait for a decision.
     ///
     /// # Errors
@@ -320,6 +358,10 @@ impl PermissionApprover {
         mode: TerminalMode,
         script: String,
     ) -> Result<bool, PermissionError> {
+        if self.yolo().await? {
+            self.record_yolo_grant(mode, &script).await?;
+            return Ok(true);
+        }
         if let ApprovalMode::Unavailable { context } = self.approval_mode {
             return Err(Self::unavailable_error(mode, context));
         }
@@ -440,15 +482,13 @@ impl PermissionHandler for PermissionApprover {
         std::future::ready(true)
     }
 
-    fn will_wait_for_approval(
-        &self,
-        mode: TerminalMode,
-        _script: &str,
-    ) -> impl Future<Output = bool> + Send {
-        std::future::ready(
-            !matches!(self.approval_mode, ApprovalMode::Unavailable { .. })
-                && matches!(mode, TerminalMode::Unsafe),
-        )
+    async fn will_wait_for_approval(&self, mode: TerminalMode, _script: &str) -> bool {
+        !matches!(self.approval_mode, ApprovalMode::Unavailable { .. })
+            && matches!(mode, TerminalMode::Unsafe)
+            && !self.yolo().await.unwrap_or_else(|error| {
+                tracing::warn!(%error, "failed to read the session yolo switch");
+                false
+            })
     }
 }
 

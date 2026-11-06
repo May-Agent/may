@@ -6,6 +6,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use aither_agent::ContextWindowPhase;
 use aither_sandbox::TerminalExecutionMode;
+use askama::Template as _;
+
+use crate::agent::cache_miss::CacheMissCause;
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
@@ -348,7 +351,58 @@ pub enum ChatElement {
     UsageReport(crate::agent::SessionUsageReport),
 }
 
-impl ChatElement {}
+impl ChatElement {
+    /// Toggle the collapsible element with `id`, recursing into the
+    /// elements folded inside a "Worked for" group. Returns whether an
+    /// element toggled.
+    fn toggle_expanded(&mut self, id: &str) -> bool {
+        match self {
+            Self::ToolCall {
+                id: tool_id,
+                display,
+            } if tool_id == id && display.expandable() => {
+                let open = display.body_open();
+                match display {
+                    ToolDisplay::Terminal { pinned, .. }
+                    | ToolDisplay::Action { pinned, .. }
+                    | ToolDisplay::Builtin { pinned, .. } => *pinned = Some(!open),
+                }
+                true
+            }
+            Self::Thinking {
+                id: think_id,
+                expanded,
+                content,
+                ..
+            } if think_id == id && !content.is_empty() => {
+                *expanded = !*expanded;
+                true
+            }
+            Self::WorkedFor {
+                id: work_id,
+                expanded,
+                elements,
+                ..
+            } => {
+                if work_id == id {
+                    *expanded = !*expanded;
+                    return true;
+                }
+                elements.iter_mut().any(|inner| inner.toggle_expanded(id))
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The notice for a compaction that failed and reruns on a cleaned context.
+#[derive(askama::Template)]
+#[template(path = "tui_compaction_recovery.txt", escape = "none")]
+struct CompactionRecoveryNotice<'a> {
+    error: &'a aither_agent::AgentError,
+    alerts_removed: usize,
+    outputs_spilled: usize,
+}
 
 /// The chat stream containing all elements.
 #[derive(Debug, Default)]
@@ -469,6 +523,26 @@ impl ChatStream {
         self.push_element(ChatElement::Notice {
             message: message.to_string(),
         });
+    }
+
+    /// Add the notice for a failed compaction that is cleaned up and rerun.
+    ///
+    /// # Panics
+    /// When the compile-time checked notice template fails to render.
+    pub fn push_compaction_recovery(
+        &mut self,
+        error: &aither_agent::AgentError,
+        alerts_removed: usize,
+        outputs_spilled: usize,
+    ) {
+        let notice = CompactionRecoveryNotice {
+            error,
+            alerts_removed,
+            outputs_spilled,
+        }
+        .render()
+        .expect("compaction recovery template renders");
+        self.push_notice(&notice);
     }
 
     /// Add a catch-up recap card.
@@ -968,47 +1042,14 @@ impl ChatStream {
     /// Flip the expansion of a collapsible element (tool call or thinking
     /// block). For tool calls this sets the click pin: `Some(true)` pins the
     /// body open, `Some(false)` pins it shut, overriding the automatic rule.
+    /// An element folded inside a "Worked for" group toggles on its own —
+    /// the group stays expanded.
     pub fn toggle_expanded(&mut self, id: &str) {
-        let mut touched = None;
         for (index, elem) in self.elements.iter_mut().enumerate() {
-            match elem {
-                ChatElement::ToolCall {
-                    id: tool_id,
-                    display,
-                } if tool_id == id && display.expandable() => {
-                    let open = display.body_open();
-                    match display {
-                        ToolDisplay::Terminal { pinned, .. }
-                        | ToolDisplay::Action { pinned, .. }
-                        | ToolDisplay::Builtin { pinned, .. } => *pinned = Some(!open),
-                    }
-                    touched = Some(index);
-                    break;
-                }
-                ChatElement::Thinking {
-                    id: think_id,
-                    expanded,
-                    content,
-                    ..
-                } if think_id == id && !content.is_empty() => {
-                    *expanded = !*expanded;
-                    touched = Some(index);
-                    break;
-                }
-                ChatElement::WorkedFor {
-                    id: work_id,
-                    expanded,
-                    ..
-                } if work_id == id => {
-                    *expanded = !*expanded;
-                    touched = Some(index);
-                    break;
-                }
-                _ => {}
+            if elem.toggle_expanded(id) {
+                self.touch(index);
+                return;
             }
-        }
-        if let Some(index) = touched {
-            self.touch(index);
         }
     }
 
@@ -1297,10 +1338,14 @@ pub struct StatusContext<'a> {
     /// Token usage info (`prompt_tokens`, model `context_window`). The status
     /// bar denominator is the auto-compact window derived from the latter.
     pub usage: Option<(u64, Option<u64>)>,
+    /// Compaction thresholds the usage denominator follows.
+    pub context_policy: aither_agent::ContextPolicy,
     /// Queued message count.
     pub queue_count: usize,
     /// Questions the agent asked that wait for an answer.
     pub open_questions: usize,
+    /// The session grants every approval request without asking.
+    pub yolo: bool,
     /// Running background terminal jobs (the sidebar lists each command).
     pub shells: usize,
     /// Running subagents (the sidebar lists each one).
@@ -1559,21 +1604,130 @@ fn usage_duration(ms: u64) -> String {
     parts.join(" ")
 }
 
+/// The `/usage` wall clock and where it went.
+#[derive(askama::Template)]
+#[template(path = "usage_wall_clock.txt", escape = "none")]
+struct UsageWallClock {
+    wall: String,
+    api: String,
+    tools: String,
+    waiting: String,
+    idle: String,
+}
+
+impl UsageWallClock {
+    fn new(report: &crate::agent::SessionUsageReport) -> Self {
+        Self {
+            wall: usage_duration(report.wall_ms),
+            api: usage_duration(report.split.api_ms),
+            tools: usage_duration(report.split.tools_ms),
+            waiting: usage_duration(report.split.user_wait_ms),
+            idle: usage_duration(report.split.idle_ms),
+        }
+    }
+}
+
+/// A model's cache misses under its `/usage` row.
+#[derive(askama::Template)]
+#[template(path = "usage_model_cache_misses.txt", escape = "none")]
+struct UsageModelCacheMisses {
+    misses: u64,
+    tokens: String,
+}
+
+/// Where a listed cache miss first changed the prefix.
+enum Diverged<'a> {
+    Tools,
+    Message { index: u64, kind: &'a str },
+    Nothing,
+}
+
+/// One cause's line of the `/usage` cache-miss breakdown.
+struct UsageMissCause {
+    cause: crate::agent::cache_miss::CacheMissCause,
+    misses: u64,
+    tokens: String,
+}
+
+/// One listed cache miss.
+struct UsageMissLine<'a> {
+    at: String,
+    model: &'a str,
+    cause: crate::agent::cache_miss::CacheMissCause,
+    tokens: String,
+    gap: String,
+    diverged: Diverged<'a>,
+}
+
+/// The `/usage` cache misses: count, causes and the newest misses.
+#[derive(askama::Template)]
+#[template(path = "usage_cache_misses.txt", escape = "none")]
+struct UsageCacheMisses<'a> {
+    total: u64,
+    tokens: String,
+    causes: Vec<UsageMissCause>,
+    recent: Vec<UsageMissLine<'a>>,
+}
+
+impl<'a> UsageCacheMisses<'a> {
+    /// The section for `report`, `None` when the session had no miss.
+    fn new(report: &'a crate::agent::SessionUsageReport) -> Option<Self> {
+        if report.cache_miss_causes.is_empty() {
+            return None;
+        }
+        let zone = jiff::tz::TimeZone::system();
+        Some(Self {
+            total: report.cache_miss_causes.iter().map(|row| row.misses).sum(),
+            tokens: compact_count(
+                report
+                    .cache_miss_causes
+                    .iter()
+                    .map(|row| row.missed_tokens)
+                    .sum(),
+            ),
+            causes: report
+                .cache_miss_causes
+                .iter()
+                .map(|row| UsageMissCause {
+                    cause: row.cause,
+                    misses: row.misses,
+                    tokens: compact_count(row.missed_tokens),
+                })
+                .collect(),
+            recent: report
+                .recent_cache_misses
+                .iter()
+                .map(|miss| UsageMissLine {
+                    at: miss.timestamp.parse::<jiff::Timestamp>().map_or_else(
+                        |_| miss.timestamp.clone(),
+                        |at| at.to_zoned(zone.clone()).strftime("%H:%M").to_string(),
+                    ),
+                    model: &miss.model,
+                    cause: miss.cause,
+                    tokens: compact_count(miss.missed_tokens),
+                    gap: usage_duration(miss.gap_ms),
+                    diverged: match (miss.diverged_kind.as_deref(), miss.diverged_index) {
+                        (Some("tools"), _) => Diverged::Tools,
+                        (Some(kind), Some(index)) => Diverged::Message { index, kind },
+                        _ => Diverged::Nothing,
+                    },
+                })
+                .collect(),
+        })
+    }
+}
+
 /// Styled lines for a `/usage` report block: session totals, then one row
-/// per model with its cache and cost breakdown.
+/// per model with its cache and cost breakdown, then the cache misses.
 fn usage_report_lines(report: &crate::agent::SessionUsageReport) -> Vec<Line<'static>> {
     let dim = Style::default().fg(Color::DarkGray);
     let value = Style::default().fg(Color::Cyan);
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled("API time   ", dim),
-            Span::styled(usage_duration(report.api_ms), value),
-        ]),
-        Line::from(vec![
-            Span::styled("Wall clock ", dim),
-            Span::styled(usage_duration(report.wall_ms), value),
-        ]),
-    ];
+    let mut lines: Vec<Line<'static>> = UsageWallClock::new(report)
+        .render()
+        .expect("the wall-clock template renders")
+        .lines()
+        .map(|line| Line::styled(line.to_string(), value))
+        .collect();
     if let Some(cost) = report.total_cost_usd {
         lines.push(Line::from(vec![
             Span::styled("Total cost ", dim),
@@ -1599,6 +1753,28 @@ fn usage_report_lines(report: &crate::agent::SessionUsageReport) -> Vec<Line<'st
             ),
             dim,
         ));
+        if model.cache_misses > 0 {
+            let misses = UsageModelCacheMisses {
+                misses: model.cache_misses,
+                tokens: compact_count(model.cache_miss_tokens),
+            };
+            lines.push(Line::styled(
+                misses
+                    .render()
+                    .expect("the model cache-miss template renders"),
+                dim,
+            ));
+        }
+    }
+    if let Some(misses) = UsageCacheMisses::new(report) {
+        lines.push(Line::from(""));
+        lines.extend(
+            misses
+                .render()
+                .expect("the cache-miss template renders")
+                .lines()
+                .map(|line| Line::styled(line.to_string(), value)),
+        );
     }
     lines
 }
@@ -1699,14 +1875,25 @@ fn context_report_lines(report: &ContextReport) -> Vec<Line<'static>> {
             value_style,
         ),
         Span::styled(
-            format!(
-                "   reserved above {:.0}%",
-                report.autocompact_trigger * 100.0
-            ),
+            format!("   reserved above {}", format_number(report.compact_tokens)),
             dim,
         ),
     ]));
-    if report.phase != ContextWindowPhase::Stable {
+    lines.push(Line::from(vec![Span::styled(
+        format!(
+            "  compaction starts at {} · pauses at {} · auto-compacts at {}",
+            format_number(report.compact_start_tokens),
+            format_number(report.compact_pause_tokens),
+            format_number(report.compact_tokens),
+        ),
+        dim,
+    )]));
+    if report.phase == ContextWindowPhase::Compacting {
+        lines.push(Line::from(Span::styled(
+            "  compaction in flight",
+            Style::default().fg(Color::Yellow),
+        )));
+    } else if report.phase != ContextWindowPhase::Stable {
         lines.push(Line::from(vec![
             Span::styled("  phase: ", dim),
             Span::styled(
@@ -1842,6 +2029,10 @@ impl ElementState {
 pub(super) struct ElementLines {
     pub lines: Vec<Line<'static>>,
     pub images: Vec<(String, usize, String)>,
+    /// `(id, first line index, one past the last)` of each collapsible
+    /// (sub-)element these lines contain — a click on those rows toggles
+    /// that element, not the one owning the lines around it.
+    pub regions: Vec<(String, usize, usize)>,
 }
 
 /// `52s`, `1m27s` — the worked-for row's compact duration.
@@ -1985,6 +2176,7 @@ pub(super) fn element_lines(
 ) -> ElementLines {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut images: Vec<(String, usize, String)> = Vec::new();
+    let mut regions: Vec<(String, usize, usize)> = Vec::new();
     match elem {
         ChatElement::UserMessage {
             content,
@@ -2068,7 +2260,7 @@ pub(super) fn element_lines(
         }
 
         ChatElement::ToolCall { id, display } => {
-            let _ = id;
+            let start = lines.len();
             let mut tool_lines = Vec::new();
             render_tool_inline_at(
                 &mut tool_lines,
@@ -2080,6 +2272,9 @@ pub(super) fn element_lines(
                 state.spinner_frame,
             );
             lines.extend(tool_lines.into_iter().map(line_into_static));
+            if display.expandable() {
+                regions.push((id.clone(), start, lines.len()));
+            }
         }
 
         ChatElement::TodoBlock { .. } if state.hide_todos => {}
@@ -2155,12 +2350,14 @@ pub(super) fn element_lines(
         }
 
         ChatElement::Thinking {
+            id,
             content,
             seconds,
             expanded,
             live,
             ..
         } => {
+            let start = lines.len();
             let header = if *expanded {
                 if thought_millis(*seconds) == 0 {
                     "◐ Thinking...".to_string()
@@ -2192,6 +2389,9 @@ pub(super) fn element_lines(
                 }
             }
             lines.push(Line::from(""));
+            if !content.is_empty() {
+                regions.push((id.clone(), start, lines.len()));
+            }
         }
 
         ChatElement::WorkedFor {
@@ -2207,9 +2407,19 @@ pub(super) fn element_lines(
             )));
             if *expanded {
                 for inner in elements {
-                    let sub = element_lines(inner, state, images_supported, tunnel_base, width);
+                    // Members carry their own expansion state — the group's
+                    // `state` describes the group row itself.
+                    let inner_state =
+                        ElementState::of(inner, None, state.hide_todos, state.spinner_frame);
+                    let sub =
+                        element_lines(inner, inner_state, images_supported, tunnel_base, width);
                     let offset = lines.len();
                     lines.extend(sub.lines);
+                    regions.extend(
+                        sub.regions
+                            .into_iter()
+                            .map(|(id, start, end)| (id, offset + start, offset + end)),
+                    );
                     images.extend(
                         sub.images
                             .into_iter()
@@ -2220,7 +2430,11 @@ pub(super) fn element_lines(
             lines.push(Line::from(""));
         }
     }
-    ElementLines { lines, images }
+    ElementLines {
+        lines,
+        images,
+        regions,
+    }
 }
 
 /// Detach a line from the data it borrows.
@@ -2738,6 +2952,10 @@ fn render_status_line(lines: &mut Vec<Line<'_>>, ctx: &StatusContext<'_>, width:
         parts.push(format!("Q:{}", ctx.queue_count));
     }
 
+    if ctx.yolo {
+        parts.push("yolo on · /yolo".to_string());
+    }
+
     if ctx.open_questions > 0 {
         parts.push(format!("? {} open · /questions", ctx.open_questions));
     }
@@ -2747,9 +2965,9 @@ fn render_status_line(lines: &mut Vec<Line<'_>>, ctx: &StatusContext<'_>, width:
     }
 
     // Context usage pinned to the right edge: `4.8K / 120.0K (4%)`.
-    let usage = ctx
-        .usage
-        .map(|(prompt_tokens, context_window)| format_status_usage(prompt_tokens, context_window));
+    let usage = ctx.usage.map(|(prompt_tokens, context_window)| {
+        format_status_usage(prompt_tokens, context_window, &ctx.context_policy)
+    });
 
     // The worktree index: fill bar while incomplete, `index ✓` once full,
     // red `index ✗` when repo-search is down.
@@ -2909,7 +3127,11 @@ impl StatusUsage {
 }
 
 /// Format prompt-token usage against the auto-compact window.
-fn format_status_usage(prompt_tokens: u64, context_window: Option<u64>) -> StatusUsage {
+fn format_status_usage(
+    prompt_tokens: u64,
+    context_window: Option<u64>,
+    policy: &aither_agent::ContextPolicy,
+) -> StatusUsage {
     let used = format_number(usize::try_from(prompt_tokens).unwrap_or(usize::MAX));
     let Some(window) = context_window else {
         return StatusUsage {
@@ -2917,8 +3139,7 @@ fn format_status_usage(prompt_tokens: u64, context_window: Option<u64>) -> Statu
             warn: None,
         };
     };
-    let compact =
-        crate::agent::autocompact_window_tokens(usize::try_from(window).unwrap_or(usize::MAX));
+    let compact = policy.compact_point(u32::try_from(window).unwrap_or(u32::MAX));
     if compact == 0 {
         return StatusUsage {
             usage: used,
@@ -3425,6 +3646,125 @@ mod tests {
     use crate::tui::queue::Attachment;
 
     #[test]
+    fn usage_shows_the_wall_clock_split() {
+        let report = crate::agent::SessionUsageReport {
+            session_id: "s".to_string(),
+            api_ms: 4_000,
+            wall_ms: 61_000,
+            split: crate::agent::WallClockSplit {
+                api_ms: 4_000,
+                tools_ms: 8_000,
+                user_wait_ms: 20_000,
+                idle_ms: 29_000,
+            },
+            total_cost_usd: None,
+            models: Vec::new(),
+            cache_miss_causes: Vec::new(),
+            recent_cache_misses: Vec::new(),
+        };
+        let rendered = super::usage_report_lines(&report)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            rendered,
+            "Wall clock 1m 1s\n  API        0m 4s\n  Waiting    0m 20s\n  Tools      0m 8s\n  Idle       0m 29s"
+        );
+    }
+
+    #[test]
+    fn usage_shows_cache_misses_with_their_causes() {
+        use crate::agent::cache_miss::CacheMissCause;
+        let miss =
+            |cause, missed_tokens, gap_ms, kind: Option<&str>, index| crate::agent::CacheMissRow {
+                timestamp: "not a timestamp".to_string(),
+                model: "opus".to_string(),
+                cause,
+                missed_tokens,
+                gap_ms,
+                diverged_kind: kind.map(str::to_string),
+                diverged_index: index,
+            };
+        let report = crate::agent::SessionUsageReport {
+            session_id: "s".to_string(),
+            api_ms: 0,
+            wall_ms: 0,
+            split: crate::agent::WallClockSplit {
+                api_ms: 0,
+                tools_ms: 0,
+                user_wait_ms: 0,
+                idle_ms: 0,
+            },
+            total_cost_usd: None,
+            models: vec![crate::agent::ModelUsageRow {
+                model: "opus".to_string(),
+                requests: 3,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                api_ms: 0,
+                cache_hit_rate: 0.0,
+                cache_misses: 2,
+                cache_miss_tokens: 30_000,
+                cost_usd: None,
+            }],
+            cache_miss_causes: vec![
+                crate::agent::CacheMissCauseRow {
+                    cause: CacheMissCause::Expired,
+                    misses: 1,
+                    missed_tokens: 20_000,
+                },
+                crate::agent::CacheMissCauseRow {
+                    cause: CacheMissCause::ToolsChanged,
+                    misses: 1,
+                    missed_tokens: 10_000,
+                },
+            ],
+            recent_cache_misses: vec![
+                miss(
+                    CacheMissCause::ToolsChanged,
+                    10_000,
+                    30_000,
+                    Some("tools"),
+                    None,
+                ),
+                miss(CacheMissCause::Expired, 20_000, 3_660_000, None, None),
+                miss(
+                    CacheMissCause::Compaction,
+                    5_000,
+                    1_000,
+                    Some("user"),
+                    Some(1),
+                ),
+            ],
+        };
+        let rendered = super::usage_report_lines(&report)
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        let misses = rendered
+            .iter()
+            .skip_while(|line| !line.starts_with("    cache misses"))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(
+            misses,
+            "    cache misses 2  30.0k tokens not read from cache\n\
+             \n\
+             Cache misses 2  30.0k tokens not read from cache\n  \
+             cache lifetime expired  1  20.0k tokens\n  \
+             tool set changed  1  10.0k tokens\n\
+             Recent cache misses\n  \
+             not a timestamp  opus  tool set changed  10.0k tokens  changed at the tool definitions  0m 30s after the previous request\n  \
+             not a timestamp  opus  cache lifetime expired  20.0k tokens  1h 1m after the previous request\n  \
+             not a timestamp  opus  compaction  5.0k tokens  changed at message 1 (user)  0m 1s after the previous request"
+        );
+    }
+
+    #[test]
     fn cost_formatting_keeps_sub_cent_precision() {
         assert_eq!(format_cost_usd(0.0), "$0.00");
         assert_eq!(format_cost_usd(1.234), "$1.23");
@@ -3442,9 +3782,10 @@ mod tests {
     #[test]
     fn status_usage_is_used_over_autocompact_window() {
         let window = 200_000_u64;
-        let compact = crate::agent::autocompact_window_tokens(usize::try_from(window).unwrap());
+        let policy = aither_agent::ContextPolicy::default();
+        let compact = policy.compact_point(u32::try_from(window).unwrap());
         let used = compact / 4;
-        let line = format_status_usage(u64::try_from(used).unwrap(), Some(window));
+        let line = format_status_usage(u64::try_from(used).unwrap(), Some(window), &policy);
         #[allow(clippy::cast_precision_loss)]
         let percent = used as f64 / compact as f64 * 100.0;
         assert_eq!(
@@ -3461,32 +3802,35 @@ mod tests {
     #[test]
     fn status_usage_warns_within_ten_percent_of_autocompact() {
         let window = 200_000_u64;
-        let compact = crate::agent::autocompact_window_tokens(usize::try_from(window).unwrap());
+        let policy = aither_agent::ContextPolicy::default();
+        let compact = policy.compact_point(u32::try_from(window).unwrap());
         let used = compact - compact / 20;
-        let line = format_status_usage(u64::try_from(used).unwrap(), Some(window));
+        let line = format_status_usage(u64::try_from(used).unwrap(), Some(window), &policy);
         assert_eq!(line.warn.as_deref(), Some("5% to auto-compact"));
     }
 
     #[test]
     fn status_usage_omits_warn_at_ten_percent_remaining() {
         let window = 200_000_u64;
-        let compact = crate::agent::autocompact_window_tokens(usize::try_from(window).unwrap());
+        let policy = aither_agent::ContextPolicy::default();
+        let compact = policy.compact_point(u32::try_from(window).unwrap());
         let used = compact - compact / 10;
-        let line = format_status_usage(u64::try_from(used).unwrap(), Some(window));
+        let line = format_status_usage(u64::try_from(used).unwrap(), Some(window), &policy);
         assert!(line.warn.is_none());
     }
 
     #[test]
     fn status_usage_warns_at_zero_headroom() {
         let window = 200_000_u64;
-        let compact = crate::agent::autocompact_window_tokens(usize::try_from(window).unwrap());
-        let line = format_status_usage(u64::try_from(compact).unwrap(), Some(window));
+        let policy = aither_agent::ContextPolicy::default();
+        let compact = policy.compact_point(u32::try_from(window).unwrap());
+        let line = format_status_usage(u64::try_from(compact).unwrap(), Some(window), &policy);
         assert_eq!(line.warn.as_deref(), Some("0% to auto-compact"));
     }
 
     #[test]
     fn status_usage_falls_back_to_used_without_a_window() {
-        let line = format_status_usage(33_400, None);
+        let line = format_status_usage(33_400, None, &aither_agent::ContextPolicy::default());
         assert_eq!(line.usage, "33.4K");
         assert!(line.warn.is_none());
     }
@@ -3875,8 +4219,10 @@ mod tests {
                         status_ctx: Some(StatusContext {
                             model: "model",
                             usage: None,
+                            context_policy: aither_agent::ContextPolicy::default(),
                             queue_count: 0,
                             open_questions: 0,
+                            yolo: false,
                             shells: 0,
                             subagents: 0,
                             decode_rate: None,
@@ -4406,6 +4752,38 @@ mod tests {
     }
 
     #[test]
+    fn suggestion_is_dimmed_ghost_text_after_the_empty_prompt() {
+        let ctx = InputContext {
+            input: "",
+            cursor: 0,
+            attachments: &[],
+            suggestion: Some("run the tests"),
+        };
+        let mut lines: Vec<Line> = Vec::new();
+        render_input_line(&mut lines, &ctx, 80, false, None);
+        let ghost = lines
+            .last()
+            .and_then(|line| line.spans.last())
+            .expect("ghost span");
+        assert!(ghost.content.starts_with("run the tests"));
+        assert_eq!(ghost.style.fg, Some(Color::DarkGray), "dimmed");
+
+        let hidden = InputContext {
+            input: "h",
+            cursor: 1,
+            suggestion: None,
+            ..ctx
+        };
+        let mut lines: Vec<Line> = Vec::new();
+        render_input_line(&mut lines, &hidden, 80, false, None);
+        let rendered: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect();
+        assert!(!rendered.contains("run the tests"));
+    }
+
+    #[test]
     fn bash_input_shows_mode_hint_and_styled_bang() {
         let ctx = InputContext {
             input: "!ls -la",
@@ -4548,6 +4926,22 @@ mod tests {
             .map(String::as_str)
             .collect();
         assert_eq!(full, ["l1", "l2", "l3", "l4", "l5", "l6", "l7", "l8"]);
+    }
+
+    #[test]
+    fn a_compaction_recovery_is_a_notice_with_the_cleanup_counts() {
+        let mut chat = ChatStream::new();
+        chat.push_compaction_recovery(&aither_agent::AgentError::llm_local("no handoff"), 3, 2);
+        let [super::ChatElement::Notice { message }] = chat.elements() else {
+            panic!("one notice expected: {:?}", chat.elements());
+        };
+        assert!(message.contains("Compaction failed"), "{message}");
+        assert!(message.contains("no handoff"), "{message}");
+        assert!(
+            message.contains("3 alerts removed, 2 long outputs moved to files"),
+            "{message}"
+        );
+        assert!(message.ends_with("Compacting again."), "{message}");
     }
 
     #[test]
@@ -4820,6 +5214,93 @@ mod tests {
         chat.toggle_expanded("work-0");
         let closed = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
         assert!(!closed.iter().any(|line| line.contains("draft reply")));
+    }
+
+    /// Inside an expanded "Worked for" group a thought or command expands
+    /// and collapses on its own; the group stays expanded throughout.
+    #[test]
+    fn worked_for_members_toggle_independently() {
+        let mut chat = ChatStream::new();
+        chat.push_thinking("inner thought body");
+        chat.collapse_thinking();
+        chat.push_tool(
+            "t1".to_string(),
+            ToolDisplay::Terminal {
+                description: "run inner".to_string(),
+                command: "echo inner".to_string(),
+                mode: TerminalExecutionMode::Default,
+                status: ToolStatus::Done,
+                output: None,
+                diffs: Vec::new(),
+                pinned: None,
+            },
+        );
+        chat.push_text("done");
+        chat.fold_turn_work(3);
+        chat.toggle_expanded("work-0");
+
+        // Expanded group: both members render collapsed — the thought body
+        // and the command's body rows stay hidden behind their headlines.
+        let grouped = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
+        assert!(grouped.iter().any(|l| l.contains("Worked for 3s")));
+        assert!(grouped.iter().any(|l| l.contains("Thought for")));
+        assert!(grouped.iter().any(|l| l.contains("run inner")));
+        assert!(!grouped.iter().any(|l| l.contains("inner thought body")));
+        assert!(!grouped.iter().any(|l| l.contains("$ echo inner")));
+
+        // Expanding the nested thought shows its body while the group and
+        // the collapsed command stay as they were.
+        chat.toggle_expanded("thinking-0");
+        let thought_open =
+            build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
+        assert!(thought_open.iter().any(|l| l.contains("Worked for 3s ▾")));
+        assert!(
+            thought_open
+                .iter()
+                .any(|l| l.contains("inner thought body"))
+        );
+        assert!(!thought_open.iter().any(|l| l.contains("$ echo inner")));
+        chat.toggle_expanded("thinking-0");
+
+        // Expanding the nested command shows its body rows; the thought
+        // stays collapsed.
+        chat.toggle_expanded("t1");
+        let cmd_open = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
+        assert!(cmd_open.iter().any(|l| l.contains("Worked for 3s ▾")));
+        assert!(cmd_open.iter().any(|l| l.contains("$ echo inner")));
+        assert!(!cmd_open.iter().any(|l| l.contains("inner thought body")));
+        chat.toggle_expanded("t1");
+
+        // A click on a member's rows resolves to the member's region, not
+        // the group's — and collapsing the group folds everything away.
+        let mut regions = Vec::new();
+        let _ = build_plain_wrapped_lines_unified(
+            &chat,
+            80,
+            None,
+            None,
+            None,
+            Some(&mut regions),
+            false,
+        );
+        let member = regions
+            .iter()
+            .filter(|r| r.element_id == "thinking-0" || r.element_id == "t1")
+            .count();
+        assert_eq!(member, 2);
+        let group = regions
+            .iter()
+            .find(|r| r.element_id == "work-0")
+            .expect("the group keeps its own click region");
+        for member_id in ["thinking-0", "t1"] {
+            let member = regions.iter().find(|r| r.element_id == member_id).unwrap();
+            assert!(member.start >= group.start && member.end <= group.end);
+        }
+
+        chat.toggle_expanded("work-0");
+        let closed = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
+        assert!(closed.iter().any(|l| l.contains("Worked for 3s")));
+        assert!(!closed.iter().any(|l| l.contains("run inner")));
     }
 
     /// An expanded thinking block stays clickable — a click folds it back.

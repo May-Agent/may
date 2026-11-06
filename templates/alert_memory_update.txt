@@ -1,3 +1,0 @@
-MEMORY.md changed since this conversation started. The memory block above is the previous version; apply this diff mentally (the context will fold it in later):
-<memory_diff>
-{{ diff }}</memory_diff>

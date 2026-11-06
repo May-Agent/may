@@ -3,27 +3,27 @@
 //! The report mirrors Claude Code's `/context` panel: a `used/window`
 //! headline plus a per-category estimate of what the next request would
 //! carry. Everything is measured from the live [`aither_agent::Context`]
-//! — persistent system blocks, the command/skill/subagent index sections
-//! inside `base_system`, staged handoff, reminders and the recent
+//! — instruction and external system blocks, the skill/subagent index
+//! sections inside `capabilities`, the command table, staged handoff,
+//! reminders and the recent
 //! conversation — plus the `terminal` tool definition providers receive
 //! alongside the messages. Numbers are estimates at ~4 bytes per token,
 //! the same heuristic the agent uses for its own context budgeting.
 
-use aither_agent::{ContextPolicy, ContextWindowMetrics, ContextWindowPhase, Handoff};
+use aither_agent::{
+    ContextPolicy, ContextWindowMetrics, ContextWindowPhase, Handoff, InstructionSlot,
+};
 use aither_sandbox::TerminalArgs;
 
 use super::runtime_context::tag;
-
-/// Tag aither-agent uses for the stable base-system block.
-const BASE_SYSTEM_TAG: &str = "base_system";
 
 /// A context-usage category, matching the rows Claude Code shows for
 /// `/context` with `Commands` added for May's terminal command index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ContextCategory {
-    /// Persistent system blocks (persona, runtime, workspace, the tool
-    /// architecture portion of `base_system`, …).
+    /// Persistent system blocks (identity, environment, workspace, the
+    /// prose of `capabilities`, …).
     SystemPrompt,
     /// The native `terminal` tool definition sent with every request.
     SystemTools,
@@ -90,12 +90,18 @@ pub struct ContextReport {
     pub free_tokens: usize,
     /// Window share kept in reserve above the auto-compaction trigger.
     pub autocompact_buffer_tokens: usize,
-    /// Usage fraction of `window_tokens` at which auto-compaction starts.
-    pub autocompact_trigger: f32,
+    /// Tokens at which a background compaction starts.
+    pub compact_start_tokens: usize,
+    /// Tokens at which the agent pauses to finish the compaction.
+    pub compact_pause_tokens: usize,
+    /// Tokens at which the conversation is auto-compacted:
+    /// `min(window * compact_at, compact_ceiling)`.
+    pub compact_tokens: usize,
 }
 
-/// Result of splitting the `base_system` block into its marked sections.
-struct BaseSystemCarve {
+/// Result of splitting the `capabilities` block, or the command table, into
+/// its marked sections.
+struct CapabilitiesCarve {
     /// Everything outside the `<native_tools>`/`<commands>`/`<skills>`/
     /// `<subagents>` spans.
     architecture_chars: usize,
@@ -121,37 +127,19 @@ struct BaseSystemCarve {
     subagent_count: usize,
 }
 
-/// Usage fraction of the calibrated window at which auto-compaction forks.
-#[must_use]
-pub fn autocompact_trigger() -> f32 {
-    ContextPolicy::default().compact_at
-}
-
-/// Token count at which auto-compaction forks, floored from
-/// [`autocompact_trigger`] × `window`.
-#[must_use]
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-pub fn autocompact_window_tokens(window: usize) -> usize {
-    let trigger = f64::from(autocompact_trigger());
-    (trigger * window as f64) as usize
-}
-
-/// Tokens reserved above the auto-compaction trigger.
-#[must_use]
-pub fn autocompact_buffer_tokens(window: usize) -> usize {
-    window.saturating_sub(autocompact_window_tokens(window))
-}
-
 impl ContextReport {
     /// Assemble a report from the agent's live context and a
-    /// [`ContextWindowMetrics`] measured on the same state.
+    /// [`ContextWindowMetrics`] measured on the same state. `named_commands`
+    /// are the commands registered by name; every other row of the command
+    /// table is an MCP connection's tool.
     pub(crate) fn assemble(
         model_id: &str,
         provider_id: &str,
-        mcp_command_names: &[String],
+        named_commands: &[String],
         context: &aither_agent::Context,
         metrics: &ContextWindowMetrics,
         phase: ContextWindowPhase,
+        policy: &ContextPolicy,
     ) -> Self {
         let mut system_prompt_chars = 0usize;
         let mut memory_chars = 0usize;
@@ -166,10 +154,17 @@ impl ContextReport {
         let mut subagent_chars = 0usize;
         let mut subagent_count = 0usize;
 
-        for (block_tag, content) in context.system_blocks() {
-            match block_tag.as_str() {
-                BASE_SYSTEM_TAG => {
-                    let carved = carve_base_system(content, mcp_command_names);
+        for (slot, block) in context.external().iter() {
+            if *slot == tag::MEMORY || *slot == tag::PROFILE_MEMORIES {
+                memory_chars += block.content().len();
+            } else {
+                system_prompt_chars += block.content().len();
+            }
+        }
+        for (slot, content) in context.instructions().iter() {
+            match slot {
+                slot if *slot == tag::CAPABILITIES || *slot == InstructionSlot::COMMANDS => {
+                    let carved = carve_capabilities(content, named_commands);
                     system_prompt_chars += carved.architecture_chars;
                     native_tool_chars += carved.native_tool_chars;
                     native_tool_count += carved.native_tool_count;
@@ -182,7 +177,6 @@ impl ContextReport {
                     subagent_chars += carved.subagent_chars;
                     subagent_count += carved.subagent_count;
                 }
-                tag::MEMORY | tag::PROFILE_MEMORIES => memory_chars += content.len(),
                 _ => system_prompt_chars += content.len(),
             }
         }
@@ -241,11 +235,10 @@ impl ContextReport {
 
         let used_tokens = categories.iter().map(|row| row.tokens).sum();
         let window = usize::try_from(metrics.context_window).expect("a u32 window fits usize");
-        // May keeps aither's default context policy: a compaction is forked at
-        // `compact_at`, so everything above it is the autocompact buffer from
-        // the user's perspective.
-        let trigger = autocompact_trigger();
-        let autocompact_buffer = autocompact_buffer_tokens(window);
+        // Everything above the auto-compact point is the autocompact buffer
+        // from the user's perspective.
+        let compact_tokens = policy.compact_point(metrics.context_window);
+        let autocompact_buffer = window.saturating_sub(compact_tokens);
 
         Self {
             model_id: model_id.to_string(),
@@ -256,7 +249,9 @@ impl ContextReport {
             categories,
             free_tokens: window.saturating_sub(used_tokens + autocompact_buffer),
             autocompact_buffer_tokens: autocompact_buffer,
-            autocompact_trigger: trigger,
+            compact_start_tokens: policy.start_point(metrics.context_window),
+            compact_pause_tokens: policy.pause_point(metrics.context_window),
+            compact_tokens,
         }
     }
 }
@@ -281,11 +276,11 @@ fn command_line_name(item: &str) -> &str {
     item.split_once(": ").map_or(item, |(name, _)| name)
 }
 
-/// Split the rendered `base_system` block into architecture text and its
-/// marked index sections, attributing `<commands>` lines to built-in
-/// commands vs MCP tools by name.
-fn carve_base_system(content: &str, mcp_command_names: &[String]) -> BaseSystemCarve {
-    let mut carved = BaseSystemCarve {
+/// Split a rendered block into its prose and its marked index sections,
+/// attributing `<commands>` lines to commands registered by name vs MCP
+/// tools.
+fn carve_capabilities(content: &str, named_commands: &[String]) -> CapabilitiesCarve {
+    let mut carved = CapabilitiesCarve {
         architecture_chars: content.len(),
         native_tool_chars: 0,
         native_tool_count: 0,
@@ -311,14 +306,14 @@ fn carve_base_system(content: &str, mcp_command_names: &[String]) -> BaseSystemC
         // index; only MCP item lines move to the MCP bucket.
         carved.command_chars = section.len();
         for item in section_items(section) {
-            if mcp_command_names
+            if named_commands
                 .iter()
                 .any(|name| name == command_line_name(item))
             {
+                carved.command_count += 1;
+            } else {
                 carved.mcp_chars += item.len();
                 carved.mcp_count += 1;
-            } else {
-                carved.command_count += 1;
             }
         }
         carved.command_chars -= carved.mcp_chars;
@@ -366,16 +361,24 @@ mod tests {
 
     fn base_system_block() -> &'static str {
         "<tool_architecture>\n<native_tools>\n- terminal: Execute terminal commands.\n- terminal_kill: Terminate a background task.\n</native_tools>\n</tool_architecture>\n\n\
-         <commands>\n\n- ask: Ask a fast model.\n- github_pr: Open a PR.\n- jira_view: View an issue.\n\n</commands>\n\n\
          <skills>\n\n- pdf: read `skills/pdf/SKILL.md` when the request matches this skill. Handle PDFs.\n\n</skills>\n\n\
          <subagents>\nInvoke with `subagent`.\n\n- researcher: Research things.\n\n</subagents>"
     }
 
+    /// The command table: `ask` is registered by name, the rest are MCP
+    /// tools.
+    const COMMAND_TABLE: &str = "<commands>\n- ask: Ask a fast model\n- github_pr: Open a PR\n- jira_view: View an issue\n</commands>";
+
     fn test_context() -> aither_agent::Context {
-        let mut context = aither_agent::Context::default();
-        context.insert_system_text(BASE_SYSTEM_TAG, base_system_block());
-        context.insert_system_text(tag::MEMORY, "remember this");
-        context.insert_system_text(tag::TERMINAL_RUNTIME_CONTEXT, "sandbox=/tmp cwd=/tmp");
+        let mut context = aither_agent::Context::with_layout(tag::layout());
+        let instructions = context.instructions_mut();
+        instructions.insert(&tag::CAPABILITIES, base_system_block());
+        instructions.insert(&InstructionSlot::COMMANDS, COMMAND_TABLE);
+        instructions.insert(&tag::ENVIRONMENT, "sandbox=/tmp cwd=/tmp");
+        context.external_mut().insert(
+            &tag::MEMORY,
+            aither_agent::ExternalContent::data("MEMORY.md", "remember this"),
+        );
         context.push(Message::user("hello"));
         context.push(Message::assistant("hi there"));
         context
@@ -409,10 +412,11 @@ mod tests {
         let report = ContextReport::assemble(
             "gpt-5",
             "openai",
-            &["github_pr".to_string(), "jira_view".to_string()],
+            &["ask".to_string()],
             &test_context(),
             &test_metrics(),
             ContextWindowPhase::Stable,
+            &ContextPolicy::default(),
         );
 
         let commands = report
@@ -484,6 +488,7 @@ mod tests {
             &test_context(),
             &test_metrics(),
             ContextWindowPhase::Stable,
+            &ContextPolicy::default(),
         );
         let summed: usize = report.categories.iter().map(|row| row.tokens).sum();
         assert_eq!(summed, report.used_tokens);
@@ -491,15 +496,53 @@ mod tests {
             report.used_tokens + report.free_tokens + report.autocompact_buffer_tokens,
             report.window_tokens
         );
-        // Default context policy: compaction forks at 0.6 of the window.
-        assert_eq!(
-            report.autocompact_buffer_tokens,
-            report.window_tokens * 2 / 5
+        // Default policy on a 200k window: 0.8 of it, below the 400k ceiling.
+        assert_eq!(report.compact_tokens, 160_000);
+        assert_eq!(report.autocompact_buffer_tokens, 40_000);
+        assert_eq!(report.compact_start_tokens, 110_000);
+        assert_eq!(report.compact_pause_tokens, 155_000);
+    }
+
+    #[test]
+    fn a_million_token_window_compacts_at_the_ceiling() {
+        let mut metrics = test_metrics();
+        metrics.context_window = 1_000_000;
+        let report = ContextReport::assemble(
+            "gpt-5",
+            "openai",
+            &[],
+            &test_context(),
+            &metrics,
+            ContextWindowPhase::Stable,
+            &ContextPolicy::default(),
         );
-        assert_eq!(autocompact_window_tokens(200_000), 120_000);
-        assert_eq!(
-            autocompact_window_tokens(200_000) + autocompact_buffer_tokens(200_000),
-            200_000
+        assert_eq!(report.compact_tokens, 400_000);
+        assert_eq!(report.compact_start_tokens, 350_000);
+        assert_eq!(report.compact_pause_tokens, 395_000);
+        assert_eq!(report.autocompact_buffer_tokens, 600_000);
+    }
+
+    #[test]
+    fn the_report_follows_the_configured_policy() {
+        let policy = crate::config::ContextConfig {
+            compact_ceiling: 100_000,
+            start_distance: 20_000,
+            safe_buffer: 1_000,
+            ..crate::config::ContextConfig::default()
+        }
+        .policy();
+        let report = ContextReport::assemble(
+            "gpt-5",
+            "openai",
+            &[],
+            &test_context(),
+            &test_metrics(),
+            ContextWindowPhase::Compacting,
+            &policy,
         );
+        assert_eq!(report.compact_tokens, 100_000);
+        assert_eq!(report.compact_start_tokens, 80_000);
+        assert_eq!(report.compact_pause_tokens, 99_000);
+        assert_eq!(report.phase, ContextWindowPhase::Compacting);
     }
 }

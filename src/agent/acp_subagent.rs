@@ -16,32 +16,225 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use acpsub::{
-    AgentConfig, Config, ConfigSource, Defaults, Host, PermissionPolicy, Session, SessionSpec,
-    TurnEnd,
+    AgentConfig, Config, ConfigSource, Defaults, Executor, FileAccess, Host, PermissionHandler,
+    PermissionPolicy, Services, Session, SessionSpec, TurnEnd, probe_with,
 };
 use aither_acp::StopReason;
-use aither_agent::specialized::{
-    ExternalSession, ExternalStart, ExternalSubagent, SubagentTool, SubagentType,
-};
+use aither_agent::specialized::{ExternalSession, ExternalStart, ExternalSubagent, SubagentTool};
 use aither_core::LanguageModel;
 use arc_swap::ArcSwap;
+use async_lock::{RwLock, RwLockReadGuardArc};
+use futures_util::StreamExt as _;
+use heel::DenyAll;
 use tokio::runtime::Handle;
 
+use super::acp_sandbox::{ApprovalPermissions, SandboxExecutor, SessionPolicy, SessionSandbox};
 use crate::config::{AcpAgentConfig, MayConfig};
+use crate::session::MayHomePaths;
 
-/// Where May keeps what acpsub stores, under the May home.
-const STORAGE_DIR: &str = "acp";
+/// An acpsub host whose agents and their commands run in a session sandbox
+/// and whose permission requests go to the session's approver.
+pub type SandboxedHost = Host<SandboxExecutor<SessionPolicy>, ApprovalPermissions<SessionPolicy>>;
+
+/// A session of a [`SandboxedHost`].
+pub type SandboxedSession =
+    Session<SandboxExecutor<SessionPolicy>, ApprovalPermissions<SessionPolicy>>;
+
+/// A host for a command under trial, which belongs to no session: its
+/// processes have no network and its permission requests no approver.
+pub type ScratchHost = Host<SandboxExecutor<DenyAll>, ApprovalPermissions<DenyAll>>;
+
+/// Whether a session's host is retired, which happens once, when the session
+/// is deleted. Opening and closing an agent session hold it for reading, so
+/// retiring waits for the ones in flight; after it nothing opens or closes
+/// through the host, which has ended its agent sessions and given up its
+/// storage itself.
+type Lease = Arc<RwLock<bool>>;
+
+/// A session's host and the cell holding the sandbox it starts processes in.
+#[derive(Clone)]
+struct SessionHost {
+    host: SandboxedHost,
+    sandbox: Arc<ArcSwap<SessionSandbox<SessionPolicy>>>,
+    lease: Lease,
+}
+
+/// The daemon's ACP hosts, one per session: a session's registry of resumable
+/// agent sessions is its own, and so is the sandbox its processes start in.
+pub struct AcpHosts {
+    config: Arc<ArcSwap<MayConfig>>,
+    layout: MayHomePaths,
+    runtime: Handle,
+    hosts: std::sync::Mutex<BTreeMap<String, SessionHost>>,
+}
+
+impl std::fmt::Debug for AcpHosts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AcpHosts")
+            .field("layout", &self.layout)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AcpHosts {
+    /// Hosts over May's live configuration, storing what acpsub keeps where
+    /// `layout` says.
+    #[must_use]
+    pub const fn new(
+        config: Arc<ArcSwap<MayConfig>>,
+        layout: MayHomePaths,
+        runtime: Handle,
+    ) -> Self {
+        Self {
+            config,
+            layout,
+            runtime,
+            hosts: std::sync::Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// The agents of `session_id`, started in `sandbox` from now on.
+    ///
+    /// # Errors
+    /// Returns acpsub's error when the session's registry file exists but
+    /// cannot be parsed.
+    ///
+    /// # Panics
+    /// Panics if the host table was poisoned.
+    pub fn agents(
+        &self,
+        session_id: &str,
+        sandbox: SessionSandbox<SessionPolicy>,
+    ) -> Result<AcpAgents, acpsub::Error> {
+        let session = self.session_host(session_id, sandbox)?;
+        Ok(AcpAgents {
+            host: session.host,
+            runtime: self.runtime.clone(),
+            connected: self.config.load().acp_agents.clone(),
+            lease: session.lease,
+        })
+    }
+
+    /// The host of `session_id`, created on first use, with `sandbox`
+    /// installed for the processes it starts from now on.
+    fn session_host(
+        &self,
+        session_id: &str,
+        sandbox: SessionSandbox<SessionPolicy>,
+    ) -> Result<SessionHost, acpsub::Error> {
+        let mut hosts = self.hosts.lock().expect("the host table is not poisoned");
+        if let Some(session) = hosts.get(session_id) {
+            session.sandbox.store(Arc::new(sandbox));
+            return Ok(session.clone());
+        }
+        let cell = Arc::new(ArcSwap::from_pointee(sandbox));
+        let source = LiveConfig {
+            config: self.config.clone(),
+            storage: self.layout.acp_session_dir(session_id),
+        };
+        let host = Host::from_config_with(
+            source.build(),
+            source,
+            Services {
+                executor: SandboxExecutor::new(cell.clone(), self.config.clone()),
+                permissions: ApprovalPermissions::new(cell.clone()),
+            },
+        )?;
+        let session = SessionHost {
+            host,
+            sandbox: cell,
+            lease: Arc::new(RwLock::new(false)),
+        };
+        hosts.insert(session_id.to_string(), session.clone());
+        drop(hosts);
+        Ok(session)
+    }
+
+    /// Retires the host of a deleted session: its agent sessions end, the
+    /// host leaves the table and what acpsub stored for the session is
+    /// removed.
+    ///
+    /// # Errors
+    /// Returns the error of removing the session's storage.
+    ///
+    /// # Panics
+    /// Panics if the host table was poisoned.
+    pub async fn remove_session(&self, session_id: &str) -> std::io::Result<()> {
+        let host = self
+            .hosts
+            .lock()
+            .expect("the host table is not poisoned")
+            .remove(session_id);
+        retire(&self.runtime, host).await;
+        remove_storage(&self.layout.acp_session_dir(session_id)).await
+    }
+
+    /// [`remove_session`](Self::remove_session) for every session at once,
+    /// including the storage of sessions this daemon never hosted.
+    ///
+    /// # Errors
+    /// Returns the error of removing the sessions' storage.
+    ///
+    /// # Panics
+    /// Panics if the host table was poisoned.
+    pub async fn remove_all_sessions(&self) -> std::io::Result<()> {
+        let hosts =
+            std::mem::take(&mut *self.hosts.lock().expect("the host table is not poisoned"));
+        retire(&self.runtime, hosts.into_values()).await;
+        remove_storage(&self.layout.acp_sessions_dir()).await
+    }
+}
+
+/// Retires `hosts`: once the agent sessions opening or closing through each
+/// one are done, it is marked retired and every agent session still live on
+/// it ends.
+async fn retire(runtime: &Handle, hosts: impl IntoIterator<Item = SessionHost>) {
+    // Ending a session kills its process tree and records the end in the
+    // registry; the work is spread like any other the daemon fans out.
+    let bound = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let retiring =
+        futures_util::stream::iter(hosts).for_each_concurrent(bound, |session| async move {
+            // Granted once the opens and closes in flight are done; every
+            // later one sees the flag and leaves the host alone.
+            *session.lease.write_arc().await = true;
+            let state = session.host.state();
+            // Out of the live table first, as acpsub's own close takes a session.
+            let live = std::mem::take(
+                &mut *state
+                    .live
+                    .lock()
+                    .expect("acpsub's live table is not poisoned"),
+            )
+            .into_values();
+            futures_util::stream::iter(live)
+                .for_each_concurrent(bound, |sub| async move {
+                    acpsub::state::end_session(state, &sub).await;
+                })
+                .await;
+        });
+    in_runtime(runtime, retiring).await;
+}
+
+/// Removes `dir` and everything under it; a session that never connected an
+/// agent has none.
+async fn remove_storage(dir: &Path) -> std::io::Result<()> {
+    match async_fs::remove_dir_all(dir).await {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
+}
 
 /// The connected ACP agents and the host that runs them, as an agent build
 /// receives them.
 #[derive(Debug, Clone)]
 pub struct AcpAgents {
-    /// The daemon's acpsub host.
-    pub host: Host,
+    /// The session's acpsub host.
+    pub host: SandboxedHost,
     /// The daemon runtime acpsub's futures are polled in.
     pub runtime: Handle,
     /// The connections to register, keyed by subagent type name.
     pub connected: BTreeMap<String, AcpAgentConfig>,
+    lease: Lease,
 }
 
 impl AcpAgents {
@@ -60,72 +253,72 @@ impl AcpAgents {
             let backend = AcpSubagent {
                 host: self.host.clone(),
                 runtime: self.runtime.clone(),
+                lease: self.lease.clone(),
                 agent: name.clone(),
                 model: connection.model.clone(),
                 mode: connection.mode.clone(),
             };
-            tool = tool.with_type(
-                name.clone(),
-                SubagentType::external(connection.description.clone(), backend),
-            );
+            tool = tool.with_external(name.clone(), connection.description.clone(), backend);
         }
         Ok(tool)
     }
 }
 
-/// The acpsub host over May's live configuration: transcripts and the session
-/// registry live under `<may_dir>/acp`.
-///
-/// # Errors
-/// Returns acpsub's error when the registry file exists but cannot be parsed.
-pub fn live_host(config: Arc<ArcSwap<MayConfig>>, may_dir: &Path) -> Result<Host, acpsub::Error> {
-    let source = LiveConfig {
-        config,
-        may_dir: may_dir.to_path_buf(),
-    };
-    Host::from_config(source.build(), source)
-}
-
-/// A host that knows exactly `agents`, with its storage under `storage`: the
-/// trial that proves a candidate connection works before it is configured.
+/// A host that knows exactly `agents`, with its storage under `storage`,
+/// starting its processes in `sandbox`: the trial that proves a candidate
+/// connection works before it is configured.
 ///
 /// # Errors
 /// Returns acpsub's error when the registry file exists but cannot be parsed.
 pub fn trial_host(
     agents: &BTreeMap<String, AcpAgentConfig>,
     storage: &Path,
-) -> Result<Host, acpsub::Error> {
+    sandbox: SessionSandbox<DenyAll>,
+) -> Result<ScratchHost, acpsub::Error> {
     let source = FixedConfig(acpsub_config(agents, storage));
-    Host::from_config(source.0.clone(), source)
+    let cell = Arc::new(ArcSwap::from_pointee(sandbox));
+    Host::from_config_with(
+        source.0.clone(),
+        source,
+        Services {
+            executor: SandboxExecutor::new(cell.clone(), Arc::default()),
+            permissions: ApprovalPermissions::new(cell),
+        },
+    )
 }
 
-/// What a connection looks like to acpsub.
+/// What a connection looks like to acpsub. Its permission policy answers
+/// nothing: May's handler decides every request.
 fn acpsub_config(agents: &BTreeMap<String, AcpAgentConfig>, storage: &Path) -> Config {
     let mut defaults = Defaults::new(storage.join("transcripts"), storage.join("registry.json"));
-    defaults.permission = PermissionPolicy::Allow;
+    defaults.permission = PermissionPolicy::Deny;
     agents
         .iter()
         .fold(Config::new(defaults), |config, (name, agent)| {
-            let mut launch = AgentConfig::new(&agent.command);
-            launch.args.clone_from(&agent.args);
-            launch.env.clone_from(&agent.env);
-            config.with_agent(name, launch)
+            config.with_agent(name, launch_config(&agent.command, &agent.args, &agent.env))
         })
+}
+
+/// How acpsub starts `command`: in the sandbox, so acpsub serves it no file
+/// access of its own; the agent reads and writes from its sandboxed process.
+fn launch_config(command: &str, args: &[String], env: &BTreeMap<String, String>) -> AgentConfig {
+    let mut launch = AgentConfig::new(command);
+    launch.args = args.to_vec();
+    launch.env.clone_from(env);
+    launch.file_access = FileAccess::Off;
+    launch
 }
 
 /// The host's configuration source: the daemon's live [`MayConfig`], read on
 /// every load.
 struct LiveConfig {
     config: Arc<ArcSwap<MayConfig>>,
-    may_dir: PathBuf,
+    storage: PathBuf,
 }
 
 impl LiveConfig {
     fn build(&self) -> Config {
-        acpsub_config(
-            &self.config.load().acp_agents,
-            &self.may_dir.join(STORAGE_DIR),
-        )
+        acpsub_config(&self.config.load().acp_agents, &self.storage)
     }
 }
 
@@ -152,6 +345,12 @@ pub enum AcpError {
         "the ACP agent `{agent}` writes only inside its own working directory, so it cannot be granted other directories to write or commit in"
     )]
     WorktreeGrant {
+        /// The subagent type.
+        agent: String,
+    },
+    /// The session this agent would run for was deleted.
+    #[error("the session was deleted, so the ACP agent `{agent}` cannot start for it")]
+    SessionDeleted {
         /// The subagent type.
         agent: String,
     },
@@ -206,8 +405,9 @@ fn finished(reply: String, end: TurnEnd) -> Result<String, AcpError> {
 /// A connected agent, opening one acpsub session per `subagent start`.
 #[derive(Debug)]
 pub struct AcpSubagent {
-    host: Host,
+    host: SandboxedHost,
     runtime: Handle,
+    lease: Lease,
     agent: String,
     model: Option<String>,
     mode: Option<String>,
@@ -223,14 +423,23 @@ impl ExternalSubagent for AcpSubagent {
                 agent: self.agent.clone(),
             });
         }
+        // Held while the agent starts, so a retiring host ends it too.
+        let retired = self.lease.read_arc().await;
+        if *retired {
+            return Err(AcpError::SessionDeleted {
+                agent: self.agent.clone(),
+            });
+        }
         let mut spec = SessionSpec::new(&self.agent, start.working_dir);
         spec.model.clone_from(&self.model);
         spec.mode.clone_from(&self.mode);
-        spec.permission = Some(PermissionPolicy::Allow);
+        spec.permission = Some(PermissionPolicy::Deny);
         let session = in_runtime(&self.runtime, self.host.spawn(spec)).await?;
+        drop(retired);
         Ok(AcpSession {
             session: Some(session),
             runtime: self.runtime.clone(),
+            lease: self.lease.clone(),
         })
     }
 }
@@ -239,12 +448,13 @@ impl ExternalSubagent for AcpSubagent {
 #[derive(Debug)]
 pub struct AcpSession {
     /// `None` once [`ExternalSession::close`] took it.
-    session: Option<Session>,
+    session: Option<SandboxedSession>,
     runtime: Handle,
+    lease: Lease,
 }
 
 impl AcpSession {
-    const fn session(&self) -> &Session {
+    const fn session(&self) -> &SandboxedSession {
         self.session
             .as_ref()
             .expect("a session is open until it is closed, which consumes it")
@@ -273,7 +483,8 @@ impl ExternalSession for AcpSession {
             .session
             .take()
             .expect("a session is open until it is closed, which consumes it");
-        close_session(&self.runtime, session).await;
+        let lease = self.lease.read_arc().await;
+        close_leased(&self.runtime, session, &lease).await;
     }
 
     fn model(&self) -> Option<String> {
@@ -289,16 +500,37 @@ impl Drop for AcpSession {
     /// A session dropped without [`ExternalSession::close`] still ends: its
     /// agent process must not outlive it.
     fn drop(&mut self) {
-        if let Some(session) = self.session.take() {
-            let runtime = self.runtime.clone();
-            self.runtime.spawn(async move {
-                close_session(&runtime, session).await;
-            });
-        }
+        let Some(session) = self.session.take() else {
+            return;
+        };
+        // Taken here, before the close is spawned, so a host retiring from
+        // now on waits for the close. While one retires no read is granted;
+        // it ends this session itself.
+        let Some(lease) = self.lease.try_read_arc() else {
+            return;
+        };
+        let runtime = self.runtime.clone();
+        self.runtime.spawn(async move {
+            close_leased(&runtime, session, &lease).await;
+        });
     }
 }
 
-async fn close_session(runtime: &Handle, session: Session) {
+/// Closes `session` unless its host retired, which ended it already.
+async fn close_leased(
+    runtime: &Handle,
+    session: SandboxedSession,
+    retired: &RwLockReadGuardArc<bool>,
+) {
+    if !**retired {
+        close_session(runtime, session).await;
+    }
+}
+
+async fn close_session<E: Executor, P: PermissionHandler>(
+    runtime: &Handle,
+    session: Session<E, P>,
+) {
     if let Err(error) = in_runtime(runtime, session.close()).await {
         tracing::warn!(%error, "closing the ACP agent's session failed");
     }
@@ -337,21 +569,28 @@ pub enum TrialError {
     /// checks.
     #[error(transparent)]
     Acpsub(#[from] acpsub::Error),
+    /// The agent stopped answering the handshake; its process was killed.
+    #[error("the agent did not open a trial session within {0:?}")]
+    TimedOut(std::time::Duration),
 }
 
 /// Opens a session with `agent` in a fresh temporary directory and closes it,
 /// proving the connection works before it is configured.
 ///
 /// The session runs on a host of its own that knows only `agent`, so nothing
-/// is registered or stored under the May home.
+/// is registered or stored under the May home. Its process starts in a
+/// sandbox that grants that directory and nothing else.
 ///
 /// # Errors
 /// Returns [`TrialError`]; [`acpsub::Error::ModelRequired`] and
 /// [`acpsub::Error::ModeRequired`] carry the ids the agent advertises.
+/// [`TrialError::TimedOut`] follows a handshake still unfinished after
+/// `limit`, with the agent's process tree killed.
 pub async fn try_connection(
     runtime: &Handle,
     name: &str,
     agent: &AcpAgentConfig,
+    limit: std::time::Duration,
 ) -> Result<(), TrialError> {
     let scratch = blocking::unblock(tempfile::tempdir).await?;
     let work = scratch.path().join("work");
@@ -359,12 +598,20 @@ pub async fn try_connection(
     let host = trial_host(
         &BTreeMap::from([(name.to_string(), agent.clone())]),
         &scratch.path().join("acp"),
+        SessionSandbox::scratch(&work),
     )?;
     let mut spec = SessionSpec::new(name, work);
     spec.model.clone_from(&agent.model);
     spec.mode.clone_from(&agent.mode);
-    spec.permission = Some(PermissionPolicy::Allow);
-    let session = in_runtime(runtime, host.spawn(spec)).await?;
+    spec.permission = Some(PermissionPolicy::Deny);
+    // The timer is built inside the runtime's context. A handshake dropped at
+    // the limit releases acpsub's last handle on the agent, which kills its
+    // process tree.
+    let session = in_runtime(runtime, async {
+        tokio::time::timeout(limit, host.spawn(spec)).await
+    })
+    .await
+    .map_err(|_| TrialError::TimedOut(limit))??;
     close_session(runtime, session).await;
     Ok(())
 }
@@ -387,21 +634,35 @@ pub enum ProbeError {
     /// The command stayed silent.
     #[error("no answer to ACP initialize within {0:?}")]
     TimedOut(std::time::Duration),
+    /// The probe's sandbox could not be prepared.
+    #[error("cannot prepare the probe's sandbox: {0}")]
+    Scratch(std::io::Error),
 }
 
-/// Starts `command` and asks it ACP `initialize`, giving up after `limit`.
-/// The process is killed when the probe ends.
+/// Starts `command` in a sandbox granting an empty scratch directory and
+/// nothing else, and asks it ACP `initialize`, giving up after `limit`. The
+/// process is killed when the probe ends.
 ///
 /// # Errors
-/// Returns [`ProbeError`] when the command is not an ACP agent.
+/// Returns [`ProbeError`] when the command is not an ACP agent or the
+/// sandbox cannot be prepared.
 pub async fn probe_agent(
     command: &str,
     args: &[String],
     limit: std::time::Duration,
 ) -> Result<AgentIdentity, ProbeError> {
-    let mut launch = AgentConfig::new(command);
-    launch.args = args.to_vec();
-    let answer = tokio::time::timeout(limit, acpsub::probe(&launch))
+    let launch = launch_config(command, args, &BTreeMap::new());
+    let scratch = blocking::unblock(tempfile::tempdir)
+        .await
+        .map_err(ProbeError::Scratch)?;
+    let cell = Arc::new(ArcSwap::from_pointee(SessionSandbox::scratch(
+        scratch.path(),
+    )));
+    let services = Services {
+        executor: SandboxExecutor::new(cell.clone(), Arc::default()),
+        permissions: ApprovalPermissions::new(cell),
+    };
+    let answer = tokio::time::timeout(limit, probe_with(&launch, services))
         .await
         .map_err(|_| ProbeError::TimedOut(limit))??;
     let info = answer.agent_info.unwrap_or_default();
@@ -449,9 +710,11 @@ mod tests {
     use aither_agent::specialized::SubagentArgs;
     use aither_core::llm::tool::{ToolContext, ToolResult};
     use aither_core::llm::{Event, LLMRequest, Tool, model::Profile};
+    use aither_sandbox::CommandUsage;
     use futures_lite::Stream;
 
     use super::*;
+    use crate::agent::PermissionApprover;
 
     /// A model that is never asked anything: external subagents bring their own.
     #[derive(Clone)]
@@ -495,19 +758,468 @@ mod tests {
             model: Some("a".to_string()),
             mode: Some("default".to_string()),
             description: "a scripted ACP agent".to_string(),
+            grants: Vec::new(),
         }
     }
 
-    fn agents(may_dir: &Path, connected: BTreeMap<String, AcpAgentConfig>) -> AcpAgents {
+    fn fixtures_dir() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+    }
+
+    /// A session sandbox rooted in `root` that reads the fake agent's script
+    /// and the `readable` directories and writes the `writable` ones.
+    fn sandbox(
+        root: &Path,
+        readable: Vec<PathBuf>,
+        writable: Vec<PathBuf>,
+        approver: Option<PermissionApprover>,
+    ) -> SessionSandbox<SessionPolicy> {
+        let grants = aither_sandbox::TerminalGrants::new();
+        grants.add_readable(fixtures_dir());
+        for path in readable {
+            grants.add_readable(path);
+        }
+        for path in writable {
+            grants.add_writable(path);
+        }
+        std::fs::create_dir_all(root).expect("session dir");
+        SessionSandbox::for_session(
+            root.to_path_buf(),
+            grants,
+            crate::terminal_permission_handler::TerminalPermissionHandler::for_agent(
+                None, None, None,
+            ),
+            heel::NetworkAuditLog::rolling_daily(root.join("audit"), 1).expect("audit log"),
+            aither_sandbox::ProcessPriority::default(),
+            approver,
+        )
+    }
+
+    fn hosts(may_dir: &Path, connected: BTreeMap<String, AcpAgentConfig>) -> AcpHosts {
+        // The sandbox spawns on the daemon's global executor.
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
         let config = MayConfig {
-            acp_agents: connected.clone(),
+            acp_agents: connected,
             ..MayConfig::default()
         };
-        AcpAgents {
-            host: live_host(Arc::new(ArcSwap::from_pointee(config)), may_dir).expect("host"),
-            runtime: Handle::current(),
-            connected,
+        AcpHosts::new(
+            Arc::new(ArcSwap::from_pointee(config)),
+            MayHomePaths::new(may_dir.to_path_buf()),
+            Handle::current(),
+        )
+    }
+
+    /// The agents of a session that may write everything under `may_dir`.
+    fn agents(may_dir: &Path, connected: BTreeMap<String, AcpAgentConfig>) -> AcpAgents {
+        hosts(may_dir, connected)
+            .agents(
+                "session",
+                sandbox(
+                    &may_dir.join("session"),
+                    Vec::new(),
+                    vec![may_dir.to_path_buf()],
+                    None,
+                ),
+            )
+            .expect("host")
+    }
+
+    /// Runs `prompt` on a fake agent in a session whose sandbox is `sandbox`
+    /// and returns the turn's reply.
+    async fn fake_turn(
+        may_dir: &Path,
+        sandbox: SessionSandbox<SessionPolicy>,
+        cwd: &Path,
+        prompt: &str,
+    ) -> String {
+        fake_turn_with(fake_connection(), may_dir, sandbox, cwd, prompt).await
+    }
+
+    /// As [`fake_turn`], with the agent started as `connection` says.
+    async fn fake_turn_with(
+        connection: AcpAgentConfig,
+        may_dir: &Path,
+        sandbox: SessionSandbox<SessionPolicy>,
+        cwd: &Path,
+        prompt: &str,
+    ) -> String {
+        let acp = hosts(may_dir, BTreeMap::from([("fake".to_string(), connection)]))
+            .agents("session", sandbox)
+            .expect("host");
+        let mut spec = SessionSpec::new("fake", cwd);
+        spec.model = Some("a".to_string());
+        spec.mode = Some("default".to_string());
+        spec.permission = Some(PermissionPolicy::Deny);
+        let session = tokio::time::timeout(
+            Duration::from_secs(60),
+            in_runtime(&acp.runtime, acp.host.spawn(spec)),
+        )
+        .await
+        .expect("the sandboxed agent starts")
+        .expect("the agent starts inside the sandbox");
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(60),
+            in_runtime(&acp.runtime, session.prompt(prompt)),
+        )
+        .await
+        .expect("the turn ends")
+        .expect("the turn runs");
+        close_session(&acp.runtime, session).await;
+        outcome.reply
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_acp_terminal_command_writes_only_inside_its_granted_directories() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let granted = dir.path().join("granted");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&granted).expect("granted dir");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        let inside_file = granted.join("inside.txt");
+        let outside_file = outside.join("outside.txt");
+
+        let reply = fake_turn(
+            dir.path(),
+            sandbox(
+                &dir.path().join("session"),
+                Vec::new(),
+                vec![granted.clone()],
+                None,
+            ),
+            &granted,
+            &format!(
+                "RUN sh -c 'echo in > {}; echo out > {}'",
+                inside_file.display(),
+                outside_file.display()
+            ),
+        )
+        .await;
+
+        assert_eq!(
+            std::fs::read_to_string(&inside_file).expect("the granted directory is writable"),
+            "in\n",
+            "{reply}"
+        );
+        assert!(
+            !outside_file.exists(),
+            "the command wrote outside its grants: {reply}"
+        );
+        assert!(reply.contains("exit:"), "{reply}");
+        assert!(!reply.contains("exit:0"), "the denied write fails: {reply}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_agent_installed_outside_the_session_keeps_its_state_in_a_granted_directory() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        // Stands in for an install prefix and for `~/.codex`; neither is a
+        // session grant.
+        let prefix = dir.path().join("prefix");
+        let state = dir.path().join("state");
+        let outside = dir.path().join("outside");
+        for path in [&prefix, &state, &outside, &dir.path().join("work")] {
+            std::fs::create_dir_all(path).expect("dir");
         }
+        std::fs::write(state.join("state"), "old\n").expect("state file");
+        let program = prefix.join("acp-agent");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\n\
+             cat \"$STATE_DIR/state\" > \"$STATE_DIR/seen\" || exit 7\n\
+             echo started >> \"$STATE_DIR/state\" || exit 7\n\
+             echo \"$HOME\" > \"$STATE_DIR/home\" || exit 7\n\
+             echo leaked > \"$OUTSIDE_FILE\" 2>/dev/null && echo leaked >> \"$STATE_DIR/state\"\n\
+             exec python3 \"$1\"\n",
+        )
+        .expect("agent script");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .expect("executable");
+        let outside_file = outside.join("leak.txt");
+        let connection = AcpAgentConfig {
+            command: program.to_string_lossy().into_owned(),
+            env: BTreeMap::from([
+                (
+                    "STATE_DIR".to_string(),
+                    state.to_string_lossy().into_owned(),
+                ),
+                (
+                    "OUTSIDE_FILE".to_string(),
+                    outside_file.to_string_lossy().into_owned(),
+                ),
+            ]),
+            grants: vec![state.clone()],
+            ..fake_connection()
+        };
+        let mut connection = connection;
+        connection.args = fake_connection().args;
+
+        let work = dir.path().join("work");
+        let reply = fake_turn_with(
+            connection,
+            dir.path(),
+            sandbox(&dir.path().join("session"), Vec::new(), Vec::new(), None),
+            &work,
+            "say something",
+        )
+        .await;
+
+        assert!(reply.contains("ab"), "the agent runs: {reply}");
+        assert_eq!(
+            std::fs::read_to_string(state.join("seen")).expect("the agent read its state"),
+            "old\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(state.join("state")).expect("the agent updated its state"),
+            "old\nstarted\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(state.join("home"))
+                .expect("the agent reported its home")
+                .trim_end(),
+            std::fs::canonicalize(std::env::home_dir().expect("home"))
+                .expect("home resolves")
+                .to_string_lossy(),
+            "the agent runs with the user's real home"
+        );
+        assert!(
+            !outside_file.exists(),
+            "the agent wrote outside its grants: {reply}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_permission_request_is_refused_unless_the_approver_grants_it() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).expect("work dir");
+        let unavailable = PermissionApprover::new()
+            .for_session("session")
+            .without_interactive_approval("this test");
+        for approver in [None, Some(unavailable)] {
+            let reply = fake_turn(
+                dir.path(),
+                sandbox(
+                    &dir.path().join("session"),
+                    Vec::new(),
+                    vec![work.clone()],
+                    approver,
+                ),
+                &work,
+                "PERMISSION",
+            )
+            .await;
+            assert!(
+                reply.contains("perm:deny-1"),
+                "an unanswered request selects the reject option: {reply}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_command_argument_naming_a_file_outside_the_grants_grants_nothing() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let work = dir.path().join("work");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&work).expect("work dir");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        let secret = outside.join("hosts.yml");
+        std::fs::write(&secret, "oauth_token: hunter2\n").expect("secret file");
+
+        let reply = fake_turn(
+            dir.path(),
+            sandbox(
+                &dir.path().join("session"),
+                Vec::new(),
+                vec![work.clone()],
+                None,
+            ),
+            &work,
+            &format!("RUN cat {}", secret.display()),
+        )
+        .await;
+
+        assert!(
+            !reply.contains("hunter2"),
+            "the command read a file only its argument named: {reply}"
+        );
+        assert!(reply.contains("exit:"), "{reply}");
+        assert!(!reply.contains("exit:0"), "the denied read fails: {reply}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_linked_program_starts_under_its_link_name() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        // `bin/agent` is a link to `prefix/real-agent`, as `cargo` is a link
+        // to `rustup`; neither directory is a session grant.
+        let prefix = dir.path().join("prefix");
+        let bin = dir.path().join("bin");
+        let state = dir.path().join("state");
+        let work = dir.path().join("work");
+        for path in [&prefix, &bin, &state, &work] {
+            std::fs::create_dir_all(path).expect("dir");
+        }
+        let program = prefix.join("real-agent");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\n\
+             echo \"$0\" > \"$STATE_DIR/argv0\" || exit 7\n\
+             echo \"$TMPDIR\" > \"$STATE_DIR/tmpdir\" || exit 7\n\
+             exec python3 \"$1\"\n",
+        )
+        .expect("agent script");
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+            .expect("executable");
+        let link = bin.join("agent");
+        std::os::unix::fs::symlink(&program, &link).expect("link");
+        let connection = AcpAgentConfig {
+            command: link.to_string_lossy().into_owned(),
+            env: BTreeMap::from([(
+                "STATE_DIR".to_string(),
+                state.to_string_lossy().into_owned(),
+            )]),
+            grants: vec![state.clone()],
+            ..fake_connection()
+        };
+
+        let session = dir.path().join("session");
+        let reply = fake_turn_with(
+            connection,
+            dir.path(),
+            sandbox(&session, Vec::new(), Vec::new(), None),
+            &work,
+            "say something",
+        )
+        .await;
+
+        assert!(reply.contains("ab"), "the agent runs: {reply}");
+        assert_eq!(
+            std::fs::read_to_string(state.join("argv0"))
+                .expect("the agent recorded its name")
+                .trim_end(),
+            link.to_string_lossy(),
+            "the agent starts under its link's name"
+        );
+        assert_eq!(
+            Path::new(
+                std::fs::read_to_string(state.join("tmpdir"))
+                    .expect("the agent recorded its TMPDIR")
+                    .trim_end()
+            ),
+            std::fs::canonicalize(&session)
+                .expect("session resolves")
+                .join("tmp"),
+            "temporary files go inside the sandbox"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sandboxed_agent_is_offered_no_client_file_access() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).expect("work dir");
+        let file = work.join("notes.txt");
+        std::fs::write(&file, "readable by the agent itself").expect("file");
+        let session = || {
+            sandbox(
+                &dir.path().join("session"),
+                Vec::new(),
+                vec![work.clone()],
+                None,
+            )
+        };
+
+        let caps = fake_turn(dir.path(), session(), &work, "CAPS").await;
+        assert!(
+            caps.contains("caps:read=false,write=false"),
+            "initialize advertises no fs capability: {caps}"
+        );
+        let read = fake_turn(
+            dir.path(),
+            session(),
+            &work,
+            &format!("READ {}", file.display()),
+        )
+        .await;
+        assert!(
+            read.contains("fserr:Method not found"),
+            "acpsub refuses fs/read_text_file: {read}"
+        );
+        assert!(!read.contains("readable by the agent"), "{read}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn deleting_a_session_ends_its_agents_and_removes_their_storage() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).expect("work dir");
+        let hosts = hosts(
+            dir.path(),
+            BTreeMap::from([("fake".to_string(), fake_connection())]),
+        );
+        let acp = hosts
+            .agents(
+                "session",
+                sandbox(
+                    &dir.path().join("session"),
+                    Vec::new(),
+                    vec![work.clone()],
+                    None,
+                ),
+            )
+            .expect("host");
+        let backend = AcpSubagent {
+            host: acp.host.clone(),
+            runtime: acp.runtime.clone(),
+            lease: acp.lease.clone(),
+            agent: "fake".to_string(),
+            model: Some("a".to_string()),
+            mode: Some("default".to_string()),
+        };
+        let start = || ExternalStart {
+            working_dir: &work,
+            worktrees: &[],
+            commit_worktrees: &[],
+        };
+        let open = || async {
+            tokio::time::timeout(
+                Duration::from_secs(60),
+                ExternalSubagent::open(&backend, start()),
+            )
+            .await
+            .expect("the agent starts")
+            .expect("the session opens")
+        };
+        let dropped = open().await;
+        let kept = open().await;
+        let storage = MayHomePaths::new(dir.path().to_path_buf()).acp_session_dir("session");
+        assert!(storage.is_dir(), "acpsub stores the session's agents");
+
+        // The dropped session's close is in flight while the session goes.
+        drop(dropped);
+        tokio::time::timeout(Duration::from_secs(60), hosts.remove_session("session"))
+            .await
+            .expect("the session's agents end")
+            .expect("the storage is removed");
+
+        assert!(!storage.exists(), "the session's ACP storage is gone");
+        assert!(
+            acp.host.state().live.lock().expect("live table").is_empty(),
+            "every agent session of the deleted session ended"
+        );
+        // A session closed after the delete leaves nothing behind, and no new
+        // one starts for the deleted session.
+        ExternalSession::close(kept).await;
+        assert!(!storage.exists(), "a late close recreated the storage");
+        let refused = ExternalSubagent::open(&backend, start())
+            .await
+            .expect_err("nothing starts for a deleted session");
+        assert!(
+            matches!(refused, AcpError::SessionDeleted { .. }),
+            "{refused}"
+        );
     }
 
     async fn call_text(
@@ -528,18 +1240,21 @@ mod tests {
             BTreeMap::from([("fake".to_string(), fake_connection())]),
         );
         let tool = acp
-            .register(SubagentTool::new(NoLlm).with_base_dir(dir.path()))
+            .register(
+                SubagentTool::new(NoLlm, dir.path().join("subagents")).with_base_dir(dir.path()),
+            )
             .expect("the name is free");
         assert!(
-            tool.type_descriptions()
-                .contains(&("fake", "a scripted ACP agent"))
+            tool.usage().await.contains("- fake: a scripted ACP agent"),
+            "the connected agent is listed with its description"
         );
         let prompt = dir.path().join("prompt.txt");
         std::fs::write(&prompt, "say something").expect("prompt file");
-        let start = |prompt: &Path| SubagentArgs::Start {
-            subagent: "fake".to_string(),
+        let start = |prompt: &Path| SubagentArgs {
+            name: "external".to_string(),
             prompt_file: prompt.to_string_lossy().into_owned(),
-            model: None,
+            id: None,
+            agent: Some("fake".to_string()),
             worktrees: Vec::new(),
             commit_worktrees: Vec::new(),
         };
@@ -558,9 +1273,13 @@ mod tests {
             Duration::from_secs(60),
             call_text(
                 &tool,
-                SubagentArgs::Resume {
-                    id,
+                SubagentArgs {
+                    name: "resume".to_string(),
                     prompt_file: prompt.to_string_lossy().into_owned(),
+                    id: Some(id),
+                    agent: None,
+                    worktrees: Vec::new(),
+                    commit_worktrees: Vec::new(),
                 },
             ),
         )
@@ -577,6 +1296,7 @@ mod tests {
         let backend = AcpSubagent {
             host: acp.host,
             runtime: acp.runtime,
+            lease: acp.lease,
             agent: "fake".to_string(),
             model: None,
             mode: None,
@@ -608,7 +1328,7 @@ mod tests {
             BTreeMap::from([("explore".to_string(), fake_connection())]),
         );
         let error = acp
-            .register(SubagentTool::new(NoLlm).with_builtins())
+            .register(SubagentTool::new(NoLlm, dir.path().join("subagents")))
             .map(|_| ())
             .expect_err("the built-in type keeps its name");
         assert!(error.to_string().contains("built-in"), "{error}");

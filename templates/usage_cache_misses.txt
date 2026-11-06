@@ -1,0 +1,22 @@
+{%- macro cause_label(cause) -%}
+{%- match cause -%}
+{%- when CacheMissCause::ToolsChanged -%}tool set changed
+{%- when CacheMissCause::Compaction -%}compaction
+{%- when CacheMissCause::Expired -%}cache lifetime expired
+{%- when CacheMissCause::AgentRebuilt -%}agent rebuilt
+{%- when CacheMissCause::PrefixChanged -%}prefix changed
+{%- when CacheMissCause::ModelSwitched -%}after a model switch
+{%- when CacheMissCause::ProviderDropped -%}provider dropped the cache
+{%- endmatch -%}
+{%- endmacro -%}
+Cache misses {{ total }}  {{ tokens }} tokens not read from cache
+{% for row in causes %}  {% call cause_label(row.cause) %}{% endcall %}  {{ row.misses }}  {{ row.tokens }} tokens
+{% endfor -%}
+Recent cache misses
+{% for miss in recent %}  {{ miss.at }}  {{ miss.model }}  {% call cause_label(miss.cause) %}{% endcall %}  {{ miss.tokens }} tokens
+{%- match miss.diverged -%}
+{%- when Diverged::Tools %}  changed at the tool definitions
+{%- when Diverged::Message { index, kind } %}  changed at message {{ index }} ({{ kind }})
+{%- when Diverged::Nothing -%}
+{%- endmatch %}  {{ miss.gap }} after the previous request
+{% endfor -%}

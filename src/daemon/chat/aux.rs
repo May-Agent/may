@@ -5,8 +5,10 @@
 //! agent, or the session's tools. Callers (prompt suggestion, recap) own
 //! eligibility and message construction; [`AuxTasks`] owns identity and
 //! cancellation so a superseded or stale result can never be applied —
-//! a result may be applied only while [`AuxTasks::is_current`] still holds
-//! for its request id.
+//! a result is published only through [`AuxTasks::commit`], which checks
+//! ownership and publishes under one lock, and [`AuxTasks::cancel`]
+//! publishes its own frame under that same lock, so a cancelled task's
+//! result can never follow the cancellation.
 //!
 //! Cancellation is cooperative: replacing or cancelling a session's slot
 //! aborts the task, and every cancellation path the issue describes (new
@@ -18,6 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 
 use crate::daemon::state::DaemonState;
@@ -29,8 +32,20 @@ pub struct AuxTasks {
     next_id: AtomicU64,
 }
 
+/// What an aux task generates, and so which setting governs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuxKind {
+    /// A prompt suggestion, governed by `[suggestions] enabled`.
+    Suggestion,
+    /// A recap the idle timer started, governed by `[recap] auto`.
+    AutoRecap,
+    /// A recap the user asked for.
+    ManualRecap,
+}
+
 struct AuxTask {
     request_id: u64,
+    kind: AuxKind,
     handle: tokio::task::JoinHandle<()>,
 }
 
@@ -52,6 +67,7 @@ impl AuxTasks {
     pub fn start<F>(
         &self,
         session_id: &str,
+        kind: AuxKind,
         make_task: impl FnOnce(u64) -> F,
         rt: &tokio::runtime::Handle,
     ) -> u64
@@ -59,37 +75,75 @@ impl AuxTasks {
         F: std::future::Future<Output = ()> + Send + 'static,
     {
         let request_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        // The slot is claimed under the lock the task's commit takes, so a
+        // task that finishes at once still finds itself the owner.
+        let mut tasks = self.tasks();
         let handle = rt.spawn(make_task(request_id));
-        let previous = self
-            .tasks()
-            .insert(session_id.to_string(), AuxTask { request_id, handle });
+        let previous = tasks.insert(
+            session_id.to_string(),
+            AuxTask {
+                request_id,
+                kind,
+                handle,
+            },
+        );
+        drop(tasks);
         if let Some(previous) = previous {
             previous.handle.abort();
         }
         request_id
     }
 
-    /// Aborts and forgets `session_id`'s in-flight aux task, if any.
-    pub fn cancel(&self, session_id: &str) {
-        let task = self.tasks().remove(session_id);
-        if let Some(task) = task {
+    /// Aborts and forgets `session_id`'s in-flight aux task, if any, then
+    /// runs `publish` (the cancellation's own frame), all under the lock
+    /// [`Self::commit`] takes: a result either published before this call or
+    /// is rejected after it.
+    pub fn cancel(&self, session_id: &str, publish: impl FnOnce()) {
+        let mut tasks = self.tasks();
+        if let Some(task) = tasks.remove(session_id) {
             task.handle.abort();
         }
+        publish();
+        drop(tasks);
     }
 
-    /// Forgets `session_id`'s task while `request_id` still owns it. A
-    /// finishing task releases its slot through this without being aborted.
-    pub fn clear(&self, session_id: &str, request_id: u64) {
-        if let std::collections::hash_map::Entry::Occupied(entry) =
-            self.tasks().entry(session_id.to_string())
-            && entry.get().request_id == request_id
-        {
-            entry.remove();
+    /// Aborts every in-flight task of `kind` and runs `publish` with each
+    /// one's session, under the lock [`Self::commit`] takes: the setting
+    /// governing `kind` went off, and no such result may follow.
+    pub fn cancel_kind(&self, kind: AuxKind, mut publish: impl FnMut(&str)) {
+        let mut tasks = self.tasks();
+        let sessions: Vec<String> = tasks
+            .iter()
+            .filter(|(_, task)| task.kind == kind)
+            .map(|(session_id, _)| session_id.clone())
+            .collect();
+        for session_id in sessions {
+            if let Some(task) = tasks.remove(&session_id) {
+                task.handle.abort();
+            }
+            publish(&session_id);
         }
+        drop(tasks);
     }
 
-    /// Whether `request_id` still owns `session_id`'s aux slot. A result is
-    /// applied only while this holds.
+    /// Publishes the result of `request_id` through `publish` and releases
+    /// its slot, while `request_id` still owns `session_id`'s slot; the
+    /// check and the publication are one step under the lock. Returns
+    /// whether the task owned the slot.
+    pub fn commit(&self, session_id: &str, request_id: u64, publish: impl FnOnce()) -> bool {
+        let mut tasks = self.tasks();
+        let owns = tasks
+            .get(session_id)
+            .is_some_and(|task| task.request_id == request_id);
+        if owns {
+            publish();
+            tasks.remove(session_id);
+        }
+        owns
+    }
+
+    /// Whether `request_id` currently owns `session_id`'s aux slot.
+    #[cfg(test)]
     pub fn is_current(&self, session_id: &str, request_id: u64) -> bool {
         self.tasks()
             .get(session_id)
@@ -109,6 +163,9 @@ pub enum AuxError {
     /// The provider call failed.
     #[error("model call failed: {0}")]
     Model(String),
+    /// The model answered, but not with an acceptable output.
+    #[error("model output rejected: {0}")]
+    Output(String),
     /// The run exceeded its timeout.
     #[error("aux run timed out")]
     Timeout,
@@ -124,117 +181,164 @@ pub fn warm_cache(state: &DaemonState, session_id: &str) -> Option<aither_agent:
         .filter(aither_agent::CacheWarmth::is_warm)
 }
 
-/// The session's persisted conversation as replay messages — the same
-/// prefix an agent rebuilt from history sees, so provider prefix caches
-/// still hit.
-pub async fn history_messages(
+/// The messages the session's idle agent would send next: its system
+/// prefix, compaction handoff and kept turns. Read without changing the
+/// agent, so the request shares the main agent's cached prefix and carries
+/// nothing a compaction replaced.
+pub async fn context_messages(
     state: &Arc<DaemonState>,
     session_id: &str,
 ) -> Result<Vec<aither_core::llm::Message>, AuxError> {
-    let history = crate::session::load_history_from_db(&state.db(), session_id)
+    let worker = super::hosts::idle_agent(state, session_id)
         .await
         .map_err(|error| AuxError::Session(error.to_string()))?;
-    history
-        .to_aither_messages()
-        .map_err(|error| AuxError::Session(error.to_string()))
+    let handle = worker.context_messages();
+    while let Some(event) = handle.recv().await {
+        if let crate::agent::TuiEvent::ContextMessages(result) = event {
+            return result.map_err(|error| AuxError::Session(error.to_string()));
+        }
+    }
+    Err(AuxError::Session(
+        "the agent stopped before it gave its context".to_string(),
+    ))
 }
 
-/// Streams `messages` through the session's own model via its parked agent
-/// and collects the text. The call is a side request like `/btw`: nothing
-/// enters the conversation. Fails as [`AuxError::Timeout`] after `timeout`.
-pub async fn run(
+/// The languages `session_id`'s agent was configured with.
+pub async fn languages(
+    state: &Arc<DaemonState>,
+    session_id: &str,
+) -> Result<aither_agent::Languages, AuxError> {
+    let worker = super::hosts::idle_agent(state, session_id)
+        .await
+        .map_err(|error| AuxError::Session(error.to_string()))?;
+    worker.languages().ok_or(AuxError::NoModel)
+}
+
+/// Generates a `T` from `messages` through the session's own model via its
+/// parked agent. The call is a side request like `/btw`: nothing enters the
+/// conversation. Fails as [`AuxError::Timeout`] after `timeout`.
+pub async fn generate<T: AuxOutput>(
     state: &Arc<DaemonState>,
     session_id: &str,
     messages: Vec<aither_core::llm::Message>,
     timeout: Duration,
-) -> Result<String, AuxError> {
-    tokio::time::timeout(timeout, Box::pin(respond(state, session_id, messages)))
+) -> Result<T, AuxError> {
+    let call = async {
+        let worker = super::hosts::idle_agent(state, session_id)
+            .await
+            .map_err(|error| AuxError::Session(error.to_string()))?;
+        let slot = worker.btw_llm().ok_or(AuxError::NoModel)?;
+        generate_unbounded(slot, messages).await
+    };
+    tokio::time::timeout(timeout, Box::pin(call))
         .await
         .unwrap_or(Err(AuxError::Timeout))
 }
 
-async fn respond(
-    state: &Arc<DaemonState>,
-    session_id: &str,
+/// [`generate`] through an explicit model slot, for tests with a mock model.
+#[cfg(test)]
+pub async fn generate_with<M: aither_core::LanguageModel, T: AuxOutput>(
+    slot: &crate::agent::ModelSlot<M>,
     messages: Vec<aither_core::llm::Message>,
-) -> Result<String, AuxError> {
-    use aither_core::LanguageModel as _;
-    use aither_core::llm::{Event, LLMRequest};
-    use futures_lite::StreamExt as _;
-
-    let worker = super::hosts::idle_agent(state, session_id)
+    timeout: Duration,
+) -> Result<T, AuxError> {
+    tokio::time::timeout(timeout, Box::pin(generate_unbounded(slot, messages)))
         .await
-        .map_err(|error| AuxError::Session(error.to_string()))?;
-    let llm = worker.btw_llm().cloned().ok_or(AuxError::NoModel)?;
-    let mut stream = std::pin::pin!(llm.respond(LLMRequest::new(messages)));
-    let mut text = String::new();
-    while let Some(event) = stream.next().await {
-        match event {
-            Ok(Event::Text(chunk)) => text.push_str(&chunk),
-            Ok(_) => {}
-            Err(error) => return Err(AuxError::Model(error.to_string())),
-        }
-    }
-    Ok(text)
+        .unwrap_or(Err(AuxError::Timeout))
 }
 
-/// Parses an aux response body: trimmed JSON of at most `max_chars`,
-/// nothing else. `T` should derive `serde::Deserialize` with
-/// `deny_unknown_fields`. Malformed output is `None` — the caller treats it
-/// as a generation failure, never a fallback.
-pub fn parse_strict<T: DeserializeOwned>(text: &str, max_chars: usize) -> Option<T> {
-    let text = text.trim();
-    if text.is_empty()
-        || text.chars().count() > max_chars
-        || text.chars().any(|ch| {
+async fn generate_unbounded<M: aither_core::LanguageModel, T: AuxOutput>(
+    slot: &crate::agent::ModelSlot<M>,
+    messages: Vec<aither_core::llm::Message>,
+) -> Result<T, AuxError> {
+    let output = slot
+        .generate::<T>(messages)
+        .await
+        .map_err(|error| match error {
+            aither_core::llm::GenerateError::Provider(error) => AuxError::Model(error.to_string()),
+            error @ aither_core::llm::GenerateError::Parse { .. } => {
+                AuxError::Output(error.to_string())
+            }
+        })?;
+    check(&output)?;
+    Ok(output)
+}
+
+/// An aux output type: the JSON schema the model fills in, and the limits
+/// of its text fields.
+pub trait AuxOutput: JsonSchema + DeserializeOwned + 'static {
+    /// Every text field with its limit in Unicode scalar values.
+    fn texts(&self) -> Vec<(&str, usize)>;
+}
+
+/// Rejects an output with a text over its limit or holding a control
+/// character other than newline and tab, or a line or paragraph separator.
+/// Nothing is truncated: such an output is a failed generation.
+fn check<T: AuxOutput>(output: &T) -> Result<(), AuxError> {
+    for (text, limit) in output.texts() {
+        if text.chars().count() > limit {
+            return Err(AuxError::Output(format!(
+                "a field exceeds {limit} characters"
+            )));
+        }
+        if text.chars().any(|ch| {
             (ch.is_control() && !matches!(ch, '\n' | '\t')) || matches!(ch, '\u{2028}' | '\u{2029}')
-        })
-    {
-        return None;
+        }) {
+            return Err(AuxError::Output(
+                "a field holds a control character".to_string(),
+            ));
+        }
     }
-    serde_json::from_str(text).ok()
+    Ok(())
+}
+
+/// A scripted model for tests: replies with its text as one event.
+#[cfg(test)]
+pub(super) mod test_support {
+    use aither_core::LanguageModel;
+    use aither_core::llm::{Event, LLMRequest, model::Profile as ModelProfile};
+    use futures_lite::Stream;
+
+    pub struct Replying(pub &'static str);
+
+    #[derive(Debug)]
+    pub struct Never;
+
+    impl std::fmt::Display for Never {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("mock error")
+        }
+    }
+
+    impl std::error::Error for Never {}
+
+    impl aither_core::llm::Classify for Never {
+        fn failure(&self) -> aither_core::llm::Failure {
+            aither_core::llm::Failure::permanent()
+        }
+    }
+
+    impl LanguageModel for Replying {
+        type Error = Never;
+
+        fn respond(
+            &self,
+            _request: LLMRequest,
+        ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
+            futures_lite::stream::iter([Ok(Event::Text(self.0.to_string()))])
+        }
+
+        fn profile(&self) -> impl std::future::Future<Output = Result<ModelProfile, Never>> + Send {
+            std::future::ready(Ok(ModelProfile::new(
+                "mock", "test", "mock", "mock", 100_000,
+            )))
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde::Deserialize;
-
-    #[derive(Debug, Deserialize, PartialEq)]
-    #[serde(deny_unknown_fields)]
-    struct Answer {
-        suggestion: Option<String>,
-    }
-
-    #[test]
-    fn parse_strict_accepts_bounded_json() {
-        let answer = parse_strict::<Answer>(r#"{"suggestion":"run the tests"}"#, 240);
-        assert_eq!(
-            answer,
-            Some(Answer {
-                suggestion: Some("run the tests".to_string())
-            })
-        );
-        let null = parse_strict::<Answer>(r#"{"suggestion":null}"#, 240);
-        assert_eq!(null, Some(Answer { suggestion: None }));
-    }
-
-    #[test]
-    fn parse_strict_rejects_malformed_output() {
-        for text in [
-            r#"{"suggestion":"x","extra":1}"#, // unknown field
-            r#"{"suggestion":"x"} trailing"#,  // trailing garbage
-            "not json",
-            "",
-            "   ",
-            "{\"suggestion\":\"x\u{2028}\"}", // control char
-        ] {
-            assert_eq!(parse_strict::<Answer>(text, 240), None, "input: {text:?}");
-        }
-        assert_eq!(parse_strict::<Answer>(r#"{"suggestion":"x"}"#, 3), None);
-        // Newlines and tabs survive: structured answers may legitimately wrap.
-        assert!(parse_strict::<Answer>("{\n  \"suggestion\": null\n}", 240).is_some());
-    }
 
     #[tokio::test]
     async fn start_supersedes_and_aborts_the_previous_task() {
@@ -243,6 +347,7 @@ mod tests {
         let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel::<()>();
         let first = registry.start(
             "s",
+            AuxKind::Suggestion,
             |_| async move {
                 // Abort drops the future and its captured sender.
                 let _dropped_tx = dropped_tx;
@@ -251,28 +356,72 @@ mod tests {
             &rt,
         );
         assert!(registry.is_current("s", first));
-        let second = registry.start("s", |_| std::future::pending(), &rt);
+        let second = registry.start("s", AuxKind::Suggestion, |_| std::future::pending(), &rt);
         assert!(registry.is_current("s", second));
         assert!(!registry.is_current("s", first));
         dropped_rx
             .await
             .expect_err("the first task was not aborted");
-        registry.cancel("s");
+        registry.cancel("s", || {});
         assert!(!registry.is_current("s", second));
     }
 
     #[tokio::test]
-    async fn clear_releases_only_the_owning_request() {
+    async fn commit_releases_only_the_owning_request() {
         let rt = tokio::runtime::Handle::current();
         let registry = AuxTasks::default();
-        let request_id = registry.start("s", |_| std::future::pending(), &rt);
-        registry.clear("s", request_id + 1);
+        let request_id = registry.start("s", AuxKind::Suggestion, |_| std::future::pending(), &rt);
+        assert!(!registry.commit("s", request_id + 1, || panic!("not the owner")));
         assert!(registry.is_current("s", request_id));
-        registry.clear("s", request_id);
+        assert!(registry.commit("s", request_id, || {}));
         assert!(!registry.is_current("s", request_id));
         assert_ne!(
-            registry.start("s", |_| std::future::pending(), &rt),
+            registry.start("s", AuxKind::Suggestion, |_| std::future::pending(), &rt),
             request_id
         );
+    }
+
+    fn logged(log: &Mutex<Vec<&'static str>>, entry: &'static str) {
+        log.lock().expect("log").push(entry);
+    }
+
+    #[tokio::test]
+    async fn a_result_never_follows_the_cancellation_it_raced() {
+        let rt = tokio::runtime::Handle::current();
+        // Interleave the two on real threads many times: whichever wins,
+        // the cancellation's frame is last, and a rejected commit
+        // publishes nothing.
+        for _ in 0..500 {
+            let registry = Arc::new(AuxTasks::default());
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let request_id =
+                registry.start("s", AuxKind::Suggestion, |_| std::future::pending(), &rt);
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let committing = {
+                let (registry, log, barrier) = (registry.clone(), log.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    registry.commit("s", request_id, || logged(&log, "ready"))
+                })
+            };
+            barrier.wait();
+            registry.cancel("s", || logged(&log, "cleared"));
+            let committed = committing.join().expect("commit thread");
+            let log = log.lock().expect("log");
+            assert_eq!(log.last(), Some(&"cleared"), "{log:?}");
+            assert_eq!(log.len(), if committed { 2 } else { 1 }, "{log:?}");
+            drop(log);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_commit_after_a_cancel_is_rejected() {
+        let rt = tokio::runtime::Handle::current();
+        let registry = AuxTasks::default();
+        let log = Mutex::new(Vec::new());
+        let request_id = registry.start("s", AuxKind::Suggestion, |_| std::future::pending(), &rt);
+        registry.cancel("s", || logged(&log, "cleared"));
+        assert!(!registry.commit("s", request_id, || logged(&log, "ready")));
+        assert_eq!(*log.lock().expect("log"), ["cleared"]);
     }
 }

@@ -1,11 +1,12 @@
 //! Bundled resources extraction.
 //!
 //! Skills are embedded in the binary and extracted
-//! to the canonical May home on first run.
+//! to the canonical May home on first run, beside aither's bundled subagent
+//! definitions.
 //! Local/heel session sandboxes get symlinks pointing to their home-scoped resources.
 //! Container sessions use mount points managed by container lifecycle code.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use async_fs;
 
@@ -43,8 +44,15 @@ impl Bundle {
         // Built-in resources must stay in lockstep with the running binary.
         // Always overwrite bundled content to avoid stale skills after upgrades.
         Self::extract_dir_overwrite(&SKILLS_DIR, &skills_dir).await?;
+        aither_agent::install_bundled_subagents(&Self::subagents_dir(may_dir)).await?;
 
         Ok(())
+    }
+
+    /// The global subagents directory: the definitions `subagent <name>` runs.
+    #[must_use]
+    pub fn subagents_dir(may_dir: &Path) -> PathBuf {
+        may_dir.join("subagents")
     }
 
     /// Create symlinks in a local/heel session sandbox pointing to its home-scoped resources.

@@ -67,7 +67,7 @@ impl ChatDb {
         session_id: &str,
         request: &PersistedAskUserRequest,
     ) -> Result<(), ChatDbError> {
-        super::common::with_busy_retry(|| async {
+        {
             let mut tx = self.db.begin().await?;
             self.insert_pending_ask_user_in_tx(&mut tx, session_id, request, false)
                 .await?;
@@ -81,8 +81,7 @@ impl ChatDb {
             .await?;
             tx.commit().await?;
             Ok(())
-        })
-        .await
+        }
     }
 
     /// Withdraw an open question of `session_id`. Returns whether it was
@@ -350,7 +349,7 @@ impl ChatDb {
         answers: &[QuestionAnswer],
         delivery: Option<impl Fn(&PersistedAskUserRequest) -> PendingUserMessage + Send + Sync>,
     ) -> Result<Option<CommittedAskUserAnswer>, ChatDbError> {
-        super::common::with_busy_retry(|| async {
+        {
             // The transaction opens with the delete so it takes the write lock
             // up front rather than upgrading a read lock.
             let mut tx = self.db.begin().await?;
@@ -423,39 +422,7 @@ impl ChatDb {
                 request,
                 delivered,
             }))
-        })
-        .await
-    }
-
-    /// Delete every pending prompt and open question of `session_id`, and
-    /// with `None` of every session.
-    ///
-    /// # Errors
-    /// Returns [`ChatDbError`] on storage failure.
-    pub(super) async fn delete_session_ask_user_requests(
-        &self,
-        session_id: Option<&str>,
-    ) -> Result<(), ChatDbError> {
-        let mut tx = self.db.begin().await?;
-        if let Some(session_id) = session_id {
-            for sql in [
-                "DELETE FROM session_pending_ask_user_question_options_v2 WHERE request_id IN (SELECT request_id FROM session_pending_ask_user_requests_v2 WHERE session_id = ?)",
-                "DELETE FROM session_pending_ask_user_questions_v2 WHERE request_id IN (SELECT request_id FROM session_pending_ask_user_requests_v2 WHERE session_id = ?)",
-                "DELETE FROM session_pending_ask_user_requests_v2 WHERE session_id = ?",
-            ] {
-                query!(tx, sql, session_id).execute().await?;
-            }
-        } else {
-            for sql in [
-                "DELETE FROM session_pending_ask_user_question_options_v2",
-                "DELETE FROM session_pending_ask_user_questions_v2",
-                "DELETE FROM session_pending_ask_user_requests_v2",
-            ] {
-                query!(tx, sql).execute().await?;
-            }
         }
-        tx.commit().await?;
-        Ok(())
     }
 
     /// Clear the pending prompt `request_id` by its id, leaving any newer

@@ -26,8 +26,8 @@ use super::cli::ExecArgs;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExecError {
-    #[error("failed to resolve May home directory")]
-    MissingHomeDirectory,
+    #[error("failed to resolve May home directory: {0}")]
+    MissingHomeDirectory(may_agent::config::ConfigError),
     #[error("failed to initialize session persistence: {0}")]
     InitializeSession(may_agent::session::SessionError),
     #[error("session '{0}' was not found")]
@@ -136,7 +136,7 @@ pub async fn run_exec(args: ExecArgs) -> Result<i32, ExecError> {
 
     let model = select_exec_model(&may_config);
     let shell_mode = select_exec_mode(&args, &environment);
-    let terminal_tool = build_exec_terminal_tool(
+    let terminal_tool = Box::pin(build_exec_terminal_tool(
         &context,
         &environment,
         &may_config,
@@ -144,7 +144,7 @@ pub async fn run_exec(args: ExecArgs) -> Result<i32, ExecError> {
         args.ssh_server_id.as_deref(),
         args.allow_runtime_install,
         tool_distribution,
-    )
+    ))
     .await?;
 
     // `may exec` reports the final result, so the command runs detached
@@ -192,7 +192,12 @@ pub async fn run_exec(args: ExecArgs) -> Result<i32, ExecError> {
                 .job_registry()
                 .get_by_task_id(&task_id)
                 .await
-                .is_some_and(|job| job.status == aither_sandbox::job_registry::JobStatus::Killed);
+                .is_some_and(|job| {
+                    matches!(
+                        job.status,
+                        aither_sandbox::job_registry::JobStatus::Killed { .. }
+                    )
+                });
             let mut result: CommandResult = completed
                 .result
                 .map_err(|error| ExecError::TerminalCall(anyhow::anyhow!(error.to_string())))?
@@ -212,8 +217,7 @@ pub async fn run_exec(args: ExecArgs) -> Result<i32, ExecError> {
 }
 
 async fn load_exec_session_context(session_id: &str) -> Result<ExecSessionContext, ExecError> {
-    let home_dir = dirs::home_dir().ok_or(ExecError::MissingHomeDirectory)?;
-    let may_dir = home_dir.join(".may");
+    let may_dir = MayConfig::may_dir().map_err(ExecError::MissingHomeDirectory)?;
     let (store, db, _default_profile_id) = initialize_session_persistence(&may_dir)
         .await
         .map_err(ExecError::InitializeSession)?;
@@ -447,9 +451,14 @@ async fn build_exec_terminal_tool(
         },
         futures_lite::future::try_zip(
             async {
-                resolve_provider_runtime(may_config, model, 0)
-                    .await
-                    .map_err(ExecError::ResolveProviderRuntime)
+                resolve_provider_runtime(
+                    may_config,
+                    model,
+                    0,
+                    &may_agent::secrets::SecretRedactor::new(&context.may_dir),
+                )
+                .await
+                .map_err(ExecError::ResolveProviderRuntime)
             },
             async {
                 may_agent::tool_dispatch::ToolDispatchers::spawn(
@@ -469,13 +478,13 @@ async fn build_exec_terminal_tool(
         ),
     )
     .await?;
-    let registry = build_exec_registry(
+    let registry = Box::pin(build_exec_registry(
         context,
         may_config,
         resolved_provider.llm,
         &tool_dispatchers,
         environment,
-    )
+    ))
     .await?;
     let terminal_tool = terminal_tool.with_registry(registry);
     Ok(terminal_tool)
@@ -515,7 +524,7 @@ where
             may_dir: context.may_dir.clone(),
             sandbox_dir: context.sandbox_dir.clone(),
             cwd: cwd.clone(),
-            db: Some(context.db.clone()),
+            db: context.db.clone(),
             ask_user: None,
             imagine: None,
             task_runtime: match environment {
@@ -541,7 +550,9 @@ where
             .map_err(ExecError::WorkspaceConfig)?,
             // exec is no main agent: it has no turn boundary to deliver at.
             agent_messaging: None,
+            languages: None,
             acp: None,
+            git: may_agent::host_git::HostGit::inherit(),
         },
     )
     .await

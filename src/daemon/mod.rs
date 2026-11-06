@@ -26,6 +26,7 @@ mod error_chain;
 mod events;
 mod helpers;
 mod interaction;
+pub use interaction::ASK_USER_NOT_OPEN;
 mod local_url_mapper;
 mod message_mapping;
 mod model_resolution;
@@ -33,6 +34,8 @@ mod notifications;
 mod profiles;
 mod remote_access;
 mod server;
+#[cfg(test)]
+mod session_directory_tests;
 mod sessions;
 mod state;
 mod tasks;
@@ -43,7 +46,17 @@ mod tunnel;
 pub(crate) mod types;
 
 #[cfg(test)]
+mod funnel_tests;
+#[cfg(test)]
+mod paths_tests;
+#[cfg(test)]
+mod repo_clones_tests;
+#[cfg(test)]
 mod response_tests;
+#[cfg(test)]
+mod secret_question_tests;
+#[cfg(test)]
+mod yolo_tests;
 
 pub use chat::{
     BtwMessage, BtwRequest, BtwResponse, CompactResponse, ContextDumpResponse, RecapRecord,
@@ -113,29 +126,43 @@ async fn release_pending_interactions(state: &crate::daemon::state::DaemonState)
 #[derive(Debug, Clone)]
 pub struct DaemonPaths {
     root: PathBuf,
+    socket: PathBuf,
 }
 
 impl DaemonPaths {
     /// Paths under `may_dir`.
     #[must_use]
-    pub const fn new(may_dir: PathBuf) -> Self {
-        Self { root: may_dir }
+    pub fn new(may_dir: PathBuf) -> Self {
+        Self {
+            socket: may_dir.join("daemon.sock"),
+            root: may_dir,
+        }
     }
 
     /// Paths under the user's `~/.may`.
     ///
     /// # Errors
-    /// Fails when the home directory cannot be determined.
+    /// Fails when the home directory cannot be determined or resolved.
     pub fn user() -> anyhow::Result<Self> {
-        Ok(Self::new(
-            MayConfig::may_dir().context("failed to resolve ~/.may")?,
-        ))
+        Self::for_home(dirs::home_dir().context("no home directory")?)
+    }
+
+    /// Paths under `home`'s `.may`. Files live at the resolved home, which
+    /// is what the sandbox grants; the socket keeps `home`'s own spelling,
+    /// since a unix socket path is limited to about 104 bytes and the
+    /// resolved spelling of a home reached through a link can exceed it.
+    fn for_home(home: PathBuf) -> anyhow::Result<Self> {
+        let socket = home.join(".may").join("daemon.sock");
+        let root = MayConfig::resolve_home(home)
+            .context("failed to resolve ~/.may")?
+            .join(".may");
+        Ok(Self { root, socket })
     }
 
     /// The unix socket clients connect to.
     #[must_use]
     pub fn socket(&self) -> PathBuf {
-        self.root.join("daemon.sock")
+        self.socket.clone()
     }
 
     /// The single-instance lock.
@@ -348,11 +375,27 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
     crate::configure_heel_binary().await;
     remove_legacy_search_index(paths.root());
 
+    // Agents of relocated homes whose runs were killed before they could
+    // retire them, swept before the daemon answers so a client never sees
+    // them. A failure leaves other homes' leftovers loaded, which must not
+    // stop this daemon, so it is logged like the retire path's.
+    match blocking::unblock(crate::repo_search::sweep_if_home_relocated).await {
+        Ok(removed) => {
+            for service in removed {
+                tracing::info!(%service, "booted out a repo-search agent of a deleted relocated home");
+            }
+        }
+        Err(error) => tracing::warn!(%error, "could not sweep stale repo-search agents"),
+    }
+
     let started = crate::daemon::start(options.mode).await?;
     let state = started.state;
     let router = Arc::new(started.router);
     let remote_router = Arc::new(started.remote_router);
     let direct_router = Arc::new(started.direct_router);
+    state
+        .remote_access_manager
+        .set_webhook_router(Arc::new(started.webhook_router));
 
     let config = state.config_snapshot();
     let tcp = options.tcp.unwrap_or_else(|| {
@@ -389,6 +432,7 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
         running: HashMap::new(),
     };
     extra.reconcile(&config.daemon.listen).await;
+    chat::watch_aux_settings(&state);
     let config_state = state.clone();
     let mut config_events = state.ui_event_bus.subscribe();
     tokio::spawn(async move {
@@ -414,7 +458,7 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
         state.search_index_wake.clone(),
         state.search_index_status.clone(),
     ));
-    tokio::spawn(AutoIndexer::new(state.db.clone(), repo_search).run());
+    tokio::spawn(AutoIndexer::new(state.db.clone(), repo_search.clone()).run());
 
     wait_for_shutdown(&state.daemon_shutdown).await;
     tracing::info!("May daemon shutting down");
@@ -438,6 +482,14 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
     let deadline = tokio::time::Instant::now() + CANCEL_SETTLE_GRACE;
     while state.runtime_service.runs().live_count() > 0 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    match repo_search.retire().await {
+        Ok(removed) => {
+            for service in removed {
+                tracing::info!(%service, "booted out a repo-search agent of the relocated home");
+            }
+        }
+        Err(error) => tracing::warn!(%error, "could not boot out the repo-search agents"),
     }
     let _ = std::fs::remove_file(paths.socket());
     Ok(())

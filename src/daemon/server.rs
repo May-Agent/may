@@ -91,6 +91,9 @@ pub struct StartedDaemon {
     /// The same routes behind an identity layer with no trusted source yet,
     /// for direct non-loopback `[daemon] listen` binds: every request is 401.
     pub(crate) direct_router: Router,
+    /// The webhook routes alone, for the public listener Tailscale Funnel
+    /// targets. It holds no other route.
+    pub(crate) webhook_router: Router,
 }
 
 /// Builds the server state, starts its background work (scheduler, title
@@ -104,7 +107,6 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
     #[cfg(not(feature = "ui"))]
     mode.ensure_supported()?;
 
-    let cwd = std::env::current_dir().context("Failed to get current working directory")?;
     let may_dir = MayConfig::may_dir().context("Failed to resolve ~/.may")?;
 
     let mcp_manager = McpManager::load()
@@ -197,10 +199,17 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
     let workspace_approver = WorkspaceApprover::new()
         .with_runtime_service(runtime_service.clone())
         .with_may_dir(may_dir.clone());
-    let ask_user_approver = AskUserApprover::new().with_runtime_service(runtime_service.clone());
+    let ask_user_approver = AskUserApprover::new()
+        .with_runtime_service(runtime_service.clone())
+        .with_secret_store(crate::secrets::SecretStore::new(&may_dir));
 
     // Initialize memory processor with fast-tier provider chain
-    let memory_processor = match crate::agent::build_fast_provider_chain(&config).await {
+    let memory_processor = match crate::agent::build_fast_provider_chain(
+        &config,
+        &crate::secrets::SecretRedactor::new(&may_dir),
+    )
+    .await
+    {
         Ok(memory_providers) => {
             tracing::info!("Profile memory processor enabled");
             Some(crate::memory::MemoryProcessor::new(
@@ -230,6 +239,9 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
         .redeliver_pending()
         .await
         .map_err(|e| anyhow!(e.to_string()))?;
+    // Prompts that task runs store for their sessions; dispatched once the
+    // daemon state exists.
+    let (task_wake_tx, task_wake_rx) = async_channel::unbounded::<String>();
     let mut task_runtime = crate::scheduler::TaskRuntime::load(
         db_for_archive.clone(),
         may_dir.clone(),
@@ -241,7 +253,11 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
     .with_ui_event_bus(ui_event_bus.clone())
     .with_network_policy(&config.preferences.network_policy)
     .map_err(|error| anyhow!(error))?
-    .with_connectivity(connectivity.clone());
+    .with_connectivity(connectivity.clone())
+    .with_session_prompts(crate::task_wake::SessionPrompts::new(
+        runtime_service.clone(),
+        task_wake_tx,
+    ));
     if let Some(ref manager) = container_manager {
         task_runtime = task_runtime.with_container_manager(manager.clone());
     }
@@ -250,8 +266,11 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
     let (search_index_wake_tx, search_index_wake) = async_channel::bounded(1);
 
     let config = Arc::new(arc_swap::ArcSwap::from_pointee(config));
-    let acp_host = crate::agent::acp_subagent::live_host(config.clone(), &may_dir)
-        .context("failed to open the ACP session registry")?;
+    let acp_host = Arc::new(crate::agent::acp_subagent::AcpHosts::new(
+        config.clone(),
+        crate::session::MayHomePaths::new(may_dir.clone()),
+        tokio::runtime::Handle::current(),
+    ));
 
     let state = Arc::new(DaemonState {
         acp_host,
@@ -282,7 +301,6 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
         task_runtime: task_runtime.clone(),
         tool_distribution,
         tool_environments: crate::agent::ToolEnvironmentCache::spawn(),
-        cwd,
         repo_search: crate::repo_search::RepoSearch::global(&may_dir),
         may_dir,
         search_index_wake_tx,
@@ -313,6 +331,7 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
     super::chat::spawn_shared_tool_dispatchers(state.clone(), tool_queues);
     super::title_generation::spawn_worker(state.clone(), title_generation_rx);
     super::chat::spawn_background_watcher(state.clone(), state.ui_event_bus.clone());
+    super::chat::spawn_task_wake_dispatcher(state.clone(), task_wake_rx);
     let scheduler = crate::scheduler::TaskScheduler::new(task_runtime);
     let _scheduler = scheduler.spawn();
     super::artifacts::spawn_artifact_watcher(&state);
@@ -336,11 +355,13 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
         )]),
     );
     let router = build_router(state.clone(), mode, None);
+    let webhook_router = build_webhook_router(state.clone());
     Ok(StartedDaemon {
         state,
         router,
         remote_router,
         direct_router,
+        webhook_router,
     })
 }
 
@@ -381,7 +402,7 @@ fn api_routes() -> Route {
         append_session_history, create_session, delete_all_sessions, delete_session, get_session,
         get_session_context_debug, get_session_history, get_session_prs, get_session_tasks,
         list_sessions, lookup_issues, rewind_session, save_session_tasks, set_session_plan_state,
-        update_session,
+        set_session_yolo, update_session,
     };
     use super::tasks::{
         approve_task, create_task, delete_task, get_task, invoke_webhook_task, list_tasks,
@@ -417,8 +438,10 @@ fn api_routes() -> Route {
                     Route::new((
                         "/tasks".at(get_session_tasks),
                         "/prs".at(get_session_prs),
+                        "/repo-clones".at(super::sessions::get_session_repo_clones),
                         "/tasks".put(save_session_tasks),
                         "/tasks/plan-state".put(set_session_plan_state),
+                        "/yolo".put(set_session_yolo),
                         "/stop".post(stop_session_run),
                         "/runtime".route(Route::new((
                             "".at(get_session_runtime),
@@ -585,6 +608,17 @@ fn artifact_page_routes() -> Route {
         "/{profileId}/session/{sessionId}/artifacts".at(serve_artifact),
         "/{profileId}/session/{sessionId}/artifacts/{*path}".at(serve_artifact),
     ))
+}
+
+/// The router of the public Funnel listener: the webhook delivery route and
+/// nothing else, so no other route is reachable through it. Authentication
+/// is the delivery's own token and signature.
+pub(super) fn build_webhook_router(state: Arc<DaemonState>) -> Router {
+    use super::tasks::invoke_webhook_task;
+    let api = "/api".route(Route::new((
+        "/tasks".route(Route::new(("/webhook/{token}".post(invoke_webhook_task),))),
+    )));
+    Route::new((api,)).middleware(State(state)).build()
 }
 
 pub(super) fn build_router(
