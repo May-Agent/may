@@ -117,8 +117,8 @@ enum MockChatScenario {
 /// How the mock answers the compaction requests of [`MockChatScenario::CompactionProbe`].
 #[derive(Clone, Copy)]
 enum CompactionProbe {
-    /// Every compaction is answered with a valid handoff after
-    /// [`COMPACTION_PROBE_DELAY`], while the run keeps going.
+    /// Every compaction is answered with a valid handoff once the run has
+    /// asked the model again, or after [`COMPACTION_PROBE_GATE_LIMIT`].
     Lands,
     /// The compaction and the retry aither makes on a bad answer get
     /// something that is no handoff; the rerun on the cleaned context gets a
@@ -130,9 +130,10 @@ enum CompactionProbe {
 const COMPACTION_PROBE_STEPS: usize = 5;
 /// How long the mock takes to ask for each command.
 const COMPACTION_PROBE_STEP_DELAY: Duration = Duration::from_secs(1);
-/// How long the mock holds a landing compaction's answer back: shorter than
-/// the steps the run keeps taking meanwhile.
-const COMPACTION_PROBE_DELAY: Duration = Duration::from_secs(2);
+/// How long the mock holds a landing compaction's answer back when the run
+/// never asks the model again, so such a run fails its assertion instead of
+/// hanging.
+const COMPACTION_PROBE_GATE_LIMIT: Duration = Duration::from_secs(60);
 /// The task the probe's handoff records; only a compacted context holds it.
 const COMPACTION_PROBE_TASK: &str = "COMPACTED-PROBE-TASK-5521";
 /// The user message that follows the restart.
@@ -183,6 +184,33 @@ const SUBAGENT_PROBE_DONE_TIMEOUT: Duration = Duration::from_secs(60);
 
 const ASK_USER_SCRIPT: &str =
     "ask_user --question 'Which database?' --option PostgreSQL --option SQLite";
+
+/// Holds a landing compaction's answer until the run asks the model again,
+/// or for [`COMPACTION_PROBE_GATE_LIMIT`].
+#[derive(Default)]
+struct CompactionGate {
+    release: tokio::sync::Notify,
+    /// Set when the limit passed first and the compaction landed unasked.
+    timed_out: std::sync::atomic::AtomicBool,
+}
+
+impl CompactionGate {
+    async fn hold(&self) {
+        if tokio::time::timeout(COMPACTION_PROBE_GATE_LIMIT, self.release.notified())
+            .await
+            .is_err()
+        {
+            self.timed_out
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Releases the answer; whether it was still held back.
+    fn release(&self) -> bool {
+        self.release.notify_one();
+        !self.timed_out.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
 
 /// Holds one agent request until the test releases it, so the test can act
 /// while a run is in flight.
@@ -360,8 +388,8 @@ struct MockScenarioState {
     probe_steps: usize,
     /// Compaction requests a compaction probe received.
     compactions: usize,
-    /// Until when a landing compaction is still unanswered.
-    compaction_open_until: Option<tokio::time::Instant>,
+    /// Releases the answer of a landing compaction that is still unanswered.
+    compaction_gate: Option<Arc<CompactionGate>>,
     /// Agent requests served while a compaction was unanswered.
     served_during_compaction: usize,
 }
@@ -375,7 +403,7 @@ impl MockScenarioState {
             probe_done: false,
             probe_steps: 0,
             compactions: 0,
-            compaction_open_until: None,
+            compaction_gate: None,
             served_during_compaction: 0,
         }
     }
@@ -394,20 +422,28 @@ impl MockScenarioState {
                     Duration::ZERO,
                 ));
             }
-            let delay = match probe {
-                CompactionProbe::Lands => COMPACTION_PROBE_DELAY,
-                CompactionProbe::FailsThenLands => Duration::ZERO,
+            let handoff = delayed_sse_frame(
+                text_chunk(&compaction_probe_handoff(), None),
+                Duration::ZERO,
+            );
+            let handoff = match probe {
+                CompactionProbe::Lands => {
+                    let gate = Arc::new(CompactionGate::default());
+                    self.compaction_gate = Some(Arc::clone(&gate));
+                    handoff.gated(gate)
+                }
+                CompactionProbe::FailsThenLands => handoff,
             };
-            self.compaction_open_until = Some(tokio::time::Instant::now() + delay);
             return MockHttpResponse::sse(vec![
-                delayed_sse_frame(text_chunk(&compaction_probe_handoff(), None), delay),
+                handoff,
                 delayed_sse_frame(text_chunk("", Some("stop")), Duration::ZERO),
                 done_frame(Duration::ZERO),
             ]);
         }
         if self
-            .compaction_open_until
-            .is_some_and(|until| tokio::time::Instant::now() < until)
+            .compaction_gate
+            .take()
+            .is_some_and(|gate| gate.release())
         {
             self.served_during_compaction += 1;
         }
@@ -1046,12 +1082,27 @@ impl MockHttpResponse {
 }
 
 struct MockSseFrame {
+    /// Held by this gate before the delay.
+    gate: Option<Arc<CompactionGate>>,
     delay: Duration,
     data: String,
 }
 
+impl MockSseFrame {
+    fn gated(self, gate: Arc<CompactionGate>) -> Self {
+        Self {
+            gate: Some(gate),
+            ..self
+        }
+    }
+}
+
 const fn delayed_sse_frame(data: String, delay: Duration) -> MockSseFrame {
-    MockSseFrame { delay, data }
+    MockSseFrame {
+        gate: None,
+        delay,
+        data,
+    }
 }
 
 fn done_frame(delay: Duration) -> MockSseFrame {
@@ -1225,6 +1276,9 @@ fn sse_response(
 ) -> Response<http_body_util::combinators::BoxBody<Bytes, Infallible>> {
     let stream = async_stream::stream! {
         for frame in frames {
+            if let Some(gate) = &frame.gate {
+                gate.hold().await;
+            }
             sleep(frame.delay).await;
             yield Ok::<Frame<Bytes>, Infallible>(Frame::data(Bytes::from(frame.data)));
         }

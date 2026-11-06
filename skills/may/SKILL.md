@@ -55,7 +55,7 @@ Everything except the native tools (`terminal`, `terminal_read`, `terminal_input
 
 ## Skills
 
-A skill is a directory with `SKILL.md` (frontmatter `name`, `description`) and optional `references/`, `assets/`, `subagents/`. The system prompt lists each skill's name and description; read the `SKILL.md` before acting on a matching request. Bundled skills are compiled into the binary, written to `~/.may/skills/` at startup (overwriting, so local edits to bundled skills are lost), copied into each profile's skills directory, and linked into the session as `skills/`. Skills can also be installed from a GitHub repository's `skills/` directory.
+A skill is a directory with `SKILL.md` (frontmatter `name`, `description`) and optional `references/` and `assets/`. The system prompt lists each skill's name and description; read the `SKILL.md` before acting on a matching request. Bundled skills are compiled into the binary, written to `~/.may/skills/` at startup (overwriting, so local edits to bundled skills are lost), copied into each profile's skills directory, and linked into the session as `skills/`. Skills can also be installed from a GitHub repository's `skills/` directory.
 
 ## Subagents
 
