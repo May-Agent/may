@@ -105,6 +105,11 @@ enum LineKind<'a> {
         completion: Option<u32>,
         total: Option<u32>,
     },
+    CompactionRecovery {
+        error: &'a AgentError,
+        alerts_removed: usize,
+        outputs_spilled: usize,
+    },
     Error {
         error: &'a AgentError,
     },
@@ -241,6 +246,8 @@ impl<O: Write, E: Write> OneShotOutput<O, E> {
             | AgentEvent::Reasoning(_)
             | AgentEvent::Complete { .. }
             | AgentEvent::BuiltInToolResult { .. }
+            | AgentEvent::ReplyTranslated { .. }
+            | AgentEvent::PromptPrefix(_)
             | AgentEvent::Text(_) => Ok(()),
             AgentEvent::ToolCallStart {
                 id,
@@ -350,6 +357,18 @@ impl<O: Write, E: Write> OneShotOutput<O, E> {
                     cache_write: usage.cache_write_tokens,
                     completion: usage.completion_tokens,
                     total: usage.total_tokens,
+                },
+            ),
+            AgentEvent::CompactionRecovery {
+                error,
+                alerts_removed,
+                outputs_spilled,
+            } => self.write_line(
+                at,
+                LineKind::CompactionRecovery {
+                    error,
+                    alerts_removed: *alerts_removed,
+                    outputs_spilled: *outputs_spilled,
                 },
             ),
             AgentEvent::Error(error) => self.write_line(at, LineKind::Error { error }),

@@ -450,6 +450,9 @@ pub struct RemoteAccessStatusResponse {
     pub(crate) enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) public_url: Option<String>,
+    /// The internet-facing base URL of the webhook routes, while Funnel is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) funnel_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) last_error: Option<String>,
     #[serde(default)]
@@ -517,6 +520,20 @@ pub struct ApiPrEvent {
 #[serde(rename_all = "camelCase")]
 pub struct SessionPlanStateRequest {
     pub(crate) plan_state: SessionPlanState,
+}
+
+/// `PUT /api/sessions/{id}/yolo` body.
+#[derive(Debug, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionYoloRequest {
+    pub(crate) yolo: bool,
+}
+
+/// The yolo switch after the update.
+#[derive(Debug, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionYoloResponse {
+    pub(crate) yolo: bool,
 }
 
 #[derive(Debug, serde::Serialize, skyzen::ToSchema)]
@@ -1136,6 +1153,7 @@ impl From<crate::session::SessionRuntimeSummary> for SessionRuntimeResponse {
         Self {
             state: summary.state,
             plan_state: summary.plan_state,
+            yolo: summary.yolo,
             interactions: SessionInteractionResponse {
                 browser: BrowserInteractionResponse {
                     takeover_active: summary.interactions.browser.takeover_active,
@@ -1226,6 +1244,7 @@ pub struct UiBootstrapResponse {
 pub struct SessionRuntimeResponse {
     pub(crate) state: SessionRuntimeState,
     pub(crate) plan_state: SessionPlanState,
+    pub(crate) yolo: bool,
     pub(crate) interactions: SessionInteractionResponse,
     pub(crate) queued_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1247,6 +1266,7 @@ impl Default for SessionRuntimeResponse {
         Self {
             state: SessionRuntimeState::Idle,
             plan_state: SessionPlanState::Disabled,
+            yolo: false,
             interactions: SessionInteractionResponse::default(),
             queued_count: 0,
             pending_immediate: None,
@@ -1527,6 +1547,19 @@ pub struct UiRemoteAccessConfig {
     /// Tailscale logins accepted for remote access besides the login owning
     /// this node, which is always accepted.
     pub(crate) allowed_logins: Vec<String>,
+    /// Whether Tailscale Funnel exposes the webhook routes to the internet.
+    #[serde(default)]
+    pub(crate) funnel: bool,
+    /// Funnel HTTPS port: 443, 8443 or 10000.
+    #[serde(default = "default_funnel_port")]
+    pub(crate) funnel_port: u16,
+    /// Largest webhook delivery body in bytes; larger ones get 413.
+    #[serde(default = "crate::config::default_webhook_max_body_bytes")]
+    pub(crate) webhook_max_body_bytes: u64,
+}
+
+const fn default_funnel_port() -> u16 {
+    443
 }
 
 impl From<&RemoteAccessConfig> for UiRemoteAccessConfig {
@@ -1537,6 +1570,9 @@ impl From<&RemoteAccessConfig> for UiRemoteAccessConfig {
             https_port: value.https_port,
             allow_local_environment: value.allow_local_environment,
             allowed_logins: value.allowed_logins.clone(),
+            funnel: value.funnel,
+            funnel_port: value.funnel_port,
+            webhook_max_body_bytes: value.webhook_max_body_bytes,
         }
     }
 }
@@ -1568,6 +1604,25 @@ pub struct UiFullConfig {
     pub(crate) remote_access: UiRemoteAccessConfig,
     pub(crate) sandbox: UiSandboxConfig,
     pub(crate) stream: UiStreamConfig,
+    /// A save without the section leaves the setting as it is.
+    #[serde(default)]
+    pub(crate) suggestions: Option<UiSuggestionsConfig>,
+    /// A save without the section leaves the setting as it is.
+    #[serde(default)]
+    pub(crate) recap: Option<UiRecapConfig>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UiSuggestionsConfig {
+    pub(crate) enabled: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UiRecapConfig {
+    pub(crate) auto: bool,
+    pub(crate) idle_minutes: u64,
 }
 
 #[derive(Debug, serde::Deserialize, skyzen::ToSchema)]

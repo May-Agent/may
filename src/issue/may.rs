@@ -7,8 +7,8 @@
 use crate::db::{ChatDb, ChatDbError};
 
 use super::{
-    IssueBackendInfo, IssueDetail, IssueError, IssueListState, IssueRelationKind, IssueState,
-    IssueStore, IssueSummary,
+    CommentedIssue, IssueBackendInfo, IssueDetail, IssueError, IssueListState, IssueRelationKind,
+    IssueState, IssueStore, IssueSummary,
 };
 
 /// Issue store over the session's [`ChatDb`].
@@ -95,11 +95,13 @@ impl IssueStore for MayIssueStore {
             .map_err(db_not_found(number))
     }
 
-    async fn comment(&self, number: i64, body: &str) -> Result<IssueDetail, IssueError> {
-        self.db
+    async fn comment(&self, number: i64, body: &str) -> Result<CommentedIssue, IssueError> {
+        let (detail, comment_id) = self
+            .db
             .add_issue_comment(&self.repo_key, number, body)
             .await
-            .map_err(db_not_found(number))
+            .map_err(db_not_found(number))?;
+        Ok(CommentedIssue { detail, comment_id })
     }
 
     async fn edit_labels(

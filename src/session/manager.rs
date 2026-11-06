@@ -461,6 +461,14 @@ impl SessionManager {
     /// Returns [`SessionError::NoHomeDir`] when no home directory exists, or [`SessionError`] when storage setup fails.
     pub async fn new() -> Result<Self, SessionError> {
         let may_dir = MayConfig::may_dir().map_err(|_| SessionError::NoHomeDir)?;
+        Self::at(may_dir).await
+    }
+
+    /// Create a `SessionManager` over the May directory `may_dir`.
+    ///
+    /// # Errors
+    /// Returns [`SessionError`] when storage setup fails.
+    pub async fn at(may_dir: PathBuf) -> Result<Self, SessionError> {
         let store = initialize_session_dirs(&may_dir).await?;
 
         let manager = Self {
@@ -492,6 +500,14 @@ impl SessionManager {
     /// Returns [`SessionError::DaemonUnavailable`] before `attach_daemon` ran.
     fn daemon(&self) -> Result<&crate::client::DaemonClient, SessionError> {
         self.daemon.as_ref().ok_or(SessionError::DaemonUnavailable)
+    }
+
+    /// A handle on the daemon this manager talks to.
+    ///
+    /// # Errors
+    /// Returns [`SessionError::DaemonUnavailable`] before `attach_daemon` ran.
+    pub fn daemon_handle(&self) -> Result<crate::client::DaemonClient, SessionError> {
+        self.daemon().cloned()
     }
 
     /// Get the May directory path.
@@ -572,6 +588,9 @@ impl SessionManager {
         };
 
         if !already_persisted {
+            // The session works where this client runs, not where the
+            // daemon happened to be started.
+            let cwd = std::env::current_dir()?;
             // The daemon creates the session's row and directory layout.
             let _: crate::client::WireSession = self
                 .daemon()?
@@ -581,7 +600,7 @@ impl SessionManager {
                         id: Some(session_id.clone()),
                         model: model.clone(),
                         profile_id: profile_id.clone(),
-                        cwd: None,
+                        cwd: Some(cwd.display().to_string()),
                         repo: self.current.as_ref().and_then(|s| s.repo.clone()),
                     },
                 )

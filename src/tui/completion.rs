@@ -51,6 +51,10 @@ pub static SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/jobs", "Background jobs and running subagents"),
     ("/questions", "Answer the questions the agent left open"),
     (
+        "/yolo",
+        "Toggle granting every approval request in this session",
+    ),
+    (
         "/btw",
         "Ask a side question without touching conversation history",
     ),

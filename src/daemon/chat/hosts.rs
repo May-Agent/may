@@ -58,6 +58,7 @@ impl ParkedAgents {
         session_id: &str,
         agent: MayAgent,
         build_key: u64,
+        released: crate::session::RunReleased,
     ) {
         // One pending wake is enough: the agent's context holds every event
         // a later wake would add, and the run it starts sees them all.
@@ -67,7 +68,7 @@ impl ParkedAgents {
             agent,
             state.db(),
             state.runtime_service.runs().clone(),
-            Some(wakes),
+            Some(crate::agent::BackgroundWakes { wakes, released }),
         );
         let previous = self.workers().insert(
             session_id.to_string(),
@@ -84,6 +85,10 @@ impl ParkedAgents {
         let session_id = session_id.to_string();
         state.tokio_handle.spawn(async move {
             while let Ok(wake) = wake_rx.recv().await {
+                // The session reads as resuming through the whole turn, so a
+                // client never sees the gap between the command finishing
+                // and the turn it starts.
+                let _resuming = wake_state.session_background.resume_pending(&session_id);
                 super::start_background_turn(&wake_state, &session_id, wake).await;
             }
         });
@@ -121,7 +126,7 @@ impl ParkedAgents {
         self.get(session_id)?.cache_warmth().cloned()
     }
 
-    fn get(&self, session_id: &str) -> Option<Arc<AgentWorker>> {
+    pub(super) fn get(&self, session_id: &str) -> Option<Arc<AgentWorker>> {
         self.workers()
             .get(session_id)
             .map(|parked| parked.worker.clone())
@@ -165,6 +170,7 @@ pub(super) async fn idle_agent(
         super::TurnAttempt {
             provider_attempt: 0,
             turn_boundary: None,
+            retained_agent: None,
         },
         &super::TurnKind::Prompt,
     )
@@ -177,9 +183,13 @@ pub(super) async fn idle_agent(
         tracing::warn!(%session_id, %error, "failed to release the session after building its agent");
     }
     let prepared = prepared?;
-    state
-        .parked_agents
-        .park(state, session_id, prepared.agent, prepared.build_key);
+    state.parked_agents.park(
+        state,
+        session_id,
+        prepared.agent,
+        prepared.build_key,
+        crate::session::RunReleased::already_released(),
+    );
     state
         .parked_agents
         .get(session_id)
@@ -273,6 +283,18 @@ pub async fn usage_report(
         .request_logs_for_session(&session_id)
         .await
         .map_err(internal_error)?;
+    let intervals = state
+        .runtime_service
+        .db()
+        .session_intervals(&session_id)
+        .await
+        .map_err(internal_error)?;
+    let misses = state
+        .runtime_service
+        .db()
+        .cache_misses_for_session(&session_id)
+        .await
+        .map_err(internal_error)?;
     let created_at_ms = state
         .runtime_service
         .db()
@@ -290,6 +312,8 @@ pub async fn usage_report(
     json_ok_response(&crate::agent::assemble_usage_report(
         &session_id,
         &rows,
+        &misses,
+        &intervals,
         created_at_ms,
         now_ms,
     ))
@@ -365,7 +389,6 @@ pub async fn btw(
     Json(req): Json<BtwRequest>,
     State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<BtwResponse>> {
-    use aither_core::LanguageModel as _;
     use aither_core::llm::Message;
     use futures_lite::StreamExt as _;
 
@@ -385,7 +408,7 @@ pub async fn btw(
         .cloned()
         .ok_or_else(|| internal_error_message("the idle agent has no model"))?;
     let mut answer = String::new();
-    let mut stream = std::pin::pin!(llm.respond(aither_core::llm::LLMRequest::new(messages)));
+    let mut stream = std::pin::pin!(llm.respond(messages));
     while let Some(event) = stream.next().await {
         match event {
             Ok(aither_core::llm::Event::Text(text)) => answer.push_str(&text),

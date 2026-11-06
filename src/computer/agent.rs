@@ -7,8 +7,10 @@
 //! respawns picks up a fresh grant while the daemon itself never restarts.
 
 use std::collections::HashMap;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
@@ -28,38 +30,21 @@ struct AgentState {
     inputs: HashMap<String, Arc<Mutex<InputState>>>,
 }
 
-/// How often a helper checks that it still owns its socket path.
-const OWNERSHIP_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+/// How often a running helper checks that its socket is still the one in
+/// its May dir.
+const SOCKET_WATCH_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Identity of the file at the socket path: device and inode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SocketId {
-    dev: u64,
-    ino: u64,
-}
-
-impl SocketId {
-    /// `None` when nothing exists at `path`.
-    fn of(path: &Path) -> Option<Self> {
-        use std::os::unix::fs::MetadataExt;
-        let meta = std::fs::symlink_metadata(path).ok()?;
-        Some(Self {
-            dev: meta.dev(),
-            ino: meta.ino(),
-        })
-    }
-
-    /// Whether the path still holds the file this helper bound.
-    fn is_current(self, now: Option<Self>) -> bool {
-        now == Some(self)
-    }
-}
-
-/// Serve requests on `<may_dir>/computer-agent.sock` until killed.
+/// Serve requests on `<may_dir>/computer-agent.sock` until killed, or
+/// until the socket in the May dir is gone or replaced.
 ///
 /// # Errors
-/// Returns a message when the socket cannot be bound.
+/// Returns a message when the socket cannot be bound or has disappeared.
 pub async fn serve(may_dir: &Path) -> Result<(), String> {
+    serve_watching(may_dir, SOCKET_WATCH_INTERVAL).await
+}
+
+/// [`serve`] with an explicit socket check interval.
+async fn serve_watching(may_dir: &Path, watch_interval: Duration) -> Result<(), String> {
     let sock = may_dir.join("computer-agent.sock");
     if sock.exists() {
         std::fs::remove_file(&sock).map_err(|e| e.to_string())?;
@@ -72,24 +57,31 @@ pub async fn serve(may_dir: &Path) -> Result<(), String> {
         may_dir.join("computer-agent.pid"),
         std::process::id().to_string(),
     );
+    let bound_inode = std::fs::metadata(&sock)
+        .map_err(|e| format!("stat {}: {e}", sock.display()))?
+        .ino();
     let state = Arc::new(Mutex::new(AgentState {
         displays: SessionDisplays::default(),
         streams: SessionStreams::default(),
         inputs: HashMap::new(),
     }));
-    let owned = SocketId::of(&sock).ok_or_else(|| format!("stat {}", sock.display()))?;
-    let mut ownership = tokio::time::interval(OWNERSHIP_CHECK_INTERVAL);
+    let mut watch = tokio::time::interval(watch_interval);
     loop {
         let conn = tokio::select! {
             accepted = listener.accept() => accepted.map_err(|e| e.to_string())?.0,
-            _ = ownership.tick() => {
-                if owned.is_current(SocketId::of(&sock)) {
-                    continue;
+            _ = watch.tick() => {
+                match std::fs::metadata(&sock) {
+                    Ok(meta) if meta.ino() == bound_inode => {}
+                    Ok(_) => {
+                        tracing::error!(socket = %sock.display(), "computer-agent socket was replaced, exiting");
+                        return Err(format!("{} was replaced", sock.display()));
+                    }
+                    Err(e) => {
+                        tracing::error!(socket = %sock.display(), error = %e, "computer-agent socket is gone, exiting");
+                        return Err(format!("{} is gone: {e}", sock.display()));
+                    }
                 }
-                // A newer helper replaced the socket, or the may dir is
-                // gone: nobody connects here any more.
-                tracing::info!(socket = %sock.display(), "computer-agent lost its socket; exiting");
-                return Ok(());
+                continue;
             }
         };
         let state = state.clone();
@@ -332,24 +324,25 @@ async fn dispatch_inner(request: AgentRequest, state: Arc<Mutex<AgentState>>) ->
 
 #[cfg(test)]
 mod tests {
-    use super::SocketId;
+    use super::*;
 
-    #[test]
-    fn socket_ownership_follows_the_file_at_the_path() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("agent.sock");
-        std::fs::write(&path, b"").expect("create");
-        let owned = SocketId::of(&path).expect("exists");
-        assert!(owned.is_current(SocketId::of(&path)));
-
-        // Replaced by another file: a newer helper bound the path.
-        std::fs::remove_file(&path).expect("remove");
-        let _occupied = std::fs::File::create(dir.path().join("other")).expect("occupy inode");
-        std::fs::write(&path, b"").expect("recreate");
-        assert!(!owned.is_current(SocketId::of(&path)));
-
-        // Removed outright, as when the may dir is deleted.
-        std::fs::remove_file(&path).expect("remove");
-        assert!(!owned.is_current(SocketId::of(&path)));
+    #[tokio::test]
+    async fn serve_exits_once_the_may_dir_is_removed() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let may_dir = dir.path().join(".may");
+        std::fs::create_dir(&may_dir).expect("may dir");
+        let server = tokio::spawn({
+            let may_dir = may_dir.clone();
+            async move { serve_watching(&may_dir, Duration::from_millis(20)).await }
+        });
+        while !may_dir.join("computer-agent.sock").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        std::fs::remove_dir_all(&may_dir).expect("remove may dir");
+        let result = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("helper keeps running after its may dir is gone")
+            .expect("serve task");
+        assert!(result.is_err_and(|e| e.contains("is gone")));
     }
 }

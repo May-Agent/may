@@ -49,7 +49,9 @@
 use async_fs;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::cache_lifetime::CacheLifetime;
 use crate::model_selector::ModelSelector;
@@ -73,6 +75,14 @@ pub enum ConfigError {
     /// Home directory not found.
     #[error("Home directory not found")]
     NoHomeDir,
+    /// The home directory does not resolve to a real path.
+    #[error("Home directory {} does not resolve: {source}", home.display())]
+    HomeUnresolvable {
+        /// The home directory as the environment names it.
+        home: PathBuf,
+        /// The resolution failure.
+        source: std::io::Error,
+    },
     /// Failed to read config.
     #[error("Failed to read config: {0}")]
     Read(#[from] std::io::Error),
@@ -756,6 +766,27 @@ pub struct AcpAgentConfig {
     pub mode: Option<String>,
     /// What the main agent reads to decide when to delegate to this agent.
     pub description: String,
+    /// Directories the agent process may read and write besides the
+    /// session's own, where it keeps its state and login (`~/.codex`). A
+    /// leading `~` is the user's home. Its terminal commands do not get them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schema(value_type = Vec<String>)]
+    pub grants: Vec<PathBuf>,
+}
+
+impl AcpAgentConfig {
+    /// The grants with a leading `~` expanded against `home`.
+    #[must_use]
+    pub fn grants_in(&self, home: &Path) -> Vec<PathBuf> {
+        self.grants
+            .iter()
+            .map(|grant| {
+                grant
+                    .strip_prefix("~")
+                    .map_or_else(|_| grant.clone(), |rest| home.join(rest))
+            })
+            .collect()
+    }
 }
 
 /// Whether `name` can be the subagent type of a connected ACP agent.
@@ -773,17 +804,16 @@ pub fn check_acp_agent_name(name: &str) -> Result<(), ConfigError> {
             reason: reason.to_string(),
         })
     };
-    if name.is_empty()
-        || !name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-    {
-        return reject("a name holds only ASCII letters, digits, `-` and `_`");
+    match aither_agent::validate_subagent_name(name) {
+        Err(aither_agent::DefinitionError::Reserved(_)) => {
+            return reject("the name belongs to a built-in subagent type");
+        }
+        Err(_) => return reject("a name holds only ASCII letters, digits, `-` and `_`"),
+        Ok(()) => {}
     }
-    if name == "fork"
-        || aither_agent::builtin_subagents()
-            .iter()
-            .any(|def| def.id == name)
+    if aither_agent::BUNDLED_SUBAGENTS
+        .iter()
+        .any(|bundled| bundled.name == name)
     {
         return reject("the name belongs to a built-in subagent type");
     }
@@ -1054,6 +1084,26 @@ pub struct RemoteAccessConfig {
     /// owns this node, which is always accepted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_logins: Vec<String>,
+    /// Whether Tailscale Funnel exposes the webhook routes
+    /// (`/api/tasks/webhook/*`, and nothing else) to the internet.
+    #[serde(default)]
+    pub funnel: bool,
+    /// Funnel HTTPS port: 443, 8443 or 10000. It must differ from
+    /// `https_port` while remote access is enabled, because Funnel exposes
+    /// its whole port.
+    #[serde(default = "default_tailscale_https_port")]
+    pub funnel_port: u16,
+    /// Largest webhook delivery body, in bytes, accepted on any listener;
+    /// a larger delivery is refused with 413 before it is buffered.
+    #[serde(default = "default_webhook_max_body_bytes")]
+    pub webhook_max_body_bytes: u64,
+}
+
+/// Default for `[remote_access] webhook_max_body_bytes`: 25 MiB, which holds
+/// the largest payload GitHub delivers (it caps webhook payloads at 25 MB).
+#[must_use]
+pub const fn default_webhook_max_body_bytes() -> u64 {
+    25 * 1024 * 1024
 }
 
 fn default_tailscale_binary() -> String {
@@ -1072,6 +1122,9 @@ impl Default for RemoteAccessConfig {
             https_port: default_tailscale_https_port(),
             allowed_logins: Vec::new(),
             allow_local_environment: false,
+            funnel: false,
+            funnel_port: default_tailscale_https_port(),
+            webhook_max_body_bytes: default_webhook_max_body_bytes(),
         }
     }
 }
@@ -1206,6 +1259,21 @@ pub struct MayConfig {
     /// Recap settings.
     #[serde(default)]
     pub recap: RecapConfig,
+    /// Communication and working languages.
+    #[serde(default)]
+    pub language: LanguageConfig,
+    /// Context compaction thresholds.
+    #[serde(default)]
+    pub context: ContextConfig,
+    /// The user's timezone.
+    #[serde(default)]
+    pub time: TimeConfig,
+    /// When host memory pressure and machine load count as high.
+    #[serde(default)]
+    pub host_load: HostLoadSettings,
+    /// How long `/connect` waits on a candidate ACP agent.
+    #[serde(default)]
+    pub acp: AcpSettings,
     /// Last model selected via /model command (used as default for new sessions).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_model: Option<ModelSelector>,
@@ -1255,6 +1323,292 @@ impl Default for RecapConfig {
     }
 }
 
+/// A language named in `config.toml`: an English name (`Chinese`), a native
+/// name or an ISO 639-3 code, rejected at load when unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ConfiguredLanguage(pub aither_agent::Language);
+
+impl TryFrom<String> for ConfiguredLanguage {
+    type Error = String;
+
+    fn try_from(name: String) -> Result<Self, String> {
+        name.parse::<aither_agent::Language>()
+            .map(Self)
+            .map_err(|error| error.to_string())
+    }
+}
+
+impl From<ConfiguredLanguage> for String {
+    fn from(language: ConfiguredLanguage) -> Self {
+        language.0.name().to_string()
+    }
+}
+
+/// `[language]` section: what the agent talks to the user in, and what it
+/// writes in for others to read (issue and PR text, messages to other agents).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct LanguageConfig {
+    /// The language replies, questions and recaps are written in; unset
+    /// leaves the agent to follow the user's own messages.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub communication: Option<ConfiguredLanguage>,
+    /// The language written for others; English when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub working: Option<ConfiguredLanguage>,
+}
+
+impl LanguageConfig {
+    /// The languages the session's agent is held to.
+    #[must_use]
+    pub fn languages(&self) -> aither_agent::Languages {
+        let languages = self
+            .communication
+            .map_or_else(aither_agent::Languages::unset, |language| {
+                aither_agent::Languages::new(language.0)
+            });
+        self.working
+            .map_or(languages, |working| languages.with_working(working.0))
+    }
+}
+
+/// `[context]` section: when a session's conversation is compacted.
+///
+/// The auto-compact point is `min(window * compact_at, compact_ceiling)`
+/// tokens; the distances are token counts before it. aither applies them, and
+/// a change reaches running sessions at their next turn.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ContextConfig {
+    /// Fraction of the model window at which the conversation is compacted.
+    pub compact_at: f32,
+    /// Most tokens the conversation may hold before it is compacted,
+    /// whatever the window.
+    pub compact_ceiling: usize,
+    /// Tokens before the auto-compact point at which compaction starts in
+    /// the background while the run keeps streaming.
+    pub start_distance: usize,
+    /// Tokens before the auto-compact point at which the agent pauses to
+    /// finish compaction.
+    pub safe_buffer: usize,
+    /// Tokens before the auto-compact point at which the agent is told once
+    /// to save its work and call `compact` itself.
+    pub warn_distance: usize,
+}
+
+impl Default for ContextConfig {
+    fn default() -> Self {
+        let policy = aither_agent::ContextPolicy::default();
+        Self {
+            compact_at: policy.compact_at,
+            compact_ceiling: policy.compact_ceiling,
+            start_distance: policy.start_distance,
+            safe_buffer: policy.safe_buffer,
+            warn_distance: policy.warn_distance,
+        }
+    }
+}
+
+impl ContextConfig {
+    /// The aither policy these thresholds configure; every other threshold
+    /// keeps aither's default.
+    #[must_use]
+    pub fn policy(&self) -> aither_agent::ContextPolicy {
+        aither_agent::ContextPolicy {
+            compact_at: self.compact_at,
+            compact_ceiling: self.compact_ceiling,
+            start_distance: self.start_distance,
+            safe_buffer: self.safe_buffer,
+            warn_distance: self.warn_distance,
+            ..aither_agent::ContextPolicy::default()
+        }
+    }
+}
+
+/// `[time]` section: the timezone the agent talks to the user in.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct TimeConfig {
+    /// IANA name of the user's timezone (`"Asia/Shanghai"`); unset follows
+    /// the host's system timezone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<TimeZoneName>,
+}
+
+impl TimeConfig {
+    /// The user's timezone: the configured one, else the host's.
+    #[must_use]
+    pub fn user_timezone(&self) -> TimeZoneName {
+        self.timezone.clone().unwrap_or_else(TimeZoneName::system)
+    }
+}
+
+/// The name of a timezone the agent states to the model: an IANA name, or a
+/// UTC offset for a host whose system timezone has none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct TimeZoneName(String);
+
+/// A configured timezone that is not in the timezone database.
+#[derive(Debug, thiserror::Error)]
+#[error("unknown timezone '{name}': expected an IANA name such as 'Asia/Shanghai'")]
+pub struct TimeZoneNameError {
+    name: String,
+}
+
+impl TimeZoneName {
+    /// The host's system timezone.
+    #[must_use]
+    pub fn system() -> Self {
+        let zone = jiff::tz::TimeZone::system();
+        Self(zone.iana_name().map_or_else(
+            || format!("UTC{}", zone.to_offset(jiff::Timestamp::now())),
+            str::to_string,
+        ))
+    }
+
+    /// The name as written.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::str::FromStr for TimeZoneName {
+    type Err = TimeZoneNameError;
+
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        let name = name.trim();
+        jiff::tz::TimeZone::get(name)
+            .map(|_| Self(name.to_string()))
+            .map_err(|_| TimeZoneNameError {
+                name: name.to_string(),
+            })
+    }
+}
+
+impl<'de> Deserialize<'de> for TimeZoneName {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        name.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+impl fmt::Display for TimeZoneName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Memory pressure at which the host counts as pressed.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryPressureThreshold {
+    /// The host is reclaiming memory (`kern.memorystatus_vm_pressure_level`
+    /// warn on macOS).
+    #[default]
+    Warning,
+    /// The host is thrashing.
+    Critical,
+}
+
+/// `[acp]` section: the bounds `/connect` puts on a candidate ACP agent.
+/// Durations are written as `"30s"`, `"1m"`. A change applies to the next
+/// `/connect`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct AcpSettings {
+    /// How long the trial session's handshake (`initialize`, `session/new`,
+    /// the mode and model) may take before the agent is killed and the
+    /// connection refused.
+    #[serde(with = "duration_text")]
+    pub trial_limit: Duration,
+}
+
+impl Default for AcpSettings {
+    fn default() -> Self {
+        Self {
+            trial_limit: Duration::from_secs(60),
+        }
+    }
+}
+
+/// `[host_load]` section: when the session agent is told the host is under
+/// memory pressure or high load, and how long the terminal's foreground
+/// window grows meanwhile. Durations are written as `"30s"`, `"1m"`.
+///
+/// A change reaches a running session at its next turn.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct HostLoadSettings {
+    /// Memory pressure at or above which the host counts as pressed.
+    pub memory_threshold: MemoryPressureThreshold,
+    /// Machine load at or above which the host counts as loaded: on macOS
+    /// the load average per core, on Linux the share of the last ten
+    /// seconds runnable tasks waited for a CPU.
+    pub load_threshold: f64,
+    /// How long a condition must hold before the agent is told it started.
+    #[serde(with = "duration_text")]
+    pub start_after: Duration,
+    /// How long a condition must be gone before the agent is told it ended.
+    #[serde(with = "duration_text")]
+    pub end_after: Duration,
+    /// How often the host is read.
+    #[serde(with = "duration_text")]
+    pub poll_interval: Duration,
+    /// The terminal's foreground window while high load lasts.
+    #[serde(with = "duration_text")]
+    pub high_load_foreground_wait: Duration,
+}
+
+impl Default for HostLoadSettings {
+    fn default() -> Self {
+        let defaults = aither_agent::HostLoadConfig::new();
+        Self {
+            memory_threshold: MemoryPressureThreshold::Warning,
+            load_threshold: defaults.load_threshold.0,
+            start_after: defaults.start_after,
+            end_after: defaults.end_after,
+            poll_interval: defaults.poll_interval,
+            high_load_foreground_wait: defaults.high_load_foreground_wait,
+        }
+    }
+}
+
+impl HostLoadSettings {
+    /// The aither monitor configuration these settings describe.
+    #[must_use]
+    pub const fn monitor_config(&self) -> aither_agent::HostLoadConfig {
+        aither_agent::HostLoadConfig::new()
+            .memory_threshold(match self.memory_threshold {
+                MemoryPressureThreshold::Warning => aither_agent::MemoryPressure::Warning,
+                MemoryPressureThreshold::Critical => aither_agent::MemoryPressure::Critical,
+            })
+            .load_threshold(aither_agent::MachineLoad(self.load_threshold))
+            .start_after(self.start_after)
+            .end_after(self.end_after)
+            .poll_interval(self.poll_interval)
+            .high_load_foreground_wait(self.high_load_foreground_wait)
+    }
+}
+
+/// Serde for a [`Duration`] written as human text (`"30s"`, `"2m"`).
+mod duration_text {
+    use std::time::Duration;
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &Duration, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(&humantime::format_duration(*value))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Duration, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        humantime::parse_duration(text.trim()).map_err(serde::de::Error::custom)
+    }
+}
+
 /// Where the May daemon listens besides its unix socket.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct DaemonConfig {
@@ -1262,8 +1616,9 @@ pub struct DaemonConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
     /// Further TCP addresses to serve on, such as a tailnet address
-    /// (`"100.101.102.103:8787"`). Requests on these are accepted from any
-    /// peer that can reach the address.
+    /// (`"100.101.102.103:8787"`). A loopback address serves the local
+    /// routes; on any other address each peer must be identified through
+    /// tailscaled's `WhoIs` or its request is refused.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub listen: Vec<std::net::SocketAddr>,
 }
@@ -1288,6 +1643,11 @@ impl Default for MayConfig {
             daemon: DaemonConfig::default(),
             suggestions: SuggestionsConfig::default(),
             recap: RecapConfig::default(),
+            language: LanguageConfig::default(),
+            context: ContextConfig::default(),
+            time: TimeConfig::default(),
+            host_load: HostLoadSettings::default(),
+            acp: AcpSettings::default(),
             last_model: None,
             last_effort: None,
             ssh_servers: Vec::new(),
@@ -1302,9 +1662,25 @@ impl MayConfig {
     /// # Errors
     /// Returns [`ConfigError`] when no home directory can be determined.
     pub fn may_dir() -> Result<PathBuf, ConfigError> {
-        dirs::home_dir()
-            .map(|h| h.join(".may"))
-            .ok_or(ConfigError::NoHomeDir)
+        Ok(Self::home_dir()?.join(".may"))
+    }
+
+    /// The user's home directory with every symlink resolved.
+    ///
+    /// The sandbox grants only real paths and never follows an ungranted
+    /// link, so every path May renders or hands to a command derives from
+    /// this one spelling.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError`] when no home directory can be determined or it
+    /// does not resolve.
+    pub fn home_dir() -> Result<PathBuf, ConfigError> {
+        Self::resolve_home(dirs::home_dir().ok_or(ConfigError::NoHomeDir)?)
+    }
+
+    /// `home` with every symlink resolved.
+    pub(crate) fn resolve_home(home: PathBuf) -> Result<PathBuf, ConfigError> {
+        dunce::canonicalize(&home).map_err(|source| ConfigError::HomeUnresolvable { home, source })
     }
 
     /// Get the config file path (~/.may/config.toml).
@@ -1604,6 +1980,25 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
+    #[test]
+    fn the_language_section_names_the_communication_language() {
+        let config: MayConfig = toml::from_str("[language]\ncommunication = \"zh\"\n").unwrap();
+        let languages = config.language.languages();
+        assert_eq!(languages.communication().unwrap().name(), "Chinese");
+        assert_eq!(languages.working().name(), "English");
+        assert!(languages.enforced());
+        let saved = toml::to_string(&config).unwrap();
+        assert!(saved.contains("communication = \"Chinese\""), "{saved}");
+        assert!(!MayConfig::default().language.languages().enforced());
+    }
+
+    #[test]
+    fn an_unknown_language_is_rejected_at_load() {
+        let error = toml::from_str::<MayConfig>("[language]\nworking = \"Klingonese\"\n")
+            .expect_err("unknown language");
+        assert!(error.to_string().contains("Klingonese"), "{error}");
+    }
+
     #[tokio::test]
     async fn cache_lifetime_and_compaction_model_survive_a_saved_config() {
         let directory = tempfile::tempdir().expect("temp dir");
@@ -1673,6 +2068,21 @@ mod tests {
         assert!(config.provider["openai"].cache_lifetime.is_default());
     }
 
+    #[test]
+    fn acp_agent_grants_expand_a_leading_tilde_against_the_home() {
+        let agent = AcpAgentConfig {
+            grants: vec![PathBuf::from("~/.codex"), PathBuf::from("/opt/state")],
+            ..devin_connection()
+        };
+        assert_eq!(
+            agent.grants_in(Path::new("/Users/me")),
+            [
+                PathBuf::from("/Users/me/.codex"),
+                PathBuf::from("/opt/state")
+            ]
+        );
+    }
+
     fn devin_connection() -> AcpAgentConfig {
         AcpAgentConfig {
             command: "devin".to_string(),
@@ -1681,6 +2091,7 @@ mod tests {
             model: Some("opus".to_string()),
             mode: None,
             description: "Devin CLI".to_string(),
+            grants: Vec::new(),
         }
     }
 
@@ -2069,5 +2480,32 @@ mod tests {
         assert!(toml.contains("[provider.anthropic]"));
         assert!(toml.contains("[models]"));
         assert!(toml.contains("anthropic::claude-sonnet-4"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_home_reached_through_a_symlink_resolves_to_the_real_path() {
+        let real = tempfile::tempdir().unwrap();
+        let links = tempfile::tempdir().unwrap();
+        let linked = links.path().join("home");
+        std::os::unix::fs::symlink(real.path(), &linked).unwrap();
+
+        let resolved = MayConfig::resolve_home(linked).unwrap();
+
+        assert_eq!(resolved, dunce::canonicalize(real.path()).unwrap());
+        assert_eq!(
+            resolved.join(".may"),
+            dunce::canonicalize(real.path()).unwrap().join(".may")
+        );
+    }
+
+    #[test]
+    fn a_home_that_does_not_resolve_is_an_error() {
+        let missing = tempfile::tempdir().unwrap().path().join("gone");
+
+        assert!(matches!(
+            MayConfig::resolve_home(missing),
+            Err(ConfigError::HomeUnresolvable { .. })
+        ));
     }
 }

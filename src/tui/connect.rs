@@ -228,7 +228,7 @@ impl App {
             Ok(ConnectOutcome::Connected(name)) => {
                 self.mode = AppMode::Chat;
                 self.chat.push_notice(&format!(
-                    "Connected `{name}`: the main agent can now start it with `subagent start --subagent {name}`"
+                    "Connected `{name}`: the main agent can now start it with `subagent external --agent {name}`"
                 ));
             }
             Ok(ConnectOutcome::Choose { request, body }) => {

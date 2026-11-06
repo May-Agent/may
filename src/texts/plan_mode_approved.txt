@@ -1,8 +1,0 @@
-This session's plan is approved. Implement it completely.
-
-`tasks.md` is the canonical execution document:
-- Update checkbox state as each item starts and completes.
-- Keep phase notes, blockers, and newly discovered work accurate.
-- Do not leave completed work unchecked or silently drop pending work.
-- When `tasks.md` changes, emit the exact tag `<tasks />`; May renders the current document in the plan panel instead of requiring you to repeat it in chat.
-- Continue until every approved item is completed, unless a genuine external blocker requires user input.

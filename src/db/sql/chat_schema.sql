@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS message_ask_user_response_selected_options (message_i
 CREATE TABLE IF NOT EXISTS session_pending_message_entries (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, delivery_mode TEXT NOT NULL, content TEXT NOT NULL, hidden_context_xml TEXT, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_pending_message_attachments (message_id INTEGER NOT NULL, ordinal INTEGER NOT NULL, attachment_id TEXT NOT NULL, name TEXT NOT NULL, attachment_type TEXT NOT NULL, url TEXT NOT NULL, upload_data_url TEXT, text_content TEXT, PRIMARY KEY (message_id, ordinal));
 CREATE TABLE IF NOT EXISTS session_pending_ask_user_requests_v2 (request_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, created_at TEXT NOT NULL, blocking BOOLEAN NOT NULL DEFAULT 1);
-CREATE TABLE IF NOT EXISTS session_pending_ask_user_questions_v2 (request_id TEXT NOT NULL, ordinal INTEGER NOT NULL, section TEXT NOT NULL, question TEXT NOT NULL, multi_select BOOLEAN NOT NULL, PRIMARY KEY (request_id, ordinal));
+CREATE TABLE IF NOT EXISTS session_pending_ask_user_questions_v2 (request_id TEXT NOT NULL, ordinal INTEGER NOT NULL, section TEXT NOT NULL, question TEXT NOT NULL, multi_select BOOLEAN NOT NULL, secret_name TEXT, secret_scope TEXT, PRIMARY KEY (request_id, ordinal));
 CREATE TABLE IF NOT EXISTS session_pending_ask_user_question_options_v2 (request_id TEXT NOT NULL, question_ordinal INTEGER NOT NULL, option_ordinal INTEGER NOT NULL, value TEXT NOT NULL, PRIMARY KEY (request_id, question_ordinal, option_ordinal));
 CREATE TABLE IF NOT EXISTS context_debug_snapshot_headers (session_id TEXT PRIMARY KEY, timestamp TEXT NOT NULL, model TEXT NOT NULL, provider_id TEXT NOT NULL, prompt TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS context_debug_snapshot_prompt_attachments (session_id TEXT NOT NULL, ordinal INTEGER NOT NULL, url TEXT NOT NULL, PRIMARY KEY (session_id, ordinal));
@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS request_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, s
 CREATE TABLE IF NOT EXISTS network_access_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, profile_id TEXT, source TEXT NOT NULL, mode TEXT NOT NULL, domain TEXT NOT NULL, port INTEGER NOT NULL, allowed BOOLEAN NOT NULL, reason TEXT, timestamp TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_runtimes (session_id TEXT PRIMARY KEY, state TEXT NOT NULL, run_id TEXT, browser_takeover_active BOOLEAN NOT NULL, browser_takeover_alert_pending BOOLEAN NOT NULL, terminal_task_id TEXT, terminal_output_file TEXT, terminal_output_preview TEXT, terminal_input_notice TEXT, terminal_background_reason TEXT, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_plans (session_id TEXT PRIMARY KEY, plan_state TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS session_yolo (session_id TEXT PRIMARY KEY, enabled BOOLEAN NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS session_pending_permissions (request_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, mode TEXT NOT NULL, script TEXT NOT NULL, created_at TEXT NOT NULL, agent_id TEXT);
 CREATE TABLE IF NOT EXISTS session_pending_workspace (request_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, path TEXT NOT NULL, reason TEXT NOT NULL, created_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_messages_session_id ON messages(session_id);
@@ -87,3 +88,11 @@ CREATE INDEX IF NOT EXISTS idx_prs_session ON prs(session_id);
 CREATE INDEX IF NOT EXISTS idx_prs_project_state ON prs(project_id, state);
 CREATE TABLE IF NOT EXISTS pr_events (id INTEGER PRIMARY KEY AUTOINCREMENT, pr_id INTEGER NOT NULL, kind TEXT NOT NULL, session_id TEXT NOT NULL, agent_id TEXT NOT NULL, message_id INTEGER, detail TEXT, created_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_pr_events_pr ON pr_events(pr_id);
+CREATE TABLE IF NOT EXISTS issue_provenance (id INTEGER PRIMARY KEY AUTOINCREMENT, backend TEXT NOT NULL, repository TEXT NOT NULL, issue_number INTEGER NOT NULL, comment_id INTEGER, action TEXT NOT NULL, detail TEXT, session_id TEXT NOT NULL, agent TEXT NOT NULL, tool_call_id TEXT, recorded_at TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_issue_provenance_issue ON issue_provenance(backend, repository, issue_number);
+CREATE TABLE IF NOT EXISTS session_repo_clones (session_id TEXT NOT NULL, repo_key TEXT NOT NULL, dir TEXT NOT NULL, source TEXT NOT NULL, local BOOLEAN NOT NULL, PRIMARY KEY (session_id, repo_key));
+CREATE TABLE IF NOT EXISTS session_intervals (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, kind TEXT NOT NULL, start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_session_intervals_session ON session_intervals(session_id);
+CREATE TABLE IF NOT EXISTS prompt_cache_routes (session_id TEXT NOT NULL, provider_id TEXT NOT NULL, model TEXT NOT NULL, observed_at_ms INTEGER NOT NULL, cache_read_tokens INTEGER NOT NULL, cache_write_tokens INTEGER, chain BLOB NOT NULL, PRIMARY KEY (session_id, provider_id, model));
+CREATE TABLE IF NOT EXISTS cache_misses (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, timestamp TEXT NOT NULL, model TEXT NOT NULL, provider_id TEXT NOT NULL, cause TEXT NOT NULL, missed_tokens INTEGER NOT NULL, read_tokens INTEGER NOT NULL, gap_ms INTEGER NOT NULL, diverged_kind TEXT, diverged_index INTEGER, compacted BOOLEAN NOT NULL, reassembled BOOLEAN NOT NULL, agent_rebuilt BOOLEAN NOT NULL, model_switched BOOLEAN NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_cache_misses_session_timestamp ON cache_misses(session_id, timestamp);

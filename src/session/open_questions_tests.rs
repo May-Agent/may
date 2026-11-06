@@ -6,7 +6,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use aither_agent::ask_user::{AnswerValue, AskUserArgs, Question, QuestionAnswer};
+use aither_agent::ask_user::{AnswerValue, QuestionAnswer};
 use aither_core::llm::{Tool, ToolContext};
 use tempfile::TempDir;
 
@@ -15,7 +15,8 @@ use super::{
 };
 use super::{PersistedAskUserQuestion, PersistedAskUserRequest};
 use crate::agent::ask_user_tool::{
-    AskUserBlockerResolver, AskUserTool, WithdrawAskUserArgs, WithdrawAskUserTool,
+    AskUserArgs, AskUserBlockerResolver, AskUserTool, AskedQuestion, WithdrawAskUserArgs,
+    WithdrawAskUserTool,
 };
 use crate::db::ChatDb;
 use crate::ui_event_bus::UiEventBus;
@@ -63,8 +64,11 @@ impl Fixture {
 fn which_database() -> AskUserArgs {
     AskUserArgs {
         question: Some("Which database?".to_string()),
+        positional_question: None,
         option: vec!["PostgreSQL".to_string(), "SQLite".to_string()],
         multi_select: false,
+        secret: None,
+        secret_scope: None,
         questions: Vec::new(),
     }
 }
@@ -72,20 +76,25 @@ fn which_database() -> AskUserArgs {
 fn two_questions() -> AskUserArgs {
     AskUserArgs {
         question: None,
+        positional_question: None,
         option: Vec::new(),
         multi_select: false,
+        secret: None,
+        secret_scope: None,
         questions: vec![
-            Question {
+            AskedQuestion {
                 section: "database".to_string(),
                 question: "Which database?".to_string(),
                 option: vec!["PostgreSQL".to_string(), "SQLite".to_string()],
                 multi_select: false,
+                secret: None,
             },
-            Question {
+            AskedQuestion {
                 section: "notes".to_string(),
                 question: "Anything else?".to_string(),
                 option: Vec::new(),
                 multi_select: false,
+                secret: None,
             },
         ],
     }
@@ -490,6 +499,7 @@ async fn an_answer_to_a_blocking_prompt_is_not_delivered_as_an_agent_question() 
                     question: "Allow SSH to host?".to_string(),
                     option: vec!["Allow".to_string(), "Deny".to_string()],
                     multi_select: false,
+                    secret: None,
                 }],
             }),
         )

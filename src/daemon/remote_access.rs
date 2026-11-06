@@ -41,11 +41,83 @@ struct ServeSpec {
     target: String,
 }
 
+/// Funnel ports Tailscale allows.
+const FUNNEL_PORTS: [u16; 3] = [443, 8443, 10000];
+
+/// The `tailscale funnel` handler: the webhook mount on a Funnel port,
+/// forwarding to the public listener.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FunnelSpec {
+    tailscale_binary: String,
+    port: u16,
+}
+
+/// The public listener behind Funnel, serving the webhook router alone. It
+/// stops listening when dropped.
+#[derive(Debug)]
+struct PublicListener {
+    addr: SocketAddr,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl PublicListener {
+    async fn bind(router: Arc<skyzen::routing::Router>) -> Result<Self, String> {
+        let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .map_err(|error| format!("failed to bind the public webhook listener: {error}"))?;
+        let addr = listener
+            .local_addr()
+            .map_err(|error| format!("the public webhook listener has no address: {error}"))?;
+        let task = tokio::spawn(super::serve::serve_tcp(listener, router));
+        Ok(Self { addr, task })
+    }
+
+    /// Proxy target, `http://127.0.0.1:<port>/api/tasks/webhook`. Tailscale
+    /// strips the mount path before proxying and joins what remains onto the
+    /// target's own path, so the target carries the mount back.
+    fn target(&self) -> String {
+        format!(
+            "http://127.0.0.1:{}{}",
+            self.addr.port(),
+            crate::task_trigger::WEBHOOK_MOUNT
+        )
+    }
+}
+
+impl PublicListener {
+    /// Stops serving and returns once the listening socket is closed: an
+    /// abort only requests cancellation, and the socket lives until the
+    /// accept task is actually dropped.
+    async fn close(mut self) {
+        self.task.abort();
+        if let Err(error) = (&mut self.task).await
+            && !error.is_cancelled()
+        {
+            tracing::warn!(%error, "the public webhook listener ended with an error");
+        }
+    }
+}
+
+impl Drop for PublicListener {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Funnel as this daemon configured it.
+#[derive(Debug)]
+struct FunnelRuntime {
+    spec: FunnelSpec,
+    listener: PublicListener,
+}
+
 #[derive(Debug)]
 struct RemoteAccessRuntime {
     status: RemoteAccessStatusResponse,
     /// The handler this daemon added, while it is in place.
     serving: Option<ServeSpec>,
+    /// The Funnel handler and public listener this daemon added.
+    funnel: Option<FunnelRuntime>,
 }
 
 impl Default for RemoteAccessRuntime {
@@ -55,11 +127,13 @@ impl Default for RemoteAccessRuntime {
                 state: RemoteAccessState::Disabled,
                 enabled: false,
                 public_url: None,
+                funnel_url: None,
                 last_error: None,
                 recent_logs: Vec::new(),
                 accepted: None,
             },
             serving: None,
+            funnel: None,
         }
     }
 }
@@ -81,6 +155,8 @@ pub struct RemoteAccessManager {
     status_rx: watch::Receiver<RemoteAccessStatusResponse>,
     /// The daemon's remote TCP address, once it listens.
     local_addr: watch::Sender<Option<SocketAddr>>,
+    /// The router of the public Funnel listener, once built.
+    webhook_router: watch::Sender<Option<Arc<skyzen::routing::Router>>>,
     /// Accepts `Tailscale-User-Login` identities the tailnet is allowed to use;
     /// the actor keeps its allow-list current.
     tailscale_identity: super::auth::TailscaleServeIdentitySource,
@@ -98,12 +174,14 @@ impl RemoteAccessManager {
         let (command_tx, command_rx) = mpsc::channel(8);
         let (status_tx, status_rx) = watch::channel(RemoteAccessRuntime::default().status);
         let (local_addr, local_addr_rx) = watch::channel(None);
+        let (webhook_router, webhook_router_rx) = watch::channel(None);
         let tailscale_identity =
             super::auth::TailscaleServeIdentitySource::new(std::collections::HashSet::default());
         tokio::spawn(run_remote_access_actor(
             command_rx,
             status_tx,
             local_addr_rx,
+            webhook_router_rx,
             ui_event_bus,
             tailscale_identity.clone(),
         ));
@@ -111,8 +189,15 @@ impl RemoteAccessManager {
             command_tx,
             status_rx,
             local_addr,
+            webhook_router,
             tailscale_identity,
         }
+    }
+
+    /// Records the router of the public Funnel listener, which serves the
+    /// webhook routes alone.
+    pub(crate) fn set_webhook_router(&self, router: Arc<skyzen::routing::Router>) {
+        self.webhook_router.send_replace(Some(router));
     }
 
     /// The identity source the remote listener's Tailcheck layer accepts.
@@ -231,6 +316,7 @@ async fn run_remote_access_actor(
     mut command_rx: mpsc::Receiver<RemoteAccessCommand>,
     status_tx: watch::Sender<RemoteAccessStatusResponse>,
     local_addr: watch::Receiver<Option<SocketAddr>>,
+    webhook_router: watch::Receiver<Option<Arc<skyzen::routing::Router>>>,
     ui_event_bus: UiEventBus,
     tailscale_identity: super::auth::TailscaleServeIdentitySource,
 ) {
@@ -247,7 +333,12 @@ async fn run_remote_access_actor(
                         let addr = *local_addr.borrow();
                         runtime.status.accepted =
                             Some(refresh_allow_list(&tailscale_identity, &config).await);
-                        let result = sync_runtime(&mut runtime, config, has_local_profile, addr).await;
+                        let router = webhook_router.borrow().clone();
+                        let serve_result =
+                            sync_runtime(&mut runtime, config.clone(), has_local_profile, addr).await;
+                        let funnel_result =
+                            sync_funnel(&mut runtime, &config, has_local_profile, router).await;
+                        let result = serve_result.and(funnel_result);
                         if let Err(error) = &result {
                             runtime.status.state = RemoteAccessState::Error;
                             runtime.status.last_error = Some(error.clone());
@@ -258,6 +349,7 @@ async fn run_remote_access_actor(
                     }
                     RemoteAccessCommand::Stop { response } => {
                         let result = stop_runtime(&mut runtime).await;
+                        let result = result.and(stop_funnel(&mut runtime).await);
                         if result.is_ok() {
                             runtime.status.last_error = None;
                         }
@@ -276,9 +368,170 @@ async fn run_remote_access_actor(
                     push_log(&mut runtime.status.recent_logs, &error);
                     publish(&runtime.status, &status_tx, &ui_event_bus);
                 }
+                if let Some(funnel) = &runtime.funnel
+                    && let Err(error) = check_funnel(&funnel.spec, &funnel.listener.target()).await
+                {
+                    // The next sync sets Funnel up again.
+                    if let Some(funnel) = runtime.funnel.take() {
+                        funnel.listener.close().await;
+                    }
+                    runtime.status.funnel_url = None;
+                    runtime.status.state = RemoteAccessState::Error;
+                    runtime.status.last_error = Some(error.clone());
+                    push_log(&mut runtime.status.recent_logs, &error);
+                    publish(&runtime.status, &status_tx, &ui_event_bus);
+                }
             }
         }
     }
+}
+
+/// Reconciles Funnel with `config`: the public listener and the
+/// `tailscale funnel` handler exist exactly while `config.funnel` is on.
+async fn sync_funnel(
+    runtime: &mut RemoteAccessRuntime,
+    config: &RemoteAccessConfig,
+    has_local_profile: bool,
+    router: Option<Arc<skyzen::routing::Router>>,
+) -> Result<(), String> {
+    if !config.funnel {
+        return stop_funnel(runtime).await;
+    }
+    let spec = match funnel_spec(config, has_local_profile) {
+        Ok(spec) => spec,
+        Err(error) => {
+            stop_funnel(runtime).await?;
+            return Err(error);
+        }
+    };
+    if let Some(funnel) = &runtime.funnel
+        && funnel.spec == spec
+        && check_funnel(&spec, &funnel.listener.target()).await.is_ok()
+    {
+        return Ok(());
+    }
+
+    stop_funnel(runtime).await?;
+    let router = router.ok_or_else(|| "the public webhook router is not ready yet".to_string())?;
+    let listener = PublicListener::bind(router).await?;
+    let target = listener.target();
+    let output = tailscale(
+        &spec.tailscale_binary,
+        vec![
+            "funnel".into(),
+            "--bg".into(),
+            https_flag(spec.port),
+            set_path_flag(),
+            target.clone(),
+        ],
+    )
+    .await?;
+    push_log(&mut runtime.status.recent_logs, &output);
+    runtime.funnel = Some(FunnelRuntime {
+        spec: spec.clone(),
+        listener,
+    });
+
+    let host = tailnet_host(&spec.tailscale_binary).await?;
+    let url = public_url(&host, spec.port);
+    push_log(
+        &mut runtime.status.recent_logs,
+        &format!(
+            "funnel exposes {} at {url} via {target}",
+            crate::task_trigger::WEBHOOK_MOUNT
+        ),
+    );
+    runtime.status.funnel_url = Some(url);
+    Ok(())
+}
+
+/// Removes the Funnel handler, then stops the public listener.
+async fn stop_funnel(runtime: &mut RemoteAccessRuntime) -> Result<(), String> {
+    if let Some(funnel) = runtime.funnel.take() {
+        let output = tailscale(
+            &funnel.spec.tailscale_binary,
+            vec![
+                "funnel".into(),
+                https_flag(funnel.spec.port),
+                set_path_flag(),
+                "off".into(),
+            ],
+        )
+        .await;
+        match output {
+            Ok(output) => {
+                push_log(&mut runtime.status.recent_logs, &output);
+                funnel.listener.close().await;
+            }
+            Err(error) => {
+                // Funnel is still on: keep the listener so deliveries work
+                // and the removal is retried.
+                runtime.funnel = Some(funnel);
+                return Err(error);
+            }
+        }
+    }
+    runtime.status.funnel_url = None;
+    Ok(())
+}
+
+fn funnel_spec(config: &RemoteAccessConfig, has_local_profile: bool) -> Result<FunnelSpec, String> {
+    if has_local_profile && !config.allow_local_environment {
+        return Err(
+            "Funnel is blocked while local-environment profiles exist; enable allow_local_environment to override"
+                .to_string(),
+        );
+    }
+    if !FUNNEL_PORTS.contains(&config.funnel_port) {
+        return Err(format!(
+            "Funnel port {} is not allowed; use 443, 8443 or 10000",
+            config.funnel_port
+        ));
+    }
+    if config.enabled && config.funnel_port == config.https_port {
+        return Err(format!(
+            "Funnel port {} is also the tailnet serve port; Funnel would expose every route on it, so choose another",
+            config.funnel_port
+        ));
+    }
+    Ok(FunnelSpec {
+        tailscale_binary: tailscale_binary(config),
+        port: config.funnel_port,
+    })
+}
+
+fn set_path_flag() -> String {
+    format!("--set-path={}", crate::task_trigger::WEBHOOK_MOUNT)
+}
+
+/// Checks that Tailscale still funnels the webhook mount to `target`.
+async fn check_funnel(spec: &FunnelSpec, target: &str) -> Result<(), String> {
+    let output = tailscale(
+        &spec.tailscale_binary,
+        vec!["serve".into(), "status".into(), "--json".into()],
+    )
+    .await?;
+    if funnels(&output, spec, target) {
+        Ok(())
+    } else {
+        Err(
+            "the Tailscale funnel configuration no longer forwards the webhook routes to May"
+                .to_string(),
+        )
+    }
+}
+
+fn funnels(status_json: &str, spec: &FunnelSpec, target: &str) -> bool {
+    let status: ServeStatus = serde_json::from_str(status_json).unwrap_or_default();
+    let suffix = format!(":{}", spec.port);
+    status.web.iter().any(|(host, served)| {
+        host.ends_with(&suffix)
+            && status.allow_funnel.get(host).copied().unwrap_or(false)
+            && served
+                .handlers
+                .get(crate::task_trigger::WEBHOOK_MOUNT)
+                .is_some_and(|handler| handler.proxy.trim_end_matches('/') == target)
+    })
 }
 
 async fn sync_runtime(
@@ -587,6 +840,9 @@ fn parse_tailnet_host(output: &str) -> Result<String, String> {
 struct ServeStatus {
     #[serde(rename = "Web", default)]
     web: std::collections::BTreeMap<String, ServeHost>,
+    /// `host:port` entries Funnel exposes to the internet.
+    #[serde(rename = "AllowFunnel", default)]
+    allow_funnel: std::collections::BTreeMap<String, bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -780,5 +1036,59 @@ mod tests {
         let accepted = futures_lite::future::block_on(refresh_allow_list(&identity, &config));
         assert!(matches!(accepted.owner, OwnerLogin::Unresolved { .. }));
         assert_eq!(accepted.listed, listed());
+    }
+
+    fn funnel_config(port: u16) -> RemoteAccessConfig {
+        RemoteAccessConfig {
+            funnel: true,
+            funnel_port: port,
+            ..RemoteAccessConfig::default()
+        }
+    }
+
+    #[test]
+    fn funnel_accepts_only_the_ports_tailscale_allows() {
+        for port in [443, 8443, 10000] {
+            assert_eq!(
+                funnel_spec(&funnel_config(port), false)
+                    .expect("allowed")
+                    .port,
+                port
+            );
+        }
+        let error = funnel_spec(&funnel_config(9000), false).expect_err("not a funnel port");
+        assert!(error.contains("443, 8443 or 10000"));
+    }
+
+    #[test]
+    fn funnel_never_shares_the_serve_port() {
+        let mut config = funnel_config(443);
+        config.enabled = true;
+        let error = funnel_spec(&config, false).expect_err("same port as serve");
+        assert!(error.contains("serve port"));
+        config.funnel_port = 8443;
+        assert!(funnel_spec(&config, false).is_ok());
+    }
+
+    #[test]
+    fn funnel_is_blocked_with_local_profiles_unless_overridden() {
+        let mut config = funnel_config(443);
+        assert!(funnel_spec(&config, true).is_err());
+        config.allow_local_environment = true;
+        assert!(funnel_spec(&config, true).is_ok());
+    }
+
+    #[test]
+    fn recognizes_its_funnel_handler_in_serve_status() {
+        let spec = funnel_spec(&funnel_config(8443), false).expect("valid spec");
+        let target = "http://127.0.0.1:5555";
+        let on = r#"{"Web":{"mac.ts.net:8443":{"Handlers":{"/api/tasks/webhook":{"Proxy":"http://127.0.0.1:5555"}}}},"AllowFunnel":{"mac.ts.net:8443":true}}"#;
+        assert!(funnels(on, &spec, target));
+        // The handler without the Funnel flag is tailnet-only.
+        let private = r#"{"Web":{"mac.ts.net:8443":{"Handlers":{"/api/tasks/webhook":{"Proxy":"http://127.0.0.1:5555"}}}}}"#;
+        assert!(!funnels(private, &spec, target));
+        let other_target = r#"{"Web":{"mac.ts.net:8443":{"Handlers":{"/api/tasks/webhook":{"Proxy":"http://127.0.0.1:1"}}}},"AllowFunnel":{"mac.ts.net:8443":true}}"#;
+        assert!(!funnels(other_target, &spec, target));
+        assert!(!funnels("{}", &spec, target));
     }
 }

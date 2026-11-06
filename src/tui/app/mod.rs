@@ -242,6 +242,11 @@ pub struct App {
     pub model_select_rx: Option<Receiver<Vec<FetchedModel>>>,
     /// Per-session file-diff worker (rebuilt on session switch)
     pub file_diffs: Option<FileDiffHandle>,
+    /// The daemon's answers to clone-root requests, waiting to join tracking
+    clone_roots: (
+        async_channel::Sender<Vec<crate::file_tracker::TrackedRootSpec>>,
+        Receiver<Vec<crate::file_tracker::TrackedRootSpec>>,
+    ),
     /// Per-root session file changes shown in the sidebar's Changes
     /// section; refreshed from the diff worker's status outcomes.
     pub file_status: Vec<crate::file_tracker::RootDiff>,
@@ -325,6 +330,11 @@ pub struct App {
     pub image_view_area: Option<ratatui::layout::Rect>,
     /// Mouse/text selection in rendered chat content
     pub selection: Option<TextSelection>,
+    /// Where the pointer last was inside the chat column (screen cell);
+    /// the link under it is underlined and its target shown.
+    pub hover: Option<(u16, u16)>,
+    /// Opens link targets; replaced in tests.
+    pub link_opener: std::sync::Arc<dyn super::ui::links::LinkOpener>,
     /// Laid-out chat transcript: the render cache, and the plain-text
     /// mirror (selection, copy, click hit-testing) of what was drawn.
     pub chat_layout: super::ui::chat_layout::ChatLayout,
@@ -337,7 +347,7 @@ pub struct App {
     /// when the agent worker installs).
     pub background: Option<crate::client::background::RemoteBackground>,
     /// Model clone for `/btw` side questions (outside conversation history).
-    pub btw_llm: Option<crate::agent::RequestParameterizedModel<aither_cloud::CloudProvider>>,
+    pub btw_llm: Option<crate::agent::ModelSlot<crate::agent::ProviderLlm>>,
     /// Daemon that answers `/btw` when the agent runs there.
     pub btw_daemon: Option<crate::client::DaemonClient>,
     /// Right sidebar: task tree, linked issues (background lists come
@@ -504,6 +514,39 @@ impl App {
             }
         }
 
+        // Build status message for env-detected providers
+        let status = if env_providers_added.is_empty() {
+            None
+        } else {
+            let names: Vec<_> = env_providers_added
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect();
+            Some(StatusNotice::transient(
+                format!("Auto-configured from env: {}", names.join(", ")),
+                STATUS_NOTICE_TTL,
+            ))
+        };
+
+        Ok(Self::with_parts(
+            config,
+            session_manager,
+            event_tx,
+            image_support,
+            status,
+        ))
+    }
+
+    /// Builds the application state around an already loaded configuration
+    /// and session manager; the part of [`Self::new`] that touches neither
+    /// the home directory nor the environment.
+    fn with_parts(
+        config: MayConfig,
+        session_manager: SessionManager,
+        event_tx: EventSender,
+        image_support: Option<super::ui::image::TerminalImageSupport>,
+        status: Option<StatusNotice>,
+    ) -> Self {
         let needs_setup = !config.is_configured();
         let tunnel_base = tunnel_base(&config);
         // Always start in Chat mode - show inline message if not configured
@@ -526,26 +569,12 @@ impl App {
         // Get current working directory
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-        // Build status message for env-detected providers
-        let status = if env_providers_added.is_empty() {
-            None
-        } else {
-            let names: Vec<_> = env_providers_added
-                .iter()
-                .map(|(id, _)| id.as_str())
-                .collect();
-            Some(StatusNotice::transient(
-                format!("Auto-configured from env: {}", names.join(", ")),
-                STATUS_NOTICE_TTL,
-            ))
-        };
-
         let secrets = crate::secrets::Secrets::load(
             &crate::secrets::SecretStore::new(session_manager.may_dir()),
             &config,
         );
 
-        Ok(Self {
+        Self {
             session_manager,
             worker_settings: crate::agent::AgentLiveSettings::of(&config),
             config,
@@ -609,6 +638,7 @@ impl App {
             model_fetch_rx: None,
             model_select_rx: None,
             file_diffs: None,
+            clone_roots: async_channel::unbounded(),
             file_status: Vec::new(),
             sidebar_file_changes: true,
             clipboard_rx: None,
@@ -650,6 +680,8 @@ impl App {
             image_regions: Vec::new(),
             image_view_area: None,
             selection: None,
+            hover: None,
+            link_opener: std::sync::Arc::new(super::ui::links::SystemOpener),
             chat_layout: super::ui::chat_layout::ChatLayout::default(),
             frame_stats: super::perf::FrameStats::default(),
             last_click: None,
@@ -674,7 +706,7 @@ impl App {
             index_loading: false,
             question_cursor: 0,
             parked_question: None,
-        })
+        }
     }
 
     fn persist_config_background(&self) {
@@ -739,34 +771,76 @@ impl App {
             let key = crate::issue::repository_identity(&worktree).ok()?;
             crate::trust::trust_for(config, &key, &worktree)
         });
-        self.sidebar_file_changes = !trust.is_some_and(crate::trust::TrustLevel::clones_work);
+        let clones_work = trust.is_some_and(crate::trust::TrustLevel::clones_work);
+        self.sidebar_file_changes = !clones_work;
+        // With clones, the daemon's registry names the roots; they join
+        // tracking when its answer arrives.
         let mut roots = Vec::new();
-        if trust.is_some_and(crate::trust::TrustLevel::clones_work) {
-            roots = Self::repo_clone_specs(&session.sandbox_dir);
-        } else if let Some(config) = &config {
-            if !config.has_write_access(&self.cwd) {
+        if !clones_work {
+            if let Some(config) = &config {
+                if !config.has_write_access(&self.cwd) {
+                    roots.push(crate::file_tracker::TrackedRootSpec::checkout(
+                        self.cwd.clone(),
+                    ));
+                }
+                roots.extend(
+                    config
+                        .workdirs
+                        .iter()
+                        .filter(|dir| dir.permission == crate::workspace::Permission::ReadWrite)
+                        .map(|dir| {
+                            crate::file_tracker::TrackedRootSpec::checkout(dir.path.clone())
+                        }),
+                );
+            } else {
                 roots.push(crate::file_tracker::TrackedRootSpec::checkout(
                     self.cwd.clone(),
                 ));
             }
-            roots.extend(
-                config
-                    .workdirs
-                    .iter()
-                    .filter(|dir| dir.permission == crate::workspace::Permission::ReadWrite)
-                    .map(|dir| crate::file_tracker::TrackedRootSpec::checkout(dir.path.clone())),
-            );
-        } else {
-            roots.push(crate::file_tracker::TrackedRootSpec::checkout(
-                self.cwd.clone(),
-            ));
         }
         self.file_status.clear();
-        self.file_diffs =
-            FileDiffHandle::start(session_id, session_paths.root().join("filebase"), roots);
+        self.file_diffs = FileDiffHandle::start(
+            session_id.clone(),
+            session_paths.root().join("filebase"),
+            roots,
+        );
         if let Some(handle) = &self.file_diffs {
             handle.request_status();
         }
+        if clones_work {
+            self.request_clone_roots(&session_id);
+        }
+    }
+
+    /// Ask the daemon for the session's repo clones; its answer is applied by
+    /// [`Self::poll_file_diffs`].
+    fn request_clone_roots(&self, session_id: &str) {
+        let Ok(client) = self.session_manager.daemon_handle() else {
+            return;
+        };
+        let results = self.clone_roots.0.clone();
+        let path = format!("/api/sessions/{session_id}/repo-clones");
+        spawn(async move {
+            match client.get::<Vec<crate::repo_clone::CloneView>>(&path).await {
+                Ok(clones) => {
+                    let specs = clones
+                        .into_iter()
+                        .map(|clone| {
+                            let label = if clone.local {
+                                crate::fs_utils::display_path(std::path::Path::new(&clone.source))
+                            } else {
+                                clone.source.clone()
+                            };
+                            crate::file_tracker::TrackedRootSpec::new(clone.path.into())
+                                .label(format!("{label} (clone)"))
+                        })
+                        .collect();
+                    let _ = results.send(specs).await;
+                }
+                Err(error) => tracing::warn!(%error, "failed to list session repo clones"),
+            }
+        })
+        .detach();
     }
 
     /// Ask the diff worker to attribute pending file changes to
@@ -828,6 +902,13 @@ impl App {
     /// Apply finished file diffs and rewind results to their tool-call
     /// blocks. Called once per event-loop iteration.
     pub fn poll_file_diffs(&mut self) {
+        while let Ok(specs) = self.clone_roots.1.try_recv() {
+            if let Some(handle) = &self.file_diffs {
+                for spec in specs {
+                    handle.request_add_root(spec);
+                }
+            }
+        }
         let outcomes = match &self.file_diffs {
             Some(handle) => handle.drain(),
             None => return,
@@ -859,42 +940,9 @@ impl App {
         if refresh_status && let Some(handle) = &self.file_diffs {
             // Repo clones created since the last refresh join tracking;
             // the worker dedupes roots it already covers.
-            if let Some(session) = self
-                .session_manager
-                .current()
-                .filter(|session| session.persisted)
-            {
-                for spec in Self::repo_clone_specs(&session.sandbox_dir) {
-                    handle.request_add_root(spec);
-                }
-            }
+            self.request_clone_roots(handle.session_id());
             handle.request_status();
         }
-    }
-
-    /// Tracked-root specs for the session's repo clones: every clone under
-    /// `<sandbox>/repos/` is an embedded repository whose working tree only
-    /// diffs against a shadow repo of its own, labeled by the repository
-    /// it serves.
-    fn repo_clone_specs(
-        sandbox_dir: &std::path::Path,
-    ) -> Vec<crate::file_tracker::TrackedRootSpec> {
-        let repos = crate::repo_clone::SessionRepos::new(sandbox_dir, "");
-        let Ok(clones) = repos.clones() else {
-            return Vec::new();
-        };
-        clones
-            .iter()
-            .map(|record| {
-                let label = if record.local {
-                    crate::fs_utils::display_path(std::path::Path::new(&record.source))
-                } else {
-                    record.source.clone()
-                };
-                crate::file_tracker::TrackedRootSpec::new(repos.root().join(&record.dir))
-                    .label(format!("{label} (clone)"))
-            })
-            .collect()
     }
 
     /// Show the result of a completed code rewind in the chat stream.
@@ -1996,14 +2044,19 @@ impl App {
                 }
             }
             AppMode::AskUser(_) => {
-                if let AppMode::AskUser(state) = &mut self.mode
-                    && let Some(qs) = state.current_state_mut()
-                    && qs.custom_mode
-                {
-                    return Some(ActiveTextInput::Simple {
-                        input: &mut qs.custom_text,
-                        filter: PasteFilter::Any,
-                    });
+                if let AppMode::AskUser(state) = &mut self.mode {
+                    let secret = state.current_secret().is_some();
+                    if let Some(qs) = state.current_state_mut()
+                        && (qs.custom_mode || secret)
+                    {
+                        if secret {
+                            qs.declined = false;
+                        }
+                        return Some(ActiveTextInput::Simple {
+                            input: &mut qs.custom_text,
+                            filter: PasteFilter::Any,
+                        });
+                    }
                 }
             }
             // FilePicker is handled separately (has its own insert_str method)
@@ -2828,6 +2881,7 @@ impl App {
     pub(super) fn handle_mouse(&mut self, mouse: MouseEvent) -> AppResult<Option<SendAction>> {
         const SCROLL_STEP_LINES: usize = 3;
 
+        self.hover = None;
         match &self.mode {
             AppMode::Chat => {}
             AppMode::ImageView(_) => {
@@ -2858,6 +2912,16 @@ impl App {
                 MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
             )
         {
+            return Ok(None);
+        }
+        self.hover = in_chat.then_some((mouse.column, mouse.row));
+
+        // Ctrl-click (Cmd where the terminal reports it) opens the link
+        // under the pointer instead of starting a selection.
+        let hit = self.link_at_screen(mouse.column, mouse.row);
+        if super::ui::links::dispatch_click(self.link_opener.as_ref(), &mouse, hit.as_ref()) {
+            self.selection = None;
+            self.last_click = None;
             return Ok(None);
         }
 
@@ -2935,7 +2999,11 @@ impl App {
                                 .chat_layout
                                 .collapse_regions()
                                 .into_iter()
-                                .find(|r| point.line >= r.start && point.line < r.end)
+                                .filter(|r| point.line >= r.start && point.line < r.end)
+                                // The innermost span wins: a click inside an
+                                // expanded "Worked for" member toggles the
+                                // member, not the group around it.
+                                .min_by_key(|r| r.end - r.start)
                         {
                             self.chat.toggle_expanded(&region.element_id);
                         }
@@ -2949,6 +3017,21 @@ impl App {
         }
 
         Ok(None)
+    }
+
+    /// The link drawn at screen cell `(col, row)`.
+    fn link_at_screen(&self, col: u16, row: u16) -> Option<super::ui::links::LinkHit> {
+        let x = col.checked_sub(self.chat_area.x)?;
+        let y = row.checked_sub(self.chat_area.y)?;
+        let doc = (self.effective_scroll() + usize::from(y))
+            .checked_sub(self.chat_layout.top_padding())?;
+        self.chat_layout.link_at(doc, x)
+    }
+
+    /// The link under the pointer, if it is inside the chat column.
+    pub(super) fn hovered_link(&self) -> Option<super::ui::links::LinkHit> {
+        let (col, row) = self.hover?;
+        self.link_at_screen(col, row)
     }
 
     fn mouse_to_selection_point(&self, mouse: MouseEvent) -> Option<SelectionPoint> {
@@ -3135,6 +3218,7 @@ impl App {
             "/quit" => self.request_quit(),
             "/compact" => Some(SendAction::Compact(None)),
             "/recap" => Some(SendAction::Recap),
+            "/yolo" => Some(SendAction::ToggleYolo),
             "/context" => Some(SendAction::ContextReport),
             "/usage" => Some(SendAction::UsageReport),
             "/context dump" => Some(SendAction::ContextDump),
@@ -3949,6 +4033,14 @@ impl App {
                             self.usage = Some(u);
                         }
                     }
+                    AgentEvent::CompactionRecovery {
+                        error,
+                        alerts_removed,
+                        outputs_spilled,
+                    } => {
+                        self.chat
+                            .push_compaction_recovery(&error, alerts_removed, outputs_spilled);
+                    }
                     // Lifecycle events are used for runtime coordination, not rendered.
                     _ => {}
                 }
@@ -4131,6 +4223,8 @@ pub enum SendAction {
     EnqueuePending(PendingMessage),
     /// Ask the daemon for a catch-up recap of the session.
     Recap,
+    /// Flip the session's yolo switch.
+    ToggleYolo,
     /// Show an open question of the session in the answer modal.
     OpenQuestions,
     /// Reload the session's history, which turns this client missed
@@ -4316,11 +4410,10 @@ fn btw_message(role: &str, content: impl Into<String>) -> crate::daemon::BtwMess
 
 /// Streams a `/btw` answer from the session's model into the overlay.
 async fn stream_btw_answer(
-    llm: crate::agent::RequestParameterizedModel<aither_cloud::CloudProvider>,
+    llm: crate::agent::ModelSlot<crate::agent::ProviderLlm>,
     messages: Vec<crate::daemon::BtwMessage>,
     tx: EventSender,
 ) {
-    use aither_core::LanguageModel;
     use aither_core::llm::Message;
     use futures_lite::StreamExt;
     let messages = messages
@@ -4331,8 +4424,7 @@ async fn stream_btw_answer(
             _ => Message::user(message.content),
         })
         .collect::<Vec<_>>();
-    let request = aither_core::llm::LLMRequest::new(messages);
-    let mut stream = std::pin::pin!(llm.respond(request));
+    let mut stream = std::pin::pin!(llm.respond(messages));
     while let Some(result) = stream.next().await {
         match result {
             Ok(aither_core::llm::Event::Text(text)) => {
@@ -4353,6 +4445,145 @@ async fn stream_btw_answer(
 #[cfg(test)]
 mod tests {
     use super::utf8_complete_len;
+    use super::{App, AppEvent, KeyCode, KeyModifiers, MayConfig, MessageRole, SendAction};
+    use crate::session::SessionManager;
+    use crate::tui::ui::chat::ChatElement;
+
+    /// An app over a scratch May directory with one attached session,
+    /// returning the session id. The directory must outlive the app.
+    async fn app_with_session(dir: &std::path::Path) -> (App, String) {
+        let mut sessions = SessionManager::at(dir.to_path_buf())
+            .await
+            .expect("session manager");
+        let id = sessions
+            .create_session_in_profile(None, None)
+            .expect("session")
+            .id
+            .as_str()
+            .to_string();
+        let (tx, _rx) = async_channel::unbounded();
+        let app = App::with_parts(MayConfig::default(), sessions, tx, None, None);
+        (app, id)
+    }
+
+    fn suggest(app: &mut App, session_id: &str, text: &str) {
+        app.handle_event(AppEvent::PromptSuggestion {
+            request_id: 1,
+            session_id: session_id.to_string(),
+            text: Some(text.to_string()),
+        })
+        .expect("suggestion event");
+    }
+
+    fn press(app: &mut App, code: KeyCode) -> Option<SendAction> {
+        app.handle_key(code, KeyModifiers::NONE).expect("key")
+    }
+
+    #[tokio::test]
+    async fn a_suggestion_frame_shows_for_the_attached_session_only() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, id) = app_with_session(dir.path()).await;
+        suggest(&mut app, "another-session", "not mine");
+        assert_eq!(app.own_visible_suggestion(), None);
+        suggest(&mut app, &id, "run the tests");
+        assert_eq!(app.own_visible_suggestion(), Some("run the tests"));
+        app.handle_event(AppEvent::PromptSuggestion {
+            request_id: 2,
+            session_id: id,
+            text: None,
+        })
+        .expect("clear");
+        assert_eq!(
+            app.own_visible_suggestion(),
+            None,
+            "a cleared frame hides it"
+        );
+    }
+
+    #[tokio::test]
+    async fn tab_lifts_the_suggestion_into_the_draft_without_sending() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, id) = app_with_session(dir.path()).await;
+        suggest(&mut app, &id, "run the tests");
+        let action = press(&mut app, KeyCode::Tab);
+        assert!(action.is_none(), "accepting never submits");
+        assert_eq!(app.input, "run the tests");
+        assert_eq!(app.cursor, app.input_char_count);
+        assert!(app.prompt_suggestion.is_none(), "consumed");
+        press(&mut app, KeyCode::Char('!'));
+        assert_eq!(app.input, "run the tests!", "the lifted text is editable");
+    }
+
+    #[tokio::test]
+    async fn esc_dismisses_the_suggestion_and_leaves_the_draft_empty() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, id) = app_with_session(dir.path()).await;
+        suggest(&mut app, &id, "run the tests");
+        assert!(press(&mut app, KeyCode::Esc).is_none());
+        assert!(app.prompt_suggestion.is_none());
+        assert_eq!(app.input, "");
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.input, "", "nothing left to accept");
+    }
+
+    #[tokio::test]
+    async fn typing_hides_the_suggestion() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, id) = app_with_session(dir.path()).await;
+        suggest(&mut app, &id, "run the tests");
+        press(&mut app, KeyCode::Char('h'));
+        assert_eq!(app.input, "h");
+        assert_eq!(app.own_visible_suggestion(), None, "hidden while typing");
+        press(&mut app, KeyCode::Tab);
+        assert_eq!(app.input, "h", "Tab never overwrites a typed draft");
+    }
+
+    #[tokio::test]
+    async fn recap_command_asks_the_daemon_and_the_frame_adds_a_card() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, id) = app_with_session(dir.path()).await;
+        for c in "/recap".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        let mut action = press(&mut app, KeyCode::Enter);
+        if action.is_none() {
+            action = press(&mut app, KeyCode::Enter);
+        }
+        assert!(matches!(action, Some(SendAction::Recap)));
+
+        app.handle_event(AppEvent::Recap {
+            session_id: id,
+            state: "ready".to_string(),
+            summary: Some("Tests pass.".to_string()),
+            next_action: Some("Merge it.".to_string()),
+        })
+        .expect("recap frame");
+        assert!(matches!(
+            app.chat.elements().last(),
+            Some(ChatElement::Recap { summary, next_action })
+                if summary == "Tests pass." && next_action.as_deref() == Some("Merge it.")
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_stored_recap_row_is_restored_as_a_card_when_history_reloads() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        let record = crate::daemon::RecapRecord {
+            summary: "Where it stands.".to_string(),
+            next_action: None,
+            turns: 1,
+        };
+        let mut row = crate::ChatMessage::user("");
+        row.role = MessageRole::Recap;
+        row.content = serde_json::to_string(&record).expect("record");
+        app.render_history(&[crate::ChatMessage::user("hi"), row])
+            .await;
+        assert!(matches!(
+            app.chat.elements().last(),
+            Some(ChatElement::Recap { summary, next_action: None }) if summary == "Where it stands."
+        ));
+    }
 
     #[test]
     fn utf8_complete_len_holds_only_incomplete_trailing_sequence() {

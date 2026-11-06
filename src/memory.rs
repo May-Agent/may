@@ -6,7 +6,6 @@
 
 use std::time::Duration;
 
-use aither_cloud::CloudProvider;
 use aither_core::LanguageModel;
 use aither_core::llm::{LLMRequest, Message};
 use futures_lite::StreamExt;
@@ -57,7 +56,7 @@ pub struct MemoryExtractionProvider {
     /// Model name to run extraction with.
     pub model: String,
     /// Client used to run the extraction prompt.
-    pub llm: CloudProvider,
+    pub llm: crate::agent::ProviderLlm,
 }
 
 impl MemoryProcessor {
@@ -287,7 +286,7 @@ impl MemoryProcessor {
     }
 
     async fn extract_with_provider(
-        llm: &CloudProvider,
+        llm: &crate::agent::ProviderLlm,
         prompt: &str,
     ) -> Result<String, MemoryProcessingError> {
         let request = LLMRequest::new(vec![Message::user(prompt)]);

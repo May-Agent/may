@@ -11,6 +11,8 @@ plan, message chunks, and a tool_call with tool_call_update updates, then:
   first 40 chars (or the error) are recorded into the reply.
 - "WRITE <path>" in the prompt -> an fs/write_text_file request; "fsw:ok" or
   the error is recorded into the reply.
+- "CAPS" in the prompt -> the client's fs capabilities from initialize are
+  recorded into the reply as "caps:read=<bool>,write=<bool>".
 - "RUN <cmd>" / "RUNLINE <cmd>" in the prompt -> terminal/create,
   wait_for_exit, output; the output, exit code, signal, and truncation flag
   are recorded into the reply.
@@ -26,6 +28,9 @@ plan, message chunks, and a tool_call with tool_call_update updates, then:
 - "die" -> the process exits mid-turn with status 3.
 - "fail" -> the prompt's request returns a JSON-RPC error; the process
   stays alive (a dropped model stream, a backend error).
+
+The argument --silent-after-initialize makes the agent answer initialize and
+then never answer session/new.
 
 FAKE_RATE_LIMIT=<secs> makes the agent's provider rate-limit it: a
 prompt containing "ratelimit" starts a per-user window of that length,
@@ -129,6 +134,7 @@ outbound = {}       # request id -> kind: perm | fs | fsw | term-create |
                     #   term-output | term-release
 terminal_id = None
 collected = []      # markers appended to the final reply
+client_fs = {}      # the client's fs capabilities, as initialize sent them
 
 
 def new_request(method, params, kind):
@@ -319,6 +325,14 @@ def begin_turn(request_id, text):
                 ],
             },
             "perm",
+        )
+    if "CAPS" in text:
+        collected.append(
+            "caps:read=%s,write=%s"
+            % (
+                json.dumps(client_fs.get("readTextFile", False)),
+                json.dumps(client_fs.get("writeTextFile", False)),
+            )
         )
     if text.startswith("READ "):
         path = text[5:].strip()
@@ -670,6 +684,7 @@ for line in sys.stdin:
     if "method" in msg and "id" in msg:
         method, request_id, params = msg["method"], msg["id"], msg.get("params") or {}
         if method == "initialize":
+            client_fs = (params.get("clientCapabilities") or {}).get("fs") or {}
             respond(
                 request_id,
                 {
@@ -680,6 +695,9 @@ for line in sys.stdin:
                     "agentInfo": {"name": "fake-agent-py", "version": "0.1.0"},
                 },
             )
+        elif method == "session/new" and "--silent-after-initialize" in sys.argv[1:]:
+            # Opt-in by argument: answers initialize, then never session/new.
+            pass
         elif method == "session/new":
             session_count += 1
             session_id = f"sess-{os.getpid()}-{session_count}"

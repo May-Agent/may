@@ -35,6 +35,20 @@ struct SessionBackground {
     subagents: SubagentHandles,
     /// Job registries of the session's agents, numbered, newest last.
     jobs: Vec<(u64, JobRegistry)>,
+    /// Background wakes being served: received from the idle agent and not
+    /// yet settled by the turn they start.
+    resuming: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// A background wake of a session being served; the session reads as
+/// resuming until this drops.
+#[must_use]
+pub struct ResumePending(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for ResumePending {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 /// Background work of every session the daemon ran.
@@ -78,6 +92,24 @@ impl SessionBackgrounds {
             .push((id, registry));
     }
 
+    /// Marks `session_id` as resuming until the guard drops.
+    pub(crate) fn resume_pending(&self, session_id: &str) -> ResumePending {
+        let counter = self
+            .sessions()
+            .entry(session_id.to_string())
+            .or_default()
+            .resuming
+            .clone();
+        counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        ResumePending(counter)
+    }
+
+    fn resuming(&self, session_id: &str) -> bool {
+        self.sessions()
+            .get(session_id)
+            .is_some_and(|session| session.resuming.load(std::sync::atomic::Ordering::Acquire) > 0)
+    }
+
     fn registries(&self, session_id: &str) -> Vec<(u64, JobRegistry)> {
         self.sessions()
             .get(session_id)
@@ -91,9 +123,9 @@ impl SessionBackgrounds {
             .map(|session| session.subagents.clone())
     }
 
-    /// Jobs of `session_id`: every job of its newest agent, and the running
-    /// ones of earlier agents. Earlier registries with nothing running are
-    /// dropped.
+    /// Jobs of `session_id`: every job of its newest agent, and the ones of
+    /// earlier agents that still run or whose completion their agent has
+    /// not taken. Earlier registries with neither are dropped.
     async fn jobs(&self, session_id: &str) -> Vec<aither_sandbox::JobInfo> {
         let registries = self.registries(session_id);
         let Some(((_, newest), older)) = registries.split_last() else {
@@ -102,16 +134,16 @@ impl SessionBackgrounds {
         let mut jobs = Vec::new();
         let mut idle = Vec::new();
         for (id, registry) in older {
-            let running: Vec<_> = registry
+            let live: Vec<_> = registry
                 .list()
                 .await
                 .into_iter()
-                .filter(|job| job.status == JobStatus::Running)
+                .filter(|job| job.status == JobStatus::Running || job.status.completion_pending())
                 .collect();
-            if running.is_empty() {
+            if live.is_empty() {
                 idle.push(*id);
             }
-            jobs.extend(running);
+            jobs.extend(live);
         }
         jobs.extend(newest.list().await);
         if !idle.is_empty()
@@ -149,10 +181,14 @@ impl SessionBackgrounds {
             .subagents_of(session_id)
             .map(|handles| handles.tracker.running())
             .unwrap_or_default();
+        // A finished job whose completion its agent has not taken still owes
+        // the session a turn, from the moment the registry records the finish.
+        let owed_turn = jobs.iter().any(|job| job.status.completion_pending());
         SessionBackgroundSnapshot {
             session_id: session_id.to_string(),
             jobs: jobs.iter().map(WireJob::from).collect(),
             subagents: subagents.iter().map(WireSubagentRun::from).collect(),
+            resuming: owed_turn || self.resuming(session_id),
         }
     }
 
@@ -416,11 +452,41 @@ mod tests {
             .iter()
             .map(|job| job.pid)
             .collect();
+        assert_eq!(pids, vec![10, 11], "its completion is still owed");
+        drop(old.owe_completion("t-old", Ok(0)).await);
+        let pids: Vec<u32> = backgrounds
+            .jobs("s")
+            .await
+            .iter()
+            .map(|job| job.pid)
+            .collect();
         assert_eq!(pids, vec![11], "a finished earlier job drops out");
         assert_eq!(
             backgrounds.registries("s").len(),
             1,
             "its registry is let go"
         );
+    }
+
+    #[tokio::test]
+    async fn a_finished_job_reads_as_resuming_until_its_completion_is_taken() {
+        let backgrounds = SessionBackgrounds::default();
+        let registry = registry_with_job(20, "t-owed").await;
+        backgrounds.add_job_registry("s", registry.clone());
+        assert!(backgrounds.snapshot("s").await.will_resume(), "it runs");
+
+        // The job finishes; the idle agent has not taken the completion yet.
+        registry.complete(20, 0, None).await;
+        let snapshot = backgrounds.snapshot("s").await;
+        assert!(snapshot.resuming, "{snapshot:?}");
+
+        let owed = registry
+            .owe_completion("t-owed", Ok(0))
+            .await
+            .expect("the job is registered");
+        assert!(backgrounds.snapshot("s").await.resuming);
+
+        drop(owed);
+        assert!(!backgrounds.snapshot("s").await.will_resume());
     }
 }

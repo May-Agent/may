@@ -4,8 +4,9 @@
 //! (cron or one-time), and executes them through profile-specific runtimes.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -36,6 +37,17 @@ use crate::task_trigger::{
 };
 use crate::ui_event_bus::{UiEventBus, UiEventTopics};
 
+/// What a webhook delivery did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebhookOutcome {
+    /// No enabled, approved task has the presented token.
+    NotFound,
+    /// Tasks match the token but every one required a signature the delivery lacked.
+    SignatureRefused,
+    /// This many tasks were started.
+    Triggered(usize),
+}
+
 /// Shared task execution facility used by the scheduler, REST API, and agent tools.
 #[derive(Debug, Clone)]
 pub struct TaskRuntime {
@@ -51,6 +63,10 @@ pub struct TaskRuntime {
     /// The daemon's connectivity source; task terminals record the outages
     /// their commands ran through.
     connectivity: Option<aither_connectivity::Connectivity>,
+    /// Where a run's `wake` command stores its prompt.
+    session_prompts: Option<crate::task_wake::SessionPrompts>,
+    /// Where webhook signing secrets are read.
+    secrets: crate::secrets::SecretStore,
 }
 
 /// Time-based wrapper that periodically asks [`TaskRuntime`] to run due tasks.
@@ -199,6 +215,13 @@ fn temp_task_file_name(prefix: &str, execution_id: &str, suffix: &str) -> String
     format!("{prefix}{execution_id}{suffix}")
 }
 
+/// Creates the directory a local task runs in; an existing one is kept.
+async fn prepare_working_dir(dir: &Path) -> Result<(), String> {
+    tokio::fs::create_dir_all(dir)
+        .await
+        .map_err(|error| workspace_prepare_error(dir, &error))
+}
+
 fn profile_workspace_key(profile: &profiles::Model) -> &str {
     profile.slug.as_deref().unwrap_or(&profile.id)
 }
@@ -264,10 +287,9 @@ fn task_value_error(
 fn stored_task_trigger(
     task: &scheduled_tasks::Model,
 ) -> Result<PersistedTaskTrigger, crate::db::ChatDbError> {
-    PersistedTaskTrigger::from_storage(task.trigger_kind.as_str(), task.trigger_type.as_str())
-        .map_err(|error| {
-            task_value_error(task.id.as_str(), "invalid stored trigger for task ", &error)
-        })
+    task.persisted_trigger().map_err(|error| {
+        task_value_error(task.id.as_str(), "invalid stored trigger for task ", &error)
+    })
 }
 
 fn workspace_prepare_error(path: &std::path::Path, error: &impl std::fmt::Display) -> String {
@@ -280,6 +302,14 @@ fn init_terminal_tool_error(prefix: &str, error: &impl std::fmt::Display) -> Str
 
 fn invalid_profile_component_error(prefix: &str, error: &impl std::fmt::Display) -> String {
     prefixed_error(prefix, error)
+}
+
+/// The task whose run a terminal serves, which gets the `wake` command.
+/// Validation runs have none.
+#[derive(Debug, Clone, Copy)]
+struct WakeScope<'a> {
+    task: &'a scheduled_tasks::Model,
+    in_container: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -398,12 +428,10 @@ struct TaskCallbackReminder<'a> {
 
 impl TaskExecutionEnvelope {
     fn new(task: &scheduled_tasks::Model, invocation: TaskInvocation) -> Result<Self, String> {
-        let trigger = PersistedTaskTrigger::from_storage(
-            task.trigger_kind.as_str(),
-            task.trigger_type.as_str(),
-        )
-        .map_err(|error| prefixed_error("invalid persisted task trigger: ", &error))?
-        .response(task.run_at.clone(), task.cron_expression.clone());
+        let trigger = task
+            .persisted_trigger()
+            .map_err(|error| prefixed_error("invalid persisted task trigger: ", &error))?
+            .response(task.run_at.clone(), task.cron_expression.clone());
         Ok(Self {
             task: TaskExecutionTask {
                 id: task.id.clone(),
@@ -478,15 +506,36 @@ impl TaskRuntime {
             db,
             notifier: None,
             ui_event_bus: None,
+            secrets: crate::secrets::SecretStore::new(&may_dir),
             may_dir,
             container_manager: None,
             tool_distribution,
             network_policy: Arc::new(ArcSwap::from_pointee(None)),
             active_tasks: Arc::new(ArcSwap::from_pointee(TaskCatalog::default())),
             connectivity: None,
+            session_prompts: None,
         };
         runtime.reload_active_tasks().await?;
         Ok(runtime)
+    }
+
+    /// Read webhook signing secrets from `secrets` instead of the OS keychain.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_secret_store(mut self, secrets: crate::secrets::SecretStore) -> Self {
+        self.secrets = secrets;
+        self
+    }
+
+    /// Give task runs a `wake` command that prompts the session that created
+    /// the task through `session_prompts`.
+    #[must_use]
+    pub fn with_session_prompts(
+        mut self,
+        session_prompts: crate::task_wake::SessionPrompts,
+    ) -> Self {
+        self.session_prompts = Some(session_prompts);
+        self
     }
 
     /// Record the sleep and offline intervals commands of local tasks run
@@ -552,6 +601,32 @@ impl TaskRuntime {
         self.active_tasks
             .store(Arc::new(TaskCatalog::from_tasks(tasks)));
         Ok(())
+    }
+
+    /// Delete a task, then its working directory, which only it owns, and
+    /// drop it from the active set.
+    ///
+    /// # Errors
+    /// Returns a message when the row or the directory cannot be removed.
+    pub async fn delete_task(&self, id: &str) -> Result<(), String> {
+        self.db
+            .delete_scheduled_task(id)
+            .await
+            .map_err(|error| prefixed_error("failed to delete task: ", &error))?;
+        let dir = crate::session::MayHomePaths::new(self.may_dir.clone()).inline_task_dir(id);
+        match tokio::fs::remove_dir_all(&dir).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "failed to remove task directory {}: {error}",
+                    dir.display()
+                ));
+            }
+        }
+        self.reload_active_tasks()
+            .await
+            .map_err(|error| prefixed_error("failed to reload tasks: ", &error))
     }
 
     /// Validate that a task script can be parsed in the target profile runtime.
@@ -663,15 +738,19 @@ impl TaskRuntime {
             })
             .await
             .map_err(|error| prefixed_error("failed to create scheduled task: ", &error))?;
+        // A yolo session stores its tasks approved and enabled.
+        let model = self
+            .db
+            .grant_task_under_yolo(&normalized.session_id, model)
+            .await
+            .map_err(|error| prefixed_error("failed to approve scheduled task: ", &error))?;
         self.reload_active_tasks()
             .await
             .map_err(|e| e.to_string())?;
-        let trigger = PersistedTaskTrigger::from_storage(
-            model.trigger_kind.as_str(),
-            model.trigger_type.as_str(),
-        )
-        .map_err(|error| prefixed_error("failed to decode persisted task trigger: ", &error))?
-        .response(model.run_at.clone(), model.cron_expression.clone());
+        let trigger = model
+            .persisted_trigger()
+            .map_err(|error| prefixed_error("failed to decode persisted task trigger: ", &error))?
+            .response(model.run_at.clone(), model.cron_expression.clone());
 
         Ok(TaskCreateResult {
             task_id: model.id,
@@ -773,28 +852,105 @@ impl TaskRuntime {
         Ok(dispatched)
     }
 
-    /// Run every enabled task whose webhook trigger matches `token`.
+    /// Run every enabled task whose webhook token matches `token` and whose
+    /// required signature, keyed by a secret from the keychain, verifies.
     ///
     /// # Errors
     /// Returns [`crate::db::ChatDbError`] on storage failure or task spawn failure.
     pub async fn dispatch_webhook(
         &self,
-        token: String,
+        token: &str,
         request: TaskWebhookRequest,
-    ) -> Result<usize, crate::db::ChatDbError> {
-        let tasks = self.db.list_tasks_for_webhook(&token).await?;
-        let triggered = tasks.len();
+    ) -> Result<WebhookOutcome, crate::db::ChatDbError> {
+        let tasks = self.webhook_tasks_for_token(token).await?;
+        let names = tasks
+            .iter()
+            .filter_map(|task| task.webhook_signature_secret.clone())
+            .collect::<Vec<_>>();
+        let store = self.secrets.clone();
+        let secrets = blocking::unblock(move || {
+            names
+                .into_iter()
+                .filter_map(|name| match store.get(&name) {
+                    Ok(Some(value)) => Some((name, value)),
+                    Ok(None) => None,
+                    Err(error) => {
+                        tracing::warn!(secret = %name, %error, "failed to read webhook signing secret");
+                        None
+                    }
+                })
+                .collect::<BTreeMap<_, _>>()
+        })
+        .await;
+        self.fire_webhook_tasks(tasks, &secrets, request).await
+    }
+
+    /// Enabled, approved webhook tasks whose token equals `token`. Every
+    /// stored token is compared in constant time with no early exit.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] on storage failure.
+    pub async fn webhook_tasks_for_token(
+        &self,
+        token: &str,
+    ) -> Result<Vec<scheduled_tasks::Model>, crate::db::ChatDbError> {
+        let mut matched = Vec::new();
+        for task in self.db.list_webhook_tasks().await? {
+            if crate::task_trigger::webhook_tokens_match(&task.trigger_type, token) {
+                matched.push(task);
+            }
+        }
+        Ok(matched)
+    }
+
+    /// Run the `tasks` whose signature requirement `secrets` satisfies for
+    /// `request`; a task whose secret is absent or whose signature is
+    /// missing or wrong does not run.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] when a task fails to spawn.
+    pub async fn fire_webhook_tasks(
+        &self,
+        tasks: Vec<scheduled_tasks::Model>,
+        secrets: &BTreeMap<String, String>,
+        mut request: TaskWebhookRequest,
+    ) -> Result<WebhookOutcome, crate::db::ChatDbError> {
+        if tasks.is_empty() {
+            return Ok(WebhookOutcome::NotFound);
+        }
+        // The path carries the token; tasks and run records never see it.
+        request.path = crate::task_trigger::WEBHOOK_ROUTE_REDACTED.to_string();
+        let mut triggered = 0;
         for task in tasks {
+            let trigger = stored_task_trigger(&task)?;
+            if let Some(signature) = trigger.webhook_signature() {
+                let verdict = secrets.get(&signature.secret).map_or_else(
+                    || Err(format!("secret {} is not stored", signature.secret)),
+                    |secret| {
+                        signature
+                            .verify(secret, &request)
+                            .map_err(|error| error.to_string())
+                    },
+                );
+                if let Err(reason) = verdict {
+                    tracing::warn!(task_id = %task.id, %reason, "refused a webhook delivery");
+                    continue;
+                }
+            }
+            triggered += 1;
             self.spawn_task(
                 task,
                 TaskInvocation::Webhook {
-                    token: token.clone(),
                     request: request.clone(),
                 },
             )
             .await?;
         }
-        Ok(triggered)
+        Ok(if triggered == 0 {
+            WebhookOutcome::SignatureRefused
+        } else {
+            WebhookOutcome::Triggered(triggered)
+        })
     }
 
     fn is_due(
@@ -914,7 +1070,11 @@ impl TaskRuntime {
             .await
             .map_err(|error| invalid_profile_error(profile.id.as_str(), &error))?;
         let script = self
-            .resolve_script_source(script_path, script_inline)
+            .resolve_script_source(
+                script_path,
+                script_inline,
+                crate::session::MayHomePaths::new(self.may_dir.clone()).task_validation_dir(),
+            )
             .await?;
 
         match profile_info.environment.kind() {
@@ -1082,6 +1242,7 @@ impl TaskRuntime {
     ) -> Result<TaskFilePlacement, String> {
         match environment {
             ProfileEnvironment::Local => {
+                prepare_working_dir(&script.host_working_dir).await?;
                 Ok(TaskFilePlacement::local(script.host_working_dir.clone()))
             }
             ProfileEnvironment::Container { .. } => self
@@ -1160,6 +1321,7 @@ impl TaskRuntime {
         &self,
         script_path: Option<&str>,
         script_inline: Option<&str>,
+        inline_dir: PathBuf,
     ) -> Result<TaskScript, String> {
         match (
             script_inline.map(str::trim).filter(|s| !s.is_empty()),
@@ -1167,7 +1329,7 @@ impl TaskRuntime {
         ) {
             (Some(inline), None) => Ok(TaskScript {
                 content: inline.to_string(),
-                host_working_dir: self.may_dir.clone(),
+                host_working_dir: inline_dir,
             }),
             (None, Some(path)) => {
                 let canonical = tokio::fs::canonicalize(path)
@@ -1201,8 +1363,12 @@ impl TaskRuntime {
     }
 
     async fn resolve_script(&self, task: &scheduled_tasks::Model) -> Result<TaskScript, String> {
-        self.resolve_script_source(task.script_path.as_deref(), task.script_inline.as_deref())
-            .await
+        self.resolve_script_source(
+            task.script_path.as_deref(),
+            task.script_inline.as_deref(),
+            crate::session::MayHomePaths::new(self.may_dir.clone()).inline_task_dir(&task.id),
+        )
+        .await
     }
 
     async fn execute_local(
@@ -1218,6 +1384,10 @@ impl TaskRuntime {
                 NetworkAccessSource::TaskLocal,
                 script,
                 task.needs_network,
+                Some(WakeScope {
+                    task,
+                    in_container: false,
+                }),
             )
             .await?;
         run_terminal_command(
@@ -1236,12 +1406,14 @@ impl TaskRuntime {
         script: &TaskScript,
         timeout: TaskTimeout,
     ) -> Result<(), String> {
+        prepare_working_dir(&script.host_working_dir).await?;
         let terminal_tool = self
             .local_terminal_tool(
                 profile_id,
                 NetworkAccessSource::TaskValidationLocal,
                 script,
                 false,
+                None,
             )
             .await?;
 
@@ -1268,6 +1440,7 @@ impl TaskRuntime {
         permission_handler: SchedulerPermissionHandler,
         workspace: PathBuf,
         shell_sessions: ShellSessionRegistry,
+        wake: Option<WakeScope<'_>>,
     ) -> Result<TerminalTool<SchedulerPermissionHandler, DefaultExecutor, Configured>, String> {
         let (terminal_tool, (network_audit, priority)) = futures_lite::future::try_zip(
             async {
@@ -1302,7 +1475,20 @@ impl TaskRuntime {
             ),
         )
         .await?;
-        let registry = Arc::new(ToolRegistryBuilder::new().build(workspace.join("outputs")));
+        let mut commands = ToolRegistryBuilder::new();
+        if let Some(scope) = wake {
+            commands.configure_tool(crate::task_wake::WakeTool::new(
+                self.session_prompts.clone(),
+                scope.task.id.clone(),
+                scope.task.name.clone(),
+                scope.task.session_id.clone(),
+                workspace.clone(),
+                scope
+                    .in_container
+                    .then(|| crate::container::lifecycle::workspace_mount(workspace.clone())),
+            ));
+        }
+        let registry = Arc::new(commands.build(workspace.join("outputs")));
         let terminal_tool = match &self.connectivity {
             Some(connectivity) => terminal_tool.with_connectivity(connectivity),
             None => terminal_tool,
@@ -1328,6 +1514,7 @@ impl TaskRuntime {
         source: NetworkAccessSource,
         script: &TaskScript,
         allow_network: bool,
+        wake: Option<WakeScope<'_>>,
     ) -> Result<TerminalTool<SchedulerPermissionHandler, DefaultExecutor, Configured>, String> {
         self.initialized_terminal_tool(
             SchedulerPermissionHandler {
@@ -1344,6 +1531,7 @@ impl TaskRuntime {
                 container: false,
                 ssh: false,
             }),
+            wake,
         )
         .await
     }
@@ -1356,6 +1544,7 @@ impl TaskRuntime {
         &self,
         profile: &profiles::Model,
         source: NetworkAccessSource,
+        task: Option<&scheduled_tasks::Model>,
     ) -> Result<
         (
             TerminalTool<SchedulerPermissionHandler, DefaultExecutor, Configured>,
@@ -1426,6 +1615,10 @@ impl TaskRuntime {
                     ssh: false,
                 })
                 .with_container_runtime(container_runtime),
+                task.map(|task| WakeScope {
+                    task,
+                    in_container: true,
+                }),
             )
             .await?;
         Ok((terminal_tool, container_manager, container_id))
@@ -1438,9 +1631,10 @@ impl TaskRuntime {
         command: String,
     ) -> Result<String, String> {
         let timeout = TaskTimeout::from_stored(task.timeout_secs)?;
-        let (terminal_tool, container_manager, container_id) =
-            Box::pin(self.container_terminal_tool(profile, NetworkAccessSource::TaskContainer))
-                .await?;
+        let (terminal_tool, container_manager, container_id) = Box::pin(
+            self.container_terminal_tool(profile, NetworkAccessSource::TaskContainer, Some(task)),
+        )
+        .await?;
         let result = run_terminal_command(
             &terminal_tool,
             TerminalExecutionMode::Default,
@@ -1495,10 +1689,13 @@ impl TaskRuntime {
         command: String,
         timeout: TaskTimeout,
     ) -> Result<(), String> {
-        let (terminal_tool, container_manager, container_id) = Box::pin(
-            self.container_terminal_tool(profile, NetworkAccessSource::TaskValidationContainer),
-        )
-        .await?;
+        let (terminal_tool, container_manager, container_id) =
+            Box::pin(self.container_terminal_tool(
+                profile,
+                NetworkAccessSource::TaskValidationContainer,
+                None,
+            ))
+            .await?;
         let result = run_terminal_command(
             &terminal_tool,
             TerminalExecutionMode::Default,
@@ -1625,7 +1822,7 @@ async fn run_terminal_command(
         .job_registry()
         .get_by_task_id(&task_id)
         .await
-        .is_some_and(|job| job.status == JobStatus::Killed);
+        .is_some_and(|job| matches!(job.status, JobStatus::Killed { .. }));
     if killed {
         return Err(format!(
             "task timed out after {} seconds and was killed",
@@ -1784,8 +1981,10 @@ mod tests {
 
         let runtime = TaskRuntime::load(
             db.clone(),
-            may_dir,
-            Arc::new(crate::tools::embedded_distribution().expect("embedded distribution")),
+            may_dir.clone(),
+            Arc::new(crate::tools::fixture_distribution(
+                &may_dir.join("tool-fixtures"),
+            )),
         )
         .await
         .expect("task runtime should load");
@@ -1800,6 +1999,198 @@ mod tests {
             .expect("event dispatch should succeed");
 
         assert_eq!(triggered, 1);
+    }
+
+    fn webhook_request(
+        signature: Option<String>,
+        body: &[u8],
+    ) -> crate::task_trigger::TaskWebhookRequest {
+        use base64::Engine as _;
+        let mut headers = std::collections::BTreeMap::new();
+        if let Some(signature) = signature {
+            headers.insert("x-hub-signature-256".to_string(), vec![signature]);
+        }
+        crate::task_trigger::TaskWebhookRequest {
+            method: "POST".to_string(),
+            path: "/api/tasks/webhook/secret-token".to_string(),
+            query: None,
+            headers,
+            body_base64: base64::engine::general_purpose::STANDARD.encode(body),
+            body_text: None,
+            body_json: None,
+            remote_addr: None,
+            body_size_bytes: body.len(),
+        }
+    }
+
+    fn sign(secret: &str, body: &[u8]) -> String {
+        use hmac::{Hmac, Mac};
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).expect("key");
+        mac.update(body);
+        format!("sha256={}", hex::encode(mac.finalize().into_bytes()))
+    }
+
+    #[tokio::test]
+    async fn webhook_delivery_needs_the_token_and_any_required_signature() {
+        use super::WebhookOutcome;
+        use crate::task_trigger::WebhookSignature;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let may_dir = dir.path().join(".may");
+        std::fs::create_dir_all(&may_dir).expect("may dir should be created");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db should initialize");
+        let profile_id = db
+            .ensure_default_profiles()
+            .await
+            .expect("default profiles should exist");
+
+        let plain_token = crate::task_trigger::new_webhook_token();
+        let signed_token = crate::task_trigger::new_webhook_token();
+        for (id, token, signature) in [
+            ("plain", plain_token.clone(), None),
+            (
+                "signed",
+                signed_token.clone(),
+                Some(WebhookSignature {
+                    secret: "HOOK_SECRET".to_string(),
+                    header: "x-hub-signature-256".to_string(),
+                }),
+            ),
+        ] {
+            let trigger = PersistedTaskTrigger::Webhook { token, signature };
+            db.create_scheduled_task(CreateScheduledTaskParams {
+                id,
+                profile_id: profile_id.as_str(),
+                session_id: None,
+                name: id,
+                trigger: &trigger,
+                cron_expression: None,
+                run_at: None,
+                script_path: None,
+                script_inline: Some("echo hi"),
+                needs_network: false,
+                timeout_secs: 60,
+            })
+            .await
+            .expect("task should persist");
+            db.approve_scheduled_task(id)
+                .await
+                .expect("task should be approved");
+        }
+        let runtime = TaskRuntime::load(
+            db,
+            may_dir.clone(),
+            Arc::new(crate::tools::fixture_distribution(
+                &may_dir.join("tool-fixtures"),
+            )),
+        )
+        .await
+        .expect("task runtime should load");
+        let secrets =
+            std::collections::BTreeMap::from([("HOOK_SECRET".to_string(), "s3cret".to_string())]);
+        let body = br#"{"event":"push"}"#;
+        let deliver = |token: String, signature: Option<String>| {
+            let runtime = runtime.clone();
+            let secrets = secrets.clone();
+            async move {
+                let tasks = runtime
+                    .webhook_tasks_for_token(&token)
+                    .await
+                    .expect("lookup should succeed");
+                runtime
+                    .fire_webhook_tasks(tasks, &secrets, webhook_request(signature, body))
+                    .await
+                    .expect("dispatch should succeed")
+            }
+        };
+
+        // A wrong token, including the old petname shape, runs nothing.
+        assert_eq!(
+            deliver(crate::task_trigger::new_webhook_token(), None).await,
+            WebhookOutcome::NotFound
+        );
+        assert_eq!(
+            deliver("quiet-brave-mint-otter".to_string(), None).await,
+            WebhookOutcome::NotFound
+        );
+        // An unsigned task needs only its token.
+        assert_eq!(
+            deliver(plain_token, None).await,
+            WebhookOutcome::Triggered(1)
+        );
+        // A signed task refuses a missing or wrong signature before running.
+        assert_eq!(
+            deliver(signed_token.clone(), None).await,
+            WebhookOutcome::SignatureRefused
+        );
+        assert_eq!(
+            deliver(signed_token.clone(), Some(sign("wrong", body))).await,
+            WebhookOutcome::SignatureRefused
+        );
+        // A correctly signed delivery runs it.
+        assert_eq!(
+            deliver(signed_token.clone(), Some(sign("s3cret", body))).await,
+            WebhookOutcome::Triggered(1)
+        );
+        // A signed task whose secret is not stored refuses everything.
+        let tasks = runtime
+            .webhook_tasks_for_token(&signed_token)
+            .await
+            .expect("lookup should succeed");
+        assert_eq!(
+            runtime
+                .fire_webhook_tasks(
+                    tasks,
+                    &std::collections::BTreeMap::new(),
+                    webhook_request(Some(sign("s3cret", body)), body)
+                )
+                .await
+                .expect("dispatch should succeed"),
+            WebhookOutcome::SignatureRefused
+        );
+    }
+
+    #[tokio::test]
+    async fn opening_the_database_replaces_weak_webhook_tokens() {
+        let dir = tempdir().expect("temp dir should be created");
+        let path = dir.path().join("history.db");
+        let db = ChatDb::open(&path).await.expect("db should initialize");
+        let profile_id = db
+            .ensure_default_profiles()
+            .await
+            .expect("default profiles should exist");
+        let trigger = PersistedTaskTrigger::Webhook {
+            token: "quiet-brave-mint-otter".to_string(),
+            signature: None,
+        };
+        db.create_scheduled_task(CreateScheduledTaskParams {
+            id: "old",
+            profile_id: profile_id.as_str(),
+            session_id: None,
+            name: "old",
+            trigger: &trigger,
+            cron_expression: None,
+            run_at: None,
+            script_path: None,
+            script_inline: Some("echo hi"),
+            needs_network: false,
+            timeout_secs: 60,
+        })
+        .await
+        .expect("task should persist");
+        drop(db);
+
+        let db = ChatDb::open(&path).await.expect("db should reopen");
+        let task = db
+            .get_scheduled_task("old")
+            .await
+            .expect("task should load")
+            .expect("task should exist");
+        assert!(crate::task_trigger::is_strong_webhook_token(
+            &task.trigger_type
+        ));
     }
 
     #[tokio::test]
@@ -1829,6 +2220,7 @@ mod tests {
                     host_working_dir: may_dir.join("task"),
                 },
                 false,
+                None,
             )
             .await
             .expect_err("a distribution without native tools must fail before any exec");
@@ -1853,8 +2245,10 @@ mod tests {
             .expect("db should initialize");
         let runtime = TaskRuntime::load(
             db,
-            may_dir,
-            Arc::new(crate::tools::embedded_distribution().expect("embedded distribution")),
+            may_dir.clone(),
+            Arc::new(crate::tools::fixture_distribution(
+                &may_dir.join("tool-fixtures"),
+            )),
         )
         .await
         .expect("task runtime should load");
@@ -1867,6 +2261,7 @@ mod tests {
                     host_working_dir: workspace,
                 },
                 false,
+                None,
             )
             .await
             .expect("terminal should initialize")
@@ -1977,5 +2372,358 @@ mod tests {
         assert!(TaskTimeout::new(cap).is_ok());
         assert!(TaskTimeout::new(cap + 1).is_err());
         assert!(TaskTimeout::from_stored(-1).is_err());
+    }
+
+    /// A daemon's `history.db` with a task runtime whose runs can `wake`.
+    struct WakeHost {
+        dir: tempfile::TempDir,
+        runtime: TaskRuntime,
+        runtime_service: Arc<crate::session::SessionRuntimeService>,
+        wakes: async_channel::Receiver<String>,
+        profile_id: String,
+    }
+
+    impl WakeHost {
+        async fn new() -> Self {
+            let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+            let dir = tempdir().expect("temp dir should be created");
+            let may_dir = dir.path().join(".may");
+            std::fs::create_dir_all(&may_dir).expect("may dir should be created");
+            let db = ChatDb::open(&dir.path().join("history.db"))
+                .await
+                .expect("db should initialize");
+            let profile_id = db
+                .ensure_default_profiles()
+                .await
+                .expect("default profiles should exist");
+            let runtime_service = Arc::new(crate::session::SessionRuntimeService::new(
+                db.clone(),
+                crate::ui_event_bus::UiEventBus::new(),
+            ));
+            let (wake_tx, wakes) = async_channel::unbounded();
+            let runtime = TaskRuntime::load(
+                db,
+                may_dir.clone(),
+                Arc::new(crate::tools::fixture_distribution(
+                    &may_dir.join("tool-fixtures"),
+                )),
+            )
+            .await
+            .expect("task runtime should load")
+            .with_session_prompts(crate::task_wake::SessionPrompts::new(
+                runtime_service.clone(),
+                wake_tx,
+            ));
+            Self {
+                dir,
+                runtime,
+                runtime_service,
+                wakes,
+                profile_id,
+            }
+        }
+
+        async fn task(
+            &self,
+            session_id: Option<&str>,
+            trigger: &PersistedTaskTrigger,
+            script: &str,
+        ) -> crate::db::entity::scheduled_tasks::Model {
+            // The script lives beside, not inside, the managed tool directory.
+            let script_dir = self.dir.path().join("scripts");
+            std::fs::create_dir_all(&script_dir).expect("script dir");
+            let script_path = script_dir.join("task.sh");
+            std::fs::write(&script_path, script).expect("script file");
+            let db = self.runtime_service.db();
+            if let Some(session_id) = session_id {
+                db.create_session(session_id, Some("main"), None)
+                    .await
+                    .expect("session is created");
+            }
+            db.create_scheduled_task(CreateScheduledTaskParams {
+                id: "task-1",
+                profile_id: self.profile_id.as_str(),
+                session_id,
+                name: "Nightly check",
+                trigger,
+                cron_expression: None,
+                run_at: None,
+                script_path: Some(script_path.to_str().expect("utf-8 path")),
+                script_inline: None,
+                needs_network: false,
+                timeout_secs: 60,
+            })
+            .await
+            .expect("task should persist");
+            db.get_scheduled_task("task-1")
+                .await
+                .expect("task reads")
+                .expect("task exists")
+        }
+
+        /// The one prompt the task stored for `session_id`, claimed as the
+        /// session's next run would.
+        async fn stored_prompt(&self, session_id: &str) -> crate::session::PendingUserMessage {
+            self.runtime_service
+                .db()
+                .claim_next_pending_message(
+                    &crate::db::RunFence {
+                        session_id: session_id.to_string(),
+                        run_id: "run".to_string(),
+                    },
+                    session_id,
+                )
+                .await
+                .expect("queue read")
+                .expect("the prompt is stored")
+        }
+    }
+
+    /// An inline script runs in a directory of the task's own, apart from the
+    /// managed tools and the rest of the may home.
+    #[tokio::test]
+    async fn an_inline_local_task_runs_in_its_own_directory() {
+        let host = WakeHost::new().await;
+        let db = host.runtime_service.db();
+        db.create_scheduled_task(CreateScheduledTaskParams {
+            id: "inline-1",
+            profile_id: host.profile_id.as_str(),
+            session_id: None,
+            name: "Inline",
+            trigger: &TIME_ONCE,
+            cron_expression: None,
+            run_at: None,
+            script_path: None,
+            script_inline: Some("echo hi; pwd -P"),
+            needs_network: false,
+            timeout_secs: 60,
+        })
+        .await
+        .expect("task should persist");
+        let task = db
+            .get_scheduled_task("inline-1")
+            .await
+            .expect("task reads")
+            .expect("task exists");
+
+        let output = Box::pin(host.runtime.execute_task_inner(
+            &task,
+            crate::task_trigger::TaskInvocation::Time {
+                trigger_type: crate::task_trigger::TimeTriggerType::Once,
+            },
+        ))
+        .await
+        .expect("the inline task run succeeds");
+
+        let may_dir = host.dir.path().join(".may");
+        let task_dir = crate::session::MayHomePaths::new(may_dir.clone())
+            .inline_task_dir("inline-1")
+            .canonicalize()
+            .expect("the task directory was created");
+        assert!(output.contains("hi"), "the output: {output}");
+        assert!(
+            output.contains(task_dir.to_str().expect("utf-8 path")),
+            "the working directory is {task_dir:?}: {output}"
+        );
+        assert!(!task_dir.starts_with(may_dir.join("tools")));
+        assert!(!may_dir.join("tools").starts_with(&task_dir));
+    }
+
+    /// Deleting a task removes its working directory, and deleting one that
+    /// never ran is fine.
+    #[tokio::test]
+    async fn deleting_a_task_removes_its_inline_directory() {
+        let host = WakeHost::new().await;
+        let db = host.runtime_service.db();
+        db.create_scheduled_task(CreateScheduledTaskParams {
+            id: "inline-2",
+            profile_id: host.profile_id.as_str(),
+            session_id: None,
+            name: "Inline",
+            trigger: &TIME_ONCE,
+            cron_expression: None,
+            run_at: None,
+            script_path: None,
+            script_inline: Some("echo hi"),
+            needs_network: false,
+            timeout_secs: 60,
+        })
+        .await
+        .expect("task should persist");
+        let task = db
+            .get_scheduled_task("inline-2")
+            .await
+            .expect("task reads")
+            .expect("task exists");
+        Box::pin(host.runtime.execute_task_inner(
+            &task,
+            crate::task_trigger::TaskInvocation::Time {
+                trigger_type: crate::task_trigger::TimeTriggerType::Once,
+            },
+        ))
+        .await
+        .expect("the inline task run succeeds");
+        let dir = crate::session::MayHomePaths::new(host.dir.path().join(".may"))
+            .inline_task_dir("inline-2");
+        assert!(dir.is_dir(), "the run created {dir:?}");
+
+        host.runtime.delete_task("inline-2").await.expect("delete");
+
+        assert!(!dir.exists(), "{dir:?} is removed with the task");
+        assert!(
+            db.get_scheduled_task("inline-2")
+                .await
+                .expect("read")
+                .is_none()
+        );
+        host.runtime
+            .delete_task("inline-2")
+            .await
+            .expect("an absent directory is fine");
+    }
+
+    const TIME_ONCE: PersistedTaskTrigger = PersistedTaskTrigger::Time {
+        trigger_type: crate::task_trigger::TimeTriggerType::Once,
+    };
+
+    /// A time-triggered task whose script runs `wake` stores a prompt in its
+    /// idle session's queue, attributed to the task, and wakes the session.
+    #[tokio::test]
+    async fn a_time_task_wakes_its_idle_session_with_a_prompt() {
+        let host = WakeHost::new().await;
+        let task = host
+            .task(
+                Some("main"),
+                &TIME_ONCE,
+                "echo 'check the backups' > \"$MAY_TASK_TRIGGER_FILE.prompt\"\nwake \"$MAY_TASK_TRIGGER_FILE.prompt\"",
+            )
+            .await;
+
+        Box::pin(host.runtime.execute_task_inner(
+            &task,
+            crate::task_trigger::TaskInvocation::Time {
+                trigger_type: crate::task_trigger::TimeTriggerType::Once,
+            },
+        ))
+        .await
+        .expect("the task run succeeds");
+
+        assert_eq!(host.wakes.recv().await.expect("a wake"), "main");
+        let prompt = host.stored_prompt("main").await;
+        assert!(prompt.content.is_empty(), "it is not the user's text");
+        let xml = prompt.hidden_context_xml.expect("task delivery");
+        assert!(xml.contains("task-1"), "the task id is named: {xml}");
+        assert!(xml.contains("Nightly check"), "the task is named: {xml}");
+        assert!(xml.contains("check the backups"), "the prompt: {xml}");
+    }
+
+    /// A busy session keeps the prompt queued for after its current turn
+    /// rather than losing it or replacing a steering message.
+    #[tokio::test]
+    async fn a_busy_session_receives_the_prompt_after_its_turn() {
+        let host = WakeHost::new().await;
+        let task = host
+            .task(
+                Some("main"),
+                &TIME_ONCE,
+                "echo 'later' > \"$MAY_TASK_TRIGGER_FILE.prompt\"\nwake \"$MAY_TASK_TRIGGER_FILE.prompt\"",
+            )
+            .await;
+        host.runtime_service
+            .set_state("main", crate::session::SessionRuntimeState::Running)
+            .await
+            .expect("state persists");
+
+        Box::pin(host.runtime.execute_task_inner(
+            &task,
+            crate::task_trigger::TaskInvocation::Time {
+                trigger_type: crate::task_trigger::TimeTriggerType::Once,
+            },
+        ))
+        .await
+        .expect("the task run succeeds");
+
+        let prompt = host.stored_prompt("main").await;
+        assert_eq!(
+            prompt.delivery_mode,
+            crate::session::PendingUserMessageMode::Queue
+        );
+        assert!(
+            prompt
+                .hidden_context_xml
+                .expect("delivery")
+                .contains("later")
+        );
+    }
+
+    /// A webhook task passes its trigger payload into the prompt.
+    #[tokio::test]
+    async fn a_webhook_task_passes_its_payload_into_the_prompt() {
+        let host = WakeHost::new().await;
+        let task = host
+            .task(
+                Some("main"),
+                &PersistedTaskTrigger::Webhook {
+                    token: "tok".to_string(),
+                    signature: None,
+                },
+                "wake \"$MAY_TASK_TRIGGER_FILE\"",
+            )
+            .await;
+
+        Box::pin(host.runtime.execute_task_inner(
+            &task,
+            crate::task_trigger::TaskInvocation::Webhook {
+                request: crate::task_trigger::TaskWebhookRequest {
+                    method: "POST".to_string(),
+                    path: "/hook".to_string(),
+                    query: None,
+                    headers: std::collections::BTreeMap::new(),
+                    body_base64: String::new(),
+                    body_text: Some("deploy finished".to_string()),
+                    body_json: None,
+                    remote_addr: None,
+                    body_size_bytes: 15,
+                },
+            },
+        ))
+        .await
+        .expect("the task run succeeds");
+
+        let xml = host
+            .stored_prompt("main")
+            .await
+            .hidden_context_xml
+            .expect("delivery");
+        assert!(xml.contains("deploy finished"), "the payload: {xml}");
+    }
+
+    /// A task no session created has nobody to prompt: the run fails with a
+    /// clear error and nothing is stored.
+    #[tokio::test]
+    async fn a_task_without_a_session_refuses_wake() {
+        let host = WakeHost::new().await;
+        let task = host
+            .task(
+                None,
+                &TIME_ONCE,
+                "echo hi > \"$MAY_TASK_TRIGGER_FILE.p\"\nwake \"$MAY_TASK_TRIGGER_FILE.p\"",
+            )
+            .await;
+
+        let error = Box::pin(host.runtime.execute_task_inner(
+            &task,
+            crate::task_trigger::TaskInvocation::Time {
+                trigger_type: crate::task_trigger::TimeTriggerType::Once,
+            },
+        ))
+        .await
+        .expect_err("wake must fail without a creating session");
+
+        assert!(
+            error.contains("was not created by a session"),
+            "unexpected error: {error}"
+        );
+        assert!(host.wakes.is_empty());
     }
 }

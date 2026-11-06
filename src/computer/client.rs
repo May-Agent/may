@@ -36,16 +36,20 @@ const HELPER_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 
 /// The daemon-side client for one `computer-agent` child.
 pub struct ComputerAgent {
+    /// The helper this client may launch; `None` for a detached client.
+    #[cfg(target_os = "macos")]
+    helper: Option<Helper>,
+}
+
+/// The helper app under one May dir.
+#[cfg(target_os = "macos")]
+struct Helper {
     /// The daemon's live config; `[computer]` is read per launch.
-    #[cfg(target_os = "macos")]
     config: Arc<ArcSwap<MayConfig>>,
-    #[cfg(target_os = "macos")]
     socket: PathBuf,
-    #[cfg(target_os = "macos")]
     may_dir: PathBuf,
     /// Serializes `open` launches — the helper reports liveness through
     /// its pid file, so a launch in flight must not overlap another.
-    #[cfg(target_os = "macos")]
     spawn_lock: Mutex<()>,
 }
 
@@ -62,13 +66,22 @@ impl ComputerAgent {
     pub fn new(may_dir: PathBuf, config: Arc<ArcSwap<MayConfig>>) -> Self {
         Self {
             #[cfg(target_os = "macos")]
-            config,
+            helper: Some(Helper {
+                config,
+                socket: may_dir.join("computer-agent.sock"),
+                may_dir,
+                spawn_lock: Mutex::new(()),
+            }),
+        }
+    }
+
+    /// A client with no helper to launch: every request fails and nothing
+    /// runs. Tests hold this so they never start the real app.
+    #[must_use]
+    pub const fn detached() -> Self {
+        Self {
             #[cfg(target_os = "macos")]
-            socket: may_dir.join("computer-agent.sock"),
-            #[cfg(target_os = "macos")]
-            may_dir,
-            #[cfg(target_os = "macos")]
-            spawn_lock: Mutex::new(()),
+            helper: None,
         }
     }
 
@@ -79,6 +92,7 @@ impl ComputerAgent {
     /// request itself failed.
     #[cfg(target_os = "macos")]
     pub async fn request(self: &Arc<Self>, request: AgentRequest) -> Result<AgentResponse, String> {
+        self.helper()?;
         let payload = serde_json::to_vec(&request)
             .map_err(|e| e.to_string())
             .map(|mut v| {
@@ -89,8 +103,9 @@ impl ComputerAgent {
         // runs on the async thread.
         let agent = self.clone();
         tokio::task::spawn_blocking(move || {
-            agent.ensure_running()?;
-            round_trip(&agent.socket, &payload)
+            let helper = agent.helper()?;
+            helper.ensure_running()?;
+            round_trip(&helper.socket, &payload)
         })
         .await
         .map_err(|e| e.to_string())?
@@ -111,14 +126,15 @@ impl ComputerAgent {
     #[cfg(target_os = "macos")]
     #[must_use]
     pub fn is_running(&self) -> bool {
-        self.responds()
+        self.helper.as_ref().is_some_and(Helper::responds)
     }
 
-    /// A connect succeeds only while a live helper owns the socket; a
-    /// leftover socket file refuses it.
+    /// The helper, or the detached message.
     #[cfg(target_os = "macos")]
-    fn responds(&self) -> bool {
-        UnixStream::connect(&self.socket).is_ok()
+    fn helper(&self) -> Result<&Helper, String> {
+        self.helper
+            .as_ref()
+            .ok_or_else(|| "this computer client is detached from any helper".to_owned())
     }
 
     /// There is no helper outside macOS.
@@ -136,11 +152,7 @@ impl ComputerAgent {
     /// Returns a message when the helper is still alive after the wait.
     #[cfg(target_os = "macos")]
     pub fn restart(&self) -> Result<(), String> {
-        let _launch = self
-            .spawn_lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.stop_helper()
+        self.helper()?.restart()
     }
 
     /// Nothing to respawn outside macOS.
@@ -162,6 +174,37 @@ impl ComputerAgent {
     /// or the request instance does not exit in time.
     #[cfg(target_os = "macos")]
     pub fn request_permissions(&self) -> Result<(), String> {
+        self.helper()?.request_permissions()
+    }
+
+    /// There are no grants to request outside macOS.
+    ///
+    /// # Errors
+    /// Always fails — virtual desktops are macOS-only for now.
+    #[cfg(not(target_os = "macos"))]
+    pub fn request_permissions(&self) -> Result<(), String> {
+        Err("virtual desktops need macOS".to_owned())
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Helper {
+    /// A connect succeeds only while a live helper owns the socket; a
+    /// leftover socket file refuses it.
+    fn responds(&self) -> bool {
+        UnixStream::connect(&self.socket).is_ok()
+    }
+
+    /// Stop the helper and wait for it to exit under the launch lock.
+    fn restart(&self) -> Result<(), String> {
+        let _launch = self
+            .spawn_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.stop_helper()
+    }
+
+    fn request_permissions(&self) -> Result<(), String> {
         let _launch = self
             .spawn_lock
             .lock()
@@ -204,17 +247,7 @@ impl ComputerAgent {
         }
     }
 
-    /// There are no grants to request outside macOS.
-    ///
-    /// # Errors
-    /// Always fails — virtual desktops are macOS-only for now.
-    #[cfg(not(target_os = "macos"))]
-    pub fn request_permissions(&self) -> Result<(), String> {
-        Err("virtual desktops need macOS".to_owned())
-    }
-
     /// SIGTERM the pid-file helper and wait for that process to exit.
-    #[cfg(target_os = "macos")]
     fn stop_helper(&self) -> Result<(), String> {
         let Some(pid) = self.helper_pid() else {
             return Ok(());

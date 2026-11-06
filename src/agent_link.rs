@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::db::ChatDbError;
 use crate::session::{
     MayHomePaths, PendingMessageState, PendingUserMessage, PendingUserMessageMode,
-    SessionRuntimeService,
+    SessionDirectory, SessionRuntimeService,
 };
 use crate::xml::{XmlBlock, XmlBlockError};
 
@@ -103,9 +103,6 @@ pub struct AgentDirectory {
     runtime_service: Arc<SessionRuntimeService>,
     /// `~/.may`.
     may_dir: PathBuf,
-    /// Directory the daemon was started in, for sessions that never recorded
-    /// one.
-    cwd: PathBuf,
     /// Nudges the daemon to dispatch a session's stored pending work.
     wake: Arc<dyn Fn(&str) + Send + Sync>,
 }
@@ -123,13 +120,11 @@ impl AgentDirectory {
     pub fn new(
         runtime_service: Arc<SessionRuntimeService>,
         may_dir: PathBuf,
-        cwd: PathBuf,
         wake: impl Fn(&str) + Send + Sync + 'static,
     ) -> Self {
         Self {
             runtime_service,
             may_dir,
-            cwd,
             wake: Arc::new(wake),
         }
     }
@@ -139,6 +134,20 @@ impl AgentDirectory {
     /// # Errors
     /// [`AgentLinkError`] on storage failure or an unreadable `tasks.md`.
     pub async fn live(&self) -> Result<Vec<AgentStatus>, AgentLinkError> {
+        Ok(self
+            .agent_tasks()
+            .await?
+            .into_iter()
+            .map(|agent| agent.status)
+            .collect())
+    }
+
+    /// Every live agent with the live `tasks.md` of its session, sorted like
+    /// [`Self::live`].
+    ///
+    /// # Errors
+    /// [`AgentLinkError`] on storage failure or an unreadable `tasks.md`.
+    pub(crate) async fn agent_tasks(&self) -> Result<Vec<AgentTasks>, AgentLinkError> {
         let mut live = Vec::new();
         for session in self.runtime_service.db().list_sessions().await? {
             if session.archived {
@@ -151,33 +160,75 @@ impl AgentDirectory {
             );
             let tasks = paths.tasks_content().await.map_err(AgentLinkError::Tasks)?;
             let state = self.runtime_service.get(&session.id).await?.state;
-            live.push(AgentStatus {
-                name: session.title.clone().unwrap_or_else(|| session.id.clone()),
-                session_id: session.id.clone(),
-                cwd: session
-                    .cwd
-                    .clone()
-                    .map_or_else(|| self.cwd.clone(), PathBuf::from),
-                activity: if state.is_idle() {
-                    Activity::Idle
-                } else {
-                    Activity::Running
+            live.push(AgentTasks {
+                status: AgentStatus {
+                    name: session.title.clone().unwrap_or_else(|| session.id.clone()),
+                    session_id: session.id.clone(),
+                    cwd: SessionDirectory::of(&session, &self.may_dir).into_path(),
+                    activity: if state.is_idle() {
+                        Activity::Idle
+                    } else {
+                        Activity::Running
+                    },
+                    roots: tasks.as_deref().map_or_else(Vec::new, parse_roots),
                 },
-                roots: tasks.as_deref().map_or_else(Vec::new, parse_roots),
+                workspace_config: paths.workspace_config(),
+                tasks_path: paths.tasks_path(),
+                tasks,
             });
         }
         live.sort_by(|a, b| {
-            a.name
-                .cmp(&b.name)
-                .then_with(|| a.session_id.cmp(&b.session_id))
+            a.status
+                .name
+                .cmp(&b.status.name)
+                .then_with(|| a.status.session_id.cmp(&b.status.session_id))
         });
         Ok(live)
+    }
+
+    /// The daemon's chat database.
+    pub(crate) fn db(&self) -> crate::db::ChatDb {
+        self.runtime_service.db()
     }
 
     /// Ask the daemon to dispatch what is stored for `session_id`.
     pub fn wake(&self, session_id: &str) {
         (self.wake)(session_id);
     }
+
+    /// Store `text` in the queue of `session_id` as a steer and wake it.
+    pub(crate) async fn deliver(
+        &self,
+        session_id: &str,
+        text: String,
+    ) -> Result<(), AgentLinkError> {
+        let message = PendingUserMessage {
+            id: None,
+            state: PendingMessageState::default(),
+            error: None,
+            content: String::new(),
+            attachments: Vec::new(),
+            hidden_context_xml: Some(XmlBlock::parse(text)?),
+            created_at: jiff::Timestamp::now().to_string(),
+            delivery_mode: PendingUserMessageMode::Steer,
+        };
+        self.runtime_service
+            .enqueue(session_id, message, PendingUserMessageMode::Steer)
+            .await?;
+        self.wake(session_id);
+        Ok(())
+    }
+}
+
+/// A live agent with its session's live `tasks.md`.
+#[derive(Debug, Clone)]
+pub(crate) struct AgentTasks {
+    pub(crate) status: AgentStatus,
+    /// The session's `workspace.toml`.
+    pub(crate) workspace_config: PathBuf,
+    pub(crate) tasks_path: PathBuf,
+    /// Contents of `tasks.md`; `None` while the file is absent.
+    pub(crate) tasks: Option<String>,
 }
 
 async fn status_name(
@@ -216,14 +267,14 @@ pub struct AgentMessaging {
 
 /// Tag names that frame text for the recipient; text from another agent must
 /// not be able to open or close them.
-const FRAMING_TAGS: [&str; 2] = ["system-reminder", "agent-message"];
+const FRAMING_TAGS: [&str; 3] = ["system-reminder", "agent-message", "task-message"];
 
 /// Text written by another agent. Displaying it turns the `<` of any opening
 /// or closing `system-reminder` or `agent-message` tag into `&lt;`, so it can
 /// neither close its own block nor open a harness one; all other text,
 /// code included, is verbatim.
 #[derive(Debug, Clone, Copy)]
-struct UntrustedText<'a>(&'a str);
+pub(crate) struct UntrustedText<'a>(pub(crate) &'a str);
 
 impl std::fmt::Display for UntrustedText<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -245,7 +296,7 @@ impl std::fmt::Display for UntrustedText<'_> {
 
 /// A session name rendered safe inside a double-quoted attribute.
 #[derive(Debug, Clone, Copy)]
-struct AttributeText<'a>(&'a str);
+pub(crate) struct AttributeText<'a>(pub(crate) &'a str);
 
 impl std::fmt::Display for AttributeText<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -323,24 +374,7 @@ impl AgentMessaging {
         }
         .render()
         .expect("agent message template must render");
-        let message = PendingUserMessage {
-            id: None,
-            state: PendingMessageState::default(),
-            error: None,
-            content: String::new(),
-            attachments: Vec::new(),
-            hidden_context_xml: Some(XmlBlock::parse(text)?),
-            created_at: jiff::Timestamp::now().to_string(),
-            delivery_mode: PendingUserMessageMode::Steer,
-        };
-        self.runtime_service
-            .enqueue(
-                &recipient.session_id,
-                message,
-                PendingUserMessageMode::Steer,
-            )
-            .await?;
-        self.directory.wake(&recipient.session_id);
+        self.directory.deliver(&recipient.session_id, text).await?;
         Ok(recipient.name.clone())
     }
 }
@@ -375,12 +409,13 @@ pub struct AgentTool {
     sandbox_dir: PathBuf,
     /// Where the sandbox appears inside the session's container, if it has one.
     workspace_mount: Option<aither_sandbox::MountRoot>,
+    languages: Option<aither_agent::LanguageGuard>,
 }
 
 /// The host file behind a path as the session's terminal spells it. In a
 /// container session the sandbox is mounted at the container root, so an
 /// absolute path must lie beneath it and nothing may climb out of it.
-fn resolve_prompt_path(
+pub(crate) fn resolve_prompt_path(
     sandbox_dir: &Path,
     mount: Option<&aither_sandbox::MountRoot>,
     prompt_file: &str,
@@ -420,7 +455,15 @@ impl AgentTool {
             session_id,
             sandbox_dir,
             workspace_mount,
+            languages: None,
         }
+    }
+
+    /// Refuse a message outside the working language `guard` enforces.
+    #[must_use]
+    pub fn with_languages(mut self, guard: aither_agent::LanguageGuard) -> Self {
+        self.languages = Some(guard);
+        self
     }
 }
 
@@ -469,6 +512,9 @@ impl Tool for AgentTool {
                 })?;
                 if body.trim().is_empty() {
                     return Err(AgentLinkError::EmptyMessage(path).into());
+                }
+                if let Some(guard) = &self.languages {
+                    guard.check_working(body.trim(), aither_agent::WorkingText::Internal)?;
                 }
                 let recipient = self
                     .messaging

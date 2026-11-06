@@ -179,7 +179,10 @@ pub fn parse_cli_mode(args: &[String]) -> CliMode {
                 .position(|a| a == "--may-dir")
                 .and_then(|i| args.get(i + 1))
                 .map_or_else(
-                    || dirs::home_dir().unwrap_or_default().join(".may"),
+                    || {
+                        may_agent::MayConfig::may_dir()
+                            .expect("the May directory must resolve for the computer agent")
+                    },
                     std::path::PathBuf::from,
                 );
             CliMode::ComputerAgent(may_dir)
