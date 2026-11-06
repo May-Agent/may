@@ -30,6 +30,8 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 #[cfg(target_os = "macos")]
+use executor_core::{DefaultExecutor, Executor};
+#[cfg(target_os = "macos")]
 use main_thread::MainThreadBound;
 #[cfg(target_os = "macos")]
 use waterkit_automation::{Input, VirtualDisplay, VirtualDisplayConfig};
@@ -52,11 +54,15 @@ pub struct SessionDisplay {
     display: Option<MainThreadBound<VirtualDisplay>>,
     display_id: u32,
     size: (u32, u32),
-    /// One input context per session — shared by the viewer's `DataChannel`
-    /// and the agent `computer` command so focus and drag state stay
-    /// coherent.
-    input: std::sync::Mutex<Input>,
+    /// Messages for the task that owns the session's one `Input`, shared by
+    /// the viewer's `DataChannel` and the agent `computer` command so focus
+    /// and drag state stay coherent.
+    posts: async_channel::Sender<input::Posting>,
 }
+
+/// Input messages queued for a display's owner task.
+#[cfg(target_os = "macos")]
+const INPUT_QUEUE: usize = 64;
 
 #[cfg(target_os = "macos")]
 impl std::fmt::Debug for SessionDisplay {
@@ -101,12 +107,22 @@ impl SessionDisplay {
         })
         .await
         .map_err(|e| DisplayError(e.to_string()))?;
-        let input = Input::new(display_id).map_err(|e| DisplayError(e.to_string()))?;
+        let input = match Input::new(display_id) {
+            Ok(input) => input,
+            Err(e) => {
+                // Dropping the display here would wait on the main thread.
+                main_thread::release(display);
+                return Err(DisplayError(e.to_string()));
+            }
+        };
+        let (posts, queue) = async_channel::bounded(INPUT_QUEUE);
+        // Ends when `posts` closes with this display.
+        DefaultExecutor.spawn(input::own(input, queue)).detach();
         Ok(Self {
             display: Some(display),
             display_id,
             size,
-            input: std::sync::Mutex::new(input),
+            posts,
         })
     }
 
@@ -127,12 +143,35 @@ impl SessionDisplay {
     /// # Errors
     /// Returns [`input::InputError`] when the message cannot be mapped or
     /// delivered.
-    pub fn post_input(&self, message: proto::InputMessage) -> Result<(), input::InputError> {
-        let mut input = self
-            .input
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        input::post(&mut input, message)
+    pub async fn post_input(&self, message: proto::InputMessage) -> Result<(), input::InputError> {
+        let (reply, answer) = async_channel::bounded(1);
+        self.posts
+            .send(input::Posting {
+                message,
+                reply: Some(reply),
+            })
+            .await
+            .map_err(|_| input::InputError::OwnerGone)?;
+        answer
+            .recv()
+            .await
+            .map_err(|_| input::InputError::OwnerGone)?
+    }
+
+    /// Queues one wire input message without waiting for its delivery; the
+    /// owner logs a failure at `warn`.
+    pub async fn queue_input(&self, message: proto::InputMessage) {
+        if self
+            .posts
+            .send(input::Posting {
+                message,
+                reply: None,
+            })
+            .await
+            .is_err()
+        {
+            tracing::warn!("computer input owner is gone");
+        }
     }
 }
 

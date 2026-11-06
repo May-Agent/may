@@ -37,6 +37,9 @@ pub enum InputError {
     /// A click count that is not a positive number.
     #[error("invalid click count {0}")]
     ClickCount(i32),
+    /// The task that owns the display's input has ended.
+    #[error("the display's input owner is gone")]
+    OwnerGone,
     /// waterkit could not deliver the event, or could not map the key.
     #[error(transparent)]
     Deliver(#[from] waterkit_automation::Error),
@@ -57,6 +60,35 @@ enum KeyEvent {
     Down(KeyDown),
     Up(KeyUp),
     Text(Text),
+}
+
+/// A wire message for a display's input owner, with where to report how
+/// its delivery went, if anyone waits.
+#[derive(Debug)]
+pub struct Posting {
+    /// The message to deliver.
+    pub message: InputMessage,
+    /// Receives the delivery result; `None` logs a failure instead.
+    pub reply: Option<async_channel::Sender<Result<(), InputError>>>,
+}
+
+/// The one owner of a display's [`Input`]: delivers each posting in order
+/// and ends when every sender is gone.
+pub async fn own(mut input: Input, postings: async_channel::Receiver<Posting>) {
+    while let Ok(Posting { message, reply }) = postings.recv().await {
+        let result = post(&mut input, message);
+        match reply {
+            Some(reply) => {
+                // The asker may have stopped waiting.
+                let _ = reply.send(result).await;
+            }
+            None => {
+                if let Err(error) = result {
+                    tracing::warn!(%error, "computer input not delivered");
+                }
+            }
+        }
+    }
 }
 
 /// Posts one wire message into the display `input` drives.
