@@ -983,6 +983,7 @@ mod tests {
         let targets = IssueTargets::new(
             db.clone(),
             dir.path().to_path_buf(),
+            dir.path().join("workspace.toml"),
             GitHubRest::with_api_base(StaticToken, &api_base),
         );
         let tool = IssueTool::new(
