@@ -86,9 +86,9 @@ export function ThinkingPicker({ sessionId, currentModel, current, disabled }: T
       </PopoverTrigger>
       <PopoverContent
         align="start"
-        className="flex w-[min(30rem,calc(100vw-2rem))] flex-col items-center gap-4 rounded-2xl bg-white px-6 pt-4 pb-5 text-neutral-900 shadow-xl"
+        className="flex w-[min(30rem,calc(100vw-2rem))] flex-col items-center gap-4 rounded-2xl bg-popover px-6 pt-4 pb-5 text-popover-foreground shadow-xl"
       >
-        <span className="inline-flex items-center gap-0.5 rounded-full bg-muted px-3 py-1 text-xs font-medium text-neutral-700">
+        <span className="inline-flex items-center gap-0.5 rounded-full bg-muted px-3 py-1 text-xs font-medium text-muted-foreground">
           {labelOf(levels[shown])}
           <ChevronRight className="size-3 opacity-60" />
         </span>
