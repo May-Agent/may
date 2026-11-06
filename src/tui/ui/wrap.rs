@@ -6,12 +6,75 @@
 //! two-column glyph to it. The half-outside glyph lands on whatever is
 //! drawn right of the area, and the buffer diff treats the next cell as
 //! that glyph's trailing half and never sends it, so stale cells survive
-//! on screen. Every row [`wrap_line`] yields fits its width, so the chat
-//! renders pre-wrapped rows and never asks `Paragraph` to wrap.
+//! on screen. Every row [`wrap_line`] yields fits its width, so the TUI
+//! renders pre-wrapped rows ([`WrappedParagraph`]) and never asks
+//! `Paragraph` to wrap.
 
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
 use ratatui::style::Style;
-use ratatui::text::{Line, Span, StyledGrapheme};
+use ratatui::text::{Line, Span, StyledGrapheme, Text};
+use ratatui::widgets::{Block, Paragraph, Widget};
 use unicode_width::UnicodeWidthStr;
+
+/// Word-wrapped text in an optional block: the text is wrapped by
+/// [`wrap_lines`] to the block's inner width, so no glyph reaches past
+/// the inner area.
+#[derive(Debug, Clone, Default)]
+pub struct WrappedParagraph<'a> {
+    text: Text<'a>,
+    block: Option<Block<'a>>,
+    style: Style,
+    scroll: u16,
+}
+
+impl<'a> WrappedParagraph<'a> {
+    /// Wrapped `text`, with no block, base style or scroll.
+    #[must_use]
+    pub fn new(text: impl Into<Text<'a>>) -> Self {
+        Self {
+            text: text.into(),
+            ..Self::default()
+        }
+    }
+
+    /// Surround the text with `block`.
+    #[must_use]
+    pub fn block(mut self, block: Block<'a>) -> Self {
+        self.block = Some(block);
+        self
+    }
+
+    /// Base style of the whole area, under the text's own styles.
+    #[must_use]
+    pub fn style(mut self, style: impl Into<Style>) -> Self {
+        self.style = style.into();
+        self
+    }
+
+    /// Skip the first `rows` wrapped rows.
+    #[must_use]
+    pub const fn scroll(mut self, rows: u16) -> Self {
+        self.scroll = rows;
+        self
+    }
+}
+
+impl Widget for WrappedParagraph<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        buf.set_style(area, self.style);
+        let inner = self.block.map_or(area, |block| {
+            let inner = block.inner(area);
+            block.render(area, buf);
+            inner
+        });
+        let mut rows = Text::from(wrap_lines(&self.text.lines, inner.width)).style(self.text.style);
+        rows.alignment = self.text.alignment;
+        Paragraph::new(rows)
+            .scroll((self.scroll, 0))
+            .render(inner, buf);
+    }
+}
 
 /// Rows of `line` wrapped to `width` display columns.
 ///

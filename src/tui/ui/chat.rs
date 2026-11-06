@@ -11,7 +11,7 @@ use askama::Template as _;
 use crate::agent::cache_miss::CacheMissCause;
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph},
 };
 
 use ratatui::Frame;
@@ -3610,15 +3610,14 @@ pub fn render_tool_fullscreen(frame: &mut Frame, area: Rect, display: &ToolDispl
     let inner_height = area.height.saturating_sub(2);
     let scroll_y = safe_scroll(scroll, lines.len(), inner_height);
 
-    let paragraph = Paragraph::new(lines)
+    let paragraph = super::wrap::WrappedParagraph::new(lines)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .title("Tool Details")
                 .border_style(Style::default().fg(Color::Cyan)),
         )
-        .wrap(Wrap { trim: false })
-        .scroll((scroll_y, 0));
+        .scroll(scroll_y);
 
     frame.render_widget(paragraph, area);
 }
