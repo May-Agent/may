@@ -145,24 +145,52 @@ impl ChatDb {
             .await?;
         }
         if let Some(entry_id) = commit_pending_entry {
-            query!(
-                tx,
-                "UPDATE session_pending_message_entries SET state = 'committed' WHERE id = ? AND state = 'claimed'",
-                entry_id
-            )
-            .execute()
-            .await?;
-            query!(
-                tx,
-                "DELETE FROM session_pending_message_attachments WHERE message_id = ?",
-                entry_id
-            )
-            .execute()
-            .await?;
+            Self::commit_pending_entry_in(&mut tx, entry_id).await?;
         }
         tx.commit().await?;
 
         Ok(model)
+    }
+
+    /// Mark a claimed queue entry `committed` and drop its staged
+    /// attachments, inside the caller's transaction.
+    async fn commit_pending_entry_in(
+        tx: &mut skyzen_services::DbTransaction,
+        entry_id: i64,
+    ) -> Result<(), ChatDbError> {
+        query!(
+            tx,
+            "UPDATE session_pending_message_entries SET state = 'committed' WHERE id = ? AND state = 'claimed'",
+            entry_id
+        )
+        .execute()
+        .await?;
+        query!(
+            tx,
+            "DELETE FROM session_pending_message_attachments WHERE message_id = ?",
+            entry_id
+        )
+        .execute()
+        .await?;
+        Ok(())
+    }
+
+    /// Commit a claimed queue entry that records no message of its own — a
+    /// hidden-context entry whose context the transcript already holds —
+    /// under the run's fence.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError::RunLost`] when the lease was taken over or
+    /// released, or [`ChatDbError`] on storage failure.
+    pub async fn commit_pending_entry_as_run(
+        &self,
+        fence: &RunFence,
+        entry_id: i64,
+    ) -> Result<(), ChatDbError> {
+        let mut tx = self.begin_fenced(fence).await?;
+        Self::commit_pending_entry_in(&mut tx, entry_id).await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Insert a structured message row within an existing transaction.
