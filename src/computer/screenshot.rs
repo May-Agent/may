@@ -1,77 +1,77 @@
-//! One-shot stills of a session desktop for the agent: `CGDisplayCreateImage`
-//! needs no running stream — it composites the display's current framebuffer.
+//! One-shot stills of a session desktop for the agent: the first frame of a
+//! short-lived `DisplayStream`, which composites the display's current
+//! framebuffer on resume.
 
-use std::ffi::c_void;
+use std::num::NonZeroU32;
+use std::time::Duration;
+
+use futures_lite::StreamExt;
+use objc2_core_video::{
+    CVPixelBufferGetBaseAddress, CVPixelBufferGetBytesPerRow, CVPixelBufferLockBaseAddress,
+    CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress, kCVReturnSuccess,
+};
+use waterkit_screen::{DisplayStream, DisplayStreamConfig, PixelBuffer, PixelFormat};
 
 use super::DisplayError;
 
-type CGImageRef = *mut c_void;
-type CGDataProviderRef = *mut c_void;
-type CFDataRef = *const c_void;
+/// How long the display may take to deliver its first frame.
+const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[link(name = "CoreGraphics", kind = "framework")]
-unsafe extern "C" {
-    fn CGDisplayCreateImage(display: u32) -> CGImageRef;
-    fn CGImageGetDataProvider(image: CGImageRef) -> CGDataProviderRef;
-    fn CGImageGetWidth(image: CGImageRef) -> usize;
-    fn CGImageGetHeight(image: CGImageRef) -> usize;
-    fn CGImageGetBytesPerRow(image: CGImageRef) -> usize;
-    fn CGDataProviderCopyData(provider: CGDataProviderRef) -> CFDataRef;
-}
-
-#[link(name = "CoreFoundation", kind = "framework")]
-unsafe extern "C" {
-    fn CFDataGetBytePtr(data: CFDataRef) -> *const u8;
-    fn CFDataGetLength(data: CFDataRef) -> isize;
-    fn CFRelease(cf: *const c_void);
-}
-
-/// A PNG of the display's current contents.
+/// A PNG of the display's current contents at `size` pixels.
 ///
 /// # Errors
-/// Returns [`DisplayError`] when the display cannot be snapshotted or
-/// the pixels cannot be encoded.
-pub fn screenshot_png(display_id: u32) -> Result<Vec<u8>, DisplayError> {
-    let image = unsafe { CGDisplayCreateImage(display_id) };
-    if image.is_null() {
-        return Err(DisplayError("the display produced no image".to_owned()));
-    }
-    let (width, height, stride) = unsafe {
-        (
-            CGImageGetWidth(image),
-            CGImageGetHeight(image),
-            CGImageGetBytesPerRow(image),
-        )
+/// Returns [`DisplayError`] when the display cannot be captured or the
+/// pixels cannot be encoded.
+pub async fn screenshot_png(display_id: u32, size: (u32, u32)) -> Result<Vec<u8>, DisplayError> {
+    let extent = |value: u32| {
+        NonZeroU32::new(value).ok_or_else(|| DisplayError("the display has no area".to_owned()))
     };
-    let provider = unsafe { CGImageGetDataProvider(image) };
-    let data = unsafe { CGDataProviderCopyData(provider) };
-    if data.is_null() {
-        unsafe { CFRelease(image) };
-        return Err(DisplayError(
-            "the display image carried no pixels".to_owned(),
-        ));
-    }
-    let raw = unsafe {
-        let len = CFDataGetLength(data);
-        std::slice::from_raw_parts(CFDataGetBytePtr(data), usize::try_from(len).unwrap_or(0))
-            .to_vec()
-    };
-    unsafe {
-        CFRelease(data);
-        CFRelease(image);
-    }
+    let config =
+        DisplayStreamConfig::new(extent(size.0)?, extent(size.1)?).pixel_format(PixelFormat::Bgra8);
+    let mut stream = DisplayStream::new(display_id, config)
+        .await
+        .map_err(|e| DisplayError(format!("create the display stream: {e}")))?;
+    let mut frames = std::pin::pin!(stream.frames());
+    stream
+        .resume()
+        .await
+        .map_err(|e| DisplayError(format!("start the display stream: {e}")))?;
+    let frame = tokio::time::timeout(FIRST_FRAME_TIMEOUT, frames.next())
+        .await
+        .map_err(|_| DisplayError("the display produced no frame".to_owned()))?
+        .ok_or_else(|| DisplayError("the display stream ended before a frame".to_owned()))?;
+    // Capture ends with the stream; the frame is already ours.
+    drop(stream);
+    tokio::task::spawn_blocking(move || encode_png(&frame))
+        .await
+        .map_err(|e| DisplayError(format!("encode the screenshot: {e}")))?
+}
 
-    // CGDisplayCreateImage surfaces are BGRA8; expand to RGB for PNG.
-    let mut rgb = image::RgbImage::new(
-        u32::try_from(width).unwrap_or(u32::MAX),
-        u32::try_from(height).unwrap_or(u32::MAX),
-    );
+/// Encodes a BGRA frame as PNG, reading its pixels under a read lock.
+fn encode_png(frame: &PixelBuffer) -> Result<Vec<u8>, DisplayError> {
+    let buffer = frame.cv_pixel_buffer();
+    let (width, height) = (frame.width() as usize, frame.height() as usize);
+    // SAFETY: the buffer is live; the lock is released below.
+    let status = unsafe { CVPixelBufferLockBaseAddress(buffer, CVPixelBufferLockFlags::ReadOnly) };
+    if status != kCVReturnSuccess {
+        return Err(DisplayError(format!("lock the frame: CVReturn {status}")));
+    }
+    let stride = CVPixelBufferGetBytesPerRow(buffer);
+    let base = CVPixelBufferGetBaseAddress(buffer).cast::<u8>();
+    // SAFETY: while locked, `base` addresses `stride * height` bytes.
+    let raw = unsafe { std::slice::from_raw_parts(base, stride * height) };
+
+    // The frame is BGRA8; reorder to RGB for PNG.
+    let mut rgb = image::RgbImage::new(frame.width(), frame.height());
     for (y, row) in raw.chunks_exact(stride).take(height).enumerate() {
         for (x, px) in row.as_chunks::<4>().0.iter().take(width).enumerate() {
             #[allow(clippy::cast_possible_truncation)]
             rgb.put_pixel(x as u32, y as u32, image::Rgb([px[2], px[1], px[0]]));
         }
     }
+    // SAFETY: balances the lock above.
+    unsafe { CVPixelBufferUnlockBaseAddress(buffer, CVPixelBufferLockFlags::ReadOnly) };
+
     let mut png = std::io::Cursor::new(Vec::new());
     rgb.write_to(&mut png, image::ImageFormat::Png)
         .map_err(|e| DisplayError(format!("encode the screenshot: {e}")))?;
