@@ -18,7 +18,12 @@ pub enum CliMode {
     Daemon(DaemonCommand),
     Exec(ExecArgs),
     Browser(BrowserCliArgs),
-    ComputerAgent(std::path::PathBuf),
+    /// The computer-agent helper: its May dir, and the file its stderr
+    /// goes to (a `LaunchServices` launch has no terminal).
+    ComputerAgent {
+        may_dir: std::path::PathBuf,
+        stderr: Option<std::path::PathBuf>,
+    },
     /// A fresh process that reports the helper's privacy grants; `true`
     /// raises the prompts for missing ones first.
     ComputerAgentProbe(bool),
@@ -174,18 +179,20 @@ pub fn parse_cli_mode(args: &[String]) -> CliMode {
             _ => CliMode::Resume(parse_resume_args(&args[2..])),
         },
         Some("computer-agent") => {
-            let may_dir = args
-                .iter()
-                .position(|a| a == "--may-dir")
-                .and_then(|i| args.get(i + 1))
-                .map_or_else(
-                    || {
-                        may_agent::MayConfig::may_dir()
-                            .expect("the May directory must resolve for the computer agent")
-                    },
-                    std::path::PathBuf::from,
-                );
-            CliMode::ComputerAgent(may_dir)
+            let value = |flag: &str| {
+                args.iter()
+                    .position(|a| a == flag)
+                    .and_then(|i| args.get(i + 1))
+                    .map(std::path::PathBuf::from)
+            };
+            let may_dir = value("--may-dir").unwrap_or_else(|| {
+                may_agent::MayConfig::may_dir()
+                    .expect("the May directory must resolve for the computer agent")
+            });
+            CliMode::ComputerAgent {
+                may_dir,
+                stderr: value("--stderr"),
+            }
         }
         Some("computer-agent-probe") => {
             CliMode::ComputerAgentProbe(args.iter().skip(2).any(|a| a == "--request"))
