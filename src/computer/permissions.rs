@@ -1,8 +1,9 @@
-//! macOS privacy grants the agent needs: Screen Recording (capture and
-//! stills) and Accessibility (event injection). Both are TCC entries
-//! evaluated per process at launch — which is exactly why this whole
-//! stack lives in a respawnable helper: the daemon never has to exit
-//! for a grant to take effect.
+//! macOS privacy grants the agent needs.
+//!
+//! Screen Recording (capture and stills) and Accessibility (event
+//! injection) are TCC entries; the helper reads and requests them only
+//! through fresh probe processes, so a grant applies without restarting
+//! the daemon.
 
 use std::ffi::c_void;
 
@@ -10,6 +11,7 @@ use std::ffi::c_void;
 unsafe extern "C" {
     fn CGPreflightScreenCaptureAccess() -> bool;
     fn CGRequestScreenCaptureAccess() -> bool;
+    fn CGMainDisplayID() -> u32;
 }
 
 #[link(name = "ApplicationServices", kind = "framework")]
@@ -101,4 +103,66 @@ pub fn request_permissions() {
 
 const fn true_u8() -> u8 {
     1
+}
+
+/// The subcommand a fresh probe process runs: `may computer-agent-probe`.
+pub const PROBE_COMMAND: &str = "computer-agent-probe";
+/// Probe flag that raises the prompts for missing grants before reporting.
+pub const PROBE_REQUEST_FLAG: &str = "--request";
+
+/// Both grants as one process sees them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Grants {
+    /// Screen Recording: capture and stills.
+    pub screen_recording: bool,
+    /// Accessibility: event injection.
+    pub accessibility: bool,
+}
+
+/// The probe process's side: optionally raise the prompts, then report.
+///
+/// With Screen Recording granted, a request also captures the main display
+/// once: from macOS 15 the first capture that bypasses the system window
+/// picker is what makes `replayd` ask for that one-time consent, and the
+/// request instance is where the user expects system prompts.
+#[must_use]
+pub fn probe(request: bool) -> Grants {
+    if request {
+        request_permissions();
+        if screen_recording_granted() {
+            // Only the consent prompt matters; the still is discarded.
+            let _ = super::screenshot::screenshot_png(unsafe { CGMainDisplayID() });
+        }
+    }
+    Grants {
+        screen_recording: screen_recording_granted(),
+        accessibility: accessibility_granted(),
+    }
+}
+
+/// Read the grants in a fresh copy of this executable.
+///
+/// macOS caches a negative answer in the process that asked, so the
+/// serving helper never asks itself. The probe is its child, so TCC
+/// attributes it to the helper's bundle. Requests go through
+/// `LaunchServices` instead (`ComputerAgent::request_permissions`): a
+/// Screen Recording request from a plain child never reaches TCC.
+///
+/// # Errors
+/// Returns a message when the probe cannot run, fails, or prints
+/// something other than its report.
+pub fn fresh_grants() -> Result<Grants, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let output = std::process::Command::new(exe)
+        .arg(PROBE_COMMAND)
+        .output()
+        .map_err(|e| format!("run permission probe: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "permission probe exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    serde_json::from_slice(&output.stdout).map_err(|e| format!("bad permission probe report: {e}"))
 }
