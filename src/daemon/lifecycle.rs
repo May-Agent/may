@@ -129,12 +129,57 @@ fn uid() -> Result<String, LifecycleError> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Longest `launchctl bootout` is given to take the service out of launchd.
+const BOOTOUT_TIMEOUT: Duration = Duration::from_secs(10);
+const BOOTOUT_POLL: Duration = Duration::from_millis(100);
+
+/// Boots the service out of `domain` and waits until launchd has dropped it:
+/// `bootout` returns first, and a `bootstrap` issued in that window fails with
+/// an input/output error. A service that was not loaded needs no wait.
+async fn boot_out(domain: &str, plist: &Path) -> Result<(), LifecycleError> {
+    let _ = run(
+        "launchctl",
+        &["bootout", domain, &plist.display().to_string()],
+    );
+    let target = format!("{domain}/{SERVICE_LABEL}");
+    wait_until_unloaded(
+        || run("launchctl", &["print", &target]).is_ok(),
+        BOOTOUT_TIMEOUT,
+        BOOTOUT_POLL,
+    )
+    .await
+    .then_some(())
+    .ok_or_else(|| LifecycleError::ServiceManager {
+        command: format!("launchctl bootout {domain}"),
+        detail: format!("{SERVICE_LABEL} was still loaded after {BOOTOUT_TIMEOUT:?}"),
+    })
+}
+
+/// Polls `is_loaded` until it reports false, for at most `timeout`. Returns
+/// whether the service is gone.
+async fn wait_until_unloaded(
+    mut is_loaded: impl FnMut() -> bool,
+    timeout: Duration,
+    poll: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !is_loaded() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        async_io::Timer::after(poll).await;
+    }
+}
+
 /// Installs the daemon as a login service and starts it.
 ///
 /// # Errors
 /// Fails when the service file cannot be written or the service manager
 /// refuses it.
-pub fn install(paths: &DaemonPaths) -> Result<PathBuf, LifecycleError> {
+pub async fn install(paths: &DaemonPaths) -> Result<PathBuf, LifecycleError> {
     let program = current_exe()?;
     let program = program.display().to_string();
     std::fs::create_dir_all(paths.log().parent().unwrap_or_else(|| paths.root()))?;
@@ -149,10 +194,7 @@ pub fn install(paths: &DaemonPaths) -> Result<PathBuf, LifecycleError> {
         .render()?;
         let domain = format!("gui/{}", uid()?);
         if path.exists() {
-            let _ = run(
-                "launchctl",
-                &["bootout", &domain, &path.display().to_string()],
-            );
+            boot_out(&domain, &path).await?;
         }
         std::fs::write(&path, plist)?;
         run(
@@ -175,17 +217,14 @@ pub fn install(paths: &DaemonPaths) -> Result<PathBuf, LifecycleError> {
 ///
 /// # Errors
 /// Fails when the service file cannot be removed.
-pub fn uninstall() -> Result<Option<PathBuf>, LifecycleError> {
+pub async fn uninstall() -> Result<Option<PathBuf>, LifecycleError> {
     if cfg!(target_os = "macos") {
         let path = launchd_plist_path()?;
         if !path.exists() {
             return Ok(None);
         }
         let domain = format!("gui/{}", uid()?);
-        let _ = run(
-            "launchctl",
-            &["bootout", &domain, &path.display().to_string()],
-        );
+        boot_out(&domain, &path).await?;
         std::fs::remove_file(&path)?;
         Ok(Some(path))
     } else {
@@ -357,6 +396,55 @@ pub async fn ensure_running(
         async_io::Timer::after(Duration::from_millis(200)).await;
     }
     Err(LifecycleError::StartTimeout { log: paths.log() })
+}
+
+#[cfg(test)]
+mod bootout_wait_tests {
+    use std::time::Duration;
+
+    use super::wait_until_unloaded;
+
+    const POLL: Duration = Duration::from_millis(1);
+
+    #[test]
+    fn returns_once_the_service_is_gone() {
+        let mut probes = 0;
+        let gone = futures_lite::future::block_on(wait_until_unloaded(
+            || {
+                probes += 1;
+                probes < 4
+            },
+            Duration::from_secs(5),
+            POLL,
+        ));
+        assert!(gone);
+        assert_eq!(probes, 4);
+    }
+
+    #[test]
+    fn an_unloaded_service_is_probed_once() {
+        let mut probes = 0;
+        let gone = futures_lite::future::block_on(wait_until_unloaded(
+            || {
+                probes += 1;
+                false
+            },
+            Duration::from_secs(5),
+            POLL,
+        ));
+        assert!(gone);
+        assert_eq!(probes, 1);
+    }
+
+    #[test]
+    fn gives_up_after_the_timeout() {
+        let gone = futures_lite::future::block_on(wait_until_unloaded(
+            || true,
+            Duration::from_millis(20),
+            POLL,
+        ));
+        assert!(!gone);
+    }
 }
 
 #[cfg(test)]
