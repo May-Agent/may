@@ -1,7 +1,8 @@
 //! Whether the user is asleep: one state for the whole daemon.
 //!
-//! `/sleep` sets it and records the time; `/sleep off`, or a user message
-//! sent [`MIN_SLEEP`] or more after it began, ends it. Every client follows
+//! `/sleep` sets it; `/sleep off`, or a user message sent [`MIN_SLEEP`] or
+//! more after it began, ends it. Only a sleep that lasted [`MIN_SLEEP`] is
+//! recorded, when it ends, at the time it began. Every client follows
 //! it on the `sleep` event of the event stream, and every session's agent is
 //! told once per change, at the start of its next turn
 //! ([`SleepState::take_notice`]). The state survives a daemon restart.
@@ -36,6 +37,20 @@ const MIN_SLEEP_MS: i64 = 60 * 60 * 1000;
 
 /// How long after the median `/sleep` time the reminder may still fire.
 const REMINDER_WINDOW_MINUTES: u32 = 30;
+
+/// The reminder needs `/sleep` on at least this many distinct nights: a few
+/// test runs never make a habit, a bedtime kept for about a week does.
+const MIN_HABIT_NIGHTS: usize = 5;
+
+/// The median absolute circular deviation of the recorded times of day from
+/// their median must not exceed this. An hour tolerates an ordinary
+/// bedtime drifting from night to night, while times spread across the day
+/// (a deviation of several hours) are no habit.
+const MAX_HABIT_DEVIATION_MINUTES: u32 = 60;
+
+/// Shifts a sleep time so that its local date names the night it belongs to
+/// (a night runs noon to noon, so 23:30 and 00:30 are two nights).
+const NIGHT_OFFSET: jiff::SignedDuration = jiff::SignedDuration::from_hours(12);
 
 /// Reminders are at least this far apart.
 const REMINDER_SPACING_MS: i64 = 12 * 60 * 60 * 1000;
@@ -138,14 +153,12 @@ impl SleepState {
         self.inner.lock().await.status()
     }
 
-    /// Records a `/sleep` run in `origin` at `now` and marks the user
-    /// asleep. Returns whether the state changed; running it again while
-    /// asleep only records the time.
+    /// Marks the user asleep from `now`, as `/sleep` run in `origin`.
+    /// Returns whether the state changed.
     ///
     /// # Errors
-    /// When the time cannot be recorded or the state persisted.
-    pub async fn sleep(&self, origin: &str, now: Timestamp) -> Result<bool, SleepError> {
-        self.db.record_sleep(now).await?;
+    /// When the state cannot be persisted.
+    pub async fn sleep(&self, origin: &str, now: Timestamp) -> std::io::Result<bool> {
         let mut inner = self.inner.lock().await;
         if inner.asleep {
             return Ok(false);
@@ -160,13 +173,14 @@ impl SleepState {
         Ok(true)
     }
 
-    /// Ends the state (`/sleep off`). Returns whether it changed.
+    /// Ends the state at `now` (`/sleep off`). Returns whether it changed.
+    /// A sleep shorter than [`MIN_SLEEP`] was no sleep and leaves no record.
     ///
     /// # Errors
-    /// When the state cannot be persisted.
-    pub async fn wake(&self) -> std::io::Result<bool> {
+    /// When the sleep cannot be recorded or the state persisted.
+    pub async fn wake(&self, now: Timestamp) -> Result<bool, SleepError> {
         let mut inner = self.inner.lock().await;
-        self.end(&mut inner).await
+        self.end(&mut inner, now).await
     }
 
     /// The user sent a message at `now`: ends the state when it began
@@ -174,21 +188,23 @@ impl SleepState {
     /// the state ended.
     ///
     /// # Errors
-    /// When the state cannot be persisted.
-    pub async fn user_message(&self, now: Timestamp) -> std::io::Result<bool> {
+    /// When the sleep cannot be recorded or the state persisted.
+    pub async fn user_message(&self, now: Timestamp) -> Result<bool, SleepError> {
         let mut inner = self.inner.lock().await;
-        let slept_long_enough = inner
-            .since_ms
-            .is_some_and(|since| now.as_millisecond().saturating_sub(since) >= MIN_SLEEP_MS);
-        if !inner.asleep || !slept_long_enough {
+        if !inner.asleep || !slept_long_enough(&inner, now) {
             return Ok(false);
         }
-        self.end(&mut inner).await
+        self.end(&mut inner, now).await
     }
 
-    async fn end(&self, inner: &mut Persisted) -> std::io::Result<bool> {
+    /// Ends the state, recording the sleep when it lasted [`MIN_SLEEP`].
+    async fn end(&self, inner: &mut Persisted, now: Timestamp) -> Result<bool, SleepError> {
         if !inner.asleep {
             return Ok(false);
+        }
+        if let (true, Some(since)) = (slept_long_enough(inner, now), inner.since_ms) {
+            let began = Timestamp::from_millisecond(since).expect("persisted start is in range");
+            self.db.record_sleep(began).await?;
         }
         inner.asleep = false;
         inner.origin = None;
@@ -223,23 +239,33 @@ impl SleepState {
 
     /// Raises the health reminder when `now` is within
     /// [`REMINDER_WINDOW_MINUTES`] after the median time of day of the
-    /// recorded `/sleep` runs in `zone`, the user is awake, and none was
-    /// raised in the last twelve hours. Without recorded runs there is no
-    /// reminder. Returns whether one was raised.
+    /// recorded sleeps in `zone`, the user is awake, and none was raised in
+    /// the last twelve hours. The history must be a habit: sleeps on at
+    /// least [`MIN_HABIT_NIGHTS`] distinct nights, within
+    /// [`MAX_HABIT_DEVIATION_MINUTES`] of their median. Returns whether one
+    /// was raised.
     ///
     /// # Errors
     /// When the history cannot be read.
     pub async fn remind_if_due(&self, now: Timestamp, zone: &TimeZone) -> Result<bool, SleepError> {
-        let minutes: Vec<u32> = self
-            .db
-            .sleep_times()
-            .await?
+        let times = self.db.sleep_times().await?;
+        let nights: BTreeSet<_> = times
+            .iter()
+            .map(|at| (*at - NIGHT_OFFSET).to_zoned(zone.clone()).date())
+            .collect();
+        if nights.len() < MIN_HABIT_NIGHTS {
+            return Ok(false);
+        }
+        let minutes: Vec<u32> = times
             .into_iter()
             .map(|at| minute_of_day(at, zone))
             .collect();
         let Some(median) = median_minute_of_day(&minutes) else {
             return Ok(false);
         };
+        if median_circular_deviation(&minutes, median) > MAX_HABIT_DEVIATION_MINUTES {
+            return Ok(false);
+        }
         let since_median = (minute_of_day(now, zone) + MINUTES_PER_DAY - median) % MINUTES_PER_DAY;
         let mut inner = self.inner.lock().await;
         let spaced = inner
@@ -278,6 +304,31 @@ pub enum SleepError {
     /// The sleep log could not be read or written.
     #[error("sleep log: {0}")]
     Db(#[from] crate::db::ChatDbError),
+}
+
+fn slept_long_enough(inner: &Persisted, now: Timestamp) -> bool {
+    inner
+        .since_ms
+        .is_some_and(|since| now.as_millisecond().saturating_sub(since) >= MIN_SLEEP_MS)
+}
+
+/// The median of the distances on the 24-hour circle from `minutes` to
+/// `center`, all minutes since midnight.
+fn median_circular_deviation(minutes: &[u32], center: u32) -> u32 {
+    let mut distances: Vec<u32> = minutes
+        .iter()
+        .map(|minute| {
+            let apart = minute.abs_diff(center) % MINUTES_PER_DAY;
+            apart.min(MINUTES_PER_DAY - apart)
+        })
+        .collect();
+    distances.sort_unstable();
+    let middle = distances.len() / 2;
+    if distances.len() % 2 == 1 {
+        distances[middle]
+    } else {
+        u32::midpoint(distances[middle - 1], distances[middle])
+    }
 }
 
 fn minute_of_day(at: Timestamp, zone: &TimeZone) -> u32 {
@@ -364,7 +415,7 @@ mod tests {
             "never replayed"
         );
 
-        assert!(sleep.wake().await.unwrap());
+        assert!(sleep.wake(at(T0)).await.unwrap());
         assert!(!sleep.is_asleep());
         assert!(events.recv().await.unwrap().contains(UiEventTopics::SLEEP));
         assert_eq!(
@@ -423,9 +474,84 @@ mod tests {
         let dir = tempfile::tempdir().expect("dir");
         let (sleep, _) = state(dir.path()).await;
         sleep.sleep("a", at(T0)).await.unwrap();
-        assert!(sleep.wake().await.unwrap());
+        assert!(sleep.wake(at(T0)).await.unwrap());
         assert!(!sleep.is_asleep());
-        assert!(!sleep.wake().await.unwrap());
+        assert!(!sleep.wake(at(T0)).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn an_early_sleep_off_leaves_no_history_and_no_reminder() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (sleep, _) = state(dir.path()).await;
+        let began = at(T0);
+        sleep.sleep("a", began).await.unwrap();
+        let early = began + MIN_SLEEP.checked_sub(Duration::from_millis(1)).unwrap();
+        assert!(sleep.wake(early).await.unwrap());
+        assert_eq!(
+            sleep.db.sleep_times().await.unwrap(),
+            Vec::<Timestamp>::new()
+        );
+        assert!(!sleep.remind_if_due(began, &TimeZone::UTC).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_real_sleep_is_recorded_at_its_start_across_a_restart() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (sleep, _) = state(dir.path()).await;
+        let began = at(T0);
+        sleep.sleep("a", began).await.unwrap();
+
+        let (restarted, _) = state(dir.path()).await;
+        assert!(
+            restarted.db.sleep_times().await.unwrap().is_empty(),
+            "nothing before it ends"
+        );
+        assert!(restarted.user_message(began + MIN_SLEEP).await.unwrap());
+        assert_eq!(restarted.db.sleep_times().await.unwrap(), vec![began]);
+    }
+
+    #[tokio::test]
+    async fn too_few_nights_or_scattered_times_never_remind() {
+        let utc = TimeZone::UTC;
+        for times in [
+            // Two runs, even at the same time.
+            &["2026-02-26T23:30:00Z", "2026-02-27T23:30:00Z"][..],
+            // Many sleeps on one night.
+            &[
+                "2026-02-27T22:00:00Z",
+                "2026-02-27T22:10:00Z",
+                "2026-02-27T22:20:00Z",
+                "2026-02-27T22:30:00Z",
+                "2026-02-27T22:40:00Z",
+            ][..],
+            // Five nights spread over the day.
+            &[
+                "2026-02-24T01:00:00Z",
+                "2026-02-25T06:00:00Z",
+                "2026-02-26T12:00:00Z",
+                "2026-02-27T17:00:00Z",
+                "2026-02-28T22:00:00Z",
+            ][..],
+        ] {
+            let dir = tempfile::tempdir().expect("dir");
+            let (sleep, _) = state(dir.path()).await;
+            for time in times {
+                sleep.db.record_sleep(at(time)).await.unwrap();
+            }
+            for probe in [
+                "2026-03-01T01:00:00Z",
+                "2026-03-01T06:00:00Z",
+                "2026-03-01T12:00:00Z",
+                "2026-03-01T17:00:00Z",
+                "2026-03-01T22:00:00Z",
+                "2026-03-01T23:30:00Z",
+            ] {
+                assert!(
+                    !sleep.remind_if_due(at(probe), &utc).await.unwrap(),
+                    "{times:?} at {probe}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -452,11 +578,13 @@ mod tests {
         );
     }
 
-    /// Sleep times the reminder is computed from, in UTC.
+    /// Five nights around midnight, in UTC; the median is 23:30.
     async fn slept_around_midnight(sleep: &SleepState) {
         for time in [
+            "2026-02-24T00:30:00Z",
+            "2026-02-25T23:30:00Z",
+            "2026-02-26T23:30:00Z",
             "2026-02-27T23:30:00Z",
-            "2026-02-28T00:30:00Z",
             "2026-02-28T23:30:00Z",
         ] {
             sleep.db.record_sleep(at(time)).await.unwrap();

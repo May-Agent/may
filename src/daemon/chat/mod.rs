@@ -5123,7 +5123,13 @@ mod tests {
 
         // The health reminder is raised for the user and reaches no agent.
         let now = jiff::Timestamp::now();
-        state.db().record_sleep(now).await.expect("sleep log");
+        for nights_ago in 1..=5 {
+            state
+                .db()
+                .record_sleep(now - jiff::SignedDuration::from_hours(24 * nights_ago))
+                .await
+                .expect("sleep log");
+        }
         assert!(
             state
                 .sleep
