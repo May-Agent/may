@@ -124,11 +124,13 @@ export const zhHant: Messages = {
     },
     thinkingPicker: {
       label: '思考',
-      off: '關閉',
+      none: '關閉',
+      minimal: '極低',
       low: '低',
       medium: '中',
       high: '高',
-      description: '在回覆前額外推理的深度',
+      xhigh: '超高',
+      max: '最高',
     },
   },
   chat: {

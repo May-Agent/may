@@ -7,6 +7,8 @@ export interface ModelInfoItem {
   nickname: string;
   contextWindow?: number | null;
   tier?: string | null;
+  /** Reasoning-effort levels the model accepts, lowest first; empty when it has no effort control. */
+  effortLadder?: string[];
 }
 
 export interface ModelsResponse {

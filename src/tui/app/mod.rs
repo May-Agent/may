@@ -194,7 +194,7 @@ pub struct App {
     /// Effort rungs each fetched model family serves, keyed by
     /// `(provider_id, family base)` — the `/effort` popup shows a family's
     /// own ladder when the catalog reports one.
-    pub family_effort_rungs: std::collections::HashMap<(String, String), Vec<&'static str>>,
+    pub family_effort_rungs: crate::models::FamilyEffortRungs,
     /// When the current turn began; `None` while idle.
     pub turn_started_at: Option<std::time::Instant>,
     /// Selected index in the effort popup
@@ -4328,21 +4328,21 @@ impl App {
     /// family's served rungs when the catalog reports them, else the
     /// provider protocol's generic ladder.
     pub fn effort_ladder_for_current(&self) -> Vec<&'static str> {
-        let family = self
+        let selector = self
             .current_model
             .as_deref()
-            .and_then(|model| model.parse::<crate::ModelSelector>().ok())
-            .map(|selector| {
-                (
-                    selector.provider_id().to_string(),
-                    crate::models::effort_family_base(selector.model_id()),
+            .and_then(|model| model.parse::<crate::ModelSelector>().ok());
+        selector.map_or_else(
+            || crate::models::provider_effort_ladder(self.current_provider_type()).to_vec(),
+            |selector| {
+                crate::models::effort_ladder(
+                    &self.family_effort_rungs,
+                    selector.provider_id(),
+                    selector.model_id(),
+                    self.current_provider_type(),
                 )
-            });
-        family
-            .and_then(|key| self.family_effort_rungs.get(&key).cloned())
-            .unwrap_or_else(|| {
-                model_picker::effort_ladder_for(self.current_provider_type()).to_vec()
-            })
+            },
+        )
     }
 
     /// The ladder index of [`Self::effective_effort`], falling back to the

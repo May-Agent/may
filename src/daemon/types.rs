@@ -1098,6 +1098,9 @@ pub struct ModelInfoItem {
     pub(crate) nickname: String,
     pub(crate) context_window: Option<u32>,
     pub(crate) abilities: Vec<String>,
+    /// The reasoning-effort levels the model accepts, lowest first; empty
+    /// when the model has no effort control.
+    pub(crate) effort_ladder: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]

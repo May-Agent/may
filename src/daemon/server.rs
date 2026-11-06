@@ -739,12 +739,46 @@ async fn models(State(state): State<Arc<DaemonState>>) -> SkyResult<Json<ModelsR
     Ok(Json(result))
 }
 
+/// The effort levels the web composer offers for a model: the shared ladder,
+/// or none when the catalog serves no effort rungs for the family and the
+/// model does not report reasoning.
+fn model_effort_ladder(
+    config: &MayConfig,
+    family_rungs: &crate::models::FamilyEffortRungs,
+    provider_id: &str,
+    model_id: &str,
+    abilities: &[String],
+) -> Vec<String> {
+    let family = crate::models::effort_family_base(model_id);
+    let served = family_rungs.contains_key(&(provider_id.to_string(), family.clone()));
+    let reasons = abilities.iter().any(|ability| ability == "reasoning")
+        || lookup_model_info(model_id)
+            .or_else(|| lookup_model_info(&family))
+            .is_some_and(|info| {
+                info.abilities()
+                    .contains(&aither_core::llm::model::Ability::Reasoning)
+            });
+    if !served && !reasons {
+        return Vec::new();
+    }
+    let provider_type = config
+        .provider
+        .get(provider_id)
+        .map(|instance| instance.resolve_type(provider_id));
+    crate::models::effort_ladder(family_rungs, provider_id, model_id, provider_type)
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
 fn build_models_response(
     config: &MayConfig,
     fetched: Vec<crate::models::FetchedModel>,
     include_static_metadata: bool,
 ) -> ModelsResponse {
     let mut model_map = std::collections::HashMap::<String, ModelInfoItem>::new();
+    let mut family_rungs = crate::models::FamilyEffortRungs::new();
+    crate::models::record_family_effort_rungs(&mut family_rungs, &fetched);
 
     for item in fetched {
         let selector = crate::ModelSelector::new(&item.provider_id, &item.id).to_string();
@@ -754,6 +788,13 @@ fn build_models_response(
             provider_id: item.provider_id.clone(),
             nickname: item.nickname,
             context_window: item.context_window,
+            effort_ladder: model_effort_ladder(
+                config,
+                &family_rungs,
+                &item.provider_id,
+                &item.id,
+                &item.abilities,
+            ),
             abilities: item.abilities,
         };
         model_map
@@ -795,6 +836,13 @@ fn build_models_response(
                     provider_id: selector.provider_id().to_string(),
                     nickname,
                     context_window,
+                    effort_ladder: model_effort_ladder(
+                        config,
+                        &family_rungs,
+                        selector.provider_id(),
+                        selector.model_id(),
+                        &abilities,
+                    ),
                     abilities,
                 }
             });
@@ -837,7 +885,7 @@ async fn models_by_provider(
                 .fetched_models_cache
                 .get_or_refresh(move || async move { fetch_all_models(&refresh_config).await })
                 .await;
-            build_provider_models_response(fetched)
+            build_provider_models_response(&config, fetched)
         })
         .await;
     let result = result.map_err(internal_error)?;
@@ -845,13 +893,23 @@ async fn models_by_provider(
 }
 
 fn build_provider_models_response(
+    config: &MayConfig,
     fetched: Vec<crate::models::FetchedModel>,
 ) -> ProviderModelsResponse {
     let mut grouped: std::collections::HashMap<String, Vec<ModelInfoItem>> =
         std::collections::HashMap::new();
+    let mut family_rungs = crate::models::FamilyEffortRungs::new();
+    crate::models::record_family_effort_rungs(&mut family_rungs, &fetched);
 
     for item in fetched {
         let selector = crate::ModelSelector::new(&item.provider_id, &item.id).to_string();
+        let effort_ladder = model_effort_ladder(
+            config,
+            &family_rungs,
+            &item.provider_id,
+            &item.id,
+            &item.abilities,
+        );
         grouped
             .entry(item.provider_id.clone())
             .or_default()
@@ -861,6 +919,7 @@ fn build_provider_models_response(
                 provider_id: item.provider_id,
                 nickname: item.nickname,
                 context_window: item.context_window,
+                effort_ladder,
                 abilities: item.abilities,
             });
     }
@@ -887,6 +946,49 @@ fn build_provider_models_response(
 mod tests {
     #[cfg(not(feature = "ui"))]
     use super::DaemonMode;
+    use super::{build_models_response, build_provider_models_response};
+    use crate::config::MayConfig;
+    use crate::models::FetchedModel;
+
+    fn fetched(id: &str, abilities: &[&str]) -> FetchedModel {
+        FetchedModel {
+            id: id.to_string(),
+            nickname: id.to_string(),
+            context_window: None,
+            abilities: abilities.iter().map(ToString::to_string).collect(),
+            provider_id: "relay".to_string(),
+        }
+    }
+
+    #[test]
+    fn model_lists_carry_each_models_effort_ladder() {
+        let models = vec![
+            fetched("o4-mini-low", &[]),
+            fetched("o4-mini-high", &[]),
+            fetched("gpt-reasoner", &["reasoning"]),
+            fetched("plain-chat", &["tool_use"]),
+        ];
+        let config = MayConfig::default();
+        let ladders = |details: &[crate::daemon::types::ModelInfoItem]| {
+            details
+                .iter()
+                .map(|item| (item.model_id.clone(), item.effort_ladder.clone()))
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+
+        let flat = ladders(&build_models_response(&config, models.clone(), false).details);
+        let grouped = build_provider_models_response(&config, models);
+        let grouped = ladders(&grouped.providers[0].details);
+        for ladders in [flat, grouped] {
+            assert_eq!(ladders["o4-mini-low"], ["low", "high"]);
+            assert_eq!(ladders["o4-mini-high"], ["low", "high"]);
+            assert_eq!(
+                ladders["gpt-reasoner"],
+                ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+            );
+            assert_eq!(ladders["plain-chat"].len(), 0);
+        }
+    }
 
     #[cfg(not(feature = "ui"))]
     #[test]
