@@ -827,21 +827,35 @@ impl ChatStream {
         if end <= start {
             return;
         }
-        let folded: Vec<ChatElement> = self.elements.splice(start..end, []).collect();
-        self.revisions.splice(start..end, []);
-        let id = self.next_worked_id;
-        self.next_worked_id += 1;
-        self.elements.insert(
-            start,
-            ChatElement::WorkedFor {
-                id: format!("work-{id}"),
-                seconds,
-                elements: folded,
-                expanded: false,
-            },
-        );
-        self.revisions.insert(start, Self::next_revision());
-        self.fold_cursor = start + 1;
+        // A failure is the turn's outcome, not its work: it stays visible
+        // after the row.
+        let (errors, folded): (Vec<_>, Vec<_>) = self
+            .elements
+            .splice(start..end, [])
+            .zip(self.revisions.splice(start..end, []))
+            .partition(|(element, _)| matches!(element, ChatElement::Error { .. }));
+        let mut at = start;
+        if !folded.is_empty() {
+            let id = self.next_worked_id;
+            self.next_worked_id += 1;
+            self.elements.insert(
+                at,
+                ChatElement::WorkedFor {
+                    id: format!("work-{id}"),
+                    seconds,
+                    elements: folded.into_iter().map(|(element, _)| element).collect(),
+                    expanded: false,
+                },
+            );
+            self.revisions.insert(at, Self::next_revision());
+            at += 1;
+        }
+        for (element, revision) in errors {
+            self.elements.insert(at, element);
+            self.revisions.insert(at, revision);
+            at += 1;
+        }
+        self.fold_cursor = at;
     }
 
     /// Start a new assistant text block.
@@ -5173,6 +5187,37 @@ mod tests {
     /// A finished turn folds its work — thinking, calls and the messages
     /// between them — behind one "Worked for" row that clicks open and
     /// shut again.
+    #[test]
+    fn a_failed_turns_error_stays_outside_the_folded_work() {
+        let mut chat = ChatStream::new();
+        chat.push_user("hi", Vec::new(), 0);
+        chat.push_thinking("draft");
+        chat.push_error("permission_denied: This model is no longer available");
+        chat.fold_turn_work(0);
+
+        let lines = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
+        assert!(
+            lines.iter().any(|line| line.contains("permission_denied")),
+            "the error shows with the work collapsed: {lines:?}"
+        );
+        assert!(matches!(
+            chat.elements.last(),
+            Some(ChatElement::Error { .. })
+        ));
+
+        // A turn that only failed has no work to fold.
+        let mut chat = ChatStream::new();
+        chat.push_user("hi", Vec::new(), 0);
+        chat.push_error("boom");
+        chat.fold_turn_work(0);
+        assert!(
+            !chat
+                .elements
+                .iter()
+                .any(|element| matches!(element, ChatElement::WorkedFor { .. }))
+        );
+    }
+
     #[test]
     fn worked_for_folds_turn_and_toggles() {
         let mut chat = ChatStream::new();
