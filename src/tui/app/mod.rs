@@ -468,6 +468,41 @@ fn tunnel_base(config: &MayConfig) -> String {
     )
 }
 
+/// The conversation rows of one turn seen so far while history is rebuilt.
+#[derive(Default)]
+struct HistoryTurn {
+    started: Option<jiff::Timestamp>,
+    last: Option<jiff::Timestamp>,
+    /// The turn's latest row is a reply: a run ends with one.
+    replied: bool,
+}
+
+impl HistoryTurn {
+    fn note(&mut self, msg: &ChatMessage) {
+        if !matches!(
+            msg.role,
+            MessageRole::User | MessageRole::Assistant | MessageRole::Tool
+        ) {
+            return;
+        }
+        if let Some(at) = msg.timestamp {
+            self.started.get_or_insert(at);
+            self.last = Some(at);
+        }
+        self.replied = msg.role == MessageRole::Assistant;
+    }
+
+    /// Whole seconds from the turn's first row to its last.
+    fn seconds(&self) -> u64 {
+        match (self.started, self.last) {
+            (Some(started), Some(last)) => {
+                u64::try_from(last.duration_since(started).as_secs()).unwrap_or(0)
+            }
+            _ => 0,
+        }
+    }
+}
+
 impl App {
     /// Create a new application.
     /// `image_support` should be detected before entering raw mode using `TerminalImageSupport::detect()`.
@@ -1665,10 +1700,19 @@ impl App {
         }
     }
 
-    /// Rebuilds the chat view from `messages`.
+    /// Rebuilds the chat view from `messages` the way the live turns built
+    /// it: tool calls replay from their stored lifecycle rows, and every
+    /// finished turn folds into its "Worked for" row. The last turn folds
+    /// only when its reply is stored; until then it may still be running.
     async fn render_history(&mut self, messages: &[ChatMessage]) {
         self.chat = ChatStream::new().with_tunnel_base(tunnel_base(&self.config));
+        let mut turn = HistoryTurn::default();
         for (history_index, msg) in messages.iter().enumerate() {
+            if msg.role == MessageRole::User {
+                self.fold_history_turn(&turn);
+                turn = HistoryTurn::default();
+            }
+            turn.note(msg);
             match msg.role {
                 MessageRole::User => {
                     let restored = futures_util::future::join_all(msg.attachments.iter().map(
@@ -1698,6 +1742,32 @@ impl App {
                     self.chat.push_text(&msg.content);
                     self.chat.end_text();
                 }
+                MessageRole::Tool => {
+                    match serde_json::from_str::<crate::session::ToolEventRecord>(&msg.content) {
+                        Ok(crate::session::ToolEventRecord::Start {
+                            id,
+                            name,
+                            arguments,
+                        }) => {
+                            // A stored call carries the arguments schema of
+                            // the build that ran it, so it is read field by
+                            // field rather than against today's schema.
+                            self.show_tool_start(id, parse_tool_start_partial(&name, &arguments));
+                        }
+                        Ok(crate::session::ToolEventRecord::End { id, result, .. }) => {
+                            self.show_tool_end(&id, &result);
+                        }
+                        Ok(crate::session::ToolEventRecord::Stopped { id, .. }) => {
+                            self.show_tool_end(
+                                &id,
+                                &crate::session::ToolEventRecord::stopped_result(),
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, row = ?msg.id, "unreadable tool row in history");
+                        }
+                    }
+                }
                 MessageRole::Recap => {
                     if let Ok(record) =
                         serde_json::from_str::<crate::daemon::RecapRecord>(&msg.content)
@@ -1708,6 +1778,16 @@ impl App {
                 _ => {}
             }
         }
+        if turn.replied {
+            self.fold_history_turn(&turn);
+        }
+    }
+
+    /// Fold the finished turn `turn` of a history rebuild, as
+    /// `finish_agent_task` folds a live one when its run ends.
+    fn fold_history_turn(&mut self, turn: &HistoryTurn) {
+        self.chat.finish_running_calls();
+        self.chat.fold_turn_work(turn.seconds());
     }
 
     /// Re-reads the current session from the database and rebuilds the chat
@@ -3798,6 +3878,41 @@ impl App {
         .detach();
     }
 
+    /// Show a tool call that started — live or replayed from history.
+    fn show_tool_start(&mut self, id: String, kind: ToolStartKind) {
+        let display = self.tool_start_display(kind);
+        self.chat.upsert_tool_display(id, display);
+    }
+
+    /// Show the result of the tool call `id` — live or replayed from history.
+    fn show_tool_end(&mut self, id: &str, result: &aither_core::llm::ToolResult) {
+        match parse_tool_end(result) {
+            ToolEndKind::Output(out) => {
+                let image = out
+                    .image
+                    .or_else(|| self.imagine_result_image(id, &out.text));
+                let status = out.failure.map_or(
+                    super::ui::chat::ToolStatus::Done,
+                    super::ui::chat::ToolStatus::Failed,
+                );
+                self.chat
+                    .update_tool_with_output(id, status, Some(out.text.as_str()));
+                if let Some(image) = image
+                    && let Some(image) = self.install_tool_image(id, image)
+                {
+                    self.chat.set_tool_image(id, image);
+                }
+            }
+            ToolEndKind::Error(err) => {
+                self.chat.update_tool_with_output(
+                    id,
+                    super::ui::chat::ToolStatus::Failed(err),
+                    None,
+                );
+            }
+        }
+    }
+
     /// Map a parsed tool-call start into its stream display. Shared by the
     /// canonical `ToolCallStart` path and the progressive `ToolCallDelta`
     /// projection — a partial parse only differs in fields still empty.
@@ -3941,41 +4056,12 @@ impl App {
                         if let Some(pending) = self.pending_tool_calls.get_mut(&id) {
                             pending.started = true;
                         }
-                        let display = self.tool_start_display(parse_tool_start(&name, &arguments));
-                        self.chat.upsert_tool_display(id, display);
+                        self.show_tool_start(id, parse_tool_start(&name, &arguments));
                     }
                     AgentEvent::ToolCallEnd { id, result, .. } => {
                         // Back to waiting on the model for the next burst.
                         self.activity_phase = crate::tui::ui::chat::ActivityPhase::Thinking;
-                        let feedback = parse_tool_end(&result);
-                        match feedback {
-                            ToolEndKind::Output(out) => {
-                                let image = out
-                                    .image
-                                    .or_else(|| self.imagine_result_image(&id, &out.text));
-                                let status = out.failure.map_or(
-                                    super::ui::chat::ToolStatus::Done,
-                                    super::ui::chat::ToolStatus::Failed,
-                                );
-                                self.chat.update_tool_with_output(
-                                    &id,
-                                    status,
-                                    Some(out.text.as_str()),
-                                );
-                                if let Some(image) = image
-                                    && let Some(image) = self.install_tool_image(&id, image)
-                                {
-                                    self.chat.set_tool_image(&id, image);
-                                }
-                            }
-                            ToolEndKind::Error(err) => {
-                                self.chat.update_tool_with_output(
-                                    &id,
-                                    super::ui::chat::ToolStatus::Failed(err),
-                                    None,
-                                );
-                            }
-                        }
+                        self.show_tool_end(&id, &result);
                         self.live_reads.remove(&id);
                         self.pending_tool_calls.remove(&id);
                         self.request_file_diff(&id);
@@ -4583,6 +4669,119 @@ mod tests {
             app.chat.elements().last(),
             Some(ChatElement::Recap { summary, next_action: None }) if summary == "Where it stands."
         ));
+    }
+
+    #[tokio::test]
+    async fn a_session_loaded_from_the_database_shows_its_tool_calls_folded_per_turn() {
+        use crate::ChatMessage;
+        use crate::session::ToolEventRecord;
+        use crate::tui::ui::chat::ToolDisplay;
+
+        let dir = tempfile::tempdir().expect("dir");
+        let db = crate::db::ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("open database");
+        db.create_session("s", None, None)
+            .await
+            .expect("create session");
+        let at = |second: i64| jiff::Timestamp::from_second(1_800_000_000 + second).expect("time");
+        let call = |id: &str, script: &str, second: i64| {
+            let start = ToolEventRecord::Start {
+                id: id.to_string(),
+                name: "terminal".to_string(),
+                arguments: serde_json::json!({ "description": script, "script": script })
+                    .to_string(),
+            };
+            let end = ToolEventRecord::End {
+                id: id.to_string(),
+                name: "terminal".to_string(),
+                result: aither_core::llm::ToolResult::text("done"),
+            };
+            [
+                ChatMessage::tool(
+                    id,
+                    serde_json::to_string(&start).expect("start"),
+                    at(second),
+                ),
+                ChatMessage::tool(
+                    id,
+                    serde_json::to_string(&end).expect("end"),
+                    at(second + 1),
+                ),
+            ]
+        };
+        let mut first = ChatMessage::user("list issues");
+        first.timestamp = Some(at(0));
+        let mut second = ChatMessage::user("and the backend?");
+        second.timestamp = Some(at(30));
+        let rows: Vec<ChatMessage> = std::iter::once(first)
+            .chain(call("terminal:0#a", "issue list", 2))
+            .chain(call("terminal:0#b", "issue list --state all", 4))
+            .chain([ChatMessage::assistant("None open.", at(20)), second])
+            .chain(call("terminal:0#c", "cat workspace.toml", 32))
+            .chain([ChatMessage::assistant("It is local.", at(40))])
+            .collect();
+        for row in &rows {
+            db.append_chat_message("s", row).await.expect("append row");
+        }
+        let history = crate::session::load_history_from_db(&db, "s")
+            .await
+            .expect("load history");
+
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        app.render_history(history.messages()).await;
+
+        let commands = |elements: &[ChatElement]| -> Vec<String> {
+            elements
+                .iter()
+                .map(|element| match element {
+                    ChatElement::ToolCall {
+                        display:
+                            ToolDisplay::Terminal {
+                                command, status, ..
+                            },
+                        ..
+                    } => {
+                        assert!(
+                            matches!(status, crate::tui::ui::chat::ToolStatus::Done),
+                            "{status:?}"
+                        );
+                        command.clone()
+                    }
+                    other => panic!("unexpected folded element {other:?}"),
+                })
+                .collect()
+        };
+        let elements = app.chat.elements();
+        assert_eq!(elements.len(), 6, "{elements:#?}");
+        assert!(matches!(&elements[0], ChatElement::UserMessage { .. }));
+        let ChatElement::WorkedFor {
+            seconds,
+            elements: work,
+            ..
+        } = &elements[1]
+        else {
+            panic!("first turn is not folded: {:?}", elements[1]);
+        };
+        assert_eq!(*seconds, 20);
+        assert_eq!(commands(work), ["issue list", "issue list --state all"]);
+        assert!(
+            matches!(&elements[2], ChatElement::AssistantText { content, .. } if content == "None open.")
+        );
+        assert!(matches!(&elements[3], ChatElement::UserMessage { .. }));
+        let ChatElement::WorkedFor {
+            seconds,
+            elements: work,
+            ..
+        } = &elements[4]
+        else {
+            panic!("last turn is not folded: {:?}", elements[4]);
+        };
+        assert_eq!(*seconds, 10);
+        assert_eq!(commands(work), ["cat workspace.toml"]);
+        assert!(
+            matches!(&elements[5], ChatElement::AssistantText { content, .. } if content == "It is local.")
+        );
     }
 
     #[test]
