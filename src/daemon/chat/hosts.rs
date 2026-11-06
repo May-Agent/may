@@ -403,10 +403,7 @@ pub async fn btw(
             _ => Message::user(message.content),
         })
         .collect::<Vec<_>>();
-    let llm = worker
-        .btw_llm()
-        .cloned()
-        .ok_or_else(|| internal_error_message("the idle agent has no model"))?;
+    let llm = worker.side_model().await.map_err(internal_error_message)?;
     let mut answer = String::new();
     let mut stream = std::pin::pin!(llm.respond(messages));
     while let Some(event) = stream.next().await {
