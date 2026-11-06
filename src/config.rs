@@ -1256,6 +1256,9 @@ pub struct MayConfig {
     /// Prompt suggestion settings.
     #[serde(default)]
     pub suggestions: SuggestionsConfig,
+    /// `/sleep` settings.
+    #[serde(default)]
+    pub sleep: SleepConfig,
     /// Recap settings.
     #[serde(default)]
     pub recap: RecapConfig,
@@ -1301,6 +1304,21 @@ pub struct SuggestionsConfig {
 impl Default for SuggestionsConfig {
     fn default() -> Self {
         Self { enabled: true }
+    }
+}
+
+/// `[sleep]` section: the health reminder around `/sleep`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SleepConfig {
+    /// Whether May suggests running `/sleep` at the user's median `/sleep`
+    /// time of day.
+    pub reminder: bool,
+}
+
+impl Default for SleepConfig {
+    fn default() -> Self {
+        Self { reminder: true }
     }
 }
 
@@ -1642,6 +1660,7 @@ impl Default for MayConfig {
             remote_access: RemoteAccessConfig::default(),
             daemon: DaemonConfig::default(),
             suggestions: SuggestionsConfig::default(),
+            sleep: SleepConfig::default(),
             recap: RecapConfig::default(),
             language: LanguageConfig::default(),
             context: ContextConfig::default(),
