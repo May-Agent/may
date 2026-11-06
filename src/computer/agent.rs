@@ -274,7 +274,7 @@ async fn dispatch(request: AgentRequest, state: &AgentState) -> AgentResponse {
                     error: "the session has no desktop".to_owned(),
                 };
             };
-            match display.post_input(message) {
+            match display.post_input(message).await {
                 Ok(()) => AgentResponse::Ok,
                 Err(e) => AgentResponse::Error {
                     error: e.to_string(),

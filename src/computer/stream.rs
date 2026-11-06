@@ -465,9 +465,7 @@ fn setup_input_channel(
                     let Ok(input) = serde_json::from_slice::<InputMessage>(&message.data) else {
                         return;
                     };
-                    if let Err(error) = display.post_input(input) {
-                        tracing::warn!(%error, "computer input not delivered");
-                    }
+                    display.queue_input(input).await;
                 })
             }));
         })
