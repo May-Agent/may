@@ -2,6 +2,7 @@ import type {
   ApiErrorCode,
   ChatStreamEvent,
   HoldReason,
+  ReplyTranslation,
   ToolSummary,
   ToolVariant,
   SseTodoItem,
@@ -33,7 +34,7 @@ export interface TurnErrorState {
 }
 
 export type TurnSegment =
-  | { kind: 'text'; text: string; seq: number }
+  | { kind: 'text'; text: string; seq: number; translation?: ReplyTranslation }
   | { kind: 'tool'; toolId: string; seq: number };
 
 export interface TurnState {
@@ -139,6 +140,19 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
         segments: appendTextSegment(state.segments, event.chunk, event.seq),
         lastSeq: event.seq,
       };
+
+    case 'translated': {
+      // The translation belongs to the reply streamed last.
+      const index = state.segments.map((s) => s.kind).lastIndexOf('text');
+      if (index < 0) return { ...state, lastSeq: event.seq };
+      const segments = state.segments.slice();
+      const segment = segments[index]!;
+      if (segment.kind === 'text') {
+        const { text, language, languageName } = event;
+        segments[index] = { ...segment, translation: { text, language, languageName } };
+      }
+      return { ...state, segments, lastSeq: event.seq };
+    }
 
     case 'reasoning':
       return { ...state, reasoning: state.reasoning + event.chunk, lastSeq: event.seq };

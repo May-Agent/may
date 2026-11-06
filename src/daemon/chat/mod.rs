@@ -133,6 +133,15 @@ trait ChatSink {
     ) -> impl Future<Output = bool> + Send;
     fn on_text(&mut self, chunk: &str) -> impl Future<Output = bool> + Send;
     fn on_reasoning(&mut self, chunk: &str) -> impl Future<Output = bool> + Send;
+    /// The reply just streamed was not in the communication language:
+    /// `text` is its translation, shown instead and marked as translated.
+    fn on_reply_translated(
+        &mut self,
+        _text: &str,
+        _language: &str,
+    ) -> impl Future<Output = bool> + Send {
+        async { true }
+    }
     /// A reasoning phase closed after `seconds`, whether or not it produced
     /// readable text. Emitted just before the first visible output that
     /// follows the phase.
@@ -271,6 +280,18 @@ impl HubSink {
     }
 }
 
+/// `session_turn` frame carrying the display translation of the reply the
+/// turn just streamed; the streamed text stays its original.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SseTranslatedEvent<'a> {
+    seq: u64,
+    turn_id: &'a str,
+    text: &'a str,
+    language: &'a str,
+    language_name: &'a str,
+}
+
 /// `session_turn` frame discarding the text the turn streamed so far.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -358,6 +379,22 @@ impl ChatSink for HubSink {
                 seq,
                 turn_id: &self.turn_id,
                 chunk,
+            },
+        );
+        true
+    }
+
+    async fn on_reply_translated(&mut self, text: &str, language: &str) -> bool {
+        let seq = self.next_seq();
+        let language_name = crate::session::language_display_name(language);
+        self.publish_turn(
+            "translated",
+            &SseTranslatedEvent {
+                seq,
+                turn_id: &self.turn_id,
+                text,
+                language,
+                language_name: &language_name,
             },
         );
         true
@@ -843,6 +880,7 @@ fn api_message_from_run_result(result: AgentRunResult) -> ApiMessage {
             context_window: result.model_context_window,
             elapsed_ms: Some(result.elapsed_ms),
         }),
+        translation: None,
     }
 }
 
@@ -1761,6 +1799,7 @@ fn run_agent_loop<'a>(
                 last_speed_emit: None,
                 segment_text: String::new(),
                 segment_at: None,
+                segment_translation: None,
                 last_event_at: None,
                 full_text: String::new(),
                 reasoning_text: String::new(),

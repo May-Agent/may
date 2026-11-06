@@ -5,6 +5,8 @@ pub mod chat_layout;
 pub mod file_picker;
 pub(super) mod highlight;
 pub mod image;
+#[cfg(unix)]
+mod image_probe;
 mod kitty_diacritics;
 mod layout;
 pub mod links;
