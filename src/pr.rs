@@ -1598,10 +1598,12 @@ fn host_git(
     Ok(host.output(dir, args)?.trim().to_string())
 }
 
-/// Test fixtures' own git, on the environment's configuration.
+/// Test fixtures' own git, on an empty configuration: neither the developer's
+/// global or system configuration nor its hooks apply. A fixture repository
+/// names its own identity.
 #[cfg(test)]
 fn git(dir: Option<&Path>, args: &[&str]) -> Result<String, crate::repo_clone::RepoCloneError> {
-    host_git(&HostGit::inherit(), dir, args)
+    host_git(&HostGit::from_file("/dev/null"), dir, args)
 }
 
 #[cfg(test)]

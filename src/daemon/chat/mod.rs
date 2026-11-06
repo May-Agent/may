@@ -1303,6 +1303,16 @@ pub(super) async fn enqueue_chat(
     Json(req): Json<ChatRequest>,
     State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<SessionRuntimeResponse>> {
+    wake_on_user_message(&state).await?;
+    enqueue_pending(&state, req).await.map(Json)
+}
+
+/// Hands `req` to the session as a pending message: the running turn takes
+/// it as `req.delivery_mode` says, and an idle session starts a turn for it.
+async fn enqueue_pending(
+    state: &Arc<DaemonState>,
+    req: ChatRequest,
+) -> SkyResult<SessionRuntimeResponse> {
     let pending = pending_user_message_from_request(req.clone());
     let runtime = state
         .runtime_service
@@ -1312,8 +1322,25 @@ pub(super) async fn enqueue_chat(
     if runtime.can_dispatch_follow_up() {
         spawn_follow_up_runs(state.clone(), req.session_id.clone());
     }
+    Ok(runtime.into())
+}
 
-    Ok(Json(runtime.into()))
+/// Delivers a message from the user the way a client does: a turn for an
+/// idle session, a pending message for a busy one.
+pub(super) async fn deliver_user_message(
+    state: &Arc<DaemonState>,
+    req: ChatRequest,
+) -> SkyResult<SessionRuntimeResponse> {
+    let runtime = state
+        .runtime_service
+        .get(&req.session_id)
+        .await
+        .map_err(internal_error)?;
+    if runtime.admits_new_request() {
+        start_prompt_turn(state, req).await
+    } else {
+        enqueue_pending(state, req).await
+    }
 }
 
 pub(super) async fn remove_pending_message(
@@ -1394,6 +1421,28 @@ pub(super) async fn send_message(
         .map_err(super::error::bad_request_error)?
         .to_string();
     req.session_id.clone_from(&session_id);
+    wake_on_user_message(&state).await?;
+    start_prompt_turn(&state, req).await.map(Json)
+}
+
+/// A message from the user ends the sleep state when it began an hour or
+/// more ago; within the hour the user stays asleep.
+async fn wake_on_user_message(state: &DaemonState) -> SkyResult<()> {
+    state
+        .sleep
+        .user_message(jiff::Timestamp::now())
+        .await
+        .map(drop)
+        .map_err(internal_error)
+}
+
+/// Starts a turn on `req` in its session and returns at once; the turn runs
+/// in the daemon.
+pub(super) async fn start_prompt_turn(
+    state: &Arc<DaemonState>,
+    req: ChatRequest,
+) -> SkyResult<SessionRuntimeResponse> {
+    let session_id = req.session_id.clone();
     if state.draining.load(std::sync::atomic::Ordering::SeqCst) {
         return Err(draining_error());
     }
@@ -1431,7 +1480,19 @@ pub(super) async fn send_message(
         .get(&session_id)
         .await
         .map_err(internal_error)?;
-    Ok(Json(runtime.into()))
+    Ok(runtime.into())
+}
+
+/// Tells `agent` of a change of the user's sleep state it has not heard of:
+/// one alert per change, at the start of the session's next turn.
+async fn tell_sleep_state(state: &DaemonState, session_id: &str, agent: &mut MayAgent) {
+    match state.sleep.take_notice(session_id).await {
+        Ok(Some(notice)) => agent.tell_sleep_notice(notice),
+        Ok(None) => {}
+        Err(error) => {
+            tracing::error!(%session_id, %error, "failed to record the sleep state an agent was told");
+        }
+    }
 }
 
 /// `POST /api/sessions/{id}/bash`: run a `!` command for the user.
@@ -1816,6 +1877,7 @@ fn run_agent_loop<'a>(
                 first_text_seen: false,
             };
             agent.sync_runtime_context().await;
+            tell_sleep_state(state, req.session_id.as_str(), &mut agent).await;
             let stopped = drive_turn(
                 &mut turn,
                 &mut agent,
@@ -2255,7 +2317,9 @@ pub(super) fn watch_aux_settings(state: &Arc<DaemonState>) {
     handle.spawn(async move {
         loop {
             match events.recv().await {
-                Ok(topics) if topics.contains(UiEventTopics::CONFIG) => apply_aux_settings(&state),
+                Ok(topics) if topics.intersects(UiEventTopics::CONFIG | UiEventTopics::SLEEP) => {
+                    apply_aux_settings(&state);
+                }
                 // A lagged receiver may have missed the change.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                     apply_aux_settings(&state);
@@ -4206,6 +4270,37 @@ mod tests {
         body
     }
 
+    /// Waits until `session_id`'s turn has ended and the session takes a new
+    /// one.
+    async fn wait_until_idle(state: &DaemonState, session_id: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            loop {
+                let runtime = state
+                    .runtime_service
+                    .get(session_id)
+                    .await
+                    .expect("runtime");
+                if runtime.admits_new_request() && state.parked_agents.contains(session_id) {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the turn ends");
+    }
+
+    /// The next request body of `stub` that carries `marker` (lowercase):
+    /// auxiliary requests of other turns are skipped.
+    async fn body_containing(stub: &StubProvider, marker: &str) -> String {
+        loop {
+            let body = last_body(stub, 1).await.to_lowercase();
+            if body.contains(marker) {
+                return body;
+            }
+        }
+    }
+
     async fn stub_provider(responses: Vec<String>) -> StubProvider {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -4868,6 +4963,178 @@ mod tests {
             !state.parked_agents.contains("session"),
             "the old idle agent was retired, not reused"
         );
+    }
+
+    /// The three things the sleep alert requires of the session `/sleep` ran in.
+    fn assert_greeting_requirements(body: &str) {
+        for required in [
+            "wish them good night",
+            "what you are working on now",
+            "what you will keep pushing forward",
+            "through ask_user now, all in one go",
+            "need a few answers first",
+        ] {
+            assert!(body.contains(required), "the alert asks: {required}");
+        }
+    }
+
+    /// `/sleep` on a session whose turn is running succeeds and is taken by
+    /// the session's next request, carrying the same requirements.
+    #[tokio::test]
+    async fn sleep_on_a_busy_session_reaches_its_next_request() {
+        use crate::daemon::sleep::{SleepRequest, start_sleep};
+        use skyzen::utils::{Json, State};
+
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let provider = stub_provider(vec![sse_text("Good night")]).await;
+        let unused = stub_provider(vec![sse_text("unused")]).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let state = failover_state(may_dir.path(), &provider, &unused).await;
+
+        // A turn holds the session.
+        let guard = state
+            .runtime_service
+            .runs()
+            .acquire("session")
+            .await
+            .expect("acquire run");
+        let runtime = state.runtime_service.get("session").await.expect("runtime");
+        assert!(!runtime.admits_new_request(), "the session is busy");
+
+        let Json(status) = start_sleep(
+            Json(SleepRequest {
+                session_id: "session".to_string(),
+            }),
+            State(state.clone()),
+        )
+        .await
+        .expect("/sleep succeeds on a busy session");
+        assert!(status.asleep);
+        let runtime = state.runtime_service.get("session").await.expect("runtime");
+        assert!(runtime.has_pending_messages(), "/sleep waits for the turn");
+
+        // The running turn ends and the session takes the pending message.
+        tokio::spawn(super::dispatch_follow_ups(state.clone(), guard));
+        let body = body_containing(&provider, "/sleep").await;
+        assert_greeting_requirements(&body);
+    }
+
+    /// `/sleep` starts a turn in the session it ran in, whose request carries
+    /// the sleep alert with the three things the agent must do; another
+    /// session is told only that the user sleeps, once, at its next turn,
+    /// and the wake reaches both.
+    #[tokio::test]
+    async fn sleep_starts_a_turn_whose_alert_asks_for_the_good_night() {
+        use crate::daemon::sleep::{SleepRequest, end_sleep, start_sleep};
+        use crate::ui_event_bus::UiEventTopics;
+        use skyzen::utils::{Json, State};
+
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let provider = stub_provider(vec![sse_text("Good night")]).await;
+        let unused = stub_provider(vec![sse_text("unused")]).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let state = failover_state(may_dir.path(), &provider, &unused).await;
+        state
+            .db()
+            .create_session("other", Some("other"), Some("a::gpt-4o"))
+            .await
+            .expect("second session");
+        let mut events = state.ui_event_bus.subscribe();
+
+        let Json(status) = start_sleep(
+            Json(SleepRequest {
+                session_id: "session".to_string(),
+            }),
+            State(state.clone()),
+        )
+        .await
+        .expect("/sleep starts");
+        assert!(status.asleep);
+        assert_eq!(status.origin.as_deref(), Some("session"));
+        assert!(
+            events
+                .recv()
+                .await
+                .expect("a sleep event")
+                .contains(UiEventTopics::SLEEP),
+            "clients hear of the state on the event stream"
+        );
+
+        // The turn started by the command carries the alert.
+        let body = last_body(&provider, 1).await.to_lowercase();
+        assert_greeting_requirements(&body);
+        assert!(body.contains("/sleep"), "the user's command opens the turn");
+
+        // Another session hears of it at its next turn, without the greeting.
+        super::start_prompt_turn(
+            &state,
+            ChatRequest {
+                session_id: "other".to_string(),
+                content: "hello".to_string(),
+                attachments: Vec::new(),
+                hidden_context_xml: None,
+                delivery_mode: crate::session::PendingUserMessageMode::default(),
+                pending_entry_id: None,
+            },
+        )
+        .await
+        .expect("the other session's turn starts");
+        let other = body_containing(&provider, "hello").await;
+        assert!(other.contains("the user is going to sleep"));
+        assert!(!other.contains("wish them good night"));
+
+        // Nobody reads suggestions while the user sleeps.
+        assert!(!super::suggest::suggestions_allowed(&state));
+
+        // Waking (`/sleep off`) reaches the sessions that were told.
+        let Json(status) = end_sleep(State(state.clone())).await.expect("/sleep off");
+        assert!(!status.asleep);
+        assert!(super::suggest::suggestions_allowed(&state));
+        wait_until_idle(&state, "other").await;
+        super::start_prompt_turn(
+            &state,
+            ChatRequest {
+                session_id: "other".to_string(),
+                content: "good morning".to_string(),
+                attachments: Vec::new(),
+                hidden_context_xml: None,
+                delivery_mode: crate::session::PendingUserMessageMode::default(),
+                pending_entry_id: None,
+            },
+        )
+        .await
+        .expect("the next turn starts");
+        let woke = body_containing(&provider, "good morning").await;
+        assert!(woke.contains("the user is awake again"), "{woke}");
+
+        // The health reminder is raised for the user and reaches no agent.
+        let now = jiff::Timestamp::now();
+        state.db().record_sleep(now).await.expect("sleep log");
+        assert!(
+            state
+                .sleep
+                .remind_if_due(now, &jiff::tz::TimeZone::UTC)
+                .await
+                .expect("reminder")
+        );
+        wait_until_idle(&state, "other").await;
+        super::start_prompt_turn(
+            &state,
+            ChatRequest {
+                session_id: "other".to_string(),
+                content: "third".to_string(),
+                attachments: Vec::new(),
+                hidden_context_xml: None,
+                delivery_mode: crate::session::PendingUserMessageMode::default(),
+                pending_entry_id: None,
+            },
+        )
+        .await
+        .expect("the third turn starts");
+        let third = body_containing(&provider, "third").await;
+        assert!(!third.contains("get some rest"));
+        assert!(!third.contains("usually go to sleep"));
+        assert!(!third.contains("time to rest"));
     }
 
     /// A queued entry that carries only hidden context (an agent message)

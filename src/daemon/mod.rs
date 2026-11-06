@@ -37,6 +37,7 @@ mod server;
 #[cfg(test)]
 mod session_directory_tests;
 mod sessions;
+mod sleep;
 mod state;
 mod tasks;
 mod terminal_parsing;
@@ -433,6 +434,7 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
     };
     extra.reconcile(&config.daemon.listen).await;
     chat::watch_aux_settings(&state);
+    sleep::spawn_reminders(&state);
     let config_state = state.clone();
     let mut config_events = state.ui_event_bus.subscribe();
     tokio::spawn(async move {
