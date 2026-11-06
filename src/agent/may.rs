@@ -201,6 +201,9 @@ pub struct MayAgentConfig {
     pub ssh_servers: Vec<crate::config::SshServerConfig>,
     /// Optional web UI permission approver.
     pub permission_approver: Option<PermissionApprover>,
+    /// The daemon's live configuration, read when the agent publishes: the
+    /// `[issue_approval]` settings apply as they are saved.
+    pub live_config: Option<Arc<arc_swap::ArcSwap<MayConfig>>>,
     /// Discovery and messaging between main agents, when the daemon hosts
     /// the session.
     pub agent_messaging: Option<crate::agent_link::AgentMessaging>,
@@ -252,6 +255,9 @@ pub struct MayAgentConfig {
     /// Keychain secrets snapshot: injected into the session env file and
     /// listed by name in the terminal runtime context.
     pub secrets: crate::secrets::Secrets,
+    /// The rules this session imports, for a session `/import-claude` or
+    /// `/import-codex` opened.
+    pub rules_import: Option<crate::rules_import::RulesImport>,
 }
 
 /// Session-scoped inputs for [`MayAgent::from_config_with_model_and_permissions`].
@@ -281,6 +287,8 @@ pub struct MayAgentSessionInput<'a> {
     pub profile_id: Option<String>,
     /// Optional permission approver handling interactive approval.
     pub permission_approver: Option<PermissionApprover>,
+    /// The daemon's live configuration, when the session has one.
+    pub live_config: Option<Arc<arc_swap::ArcSwap<MayConfig>>>,
     /// Discovery and messaging between main agents, when the daemon hosts
     /// the session.
     pub agent_messaging: Option<crate::agent_link::AgentMessaging>,
@@ -324,6 +332,9 @@ pub struct MayAgentSessionInput<'a> {
     pub background_jobs: aither_agent::BackgroundJobPolicy,
     /// The daemon's connectivity source.
     pub connectivity: aither_connectivity::Connectivity,
+    /// The rules this session imports, for a session `/import-claude` or
+    /// `/import-codex` opened.
+    pub rules_import: Option<crate::rules_import::RulesImport>,
 }
 
 type MayAgentInner = Agent<ProviderLlm, ProviderLlm, ProviderLlm, MayHooks>;
@@ -579,14 +590,22 @@ impl MayAgent {
                 runtime_system_context.with_instruction(tag::REPO_CLONES, repo_clones);
         }
 
-        // Project rules: the launch directory's AGENTS.md is loaded into
-        // the stable prefix and nested AGENTS.md files are listed, so
-        // the agent never has to find them itself.
-        let agents_index = agents_md::discover(&config.cwd).await;
+        // Rules: the global `~/.may/AGENTS.md` and the launch directory's
+        // AGENTS.md are loaded into the stable prefix and nested AGENTS.md
+        // files are listed, so the agent never has to find them itself.
+        let global_agents_path =
+            crate::session::MayHomePaths::new(config.may_dir.clone()).global_agents_md();
+        let (global_agents, agents_index) = futures_lite::future::zip(
+            agents_md::load_global(&global_agents_path),
+            agents_md::discover(&config.cwd),
+        )
+        .await;
         let agents_label = (!is_container).then(|| config.cwd.display().to_string());
-        runtime_system_context =
-            runtime_system_context.with_agents_source(config.cwd.clone(), agents_label.as_deref());
+        runtime_system_context = runtime_system_context
+            .with_global_agents_source(global_agents_path)
+            .with_agents_source(config.cwd.clone(), agents_label.as_deref());
         let agents_blocks = build_agents_md_blocks(
+            global_agents.as_ref(),
             &agents_index,
             runtime_system_context.agents_root_source(),
             &[],
@@ -611,6 +630,11 @@ impl MayAgent {
             &session_paths.workspace_config(),
             config.db.clone(),
         )?;
+        let publish_gate = config
+            .live_config
+            .clone()
+            .zip(config.permission_approver.clone())
+            .map(|(live, approver)| super::publish_approval::PublishGate::new(live, approver));
         let ssh_authorizer_broker = config.ask_user_broker.clone();
         let imagine_config = ImagineCommandConfig {
             generator: config.image_generator.clone(),
@@ -746,6 +770,7 @@ impl MayAgent {
                 subagent_runs: subagent_runs.clone(),
                 issue_store: issue_store.clone(),
                 task_events: task_events.clone(),
+                publish_gate,
                 workspace_config: workspace.config.clone(),
                 agent_messaging,
                 languages: Some(language_guard.clone()),
@@ -753,6 +778,7 @@ impl MayAgent {
                 git: crate::host_git::HostGit::inherit(),
                 #[cfg(target_os = "macos")]
                 computer: config.computer.clone(),
+                rules_import: config.rules_import.clone(),
             },
         ))
         .await?;
@@ -888,6 +914,7 @@ impl MayAgent {
             prompt_cache_epoch,
             profile_id,
             permission_approver,
+            live_config,
             agent_messaging,
             profile_persona,
             profile_memories,
@@ -908,6 +935,7 @@ impl MayAgent {
             subagents,
             background_jobs,
             connectivity,
+            rules_import,
         } = input;
         let selector = super::provider::parse_model_selector(model)?;
         let redactor = crate::secrets::SecretRedactor::for_session(&may_dir, session_id.as_str());
@@ -983,6 +1011,7 @@ impl MayAgent {
             image_generator: resolve_image_generator_config(may_config),
             ssh_servers,
             permission_approver,
+            live_config,
             agent_messaging,
             environment,
             profile_persona,
@@ -1010,6 +1039,7 @@ impl MayAgent {
             request_parameters,
             prompt_cache_epoch,
             db,
+            rules_import,
         })
     }
 
@@ -1330,6 +1360,11 @@ impl MayAgent {
     /// Clear conversation history.
     pub fn clear_history(&mut self) {
         self.inner.clear_history();
+    }
+
+    /// Tells the agent the user's sleep state changed; one alert per change.
+    pub(crate) fn tell_sleep_notice(&mut self, notice: crate::sleep::SleepNotice) {
+        RuntimeSystemContext::push_sleep_notice(self.inner.context_mut(), notice);
     }
 
     pub(crate) async fn sync_runtime_context(&mut self) {

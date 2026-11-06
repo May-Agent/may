@@ -516,6 +516,7 @@ where
         SharedTerminalCommandConfig {
             #[cfg(target_os = "macos")]
             computer: None,
+            rules_import: None,
             llm,
             ask_flagship: None,
             ask_balanced: None,
@@ -546,6 +547,8 @@ where
             issue_store,
             // exec has no agent and so no `tasks.md` to follow its changes.
             task_events: aither_agent::TaskEvents::new(),
+            // `may exec` runs the user's own script: nobody to ask.
+            publish_gate: None,
             workspace_config: may_agent::workspace::WorkspaceConfig::load(
                 &session_paths.workspace_config(),
             )

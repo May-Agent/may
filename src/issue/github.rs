@@ -146,6 +146,89 @@ impl<T: GitHubTokenSource> GitHubRest<T> {
             Err(error) => Err(IssueError::GitHub(error.to_string())),
         }
     }
+
+    /// The login the token authenticates as.
+    ///
+    /// # Errors
+    /// Fails on token, transport or status errors.
+    pub async fn viewer_login(&self) -> Result<String, IssueError> {
+        let user = self
+            .request(Method::GET, format!("{}/user", self.api_base), None)
+            .await?
+            .into_json::<GhUser>()
+            .await
+            .map_err(|error| IssueError::GitHub(error.to_string()))?;
+        Ok(user.login)
+    }
+
+    /// Whether the authenticated user owns `repository`: the owner's login
+    /// is theirs, or they hold admin permission on it.
+    ///
+    /// # Errors
+    /// Fails on token, transport or status errors, a missing repository
+    /// included: a failed lookup never counts as owned.
+    pub async fn repository_owned(
+        &self,
+        repository: &GitHubRepository,
+    ) -> Result<bool, IssueError> {
+        let url = format!("{}/repos/{repository}", self.api_base);
+        let (viewer, details) = futures_lite::future::try_zip(self.viewer_login(), async {
+            self.request(Method::GET, url, None)
+                .await?
+                .into_json::<GhRepository>()
+                .await
+                .map_err(|error| IssueError::GitHub(error.to_string()))
+        })
+        .await?;
+        Ok(details.owner.login.eq_ignore_ascii_case(&viewer)
+            || details.permissions.is_some_and(|p| p.admin))
+    }
+
+    /// Whether the authenticated user's account opened issue or pull
+    /// request `number` of `repository`. The agent publishes through that
+    /// account, so what the agent opened counts too.
+    ///
+    /// # Errors
+    /// Fails on token, transport or status errors.
+    pub async fn opened_by_viewer(
+        &self,
+        repository: &GitHubRepository,
+        number: i64,
+    ) -> Result<bool, IssueError> {
+        let url = format!("{}/repos/{repository}/issues/{number}", self.api_base);
+        let (viewer, issue) = futures_lite::future::try_zip(self.viewer_login(), async {
+            self.request(Method::GET, url, None)
+                .await
+                .map_err(|error| match error {
+                    IssueError::NotFound(_) => IssueError::NotFound(number),
+                    other => other,
+                })?
+                .into_json::<GhAuthored>()
+                .await
+                .map_err(|error| IssueError::GitHub(error.to_string()))
+        })
+        .await?;
+        Ok(issue
+            .user
+            .is_some_and(|user| user.login.eq_ignore_ascii_case(&viewer)))
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GhRepository {
+    owner: GhUser,
+    permissions: Option<GhPermissions>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GhPermissions {
+    #[serde(default)]
+    admin: bool,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GhAuthored {
+    user: Option<GhUser>,
 }
 
 /// GitHub issues backend for one repository.
@@ -290,6 +373,14 @@ impl<T: GitHubTokenSource> IssueStore for GitHubIssueStore<T> {
 
     fn search_key(&self) -> String {
         format!("github:{}", self.repository)
+    }
+
+    async fn owned_by_user(&self) -> Result<bool, IssueError> {
+        self.rest.repository_owned(&self.repository).await
+    }
+
+    async fn opened_by_user(&self, number: i64) -> Result<bool, IssueError> {
+        self.rest.opened_by_viewer(&self.repository, number).await
     }
 
     async fn updated_since(
@@ -750,7 +841,7 @@ mod tests {
     use hyper_util::rt::TokioIo;
 
     use super::*;
-    use crate::issue::IssueListState;
+    use crate::issue::{IssueKind, IssueListState};
 
     #[derive(Debug, Clone)]
     struct StaticToken;
@@ -1350,6 +1441,141 @@ mod tests {
             next_page_url("<https://api.github.com/x?page=1>; rel=\"prev\""),
             None
         );
+    }
+
+    /// A mock API where the authenticated user is `me` and repository `o/r`
+    /// has the given owner and admin permission; issue 5 was opened by
+    /// `thread_author`.
+    async fn ownership_api(
+        owner: &'static str,
+        admin: bool,
+        thread_author: &'static str,
+    ) -> String {
+        mock_api(move |method, path, _body| match (method, path) {
+            ("GET", "/user") => (200, serde_json::json!({"login": "me"})),
+            ("GET", "/repos/o/r") => (
+                200,
+                serde_json::json!({"owner": {"login": owner}, "permissions": {"admin": admin}}),
+            ),
+            ("GET", "/repos/o/r/issues/5") => {
+                let mut issue = gh_issue_json(5, "thread", "open");
+                issue["user"] = serde_json::json!({"login": thread_author});
+                (200, issue)
+            }
+            _ => panic!("unexpected request {method} {path}"),
+        })
+        .await
+        .0
+    }
+
+    #[tokio::test]
+    async fn a_repository_is_owned_by_its_owner_login_or_admin_permission() {
+        for (owner, admin, owned) in [
+            ("me", false, true),
+            ("ME", false, true),
+            ("org", true, true),
+            ("org", false, false),
+        ] {
+            let api_base = ownership_api(owner, admin, "x").await;
+            assert_eq!(
+                store(&api_base).owned_by_user().await.expect("lookup"),
+                owned,
+                "owner {owner} admin {admin}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_ownership_lookup_is_an_error_never_owned() {
+        let (api_base, _requests) = mock_api(|_method, path, _body| match path {
+            "/user" => (200, serde_json::json!({"login": "me"})),
+            _ => (500, serde_json::json!({"message": "boom"})),
+        })
+        .await;
+        assert!(store(&api_base).owned_by_user().await.is_err());
+        let (api_base, _requests) =
+            mock_api(|_method, _path, _body| (404, serde_json::json!({"message": "Not Found"})))
+                .await;
+        assert!(store(&api_base).owned_by_user().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_thread_is_the_users_when_their_account_opened_it() {
+        let api_base = ownership_api("org", false, "me").await;
+        assert!(store(&api_base).opened_by_user(5).await.expect("lookup"));
+        let api_base = ownership_api("org", false, "someone").await;
+        assert!(!store(&api_base).opened_by_user(5).await.expect("lookup"));
+    }
+
+    fn gate(timeout: std::time::Duration) -> crate::agent::publish_approval::PublishGate {
+        crate::agent::publish_approval::PublishGate::new(
+            Arc::new(arc_swap::ArcSwap::from_pointee(
+                crate::config::MayConfig::default(),
+            )),
+            crate::agent::permission::PermissionApprover::new()
+                .with_approval_timeout(timeout)
+                .for_session("session-1"),
+        )
+    }
+
+    #[tokio::test]
+    async fn the_gate_holds_publishing_on_an_external_repository() {
+        let short = std::time::Duration::from_millis(60);
+        let external = store(&ownership_api("org", false, "someone").await);
+        let gate = gate(short);
+
+        for kind in [IssueKind::Bug, IssueKind::Feature, IssueKind::Performance] {
+            let error = gate
+                .approve_issue(&external, kind, "t", &[], "b")
+                .await
+                .expect_err("an unanswered external issue is denied");
+            assert!(matches!(error, IssueError::ApprovalDenied(_)), "{error:?}");
+        }
+        gate.approve_comment(&external, 5, "hi")
+            .await
+            .expect_err("an unanswered external comment is denied");
+        let repository: GitHubRepository = "o/r".parse().expect("repository");
+        gate.approve_pull_request(&external.rest, &repository, "t", "b")
+            .await
+            .expect_err("an unanswered external pull request is denied");
+    }
+
+    #[tokio::test]
+    async fn the_gate_lets_the_user_comment_on_their_own_thread_of_an_external_repository() {
+        let own_thread = store(&ownership_api("org", false, "me").await);
+        gate(std::time::Duration::from_secs(30))
+            .approve_comment(&own_thread, 5, "hi")
+            .await
+            .expect("no prompt for a thread the user's account opened");
+    }
+
+    #[tokio::test]
+    async fn the_gate_asks_nothing_for_an_owned_repository_beyond_the_kind_entry() {
+        let owned = store(&ownership_api("me", false, "someone").await);
+        let slow = gate(std::time::Duration::from_secs(30));
+        let repository: GitHubRepository = "o/r".parse().expect("repository");
+        let quick = std::time::Duration::from_millis(500);
+        tokio::time::timeout(quick, async {
+            slow.approve_issue(&owned, IssueKind::Bug, "t", &[], "b")
+                .await
+                .expect("bug");
+            slow.approve_issue(&owned, IssueKind::Performance, "t", &[], "b")
+                .await
+                .expect("performance");
+            slow.approve_comment(&owned, 5, "hi")
+                .await
+                .expect("comment");
+            slow.approve_pull_request(&owned.rest, &repository, "t", "b")
+                .await
+                .expect("pull request");
+        })
+        .await
+        .expect("nothing was asked");
+        // A feature issue on an owned repository is approved when nobody answers.
+        gate(std::time::Duration::from_millis(60))
+            .approve_issue(&owned, IssueKind::Feature, "t", &[], "b")
+            .await
+            .expect("auto approves");
     }
 
     #[tokio::test]

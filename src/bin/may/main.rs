@@ -127,15 +127,38 @@ fn main() -> anyhow::Result<()> {
         .block_on(async_main())
 }
 
+/// Points this process's stderr at `path`, appending, so panics and the
+/// error `main` returns land there too.
+fn redirect_stderr(path: &std::path::Path) -> anyhow::Result<()> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("open the stderr log {}", path.display()))?;
+    rustix::stdio::dup2_stderr(&file)
+        .with_context(|| format!("redirect stderr to {}", path.display()))?;
+    Ok(())
+}
+
 async fn async_main() -> anyhow::Result<()> {
     let _ = try_init_global_executor(TokioGlobal);
     ensure_rustls_provider();
 
     let cli_mode = parse_cli_mode_from_env();
-    // The daemon's stderr is its log file; its diagnostics go there too.
+    if let CliMode::ComputerAgent {
+        stderr: Some(path), ..
+    } = &cli_mode
+    {
+        redirect_stderr(path)?;
+    }
+    // The daemon's and the helper's stderr is their log file; their
+    // diagnostics go there too.
     let is_server_mode = matches!(
         cli_mode,
-        CliMode::Ui(_) | CliMode::Rest(_) | CliMode::Daemon(cli::DaemonCommand::Run)
+        CliMode::Ui(_)
+            | CliMode::Rest(_)
+            | CliMode::Daemon(cli::DaemonCommand::Run)
+            | CliMode::ComputerAgent { .. }
     );
 
     // Diagnostics live in a bounded in-memory ring; `/bug` and the panic
@@ -230,7 +253,7 @@ async fn async_main() -> anyhow::Result<()> {
             .await;
         }
         CliMode::Daemon(command) => return run_daemon_command(command).await,
-        CliMode::ComputerAgent(may_dir) => {
+        CliMode::ComputerAgent { may_dir, .. } => {
             #[cfg(target_os = "macos")]
             {
                 return may_agent::computer::agent::serve(&may_dir)
@@ -1424,6 +1447,21 @@ where
                             build: runtime_deps.begin_load_session(app, worker, &id).await?,
                         });
                     }
+                    Some(SendAction::RulesImport(source)) => {
+                        match runtime_deps.begin_rules_import(app, worker, source).await {
+                            Ok(Some(build)) => {
+                                held_turn = None;
+                                worker_build = Some(WorkerBuild {
+                                    purpose: WorkerBuildPurpose::Session,
+                                    build,
+                                });
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                app.chat.push_error(&format!("{error}"));
+                            }
+                        }
+                    }
                     Some(SendAction::ResumeImport { source, query }) => {
                         match runtime_deps
                             .begin_import_session(app, worker, source, &query)
@@ -1744,6 +1782,33 @@ where
                                         "Yolo off: approval requests ask again"
                                     }),
                                     Err(error) => app.chat.push_error(&error.to_string()),
+                                }
+                            }
+                            _ => app.chat.push_notice("No session is attached"),
+                        }
+                    }
+                    Some(action @ (SendAction::Sleep | SendAction::Wake)) => {
+                        let session_id = app
+                            .session_manager
+                            .current()
+                            .map(|session| session.id.clone());
+                        match (runtime_deps.daemon(), session_id) {
+                            (Some(client), Some(session_id)) => {
+                                // The `sleep` event updates the screen; the
+                                // turn `/sleep` starts follows as any
+                                // other client's turn.
+                                let posted = if matches!(action, SendAction::Sleep) {
+                                    client
+                                        .post::<_, serde_json::Value>(
+                                            "/api/sleep",
+                                            &serde_json::json!({ "sessionId": session_id.as_str() }),
+                                        )
+                                        .await
+                                } else {
+                                    client.delete::<serde_json::Value>("/api/sleep").await
+                                };
+                                if let Err(error) = posted {
+                                    app.chat.push_error(&error.to_string());
                                 }
                             }
                             _ => app.chat.push_notice("No session is attached"),
@@ -2938,7 +3003,7 @@ async fn run_daemon_command(command: cli::DaemonCommand) -> anyhow::Result<()> {
     match command {
         cli::DaemonCommand::Run => may_agent::daemon::run_daemon(DaemonOptions::new()).await,
         cli::DaemonCommand::Install => {
-            let path = lifecycle::install(&paths)?;
+            let path = lifecycle::install(&paths).await?;
             eprintln!(
                 "Installed the May daemon as a login service: {}",
                 path.display()
@@ -2946,7 +3011,7 @@ async fn run_daemon_command(command: cli::DaemonCommand) -> anyhow::Result<()> {
             Ok(())
         }
         cli::DaemonCommand::Uninstall => {
-            match lifecycle::uninstall()? {
+            match lifecycle::uninstall().await? {
                 Some(path) => eprintln!("Removed the May daemon login service: {}", path.display()),
                 None => eprintln!("The May daemon is not installed as a login service."),
             }

@@ -2,8 +2,8 @@
 //!
 //! Instruction blocks come first, one per concern, each rendered from its own
 //! typed template under `templates/prompt/` and wrapped in a tag named after
-//! its slot. External content (memory, a repository's `AGENTS.md`, the
-//! approved workspace directories) comes last, in aither's provenance-labelled
+//! its slot. External content (memory, the global `~/.may/AGENTS.md`, a
+//! repository's `AGENTS.md`, the approved workspace directories) comes last, in aither's provenance-labelled
 //! blocks whose boundary their content cannot close.
 //!
 //! [`RuntimeSystemContext`] holds every block May writes and reconciles them
@@ -23,7 +23,7 @@ use askama::Template;
 use async_fs;
 
 use super::may::{AgentEnvironment, MayAgentError};
-use crate::agent::agents_md::{self, AgentsIndex, HandoffAgentDoc};
+use crate::agent::agents_md::{self, AgentsIndex, HandoffAgentDoc, RulesDocument};
 use crate::config::{SshServerConfig, TimeZoneName};
 use crate::network_policy::{CompiledNetworkPolicy, NetworkPolicyMode};
 use crate::session::{SessionPaths, SessionPlanState};
@@ -54,6 +54,7 @@ pub mod tag {
 
     pub const MEMORY: ExternalSlot = ExternalSlot::new("memory");
     pub const PROFILE_MEMORIES: ExternalSlot = ExternalSlot::new("profile_memories");
+    pub const GLOBAL_AGENTS_MD: ExternalSlot = ExternalSlot::new("global_agents_md");
     pub const AGENTS_MD: ExternalSlot = ExternalSlot::new("agents_md");
     pub const HANDOFF_AGENTS_MD: ExternalSlot = ExternalSlot::new("handoff_agents_md");
     pub const WORKSPACE_WORKDIRS: ExternalSlot = ExternalSlot::new("workspace_workdirs");
@@ -108,6 +109,7 @@ pub mod tag {
             [
                 MEMORY,
                 PROFILE_MEMORIES,
+                GLOBAL_AGENTS_MD,
                 AGENTS_MD,
                 HANDOFF_AGENTS_MD,
                 WORKSPACE_WORKDIRS,
@@ -118,6 +120,8 @@ pub mod tag {
 
 /// Where memory lives as the shell sees it, the source label of its block.
 const MEMORY_SOURCE: &str = "~/.may/memories/MEMORY.md";
+/// The source label of the global rules block.
+const GLOBAL_AGENTS_SOURCE: &str = "~/.may/AGENTS.md";
 const PROFILE_MEMORIES_SOURCE: &str = "profile memories extracted from past sessions";
 const WORKDIRS_SOURCE: &str = "approved workspace directories";
 const HANDOFF_AGENTS_SOURCE: &str = "AGENTS.md files linked from the compaction handoff";
@@ -135,6 +139,8 @@ pub struct RuntimeSystemContext {
     /// first scan establishes a silent baseline.
     memories_snapshot: Option<HashMap<String, String>>,
     last_memory_content: String,
+    /// The global rules file, re-read every turn.
+    global_agents_path: Option<PathBuf>,
     agents_workdir: Option<PathBuf>,
     agents_root_source: String,
     agents: AgentsMdBlocks,
@@ -151,6 +157,7 @@ impl RuntimeSystemContext {
             memory_path,
             memories_snapshot: None,
             last_memory_content: memory_content,
+            global_agents_path: None,
             agents_workdir: None,
             agents_root_source: agents_md_source(None),
             agents: AgentsMdBlocks::default(),
@@ -198,6 +205,13 @@ impl RuntimeSystemContext {
         self
     }
 
+    /// Marks the global rules file, so [`Self::sync_agents_md`] re-reads it
+    /// every turn.
+    pub(crate) fn with_global_agents_source(mut self, path: PathBuf) -> Self {
+        self.global_agents_path = Some(path);
+        self
+    }
+
     /// The source label of the launch directory's `AGENTS.md` block.
     pub(crate) fn agents_root_source(&self) -> &str {
         &self.agents_root_source
@@ -219,6 +233,7 @@ impl RuntimeSystemContext {
         builder = builder.external_content(&tag::MEMORY, self.memory_block());
         for (slot, block) in [
             (&tag::PROFILE_MEMORIES, &self.profile_memories),
+            (&tag::GLOBAL_AGENTS_MD, &self.agents.global),
             (&tag::AGENTS_MD, &self.agents.root),
             (&tag::HANDOFF_AGENTS_MD, &self.agents.handoff),
             (&tag::WORKSPACE_WORKDIRS, &self.workdirs),
@@ -249,6 +264,7 @@ impl RuntimeSystemContext {
         context.update_live(&AGENTS_MD_CONTENT, |update| {
             update
                 .instruction(&tag::PROJECT_RULES, self.agents.rules.clone())
+                .external(&tag::GLOBAL_AGENTS_MD, self.agents.global.clone())
                 .external(&tag::AGENTS_MD, self.agents.root.clone())
                 .external(&tag::HANDOFF_AGENTS_MD, self.agents.handoff.clone());
         });
@@ -266,13 +282,20 @@ impl RuntimeSystemContext {
         }
     }
 
-    /// Refreshes the `AGENTS.md` blocks: rescans the launch directory and,
-    /// when the active handoff changed, reloads the `AGENTS.md` files it
-    /// links to. The reconcile stages any difference with a diff alert,
-    /// so the cached prefix stays warm until reassembly folds it in.
+    /// Refreshes the `AGENTS.md` blocks: re-reads the global rules, rescans
+    /// the launch directory and, when the active handoff changed, reloads
+    /// the `AGENTS.md` files it links to. The reconcile stages any difference
+    /// with a diff alert, so the cached prefix stays warm until reassembly
+    /// folds it in.
     pub(crate) async fn sync_agents_md(&mut self, handoff: Option<&str>) {
         let workdir = self.agents_workdir.clone();
         let reload = handoff != self.last_handoff.as_deref();
+        let global_fut = async {
+            match &self.global_agents_path {
+                Some(path) => agents_md::load_global(path).await,
+                None => None,
+            }
+        };
         let index_fut = async {
             match &workdir {
                 Some(dir) => agents_md::discover(dir).await,
@@ -288,13 +311,19 @@ impl RuntimeSystemContext {
                 None => Vec::new(),
             }
         };
-        let (index, docs) = futures_lite::future::zip(index_fut, docs_fut).await;
+        let ((global, index), docs) =
+            futures_lite::future::zip(futures_lite::future::zip(global_fut, index_fut), docs_fut)
+                .await;
         if reload {
             self.last_handoff = handoff.map(str::to_string);
             self.handoff_agents = docs;
         }
-        self.agents =
-            build_agents_md_blocks(&index, &self.agents_root_source, &self.handoff_agents);
+        self.agents = build_agents_md_blocks(
+            global.as_ref(),
+            &index,
+            &self.agents_root_source,
+            &self.handoff_agents,
+        );
     }
 
     /// Re-read the memory index and watch the whole memories directory,
@@ -393,20 +422,52 @@ struct MemoriesChanges {
     files: Vec<String>,
 }
 
+/// Durable alert telling the agent the user fell asleep; `greet` is set in
+/// the session that ran `/sleep`.
+#[derive(Template)]
+#[template(path = "alert_sleep.txt", escape = "none")]
+pub struct SleepAlert {
+    greet: bool,
+}
+
+/// Durable alert telling the agent the user woke.
+#[derive(Template)]
+#[template(path = "alert_wake.txt", escape = "none")]
+pub struct WakeAlert;
+
+impl RuntimeSystemContext {
+    /// Records what the user's sleep state changed to as a durable alert.
+    pub(crate) fn push_sleep_notice(
+        context: &mut aither_agent::Context,
+        notice: crate::sleep::SleepNotice,
+    ) {
+        match notice {
+            crate::sleep::SleepNotice::Asleep { greet } => {
+                context.push_alert(&SleepAlert { greet });
+            }
+            crate::sleep::SleepNotice::Woke => {
+                context.push_alert(&WakeAlert);
+            }
+        }
+    }
+}
+
 /// The memory index, announced by name when it changes mid-session.
 const MEMORY_CONTENT: LiveContent = LiveContent::new("MEMORY.md", "memory_diff");
 
-/// The `AGENTS.md` blocks (the rules on how to treat them, the launch
-/// directory's own file and the files the handoff linked), announced
-/// together when any of them changes mid-session.
-const AGENTS_MD_CONTENT: LiveContent =
-    LiveContent::new("The launch directory's AGENTS.md files", "agents_md_diff");
+/// The `AGENTS.md` blocks (the rules on how to treat them, the global rules,
+/// the launch directory's own file and the files the handoff linked),
+/// announced together when any of them changes mid-session.
+const AGENTS_MD_CONTENT: LiveContent = LiveContent::new("The AGENTS.md files", "agents_md_diff");
 
-/// The blocks a launch directory's `AGENTS.md` files produce.
+/// The blocks the global rules and a launch directory's `AGENTS.md` files
+/// produce.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AgentsMdBlocks {
-    /// How to treat the files: the nested list, a cut root, handoff links.
+    /// How to treat the files: the nested list, a cut file, handoff links.
     rules: Option<String>,
+    /// The global rules, `~/.may/AGENTS.md`.
+    global: Option<ExternalContent>,
     /// The launch directory's own `AGENTS.md`.
     root: Option<ExternalContent>,
     /// The `AGENTS.md` files the compaction handoff linked.
@@ -424,6 +485,7 @@ fn agents_md_source(launch_dir: Option<&str>) -> String {
 #[derive(Template)]
 #[template(path = "prompt/project_rules.md", escape = "none")]
 struct ProjectRulesTemplate<'a> {
+    global_truncated: bool,
     truncated_root: Option<&'a str>,
     nested: &'a [String],
     extra_nested: usize,
@@ -435,18 +497,24 @@ struct HandoffAgentsTemplate<'a> {
     documents: &'a [HandoffAgentDoc],
 }
 
-/// Builds the `AGENTS.md` blocks from the launch-directory scan and the
-/// documents the active compaction handoff linked; `root_source` labels the
-/// launch directory's own file.
+/// Builds the `AGENTS.md` blocks from the global rules, the launch-directory
+/// scan and the documents the active compaction handoff linked;
+/// `root_source` labels the launch directory's own file.
 pub fn build_agents_md_blocks(
+    global: Option<&RulesDocument>,
     index: &AgentsIndex,
     root_source: &str,
     handoff_documents: &[HandoffAgentDoc],
 ) -> AgentsMdBlocks {
-    if index.root_document.is_none() && index.nested.is_empty() && handoff_documents.is_empty() {
+    if global.is_none()
+        && index.root_document.is_none()
+        && index.nested.is_empty()
+        && handoff_documents.is_empty()
+    {
         return AgentsMdBlocks::default();
     }
     let rules = ProjectRulesTemplate {
+        global_truncated: global.is_some_and(|document| document.truncated),
         truncated_root: (index.root_document.is_some() && index.root_truncated)
             .then_some(root_source),
         nested: &index.nested,
@@ -464,6 +532,9 @@ pub fn build_agents_md_blocks(
     });
     AgentsMdBlocks {
         rules: Some(rules),
+        global: global.map(|document| {
+            ExternalContent::repository_instructions(GLOBAL_AGENTS_SOURCE, &document.content)
+        }),
         root: index
             .root_document
             .as_ref()

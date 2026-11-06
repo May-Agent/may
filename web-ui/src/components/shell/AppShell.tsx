@@ -8,6 +8,7 @@ import { useNewChat } from '@/lib/useNewChat';
 import { INSPECTOR_COLUMN_QUERY, SIDEBAR_COLUMN_QUERY, useMediaQuery } from '@/lib/useMediaQuery';
 import { useTranslation } from '@/lib/i18n';
 import { CommandPalette } from './CommandPalette';
+import { SleepNotices } from './SleepNotices';
 import { BrowserViewer } from '@/components/browser/BrowserViewer';
 import { ComputerViewer } from '@/components/computer/ComputerViewer';
 import { TooltipProvider } from '@/components/ui/tooltip';
@@ -114,6 +115,7 @@ export function AppShell() {
         <ComputerViewer />
         <InteractionLayer />
         <CommandPalette />
+        <SleepNotices />
         <Toaster theme={toasterTheme} closeButton position="top-right" />
       </div>
     </TooltipProvider>

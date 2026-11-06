@@ -284,7 +284,7 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
         tool_dispatchers,
         fetched_models_cache: super::state::RefreshableCache::new(Duration::from_secs(20)),
         config: config.clone(),
-        ui_event_bus,
+        ui_event_bus: ui_event_bus.clone(),
         container_prepare,
         container_manager,
         browser_manager: arc_swap::ArcSwapOption::from(browser_manager),
@@ -292,6 +292,11 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
         browser_lifecycle_tx,
         computer: Arc::new(crate::computer::ComputerAgent::new(may_dir.clone(), config)),
         remote_access_manager,
+        sleep: Arc::new(crate::sleep::SleepState::load(
+            &may_dir,
+            ui_event_bus.clone(),
+            db_for_archive.clone(),
+        )),
         notification_service: notification_service.clone(),
         memory_processor,
         local_url_port_mapper: Arc::new(super::local_url_mapper::LocalUrlPortMapper::new()),
@@ -404,6 +409,7 @@ fn api_routes() -> Route {
         list_sessions, lookup_issues, rewind_session, save_session_tasks, set_session_plan_state,
         set_session_yolo, update_session,
     };
+    use super::sleep::{end_sleep, get_sleep, start_sleep};
     use super::tasks::{
         approve_task, create_task, delete_task, get_task, invoke_webhook_task, list_tasks,
         run_task, update_task,
@@ -541,6 +547,7 @@ fn api_routes() -> Route {
                 "/install".post(install_skill),
                 "/{dir}".delete(delete_skill),
             ))),
+            "/rules/import".post(super::rules_import::import_rules),
             "/tasks".route(Route::new((
                 "".at(list_tasks),
                 "".post(create_task),
@@ -569,6 +576,11 @@ fn api_routes() -> Route {
                 "/viewport".post(browser_resize_viewport),
                 "/takeover/start".post(browser_takeover_start),
                 "/takeover/stop".post(browser_takeover_stop),
+            ))),
+            "/sleep".route(Route::new((
+                "".at(get_sleep),
+                "".post(start_sleep),
+                "".delete(end_sleep),
             ))),
             "/remote-access".route(Route::new((
                 "/status".at(get_remote_access_status),

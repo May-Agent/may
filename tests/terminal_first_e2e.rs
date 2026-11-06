@@ -2878,7 +2878,7 @@ async fn issue_changes_are_recorded_and_gh_credentials_are_unreadable_from_the_s
         "sandboxed",
         &bin,
         work.path(),
-        "issue create 'from exec' --body body && issue comment 1 hello && issue close 1",
+        "issue create bug 'from exec' --body body && issue comment 1 hello && issue close 1",
     )
     .await;
     assert!(

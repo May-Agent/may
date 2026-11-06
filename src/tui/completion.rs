@@ -55,6 +55,11 @@ pub static SLASH_COMMANDS: &[(&str, &str)] = &[
         "Toggle granting every approval request in this session",
     ),
     (
+        "/sleep",
+        "Tell every session you are asleep: agents keep working and collect questions",
+    ),
+    ("/sleep off", "End the sleep state"),
+    (
         "/btw",
         "Ask a side question without touching conversation history",
     ),
@@ -66,6 +71,11 @@ pub static SLASH_COMMANDS: &[(&str, &str)] = &[
         "/resume-claude",
         "Import a Claude Code session (opens picker)",
     ),
+    (
+        "/import-claude",
+        "Import Claude Code's global rules and skills",
+    ),
+    ("/import-codex", "Import Codex's global rules and skills"),
     (
         "/secret",
         "Store a secret in the OS keychain (injected into shell env)",

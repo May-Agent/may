@@ -228,6 +228,9 @@ pub enum IssueError {
     /// the refusal template.
     #[error("{0}")]
     Reserved(String),
+    /// The user's approval for publishing was denied or could not be asked.
+    #[error("{0}")]
+    ApprovalDenied(String),
     /// Workspace configuration could not be read.
     #[error(transparent)]
     WorkspaceConfig(#[from] WorkspaceConfigError),
@@ -240,6 +243,32 @@ pub enum IssueError {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+}
+
+/// What an issue is about, which decides whether creating it needs approval.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum IssueKind {
+    /// Something behaves wrongly.
+    Bug,
+    /// New or changed functionality.
+    Feature,
+    /// Something is slower or heavier than it should be.
+    Performance,
+}
+
+impl IssueKind {
+    /// The kind as typed on the command line.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bug => "bug",
+            Self::Feature => "feature",
+            Self::Performance => "performance",
+        }
+    }
 }
 
 /// Backend identity surfaced to the base system prompt.
@@ -262,6 +291,15 @@ pub trait IssueStore: Send + Sync + fmt::Debug {
 
     /// Stable name of this backend's issue set, keying its search index.
     fn search_key(&self) -> String;
+
+    /// Whether the user owns the repository the issues live in: its owner's
+    /// login is the user's, or the user has admin permission on it. A failed
+    /// lookup is an error, never "owned".
+    fn owned_by_user(&self) -> impl Future<Output = Result<bool, IssueError>> + Send;
+
+    /// Whether the user's account opened issue `number`, which is also
+    /// every issue the agent opened.
+    fn opened_by_user(&self, number: i64) -> impl Future<Output = Result<bool, IssueError>> + Send;
 
     /// Issues updated at or after `since` (every issue when `None`), oldest
     /// update first: the ones at `since` itself, then at least `limit`
@@ -355,6 +393,20 @@ impl IssueStore for ResolvedIssueStore {
         match self {
             Self::May(store) => store.search_key(),
             Self::GitHub(store) => store.search_key(),
+        }
+    }
+
+    async fn owned_by_user(&self) -> Result<bool, IssueError> {
+        match self {
+            Self::May(store) => store.owned_by_user().await,
+            Self::GitHub(store) => store.owned_by_user().await,
+        }
+    }
+
+    async fn opened_by_user(&self, number: i64) -> Result<bool, IssueError> {
+        match self {
+            Self::May(store) => store.opened_by_user(number).await,
+            Self::GitHub(store) => store.opened_by_user(number).await,
         }
     }
 

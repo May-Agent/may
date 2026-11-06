@@ -46,14 +46,18 @@ struct SuggestionFrame<'a> {
     text: Option<&'a str>,
 }
 
+/// Whether suggestions may be generated: the setting is on and the user is
+/// awake, since nobody reads them while asleep.
+pub(super) fn suggestions_allowed(state: &DaemonState) -> bool {
+    state.config.load().suggestions.enabled && !state.sleep.is_asleep()
+}
+
 /// Schedules a suggested next prompt for `session_id` after a completed
 /// turn left it idle. No-op while `[suggestions] enabled` is off or the
 /// session's prompt cache is cold; an aux task already in flight is
 /// superseded.
 pub(super) fn maybe_suggest(state: &Arc<DaemonState>, session_id: &str) {
-    if !state.config.load().suggestions.enabled
-        || super::aux::warm_cache(state, session_id).is_none()
-    {
+    if !suggestions_allowed(state) || super::aux::warm_cache(state, session_id).is_none() {
         return;
     }
     let task_state = Arc::clone(state);
@@ -68,9 +72,7 @@ pub(super) fn maybe_suggest(state: &Arc<DaemonState>, session_id: &str) {
             // setting is read live: a suggestion never appears under a
             // disabled setting.
             task_state.aux_tasks.commit(&task_session, request_id, || {
-                let text = text
-                    .as_deref()
-                    .filter(|_| task_state.config.load().suggestions.enabled);
+                let text = text.as_deref().filter(|_| suggestions_allowed(&task_state));
                 match text {
                     Some(text) => {
                         publish(&task_state, &task_session, request_id, "ready", Some(text));
@@ -86,7 +88,7 @@ pub(super) fn maybe_suggest(state: &Arc<DaemonState>, session_id: &str) {
 /// Applies the live `[suggestions]` setting: once disabled, every
 /// suggestion in flight is cancelled and its composer cleared.
 pub(super) fn apply_settings(state: &Arc<DaemonState>) {
-    if !state.config.load().suggestions.enabled {
+    if !suggestions_allowed(state) {
         state
             .aux_tasks
             .cancel_kind(super::aux::AuxKind::Suggestion, |session_id| {

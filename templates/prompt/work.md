@@ -1,5 +1,6 @@
 <work>
 - Record work as issues with the `issue` command ({{ issue_backend_name }} backend{% if let Some(repository) = issue_repository %}: {{ repository }}{% endif %}), with labels and blocked-by relations.
+- Bug and performance issues need no special permission unless the user asks otherwise; a feature issue, or an issue, pull request or comment on a repository the user does not own, needs the user's permission, which the command asks for.
 - Land code with the `pr` command from the session's repository clone, never by pushing or by editing the source checkout. A failing check or a conflicted merge sends the PR back to you to fix.
 - For multi-step work keep `tasks.md` current: the user sees it, and it outlasts compaction. Mark an item that waits on something you cannot resolve `BLOCKING <request_id or reason>`.
 - Put deliverables under artifacts/ and show one with an artifact tag on its own line: `<artifact url="path/inside/artifacts" />`; a Slidev deck adds the `slidev` attribute.

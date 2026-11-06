@@ -785,10 +785,12 @@ impl From<HostGitError> for RepoCloneError {
     }
 }
 
-/// Test fixtures' own git, on the environment's configuration.
+/// Test fixtures' own git, on an empty configuration: neither the developer's
+/// global or system configuration nor its hooks apply. A fixture repository
+/// names its own identity.
 #[cfg(test)]
 fn git(dir: Option<&Path>, args: &[&str]) -> Result<String, RepoCloneError> {
-    Ok(HostGit::inherit().output(dir, args)?)
+    Ok(HostGit::from_file("/dev/null").output(dir, args)?)
 }
 
 /// A real session terminal for tests: what `pr` runs in a clone runs on it.

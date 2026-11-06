@@ -1,0 +1,6 @@
+The user is going to sleep and will not answer for hours.
+Keep driving your tasks forward on your own. Anything that needs the user's explicit permission goes out through ask_user and waits there; do not decide it for them, and carry on with the rest of the work.
+{% if greet %}The user just ran /sleep in this session. Before carrying on:
+1. Wish them good night politely, saying what you are working on now and what you will keep pushing forward while they sleep.
+2. Send every question you were about to ask through ask_user now, all in one go, while they are still here. Tell them you want to push further overnight and need a few answers first.
+{% endif %}

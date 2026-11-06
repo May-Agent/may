@@ -69,6 +69,9 @@ pub enum PrError {
     /// A subagent called an action only the main agent has.
     #[error("`pr {0}` is the main agent's; a subagent has `pr list` and `pr show`")]
     MainAgentOnly(&'static str),
+    /// The user's approval to open the PR was refused or could not be had.
+    #[error(transparent)]
+    Publish(#[from] crate::agent::publish_approval::PublishError),
 }
 
 /// `pr`-side workspace fields the land path reads.
@@ -98,6 +101,9 @@ pub struct PrContext {
     /// The main agent's `tasks.md` inbox: told when a PR opens, merges, is
     /// rejected or closes.
     pub task_events: Option<aither_agent::TaskEvents>,
+    /// Asks the user before a PR is opened on a repository they do not own;
+    /// `None` publishes without asking.
+    pub publish: Option<crate::agent::publish_approval::PublishGate>,
 }
 
 /// Token source for the GitHub backend's REST client.
@@ -329,6 +335,15 @@ impl PrStore {
             && let Some(reason) = self.screen_outbound(&resolved.record, title, body).await?
         {
             return Err(PrError::Screened(reason));
+        }
+        if backend == "github"
+            && let (Some(gate), Some(owner_repo)) = (&self.context.publish, github_repo.as_deref())
+        {
+            let repository = owner_repo
+                .parse::<crate::workspace::GitHubRepository>()
+                .map_err(|error| PrError::Resolve(error.to_string()))?;
+            gate.approve_pull_request(&self.context.github_api, &repository, title, body)
+                .await?;
         }
         // GitHub-bound: push the session branch before recording, so the
         // row never points at a PR that failed to exist upstream.
@@ -1621,10 +1636,12 @@ fn host_git(
     Ok(host.output(dir, args)?.trim().to_string())
 }
 
-/// Test fixtures' own git, on the environment's configuration.
+/// Test fixtures' own git, on an empty configuration: neither the developer's
+/// global or system configuration nor its hooks apply. A fixture repository
+/// names its own identity.
 #[cfg(test)]
 fn git(dir: Option<&Path>, args: &[&str]) -> Result<String, crate::repo_clone::RepoCloneError> {
-    host_git(&HostGit::inherit(), dir, args)
+    host_git(&HostGit::from_file("/dev/null"), dir, args)
 }
 
 #[cfg(test)]
@@ -1752,6 +1769,7 @@ mod tests {
                     signing: self.signing(id),
                     github_api: PrContext::default_github_api(),
                     task_events: None,
+                    publish: None,
                 },
                 self.sandbox(id).await,
             );
@@ -1814,6 +1832,7 @@ mod tests {
                         base,
                     ),
                     task_events: None,
+                    publish: None,
                 },
                 self.sandbox(id).await,
             )
@@ -2202,6 +2221,7 @@ mod tests {
                 signing: fx.signing(id),
                 github_api,
                 task_events: None,
+                publish: None,
             },
             fx.sandbox(id).await,
         )

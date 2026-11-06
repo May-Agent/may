@@ -22,6 +22,7 @@ mod search_outbox;
 mod session;
 mod session_intervals;
 mod session_run;
+mod sleep_log;
 mod sql;
 mod task;
 
@@ -159,6 +160,11 @@ impl ChatDb {
             )
             .execute()
             .await?;
+        }
+        if !existing.contains("rules_import") {
+            query!(db, "ALTER TABLE sessions ADD COLUMN rules_import TEXT")
+                .execute()
+                .await?;
         }
         Ok(())
     }
