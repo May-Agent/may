@@ -148,6 +148,14 @@ async fn a_send_enqueues_the_message_and_wakes_the_recipient() {
     let xml = pending.hidden_context_xml.expect("steer delivery");
     assert!(xml.contains("main"), "the sender is named: {xml}");
     assert!(xml.contains("status?"), "the body is stored: {xml}");
+    assert!(
+        xml.contains("not from the user"),
+        "the message says it is not the user's: {xml}"
+    );
+    assert!(
+        xml.contains("agent send main <prompt-file>"),
+        "the reply route names the sender's id: {xml}"
+    );
 }
 
 /// A running recipient still gets the store+wake: the dispatch decides when
