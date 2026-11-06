@@ -19,6 +19,8 @@ use ratatui::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use super::wrap::WrappedParagraph;
+
 use ratatui::Frame;
 
 use super::super::app::{App, ImageRegion};
@@ -689,7 +691,7 @@ fn render_help_popup(frame: &mut Frame, area: Rect, scroll: u16) {
     let max_scroll = u16::try_from(HELP_TEXT.lines().count())
         .unwrap_or(u16::MAX)
         .saturating_sub(area.height.saturating_sub(2));
-    let help = Paragraph::new(HELP_TEXT)
+    let help = WrappedParagraph::new(HELP_TEXT)
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -697,8 +699,7 @@ fn render_help_popup(frame: &mut Frame, area: Rect, scroll: u16) {
                 .title("Help (↑↓ scroll · ? or Esc to close)"),
         )
         .style(Style::default().fg(Color::White))
-        .wrap(ratatui::widgets::Wrap { trim: false })
-        .scroll((scroll.min(max_scroll), 0));
+        .scroll(scroll.min(max_scroll));
 
     frame.render_widget(help, area);
 }
@@ -1080,6 +1081,21 @@ fn prompt_preview(content: &str) -> String {
     }
 }
 
+/// Second line of a job row. Only a running job shows how long it has been
+/// going: the registry records no end time, so a finished job's time since
+/// start would keep growing for as long as the row is on screen.
+fn job_row_detail(job: &aither_sandbox::JobInfo, status: &str) -> String {
+    if matches!(job.status, aither_sandbox::JobStatus::Running) {
+        format!(
+            "    {status} · {} · task {}",
+            chat::format_elapsed(job.started_at.elapsed().as_secs()),
+            job.task_id
+        )
+    } else {
+        format!("    {status} · task {}", job.task_id)
+    }
+}
+
 /// Jobs panel: bottom-anchored drawer listing running subagents and
 /// background terminal jobs.
 fn render_jobs_panel(frame: &mut Frame, area: Rect, app: &App) {
@@ -1145,11 +1161,7 @@ fn render_jobs_panel(frame: &mut Frame, area: Rect, app: &App) {
                     let cmd: String = first_line.chars().take(60).collect();
                     (
                         format!("{prefix}{icon} pid {} · {cmd}", job.pid),
-                        format!(
-                            "    {status} · {} · task {}",
-                            chat::format_elapsed(job.started_at.elapsed().as_secs()),
-                            job.task_id
-                        ),
+                        job_row_detail(job, &status),
                     )
                 }
             };
@@ -1365,9 +1377,7 @@ fn render_btw_popup(frame: &mut Frame, area: Rect, state: &BtwState) {
         }
     }
 
-    let paragraph = Paragraph::new(lines)
-        .wrap(ratatui::widgets::Wrap { trim: false })
-        .scroll((state.scroll, 0));
+    let paragraph = WrappedParagraph::new(lines).scroll(state.scroll);
     frame.render_widget(paragraph, inner);
 }
 
@@ -2037,14 +2047,12 @@ fn render_workspace_confirm(frame: &mut Frame, area: Rect, path: &str, reason: &
         ]),
     ];
 
-    let widget = Paragraph::new(content)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow))
-                .title(" Workspace Access Request "),
-        )
-        .wrap(ratatui::widgets::Wrap { trim: false });
+    let widget = WrappedParagraph::new(content).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title(" Workspace Access Request "),
+    );
 
     frame.render_widget(widget, area);
 }
@@ -2212,14 +2220,12 @@ fn render_quit_confirm(frame: &mut Frame, area: Rect) {
         ]),
     ];
 
-    let widget = Paragraph::new(content)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow))
-                .title(" Quit "),
-        )
-        .wrap(ratatui::widgets::Wrap { trim: false });
+    let widget = WrappedParagraph::new(content).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title(" Quit "),
+    );
 
     frame.render_widget(widget, area);
 }
@@ -2256,14 +2262,12 @@ fn render_permission_confirm(
         ]),
     ];
 
-    let widget = Paragraph::new(content)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::LightRed))
-                .title(" Permission Request "),
-        )
-        .wrap(ratatui::widgets::Wrap { trim: false });
+    let widget = WrappedParagraph::new(content).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::LightRed))
+            .title(" Permission Request "),
+    );
     frame.render_widget(widget, area);
 }
 
@@ -2332,13 +2336,12 @@ fn render_secret_question(
         ])
         .split(inner);
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
+        WrappedParagraph::new(Line::from(Span::styled(
             &question.question,
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
-        )))
-        .wrap(ratatui::widgets::Wrap { trim: false }),
+        ))),
         chunks[0],
     );
     let columns = UnicodeWidthStr::width(qs.custom_text.as_str());
@@ -2454,13 +2457,12 @@ fn render_ask_user(frame: &mut Frame, area: Rect, state: &AskUserState) {
         .split(inner);
 
     // Render question text
-    let q_text = Paragraph::new(Line::from(Span::styled(
+    let q_text = WrappedParagraph::new(Line::from(Span::styled(
         &question.question,
         Style::default()
             .fg(Color::White)
             .add_modifier(Modifier::BOLD),
-    )))
-    .wrap(ratatui::widgets::Wrap { trim: false });
+    )));
     frame.render_widget(q_text, chunks[0]);
 
     // Render items: options + Custom answer
@@ -2748,7 +2750,7 @@ mod tests {
     use super::super::chat_layout::ChatLayout;
     use super::super::image::{ImageState, render_image};
     use super::super::test_screen::{IMAGE_MARK, ScreenBackend, buffer_screen};
-    use super::render_inline_images;
+    use super::{job_row_detail, render_inline_images};
     use crate::tui::app::ImageRegion;
     use crate::tui::state::{AppMode, AskUserState, LaunchGrantState, RepoTrustState};
     use ratatui::Terminal;
@@ -2756,6 +2758,37 @@ mod tests {
     use ratatui::layout::Rect;
     use ratatui_image::picker::{Picker, ProtocolType};
     use std::path::PathBuf;
+
+    fn job(status: aither_sandbox::JobStatus, age_secs: u64) -> aither_sandbox::JobInfo {
+        aither_sandbox::JobInfo {
+            pid: 1,
+            task_id: "amber".to_string(),
+            execution_key: String::new(),
+            script: "true".to_string(),
+            mode: aither_sandbox::TerminalMode::default(),
+            started_at: std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(age_secs))
+                .expect("instant in range"),
+            status,
+            output_path: None,
+        }
+    }
+
+    /// A finished job's row carries no elapsed time, so it is the same on
+    /// every refresh; a running job's row still does.
+    #[test]
+    fn only_a_running_job_row_shows_elapsed_time() {
+        let done = job(
+            aither_sandbox::JobStatus::Completed {
+                exit_code: 0,
+                delivery: aither_sandbox::Delivery::Taken,
+            },
+            135,
+        );
+        assert_eq!(job_row_detail(&done, "exit 0"), "    exit 0 · task amber");
+        let running = job(aither_sandbox::JobStatus::Running, 135);
+        assert!(job_row_detail(&running, "running").contains("2m"));
+    }
 
     /// A link in a user message, drawn as the chat column draws it, is
     /// painted (underlined when hovered) on the cells the frame shows.
@@ -3200,5 +3233,140 @@ mod tests {
         assert_eq!(buf[(1, 0)].bg, super::IMAGE_VIEW_VEIL);
         assert!(buf[(0, 0)].modifier.contains(Modifier::DIM));
         assert!(buf[(1, 0)].modifier.contains(Modifier::DIM));
+    }
+
+    /// CJK text at which ratatui's own word wrapper ends rows with a
+    /// double-width glyph past the area at many widths.
+    const OVERFLOWING_CJK: &str = "x 编译整个工作区并运行所有单元测试，确认没有回归并检查代码风格";
+
+    /// Draw one frame of `render` into `area` of `terminal` and check it:
+    /// the terminal shows exactly the rendered frame, and every wide glyph
+    /// inside `area` keeps its trailing half inside `area` on a blank cell
+    /// (never on a border, a neighbour or the next row).
+    fn draw_checked(
+        terminal: &mut Terminal<ScreenBackend>,
+        area: Rect,
+        render: impl FnOnce(&mut ratatui::Frame, Rect),
+    ) {
+        let mut truth = None;
+        terminal
+            .draw(|frame| {
+                render(frame, area);
+                truth = Some(frame.buffer_mut().clone());
+            })
+            .unwrap();
+        let buf = truth.expect("frame drawn");
+        assert_eq!(terminal.backend().screen(), buffer_screen(&buf));
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                let symbol = buf[(x, y)].symbol();
+                if unicode_width::UnicodeWidthStr::width(symbol) < 2 {
+                    continue;
+                }
+                assert!(
+                    x + 1 < area.right() && buf[(x + 1, y)].symbol() == " ",
+                    "wide glyph {symbol:?} at ({x}, {y}) overflows {area:?}: {:#?}",
+                    buffer_screen(&buf)
+                );
+            }
+        }
+    }
+
+    /// A bordered popup (the workspace, quit and permission dialogs, the
+    /// help sheet) wraps its text inside the border at every width.
+    #[test]
+    fn bordered_popup_wraps_inside_its_border() {
+        for width in 12u16..=44 {
+            let mut terminal = Terminal::new(ScreenBackend::new(width, 24)).unwrap();
+            draw_checked(&mut terminal, Rect::new(0, 0, width, 24), |frame, area| {
+                super::render_workspace_confirm(
+                    frame,
+                    area,
+                    "/工作区/项目/源代码目录",
+                    OVERFLOWING_CJK,
+                );
+            });
+        }
+    }
+
+    /// The btw sheet's answer, streamed with a frame per chunk and then
+    /// scrolled, wraps inside the popup at every width.
+    #[test]
+    fn streamed_btw_answer_wraps_inside_the_popup() {
+        for width in 12u16..=44 {
+            let mut terminal = Terminal::new(ScreenBackend::new(width, 20)).unwrap();
+            let area = Rect::new(0, 0, width, 20);
+            let mut state = crate::tui::state::BtwState {
+                input: "为什么？".to_string(),
+                loading: true,
+                ..crate::tui::state::BtwState::default()
+            };
+            let mut rest = OVERFLOWING_CJK;
+            while !rest.is_empty() {
+                let split = rest.char_indices().nth(3).map_or(rest.len(), |(i, _)| i);
+                let (chunk, tail) = rest.split_at(split);
+                state.answer.push_str(chunk);
+                draw_checked(&mut terminal, area, |frame, area| {
+                    super::render_btw_popup(frame, area, &state);
+                });
+                rest = tail;
+            }
+            state.loading = false;
+            state.done = true;
+            for scroll in [1, 3, 0] {
+                state.scroll = scroll;
+                draw_checked(&mut terminal, area, |frame, area| {
+                    super::render_btw_popup(frame, area, &state);
+                });
+            }
+        }
+    }
+
+    /// An `ask_user` question, drawn without a border of its own, wraps
+    /// inside the sheet at every width.
+    #[test]
+    fn ask_user_question_wraps_inside_the_sheet() {
+        let state = AskUserState::for_open_question(crate::session::PersistedAskUserRequest {
+            id: "q1".to_string(),
+            questions: vec![crate::session::PersistedAskUserQuestion {
+                section: "构建".to_string(),
+                question: OVERFLOWING_CJK.to_string(),
+                option: vec!["继续".to_string(), "停止".to_string()],
+                multi_select: false,
+                secret: None,
+            }],
+        });
+        for width in 12u16..=44 {
+            let mut terminal = Terminal::new(ScreenBackend::new(width, 16)).unwrap();
+            draw_checked(&mut terminal, Rect::new(0, 0, width, 16), |frame, area| {
+                super::render_ask_user(frame, area, &state);
+            });
+        }
+    }
+
+    /// The full-screen tool details view wraps a command's CJK output
+    /// inside its border at every width and scroll offset.
+    #[test]
+    fn tool_details_wrap_inside_the_border() {
+        use super::super::chat::{TerminalCallInfo, ToolDisplay, ToolStatus};
+        let mut output = TerminalCallInfo::new("cargo test".to_string());
+        output.output = [OVERFLOWING_CJK; 4].join("\n");
+        let display = ToolDisplay::Terminal {
+            description: "运行测试".to_string(),
+            command: "cargo test --workspace".to_string(),
+            mode: aither_sandbox::TerminalExecutionMode::Default,
+            status: ToolStatus::Done,
+            output: Some(output),
+            diffs: Vec::new(),
+            pinned: None,
+        };
+        for width in 12u16..=44 {
+            let mut terminal = Terminal::new(ScreenBackend::new(width, 18)).unwrap();
+            for scroll in [0, 2, 5] {
+                draw_checked(&mut terminal, Rect::new(0, 0, width, 18), |frame, area| {
+                    super::super::chat::render_tool_fullscreen(frame, area, &display, scroll);
+                });
+            }
+        }
     }
 }

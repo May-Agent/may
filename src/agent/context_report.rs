@@ -13,7 +13,7 @@
 use aither_agent::{
     ContextPolicy, ContextWindowMetrics, ContextWindowPhase, Handoff, InstructionSlot,
 };
-use aither_sandbox::TerminalArgs;
+use aither_core::llm::tool::ToolDefinition;
 
 use super::runtime_context::tag;
 
@@ -102,13 +102,8 @@ pub struct ContextReport {
 /// Result of splitting the `capabilities` block, or the command table, into
 /// its marked sections.
 struct CapabilitiesCarve {
-    /// Everything outside the `<native_tools>`/`<commands>`/`<skills>`/
-    /// `<subagents>` spans.
+    /// Everything outside the `<commands>`/`<skills>`/`<subagents>` spans.
     architecture_chars: usize,
-    /// `<native_tools>` span bytes.
-    native_tool_chars: usize,
-    /// Item count in `<native_tools>`.
-    native_tool_count: usize,
     /// `<commands>` span bytes attributed to built-in commands.
     command_chars: usize,
     /// `- name: …` item lines in `<commands>` that are not MCP tools.
@@ -127,24 +122,33 @@ struct CapabilitiesCarve {
     subagent_count: usize,
 }
 
+/// The tools an agent was built with.
+pub struct ToolInventory<'a> {
+    /// The commands registered by name; every other row of the command table
+    /// is an MCP connection's tool.
+    pub named_commands: &'a [String],
+    /// The native tool definitions the agent sends with every request.
+    pub native_tools: &'a [ToolDefinition],
+}
+
 impl ContextReport {
     /// Assemble a report from the agent's live context and a
-    /// [`ContextWindowMetrics`] measured on the same state. `named_commands`
-    /// are the commands registered by name; every other row of the command
-    /// table is an MCP connection's tool.
+    /// [`ContextWindowMetrics`] measured on the same state.
     pub(crate) fn assemble(
         model_id: &str,
         provider_id: &str,
-        named_commands: &[String],
+        tools: &ToolInventory<'_>,
         context: &aither_agent::Context,
         metrics: &ContextWindowMetrics,
         phase: ContextWindowPhase,
         policy: &ContextPolicy,
     ) -> Self {
+        let ToolInventory {
+            named_commands,
+            native_tools,
+        } = tools;
         let mut system_prompt_chars = 0usize;
         let mut memory_chars = 0usize;
-        let mut native_tool_chars = 0usize;
-        let mut native_tool_count = 0usize;
         let mut command_chars = 0usize;
         let mut mcp_chars = 0usize;
         let mut command_count = 0usize;
@@ -166,8 +170,6 @@ impl ContextReport {
                 slot if *slot == tag::CAPABILITIES || *slot == InstructionSlot::COMMANDS => {
                     let carved = carve_capabilities(content, named_commands);
                     system_prompt_chars += carved.architecture_chars;
-                    native_tool_chars += carved.native_tool_chars;
-                    native_tool_count += carved.native_tool_count;
                     command_chars += carved.command_chars;
                     mcp_chars += carved.mcp_chars;
                     command_count += carved.command_count;
@@ -195,8 +197,8 @@ impl ContextReport {
             (ContextCategory::SystemPrompt, system_prompt_chars, None),
             (
                 ContextCategory::SystemTools,
-                terminal_tool_definition_chars() + native_tool_chars,
-                Some(format!("{native_tool_count} tools")),
+                native_tools.iter().map(tool_definition_chars).sum(),
+                Some(format!("{} tools", native_tools.len())),
             ),
             (
                 ContextCategory::Commands,
@@ -282,8 +284,6 @@ fn command_line_name(item: &str) -> &str {
 fn carve_capabilities(content: &str, named_commands: &[String]) -> CapabilitiesCarve {
     let mut carved = CapabilitiesCarve {
         architecture_chars: content.len(),
-        native_tool_chars: 0,
-        native_tool_count: 0,
         command_chars: 0,
         command_count: 0,
         mcp_chars: 0,
@@ -294,12 +294,6 @@ fn carve_capabilities(content: &str, named_commands: &[String]) -> CapabilitiesC
         subagent_count: 0,
     };
 
-    if let Some((start, end)) = section_span(content, "native_tools") {
-        let section = &content[start..end];
-        carved.native_tool_chars = section.len();
-        carved.native_tool_count = section_items(section).count();
-        carved.architecture_chars -= section.len();
-    }
     if let Some((start, end)) = section_span(content, "commands") {
         let section = &content[start..end];
         // Section wrapper (tags, blank lines) counts toward the built-in
@@ -335,20 +329,13 @@ fn carve_capabilities(content: &str, named_commands: &[String]) -> CapabilitiesC
     carved
 }
 
-/// Estimated wire size of the native `terminal` tool definition — the only
-/// tool providers see, since every other capability is an IPC command.
-fn terminal_tool_definition_chars() -> usize {
-    let schema = schemars::schema_for!(TerminalArgs).to_value();
-    let description = schema
-        .get("description")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
-    // Providers receive a {name, description, parameters} object; the
-    // description rides both at top level and inside the schema.
+/// Estimated wire size of one native tool definition: the
+/// `{name, description, parameters}` object providers receive.
+fn tool_definition_chars(definition: &ToolDefinition) -> usize {
     serde_json::json!({
-        "name": "terminal",
-        "description": description,
-        "parameters": schema,
+        "name": definition.name(),
+        "description": definition.description(),
+        "parameters": definition.arguments_openai_schema(),
     })
     .to_string()
     .len()
@@ -360,9 +347,33 @@ mod tests {
     use aither_core::llm::Message;
 
     fn base_system_block() -> &'static str {
-        "<tool_architecture>\n<native_tools>\n- terminal: Execute terminal commands.\n- terminal_kill: Terminate a background task.\n</native_tools>\n</tool_architecture>\n\n\
+        "<tool-architecture>\nNative tools run commands.\n</tool-architecture>\n\n\
          <skills>\n\n- pdf: read `skills/pdf/SKILL.md` when the request matches this skill. Handle PDFs.\n\n</skills>\n\n\
          <subagents>\nInvoke with `subagent`.\n\n- researcher: Research things.\n\n</subagents>"
+    }
+
+    fn inventory<'a>(
+        named_commands: &'a [String],
+        native_tools: &'a [ToolDefinition],
+    ) -> ToolInventory<'a> {
+        ToolInventory {
+            named_commands,
+            native_tools,
+        }
+    }
+
+    fn native_tools() -> Vec<ToolDefinition> {
+        ["terminal", "terminal_kill"]
+            .into_iter()
+            .map(|name| {
+                ToolDefinition::from_parts(
+                    name.into(),
+                    "runs a command".into(),
+                    serde_json::json!({"type": "object"}),
+                )
+                .expect("an object schema is valid")
+            })
+            .collect()
     }
 
     /// The command table: `ask` is registered by name, the rest are MCP
@@ -412,7 +423,7 @@ mod tests {
         let report = ContextReport::assemble(
             "gpt-5",
             "openai",
-            &["ask".to_string()],
+            &inventory(&["ask".to_string()], &native_tools()),
             &test_context(),
             &test_metrics(),
             ContextWindowPhase::Stable,
@@ -448,10 +459,7 @@ mod tests {
             .expect("agents row");
         assert_eq!(agents.detail.as_deref(), Some("1 agents"));
 
-        // The `<native_tools>` section lands on System tools alongside the
-        // wire `terminal` definition estimate.
-        let native_span = &base_system_block()[base_system_block().find("<native_tools>").unwrap()
-            ..base_system_block().find("</native_tools>").unwrap() + "</native_tools>".len()];
+        // System tools counts and sizes the definitions the agent sends.
         let system_tools = report
             .categories
             .iter()
@@ -460,8 +468,13 @@ mod tests {
         assert_eq!(system_tools.detail.as_deref(), Some("2 tools"));
         assert_eq!(
             system_tools.tokens,
-            (terminal_tool_definition_chars() + native_span.len()) / 4
+            native_tools()
+                .iter()
+                .map(tool_definition_chars)
+                .sum::<usize>()
+                / 4
         );
+        assert!(system_tools.tokens > 0);
 
         let skills_span = &base_system_block()[base_system_block().find("<skills>").unwrap()
             ..base_system_block().find("</skills>").unwrap() + "</skills>".len()];
@@ -484,7 +497,7 @@ mod tests {
         let report = ContextReport::assemble(
             "gpt-5",
             "openai",
-            &[],
+            &inventory(&[], &native_tools()),
             &test_context(),
             &test_metrics(),
             ContextWindowPhase::Stable,
@@ -510,7 +523,7 @@ mod tests {
         let report = ContextReport::assemble(
             "gpt-5",
             "openai",
-            &[],
+            &inventory(&[], &native_tools()),
             &test_context(),
             &metrics,
             ContextWindowPhase::Stable,
@@ -534,7 +547,7 @@ mod tests {
         let report = ContextReport::assemble(
             "gpt-5",
             "openai",
-            &[],
+            &inventory(&[], &native_tools()),
             &test_context(),
             &test_metrics(),
             ContextWindowPhase::Compacting,
