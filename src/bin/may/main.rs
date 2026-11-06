@@ -852,16 +852,7 @@ where
         phases.step("paste_results", step_start.elapsed());
 
         let step_start = std::time::Instant::now();
-        if matches!(app.mode, may_agent::tui::AppMode::Chat)
-            && let Some(request) = &app.session_runtime.waiting_permission
-        {
-            app.mode = may_agent::tui::AppMode::PermissionConfirm(
-                may_agent::tui::state::PermissionConfirmState {
-                    request_id: request.id.clone(),
-                    request: request.request.clone(),
-                },
-            );
-        }
+        app.open_waiting_permission();
         // A daemon run waits on its prompts in the daemon; they show here
         // from the session's runtime state and are answered over REST.
         if matches!(app.mode, may_agent::tui::AppMode::Chat) {
