@@ -242,6 +242,9 @@ pub fn sweep_if_home_relocated() -> Result<Vec<String>, RepoSearchError> {
 }
 
 /// No launchd agents exist off macOS.
+///
+/// # Errors
+/// Never; the signature is the macOS variant's.
 #[cfg(not(target_os = "macos"))]
 #[allow(clippy::unnecessary_wraps)] // the macOS variant's signature
 pub const fn sweep_if_home_relocated() -> Result<Vec<String>, RepoSearchError> {
@@ -249,6 +252,9 @@ pub const fn sweep_if_home_relocated() -> Result<Vec<String>, RepoSearchError> {
 }
 
 /// No launchd agents exist off macOS.
+///
+/// # Errors
+/// Never; the signature is the macOS variant's.
 #[cfg(not(target_os = "macos"))]
 #[allow(clippy::unnecessary_wraps)] // the macOS variant's signature
 pub const fn sweep_stale_relocated_agents() -> Result<Vec<String>, RepoSearchError> {
