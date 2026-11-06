@@ -188,7 +188,7 @@ hex = { version = "0.4", default-features = false, features = ["alloc"] }
 dunce = "1.0.5"
 keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native", "linux-native"] }
 linkify = { version = "0.11.0", default-features = false }
-rustix = { version = "1.1.6", default-features = false, features = ["std", "fs"] }
+rustix = { version = "1.1.6", default-features = false, features = ["std", "fs", "event", "stdio", "termios"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Direct NSPasteboard reads skip the decode-to-RGBA / re-encode round trip
@@ -200,6 +200,7 @@ objc2-foundation = "0.3"
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFDictionary", "CFNumber", "CFString"] }
 objc2-core-video = { version = "0.3", default-features = false, features = ["std", "objc2-io-surface", "CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVPixelBufferIOSurface", "CVReturn"] }
 objc2-io-surface = { version = "0.3", default-features = false, features = ["std", "IOSurfaceRef"] }
+waterkit-screen = { git = "https://github.com/water-rs/waterkit", branch = "dev", default-features = false, features = ["display-stream"] }
 
 [build-dependencies]
 sha2 = "0.10"

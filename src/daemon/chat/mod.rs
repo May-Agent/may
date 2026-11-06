@@ -133,6 +133,15 @@ trait ChatSink {
     ) -> impl Future<Output = bool> + Send;
     fn on_text(&mut self, chunk: &str) -> impl Future<Output = bool> + Send;
     fn on_reasoning(&mut self, chunk: &str) -> impl Future<Output = bool> + Send;
+    /// The reply just streamed was not in the communication language:
+    /// `text` is its translation, shown instead and marked as translated.
+    fn on_reply_translated(
+        &mut self,
+        _text: &str,
+        _language: &str,
+    ) -> impl Future<Output = bool> + Send {
+        async { true }
+    }
     /// A reasoning phase closed after `seconds`, whether or not it produced
     /// readable text. Emitted just before the first visible output that
     /// follows the phase.
@@ -271,6 +280,18 @@ impl HubSink {
     }
 }
 
+/// `session_turn` frame carrying the display translation of the reply the
+/// turn just streamed; the streamed text stays its original.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SseTranslatedEvent<'a> {
+    seq: u64,
+    turn_id: &'a str,
+    text: &'a str,
+    language: &'a str,
+    language_name: &'a str,
+}
+
 /// `session_turn` frame discarding the text the turn streamed so far.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -358,6 +379,22 @@ impl ChatSink for HubSink {
                 seq,
                 turn_id: &self.turn_id,
                 chunk,
+            },
+        );
+        true
+    }
+
+    async fn on_reply_translated(&mut self, text: &str, language: &str) -> bool {
+        let seq = self.next_seq();
+        let language_name = crate::session::language_display_name(language);
+        self.publish_turn(
+            "translated",
+            &SseTranslatedEvent {
+                seq,
+                turn_id: &self.turn_id,
+                text,
+                language,
+                language_name: &language_name,
             },
         );
         true
@@ -843,6 +880,7 @@ fn api_message_from_run_result(result: AgentRunResult) -> ApiMessage {
             context_window: result.model_context_window,
             elapsed_ms: Some(result.elapsed_ms),
         }),
+        translation: None,
     }
 }
 
@@ -1265,6 +1303,16 @@ pub(super) async fn enqueue_chat(
     Json(req): Json<ChatRequest>,
     State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<SessionRuntimeResponse>> {
+    wake_on_user_message(&state).await?;
+    enqueue_pending(&state, req).await.map(Json)
+}
+
+/// Hands `req` to the session as a pending message: the running turn takes
+/// it as `req.delivery_mode` says, and an idle session starts a turn for it.
+async fn enqueue_pending(
+    state: &Arc<DaemonState>,
+    req: ChatRequest,
+) -> SkyResult<SessionRuntimeResponse> {
     let pending = pending_user_message_from_request(req.clone());
     let runtime = state
         .runtime_service
@@ -1274,8 +1322,25 @@ pub(super) async fn enqueue_chat(
     if runtime.can_dispatch_follow_up() {
         spawn_follow_up_runs(state.clone(), req.session_id.clone());
     }
+    Ok(runtime.into())
+}
 
-    Ok(Json(runtime.into()))
+/// Delivers a message from the user the way a client does: a turn for an
+/// idle session, a pending message for a busy one.
+pub(super) async fn deliver_user_message(
+    state: &Arc<DaemonState>,
+    req: ChatRequest,
+) -> SkyResult<SessionRuntimeResponse> {
+    let runtime = state
+        .runtime_service
+        .get(&req.session_id)
+        .await
+        .map_err(internal_error)?;
+    if runtime.admits_new_request() {
+        start_prompt_turn(state, req).await
+    } else {
+        enqueue_pending(state, req).await
+    }
 }
 
 pub(super) async fn remove_pending_message(
@@ -1356,7 +1421,19 @@ pub(super) async fn send_message(
         .map_err(super::error::bad_request_error)?
         .to_string();
     req.session_id.clone_from(&session_id);
+    wake_on_user_message(&state).await?;
     start_prompt_turn(&state, req).await.map(Json)
+}
+
+/// A message from the user ends the sleep state when it began an hour or
+/// more ago; within the hour the user stays asleep.
+async fn wake_on_user_message(state: &DaemonState) -> SkyResult<()> {
+    state
+        .sleep
+        .user_message(jiff::Timestamp::now())
+        .await
+        .map(drop)
+        .map_err(internal_error)
 }
 
 /// Starts the turn `req` asks for in its session and returns at once, with
@@ -1404,6 +1481,18 @@ pub(super) async fn start_prompt_turn(
         .await
         .map_err(internal_error)?;
     Ok(runtime.into())
+}
+
+/// Tells `agent` of a change of the user's sleep state it has not heard of:
+/// one alert per change, at the start of the session's next turn.
+async fn tell_sleep_state(state: &DaemonState, session_id: &str, agent: &mut MayAgent) {
+    match state.sleep.take_notice(session_id).await {
+        Ok(Some(notice)) => agent.tell_sleep_notice(notice),
+        Ok(None) => {}
+        Err(error) => {
+            tracing::error!(%session_id, %error, "failed to record the sleep state an agent was told");
+        }
+    }
 }
 
 /// `POST /api/sessions/{id}/bash`: run a `!` command for the user.
@@ -1771,6 +1860,7 @@ fn run_agent_loop<'a>(
                 last_speed_emit: None,
                 segment_text: String::new(),
                 segment_at: None,
+                segment_translation: None,
                 last_event_at: None,
                 full_text: String::new(),
                 reasoning_text: String::new(),
@@ -1787,6 +1877,7 @@ fn run_agent_loop<'a>(
                 first_text_seen: false,
             };
             agent.sync_runtime_context().await;
+            tell_sleep_state(state, req.session_id.as_str(), &mut agent).await;
             let stopped = drive_turn(
                 &mut turn,
                 &mut agent,
@@ -2226,7 +2317,9 @@ pub(super) fn watch_aux_settings(state: &Arc<DaemonState>) {
     handle.spawn(async move {
         loop {
             match events.recv().await {
-                Ok(topics) if topics.contains(UiEventTopics::CONFIG) => apply_aux_settings(&state),
+                Ok(topics) if topics.intersects(UiEventTopics::CONFIG | UiEventTopics::SLEEP) => {
+                    apply_aux_settings(&state);
+                }
                 // A lagged receiver may have missed the change.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
                     apply_aux_settings(&state);
@@ -2831,6 +2924,12 @@ async fn resolve_session_context(
     };
 
     let mut hidden_context_parts = Vec::<String>::new();
+    // A claimed entry with no visible input commits with the first hidden
+    // context row the run persists for it; a visible message commits it
+    // instead, so a failure between the two never leaves it half-delivered.
+    let mut hidden_commit_entry = req
+        .pending_entry_id
+        .filter(|_| persist_user_message && !request_has_visible_user_input(req));
     if persist_user_message && take_over_alert_pending(state, &session_id).await {
         push_hidden_context_part(
             &db,
@@ -2839,6 +2938,7 @@ async fn resolve_session_context(
             &mut hidden_context_parts,
             browser_takeover_alert(),
             persist_user_message,
+            &mut hidden_commit_entry,
         )
         .await
         .map_err(UiChatPreparationError::PersistHiddenContext)?;
@@ -2857,6 +2957,7 @@ async fn resolve_session_context(
             &mut hidden_context_parts,
             hidden_context_xml.to_string(),
             persist_user_message,
+            &mut hidden_commit_entry,
         )
         .await
         .map_err(UiChatPreparationError::PersistHiddenContext)?;
@@ -2873,6 +2974,7 @@ async fn resolve_session_context(
             &mut hidden_context_parts,
             session_mentions_xml,
             persist_user_message,
+            &mut hidden_commit_entry,
         )
         .await
         .map_err(UiChatPreparationError::PersistHiddenContext)?;
@@ -2900,9 +3002,18 @@ async fn resolve_session_context(
             &mut hidden_context_parts,
             file_mentions_xml,
             persist_user_message,
+            &mut hidden_commit_entry,
         )
         .await
         .map_err(UiChatPreparationError::PersistHiddenContext)?;
+    }
+
+    if let Some(entry_id) = hidden_commit_entry.take() {
+        // Every hidden part was already in the transcript: nothing carried
+        // the commit, so it lands on its own.
+        db.commit_pending_entry_as_run(fence, entry_id)
+            .await
+            .map_err(UiChatPreparationError::PersistHiddenContext)?;
     }
 
     let user_message_id = if persist_user_message && request_has_visible_user_input(req) {
@@ -3018,6 +3129,7 @@ async fn push_hidden_context_part(
     hidden_context_parts: &mut Vec<String>,
     content: String,
     persist_user_message: bool,
+    commit_entry: &mut Option<i64>,
 ) -> Result<(), crate::db::ChatDbError> {
     let trimmed = content.trim();
     if trimmed.is_empty() {
@@ -3031,8 +3143,16 @@ async fn push_hidden_context_part(
             matches!(message.role, MessageRole::HiddenContext) && message.content == trimmed
         })
     {
-        db.append_chat_message_as_run(fence, &ChatMessage::hidden_context(trimmed.to_string()))
-            .await?;
+        let message = ChatMessage::hidden_context(trimmed.to_string());
+        match commit_entry.take() {
+            Some(entry_id) => {
+                db.append_chat_message_as_run_and_commit_pending(fence, entry_id, &message)
+                    .await?;
+            }
+            None => {
+                db.append_chat_message_as_run(fence, &message).await?;
+            }
+        }
     }
 
     if !already_queued {
@@ -4163,6 +4283,37 @@ mod tests {
         body
     }
 
+    /// Waits until `session_id`'s turn has ended and the session takes a new
+    /// one.
+    async fn wait_until_idle(state: &DaemonState, session_id: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            loop {
+                let runtime = state
+                    .runtime_service
+                    .get(session_id)
+                    .await
+                    .expect("runtime");
+                if runtime.admits_new_request() && state.parked_agents.contains(session_id) {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the turn ends");
+    }
+
+    /// The next request body of `stub` that carries `marker` (lowercase):
+    /// auxiliary requests of other turns are skipped.
+    async fn body_containing(stub: &StubProvider, marker: &str) -> String {
+        loop {
+            let body = last_body(stub, 1).await.to_lowercase();
+            if body.contains(marker) {
+                return body;
+            }
+        }
+    }
+
     async fn stub_provider(responses: Vec<String>) -> StubProvider {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -4824,6 +4975,273 @@ mod tests {
         assert!(
             !state.parked_agents.contains("session"),
             "the old idle agent was retired, not reused"
+        );
+    }
+
+    /// The three things the sleep alert requires of the session `/sleep` ran in.
+    fn assert_greeting_requirements(body: &str) {
+        for required in [
+            "wish them good night",
+            "what you are working on now",
+            "what you will keep pushing forward",
+            "through ask_user now, all in one go",
+            "need a few answers first",
+        ] {
+            assert!(body.contains(required), "the alert asks: {required}");
+        }
+    }
+
+    /// `/sleep` on a session whose turn is running succeeds and is taken by
+    /// the session's next request, carrying the same requirements.
+    #[tokio::test]
+    async fn sleep_on_a_busy_session_reaches_its_next_request() {
+        use crate::daemon::sleep::{SleepRequest, start_sleep};
+        use skyzen::utils::{Json, State};
+
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let provider = stub_provider(vec![sse_text("Good night")]).await;
+        let unused = stub_provider(vec![sse_text("unused")]).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let state = failover_state(may_dir.path(), &provider, &unused).await;
+
+        // A turn holds the session.
+        let guard = state
+            .runtime_service
+            .runs()
+            .acquire("session")
+            .await
+            .expect("acquire run");
+        let runtime = state.runtime_service.get("session").await.expect("runtime");
+        assert!(!runtime.admits_new_request(), "the session is busy");
+
+        let Json(status) = start_sleep(
+            Json(SleepRequest {
+                session_id: "session".to_string(),
+            }),
+            State(state.clone()),
+        )
+        .await
+        .expect("/sleep succeeds on a busy session");
+        assert!(status.asleep);
+        let runtime = state.runtime_service.get("session").await.expect("runtime");
+        assert!(runtime.has_pending_messages(), "/sleep waits for the turn");
+
+        // The running turn ends and the session takes the pending message.
+        tokio::spawn(super::dispatch_follow_ups(state.clone(), guard));
+        let body = body_containing(&provider, "/sleep").await;
+        assert_greeting_requirements(&body);
+    }
+
+    /// `/sleep` starts a turn in the session it ran in, whose request carries
+    /// the sleep alert with the three things the agent must do; another
+    /// session is told only that the user sleeps, once, at its next turn,
+    /// and the wake reaches both.
+    #[tokio::test]
+    async fn sleep_starts_a_turn_whose_alert_asks_for_the_good_night() {
+        use crate::daemon::sleep::{SleepRequest, end_sleep, start_sleep};
+        use crate::ui_event_bus::UiEventTopics;
+        use skyzen::utils::{Json, State};
+
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let provider = stub_provider(vec![sse_text("Good night")]).await;
+        let unused = stub_provider(vec![sse_text("unused")]).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let state = failover_state(may_dir.path(), &provider, &unused).await;
+        state
+            .db()
+            .create_session("other", Some("other"), Some("a::gpt-4o"))
+            .await
+            .expect("second session");
+        let mut events = state.ui_event_bus.subscribe();
+
+        let Json(status) = start_sleep(
+            Json(SleepRequest {
+                session_id: "session".to_string(),
+            }),
+            State(state.clone()),
+        )
+        .await
+        .expect("/sleep starts");
+        assert!(status.asleep);
+        assert_eq!(status.origin.as_deref(), Some("session"));
+        assert!(
+            events
+                .recv()
+                .await
+                .expect("a sleep event")
+                .contains(UiEventTopics::SLEEP),
+            "clients hear of the state on the event stream"
+        );
+
+        // The turn started by the command carries the alert.
+        let body = last_body(&provider, 1).await.to_lowercase();
+        assert_greeting_requirements(&body);
+        assert!(body.contains("/sleep"), "the user's command opens the turn");
+
+        // Another session hears of it at its next turn, without the greeting.
+        super::start_prompt_turn(
+            &state,
+            ChatRequest {
+                session_id: "other".to_string(),
+                content: "hello".to_string(),
+                attachments: Vec::new(),
+                hidden_context_xml: None,
+                delivery_mode: crate::session::PendingUserMessageMode::default(),
+                pending_entry_id: None,
+            },
+        )
+        .await
+        .expect("the other session's turn starts");
+        let other = body_containing(&provider, "hello").await;
+        assert!(other.contains("the user is going to sleep"));
+        assert!(!other.contains("wish them good night"));
+
+        // Nobody reads suggestions while the user sleeps.
+        assert!(!super::suggest::suggestions_allowed(&state));
+
+        // Waking (`/sleep off`) reaches the sessions that were told.
+        let Json(status) = end_sleep(State(state.clone())).await.expect("/sleep off");
+        assert!(!status.asleep);
+        assert!(super::suggest::suggestions_allowed(&state));
+        wait_until_idle(&state, "other").await;
+        super::start_prompt_turn(
+            &state,
+            ChatRequest {
+                session_id: "other".to_string(),
+                content: "good morning".to_string(),
+                attachments: Vec::new(),
+                hidden_context_xml: None,
+                delivery_mode: crate::session::PendingUserMessageMode::default(),
+                pending_entry_id: None,
+            },
+        )
+        .await
+        .expect("the next turn starts");
+        let woke = body_containing(&provider, "good morning").await;
+        assert!(woke.contains("the user is awake again"), "{woke}");
+
+        // The health reminder is raised for the user and reaches no agent.
+        let now = jiff::Timestamp::now();
+        state.db().record_sleep(now).await.expect("sleep log");
+        assert!(
+            state
+                .sleep
+                .remind_if_due(now, &jiff::tz::TimeZone::UTC)
+                .await
+                .expect("reminder")
+        );
+        wait_until_idle(&state, "other").await;
+        super::start_prompt_turn(
+            &state,
+            ChatRequest {
+                session_id: "other".to_string(),
+                content: "third".to_string(),
+                attachments: Vec::new(),
+                hidden_context_xml: None,
+                delivery_mode: crate::session::PendingUserMessageMode::default(),
+                pending_entry_id: None,
+            },
+        )
+        .await
+        .expect("the third turn starts");
+        let third = body_containing(&provider, "third").await;
+        assert!(!third.contains("get some rest"));
+        assert!(!third.contains("usually go to sleep"));
+        assert!(!third.contains("time to rest"));
+    }
+
+    /// A queued entry that carries only hidden context (an agent message)
+    /// is committed by the run that delivers it: the claim reset at daemon
+    /// start does not deliver it again and the queue reports it gone.
+    #[tokio::test]
+    async fn a_delivered_hidden_context_entry_is_not_redelivered_after_restart() {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let provider = stub_provider(vec![sse_text("unused")]).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let state = failover_state(may_dir.path(), &provider, &provider).await;
+        let db = state.db();
+        db.set_pending_immediate_message(
+            "session",
+            crate::session::PendingUserMessage {
+                id: None,
+                state: crate::session::PendingMessageState::default(),
+                error: None,
+                content: String::new(),
+                attachments: Vec::new(),
+                hidden_context_xml: Some(
+                    crate::XmlBlock::parse("<agent_message>ping</agent_message>")
+                        .expect("hidden context"),
+                ),
+                created_at: jiff::Timestamp::now().to_string(),
+                delivery_mode: crate::session::PendingUserMessageMode::Queue,
+            },
+        )
+        .await
+        .expect("enqueue");
+        let guard = state
+            .runtime_service
+            .runs()
+            .acquire("session")
+            .await
+            .expect("acquire run");
+        let next = db
+            .claim_next_pending_message(guard.fence(), "session")
+            .await
+            .expect("claim")
+            .expect("the entry waits in the queue");
+        let req = ChatRequest {
+            session_id: "session".to_string(),
+            content: next.content,
+            attachments: Vec::new(),
+            hidden_context_xml: next.hidden_context_xml,
+            delivery_mode: next.delivery_mode,
+            pending_entry_id: next.id,
+        };
+        super::prepare_agent_for_request(
+            &state,
+            &req,
+            guard.fence(),
+            true,
+            true,
+            super::TurnAttempt {
+                provider_attempt: 0,
+                turn_boundary: None,
+                retained_agent: None,
+            },
+            &TurnKind::Prompt,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("the entry's turn prepares: {error}"));
+        guard
+            .finish_idle(crate::session::RunOutcome::Completed)
+            .await
+            .expect("release the run");
+
+        assert!(
+            state
+                .runtime_service
+                .get("session")
+                .await
+                .expect("runtime")
+                .queued_count
+                == 0,
+            "a delivered entry leaves the queue"
+        );
+        db.recover_session_runtimes_after_restart()
+            .await
+            .expect("daemon start resets claims");
+        let guard = state
+            .runtime_service
+            .runs()
+            .acquire("session")
+            .await
+            .expect("acquire run");
+        assert!(
+            db.claim_next_pending_message(guard.fence(), "session")
+                .await
+                .expect("claim")
+                .is_none(),
+            "the delivered entry is not delivered again"
         );
     }
 

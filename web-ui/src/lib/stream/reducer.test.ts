@@ -339,6 +339,39 @@ describe('reducer', () => {
     expect(retried.turnId).toBe('t2');
   });
 
+  test('translated attaches the translation to the reply streamed last and keeps the original', () => {
+    const t = stream([
+      { kind: 'start', seq: 1, turnId: 't1', sessionId: 's1', assistantId: 'a1' },
+      { kind: 'text', seq: 2, turnId: 't1', chunk: 'All done.' },
+      {
+        kind: 'translated',
+        seq: 3,
+        turnId: 't1',
+        text: '全部完成。',
+        language: 'cmn',
+        languageName: 'Chinese',
+      },
+    ]);
+    expect(t.text).toBe('All done.');
+    expect(t.segments).toEqual([
+      {
+        kind: 'text',
+        text: 'All done.',
+        seq: 2,
+        translation: { text: '全部完成。', language: 'cmn', languageName: 'Chinese' },
+      },
+    ]);
+    expect(t.lastSeq).toBe(3);
+  });
+
+  test('a reply without a translation event carries none', () => {
+    const t = stream([
+      { kind: 'start', seq: 1, turnId: 't1', sessionId: 's1', assistantId: 'a1' },
+      { kind: 'text', seq: 2, turnId: 't1', chunk: 'Hi' },
+    ]);
+    expect(t.segments[0]).toEqual({ kind: 'text', text: 'Hi', seq: 2 });
+  });
+
   test('retract discards the streamed text but keeps tools', () => {
     const t = stream([
       { kind: 'start', seq: 1, turnId: 't1', sessionId: 's1', assistantId: 'a1' },

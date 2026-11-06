@@ -137,6 +137,10 @@ export const zhHant: Messages = {
     thinking: '思考中',
     responding: '回應中',
     scrollToBottom: '回到最新',
+    translatedTo: '已翻譯為{language}',
+    originalReply: '原始回覆',
+    showOriginal: '顯示原文',
+    showTranslation: '顯示翻譯',
     thought: '思考過程',
     thoughtFor: '思考了 {duration}',
     plan: '計畫',
@@ -561,6 +565,12 @@ export const zhHant: Messages = {
     killConfirmBody: '程序會被終止，已寫入的輸出會保留。',
     stopping: '正在停止…',
     loadFailed: '無法載入：{message}',
+  },
+  sleep: {
+    asleep: '你正在睡覺：代理會繼續工作並累積問題。傳送 /sleep off 結束。',
+    awake: '你已醒來',
+    reminder: '差不多是你平常睡覺的時間了。執行 /sleep 並好好休息。',
+    failed: '無法變更睡眠狀態：{message}',
   },
   yolo: {
     label: 'Yolo',

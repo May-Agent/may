@@ -137,6 +137,10 @@ export const ja: Messages = {
     thinking: '思考中',
     responding: '応答中',
     scrollToBottom: '最新へ戻る',
+    translatedTo: '{language}に翻訳済み',
+    originalReply: '元の返信',
+    showOriginal: '原文を表示',
+    showTranslation: '翻訳を表示',
     thought: '思考過程',
     thoughtFor: '{duration} 思考',
     plan: 'プラン',
@@ -561,6 +565,12 @@ export const ja: Messages = {
     killConfirmBody: 'プロセスを終了します。書き込み済みの出力は残ります。',
     stopping: '停止中…',
     loadFailed: '読み込めませんでした：{message}',
+  },
+  sleep: {
+    asleep: '就寝中です。エージェントは作業を続け、質問をためておきます。/sleep off で終了します。',
+    awake: '起きています',
+    reminder: 'いつも就寝する時間です。/sleep を実行して休みましょう。',
+    failed: '就寝状態を変更できませんでした: {message}',
   },
   yolo: {
     label: 'Yolo',

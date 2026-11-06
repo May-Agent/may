@@ -7,7 +7,7 @@
 //! built by [`VideoCodec::webrtc`] advertises exactly that codec.
 //!
 //! Two sources feed it: the managed browser's CDP screencast JPEGs and a
-//! session desktop's `CGDisplayStream` surfaces, so the frame type is
+//! session desktop's `DisplayStream` surfaces, so the frame type is
 //! [`RawFrame`]. Where the host allows, neither touches the CPU: the surface
 //! goes to the encoder as a `CVPixelBuffer` and a JPEG is decoded by the
 //! platform into one.
