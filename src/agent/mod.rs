@@ -48,6 +48,7 @@ pub mod session_tool;
 /// Authorization for `terminal` ssh-mode targets.
 pub mod ssh_authorizer;
 /// Live tracking of `subagent` command invocations.
+pub mod subagent_spaces;
 pub mod subagent_tracker;
 pub(crate) mod task_tool;
 pub mod tool_environment_cache;

@@ -446,6 +446,16 @@ impl MayAgent {
             .with_process_priority(config.command_priority.process_priority())
             .with_readable_paths(readable)
             .with_writable_paths(writable)
+            // A subagent launched from inside a session clone works in a
+            // child clone of it.
+            .with_subagent_spaces(super::subagent_spaces::SessionSubagentSpaces::new(
+                crate::repo_clone::SessionRepos::new(
+                    &config.sandbox_dir,
+                    config.session_id.as_str(),
+                    config.db.clone(),
+                )
+                .with_host(crate::host_git::HostGit::inherit()),
+            ))
             // Keychain secrets (`/secret`) land as env vars in every spawned
             // command; the store is re-read per call, so additions take
             // effect without rebuilding the agent.
