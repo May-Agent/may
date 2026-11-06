@@ -2,7 +2,7 @@
 //!
 //! Skills are Markdown-based capability definitions stored in `~/.may/skills/`.
 //! Each skill is a directory containing a `SKILL.md` file with YAML frontmatter
-//! and optional subagents, references, and assets.
+//! and optional references and assets.
 //!
 //! Skills can be bundled with the application or installed from GitHub repositories.
 

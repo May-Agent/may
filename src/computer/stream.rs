@@ -75,7 +75,7 @@ impl std::fmt::Debug for SessionStream {
 struct StreamRuntime {
     inputs: Arc<std::sync::Mutex<InputState>>,
     // Runs only while `peers` is non-empty (`sync_capture`). Its Drop stops
-    // `CGDisplayStream` and frees the dispatch queue. The frame channel
+    // the display stream and its forwarder. The frame channel
     // closes with it, which ends the bridge, encoder and writer tasks.
     capture: DisplayCapture,
     capture_gate: SourceGate,
@@ -113,14 +113,14 @@ impl StreamRuntime {
     /// Brings the display capture in line with the peers map: running while
     /// a viewer is attached, stopped otherwise so nothing is captured or
     /// encoded for nobody.
-    fn sync_capture(&mut self) -> Result<(), DisplayError> {
+    async fn sync_capture(&mut self) -> Result<(), DisplayError> {
         let viewers = self.peers.len();
         let Some(change) = self.capture_gate.required(viewers) else {
             return Ok(());
         };
         match change {
-            GateChange::Start => self.capture.resume()?,
-            GateChange::Stop => self.capture.pause(),
+            GateChange::Start => self.capture.resume().await?,
+            GateChange::Stop => self.capture.pause().await?,
         }
         self.capture_gate.applied(change);
         tracing::debug!(?change, viewers, "computer capture gate");
@@ -168,7 +168,7 @@ impl SessionStream {
             return Ok(());
         }
         let codec = select_codec(&display, preference)?;
-        self.start_locked(&mut guard, display, inputs, codec)
+        self.start_locked(&mut guard, display, inputs, codec).await
     }
 
     /// Moves a running stream to the codec `preference` selects: its peers
@@ -188,10 +188,10 @@ impl SessionStream {
         let (display, inputs) = (running.display.clone(), running.inputs.clone());
         let codec = select_codec(&display, preference)?;
         *guard = None;
-        self.start_locked(&mut guard, display, inputs, codec)
+        self.start_locked(&mut guard, display, inputs, codec).await
     }
 
-    fn start_locked(
+    async fn start_locked(
         &self,
         guard: &mut Option<StreamRuntime>,
         display: Arc<PlatformDisplay>,
@@ -208,7 +208,8 @@ impl SessionStream {
         let (captured_tx, mut captured_rx) =
             tokio::sync::mpsc::channel::<CapturedFrame>(FRAME_QUEUE_CAPACITY);
 
-        let capture = DisplayCapture::new(display.display_id(), display.size(), captured_tx)?;
+        let capture =
+            DisplayCapture::new(display.display_id(), display.size(), captured_tx).await?;
         // The display backs 2x; the capture surfaces physical pixels.
         // `size()` reports points — recheck against the first frame if
         // the stream's output size ever differs from the surface's.
@@ -378,7 +379,7 @@ impl SessionStream {
         // The keyframe requested above is read at the first frame of the
         // capture this starts, so the viewer's first frame is an IDR.
         runtime.peers.insert(peer_id.clone(), peer);
-        if let Err(error) = runtime.sync_capture() {
+        if let Err(error) = runtime.sync_capture().await {
             if let Some(peer) = runtime.peers.remove(&peer_id) {
                 tokio::spawn(async move {
                     let _ = peer.close().await;
@@ -411,15 +412,21 @@ fn select_codec(
 /// out of the encoder's minimum. It runs apart from the caller, which may be
 /// a webrtc handler that `close` raises again.
 async fn forget_peer(runtime: &Mutex<Option<StreamRuntime>>, peer_id: &str) {
-    let gone = runtime.lock().await.as_mut().and_then(|runtime| {
-        let gone = runtime.peers.remove(peer_id);
-        if gone.is_some()
-            && let Err(error) = runtime.sync_capture()
-        {
-            tracing::warn!(%error, "pausing the display capture failed");
+    let gone = {
+        let mut guard = runtime.lock().await;
+        match guard.as_mut() {
+            Some(runtime) => {
+                let gone = runtime.peers.remove(peer_id);
+                if gone.is_some()
+                    && let Err(error) = runtime.sync_capture().await
+                {
+                    tracing::warn!(%error, "pausing the display capture failed");
+                }
+                gone
+            }
+            None => None,
         }
-        gone
-    });
+    };
     if let Some(peer) = gone {
         tracing::debug!(peer_id, "computer peer went away");
         tokio::spawn(async move {
