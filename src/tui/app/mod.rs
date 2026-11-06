@@ -4037,6 +4037,14 @@ impl App {
         }
     }
 
+    /// The model response in flight is being sent again: drop what it
+    /// streamed, which the replacement does not continue.
+    pub fn retract_response(&mut self) {
+        self.chat.retract_response();
+        self.pending_tool_calls.retain(|_, pending| pending.started);
+        self.thinking_start = None;
+    }
+
     /// Handle an agent event. Returns true if stream ended.
     pub async fn handle_agent_event(&mut self, result: Result<TimedEvent, AgentError>) -> bool {
         match result {
@@ -4152,12 +4160,12 @@ impl App {
                     // by another in the same run (the harness re-prompting,
                     // a background command finishing): it starts a block of
                     // its own instead of being glued onto this one.
-                    AgentEvent::TurnComplete {
-                        has_tool_calls: false,
-                        ..
-                    } => {
-                        self.chat.end_text();
-                        self.decode_meter.note_boundary();
+                    AgentEvent::TurnComplete { has_tool_calls, .. } => {
+                        if !has_tool_calls {
+                            self.chat.end_text();
+                            self.decode_meter.note_boundary();
+                        }
+                        self.chat.seal_response();
                     }
                     AgentEvent::Complete { .. } => {
                         // Text was already streamed via AgentEvent::Text events

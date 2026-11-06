@@ -1171,7 +1171,7 @@ where
                         }
                     },
                     TuiEvent::Retract => {
-                        app.chat.retract_text();
+                        app.retract_response();
                         assistant_response.clear();
                     }
                     TuiEvent::Compacted(result) => match result {

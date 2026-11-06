@@ -1803,6 +1803,7 @@ fn run_agent_loop<'a>(
                 last_event_at: None,
                 full_text: String::new(),
                 reasoning_text: String::new(),
+                reasoning_floor: 0,
                 terminal_snapshot: TerminalStateSnapshot::default(),
                 saw_tool_activity: false,
                 tool_arguments_by_id: std::collections::HashMap::new(),
