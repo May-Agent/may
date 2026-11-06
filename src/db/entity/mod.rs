@@ -21,3 +21,4 @@ pub mod session_plans;
 pub mod session_runtimes;
 pub mod session_yolo;
 pub mod sessions;
+pub mod sleep_log;

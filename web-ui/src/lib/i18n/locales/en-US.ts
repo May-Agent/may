@@ -135,6 +135,10 @@ export const enUS = {
     thinking: 'Thinking',
     responding: 'Responding',
     scrollToBottom: 'Jump to latest',
+    translatedTo: 'Translated to {language}',
+    originalReply: 'Original reply',
+    showOriginal: 'Show original',
+    showTranslation: 'Show translation',
     thought: 'Thought',
     thoughtFor: 'Thought for {duration}',
     plan: 'Plan',
@@ -559,6 +563,12 @@ export const enUS = {
     killConfirmBody: 'The process is killed. Output written so far is kept.',
     stopping: 'Stopping…',
     loadFailed: 'Couldn’t load: {message}',
+  },
+  sleep: {
+    asleep: 'You are asleep: agents keep working and collect their questions. Send /sleep off to end it.',
+    awake: 'You are awake',
+    reminder: 'It is about when you usually go to sleep. Run /sleep and get some rest.',
+    failed: 'Couldn’t change the sleep state: {message}',
   },
   yolo: {
     label: 'Yolo',

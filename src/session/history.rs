@@ -246,8 +246,9 @@ impl core::str::FromStr for MessageRole {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     /// Row id in the session's stored history; `None` for a message not
-    /// stored yet.
-    #[serde(skip)]
+    /// stored yet. The daemon sends it with the history so a client can tell
+    /// whether a replayed turn's prompt is already loaded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<i32>,
     /// Message role.
     pub role: MessageRole,
@@ -271,6 +272,28 @@ pub struct ChatMessage {
     /// Tool calls carried by an assistant message.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<aither_core::llm::ToolCall>,
+    /// The display translation of an assistant reply that drifted from the
+    /// communication language. Never part of the model's context: the
+    /// content above stays the original.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub translation: Option<MessageTranslation>,
+}
+
+/// A reply translated into the communication language for display.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageTranslation {
+    /// The reply translated by the fast model.
+    pub text: String,
+    /// The communication language's ISO 639-3 code.
+    pub language: String,
+}
+
+/// The display name of the language with ISO 639-3 `code`; the code itself
+/// when the detector does not know it.
+#[must_use]
+pub fn language_display_name(code: &str) -> String {
+    code.parse::<aither_agent::Language>()
+        .map_or_else(|_| code.to_string(), |language| language.name().to_string())
 }
 
 impl ChatMessage {
@@ -294,6 +317,7 @@ impl ChatMessage {
             stats: None,
             reasoning: Vec::new(),
             tool_calls: Vec::new(),
+            translation: None,
         }
     }
 
@@ -309,6 +333,7 @@ impl ChatMessage {
             stats: None,
             reasoning: Vec::new(),
             tool_calls: Vec::new(),
+            translation: None,
         }
     }
 
@@ -328,6 +353,7 @@ impl ChatMessage {
             stats: Some(stats),
             reasoning: Vec::new(),
             tool_calls: Vec::new(),
+            translation: None,
         }
     }
 
@@ -343,6 +369,7 @@ impl ChatMessage {
             stats: None,
             reasoning: Vec::new(),
             tool_calls: Vec::new(),
+            translation: None,
         }
     }
 
@@ -362,6 +389,7 @@ impl ChatMessage {
             stats: None,
             reasoning: Vec::new(),
             tool_calls: Vec::new(),
+            translation: None,
         }
     }
 
@@ -380,6 +408,7 @@ impl ChatMessage {
             stats: None,
             reasoning: Vec::new(),
             tool_calls: Vec::new(),
+            translation: None,
         }
     }
 }
@@ -653,6 +682,20 @@ fn attachment_media_type(
 mod tests {
     use super::*;
     use aither_core::llm::{Role, ToolResult};
+
+    #[test]
+    fn the_row_id_crosses_the_wire_with_the_history() {
+        let mut message = ChatMessage::user("hello");
+        message.id = Some(41);
+        let wire = serde_json::to_string(&message).expect("serializes");
+        let back: ChatMessage = serde_json::from_str(&wire).expect("deserializes");
+        assert_eq!(back.id, Some(41));
+
+        let unstored: ChatMessage =
+            serde_json::from_str(&serde_json::to_string(&ChatMessage::user("hi")).unwrap())
+                .expect("deserializes");
+        assert_eq!(unstored.id, None);
+    }
 
     #[test]
     fn hidden_context_replays_as_system_message() {

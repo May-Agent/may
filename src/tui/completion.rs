@@ -55,6 +55,11 @@ pub static SLASH_COMMANDS: &[(&str, &str)] = &[
         "Toggle granting every approval request in this session",
     ),
     (
+        "/sleep",
+        "Tell every session you are asleep: agents keep working and collect questions",
+    ),
+    ("/sleep off", "End the sleep state"),
+    (
         "/btw",
         "Ask a side question without touching conversation history",
     ),

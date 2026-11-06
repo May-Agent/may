@@ -251,6 +251,7 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
         }
         AppEvent::SessionRuntime(event) => {
             app.session_runtime = event.runtime;
+            app.close_resolved_permission();
             app.sync_queue_from_runtime();
             Ok(None)
         }
@@ -267,6 +268,25 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             Ok(None)
         }
         AppEvent::HistoryStale => Ok(Some(SendAction::ReloadHistory)),
+        AppEvent::Sleep(status) => {
+            if status.asleep != app.asleep {
+                app.asleep = status.asleep;
+                app.chat.push_notice(if status.asleep {
+                    "You are asleep: agents keep working and collect their questions. /sleep off ends it"
+                } else {
+                    "You are awake"
+                });
+            }
+            // The first report only sets the baseline: a reminder raised
+            // before this client attached is not shown again.
+            match app.sleep_reminders.replace(status.reminders) {
+                Some(seen) if status.reminders > seen => app.chat.push_notice(
+                    "It is about when you usually go to sleep. Run /sleep and get some rest",
+                ),
+                _ => {}
+            }
+            Ok(None)
+        }
         AppEvent::PromptSuggestion {
             session_id, text, ..
         } => {
