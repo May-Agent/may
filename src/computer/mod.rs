@@ -30,7 +30,6 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 
 #[cfg(target_os = "macos")]
-use executor_core::{DefaultExecutor, Executor};
 #[cfg(target_os = "macos")]
 use main_thread::MainThreadBound;
 #[cfg(target_os = "macos")]
@@ -117,7 +116,15 @@ impl SessionDisplay {
         };
         let (posts, queue) = async_channel::bounded(INPUT_QUEUE);
         // Ends when `posts` closes with this display.
-        DefaultExecutor.spawn(input::own(input, queue)).detach();
+        let owner = std::thread::Builder::new()
+            .name(format!("computer-input-{display_id}"))
+            .spawn(move || input::own(input, &queue));
+        if let Err(e) = owner {
+            main_thread::release(display);
+            return Err(DisplayError(format!(
+                "the input thread for display {display_id} did not start: {e}"
+            )));
+        }
         Ok(Self {
             display: Some(display),
             display_id,
