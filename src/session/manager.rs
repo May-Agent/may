@@ -661,7 +661,6 @@ impl SessionManager {
         let title = Some(api.title.clone()).filter(|t| t != "New Chat");
         let model = Some(api.model.clone()).filter(|m| !m.is_empty());
         let profile_id = api.profile_id.clone();
-        self.reconcile_container_layout_for_session(id).await?;
 
         let updated_at = api
             .last_modified
@@ -689,35 +688,6 @@ impl SessionManager {
         *self.current.insert(session).history.messages_mut() = messages;
 
         Ok(self.current.as_ref().expect("just assigned"))
-    }
-
-    /// Force reconcile container mount-point layout for one persisted session.
-    ///
-    /// # Errors
-    /// Returns [`SessionError`] on storage failure or when the layout cannot be reconciled.
-    pub async fn reconcile_container_layout_for_session(
-        &self,
-        id: &SessionId,
-    ) -> Result<(), SessionError> {
-        let profile_id = if let Some(session) = &self.current {
-            if session.id == *id {
-                session.profile_id.clone()
-            } else {
-                self.daemon()?
-                    .get::<crate::client::WireSession>(&format!("/api/sessions/{}", id.as_str()))
-                    .await?
-                    .profile_id
-            }
-        } else {
-            self.daemon()?
-                .get::<crate::client::WireSession>(&format!("/api/sessions/{}", id.as_str()))
-                .await?
-                .profile_id
-        };
-        self.store
-            .reconcile_container_mount_points(id.as_str(), profile_id.as_deref())
-            .await?;
-        Ok(())
     }
 
     /// Rewind the current session's conversation to just before the user
