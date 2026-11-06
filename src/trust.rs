@@ -166,8 +166,31 @@ pub fn level_for_answer(answer: &QuestionAnswer) -> Option<TrustLevel> {
         AnswerValue::Custom(text) => text.as_str(),
         AnswerValue::Skipped => return None,
     };
-    // Options read `level — description`; custom text is a bare level name.
-    TrustLevel::parse(text.split(" —").next().unwrap_or(text).trim())
+    option_level(text)
+}
+
+/// The level a gate option names. Options read `level — description`;
+/// custom text is a bare level name.
+#[must_use]
+pub fn option_level(option: &str) -> Option<TrustLevel> {
+    TrustLevel::parse(option.split(" —").next().unwrap_or(option).trim())
+}
+
+/// The trust level persisted in `config_path` for `worktree`'s repository;
+/// `None` when it is undecided or the repository identity cannot be
+/// resolved.
+///
+/// # Errors
+/// Fails when `config_path` exists but cannot be read or parsed.
+pub fn persisted_level(
+    worktree: &Path,
+    config_path: &Path,
+) -> Result<Option<TrustLevel>, WorkspaceConfigError> {
+    let Ok(repo_key) = crate::issue::repository_identity(worktree) else {
+        return Ok(None);
+    };
+    let config = WorkspaceConfig::load(config_path)?;
+    Ok(trust_for(&config, &repo_key, worktree))
 }
 
 /// The persisted trust for a repository identity, when a `[[projects]]`
