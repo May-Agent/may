@@ -2771,6 +2771,7 @@ mod tests {
                 .expect("instant in range"),
             status,
             output_path: None,
+            place: aither_sandbox::JobPlace::Host,
         }
     }
 

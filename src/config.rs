@@ -1501,18 +1501,6 @@ impl fmt::Display for TimeZoneName {
     }
 }
 
-/// Memory pressure at which the host counts as pressed.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum MemoryPressureThreshold {
-    /// The host is reclaiming memory (`kern.memorystatus_vm_pressure_level`
-    /// warn on macOS).
-    #[default]
-    Warning,
-    /// The host is thrashing.
-    Critical,
-}
-
 /// `[acp]` section: the bounds `/connect` puts on a candidate ACP agent.
 /// Durations are written as `"30s"`, `"1m"`. A change applies to the next
 /// `/connect`.
@@ -1535,15 +1523,16 @@ impl Default for AcpSettings {
 }
 
 /// `[host_load]` section: when the session agent is told the host is under
-/// memory pressure or high load, and how long the terminal's foreground
-/// window grows meanwhile. Durations are written as `"30s"`, `"1m"`.
+/// high load.
+///
+/// The terminal's foreground window grows meanwhile. Memory pressure is not
+/// configured here: aither's memory guard warns on the platform's own
+/// pressure levels. Durations are written as `"30s"`, `"1m"`.
 ///
 /// A change reaches a running session at its next turn.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct HostLoadSettings {
-    /// Memory pressure at or above which the host counts as pressed.
-    pub memory_threshold: MemoryPressureThreshold,
     /// Machine load at or above which the host counts as loaded: on macOS
     /// the load average per core, on Linux the share of the last ten
     /// seconds runnable tasks waited for a CPU.
@@ -1566,7 +1555,6 @@ impl Default for HostLoadSettings {
     fn default() -> Self {
         let defaults = aither_agent::HostLoadConfig::new();
         Self {
-            memory_threshold: MemoryPressureThreshold::Warning,
             load_threshold: defaults.load_threshold.0,
             start_after: defaults.start_after,
             end_after: defaults.end_after,
@@ -1581,10 +1569,6 @@ impl HostLoadSettings {
     #[must_use]
     pub const fn monitor_config(&self) -> aither_agent::HostLoadConfig {
         aither_agent::HostLoadConfig::new()
-            .memory_threshold(match self.memory_threshold {
-                MemoryPressureThreshold::Warning => aither_agent::MemoryPressure::Warning,
-                MemoryPressureThreshold::Critical => aither_agent::MemoryPressure::Critical,
-            })
             .load_threshold(aither_agent::MachineLoad(self.load_threshold))
             .start_after(self.start_after)
             .end_after(self.end_after)

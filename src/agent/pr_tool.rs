@@ -381,6 +381,7 @@ mod tests {
                     screen: None,
                     signing: user.signing(&tmp.join("may-home"), "s1"),
                     github_api: PrContext::default_github_api(),
+                    task_events: None,
                 },
                 terminal.sandbox(),
             ),
