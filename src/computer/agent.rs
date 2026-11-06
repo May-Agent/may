@@ -166,18 +166,14 @@ async fn dispatch_inner(request: AgentRequest, state: Arc<Mutex<AgentState>>) ->
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .displays
                 .get(&session_id)
-                .map(|d| d.display_id());
-            let Some(display_id) = display_id else {
+                .map(|d| (d.display_id(), d.size()));
+            let Some((display_id, size)) = display_id else {
                 return AgentResponse::Error {
                     error: "the session has no desktop".to_owned(),
                 };
             };
-            match tokio::task::spawn_blocking(move || screenshot::screenshot_png(display_id)).await
-            {
-                Ok(Ok(data)) => AgentResponse::Png { data },
-                Ok(Err(e)) => AgentResponse::Error {
-                    error: e.to_string(),
-                },
+            match screenshot::screenshot_png(display_id, size).await {
+                Ok(data) => AgentResponse::Png { data },
                 Err(e) => AgentResponse::Error {
                     error: e.to_string(),
                 },
