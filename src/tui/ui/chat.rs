@@ -11,7 +11,7 @@ use askama::Template as _;
 use crate::agent::cache_miss::CacheMissCause;
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph},
 };
 
 use ratatui::Frame;
@@ -2611,8 +2611,8 @@ fn render_impl(
             .saturating_sub(u16::try_from(top_padding).unwrap_or(0)),
         ..area
     };
-    Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
+    // Rows come pre-wrapped so none reaches past the column (see `wrap`).
+    Paragraph::new(super::wrap::wrap_lines(&lines, area.width))
         .scroll((u16::try_from(skip).unwrap_or(u16::MAX), 0))
         .render(body, frame.buffer_mut());
 
@@ -2628,7 +2628,7 @@ fn render_impl(
     // Anchor the terminal cursor on the caret cell so IME composition and
     // its candidate window track the real insertion point.
     if let (Some(caret_line), Some(input_idx)) = (caret_line, input_line_idx)
-        && let Some((cx, cy)) = wrapped_tail_cell(caret_line, area.width)
+        && let Some((cx, cy)) = wrapped_tail_cell(&caret_line, area.width)
     {
         let caret_row = top_padding
             + element_rows
@@ -2648,19 +2648,6 @@ fn render_impl(
 /// Convert a character index to a byte index in a string.
 fn char_to_byte_index(s: &str, char_idx: usize) -> usize {
     s.char_indices().nth(char_idx).map_or(s.len(), |(i, _)| i)
-}
-
-/// Wrapped row count of a single rendered line, matching the main
-/// paragraph's word wrap exactly — `Paragraph::line_count` is the only
-/// way to get an exact match for the wrap behavior.
-fn wrapped_line_rows(line: &Line<'_>, width: usize) -> usize {
-    if width == 0 {
-        return 0;
-    }
-    let w = u16::try_from(width).unwrap_or(u16::MAX);
-    Paragraph::new(vec![line.clone()])
-        .wrap(Wrap { trim: false })
-        .line_count(w)
 }
 
 /// Style of the leading `!` chip while the composer is in bash mode.
@@ -2760,21 +2747,21 @@ fn input_caret_line(ctx: &InputContext<'_>) -> Line<'static> {
 }
 
 /// Cell of `line`'s last grapheme once wrapped to `width`: the caret cell
-/// of the input caret line. Rendering into a scratch buffer keeps this
-/// exactly in step with `Paragraph` wrapping (wide graphemes included).
-fn wrapped_tail_cell(line: Line<'static>, width: u16) -> Option<(u16, u16)> {
+/// of the input caret line. Rendering the same pre-wrapped rows into a
+/// scratch buffer keeps this exactly in step with the chat's wrapping
+/// (wide graphemes included).
+fn wrapped_tail_cell(line: &Line<'static>, width: u16) -> Option<(u16, u16)> {
     if width == 0 {
         return None;
     }
-    let rows = u16::try_from(wrapped_line_rows(&line, width as usize)).unwrap_or(u16::MAX);
+    let wrapped = super::wrap::wrap_line(line, width);
+    let rows = u16::try_from(wrapped.len()).unwrap_or(u16::MAX);
     if rows == 0 {
         return None;
     }
     let buf_area = Rect::new(0, 0, width, rows);
     let mut buf = Buffer::empty(buf_area);
-    Paragraph::new(vec![line])
-        .wrap(Wrap { trim: false })
-        .render(buf_area, &mut buf);
+    Paragraph::new(wrapped).render(buf_area, &mut buf);
     // Trailing cells of wide graphemes are reset to blank, so the last
     // non-blank cell is the caret marker itself.
     for y in (buf_area.top()..buf_area.bottom()).rev() {
@@ -3630,15 +3617,14 @@ pub fn render_tool_fullscreen(frame: &mut Frame, area: Rect, display: &ToolDispl
     let inner_height = area.height.saturating_sub(2);
     let scroll_y = safe_scroll(scroll, lines.len(), inner_height);
 
-    let paragraph = Paragraph::new(lines)
+    let paragraph = super::wrap::WrappedParagraph::new(lines)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .title("Tool Details")
                 .border_style(Style::default().fg(Color::Cyan)),
         )
-        .wrap(Wrap { trim: false })
-        .scroll((scroll_y, 0));
+        .scroll(scroll_y);
 
     frame.render_widget(paragraph, area);
 }
@@ -4296,7 +4282,9 @@ mod tests {
         assert_eq!(streamed_screen, whole_screen);
     }
 
-    const TABLE_REPLY: &str = "对比如下：\n\n| 项目 | 说明 | 命令 |\n|---|---|---|\n| 构建 | 编译整个工作区并运行所有单元测试，确认没有回归 | `cargo test --workspace --all-features --locked` |\n| 格式化 | 检查代码风格 | `cargo fmt --all -- --check` |\n\n```sh\ncargo test\n```\n\n以上命令都需要在仓库根目录运行。";
+    /// A three-column table of CJK cells and a long inline code span,
+    /// wider than the chat column, then a fenced block and a paragraph.
+    const TABLE_REPLY: &str = "对比如下：\n\n| 项目 | 说明 | 命令 |\n|---|---|---|\n| 构建 | 编译整个工作区并运行所有单元测试，确认没有回归 | `cargo test --workspace --all-features --locked` |\n| 格式化 | 检查代码风格 | `cargo fmt --all -- --check` |\n\n```sh\ncargo test --workspace\n```\n\n以上命令都需要在仓库根目录运行，结果会写入目标目录。";
 
     /// Display columns of the table border glyphs on a screen row.
     fn screen_border_columns(row: &str) -> Vec<usize> {
@@ -4357,6 +4345,70 @@ mod tests {
         // The rows around the table are the text before it and a blank.
         assert_eq!(rows[first - 2], "对比如下：");
         assert_eq!(rows[last + 1], "");
+    }
+
+    /// A reply holding a table wider than the chat column and a fenced
+    /// block, streamed with a frame per chunk and followed by more frames,
+    /// leaves no stray cell: no frame puts a wide glyph half outside the
+    /// column (which the diff would follow by skipping the next cell), the
+    /// terminal shows each frame exactly (`draw_unified` checks), and the
+    /// final screen equals a fresh render of the final state.
+    #[test]
+    fn wide_table_reply_leaves_no_stray_cells() {
+        use crate::tui::ui::test_screen::ScreenBackend as TestBackend;
+        use ratatui::Terminal;
+
+        let height = 24;
+        let draw = |terminal: &mut Terminal<TestBackend>,
+                    chat: &ChatStream,
+                    layout: &mut super::ChatLayout,
+                    scroll: usize| {
+            let frame = draw_unified(terminal, chat, layout, scroll);
+            let last = frame.area.right() - 1;
+            for y in frame.area.top()..frame.area.bottom() {
+                let symbol = frame[(last, y)].symbol();
+                assert!(
+                    unicode_width::UnicodeWidthStr::width(symbol) < 2,
+                    "wide glyph {symbol:?} overflows the last column on row {y}"
+                );
+            }
+        };
+        for width in (20u16..=56).step_by(4) {
+            for chunk in [1usize, 6] {
+                let mut chat = ChatStream::new();
+                chat.push_user("对比", Vec::new(), 0);
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                let mut layout = super::ChatLayout::default();
+                let mut rest = TABLE_REPLY;
+                while !rest.is_empty() {
+                    let split = rest
+                        .char_indices()
+                        .nth(chunk)
+                        .map_or(rest.len(), |(i, _)| i);
+                    let (text, tail) = rest.split_at(split);
+                    chat.push_text(text);
+                    draw(&mut terminal, &chat, &mut layout, usize::MAX);
+                    rest = tail;
+                }
+                chat.end_text();
+                chat.push_user("再说一遍", Vec::new(), 1);
+                chat.push_text("好的。\n\n第二段说明文字，稍微长一些，会在窄窗口里换行。");
+                chat.end_text();
+                for scroll in [0, 3, 11, usize::MAX] {
+                    draw(&mut terminal, &chat, &mut layout, scroll);
+                }
+                let shown = terminal.backend().screen();
+
+                let mut fresh = Terminal::new(TestBackend::new(width, height)).unwrap();
+                let mut fresh_layout = super::ChatLayout::default();
+                draw_unified(&mut fresh, &chat, &mut fresh_layout, usize::MAX);
+                assert_eq!(
+                    shown,
+                    fresh.backend().screen(),
+                    "width={width} chunk={chunk}"
+                );
+            }
+        }
     }
 
     /// A width change re-wraps every element: the narrower screen equals a
@@ -4424,7 +4476,7 @@ mod tests {
             Terminal,
             buffer::Buffer,
             layout::Rect,
-            widgets::{Paragraph, Widget, Wrap},
+            widgets::{Paragraph, Widget},
         };
 
         let mut chat = ChatStream::new();
@@ -4462,7 +4514,7 @@ mod tests {
             }
         }
 
-        // And the mirror itself matches a plain full-document paragraph.
+        // And the mirror itself matches the whole document wrapped at once.
         let mut lines = Vec::new();
         for (index, elem) in chat.active_elements().iter().enumerate() {
             let _ = index;
@@ -4480,9 +4532,7 @@ mod tests {
         let element_rows = layout.element_rows();
         let area = Rect::new(0, 0, width, u16::try_from(element_rows).unwrap());
         let mut buf = Buffer::empty(area);
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .render(area, &mut buf);
+        Paragraph::new(crate::tui::ui::wrap::wrap_lines(&lines, width)).render(area, &mut buf);
         for (row, expected) in doc.iter().enumerate().take(element_rows) {
             let y = u16::try_from(row).unwrap();
             let mut text = String::new();

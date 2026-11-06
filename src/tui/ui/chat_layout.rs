@@ -21,7 +21,7 @@ use std::sync::OnceLock;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
-use ratatui::widgets::{Paragraph, Widget, Wrap};
+use ratatui::widgets::{Paragraph, Widget};
 use unicode_width::UnicodeWidthStr;
 
 use super::chat::{
@@ -29,25 +29,16 @@ use super::chat::{
 };
 use super::links::{self, LinkHit, LinkId, LinkRun, ScreenRun};
 use super::streaming_markdown::IMAGE_HEIGHT;
+use super::wrap;
 
 /// How far ahead the cache looks for an element that moved because
 /// elements before it were removed (`set_todos`, rewind).
 const REUSE_LOOKAHEAD: usize = 4;
 
-/// Wrapped row count of `line` at `width`, exactly as `Paragraph` with
-/// `Wrap { trim: false }` lays it out.
+/// Wrapped row count of `line` at `width`, exactly as the chat draws it
+/// (see [`wrap`]).
 pub(super) fn line_rows(line: &Line<'_>, width: u16) -> usize {
-    if width == 0 {
-        return 0;
-    }
-    // A line that fits never wraps; only longer lines need the real
-    // word-wrapper (which needs an owned copy).
-    if line.width() <= usize::from(width) {
-        return 1;
-    }
-    Paragraph::new(line.clone())
-        .wrap(Wrap { trim: false })
-        .line_count(width)
+    wrap::line_rows(line, width)
 }
 
 /// Plain text of each wrapped row of `lines`, read back from a scratch
@@ -71,9 +62,7 @@ fn scratch(lines: &[Line<'_>], width: u16, rows: usize) -> Scratch {
     let height = u16::try_from(rows).unwrap_or(u16::MAX);
     let area = Rect::new(0, 0, width, height);
     let mut buf = Buffer::empty(area);
-    Paragraph::new(lines.to_vec())
-        .wrap(Wrap { trim: false })
-        .render(area, &mut buf);
+    Paragraph::new(wrap::wrap_lines(lines, width)).render(area, &mut buf);
     let mut out = Vec::with_capacity(rows);
     let mut runs = Vec::new();
     for y in 0..height {
