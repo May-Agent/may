@@ -130,6 +130,8 @@ pub enum AppEvent {
     /// The daemon dropped turn frames this client missed: the session's
     /// history must be reloaded.
     HistoryStale,
+    /// The user's global sleep state, from the `sleep` event.
+    Sleep(crate::sleep::SleepStatus),
     /// A `session_suggestion` frame arrived: `text` is the new ghost text,
     /// `None` clears it.
     PromptSuggestion {
@@ -222,6 +224,7 @@ impl AppEvent {
             Self::IndexCoverage(_) => "index_coverage",
             Self::TurnStarted { .. } => "turn_started",
             Self::HistoryStale => "history_stale",
+            Self::Sleep(_) => "sleep",
             Self::PromptSuggestion { .. } => "prompt_suggestion",
             Self::Recap { .. } => "recap",
             Self::JobKilled { .. } => "job_killed",
