@@ -133,6 +133,15 @@ trait ChatSink {
     ) -> impl Future<Output = bool> + Send;
     fn on_text(&mut self, chunk: &str) -> impl Future<Output = bool> + Send;
     fn on_reasoning(&mut self, chunk: &str) -> impl Future<Output = bool> + Send;
+    /// The reply just streamed was not in the communication language:
+    /// `text` is its translation, shown instead and marked as translated.
+    fn on_reply_translated(
+        &mut self,
+        _text: &str,
+        _language: &str,
+    ) -> impl Future<Output = bool> + Send {
+        async { true }
+    }
     /// A reasoning phase closed after `seconds`, whether or not it produced
     /// readable text. Emitted just before the first visible output that
     /// follows the phase.
@@ -271,6 +280,18 @@ impl HubSink {
     }
 }
 
+/// `session_turn` frame carrying the display translation of the reply the
+/// turn just streamed; the streamed text stays its original.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SseTranslatedEvent<'a> {
+    seq: u64,
+    turn_id: &'a str,
+    text: &'a str,
+    language: &'a str,
+    language_name: &'a str,
+}
+
 /// `session_turn` frame discarding the text the turn streamed so far.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -358,6 +379,22 @@ impl ChatSink for HubSink {
                 seq,
                 turn_id: &self.turn_id,
                 chunk,
+            },
+        );
+        true
+    }
+
+    async fn on_reply_translated(&mut self, text: &str, language: &str) -> bool {
+        let seq = self.next_seq();
+        let language_name = crate::session::language_display_name(language);
+        self.publish_turn(
+            "translated",
+            &SseTranslatedEvent {
+                seq,
+                turn_id: &self.turn_id,
+                text,
+                language,
+                language_name: &language_name,
             },
         );
         true
@@ -843,6 +880,7 @@ fn api_message_from_run_result(result: AgentRunResult) -> ApiMessage {
             context_window: result.model_context_window,
             elapsed_ms: Some(result.elapsed_ms),
         }),
+        translation: None,
     }
 }
 
@@ -1822,6 +1860,7 @@ fn run_agent_loop<'a>(
                 last_speed_emit: None,
                 segment_text: String::new(),
                 segment_at: None,
+                segment_translation: None,
                 last_event_at: None,
                 full_text: String::new(),
                 reasoning_text: String::new(),
@@ -2882,6 +2921,12 @@ async fn resolve_session_context(
     };
 
     let mut hidden_context_parts = Vec::<String>::new();
+    // A claimed entry with no visible input commits with the first hidden
+    // context row the run persists for it; a visible message commits it
+    // instead, so a failure between the two never leaves it half-delivered.
+    let mut hidden_commit_entry = req
+        .pending_entry_id
+        .filter(|_| persist_user_message && !request_has_visible_user_input(req));
     if persist_user_message && take_over_alert_pending(state, &session_id).await {
         push_hidden_context_part(
             &db,
@@ -2890,6 +2935,7 @@ async fn resolve_session_context(
             &mut hidden_context_parts,
             browser_takeover_alert(),
             persist_user_message,
+            &mut hidden_commit_entry,
         )
         .await
         .map_err(UiChatPreparationError::PersistHiddenContext)?;
@@ -2908,6 +2954,7 @@ async fn resolve_session_context(
             &mut hidden_context_parts,
             hidden_context_xml.to_string(),
             persist_user_message,
+            &mut hidden_commit_entry,
         )
         .await
         .map_err(UiChatPreparationError::PersistHiddenContext)?;
@@ -2924,6 +2971,7 @@ async fn resolve_session_context(
             &mut hidden_context_parts,
             session_mentions_xml,
             persist_user_message,
+            &mut hidden_commit_entry,
         )
         .await
         .map_err(UiChatPreparationError::PersistHiddenContext)?;
@@ -2951,9 +2999,18 @@ async fn resolve_session_context(
             &mut hidden_context_parts,
             file_mentions_xml,
             persist_user_message,
+            &mut hidden_commit_entry,
         )
         .await
         .map_err(UiChatPreparationError::PersistHiddenContext)?;
+    }
+
+    if let Some(entry_id) = hidden_commit_entry.take() {
+        // Every hidden part was already in the transcript: nothing carried
+        // the commit, so it lands on its own.
+        db.commit_pending_entry_as_run(fence, entry_id)
+            .await
+            .map_err(UiChatPreparationError::PersistHiddenContext)?;
     }
 
     let user_message_id = if persist_user_message && request_has_visible_user_input(req) {
@@ -3061,6 +3118,7 @@ async fn push_hidden_context_part(
     hidden_context_parts: &mut Vec<String>,
     content: String,
     persist_user_message: bool,
+    commit_entry: &mut Option<i64>,
 ) -> Result<(), crate::db::ChatDbError> {
     let trimmed = content.trim();
     if trimmed.is_empty() {
@@ -3074,8 +3132,16 @@ async fn push_hidden_context_part(
             matches!(message.role, MessageRole::HiddenContext) && message.content == trimmed
         })
     {
-        db.append_chat_message_as_run(fence, &ChatMessage::hidden_context(trimmed.to_string()))
-            .await?;
+        let message = ChatMessage::hidden_context(trimmed.to_string());
+        match commit_entry.take() {
+            Some(entry_id) => {
+                db.append_chat_message_as_run_and_commit_pending(fence, entry_id, &message)
+                    .await?;
+            }
+            None => {
+                db.append_chat_message_as_run(fence, &message).await?;
+            }
+        }
     }
 
     if !already_queued {
@@ -5069,6 +5135,101 @@ mod tests {
         assert!(!third.contains("get some rest"));
         assert!(!third.contains("usually go to sleep"));
         assert!(!third.contains("time to rest"));
+    }
+
+    /// A queued entry that carries only hidden context (an agent message)
+    /// is committed by the run that delivers it: the claim reset at daemon
+    /// start does not deliver it again and the queue reports it gone.
+    #[tokio::test]
+    async fn a_delivered_hidden_context_entry_is_not_redelivered_after_restart() {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let provider = stub_provider(vec![sse_text("unused")]).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let state = failover_state(may_dir.path(), &provider, &provider).await;
+        let db = state.db();
+        db.set_pending_immediate_message(
+            "session",
+            crate::session::PendingUserMessage {
+                id: None,
+                state: crate::session::PendingMessageState::default(),
+                error: None,
+                content: String::new(),
+                attachments: Vec::new(),
+                hidden_context_xml: Some(
+                    crate::XmlBlock::parse("<agent_message>ping</agent_message>")
+                        .expect("hidden context"),
+                ),
+                created_at: jiff::Timestamp::now().to_string(),
+                delivery_mode: crate::session::PendingUserMessageMode::Queue,
+            },
+        )
+        .await
+        .expect("enqueue");
+        let guard = state
+            .runtime_service
+            .runs()
+            .acquire("session")
+            .await
+            .expect("acquire run");
+        let next = db
+            .claim_next_pending_message(guard.fence(), "session")
+            .await
+            .expect("claim")
+            .expect("the entry waits in the queue");
+        let req = ChatRequest {
+            session_id: "session".to_string(),
+            content: next.content,
+            attachments: Vec::new(),
+            hidden_context_xml: next.hidden_context_xml,
+            delivery_mode: next.delivery_mode,
+            pending_entry_id: next.id,
+        };
+        super::prepare_agent_for_request(
+            &state,
+            &req,
+            guard.fence(),
+            true,
+            true,
+            super::TurnAttempt {
+                provider_attempt: 0,
+                turn_boundary: None,
+                retained_agent: None,
+            },
+            &TurnKind::Prompt,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("the entry's turn prepares: {error}"));
+        guard
+            .finish_idle(crate::session::RunOutcome::Completed)
+            .await
+            .expect("release the run");
+
+        assert!(
+            state
+                .runtime_service
+                .get("session")
+                .await
+                .expect("runtime")
+                .queued_count
+                == 0,
+            "a delivered entry leaves the queue"
+        );
+        db.recover_session_runtimes_after_restart()
+            .await
+            .expect("daemon start resets claims");
+        let guard = state
+            .runtime_service
+            .runs()
+            .acquire("session")
+            .await
+            .expect("acquire run");
+        assert!(
+            db.claim_next_pending_message(guard.fence(), "session")
+                .await
+                .expect("claim")
+                .is_none(),
+            "the delivered entry is not delivered again"
+        );
     }
 
     /// Runs one prompt turn of "session" to completion on `sink`.

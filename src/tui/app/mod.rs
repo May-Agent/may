@@ -380,6 +380,9 @@ pub struct App {
     /// The session's blocking state as the daemon last reported it on the
     /// `session_runtime` stream.
     pub session_runtime: crate::client::SessionRuntimeSnapshot,
+    /// Permission requests whose dialog was already opened, so a snapshot
+    /// that still lists an answered request does not reopen it.
+    shown_permission_requests: std::collections::HashSet<String>,
     /// Coverage of the session's worktree index, as the `session_index`
     /// stream last reported it; `None` until the first report or when the
     /// session is not in an indexed worktree.
@@ -470,6 +473,41 @@ fn tunnel_base(config: &MayConfig) -> String {
         "http://localhost:{}/tunnel",
         config.daemon.port.unwrap_or(crate::daemon::DEFAULT_PORT)
     )
+}
+
+/// The conversation rows of one turn seen so far while history is rebuilt.
+#[derive(Default)]
+struct HistoryTurn {
+    started: Option<jiff::Timestamp>,
+    last: Option<jiff::Timestamp>,
+    /// The turn's latest row is a reply: a run ends with one.
+    replied: bool,
+}
+
+impl HistoryTurn {
+    fn note(&mut self, msg: &ChatMessage) {
+        if !matches!(
+            msg.role,
+            MessageRole::User | MessageRole::Assistant | MessageRole::Tool
+        ) {
+            return;
+        }
+        if let Some(at) = msg.timestamp {
+            self.started.get_or_insert(at);
+            self.last = Some(at);
+        }
+        self.replied = msg.role == MessageRole::Assistant;
+    }
+
+    /// Whole seconds from the turn's first row to its last.
+    fn seconds(&self) -> u64 {
+        match (self.started, self.last) {
+            (Some(started), Some(last)) => {
+                u64::try_from(last.duration_since(started).as_secs()).unwrap_or(0)
+            }
+            _ => 0,
+        }
+    }
 }
 
 impl App {
@@ -704,6 +742,7 @@ impl App {
             secrets,
             open_question_count: 0,
             session_runtime: crate::client::SessionRuntimeSnapshot::default(),
+            shown_permission_requests: std::collections::HashSet::new(),
             index_coverage: None,
             asleep: false,
             sleep_reminders: None,
@@ -1663,10 +1702,19 @@ impl App {
         }
     }
 
-    /// Rebuilds the chat view from `messages`.
+    /// Rebuilds the chat view from `messages` the way the live turns built
+    /// it: tool calls replay from their stored lifecycle rows, and every
+    /// finished turn folds into its "Worked for" row. The last turn folds
+    /// only when its reply is stored; until then it may still be running.
     async fn render_history(&mut self, messages: &[ChatMessage]) {
         self.chat = ChatStream::new().with_tunnel_base(tunnel_base(&self.config));
+        let mut turn = HistoryTurn::default();
         for (history_index, msg) in messages.iter().enumerate() {
+            if msg.role == MessageRole::User {
+                self.fold_history_turn(&turn);
+                turn = HistoryTurn::default();
+            }
+            turn.note(msg);
             match msg.role {
                 MessageRole::User => {
                     let restored = futures_util::future::join_all(msg.attachments.iter().map(
@@ -1695,6 +1743,36 @@ impl App {
                 MessageRole::Assistant => {
                     self.chat.push_text(&msg.content);
                     self.chat.end_text();
+                    if let Some(translation) = &msg.translation {
+                        self.chat
+                            .set_translation(translation.text.clone(), &translation.language);
+                    }
+                }
+                MessageRole::Tool => {
+                    match serde_json::from_str::<crate::session::ToolEventRecord>(&msg.content) {
+                        Ok(crate::session::ToolEventRecord::Start {
+                            id,
+                            name,
+                            arguments,
+                        }) => {
+                            // A stored call carries the arguments schema of
+                            // the build that ran it, so it is read field by
+                            // field rather than against today's schema.
+                            self.show_tool_start(id, parse_tool_start_partial(&name, &arguments));
+                        }
+                        Ok(crate::session::ToolEventRecord::End { id, result, .. }) => {
+                            self.show_tool_end(&id, &result);
+                        }
+                        Ok(crate::session::ToolEventRecord::Stopped { id, .. }) => {
+                            self.show_tool_end(
+                                &id,
+                                &crate::session::ToolEventRecord::stopped_result(),
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, row = ?msg.id, "unreadable tool row in history");
+                        }
+                    }
                 }
                 MessageRole::Recap => {
                     if let Ok(record) =
@@ -1706,6 +1784,16 @@ impl App {
                 _ => {}
             }
         }
+        if turn.replied {
+            self.fold_history_turn(&turn);
+        }
+    }
+
+    /// Fold the finished turn `turn` of a history rebuild, as
+    /// `finish_agent_task` folds a live one when its run ends.
+    fn fold_history_turn(&mut self, turn: &HistoryTurn) {
+        self.chat.finish_running_calls();
+        self.chat.fold_turn_work(turn.seconds());
     }
 
     /// Re-reads the current session from the database and rebuilds the chat
@@ -1820,6 +1908,58 @@ impl App {
             &mut self.parked_question,
             prompt,
         );
+    }
+
+    /// The handler boundary: the outcome of a key, event or action handler.
+    /// A failure of an ordinary interaction (a refused daemon request, a
+    /// failed session operation) becomes a chat error and the TUI keeps
+    /// running; `None` tells the caller the interaction produced nothing.
+    /// Only failures that leave nothing to run (a terminal that cannot draw,
+    /// no daemon at startup) are propagated by their callers instead.
+    pub fn settle<T, E: std::fmt::Display>(&mut self, outcome: Result<T, E>) -> Option<T> {
+        match outcome {
+            Ok(value) => Some(value),
+            Err(error) => {
+                tracing::warn!(%error, "interaction failed");
+                self.chat.end_text();
+                self.chat.push_error(&format!("{error:#}"));
+                self.scroll = usize::MAX;
+                None
+            }
+        }
+    }
+
+    /// Open the dialog for the permission request the session waits on, once
+    /// per request: the runtime snapshot keeps listing a request until the
+    /// daemon's next report, so an answered one must not reopen.
+    pub fn open_waiting_permission(&mut self) {
+        if !matches!(self.mode, AppMode::Chat) {
+            return;
+        }
+        let Some(request) = &self.session_runtime.waiting_permission else {
+            return;
+        };
+        if !self.shown_permission_requests.insert(request.id.clone()) {
+            return;
+        }
+        self.mode = AppMode::PermissionConfirm(crate::tui::state::PermissionConfirmState {
+            request_id: request.id.clone(),
+            request: request.request.clone(),
+        });
+    }
+
+    /// Close the permission dialog once its request is no longer the one the
+    /// session waits on: another client answered it, or it was withdrawn.
+    pub fn close_resolved_permission(&mut self) {
+        if let AppMode::PermissionConfirm(state) = &self.mode
+            && self
+                .session_runtime
+                .waiting_permission
+                .as_ref()
+                .is_none_or(|request| request.id != state.request_id)
+        {
+            self.mode = AppMode::Chat;
+        }
     }
 
     /// `/permission` re-asks the launch directory's access decision — the
@@ -2255,6 +2395,14 @@ impl App {
         if self.quit_pending {
             self.quit_pending = false;
             self.status = None;
+        }
+
+        // The per-mode handlers see the key code alone, so a modified
+        // character with no binding above must not reach them as text.
+        if matches!(code, KeyCode::Char(_))
+            && modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+        {
+            return Ok(None);
         }
 
         match &self.mode {
@@ -3641,6 +3789,16 @@ impl App {
         self.input_visible = true;
     }
 
+    /// Times the running turn from `started_at`, when the daemon started it,
+    /// instead of from this client's first sight of it.
+    pub fn set_turn_started_at(&mut self, started_at: jiff::Timestamp) {
+        let elapsed = jiff::Timestamp::now()
+            .duration_since(started_at)
+            .unsigned_abs();
+        let now = std::time::Instant::now();
+        self.turn_started_at = Some(now.checked_sub(elapsed).unwrap_or(now));
+    }
+
     /// Working directory for the status bar: the absolute path with the
     /// user home shown as `~` (component-wise, so `~/foo2` is not mistaken
     /// for home).
@@ -3818,6 +3976,41 @@ impl App {
         .detach();
     }
 
+    /// Show a tool call that started — live or replayed from history.
+    fn show_tool_start(&mut self, id: String, kind: ToolStartKind) {
+        let display = self.tool_start_display(kind);
+        self.chat.upsert_tool_display(id, display);
+    }
+
+    /// Show the result of the tool call `id` — live or replayed from history.
+    fn show_tool_end(&mut self, id: &str, result: &aither_core::llm::ToolResult) {
+        match parse_tool_end(result) {
+            ToolEndKind::Output(out) => {
+                let image = out
+                    .image
+                    .or_else(|| self.imagine_result_image(id, &out.text));
+                let status = out.failure.map_or(
+                    super::ui::chat::ToolStatus::Done,
+                    super::ui::chat::ToolStatus::Failed,
+                );
+                self.chat
+                    .update_tool_with_output(id, status, Some(out.text.as_str()));
+                if let Some(image) = image
+                    && let Some(image) = self.install_tool_image(id, image)
+                {
+                    self.chat.set_tool_image(id, image);
+                }
+            }
+            ToolEndKind::Error(err) => {
+                self.chat.update_tool_with_output(
+                    id,
+                    super::ui::chat::ToolStatus::Failed(err),
+                    None,
+                );
+            }
+        }
+    }
+
     /// Map a parsed tool-call start into its stream display. Shared by the
     /// canonical `ToolCallStart` path and the progressive `ToolCallDelta`
     /// projection — a partial parse only differs in fields still empty.
@@ -3897,6 +4090,9 @@ impl App {
                         self.chat.push_text(&chunk);
                         self.input_visible = true;
                     }
+                    AgentEvent::ReplyTranslated { text, language } => {
+                        self.chat.set_translation(text, &language);
+                    }
                     AgentEvent::Reasoning(chunk) => {
                         self.activity_phase = crate::tui::ui::chat::ActivityPhase::Thinking;
                         self.decode_meter.note_output(chunk.len());
@@ -3961,41 +4157,12 @@ impl App {
                         if let Some(pending) = self.pending_tool_calls.get_mut(&id) {
                             pending.started = true;
                         }
-                        let display = self.tool_start_display(parse_tool_start(&name, &arguments));
-                        self.chat.upsert_tool_display(id, display);
+                        self.show_tool_start(id, parse_tool_start(&name, &arguments));
                     }
                     AgentEvent::ToolCallEnd { id, result, .. } => {
                         // Back to waiting on the model for the next burst.
                         self.activity_phase = crate::tui::ui::chat::ActivityPhase::Thinking;
-                        let feedback = parse_tool_end(&result);
-                        match feedback {
-                            ToolEndKind::Output(out) => {
-                                let image = out
-                                    .image
-                                    .or_else(|| self.imagine_result_image(&id, &out.text));
-                                let status = out.failure.map_or(
-                                    super::ui::chat::ToolStatus::Done,
-                                    super::ui::chat::ToolStatus::Failed,
-                                );
-                                self.chat.update_tool_with_output(
-                                    &id,
-                                    status,
-                                    Some(out.text.as_str()),
-                                );
-                                if let Some(image) = image
-                                    && let Some(image) = self.install_tool_image(&id, image)
-                                {
-                                    self.chat.set_tool_image(&id, image);
-                                }
-                            }
-                            ToolEndKind::Error(err) => {
-                                self.chat.update_tool_with_output(
-                                    &id,
-                                    super::ui::chat::ToolStatus::Failed(err),
-                                    None,
-                                );
-                            }
-                        }
+                        self.show_tool_end(&id, &result);
                         self.live_reads.remove(&id);
                         self.pending_tool_calls.remove(&id);
                         self.request_file_diff(&id);
@@ -4471,6 +4638,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_unbound_modified_character_is_not_text() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        for modifier in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::SUPER,
+        ] {
+            for c in ['a', 'k', 'u'] {
+                assert!(
+                    app.handle_key(KeyCode::Char(c), modifier)
+                        .expect("key")
+                        .is_none()
+                );
+            }
+        }
+        assert_eq!(app.input, "", "no modified key types its letter");
+
+        app.handle_key(KeyCode::Char('A'), KeyModifiers::SHIFT)
+            .expect("key");
+        press(&mut app, KeyCode::Char('b'));
+        assert_eq!(app.input, "Ab", "plain and shifted characters still type");
+    }
+
+    #[tokio::test]
+    async fn a_replayed_turn_is_timed_from_the_daemons_start_and_matched_by_row_id() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+
+        app.set_turn_started_at(jiff::Timestamp::now() - std::time::Duration::from_secs(90));
+        let elapsed = app.turn_started_at.expect("set").elapsed().as_secs();
+        assert!(
+            (90..95).contains(&elapsed),
+            "counts from the start: {elapsed}"
+        );
+
+        let mut prompt = crate::session::ChatMessage::user("hello");
+        prompt.id = Some(7);
+        app.session_manager.record_unpersisted(prompt);
+        let session = app.session_manager.current().expect("session");
+        assert!(session.holds_message(7));
+        assert!(!session.holds_message(8));
+    }
+
+    #[tokio::test]
     async fn permission_sheet_opens_on_the_persisted_trust_level() {
         use crate::trust::{RepoKind, TrustLevel};
 
@@ -4505,6 +4717,53 @@ mod tests {
             crate::trust::option_level(&state.ask.questions[0].option[cursor]),
             Some(TrustLevel::Local),
             "the sheet highlights the level in force, not the first option"
+        );
+    }
+
+    fn last_error(app: &App) -> Option<&str> {
+        app.chat
+            .elements()
+            .iter()
+            .rev()
+            .find_map(|element| match element {
+                ChatElement::Error { message } => Some(message.as_str()),
+                _ => None,
+            })
+    }
+
+    #[tokio::test]
+    async fn a_refused_daemon_request_is_a_chat_error_not_a_failure() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _) = app_with_session(dir.path()).await;
+        let refused: Result<(), crate::tui::runtime::TuiRuntimeError> =
+            Err(crate::client::DaemonClientError::Status {
+                path: "/api/permissions/respond".to_string(),
+                status: hyper::StatusCode::BAD_REQUEST,
+                message: "permission request not found or already resolved".to_string(),
+            }
+            .into());
+        assert!(app.settle(refused).is_none());
+        let shown = last_error(&app).expect("the refusal is shown in the chat");
+        assert!(shown.contains("already resolved"), "{shown}");
+        // The app still handles input afterwards.
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.input, "a");
+    }
+
+    #[tokio::test]
+    async fn a_failed_session_operation_is_a_chat_error_not_a_failure() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _) = app_with_session(dir.path()).await;
+        let failed: Result<(), crate::session::SessionError> =
+            Err(crate::session::SessionError::NotFound(
+                "history position 3 is not a user message".to_string(),
+            ));
+        assert!(app.settle(failed).is_none());
+        let shown = last_error(&app).expect("the failure is shown in the chat");
+        assert!(shown.contains("is not a user message"), "{shown}");
+        assert_eq!(
+            app.settle(Ok::<_, crate::session::SessionError>(7)),
+            Some(7)
         );
     }
 
@@ -4614,6 +4873,119 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn a_session_loaded_from_the_database_shows_its_tool_calls_folded_per_turn() {
+        use crate::ChatMessage;
+        use crate::session::ToolEventRecord;
+        use crate::tui::ui::chat::ToolDisplay;
+
+        let dir = tempfile::tempdir().expect("dir");
+        let db = crate::db::ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("open database");
+        db.create_session("s", None, None)
+            .await
+            .expect("create session");
+        let at = |second: i64| jiff::Timestamp::from_second(1_800_000_000 + second).expect("time");
+        let call = |id: &str, script: &str, second: i64| {
+            let start = ToolEventRecord::Start {
+                id: id.to_string(),
+                name: "terminal".to_string(),
+                arguments: serde_json::json!({ "description": script, "script": script })
+                    .to_string(),
+            };
+            let end = ToolEventRecord::End {
+                id: id.to_string(),
+                name: "terminal".to_string(),
+                result: aither_core::llm::ToolResult::text("done"),
+            };
+            [
+                ChatMessage::tool(
+                    id,
+                    serde_json::to_string(&start).expect("start"),
+                    at(second),
+                ),
+                ChatMessage::tool(
+                    id,
+                    serde_json::to_string(&end).expect("end"),
+                    at(second + 1),
+                ),
+            ]
+        };
+        let mut first = ChatMessage::user("list issues");
+        first.timestamp = Some(at(0));
+        let mut second = ChatMessage::user("and the backend?");
+        second.timestamp = Some(at(30));
+        let rows: Vec<ChatMessage> = std::iter::once(first)
+            .chain(call("terminal:0#a", "issue list", 2))
+            .chain(call("terminal:0#b", "issue list --state all", 4))
+            .chain([ChatMessage::assistant("None open.", at(20)), second])
+            .chain(call("terminal:0#c", "cat workspace.toml", 32))
+            .chain([ChatMessage::assistant("It is local.", at(40))])
+            .collect();
+        for row in &rows {
+            db.append_chat_message("s", row).await.expect("append row");
+        }
+        let history = crate::session::load_history_from_db(&db, "s")
+            .await
+            .expect("load history");
+
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        app.render_history(history.messages()).await;
+
+        let commands = |elements: &[ChatElement]| -> Vec<String> {
+            elements
+                .iter()
+                .map(|element| match element {
+                    ChatElement::ToolCall {
+                        display:
+                            ToolDisplay::Terminal {
+                                command, status, ..
+                            },
+                        ..
+                    } => {
+                        assert!(
+                            matches!(status, crate::tui::ui::chat::ToolStatus::Done),
+                            "{status:?}"
+                        );
+                        command.clone()
+                    }
+                    other => panic!("unexpected folded element {other:?}"),
+                })
+                .collect()
+        };
+        let elements = app.chat.elements();
+        assert_eq!(elements.len(), 6, "{elements:#?}");
+        assert!(matches!(&elements[0], ChatElement::UserMessage { .. }));
+        let ChatElement::WorkedFor {
+            seconds,
+            elements: work,
+            ..
+        } = &elements[1]
+        else {
+            panic!("first turn is not folded: {:?}", elements[1]);
+        };
+        assert_eq!(*seconds, 20);
+        assert_eq!(commands(work), ["issue list", "issue list --state all"]);
+        assert!(
+            matches!(&elements[2], ChatElement::AssistantText { content, .. } if content == "None open.")
+        );
+        assert!(matches!(&elements[3], ChatElement::UserMessage { .. }));
+        let ChatElement::WorkedFor {
+            seconds,
+            elements: work,
+            ..
+        } = &elements[4]
+        else {
+            panic!("last turn is not folded: {:?}", elements[4]);
+        };
+        assert_eq!(*seconds, 10);
+        assert_eq!(commands(work), ["cat workspace.toml"]);
+        assert!(
+            matches!(&elements[5], ChatElement::AssistantText { content, .. } if content == "It is local.")
+        );
+    }
+
     #[test]
     fn utf8_complete_len_holds_only_incomplete_trailing_sequence() {
         assert_eq!(utf8_complete_len(b"hello"), 5);
@@ -4639,5 +5011,73 @@ mod tests {
         // trailing incomplete sequence shortens the prefix.
         let buf = [b"ok".as_slice(), &[0xff], b"!", &emoji[..2]].concat();
         assert_eq!(utf8_complete_len(&buf), 4);
+    }
+
+    fn waiting_permission_snapshot(id: Option<&str>) -> AppEvent {
+        let runtime = crate::client::SessionRuntimeSnapshot {
+            waiting_permission: id.map(|id| crate::client::PermissionPollItem {
+                id: id.to_string(),
+                request: crate::session::PersistedPermissionRequestPayload {
+                    mode: crate::PermissionRequestMode::Unsafe,
+                    script: "rm -rf build".to_string(),
+                    session_id: None,
+                    agent_id: None,
+                },
+            }),
+            ..Default::default()
+        };
+        AppEvent::SessionRuntime(Box::new(crate::client::SessionRuntimeEvent {
+            session_id: "s".to_string(),
+            runtime,
+        }))
+    }
+
+    #[tokio::test]
+    async fn an_answered_permission_request_does_not_reopen_the_dialog() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _) = app_with_session(dir.path()).await;
+        app.handle_event(waiting_permission_snapshot(Some("p1")))
+            .expect("snapshot");
+        app.open_waiting_permission();
+        assert!(matches!(
+            app.mode,
+            crate::tui::AppMode::PermissionConfirm(_)
+        ));
+        let action = press(&mut app, KeyCode::Enter);
+        assert!(matches!(
+            action,
+            Some(SendAction::RespondPermission { approved: true, .. })
+        ));
+        assert!(matches!(app.mode, crate::tui::AppMode::Chat));
+        // The daemon has not reported the resolution yet: same snapshot.
+        app.open_waiting_permission();
+        assert!(
+            matches!(app.mode, crate::tui::AppMode::Chat),
+            "the stale snapshot must not reopen the answered request"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_request_resolved_elsewhere_closes_the_dialog() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _) = app_with_session(dir.path()).await;
+        app.handle_event(waiting_permission_snapshot(Some("p1")))
+            .expect("snapshot");
+        app.open_waiting_permission();
+        assert!(matches!(
+            app.mode,
+            crate::tui::AppMode::PermissionConfirm(_)
+        ));
+        app.handle_event(waiting_permission_snapshot(None))
+            .expect("resolved snapshot");
+        assert!(matches!(app.mode, crate::tui::AppMode::Chat));
+        // A later, different request still opens its own dialog.
+        app.handle_event(waiting_permission_snapshot(Some("p2")))
+            .expect("next snapshot");
+        app.open_waiting_permission();
+        assert!(matches!(
+            app.mode,
+            crate::tui::AppMode::PermissionConfirm(_)
+        ));
     }
 }
