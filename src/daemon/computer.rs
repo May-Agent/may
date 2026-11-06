@@ -71,15 +71,14 @@ pub(super) async fn computer_start(
     if let Some(permissions) = needs_permissions(&state).await? {
         // An explicit start is the consent point: raise the TCC prompts,
         // then respawn the helper so the next call sees a fresh grant.
-        let _ = state
-            .computer
-            .request(AgentRequest::RequestPermissions)
-            .await;
         let computer = state.computer.clone();
-        tokio::task::spawn_blocking(move || computer.restart())
-            .await
-            .map_err(internal_error_message)?
-            .map_err(internal_error_message)?;
+        tokio::task::spawn_blocking(move || {
+            computer.request_permissions()?;
+            computer.restart()
+        })
+        .await
+        .map_err(internal_error_message)?
+        .map_err(internal_error_message)?;
         return Ok(Json(ComputerStatus {
             running: false,
             needs_permissions: Some(permissions),
