@@ -36,15 +36,18 @@ pub async fn screenshot_png(display_id: u32, size: (u32, u32)) -> Result<Vec<u8>
         .resume()
         .await
         .map_err(|e| DisplayError(format!("start the display stream: {e}")))?;
-    let frame = tokio::time::timeout(FIRST_FRAME_TIMEOUT, frames.next())
+    let first = async { Some(frames.next().await) };
+    let timeout = async {
+        async_io::Timer::after(FIRST_FRAME_TIMEOUT).await;
+        None
+    };
+    let frame = futures_lite::future::or(first, timeout)
         .await
-        .map_err(|_| DisplayError("the display produced no frame".to_owned()))?
+        .ok_or_else(|| DisplayError("the display produced no frame".to_owned()))?
         .ok_or_else(|| DisplayError("the display stream ended before a frame".to_owned()))?;
     // Capture ends with the stream; the frame is already ours.
     drop(stream);
-    tokio::task::spawn_blocking(move || encode_png(&frame))
-        .await
-        .map_err(|e| DisplayError(format!("encode the screenshot: {e}")))?
+    blocking::unblock(move || encode_png(&frame)).await
 }
 
 /// Encodes a BGRA frame as PNG, reading its pixels under a read lock.

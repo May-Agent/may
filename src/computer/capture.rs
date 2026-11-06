@@ -28,7 +28,8 @@ const CAPTURE_FRAME_RATE: NonZeroU32 = NonZeroU32::new(60).expect("60 is non-zer
 pub struct DisplayCapture {
     // Created paused: it runs only while the desktop stream has viewers.
     stream: DisplayStream,
-    forwarder: tokio::task::JoinHandle<()>,
+    // Dropping the task cancels the forwarding.
+    _forwarder: executor_core::AnyExecutorTask<()>,
 }
 
 impl std::fmt::Debug for DisplayCapture {
@@ -55,7 +56,7 @@ impl DisplayCapture {
             .await
             .map_err(|e| DisplayError(format!("create the display stream: {e}")))?;
         let mut delivered = Box::pin(stream.frames());
-        let forwarder = tokio::spawn(async move {
+        let forwarder = executor_core::spawn(async move {
             while let Some(buffer) = delivered.next().await {
                 let frame = match PixelBuffer::from_io_surface(buffer.io_surface()) {
                     Ok(surface) => CapturedFrame { surface },
@@ -73,7 +74,10 @@ impl DisplayCapture {
                 }
             }
         });
-        Ok(Self { stream, forwarder })
+        Ok(Self {
+            stream,
+            _forwarder: forwarder,
+        })
     }
 
     /// Starts delivering frames; the first frame follows at once.
@@ -97,12 +101,6 @@ impl DisplayCapture {
             .pause()
             .await
             .map_err(|e| DisplayError(format!("stop the display stream: {e}")))
-    }
-}
-
-impl Drop for DisplayCapture {
-    fn drop(&mut self) {
-        self.forwarder.abort();
     }
 }
 
