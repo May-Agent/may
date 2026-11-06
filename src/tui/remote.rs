@@ -92,6 +92,10 @@ struct Forwarding {
 struct ForwardedTurn {
     events: Sender<TuiEvent>,
     saw_error: bool,
+    /// The agent's `Complete`, held until the daemon ends the turn: the
+    /// daemon writes the turn's rows after its agent completes, and the
+    /// client re-reads the history as soon as it sees the turn complete.
+    held_complete: Option<TuiEvent>,
 }
 
 impl ForwardedTurn {
@@ -99,7 +103,32 @@ impl ForwardedTurn {
         Self {
             events,
             saw_error: false,
+            held_complete: None,
         }
+    }
+
+    /// Forward one agent event; a `Complete` waits for [`Self::end`].
+    async fn agent(&mut self, event: WireAgentEvent, at: jiff::Timestamp) {
+        self.saw_error |= matches!(event, WireAgentEvent::Error { .. });
+        let complete = matches!(event, WireAgentEvent::Complete { .. });
+        let event = TuiEvent::Agent(event.into_timed(at));
+        if complete {
+            self.held_complete = Some(event);
+            return;
+        }
+        if let Some(held) = self.held_complete.take() {
+            let _ = self.events.send(held).await;
+        }
+        let _ = self.events.send(event).await;
+    }
+
+    /// The daemon ended the turn (or this client saw it end unseen): the
+    /// held `Complete` goes out, then the end of the stream.
+    async fn end(self) {
+        if let Some(held) = self.held_complete {
+            let _ = self.events.send(held).await;
+        }
+        let _ = self.events.send(TuiEvent::Complete).await;
     }
 }
 
@@ -247,7 +276,7 @@ async fn follow_session(
                 // its start.
                 "session_resync" => {
                     if let Some(turn) = current.take() {
-                        let _ = turn.events.send(TuiEvent::Complete).await;
+                        turn.end().await;
                     }
                     let _ = forwarding.app_events.send(AppEvent::HistoryStale).await;
                 }
@@ -309,7 +338,7 @@ async fn forward_agent_frame(
         } => {
             // A turn whose end this client never saw is over.
             if let Some(turn) = current.take() {
-                let _ = turn.events.send(TuiEvent::Complete).await;
+                turn.end().await;
             }
             // Turn boundary: the file tracker marks the pre-turn tree
             // under the prompt's row id, whoever started the turn.
@@ -322,6 +351,7 @@ async fn forward_agent_frame(
                     handle: AgentHandle::new(rx, command_tx.clone()),
                     content,
                     message_id,
+                    started_at: frame.at,
                 });
                 events
             });
@@ -329,11 +359,7 @@ async fn forward_agent_frame(
         }
         SessionAgentBody::Agent { event } => {
             if let Some(turn) = current.as_mut() {
-                turn.saw_error |= matches!(event, WireAgentEvent::Error { .. });
-                let _ = turn
-                    .events
-                    .send(TuiEvent::Agent(event.into_timed(frame.at)))
-                    .await;
+                turn.agent(event, frame.at).await;
             }
         }
         SessionAgentBody::ReasoningEnd { seconds } => {
@@ -361,7 +387,7 @@ async fn forward_agent_frame(
                         ))
                         .await;
                 }
-                let _ = turn.events.send(TuiEvent::Complete).await;
+                turn.end().await;
             }
         }
     }
@@ -508,6 +534,13 @@ async fn run_commands(
                 )
                 .await;
             }
+            WorkerCommand::SideModel { event_tx } => {
+                fail(
+                    &event_tx,
+                    "side requests run inside the May daemon".to_string(),
+                )
+                .await;
+            }
             WorkerCommand::Run { event_tx, .. } => {
                 fail(
                     &event_tx,
@@ -647,5 +680,65 @@ mod tests {
             foreign_rx.try_recv().is_ok(),
             "the new turn is a foreign turn"
         );
+    }
+
+    /// The daemon writes a turn's rows after its agent completes and before
+    /// it ends the turn; the client re-reads the history when it sees the
+    /// agent complete, so that `Complete` reaches it only with the end.
+    #[tokio::test]
+    async fn the_agents_completion_reaches_the_turn_only_when_the_daemon_ends_it() {
+        let shared = Shared::default();
+        let (events, rx) = unbounded();
+        shared.set_pending(events);
+        let (foreign_tx, _foreign_rx) = unbounded();
+        let (commands, _command_rx) = unbounded();
+        let mut current = None;
+        let (app_events, _app_rx) = unbounded();
+        let mut forward = async |body| {
+            forward_agent_frame(
+                frame("t1", body),
+                &mut current,
+                &shared,
+                &foreign_tx,
+                &commands,
+                &app_events,
+            )
+            .await;
+        };
+        let is_complete = |event: &TuiEvent| {
+            matches!(
+                event,
+                TuiEvent::Agent(Ok(aither_agent::TimedEvent {
+                    event: aither_agent::AgentEvent::Complete { .. },
+                    ..
+                }))
+            )
+        };
+
+        forward(SessionAgentBody::Start {
+            content: None,
+            message_id: None,
+        })
+        .await;
+        forward(text("done")).await;
+        forward(SessionAgentBody::Agent {
+            event: WireAgentEvent::Complete {
+                final_text: "done".to_string(),
+                turns: 1,
+            },
+        })
+        .await;
+        let before_end: Vec<TuiEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(before_end.len(), 1, "only the text arrives before the end");
+        assert!(!before_end.iter().any(is_complete));
+
+        forward(SessionAgentBody::End {
+            outcome: RunEnd::Completed,
+        })
+        .await;
+        let at_end: Vec<TuiEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(at_end.len(), 2, "{at_end:?}");
+        assert!(is_complete(&at_end[0]), "{at_end:?}");
+        assert!(matches!(at_end[1], TuiEvent::Complete), "{at_end:?}");
     }
 }

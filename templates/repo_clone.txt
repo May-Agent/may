@@ -1,0 +1,8 @@
+{% match outcome -%}
+{% when CloneOutcome::Cloned with (clone) -%}
+{{ clone }} is this session's clone of the repository at {{ worktree }}. Edit and commit there; `pr open` run inside it lands the work, and the merge deletes the clone.
+{% when CloneOutcome::Undecided -%}
+{{ worktree }} has no trust decision yet: run `repo trust set <full|prs-only|local-branch|local>` in it first.
+{% when CloneOutcome::WritesCheckout -%}
+{{ worktree }} has `local` trust: the session works in that checkout itself and holds no clone of it.
+{% endmatch -%}

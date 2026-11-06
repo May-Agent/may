@@ -53,6 +53,8 @@ pub enum TuiEvent {
     ContextDump(Result<ContextDump, aither_agent::AgentError>),
     /// The agent's effective context, read for a side request.
     ContextMessages(Result<Vec<aither_core::llm::Message>, aither_agent::AgentError>),
+    /// The agent's model for a side request, under its prompt-cache key.
+    SideModel(Result<Box<ModelSlot<crate::agent::ProviderLlm>>, aither_agent::AgentError>),
     /// The daemon wrote the `/context dump` to `path`.
     ContextDumpSaved {
         /// Where the dump was written.
@@ -127,6 +129,8 @@ pub struct ForeignTurn {
     /// Row id of that message in the session history, when the daemon
     /// stored it.
     pub message_id: Option<i32>,
+    /// When the daemon started the turn.
+    pub started_at: jiff::Timestamp,
 }
 
 /// Command sent from main thread to agent worker.
@@ -152,6 +156,8 @@ pub(crate) enum WorkerCommand {
     ContextDump { event_tx: Sender<TuiEvent> },
     /// Read the effective context as request messages.
     ContextMessages { event_tx: Sender<TuiEvent> },
+    /// Read the model for a side request.
+    SideModel { event_tx: Sender<TuiEvent> },
     /// Run a turn in the daemon (remote workers only).
     Send {
         turn: RemoteTurn,
@@ -176,9 +182,6 @@ pub struct AgentWorker {
     /// Registry of in-flight `subagent` command runs; `None` when the agent
     /// runs in the daemon.
     subagent_runs: Option<aither_agent::specialized::SubagentRuns>,
-    /// Model clone for `/btw` side questions; `None` when the agent runs in
-    /// the daemon, which answers `/btw` itself.
-    btw_llm: Option<ModelSlot<crate::agent::ProviderLlm>>,
     /// The agent's own language guard; `None` when the agent runs in the
     /// daemon.
     languages: Option<aither_agent::LanguageGuard>,
@@ -402,10 +405,36 @@ impl AgentWorker {
         self.subagent_runs.as_ref()
     }
 
-    /// Model clone for `/btw` side questions.
-    #[must_use]
-    pub const fn btw_llm(&self) -> Option<&ModelSlot<crate::agent::ProviderLlm>> {
-        self.btw_llm.as_ref()
+    /// The model for side requests, under the prompt-cache key the agent's
+    /// next request carries. Read from the idle agent, so a cache epoch the
+    /// agent has moved to is the one the side request uses.
+    ///
+    /// # Errors
+    ///
+    /// Returns the agent's message when it cannot give its model, or when it
+    /// stops before answering.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the worker command channel is already closed — the worker
+    /// task has stopped unexpectedly.
+    pub async fn side_model(&self) -> Result<ModelSlot<crate::agent::ProviderLlm>, String> {
+        const ERR_WORKER_CHANNEL_CLOSED: &str =
+            include_str!("../texts/agent_worker_channel_closed.txt");
+        let (event_tx, event_rx) = unbounded();
+        self.command_tx
+            .try_send(WorkerCommand::SideModel { event_tx })
+            .unwrap_or_else(|_| panic!("{}", ERR_WORKER_CHANNEL_CLOSED.trim()));
+        while let Ok(event) = event_rx.recv().await {
+            match event {
+                TuiEvent::SideModel(result) => {
+                    return result.map(|slot| *slot).map_err(|error| error.to_string());
+                }
+                TuiEvent::Error(message) => return Err(message),
+                _ => {}
+            }
+        }
+        Err("the agent stopped before it gave its model".to_string())
     }
 
     /// The communication and working languages the agent was configured
@@ -432,7 +461,6 @@ impl AgentWorker {
             command_tx,
             job_registry: None,
             subagent_runs: None,
-            btw_llm: None,
             languages: None,
             warmth: None,
             subagent_tracker: crate::agent::SubagentTracker::default(),
@@ -538,7 +566,6 @@ pub fn spawn_idle_worker<E: Executor + 'static>(
     let (command_tx, command_rx) = unbounded::<WorkerCommand>();
     let job_registry = agent.job_registry();
     let subagent_runs = agent.subagent_runs();
-    let btw_llm = agent.btw_llm();
     let languages = agent.language_guard();
     let warmth = agent.cache_warmth();
     let subagent_tracker = agent.subagent_tracker();
@@ -558,7 +585,6 @@ pub fn spawn_idle_worker<E: Executor + 'static>(
         command_tx,
         job_registry: Some(job_registry),
         subagent_runs: Some(subagent_runs),
-        btw_llm: Some(btw_llm),
         languages: Some(languages),
         warmth: Some(warmth),
         subagent_tracker,
@@ -676,6 +702,11 @@ async fn run_worker(
             WorkerCommand::ContextMessages { event_tx } => {
                 let messages = agent.context_messages().await;
                 let _ = event_tx.send(TuiEvent::ContextMessages(messages)).await;
+                let _ = event_tx.send(TuiEvent::Complete).await;
+            }
+            WorkerCommand::SideModel { event_tx } => {
+                let model = agent.side_model().await.map(Box::new);
+                let _ = event_tx.send(TuiEvent::SideModel(model)).await;
                 let _ = event_tx.send(TuiEvent::Complete).await;
             }
             WorkerCommand::Send { event_tx, .. } => {
@@ -865,7 +896,8 @@ async fn race_against_commands<F: Future>(
                 | WorkerCommand::ContextReport { .. }
                 | WorkerCommand::UsageReport { .. }
                 | WorkerCommand::ContextDump { .. }
-                | WorkerCommand::ContextMessages { .. } => deferred.push(command),
+                | WorkerCommand::ContextMessages { .. }
+                | WorkerCommand::SideModel { .. } => deferred.push(command),
                 WorkerCommand::Compact { event_tx, .. } => {
                     let _ = event_tx
                         .send(TuiEvent::Error(ERR_WORKER_BUSY.trim().to_string()))
