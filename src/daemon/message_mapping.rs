@@ -6,7 +6,8 @@ use crate::session::{MessageRole, PersistedMessage, PersistedMessageError};
 
 use super::terminal_parsing::update_terminal_snapshot_from_tool_event;
 use super::types::{
-    ApiMessage, RequestStats, SkillInfoDto, TerminalStateSnapshot, ToolEventRecord, ToolVariant,
+    ApiMessage, ApiTranslation, RequestStats, SkillInfoDto, TerminalStateSnapshot, ToolEventRecord,
+    ToolVariant,
 };
 
 /// Convert DB message rows to API messages, with native terminal execution tracking.
@@ -66,6 +67,7 @@ pub(super) fn map_db_messages(
                     tool_event: None,
                     terminal_executions: Vec::new(),
                     stats: map_db_message_stats(msg),
+                    translation: None,
                 });
             }
             MessageRole::Assistant | MessageRole::System => {
@@ -91,6 +93,7 @@ pub(super) fn map_db_messages(
                     tool_event,
                     terminal_executions: Vec::new(),
                     stats: map_db_message_stats(msg),
+                    translation: persisted_translation(msg)?,
                 };
 
                 if persisted.role == MessageRole::Assistant
@@ -110,6 +113,28 @@ pub(super) fn map_db_messages(
     flush_trailing_tools_in_turn(&mut out, &mut pending_tool_events, last_assistant_in_turn);
 
     Ok(out)
+}
+
+/// The display translation stored with `msg`, if it has one.
+fn persisted_translation(
+    msg: &crate::db::entity::messages::Model,
+) -> Result<Option<ApiTranslation>, PersistedMessageError> {
+    msg.translation
+        .as_deref()
+        .map(serde_json::from_str::<crate::session::MessageTranslation>)
+        .transpose()
+        .map(|translation| {
+            translation.map(|translation| ApiTranslation {
+                text: translation.text,
+                language_name: crate::session::language_display_name(&translation.language),
+                language: translation.language,
+            })
+        })
+        .map_err(|source| PersistedMessageError::InvalidAttachments {
+            session_id: msg.session_id.clone(),
+            message_id: msg.id,
+            source,
+        })
 }
 
 /// Flush tools that followed an assistant inside the just-ended turn onto that

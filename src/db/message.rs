@@ -32,6 +32,8 @@ pub struct MessageMeta<'a> {
     pub reasoning: Option<&'a str>,
     /// Serialized tool calls (JSON) on an assistant message.
     pub tool_calls: Option<&'a str>,
+    /// Serialized display translation (JSON) of an assistant reply.
+    pub translation: Option<&'a str>,
     /// Claimed queue entry the append commits in the same transaction.
     pub commit_pending_entry: Option<i64>,
 }
@@ -70,6 +72,7 @@ impl ChatDb {
             attachments,
             reasoning,
             tool_calls,
+            translation,
             commit_pending_entry,
         } = meta;
         let now = jiff::Timestamp::now().to_string();
@@ -110,7 +113,7 @@ impl ChatDb {
         };
         let model = query!(
             tx,
-            "INSERT INTO messages (session_id, role, content, timestamp, tool_call_id, provider_id, prompt_tokens, completion_tokens, total_tokens, cache_read_tokens, cache_write_tokens, context_window, elapsed_ms, attachments, reasoning, tool_calls) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *",
+            "INSERT INTO messages (session_id, role, content, timestamp, tool_call_id, provider_id, prompt_tokens, completion_tokens, total_tokens, cache_read_tokens, cache_write_tokens, context_window, elapsed_ms, attachments, reasoning, tool_calls, translation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *",
             session_id,
             role_str,
             content,
@@ -126,7 +129,8 @@ impl ChatDb {
             elapsed_ms,
             attachments,
             reasoning,
-            tool_calls
+            tool_calls,
+            translation
         )
         .fetch_one::<messages::Model>()
         .await?;
@@ -177,7 +181,7 @@ impl ChatDb {
         let role_str = role.as_str();
         let model = query!(
             tx,
-            "INSERT INTO messages (session_id, role, content, timestamp, tool_call_id, provider_id, prompt_tokens, completion_tokens, total_tokens, cache_read_tokens, cache_write_tokens, context_window, elapsed_ms, attachments, reasoning, tool_calls) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *",
+            "INSERT INTO messages (session_id, role, content, timestamp, tool_call_id, provider_id, prompt_tokens, completion_tokens, total_tokens, cache_read_tokens, cache_write_tokens, context_window, elapsed_ms, attachments, reasoning, tool_calls, translation) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *",
             session_id,
             role_str,
             "",
@@ -191,6 +195,7 @@ impl ChatDb {
             Option::<i32>::None,
             Option::<i32>::None,
             Option::<i64>::None,
+            Option::<String>::None,
             Option::<String>::None,
             Option::<String>::None,
             Option::<String>::None
@@ -634,6 +639,14 @@ impl ChatDb {
                 storage_error(format!("failed to serialize message tool calls: {error}"))
             })?)
         };
+        let translation = message
+            .translation
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| {
+                storage_error(format!("failed to serialize message translation: {error}"))
+            })?;
         self.append_message_fenced(
             fence,
             session_id,
@@ -646,6 +659,7 @@ impl ChatDb {
                 attachments: attachments.as_deref(),
                 reasoning: reasoning.as_deref(),
                 tool_calls: tool_calls.as_deref(),
+                translation: translation.as_deref(),
                 commit_pending_entry,
             },
         )
