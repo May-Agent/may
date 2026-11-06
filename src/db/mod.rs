@@ -161,6 +161,11 @@ impl ChatDb {
             .execute()
             .await?;
         }
+        if !existing.contains("rules_import") {
+            query!(db, "ALTER TABLE sessions ADD COLUMN rules_import TEXT")
+                .execute()
+                .await?;
+        }
         Ok(())
     }
 

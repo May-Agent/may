@@ -41,6 +41,8 @@ pub(crate) mod register_tool;
 pub(crate) mod repo_tool;
 #[cfg(test)]
 mod request_parameters_tests;
+#[cfg(test)]
+mod rules_import_session_tests;
 pub mod runner;
 mod runtime_context;
 #[cfg(test)]

@@ -193,6 +193,22 @@ impl ChatDb {
         .map(|lookup| lookup.session_id))
     }
 
+    /// Whether the user has answered any `ask_user` question of
+    /// `session_id`.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn session_has_ask_user_answer(&self, session_id: &str) -> Result<bool, ChatDbError> {
+        Ok(query!(
+            self.db,
+            "SELECT m.session_id AS session_id FROM message_ask_user_responses r JOIN messages m ON m.id = r.message_id WHERE m.session_id = ? LIMIT 1",
+            session_id
+        )
+        .fetch_optional::<PendingPermissionLookup>()
+        .await?
+        .is_some())
+    }
+
     /// The answers committed for the question `request_id`, read back from
     /// the history, or `None` when no answer was committed for it.
     ///

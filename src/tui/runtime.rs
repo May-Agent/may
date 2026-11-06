@@ -541,6 +541,62 @@ impl RuntimeDeps {
         self.begin_worker_build(app, sandbox_dir, session_id, selected_model, None)
     }
 
+    /// Import a foreign agent's global rules and skills: the daemon copies
+    /// the skills and opens the session that rewrites the rules into
+    /// `~/.may/AGENTS.md`, which this switches to. `None` when the agent has
+    /// no rules file, so only its skills were copied.
+    ///
+    /// # Errors
+    /// Returns [`TuiRuntimeError`] when the daemon refuses the import or the
+    /// import session cannot be loaded.
+    pub async fn begin_rules_import(
+        &self,
+        app: &mut App,
+        worker: &mut Option<AgentWorker>,
+        source: crate::session::import::ForeignAgent,
+    ) -> Result<Option<PendingWorkerBuild>, TuiRuntimeError> {
+        app.chat.push_notice(&format!(
+            "Importing {}'s skills and global rules…",
+            source.product_name()
+        ));
+        let response: crate::rules_import::RulesImportResponse = self
+            .daemon()
+            .ok_or(TuiRuntimeError::DaemonUnavailable)?
+            .post(
+                "/api/rules/import",
+                &crate::rules_import::RulesImportRequest {
+                    source: source.label().to_string(),
+                    profile_id: app.current_profile_id.clone(),
+                },
+            )
+            .await?;
+        let skills = |names: &[String]| {
+            if names.is_empty() {
+                "none".to_string()
+            } else {
+                names.join(", ")
+            }
+        };
+        let skills_notice = format!(
+            "Skills imported: {}. Skipped, May already has one by that name: {}.",
+            skills(&response.imported_skills),
+            skills(&response.skipped_skills)
+        );
+        let Some(session_id) = response.session_id else {
+            app.chat.push_notice(&skills_notice);
+            app.chat.push_notice(&format!(
+                "No global rules to import: {} does not exist.",
+                response.rules_file
+            ));
+            return Ok(None);
+        };
+        let build = self
+            .begin_load_session(app, worker, &SessionId::from(session_id))
+            .await?;
+        app.chat.push_notice(&skills_notice);
+        Ok(Some(build))
+    }
+
     /// Import a foreign agent transcript into a fresh session and start
     /// building its worker.
     ///

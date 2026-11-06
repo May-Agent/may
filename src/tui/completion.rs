@@ -72,6 +72,11 @@ pub static SLASH_COMMANDS: &[(&str, &str)] = &[
         "Import a Claude Code session (opens picker)",
     ),
     (
+        "/import-claude",
+        "Import Claude Code's global rules and skills",
+    ),
+    ("/import-codex", "Import Codex's global rules and skills"),
+    (
         "/secret",
         "Store a secret in the OS keychain (injected into shell env)",
     ),
