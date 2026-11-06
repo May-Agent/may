@@ -130,25 +130,21 @@ pub fn probe(request: bool) -> Grants {
     }
 }
 
-/// Read — or, with `request`, ask for — the grants in a fresh copy of
-/// this executable.
+/// Read the grants in a fresh copy of this executable.
 ///
-/// macOS caches a negative answer in the process that asked, and a
-/// request from a process holding that cached answer never reaches the
-/// TCC daemon, so the serving helper never asks itself. The probe is its
-/// child, so TCC attributes it to the helper's bundle.
+/// macOS caches a negative answer in the process that asked, so the
+/// serving helper never asks itself. The probe is its child, so TCC
+/// attributes it to the helper's bundle. Requests go through
+/// `LaunchServices` instead (`ComputerAgent::request_permissions`): a
+/// Screen Recording request from a plain child never reaches TCC.
 ///
 /// # Errors
 /// Returns a message when the probe cannot run, fails, or prints
 /// something other than its report.
-pub fn fresh_grants(request: bool) -> Result<Grants, String> {
+pub fn fresh_grants() -> Result<Grants, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let mut command = std::process::Command::new(exe);
-    command.arg(PROBE_COMMAND);
-    if request {
-        command.arg(PROBE_REQUEST_FLAG);
-    }
-    let output = command
+    let output = std::process::Command::new(exe)
+        .arg(PROBE_COMMAND)
         .output()
         .map_err(|e| format!("run permission probe: {e}"))?;
     if !output.status.success() {

@@ -26,6 +26,10 @@ const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100)
 /// How long a launched helper has to start answering.
 #[cfg(target_os = "macos")]
 const HELPER_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long the `LaunchServices` request instance has to raise the prompts
+/// and exit.
+#[cfg(target_os = "macos")]
+const PERMISSION_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// How long a terminated helper has to exit.
 #[cfg(target_os = "macos")]
 const HELPER_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -146,6 +150,67 @@ impl ComputerAgent {
     #[cfg(not(target_os = "macos"))]
     pub const fn restart(&self) -> Result<(), String> {
         Ok(())
+    }
+
+    /// Raise the system prompts for the missing grants from an instance of
+    /// the helper bundle that `LaunchServices` launches on its own: TCC
+    /// registers a Screen Recording request only from such an app
+    /// instance, never from a child the helper execs.
+    ///
+    /// # Errors
+    /// Returns a message when the bundle cannot be prepared, `open` fails,
+    /// or the request instance does not exit in time.
+    #[cfg(target_os = "macos")]
+    pub fn request_permissions(&self) -> Result<(), String> {
+        let _launch = self
+            .spawn_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let identity = self.config.load().computer.signing_identity.clone();
+        let app = self.materialize_app(identity.as_deref())?;
+        // `-W` waits for the request instance; `-g` keeps it in the
+        // background so only the system's own prompt takes focus.
+        let mut child = std::process::Command::new("open")
+            .args(["-n", "-W", "-g"])
+            .arg(&app)
+            .arg("--args")
+            .arg(super::permissions::PROBE_COMMAND)
+            .arg(super::permissions::PROBE_REQUEST_FLAG)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("launch permission request: {e}"))?;
+        let deadline = std::time::Instant::now() + PERMISSION_REQUEST_TIMEOUT;
+        loop {
+            if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
+                if status.success() {
+                    return Ok(());
+                }
+                let mut stderr = String::new();
+                if let Some(mut pipe) = child.stderr.take() {
+                    use std::io::Read;
+                    let _ = pipe.read_to_string(&mut stderr);
+                }
+                return Err(format!(
+                    "permission request exited with {status}: {}",
+                    stderr.trim()
+                ));
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                return Err("permission request did not finish".to_owned());
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    }
+
+    /// There are no grants to request outside macOS.
+    ///
+    /// # Errors
+    /// Always fails — virtual desktops are macOS-only for now.
+    #[cfg(not(target_os = "macos"))]
+    pub fn request_permissions(&self) -> Result<(), String> {
+        Err("virtual desktops need macOS".to_owned())
     }
 
     /// SIGTERM the pid-file helper and wait for that process to exit.
