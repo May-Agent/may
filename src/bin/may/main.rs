@@ -127,15 +127,38 @@ fn main() -> anyhow::Result<()> {
         .block_on(async_main())
 }
 
+/// Points this process's stderr at `path`, appending, so panics and the
+/// error `main` returns land there too.
+fn redirect_stderr(path: &std::path::Path) -> anyhow::Result<()> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("open the stderr log {}", path.display()))?;
+    rustix::stdio::dup2_stderr(&file)
+        .with_context(|| format!("redirect stderr to {}", path.display()))?;
+    Ok(())
+}
+
 async fn async_main() -> anyhow::Result<()> {
     let _ = try_init_global_executor(TokioGlobal);
     ensure_rustls_provider();
 
     let cli_mode = parse_cli_mode_from_env();
-    // The daemon's stderr is its log file; its diagnostics go there too.
+    if let CliMode::ComputerAgent {
+        stderr: Some(path), ..
+    } = &cli_mode
+    {
+        redirect_stderr(path)?;
+    }
+    // The daemon's and the helper's stderr is their log file; their
+    // diagnostics go there too.
     let is_server_mode = matches!(
         cli_mode,
-        CliMode::Ui(_) | CliMode::Rest(_) | CliMode::Daemon(cli::DaemonCommand::Run)
+        CliMode::Ui(_)
+            | CliMode::Rest(_)
+            | CliMode::Daemon(cli::DaemonCommand::Run)
+            | CliMode::ComputerAgent { .. }
     );
 
     // Diagnostics live in a bounded in-memory ring; `/bug` and the panic
@@ -230,7 +253,7 @@ async fn async_main() -> anyhow::Result<()> {
             .await;
         }
         CliMode::Daemon(command) => return run_daemon_command(command).await,
-        CliMode::ComputerAgent(may_dir) => {
+        CliMode::ComputerAgent { may_dir, .. } => {
             #[cfg(target_os = "macos")]
             {
                 return may_agent::computer::agent::serve(&may_dir)
