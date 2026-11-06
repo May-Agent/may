@@ -24,6 +24,9 @@ mod config;
 mod error;
 mod error_chain;
 mod events;
+mod github_repos;
+#[cfg(test)]
+mod github_repos_tests;
 mod helpers;
 mod interaction;
 pub use interaction::ASK_USER_NOT_OPEN;

@@ -413,6 +413,8 @@ pub struct DaemonState {
     pub(crate) acp_host: Arc<crate::agent::acp_subagent::AcpHosts>,
     pub(crate) tokio_handle: tokio::runtime::Handle,
     pub(crate) db: crate::db::ChatDb,
+    /// The host's GitHub REST client, for the repository picker.
+    pub(crate) github_api: crate::issue::github::GitHubRest<crate::pr::PrTokenSource>,
     pub(crate) default_profile_id: String,
     pub(crate) mcp_service: McpService,
     pub(crate) permission_approver: PermissionApprover,
@@ -1282,6 +1284,7 @@ impl DaemonState {
                 db.clone(),
             )),
             db,
+            github_api: crate::pr::PrContext::default_github_api(),
             default_profile_id: "test".to_string(),
             mcp_service: McpService::spawn(crate::mcp::McpManager::new(
                 crate::mcp::McpConfig::default(),
