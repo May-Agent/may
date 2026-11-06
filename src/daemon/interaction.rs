@@ -76,6 +76,22 @@ fn ask_user_not_open_error() -> skyzen::Error {
     skyzen::Error::msg("ask_user request not found or withdrawn").set_status(ASK_USER_NOT_OPEN)
 }
 
+/// The HTTP error of a refused answer. A secret the store refuses is
+/// reported with its message: a `5xx` body is redacted, and the person
+/// answering is the one who can fix the keychain.
+fn ask_user_respond_error(error: AskUserRespondError) -> skyzen::Error {
+    match error {
+        AskUserRespondError::Input(error) => bad_request_error(error.to_string()),
+        AskUserRespondError::Answer(AnswerError::Mismatch(error)) => {
+            bad_request_error(error.to_string())
+        }
+        error @ AskUserRespondError::Store { .. } => skyzen::Error::msg(error.to_string())
+            .set_status(skyzen::StatusCode::UNPROCESSABLE_ENTITY),
+        error @ (AskUserRespondError::Answer(AnswerError::Storage(_))
+        | AskUserRespondError::Lookup(_)) => internal_error(error),
+    }
+}
+
 pub(super) async fn respond_ask_user_request(
     Json(req): Json<AskUserRespondRequest>,
     State(state): State<Arc<DaemonState>>,
@@ -84,15 +100,7 @@ pub(super) async fn respond_ask_user_request(
         .ask_user_approver
         .respond(&req.id, req.answers)
         .await
-        .map_err(|error| match error {
-            AskUserRespondError::Input(error) => bad_request_error(error.to_string()),
-            AskUserRespondError::Answer(AnswerError::Mismatch(error)) => {
-                bad_request_error(error.to_string())
-            }
-            error @ (AskUserRespondError::Answer(AnswerError::Storage(_))
-            | AskUserRespondError::Lookup(_)
-            | AskUserRespondError::Store { .. }) => internal_error(error),
-        })?
+        .map_err(ask_user_respond_error)?
         .ok_or_else(ask_user_not_open_error)?;
     let runtime = match resolved.outcome {
         AskUserOutcome::Woke | AskUserOutcome::AlreadyAnswered => state
@@ -163,6 +171,21 @@ mod tests {
         assert_eq!(
             ask_user_not_open_error().status(),
             skyzen::StatusCode::NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn a_secret_the_store_refuses_is_reported_with_its_message() {
+        let error = ask_user_respond_error(AskUserRespondError::Store {
+            name: "deploy_token".to_string(),
+            source: crate::secrets::SecretError::InvalidName("1x".to_string()),
+        });
+        assert_eq!(error.status(), skyzen::StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            error
+                .to_string()
+                .contains("failed to store secret deploy_token"),
+            "{error}"
         );
     }
 }

@@ -157,3 +157,30 @@ impl Bundle {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use include_dir::{Dir, DirEntry};
+
+    use super::SKILLS_DIR;
+
+    fn collect_dirs<'a>(dir: &'a Dir<'a>, found: &mut Vec<&'a std::path::Path>) {
+        for entry in dir.entries() {
+            if let DirEntry::Dir(sub) = entry {
+                found.push(sub.path());
+                collect_dirs(sub, found);
+            }
+        }
+    }
+
+    #[test]
+    fn bundled_skills_have_no_subagents_directory() {
+        let mut dirs = Vec::new();
+        collect_dirs(&SKILLS_DIR, &mut dirs);
+        let offending: Vec<_> = dirs
+            .iter()
+            .filter(|path| path.file_name().is_some_and(|name| name == "subagents"))
+            .collect();
+        assert!(offending.is_empty(), "skill-local subagents: {offending:?}");
+    }
+}
