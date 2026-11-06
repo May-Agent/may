@@ -32,12 +32,12 @@ const COMPACTION_HOLD_LIMIT: Duration = Duration::from_secs(60);
 const STEP_DELAY: Duration = Duration::from_millis(150);
 
 /// What the scripted model answers to the nth turn request.
-enum Step {
+pub(super) enum Step {
     Text(&'static str),
     Tool(&'static str, Value),
 }
 
-fn terminal(script: &'static str) -> Step {
+pub(super) fn terminal(script: &'static str) -> Step {
     Step::Tool(
         "terminal",
         json!({
@@ -67,7 +67,7 @@ struct Traffic {
 /// A scripted `OpenAI`-compatible server: `script` answers turn requests by
 /// their index. A server built with [`ScriptedModel::spawn_holding_compaction`]
 /// holds each compaction reply until a turn request has been served.
-struct ScriptedModel {
+pub(super) struct ScriptedModel {
     base_url: String,
     traffic: Arc<tokio::sync::Mutex<Traffic>>,
 }
@@ -76,7 +76,7 @@ struct ScriptedModel {
 type CompactionGate = Option<Arc<tokio::sync::Notify>>;
 
 impl ScriptedModel {
-    async fn spawn(script: fn(usize) -> Step) -> Self {
+    pub(super) async fn spawn(script: fn(usize) -> Step) -> Self {
         Self::start(script, None).await
     }
 
@@ -111,7 +111,7 @@ impl ScriptedModel {
         }
     }
 
-    async fn last_request(&self) -> String {
+    pub(super) async fn last_request(&self) -> String {
         self.traffic
             .lock()
             .await
@@ -237,7 +237,10 @@ fn reply(status: StatusCode, content_type: &'static str, body: String) -> Respon
     response
 }
 
-fn config_for(model: &ScriptedModel, context: ContextConfig) -> crate::config::MayConfig {
+pub(super) fn config_for(
+    model: &ScriptedModel,
+    context: ContextConfig,
+) -> crate::config::MayConfig {
     let mut config = crate::config::MayConfig::default();
     config.provider.insert(
         "session".to_string(),
@@ -252,7 +255,7 @@ fn config_for(model: &ScriptedModel, context: ContextConfig) -> crate::config::M
 }
 
 /// Runs `prompt` to completion on top of `filler_chars` of history.
-async fn run(session: &mut Session, filler_chars: usize, prompt: &str) {
+pub(super) async fn run(session: &mut Session, filler_chars: usize, prompt: &str) {
     session
         .agent
         .push_message(aither_core::llm::Message::assistant(
@@ -269,7 +272,7 @@ async fn run(session: &mut Session, filler_chars: usize, prompt: &str) {
 }
 
 /// Holds the run lease the way a served run does, so checkpoints persist.
-async fn lease(session: &Session) -> impl Drop + use<> {
+pub(super) async fn lease(session: &Session) -> impl Drop + use<> {
     let runtime = session.parts.runtime.clone().expect("a runtime");
     runtime
         .runs()

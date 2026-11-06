@@ -1375,6 +1375,21 @@ where
                             build: runtime_deps.begin_load_session(app, worker, &id).await?,
                         });
                     }
+                    Some(SendAction::RulesImport(source)) => {
+                        match runtime_deps.begin_rules_import(app, worker, source).await {
+                            Ok(Some(build)) => {
+                                held_turn = None;
+                                worker_build = Some(WorkerBuild {
+                                    purpose: WorkerBuildPurpose::Session,
+                                    build,
+                                });
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                app.chat.push_error(&format!("{error}"));
+                            }
+                        }
+                    }
                     Some(SendAction::ResumeImport { source, query }) => {
                         match runtime_deps
                             .begin_import_session(app, worker, source, &query)
