@@ -11,6 +11,8 @@ use serde::Deserialize;
 use crate::issue::owner::{IssueOwner, IssueOwners, OwnerIndex};
 use crate::issue::provenance::{CallOrigin, IssueAction, IssueMarks, IssueProvenance};
 use crate::issue::search::{IssueHit, IssueSearch};
+use crate::issue::target::{IssueTargets, TargetStore};
+use crate::issue::{GhCliTokenSource, GitHubTokenSource};
 use crate::issue::{
     IssueDetail, IssueError, IssueListState, IssueRelationKind, IssueState, IssueStore,
     IssueSummary,
@@ -45,12 +47,19 @@ const fn default_list_state() -> IssueListState {
 ///
 /// Subcommands:
 /// - `issue create <title> [--body text] [--labels name ...]`
-/// - `issue view <number>` — an open issue also names its owning agent
-/// - `issue owner <number>` — the agent whose `tasks.md` lists the open
-///   issue; at most one agent owns an issue
-/// - `issue list [--state open|closed|all] [--labels name ...] [--limit n]`
-/// - `issue search <query> [--state open|closed|all] [--limit n]` — issues
-///   whose title, body or comments match the described topic
+/// - `issue view <number> [--repo target]` — an open issue also names its
+///   owning agent
+/// - `issue owner <number> [--repo target]` — the agent whose `tasks.md` lists
+///   the open issue; at most one agent owns an issue
+/// - `issue list [--state open|closed|all] [--labels name ...] [--limit n] [--repo target]`
+/// - `issue search <query> [--state open|closed|all] [--limit n] [--repo target]`
+///   — issues whose title, body or comments match the described topic
+///
+/// `--repo` on `view`, `owner`, `list` and `search` reads another project's
+/// issues instead of the session's: `OWNER/REPO` for a GitHub repository, or
+/// the path of a local repository (absolute, or starting with `./`, `../` or
+/// `~/`) for its may issues. The write subcommands always act on the
+/// session's own backend.
 /// - `issue provenance <number> [--messages n]` — the changes may made to the
 ///   issue, with the session, agent, tool call and preceding user messages
 /// - `issue edit <number> [--title t] [--body b] [--state open|closed]`
@@ -79,12 +88,20 @@ pub enum IssueArgs {
     View {
         /// Issue number.
         number: i64,
+        /// Read another project's issues: `OWNER/REPO` on GitHub, or the
+        /// path of a local repository.
+        #[serde(default)]
+        repo: Option<String>,
     },
     /// Name the agent that owns an open issue: the one whose `tasks.md`
     /// lists it.
     Owner {
         /// Issue number.
         number: i64,
+        /// Read another project's issues: `OWNER/REPO` on GitHub, or the
+        /// path of a local repository.
+        #[serde(default)]
+        repo: Option<String>,
     },
     /// List issues, newest first.
     List {
@@ -97,6 +114,10 @@ pub enum IssueArgs {
         /// Maximum issues returned.
         #[serde(default = "default_list_limit")]
         limit: i64,
+        /// Read another project's issues: `OWNER/REPO` on GitHub, or the
+        /// path of a local repository.
+        #[serde(default)]
+        repo: Option<String>,
     },
     /// List the changes may made to an issue: session, agent, tool call and
     /// the user messages that explain each.
@@ -117,6 +138,10 @@ pub enum IssueArgs {
         /// Maximum issues returned.
         #[serde(default = "default_search_limit")]
         limit: usize,
+        /// Read another project's issues: `OWNER/REPO` on GitHub, or the
+        /// path of a local repository.
+        #[serde(default)]
+        repo: Option<String>,
     },
     /// Edit an issue's title, body and/or state.
     Edit {
@@ -200,6 +225,17 @@ impl IssueArgs {
         }
     }
 
+    /// The `--repo` target of a read subcommand.
+    fn repo(&self) -> Option<&str> {
+        match self {
+            Self::View { repo, .. }
+            | Self::Owner { repo, .. }
+            | Self::List { repo, .. }
+            | Self::Search { repo, .. } => repo.as_deref(),
+            _ => None,
+        }
+    }
+
     /// Whether the subcommand changes the issue backend.
     const fn writes(&self) -> bool {
         !matches!(
@@ -280,8 +316,9 @@ impl std::fmt::Debug for IssueChangeNotifier {
 
 /// `issue` tool: unified issue tracker over the resolved backend.
 #[derive(Debug, Clone)]
-pub struct IssueTool<S> {
+pub struct IssueTool<S, T = GhCliTokenSource> {
     store: S,
+    targets: Option<IssueTargets<T>>,
     provenance: IssueProvenance,
     search: Option<SessionIssueSearch>,
     languages: Option<aither_agent::LanguageGuard>,
@@ -292,8 +329,9 @@ pub struct IssueTool<S> {
 /// The `issue` tool as a subagent sees it: the read subcommands work and every
 /// write subcommand is refused before it reaches the backend.
 #[derive(Debug, Clone)]
-pub struct SubagentIssueTool<S> {
+pub struct SubagentIssueTool<S, T = GhCliTokenSource> {
     store: S,
+    targets: Option<IssueTargets<T>>,
     provenance: IssueProvenance,
     search: Option<SessionIssueSearch>,
     owners: Option<IssueOwners>,
@@ -305,9 +343,24 @@ impl<S: IssueStore> SubagentIssueTool<S> {
     pub const fn new(store: S, provenance: IssueProvenance) -> Self {
         Self {
             store,
+            targets: None,
             provenance,
             search: None,
             owners: None,
+        }
+    }
+}
+
+impl<S: IssueStore, T> SubagentIssueTool<S, T> {
+    /// Let the read subcommands take `--repo` targets resolved by `targets`.
+    #[must_use]
+    pub fn with_targets<U>(self, targets: IssueTargets<U>) -> SubagentIssueTool<S, U> {
+        SubagentIssueTool {
+            store: self.store,
+            targets: Some(targets),
+            provenance: self.provenance,
+            search: self.search,
+            owners: self.owners,
         }
     }
 
@@ -326,7 +379,11 @@ impl<S: IssueStore> SubagentIssueTool<S> {
     }
 }
 
-impl<S: IssueStore + Clone + 'static> Tool for SubagentIssueTool<S> {
+impl<S, T> Tool for SubagentIssueTool<S, T>
+where
+    S: IssueStore + Clone + 'static,
+    T: GitHubTokenSource + Clone + 'static,
+{
     fn name(&self) -> Cow<'static, str> {
         Cow::Borrowed("issue")
     }
@@ -346,8 +403,9 @@ impl<S: IssueStore + Clone + 'static> Tool for SubagentIssueTool<S> {
             .render()?;
             return Err(IssueError::Reserved(refusal).into());
         }
-        execute(
+        execute_in_target(
             &self.store,
+            self.targets.as_ref(),
             &self.provenance,
             &CallOrigin::from_context(&cx),
             self.search.as_ref(),
@@ -365,11 +423,28 @@ impl<S: IssueStore> IssueTool<S> {
     pub const fn new(store: S, provenance: IssueProvenance) -> Self {
         Self {
             store,
+            targets: None,
             provenance,
             search: None,
             languages: None,
             changes: None,
             owners: None,
+        }
+    }
+}
+
+impl<S: IssueStore, T> IssueTool<S, T> {
+    /// Let the read subcommands take `--repo` targets resolved by `targets`.
+    #[must_use]
+    pub fn with_targets<U>(self, targets: IssueTargets<U>) -> IssueTool<S, U> {
+        IssueTool {
+            store: self.store,
+            targets: Some(targets),
+            provenance: self.provenance,
+            search: self.search,
+            languages: self.languages,
+            changes: self.changes,
+            owners: self.owners,
         }
     }
 
@@ -402,7 +477,11 @@ impl<S: IssueStore> IssueTool<S> {
     }
 }
 
-impl<S: IssueStore + Clone + 'static> Tool for IssueTool<S> {
+impl<S, T> Tool for IssueTool<S, T>
+where
+    S: IssueStore + Clone + 'static,
+    T: GitHubTokenSource + Clone + 'static,
+{
     fn name(&self) -> Cow<'static, str> {
         Cow::Borrowed("issue")
     }
@@ -421,8 +500,9 @@ impl<S: IssueStore + Clone + 'static> Tool for IssueTool<S> {
             }
         }
         let writes = arguments.writes();
-        let result = execute(
+        let result = execute_in_target(
             &self.store,
+            self.targets.as_ref(),
             &self.provenance,
             &CallOrigin::from_context(&cx),
             self.search.as_ref(),
@@ -436,6 +516,32 @@ impl<S: IssueStore + Clone + 'static> Tool for IssueTool<S> {
             changes.notify();
         }
         result.map_err(Into::into)
+    }
+}
+
+/// Run `args` on the session's store, or on the project its `--repo` names.
+async fn execute_in_target<S: IssueStore, T: GitHubTokenSource + Clone>(
+    session_store: &S,
+    targets: Option<&IssueTargets<T>>,
+    provenance: &IssueProvenance,
+    origin: &CallOrigin,
+    search: Option<&SessionIssueSearch>,
+    owners: Option<&IssueOwners>,
+    args: IssueArgs,
+) -> Result<ToolResult, IssueError> {
+    let Some(target) = args.repo().map(str::to_owned) else {
+        return execute(session_store, provenance, origin, search, owners, args).await;
+    };
+    let Some(targets) = targets else {
+        return Err(IssueError::Invalid(
+            "this session cannot read other projects' issues".to_string(),
+        ));
+    };
+    match targets.resolve(&target).await? {
+        TargetStore::May(store) => execute(&store, provenance, origin, search, owners, args).await,
+        TargetStore::GitHub(store) => {
+            execute(&store, provenance, origin, search, owners, args).await
+        }
     }
 }
 
@@ -479,7 +585,7 @@ async fn execute<S: IssueStore>(
             record(detail.number, None, IssueAction::Create, None).await?;
             Ok(ToolResult::text(render_detail(&detail, None, None)))
         }
-        IssueArgs::View { number } => {
+        IssueArgs::View { number, .. } => {
             let detail = backend.get(number).await?;
             let marks = provenance.marks(backend, number).await?;
             let owner = match owners {
@@ -494,7 +600,7 @@ async fn execute<S: IssueStore>(
                 owner.as_ref(),
             )))
         }
-        IssueArgs::Owner { number } => {
+        IssueArgs::Owner { number, .. } => {
             let detail = backend.get(number).await?;
             let owner = match owners {
                 Some(owners) if detail.state == IssueState::Open => {
@@ -517,6 +623,7 @@ async fn execute<S: IssueStore>(
             state,
             labels,
             limit,
+            ..
         } => {
             let summaries = backend.list(state, &labels, limit).await?;
             let index = match owners {
@@ -529,6 +636,7 @@ async fn execute<S: IssueStore>(
             query,
             state,
             limit,
+            ..
         } => {
             let Some(search) = search else {
                 return Err(IssueError::Search(
@@ -899,7 +1007,7 @@ pub mod subagent_checks {
         number: i64,
     ) {
         let viewed = tool
-            .call(IssueArgs::View { number }, ToolContext::new())
+            .call(IssueArgs::View { number, repo: None }, ToolContext::new())
             .await
             .expect("a subagent may view an issue");
         assert!(format!("{viewed:?}").contains(&format!("#{number}")));
@@ -908,6 +1016,7 @@ pub mod subagent_checks {
                 state: IssueListState::All,
                 labels: Vec::new(),
                 limit: 10,
+                repo: None,
             },
             ToolContext::new(),
         )
@@ -1075,10 +1184,18 @@ pub mod provenance_checks {
             "later messages are no explanation: {report}"
         );
 
-        let viewed = run(&tool, "call_view", IssueArgs::View { number }).await;
+        let viewed = run(&tool, "call_view", IssueArgs::View { number, repo: None }).await;
         assert!(viewed.contains("written by may: yes"), "{viewed}");
         assert!(viewed.contains("[written by may] hello"), "{viewed}");
-        let viewed = run(&tool, "call_view", IssueArgs::View { number: outside }).await;
+        let viewed = run(
+            &tool,
+            "call_view",
+            IssueArgs::View {
+                number: outside,
+                repo: None,
+            },
+        )
+        .await;
         assert!(viewed.contains("written by may: no"), "{viewed}");
     }
 }
@@ -1127,6 +1244,7 @@ mod tests {
             "call_view",
             IssueArgs::View {
                 number: outside.number,
+                repo: None,
             },
         )
         .await;
@@ -1185,6 +1303,7 @@ mod tests {
         tool.call(
             IssueArgs::View {
                 number: seed.number,
+                repo: None,
             },
             ToolContext::new(),
         )
@@ -1306,6 +1425,7 @@ mod tests {
                 state,
                 labels,
                 limit,
+                ..
             } => {
                 assert_eq!(state, IssueListState::All);
                 assert_eq!(labels, [] as [String; 0]);
