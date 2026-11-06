@@ -569,6 +569,9 @@ pub enum TrialError {
     /// checks.
     #[error(transparent)]
     Acpsub(#[from] acpsub::Error),
+    /// The agent stopped answering the handshake; its process was killed.
+    #[error("the agent did not open a trial session within {0:?}")]
+    TimedOut(std::time::Duration),
 }
 
 /// Opens a session with `agent` in a fresh temporary directory and closes it,
@@ -581,10 +584,13 @@ pub enum TrialError {
 /// # Errors
 /// Returns [`TrialError`]; [`acpsub::Error::ModelRequired`] and
 /// [`acpsub::Error::ModeRequired`] carry the ids the agent advertises.
+/// [`TrialError::TimedOut`] follows a handshake still unfinished after
+/// `limit`, with the agent's process tree killed.
 pub async fn try_connection(
     runtime: &Handle,
     name: &str,
     agent: &AcpAgentConfig,
+    limit: std::time::Duration,
 ) -> Result<(), TrialError> {
     let scratch = blocking::unblock(tempfile::tempdir).await?;
     let work = scratch.path().join("work");
@@ -598,7 +604,14 @@ pub async fn try_connection(
     spec.model.clone_from(&agent.model);
     spec.mode.clone_from(&agent.mode);
     spec.permission = Some(PermissionPolicy::Deny);
-    let session = in_runtime(runtime, host.spawn(spec)).await?;
+    // The timer is built inside the runtime's context. A handshake dropped at
+    // the limit releases acpsub's last handle on the agent, which kills its
+    // process tree.
+    let session = in_runtime(runtime, async {
+        tokio::time::timeout(limit, host.spawn(spec)).await
+    })
+    .await
+    .map_err(|_| TrialError::TimedOut(limit))??;
     close_session(runtime, session).await;
     Ok(())
 }
