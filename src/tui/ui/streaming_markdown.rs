@@ -3,8 +3,8 @@
 //! Uses streamdown-parser for true incremental parsing - only processes
 //! new lines as they arrive, maintaining parser state between chunks.
 
+use super::wrap::wrap_line;
 use ratatui::prelude::*;
-use ratatui::text::StyledGrapheme;
 use streamdown_parser::{InlineElement, InlineParser, ParseEvent, Parser};
 use syntect::easy::HighlightLines;
 use unicode_width::UnicodeWidthStr;
@@ -586,92 +586,20 @@ fn column_widths(rows: &[Vec<Vec<Span<'static>>>], max_width: usize) -> Vec<usiz
     widths
 }
 
-/// `cell` wrapped to `width` display columns, one span list per row.
-///
-/// Breaks at whitespace, which is dropped at a break; between wide
-/// (CJK) graphemes, each of which is its own break opportunity; and
-/// inside a run of narrow graphemes only when the run is wider than the
-/// column. Always yields at least one row.
-fn wrap_cell(cell: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
-    let graphemes: Vec<StyledGrapheme<'_>> = cell
-        .iter()
-        .flat_map(|span| span.styled_graphemes(Style::default()))
-        .collect();
-    let is_space = |g: &StyledGrapheme<'_>| g.symbol.trim().is_empty();
-    let mut rows: Vec<Vec<&StyledGrapheme<'_>>> = Vec::new();
-    let mut current: Vec<&StyledGrapheme<'_>> = Vec::new();
-    let mut row_width = 0usize;
-    let mut i = 0;
-    while i < graphemes.len() {
-        let g = &graphemes[i];
-        let g_width = g.symbol.width();
-        if is_space(g) {
-            if row_width + g_width > width {
-                rows.push(std::mem::take(&mut current));
-                row_width = 0;
-            } else if row_width > 0 {
-                current.push(g);
-                row_width += g_width;
-            }
-            i += 1;
-            continue;
-        }
-        // One unbreakable token: a single wide grapheme, or a run of
-        // narrow non-space graphemes.
-        let end = if g_width > 1 {
-            i + 1
-        } else {
-            graphemes[i..]
-                .iter()
-                .position(|g| is_space(g) || g.symbol.width() > 1)
-                .map_or(graphemes.len(), |len| i + len)
-        };
-        let token_width: usize = graphemes[i..end].iter().map(|g| g.symbol.width()).sum();
-        if row_width > 0 && row_width + token_width > width && token_width <= width {
-            rows.push(std::mem::take(&mut current));
-            row_width = 0;
-        }
-        for g in &graphemes[i..end] {
-            let w = g.symbol.width();
-            if row_width > 0 && row_width + w > width {
-                rows.push(std::mem::take(&mut current));
-                row_width = 0;
-            }
-            current.push(g);
-            row_width += w;
-        }
-        i = end;
-    }
-    rows.push(current);
-    rows.into_iter()
-        .map(|mut row| {
-            while row.last().is_some_and(|g| is_space(g)) {
-                row.pop();
-            }
-            let mut spans: Vec<Span<'static>> = Vec::new();
-            for g in row {
-                match spans.last_mut() {
-                    Some(last) if last.style == g.style => last.content.to_mut().push_str(g.symbol),
-                    _ => spans.push(Span::styled(g.symbol.to_string(), g.style)),
-                }
-            }
-            spans
-        })
-        .collect()
-}
-
 /// The display lines of one table row: `│ cell │ cell │`, every cell
-/// wrapped to and padded to its column's width, so a row too wide for
-/// the area becomes several lines whose borders stay aligned.
+/// wrapped (by [`wrap_line`]) to and padded to its column's width, so a
+/// row too wide for the area becomes several lines whose borders stay
+/// aligned.
 fn table_row_lines(cells: &[Vec<Span<'static>>], widths: &[usize]) -> Vec<Line<'static>> {
     let border = Style::default().fg(Color::DarkGray);
-    let wrapped: Vec<Vec<Vec<Span<'static>>>> = widths
+    let wrapped: Vec<Vec<Line<'static>>> = widths
         .iter()
         .enumerate()
         .map(|(col, &width)| {
-            cells
-                .get(col)
-                .map_or_else(Vec::new, |cell| wrap_cell(cell, width))
+            cells.get(col).map_or_else(Vec::new, |cell| {
+                let width = u16::try_from(width).unwrap_or(u16::MAX);
+                wrap_line(&Line::from(cell.clone()), width)
+            })
         })
         .collect();
     let height = wrapped.iter().map(Vec::len).max().unwrap_or(0).max(1);
@@ -683,8 +611,8 @@ fn table_row_lines(cells: &[Vec<Span<'static>>], widths: &[usize]) -> Vec<Line<'
                     spans.push(Span::styled(" │ ", border));
                 }
                 let filled = wrapped[col].get(row).map_or(0, |part| {
-                    spans.extend(part.iter().cloned());
-                    cell_width(part)
+                    spans.extend(part.spans.iter().cloned());
+                    part.width()
                 });
                 if filled < *width {
                     spans.push(Span::raw(" ".repeat(width - filled)));
@@ -1127,25 +1055,6 @@ mod tests {
         let natural = lines[0].width();
         assert!(natural < 200);
         assert!(lines.iter().all(|l| l.width() == natural));
-    }
-
-    #[test]
-    fn test_table_cell_wraps_at_whitespace_and_between_cjk() {
-        let spans = vec![
-            Span::raw("宽字符"),
-            Span::styled("ab cd", Style::default().add_modifier(Modifier::BOLD)),
-        ];
-        let rows: Vec<String> = wrap_cell(&spans, 4)
-            .iter()
-            .map(|row| row.iter().map(|s| s.content.as_ref()).collect())
-            .collect();
-        assert_eq!(rows, ["宽字", "符ab", "cd"]);
-        let long = vec![Span::raw("abcdefghij")];
-        let rows: Vec<String> = wrap_cell(&long, 4)
-            .iter()
-            .map(|row| row.iter().map(|s| s.content.as_ref()).collect())
-            .collect();
-        assert_eq!(rows, ["abcd", "efgh", "ij"]);
     }
 
     #[test]
