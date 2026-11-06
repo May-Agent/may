@@ -28,7 +28,9 @@ use crate::daemon::terminal_parsing::update_terminal_snapshot_from_tool_event;
 use crate::daemon::types::{TerminalStateSnapshot, ToolEventRecord};
 use crate::db::ChatDbError;
 use crate::decode_meter::DecodeMeter;
-use crate::session::{SessionId, SessionPaths, SessionRunGuard, TerminalRuntimeState};
+use crate::session::{
+    MessageTranslation, SessionId, SessionPaths, SessionRunGuard, TerminalRuntimeState,
+};
 
 /// Why a turn's run stopped before it finished.
 #[derive(Debug)]
@@ -73,6 +75,9 @@ pub(super) struct TurnEvents<'t, 's, S> {
     pub(super) segment_text: String,
     /// Emission time of the newest text chunk in `segment_text`.
     pub(super) segment_at: Option<jiff::Timestamp>,
+    /// The translation of `segment_text`, when the reply drifted from the
+    /// communication language.
+    pub(super) segment_translation: Option<MessageTranslation>,
     /// Emission time of the newest agent event.
     pub(super) last_event_at: Option<jiff::Timestamp>,
     /// The whole assistant text.
@@ -218,6 +223,9 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                 std::mem::take(&mut self.segment_text),
                 segment_emitted_at(self.segment_at),
             );
+            if let Some(translation) = self.segment_translation.take() {
+                self.turn_persister.translate_last(translation);
+            }
         }
     }
 
@@ -269,6 +277,18 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                 Ok(self
                     .emit_speed("client disconnected during text stream")
                     .await)
+            }
+            // The reply just streamed drifted from the communication
+            // language: clients show this copy, the stored message keeps it
+            // beside the original.
+            AgentEvent::ReplyTranslated { text, language } => {
+                if !self.sink.on_reply_translated(&text, &language).await {
+                    return Ok(ControlFlow::Break(TurnStop::Cancelled(
+                        "client disconnected during reply translation",
+                    )));
+                }
+                self.segment_translation = Some(MessageTranslation { text, language });
+                Ok(ControlFlow::Continue(()))
             }
             AgentEvent::PromptPrefix(prefix) => {
                 self.request_prefix = Some(prefix);
