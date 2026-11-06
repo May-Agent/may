@@ -19,9 +19,6 @@ pub enum CliMode {
     Exec(ExecArgs),
     Browser(BrowserCliArgs),
     ComputerAgent(std::path::PathBuf),
-    /// A fresh process that reports the helper's privacy grants; `true`
-    /// raises the prompts for missing ones first.
-    ComputerAgentProbe(bool),
     OneShot(OneShotArgs),
     Help(&'static str),
 }
@@ -186,9 +183,6 @@ pub fn parse_cli_mode(args: &[String]) -> CliMode {
                     std::path::PathBuf::from,
                 );
             CliMode::ComputerAgent(may_dir)
-        }
-        Some("computer-agent-probe") => {
-            CliMode::ComputerAgentProbe(args.iter().skip(2).any(|a| a == "--request"))
         }
         Some("browser") => match args.get(2).map(String::as_str) {
             Some("--help" | "-h") => CliMode::Help(BrowserCliArgs::help_text()),
