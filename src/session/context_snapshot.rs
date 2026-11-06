@@ -35,6 +35,7 @@ pub fn checkpoint_from_hook(ctx: &CheckpointContext<'_>) -> AgentCheckpoint {
         tool_surface_hash: ctx.tool_surface_hash.to_string(),
         context_window: ctx.window.clone(),
         has_background_tasks: ctx.has_background_tasks,
+        tasks: ctx.tasks.cloned(),
     }
 }
 
@@ -191,6 +192,7 @@ mod tests {
                 messages: Vec::new(),
             },
             has_background_tasks: false,
+            tasks: None,
         }
     }
 

@@ -1973,7 +1973,8 @@ mod tests {
         tasks.on_request(false).await;
         let alert = tasks.on_tool_turn_end().await.expect("the row is told");
         let text = alert.content();
-        assert_eq!(text.matches("PR #1 was opened").count(), 1, "{text}");
+        // The row naming PR #1 already records its opening.
+        assert_eq!(text.matches("PR #1 was opened").count(), 0, "{text}");
         assert_eq!(text.matches("PR #1 was closed").count(), 1, "{text}");
     }
 

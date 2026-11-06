@@ -690,7 +690,13 @@ impl MayAgent {
             builder = builder.compaction_model(compaction.llm, compaction.parameters);
         }
         let subagent_tracker = subagents.tracker;
-        let task_events = aither_agent::TaskEvents::new();
+        // The session's own inbox when the daemon keeps one, so answers
+        // committed between agent builds still reach `tasks.md`.
+        let task_events = hook_runtime
+            .as_ref()
+            .map_or_else(aither_agent::TaskEvents::new, |runtime| {
+                runtime.task_events(config.session_id.as_str())
+            });
         let shared_terminal_commands = Box::pin(register_shared_terminal_commands(
             builder.tool_registry_mut(),
             SharedTerminalCommandConfig {

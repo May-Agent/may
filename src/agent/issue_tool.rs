@@ -1232,7 +1232,9 @@ mod tests {
         tasks.on_request(false).await;
         let alert = tasks.on_tool_turn_end().await.expect("the row is told");
         let text = alert.content();
-        assert_eq!(text.matches("Issue #1 was created").count(), 1, "{text}");
+        // The row naming #1 already records its creation; its closing is
+        // what the row has yet to follow.
+        assert_eq!(text.matches("Issue #1 was created").count(), 0, "{text}");
         assert_eq!(text.matches("Issue #1 was closed").count(), 1, "{text}");
         assert!(text.contains("\"#1 the login bug\""), "{text}");
     }
