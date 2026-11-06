@@ -1902,6 +1902,25 @@ impl App {
         );
     }
 
+    /// The handler boundary: the outcome of a key, event or action handler.
+    /// A failure of an ordinary interaction (a refused daemon request, a
+    /// failed session operation) becomes a chat error and the TUI keeps
+    /// running; `None` tells the caller the interaction produced nothing.
+    /// Only failures that leave nothing to run (a terminal that cannot draw,
+    /// no daemon at startup) are propagated by their callers instead.
+    pub fn settle<T, E: std::fmt::Display>(&mut self, outcome: Result<T, E>) -> Option<T> {
+        match outcome {
+            Ok(value) => Some(value),
+            Err(error) => {
+                tracing::warn!(%error, "interaction failed");
+                self.chat.end_text();
+                self.chat.push_error(&format!("{error:#}"));
+                self.scroll = usize::MAX;
+                None
+            }
+        }
+    }
+
     /// Open the dialog for the permission request the session waits on, once
     /// per request: the runtime snapshot keeps listing a request until the
     /// daemon's next report, so an answered one must not reopen.
@@ -4683,6 +4702,53 @@ mod tests {
             crate::trust::option_level(&state.ask.questions[0].option[cursor]),
             Some(TrustLevel::Local),
             "the sheet highlights the level in force, not the first option"
+        );
+    }
+
+    fn last_error(app: &App) -> Option<&str> {
+        app.chat
+            .elements()
+            .iter()
+            .rev()
+            .find_map(|element| match element {
+                ChatElement::Error { message } => Some(message.as_str()),
+                _ => None,
+            })
+    }
+
+    #[tokio::test]
+    async fn a_refused_daemon_request_is_a_chat_error_not_a_failure() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _) = app_with_session(dir.path()).await;
+        let refused: Result<(), crate::tui::runtime::TuiRuntimeError> =
+            Err(crate::client::DaemonClientError::Status {
+                path: "/api/permissions/respond".to_string(),
+                status: hyper::StatusCode::BAD_REQUEST,
+                message: "permission request not found or already resolved".to_string(),
+            }
+            .into());
+        assert!(app.settle(refused).is_none());
+        let shown = last_error(&app).expect("the refusal is shown in the chat");
+        assert!(shown.contains("already resolved"), "{shown}");
+        // The app still handles input afterwards.
+        press(&mut app, KeyCode::Char('a'));
+        assert_eq!(app.input, "a");
+    }
+
+    #[tokio::test]
+    async fn a_failed_session_operation_is_a_chat_error_not_a_failure() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _) = app_with_session(dir.path()).await;
+        let failed: Result<(), crate::session::SessionError> =
+            Err(crate::session::SessionError::NotFound(
+                "history position 3 is not a user message".to_string(),
+            ));
+        assert!(app.settle(failed).is_none());
+        let shown = last_error(&app).expect("the failure is shown in the chat");
+        assert!(shown.contains("is not a user message"), "{shown}");
+        assert_eq!(
+            app.settle(Ok::<_, crate::session::SessionError>(7)),
+            Some(7)
         );
     }
 
