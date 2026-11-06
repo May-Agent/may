@@ -155,6 +155,7 @@ fn agents_md_blocks_are_reconciled_and_pruned() {
     assert!(!context.external().contains(&tag::AGENTS_MD));
 
     runtime_context = runtime_context.with_agents_md(build_agents_md_blocks(
+        None,
         &index(Some("project rules"), &[]),
         "/launch/AGENTS.md",
         &[],
@@ -180,7 +181,7 @@ fn agents_md_blocks_list_nested_files_and_note_a_cut_root() {
     let mut scanned = index(Some("do the thing"), &["crates/foo/AGENTS.md"]);
     scanned.extra_nested = 2;
     scanned.root_truncated = true;
-    let blocks = build_agents_md_blocks(&scanned, "/launch/AGENTS.md", &[]);
+    let blocks = build_agents_md_blocks(None, &scanned, "/launch/AGENTS.md", &[]);
     let rules = blocks.rules.expect("rules render");
     assert!(
         rules.contains("read /launch/AGENTS.md for the rest"),
@@ -197,9 +198,62 @@ fn agents_md_blocks_list_nested_files_and_note_a_cut_root() {
 
     let empty = crate::agent::agents_md::AgentsIndex::default();
     assert_eq!(
-        build_agents_md_blocks(&empty, "/launch/AGENTS.md", &[]),
+        build_agents_md_blocks(None, &empty, "/launch/AGENTS.md", &[]),
         super::AgentsMdBlocks::default()
     );
+}
+
+#[test]
+fn global_rules_render_alone_and_note_a_cut() {
+    let global = crate::agent::agents_md::RulesDocument {
+        content: "Answer in English.".to_string(),
+        truncated: true,
+    };
+    let empty = crate::agent::agents_md::AgentsIndex::default();
+    let blocks = build_agents_md_blocks(Some(&global), &empty, "/launch/AGENTS.md", &[]);
+
+    assert_eq!(
+        blocks.global,
+        Some(ExternalContent::repository_instructions(
+            "~/.may/AGENTS.md",
+            "Answer in English."
+        ))
+    );
+    assert_eq!(blocks.root, None);
+    let rules = blocks.rules.expect("rules render");
+    assert!(
+        rules.contains("The global rules below are cut to fit the context."),
+        "{rules}"
+    );
+    assert!(
+        !rules.contains("launch directory's AGENTS.md below"),
+        "{rules}"
+    );
+}
+
+#[test]
+fn global_rules_are_reread_each_sync() {
+    let (dir, memory_path) = test_memory_file();
+    let global_path = dir.path().join("AGENTS.md");
+    let mut runtime_context = RuntimeSystemContext::new(memory_path, String::new())
+        .with_global_agents_source(global_path.clone());
+    let mut context = test_context();
+
+    tokio_test::block_on(runtime_context.sync_agents_md(None));
+    runtime_context.reconcile(&mut context);
+    assert!(!context.external().contains(&tag::GLOBAL_AGENTS_MD));
+
+    std::fs::write(&global_path, "Never push to main.\n").expect("write global rules");
+    tokio_test::block_on(runtime_context.sync_agents_md(None));
+    runtime_context.reconcile(&mut context);
+    assert_eq!(
+        context.external().get(&tag::GLOBAL_AGENTS_MD),
+        Some(&ExternalContent::repository_instructions(
+            "~/.may/AGENTS.md",
+            "Never push to main.\n"
+        ))
+    );
+    assert!(context.instructions().contains(&tag::PROJECT_RULES));
 }
 
 fn render_capabilities(commands: &[(String, String)], parameters: &Parameters) -> String {

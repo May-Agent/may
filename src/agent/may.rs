@@ -566,14 +566,22 @@ impl MayAgent {
                 runtime_system_context.with_instruction(tag::REPO_CLONES, repo_clones);
         }
 
-        // Project rules: the launch directory's AGENTS.md is loaded into
-        // the stable prefix and nested AGENTS.md files are listed, so
-        // the agent never has to find them itself.
-        let agents_index = agents_md::discover(&config.cwd).await;
+        // Rules: the global `~/.may/AGENTS.md` and the launch directory's
+        // AGENTS.md are loaded into the stable prefix and nested AGENTS.md
+        // files are listed, so the agent never has to find them itself.
+        let global_agents_path =
+            crate::session::MayHomePaths::new(config.may_dir.clone()).global_agents_md();
+        let (global_agents, agents_index) = futures_lite::future::zip(
+            agents_md::load_global(&global_agents_path),
+            agents_md::discover(&config.cwd),
+        )
+        .await;
         let agents_label = (!is_container).then(|| config.cwd.display().to_string());
-        runtime_system_context =
-            runtime_system_context.with_agents_source(config.cwd.clone(), agents_label.as_deref());
+        runtime_system_context = runtime_system_context
+            .with_global_agents_source(global_agents_path)
+            .with_agents_source(config.cwd.clone(), agents_label.as_deref());
         let agents_blocks = build_agents_md_blocks(
+            global_agents.as_ref(),
             &agents_index,
             runtime_system_context.agents_root_source(),
             &[],
