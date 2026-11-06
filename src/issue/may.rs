@@ -34,6 +34,17 @@ impl IssueStore for MayIssueStore {
         }
     }
 
+    fn owned_by_user(&self) -> impl Future<Output = Result<bool, IssueError>> + Send {
+        std::future::ready(Ok(true))
+    }
+
+    fn opened_by_user(
+        &self,
+        _number: i64,
+    ) -> impl Future<Output = Result<bool, IssueError>> + Send {
+        std::future::ready(Ok(true))
+    }
+
     fn search_key(&self) -> String {
         let mut key = String::from("may:");
         key.push_str(&self.repo_key);
