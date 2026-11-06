@@ -95,7 +95,13 @@ async fn a_source_with_nothing_to_change_is_installed_byte_identical() {
 fn ask_then_write(index: usize) -> Step {
     match index {
         0 => terminal("printf 'Always use bun.\\n' > rules.md && global-rules write rules.md"),
-        1 => terminal("ask_user --question 'Change `npm` to `bun`?'"),
+        // The question holds the turn open until a `tasks.md` row waits on
+        // it, so the agent marks the row the way the command's result says.
+        1 => terminal(
+            "out=$(ask_user --question 'Change `npm` to `bun`?') && id=${out#Question } && \
+             printf '## Doing\\n- import the rules BLOCKING %s\\n' \"${id%% *}\" > tasks.md && \
+             echo \"$out\"",
+        ),
         2 => Step::Text("Waiting for your answer."),
         3 => terminal("global-rules write rules.md"),
         _ => Step::Text("Installed."),
