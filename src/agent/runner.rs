@@ -1130,12 +1130,15 @@ mod tests {
         let baseline = context_report(&worker, TIMEOUT).await;
 
         let compact_handle = worker.compact(None);
-        if tokio::time::timeout(TIMEOUT, request_rx.recv())
-            .await
-            .is_err()
-        {
-            let event = tokio::time::timeout(TIMEOUT, compact_handle.recv()).await;
-            panic!("compact request never reached the stub server; the compaction sent {event:?}");
+        match tokio::time::timeout(TIMEOUT, request_rx.recv()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => panic!("stub server request channel closed: {error}"),
+            Err(_) => {
+                let event = tokio::time::timeout(TIMEOUT, compact_handle.recv()).await;
+                panic!(
+                    "compact request never reached the stub server; the compaction sent {event:?}"
+                );
+            }
         }
 
         compact_handle.cancel();
