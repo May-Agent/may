@@ -121,6 +121,17 @@ pub struct Session {
     pub repo: Option<String>,
 }
 
+impl Session {
+    /// Whether the loaded history already holds the stored message `id`.
+    #[must_use]
+    pub fn holds_message(&self, id: i32) -> bool {
+        self.history
+            .messages()
+            .iter()
+            .any(|message| message.id == Some(id))
+    }
+}
+
 /// Summary of a session for listing.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 pub struct SessionSummary {

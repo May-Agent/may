@@ -246,8 +246,9 @@ impl core::str::FromStr for MessageRole {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     /// Row id in the session's stored history; `None` for a message not
-    /// stored yet.
-    #[serde(skip)]
+    /// stored yet. The daemon sends it with the history so a client can tell
+    /// whether a replayed turn's prompt is already loaded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<i32>,
     /// Message role.
     pub role: MessageRole,
@@ -653,6 +654,20 @@ fn attachment_media_type(
 mod tests {
     use super::*;
     use aither_core::llm::{Role, ToolResult};
+
+    #[test]
+    fn the_row_id_crosses_the_wire_with_the_history() {
+        let mut message = ChatMessage::user("hello");
+        message.id = Some(41);
+        let wire = serde_json::to_string(&message).expect("serializes");
+        let back: ChatMessage = serde_json::from_str(&wire).expect("deserializes");
+        assert_eq!(back.id, Some(41));
+
+        let unstored: ChatMessage =
+            serde_json::from_str(&serde_json::to_string(&ChatMessage::user("hi")).unwrap())
+                .expect("deserializes");
+        assert_eq!(unstored.id, None);
+    }
 
     #[test]
     fn hidden_context_replays_as_system_message() {

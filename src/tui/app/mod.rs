@@ -3611,6 +3611,16 @@ impl App {
         self.input_visible = true;
     }
 
+    /// Times the running turn from `started_at`, when the daemon started it,
+    /// instead of from this client's first sight of it.
+    pub fn set_turn_started_at(&mut self, started_at: jiff::Timestamp) {
+        let elapsed = jiff::Timestamp::now()
+            .duration_since(started_at)
+            .unsigned_abs();
+        let now = std::time::Instant::now();
+        self.turn_started_at = Some(now.checked_sub(elapsed).unwrap_or(now));
+    }
+
     /// Working directory for the status bar: the absolute path with the
     /// user home shown as `~` (component-wise, so `~/foo2` is not mistaken
     /// for home).
@@ -4433,6 +4443,26 @@ mod tests {
 
     fn press(app: &mut App, code: KeyCode) -> Option<SendAction> {
         app.handle_key(code, KeyModifiers::NONE).expect("key")
+    }
+
+    #[tokio::test]
+    async fn a_replayed_turn_is_timed_from_the_daemons_start_and_matched_by_row_id() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+
+        app.set_turn_started_at(jiff::Timestamp::now() - std::time::Duration::from_secs(90));
+        let elapsed = app.turn_started_at.expect("set").elapsed().as_secs();
+        assert!(
+            (90..95).contains(&elapsed),
+            "counts from the start: {elapsed}"
+        );
+
+        let mut prompt = crate::session::ChatMessage::user("hello");
+        prompt.id = Some(7);
+        app.session_manager.record_unpersisted(prompt);
+        let session = app.session_manager.current().expect("session");
+        assert!(session.holds_message(7));
+        assert!(!session.holds_message(8));
     }
 
     #[tokio::test]
