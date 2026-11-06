@@ -1154,6 +1154,34 @@ impl PrStore {
         }
     }
 
+    /// The name of the session clone `dir` lies in, when it lies in one:
+    /// a `pr` run inside a clone means that clone's repository.
+    ///
+    /// # Errors
+    /// Fails when the clone registry cannot be read.
+    pub async fn clone_containing(&self, dir: &Path) -> Result<Option<String>, PrError> {
+        let repos = self.repos()?;
+        let (Ok(dir), Ok(root)) = (
+            async_fs::canonicalize(dir).await,
+            async_fs::canonicalize(repos.root()).await,
+        ) else {
+            return Ok(None);
+        };
+        let Some(std::path::Component::Normal(name)) = dir
+            .strip_prefix(&root)
+            .ok()
+            .and_then(|rest| rest.components().next())
+        else {
+            return Ok(None);
+        };
+        Ok(repos
+            .clones()
+            .await?
+            .into_iter()
+            .find(|c| std::ffi::OsStr::new(c.dir.as_str()) == name)
+            .map(|c| c.dir.as_str().to_string()))
+    }
+
     async fn event(&self, pr: &crate::db::PrRow, kind: &str, detail: Option<&str>) {
         if let Some(db) = self.context.db.as_ref() {
             let _ = db
