@@ -246,6 +246,20 @@ async fn async_main() -> anyhow::Result<()> {
                 return Err(anyhow::Error::msg("computer-agent needs macOS"));
             }
         }
+        CliMode::ComputerAgentProbe(request) => {
+            #[cfg(target_os = "macos")]
+            {
+                use std::io::Write;
+                let report = serde_json::to_vec(&may_agent::computer::permissions::probe(request))?;
+                std::io::stdout().write_all(&report)?;
+                return Ok(());
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = request;
+                return Err(anyhow::Error::msg("computer-agent-probe needs macOS"));
+            }
+        }
         CliMode::Browser(args) => std::process::exit(run_browser(args).await?),
         CliMode::Exec(args) => std::process::exit(Box::pin(run_exec(args)).await?),
         CliMode::OneShot(args) => return run_oneshot(args).await,
