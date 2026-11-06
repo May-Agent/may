@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { ChevronDown, Sparkles } from 'lucide-react';
 import { cn, formatThoughtDuration } from '@/lib/utils';
 import { useTranslation } from '@/lib/i18n';
+import { MessageText } from './MessageText';
 
 interface ReasoningBlockProps {
   text: string;
@@ -56,8 +57,8 @@ export function ReasoningBlock({ text, seconds, streaming }: ReasoningBlockProps
         <ChevronDown className={cn('size-3 ml-auto transition-transform', open && 'rotate-180')} />
       </button>
       {open && (
-        <div className="mt-1.5 text-xs leading-relaxed text-muted-foreground whitespace-pre-wrap">
-          {text}
+        <div className="mt-1.5 text-xs leading-relaxed text-muted-foreground [&_.prose]:text-inherit [&_.prose_*]:text-inherit">
+          <MessageText text={text} streaming={streaming} />
         </div>
       )}
     </div>
