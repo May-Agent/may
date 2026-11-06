@@ -39,8 +39,12 @@ impl TerminalImageSupport {
     /// images should be displayed as links instead.
     pub fn detect() -> Option<Self> {
         // Query terminal for native graphics protocol support
-        let picker = match Picker::from_query_stdio() {
-            Ok(p) => p,
+        let picker = match query_picker() {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                tracing::debug!("Terminal did not answer the graphics query");
+                return None;
+            }
             Err(e) => {
                 tracing::debug!("Failed to query terminal graphics support: {}", e);
                 return None;
@@ -82,6 +86,49 @@ impl TerminalImageSupport {
     pub const fn picker(&self) -> &Picker {
         &self.picker
     }
+}
+
+/// Probes the terminal on stdin/stdout. `None` when it does not answer or
+/// reports no cell size, in which case only halfblocks would be available.
+///
+/// ratatui-image's own `Picker::from_query_stdio` is not used: it reads stdin
+/// on a thread that outlives its timeout (see `image_probe`).
+#[cfg(unix)]
+fn query_picker() -> std::io::Result<Option<Picker>> {
+    use std::time::Duration;
+
+    let is_tmux = std::env::var_os("TMUX").is_some_and(|value| !value.is_empty());
+    let Some(reply) = super::image_probe::query(
+        &std::io::stdin(),
+        &mut std::io::stdout(),
+        is_tmux,
+        Duration::from_secs(2),
+        super::image_probe::ignores_kitty_and_sixel(),
+    )?
+    else {
+        return Ok(None);
+    };
+    let cell_size = reply.cell_size.or_else(|| {
+        let size = crossterm::terminal::window_size().ok()?;
+        (size.columns > 0 && size.rows > 0 && size.width > 0 && size.height > 0)
+            .then(|| (size.width / size.columns, size.height / size.rows))
+    });
+    let Some(cell_size) = cell_size else {
+        return Ok(None);
+    };
+    // `from_fontsize` is the only public constructor that takes a measured
+    // cell size; it also carries the tmux and iTerm2 environment hints.
+    #[allow(deprecated)]
+    let mut picker = Picker::from_fontsize(cell_size);
+    if let Some(protocol) = reply.protocol {
+        picker.set_protocol_type(protocol);
+    }
+    Ok(Some(picker))
+}
+
+#[cfg(not(unix))]
+fn query_picker() -> std::io::Result<Option<Picker>> {
+    Ok(Picker::from_query_stdio().ok())
 }
 
 /// Image state for rendering.
