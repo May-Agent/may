@@ -72,15 +72,19 @@ pub struct Posting {
     pub reply: Option<async_channel::Sender<Result<(), InputError>>>,
 }
 
-/// The one owner of a display's [`Input`]: delivers each posting in order
-/// and ends when every sender is gone.
-pub async fn own(mut input: Input, postings: async_channel::Receiver<Posting>) {
-    while let Ok(Posting { message, reply }) = postings.recv().await {
+/// The one owner of a display's [`Input`], run on a thread of its own:
+/// delivers each posting in order and ends when every sender is gone.
+///
+/// A post holds its thread until the target confirms the input arrived,
+/// serving that thread's run loop meanwhile, so it never runs on an
+/// executor thread.
+pub fn own(mut input: Input, postings: &async_channel::Receiver<Posting>) {
+    while let Ok(Posting { message, reply }) = postings.recv_blocking() {
         let result = post(&mut input, message);
         match reply {
             Some(reply) => {
                 // The asker may have stopped waiting.
-                let _ = reply.send(result).await;
+                let _ = reply.send_blocking(result);
             }
             None => {
                 if let Err(error) = result {
