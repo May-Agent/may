@@ -165,7 +165,13 @@ where
     LLM: LanguageModel + Clone + 'static,
 {
     let mut descriptions = Vec::new();
-    crate::command_policy::register(builder);
+    crate::command_policy::register(
+        builder,
+        crate::command_policy::runs_managed_bash(matches!(
+            config.task_runtime,
+            TaskRuntimeKind::Container
+        )),
+    );
 
     if !config.request_parameters.hosted_web_fetch() {
         register_tool_with_description(builder, &mut descriptions, WebFetchTool::new());

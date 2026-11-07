@@ -706,11 +706,18 @@ pub fn build_environment(
 #[template(path = "prompt/terminal.md", escape = "none")]
 struct TerminalTemplate {
     session_dir: String,
+    /// Whether scripts run in the managed bash, which May's command policy
+    /// confines to `rg`, `fd` and line-range `sed`.
+    managed_bash: bool,
 }
 
 /// The terminal section: how to run commands.
 pub fn build_terminal(environment: &AgentEnvironment, session_paths: &SessionPaths) -> String {
     TerminalTemplate {
+        managed_bash: crate::command_policy::runs_managed_bash(matches!(
+            environment,
+            AgentEnvironment::Container { .. }
+        )),
         session_dir: sandbox_visible_path(environment, session_paths, session_paths.root()),
     }
     .render()

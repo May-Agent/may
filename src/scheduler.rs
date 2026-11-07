@@ -1406,7 +1406,10 @@ impl TaskRuntime {
         )
         .await?;
         let mut commands = ToolRegistryBuilder::new();
-        crate::command_policy::register(&mut commands);
+        crate::command_policy::register(
+            &mut commands,
+            crate::command_policy::runs_managed_bash(shell_sessions.availability().container),
+        );
         if let Some(scope) = wake {
             commands.configure_tool(crate::task_wake::WakeTool::new(
                 self.session_prompts.clone(),

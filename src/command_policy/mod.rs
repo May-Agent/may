@@ -20,15 +20,23 @@ use aither_sandbox::{
 };
 use askama::Template;
 
-/// Puts every script `builder`'s terminals run to May's policies.
-pub fn register(builder: &mut ToolRegistryBuilder) {
+/// Whether the scripts of a session run in the managed bash: always inside a
+/// container, and on the host everywhere but Windows, where `cmd.exe` runs
+/// them with the host's own programs.
+#[must_use]
+pub const fn runs_managed_bash(in_container: bool) -> bool {
+    in_container || cfg!(not(windows))
+}
+
+/// Puts every script `builder`'s terminals run to May's policies;
+/// `managed_bash` is [`runs_managed_bash`] of the session.
+pub fn register(builder: &mut ToolRegistryBuilder, managed_bash: bool) {
     builder.command_policy(KillByName);
     builder.command_policy(ForegroundSleep);
     builder.command_policy(UnchangedFileReads);
-    // The managed bash runs every script but on Windows, where `cmd.exe`
-    // runs them with the host's own programs.
-    #[cfg(not(windows))]
-    builder.command_policy(ManagedShellCommands);
+    if managed_bash {
+        builder.command_policy(ManagedShellCommands);
+    }
 }
 
 fn refuse(template: &impl Template) -> PolicyDecision {
