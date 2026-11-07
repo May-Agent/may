@@ -2638,8 +2638,11 @@ impl App {
             }
         }
 
-        // Regular sessions
-        list.extend(ps.regular.iter().cloned());
+        // Regular sessions, grouped by project
+        list.extend(crate::session::group_sessions(
+            ps.regular.clone(),
+            |session| session.repo.as_deref(),
+        ));
 
         self.session_list = list;
     }

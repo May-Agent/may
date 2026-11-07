@@ -111,6 +111,21 @@ pub fn handle_session_select_key(app: &mut App, code: KeyCode) -> Option<SendAct
                         app.mode = AppMode::Chat;
                         return Some(SendAction::NewSession);
                     }
+                    'N' => {
+                        // A new chat under the highlighted session's project.
+                        let binding = filtered
+                            .get(app.session_selected)
+                            .and_then(|(_, summary)| summary.repo.as_deref())
+                            .and_then(|stored| crate::session::RepoBinding::parse(stored).ok());
+                        let Some(binding) = binding else {
+                            app.set_status("That session belongs to no project");
+                            return None;
+                        };
+                        app.session_manager
+                            .set_launch(crate::session::SessionLaunch::Repo(binding.launch_spec()));
+                        app.mode = AppMode::Chat;
+                        return Some(SendAction::NewSession);
+                    }
                     'p' => {
                         // Toggle pin/unpin for selected session
                         toggle_pin(app);
