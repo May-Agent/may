@@ -321,6 +321,9 @@ pub struct App {
     pub event_tx: EventSender,
     /// Terminal image rendering support (None if terminal doesn't support graphics)
     pub image_support: Option<super::ui::image::TerminalImageSupport>,
+    /// Background of the input band, queried from the terminal at startup;
+    /// `None` keeps the terminal's default background.
+    pub band_bg: Option<ratatui::style::Color>,
     /// Image cache: URL -> fetched image state (for terminal image rendering)
     pub image_cache: ahash::AHashMap<String, super::ui::image::ImageState>,
     /// URLs currently being fetched (to avoid duplicate requests)
@@ -735,6 +738,7 @@ impl App {
             btw_daemon: None,
             sidebar: super::sidebar::SidebarState::default(),
             chat_area: ratatui::layout::Rect::default(),
+            band_bg: None,
             jobs: Vec::new(),
             jobs_selected: 0,
             subagents: Vec::new(),
