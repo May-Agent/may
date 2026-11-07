@@ -129,6 +129,14 @@ pub enum AppEvent {
         /// Row id of the user message the turn answers.
         message_id: i32,
     },
+    /// The daemon withdrew the latest turn: it was stopped before any tool
+    /// call or response text, so its message left the conversation.
+    TurnWithdrawn {
+        /// The withdrawn message text.
+        content: String,
+        /// Whether this client sent it and gets it back in its input.
+        own: bool,
+    },
     /// The daemon dropped turn frames this client missed: the session's
     /// history must be reloaded.
     HistoryStale,
@@ -232,6 +240,7 @@ impl AppEvent {
             Self::SessionRuntime(_) => "session_runtime",
             Self::IndexCoverage(_) => "index_coverage",
             Self::TurnStarted { .. } => "turn_started",
+            Self::TurnWithdrawn { .. } => "turn_withdrawn",
             Self::HistoryStale => "history_stale",
             Self::Sleep(_) => "sleep",
             Self::PromptSuggestion { .. } => "prompt_suggestion",

@@ -1211,6 +1211,27 @@ impl ChatDb {
         Ok(result.rows_written > 0)
     }
 
+    /// Mark the browser takeover alert pending again: the turn that
+    /// consumed it was withdrawn before the model saw it.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn restore_browser_takeover_alert_pending(
+        &self,
+        session_id: &str,
+    ) -> Result<(), ChatDbError> {
+        let now = jiff::Timestamp::now().to_string();
+        query!(
+            self.db,
+            "INSERT INTO session_runtimes (session_id, state, browser_takeover_active, browser_takeover_alert_pending, updated_at) VALUES (?, 'idle', 0, 1, ?) ON CONFLICT(session_id) DO UPDATE SET browser_takeover_alert_pending = 1, updated_at = excluded.updated_at",
+            session_id,
+            now.as_str()
+        )
+        .execute()
+        .await?;
+        Ok(())
+    }
+
     /// Session has browser takeover.
     ///
     /// # Errors

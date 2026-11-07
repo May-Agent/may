@@ -744,6 +744,22 @@ impl SessionRuntimeService {
         Ok(pending)
     }
 
+    /// Mark the takeover-ended alert pending again, for a turn that
+    /// consumed it and was withdrawn before the model saw it.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] on storage failure.
+    pub async fn restore_browser_takeover_alert_pending(
+        &self,
+        session_id: &str,
+    ) -> Result<(), crate::db::ChatDbError> {
+        self.db
+            .restore_browser_takeover_alert_pending(session_id)
+            .await?;
+        self.publish_ui(UiEventTopics::SESSION_RUNTIME | UiEventTopics::SESSION_RUNTIMES);
+        Ok(())
+    }
+
     /// Persist terminal runtime state for a session.
     ///
     /// # Errors

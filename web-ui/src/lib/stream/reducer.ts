@@ -309,6 +309,10 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
       return { ...state, hold, lastSeq: event.seq };
     }
 
+    // The turn's message leaves the conversation; the stores handle it.
+    case 'withdrawn':
+      return { ...state, lastSeq: event.seq };
+
     case 'retract':
       return {
         ...state,
