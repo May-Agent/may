@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS push_subscriptions (id TEXT PRIMARY KEY, endpoint TEX
 CREATE TABLE IF NOT EXISTS profile_memories (id TEXT PRIMARY KEY, profile_id TEXT NOT NULL, memory_type TEXT NOT NULL, content TEXT NOT NULL, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS profile_memory_jobs (profile_id TEXT PRIMARY KEY, dirty BOOLEAN NOT NULL, last_processed_at TEXT, updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS profile_container_mounts (profile_id TEXT NOT NULL, ordinal INTEGER NOT NULL, host_path TEXT NOT NULL, container_path TEXT NOT NULL, access TEXT NOT NULL, PRIMARY KEY (profile_id, ordinal));
-CREATE TABLE IF NOT EXISTS message_permission_requests (message_id INTEGER PRIMARY KEY, request_id TEXT NOT NULL, mode TEXT NOT NULL, script TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS message_permission_requests (message_id INTEGER PRIMARY KEY, request_id TEXT NOT NULL, mode TEXT NOT NULL, script TEXT NOT NULL, reading TEXT);
 CREATE TABLE IF NOT EXISTS message_permission_responses (message_id INTEGER PRIMARY KEY, request_id TEXT NOT NULL, approved BOOLEAN NOT NULL);
 CREATE TABLE IF NOT EXISTS message_workspace_requests (message_id INTEGER PRIMARY KEY, request_id TEXT NOT NULL, path TEXT NOT NULL, reason TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS message_workspace_responses (message_id INTEGER PRIMARY KEY, request_id TEXT NOT NULL, approved BOOLEAN NOT NULL);

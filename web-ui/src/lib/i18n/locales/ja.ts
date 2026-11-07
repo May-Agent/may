@@ -281,6 +281,8 @@ export const ja: Messages = {
       modeSandboxed: '隔離',
       modeUnsafe: '権限昇格',
       modeRemote: 'リモート',
+      showScript: '生のスクリプトを表示',
+      showReading: '実行内容を表示',
     },
     workspace: {
       title: 'ワークスペース権限の確認',

@@ -22,6 +22,9 @@ use super::chat_layout::{self, ChatLayout};
 use super::markdown;
 use super::streaming_markdown::IMAGE_HEIGHT;
 use crate::agent::ContextReport;
+use crate::command_reading::{
+    CommandReading, DiffLine, DiffOp, FileChange, FileEdit, Intent, Link,
+};
 use crate::todo_parser::TodoChecklistItem;
 
 /// Status of a tool call.
@@ -146,6 +149,9 @@ pub enum ToolDisplay {
         command: String,
         /// Requested execution backend.
         mode: TerminalExecutionMode,
+        /// How May reads the script; `None` while the script streams in
+        /// and for `!` bash calls.
+        reading: Option<CommandReading>,
         /// Call status.
         status: ToolStatus,
         /// The output from this command.
@@ -3485,11 +3491,22 @@ fn render_tool_inline_at<'a>(
             mode,
             status,
             output,
+            reading,
             ..
         } => {
             let mode_prefix = terminal_mode_marker(*mode);
-            let mut command_rows = super::highlight::shell_spans(command).into_iter();
-            if let Some(first) = command_rows.next() {
+            // A script May recognises shows as what it does; one it does
+            // not shows as the script, as before.
+            let recognised = reading.as_ref().filter(|reading| reading.recognises_any());
+            let mut command_rows = if recognised.is_some() {
+                Vec::new()
+            } else {
+                super::highlight::shell_spans(command)
+            }
+            .into_iter();
+            if let Some(reading) = recognised {
+                lines.extend(reading_lines(reading, selection_style));
+            } else if let Some(first) = command_rows.next() {
                 let mut first_spans = vec![
                     Span::styled(
                         mode_prefix,
@@ -3580,6 +3597,133 @@ fn render_tool_inline_at<'a>(
             }
         }
     }
+}
+
+/// Diff rows an edit shows inline before the rest folds into a count; the
+/// full-screen view still carries the whole script.
+const EDIT_PREVIEW_ROWS: usize = 40;
+
+/// What joins a step to the one before it.
+const fn link_marker(link: Link) -> &'static str {
+    match link {
+        Link::Start => "",
+        Link::Pipe => "| ",
+        Link::And => "&& ",
+        Link::Or => "|| ",
+        Link::Then => "; ",
+    }
+}
+
+/// The rows a recognised script renders as: one line per step in plain
+/// words (an unknown step as its raw command), and a line-numbered diff
+/// under every edit.
+#[must_use]
+pub fn reading_lines(reading: &CommandReading, selection_style: Style) -> Vec<Line<'static>> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let mut lines = Vec::new();
+    let mut diff_rows = 0;
+    for step in &reading.steps {
+        let marker = Span::styled(link_marker(step.link), dim.patch(selection_style));
+        if let Intent::Unknown { source } = &step.intent {
+            let mut rows = source.lines();
+            let first = rows.next().unwrap_or_default();
+            lines.push(Line::from(vec![
+                marker,
+                Span::styled("$ ", dim.patch(selection_style)),
+                Span::styled(
+                    first.to_string(),
+                    Style::default().fg(Color::Yellow).patch(selection_style),
+                ),
+            ]));
+            for row in rows {
+                lines.push(Line::from(Span::styled(
+                    format!("│ {row}"),
+                    dim.patch(selection_style),
+                )));
+            }
+            continue;
+        }
+        lines.push(Line::from(vec![
+            marker,
+            Span::styled(
+                step.line.clone(),
+                Style::default().fg(Color::Cyan).patch(selection_style),
+            ),
+        ]));
+        if let Intent::Edit { files } = &step.intent {
+            for file in files {
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", file_heading(file)),
+                    Style::default().bold().patch(selection_style),
+                )));
+                for (anchor, rows) in file_hunks(&file.change) {
+                    if let Some(anchor) = anchor {
+                        lines.push(Line::from(Span::styled(
+                            format!("  @@ {anchor}"),
+                            dim.patch(selection_style),
+                        )));
+                    }
+                    for row in rows {
+                        if diff_rows == EDIT_PREVIEW_ROWS {
+                            lines.push(Line::from(Span::styled(
+                                "  … more lines".to_string(),
+                                dim.italic().patch(selection_style),
+                            )));
+                        }
+                        diff_rows += 1;
+                        if diff_rows > EDIT_PREVIEW_ROWS {
+                            continue;
+                        }
+                        lines.push(diff_row(row, selection_style));
+                    }
+                }
+            }
+        }
+    }
+    lines
+}
+
+fn file_heading(file: &FileEdit) -> String {
+    match &file.change {
+        FileChange::Add { .. } => format!("+ {} (new file)", file.path),
+        FileChange::Delete => format!("- {} (deleted)", file.path),
+        FileChange::Update {
+            moved_to: Some(to), ..
+        } => format!("~ {} → {to}", file.path),
+        FileChange::Update { .. } => format!("~ {}", file.path),
+    }
+}
+
+/// A file change's hunks as `(anchor, lines)`; a new file is one hunk.
+fn file_hunks(change: &FileChange) -> Vec<(Option<&str>, &[DiffLine])> {
+    match change {
+        FileChange::Add { lines } => vec![(None, lines.as_slice())],
+        FileChange::Delete => Vec::new(),
+        FileChange::Update { hunks, .. } => hunks
+            .iter()
+            .map(|hunk| (hunk.anchor.as_deref(), hunk.lines.as_slice()))
+            .collect(),
+    }
+}
+
+fn diff_row(row: &DiffLine, selection_style: Style) -> Line<'static> {
+    let (sign, color) = match row.op {
+        DiffOp::Context => (' ', Color::Gray),
+        DiffOp::Added => ('+', Color::Green),
+        DiffOp::Removed => ('-', Color::Red),
+    };
+    let number =
+        |value: Option<u32>| value.map_or_else(|| "    ".to_string(), |n| format!("{n:>4}"));
+    Line::from(vec![
+        Span::styled(
+            format!("  {} {} ", number(row.old), number(row.new)),
+            Style::default().fg(Color::DarkGray).patch(selection_style),
+        ),
+        Span::styled(
+            format!("{sign} {}", row.text),
+            Style::default().fg(color).patch(selection_style),
+        ),
+    ])
 }
 
 /// Render full-screen tool detail view.
@@ -4030,6 +4174,7 @@ mod tests {
                 description: String::new(),
                 command: "echo hi".to_string(),
                 mode: TerminalExecutionMode::Default,
+                reading: None,
                 status: ToolStatus::Running,
                 output: None,
                 diffs: Vec::new(),
@@ -4076,6 +4221,7 @@ mod tests {
                 description: String::new(),
                 command: command.to_string(),
                 mode: TerminalExecutionMode::Default,
+                reading: None,
                 status: ToolStatus::Running,
                 output: None,
                 diffs: Vec::new(),
@@ -4123,6 +4269,7 @@ mod tests {
                 description: String::new(),
                 command: "ech".to_string(),
                 mode: TerminalExecutionMode::Default,
+                reading: None,
                 status: ToolStatus::Running,
                 output: None,
                 diffs: Vec::new(),
@@ -4151,6 +4298,7 @@ mod tests {
                 description: "greet".to_string(),
                 command: "echo hi".to_string(),
                 mode: TerminalExecutionMode::Default,
+                reading: None,
                 status: ToolStatus::Running,
                 output: None,
                 diffs: Vec::new(),
@@ -4201,6 +4349,7 @@ mod tests {
                 description: String::new(),
                 command: "echo hi".to_string(),
                 mode,
+                reading: None,
                 status: ToolStatus::Done,
                 output: None,
                 diffs: Vec::new(),
@@ -4225,6 +4374,7 @@ mod tests {
             description: String::new(),
             command: command.to_string(),
             mode: TerminalExecutionMode::Default,
+            reading: None,
             status: ToolStatus::Done,
             output: None,
             diffs: Vec::new(),
@@ -4250,6 +4400,7 @@ mod tests {
                 description: String::new(),
                 command: "terminal {…}".to_string(),
                 mode: TerminalExecutionMode::Default,
+                reading: None,
                 status: ToolStatus::Done,
                 output: Some(
                     super::TerminalCallInfo::new("terminal".to_string()).with_output(
@@ -4681,6 +4832,73 @@ mod tests {
                 "reserved row {row} not blank"
             );
         }
+    }
+
+    /// A running terminal call carrying the reading of `script`.
+    fn read_call(script: &str) -> ToolDisplay {
+        ToolDisplay::Terminal {
+            description: "work".to_string(),
+            command: script.to_string(),
+            mode: TerminalExecutionMode::Default,
+            reading: Some(crate::command_reading::CommandReading::of(script)),
+            status: ToolStatus::Running,
+            output: None,
+            diffs: Vec::new(),
+            pinned: None,
+        }
+    }
+
+    fn call_rows(display: &ToolDisplay) -> Vec<String> {
+        let mut lines: Vec<Line> = Vec::new();
+        let mut positions = Vec::new();
+        render_tool_inline(&mut lines, display, false, true, &mut positions);
+        rendered_text(&lines)
+    }
+
+    #[test]
+    fn an_edit_renders_as_a_numbered_diff_before_it_runs() {
+        let rows = call_rows(&read_call(
+            "apply_patch <<'P'\n*** Begin Patch\n*** Update File: src/a.rs\n@@ fn main\n keep\n-old line\n+new line\n*** Add File: b.txt\n+one\n*** End Patch\nP\n",
+        ));
+        assert_eq!(rows[0], "▾ ⠋ work");
+        assert_eq!(rows[1], "Edit 2 files");
+        assert_eq!(rows[2], "  ~ src/a.rs");
+        assert_eq!(rows[3], "  @@ fn main");
+        assert_eq!(rows[4], "     1    1   keep");
+        assert_eq!(rows[5], "     2      - old line");
+        assert_eq!(rows[6], "          2 + new line");
+        assert_eq!(rows[7], "  + b.txt (new file)");
+        assert_eq!(rows[8], "          1 + one");
+        assert!(
+            rows.iter().all(|row| !row.contains("$ apply_patch")),
+            "the raw script is not the body of a recognised call"
+        );
+    }
+
+    #[test]
+    fn a_read_and_a_search_render_as_one_line_each() {
+        assert_eq!(
+            call_rows(&read_call("cat src/lib.rs"))[1],
+            "Read src/lib.rs"
+        );
+        assert_eq!(
+            call_rows(&read_call("rg -n \"fn main\" src"))[1],
+            "Search for \"fn main\" in src"
+        );
+    }
+
+    #[test]
+    fn a_pipeline_shows_its_parts_and_an_unknown_part_as_its_command() {
+        let rows = call_rows(&read_call("rg -n foo src | wc -l && cargo test"));
+        assert_eq!(rows[1], "Search for \"foo\" in src");
+        assert_eq!(rows[2], "| $ wc -l");
+        assert_eq!(rows[3], "&& Run cargo test");
+    }
+
+    #[test]
+    fn a_call_with_no_recognised_part_looks_as_it_did() {
+        let rows = call_rows(&read_call("echo hi | wc -c"));
+        assert_eq!(rows[1], "$ echo hi | wc -c");
     }
 
     fn rendered_text(lines: &[Line]) -> Vec<String> {
@@ -5495,6 +5713,7 @@ mod tests {
                 description: String::new(),
                 command: "echo hi".to_string(),
                 mode: TerminalExecutionMode::Default,
+                reading: None,
                 status: ToolStatus::Done,
                 output: None,
                 diffs: Vec::new(),
@@ -5540,6 +5759,7 @@ mod tests {
                 description: "run inner".to_string(),
                 command: "echo inner".to_string(),
                 mode: TerminalExecutionMode::Default,
+                reading: None,
                 status: ToolStatus::Done,
                 output: None,
                 diffs: Vec::new(),

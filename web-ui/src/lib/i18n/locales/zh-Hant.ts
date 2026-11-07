@@ -281,6 +281,8 @@ export const zhHant: Messages = {
       modeSandboxed: '隔離',
       modeUnsafe: '提升權限',
       modeRemote: '遠端',
+      showScript: '顯示原始腳本',
+      showReading: '顯示執行內容',
     },
     workspace: {
       title: '需要工作區權限',

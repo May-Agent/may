@@ -172,6 +172,9 @@ pub struct PermissionRequest {
     /// subagents, each with an instance-unique `word-word-word` id.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
+    /// How May reads the script; absent for a request that covers no script.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reading: Option<crate::command_reading::CommandReading>,
 }
 
 /// What an approval request nobody answers resolves to.
@@ -308,6 +311,7 @@ impl PermissionApprover {
                 script: payload.script,
                 session_id: payload.session_id,
                 agent_id: payload.agent_id,
+                reading: payload.reading,
             },
         }
     }
@@ -318,8 +322,9 @@ impl PermissionApprover {
         request_id: &str,
         mode: PermissionHistoryMode,
         script: &str,
+        reading: Option<&crate::command_reading::CommandReading>,
     ) -> Result<(), PermissionError> {
-        db.append_permission_request_message(session_id, request_id, mode, script, None)
+        db.append_permission_request_message(session_id, request_id, mode, script, reading, None)
             .await
             .map_err(anyhow::Error::from)
             .map_err(PermissionError::Internal)?;
@@ -353,7 +358,14 @@ impl PermissionApprover {
         };
         runtime_service
             .db()
-            .append_granted_permission(session_id, mode, script)
+            .append_granted_permission(
+                session_id,
+                mode,
+                script,
+                (mode != PermissionHistoryMode::Publish)
+                    .then(|| crate::command_reading::CommandReading::of(script))
+                    .as_ref(),
+            )
             .await
             .map_err(anyhow::Error::from)
             .map_err(PermissionError::Internal)?;
@@ -438,11 +450,14 @@ impl PermissionApprover {
             )));
         };
 
+        let reading = (mode != PermissionRequestMode::Publish)
+            .then(|| crate::command_reading::CommandReading::of(&script));
         let payload = PermissionRequest {
             mode,
             script,
             session_id: Some(session_id.clone()),
             agent_id: Some(self.agent_id.clone()),
+            reading,
         };
         let request_id = crate::id::new();
         let rx = self.live_responses.open(&request_id);
@@ -457,8 +472,15 @@ impl PermissionApprover {
                 .map_err(anyhow::Error::from)
                 .map_err(PermissionError::Internal)?;
             let db = runtime_service.db();
-            Self::append_request_history(&db, &session_id, &request_id, history, &payload.script)
-                .await?;
+            Self::append_request_history(
+                &db,
+                &session_id,
+                &request_id,
+                history,
+                &payload.script,
+                payload.reading.as_ref(),
+            )
+            .await?;
         }
 
         if let Ok(decision) = tokio::time::timeout(self.timeout, rx.recv()).await {

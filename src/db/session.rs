@@ -205,17 +205,17 @@ impl ChatDb {
     ) -> Result<PersistedPermissionRequest, ChatDbError> {
         Ok(PersistedPermissionRequest {
             id: row.request_id,
-            request: crate::session::PersistedPermissionRequestPayload {
-                mode: row.mode.parse().map_err(|error| {
+            request: crate::session::PersistedPermissionRequestPayload::new(
+                row.mode.parse().map_err(|error| {
                     storage_error(db_custom_error(
                         "invalid persisted permission request mode: ",
                         &error,
                     ))
                 })?,
-                script: row.script,
-                session_id: Some(row.session_id),
-                agent_id: row.agent_id,
-            },
+                row.script,
+                Some(row.session_id),
+                row.agent_id,
+            ),
         })
     }
 

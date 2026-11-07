@@ -5540,6 +5540,7 @@ dependencies = [
  "block2",
  "blocking",
  "bollard",
+ "brush-parser",
  "bytes",
  "chromiumoxide",
  "chromiumoxide_fetcher",

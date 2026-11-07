@@ -23,6 +23,8 @@ pub mod chatgpt;
 pub mod client;
 /// Configuration loading and types.
 pub mod command_output;
+/// How a terminal call's script is read before it runs.
+pub mod command_reading;
 /// One virtual desktop per session — computer use.
 pub mod computer;
 pub mod config;

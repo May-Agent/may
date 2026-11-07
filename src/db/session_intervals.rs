@@ -136,12 +136,12 @@ mod tests {
     fn permission(id: &str, session: &str) -> PersistedPermissionRequest {
         PersistedPermissionRequest {
             id: id.to_string(),
-            request: PersistedPermissionRequestPayload {
-                mode: crate::PermissionRequestMode::Default,
-                script: "echo hi".to_string(),
-                session_id: Some(session.to_string()),
-                agent_id: None,
-            },
+            request: PersistedPermissionRequestPayload::new(
+                crate::PermissionRequestMode::Default,
+                "echo hi".to_string(),
+                Some(session.to_string()),
+                None,
+            ),
         }
     }
 

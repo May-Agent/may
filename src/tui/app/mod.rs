@@ -1945,6 +1945,7 @@ impl App {
         self.mode = AppMode::PermissionConfirm(crate::tui::state::PermissionConfirmState {
             request_id: request.id.clone(),
             request: request.request.clone(),
+            show_script: false,
         });
     }
 
@@ -3628,6 +3629,7 @@ impl App {
                 description: String::new(),
                 command: format!("! {masked}"),
                 mode: aither_sandbox::TerminalExecutionMode::Unsafe,
+                reading: None,
                 status: super::ui::chat::ToolStatus::Running,
                 output: None,
                 diffs: Vec::new(),
@@ -4036,10 +4038,12 @@ impl App {
                 description,
                 script,
                 mode,
+                reading,
             } => ToolDisplay::Terminal {
                 description,
                 command: script,
                 mode,
+                reading,
                 status: super::ui::chat::ToolStatus::Running,
                 output: None,
                 diffs: Vec::new(),
@@ -5036,12 +5040,12 @@ mod tests {
         let runtime = crate::client::SessionRuntimeSnapshot {
             waiting_permission: id.map(|id| crate::client::PermissionPollItem {
                 id: id.to_string(),
-                request: crate::session::PersistedPermissionRequestPayload {
-                    mode: crate::PermissionRequestMode::Unsafe,
-                    script: "rm -rf build".to_string(),
-                    session_id: None,
-                    agent_id: None,
-                },
+                request: crate::session::PersistedPermissionRequestPayload::new(
+                    crate::PermissionRequestMode::Unsafe,
+                    "rm -rf build".to_string(),
+                    None,
+                    None,
+                ),
             }),
             ..Default::default()
         };

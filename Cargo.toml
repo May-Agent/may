@@ -167,6 +167,9 @@ fd-lock = "4.0.4"
 # Templating
 askama = "0.16"
 
+# Shell parsing: terminal calls are read before they run
+brush-parser = { version = "0.3.0", default-features = false }
+
 # Embedded resources
 include_dir = "0.7"
 itertools = "0.14.0"
