@@ -98,6 +98,8 @@ struct ForwardedTurn {
     held_complete: Option<TuiEvent>,
     /// This client sent the turn's message.
     own: bool,
+    /// The daemon withdrew the turn: nothing that renders a marker follows.
+    withdrawn: bool,
 }
 
 impl ForwardedTurn {
@@ -105,13 +107,34 @@ impl ForwardedTurn {
         Self {
             events,
             own,
+            withdrawn: false,
             saw_error: false,
             held_complete: None,
         }
     }
 
+    /// The daemon withdrew the turn. The turn's own stream carries the news
+    /// so it lands before the stream's end; when that stream is gone (the
+    /// stop that caused the withdrawal dropped the handle) the app hears of
+    /// it directly. The turn's held `Complete` is dropped, since it would
+    /// render a marker for a turn that no longer exists.
+    async fn withdraw(&mut self, content: String, app_events: &EventSender) {
+        self.withdrawn = true;
+        self.held_complete = None;
+        let own = self.own;
+        if let Err(closed) = self.events.send(TuiEvent::Withdrawn { content, own }).await {
+            let TuiEvent::Withdrawn { content, .. } = closed.0 else {
+                unreachable!("the unsent event is the one that was sent");
+            };
+            let _ = app_events.try_send(AppEvent::TurnWithdrawn { content, own });
+        }
+    }
+
     /// Forward one agent event; a `Complete` waits for [`Self::end`].
     async fn agent(&mut self, event: WireAgentEvent, at: jiff::Timestamp) {
+        if self.withdrawn {
+            return;
+        }
         self.saw_error |= matches!(event, WireAgentEvent::Error { .. });
         let complete = matches!(event, WireAgentEvent::Complete { .. });
         let event = TuiEvent::Agent(event.into_timed(at));
@@ -369,13 +392,15 @@ async fn forward_agent_frame(
             });
             *current = Some(ForwardedTurn::new(events, own));
         }
-        SessionAgentBody::Withdrawn { content, .. } => {
-            // The client that sent the message gets it back; the turn's
-            // handle may already be gone (the stop that caused this
-            // dropped it), so the app hears of it directly.
-            let own = current.as_ref().is_some_and(|turn| turn.own);
-            let _ = app_events.try_send(AppEvent::TurnWithdrawn { content, own });
-        }
+        SessionAgentBody::Withdrawn { content, .. } => match current.as_mut() {
+            Some(turn) => turn.withdraw(content, app_events).await,
+            None => {
+                let _ = app_events.try_send(AppEvent::TurnWithdrawn {
+                    content,
+                    own: false,
+                });
+            }
+        },
         SessionAgentBody::Agent { event } => {
             if let Some(turn) = current.as_mut() {
                 turn.agent(event, frame.at).await;
@@ -701,45 +726,90 @@ mod tests {
         );
     }
 
-    /// A withdrawn turn reaches the app with whether this client sent it,
-    /// even though the stop that caused it already dropped the turn's handle.
+    const WITHDRAWN: &str = "你好 こんにちは 안녕하세요";
+
+    /// Feeds a withdrawn turn's frames — start, withdrawal, then the agent's
+    /// completion and the end. Nobody takes foreign turns, so another
+    /// client's turn has no open stream.
+    async fn forward_withdrawn_turn(shared: &Shared, app_events: &EventSender) {
+        let (foreign_tx, foreign_rx) = unbounded();
+        drop(foreign_rx);
+        let (commands, _command_rx) = unbounded();
+        let mut current = None;
+        for body in [
+            SessionAgentBody::Start {
+                content: Some(WITHDRAWN.to_string()),
+                message_id: None,
+            },
+            SessionAgentBody::Withdrawn {
+                content: WITHDRAWN.to_string(),
+                attachments: Vec::new(),
+            },
+            SessionAgentBody::Agent {
+                event: WireAgentEvent::Complete {
+                    final_text: String::new(),
+                    turns: 1,
+                },
+            },
+            SessionAgentBody::End {
+                outcome: RunEnd::Cancelled,
+            },
+        ] {
+            forward_agent_frame(
+                frame("t1", body),
+                &mut current,
+                shared,
+                &foreign_tx,
+                &commands,
+                app_events,
+            )
+            .await;
+        }
+    }
+
+    /// A turn this client sent, withdrawn while its stream is still open:
+    /// the withdrawal arrives on the stream, ahead of its end, and nothing
+    /// that renders a marker follows — no held `Complete`, no error.
+    #[tokio::test]
+    async fn a_withdrawn_turn_forwards_no_marker_before_its_end() {
+        let shared = Shared::default();
+        let (events, rx) = unbounded();
+        shared.set_pending(events);
+        let (app_events, app_rx) = unbounded();
+        forward_withdrawn_turn(&shared, &app_events).await;
+
+        let seen: Vec<TuiEvent> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            matches!(
+                seen.as_slice(),
+                [TuiEvent::Withdrawn { content, own: true }, TuiEvent::Complete]
+                    if content == WITHDRAWN
+            ),
+            "{seen:?}"
+        );
+        assert!(app_rx.try_recv().is_err(), "the stream carried the news");
+    }
+
+    /// The stop that caused a withdrawal dropped the turn's handle, or the
+    /// turn is another client's: the app hears of it directly, with whether
+    /// this client sent the message.
     #[tokio::test]
     async fn a_withdrawn_turn_tells_the_app_who_sent_it() {
         for sent_here in [true, false] {
             let shared = Shared::default();
-            let (events, _rx) = unbounded();
+            let (events, rx) = unbounded();
             if sent_here {
                 shared.set_pending(events);
             }
-            let (foreign_tx, _foreign_rx) = unbounded();
-            let (commands, _command_rx) = unbounded();
+            drop(rx);
             let (app_events, app_rx) = unbounded();
-            let mut current = None;
-            for body in [
-                SessionAgentBody::Start {
-                    content: Some("你好 こんにちは 안녕하세요".to_string()),
-                    message_id: None,
-                },
-                SessionAgentBody::Withdrawn {
-                    content: "你好 こんにちは 안녕하세요".to_string(),
-                    attachments: Vec::new(),
-                },
-            ] {
-                forward_agent_frame(
-                    frame("t1", body),
-                    &mut current,
-                    &shared,
-                    &foreign_tx,
-                    &commands,
-                    &app_events,
-                )
-                .await;
-            }
+            forward_withdrawn_turn(&shared, &app_events).await;
             let Ok(AppEvent::TurnWithdrawn { content, own }) = app_rx.try_recv() else {
                 panic!("the app hears of the withdrawal");
             };
-            assert_eq!(content, "你好 こんにちは 안녕하세요");
+            assert_eq!(content, WITHDRAWN);
             assert_eq!(own, sent_here);
+            assert!(app_rx.try_recv().is_err(), "once");
         }
     }
 

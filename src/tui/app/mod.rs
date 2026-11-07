@@ -145,6 +145,10 @@ pub struct App {
     /// agent the conversation was cut back while the world — open and
     /// merged PRs — stands as recorded.
     pub rewind_notice: Option<crate::xml::XmlBlock>,
+    /// The hidden context the latest send carried, kept client-side until
+    /// the next send: a withdrawn turn deletes its rows, so the sender
+    /// attaches it to the message it sends again.
+    sent_hidden_context: Option<crate::xml::XmlBlock>,
     /// File picker state (when in `FilePicker` mode)
     pub file_picker: Option<FilePicker>,
     /// Image manager for clipboard images
@@ -625,6 +629,7 @@ impl App {
             view_height: AtomicUsize::new(0),
             mode,
             rewind_notice: None,
+            sent_hidden_context: None,
             queue: MessageQueue::new(),
             status,
             processing: false,
@@ -3741,9 +3746,10 @@ impl App {
             return self.open_model_select(rest.trim());
         }
 
+        self.sent_hidden_context = self.rewind_notice.take();
         let msg = PendingMessage {
             content,
-            hidden_context_xml: self.rewind_notice.take(),
+            hidden_context_xml: self.sent_hidden_context.clone(),
             attachments,
             queued_at: jiff::Timestamp::now(),
             delivery_mode,
@@ -3765,6 +3771,11 @@ impl App {
     pub fn withdraw_turn(&mut self, content: String, own: bool) {
         let attachments = self.chat.withdraw_last_prompt(&content);
         if own {
+            // The withdrawn message took its hidden context with it; a
+            // rewind since then supersedes it.
+            if self.rewind_notice.is_none() {
+                self.rewind_notice = self.sent_hidden_context.take();
+            }
             self.input_char_count = content.chars().count();
             self.cursor = self.input_char_count;
             self.input = content;
@@ -4642,6 +4653,40 @@ mod tests {
 
     fn press(app: &mut App, code: KeyCode) -> Option<SendAction> {
         app.handle_key(code, KeyModifiers::NONE).expect("key")
+    }
+
+    /// A withdrawn message takes its hidden context with it; the sender puts
+    /// the rewind notice back so the message it sends again carries it.
+    #[tokio::test]
+    async fn a_withdrawn_message_returns_its_rewind_notice_to_the_sender() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        let text = "你好 こんにちは 안녕하세요";
+        let notice = crate::xml::XmlBlock::parse("The conversation was rewound.".to_string())
+            .expect("notice parses");
+        app.rewind_notice = Some(notice.clone());
+        for c in text.chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        let Some(SendAction::Send(sent)) = press(&mut app, KeyCode::Enter) else {
+            panic!("Enter sends the message");
+        };
+        assert_eq!(sent.hidden_context_xml, Some(notice.clone()));
+        assert!(app.rewind_notice.is_none(), "the send took the notice");
+
+        // Another client's withdrawn turn leaves this client's state alone.
+        app.withdraw_turn("someone else's".to_string(), false);
+        assert!(app.rewind_notice.is_none());
+
+        app.withdraw_turn(text.to_string(), true);
+        assert_eq!(app.input, text);
+        assert_eq!(app.rewind_notice, Some(notice.clone()));
+
+        let Some(SendAction::Send(again)) = press(&mut app, KeyCode::Enter) else {
+            panic!("Enter sends the restored message");
+        };
+        assert_eq!(again.content, text);
+        assert_eq!(again.hidden_context_xml, Some(notice));
     }
 
     #[tokio::test]

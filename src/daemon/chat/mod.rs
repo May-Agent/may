@@ -1739,6 +1739,9 @@ fn run_agent_loop<'a>(
         let mut turn_hidden_context_xml: Option<String> = None;
         // The stored user message, from the first attempt.
         let mut turn_user_message_id: Option<i32> = None;
+        // Whether the turn consumed the pending takeover-ended alert, which
+        // a withdrawal gives back.
+        let mut turn_consumed_takeover_alert = false;
         // The largest history row id before this turn persists anything. A
         // retry that resubmits the prompt rebuilds context only up to it,
         // so the rows the turn itself wrote are not fed back alongside the
@@ -1787,6 +1790,7 @@ fn run_agent_loop<'a>(
                 provider_candidate_count,
                 build_key,
                 user_message_id,
+                takeover_alert_consumed,
                 reasoning_effort,
             } = match prepare_agent_for_request(
                 state,
@@ -1845,6 +1849,7 @@ fn run_agent_loop<'a>(
             if user_message_id.is_some() {
                 turn_user_message_id = user_message_id;
             }
+            turn_consumed_takeover_alert |= takeover_alert_consumed;
             sink.on_prepared(turn_user_message_id);
             if let Some(hidden_context_xml) = hidden_context_xml {
                 turn_hidden_context_xml = Some(hidden_context_xml);
@@ -2201,6 +2206,14 @@ fn run_agent_loop<'a>(
                         .delete_messages_from(session_id.as_str(), i64::from(turn_boundary) + 1)
                         .await?;
                     state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
+                    // The alert's row went with the turn; the model has yet
+                    // to see it, so the next turn delivers it.
+                    if turn_consumed_takeover_alert {
+                        state
+                            .runtime_service
+                            .restore_browser_takeover_alert_pending(session_id.as_str())
+                            .await?;
+                    }
                     sink.on_withdrawn(&req.content, &req.attachments).await;
                     record_request_log(state, ledger.interrupted(Instant::now(), reason)).await;
                     return Err(AgentLoopError::Cancelled(reason));
@@ -2653,6 +2666,8 @@ fn enqueue_event_triggered_tasks(
 struct SessionContext {
     /// Row id of the user message this turn stored, when it stored one.
     user_message_id: Option<i32>,
+    /// Whether preparing the turn consumed the pending takeover-ended alert.
+    takeover_alert_consumed: bool,
     session_id: SessionId,
     current_model: String,
     provider_candidate_count: usize,
@@ -2696,6 +2711,8 @@ struct PreparedAgent {
     build_key: u64,
     /// Row id of the user message this turn stored, when it stored one.
     user_message_id: Option<i32>,
+    /// Whether preparing the turn consumed the pending takeover-ended alert.
+    takeover_alert_consumed: bool,
     /// Reasoning effort resolved for this turn's requests.
     reasoning_effort: Option<aither_core::llm::model::ReasoningEffort>,
 }
@@ -2996,7 +3013,9 @@ async fn resolve_session_context(
     let mut hidden_commit_entry = req
         .pending_entry_id
         .filter(|_| persist_user_message && !request_has_visible_user_input(req));
-    if persist_user_message && take_over_alert_pending(state, &session_id).await {
+    let takeover_alert_consumed =
+        persist_user_message && take_over_alert_pending(state, &session_id).await;
+    if takeover_alert_consumed {
         push_hidden_context_part(
             &db,
             fence,
@@ -3136,6 +3155,7 @@ async fn resolve_session_context(
 
     Ok(SessionContext {
         user_message_id,
+        takeover_alert_consumed,
         session_id,
         current_model,
         provider_candidate_count,
@@ -3538,6 +3558,7 @@ fn prepare_agent_for_request<'a>(
             provider_candidate_count: ctx.provider_candidate_count,
             build_key,
             user_message_id: ctx.user_message_id,
+            takeover_alert_consumed: ctx.takeover_alert_consumed,
             reasoning_effort: ctx.reasoning_effort,
         })
     })
@@ -5697,6 +5718,64 @@ mod tests {
                 .iter()
                 .all(|item| !format!("{:?}", item.message()).contains("hello")),
             "the agent's context holds nothing of the message"
+        );
+    }
+
+    /// The takeover-ended alert a withdrawn turn consumed is still pending:
+    /// its row left with the turn, and the next turn's request carries it.
+    #[tokio::test]
+    async fn a_withdrawn_turn_gives_back_the_takeover_alert() {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let thinking = sse_chunk(
+            &serde_json::json!({
+                "choices": [{"index": 0, "delta": {"reasoning_content": "let me think"}}]
+            })
+            .to_string(),
+        );
+        let provider = stub_provider(vec![format!("stall:{thinking}"), sse_text("ok")]).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let state = failover_state(may_dir.path(), &provider, &provider).await;
+        // The session's browser takeover ended, so the alert is pending.
+        state
+            .runtime_service
+            .restore_browser_takeover_alert_pending("session")
+            .await
+            .expect("alert marked pending");
+
+        let alert = super::browser_takeover_alert();
+        let first_line = alert.lines().next().expect("the alert has text");
+        let escaped = serde_json::to_string(first_line).expect("encodes");
+        let fragment = escaped.trim_matches('"');
+
+        let mut sink = TestSink::default();
+        let stop = async {
+            let body = last_body(&provider, 1).await;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            assert!(
+                state
+                    .runtime_service
+                    .runs()
+                    .cancel("session", crate::session::CancelReason::User),
+                "the run is live"
+            );
+            body
+        };
+        let (result, withdrawn_body) = tokio::join!(run_prompt_turn(&state, &mut sink), stop);
+        assert!(matches!(result, Err(super::AgentLoopError::Cancelled(_))));
+        assert_eq!(sink.withdrawn, vec!["hello".to_string()]);
+        assert!(
+            withdrawn_body.contains(fragment),
+            "the withdrawn turn consumed the alert"
+        );
+
+        let mut next = TestSink::default();
+        run_prompt_turn(&state, &mut next)
+            .await
+            .expect("the next turn completes");
+        let body = last_body(&provider, 1).await;
+        assert!(
+            body.contains(fragment),
+            "the next request carries the alert"
         );
     }
 

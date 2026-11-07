@@ -1242,6 +1242,10 @@ where
                         app.chat.retract_text();
                         assistant_response.clear();
                     }
+                    TuiEvent::Withdrawn { content, own } => {
+                        assistant_response.clear();
+                        app.withdraw_turn(content, own);
+                    }
                     TuiEvent::Compacted(result) => match result {
                         Ok(Some(stats)) => {
                             app.set_status(format!(

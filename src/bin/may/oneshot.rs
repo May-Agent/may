@@ -544,6 +544,9 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                     "[retrying] the response was cut off; the text above is discarded"
                 )?;
             }
+            Event::Agent(TuiEvent::Withdrawn { .. }) => {
+                writeln!(output.stderr()?, "[stopped] the message was withdrawn")?;
+            }
             Event::Agent(TuiEvent::Error(error)) => {
                 writeln!(output.stderr()?, "[error] {error}")?;
                 runtime_deps
