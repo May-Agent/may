@@ -503,7 +503,9 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
                 | TuiEvent::ContextDump(_)
                 | TuiEvent::ContextMessages(_)
                 | TuiEvent::SideModel(_)
-                | TuiEvent::ContextDumpSaved { .. },
+                | TuiEvent::ContextDumpSaved { .. }
+                // A one-shot run prints no tool cards.
+                | TuiEvent::ToolReading { .. },
             ) => {}
             Event::Agent(TuiEvent::Hold {
                 reason: HoldReason::Retry { until, retry },

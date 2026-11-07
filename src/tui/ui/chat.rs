@@ -1019,6 +1019,21 @@ impl ChatStream {
         self.push_tool(id, display);
     }
 
+    /// Attach the daemon's reading of a terminal call's script to the call.
+    pub fn set_tool_reading(&mut self, id: &str, reading: CommandReading) {
+        let Some(index) = self.tool_index(id) else {
+            return;
+        };
+        if let ChatElement::ToolCall {
+            display: ToolDisplay::Terminal { reading: slot, .. },
+            ..
+        } = &mut self.elements[index]
+        {
+            *slot = Some(reading);
+            self.touch(index);
+        }
+    }
+
     /// Record a provider-hosted tool call the model just invoked.
     pub fn push_builtin(&mut self, id: String, tool: String, detail: String) {
         self.end_text();
@@ -3482,6 +3497,15 @@ fn render_tool_inline_at<'a>(
         spinner_frame,
     ));
     if !open {
+        // A folded edit keeps a compact diff; every other call folds to its
+        // headline.
+        if let ToolDisplay::Terminal {
+            reading: Some(reading),
+            ..
+        } = display
+        {
+            lines.extend(edit_preview_lines(reading, selection_style));
+        }
         return;
     }
 
@@ -3619,11 +3643,49 @@ const fn link_marker(link: Link) -> &'static str {
 /// under every edit.
 #[must_use]
 pub fn reading_lines(reading: &CommandReading, selection_style: Style) -> Vec<Line<'static>> {
+    reading_rows(reading, selection_style, false, EDIT_PREVIEW_ROWS)
+}
+
+/// What a finished, collapsed call keeps of its edits: each file and a
+/// compact diff preview capped at [`DIFF_PREVIEW_LINES`] rows. Empty when
+/// the script edits nothing.
+#[must_use]
+pub fn edit_preview_lines(reading: &CommandReading, selection_style: Style) -> Vec<Line<'static>> {
+    reading_rows(reading, selection_style, true, DIFF_PREVIEW_LINES)
+}
+
+fn reading_rows(
+    reading: &CommandReading,
+    selection_style: Style,
+    edits_only: bool,
+    max_diff_rows: usize,
+) -> Vec<Line<'static>> {
     let dim = Style::default().fg(Color::DarkGray);
     let mut lines = Vec::new();
+    let total_diff_rows: usize = reading
+        .steps
+        .iter()
+        .filter_map(|step| match &step.intent {
+            Intent::Edit { files } => Some(files),
+            _ => None,
+        })
+        .flatten()
+        .flat_map(|file| file_hunks(&file.change))
+        .map(|(_, rows)| rows.len())
+        .sum();
     let mut diff_rows = 0;
     for step in &reading.steps {
-        let marker = Span::styled(link_marker(step.link), dim.patch(selection_style));
+        if edits_only && !matches!(step.intent, Intent::Edit { .. }) {
+            continue;
+        }
+        let marker = Span::styled(
+            if edits_only {
+                ""
+            } else {
+                link_marker(step.link)
+            },
+            dim.patch(selection_style),
+        );
         if let Intent::Unknown { source } = &step.intent {
             let mut rows = source.lines();
             let first = rows.next().unwrap_or_default();
@@ -3643,13 +3705,15 @@ pub fn reading_lines(reading: &CommandReading, selection_style: Style) -> Vec<Li
             }
             continue;
         }
-        lines.push(Line::from(vec![
-            marker,
-            Span::styled(
-                step.line.clone(),
-                Style::default().fg(Color::Cyan).patch(selection_style),
-            ),
-        ]));
+        if !edits_only {
+            lines.push(Line::from(vec![
+                marker,
+                Span::styled(
+                    step.line.clone(),
+                    Style::default().fg(Color::Cyan).patch(selection_style),
+                ),
+            ]));
+        }
         if let Intent::Edit { files } = &step.intent {
             for file in files {
                 lines.push(Line::from(Span::styled(
@@ -3664,14 +3728,14 @@ pub fn reading_lines(reading: &CommandReading, selection_style: Style) -> Vec<Li
                         )));
                     }
                     for row in rows {
-                        if diff_rows == EDIT_PREVIEW_ROWS {
+                        if diff_rows == max_diff_rows {
                             lines.push(Line::from(Span::styled(
-                                "  … more lines".to_string(),
+                                format!("  … {} more lines", total_diff_rows - max_diff_rows),
                                 dim.italic().patch(selection_style),
                             )));
                         }
                         diff_rows += 1;
-                        if diff_rows > EDIT_PREVIEW_ROWS {
+                        if diff_rows > max_diff_rows {
                             continue;
                         }
                         lines.push(diff_row(row, selection_style));
@@ -4893,6 +4957,52 @@ mod tests {
         assert_eq!(rows[1], "Search for \"foo\" in src");
         assert_eq!(rows[2], "| $ wc -l");
         assert_eq!(rows[3], "&& Run cargo test");
+    }
+
+    fn finished(mut display: ToolDisplay) -> ToolDisplay {
+        if let ToolDisplay::Terminal { status, .. } = &mut display {
+            *status = ToolStatus::Done;
+        }
+        display
+    }
+
+    #[test]
+    fn a_finished_edit_keeps_a_capped_diff_preview_when_collapsed() {
+        let body = "+line\n".repeat(12);
+        let script = format!(
+            "apply_patch <<'P'\n*** Begin Patch\n*** Add File: big.txt\n{body}*** End Patch\nP\n"
+        );
+        let rows = call_rows(&finished(read_call(&script)));
+        assert!(rows[0].ends_with("work"), "{rows:?}");
+        assert_eq!(rows[1], "  + big.txt (new file)");
+        let diff = rows.iter().filter(|row| row.contains("+ line")).count();
+        assert_eq!(diff, super::DIFF_PREVIEW_LINES);
+        assert_eq!(rows.last().unwrap(), "  … 4 more lines");
+    }
+
+    #[test]
+    fn a_finished_read_folds_to_its_headline() {
+        let rows = call_rows(&finished(read_call("cat src/lib.rs")));
+        assert_eq!(rows.len(), 1, "{rows:?}");
+    }
+
+    #[test]
+    fn the_daemons_reading_attaches_to_the_call_it_names() {
+        let mut stream = ChatStream::new();
+        let mut display = read_call("cat a.rs");
+        if let ToolDisplay::Terminal { reading, .. } = &mut display {
+            *reading = None;
+        }
+        stream.push_tool("c1".to_string(), display);
+        stream.set_tool_reading("c1", crate::command_reading::CommandReading::of("cat a.rs"));
+        let Some(ChatElement::ToolCall {
+            display: ToolDisplay::Terminal { reading, .. },
+            ..
+        }) = stream.elements.first()
+        else {
+            panic!("terminal call expected");
+        };
+        assert!(reading.is_some());
     }
 
     #[test]

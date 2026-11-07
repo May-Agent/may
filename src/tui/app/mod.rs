@@ -4038,12 +4038,12 @@ impl App {
                 description,
                 script,
                 mode,
-                reading,
             } => ToolDisplay::Terminal {
                 description,
                 command: script,
                 mode,
-                reading,
+                // The daemon's reading arrives right after the start.
+                reading: None,
                 status: super::ui::chat::ToolStatus::Running,
                 output: None,
                 diffs: Vec::new(),

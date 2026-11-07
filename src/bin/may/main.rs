@@ -1209,6 +1209,9 @@ where
                     TuiEvent::ReasoningEnd { seconds } => {
                         app.chat.finish_thinking(seconds);
                     }
+                    TuiEvent::ToolReading { call_id, reading } => {
+                        app.chat.set_tool_reading(&call_id, reading);
+                    }
                     TuiEvent::Hold { reason, .. } => match reason {
                         HoldReason::Retry { until, retry } => {
                             let at = until

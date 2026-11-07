@@ -457,6 +457,12 @@ impl ChatSink for HubSink {
         arguments: &str,
         summary: crate::daemon::tool_summary::ToolSummary,
     ) -> bool {
+        if let Some(reading) = &summary.reading {
+            self.publish_agent(crate::client::SessionAgentBody::ToolReading {
+                call_id: id.to_string(),
+                reading: reading.clone(),
+            });
+        }
         let seq = self.next_seq();
         self.publish_turn(
             "tool_start",

@@ -5,8 +5,6 @@ use aither_sandbox::builtin::{InputTerminalArgs, KillTerminalArgs, ReadTerminalD
 use aither_sandbox::{TerminalArgs, TerminalExecutionMode};
 use partial_json_fixer::fix_json;
 
-use crate::command_reading::CommandReading;
-
 /// Frontend-agnostic start event for a tool call.
 #[derive(Debug, Clone)]
 pub enum ToolStartKind {
@@ -18,8 +16,6 @@ pub enum ToolStartKind {
         script: String,
         /// Requested execution backend for the command.
         mode: TerminalExecutionMode,
-        /// How May reads the script; absent while it is still streaming.
-        reading: Option<CommandReading>,
     },
     /// A `terminal_input` invocation: text written to a background task's
     /// stdin. The task id is kept for the frontend to resolve into a
@@ -118,7 +114,6 @@ pub fn parse_tool_start(name: &str, arguments: &str) -> ToolStartKind {
                 .unwrap_or_else(|e| panic!("invalid terminal tool args payload: {e}"));
             ToolStartKind::Terminal {
                 description: args.description,
-                reading: Some(CommandReading::of(&args.script)),
                 script: args.script,
                 mode: args.mode,
             }
@@ -171,8 +166,6 @@ pub fn parse_tool_start_partial(name: &str, arguments: &str) -> ToolStartKind {
         "terminal" => ToolStartKind::Terminal {
             description: pick(&value, "description"),
             script: pick(&value, "script"),
-            // A script still streaming is not read.
-            reading: None,
             mode: value
                 .get("mode")
                 .and_then(|mode| serde_json::from_value(mode.clone()).ok())
