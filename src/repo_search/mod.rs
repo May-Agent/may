@@ -84,12 +84,13 @@ pub struct RepoSearch {
 }
 
 impl RepoSearch {
-    /// Handle that caches the pinned binary under `<may_dir>/cache/host-programs`.
+    /// Handle that caches the pinned binary under
+    /// [`MayHomePaths::host_programs_dir`](crate::MayHomePaths::host_programs_dir).
     #[must_use]
     pub fn new(may_dir: &Path) -> Self {
         Self {
             inner: Arc::new(Inner {
-                cache_root: may_dir.join("cache").join("host-programs"),
+                cache_root: crate::MayHomePaths::new(may_dir.to_path_buf()).host_programs_dir(),
                 prepared: OnceCell::new(),
                 retired: async_lock::RwLock::new(false),
             }),
