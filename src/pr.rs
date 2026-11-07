@@ -311,6 +311,11 @@ impl PrStore {
         hold: bool,
     ) -> Result<String, PrError> {
         let resolved = self.resolve(repo).await?;
+        // `[[projects]] pr.auto_merge = false` makes opening the end state.
+        let hold = hold
+            || self
+                .project_for_record(&resolved.record)
+                .is_some_and(|p| p.pr.auto_merge == Some(false));
         if self
             .db()?
             .open_pr_for(&resolved.record.repo_key, &self.context.session_id)
@@ -485,6 +490,28 @@ impl PrStore {
                 ))
             })?
         };
+        // `[[projects]] pr.require_review` parks the merge on the user's
+        // answer; a refusal leaves the PR as it was.
+        if self
+            .project_for_record(&resolved.record)
+            .is_some_and(|p| p.pr.require_review == Some(true))
+        {
+            let Some(gate) = &self.context.publish else {
+                return Err(PrError::State(
+                    "this repository requires review, and the session has no way to ask the user"
+                        .to_string(),
+                ));
+            };
+            if let Err(error) = gate
+                .approve_merge(&resolved.record.repo_key, number, &pr.title, &pr.body)
+                .await
+            {
+                self.event(&pr, "review_denied", Some(&error.to_string()))
+                    .await;
+                return Err(error.into());
+            }
+            self.event(&pr, "review_approved", None).await;
+        }
         self.db()?
             .update_pr(pr.id, "checks_pending", Some(&head_sha), None, None)
             .await?;
@@ -1953,21 +1980,31 @@ mod tests {
 
         /// A session's store with a clone of the checkout already made.
         async fn store(&self, id: &str, checks: Option<&str>) -> (PrStore, PathBuf) {
+            self.configured_store(id, checks, ProjectPr::default(), None)
+                .await
+        }
+
+        /// A session's store whose `[[projects]]` entry carries `checks` and
+        /// `pr`, asking the user through `publish`.
+        async fn configured_store(
+            &self,
+            id: &str,
+            checks: Option<&str>,
+            pr: ProjectPr,
+            publish: Option<crate::agent::publish_approval::PublishGate>,
+        ) -> (PrStore, PathBuf) {
             let root = self.session_root(id);
             let clone = SessionRepos::new(&root, id, self.db.clone())
                 .ensure_local_clone(&self.checkout, &self.repo_key, &self.scratch_root())
                 .await
                 .unwrap();
             self.user.identify(&clone);
-            let projects = checks
-                .map(|c| ProjectConfig {
-                    path: self.checkout.clone(),
-                    issues: ProjectIssues::default(),
-                    checks: Some(c.to_string()),
-                    pr: ProjectPr::default(),
-                })
-                .into_iter()
-                .collect();
+            let projects = vec![ProjectConfig {
+                path: self.checkout.clone(),
+                issues: ProjectIssues::default(),
+                checks: checks.map(str::to_string),
+                pr,
+            }];
             let store = PrStore::new(
                 PrContext {
                     db: Some(self.db.clone()),
@@ -1983,7 +2020,7 @@ mod tests {
                     signing: self.signing(id),
                     github_api: PrContext::default_github_api(),
                     task_events: None,
-                    publish: None,
+                    publish,
                 },
                 self.sandbox(id).await,
             );
@@ -2323,6 +2360,158 @@ mod tests {
             "{kinds:?}"
         );
         assert_eq!(kinds.last(), Some(&"merged"));
+    }
+
+    /// `[[projects]] pr.auto_merge = false` makes opening the end state: the
+    /// PR waits, nothing lands, until `pr merge`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_project_without_auto_merge_stops_at_open_until_pr_merge() {
+        let fx = Fixture::new().await;
+        let pr = ProjectPr {
+            auto_merge: Some(false),
+            ..ProjectPr::default()
+        };
+        let (store, clone) = fx.configured_store("s1", None, pr, None).await;
+        commit_file(&clone, "work.txt");
+        let key = fx.repo_key.to_str().unwrap();
+
+        let opened = store.open(None, Some("work"), None, false).await.unwrap();
+
+        assert_eq!(opened, "opened PR #1 (hold)");
+        assert_eq!(fx.db.get_pr(key, 1).await.unwrap().unwrap().state, "open");
+        assert!(!fx.checkout.join("work.txt").exists());
+
+        let merged = store.merge(1, None).await.unwrap();
+        assert!(merged.starts_with("merged PR #1 as "), "{merged}");
+        assert!(fx.checkout.join("work.txt").exists());
+    }
+
+    /// `[[projects]] checks` runs in the clone's pinned commit before a local
+    /// merge: a failing check keeps the work out and fails the PR, and the
+    /// same PR lands once the check passes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failing_check_blocks_the_local_merge_and_a_passing_one_lands() {
+        let fx = Fixture::new().await;
+        let (failing, clone) = fx
+            .configured_store("s1", Some("test -f never.txt"), ProjectPr::default(), None)
+            .await;
+        commit_file(&clone, "work.txt");
+        let key = fx.repo_key.to_str().unwrap();
+
+        let blocked = failing
+            .open(None, Some("work"), None, false)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(blocked, super::PrError::CheckFailed(_)),
+            "{blocked}"
+        );
+        assert!(!fx.checkout.join("work.txt").exists());
+        assert_eq!(fx.db.get_pr(key, 1).await.unwrap().unwrap().state, "failed");
+
+        let (passing, _) = fx
+            .configured_store("s1", Some("test -f work.txt"), ProjectPr::default(), None)
+            .await;
+        let merged = passing.merge(1, None).await.unwrap();
+
+        assert!(merged.starts_with("merged PR #1 as "), "{merged}");
+        assert!(fx.checkout.join("work.txt").exists());
+    }
+
+    /// A gate asking through a live approver whose answers the test gives.
+    fn review_gate(timeout: std::time::Duration) -> crate::agent::publish_approval::PublishGate {
+        crate::agent::publish_approval::PublishGate::new(
+            Arc::new(arc_swap::ArcSwap::from_pointee(
+                crate::config::MayConfig::default(),
+            )),
+            crate::agent::permission::PermissionApprover::new()
+                .with_approval_timeout(timeout)
+                .for_session("s1"),
+        )
+    }
+
+    /// `pr.require_review` parks the merge on the user's answer through the
+    /// permission machinery: approval lets it land, a denial refuses it and
+    /// leaves the PR open with the refusal in its trail, and an unanswered
+    /// question is a denial.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reviewed_project_merges_on_approval_and_refuses_on_denial() {
+        let review = ProjectPr {
+            require_review: Some(true),
+            ..ProjectPr::default()
+        };
+        for approve in [false, true] {
+            let fx = Fixture::new().await;
+            let gate = review_gate(std::time::Duration::from_secs(60));
+            let responder = gate.clone();
+            let (store, clone) = fx
+                .configured_store("s1", None, review.clone(), Some(gate))
+                .await;
+            commit_file(&clone, "work.txt");
+            let key = fx.repo_key.to_str().unwrap();
+            store.open(None, Some("work"), None, true).await.unwrap();
+
+            let merging = tokio::spawn({
+                let store = store.clone();
+                async move { store.merge(1, None).await }
+            });
+            let pending = loop {
+                let pending = responder.pending_requests();
+                if !pending.is_empty() {
+                    break pending;
+                }
+                assert!(!merging.is_finished(), "the merge did not wait for review");
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            };
+            assert_eq!(pending.len(), 1);
+            assert!(!fx.checkout.join("work.txt").exists(), "parked, not landed");
+            assert!(responder.answer(&pending[0], approve));
+            let result = merging.await.unwrap();
+
+            let pr = fx.db.get_pr(key, 1).await.unwrap().unwrap();
+            let kinds = fx
+                .db
+                .pr_events(pr.id)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|e| e.kind)
+                .collect::<Vec<_>>();
+            if approve {
+                assert!(result.unwrap().starts_with("merged PR #1 as "));
+                assert!(fx.checkout.join("work.txt").exists());
+                assert!(kinds.contains(&"review_approved".to_string()), "{kinds:?}");
+            } else {
+                assert!(
+                    matches!(result, Err(super::PrError::Publish(_))),
+                    "{result:?}"
+                );
+                assert!(!fx.checkout.join("work.txt").exists());
+                assert_eq!(pr.state, "open");
+                assert!(kinds.contains(&"review_denied".to_string()), "{kinds:?}");
+            }
+        }
+
+        // Nobody answers: refused.
+        let fx = Fixture::new().await;
+        let gate = review_gate(std::time::Duration::from_millis(100));
+        let (store, clone) = fx
+            .configured_store("s1", None, review.clone(), Some(gate))
+            .await;
+        commit_file(&clone, "work.txt");
+        store.open(None, Some("work"), None, true).await.unwrap();
+        assert!(store.merge(1, None).await.is_err());
+        assert!(!fx.checkout.join("work.txt").exists());
+
+        // A project that requires review in a session with no way to ask
+        // refuses rather than merging unreviewed.
+        let fx = Fixture::new().await;
+        let (store, clone) = fx.configured_store("s1", None, review, None).await;
+        commit_file(&clone, "work.txt");
+        store.open(None, Some("work"), None, true).await.unwrap();
+        let refused = store.merge(1, None).await.unwrap_err();
+        assert!(refused.to_string().contains("requires review"), "{refused}");
     }
 
     /// Every transition names its session, agent and tool call, and `pr show`

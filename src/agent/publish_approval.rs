@@ -72,6 +72,16 @@ struct PublishRequest<'a> {
     body: &'a str,
 }
 
+/// The text the user is shown for a pending merge.
+#[derive(Template)]
+#[template(path = "merge_request.txt", escape = "none")]
+struct MergeRequest<'a> {
+    number: i64,
+    repository: &'a str,
+    title: &'a str,
+    body: &'a str,
+}
+
 /// The refusal the agent reads.
 #[derive(Template)]
 #[template(path = "publish_denied.txt", escape = "none")]
@@ -152,6 +162,18 @@ impl PublishGate {
     #[must_use]
     pub const fn new(config: Arc<ArcSwap<MayConfig>>, approver: PermissionApprover) -> Self {
         Self { config, approver }
+    }
+
+    /// The questions waiting for the user, for tests that answer them.
+    #[cfg(test)]
+    pub(crate) fn pending_requests(&self) -> Vec<String> {
+        self.approver.pending_request_ids()
+    }
+
+    /// Answer the waiting question `request_id`, as the user would.
+    #[cfg(test)]
+    pub(crate) fn answer(&self, request_id: &str, approved: bool) -> bool {
+        self.approver.respond(request_id, approved)
     }
 
     fn settings(&self) -> IssueApprovalConfig {
@@ -238,6 +260,35 @@ impl PublishGate {
         .map_err(PublishError::Denied)
     }
 
+    /// Ask the user whether pull request `number` of `repository` may merge,
+    /// as the project's `pr.require_review` demands: an unanswered question
+    /// is a refusal.
+    ///
+    /// # Errors
+    /// Fails when the user denies or does not answer.
+    ///
+    /// # Panics
+    /// Never: the request renders for every input.
+    pub async fn approve_merge(
+        &self,
+        repository: &str,
+        number: i64,
+        title: &str,
+        body: &str,
+    ) -> Result<(), PublishError> {
+        let text = MergeRequest {
+            number,
+            repository,
+            title,
+            body,
+        }
+        .render()
+        .unwrap_or_else(|error| panic!("failed to render the merge request: {error}"));
+        self.ask(text, OnTimeout::Deny)
+            .await
+            .map_err(PublishError::Denied)
+    }
+
     /// Apply the entry for `publication`: nothing, or a question whose
     /// unanswered outcome the entry names.
     async fn decide(
@@ -254,6 +305,11 @@ impl PublishGate {
         let text = publication
             .render(repository)
             .unwrap_or_else(|error| panic!("failed to render the publish request: {error}"));
+        self.ask(text, on_timeout).await
+    }
+
+    /// Put `text` to the user through the live-response machinery.
+    async fn ask(&self, text: String, on_timeout: OnTimeout) -> Result<(), PublishDenied> {
         let reason = match self.approver.request_publication(text, on_timeout).await {
             Ok(true) => return Ok(()),
             Ok(false) => "the user denied it".to_string(),

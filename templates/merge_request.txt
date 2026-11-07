@@ -1,0 +1,5 @@
+merge pull request #{{ number }} into {{ repository }}
+
+Title: {{ title }}
+
+{{ body }}
