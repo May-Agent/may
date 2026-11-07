@@ -115,7 +115,11 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y nasm
       - name: cargo build
         run: cargo build --locked --all-targets
+      # The merge queue already tested the tree a push to dev lands, so that
+      # push only builds, to seed dev's caches; it still tests when the test
+      # downloads missed, since the tests are what fetch them.
       - name: cargo test
+        if: github.event_name != 'push' || steps.downloads.outputs.tools-hit != 'true' || steps.downloads.outputs.heel-hit != 'true'
         run: cargo test --locked --all-targets
       - if: success() && steps.downloads.outputs.tools-hit != 'true' && github.ref == 'refs/heads/dev'
         uses: actions/cache/save@v4
