@@ -48,6 +48,8 @@ pub mod host_git;
 mod id;
 /// Issue tracking: may issues by default, GitHub when configured.
 pub mod issue;
+/// The machine-wide jobserver token pool shared by every terminal.
+pub mod jobserver;
 mod live_response;
 /// Location lookup for location-aware profiles.
 pub mod location;

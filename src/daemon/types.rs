@@ -1580,6 +1580,10 @@ pub struct UiStreamConfig {
 pub struct UiSandboxConfig {
     #[schema(value_type = String)]
     pub(crate) command_priority: CommandPriority,
+    /// Jobserver tokens shared by every terminal; `None` is the host's
+    /// available parallelism.
+    #[serde(default)]
+    pub(crate) job_pool_size: Option<usize>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
@@ -1700,6 +1704,14 @@ pub struct SkillInfoDto {
 #[serde(rename_all = "camelCase")]
 pub struct LastModelRequest {
     pub(crate) model: String,
+}
+
+/// Body of `PUT /api/config/job-pool`: the machine-wide jobserver pool size,
+/// `None` for the host's available parallelism.
+#[derive(Debug, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct JobPoolRequest {
+    pub(crate) size: Option<usize>,
 }
 
 #[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
