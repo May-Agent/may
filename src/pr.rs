@@ -102,7 +102,7 @@ pub struct PrContext {
     pub github_api: GitHubRest<PrTokenSource>,
     /// The main agent's `tasks.md` inbox: told when a PR opens, merges, is
     /// rejected or closes.
-    pub task_events: Option<aither_agent::TaskEvents>,
+    pub task_events: Option<aither_agent::WorkEvents>,
     /// Asks the user before a PR is opened on a repository they do not own;
     /// `None` publishes without asking.
     pub publish: Option<crate::agent::publish_approval::PublishGate>,
@@ -392,7 +392,7 @@ impl PrStore {
             .await?;
         self.event(&pr, "opened", Some(&format!("base {base_sha}")))
             .await;
-        self.task_event(&pr, aither_agent::TaskEvent::PullRequestOpened);
+        self.task_event(&pr, aither_agent::WorkEvent::PullRequestOpened);
         if let Some(n) = external_number {
             self.event(&pr, "opened", Some(&format!("github PR #{n}")))
                 .await;
@@ -489,7 +489,7 @@ impl PrStore {
                     )
                     .await?;
                 self.event(&pr, "merged", Some(&merge_sha)).await;
-                self.task_event(&pr, aither_agent::TaskEvent::PullRequestMerged);
+                self.task_event(&pr, aither_agent::WorkEvent::PullRequestMerged);
                 let clone = self.retire_clone(&resolved, &head_sha).await?;
                 Ok(PrMerged {
                     number,
@@ -506,7 +506,7 @@ impl PrStore {
                     .update_pr(pr.id, "rejected", Some(&head_sha), None, None)
                     .await?;
                 self.event(&pr, "rejected", Some(&reason)).await;
-                self.task_event(&pr, aither_agent::TaskEvent::PullRequestRejected);
+                self.task_event(&pr, aither_agent::WorkEvent::PullRequestRejected);
                 Err(PrError::Rejected(reason))
             }
         }
@@ -548,7 +548,7 @@ impl PrStore {
         }
         self.db()?.close_pr(pr.id).await?;
         self.event(&pr, "closed", None).await;
-        self.task_event(&pr, aither_agent::TaskEvent::PullRequestClosed);
+        self.task_event(&pr, aither_agent::WorkEvent::PullRequestClosed);
         if resolved.record.local {
             drop_ref(
                 self.context.signing.host(),
@@ -912,7 +912,7 @@ impl PrStore {
                     .update_pr(pr.id, "merged", Some(head_sha), None, Some(now.as_str()))
                     .await?;
                 self.event(pr, "merged", Some(head_sha)).await;
-                self.task_event(pr, aither_agent::TaskEvent::PullRequestMerged);
+                self.task_event(pr, aither_agent::WorkEvent::PullRequestMerged);
                 self.pull_sync(&owner_repo).await;
                 let clone = self.retire_clone(resolved, head_sha).await?;
                 let remote_branch = self.delete_remote_branch(&owner_repo, &pr.branch).await;
@@ -937,7 +937,7 @@ impl PrStore {
                             .update_pr(pr.id, "closed", Some(head_sha), None, None)
                             .await?;
                         self.event(pr, "closed", Some(&report)).await;
-                        self.task_event(pr, aither_agent::TaskEvent::PullRequestClosed);
+                        self.task_event(pr, aither_agent::WorkEvent::PullRequestClosed);
                         Err(PrError::State(report))
                     }
                     merge_watch::Stopped::CheckFailed(_) => {
@@ -1205,7 +1205,7 @@ impl PrStore {
     fn task_event(
         &self,
         pr: &crate::db::PrRow,
-        change: fn(aither_agent::WorkRef) -> aither_agent::TaskEvent,
+        change: fn(aither_agent::WorkRef) -> aither_agent::WorkEvent,
     ) {
         if let Some(events) = &self.context.task_events
             && let Ok(number) = u64::try_from(pr.number)
@@ -2117,7 +2117,7 @@ mod tests {
 
         let fx = Fixture::new().await;
         let (mut store, clone) = fx.store("s1", None).await;
-        let events = aither_agent::TaskEvents::new();
+        let events = aither_agent::WorkEvents::new();
         store.context.task_events = Some(events.clone());
         let sandbox = tempfile::tempdir().unwrap();
         std::fs::write(
@@ -2125,7 +2125,7 @@ mod tests {
             "## Doing\n- #3 work, PR #1 open\n",
         )
         .unwrap();
-        let mut tasks = aither_agent::TasksDocument::new(sandbox.path(), 60, events);
+        let mut tasks = crate::tasks_md::schema::working_document(sandbox.path(), events);
         tasks.on_request(false).await;
 
         commit_file(&clone, "work.txt");

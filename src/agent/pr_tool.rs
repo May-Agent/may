@@ -217,7 +217,9 @@ impl Tool for PrTool {
             },
         ) = (&self.languages, &args)
         {
-            guard.check_working(title, aither_agent::WorkingText::Public)?;
+            guard
+                .check_working(title, aither_agent::WorkingText::Public)
+                .map_err(super::notices::language_refused)?;
         }
         let result = match args {
             PrArgs::Open {

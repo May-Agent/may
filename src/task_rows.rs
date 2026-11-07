@@ -1,11 +1,14 @@
 //! The rows of a session's `tasks.md` as clients see them.
 //!
-//! The format and its parser belong to `aither_agent::TasksFile`; this module
-//! only reshapes its rows into one serializable model that the daemon sends
-//! (`todo_update` events, `GET /api/sessions/{id}/tasks`) and the TUI reads.
+//! The format and its parser belong to [`crate::tasks_md::TasksFile`]; this
+//! module only reshapes its rows into one serializable model that the daemon
+//! sends (`todo_update` events, `GET /api/sessions/{id}/tasks`) and the TUI
+//! reads.
 
 use aither_agent::WorkRef;
-use aither_agent::tasks::{Section, TasksFile, WorkKind};
+use aither_agent::working_document::WorkKind;
+
+use crate::tasks_md::{Section, TasksFile};
 
 /// A section that holds rows.
 #[derive(
@@ -86,7 +89,7 @@ pub fn task_rows(content: &str) -> Vec<TaskRow> {
                 Section::Doing => TaskSection::Doing,
                 Section::Queued => TaskSection::Queued,
                 Section::Notes | Section::Decisions => {
-                    unreachable!("aither parses rows only in row sections")
+                    unreachable!("tasks.md has rows only in row sections")
                 }
             },
             text: row.text().to_string(),

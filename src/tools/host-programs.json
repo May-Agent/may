@@ -10,6 +10,7 @@
       },
       "url": "https://github.com/May-Agent/repo-search/releases/download/v0.0.12/repo-search-aarch64-apple-darwin.tar.xz",
       "sha256": "e86f7979c882131fc1e650c14d798784a32f376d5d992bf8d5f464857ac64e48",
+      "size": 5794384,
       "encoding": {
         "format": "tar_xz",
         "executable": "repo-search-aarch64-apple-darwin/search"
@@ -25,6 +26,7 @@
       },
       "url": "https://github.com/May-Agent/repo-search/releases/download/v0.0.12/repo-search-aarch64-unknown-linux-gnu.tar.xz",
       "sha256": "47b2d9f28263cd0e7c7cf4fa5422bfccbd21b33cc61338d379682df6835c5e6b",
+      "size": 12855076,
       "encoding": {
         "format": "tar_xz",
         "executable": "repo-search-aarch64-unknown-linux-gnu/search"
@@ -40,6 +42,7 @@
       },
       "url": "https://github.com/May-Agent/repo-search/releases/download/v0.0.12/repo-search-x86_64-unknown-linux-gnu.tar.xz",
       "sha256": "045b40cc581a341cda676520ceb986c76c43c9a05706938fd787102f4bd6073a",
+      "size": 14700200,
       "encoding": {
         "format": "tar_xz",
         "executable": "repo-search-x86_64-unknown-linux-gnu/search"

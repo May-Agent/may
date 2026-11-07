@@ -35,7 +35,7 @@ pub fn checkpoint_from_hook(ctx: &CheckpointContext<'_>) -> AgentCheckpoint {
         tool_surface_hash: ctx.tool_surface_hash.to_string(),
         context_window: ctx.window.clone(),
         has_background_tasks: ctx.has_background_tasks,
-        tasks: ctx.tasks.cloned(),
+        document: ctx.document.cloned(),
     }
 }
 
@@ -164,7 +164,7 @@ pub async fn persist_agent_context_snapshot(
 mod tests {
     use aither_agent::{
         AgentCheckpoint, Context, ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot,
-        HandoffDocument,
+        Handoff,
     };
     use aither_core::llm::Message;
 
@@ -192,7 +192,7 @@ mod tests {
                 messages: Vec::new(),
             },
             has_background_tasks: false,
-            tasks: None,
+            document: None,
         }
     }
 
@@ -222,7 +222,7 @@ mod tests {
         let second = context.push(answer.clone());
         assert_eq!((first, second), (0, 1));
         let fork_point = context.fork_point();
-        context.apply_handoff(&HandoffDocument::default(), fork_point, 0);
+        context.apply_handoff(Handoff::new("summary"), fork_point, 0);
         assert!(
             context.checkpoint().items().is_empty(),
             "the handoff covers every item"

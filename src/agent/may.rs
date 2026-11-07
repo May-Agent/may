@@ -721,6 +721,7 @@ impl MayAgent {
         let language_guard = aither_agent::LanguageGuard::new(config.languages);
         let mut builder = TerminalAgentBuilder::new(llm, terminal_tool)
             .system_layout(tag::layout())
+            .notices(super::notices::may_notices())
             .languages(language_guard.clone())
             .hook(context_snapshot_hook)
             .hook(pending_steer_hook)
@@ -758,7 +759,7 @@ impl MayAgent {
         // committed between agent builds still reach `tasks.md`.
         let task_events = hook_runtime
             .as_ref()
-            .map_or_else(aither_agent::TaskEvents::new, |runtime| {
+            .map_or_else(aither_agent::WorkEvents::new, |runtime| {
                 runtime.task_events(config.session_id.as_str())
             });
         let shared_terminal_commands = Box::pin(register_shared_terminal_commands(
@@ -805,11 +806,19 @@ impl MayAgent {
         for (name, description) in &shared_terminal_commands.descriptions {
             builder = builder.tool_description(name.clone(), description.clone());
         }
+        // The agent's sandbox, where it keeps `tasks.md`.
+        let home_dir = PathBuf::from(builder.sandbox_dir().as_ref());
         builder = builder
             .fork_source(shared_terminal_commands.fork_source.clone())
             // `tasks.md` follows what the commands above record, and reads
-            // the state of the issues and PRs its rows name.
-            .task_events(task_events)
+            // the state of the issues and PRs its rows name. Its subagents
+            // keep their own under the same schema and stop rule.
+            .working_document(crate::tasks_md::schema::document_spec())
+            .stop_hook(aither_agent::AnyStopHook::new(
+                crate::tasks_md::schema::TasksStopHook,
+            ))
+            .context_source(crate::tasks_md::schema::TasksLineLimit::new(&home_dir))
+            .work_events(task_events)
             .work_tracker(super::work_tracker::MayWorkTracker::new(
                 issue_store.clone(),
                 config.db.clone(),
@@ -1473,10 +1482,7 @@ pub async fn generate_session_title(
 /// Rendered markdown of the context's active handoff, if any — the text
 /// `AGENTS.md` links are extracted from.
 fn handoff_markdown(context: &aither_agent::Context) -> Option<String> {
-    match context.handoff()? {
-        aither_agent::Handoff::Text(text) => Some(text.clone()),
-        aither_agent::Handoff::Document(document) => Some(document.render_markdown()),
-    }
+    context.handoff().map(|handoff| handoff.text().to_string())
 }
 
 fn truncate_at_char_boundary(input: &str, max_chars: usize) -> &str {

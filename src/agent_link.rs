@@ -638,7 +638,9 @@ impl Tool for AgentTool {
                     return Err(AgentLinkError::EmptyMessage(path).into());
                 }
                 if let Some(guard) = &self.languages {
-                    guard.check_working(body.trim(), aither_agent::WorkingText::Internal)?;
+                    guard
+                        .check_working(body.trim(), aither_agent::WorkingText::Internal)
+                        .map_err(crate::agent::notices::language_refused)?;
                 }
                 let recipient = self
                     .messaging

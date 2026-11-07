@@ -1,0 +1,3 @@
+<tasks_alert>
+tasks.md has {{ lines }} lines, more than its limit of {{ limit }}. Rewrite it to hold only current state: delete finished rows and stale notes, and merge duplicates.
+</tasks_alert>

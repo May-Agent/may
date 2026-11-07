@@ -93,7 +93,7 @@ pub struct SharedTerminalCommandConfig<LLM> {
     pub issue_store: crate::issue::ResolvedIssueStore,
     /// The main agent's `tasks.md` inbox: `issue`, `pr`, `ask_user` and
     /// `subagent` record the state changes its rows track on it.
-    pub task_events: aither_agent::TaskEvents,
+    pub task_events: aither_agent::WorkEvents,
     /// Asks the user before an issue, PR or comment is published, when the
     /// session can ask; `None` publishes without asking.
     pub publish_gate: Option<crate::agent::publish_approval::PublishGate>,
@@ -456,7 +456,16 @@ where
     .with_balanced_model(UsageObservedModel::new(balanced.llm), balanced.parameters)
     .with_fast_model(UsageObservedModel::new(fast_llm), fast.parameters)
     .with_runs(config.subagent_runs)
-    .with_task_events(config.task_events.clone())
+    .with_work_events(config.task_events.clone())
+    // Each subagent keeps its own `tasks.md` under the main agent's schema
+    // and stop rule, and reads May's wording.
+    .with_working_document(
+        Some(crate::tasks_md::schema::document_spec()),
+        Some(aither_agent::AnyStopHook::new(
+            crate::tasks_md::schema::TasksStopHook,
+        )),
+    )
+    .with_notices(crate::agent::notices::may_notices())
     .with_base_dir(&config.sandbox_dir)
     .with_file_mounts([
         SubagentFileMount::new(PathBuf::from("."), config.sandbox_dir.clone()),
@@ -682,7 +691,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
-                task_events: aither_agent::TaskEvents::new(),
+                task_events: aither_agent::WorkEvents::new(),
                 publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
@@ -743,7 +752,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
-                task_events: aither_agent::TaskEvents::new(),
+                task_events: aither_agent::WorkEvents::new(),
                 publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
@@ -804,7 +813,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
-                task_events: aither_agent::TaskEvents::new(),
+                task_events: aither_agent::WorkEvents::new(),
                 publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
@@ -859,7 +868,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters,
                 issue_store: test_issue_store(temp.path()).await,
-                task_events: aither_agent::TaskEvents::new(),
+                task_events: aither_agent::WorkEvents::new(),
                 publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
@@ -910,7 +919,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
-                task_events: aither_agent::TaskEvents::new(),
+                task_events: aither_agent::WorkEvents::new(),
                 publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
@@ -1082,7 +1091,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store,
-                task_events: aither_agent::TaskEvents::new(),
+                task_events: aither_agent::WorkEvents::new(),
                 publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: Some(messaging),
@@ -1165,7 +1174,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
-                task_events: aither_agent::TaskEvents::new(),
+                task_events: aither_agent::WorkEvents::new(),
                 publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
@@ -1217,7 +1226,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
-                task_events: aither_agent::TaskEvents::new(),
+                task_events: aither_agent::WorkEvents::new(),
                 publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
@@ -1273,7 +1282,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp).await,
-                task_events: aither_agent::TaskEvents::new(),
+                task_events: aither_agent::WorkEvents::new(),
                 publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,

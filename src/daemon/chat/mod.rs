@@ -4020,7 +4020,7 @@ mod tests {
                         messages: Vec::new(),
                     },
                     has_background_tasks: false,
-                    tasks: None,
+                    document: None,
                 },
                 applied_seq: 42,
                 updated_at: "2026-03-14T00:00:00Z".to_string(),

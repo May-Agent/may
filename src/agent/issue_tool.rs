@@ -330,7 +330,7 @@ pub struct IssueTool<S, T = GhCliTokenSource> {
     languages: Option<aither_agent::LanguageGuard>,
     changes: Option<IssueChangeNotifier>,
     owners: Option<IssueOwners>,
-    task_events: Option<aither_agent::TaskEvents>,
+    task_events: Option<aither_agent::WorkEvents>,
     publish: Option<PublishGate>,
 }
 
@@ -466,7 +466,7 @@ impl<S: IssueStore, T> IssueTool<S, T> {
     /// Record every issue created or closed on `events`, the main agent's
     /// `tasks.md` inbox.
     #[must_use]
-    pub fn with_task_events(mut self, events: aither_agent::TaskEvents) -> Self {
+    pub fn with_task_events(mut self, events: aither_agent::WorkEvents) -> Self {
         self.task_events = Some(events);
         self
     }
@@ -526,7 +526,9 @@ where
     ) -> aither_core::Result<Self::Res> {
         if let Some(guard) = &self.languages {
             for text in arguments.published_texts() {
-                guard.check_working(text, aither_agent::WorkingText::Public)?;
+                guard
+                    .check_working(text, aither_agent::WorkingText::Public)
+                    .map_err(super::notices::language_refused)?;
             }
         }
         if let Some(gate) = &self.publish {
@@ -582,7 +584,7 @@ struct SessionServices<'a> {
     owners: Option<&'a IssueOwners>,
     /// The `tasks.md` inbox that hears of issues the session creates or
     /// closes.
-    events: Option<&'a aither_agent::TaskEvents>,
+    events: Option<&'a aither_agent::WorkEvents>,
 }
 
 /// Run `args` on the session's store, or on the project its `--repo` names.
@@ -633,7 +635,7 @@ async fn execute<S: IssueStore>(
     origin: &CallOrigin,
     search: Option<&SessionIssueSearch>,
     owners: Option<&IssueOwners>,
-    events: Option<&aither_agent::TaskEvents>,
+    events: Option<&aither_agent::WorkEvents>,
     args: IssueArgs,
 ) -> Result<ToolResult, IssueError> {
     let record = |number: i64,
@@ -656,8 +658,8 @@ async fn execute<S: IssueStore>(
         {
             let issue = aither_agent::WorkRef::issue(number);
             match action {
-                IssueAction::Create => events.record(aither_agent::TaskEvent::IssueCreated(issue)),
-                IssueAction::Close => events.record(aither_agent::TaskEvent::IssueClosed(issue)),
+                IssueAction::Create => events.record(aither_agent::WorkEvent::IssueCreated(issue)),
+                IssueAction::Close => events.record(aither_agent::WorkEvent::IssueClosed(issue)),
                 _ => {}
             }
         }
@@ -1392,14 +1394,14 @@ mod tests {
             .await
             .expect("chat db should open");
         let store = crate::issue::MayIssueStore::new(db.clone(), "test".to_string());
-        let events = aither_agent::TaskEvents::new();
+        let events = aither_agent::WorkEvents::new();
         let tool = IssueTool::new(store, IssueProvenance::new(db, "test".to_string()))
             .with_task_events(events.clone());
         let sandbox = dir.path().join("sandbox");
         std::fs::create_dir_all(&sandbox).expect("sandbox");
         std::fs::write(sandbox.join("tasks.md"), "## Doing\n- #1 the login bug\n")
             .expect("tasks.md");
-        let mut tasks = aither_agent::TasksDocument::new(&sandbox, 60, events);
+        let mut tasks = crate::tasks_md::schema::working_document(&sandbox, events);
         tasks.on_request(false).await;
 
         let created = tool

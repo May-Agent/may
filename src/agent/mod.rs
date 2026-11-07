@@ -27,6 +27,8 @@ pub(crate) mod issue_tool;
 mod live_content_tests;
 mod live_settings;
 mod may;
+/// The text May's agents read for aither's alerts, notices and refusals.
+pub mod notices;
 #[cfg(test)]
 mod open_questions_tests;
 pub(crate) mod permission;

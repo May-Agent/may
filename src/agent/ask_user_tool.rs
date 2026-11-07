@@ -75,7 +75,7 @@ pub struct AskUserTool {
     runtime: Arc<SessionRuntimeService>,
     session_id: String,
     languages: Option<aither_agent::LanguageGuard>,
-    task_events: Option<aither_agent::TaskEvents>,
+    task_events: Option<aither_agent::WorkEvents>,
 }
 
 impl AskUserTool {
@@ -93,7 +93,7 @@ impl AskUserTool {
     /// Record every question asked on `events`, the main agent's `tasks.md`
     /// inbox.
     #[must_use]
-    pub fn with_task_events(mut self, events: aither_agent::TaskEvents) -> Self {
+    pub fn with_task_events(mut self, events: aither_agent::WorkEvents) -> Self {
         self.task_events = Some(events);
         self
     }
@@ -260,10 +260,12 @@ impl Tool for AskUserTool {
             return Err(AskUserToolError::NoQuestion.into());
         }
         if let Some(guard) = &self.languages {
-            guard.check_question(questions.iter().flat_map(|question| {
-                std::iter::once(question.question.as_str())
-                    .chain(question.option.iter().map(String::as_str))
-            }))?;
+            guard
+                .check_question(questions.iter().flat_map(|question| {
+                    std::iter::once(question.question.as_str())
+                        .chain(question.option.iter().map(String::as_str))
+                }))
+                .map_err(super::notices::language_refused)?;
         }
         let request = PersistedAskUserRequest {
             id: crate::id::new(),
@@ -278,7 +280,7 @@ impl Tool for AskUserTool {
             ask: crate::session::UserAsk::question(&request),
         });
         if let Some(events) = &self.task_events {
-            events.record(aither_agent::TaskEvent::QuestionAsked(request.id.clone()));
+            events.record(aither_agent::WorkEvent::QuestionAsked(request.id.clone()));
         }
         Ok(ToolResult::text(
             AskedText {
@@ -302,7 +304,7 @@ pub struct WithdrawAskUserArgs {
 pub struct WithdrawAskUserTool {
     runtime: Arc<SessionRuntimeService>,
     session_id: String,
-    task_events: Option<aither_agent::TaskEvents>,
+    task_events: Option<aither_agent::WorkEvents>,
 }
 
 impl WithdrawAskUserTool {
@@ -319,7 +321,7 @@ impl WithdrawAskUserTool {
     /// Record every question withdrawn on `events`, the main agent's
     /// `tasks.md` inbox.
     #[must_use]
-    pub fn with_task_events(mut self, events: aither_agent::TaskEvents) -> Self {
+    pub fn with_task_events(mut self, events: aither_agent::WorkEvents) -> Self {
         self.task_events = Some(events);
         self
     }
@@ -351,7 +353,7 @@ impl Tool for WithdrawAskUserTool {
             return Err(AskUserToolError::NotOpen(args.request_id).into());
         }
         if let Some(events) = &self.task_events {
-            events.record(aither_agent::TaskEvent::QuestionWithdrawn(
+            events.record(aither_agent::WorkEvent::QuestionWithdrawn(
                 args.request_id.clone(),
             ));
         }
@@ -387,13 +389,12 @@ impl AskUserBlockerResolver {
     }
 }
 
-impl aither_agent::TaskBlockerResolver for AskUserBlockerResolver {
-    async fn is_open(&self, mark: &str) -> Result<bool, aither_agent::TaskBlockerError> {
-        let unavailable =
-            |error: crate::db::ChatDbError| aither_agent::TaskBlockerError::Unavailable {
-                mark: mark.to_string(),
-                reason: error.to_string(),
-            };
+impl aither_agent::BlockerResolver for AskUserBlockerResolver {
+    async fn is_open(&self, mark: &str) -> Result<bool, aither_agent::BlockerError> {
+        let unavailable = |error: crate::db::ChatDbError| aither_agent::BlockerError::Unavailable {
+            blocker: mark.to_string(),
+            reason: error.to_string(),
+        };
         let db = self.runtime.db();
         // A payload no question of this session carries is free text the
         // harness cannot check, and holds.

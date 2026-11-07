@@ -317,7 +317,9 @@ impl Tool for BtwTool {
             return Err(AgentLinkError::EmptyQuestion.into());
         }
         if let Some(guard) = &self.command.languages {
-            guard.check_working(question, aither_agent::WorkingText::Internal)?;
+            guard
+                .check_working(question, aither_agent::WorkingText::Internal)
+                .map_err(crate::agent::notices::language_refused)?;
         }
         let answer = self
             .command

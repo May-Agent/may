@@ -63,7 +63,7 @@ pub struct SessionRuntimeService {
     /// changes from. It outlives any one agent build, so an answer committed
     /// while no agent runs reaches the next one.
     task_events: std::sync::Arc<
-        std::sync::Mutex<std::collections::HashMap<String, aither_agent::TaskEvents>>,
+        std::sync::Mutex<std::collections::HashMap<String, aither_agent::WorkEvents>>,
     >,
 }
 
@@ -103,7 +103,7 @@ impl SessionRuntimeService {
     /// # Panics
     /// When the `task_events` lock is poisoned.
     #[must_use]
-    pub fn task_events(&self, session_id: &str) -> aither_agent::TaskEvents {
+    pub fn task_events(&self, session_id: &str) -> aither_agent::WorkEvents {
         self.task_events
             .lock()
             .expect("task_events poisoned")
@@ -651,7 +651,7 @@ impl SessionRuntimeService {
         // prompt a run blocks on is no question of the agent's.
         if !pending.blocking {
             self.task_events(&pending.session_id).record(
-                aither_agent::TaskEvent::QuestionAnswered(request_id.to_string()),
+                aither_agent::WorkEvent::QuestionAnswered(request_id.to_string()),
             );
         }
         self.publish_ui(UiEventTopics::SESSION_RUNTIME | UiEventTopics::SESSION_RUNTIMES);
