@@ -278,7 +278,6 @@ impl SessionParts {
             plan_state: SessionPlanState::default(),
             location: None,
             task_broker: None,
-            notify_broker: None,
             tunnel_broker: None,
             browser_broker: None,
             acp_host: None,

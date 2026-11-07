@@ -182,7 +182,6 @@ export const ja: Messages = {
     webFetch: 'ページを取得',
     ask: 'アシスタントに相談',
     session: '会話を振り返り中',
-    notify: '通知を送信',
     task: 'タスクを委任',
     generic: '処理中',
     output: '結果',

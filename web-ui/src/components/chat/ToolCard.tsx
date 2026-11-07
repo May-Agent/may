@@ -42,7 +42,6 @@ const VARIANT_ICON: Record<ToolVariant, typeof Wrench> = {
   web_fetch: Globe,
   ask: HelpCircle,
   session: MessageSquare,
-  notify: MessageSquare,
   task: Sparkles,
   generic: Wrench,
 };
@@ -57,7 +56,6 @@ const VARIANT_LABEL_KEY: Record<ToolVariant, MessageKey> = {
   web_fetch: 'tools.webFetch',
   ask: 'tools.ask',
   session: 'tools.session',
-  notify: 'tools.notify',
   task: 'tools.task',
   generic: 'tools.generic',
 };

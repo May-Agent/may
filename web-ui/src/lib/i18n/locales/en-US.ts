@@ -180,7 +180,6 @@ export const enUS = {
     webFetch: 'Fetching a page',
     ask: 'Consulting a helper',
     session: 'Recalling history',
-    notify: 'Sending a notification',
     task: 'Delegating a task',
     generic: 'Working',
     output: 'Output',

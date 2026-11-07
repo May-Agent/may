@@ -27,8 +27,7 @@ mod turn_persister;
 mod warm_aux_tests;
 
 use self::tool_dispatch::{
-    handle_browser_request, handle_notify_request, handle_register_skills_request,
-    handle_task_request,
+    handle_browser_request, handle_register_skills_request, handle_task_request,
 };
 
 use std::future::Future;
@@ -1669,7 +1668,6 @@ pub(super) async fn run_bash(
 pub(super) fn spawn_shared_tool_dispatchers(state: Arc<DaemonState>, queues: UiToolQueues) {
     let UiToolQueues {
         task,
-        notify,
         browser,
         register_skills,
         tunnel,
@@ -1680,16 +1678,6 @@ pub(super) fn spawn_shared_tool_dispatchers(state: Arc<DaemonState>, queues: UiT
     tokio_handle.spawn(async move {
         while let Some(request) = task.next().await {
             let result = Box::pin(handle_task_request(&task_state, request.args.clone())).await;
-            let _ = request.respond(result);
-        }
-    });
-
-    let notification_service = state.notification_service.clone();
-    let tokio_handle = state.tokio_handle.clone();
-    tokio_handle.spawn(async move {
-        while let Some(request) = notify.next().await {
-            let result =
-                handle_notify_request(notification_service.clone(), request.args.clone()).await;
             let _ = request.respond(result);
         }
     });
@@ -2809,7 +2797,6 @@ struct ToolBrokers {
     workspace: crate::workspace_request::WorkspaceRequestBroker,
     ask_user: ask_user::AskUserBroker,
     task: crate::agent::task_tool::TaskBroker,
-    notify: crate::agent::notify_tool::NotifyBroker,
     browser: crate::agent::browser_tool::BrowserBroker,
     register_skills: crate::agent::register_tool::RegisterBroker,
     tunnel: crate::agent::tunnel_tool::TunnelBroker,
@@ -3509,7 +3496,6 @@ fn build_tool_brokers(state: &Arc<DaemonState>, session_id: &SessionId) -> ToolB
         workspace: spawn_workspace_forwarder(state, session_id),
         ask_user: spawn_ask_user_forwarder(state, session_id),
         task: state.tool_dispatchers.task.clone(),
-        notify: state.tool_dispatchers.notify.clone(),
         browser: state.tool_dispatchers.browser.clone(),
         register_skills: state.tool_dispatchers.register_skills.clone(),
         tunnel: state.tool_dispatchers.tunnel.clone(),
@@ -3707,7 +3693,6 @@ fn build_session_agent<'a>(
                 plan_state: ctx.plan_state,
                 location,
                 task_broker: Some(brokers.task),
-                notify_broker: Some(brokers.notify),
                 tunnel_broker: Some(brokers.tunnel),
                 browser_broker: state.browser_manager().map(|_| brokers.browser),
                 acp_host: Some(state.acp_host.clone()),

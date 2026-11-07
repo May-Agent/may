@@ -263,6 +263,10 @@ impl Tool for AskUserTool {
             .open_question(&self.session_id, &request)
             .await
             .map_err(AskUserToolError::Persist)?;
+        self.runtime.announce_user_wait(crate::session::UserWait {
+            session_id: self.session_id.clone(),
+            ask: crate::session::UserAsk::question(&request),
+        });
         Ok(ToolResult::text(
             AskedText {
                 request_id: &request.id,

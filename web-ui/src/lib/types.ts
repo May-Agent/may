@@ -29,7 +29,6 @@ export type ToolVariant =
   | 'web_fetch'
   | 'ask'
   | 'session'
-  | 'notify'
   | 'task'
   | 'generic';
 

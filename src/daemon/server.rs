@@ -336,6 +336,7 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
     }
     super::chat::spawn_shared_tool_dispatchers(state.clone(), tool_queues);
     super::title_generation::spawn_worker(state.clone(), title_generation_rx);
+    super::user_wait::spawn_notifier(&state);
     super::chat::spawn_background_watcher(state.clone(), state.ui_event_bus.clone());
     super::chat::spawn_task_wake_dispatcher(state.clone(), task_wake_rx);
     let scheduler = crate::scheduler::TaskScheduler::new(task_runtime);
@@ -394,8 +395,8 @@ fn api_routes() -> Route {
         respond_ask_user_request, respond_permission_request, respond_workspace_request,
     };
     use super::notifications::{
-        consume_notification_callback, get_vapid_key, list_network_access_logs,
-        list_notification_mailbox, send_notification, subscribe, test_notification, unsubscribe,
+        get_vapid_key, list_network_access_logs, list_notification_mailbox, subscribe,
+        test_notification, unsubscribe,
     };
     use super::profiles::{
         archive_session, create_folder, create_profile, delete_folder, delete_profile,
@@ -597,9 +598,7 @@ fn api_routes() -> Route {
                 "/test".post(test_notification),
             ))),
             "/notifications".route(Route::new((
-                "".post(send_notification),
                 "/mailbox".at(list_notification_mailbox),
-                "/{id}/callback".post(consume_notification_callback),
                 "/network-access".at(list_network_access_logs),
             ))),
         )),

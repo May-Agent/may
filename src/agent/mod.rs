@@ -27,7 +27,6 @@ pub(crate) mod issue_tool;
 mod live_content_tests;
 mod live_settings;
 mod may;
-pub(crate) mod notify_tool;
 #[cfg(test)]
 mod open_questions_tests;
 pub(crate) mod permission;
@@ -71,7 +70,6 @@ pub use may::{
     AgentEnvironment, MayAgent, MayAgentConfig, MayAgentError, MayAgentSessionInput,
     generate_session_title,
 };
-pub use notify_tool::{NotifyArgs, NotifyBroker, NotifyResult, channel as notify_channel};
 pub use permission::{
     OnTimeout, PermissionApprover, PermissionHistoryMode, PermissionHistoryModeParseError,
     PermissionRequest, PermissionRequestMode, PermissionRequestModeParseError,

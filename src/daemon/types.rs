@@ -62,7 +62,6 @@ pub enum ToolVariant {
     WebFetch,
     Ask,
     Session,
-    Notify,
     Task,
     Generic,
 }
@@ -82,7 +81,6 @@ impl ToolVariant {
             "web_fetch" | "webfetch" => Self::WebFetch,
             "ask" => Self::Ask,
             "session" => Self::Session,
-            "notify" => Self::Notify,
             "task" => Self::Task,
             _ => Self::Generic,
         }
@@ -338,7 +336,6 @@ pub struct NotificationMailboxEntryResponse {
     pub(crate) delivered_at: Option<String>,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
-    pub(crate) has_callback: bool,
 }
 
 impl From<crate::db::entity::notification_mailbox::Model> for NotificationMailboxEntryResponse {
@@ -354,7 +351,6 @@ impl From<crate::db::entity::notification_mailbox::Model> for NotificationMailbo
             delivered_at: value.delivered_at,
             created_at: value.created_at,
             updated_at: value.updated_at,
-            has_callback: value.callback_context_xml.is_some() || value.callback_message.is_some(),
         }
     }
 }
@@ -363,18 +359,6 @@ impl From<crate::db::entity::notification_mailbox::Model> for NotificationMailbo
 #[serde(rename_all = "camelCase")]
 pub struct NotificationMailboxResponse {
     pub(crate) items: Vec<NotificationMailboxEntryResponse>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct NotificationCallbackResponse {
-    pub(crate) notification_id: String,
-    pub(crate) session_id: Option<String>,
-    pub(crate) profile_id: Option<String>,
-    pub(crate) has_callback: bool,
-    pub(crate) callback_consumed: bool,
-    pub(crate) callback_context_xml: Option<String>,
-    pub(crate) callback_message: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]

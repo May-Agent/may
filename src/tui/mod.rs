@@ -10,6 +10,8 @@ pub mod clipboard;
 pub mod completion;
 /// The `/connect` picker for ACP agents.
 pub mod connect;
+/// Desktop notifications raised through the terminal.
+pub mod desktop_notification;
 /// TUI error type and result alias.
 pub mod error;
 /// Terminal event polling and app event channel.

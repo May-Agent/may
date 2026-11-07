@@ -955,19 +955,6 @@ where
         let had_none = app.open_question_count == 0;
         app.open_question_count = open.len();
         if had_none && let Some(first) = open.into_iter().next() {
-            let question_text = first
-                .questions
-                .first()
-                .map_or("A new question is waiting", |q| q.question.as_str());
-            if let Some(session_id) = app
-                .session_manager
-                .current()
-                .map(|session| session.id.clone())
-            {
-                runtime_deps
-                    .notify_open_question(&session_id, question_text)
-                    .await;
-            }
             let _ = io::stdout()
                 .write_all(b"\x07")
                 .and_then(|()| io::stdout().flush());
@@ -1631,6 +1618,23 @@ where
                     }
                     Some(SendAction::ReloadHistory) => {
                         app.reload_chat().await;
+                    }
+                    Some(SendAction::DesktopNotification(notification)) => {
+                        // The terminal write stays off the event loop; a
+                        // failure never reaches the popup.
+                        let protocol = may_agent::tui::desktop_notification::Protocol::detect(
+                            std::env::var("TERM_PROGRAM").ok().as_deref(),
+                            std::env::var("TERM").ok().as_deref(),
+                        );
+                        blocking::unblock(move || {
+                            if let Err(error) = may_agent::tui::desktop_notification::raise(
+                                &notification,
+                                protocol,
+                            ) {
+                                tracing::warn!(%error, "failed to raise the desktop notification");
+                            }
+                        })
+                        .detach();
                     }
                     Some(SendAction::OpenQuestions) => {
                         let open = app.session_runtime.open_questions.clone();

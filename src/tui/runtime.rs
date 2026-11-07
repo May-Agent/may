@@ -1080,33 +1080,6 @@ impl RuntimeDeps {
         Ok(true)
     }
 
-    /// Push-notify the user that a new open question arrived, through the
-    /// daemon's notification service. Best effort: a rejected or unroutable
-    /// notification is logged, never fatal.
-    pub async fn notify_open_question(&self, session_id: &SessionId, question: &str) {
-        let Some(client) = self.daemon() else {
-            return;
-        };
-        match client
-            .post::<_, serde_json::Value>(
-                "/api/notifications",
-                &serde_json::json!({
-                    "title": "May has a question for you",
-                    "body": question,
-                    "sessionId": session_id.as_str(),
-                }),
-            )
-            .await
-        {
-            Ok(_) => {
-                tracing::debug!("open-question notification delivered");
-            }
-            Err(error) => {
-                tracing::warn!(error = %error, "failed to send open-question notification");
-            }
-        }
-    }
-
     /// Commit the user's answers to an open question; the answer joins the
     /// session queue, which the event loop dispatches. Returns whether this
     /// call committed them: `false` when the question is no longer open.

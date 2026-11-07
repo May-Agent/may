@@ -4,7 +4,7 @@ use crate::ui_event_bus::{UiEventBus, UiEventTopics};
 use super::{
     AcquireError, PendingUserMessage, PendingUserMessageMode, PersistedAskUserRequest,
     PersistedPermissionRequest, PersistedWorkspaceRequest, RunOutcome, SessionPlanState,
-    SessionRuns, SessionRuntimeState, SessionRuntimeSummary, TerminalRuntimeState,
+    SessionRuns, SessionRuntimeState, SessionRuntimeSummary, TerminalRuntimeState, UserWait,
 };
 
 /// How often a stop re-checks whether the stopped run has ended.
@@ -57,7 +57,12 @@ pub struct SessionRuntimeService {
     terminal_grants: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<String, aither_sandbox::TerminalGrants>>,
     >,
+    /// Popups announcing they wait on the user; see [`Self::announce_user_wait`].
+    user_waits: tokio::sync::broadcast::Sender<UserWait>,
 }
+
+/// Announcements buffered for a slow subscriber of the user-wait stream.
+const USER_WAIT_CAPACITY: usize = 64;
 
 impl std::fmt::Debug for SessionRuntimeService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -79,7 +84,20 @@ impl SessionRuntimeService {
             terminal_grants: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            user_waits: tokio::sync::broadcast::channel(USER_WAIT_CAPACITY).0,
         }
+    }
+
+    /// Announce a popup that waits on the user. Nobody listening is fine:
+    /// the popup is still shown.
+    pub fn announce_user_wait(&self, wait: UserWait) {
+        let _ = self.user_waits.send(wait);
+    }
+
+    /// The announcements of popups waiting on the user, from now on.
+    #[must_use]
+    pub fn subscribe_user_waits(&self) -> tokio::sync::broadcast::Receiver<UserWait> {
+        self.user_waits.subscribe()
     }
 
     /// Spawn the background tasks of run leases with `spawner`; see
