@@ -81,6 +81,8 @@ pub mod prompt_mentions;
 mod quota;
 /// Per-session repository clones inside the session sandbox.
 pub mod repo_clone;
+pub mod repo_gate;
+pub mod repo_preflight;
 /// repo-search daemon: code, session and issue search.
 pub mod repo_search;
 /// `/import-claude` and `/import-codex`: another agent's global rules and

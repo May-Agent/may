@@ -2873,6 +2873,81 @@ enum UiChatPreparationError {
     PreviewRequest(#[source] aither_agent::AgentError),
     #[error("failed to persist context debug snapshot: {0}")]
     PersistContextDebugSnapshot(#[source] crate::db::ChatDbError),
+    #[error("failed to bind the session to its repository: {0}")]
+    RepoGate(#[source] crate::repo_gate::GateError),
+    #[error("the session did not start: it was not allowed to work in this repository")]
+    RepoGateDeclined,
+}
+
+/// Puts the session gate's questions to the user through the session's
+/// `ask_user` channel, so every attached client shows them.
+struct SessionAsker {
+    broker: ask_user::AskUserBroker,
+    session_id: String,
+}
+
+impl crate::repo_gate::Asker for SessionAsker {
+    async fn ask(
+        &self,
+        question: ask_user::Question,
+    ) -> Result<Vec<ask_user::QuestionAnswer>, crate::repo_gate::GateError> {
+        self.broker
+            .request(ask_user::AskUserRequestPayload {
+                session_id: self.session_id.clone(),
+                request: ask_user::AskUserArgs {
+                    question: None,
+                    option: Vec::new(),
+                    multi_select: false,
+                    questions: vec![question],
+                },
+            })
+            .await
+            .map_err(|error| crate::repo_gate::GateError::Ask(error.to_string()))
+    }
+}
+
+/// Binds the session to its repository and runs the checkout preflight
+/// before its first turn builds an agent.
+async fn gate_session_repo(
+    state: &Arc<DaemonState>,
+    session_id: &str,
+) -> Result<(), UiChatPreparationError> {
+    let session_id = SessionId::from_string(session_id.to_string());
+    let session_id = &session_id;
+    let db = state.db();
+    let Some(row) = db
+        .get_session(session_id.as_str())
+        .await
+        .map_err(UiChatPreparationError::LoadSession)?
+    else {
+        return Ok(());
+    };
+    let home = MayHomePaths::new(state.may_dir.clone());
+    let sandbox =
+        SessionStore::new(home.clone()).sandbox_dir(session_id.as_str(), row.profile_id.as_deref());
+    let config_path = crate::session::SessionPaths::new(sandbox.clone()).workspace_config();
+    let staging = home.repo_staging_dir();
+    let asker = SessionAsker {
+        broker: spawn_ask_user_forwarder(state, session_id),
+        session_id: session_id.as_str().to_string(),
+    };
+    let host = crate::host_git::HostGit::inherit();
+    let verdict = crate::repo_gate::RepoGate {
+        db: &db,
+        host: &host,
+        asker: &asker,
+        config_path: &config_path,
+        session_root: &sandbox,
+        staging: &staging,
+        remote: "origin",
+    }
+    .run(session_id.as_str())
+    .await
+    .map_err(UiChatPreparationError::RepoGate)?;
+    match verdict {
+        crate::repo_gate::Verdict::Proceed => Ok(()),
+        crate::repo_gate::Verdict::Exit => Err(UiChatPreparationError::RepoGateDeclined),
+    }
 }
 
 impl UiChatPreparationError {
@@ -2910,6 +2985,8 @@ impl UiChatPreparationError {
             | Self::PreviewRequest(_)
             | Self::PersistContextDebugSnapshot(_)
             | Self::HistoryReplay(_)
+            | Self::RepoGate(_)
+            | Self::RepoGateDeclined
             | Self::NothingToResume => ApiErrorCode::InternalError,
         }
     }
@@ -3560,6 +3637,9 @@ fn prepare_agent_for_request<'a>(
     kind: &'a TurnKind,
 ) -> Pin<Box<impl Future<Output = Result<PreparedAgent, UiChatPreparationError>> + 'a>> {
     Box::pin(async move {
+        if !kind.is_resume() {
+            gate_session_repo(state, &req.session_id).await?;
+        }
         let ctx = Box::pin(resolve_session_context(
             state,
             req,
