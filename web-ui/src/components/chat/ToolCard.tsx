@@ -25,6 +25,8 @@ import { useTranslation, type MessageKey } from '@/lib/i18n';
 import { useSessionsStore } from '@/lib/stores/sessions';
 import { outputsPreviewUrl } from '@/lib/api/artifacts';
 import { extractTerminalResult, type OutputStream } from '@/lib/terminalResult';
+import { searchFetchLabel } from '@/lib/hostedLabel';
+import { SearchRow } from './SearchRow';
 
 SyntaxHighlighter.registerLanguage('bash', bash);
 
@@ -92,9 +94,8 @@ function pickPrimaryLabel(tool: TurnToolState, fallback: string): string {
       return fallback;
     }
     case 'web_search':
-      return s.query ? `Searched "${s.query}"` : fallback;
     case 'web_fetch':
-      return s.url ?? fallback;
+      return searchFetchLabel(tool.variant, s, fallback) ?? fallback;
     case 'browser': {
       if (s.action && s.target) return `${s.action} ${s.target}`;
       return s.action || s.target || fallback;
@@ -307,6 +308,17 @@ function selectDetails(tool: TurnToolState, primary: string) {
 
 export const ToolCard = memo(function ToolCard({ tool }: ToolCardProps) {
   const { t } = useTranslation();
+  const rowLabel = searchFetchLabel(
+    tool.variant,
+    tool.summary,
+    t(VARIANT_LABEL_KEY[tool.variant] ?? 'tools.generic'),
+  );
+  if (rowLabel !== null) return <SearchRow tool={tool} label={rowLabel} />;
+  return <ExpandableToolCard tool={tool} />;
+});
+
+function ExpandableToolCard({ tool }: ToolCardProps) {
+  const { t } = useTranslation();
   const detailsRef = useRef<HTMLDetailsElement>(null);
   const Icon = VARIANT_ICON[tool.variant] ?? Wrench;
   const variantLabel = t(VARIANT_LABEL_KEY[tool.variant] ?? 'tools.generic');
@@ -352,4 +364,4 @@ export const ToolCard = memo(function ToolCard({ tool }: ToolCardProps) {
       {details && <div className="mt-1.5 ml-5 space-y-2">{details}</div>}
     </details>
   );
-});
+}
