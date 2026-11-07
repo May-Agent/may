@@ -52,6 +52,7 @@ export const enUS = {
       all: 'Your repositories',
       unauthenticated: 'GitHub is not signed in on this machine. Run `gh auth login` and reopen this list.',
     },
+    newChatInRepo: 'New chat in {repo}',
     sessions: 'Sessions',
     noSessions: 'No sessions yet',
     noSessionsInProfile: "This profile hasn't started any chats yet.",
