@@ -1144,6 +1144,37 @@ impl App {
         .detach();
     }
 
+    /// Open the `/progress` overlay and ask the daemon for the remaining
+    /// work. The request runs on the side: nothing touches the conversation.
+    pub fn open_progress(&mut self) {
+        let (Some(client), Some(session)) = (
+            self.btw_daemon.clone(),
+            self.session_manager
+                .current()
+                .filter(|session| session.persisted),
+        ) else {
+            self.chat
+                .push_notice("No model available for /progress — start a session first");
+            return;
+        };
+        let path = crate::client::session_path(session.id.as_str(), "/progress");
+        self.mode = AppMode::Progress(super::state::ProgressState {
+            loading: true,
+            ..super::state::ProgressState::default()
+        });
+        let tx = self.event_tx.clone();
+        spawn(async move {
+            let report: Result<crate::daemon::ProgressReport, _> =
+                client.post(&path, &serde_json::json!({})).await;
+            let event = match report {
+                Ok(report) => AppEvent::ProgressLoaded(report),
+                Err(error) => AppEvent::ProgressFailed(error.to_string()),
+            };
+            let _ = tx.send(event).await;
+        })
+        .detach();
+    }
+
     /// System prompt for `/btw`: answer once, no tools, no side effects.
     const BTW_SYSTEM: &'static str = "This is a side question from the user. \
         Answer it directly in a single response. You share the conversation \
@@ -2465,6 +2496,7 @@ impl App {
                 self, code,
             )),
             AppMode::Btw(_) => Ok(super::reducer::navigation::handle_btw_key(self, code)),
+            AppMode::Progress(_) => Ok(super::reducer::navigation::handle_progress_key(self, code)),
             AppMode::ImageView(_) => Ok(super::reducer::navigation::handle_image_view_key(
                 self, code,
             )),
@@ -3395,6 +3427,10 @@ impl App {
             "/questions" => Some(SendAction::OpenQuestions),
             "/btw" => {
                 self.open_btw();
+                None
+            }
+            "/progress" => {
+                self.open_progress();
                 None
             }
             "/resume-claude" => {

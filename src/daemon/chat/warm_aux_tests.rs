@@ -27,7 +27,7 @@ async fn state_with_idle_agent(
 }
 
 /// [`state_with_idle_agent`] against `stub`.
-async fn state_with_idle_agent_on(
+pub(super) async fn state_with_idle_agent_on(
     dir: &std::path::Path,
     ran_turn: bool,
     stub: &StubModel,
