@@ -28,6 +28,11 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             // cadence bounds how long an expired notice can linger.
             StatusNotice::clear_expired(&mut app.status, std::time::Instant::now());
             app.sync_profile_follow();
+            if app.new_year.check_due(std::time::Instant::now()) {
+                let zone = crate::tui::new_year::user_zone(&app.config.time);
+                app.new_year.set_date(jiff::Timestamp::now(), &zone);
+            }
+            app.new_year.tick();
             if app.processing
                 || app.index_loading
                 || (matches!(app.mode, AppMode::SessionSelect)

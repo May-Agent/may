@@ -11,6 +11,7 @@ import { AssistantTurn } from './AssistantTurn';
 import { UserMessage } from './UserMessage';
 import { PersistedAssistant } from './PersistedAssistant';
 import { Composer } from './Composer';
+import { NewYearBanner } from './NewYearBanner';
 import { SessionHeader } from './SessionHeader';
 import { BrowserTakeoverBanner } from './BrowserTakeoverBanner';
 import { PlanBanner } from './PlanBanner';
@@ -329,6 +330,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
                 : t('composer.bashFailed', { error: bashStatus.error })}
             </div>
           )}
+          {config && <NewYearBanner timeZone={config.timezone} now={now} />}
           <Composer
             disabled={!configUsable}
             streaming={streaming}

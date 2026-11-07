@@ -85,6 +85,7 @@ pub(super) fn build_ui_config_response(config: &MayConfig) -> UiConfigResponse {
         max_iterations: config.max_iterations,
         ui_font: config.appearance.font.clone(),
         ui_theme: config.appearance.theme.clone(),
+        timezone: config.time.user_timezone().to_string(),
         full_config: build_ui_full_config(config),
     }
 }

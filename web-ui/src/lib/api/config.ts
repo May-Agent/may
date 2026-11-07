@@ -172,6 +172,8 @@ export interface UiConfigResponse {
   maxIterations: number;
   uiFont: string;
   uiTheme: string;
+  /** IANA name of the user's timezone (`[time] timezone`). */
+  timezone: string;
   fullConfig: UiFullConfig;
 }
 
