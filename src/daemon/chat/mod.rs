@@ -4346,7 +4346,9 @@ mod tests {
                         let headers = String::from_utf8_lossy(&buf[..head_end]);
                         if headers.starts_with("GET /v1/models") {
                             let _ = socket
-                                .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                                .write_all(
+                                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                                )
                                 .await;
                             return;
                         }
@@ -4420,7 +4422,7 @@ mod tests {
                         body => ("HTTP/1.1 200 OK", body.to_string()),
                     };
                     let wire = format!(
-                        "{status}\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{body_out}",
+                        "{status}\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body_out}",
                         body_out.len()
                     );
                     let _ = socket.write_all(wire.as_bytes()).await;
