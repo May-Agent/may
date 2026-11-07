@@ -849,6 +849,9 @@ impl ChatStream {
     /// intermediate messages between them — into a single "Worked for" row.
     /// The turn's final reply stays visible, as do notices and reports.
     pub fn fold_turn_work(&mut self, seconds: u64) {
+        // A turn that ends on a thought never saw text or a call close it:
+        // a folded thought is finished, so its body can expand.
+        self.collapse_thinking();
         self.fold_cursor = self.fold_cursor.min(self.elements.len());
         let start = self
             .elements
@@ -874,7 +877,14 @@ impl ChatStream {
             .zip(self.revisions.splice(start..end, []))
             .partition(|(element, _)| matches!(element, ChatElement::Error { .. }));
         let mut at = start;
-        if !folded.is_empty() {
+        // A single item is its own row: a group around it hides nothing.
+        if let [_] = folded.as_slice() {
+            for (element, revision) in folded {
+                self.elements.insert(at, element);
+                self.revisions.insert(at, revision);
+                at += 1;
+            }
+        } else if !folded.is_empty() {
             let id = self.next_worked_id;
             self.next_worked_id += 1;
             self.elements.insert(
