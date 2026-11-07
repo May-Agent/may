@@ -17,6 +17,7 @@ use ratatui::{
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use super::super::agent_event_adapter::{COMPACT_TOOL, compaction_refusal};
 use super::super::queue::Attachment;
 use super::chat_layout::{self, ChatLayout};
 use super::markdown;
@@ -1084,6 +1085,16 @@ impl ChatStream {
                             image: None,
                         });
                     }
+                }
+                ToolDisplay::Action {
+                    status: s, chip, ..
+                } if chip == COMPACT_TOOL => {
+                    // A compaction is a status row with nothing to expand:
+                    // a refusal is its failure, and its reason the mark.
+                    *s = match (status, output.and_then(compaction_refusal)) {
+                        (ToolStatus::Done, Some(reason)) => ToolStatus::Failed(reason),
+                        (status, _) => status,
+                    };
                 }
                 ToolDisplay::Action {
                     status: s,
@@ -3429,6 +3440,7 @@ fn semantic_headline(name: &str, summary: &str) -> (String, String) {
             },
         ),
         "webfetch" | "web_fetch" => ("Fetched".to_string(), summary.to_string()),
+        COMPACT_TOOL => ("Compaction".to_string(), String::new()),
         _ => (format!("[{name}]"), summary.to_string()),
     }
 }
@@ -5715,5 +5727,54 @@ mod tests {
         );
         assert_eq!(regions.len(), 1);
         assert_eq!(regions[0].element_id, "thinking-0");
+    }
+
+    fn compact_row(result: &str) -> (Vec<String>, usize) {
+        let mut chat = ChatStream::new();
+        chat.push_tool(
+            "c1".to_string(),
+            ToolDisplay::Action {
+                chip: "compact".to_string(),
+                task_id: None,
+                summary: String::new(),
+                detail: Vec::new(),
+                status: ToolStatus::Running,
+                output: None,
+                pinned: None,
+            },
+        );
+        chat.update_tool_with_output("c1", ToolStatus::Done, Some(result));
+        let mut regions = Vec::new();
+        let lines = build_plain_wrapped_lines_unified(
+            &chat,
+            300,
+            None,
+            None,
+            None,
+            Some(&mut regions),
+            false,
+        );
+        (
+            lines.into_iter().filter(|l| !l.is_empty()).collect(),
+            regions.len(),
+        )
+    }
+
+    /// A compaction is one status row: a tick when it started, a cross
+    /// with the refusal when it was refused, and nothing to expand either way.
+    #[test]
+    fn a_compaction_is_a_one_line_status_row() {
+        let (rows, regions) = compact_row(
+            "Compaction started in the background. Keep working: the summary replaces the older conversation at a later step.",
+        );
+        assert_eq!(rows, ["  ✓ Compaction"]);
+        assert_eq!(regions, 0);
+
+        let (rows, regions) = compact_row(
+            "Nothing was started: the context holds fewer than 5000 tokens, too little for compaction to pay off. Carry on with the work.",
+        );
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0].starts_with("  ✗ Compaction — failed: Nothing was started: the context"));
+        assert_eq!(regions, 0);
     }
 }

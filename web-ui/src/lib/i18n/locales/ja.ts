@@ -184,6 +184,7 @@ export const ja: Messages = {
     session: '会話を振り返り中',
     notify: '通知を送信',
     task: 'タスクを委任',
+    compact: '会話の圧縮',
     generic: '処理中',
     output: '結果',
     escalated: '権限を昇格',

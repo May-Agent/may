@@ -118,6 +118,8 @@ pub fn project_tool_summary(arguments_raw: &str, variant: ToolVariant) -> ToolSu
             prompt: pick(&value, "prompt"),
             ..ToolSummary::default()
         },
+        // A compaction takes no arguments.
+        ToolVariant::Compact => ToolSummary::default(),
         ToolVariant::Ask | ToolVariant::Session | ToolVariant::Notify | ToolVariant::Generic => {
             ToolSummary {
                 description: pick(&value, "description"),

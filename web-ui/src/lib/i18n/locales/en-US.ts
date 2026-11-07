@@ -182,6 +182,7 @@ export const enUS = {
     session: 'Recalling history',
     notify: 'Sending a notification',
     task: 'Delegating a task',
+    compact: 'Compaction',
     generic: 'Working',
     output: 'Output',
     escalated: 'Elevated permissions',

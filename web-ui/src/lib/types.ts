@@ -31,6 +31,7 @@ export type ToolVariant =
   | 'session'
   | 'notify'
   | 'task'
+  | 'compact'
   | 'generic';
 
 export type MessageRole = 'user' | 'assistant' | 'system';

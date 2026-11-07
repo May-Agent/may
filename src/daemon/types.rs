@@ -64,6 +64,7 @@ pub enum ToolVariant {
     Session,
     Notify,
     Task,
+    Compact,
     Generic,
 }
 
@@ -84,6 +85,7 @@ impl ToolVariant {
             "session" => Self::Session,
             "notify" => Self::Notify,
             "task" => Self::Task,
+            "compact" => Self::Compact,
             _ => Self::Generic,
         }
     }

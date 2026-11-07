@@ -25,6 +25,7 @@ import { useTranslation, type MessageKey } from '@/lib/i18n';
 import { useSessionsStore } from '@/lib/stores/sessions';
 import { outputsPreviewUrl } from '@/lib/api/artifacts';
 import { extractTerminalResult, type OutputStream } from '@/lib/terminalResult';
+import { CompactionRow } from './CompactionRow';
 
 SyntaxHighlighter.registerLanguage('bash', bash);
 
@@ -44,6 +45,7 @@ const VARIANT_ICON: Record<ToolVariant, typeof Wrench> = {
   session: MessageSquare,
   notify: MessageSquare,
   task: Sparkles,
+  compact: Sparkles,
   generic: Wrench,
 };
 
@@ -59,6 +61,7 @@ const VARIANT_LABEL_KEY: Record<ToolVariant, MessageKey> = {
   session: 'tools.session',
   notify: 'tools.notify',
   task: 'tools.task',
+  compact: 'tools.compact',
   generic: 'tools.generic',
 };
 
@@ -306,6 +309,11 @@ function selectDetails(tool: TurnToolState, primary: string) {
 }
 
 export const ToolCard = memo(function ToolCard({ tool }: ToolCardProps) {
+  if (tool.variant === 'compact') return <CompactionRow tool={tool} />;
+  return <ExpandableToolCard tool={tool} />;
+});
+
+function ExpandableToolCard({ tool }: ToolCardProps) {
   const { t } = useTranslation();
   const detailsRef = useRef<HTMLDetailsElement>(null);
   const Icon = VARIANT_ICON[tool.variant] ?? Wrench;
@@ -352,4 +360,4 @@ export const ToolCard = memo(function ToolCard({ tool }: ToolCardProps) {
       {details && <div className="mt-1.5 ml-5 space-y-2">{details}</div>}
     </details>
   );
-});
+}
