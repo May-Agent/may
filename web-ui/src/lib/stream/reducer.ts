@@ -5,7 +5,7 @@ import type {
   ReplyTranslation,
   ToolSummary,
   ToolVariant,
-  SseTodoItem,
+  TaskRow,
 } from '../types';
 
 export interface TurnToolState {
@@ -63,13 +63,19 @@ export interface TurnState {
    * narration visually between the tool it introduces and the one after.
    */
   segments: TurnSegment[];
-  todo: { items: SseTodoItem[]; total: number; completed: number } | null;
+  todo: { rows: TaskRow[] } | null;
   error: TurnErrorState | null;
   status: 'streaming' | 'done';
   /** Latest decode-rate sample reported by the backend, in tokens/second. */
   tokensPerSecond: number | null;
   /** Set while the turn waits out a quota reset or a provider retry. */
   hold: ({ message: string } & HoldReason) | null;
+  /**
+   * Where the model responses that finished end: what follows is the
+   * response in flight, which a `retract` discards. A tool result closes the
+   * response that called it.
+   */
+  responseFloor: { reasoning: number; segments: number };
   lastSeq: number;
 }
 
@@ -93,6 +99,7 @@ export function emptyTurn(
     status: 'streaming',
     tokensPerSecond: null,
     hold: null,
+    responseFloor: { reasoning: 0, segments: 0 },
     lastSeq: 0,
   };
 }
@@ -145,6 +152,7 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
         ...state,
         text: state.text + event.chunk,
         segments: appendTextSegment(state.segments, event.chunk, event.seq),
+        hold: null,
         lastSeq: event.seq,
       };
 
@@ -162,7 +170,12 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
     }
 
     case 'reasoning':
-      return { ...state, reasoning: state.reasoning + event.chunk, lastSeq: event.seq };
+      return {
+        ...state,
+        reasoning: state.reasoning + event.chunk,
+        hold: null,
+        lastSeq: event.seq,
+      };
 
     case 'reasoning_end':
       return { ...state, reasoningMs: event.seconds * 1000, lastSeq: event.seq };
@@ -194,6 +207,7 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
         ...state,
         tools,
         segments: appendToolSegment(state.segments, event.id, event.seq),
+        hold: null,
         lastSeq: event.seq,
       };
     }
@@ -224,6 +238,7 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
         ...state,
         tools,
         segments: appendToolSegment(state.segments, event.id, event.seq),
+        hold: null,
         lastSeq: event.seq,
       };
     }
@@ -251,10 +266,12 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
           seq: event.seq,
         }),
       );
+      const segments = appendToolSegment(state.segments, event.id, event.seq);
       return {
         ...state,
         tools,
-        segments: appendToolSegment(state.segments, event.id, event.seq),
+        segments,
+        responseFloor: { reasoning: state.reasoning.length, segments: segments.length },
         lastSeq: event.seq,
       };
     }
@@ -262,7 +279,7 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
     case 'todo_update':
       return {
         ...state,
-        todo: { items: event.items, total: event.total, completed: event.completed },
+        todo: { rows: event.rows },
         lastSeq: event.seq,
       };
 
@@ -313,15 +330,21 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
     case 'withdrawn':
       return { ...state, lastSeq: event.seq };
 
-    case 'retract':
+    case 'retract': {
+      // Only the response in flight goes: its text, its reasoning and the
+      // tool calls it began to stream. Finished responses stay.
+      const segments = state.segments.slice(0, state.responseFloor.segments);
+      const kept = new Set(segments.flatMap((s) => (s.kind === 'tool' ? [s.toolId] : [])));
       return {
         ...state,
-        text: '',
-        reasoning: '',
+        text: segments.flatMap((s) => (s.kind === 'text' ? [s.text] : [])).join(''),
+        reasoning: state.reasoning.slice(0, state.responseFloor.reasoning),
         reasoningMs: null,
-        segments: state.segments.filter((s) => s.kind !== 'text'),
+        segments,
+        tools: state.tools.filter((t) => kept.has(t.id)),
         lastSeq: event.seq,
       };
+    }
   }
 }
 

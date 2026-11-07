@@ -9,8 +9,9 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::super::chat::{format_elapsed, format_number};
+use crate::task_rows::{TaskRow, TaskSection};
 use crate::tui::app::App;
-use crate::tui::sidebar::{IssueBrief, TaskTree};
+use crate::tui::sidebar::IssueBrief;
 
 /// Rows kept for each background section when tasks compete for space.
 const BACKGROUND_ROWS: usize = 6;
@@ -118,37 +119,50 @@ fn home_label(path: &std::path::Path) -> String {
 }
 
 /// Rows of the task tree, plus the row of the first open task.
-fn task_rows(tree: &TaskTree, width: usize) -> (Vec<Line<'static>>, Option<usize>) {
-    let mut rows = Vec::new();
+/// The open work grouped under its section's heading, plus the line of the
+/// first row of `Doing` (or of the first section when nothing is doing).
+/// Roots are not listed here: the issues they name appear under "Issues".
+fn task_rows(rows: &[TaskRow], width: usize) -> (Vec<Line<'static>>, Option<usize>) {
+    let mut lines = Vec::new();
     let mut first_open = None;
-    for node in &tree.nodes {
-        let indent = 2 * node.depth.min(6);
-        let (marker, marker_style, text_style) = if node.done {
-            (
-                "✓ ",
-                Style::default().fg(Color::Green),
-                Style::default().fg(Color::DarkGray),
-            )
-        } else {
-            ("○ ", Style::default().fg(Color::Yellow), Style::default())
-        };
-        if !node.done && first_open.is_none() {
-            first_open = Some(rows.len());
+    for (section, title) in [
+        (TaskSection::Doing, "Doing"),
+        (TaskSection::Queued, "Queued"),
+    ] {
+        let mut section_rows = rows.iter().filter(|row| row.section == section).peekable();
+        if section_rows.peek().is_none() {
+            continue;
         }
-        let text_width = width.saturating_sub(indent + 2);
-        for (index, part) in wrap_hanging(&node.text, text_width, 0)
-            .into_iter()
-            .enumerate()
-        {
-            let lead = if index == 0 { marker } else { "  " };
-            rows.push(Line::from(vec![
-                Span::raw(" ".repeat(indent)),
-                Span::styled(lead, marker_style),
-                Span::styled(part, text_style),
-            ]));
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+        lines.push(heading(title.to_string()));
+        for row in section_rows {
+            if first_open.is_none() {
+                first_open = Some(lines.len());
+            }
+            let (marker, marker_style) = if row.blocking.is_some() {
+                ("⏸ ", Style::default().fg(Color::Red))
+            } else {
+                ("○ ", Style::default().fg(Color::Yellow))
+            };
+            let mut text = row.text.split_whitespace().collect::<Vec<_>>().join(" ");
+            if let Some(what) = &row.blocking {
+                text = format!("{text} (blocked: {what})");
+            }
+            for (index, part) in wrap_hanging(&text, width.saturating_sub(2), 0)
+                .into_iter()
+                .enumerate()
+            {
+                let lead = if index == 0 { marker } else { "  " };
+                lines.push(Line::from(vec![
+                    Span::styled(lead, marker_style),
+                    Span::raw(part),
+                ]));
+            }
         }
     }
-    (rows, first_open)
+    (lines, first_open)
 }
 
 fn issue_row(issue: &IssueBrief, width: usize) -> Line<'static> {
@@ -332,12 +346,10 @@ pub(super) fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
     let mut tasks: Vec<Line<'static>> = Vec::new();
     let mut first_open = None;
     match &app.sidebar.tasks {
-        Some(tree) if !tree.nodes.is_empty() => {
-            let (done, total) = tree.progress();
-            tasks.push(heading(format!("Tasks {done}/{total}")));
-            let (rows, open) = task_rows(tree, width);
-            first_open = open.map(|row| row + 1);
-            tasks.extend(rows);
+        Some(rows) if rows.iter().any(|row| row.section.is_open_work()) => {
+            let (lines, open) = task_rows(rows, width);
+            first_open = open;
+            tasks.extend(lines);
         }
         _ => {
             tasks.push(heading("Tasks".to_string()));

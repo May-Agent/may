@@ -93,15 +93,11 @@ mod tests {
     #[test]
     fn host_load_and_time_settings_parse_from_toml() {
         let config: MayConfig = toml::from_str(
-            "[time]\ntimezone = \"America/New_York\"\n\n[host_load]\nmemory_threshold = \"critical\"\nload_threshold = 1.5\nstart_after = \"10s\"\nhigh_load_foreground_wait = \"2m\"\n",
+            "[time]\ntimezone = \"America/New_York\"\n\n[host_load]\nload_threshold = 1.5\nstart_after = \"10s\"\nhigh_load_foreground_wait = \"2m\"\n",
         )
         .expect("the settings parse");
         assert_eq!(config.time.user_timezone().as_str(), "America/New_York");
         let monitor = config.host_load.monitor_config();
-        assert_eq!(
-            monitor.memory_threshold,
-            aither_agent::MemoryPressure::Critical
-        );
         assert_eq!(monitor.start_after, Duration::from_secs(10));
         assert_eq!(monitor.high_load_foreground_wait, Duration::from_mins(2));
         assert_eq!(

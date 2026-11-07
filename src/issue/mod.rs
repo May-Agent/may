@@ -153,6 +153,10 @@ pub struct CommentedIssue {
 /// A related issue in compact form.
 #[derive(Debug, Clone)]
 pub struct RelatedIssue {
+    /// `owner/repo` the issue lives in, which a GitHub relation may take
+    /// outside the store's own repository; `None` in the may backend, whose
+    /// relations stay inside its one repository.
+    pub repository: Option<String>,
     /// Issue number within the repository.
     pub number: i64,
     /// Issue title.
@@ -184,6 +188,16 @@ pub struct IssueDetail {
     pub created_at: String,
     /// Last update timestamp (ISO 8601).
     pub updated_at: String,
+}
+
+/// What deciding whether an issue's work can go on needs of it: its state
+/// and what blocks it, without its body, comments or sub-issues.
+#[derive(Debug, Clone)]
+pub struct IssueStatus {
+    /// Issue state.
+    pub state: IssueState,
+    /// Issues this issue is blocked by.
+    pub blocked_by: Vec<RelatedIssue>,
 }
 
 /// Error type for issue-backend operations.
@@ -309,6 +323,9 @@ pub trait IssueStore: Send + Sync + fmt::Debug {
     /// Fetch one issue with labels, comments and relations.
     fn get(&self, number: i64) -> impl Future<Output = Result<IssueDetail, IssueError>> + Send;
 
+    /// Fetch one issue's state and blockers only.
+    fn status(&self, number: i64) -> impl Future<Output = Result<IssueStatus, IssueError>> + Send;
+
     /// List issues, newest first.
     fn list(
         &self,
@@ -420,6 +437,13 @@ impl IssueStore for ResolvedIssueStore {
         match self {
             Self::May(store) => store.get(number).await,
             Self::GitHub(store) => store.get(number).await,
+        }
+    }
+
+    async fn status(&self, number: i64) -> Result<IssueStatus, IssueError> {
+        match self {
+            Self::May(store) => store.status(number).await,
+            Self::GitHub(store) => store.status(number).await,
         }
     }
 

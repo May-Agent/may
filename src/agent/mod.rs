@@ -51,12 +51,14 @@ pub mod session_tool;
 /// Authorization for `terminal` ssh-mode targets.
 pub mod ssh_authorizer;
 /// Live tracking of `subagent` command invocations.
+pub mod subagent_spaces;
 pub mod subagent_tracker;
 pub(crate) mod task_tool;
 pub mod tool_environment_cache;
 pub(crate) mod tunnel_tool;
 mod usage;
 mod wall_clock;
+pub mod work_tracker;
 
 pub use browser_tool::{
     BrowserArgs, BrowserBroker, BrowserRequest, BrowserResult, channel as browser_channel,

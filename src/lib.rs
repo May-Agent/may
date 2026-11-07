@@ -98,6 +98,8 @@ pub mod skill;
 pub mod sleep;
 /// Startup validation of configuration files.
 pub mod startup;
+/// The rows of `tasks.md` as clients see them.
+pub mod task_rows;
 /// Scheduled-task trigger definitions.
 pub mod task_trigger;
 /// The command a scheduled task's run uses to prompt its session.
@@ -106,8 +108,6 @@ pub mod task_wake;
 pub mod terminal_commands;
 /// Permission handling for terminal command execution.
 pub mod terminal_permission_handler;
-/// Todo checklist parsing from agent output.
-pub mod todo_parser;
 /// Tool request dispatch to session handlers.
 pub mod tool_dispatch;
 /// Miscellaneous tool helpers.
