@@ -38,9 +38,9 @@ pub use cache_misses::PromptCacheRequest;
 pub use common::{
     AssistantCacheUsageSummary, ChatDbError, ContextDebugSnapshot, ContextDebugSnapshotMessage,
     CreateProfileParams, CreateScheduledTaskParams, MessageStatsParams, NetworkAccessLogParams,
-    NetworkAccessMode, NetworkAccessSource, NotificationCallbackConsumeResult,
-    PendingWorkspaceLookup, ProfileEnvironmentKind, RequestLogParams, SessionContextSnapshotUpsert,
-    StoredSessionContextSnapshot, TranscriptEntry, UpdateProfileParams, UpdateScheduledTaskParams,
+    NetworkAccessMode, NetworkAccessSource, PendingWorkspaceLookup, ProfileEnvironmentKind,
+    RequestLogParams, SessionContextSnapshotUpsert, StoredSessionContextSnapshot, TranscriptEntry,
+    UpdateProfileParams, UpdateScheduledTaskParams,
 };
 pub use context_snapshot::ContextDebugSnapshotWrite;
 pub use issue_provenance::{IssueProvenanceRecord, NewIssueProvenance, UserMessageAt};
@@ -57,7 +57,7 @@ pub use session_run::RunFence;
 use common::{
     AskUserRequestMessageRow, AskUserRequestQuestionOptionRow, AskUserRequestQuestionRow,
     I64ValueRow, PermissionRequestMessageRow, SnapshotMigrationRow, SqliteTableInfoRow,
-    db_custom_error, overflow_error, row_not_found, storage_error, to_i32, to_i64_from_u64,
+    db_custom_error, overflow_error, storage_error, to_i32, to_i64_from_u64,
 };
 
 macro_rules! query {
@@ -115,6 +115,7 @@ impl ChatDb {
         Self::migrate_removed_waiting_terminal_input(&db).await?;
         Self::ensure_search_outbox(&db).await?;
         Self::ensure_session_interval_triggers(&db).await?;
+        Self::migrate_notification_mailbox(&db).await?;
         Ok(Self {
             db,
             #[cfg(test)]
@@ -360,6 +361,40 @@ impl ChatDb {
         query!(
             db,
             "UPDATE session_runtimes SET state = 'idle', terminal_task_id = NULL, terminal_output_file = NULL, terminal_output_preview = NULL, terminal_input_notice = NULL, terminal_background_reason = NULL WHERE state = 'waiting_terminal_input'"
+        )
+        .execute()
+        .await?;
+        Ok(())
+    }
+
+    /// The notification mailbox lost its callback columns with the `notify`
+    /// command and gained the profile a notification opens in. A row stored
+    /// as `opened` or mid-delivery is a delivered one.
+    async fn migrate_notification_mailbox(db: &SkyDb) -> Result<(), ChatDbError> {
+        let columns = query!(db, "PRAGMA table_info(notification_mailbox)")
+            .fetch_all::<SqliteTableInfoRow>()
+            .await?;
+        let existing = columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        if !existing.contains("profile_id") {
+            query!(
+                db,
+                "ALTER TABLE notification_mailbox ADD COLUMN profile_id TEXT"
+            )
+            .execute()
+            .await?;
+        }
+        for column in ["callback_context_xml", "callback_message"] {
+            if existing.contains(column) {
+                let sql = format!("ALTER TABLE notification_mailbox DROP COLUMN {column}");
+                query!(db, sql.as_str()).execute().await?;
+            }
+        }
+        query!(
+            db,
+            "UPDATE notification_mailbox SET status = 'delivered' WHERE status IN ('opened', 'delivering')"
         )
         .execute()
         .await?;
@@ -1401,6 +1436,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deleting_a_profile_moves_its_sessions_to_the_default_profile() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db should initialize successfully");
+        let default_id = db
+            .ensure_default_profiles()
+            .await
+            .expect("default profiles should exist");
+        db.create_profile(CreateProfileParams {
+            id: "doomed",
+            name: "Doomed",
+            environment: ProfileEnvironmentKind::Local,
+            slug: None,
+            icon: None,
+            persona: None,
+            preferences: None,
+            location_aware: false,
+        })
+        .await
+        .expect("profile should be created");
+        db.create_session_in_profile("s1", Some("one"), None, Some("doomed"))
+            .await
+            .expect("session should be created");
+
+        db.delete_profile("doomed")
+            .await
+            .expect("a non-default profile can be deleted");
+
+        assert!(
+            db.get_profile("doomed")
+                .await
+                .expect("profile query")
+                .is_none()
+        );
+        let session = db
+            .get_session("s1")
+            .await
+            .expect("session query")
+            .expect("session survives");
+        assert_eq!(session.profile_id.as_deref(), Some(default_id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn the_default_profile_cannot_be_deleted() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db should initialize successfully");
+        let default_id = db
+            .ensure_default_profiles()
+            .await
+            .expect("default profiles should exist");
+
+        let error = db
+            .delete_profile(&default_id)
+            .await
+            .expect_err("the default profile is protected");
+        assert!(matches!(
+            error,
+            crate::db::ChatDbError::DefaultProfileProtected
+        ));
+        assert!(
+            db.get_profile(&default_id)
+                .await
+                .expect("profile query")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
     async fn profile_remote_attachments_round_trip() {
         let dir = tempdir().expect("temp dir should be created");
         let db_path = dir.path().join("history.db");
@@ -1720,43 +1826,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn notification_callback_consumes_only_once() {
+    async fn a_mailbox_with_callback_columns_migrates() {
         let dir = tempdir().expect("temp dir should be created");
         let db_path = dir.path().join("history.db");
         let db = ChatDb::open(&db_path)
             .await
             .expect("db should initialize successfully");
+        for sql in [
+            "DROP TABLE notification_mailbox",
+            "CREATE TABLE notification_mailbox (id TEXT PRIMARY KEY, title TEXT NOT NULL, body TEXT NOT NULL, session_id TEXT, callback_context_xml TEXT, callback_message TEXT, status TEXT NOT NULL, sent_count INTEGER NOT NULL, last_error TEXT, delivered_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+            "INSERT INTO notification_mailbox VALUES ('n1', 'Task', 'Done', 's1', '<x/>', 'Follow up', 'opened', 1, NULL, NULL, 'a', 'a')",
+        ] {
+            db.execute_for_test(sql).await.expect("old mailbox");
+        }
+        drop(db);
 
-        let payload = crate::notification::NotificationPayload {
-            notification_id: Some("notification-1".to_string()),
-            title: "Task".to_string(),
-            body: "Completed".to_string(),
-            session_id: Some("session-1".to_string()),
-            callback_context_xml: Some(
-                crate::XmlBlock::parse("<system-reminder><status>ok</status></system-reminder>")
-                    .expect("callback XML should parse"),
-            ),
-            callback_message: Some("Follow up".to_string()),
-        };
-        db.create_notification_mailbox_entry("notification-1", &payload, "delivered")
+        let db = ChatDb::open(&db_path).await.expect("reopen migrates");
+        let columns = query!(db.db, "PRAGMA table_info(notification_mailbox)")
+            .fetch_all::<super::common::SqliteTableInfoRow>()
             .await
-            .expect("mailbox entry should persist");
-
-        let first = db
-            .consume_notification_callback("notification-1")
+            .expect("columns")
+            .into_iter()
+            .map(|column| column.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            columns,
+            [
+                "id",
+                "title",
+                "body",
+                "session_id",
+                "status",
+                "sent_count",
+                "last_error",
+                "delivered_at",
+                "created_at",
+                "updated_at",
+                "profile_id",
+            ]
+        );
+        let status = query!(db.db, "SELECT status AS value FROM notification_mailbox")
+            .fetch_all::<super::common::StringValueRow>()
             .await
-            .expect("first callback consume should succeed");
-        assert!(first.has_callback);
-        assert!(first.callback_consumed);
-        assert_eq!(first.callback_message.as_deref(), Some("Follow up"));
-
-        let second = db
-            .consume_notification_callback("notification-1")
-            .await
-            .expect("second callback consume should succeed");
-        assert!(second.has_callback);
-        assert!(!second.callback_consumed);
-        assert_eq!(second.callback_message.as_deref(), Some("Follow up"));
+            .expect("status");
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].value, "delivered");
     }
 
     #[tokio::test]

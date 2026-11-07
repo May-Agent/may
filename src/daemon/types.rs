@@ -62,7 +62,6 @@ pub enum ToolVariant {
     WebFetch,
     Ask,
     Session,
-    Notify,
     Task,
     Generic,
 }
@@ -82,7 +81,6 @@ impl ToolVariant {
             "web_fetch" | "webfetch" => Self::WebFetch,
             "ask" => Self::Ask,
             "session" => Self::Session,
-            "notify" => Self::Notify,
             "task" => Self::Task,
             _ => Self::Generic,
         }
@@ -304,7 +302,6 @@ pub struct NotificationMailboxEntryResponse {
     pub(crate) delivered_at: Option<String>,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
-    pub(crate) has_callback: bool,
 }
 
 impl From<crate::db::entity::notification_mailbox::Model> for NotificationMailboxEntryResponse {
@@ -320,7 +317,6 @@ impl From<crate::db::entity::notification_mailbox::Model> for NotificationMailbo
             delivered_at: value.delivered_at,
             created_at: value.created_at,
             updated_at: value.updated_at,
-            has_callback: value.callback_context_xml.is_some() || value.callback_message.is_some(),
         }
     }
 }
@@ -329,18 +325,6 @@ impl From<crate::db::entity::notification_mailbox::Model> for NotificationMailbo
 #[serde(rename_all = "camelCase")]
 pub struct NotificationMailboxResponse {
     pub(crate) items: Vec<NotificationMailboxEntryResponse>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct NotificationCallbackResponse {
-    pub(crate) notification_id: String,
-    pub(crate) session_id: Option<String>,
-    pub(crate) profile_id: Option<String>,
-    pub(crate) has_callback: bool,
-    pub(crate) callback_consumed: bool,
-    pub(crate) callback_context_xml: Option<String>,
-    pub(crate) callback_message: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
@@ -1596,6 +1580,10 @@ pub struct UiStreamConfig {
 pub struct UiSandboxConfig {
     #[schema(value_type = String)]
     pub(crate) command_priority: CommandPriority,
+    /// Jobserver tokens shared by every terminal; `None` is the host's
+    /// available parallelism.
+    #[serde(default)]
+    pub(crate) job_pool_size: Option<usize>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
@@ -1716,6 +1704,14 @@ pub struct SkillInfoDto {
 #[serde(rename_all = "camelCase")]
 pub struct LastModelRequest {
     pub(crate) model: String,
+}
+
+/// Body of `PUT /api/config/job-pool`: the machine-wide jobserver pool size,
+/// `None` for the host's available parallelism.
+#[derive(Debug, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct JobPoolRequest {
+    pub(crate) size: Option<usize>,
 }
 
 #[derive(Debug, serde::Deserialize, skyzen::ToSchema)]

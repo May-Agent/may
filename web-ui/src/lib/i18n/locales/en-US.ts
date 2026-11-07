@@ -180,7 +180,6 @@ export const enUS = {
     webFetch: 'Fetching a page',
     ask: 'Consulting a helper',
     session: 'Recalling history',
-    notify: 'Sending a notification',
     task: 'Delegating a task',
     generic: 'Working',
     output: 'Output',
@@ -459,6 +458,10 @@ export const enUS = {
       low: 'Low',
       lowest: 'Lowest',
       info: 'Lower priority changes scheduling under contention; it does not cap CPU usage.',
+      jobPool: 'Job pool size',
+      jobPoolAuto: 'Automatic (CPU cores)',
+      jobPoolInfo: 'Jobs that builds started by all sessions may run at once, as a jobserver token pool. Leave empty to use the number of CPU cores. Commands in container or SSH sessions are not counted.',
+      jobPoolInvalid: 'The job pool size must be a whole number of at least 1, or empty.',
     },
     stream: {
       title: 'Stream codec',

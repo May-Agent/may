@@ -142,6 +142,9 @@ pub enum AppEvent {
     HistoryStale,
     /// The user's global sleep state, from the `sleep` event.
     Sleep(crate::sleep::SleepStatus),
+    /// A popup of some session waits on the user, from the
+    /// `user_notification` event.
+    UserNotification(Box<crate::notification::UserNotification>),
     /// A `session_suggestion` frame arrived: `text` is the new ghost text,
     /// `None` clears it.
     PromptSuggestion {
@@ -163,6 +166,14 @@ pub enum AppEvent {
         summary: Option<String>,
         /// The suggested next step, when the recap named one.
         next_action: Option<String>,
+    },
+    /// A usage frame carried the context window the daemon resolved for the
+    /// session's model.
+    ContextWindow {
+        /// Session the window belongs to.
+        session_id: String,
+        /// The window in tokens.
+        window: u32,
     },
     /// A kill request finished; `true` when the job accepted it.
     JobKilled {
@@ -243,8 +254,10 @@ impl AppEvent {
             Self::TurnWithdrawn { .. } => "turn_withdrawn",
             Self::HistoryStale => "history_stale",
             Self::Sleep(_) => "sleep",
+            Self::UserNotification(_) => "user_notification",
             Self::PromptSuggestion { .. } => "prompt_suggestion",
             Self::Recap { .. } => "recap",
+            Self::ContextWindow { .. } => "context_window",
             Self::JobKilled { .. } => "job_killed",
             Self::JobDetailLoaded { .. } => "job_detail_loaded",
             Self::TerminalOutputs(_) => "terminal_outputs",

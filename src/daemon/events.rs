@@ -98,6 +98,9 @@ pub(super) async fn stream_events(
     // a distinct event kind, per AGENTS.md.
     let mut lifecycle_rx = state.browser_lifecycle_subscribe();
     let lifecycle_subscribed = subscribed_topics.contains(UiEventTopics::BROWSER_LIFECYCLE);
+    // Popups waiting on the user are transients too: one event per popup.
+    let mut notification_rx = state.notification_service.subscribe_user_notifications();
+    let notification_subscribed = subscribed_topics.contains(UiEventTopics::USER_NOTIFICATION);
     let index_subscribed = subscribed_topics.contains(UiEventTopics::SESSION_INDEX);
     // Live turn frames of the filtered session, replayed from the turn's
     // start for a client attaching mid-turn, or from the frame after the
@@ -213,6 +216,19 @@ pub(super) async fn stream_events(
                             }
                             Err(RecvError::Lagged(skipped)) => {
                                 tracing::warn!(skipped, "browser lifecycle stream lagged; dropping events");
+                            }
+                            Err(RecvError::Closed) => {}
+                        }
+                    }
+                    notification = notification_rx.recv(), if notification_subscribed => {
+                        match notification {
+                            Ok(notification) => {
+                                if !send_event(&sender, "user_notification", &notification).await {
+                                    break;
+                                }
+                            }
+                            Err(RecvError::Lagged(skipped)) => {
+                                tracing::warn!(skipped, "user notification stream lagged; dropping notifications");
                             }
                             Err(RecvError::Closed) => {}
                         }

@@ -1,14 +1,10 @@
 May - AI coding assistant
 
 COMMANDS
-  /help         Show this help
-  /new          Create new session
-  /session      Switch sessions
-  /config       Provider settings
-  /clear        Clear chat
-  /secret K V   Store a secret in the OS keychain
-  /quit         Exit
-
+{% for command in commands -%}
+  {{ command.name }}{% if !command.args.is_empty() %} {{ command.args }}{% endif %}
+      {{ command.description }}
+{% endfor %}
 SHORTCUTS
   Enter         Send message
   ! command     Run a bash command in may's environment

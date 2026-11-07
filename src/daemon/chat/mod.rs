@@ -27,8 +27,7 @@ mod turn_persister;
 mod warm_aux_tests;
 
 use self::tool_dispatch::{
-    handle_browser_request, handle_notify_request, handle_register_skills_request,
-    handle_task_request,
+    handle_browser_request, handle_register_skills_request, handle_task_request,
 };
 
 use std::future::Future;
@@ -46,7 +45,6 @@ use aither_core::llm::{
     Attachment as LlmAttachment, Message as LlmMessage, Role as LlmRole, ToolResult, Usage,
 };
 use aither_core::llm::{Failure, FailureKind};
-use aither_models::lookup as lookup_model_info;
 use aither_sandbox::{AnyContainerExec, BollardContainerExec, ContainerLaunchSpec};
 
 use crate::agent::MayAgent;
@@ -123,10 +121,12 @@ trait ChatSink {
     /// The run is prepared; `user_message_id` is the row of the user
     /// message it answers, when it stored one.
     fn on_prepared(&mut self, _user_message_id: Option<i32>) {}
-    /// Every agent event of the run, as the agent emitted it.
+    /// Every agent event of the run, as the agent emitted it, with the
+    /// model's context window.
     fn on_agent_event(
         &mut self,
         _event: Result<&aither_agent::AgentEvent, &aither_agent::AgentError>,
+        _context_window: Option<u32>,
     ) {
     }
     fn on_start(
@@ -392,8 +392,9 @@ impl ChatSink for HubSink {
     fn on_agent_event(
         &mut self,
         event: Result<&aither_agent::AgentEvent, &aither_agent::AgentError>,
+        context_window: Option<u32>,
     ) {
-        if let Some(event) = crate::client::WireAgentEvent::from_agent(event) {
+        if let Some(event) = crate::client::WireAgentEvent::from_agent(event, context_window) {
             self.publish_agent(crate::client::SessionAgentBody::Agent { event });
         }
     }
@@ -1673,7 +1674,6 @@ pub(super) async fn run_bash(
 pub(super) fn spawn_shared_tool_dispatchers(state: Arc<DaemonState>, queues: UiToolQueues) {
     let UiToolQueues {
         task,
-        notify,
         browser,
         register_skills,
         tunnel,
@@ -1684,16 +1684,6 @@ pub(super) fn spawn_shared_tool_dispatchers(state: Arc<DaemonState>, queues: UiT
     tokio_handle.spawn(async move {
         while let Some(request) = task.next().await {
             let result = Box::pin(handle_task_request(&task_state, request.args.clone())).await;
-            let _ = request.respond(result);
-        }
-    });
-
-    let notification_service = state.notification_service.clone();
-    let tokio_handle = state.tokio_handle.clone();
-    tokio_handle.spawn(async move {
-        while let Some(request) = notify.next().await {
-            let result =
-                handle_notify_request(notification_service.clone(), request.args.clone()).await;
             let _ = request.respond(result);
         }
     });
@@ -1786,7 +1776,7 @@ async fn drive_turn<S: ChatSink>(
             if let ControlFlow::Break(stop) = turn.close_reasoning_phase().await {
                 return Err(stop);
             }
-            turn.sink.on_agent_event(Err(&error));
+            turn.sink.on_agent_event(Err(&error), turn.context_window);
             Err(turn_events::TurnStop::Failed(error))
         }
     }
@@ -1943,10 +1933,7 @@ fn run_agent_loop<'a>(
             if let Some(hidden_context_xml) = hidden_context_xml {
                 turn_hidden_context_xml = Some(hidden_context_xml);
             }
-            let model_context_window = agent.model_context_window().or_else(|| {
-                lookup_model_info(crate::model_selector::selector_model_id(&current_model))
-                    .and_then(aither_models::ModelEntry::max_input_tokens)
-            });
+            let model_context_window = agent.model_context_window();
 
             let session_paths =
                 session_paths_for_session(state, profile_id.as_deref(), &session_id);
@@ -1979,6 +1966,7 @@ fn run_agent_loop<'a>(
                 started_at,
                 reasoning_display,
                 reasoning_phase: reasoning_display.then_some(started_at),
+                context_window: model_context_window,
                 provider_id: &provider_id,
                 model: &current_model,
                 request_prefix: None,
@@ -2815,7 +2803,6 @@ struct ToolBrokers {
     workspace: crate::workspace_request::WorkspaceRequestBroker,
     ask_user: ask_user::AskUserBroker,
     task: crate::agent::task_tool::TaskBroker,
-    notify: crate::agent::notify_tool::NotifyBroker,
     browser: crate::agent::browser_tool::BrowserBroker,
     register_skills: crate::agent::register_tool::RegisterBroker,
     tunnel: crate::agent::tunnel_tool::TunnelBroker,
@@ -3515,7 +3502,6 @@ fn build_tool_brokers(state: &Arc<DaemonState>, session_id: &SessionId) -> ToolB
         workspace: spawn_workspace_forwarder(state, session_id),
         ask_user: spawn_ask_user_forwarder(state, session_id),
         task: state.tool_dispatchers.task.clone(),
-        notify: state.tool_dispatchers.notify.clone(),
         browser: state.tool_dispatchers.browser.clone(),
         register_skills: state.tool_dispatchers.register_skills.clone(),
         tunnel: state.tool_dispatchers.tunnel.clone(),
@@ -3547,6 +3533,7 @@ fn agent_messaging(state: &Arc<DaemonState>) -> crate::agent_link::AgentMessagin
                     .unwrap_or_default()
             })
         },
+        forks: state.agent_forks.clone(),
     }
 }
 
@@ -3682,6 +3669,11 @@ fn build_session_agent<'a>(
     Box::pin(async move {
         let (environment, location) = Box::pin(setup_agent_environment(state, ctx)).await?;
         let brokers = build_tool_brokers(state, &ctx.session_id);
+        let model_context_window = match ctx.current_model.parse::<crate::ModelSelector>() {
+            Ok(selector) => state.model_context_window(&selector).await,
+            // The build reports the invalid selector.
+            Err(_) => None,
+        };
 
         let mut agent = MayAgent::from_config_with_model_and_permissions(
             config,
@@ -3713,7 +3705,6 @@ fn build_session_agent<'a>(
                 plan_state: ctx.plan_state,
                 location,
                 task_broker: Some(brokers.task),
-                notify_broker: Some(brokers.notify),
                 tunnel_broker: Some(brokers.tunnel),
                 browser_broker: state.browser_manager().map(|_| brokers.browser),
                 acp_host: Some(state.acp_host.clone()),
@@ -3729,6 +3720,7 @@ fn build_session_agent<'a>(
                 environment,
                 tool_distribution: state.tool_distribution.clone(),
                 tool_environments: state.tool_environments.clone(),
+                job_server: state.job_server.clone(),
                 provider_attempt,
                 prompt_cache_epoch: ctx.context_snapshot.as_ref().map_or(0, |snapshot| {
                     snapshot
@@ -3741,6 +3733,7 @@ fn build_session_agent<'a>(
                 background_jobs: aither_agent::BackgroundJobPolicy::Detach,
                 connectivity: state.connectivity.clone(),
                 rules_import: ctx.rules_import.clone(),
+                model_context_window,
             },
         )
         .await
@@ -4335,6 +4328,7 @@ mod tests {
         fn on_agent_event(
             &mut self,
             event: Result<&aither_agent::AgentEvent, &aither_agent::AgentError>,
+            _context_window: Option<u32>,
         ) {
             if matches!(event, Ok(aither_agent::AgentEvent::Text(text)) if text == WAKE_TEXT) {
                 self.wake_texts += 1;

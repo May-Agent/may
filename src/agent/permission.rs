@@ -459,6 +459,10 @@ impl PermissionApprover {
             let db = runtime_service.db();
             Self::append_request_history(&db, &session_id, &request_id, history, &payload.script)
                 .await?;
+            runtime_service.announce_user_wait(crate::session::UserWait {
+                session_id: session_id.clone(),
+                ask: crate::session::UserAsk::permission(mode, &payload.script),
+            });
         }
 
         if let Ok(decision) = tokio::time::timeout(self.timeout, rx.recv()).await {

@@ -121,6 +121,8 @@ export type CommandPriority = 'normal' | 'low' | 'lowest';
 
 export interface UiSandboxConfig {
   commandPriority: CommandPriority;
+  /** Jobserver tokens shared by every terminal; null is the host's available parallelism. */
+  jobPoolSize: number | null;
 }
 
 export type StreamCodec = 'auto' | 'h264' | 'av1';

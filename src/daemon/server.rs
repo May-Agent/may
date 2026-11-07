@@ -239,6 +239,9 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
         .redeliver_pending()
         .await
         .map_err(|e| anyhow!(e.to_string()))?;
+    let job_server = crate::jobserver::JobServer::start(&may_dir, config.sandbox.job_pool_size())
+        .await
+        .context("failed to create the jobserver pool")?;
     // Prompts that task runs store for their sessions; dispatched once the
     // daemon state exists.
     let (task_wake_tx, task_wake_rx) = async_channel::unbounded::<String>();
@@ -254,6 +257,7 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
     .with_network_policy(&config.preferences.network_policy)
     .map_err(|error| anyhow!(error))?
     .with_connectivity(connectivity.clone())
+    .with_job_server(job_server.clone())
     .with_session_prompts(crate::task_wake::SessionPrompts::new(
         runtime_service.clone(),
         task_wake_tx,
@@ -307,6 +311,7 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
         task_runtime: task_runtime.clone(),
         tool_distribution,
         tool_environments: crate::agent::ToolEnvironmentCache::spawn(),
+        job_server,
         repo_search: crate::repo_search::RepoSearch::global(&may_dir),
         may_dir,
         search_index_wake_tx,
@@ -318,6 +323,7 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
             .context("failed to identify the running build")?,
         turn_hub: Arc::new(super::chat::TurnHub::default()),
         parked_agents: super::chat::ParkedAgents::default(),
+        agent_forks: crate::agent_link::ForkHosts::default(),
         aux_tasks: super::chat::AuxTasks::default(),
         recap_schedules: super::chat::RecapSchedules::default(),
         session_background: super::chat::SessionBackgrounds::default(),
@@ -336,6 +342,7 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
     }
     super::chat::spawn_shared_tool_dispatchers(state.clone(), tool_queues);
     super::title_generation::spawn_worker(state.clone(), title_generation_rx);
+    super::user_wait::spawn_notifier(&state);
     super::chat::spawn_background_watcher(state.clone(), state.ui_event_bus.clone());
     super::chat::spawn_task_wake_dispatcher(state.clone(), task_wake_rx);
     let scheduler = crate::scheduler::TaskScheduler::new(task_runtime);
@@ -387,15 +394,15 @@ fn api_routes() -> Route {
         add_mcp_server, add_ssh_server, copilot_logout, copilot_start, copilot_status,
         copilot_stream, delete_skill, get_memory, get_ui_config, install_skill, list_mcp_servers,
         list_skills, reconnect_mcp_server, remove_mcp_server, remove_ssh_server, save_full_config,
-        save_memory, set_last_model,
+        save_memory, set_job_pool, set_last_model,
     };
     use super::events::stream_events;
     use super::interaction::{
         respond_ask_user_request, respond_permission_request, respond_workspace_request,
     };
     use super::notifications::{
-        consume_notification_callback, get_vapid_key, list_network_access_logs,
-        list_notification_mailbox, send_notification, subscribe, test_notification, unsubscribe,
+        get_vapid_key, list_network_access_logs, list_notification_mailbox, subscribe,
+        test_notification, unsubscribe,
     };
     use super::profiles::{
         archive_session, create_folder, create_profile, delete_folder, delete_profile,
@@ -526,6 +533,7 @@ fn api_routes() -> Route {
                 "".at(get_ui_config),
                 "/full".post(save_full_config),
                 "/last-model".post(set_last_model),
+                "/job-pool".put(set_job_pool),
             ))),
         )),
         Route::new((
@@ -597,9 +605,7 @@ fn api_routes() -> Route {
                 "/test".post(test_notification),
             ))),
             "/notifications".route(Route::new((
-                "".post(send_notification),
                 "/mailbox".at(list_notification_mailbox),
-                "/{id}/callback".post(consume_notification_callback),
                 "/network-access".at(list_network_access_logs),
             ))),
         )),

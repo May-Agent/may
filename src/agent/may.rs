@@ -158,6 +158,9 @@ pub struct MayAgentConfig {
     pub tool_distribution: Arc<aither_sandbox::ToolDistribution>,
     /// Prepared tool environments kept across rebuilds of a session's agent.
     pub tool_environments: ToolEnvironmentCache,
+    /// The daemon's machine-wide jobserver pool; this agent's terminal and
+    /// its subagents' draw their jobs from it.
+    pub job_server: crate::jobserver::JobServer,
     /// Scheduling priority applied to commands this agent runs.
     pub command_priority: crate::config::CommandPriority,
     /// The LLM provider.
@@ -221,8 +224,6 @@ pub struct MayAgentConfig {
     pub location: Option<crate::location::LocationInfo>,
     /// Optional broker for `task` command requests.
     pub task_broker: Option<crate::agent::task_tool::TaskBroker>,
-    /// Optional broker for `notify` command requests.
-    pub notify_broker: Option<crate::agent::notify_tool::NotifyBroker>,
     /// Optional broker for `tunnel` command requests.
     pub tunnel_broker: Option<crate::agent::tunnel_tool::TunnelBroker>,
     /// Optional broker for `browser` command requests.
@@ -302,8 +303,6 @@ pub struct MayAgentSessionInput<'a> {
     pub location: Option<crate::location::LocationInfo>,
     /// Channel for scheduled-task create requests.
     pub task_broker: Option<crate::agent::task_tool::TaskBroker>,
-    /// Channel for notification requests.
-    pub notify_broker: Option<crate::agent::notify_tool::NotifyBroker>,
     /// Channel for tunnel registrations.
     pub tunnel_broker: Option<crate::agent::tunnel_tool::TunnelBroker>,
     /// The daemon's ACP hosts; connected ACP agents run on them, inside the
@@ -322,6 +321,8 @@ pub struct MayAgentSessionInput<'a> {
     pub tool_distribution: Arc<aither_sandbox::ToolDistribution>,
     /// Prepared tool environments kept across agent rebuilds.
     pub tool_environments: ToolEnvironmentCache,
+    /// The daemon's machine-wide jobserver pool.
+    pub job_server: crate::jobserver::JobServer,
     /// Which provider candidate this build should try (retry counter).
     pub provider_attempt: usize,
     /// The session's subagent handles; `None` starts fresh ones.
@@ -335,6 +336,9 @@ pub struct MayAgentSessionInput<'a> {
     /// The rules this session imports, for a session `/import-claude` or
     /// `/import-codex` opened.
     pub rules_import: Option<crate::rules_import::RulesImport>,
+    /// The model's context window as the daemon resolved it (provider
+    /// report, then the model table); the agent compacts against it.
+    pub model_context_window: Option<u32>,
 }
 
 type MayAgentInner = Agent<ProviderLlm, ProviderLlm, ProviderLlm, MayHooks>;
@@ -369,6 +373,9 @@ pub struct MayAgent {
     /// Model clone reserved for `/btw` side questions.
     btw_llm: ModelSlot<ProviderLlm>,
     subagent_tracker: crate::agent::subagent_tracker::SubagentTracker,
+    /// This agent's entry among the daemon's btw fork hosts, while it is the
+    /// session's agent.
+    _fork_registration: Option<crate::agent_link::ForkRegistration>,
 }
 
 /// The prompt cache of `session_id`'s agent resumed at `epoch`: the one
@@ -474,6 +481,20 @@ impl MayAgent {
                 crate::secrets::SecretStore::new(&config.may_dir),
                 config.session_id.as_str(),
             ));
+        // The pool reaches only local commands: aither fails container and
+        // SSH executions while a pool is configured, so those sessions run
+        // without one until aither brokers tokens into them.
+        let terminal_tool = if is_container || !config.ssh_servers.is_empty() {
+            terminal_tool
+        } else {
+            let connection = config
+                .job_server
+                .connect()
+                .map_err(|e| MayAgentError::Sandbox(e.to_string()))?;
+            terminal_tool
+                .with_jobserver_pool(connection.pool, connection.fifo_dir)
+                .map_err(|e| MayAgentError::Sandbox(e.to_string()))?
+        };
         let job_registry = terminal_tool.job_registry();
         let subagents = config.subagents.clone().unwrap_or_default();
         let subagent_runs = subagents.runs;
@@ -760,7 +781,6 @@ impl MayAgent {
                     AgentEnvironment::Local => TaskRuntimeKind::Local,
                 },
                 task_broker: config.task_broker.clone(),
-                notify_broker: config.notify_broker.clone(),
                 tunnel_broker: config.tunnel_broker.clone(),
                 browser_broker: config.browser_broker.clone(),
                 register_skills_broker: config.register_skills_broker.clone(),
@@ -797,6 +817,15 @@ impl MayAgent {
                 config.session_id.as_str(),
                 config.cwd.clone(),
             ));
+        // Another agent's `btw` forks this agent from the requests it
+        // publishes, whether it is working or idle.
+        let fork_registration = config.agent_messaging.as_ref().map(|messaging| {
+            messaging.forks.register(
+                config.session_id.as_str(),
+                shared_terminal_commands.fork_source.clone(),
+                btw_llm.llm.clone(),
+            )
+        });
         if is_container {
             builder = Box::pin(builder.with_skills_readable_only(&skills_dir)).await?;
         } else {
@@ -872,6 +901,7 @@ impl MayAgent {
             subagent_runs,
             btw_llm,
             subagent_tracker,
+            _fork_registration: fork_registration,
         })
     }
 
@@ -921,7 +951,6 @@ impl MayAgent {
             plan_state,
             location,
             task_broker,
-            notify_broker,
             tunnel_broker,
             browser_broker,
             acp_host,
@@ -931,19 +960,22 @@ impl MayAgent {
             environment,
             tool_distribution,
             tool_environments,
+            job_server,
             provider_attempt,
             subagents,
             background_jobs,
             connectivity,
             rules_import,
+            model_context_window,
         } = input;
         let selector = super::provider::parse_model_selector(model)?;
         let redactor = crate::secrets::SecretRedactor::for_session(&may_dir, session_id.as_str());
         let resolved_provider =
             resolve_provider_runtime(may_config, &selector, provider_attempt, &redactor).await?;
         let provider_id = resolved_provider.provider_id;
-        let llm = resolved_provider.llm;
-        let model_info = aither_models::lookup(selector.model_id());
+        let llm = resolved_provider
+            .llm
+            .with_context_window(model_context_window);
         let request_parameters =
             super::provider::session_request_parameters(may_config, &selector, reasoning_effort);
 
@@ -990,6 +1022,7 @@ impl MayAgent {
             connectivity,
             tool_distribution,
             tool_environments,
+            job_server,
             command_priority: may_config.sandbox.command_priority,
             llm,
             model_id: selector.model_id().to_string(),
@@ -1025,7 +1058,6 @@ impl MayAgent {
             secrets,
             location,
             task_broker,
-            notify_broker,
             tunnel_broker,
             browser_broker,
             acp: acp_host,
@@ -1035,7 +1067,7 @@ impl MayAgent {
             timezone: may_config.time.user_timezone(),
             host_load: may_config.host_load.monitor_config(),
             host_reader: None,
-            model_context_window: model_info.and_then(aither_models::ModelEntry::max_input_tokens),
+            model_context_window,
             request_parameters,
             prompt_cache_epoch,
             db,
@@ -1502,6 +1534,7 @@ pub async fn test_agent(
                 String::new(),
             ),
             subagent_tracker: crate::agent::subagent_tracker::SubagentTracker::default(),
+            _fork_registration: None,
         },
         temp,
     )

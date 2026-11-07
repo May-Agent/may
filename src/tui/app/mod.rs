@@ -33,6 +33,7 @@ use super::event::{AppEvent, EventSender};
 use super::file_diff::FileDiffHandle;
 use super::history::InputHistory;
 use super::queue::{Attachment, MessageQueue, PendingMessage};
+use super::slash::SlashCommand;
 use super::ui::chat::{ChatStream, ToolDisplay, clamp_column_by_width};
 use super::ui::file_picker::FilePicker;
 use crate::pasted_text::LARGE_PASTE_THRESHOLD;
@@ -1853,12 +1854,7 @@ impl App {
     ///
     /// Panics if the session manager has no current session while a session is
     /// being initialized.
-    pub async fn init_session(
-        &mut self,
-        session_id: &SessionId,
-        messages: &[ChatMessage],
-        model: Option<&str>,
-    ) {
+    pub async fn init_session(&mut self, session_id: &SessionId, messages: &[ChatMessage]) {
         // Reset per-session UI state so /new starts from a clean screen in inline viewport mode.
         self.input.clear();
         self.cursor = 0;
@@ -1909,16 +1905,8 @@ impl App {
         // Reset usage tracking for new session
         self.usage = None;
 
-        // Set context window from model info
-        if let Some(model_name) = model {
-            if let Some(info) = aither_models::lookup(model_name) {
-                self.context_window = info.max_input_tokens();
-            } else {
-                self.context_window = None;
-            }
-        } else {
-            self.context_window = None;
-        }
+        // The daemon sends the window with the session's next usage.
+        self.context_window = None;
     }
 
     /// Handle an event. Returns Some(message) if user wants to send a message.
@@ -2890,7 +2878,9 @@ impl App {
                             self.input.clear();
                             self.cursor = 0;
                             self.input_char_count = 0;
-                            return self.execute_slash_command(&cmd);
+                            let command = SlashCommand::from_name(&cmd)
+                                .expect("completion lists only table commands");
+                            return self.execute_slash_command(command);
                         }
 
                         // For file completion, insert into input
@@ -3339,20 +3329,20 @@ impl App {
     }
 
     /// Execute a slash command directly (from menu selection only).
-    fn execute_slash_command(&mut self, cmd: &str) -> Option<SendAction> {
-        match cmd {
-            "/session" => {
+    fn execute_slash_command(&mut self, command: SlashCommand) -> Option<SendAction> {
+        match command {
+            SlashCommand::Session => {
                 self.session_view = super::state::SessionView::Recent;
                 self.load_session_list();
                 None
             }
-            "/archive" => {
+            SlashCommand::Archive => {
                 self.session_view = super::state::SessionView::Archive;
                 self.load_session_list();
                 None
             }
-            "/new" => Some(SendAction::NewSession),
-            "/profile" => {
+            SlashCommand::New => Some(SendAction::NewSession),
+            SlashCommand::Profile => {
                 if self.profiles.len() > 1 {
                     self.profile_selected = self
                         .profiles
@@ -3366,7 +3356,7 @@ impl App {
                 }
                 None
             }
-            "/sandbox" => {
+            SlashCommand::Sandbox => {
                 if let Some(session) = self.session_manager.current() {
                     let sandbox_dir = &session.sandbox_dir;
                     #[cfg(target_os = "macos")]
@@ -3388,26 +3378,26 @@ impl App {
                 }
                 None
             }
-            "/help" => {
+            SlashCommand::Help => {
                 self.help_scroll = 0;
                 self.mode = AppMode::Help;
                 None
             }
-            "/config" => {
+            SlashCommand::Config => {
                 self.config_state = ConfigState::default();
                 self.config_state.load_providers(&self.config);
                 self.mode = AppMode::Config;
                 None
             }
-            "/model" => self.open_model_select(""),
-            "/effort" => {
+            SlashCommand::Model => self.open_model_select(""),
+            SlashCommand::Effort => {
                 self.effort_ladder = self.effort_ladder_for_current();
                 self.effort_index = self.effort_ladder_index();
                 self.mode = AppMode::EffortSelect;
                 self.fetch_current_effort();
                 None
             }
-            "/rewind" => {
+            SlashCommand::Rewind => {
                 if self.processing {
                     self.chat
                         .push_notice("Wait for the current turn to finish before rewinding");
@@ -3416,69 +3406,69 @@ impl App {
                 }
                 None
             }
-            "/jobs" => {
+            SlashCommand::Jobs => {
                 self.open_jobs();
                 None
             }
-            "/questions" => Some(SendAction::OpenQuestions),
-            "/btw" => {
+            SlashCommand::Questions => Some(SendAction::OpenQuestions),
+            SlashCommand::Btw => {
                 self.open_btw();
                 None
             }
-            "/progress" => {
+            SlashCommand::Progress => {
                 self.open_progress();
                 None
             }
-            "/resume-claude" => {
+            SlashCommand::ResumeClaude => {
                 self.open_resume_picker();
                 None
             }
-            "/import-claude" => Some(SendAction::RulesImport(
+            SlashCommand::ImportClaude => Some(SendAction::RulesImport(
                 crate::session::import::ForeignAgent::Claude,
             )),
-            "/import-codex" => Some(SendAction::RulesImport(
+            SlashCommand::ImportCodex => Some(SendAction::RulesImport(
                 crate::session::import::ForeignAgent::Codex,
             )),
-            "/connect" => {
+            SlashCommand::Connect => {
                 self.open_connect_picker();
                 None
             }
-            "/login" => {
+            SlashCommand::Login => {
                 self.login_selected = 0;
                 self.mode = AppMode::Login;
                 None
             }
-            "/resume-codex" | "/secret" => {
+            SlashCommand::ResumeCodex | SlashCommand::Secret => {
                 // These take arguments — leave the command in the input so
                 // the user can type them, rather than executing now.
-                self.input = format!("{cmd} ");
+                self.input = format!("{} ", command.name());
                 self.input_char_count = self.input.chars().count();
                 self.cursor = self.input_char_count;
                 None
             }
-            "/quit" => self.request_quit(),
-            "/compact" => Some(SendAction::Compact(None)),
-            "/recap" => Some(SendAction::Recap),
-            "/yolo" => Some(SendAction::ToggleYolo),
-            "/sleep" => Some(SendAction::Sleep),
-            "/sleep off" => Some(SendAction::Wake),
-            "/context" => Some(SendAction::ContextReport),
-            "/usage" => Some(SendAction::UsageReport),
-            "/context dump" => Some(SendAction::ContextDump),
-            "/bug" => Some(SendAction::BugReport),
-            "/mcp" => {
+            SlashCommand::Quit => self.request_quit(),
+            SlashCommand::Compact => Some(SendAction::Compact(None)),
+            SlashCommand::Recap => Some(SendAction::Recap),
+            SlashCommand::Yolo => Some(SendAction::ToggleYolo),
+            SlashCommand::Sleep => Some(SendAction::Sleep),
+            SlashCommand::SleepOff => Some(SendAction::Wake),
+            SlashCommand::Context => Some(SendAction::ContextReport),
+            SlashCommand::Usage => Some(SendAction::UsageReport),
+            SlashCommand::ContextDump => Some(SendAction::ContextDump),
+            SlashCommand::Bug => Some(SendAction::BugReport),
+            SlashCommand::Mcp => {
                 self.mode = AppMode::McpManage;
                 None
             }
-            "/ssh" => {
+            SlashCommand::Ssh => {
                 self.mode = AppMode::SshManage;
                 None
             }
-            "/permission" => {
+            SlashCommand::Permission => {
                 self.open_permission_gate();
                 None
             }
-            "/skill" => {
+            SlashCommand::Skill => {
                 let tx = self.event_tx.clone();
                 let may_dir = self.session_manager.may_dir().to_path_buf();
                 let profile_id = self
@@ -3500,7 +3490,6 @@ impl App {
                 self.set_status("Loading skills...");
                 None
             }
-            _ => None,
         }
     }
 
@@ -3750,16 +3739,16 @@ impl App {
         self.input_char_count = 0;
 
         let trimmed = content.trim();
-        if trimmed == "/context" && attachments.is_empty() {
+        if trimmed == SlashCommand::Context.name() && attachments.is_empty() {
             return Some(SendAction::ContextReport);
         }
-        if trimmed == "/context dump" && attachments.is_empty() {
+        if trimmed == SlashCommand::ContextDump.name() && attachments.is_empty() {
             return Some(SendAction::ContextDump);
         }
-        if trimmed == "/bug" && attachments.is_empty() {
+        if trimmed == SlashCommand::Bug.name() && attachments.is_empty() {
             return Some(SendAction::BugReport);
         }
-        if let Some(rest) = trimmed.strip_prefix("/compact")
+        if let Some(rest) = trimmed.strip_prefix(SlashCommand::Compact.name())
             && attachments.is_empty()
         {
             let focus = rest.trim();
@@ -3779,9 +3768,12 @@ impl App {
             return Some(SendAction::RulesImport(source));
         }
         for (cmd, source) in [
-            ("/resume-codex", crate::session::import::ForeignAgent::Codex),
             (
-                "/resume-claude",
+                SlashCommand::ResumeCodex.name(),
+                crate::session::import::ForeignAgent::Codex,
+            ),
+            (
+                SlashCommand::ResumeClaude.name(),
                 crate::session::import::ForeignAgent::Claude,
             ),
         ] {
@@ -3797,7 +3789,7 @@ impl App {
         // `/connect` opens the picker; `/connect <command> [args…]` connects
         // that command directly.
         if attachments.is_empty()
-            && let Some(rest) = trimmed.strip_prefix("/connect")
+            && let Some(rest) = trimmed.strip_prefix(SlashCommand::Connect.name())
             && (rest.is_empty() || rest.starts_with(char::is_whitespace))
         {
             if rest.trim().is_empty() {
@@ -3813,7 +3805,7 @@ impl App {
         // `/model` opens the picker and `/model <query>` searches it —
         // either way the line is a command, never a message to the agent.
         if attachments.is_empty()
-            && let Some(rest) = trimmed.strip_prefix("/model")
+            && let Some(rest) = trimmed.strip_prefix(SlashCommand::Model.name())
             && (rest.is_empty() || rest.starts_with(char::is_whitespace))
         {
             return self.open_model_select(rest.trim());
@@ -4400,7 +4392,7 @@ impl App {
         self.current_effort
             .as_deref()
             .or(self.config.last_effort.as_deref())
-            .unwrap_or("medium")
+            .unwrap_or(crate::models::DEFAULT_EFFORT)
     }
 
     /// The effort rungs `/effort` offers for the current model: the
@@ -4430,7 +4422,11 @@ impl App {
         self.effort_ladder
             .iter()
             .position(|rung| *rung == self.effective_effort())
-            .or_else(|| self.effort_ladder.iter().position(|rung| *rung == "medium"))
+            .or_else(|| {
+                self.effort_ladder
+                    .iter()
+                    .position(|rung| *rung == crate::models::DEFAULT_EFFORT)
+            })
             .unwrap_or(0)
     }
 
@@ -4450,15 +4446,12 @@ impl App {
 
     /// Set the current model being used.
     pub fn set_current_model(&mut self, model: &str) {
-        self.current_model = Some(model.to_string());
-        // Also update context window from model info
-        let lookup_model = model.parse::<crate::ModelSelector>().map_or_else(
-            |_| model.to_string(),
-            |selector| crate::models::effort_family_base(selector.model_id()),
-        );
-        if let Some(info) = aither_models::lookup(&lookup_model) {
-            self.context_window = info.max_input_tokens();
+        // The window belongs to the model: the daemon sends the new one
+        // with the next usage.
+        if self.current_model.as_deref() != Some(model) {
+            self.context_window = None;
         }
+        self.current_model = Some(model.to_string());
     }
 
     /// Get context usage information for display.
@@ -4517,6 +4510,9 @@ pub enum SendAction {
     /// Reload the session's history, which turns this client missed
     /// changed.
     ReloadHistory,
+    /// Raise a desktop notification through the terminal: a popup of some
+    /// session waits on the user.
+    DesktopNotification(Box<crate::notification::UserNotification>),
     /// Submit an ask-user response.
     RespondAskUser {
         /// ID of the pending ask-user request being answered.
@@ -5045,6 +5041,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_status_window_is_the_one_the_daemon_sent() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, id) = app_with_session(dir.path()).await;
+        app.usage = Some(aither_core::llm::Usage {
+            prompt_tokens: Some(1_000),
+            ..aither_core::llm::Usage::default()
+        });
+        // A model the table lacks: the client looks nothing up.
+        app.set_current_model("relay::relay-only-model");
+        assert_eq!(
+            app.context_usage(),
+            None,
+            "no window before the daemon sends one"
+        );
+
+        app.handle_event(AppEvent::ContextWindow {
+            session_id: "another-session".to_string(),
+            window: 1,
+        })
+        .expect("window frame");
+        assert_eq!(
+            app.context_usage(),
+            None,
+            "another session's window is ignored"
+        );
+
+        app.handle_event(AppEvent::ContextWindow {
+            session_id: id,
+            window: 262_144,
+        })
+        .expect("window frame");
+        assert_eq!(app.context_usage(), Some((1_000, 262_144)));
+
+        app.set_current_model("relay::another-model");
+        assert_eq!(
+            app.context_usage(),
+            None,
+            "a new model drops the old window"
+        );
+    }
+
+    #[tokio::test]
     async fn a_stored_recap_row_is_restored_as_a_card_when_history_reloads() {
         let dir = tempfile::tempdir().expect("dir");
         let (mut app, _id) = app_with_session(dir.path()).await;
@@ -5162,16 +5200,13 @@ mod tests {
             matches!(&elements[2], ChatElement::AssistantText { content, .. } if content == "None open.")
         );
         assert!(matches!(&elements[3], ChatElement::UserMessage { .. }));
-        let ChatElement::WorkedFor {
-            seconds,
-            elements: work,
-            ..
-        } = &elements[4]
-        else {
-            panic!("last turn is not folded: {:?}", elements[4]);
-        };
-        assert_eq!(*seconds, 10);
-        assert_eq!(commands(work), ["cat workspace.toml"]);
+        // A turn whose work is one command shows that command's own row.
+        assert_eq!(
+            commands(&elements[4..5]),
+            ["cat workspace.toml"],
+            "{:?}",
+            elements[4]
+        );
         assert!(
             matches!(&elements[5], ChatElement::AssistantText { content, .. } if content == "It is local.")
         );
@@ -5270,5 +5305,52 @@ mod tests {
             app.mode,
             crate::tui::AppMode::PermissionConfirm(_)
         ));
+    }
+
+    async fn effort_app(dir: &std::path::Path) -> App {
+        let (mut app, _) = app_with_session(dir).await;
+        app.current_effort = Some("medium".to_string());
+        app.effort_ladder = vec!["low", "medium", "high", "max"];
+        app.effort_index = app.effort_ladder_index();
+        app.mode = crate::tui::AppMode::EffortSelect;
+        app
+    }
+
+    #[tokio::test]
+    async fn effort_arrows_send_nothing_until_enter() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut app = effort_app(dir.path()).await;
+        assert!(press(&mut app, KeyCode::Right).is_none());
+        assert!(press(&mut app, KeyCode::Right).is_none());
+        assert!(press(&mut app, KeyCode::Left).is_none());
+        assert!(matches!(app.mode, crate::tui::AppMode::EffortSelect));
+        assert_eq!(app.current_effort.as_deref(), Some("medium"));
+        match press(&mut app, KeyCode::Enter) {
+            Some(SendAction::SetEffort(Some(effort))) => assert_eq!(effort, "high"),
+            _ => panic!("Enter must apply the highlighted level"),
+        }
+        assert!(matches!(app.mode, crate::tui::AppMode::Chat));
+    }
+
+    #[tokio::test]
+    async fn effort_escape_keeps_the_previous_effort() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut app = effort_app(dir.path()).await;
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
+        assert!(press(&mut app, KeyCode::Esc).is_none());
+        assert!(matches!(app.mode, crate::tui::AppMode::Chat));
+        assert_eq!(app.current_effort.as_deref(), Some("medium"));
+        assert_eq!(app.effective_effort(), "medium");
+    }
+
+    #[tokio::test]
+    async fn effort_panel_is_drawn_with_the_marker_under_the_heading() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut app = effort_app(dir.path()).await;
+        let screen = session_screen(&mut app).join("\n");
+        assert!(screen.contains("Effort"), "{screen}");
+        assert!(screen.contains("▲"), "{screen}");
+        assert!(screen.contains("Esc to cancel"), "{screen}");
     }
 }

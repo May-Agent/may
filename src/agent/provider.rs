@@ -80,12 +80,26 @@ fn resolve_model_selector(
 pub struct RedactedModel<M> {
     inner: M,
     redactor: SecretRedactor,
+    /// Replaces the context length of the inner model's profile.
+    context_window: Option<u32>,
 }
 
 impl<M> RedactedModel<M> {
     /// Wraps `inner`, redacting the secrets `redactor` reads.
     pub const fn new(inner: M, redactor: SecretRedactor) -> Self {
-        Self { inner, redactor }
+        Self {
+            inner,
+            redactor,
+            context_window: None,
+        }
+    }
+
+    /// Reports `window`, when known, as the model's context length instead
+    /// of the inner model's own.
+    #[must_use]
+    pub const fn with_context_window(mut self, window: Option<u32>) -> Self {
+        self.context_window = window;
+        self
     }
 }
 
@@ -112,7 +126,11 @@ where
     }
 
     async fn profile(&self) -> Result<ModelProfile, M::Error> {
-        self.inner.profile().await
+        let mut profile = self.inner.profile().await?;
+        if let Some(window) = self.context_window {
+            profile.context_length = window;
+        }
+        Ok(profile)
     }
 }
 

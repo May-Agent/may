@@ -534,7 +534,6 @@ where
                 may_agent::AgentEnvironment::Local => TaskRuntimeKind::Local,
             },
             task_broker: Some(tool_dispatchers.task.clone()),
-            notify_broker: Some(tool_dispatchers.notify.clone()),
             tunnel_broker: Some(tool_dispatchers.tunnel.clone()),
             browser_broker: tool_dispatchers.browser.clone(),
             register_skills_broker: None,
