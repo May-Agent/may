@@ -308,6 +308,10 @@ async fn async_main() -> anyhow::Result<()> {
         default_hook(panic_info);
     }));
 
+    // The band colour comes from the terminal's own colours: asked once,
+    // on a blocking thread so the runtime keeps turning, before raw mode.
+    let band_bg = blocking::unblock(may_agent::tui::ui::band::query_band_color).await;
+
     // Detect terminal image support (must be before raw mode)
     let image_support = may_agent::tui::ui::image::TerminalImageSupport::detect();
 
@@ -325,7 +329,15 @@ async fn async_main() -> anyhow::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Create app and run
-    let result = run_app(&mut terminal, image_support, log_ring, resume, tui_repo).await;
+    let result = run_app(
+        &mut terminal,
+        image_support,
+        band_bg,
+        log_ring,
+        resume,
+        tui_repo,
+    )
+    .await;
 
     // Cleanup terminal
     disable_raw_mode()?;
@@ -376,6 +388,7 @@ struct ExitSummary {
 async fn run_app<B: Backend>(
     terminal: &mut Terminal<B>,
     image_support: Option<may_agent::tui::ui::image::TerminalImageSupport>,
+    band_bg: Option<ratatui::style::Color>,
     log_ring: may_agent::log_ring::LogRingHandle,
     resume: Option<cli::ResumeArgs>,
     tui_repo: Option<String>,
@@ -385,6 +398,7 @@ where
 {
     let mut events = EventHandler::new();
     let mut app = App::new(events.sender(), image_support).await?;
+    app.band_bg = band_bg;
     app.session_manager.set_pending_repo(tui_repo);
     let mut worker: Option<AgentWorker> = None;
 

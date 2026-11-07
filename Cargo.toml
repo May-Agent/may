@@ -66,6 +66,7 @@ humantime = { version = "2.4", default-features = false }
 async-net = "2"
 async-channel = "2"
 blocking = "1"
+terminal-colorsaurus = { version = "1.0.3", default-features = false }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
