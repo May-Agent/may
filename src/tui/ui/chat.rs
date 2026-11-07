@@ -1445,6 +1445,8 @@ pub struct InputContext<'a> {
     pub attachments: &'a [Attachment],
     /// Ghost text suggested for the empty input; `None` hides it.
     pub suggestion: Option<&'a str>,
+    /// Greeting line drawn directly above the input line.
+    pub greeting: Option<&'a str>,
 }
 
 /// What the run is doing right now, for the activity line above the
@@ -1639,6 +1641,9 @@ pub fn build_plain_wrapped_lines_unified(
         render_queue_lines(&mut tail, ctx, width);
     }
     if let Some(ctx) = input_ctx {
+        if let Some(text) = ctx.greeting {
+            tail.push(greeting_line(text));
+        }
         render_input_line(&mut tail, &ctx, width, images_supported, None);
     }
     if let Some(ctx) = status_ctx {
@@ -2729,9 +2734,14 @@ fn render_impl(
     {
         render_queue_lines(&mut tail, ctx, area.width);
     }
+    let mut greeting_line_idx = None;
     let mut input_line_idx = None;
     let mut caret_line = None;
     if let Some(ctx) = input_ctx {
+        if let Some(text) = ctx.greeting {
+            greeting_line_idx = Some(tail.len());
+            tail.push(greeting_line(text));
+        }
         if input_caret_active {
             caret_line = Some(input_caret_line(&ctx));
         }
@@ -2834,6 +2844,9 @@ fn render_impl(
 
     // Plain mirror of the tail, for selection.
     layout.set_tail_plain(chat_layout::plain_rows(&tail, area.width, tail_rows));
+    layout.set_greeting_row(
+        greeting_line_idx.map(|index| element_rows + tail_starts.get(index).copied().unwrap_or(0)),
+    );
     layout.set_input_span(input_line_idx.map(|index| {
         (
             element_rows + tail_starts.get(index).copied().unwrap_or(0),
@@ -2859,6 +2872,16 @@ fn render_impl(
     }
     stats.widget = widget_start.elapsed();
     stats
+}
+
+/// The New Year greeting drawn above the input line.
+fn greeting_line(text: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        text.to_string(),
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    ))
 }
 
 /// Convert a character index to a byte index in a string.
@@ -4491,6 +4514,7 @@ mod tests {
                             cursor: 5,
                             attachments: &[],
                             suggestion: None,
+                            greeting: None,
                         }),
                         input_caret_active: true,
                         queue_ctx: None,
@@ -5140,6 +5164,7 @@ mod tests {
             cursor: 7,
             attachments: &attachments,
             suggestion: None,
+            greeting: None,
         };
         let mut lines: Vec<Line> = Vec::new();
         let mut positions = Vec::new();
@@ -5164,6 +5189,7 @@ mod tests {
             cursor: 7,
             attachments: &attachments,
             suggestion: None,
+            greeting: None,
         };
         let mut lines: Vec<Line> = Vec::new();
         render_input_line(&mut lines, &ctx, 80, false, None);
@@ -5184,6 +5210,7 @@ mod tests {
             cursor: 0,
             attachments: &[],
             suggestion: Some("run the tests"),
+            greeting: None,
         };
         let mut lines: Vec<Line> = Vec::new();
         render_input_line(&mut lines, &ctx, 80, false, None);
@@ -5198,6 +5225,7 @@ mod tests {
             input: "h",
             cursor: 1,
             suggestion: None,
+            greeting: None,
             ..ctx
         };
         let mut lines: Vec<Line> = Vec::new();
@@ -5216,6 +5244,7 @@ mod tests {
             cursor: 7,
             attachments: &[],
             suggestion: None,
+            greeting: None,
         };
         let mut lines: Vec<Line> = Vec::new();
         let index = render_input_line(&mut lines, &ctx, 80, false, None);
@@ -5241,6 +5270,7 @@ mod tests {
             cursor: 19,
             attachments: &[],
             suggestion: None,
+            greeting: None,
         };
         let mut lines: Vec<Line> = Vec::new();
         render_input_line(&mut lines, &ctx, 80, false, None);

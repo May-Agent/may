@@ -16,6 +16,7 @@ pub mod computer_tool;
 mod context_dump;
 mod context_report;
 mod environment;
+pub(crate) mod explore_tool;
 mod hooks;
 #[cfg(test)]
 mod host_load_tests;

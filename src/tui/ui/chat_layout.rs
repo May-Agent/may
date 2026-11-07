@@ -222,6 +222,8 @@ pub struct ChatLayout {
     /// Doc-row span of the composer input last frame — click-to-caret
     /// hit testing. `None` when no input was drawn.
     input_span: Option<(usize, usize)>,
+    /// Doc row of the New Year greeting last frame — click hit testing.
+    greeting_row: Option<usize>,
     /// Blank rows drawn above the content when it underflows the view.
     top_padding: usize,
     /// Elements re-laid-out by the last [`ChatLayout::sync`].
@@ -397,6 +399,17 @@ impl ChatLayout {
     /// testing; `None` when the frame drew no input.
     pub const fn set_input_span(&mut self, span: Option<(usize, usize)>) {
         self.input_span = span;
+    }
+
+    /// Record the greeting line's doc row; `None` when none was drawn.
+    pub const fn set_greeting_row(&mut self, row: Option<usize>) {
+        self.greeting_row = row;
+    }
+
+    /// The greeting line's doc row last frame.
+    #[must_use]
+    pub const fn greeting_row(&self) -> Option<usize> {
+        self.greeting_row
     }
 
     /// The composer input's doc-row span `(start, rows)` last frame.

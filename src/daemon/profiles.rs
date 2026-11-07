@@ -57,9 +57,9 @@ const fn default_env() -> ProfileEnvironmentKind {
 
 fn map_profile_error(err: ChatDbError) -> skyzen::Error {
     match err {
-        ChatDbError::PinnedLimitExceeded { .. } | ChatDbError::InvalidProfileEnvironment(_) => {
-            bad_request_error(err)
-        }
+        ChatDbError::PinnedLimitExceeded { .. }
+        | ChatDbError::InvalidProfileEnvironment(_)
+        | ChatDbError::DefaultProfileProtected => bad_request_error(err),
         _ => internal_error(err),
     }
 }
@@ -406,7 +406,7 @@ pub(super) async fn delete_profile(
 
     let db = state.db();
 
-    db.delete_profile(&id).await.map_err(internal_error)?;
+    db.delete_profile(&id).await.map_err(map_profile_error)?;
     super::remote_access::sync_remote_access_from_state(&state)
         .await
         .map_err(internal_error)?;

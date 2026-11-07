@@ -33,6 +33,7 @@ use super::event::{AppEvent, EventSender};
 use super::file_diff::FileDiffHandle;
 use super::history::InputHistory;
 use super::queue::{Attachment, MessageQueue, PendingMessage};
+use super::slash::SlashCommand;
 use super::ui::chat::{ChatStream, ToolDisplay, clamp_column_by_width};
 use super::ui::file_picker::FilePicker;
 use crate::pasted_text::LARGE_PASTE_THRESHOLD;
@@ -260,6 +261,8 @@ pub struct App {
     pub usage: Option<aither_core::llm::Usage>,
     /// Decode-speed measurement for the streaming response
     pub decode_meter: crate::decode_meter::DecodeMeter,
+    /// New Year greeting and fireworks
+    pub new_year: crate::tui::new_year::NewYearState,
     /// Spinner animation frame for the activity indicator above the status bar
     pub spinner_frame: usize,
     /// What the in-flight run is doing (thinking vs. producing output)
@@ -687,6 +690,7 @@ impl App {
             pending_attachment_jobs: 0,
             usage: None,
             decode_meter: crate::decode_meter::DecodeMeter::default(),
+            new_year: crate::tui::new_year::NewYearState::default(),
             spinner_frame: 0,
             activity_phase: crate::tui::ui::chat::ActivityPhase::Thinking,
             context_window: None,
@@ -2337,6 +2341,11 @@ impl App {
         code: KeyCode,
         modifiers: KeyModifiers,
     ) -> AppResult<Option<SendAction>> {
+        // Any key ends the fireworks and is spent on that.
+        if self.new_year.animating() {
+            self.new_year.stop();
+            return Ok(None);
+        }
         // Global shortcuts
         if modifiers.contains(KeyModifiers::CONTROL) {
             match code {
@@ -2370,6 +2379,13 @@ impl App {
                     return Ok(None);
                 }
                 KeyCode::Left => return Ok(Some(SendAction::OpenQuestions)),
+                // Ctrl+F plays the New Year fireworks while the greeting shows.
+                KeyCode::Char('f')
+                    if matches!(self.mode, AppMode::Chat) && self.new_year.greeting() =>
+                {
+                    self.new_year.start();
+                    return Ok(None);
+                }
                 // Ctrl+B shows/hides the right sidebar (wide terminals only).
                 KeyCode::Char('b') => {
                     self.sidebar.enabled = !self.sidebar.enabled;
@@ -2877,7 +2893,9 @@ impl App {
                             self.input.clear();
                             self.cursor = 0;
                             self.input_char_count = 0;
-                            return self.execute_slash_command(&cmd);
+                            let command = SlashCommand::from_name(&cmd)
+                                .expect("completion lists only table commands");
+                            return self.execute_slash_command(command);
                         }
 
                         // For file completion, insert into input
@@ -3093,6 +3111,13 @@ impl App {
         const SCROLL_STEP_LINES: usize = 3;
 
         self.hover = None;
+        // Any click ends the fireworks and is spent on that.
+        if self.new_year.animating() {
+            if matches!(mouse.kind, MouseEventKind::Down(_)) {
+                self.new_year.stop();
+            }
+            return Ok(None);
+        }
         match &self.mode {
             AppMode::Chat => {}
             AppMode::ImageView(_) => {
@@ -3141,6 +3166,13 @@ impl App {
             MouseEventKind::ScrollDown => self.scroll_chat_down(SCROLL_STEP_LINES),
             MouseEventKind::Down(MouseButton::Left) => {
                 let point = self.mouse_to_selection_point(mouse);
+                if let Some(p) = point
+                    && self.chat_layout.greeting_row() == Some(p.line)
+                {
+                    self.new_year.start();
+                    self.selection = None;
+                    return Ok(None);
+                }
                 // A click inside the composer moves the input caret to the
                 // hit cell instead of starting a text selection.
                 if let Some(p) = point
@@ -3326,20 +3358,20 @@ impl App {
     }
 
     /// Execute a slash command directly (from menu selection only).
-    fn execute_slash_command(&mut self, cmd: &str) -> Option<SendAction> {
-        match cmd {
-            "/session" => {
+    fn execute_slash_command(&mut self, command: SlashCommand) -> Option<SendAction> {
+        match command {
+            SlashCommand::Session => {
                 self.session_view = super::state::SessionView::Recent;
                 self.load_session_list();
                 None
             }
-            "/archive" => {
+            SlashCommand::Archive => {
                 self.session_view = super::state::SessionView::Archive;
                 self.load_session_list();
                 None
             }
-            "/new" => Some(SendAction::NewSession),
-            "/profile" => {
+            SlashCommand::New => Some(SendAction::NewSession),
+            SlashCommand::Profile => {
                 if self.profiles.len() > 1 {
                     self.profile_selected = self
                         .profiles
@@ -3353,7 +3385,7 @@ impl App {
                 }
                 None
             }
-            "/sandbox" => {
+            SlashCommand::Sandbox => {
                 if let Some(session) = self.session_manager.current() {
                     let sandbox_dir = &session.sandbox_dir;
                     #[cfg(target_os = "macos")]
@@ -3375,26 +3407,26 @@ impl App {
                 }
                 None
             }
-            "/help" => {
+            SlashCommand::Help => {
                 self.help_scroll = 0;
                 self.mode = AppMode::Help;
                 None
             }
-            "/config" => {
+            SlashCommand::Config => {
                 self.config_state = ConfigState::default();
                 self.config_state.load_providers(&self.config);
                 self.mode = AppMode::Config;
                 None
             }
-            "/model" => self.open_model_select(""),
-            "/effort" => {
+            SlashCommand::Model => self.open_model_select(""),
+            SlashCommand::Effort => {
                 self.effort_ladder = self.effort_ladder_for_current();
                 self.effort_index = self.effort_ladder_index();
                 self.mode = AppMode::EffortSelect;
                 self.fetch_current_effort();
                 None
             }
-            "/rewind" => {
+            SlashCommand::Rewind => {
                 if self.processing {
                     self.chat
                         .push_notice("Wait for the current turn to finish before rewinding");
@@ -3403,69 +3435,69 @@ impl App {
                 }
                 None
             }
-            "/jobs" => {
+            SlashCommand::Jobs => {
                 self.open_jobs();
                 None
             }
-            "/questions" => Some(SendAction::OpenQuestions),
-            "/btw" => {
+            SlashCommand::Questions => Some(SendAction::OpenQuestions),
+            SlashCommand::Btw => {
                 self.open_btw();
                 None
             }
-            "/progress" => {
+            SlashCommand::Progress => {
                 self.open_progress();
                 None
             }
-            "/resume-claude" => {
+            SlashCommand::ResumeClaude => {
                 self.open_resume_picker();
                 None
             }
-            "/import-claude" => Some(SendAction::RulesImport(
+            SlashCommand::ImportClaude => Some(SendAction::RulesImport(
                 crate::session::import::ForeignAgent::Claude,
             )),
-            "/import-codex" => Some(SendAction::RulesImport(
+            SlashCommand::ImportCodex => Some(SendAction::RulesImport(
                 crate::session::import::ForeignAgent::Codex,
             )),
-            "/connect" => {
+            SlashCommand::Connect => {
                 self.open_connect_picker();
                 None
             }
-            "/login" => {
+            SlashCommand::Login => {
                 self.login_selected = 0;
                 self.mode = AppMode::Login;
                 None
             }
-            "/resume-codex" | "/secret" => {
+            SlashCommand::ResumeCodex | SlashCommand::Secret => {
                 // These take arguments — leave the command in the input so
                 // the user can type them, rather than executing now.
-                self.input = format!("{cmd} ");
+                self.input = format!("{} ", command.name());
                 self.input_char_count = self.input.chars().count();
                 self.cursor = self.input_char_count;
                 None
             }
-            "/quit" => self.request_quit(),
-            "/compact" => Some(SendAction::Compact(None)),
-            "/recap" => Some(SendAction::Recap),
-            "/yolo" => Some(SendAction::ToggleYolo),
-            "/sleep" => Some(SendAction::Sleep),
-            "/sleep off" => Some(SendAction::Wake),
-            "/context" => Some(SendAction::ContextReport),
-            "/usage" => Some(SendAction::UsageReport),
-            "/context dump" => Some(SendAction::ContextDump),
-            "/bug" => Some(SendAction::BugReport),
-            "/mcp" => {
+            SlashCommand::Quit => self.request_quit(),
+            SlashCommand::Compact => Some(SendAction::Compact(None)),
+            SlashCommand::Recap => Some(SendAction::Recap),
+            SlashCommand::Yolo => Some(SendAction::ToggleYolo),
+            SlashCommand::Sleep => Some(SendAction::Sleep),
+            SlashCommand::SleepOff => Some(SendAction::Wake),
+            SlashCommand::Context => Some(SendAction::ContextReport),
+            SlashCommand::Usage => Some(SendAction::UsageReport),
+            SlashCommand::ContextDump => Some(SendAction::ContextDump),
+            SlashCommand::Bug => Some(SendAction::BugReport),
+            SlashCommand::Mcp => {
                 self.mode = AppMode::McpManage;
                 None
             }
-            "/ssh" => {
+            SlashCommand::Ssh => {
                 self.mode = AppMode::SshManage;
                 None
             }
-            "/permission" => {
+            SlashCommand::Permission => {
                 self.open_permission_gate();
                 None
             }
-            "/skill" => {
+            SlashCommand::Skill => {
                 let tx = self.event_tx.clone();
                 let may_dir = self.session_manager.may_dir().to_path_buf();
                 let profile_id = self
@@ -3487,7 +3519,6 @@ impl App {
                 self.set_status("Loading skills...");
                 None
             }
-            _ => None,
         }
     }
 
@@ -3737,16 +3768,16 @@ impl App {
         self.input_char_count = 0;
 
         let trimmed = content.trim();
-        if trimmed == "/context" && attachments.is_empty() {
+        if trimmed == SlashCommand::Context.name() && attachments.is_empty() {
             return Some(SendAction::ContextReport);
         }
-        if trimmed == "/context dump" && attachments.is_empty() {
+        if trimmed == SlashCommand::ContextDump.name() && attachments.is_empty() {
             return Some(SendAction::ContextDump);
         }
-        if trimmed == "/bug" && attachments.is_empty() {
+        if trimmed == SlashCommand::Bug.name() && attachments.is_empty() {
             return Some(SendAction::BugReport);
         }
-        if let Some(rest) = trimmed.strip_prefix("/compact")
+        if let Some(rest) = trimmed.strip_prefix(SlashCommand::Compact.name())
             && attachments.is_empty()
         {
             let focus = rest.trim();
@@ -3766,9 +3797,12 @@ impl App {
             return Some(SendAction::RulesImport(source));
         }
         for (cmd, source) in [
-            ("/resume-codex", crate::session::import::ForeignAgent::Codex),
             (
-                "/resume-claude",
+                SlashCommand::ResumeCodex.name(),
+                crate::session::import::ForeignAgent::Codex,
+            ),
+            (
+                SlashCommand::ResumeClaude.name(),
                 crate::session::import::ForeignAgent::Claude,
             ),
         ] {
@@ -3784,7 +3818,7 @@ impl App {
         // `/connect` opens the picker; `/connect <command> [args…]` connects
         // that command directly.
         if attachments.is_empty()
-            && let Some(rest) = trimmed.strip_prefix("/connect")
+            && let Some(rest) = trimmed.strip_prefix(SlashCommand::Connect.name())
             && (rest.is_empty() || rest.starts_with(char::is_whitespace))
         {
             if rest.trim().is_empty() {
@@ -3800,7 +3834,7 @@ impl App {
         // `/model` opens the picker and `/model <query>` searches it —
         // either way the line is a command, never a message to the agent.
         if attachments.is_empty()
-            && let Some(rest) = trimmed.strip_prefix("/model")
+            && let Some(rest) = trimmed.strip_prefix(SlashCommand::Model.name())
             && (rest.is_empty() || rest.starts_with(char::is_whitespace))
         {
             return self.open_model_select(rest.trim());
@@ -5300,6 +5334,131 @@ mod tests {
             app.mode,
             crate::tui::AppMode::PermissionConfirm(_)
         ));
+    }
+
+    /// The screen as rows of text.
+    fn draw_rows(
+        terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>,
+        app: &mut App,
+    ) -> Vec<String> {
+        terminal
+            .draw(|frame| crate::tui::ui::render(frame, app))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn set_date(app: &mut App, date: &str, zone: &str) {
+        let zone = jiff::tz::TimeZone::get(zone).expect("zone");
+        let now = date
+            .parse::<jiff::civil::DateTime>()
+            .expect("datetime")
+            .to_zoned(zone.clone())
+            .expect("zoned")
+            .timestamp();
+        app.new_year.set_date(now, &zone);
+    }
+
+    #[tokio::test]
+    async fn the_greeting_sits_above_the_input_only_on_new_year_days() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        for zone in ["America/New_York", "Asia/Tokyo"] {
+            for (date, shown) in [
+                ("2026-12-30T12:00:00", false),
+                ("2026-12-31T12:00:00", true),
+                ("2027-01-01T12:00:00", true),
+                ("2027-01-02T12:00:00", false),
+            ] {
+                set_date(&mut app, date, zone);
+                let rows = draw_rows(&mut terminal, &mut app);
+                let greeting = rows
+                    .iter()
+                    .position(|row| row.contains(crate::tui::new_year::GREETING));
+                assert_eq!(greeting.is_some(), shown, "{date} in {zone}");
+                if greeting.is_some() {
+                    assert!(app.chat_layout.greeting_row().is_some());
+                } else {
+                    assert_eq!(app.chat_layout.greeting_row(), None);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fireworks_start_and_end_early_leave_the_chat_as_it_was() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        app.chat.push_user("hello", Vec::new(), 0);
+        app.input = "draft".to_string();
+        app.cursor = 5;
+        app.input_char_count = 5;
+        set_date(&mut app, "2026-12-31T12:00:00", "America/New_York");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        let before = draw_rows(&mut terminal, &mut app);
+        let scroll = app.scroll;
+
+        // Ctrl+F starts them; the animation paints over the chat.
+        app.handle_key(KeyCode::Char('f'), KeyModifiers::CONTROL)
+            .expect("key");
+        assert!(app.new_year.animating());
+        for _ in 0..10 {
+            app.new_year.tick();
+        }
+        assert_ne!(draw_rows(&mut terminal, &mut app), before, "sparks drawn");
+
+        // Any key ends them early and is not typed.
+        press(&mut app, KeyCode::Char('x'));
+        assert!(!app.new_year.animating());
+        assert_eq!(app.input, "draft");
+        assert_eq!(app.scroll, scroll);
+        assert_eq!(draw_rows(&mut terminal, &mut app), before);
+
+        // A click on the greeting starts them; a click anywhere ends them.
+        let row = app.chat_layout.greeting_row().expect("greeting row");
+        let area = app.chat_area;
+        let screen_row = area.y
+            + u16::try_from(row + app.chat_layout.top_padding() - app.effective_scroll())
+                .expect("row");
+        let click = |kind| crossterm::event::MouseEvent {
+            kind,
+            column: area.x + 2,
+            row: screen_row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let down = crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left);
+        app.handle_mouse(click(down)).expect("mouse");
+        assert!(app.new_year.animating(), "clicking the greeting plays them");
+        app.handle_mouse(click(down)).expect("mouse");
+        assert!(!app.new_year.animating());
+        assert_eq!(draw_rows(&mut terminal, &mut app), before);
+
+        // They end by themselves.
+        app.new_year.start();
+        for _ in 0..crate::tui::new_year::Fireworks::FRAMES {
+            app.new_year.tick();
+        }
+        assert!(!app.new_year.animating());
+        assert_eq!(draw_rows(&mut terminal, &mut app), before);
+    }
+
+    #[tokio::test]
+    async fn ctrl_f_does_nothing_off_new_year_days() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        set_date(&mut app, "2026-12-30T12:00:00", "Asia/Tokyo");
+        app.handle_key(KeyCode::Char('f'), KeyModifiers::CONTROL)
+            .expect("key");
+        assert!(!app.new_year.animating());
     }
 
     async fn effort_app(dir: &std::path::Path) -> App {
