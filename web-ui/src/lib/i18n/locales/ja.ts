@@ -126,11 +126,13 @@ export const ja: Messages = {
     },
     thinkingPicker: {
       label: '思考',
-      off: 'オフ',
+      none: 'オフ',
+      minimal: '最小',
       low: '低',
       medium: '中',
       high: '高',
-      description: '回答前に追加で思考する深さ',
+      xhigh: '非常に高',
+      max: '最大',
     },
   },
   chat: {

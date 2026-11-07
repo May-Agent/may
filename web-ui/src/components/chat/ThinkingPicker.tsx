@@ -1,99 +1,105 @@
-import { useCallback, useState } from 'react';
-import { Brain, Check, ChevronDown } from 'lucide-react';
-import { Button } from '@/components/ui/button';
+import { useCallback, useEffect, useState } from 'react';
+import { ChevronDown, ChevronRight } from 'lucide-react';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { useTranslation } from '@/lib/i18n';
+import { ladderForModel, patchOfEffort, stopOfEffort } from '@/lib/effort';
+import { useModelsStore } from '@/lib/stores/models';
 import { useSessionsStore } from '@/lib/stores/sessions';
-import { cn } from '@/lib/utils';
-import type { ReasoningEffortPatch } from '@/lib/api/sessions';
-
-type Effort = 'off' | 'low' | 'medium' | 'high';
+import { EffortSlider } from './EffortSlider';
 
 interface ThinkingPickerProps {
   sessionId: string;
+  currentModel: string;
   current: string | null | undefined;
   disabled?: boolean;
 }
 
-function normalize(current: string | null | undefined): Effort {
-  const v = current?.toLowerCase();
-  if (v === 'low' || v === 'medium' || v === 'high') return v;
-  return 'off';
-}
-
-function toPatch(effort: Effort): ReasoningEffortPatch {
-  return effort === 'off' ? null : effort;
-}
-
-export function ThinkingPicker({ sessionId, current, disabled }: ThinkingPickerProps) {
+export function ThinkingPicker({ sessionId, currentModel, current, disabled }: ThinkingPickerProps) {
   const [open, setOpen] = useState(false);
-  const [pending, setPending] = useState(false);
+  const [preview, setPreview] = useState<number | null>(null);
+  const groups = useModelsStore((s) => s.groups);
+  const refresh = useModelsStore((s) => s.refresh);
   const setReasoningEffort = useSessionsStore((s) => s.setReasoningEffort);
   const { t } = useTranslation();
-  const active = normalize(current);
 
-  const label = t(`composer.thinkingPicker.${active}`);
+  useEffect(() => {
+    if (groups === null) void refresh();
+  }, [groups, refresh]);
 
-  const choose = useCallback(
-    async (next: Effort) => {
-      if (next === active) {
-        setOpen(false);
-        return;
-      }
-      setPending(true);
-      try {
-        await setReasoningEffort(sessionId, toPatch(next));
-      } finally {
-        setPending(false);
-        setOpen(false);
+  const levels = ladderForModel(groups, currentModel);
+  const stored = stopOfEffort(levels, current);
+  const shown = preview ?? stored;
+
+  const labelOf = useCallback(
+    (level: string) => {
+      switch (level) {
+        case 'none':
+          return t('composer.thinkingPicker.none');
+        case 'minimal':
+          return t('composer.thinkingPicker.minimal');
+        case 'low':
+          return t('composer.thinkingPicker.low');
+        case 'medium':
+          return t('composer.thinkingPicker.medium');
+        case 'high':
+          return t('composer.thinkingPicker.high');
+        case 'xhigh':
+          return t('composer.thinkingPicker.xhigh');
+        case 'max':
+          return t('composer.thinkingPicker.max');
+        default:
+          return level;
       }
     },
-    [sessionId, active, setReasoningEffort],
+    [t],
   );
 
+  const commit = useCallback(
+    (stop: number) => {
+      setPreview(null);
+      const level = levels[stop];
+      if (level === undefined || stop === stored) return;
+      void setReasoningEffort(sessionId, patchOfEffort(level));
+    },
+    [levels, stored, sessionId, setReasoningEffort],
+  );
+
+  const onOpenChange = (next: boolean) => {
+    if (!next && preview !== null) commit(preview);
+    setOpen(next);
+  };
+
+  if (levels.length === 0) return null;
+
   return (
-    <Popover open={open} onOpenChange={setOpen}>
+    <Popover open={open} onOpenChange={onOpenChange}>
       <PopoverTrigger asChild>
-        <Button
+        <button
           type="button"
-          variant="ghost"
-          size="sm"
           disabled={disabled}
-          className={cn(
-            'h-7 gap-1.5 px-2 text-xs font-normal',
-            active === 'off' ? 'text-muted-foreground' : 'text-foreground',
-          )}
           aria-label={t('composer.thinkingPicker.label')}
+          className="inline-flex h-7 items-center gap-1 rounded-full bg-muted px-3 text-xs text-foreground transition-colors hover:bg-muted/70 disabled:pointer-events-none disabled:opacity-50"
         >
-          <Brain className="size-3.5" />
-          <span className="truncate">{label}</span>
+          <span className="truncate">{labelOf(levels[stored])}</span>
           <ChevronDown className="size-3 opacity-60" />
-        </Button>
+        </button>
       </PopoverTrigger>
-      <PopoverContent align="start" className="w-64 p-1">
-        <div className="px-2 pt-1.5 pb-1 text-[11px] uppercase tracking-wider text-muted-foreground">
-          {t('composer.thinkingPicker.label')}
-        </div>
-        <ul className="flex flex-col">
-          {(['off', 'low', 'medium', 'high'] as const).map((option) => (
-            <li key={option}>
-              <button
-                type="button"
-                disabled={pending}
-                onClick={() => void choose(option)}
-                className={cn(
-                  'flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-accent disabled:pointer-events-none disabled:opacity-50',
-                )}
-              >
-                <span className="flex-1">{t(`composer.thinkingPicker.${option}`)}</span>
-                {option === active && <Check className="size-3.5 text-muted-foreground" />}
-              </button>
-            </li>
-          ))}
-        </ul>
-        <p className="px-2 pt-1 pb-1 text-[11px] text-muted-foreground/80">
-          {t('composer.thinkingPicker.description')}
-        </p>
+      <PopoverContent
+        align="start"
+        className="flex w-[min(30rem,calc(100vw-2rem))] flex-col items-center gap-4 rounded-2xl bg-popover px-6 pt-4 pb-5 text-popover-foreground shadow-xl"
+      >
+        <span className="inline-flex items-center gap-0.5 rounded-full bg-muted px-3 py-1 text-xs font-medium text-muted-foreground">
+          {labelOf(levels[shown])}
+          <ChevronRight className="size-3 opacity-60" />
+        </span>
+        <EffortSlider
+          levels={levels}
+          value={shown}
+          labelOf={labelOf}
+          onChange={setPreview}
+          onCommit={commit}
+          ariaLabel={t('composer.thinkingPicker.label')}
+        />
       </PopoverContent>
     </Popover>
   );

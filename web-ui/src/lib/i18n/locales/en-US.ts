@@ -124,11 +124,13 @@ export const enUS = {
     },
     thinkingPicker: {
       label: 'Thinking',
-      off: 'Off',
+      none: 'Off',
+      minimal: 'Minimal',
       low: 'Low',
       medium: 'Medium',
       high: 'High',
-      description: 'Extra reasoning effort before answering',
+      xhigh: 'Extra high',
+      max: 'Max',
     },
   },
   chat: {
