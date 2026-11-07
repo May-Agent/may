@@ -1,6 +1,6 @@
 # Slash commands
 
-Checked against `src/tui/completion.rs` (the list), `src/tui/app/mod.rs` (`execute_slash_command`, `prepare_message`) and `src/bin/may/main.rs` (the handlers). These are TUI commands. The web UI has no slash palette: its composer treats only the exact texts `/sleep` and `/sleep off` as commands (`web-ui/src/lib/api/sleep.ts`); other things (model, effort, yolo) are controls on the page (see `clients.md`).
+These are TUI commands. The web UI has no slash palette: its composer treats only the exact texts `/sleep` and `/sleep off` as commands; other things (model, effort, yolo) are controls on the page (see `clients.md`).
 
 ## How they are entered
 

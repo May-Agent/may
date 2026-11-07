@@ -1,6 +1,6 @@
 # Clients
 
-Checked against `src/bin/may/cli.rs`, `src/tui/app/mod.rs` (`handle_key`, `handle_chat_key`), `src/tui/reducer/navigation.rs`, `src/tui/ui/help.txt` and, for the web UI, `web-ui/src/App.tsx`, `lib/shortcuts.ts`, `lib/i18n/locales/en-US.ts` and the components under `web-ui/src/components/`. Every client is a front end of the one daemon; a turn started in one is visible in all, and closing a client does not stop it.
+Every client is a front end of the one daemon; a turn started in one is visible in all, and closing a client does not stop it.
 
 ## Command line (`may`)
 

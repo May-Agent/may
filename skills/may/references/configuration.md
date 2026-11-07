@@ -1,7 +1,5 @@
 # Configuration
 
-Checked against `src/config.rs` (`MayConfig` and the sections it contains), `src/mcp.rs`, `src/tui/app/config.rs`, `src/tui/ui/layout/config.rs` and `web-ui/src/routes/SettingsPage.tsx`.
-
 Settings live in `~/.may/config.toml`, a missing file means defaults, and a change applies live without a restart (some sections reach a running session at its next turn). An invalid file or value is rejected with an error naming the problem. The same settings are edited in the TUI `/config` screen and the web UI Settings page. MCP servers are not in this file: they are in `~/.may/mcp.json`.
 
 ## Setting up a model

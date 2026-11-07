@@ -1,7 +1,5 @@
 # Remote access
 
-Checked against `src/daemon/remote_access.rs`, `src/daemon/auth.rs`, `src/config.rs` (`RemoteAccessConfig`, `DaemonConfig`), `src/task_trigger.rs` (`WEBHOOK_MOUNT`) and `web-ui/src/components/settings/RemoteAccessSection.tsx`.
-
 Remote access makes the web UI and API reachable from the user's other devices over Tailscale. It needs the `tailscale` CLI installed and signed in on the machine running the daemon.
 
 ## How it works

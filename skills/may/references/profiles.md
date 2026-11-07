@@ -1,7 +1,5 @@
 # Profiles and session organisation
 
-Checked against `src/profile/mod.rs`, `src/db/profile.rs` (`ensure_default_profiles`, `delete_profile`, `sessions_needing_archive`, pinned limit), `src/daemon/profiles.rs`, `src/daemon/archive.rs` and `web-ui/src/components/shell/` and `settings/ProfilesSection.tsx`.
-
 A profile groups sessions and sets where their agents run. Three exist from the start, all on the local machine: Daily (everyday chat; the web UI lands on it; location context is injected), Build (coding; the TUI and one-shot runs use it, and a session created without a profile falls back to it) and Work.
 
 ## A profile holds

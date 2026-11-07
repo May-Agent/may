@@ -1,7 +1,5 @@
 # Tools and runtimes
 
-Checked against `src/tools/mod.rs`, `src/tools/tool-distribution-0.14.1.json`, `src/tools/host-programs.json`, `src/session/layout.rs` (`tools_dir`, `tool_artifacts_dir`), `src/agent/may.rs` (`initialize_tools` call) and, for the preparation code May links, `aither-sandbox` 0.19.0: `src/tool_runtime.rs`, `src/tool_python.rs`, `src/tool_environment.rs`, `src/terminal.rs` (session environment) and `templates/tool_path.sh`.
-
 ## The shell
 
 Terminal commands run in a managed GNU bash 5.3.20 (pinned for macOS arm64, Linux arm64 and Linux x86_64), not in the system `sh` or the user's login shell. It is started as `bash --noprofile --norc -c <script>`: no startup file is read, so a script behaves the same on every machine. Local sandboxed, `unsafe` host, SSH and container runs all use the managed bash (a container image carries the same pinned tools). Windows has no managed bash.

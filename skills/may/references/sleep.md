@@ -1,7 +1,5 @@
 # Sleep
 
-Checked against `src/sleep.rs`, `src/daemon/sleep.rs`, `templates/alert_sleep.txt`, `src/config.rs` (`SleepConfig`) and `web-ui/src/lib/api/sleep.ts`.
-
 `/sleep` tells every session the user is going to sleep: one state for the whole daemon, shared by all clients and kept across daemon restarts. Run it from the TUI palette or by sending exactly `/sleep` in the web UI.
 
 ## What it does
