@@ -806,8 +806,7 @@ impl MayAgent {
         for (name, description) in &shared_terminal_commands.descriptions {
             builder = builder.tool_description(name.clone(), description.clone());
         }
-        // The agent's sandbox: where it keeps `tasks.md` and its tool results,
-        // so the volume its home environment's disk pressure is judged on.
+        // The agent's sandbox, where it keeps `tasks.md`.
         let home_dir = PathBuf::from(builder.sandbox_dir().as_ref());
         builder = builder
             .fork_source(shared_terminal_commands.fork_source.clone())
@@ -861,8 +860,6 @@ impl MayAgent {
             );
         builder = builder
             .host_load(config.host_load.clone())
-            // A container session's own filesystem is watched besides it.
-            .home_volume(&home_dir)
             // Shell runtime depends on the home environment. SSH remains a
             // per-command routing capability on top of it.
             .shell_runtime_availability(tool_environment_key.availability())
