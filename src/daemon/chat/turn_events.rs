@@ -592,52 +592,6 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                 mark_run_running(self.state, self.guard.fence()).await?;
                 Ok(ControlFlow::Continue(()))
             }
-            AgentEvent::ResponseRetry {
-                error,
-                retry,
-                max_retries,
-                delay,
-            } => {
-                tracing::warn!(
-                    session_id = %self.session_id,
-                    %error,
-                    retry,
-                    max_retries,
-                    delay_ms = delay.as_millis(),
-                    "model response stream broke; retrying the request"
-                );
-                // The broken attempt's text never enters the conversation:
-                // clients drop what they rendered of it, then wait out the
-                // backoff.
-                if !self.segment_text.is_empty() {
-                    let kept = self.full_text.len() - self.segment_text.len();
-                    self.full_text.truncate(kept);
-                    self.segment_text.clear();
-                    self.segment_at = None;
-                    self.segment_translation = None;
-                    if !self.sink.on_retract().await {
-                        return Ok(ControlFlow::Break(TurnStop::Cancelled(
-                            "client disconnected during retract",
-                        )));
-                    }
-                }
-                let until = jiff::Timestamp::now()
-                    .checked_add(delay)
-                    .expect("a retry delay is far below the timestamp range");
-                if !self
-                    .sink
-                    .on_hold(
-                        crate::client::HoldReason::Retry { until, retry },
-                        &error.to_string(),
-                    )
-                    .await
-                {
-                    return Ok(ControlFlow::Break(TurnStop::Cancelled(
-                        "client disconnected during retry hold",
-                    )));
-                }
-                Ok(ControlFlow::Continue(()))
-            }
             AgentEvent::Error(error) => Ok(ControlFlow::Break(TurnStop::Failed(error))),
             _ => Ok(ControlFlow::Continue(())),
         }
