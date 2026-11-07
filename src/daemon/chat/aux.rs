@@ -181,6 +181,20 @@ pub fn warm_cache(state: &DaemonState, session_id: &str) -> Option<aither_agent:
         .filter(aither_agent::CacheWarmth::is_warm)
 }
 
+/// The context of the session's live agent for a side request, read from a
+/// read-only fork of the agent's last request, so it holds what the agent
+/// has now, mid-turn or idle, and the agent is never touched. `None` when
+/// the session has no live agent that has sent a request.
+pub async fn side_context(
+    state: &Arc<DaemonState>,
+    session_id: &str,
+) -> Result<Option<crate::agent_link::SideContext>, AuxError> {
+    super::agent_messaging(state)
+        .side_context(session_id)
+        .await
+        .map_err(|error| AuxError::Session(error.to_string()))
+}
+
 /// The messages the session's idle agent would send next: its system
 /// prefix, compaction handoff and kept turns. Read without changing the
 /// agent, so the request shares the main agent's cached prefix and carries
@@ -235,8 +249,8 @@ pub async fn generate<T: AuxOutput>(
         .unwrap_or(Err(AuxError::Timeout))
 }
 
-/// [`generate`] through an explicit model slot, for tests with a mock model.
-#[cfg(test)]
+/// [`generate`] through an explicit model slot, such as the one of a
+/// [`SideContext`](crate::agent_link::SideContext).
 pub async fn generate_with<M: aither_core::LanguageModel, T: AuxOutput>(
     slot: &crate::agent::ModelSlot<M>,
     messages: Vec<aither_core::llm::Message>,

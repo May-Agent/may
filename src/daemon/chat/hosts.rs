@@ -393,8 +393,7 @@ pub async fn btw(
     use futures_lite::StreamExt as _;
 
     let session_id = session_id_param(&params)?;
-    let worker = idle_agent(&state, &session_id).await?;
-    let messages = req
+    let mut messages = req
         .messages
         .into_iter()
         .map(|message| match message.role.as_str() {
@@ -403,7 +402,26 @@ pub async fn btw(
             _ => Message::user(message.content),
         })
         .collect::<Vec<_>>();
-    let llm = worker.side_model().await.map_err(internal_error_message)?;
+    let side = super::aux::side_context(&state, &session_id)
+        .await
+        .map_err(internal_error)?;
+    let llm = if let Some(side) = side {
+        // The agent's own context replaces the client's rendering of the
+        // chat: only the contract (first, when it is a system message) and
+        // the question (last) are kept.
+        let question = messages.pop();
+        let contract = messages
+            .into_iter()
+            .next()
+            .filter(|message| message.role() == aither_core::llm::Role::System);
+        messages = side.messages;
+        messages.extend(contract);
+        messages.extend(question);
+        side.model
+    } else {
+        let worker = idle_agent(&state, &session_id).await?;
+        worker.side_model().await.map_err(internal_error_message)?
+    };
     let mut answer = String::new();
     let mut stream = std::pin::pin!(llm.respond(messages));
     while let Some(event) = stream.next().await {

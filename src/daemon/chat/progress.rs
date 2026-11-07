@@ -101,6 +101,20 @@ pub async fn progress(
 
 /// Generates the remaining-work report of `session_id`.
 async fn report(state: &Arc<DaemonState>, session_id: &str) -> SkyResult<ProgressReport> {
+    if let Some(side) = super::aux::side_context(state, session_id)
+        .await
+        .map_err(internal_error)?
+    {
+        let messages = progress_messages(side.messages, side.languages.communication());
+        return super::aux::generate_with::<_, ProgressReport>(
+            &side.model,
+            messages,
+            GENERATION_TIMEOUT,
+        )
+        .await
+        .and_then(validated)
+        .map_err(internal_error_message);
+    }
     let context = super::aux::context_messages(state, session_id)
         .await
         .map_err(internal_error)?;
