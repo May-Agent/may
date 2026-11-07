@@ -16,7 +16,57 @@ permissions:
   contents: read
 
 jobs:
+  # Selects the jobs the change reads (.github/scripts/ci-scope.sh holds the
+  # path rules). The ruleset requires `fmt`, `clippy`, `web-ui`,
+  # `test (ubuntu-latest)` and `test (macos-latest)`; a job skipped by its
+  # job-level `if` reports success under its own name, which is why the test
+  # job exists once per runner with a literal name: a skipped matrix job
+  # reports the unexpanded `test (${{ matrix.os }})` and leaves the required
+  # names pending. Should this job itself fail, the others run, so a broken
+  # scope never skips coverage.
+  scope:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      fmt: ${{ steps.scope.outputs.fmt }}
+      clippy: ${{ steps.scope.outputs.clippy }}
+      test: ${{ steps.scope.outputs.test }}
+      web_ui: ${{ steps.scope.outputs.web_ui }}
+    steps:
+      # The diff needs the base commit, which a shallow clone lacks.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # A pull request measures from the merge base with its base branch; a
+      # merge group from the dev commit it is built on; a push from the commit
+      # dev pointed at before. A push with no previous commit (all zeros) has no
+      # base, so it selects everything.
+      - id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          GROUP_BASE: ${{ github.event.merge_group.base_sha }}
+          GROUP_HEAD: ${{ github.event.merge_group.head_sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.event.after }}
+        run: |
+          set -euo pipefail
+          case "${EVENT}" in
+            pull_request) range="${PR_BASE}...${PR_HEAD}" ;;
+            merge_group) range="${GROUP_BASE}..${GROUP_HEAD}" ;;
+            push) range="${PUSH_BEFORE}..${PUSH_AFTER}" ;;
+            *) echo "::error::unexpected event ${EVENT}"; exit 1 ;;
+          esac
+          if [ "${EVENT}" = push ] && [ "${PUSH_BEFORE}" = 0000000000000000000000000000000000000000 ]; then
+            printf 'fmt=true\nclippy=true\ntest=true\nweb_ui=true\n' | tee -a "${GITHUB_OUTPUT}"
+          else
+            git diff --name-only "${range}" | tee /dev/stderr | .github/scripts/ci-scope.sh | tee -a "${GITHUB_OUTPUT}"
+          fi
+
   fmt:
+    needs: scope
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.fmt == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -28,6 +78,8 @@ jobs:
         run: cargo fmt --check
 
   clippy:
+    needs: scope
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.clippy == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
@@ -67,72 +119,36 @@ jobs:
       - name: cargo clippy (ui)
         run: cargo clippy --locked --all-targets --features ui -- -D warnings
 
-  test:
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+  test-ubuntu:
+    name: test (ubuntu-latest)
+    needs: scope
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test == 'true') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
       # Full debuginfo for this dependency tree overflows the hosted runner's disk;
       # line tables keep test backtraces readable.
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
-      # A rebuilt merge queue deletes its old group branches but leaves their
-      # runs queued; such a run ends here instead of holding a runner.
-      - name: Stop a superseded merge group
-        if: github.event_name == 'merge_group'
-        run: |
-          if ! git ls-remote --exit-code "https://github.com/${{ github.repository }}" "${{ github.ref }}" > /dev/null; then
-            echo "::error::${{ github.ref }} no longer exists; the merge queue superseded this group"
-            exit 1
-          fi
-      - name: Free runner disk
-        if: runner.os == 'Linux'
-        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      # Only dev saves; see the clippy job.
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/dev' }}
-      # rust-cache prunes the files under target/tmp but keeps its directories,
-      # so a restored cache holds an empty skeleton of the tests' shared tool
-      # cache that the tests would take for a prepared one.
-      - name: Drop restored test scratch
-        shell: bash
-        run: |
-          chmod -R u+w target/tmp 2>/dev/null || true
-          rm -rf target/tmp
-      - uses: ./.github/actions/install-heel
-      # The pinned tool artifacts, their prepared runtimes and the container
-      # heel the tests download from GitHub releases on a miss.
-      - id: downloads
-        uses: ./.github/actions/restore-test-downloads
-      # rav1e's x86_64 assembly is built with nasm.
-      - name: Install nasm
-        if: runner.os == 'Linux' && runner.arch == 'X64'
-        run: sudo apt-get update && sudo apt-get install -y nasm
-      - name: cargo build
-        run: cargo build --locked --all-targets
-      # The merge queue already tested the tree a push to dev lands, so that
-      # push only builds, to seed dev's caches; it still tests when the test
-      # downloads missed, since the tests are what fetch them.
-      - name: cargo test
-        if: github.event_name != 'push' || steps.downloads.outputs.tools-hit != 'true' || steps.downloads.outputs.heel-hit != 'true'
-        run: cargo test --locked --all-targets
-      - if: success() && steps.downloads.outputs.tools-hit != 'true' && github.ref == 'refs/heads/dev'
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ steps.downloads.outputs.tools-path }}
-          key: ${{ steps.downloads.outputs.tools-key }}
-      - if: success() && steps.downloads.outputs.heel-hit != 'true' && github.ref == 'refs/heads/dev'
-        uses: actions/cache/save@v4
-        with:
-          path: ${{ steps.downloads.outputs.heel-path }}
-          key: ${{ steps.downloads.outputs.heel-key }}
+      - uses: ./.github/actions/test
+
+  test-macos:
+    name: test (macos-latest)
+    needs: scope
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test == 'true') }}
+    runs-on: macos-latest
+    timeout-minutes: 40
+    env:
+      # See test-ubuntu.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/test
 
   web-ui:
+    needs: scope
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.web_ui == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
