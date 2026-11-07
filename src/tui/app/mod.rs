@@ -5162,16 +5162,13 @@ mod tests {
             matches!(&elements[2], ChatElement::AssistantText { content, .. } if content == "None open.")
         );
         assert!(matches!(&elements[3], ChatElement::UserMessage { .. }));
-        let ChatElement::WorkedFor {
-            seconds,
-            elements: work,
-            ..
-        } = &elements[4]
-        else {
-            panic!("last turn is not folded: {:?}", elements[4]);
-        };
-        assert_eq!(*seconds, 10);
-        assert_eq!(commands(work), ["cat workspace.toml"]);
+        // A turn whose work is one command shows that command's own row.
+        assert_eq!(
+            commands(&elements[4..5]),
+            ["cat workspace.toml"],
+            "{:?}",
+            elements[4]
+        );
         assert!(
             matches!(&elements[5], ChatElement::AssistantText { content, .. } if content == "It is local.")
         );

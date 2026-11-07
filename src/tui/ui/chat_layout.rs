@@ -647,4 +647,58 @@ mod tests {
         chat.end_text();
         assert_eq!(hits(&layout_of(&chat, 60), 60).len(), 0);
     }
+
+    /// Click the innermost collapsible region on `row`, as the mouse handler does.
+    fn click(chat: &mut ChatStream, row: usize, width: u16) {
+        let layout = layout_of(chat, width);
+        let region = layout
+            .collapse_regions()
+            .into_iter()
+            .filter(|r| row >= r.start && row < r.end)
+            .min_by_key(|r| r.end - r.start)
+            .expect("a collapsible region on the clicked row");
+        chat.toggle_expanded(&region.element_id);
+    }
+
+    fn rows(chat: &ChatStream, width: u16) -> Vec<String> {
+        let layout = layout_of(chat, width);
+        (0..layout.element_rows())
+            .filter_map(|row| layout.plain_line(row).map(str::to_string))
+            .collect()
+    }
+
+    #[test]
+    fn thinking_only_group_expands_its_thought() {
+        let mut chat = ChatStream::new();
+        chat.push_user("你好 こんにちは 안녕", Vec::new(), 0);
+        chat.push_thinking("先に考える 생각 first body");
+        chat.collapse_thinking();
+        chat.push_thinking("second body");
+        chat.fold_turn_work(4);
+        assert_eq!(rows(&chat, 60)[2], "✦ Worked for 4s ▸");
+        click(&mut chat, 2, 60);
+        let grouped = rows(&chat, 60);
+        assert_eq!(grouped[3], "◐ Thought for 0ms ▸", "{grouped:?}");
+        click(&mut chat, 3, 60);
+        let open = rows(&chat, 60);
+        assert!(open.iter().any(|l| l.contains("first body")), "{open:?}");
+        assert!(!open.iter().any(|l| l.contains("second body")), "{open:?}");
+    }
+
+    #[test]
+    fn single_thought_turn_is_its_own_row() {
+        let mut chat = ChatStream::new();
+        chat.push_user("你好 こんにちは 안녕", Vec::new(), 0);
+        chat.push_thinking("only body");
+        chat.fold_turn_work(4);
+        let folded = rows(&chat, 60);
+        assert!(
+            !folded.iter().any(|l| l.contains("Worked for")),
+            "{folded:?}"
+        );
+        assert_eq!(folded[2], "◐ Thought for 0ms ▸");
+        click(&mut chat, 2, 60);
+        let open = rows(&chat, 60);
+        assert!(open.iter().any(|l| l.contains("only body")), "{open:?}");
+    }
 }
