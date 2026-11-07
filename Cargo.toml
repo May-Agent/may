@@ -197,10 +197,13 @@ block2 = "0.6"
 objc2 = "0.6"
 objc2-app-kit = "0.3"
 objc2-foundation = "0.3"
-objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFDictionary", "CFNumber", "CFString"] }
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFDate", "CFDictionary", "CFNumber", "CFRunLoop", "CFString"] }
 objc2-core-video = { version = "0.3", default-features = false, features = ["std", "objc2-io-surface", "CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVPixelBufferIOSurface", "CVReturn"] }
 objc2-io-surface = { version = "0.3", default-features = false, features = ["std", "IOSurfaceRef"] }
 waterkit-screen = { git = "https://github.com/water-rs/waterkit", branch = "dev", default-features = false, features = ["display-stream"] }
+waterkit-permission = { git = "https://github.com/water-rs/waterkit", branch = "dev", default-features = false }
+waterkit-automation = { git = "https://github.com/water-rs/waterkit", branch = "dev", default-features = false }
+dispatch2 = { version = "0.3", default-features = false, features = ["std", "objc2"] }
 
 [build-dependencies]
 sha2 = "0.10"

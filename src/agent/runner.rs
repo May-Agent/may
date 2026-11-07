@@ -1088,7 +1088,9 @@ mod tests {
                         .is_some_and(|line| line.contains("/models"))
                     {
                         let _ = socket
-                            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                            .write_all(
+                                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            )
                             .await;
                         return;
                     }
@@ -1128,10 +1130,16 @@ mod tests {
         let baseline = context_report(&worker, TIMEOUT).await;
 
         let compact_handle = worker.compact(None);
-        tokio::time::timeout(TIMEOUT, request_rx.recv())
-            .await
-            .expect("compact request never reached the stub server")
-            .expect("stub server request channel closed");
+        match tokio::time::timeout(TIMEOUT, request_rx.recv()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => panic!("stub server request channel closed: {error}"),
+            Err(_) => {
+                let event = tokio::time::timeout(TIMEOUT, compact_handle.recv()).await;
+                panic!(
+                    "compact request never reached the stub server; the compaction sent {event:?}"
+                );
+            }
+        }
 
         compact_handle.cancel();
         match tokio::time::timeout(TIMEOUT, compact_handle.recv()).await {

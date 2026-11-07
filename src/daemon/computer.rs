@@ -69,16 +69,24 @@ pub(super) async fn computer_start(
 ) -> SkyResult<Json<ComputerStatus>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
     if let Some(permissions) = needs_permissions(&state).await? {
-        // An explicit start is the consent point: raise the TCC prompts,
-        // then respawn the helper so the next call sees a fresh grant.
+        // An explicit start is the consent point: the helper, which runs from
+        // its app bundle, raises the TCC prompts; then it respawns so the
+        // next call sees a fresh grant.
+        match rpc(&state, AgentRequest::RequestPermissions).await? {
+            AgentResponse::Ok => {}
+            AgentResponse::Error { error } => {
+                return Err(skyzen::Error::msg(error).set_status(StatusCode::INTERNAL_SERVER_ERROR));
+            }
+            _ => {
+                return Err(skyzen::Error::msg("unexpected reply from computer-agent")
+                    .set_status(StatusCode::INTERNAL_SERVER_ERROR));
+            }
+        }
         let computer = state.computer.clone();
-        tokio::task::spawn_blocking(move || {
-            computer.request_permissions()?;
-            computer.restart()
-        })
-        .await
-        .map_err(internal_error_message)?
-        .map_err(internal_error_message)?;
+        tokio::task::spawn_blocking(move || computer.restart())
+            .await
+            .map_err(internal_error_message)?
+            .map_err(internal_error_message)?;
         return Ok(Json(ComputerStatus {
             running: false,
             needs_permissions: Some(permissions),

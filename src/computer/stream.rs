@@ -28,9 +28,8 @@ use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSampl
 use crate::config::StreamCodec;
 
 use super::capture::{CapturedFrame, DisplayCapture};
-use super::input::{self, InputState};
 use super::proto::InputMessage;
-use super::{DisplayError, PlatformDisplay, SessionDisplay};
+use super::{DisplayError, SessionDisplay};
 use crate::video::{
     EncodedSample, EncoderControl, FRAME_QUEUE_CAPACITY, GateChange, OfferCodecError, RawFrame,
     SourceGate, StreamFormat, VideoCodec, encode_loop, encoder_control,
@@ -73,14 +72,13 @@ impl std::fmt::Debug for SessionStream {
 }
 
 struct StreamRuntime {
-    inputs: Arc<std::sync::Mutex<InputState>>,
     // Runs only while `peers` is non-empty (`sync_capture`). Its Drop stops
     // the display stream and its forwarder. The frame channel
     // closes with it, which ends the bridge, encoder and writer tasks.
     capture: DisplayCapture,
     capture_gate: SourceGate,
     // The display `DataChannel` input posts into.
-    display: Arc<PlatformDisplay>,
+    display: Arc<SessionDisplay>,
     // Set while the session's user is driving the desktop; `DataChannel`
     // input is dropped otherwise, as in the browser's takeover gate.
     takeover_active: Arc<AtomicBool>,
@@ -159,8 +157,7 @@ impl SessionStream {
     #[allow(clippy::significant_drop_tightening)]
     pub async fn start(
         &self,
-        display: Arc<PlatformDisplay>,
-        inputs: Arc<std::sync::Mutex<super::input::InputState>>,
+        display: Arc<SessionDisplay>,
         preference: StreamCodec,
     ) -> Result<(), DisplayError> {
         let mut guard = self.runtime.lock().await;
@@ -168,7 +165,7 @@ impl SessionStream {
             return Ok(());
         }
         let codec = select_codec(&display, preference)?;
-        self.start_locked(&mut guard, display, inputs, codec).await
+        self.start_locked(&mut guard, display, codec).await
     }
 
     /// Moves a running stream to the codec `preference` selects: its peers
@@ -185,17 +182,16 @@ impl SessionStream {
         let Some(running) = guard.as_ref() else {
             return Ok(());
         };
-        let (display, inputs) = (running.display.clone(), running.inputs.clone());
+        let display = running.display.clone();
         let codec = select_codec(&display, preference)?;
         *guard = None;
-        self.start_locked(&mut guard, display, inputs, codec).await
+        self.start_locked(&mut guard, display, codec).await
     }
 
     async fn start_locked(
         &self,
         guard: &mut Option<StreamRuntime>,
-        display: Arc<PlatformDisplay>,
-        inputs: Arc<std::sync::Mutex<super::input::InputState>>,
+        display: Arc<SessionDisplay>,
         codec: VideoCodec,
     ) -> Result<(), DisplayError> {
         let (webrtc_api, video_track) = codec
@@ -253,7 +249,6 @@ impl SessionStream {
         });
 
         *guard = Some(StreamRuntime {
-            inputs,
             capture,
             capture_gate: SourceGate::stopped(),
             display,
@@ -349,7 +344,6 @@ impl SessionStream {
             &peer,
             runtime.display.clone(),
             runtime.takeover_active.clone(),
-            runtime.inputs.clone(),
             self.runtime.clone(),
             peer_id.clone(),
         );
@@ -392,7 +386,7 @@ impl SessionStream {
 }
 
 fn select_codec(
-    display: &PlatformDisplay,
+    display: &SessionDisplay,
     preference: StreamCodec,
 ) -> Result<VideoCodec, DisplayError> {
     let (width, height) = display.size();
@@ -438,20 +432,18 @@ async fn forget_peer(runtime: &Mutex<Option<StreamRuntime>>, peer_id: &str) {
 }
 
 /// Routes a peer's `DataChannel` input into the display while takeover
-/// is held. Each channel carries its own held-button state so drags
+/// is held. The display holds the held-button state, so drags
 /// survive across messages.
 fn setup_input_channel(
     peer: &Arc<RTCPeerConnection>,
-    display: Arc<PlatformDisplay>,
+    display: Arc<SessionDisplay>,
     takeover_active: Arc<AtomicBool>,
-    inputs: Arc<std::sync::Mutex<super::input::InputState>>,
     runtime: Arc<Mutex<Option<StreamRuntime>>>,
     peer_id: String,
 ) {
     peer.on_data_channel(Box::new(move |dc: Arc<RTCDataChannel>| {
         let display = display.clone();
         let takeover_active = takeover_active.clone();
-        let inputs = inputs.clone();
         let runtime = runtime.clone();
         let peer_id = peer_id.clone();
         Box::pin(async move {
@@ -466,7 +458,6 @@ fn setup_input_channel(
             dc.on_message(Box::new(move |message: DataChannelMessage| {
                 let display = display.clone();
                 let takeover_active = takeover_active.clone();
-                let inputs = inputs.clone();
                 Box::pin(async move {
                     if !takeover_active.load(Ordering::Acquire) {
                         return;
@@ -474,12 +465,7 @@ fn setup_input_channel(
                     let Ok(input) = serde_json::from_slice::<InputMessage>(&message.data) else {
                         return;
                     };
-                    let mut state = inputs
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if let Err(error) = input::post_input(display.display_id(), input, &mut state) {
-                        tracing::debug!(%error, "computer input dropped");
-                    }
+                    display.queue_input(input).await;
                 })
             }));
         })

@@ -121,10 +121,25 @@ fn tokio_runtime() -> io::Result<tokio::runtime::Runtime> {
         .build()
 }
 
-fn main() -> anyhow::Result<()> {
-    tokio_runtime()
-        .context("failed to build the tokio runtime")?
-        .block_on(async_main())
+fn main() -> anyhow::Result<std::process::ExitCode> {
+    // The permission helper instances the computer agent launches run this
+    // same executable; they do their work and exit before anything else.
+    #[cfg(target_os = "macos")]
+    if let Some(code) = waterkit_permission::run_helper_entry_if_requested() {
+        return Ok(code);
+    }
+    let runtime = tokio_runtime().context("failed to build the tokio runtime")?;
+    // The computer agent's main thread services the run loop virtual
+    // displays are built on; everything else runs on a thread of its own.
+    #[cfg(target_os = "macos")]
+    if matches!(parse_cli_mode_from_env(), CliMode::ComputerAgent { .. }) {
+        may_agent::computer::main_thread::host(WORKER_STACK_BYTES, move || {
+            runtime.block_on(async_main())
+        })?;
+        return Ok(std::process::ExitCode::SUCCESS);
+    }
+    runtime.block_on(async_main())?;
+    Ok(std::process::ExitCode::SUCCESS)
 }
 
 /// Points this process's stderr at `path`, appending, so panics and the
@@ -264,21 +279,6 @@ async fn async_main() -> anyhow::Result<()> {
             {
                 let _ = may_dir;
                 return Err(anyhow::Error::msg("computer-agent needs macOS"));
-            }
-        }
-        CliMode::ComputerAgentProbe(request) => {
-            #[cfg(target_os = "macos")]
-            {
-                use std::io::Write;
-                let report =
-                    serde_json::to_vec(&may_agent::computer::permissions::probe(request).await)?;
-                std::io::stdout().write_all(&report)?;
-                return Ok(());
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                let _ = request;
-                return Err(anyhow::Error::msg("computer-agent-probe needs macOS"));
             }
         }
         CliMode::Browser(args) => std::process::exit(run_browser(args).await?),

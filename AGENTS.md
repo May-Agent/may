@@ -119,7 +119,7 @@ May is a terminal-based AI assistant built as an application layer on the **aith
 
 **`src/client/`** - `DaemonClient`: REST over the unix socket, and the `/api/events` SSE parser
 
-**`src/repo_search/`** - Code, session and issue search through the repo-search daemon (`search` command, `may-sessions` / `may-issues-*` collections, the SQLite `search_outbox`, auto-indexing of frequently used repos)
+**`src/repo_search/`** - The repo-search daemon client. Its `search` command searches code only; sessions are searched with `session search` and issues with `issue search`, each over its own collection (`may-sessions`, `may-issues-*`). Also the SQLite `search_outbox` and auto-indexing of frequently used repos
 
 **`src/session/`** - Session lifecycle
 - `manager.rs`: Creates/loads/lists sessions, manages current session
