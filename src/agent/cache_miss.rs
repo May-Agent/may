@@ -196,6 +196,7 @@ pub const fn block_kind(block: PrefixBlock) -> &'static str {
             Role::User => "user",
             Role::Assistant => "assistant",
             Role::Tool => "tool",
+            Role::Configuration => "configuration",
         },
     }
 }

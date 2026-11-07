@@ -10,7 +10,7 @@
 use std::time::{Duration, Instant};
 
 use aither_sandbox::{
-    Delivery, JobInfo, JobPlace, JobStatus, KillCause, MemoryDomain, TerminalMode,
+    Delivery, JobInfo, JobPlace, JobStatus, KillCause, MemoryDomain, ScriptLanguage, TerminalMode,
 };
 use serde::{Deserialize, Serialize};
 
@@ -233,6 +233,9 @@ pub struct WireJob {
     pub execution_key: String,
     /// The script it runs.
     pub script: String,
+    /// The language of the script.
+    #[schema(value_type = String)]
+    pub language: ScriptLanguage,
     /// Permission mode.
     #[schema(value_type = String)]
     pub mode: TerminalMode,
@@ -266,6 +269,7 @@ impl From<&JobInfo> for WireJob {
             task_id: job.task_id.clone(),
             execution_key: job.execution_key.clone(),
             script: job.script.clone(),
+            language: job.language,
             mode: job.mode,
             elapsed_ms: elapsed_ms(job.started_at),
             status: (&job.status).into(),
@@ -282,6 +286,7 @@ impl From<WireJob> for JobInfo {
             task_id: job.task_id,
             execution_key: job.execution_key,
             script: job.script,
+            language: job.language,
             mode: job.mode,
             started_at: started_at(job.elapsed_ms),
             status: job.status.into(),
@@ -593,6 +598,7 @@ mod tests {
             task_id: "t".into(),
             execution_key: "k".into(),
             script: "sleep 1".into(),
+            language: ScriptLanguage::Shell,
             mode: TerminalMode::Sandboxed,
             elapsed_ms: 0,
             status,
@@ -620,6 +626,7 @@ mod tests {
             task_id: "t1".into(),
             execution_key: "k".into(),
             script: "sleep 30".into(),
+            language: ScriptLanguage::Shell,
             mode: TerminalMode::Sandboxed,
             started_at: Instant::now()
                 .checked_sub(Duration::from_secs(5))

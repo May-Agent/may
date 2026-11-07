@@ -687,6 +687,7 @@ impl Redactions {
                         self.redact_json(&mut call.arguments);
                     }
                 }
+                Message::Configuration { .. } => {}
             }
         }
     }

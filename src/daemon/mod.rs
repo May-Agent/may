@@ -54,6 +54,8 @@ pub(crate) mod types;
 #[cfg(test)]
 mod funnel_tests;
 #[cfg(test)]
+mod issue_brief_tests;
+#[cfg(test)]
 mod paths_tests;
 #[cfg(test)]
 mod repo_clones_tests;

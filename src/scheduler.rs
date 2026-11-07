@@ -460,6 +460,7 @@ impl PermissionHandler for SchedulerPermissionHandler {
         &self,
         _mode: TerminalMode,
         _script: &str,
+        _language: aither_sandbox::ScriptLanguage,
     ) -> impl Future<Output = Result<bool, PermissionError>> + Send {
         std::future::ready(Ok(true))
     }
@@ -1782,6 +1783,7 @@ async fn run_terminal_command(
         .run_background(TerminalArgs {
             description: "run the scheduled task script".to_string(),
             script,
+            language: aither_sandbox::ScriptLanguage::Shell,
             mode,
             ssh_server_id,
             expect: OutputFormat::Text,

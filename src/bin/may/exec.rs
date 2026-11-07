@@ -153,6 +153,7 @@ pub async fn run_exec(args: ExecArgs) -> Result<i32, ExecError> {
         .run_background(TerminalArgs {
             description: "execute the requested shell command".to_string(),
             script: args.script,
+            language: aither_sandbox::ScriptLanguage::Shell,
             mode: shell_mode,
             ssh_server_id: args.ssh_server_id,
             expect: OutputFormat::Text,

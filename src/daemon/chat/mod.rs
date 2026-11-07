@@ -2676,6 +2676,7 @@ const fn map_llm_role(role: LlmRole) -> &'static str {
         LlmRole::Assistant => "assistant",
         LlmRole::System => "system",
         LlmRole::Tool => "tool",
+        LlmRole::Configuration => "configuration",
     }
 }
 
