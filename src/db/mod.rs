@@ -1401,6 +1401,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deleting_a_profile_moves_its_sessions_to_the_default_profile() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db should initialize successfully");
+        let default_id = db
+            .ensure_default_profiles()
+            .await
+            .expect("default profiles should exist");
+        db.create_profile(CreateProfileParams {
+            id: "doomed",
+            name: "Doomed",
+            environment: ProfileEnvironmentKind::Local,
+            slug: None,
+            icon: None,
+            persona: None,
+            preferences: None,
+            location_aware: false,
+        })
+        .await
+        .expect("profile should be created");
+        db.create_session_in_profile("s1", Some("one"), None, Some("doomed"))
+            .await
+            .expect("session should be created");
+
+        db.delete_profile("doomed")
+            .await
+            .expect("a non-default profile can be deleted");
+
+        assert!(
+            db.get_profile("doomed")
+                .await
+                .expect("profile query")
+                .is_none()
+        );
+        let session = db
+            .get_session("s1")
+            .await
+            .expect("session query")
+            .expect("session survives");
+        assert_eq!(session.profile_id.as_deref(), Some(default_id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn the_default_profile_cannot_be_deleted() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db should initialize successfully");
+        let default_id = db
+            .ensure_default_profiles()
+            .await
+            .expect("default profiles should exist");
+
+        let error = db
+            .delete_profile(&default_id)
+            .await
+            .expect_err("the default profile is protected");
+        assert!(matches!(
+            error,
+            crate::db::ChatDbError::DefaultProfileProtected
+        ));
+        assert!(
+            db.get_profile(&default_id)
+                .await
+                .expect("profile query")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
     async fn profile_remote_attachments_round_trip() {
         let dir = tempdir().expect("temp dir should be created");
         let db_path = dir.path().join("history.db");

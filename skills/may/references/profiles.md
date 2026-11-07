@@ -15,7 +15,7 @@ A profile groups sessions and sets where their agents run. Three exist from the 
 ## Managing them
 
 - Web UI: Settings > Profiles, or New profile in the sidebar (name, persona; environment and the other fields in settings). TUI: `/profile` or Ctrl+P to switch; creating and editing is done in the web UI.
-- Deleting a profile moves its sessions to no profile (they fall back to the default) and deletes its folders.
+- Deleting a profile moves its sessions to the default profile (Build) and deletes its folders. The default profile cannot be deleted.
 - Changing profiles re-evaluates remote access (see `remote-access.md`).
 
 ## Session organisation
