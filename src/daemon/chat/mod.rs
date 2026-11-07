@@ -5080,6 +5080,64 @@ mod tests {
         }
     }
 
+    /// `/sleep` cancels the suggestions in flight and clears the shown ones;
+    /// none is generated until the user wakes.
+    #[tokio::test]
+    async fn sleeping_clears_shown_suggestions_and_blocks_new_ones() {
+        use crate::daemon::sleep::{SleepRequest, start_sleep};
+        use skyzen::utils::{Json, State};
+
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let provider = stub_provider(vec![sse_text("Good night")]).await;
+        let unused = stub_provider(vec![sse_text("unused")]).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let state = failover_state(may_dir.path(), &provider, &unused).await;
+
+        // A composer is attached and shows a suggestion; another one is
+        // still being generated.
+        let subscription = state.turn_hub.subscribe("session", None);
+        state.turn_hub.publish(
+            "session",
+            "session_suggestion",
+            r#"{"requestId":1,"sessionId":"session","state":"ready","text":"run the tests"}"#
+                .into(),
+        );
+        let request_id = state.aux_tasks.start(
+            "session",
+            super::aux::AuxKind::Suggestion,
+            |_| std::future::pending(),
+            &state.tokio_handle,
+        );
+        let shown = subscription.next().await.expect("the shown suggestion");
+        assert_eq!(shown.len(), 1);
+
+        start_sleep(
+            Json(SleepRequest {
+                session_id: "session".to_string(),
+            }),
+            State(state.clone()),
+        )
+        .await
+        .expect("/sleep starts");
+        // The `/sleep` turn itself supersedes the composer; what the sleep
+        // state publishes on its own is what follows.
+        subscription.take_unread().expect("subscribed");
+        super::suggest::apply_settings(&state);
+
+        assert!(!state.aux_tasks.is_current("session", request_id));
+        let frames = subscription.take_unread().expect("subscribed");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].kind, "session_suggestion");
+        let cleared: serde_json::Value = serde_json::from_str(&frames[0].data).expect("json");
+        assert_eq!(cleared["state"], "cleared");
+        assert_eq!(cleared["sessionId"], "session");
+
+        // A turn that completes while asleep schedules nothing.
+        super::suggest::maybe_suggest(&state, "session");
+        assert!(!super::suggest::suggestions_allowed(&state));
+        assert!(!state.aux_tasks.is_current("session", request_id + 1));
+    }
+
     /// `/sleep` on a session whose turn is running succeeds and is taken by
     /// the session's next request, carrying the same requirements.
     #[tokio::test]
