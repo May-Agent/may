@@ -329,16 +329,26 @@ export interface SseDone {
   seq: number;
   turnId: string;
   sessionId: string;
+  /** The reply, under the id of the first assistant message the turn stored. */
   assistant: ApiMessage;
+  /** The stored user message the turn answers, as the session's messages name it. */
+  userMessageId: string | null;
+  /** Every assistant message the turn stored, as the session's messages name them. */
+  messageIds: string[];
 }
 
-/** The turn paused for a browser takeover; carries the partial reply. */
+/**
+ * The turn paused for a browser takeover; carries the partial reply, which
+ * is absent when the pause came before the turn stored one.
+ */
 export interface SsePaused {
   kind: 'paused';
   seq: number;
   turnId: string;
   sessionId: string;
-  assistant: ApiMessage;
+  assistant: ApiMessage | null;
+  userMessageId: string | null;
+  messageIds: string[];
 }
 
 /** Last event of every turn, however it ended. */
@@ -387,6 +397,19 @@ export interface SseRetract {
   turnId: string;
 }
 
+/**
+ * The turn was stopped before any tool call or response text: the daemon
+ * withdrew it, so its message left the conversation. The client that sent
+ * the message puts it back into its composer.
+ */
+export interface SseWithdrawn {
+  kind: 'withdrawn';
+  seq: number;
+  turnId: string;
+  content: string;
+  attachments: ApiAttachment[];
+}
+
 export type ChatStreamEvent =
   | SseStart
   | SseText
@@ -404,7 +427,8 @@ export type ChatStreamEvent =
   | SsePing
   | SseSpeed
   | SseHold
-  | SseRetract;
+  | SseRetract
+  | SseWithdrawn;
 
 // ── UI event stream /api/events ─────────────────────────────
 

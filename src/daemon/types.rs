@@ -169,7 +169,25 @@ pub struct SseDoneEvent {
     pub(crate) seq: u64,
     pub(crate) turn_id: String,
     pub(crate) session_id: String,
+    /// The stored user message the turn answers, named as REST names it.
+    pub(crate) user_message_id: Option<String>,
+    /// Every assistant message the turn stored, named as REST names them;
+    /// `assistant` carries the first.
+    pub(crate) message_ids: Vec<String>,
     pub(crate) assistant: ApiMessage,
+}
+
+/// A turn a browser takeover paused. It carries the reply only when the
+/// turn stored one before the pause.
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SsePausedEvent {
+    pub(crate) seq: u64,
+    pub(crate) turn_id: String,
+    pub(crate) session_id: String,
+    pub(crate) user_message_id: Option<String>,
+    pub(crate) message_ids: Vec<String>,
+    pub(crate) assistant: Option<ApiMessage>,
 }
 
 #[derive(Debug, serde::Serialize, skyzen::ToSchema)]
@@ -724,7 +742,7 @@ pub struct MemoryPayload {
     pub(crate) content: String,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ApiAttachment {
     pub(crate) id: String,

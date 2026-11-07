@@ -78,6 +78,14 @@ pub enum TuiEvent {
     /// The text streamed so far is discarded: the attempt failed and the
     /// prompt is resubmitted.
     Retract,
+    /// The daemon withdrew the turn: it was stopped before any tool call or
+    /// response text, so its message left the conversation.
+    Withdrawn {
+        /// The withdrawn message text.
+        content: String,
+        /// Whether this client sent it and gets it back in its input.
+        own: bool,
+    },
     /// Agent stream completed (ready for next prompt).
     Complete,
     /// Agent encountered a fatal error.

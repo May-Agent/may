@@ -672,6 +672,22 @@ impl ChatStream {
         true
     }
 
+    /// Drop the latest user message whose text is `content`, with everything
+    /// after it (the turn's output and markers) — the stream's half of a
+    /// withdrawn turn. Returns that message's attachments, `None` when no
+    /// such message is shown.
+    pub fn withdraw_last_prompt(&mut self, content: &str) -> Option<Vec<Attachment>> {
+        let pos = self.elements.iter().rposition(
+            |elem| matches!(elem, ChatElement::UserMessage { content: shown, .. } if shown == content),
+        )?;
+        let removed = self.elements.drain(pos..).next();
+        self.revisions.truncate(pos);
+        match removed {
+            Some(ChatElement::UserMessage { attachments, .. }) => Some(attachments),
+            _ => unreachable!("rposition matched a user message"),
+        }
+    }
+
     fn pop_last(&mut self) {
         self.elements.pop();
         self.revisions.pop();
@@ -856,11 +872,12 @@ impl ChatStream {
             .rposition(|e| matches!(e, ChatElement::UserMessage { .. }))
             .map_or(self.fold_cursor, |i| (i + 1).max(self.fold_cursor));
         // The reply ends the turn: everything before its last block is work.
+        // A reply that is the turn's first element leaves nothing to fold.
         let end = self
             .elements
             .iter()
             .rposition(|e| matches!(e, ChatElement::AssistantText { .. }))
-            .filter(|index| *index > start)
+            .filter(|index| *index >= start)
             .unwrap_or(self.elements.len());
         if end <= start {
             return;
@@ -4421,6 +4438,27 @@ mod tests {
     /// or whole, every table row on screen has its borders at the
     /// header's columns, one rule is drawn, and no cell text spills onto
     /// a row outside the table.
+    /// A withdrawn turn takes its user bubble and everything the turn
+    /// showed after it; earlier prompts stay.
+    #[test]
+    fn withdrawing_a_prompt_removes_its_bubble_and_markers() {
+        let mut chat = ChatStream::new();
+        chat.push_user("earlier", Vec::new(), 0);
+        chat.push_text("answer");
+        chat.end_text();
+        chat.push_user("你好 こんにちは 안녕하세요", Vec::new(), 2);
+        chat.push_text("\n\n[Interrupted]");
+        chat.end_text();
+
+        assert!(chat.withdraw_last_prompt("never sent").is_none());
+        let attachments = chat.withdraw_last_prompt("你好 こんにちは 안녕하세요");
+        assert_eq!(attachments.map(|a| a.len()), Some(0));
+        let targets = chat.rewind_targets();
+        assert_eq!(targets.len(), 1, "only the earlier prompt remains");
+        assert_eq!(targets[0].content, "earlier");
+        assert_eq!(chat.elements.len(), 2, "the earlier prompt and its answer");
+    }
+
     #[test]
     fn wide_table_reply_stays_aligned_on_screen() {
         use crate::tui::ui::test_screen::ScreenBackend as TestBackend;
@@ -5494,6 +5532,30 @@ mod tests {
                 .iter()
                 .any(|element| matches!(element, ChatElement::WorkedFor { .. }))
         );
+    }
+
+    /// A turn whose reply is its only output keeps the reply visible and
+    /// gets no folded row: there is no work before it.
+    #[test]
+    fn a_reply_only_turn_keeps_its_reply_outside_the_fold() {
+        let mut chat = ChatStream::new();
+        chat.push_user("你知道吗 知っていますか 알아요?", Vec::new(), 0);
+        chat.push_text("知道。はい。네.");
+        chat.end_text();
+        chat.fold_turn_work(7);
+
+        assert!(
+            !chat
+                .elements
+                .iter()
+                .any(|element| matches!(element, ChatElement::WorkedFor { .. })),
+            "{:#?}",
+            chat.elements
+        );
+        assert!(matches!(
+            chat.elements.last(),
+            Some(ChatElement::AssistantText { content, .. }) if content == "知道。はい。네."
+        ));
     }
 
     #[test]

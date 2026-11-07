@@ -40,7 +40,13 @@ export type TurnSegment =
 export interface TurnState {
   turnId: string;
   sessionId: string;
+  /**
+   * Names the reply while it streams; once the turn is done, the id of its
+   * first stored assistant message, which the session's messages carry too.
+   */
   assistantId: string;
+  /** Ids of the assistant messages the finished turn stored. */
+  messageIds: string[];
   text: string;
   reasoning: string;
   /**
@@ -76,6 +82,7 @@ export function emptyTurn(
     turnId,
     sessionId,
     assistantId,
+    messageIds: [],
     text: '',
     reasoning: '',
     reasoningMs: null,
@@ -269,7 +276,9 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
 
     case 'done':
     case 'paused': {
-      const finalText = event.assistant.content || state.text;
+      // A turn paused before it stored a reply has none to carry.
+      const reply = event.assistant;
+      const finalText = reply?.content || state.text;
       const hasTextSegment = state.segments.some((s) => s.kind === 'text');
       const segments =
         !hasTextSegment && finalText.length > 0
@@ -277,6 +286,8 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
           : state.segments;
       return {
         ...state,
+        assistantId: reply?.id ?? state.assistantId,
+        messageIds: event.messageIds,
         text: finalText,
         segments,
         status: 'done',
@@ -297,6 +308,10 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
       const { kind: _kind, seq: _seq, turnId: _turnId, ...hold } = event;
       return { ...state, hold, lastSeq: event.seq };
     }
+
+    // The turn's message leaves the conversation; the stores handle it.
+    case 'withdrawn':
+      return { ...state, lastSeq: event.seq };
 
     case 'retract':
       return {
