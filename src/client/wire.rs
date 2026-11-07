@@ -501,6 +501,16 @@ pub enum SessionAgentBody {
     /// The text the run streamed so far is discarded: its attempt failed and
     /// the prompt is resubmitted.
     Retract,
+    /// The daemon withdrew the turn: it was stopped before any tool call or
+    /// response text, so its message left the conversation, stored history
+    /// and the agent's context. The client that sent it puts it back into
+    /// its input; every client removes the message and the turn's markers.
+    Withdrawn {
+        /// The message text.
+        content: String,
+        /// The message's attachments.
+        attachments: Vec<crate::daemon::types::ApiAttachment>,
+    },
     /// The run ended.
     End {
         /// How it ended.

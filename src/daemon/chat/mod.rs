@@ -2,6 +2,7 @@ mod aux;
 mod background;
 mod hosts;
 mod hub;
+mod progress;
 mod recap;
 mod request_ledger;
 mod retry;
@@ -17,6 +18,7 @@ pub use hosts::{
     ParkedAgents, btw, compact_session, context_dump, context_report, release_agent, usage_report,
 };
 pub use hub::{TurnFrame, TurnHub, TurnSubscription};
+pub use progress::{ProgressReport, progress};
 pub use recap::{RecapRecord, RecapSchedules, recap_session};
 mod tool_dispatch;
 mod turn_events;
@@ -72,11 +74,11 @@ use super::state::{DaemonState, UiToolQueues};
 use super::terminal_parsing::update_terminal_snapshot_from_tool_event;
 use super::title_generation;
 use super::types::{
-    ApiErrorCode, ApiMessage, ChatRequest, PendingMessageKind, RemovePendingMessageRequest,
-    RequestLogEntry, RequestStats, SessionRuntimeResponse, SseChunkEvent, SseDoneEvent,
-    SseErrorEvent, SseHoldEvent, SsePausedEvent, SseSpeedEvent, SseStartEvent, SseTodoUpdateEvent,
-    SseToolDeltaEvent, SseToolEndEvent, SseToolStartEvent, TerminalStateSnapshot, ToolEventRecord,
-    ToolVariant,
+    ApiAttachment, ApiErrorCode, ApiMessage, ChatRequest, PendingMessageKind,
+    RemovePendingMessageRequest, RequestLogEntry, RequestStats, SessionRuntimeResponse,
+    SseChunkEvent, SseDoneEvent, SseErrorEvent, SseHoldEvent, SsePausedEvent, SseSpeedEvent,
+    SseStartEvent, SseTodoUpdateEvent, SseToolDeltaEvent, SseToolEndEvent, SseToolStartEvent,
+    TerminalStateSnapshot, ToolEventRecord, ToolVariant,
 };
 use crate::decode_meter::DecodeMeter;
 
@@ -188,6 +190,15 @@ trait ChatSink {
     /// failed and the prompt is resubmitted.
     fn on_retract(&mut self) -> impl Future<Output = bool> + Send {
         async { true }
+    }
+    /// The turn was stopped before any tool call or response text and is
+    /// withdrawn: its message left stored history and the agent's context.
+    fn on_withdrawn(
+        &mut self,
+        _content: &str,
+        _attachments: &[ApiAttachment],
+    ) -> impl Future<Output = ()> + Send {
+        async {}
     }
     fn on_error(
         &mut self,
@@ -303,6 +314,17 @@ struct SseTranslatedEvent<'a> {
 struct SseRetractEvent<'a> {
     seq: u64,
     turn_id: &'a str,
+}
+
+/// `session_turn` frame withdrawing the turn: the message it answered left
+/// the conversation, and the sender gets its text and attachments back.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SseWithdrawnEvent<'a> {
+    seq: u64,
+    turn_id: &'a str,
+    content: &'a str,
+    attachments: &'a [ApiAttachment],
 }
 
 /// `session_turn` frame closing a reasoning phase: `seconds` is its length
@@ -541,6 +563,23 @@ impl ChatSink for HubSink {
         true
     }
 
+    async fn on_withdrawn(&mut self, content: &str, attachments: &[ApiAttachment]) {
+        let seq = self.next_seq();
+        self.publish_turn(
+            "withdrawn",
+            &SseWithdrawnEvent {
+                seq,
+                turn_id: &self.turn_id,
+                content,
+                attachments,
+            },
+        );
+        self.publish_agent(crate::client::SessionAgentBody::Withdrawn {
+            content: content.to_string(),
+            attachments: attachments.to_vec(),
+        });
+    }
+
     async fn on_retract(&mut self) -> bool {
         let seq = self.next_seq();
         self.publish_turn(
@@ -616,9 +655,12 @@ async fn wait_or_cancel(guard: &SessionRunGuard, wait: Duration) -> Result<(), &
     }
 }
 
+/// Why a run the user stopped reports it ended.
+const USER_CANCELLED: &str = "run cancelled by user";
+
 const fn cancellation_reason_of<E>(cancel: &Result<CancelReason, E>) -> &'static str {
     match cancel {
-        Ok(CancelReason::User) => "run cancelled by user",
+        Ok(CancelReason::User) => USER_CANCELLED,
         Ok(CancelReason::DaemonRestarting) => "run interrupted: the daemon is restarting",
         Err(_) => "run cancellation channel closed unexpectedly",
     }
@@ -1782,6 +1824,9 @@ fn run_agent_loop<'a>(
         let mut turn_hidden_context_xml: Option<String> = None;
         // The stored user message, from the first attempt.
         let mut turn_user_message_id: Option<i32> = None;
+        // Whether the turn consumed the pending takeover-ended alert, which
+        // a withdrawal gives back.
+        let mut turn_consumed_takeover_alert = false;
         // The largest history row id before this turn persists anything. A
         // retry that resubmits the prompt rebuilds context only up to it,
         // so the rows the turn itself wrote are not fed back alongside the
@@ -1830,6 +1875,7 @@ fn run_agent_loop<'a>(
                 provider_candidate_count,
                 build_key,
                 user_message_id,
+                takeover_alert_consumed,
                 reasoning_effort,
             } = match prepare_agent_for_request(
                 state,
@@ -1888,6 +1934,7 @@ fn run_agent_loop<'a>(
             if user_message_id.is_some() {
                 turn_user_message_id = user_message_id;
             }
+            turn_consumed_takeover_alert |= takeover_alert_consumed;
             sink.on_prepared(turn_user_message_id);
             if let Some(hidden_context_xml) = hidden_context_xml {
                 turn_hidden_context_xml = Some(hidden_context_xml);
@@ -1974,6 +2021,7 @@ fn run_agent_loop<'a>(
                 },
             )
             .await;
+            let took_action = turn.took_action();
             let turn_events::TurnEvents {
                 sink: _,
                 usage,
@@ -2225,7 +2273,40 @@ fn run_agent_loop<'a>(
             }
 
             if let Some(reason) = cancellation_reason {
-                if reason == "run cancelled by user" {
+                // A user stop before any tool call or response text
+                // withdraws the turn. A message taken from the queue is not
+                // withdrawn: no client holds it to put back.
+                if reason == USER_CANCELLED
+                    && !took_action
+                    && !kind.is_resume()
+                    && req.pending_entry_id.is_none()
+                    && turn_user_message_id.is_some()
+                {
+                    // The rows the turn added, the user message and the
+                    // hidden context before it. The model transcript holds
+                    // nothing of the turn: checkpoints are written only at
+                    // a tool-cycle boundary or a finished run, and this
+                    // run reached neither. The agent is dropped with the
+                    // cancelled run, so the next turn rebuilds its context
+                    // from that transcript.
+                    state
+                        .db()
+                        .delete_messages_from(session_id.as_str(), i64::from(turn_boundary) + 1)
+                        .await?;
+                    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
+                    // The alert's row went with the turn; the model has yet
+                    // to see it, so the next turn delivers it.
+                    if turn_consumed_takeover_alert {
+                        state
+                            .runtime_service
+                            .restore_browser_takeover_alert_pending(session_id.as_str())
+                            .await?;
+                    }
+                    sink.on_withdrawn(&req.content, &req.attachments).await;
+                    record_request_log(state, ledger.interrupted(Instant::now(), reason)).await;
+                    return Err(AgentLoopError::Cancelled(reason));
+                }
+                if reason == USER_CANCELLED {
                     let killed = agent.kill_running_terminal_jobs().await;
                     tracing::info!(
                         session_id = %session_id,
@@ -2673,6 +2754,8 @@ fn enqueue_event_triggered_tasks(
 struct SessionContext {
     /// Row id of the user message this turn stored, when it stored one.
     user_message_id: Option<i32>,
+    /// Whether preparing the turn consumed the pending takeover-ended alert.
+    takeover_alert_consumed: bool,
     session_id: SessionId,
     current_model: String,
     provider_candidate_count: usize,
@@ -2716,6 +2799,8 @@ struct PreparedAgent {
     build_key: u64,
     /// Row id of the user message this turn stored, when it stored one.
     user_message_id: Option<i32>,
+    /// Whether preparing the turn consumed the pending takeover-ended alert.
+    takeover_alert_consumed: bool,
     /// Reasoning effort resolved for this turn's requests.
     reasoning_effort: Option<aither_core::llm::model::ReasoningEffort>,
 }
@@ -3016,7 +3101,9 @@ async fn resolve_session_context(
     let mut hidden_commit_entry = req
         .pending_entry_id
         .filter(|_| persist_user_message && !request_has_visible_user_input(req));
-    if persist_user_message && take_over_alert_pending(state, &session_id).await {
+    let takeover_alert_consumed =
+        persist_user_message && take_over_alert_pending(state, &session_id).await;
+    if takeover_alert_consumed {
         push_hidden_context_part(
             &db,
             fence,
@@ -3156,6 +3243,7 @@ async fn resolve_session_context(
 
     Ok(SessionContext {
         user_message_id,
+        takeover_alert_consumed,
         session_id,
         current_model,
         provider_candidate_count,
@@ -3441,6 +3529,18 @@ fn agent_messaging(state: &Arc<DaemonState>) -> crate::agent_link::AgentMessagin
             },
         ),
         runtime_service: state.runtime_service.clone(),
+        cache_lifetime: {
+            let state = state.clone();
+            crate::agent_link::CacheLifetimes::new(move |provider_id: &str| {
+                state
+                    .config
+                    .load()
+                    .provider
+                    .get(provider_id)
+                    .map(|instance| instance.cache_lifetime)
+                    .unwrap_or_default()
+            })
+        },
     }
 }
 
@@ -3558,6 +3658,7 @@ fn prepare_agent_for_request<'a>(
             provider_candidate_count: ctx.provider_candidate_count,
             build_key,
             user_message_id: ctx.user_message_id,
+            takeover_alert_consumed: ctx.takeover_alert_consumed,
             reasoning_effort: ctx.reasoning_effort,
         })
     })
@@ -4207,6 +4308,8 @@ mod tests {
         notes: Option<async_channel::Sender<Note>>,
         /// How many times the run showed the text `WAKE_TEXT` as an agent event.
         wake_texts: usize,
+        /// The message texts the run withdrew.
+        withdrawn: Vec<String>,
     }
 
     /// The text of the background event a test resume turn opens with.
@@ -4297,6 +4400,14 @@ mod tests {
         fn on_retract(&mut self) -> impl Future<Output = bool> + Send {
             self.note(Note::Retract);
             std::future::ready(true)
+        }
+        fn on_withdrawn(
+            &mut self,
+            content: &str,
+            _attachments: &[crate::daemon::types::ApiAttachment],
+        ) -> impl Future<Output = ()> + Send {
+            self.withdrawn.push(content.to_string());
+            std::future::ready(())
         }
         fn on_error(
             &mut self,
@@ -5713,5 +5824,216 @@ mod tests {
                 "transcript seqs are aither's own seqs"
             );
         }
+    }
+
+    /// Stops a turn whose provider stream opens with `partial` and then
+    /// stalls, once the run has had time to take it in.
+    async fn stop_stalled_turn(
+        partial: String,
+    ) -> (
+        std::sync::Arc<DaemonState>,
+        TestSink,
+        Result<super::AgentRunResult, super::AgentLoopError>,
+        tempfile::TempDir,
+    ) {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let provider = stub_provider(vec![format!("stall:{partial}")]).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let state = failover_state(may_dir.path(), &provider, &provider).await;
+        let mut sink = TestSink::default();
+        let stop = async {
+            last_body(&provider, 1).await;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            assert!(
+                state
+                    .runtime_service
+                    .runs()
+                    .cancel("session", crate::session::CancelReason::User),
+                "the run is live"
+            );
+        };
+        let (result, ()) = tokio::join!(run_prompt_turn(&state, &mut sink), stop);
+        (state, sink, result, may_dir)
+    }
+
+    fn user_rows(history: &crate::session::ChatHistory) -> Vec<String> {
+        history
+            .messages()
+            .iter()
+            .filter(|m| matches!(m.role, super::MessageRole::User))
+            .map(|m| m.content.clone())
+            .collect()
+    }
+
+    /// A stop before any tool call or response text withdraws the turn:
+    /// stored history, the model transcript and an agent rebuilt for the next
+    /// turn hold nothing of the message.
+    #[tokio::test]
+    async fn a_stop_during_thinking_withdraws_the_turn() {
+        let thinking = sse_chunk(
+            &serde_json::json!({
+                "choices": [{"index": 0, "delta": {"reasoning_content": "let me think"}}]
+            })
+            .to_string(),
+        );
+        let (state, sink, result, _dir) = stop_stalled_turn(thinking).await;
+        assert!(
+            matches!(result, Err(super::AgentLoopError::Cancelled(_))),
+            "the turn was stopped"
+        );
+        assert_eq!(sink.withdrawn, vec!["hello".to_string()]);
+
+        let history = crate::session::load_history_from_db(&state.db(), "session")
+            .await
+            .expect("history");
+        assert!(user_rows(&history).is_empty(), "no user row remains");
+        assert!(
+            history.messages().is_empty(),
+            "nothing the turn added remains"
+        );
+
+        let entries = state
+            .db()
+            .transcript_entries_after("session", -1)
+            .await
+            .expect("transcript");
+        assert!(
+            entries.iter().all(|entry| !format!(
+                "{:?}",
+                rmp_serde::from_slice::<aither_core::llm::Message>(&entry.message_blob)
+            )
+            .contains("hello")),
+            "the model transcript holds nothing of the message"
+        );
+
+        // The next turn's agent, rebuilt from storage.
+        let guard = state
+            .runtime_service
+            .runs()
+            .acquire("session")
+            .await
+            .expect("acquire run");
+        let req = ChatRequest {
+            session_id: "session".to_string(),
+            content: String::new(),
+            attachments: Vec::new(),
+            hidden_context_xml: None,
+            delivery_mode: crate::session::PendingUserMessageMode::default(),
+            pending_entry_id: None,
+        };
+        let config = state.config_snapshot();
+        let ctx = resolve_session_context(&state, &req, guard.fence(), false, true, None)
+            .await
+            .expect("context resolves");
+        let mut agent = build_session_agent(&state, &config, &ctx, guard.fence(), 0)
+            .await
+            .expect("agent builds from storage");
+        let checkpoint = agent.export_checkpoint().await.expect("checkpoint");
+        assert!(
+            checkpoint
+                .context
+                .items()
+                .iter()
+                .all(|item| !format!("{:?}", item.message()).contains("hello")),
+            "the agent's context holds nothing of the message"
+        );
+    }
+
+    /// The takeover-ended alert a withdrawn turn consumed is still pending:
+    /// its row left with the turn, and the next turn's request carries it.
+    #[tokio::test]
+    async fn a_withdrawn_turn_gives_back_the_takeover_alert() {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let thinking = sse_chunk(
+            &serde_json::json!({
+                "choices": [{"index": 0, "delta": {"reasoning_content": "let me think"}}]
+            })
+            .to_string(),
+        );
+        let provider = stub_provider(vec![format!("stall:{thinking}"), sse_text("ok")]).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let state = failover_state(may_dir.path(), &provider, &provider).await;
+        // The session's browser takeover ended, so the alert is pending.
+        state
+            .runtime_service
+            .restore_browser_takeover_alert_pending("session")
+            .await
+            .expect("alert marked pending");
+
+        let alert = super::browser_takeover_alert();
+        let first_line = alert.lines().next().expect("the alert has text");
+        let escaped = serde_json::to_string(first_line).expect("encodes");
+        let fragment = escaped.trim_matches('"');
+
+        let mut sink = TestSink::default();
+        let stop = async {
+            let body = last_body(&provider, 1).await;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            assert!(
+                state
+                    .runtime_service
+                    .runs()
+                    .cancel("session", crate::session::CancelReason::User),
+                "the run is live"
+            );
+            body
+        };
+        let (result, withdrawn_body) = tokio::join!(run_prompt_turn(&state, &mut sink), stop);
+        assert!(matches!(result, Err(super::AgentLoopError::Cancelled(_))));
+        assert_eq!(sink.withdrawn, vec!["hello".to_string()]);
+        assert!(
+            withdrawn_body.contains(fragment),
+            "the withdrawn turn consumed the alert"
+        );
+
+        let mut next = TestSink::default();
+        run_prompt_turn(&state, &mut next)
+            .await
+            .expect("the next turn completes");
+        let body = last_body(&provider, 1).await;
+        assert!(
+            body.contains(fragment),
+            "the next request carries the alert"
+        );
+    }
+
+    /// A stop after response text keeps the message: only a turn that did
+    /// nothing but think is withdrawn.
+    #[tokio::test]
+    async fn a_stop_after_response_text_keeps_the_message() {
+        let text = sse_chunk(
+            &serde_json::json!({
+                "choices": [{"index": 0, "delta": {"content": "half an ans"}}]
+            })
+            .to_string(),
+        );
+        let (state, sink, result, _dir) = stop_stalled_turn(text).await;
+        assert!(matches!(result, Err(super::AgentLoopError::Cancelled(_))));
+        assert_eq!(sink.withdrawn, Vec::<String>::new());
+        let history = crate::session::load_history_from_db(&state.db(), "session")
+            .await
+            .expect("history");
+        assert_eq!(user_rows(&history), vec!["hello".to_string()]);
+    }
+
+    /// A stop after a tool call began keeps the message too.
+    #[tokio::test]
+    async fn a_stop_after_a_tool_call_keeps_the_message() {
+        let call = sse_chunk(
+            &serde_json::json!({
+                "choices": [{"index": 0, "delta": {"tool_calls": [{
+                    "index": 0, "id": "call_1", "type": "function",
+                    "function": {"name": "terminal", "arguments": "{\"command\":"}
+                }]}}]
+            })
+            .to_string(),
+        );
+        let (state, sink, result, _dir) = stop_stalled_turn(call).await;
+        assert!(matches!(result, Err(super::AgentLoopError::Cancelled(_))));
+        assert_eq!(sink.withdrawn, Vec::<String>::new());
+        let history = crate::session::load_history_from_db(&state.db(), "session")
+            .await
+            .expect("history");
+        assert_eq!(user_rows(&history), vec!["hello".to_string()]);
     }
 }

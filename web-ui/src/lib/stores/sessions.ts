@@ -102,6 +102,8 @@ interface SessionsState {
 
   appendMessage: (sessionId: string, msg: ApiMessage) => void;
   replaceMessage: (sessionId: string, msg: ApiMessage) => void;
+  /** Drop the latest user message whose text is `content`: a withdrawn turn's. */
+  withdrawUserMessage: (sessionId: string, content: string) => void;
   /**
    * A turn ended: the oldest not-yet-stored user message takes the id the
    * daemon stored it under, and the reply, when the turn stored one, joins
@@ -382,6 +384,17 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
         [sessionId]: [...(prev.messages[sessionId] ?? []), msg],
       },
     }));
+  },
+
+  withdrawUserMessage(sessionId, content) {
+    set((prev) => {
+      const messages = prev.messages[sessionId] ?? [];
+      const at = messages.findLastIndex((m) => m.role === 'user' && m.content === content);
+      if (at < 0) return prev;
+      return {
+        messages: { ...prev.messages, [sessionId]: messages.filter((_, i) => i !== at) },
+      };
+    });
   },
 
   replaceMessage(sessionId, msg) {

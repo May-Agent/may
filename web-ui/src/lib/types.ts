@@ -397,6 +397,19 @@ export interface SseRetract {
   turnId: string;
 }
 
+/**
+ * The turn was stopped before any tool call or response text: the daemon
+ * withdrew it, so its message left the conversation. The client that sent
+ * the message puts it back into its composer.
+ */
+export interface SseWithdrawn {
+  kind: 'withdrawn';
+  seq: number;
+  turnId: string;
+  content: string;
+  attachments: ApiAttachment[];
+}
+
 export type ChatStreamEvent =
   | SseStart
   | SseText
@@ -414,7 +427,8 @@ export type ChatStreamEvent =
   | SsePing
   | SseSpeed
   | SseHold
-  | SseRetract;
+  | SseRetract
+  | SseWithdrawn;
 
 // ── UI event stream /api/events ─────────────────────────────
 

@@ -293,6 +293,10 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             app.request_prompt_mark(i64::from(message_id));
             Ok(None)
         }
+        AppEvent::TurnWithdrawn { content, own } => {
+            app.withdraw_turn(content, own);
+            Ok(Some(SendAction::ReloadHistory))
+        }
         AppEvent::HistoryStale => Ok(Some(SendAction::ReloadHistory)),
         AppEvent::Sleep(status) => {
             if status.asleep != app.asleep {
@@ -403,6 +407,20 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             if let crate::tui::state::AppMode::Btw(state) = &mut app.mode {
                 state.loading = false;
                 state.done = true;
+                state.error = Some(error);
+            }
+            Ok(None)
+        }
+        AppEvent::ProgressLoaded(report) => {
+            if let crate::tui::state::AppMode::Progress(state) = &mut app.mode {
+                state.loading = false;
+                state.report = Some(report);
+            }
+            Ok(None)
+        }
+        AppEvent::ProgressFailed(error) => {
+            if let crate::tui::state::AppMode::Progress(state) = &mut app.mode {
+                state.loading = false;
                 state.error = Some(error);
             }
             Ok(None)
