@@ -14,7 +14,6 @@ use skyzen::utils::{Json, State};
 
 use crate::daemon::error::{internal_error, internal_error_message};
 use crate::daemon::state::DaemonState;
-use crate::session::MessageRole;
 
 /// Longest a progress generation may take.
 const GENERATION_TIMEOUT: Duration = Duration::from_secs(60);
@@ -66,23 +65,17 @@ struct ProgressPrompt {
     language: Option<aither_agent::Language>,
 }
 
-/// The side request: the windowed conversation, then the instruction.
+/// The side request: the messages the session's agent would send next, then
+/// the instruction.
 fn progress_messages(
-    conversation: &[(&MessageRole, &str)],
+    mut context: Vec<aither_core::llm::Message>,
     language: Option<aither_agent::Language>,
 ) -> Vec<aither_core::llm::Message> {
     let prompt = ProgressPrompt { language }
         .render()
         .expect("progress prompt template must render");
-    let mut messages: Vec<_> = conversation
-        .iter()
-        .map(|(role, content)| match role {
-            MessageRole::User => aither_core::llm::Message::user(*content),
-            _ => aither_core::llm::Message::assistant(*content),
-        })
-        .collect();
-    messages.push(aither_core::llm::Message::user(prompt));
-    messages
+    context.push(aither_core::llm::Message::user(prompt));
+    context
 }
 
 /// Rejects a report that finished more items than it counted.
@@ -108,20 +101,13 @@ pub async fn progress(
 
 /// Generates the remaining-work report of `session_id`.
 async fn report(state: &Arc<DaemonState>, session_id: &str) -> SkyResult<ProgressReport> {
-    let history = crate::session::load_history_from_db(&state.db(), session_id)
+    let context = super::aux::context_messages(state, session_id)
         .await
         .map_err(internal_error)?;
-    let window = super::recap::recap_window(
-        history
-            .messages()
-            .iter()
-            .map(|message| (&message.role, message.content.as_str())),
-        super::recap::HISTORY_BUDGET,
-    );
     let languages = super::aux::languages(state, session_id)
         .await
         .map_err(internal_error)?;
-    let messages = progress_messages(&window.conversation, languages.communication());
+    let messages = progress_messages(context, languages.communication());
     super::aux::generate::<ProgressReport>(state, session_id, messages, GENERATION_TIMEOUT)
         .await
         .and_then(validated)
@@ -152,8 +138,9 @@ mod tests {
     #[test]
     fn the_instruction_names_the_session_language() {
         let chinese: aither_agent::Language = "Chinese".parse().unwrap();
-        let messages = progress_messages(&[(&MessageRole::User, "继续")], Some(chinese));
-        assert_eq!(messages.len(), 2, "the conversation, then the instruction");
+        let context = vec![aither_core::llm::Message::user("继续")];
+        let messages = progress_messages(context, Some(chinese));
+        assert_eq!(messages.len(), 2, "the context, then the instruction");
         let text = messages[1].content().to_string();
         assert!(text.contains("Write in Chinese"), "{text}");
     }
@@ -189,7 +176,7 @@ mod tests {
             .db()
             .append_message(
                 SESSION,
-                MessageRole::User,
+                crate::session::MessageRole::User,
                 "把剩下的工作做完",
                 None,
                 crate::db::MessageMeta::default(),
@@ -211,6 +198,25 @@ mod tests {
             .find(|body| body.contains("Report the work that remains"))
             .cloned()
             .expect("the side request reached the model");
+        // The context is the agent's own, not the stored rows: it carries
+        // the turn the agent ran ("Say hello."), never written to the
+        // database here, and the stored row's text is absent.
+        assert!(request.contains("Say hello."), "the agent's turn is in it");
+        assert!(!request.contains("把剩下的工作做完"));
+        let turn = stub
+            .requests
+            .lock()
+            .await
+            .iter()
+            .find(|body| body.contains("Say hello.") && !body.contains("Report the work"))
+            .cloned()
+            .expect("the agent's own turn reached the model");
+        let key = |body: &str| {
+            serde_json::from_str::<serde_json::Value>(body).expect("a JSON request")
+                ["prompt_cache_key"]
+                .clone()
+        };
+        assert_eq!(key(&request), key(&turn), "the same prompt-cache entry");
         for field in [
             "done",
             "total",
