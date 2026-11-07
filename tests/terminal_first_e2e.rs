@@ -770,21 +770,27 @@ impl MockScenarioState {
             },
             MockChatScenario::WritesTasksFile => {
                 // The run loop keeps the model going while `tasks.md` has
-                // unchecked items, and the model side sees the file once per
-                // change (whole at session start, a diff afterwards), so the
-                // mock finishes the checklist whenever the newest injection
-                // adds an unchecked item and replies with plain text once
-                // everything is checked.
+                // open rows (`Doing`, `Queued`), so the mock writes two rows,
+                // finishes the work by deleting them on the next request and
+                // replies with plain text once nothing is open.
                 if self.request_index >= TASKS_SCENARIO_MAX_REQUESTS {
                     return Err(format!(
                         "tasks scenario still looping after {} requests: the run loop keeps objecting to tasks.md",
                         self.request_index
                     ));
                 }
-                let script = match tasks_injection(request) {
-                    None if self.request_index == 0 => Some(TASKS_PARTIAL_SCRIPT),
-                    Some(tasks) if injection_adds_unchecked_item(tasks) => Some(TASKS_DONE_SCRIPT),
-                    _ => None,
+                let objected = request
+                    .get("messages")
+                    .and_then(Value::as_array)
+                    .and_then(|messages| messages.last())
+                    .and_then(|message| message.get("content").and_then(Value::as_str))
+                    .is_some_and(|content| content.contains("tasks.md still has rows"));
+                let script = if self.request_index == 0 {
+                    Some(TASKS_OPEN_SCRIPT)
+                } else if objected {
+                    Some(TASKS_DONE_SCRIPT)
+                } else {
+                    None
                 };
                 match script {
                     Some(script) => MockHttpResponse::sse(vec![
@@ -973,24 +979,13 @@ impl MockScenarioState {
     }
 }
 
-const TASKS_PARTIAL_SCRIPT: &str = "printf -- '- [x] write report\\n- [ ] ship it\\n' > tasks.md";
-const TASKS_DONE_SCRIPT: &str = "printf -- '- [x] write report\\n- [x] ship it\\n' > tasks.md";
+const TASKS_OPEN_SCRIPT: &str =
+    "printf -- '## Doing\\n- write report\\n\\n## Queued\\n- ship it\\n' > tasks.md";
+const TASKS_DONE_SCRIPT: &str = "printf -- '## Notes\\nreport shipped\\n' > tasks.md";
 
 /// Requests the tasks scenario may serve before the harness fails it, so a
 /// run loop that never settles ends the test with a message instead of hanging.
 const TASKS_SCENARIO_MAX_REQUESTS: usize = 8;
-
-/// Whether a `<tasks_document>` injection leaves an unchecked item open: the
-/// whole document at session start, or a diff whose added (`+ `) lines carry
-/// one. Removed lines of a diff say nothing about the current file.
-fn injection_adds_unchecked_item(injection: &str) -> bool {
-    injection.lines().any(|line| {
-        line.starts_with("- [ ]")
-            || line
-                .strip_prefix("+ ")
-                .is_some_and(|added| added.starts_with("- [ ]"))
-    })
-}
 
 /// How long a chat turn in the tasks test may take before the test fails.
 const TASKS_TURN_TIMEOUT: Duration = Duration::from_secs(60);
@@ -1689,7 +1684,7 @@ fn may_binary_path() -> PathBuf {
 }
 
 /// Release of heel whose Linux binary the harness stages as the container heel.
-const CONTAINER_HEEL_RELEASE_TAG: &str = "heel-v0.7.4";
+const CONTAINER_HEEL_RELEASE_TAG: &str = "heel-v0.9.0";
 
 /// A pinned Linux heel release asset and the SHA-256 of its published bytes.
 struct PinnedHeelAsset {
@@ -1702,12 +1697,12 @@ struct PinnedHeelAsset {
 #[cfg(target_arch = "x86_64")]
 const CONTAINER_HEEL_ASSET: PinnedHeelAsset = PinnedHeelAsset {
     name: "heel-x86_64-unknown-linux-gnu",
-    sha256: "7866e81549ce2ed7295f53ad5608bd568512cd7ae03887755de47759fe09a843",
+    sha256: "d42181f9f566e2578fd90a6c11f25158377aa3089ded3cc75d3fe09cd20fe453",
 };
 #[cfg(target_arch = "aarch64")]
 const CONTAINER_HEEL_ASSET: PinnedHeelAsset = PinnedHeelAsset {
     name: "heel-aarch64-unknown-linux-gnu",
-    sha256: "1288a2cf82f6f73fc7f1bcd5ddb4b741de2cacd8c92bed2e3a6dd67ec4c84570",
+    sha256: "be5e276a0325845f890c6f7ded19bda0919ae4fa5e7d6c7665cee2d4973267b6",
 };
 
 /// Stages the pinned container heel in the test home exactly as the product's
@@ -3150,8 +3145,8 @@ async fn ui_session_crud_round_trip_matches_api_contract() {
 #[tokio::test]
 #[serial]
 async fn ui_chat_tasks_file_is_the_canonical_todo_document() {
-    const MODEL_WRITTEN: &str = "- [x] write report\n- [x] ship it\n";
-    const REWRITTEN: &str = "- [ ] rewritten plan\n";
+    const MODEL_WRITTEN: &str = "## Notes\nreport shipped\n";
+    const REWRITTEN: &str = "## Doing\n- rewritten plan\n";
 
     let mock = MockOpenAiServer::spawn(MockChatScenario::WritesTasksFile).await;
     let harness = TestHarness::new(&mock.base_url()).await;
@@ -3183,18 +3178,32 @@ async fn ui_chat_tasks_file_is_the_canonical_todo_document() {
     );
 
     // The tool-end tasks check parsed the freshly written file and pushed
-    // its checklist down the stream.
-    let todo_update = events
+    // its rows down the stream; deleting them later pushes an empty list.
+    let updates: Vec<&Value> = events
         .iter()
-        .find(|(kind, _)| kind == "todo_update")
-        .expect("a tool call writing tasks.md should emit todo_update");
+        .filter(|(kind, _)| kind == "todo_update")
+        .map(|(_, payload)| payload)
+        .collect();
     assert_eq!(
-        todo_update.1.get("items"),
-        Some(&serde_json::json!([
-            { "text": "write report", "checked": true },
-            { "text": "ship it", "checked": false },
+        updates.len(),
+        2,
+        "each tasks.md write should emit one todo_update: {events:?}"
+    );
+    let rows = |update: &Value| update.get("rows").cloned();
+    assert_eq!(
+        rows(updates[0]),
+        Some(serde_json::json!([
+            { "section": "doing", "text": "write report", "blocking": null, "references": [] },
+            { "section": "queued", "text": "ship it", "blocking": null, "references": [] },
         ])),
-        "todo_update should carry the parsed tasks.md items: {todo_update:?}"
+        "todo_update should carry the parsed tasks.md rows: {:?}",
+        updates[0]
+    );
+    assert_eq!(
+        rows(updates[1]),
+        Some(serde_json::json!([])),
+        "finishing the work deletes its rows: {:?}",
+        updates[1]
     );
 
     // GET serves the file the model wrote.
@@ -3583,11 +3592,13 @@ const CHILD_COMMIT: &str = "cd ../../wt && echo x > f.txt && echo WROTE_FILE && 
 #[tokio::test]
 #[serial]
 async fn subagent_cannot_write_tasks_md_but_the_main_agent_can() {
+    // The fixture is well-formed free text under `## Notes`: the run loop
+    // holds the turn open while tasks.md breaks its format or has open rows.
     let (files, mock) = run_subagent_probe(SubagentProbe {
-        setup: "printf -- '- [x] original\\n' > tasks.md",
+        setup: "printf -- '## Notes\\noriginal\\n' > tasks.md",
         launch: "subagent explore --prompt-file prompt.md",
-        child_script: "printf -- '- [x] hacked\\n' >> ../../tasks.md; echo CHILD_RC=$?",
-        final_script: "cp tasks.md tasks.before; printf -- '- [x] original\\n- [x] main wrote\\n' > tasks.md; echo MAIN_FINAL",
+        child_script: "printf -- 'hacked\\n' >> ../../tasks.md; echo CHILD_RC=$?",
+        final_script: "cp tasks.md tasks.before; printf -- '## Notes\\noriginal\\nmain wrote\\n' > tasks.md; echo MAIN_FINAL",
     })
     .await;
 
@@ -3599,12 +3610,12 @@ async fn subagent_cannot_write_tasks_md_but_the_main_agent_can() {
     );
     assert_eq!(
         files.get("tasks.before"),
-        "- [x] original\n",
+        "## Notes\noriginal\n",
         "tasks.md changed while only the subagent had run"
     );
     assert_eq!(
         files.get("tasks.md"),
-        "- [x] original\n- [x] main wrote\n",
+        "## Notes\noriginal\nmain wrote\n",
         "the main agent's write in the same session must succeed"
     );
 }

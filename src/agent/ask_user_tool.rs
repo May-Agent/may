@@ -75,6 +75,7 @@ pub struct AskUserTool {
     runtime: Arc<SessionRuntimeService>,
     session_id: String,
     languages: Option<aither_agent::LanguageGuard>,
+    task_events: Option<aither_agent::TaskEvents>,
 }
 
 impl AskUserTool {
@@ -85,7 +86,16 @@ impl AskUserTool {
             runtime,
             session_id: session_id.into(),
             languages: None,
+            task_events: None,
         }
+    }
+
+    /// Record every question asked on `events`, the main agent's `tasks.md`
+    /// inbox.
+    #[must_use]
+    pub fn with_task_events(mut self, events: aither_agent::TaskEvents) -> Self {
+        self.task_events = Some(events);
+        self
     }
 
     /// Refuse a question outside the communication language `guard` enforces.
@@ -263,6 +273,9 @@ impl Tool for AskUserTool {
             .open_question(&self.session_id, &request)
             .await
             .map_err(AskUserToolError::Persist)?;
+        if let Some(events) = &self.task_events {
+            events.record(aither_agent::TaskEvent::QuestionAsked(request.id.clone()));
+        }
         Ok(ToolResult::text(
             AskedText {
                 request_id: &request.id,
@@ -285,6 +298,7 @@ pub struct WithdrawAskUserArgs {
 pub struct WithdrawAskUserTool {
     runtime: Arc<SessionRuntimeService>,
     session_id: String,
+    task_events: Option<aither_agent::TaskEvents>,
 }
 
 impl WithdrawAskUserTool {
@@ -294,7 +308,16 @@ impl WithdrawAskUserTool {
         Self {
             runtime,
             session_id: session_id.into(),
+            task_events: None,
         }
+    }
+
+    /// Record every question withdrawn on `events`, the main agent's
+    /// `tasks.md` inbox.
+    #[must_use]
+    pub fn with_task_events(mut self, events: aither_agent::TaskEvents) -> Self {
+        self.task_events = Some(events);
+        self
     }
 }
 
@@ -322,6 +345,11 @@ impl Tool for WithdrawAskUserTool {
             .map_err(AskUserToolError::Withdraw)?;
         if !withdrawn {
             return Err(AskUserToolError::NotOpen(args.request_id).into());
+        }
+        if let Some(events) = &self.task_events {
+            events.record(aither_agent::TaskEvent::QuestionWithdrawn(
+                args.request_id.clone(),
+            ));
         }
         Ok(ToolResult::text(
             WithdrawnText {
@@ -356,24 +384,27 @@ impl AskUserBlockerResolver {
 }
 
 impl aither_agent::TaskBlockerResolver for AskUserBlockerResolver {
-    async fn is_open(&self, mark: &str) -> bool {
+    async fn is_open(&self, mark: &str) -> Result<bool, aither_agent::TaskBlockerError> {
+        let unavailable =
+            |error: crate::db::ChatDbError| aither_agent::TaskBlockerError::Unavailable {
+                mark: mark.to_string(),
+                reason: error.to_string(),
+            };
         let db = self.runtime.db();
-        match db
+        // A payload no question of this session carries is free text the
+        // harness cannot check, and holds.
+        if !db
             .session_ask_user_request_exists(&self.session_id, mark)
             .await
+            .map_err(unavailable)?
         {
-            Ok(true) => db
-                .pending_ask_user_request(mark)
-                .await
-                .is_ok_and(|pending| {
-                    pending.is_some_and(|pending| pending.session_id == self.session_id)
-                }),
-            Ok(false) => true,
-            Err(error) => {
-                tracing::error!(session_id = %self.session_id, %error, "failed to resolve a BLOCKING mark");
-                false
-            }
+            return Ok(true);
         }
+        Ok(db
+            .pending_ask_user_request(mark)
+            .await
+            .map_err(unavailable)?
+            .is_some_and(|pending| pending.session_id == self.session_id))
     }
 }
 

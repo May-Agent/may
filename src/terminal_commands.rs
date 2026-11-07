@@ -94,6 +94,9 @@ pub struct SharedTerminalCommandConfig<LLM> {
     /// Issue store for the `issue` command, resolved from the session
     /// workspace and its per-project configuration.
     pub issue_store: crate::issue::ResolvedIssueStore,
+    /// The main agent's `tasks.md` inbox: `issue`, `pr`, `ask_user` and
+    /// `subagent` record the state changes its rows track on it.
+    pub task_events: aither_agent::TaskEvents,
     /// Asks the user before an issue, PR or comment is published, when the
     /// session can ask; `None` publishes without asking.
     pub publish_gate: Option<crate::agent::publish_approval::PublishGate>,
@@ -228,7 +231,9 @@ where
             crate::issue::github::GitHubRest::new(crate::issue::GhCliTokenSource),
         )
     };
-    let mut issue_tool = issue_tool.with_targets(issue_targets());
+    let mut issue_tool = issue_tool
+        .with_targets(issue_targets())
+        .with_task_events(config.task_events.clone());
     if let Some(gate) = &config.publish_gate {
         issue_tool = issue_tool.with_publish_gate(gate.clone());
     }
@@ -295,6 +300,7 @@ where
         screen: Some(screen),
         signing,
         github_api: crate::pr::PrContext::default_github_api(),
+        task_events: Some(config.task_events.clone()),
         publish: config.publish_gate.clone(),
     };
     let mut pr_command = PrCommand::new(pr_context);
@@ -322,7 +328,8 @@ where
     builder.configure_role_tools(repo_tool, subagent_repo_tool);
 
     if let Some(runtime) = config.ask_user {
-        let mut ask_user = AskUserTool::new(runtime.clone(), config.session_id.clone());
+        let mut ask_user = AskUserTool::new(runtime.clone(), config.session_id.clone())
+            .with_task_events(config.task_events.clone());
         if let Some(guard) = &config.languages {
             ask_user = ask_user.with_languages(guard.clone());
         }
@@ -331,7 +338,8 @@ where
         builder.kept_through_compaction(|kept| {
             kept.main_only(|reserved| reserved.configure_tool(ask_user));
         });
-        let withdraw = WithdrawAskUserTool::new(runtime, config.session_id.clone());
+        let withdraw = WithdrawAskUserTool::new(runtime, config.session_id.clone())
+            .with_task_events(config.task_events.clone());
         describe_tool(&mut descriptions, &withdraw);
         builder.main_only(|reserved| reserved.configure_tool(withdraw));
     }
@@ -448,6 +456,7 @@ where
     .with_balanced_model(UsageObservedModel::new(balanced.llm), balanced.parameters)
     .with_fast_model(UsageObservedModel::new(fast_llm), fast.parameters)
     .with_runs(config.subagent_runs)
+    .with_task_events(config.task_events.clone())
     .with_base_dir(&config.sandbox_dir)
     .with_file_mounts([
         SubagentFileMount::new(PathBuf::from("."), config.sandbox_dir.clone()),
@@ -674,6 +683,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
+                task_events: aither_agent::TaskEvents::new(),
                 publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
@@ -735,6 +745,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
+                task_events: aither_agent::TaskEvents::new(),
                 publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
@@ -796,6 +807,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
+                task_events: aither_agent::TaskEvents::new(),
                 publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
@@ -851,6 +863,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters,
                 issue_store: test_issue_store(temp.path()).await,
+                task_events: aither_agent::TaskEvents::new(),
                 publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
@@ -902,6 +915,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
+                task_events: aither_agent::TaskEvents::new(),
                 publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
@@ -1073,6 +1087,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store,
+                task_events: aither_agent::TaskEvents::new(),
                 publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: Some(messaging),
@@ -1154,6 +1169,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
+                task_events: aither_agent::TaskEvents::new(),
                 publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
@@ -1206,6 +1222,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
+                task_events: aither_agent::TaskEvents::new(),
                 publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
@@ -1262,6 +1279,7 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp).await,
+                task_events: aither_agent::TaskEvents::new(),
                 publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,

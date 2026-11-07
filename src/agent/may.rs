@@ -457,6 +457,16 @@ impl MayAgent {
             .with_process_priority(config.command_priority.process_priority())
             .with_readable_paths(readable)
             .with_writable_paths(writable)
+            // A subagent launched from inside a session clone works in a
+            // child clone of it.
+            .with_subagent_spaces(super::subagent_spaces::SessionSubagentSpaces::new(
+                crate::repo_clone::SessionRepos::new(
+                    &config.sandbox_dir,
+                    config.session_id.as_str(),
+                    config.db.clone(),
+                )
+                .with_host(crate::host_git::HostGit::inherit()),
+            ))
             // Keychain secrets (`/secret`) land as env vars in every spawned
             // command; the store is re-read per call, so additions take
             // effect without rebuilding the agent.
@@ -723,6 +733,13 @@ impl MayAgent {
             builder = builder.compaction_model(compaction.llm, compaction.parameters);
         }
         let subagent_tracker = subagents.tracker;
+        // The session's own inbox when the daemon keeps one, so answers
+        // committed between agent builds still reach `tasks.md`.
+        let task_events = hook_runtime
+            .as_ref()
+            .map_or_else(aither_agent::TaskEvents::new, |runtime| {
+                runtime.task_events(config.session_id.as_str())
+            });
         let shared_terminal_commands = Box::pin(register_shared_terminal_commands(
             builder.tool_registry_mut(),
             SharedTerminalCommandConfig {
@@ -752,6 +769,7 @@ impl MayAgent {
                     .then_some(config.workspace_request_broker.clone()),
                 subagent_runs: subagent_runs.clone(),
                 issue_store: issue_store.clone(),
+                task_events: task_events.clone(),
                 publish_gate,
                 workspace_config: workspace.config.clone(),
                 agent_messaging,
@@ -767,7 +785,18 @@ impl MayAgent {
         for (name, description) in &shared_terminal_commands.descriptions {
             builder = builder.tool_description(name.clone(), description.clone());
         }
-        builder = builder.fork_source(shared_terminal_commands.fork_source.clone());
+        builder = builder
+            .fork_source(shared_terminal_commands.fork_source.clone())
+            // `tasks.md` follows what the commands above record, and reads
+            // the state of the issues and PRs its rows name.
+            .task_events(task_events)
+            .work_tracker(super::work_tracker::MayWorkTracker::new(
+                issue_store.clone(),
+                config.db.clone(),
+                &config.sandbox_dir,
+                config.session_id.as_str(),
+                config.cwd.clone(),
+            ));
         if is_container {
             builder = Box::pin(builder.with_skills_readable_only(&skills_dir)).await?;
         } else {

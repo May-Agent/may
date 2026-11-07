@@ -175,7 +175,7 @@ trait ChatSink {
     ) -> impl Future<Output = bool> + Send;
     fn on_todo_update(
         &mut self,
-        checklist: &crate::todo_parser::TodoChecklist,
+        rows: Vec<crate::task_rows::TaskRow>,
     ) -> impl Future<Output = bool> + Send;
     fn on_speed(&mut self, tokens_per_second: f64) -> impl Future<Output = bool> + Send;
     /// The run waits for `reason` before it continues.
@@ -525,9 +525,13 @@ impl ChatSink for HubSink {
         true
     }
 
-    async fn on_todo_update(&mut self, checklist: &crate::todo_parser::TodoChecklist) -> bool {
+    async fn on_todo_update(&mut self, rows: Vec<crate::task_rows::TaskRow>) -> bool {
         let seq = self.next_seq();
-        let event = SseTodoUpdateEvent::from_checklist(checklist, seq, self.turn_id.clone());
+        let event = SseTodoUpdateEvent {
+            seq,
+            turn_id: self.turn_id.clone(),
+            rows,
+        };
         self.publish_turn("todo_update", &event);
         true
     }
@@ -1994,6 +1998,7 @@ fn run_agent_loop<'a>(
                 last_event_at: None,
                 full_text: String::new(),
                 reasoning_text: String::new(),
+                reasoning_floor: 0,
                 terminal_snapshot: TerminalStateSnapshot::default(),
                 saw_tool_activity: false,
                 tool_arguments_by_id: std::collections::HashMap::new(),
@@ -3861,12 +3866,12 @@ async fn enforce_issue_ownership(
     }
 }
 
-/// Read tasks.md and return the parsed checklist if its content changed since the last check.
-/// The sink is responsible for wrapping it in the SSE envelope with `seq/turn_id`.
+/// Read tasks.md and return its rows if its content changed since the last check.
+/// The sink is responsible for wrapping them in the SSE envelope with `seq/turn_id`.
 async fn check_tasks_update(
     paths: &SessionPaths,
     last_hash: &mut Option<u64>,
-) -> Option<crate::todo_parser::TodoChecklist> {
+) -> Option<Vec<crate::task_rows::TaskRow>> {
     use std::hash::{Hash, Hasher};
 
     let content = match paths.tasks_content().await {
@@ -3886,11 +3891,8 @@ async fn check_tasks_update(
     }
     *last_hash = Some(hash);
 
-    let checklist = crate::todo_parser::TodoChecklist::parse(&content);
-    if checklist.is_empty() {
-        return None;
-    }
-    Some(checklist)
+    // An empty list is an update too: finishing work deletes its row.
+    Some(crate::task_rows::task_rows(&content))
 }
 
 async fn is_takeover_active_for_session(state: &DaemonState, session_id: &SessionId) -> bool {
@@ -4024,6 +4026,7 @@ mod tests {
                         messages: Vec::new(),
                     },
                     has_background_tasks: false,
+                    tasks: None,
                 },
                 applied_seq: 42,
                 updated_at: "2026-03-14T00:00:00Z".to_string(),
@@ -4256,15 +4259,19 @@ mod tests {
                 .is_none()
         );
 
-        // A model-side write produces the parsed checklist once.
-        async_fs::write(&tasks_path, "- [x] done\n- [ ] pending\n")
+        // A model-side write produces its rows once.
+        async_fs::write(
+            &tasks_path,
+            "## Doing\n- write report\n\n## Queued\n- ship it BLOCKING q1\n",
+        )
+        .await
+        .expect("tasks.md should be written");
+        let rows = super::check_tasks_update(&paths, &mut last_hash)
             .await
-            .expect("tasks.md should be written");
-        let checklist = super::check_tasks_update(&paths, &mut last_hash)
-            .await
-            .expect("a written tasks.md should produce a checklist");
-        assert_eq!(checklist.total(), 2);
-        assert_eq!(checklist.completed(), 1);
+            .expect("a written tasks.md should produce rows");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].section, crate::task_rows::TaskSection::Doing);
+        assert_eq!(rows[1].blocking.as_deref(), Some("q1"));
 
         // The same content is deduplicated by hash.
         assert!(
@@ -4273,25 +4280,14 @@ mod tests {
                 .is_none()
         );
 
-        // A further model-side write produces an updated checklist.
-        async_fs::write(&tasks_path, "- [ ] new task\n")
+        // Finishing the work deletes its row; the empty list is still an update.
+        async_fs::write(&tasks_path, "## Doing\n")
             .await
             .expect("tasks.md should be rewritten");
-        let checklist = super::check_tasks_update(&paths, &mut last_hash)
+        let rows = super::check_tasks_update(&paths, &mut last_hash)
             .await
-            .expect("a changed tasks.md should produce a new checklist");
-        assert_eq!(checklist.total(), 1);
-        assert_eq!(checklist.items[0].text, "new task");
-
-        // A document without checklist items produces no update.
-        async_fs::write(&tasks_path, "just prose\n")
-            .await
-            .expect("tasks.md should be rewritten");
-        assert!(
-            super::check_tasks_update(&paths, &mut last_hash)
-                .await
-                .is_none()
-        );
+            .expect("a changed tasks.md should produce an update");
+        assert_eq!(rows, Vec::<crate::task_rows::TaskRow>::new());
     }
 
     /// What a run told its clients about waiting and discarding text.
@@ -4382,7 +4378,7 @@ mod tests {
         }
         fn on_todo_update(
             &mut self,
-            _c: &crate::todo_parser::TodoChecklist,
+            _rows: Vec<crate::task_rows::TaskRow>,
         ) -> impl Future<Output = bool> + Send {
             std::future::ready(true)
         }
