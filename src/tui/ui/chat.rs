@@ -216,6 +216,11 @@ impl ToolDisplay {
     pub fn expandable(&self) -> bool {
         match self {
             Self::Terminal { .. } => true,
+            Self::Action { chip: name, .. } | Self::Builtin { tool: name, .. }
+                if is_one_row_tool(name) =>
+            {
+                false
+            }
             Self::Action { detail, output, .. } => {
                 !detail.is_empty() || output.as_ref().is_some_and(|info| !info.output.is_empty())
             }
@@ -1081,11 +1086,24 @@ impl ChatStream {
         });
         if let Some(index) = found {
             if let ChatElement::ToolCall {
-                display: ToolDisplay::Builtin { status, output, .. },
+                display:
+                    ToolDisplay::Builtin {
+                        tool,
+                        detail,
+                        status,
+                        output,
+                        ..
+                    },
                 ..
             } = &mut self.elements[index]
             {
                 *status = ToolStatus::Done;
+                if detail.is_empty()
+                    && is_one_row_tool(tool)
+                    && let Some(query) = quoted_result(&result)
+                {
+                    *detail = query.to_string();
+                }
                 *output = Some(result);
             }
             self.touch(index);
@@ -1096,7 +1114,11 @@ impl ChatStream {
             id: id.to_string(),
             display: ToolDisplay::Builtin {
                 tool: tool.to_string(),
-                detail: String::new(),
+                detail: if is_one_row_tool(tool) {
+                    quoted_result(&result).unwrap_or_default().to_string()
+                } else {
+                    String::new()
+                },
                 status: ToolStatus::Done,
                 output: Some(result),
                 pinned: None,
@@ -3490,6 +3512,25 @@ fn tool_header_line(
     Line::from(spans)
 }
 
+/// Search and fetch calls are one headline row (`Searched "query"`,
+/// `Fetched url`) with nothing to unfold, whichever path renders them.
+fn is_one_row_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "websearch" | "web_search" | "google_search" | "webfetch" | "web_fetch"
+    )
+}
+
+/// The query or URL a hosted call's result repeats, when the provider
+/// announced the call before it knew it (the `OpenAI` Responses API does).
+fn quoted_result(result: &str) -> Option<&str> {
+    result
+        .trim()
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .filter(|inner| !inner.is_empty() && !inner.contains('\n'))
+}
+
 /// A tool headline as `(label, rest)`: hosted and IPC search names become
 /// `Searched "query"`, fetch becomes `Fetched url`, everything else keeps
 /// its `[name]` label.
@@ -5861,5 +5902,70 @@ mod tests {
         );
         assert_eq!(regions.len(), 1);
         assert_eq!(regions[0].element_id, "thinking-0");
+    }
+
+    /// Rows of the stream and how many of them click open.
+    fn rows_and_regions(chat: &ChatStream) -> (Vec<String>, usize) {
+        let mut regions = Vec::new();
+        let lines = build_plain_wrapped_lines_unified(
+            chat,
+            200,
+            None,
+            None,
+            None,
+            Some(&mut regions),
+            false,
+        );
+        (
+            lines.into_iter().filter(|l| !l.is_empty()).collect(),
+            regions.len(),
+        )
+    }
+
+    /// The `OpenAI` Responses API announces a hosted search before it knows
+    /// the query and repeats it, quoted, in the result.
+    #[test]
+    fn a_hosted_search_announced_without_its_query_is_one_row() {
+        let mut chat = ChatStream::new();
+        chat.push_builtin("ws_1".into(), "web_search".into(), String::new());
+        chat.finish_builtin("ws_1", "web_search", "\"Rust 异步 非同期 비동기\"".into());
+        chat.push_builtin("wf_1".into(), "web_fetch".into(), String::new());
+        chat.finish_builtin("wf_1", "web_fetch", "\"https://example.com/a\"".into());
+        // A result with no matching start is appended as a finished row.
+        chat.finish_builtin("ws_2", "web_search", "\"late query\"".into());
+
+        let (rows, regions) = rows_and_regions(&chat);
+        assert_eq!(
+            rows,
+            [
+                "  ✓ Searched \"Rust 异步 非同期 비동기\"",
+                "  ✓ Fetched https://example.com/a",
+                "  ✓ Searched \"late query\"",
+            ]
+        );
+        assert_eq!(regions, 0);
+    }
+
+    /// The IPC search and fetch rows carry arguments and results too, but
+    /// are one row all the same.
+    #[test]
+    fn an_inline_search_with_a_result_is_one_row() {
+        let mut chat = ChatStream::new();
+        chat.push_tool(
+            "s1".to_string(),
+            ToolDisplay::Action {
+                chip: "websearch".to_string(),
+                task_id: None,
+                summary: "may agent".to_string(),
+                detail: vec!["{\"query\":\"may agent\"}".to_string()],
+                status: ToolStatus::Running,
+                output: None,
+                pinned: None,
+            },
+        );
+        chat.update_tool_with_output("s1", ToolStatus::Done, Some("result one\nresult two"));
+        let (rows, regions) = rows_and_regions(&chat);
+        assert_eq!(rows, ["  ✓ Searched \"may agent\""]);
+        assert_eq!(regions, 0);
     }
 }
