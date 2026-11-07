@@ -15,7 +15,8 @@ export type ApiErrorCode =
   | 'container_start_failed'
   | 'container_runtime_unavailable'
   | 'managed_podman_approval_required'
-  | 'location_unavailable';
+  | 'location_unavailable'
+  | 'github_unauthenticated';
 
 /** Semantic variant of a tool call — server-assigned, never re-inferred client-side. */
 export type ToolVariant =
@@ -452,6 +453,8 @@ export interface ProfileSessionSummary {
   updated_at?: string | null;
   profile_id?: string | null;
   repo?: string | null;
+  /** Something runs in the session: a turn, a background command or a subagent. */
+  working?: boolean;
 }
 
 export type ProfileSessionsPayload = {

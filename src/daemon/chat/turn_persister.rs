@@ -17,6 +17,8 @@ struct PendingMessage {
     /// The reply's display translation, when it drifted from the
     /// communication language.
     translation: Option<MessageTranslation>,
+    /// The reasoning streamed before this message.
+    thinking: Option<String>,
     /// When the event happened, as stamped at its emission.
     at: Timestamp,
 }
@@ -25,6 +27,9 @@ struct PendingMessage {
 pub(super) struct TurnPersister {
     fence: RunFence,
     pending: Vec<PendingMessage>,
+    /// Reasoning streamed since the last assistant message; the next one
+    /// carries it.
+    reasoning: String,
 }
 
 impl TurnPersister {
@@ -32,16 +37,25 @@ impl TurnPersister {
         Self {
             fence,
             pending: Vec::new(),
+            reasoning: String::new(),
         }
     }
 
-    /// Buffer an assistant text message emitted at `at`.
+    /// Collect a streamed reasoning chunk for the next assistant message.
+    pub fn push_reasoning(&mut self, chunk: &str) {
+        self.reasoning.push_str(chunk);
+    }
+
+    /// Buffer an assistant text message emitted at `at`, carrying the
+    /// reasoning streamed before it.
     pub fn push_assistant(&mut self, content: String, at: Timestamp) {
+        let thinking = std::mem::take(&mut self.reasoning);
         self.pending.push(PendingMessage {
             role: MessageRole::Assistant,
             content,
             tool_call_id: None,
             translation: None,
+            thinking: (!thinking.trim().is_empty()).then_some(thinking),
             at,
         });
     }
@@ -66,6 +80,7 @@ impl TurnPersister {
             content: serialized,
             tool_call_id: Some(tool_call_id),
             translation: None,
+            thinking: None,
             at,
         });
     }
@@ -93,6 +108,7 @@ impl TurnPersister {
                 reasoning: Vec::new(),
                 tool_calls: Vec::new(),
                 translation: msg.translation.clone(),
+                thinking: msg.thinking.clone(),
             };
             let row = db
                 .append_chat_message_as_run(&self.fence, &chat_msg)
@@ -171,6 +187,63 @@ mod tests {
         assert_eq!(translation.language_name, "Chinese");
         assert_eq!(api[0].content, "All done.");
         assert!(api[1].translation.is_none());
+    }
+
+    #[tokio::test]
+    async fn streamed_reasoning_reaches_the_message_it_precedes_after_reload() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db should open");
+        let session_id = "session-thinking";
+        db.create_session(session_id, None, None)
+            .await
+            .expect("session should be created");
+        let fence = crate::db::RunFence {
+            session_id: session_id.to_string(),
+            run_id: "run-1".to_string(),
+        };
+        assert!(
+            db.claim_session_run(&fence)
+                .await
+                .expect("run claim should succeed")
+        );
+        let at = Timestamp::now();
+        let mut persister = TurnPersister::new(fence);
+        persister.push_reasoning("plan the ");
+        persister.push_reasoning("lookup");
+        persister.push_assistant("Checking.".to_string(), at);
+        persister.push_tool_event("call_1".to_string(), "start".to_string(), at);
+        persister.push_tool_event("call_1".to_string(), "end".to_string(), at);
+        persister.push_reasoning("思考 / 考える / 생각");
+        persister.push_assistant("Done.".to_string(), at);
+        persister.push_assistant("No reasoning.".to_string(), at);
+        persister.flush(&db).await.expect("turn should flush");
+
+        let history = load_history_from_db(&db, session_id)
+            .await
+            .expect("history should load");
+        let thinking: Vec<_> = history
+            .messages()
+            .iter()
+            .map(|m| m.thinking.as_deref())
+            .collect();
+        assert_eq!(
+            thinking,
+            [
+                Some("plan the lookup"),
+                None,
+                None,
+                Some("思考 / 考える / 생각"),
+                None
+            ]
+        );
+
+        let rows = db.get_messages(session_id).await.expect("rows load");
+        let api = crate::daemon::message_mapping::map_db_messages(&rows).expect("rows map");
+        assert_eq!(api[0].thinking.as_deref(), Some("plan the lookup"));
+        assert_eq!(api[1].thinking.as_deref(), Some("思考 / 考える / 생각"));
+        assert_eq!(api[2].thinking, None);
     }
 
     #[tokio::test]

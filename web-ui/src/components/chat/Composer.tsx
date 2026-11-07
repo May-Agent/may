@@ -218,6 +218,7 @@ export function Composer({
           />
           <ThinkingPicker
             sessionId={sessionId}
+            currentModel={currentModel}
             current={currentReasoningEffort}
             disabled={disabled}
           />

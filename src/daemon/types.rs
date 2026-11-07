@@ -33,6 +33,8 @@ pub enum ApiErrorCode {
     ManagedPodmanApprovalRequired,
     LocationUnavailable,
     UnknownSshServer,
+    /// The host has no usable GitHub login.
+    GithubUnauthenticated,
 }
 
 /// Structured error body with a machine-readable `code` and human-readable `error` message.
@@ -1067,6 +1069,9 @@ pub struct ModelInfoItem {
     pub(crate) nickname: String,
     pub(crate) context_window: Option<u32>,
     pub(crate) abilities: Vec<String>,
+    /// The reasoning-effort levels the model accepts, lowest first; empty
+    /// when the model has no effort control.
+    pub(crate) effort_ladder: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
@@ -1594,6 +1599,15 @@ pub struct UiFullConfig {
     /// A save without the section leaves the setting as it is.
     #[serde(default)]
     pub(crate) recap: Option<UiRecapConfig>,
+    /// A save without the section leaves the setting as it is.
+    #[serde(default)]
+    pub(crate) sessions: Option<UiSessionsConfig>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UiSessionsConfig {
+    pub(crate) recent_hours: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
@@ -1748,4 +1762,22 @@ pub struct TunnelRegisterResponse {
 pub struct TunnelInfoResponse {
     pub id: String,
     pub target: String,
+}
+
+// ── GitHub repository picker ────────────────────────────────
+
+/// One GitHub repository a new chat can be bound to.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiGithubRepo {
+    /// `owner/repo`.
+    pub(crate) full_name: String,
+    /// Whether a local checkout of it was used recently.
+    pub(crate) recent: bool,
+}
+
+/// The picker's list: recently used repositories first.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+pub struct ApiGithubRepos {
+    pub(crate) repos: Vec<ApiGithubRepo>,
 }

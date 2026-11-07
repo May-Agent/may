@@ -59,6 +59,22 @@ impl SessionRuntimeState {
         !matches!(self, Self::Idle)
     }
 
+    /// Whether the state keeps a session out of the archive: a turn in
+    /// flight or a pending permission or workspace request.
+    #[must_use]
+    pub const fn blocks_auto_archive(self) -> bool {
+        matches!(
+            self,
+            Self::Running | Self::WaitingPermission | Self::WaitingWorkspace
+        )
+    }
+
+    /// Whether a turn is in flight.
+    #[must_use]
+    pub const fn is_running(self) -> bool {
+        matches!(self, Self::Running)
+    }
+
     /// Whether the state is `Idle`.
     #[must_use]
     pub const fn is_idle(&self) -> bool {
@@ -493,10 +509,13 @@ impl SessionRuntimeSummary {
             && self.has_pending_messages()
     }
 
-    /// Whether the session should block auto-archive: running, pending messages, active plan, or live interaction.
+    /// Whether the session should block auto-archive: a turn running or
+    /// waiting on a permission or workspace request, pending messages, an
+    /// active plan, or a live interaction. An open `ask_user` question does
+    /// not: nothing runs while it waits for the user.
     #[must_use]
     pub fn blocks_auto_archive(&self) -> bool {
-        self.state.is_executing()
+        self.state.blocks_auto_archive()
             || self.has_pending_messages()
             || self.plan_state.blocks_auto_archive()
             || self.interactions.is_active()

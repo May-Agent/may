@@ -1,5 +1,5 @@
-import { useState } from 'react';
-import { Github, Loader2 } from 'lucide-react';
+import { useEffect, useState } from 'react';
+import { Github } from 'lucide-react';
 import {
   Dialog,
   DialogContent,
@@ -7,47 +7,35 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
-import { Button } from '@/components/ui/button';
-import { Input } from '@/components/ui/input';
+import { listGithubRepos } from '@/lib/api/githubRepos';
+import { ApiError } from '@/lib/api/client';
 import { useTranslation } from '@/lib/i18n';
+import { RepoPickerList, type RepoListState } from './RepoPickerList';
 
 interface NewChatRepoDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  /** Repositories other sessions are already bound to, `owner/repo` form. */
-  knownRepos: string[];
-  /** Called with `owner/repo`; the caller starts the session. */
-  onSubmit: (repo: string) => void;
+  /** Called with the picked `owner/repo`; the caller starts the session. */
+  onPick: (repo: string) => void;
   busy?: boolean;
 }
-
-const REPO_RE = /^[\w.-]+\/[\w.-]+$/;
 
 /**
  * Start a chat bound to a GitHub repository that needs no local checkout —
  * the session binds to `github:owner/repo` and the cloud remote is the
- * source of truth.
+ * source of truth. The repository is picked from the daemon's list of what
+ * the host's GitHub account can reach.
  */
 export function NewChatRepoDialog({
   open,
   onOpenChange,
-  knownRepos,
-  onSubmit,
+  onPick,
   busy = false,
 }: NewChatRepoDialogProps) {
   const { t } = useTranslation();
-  const [value, setValue] = useState('');
-  const trimmed = value.trim();
-  const valid = REPO_RE.test(trimmed);
-
-  const submit = (repo: string) => {
-    onSubmit(repo);
-    setValue('');
-  };
-
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md">
+      <DialogContent className="gap-3 sm:max-w-md">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <Github className="size-4" aria-hidden />
@@ -55,47 +43,57 @@ export function NewChatRepoDialog({
           </DialogTitle>
           <DialogDescription>{t('sidebar.newChatRepo.description')}</DialogDescription>
         </DialogHeader>
-        <form
-          className="flex items-center gap-2"
-          onSubmit={(e) => {
-            e.preventDefault();
-            if (valid && !busy) submit(trimmed);
-          }}
-        >
-          <Input
-            value={value}
-            onChange={(e) => setValue(e.target.value)}
-            placeholder={t('sidebar.newChatRepo.placeholder')}
-            aria-label={t('sidebar.newChatRepo.placeholder')}
-            autoFocus
-          />
-          <Button type="submit" disabled={!valid || busy}>
-            {busy ? <Loader2 className="animate-spin" aria-hidden /> : t('sidebar.newChatRepo.start')}
-          </Button>
-        </form>
-        {knownRepos.length > 0 && (
-          <div className="mt-1">
-            <div className="px-1 pb-1 text-xs font-medium text-muted-foreground">
-              {t('sidebar.newChatRepo.known')}
-            </div>
-            <ul className="max-h-48 space-y-px overflow-y-auto">
-              {knownRepos.map((repo) => (
-                <li key={repo}>
-                  <button
-                    type="button"
-                    disabled={busy}
-                    onClick={() => submit(repo)}
-                    className="flex h-8 w-full items-center gap-2 rounded-md px-2 text-[13px] hover:bg-accent disabled:opacity-50"
-                  >
-                    <Github className="size-3.5 text-muted-foreground" aria-hidden />
-                    <span className="truncate">{repo}</span>
-                  </button>
-                </li>
-              ))}
-            </ul>
-          </div>
-        )}
+        <RepoPicker onPick={onPick} busy={busy} />
       </DialogContent>
     </Dialog>
+  );
+}
+
+/** Mounted with the dialog content, so each opening fetches a fresh list. */
+function RepoPicker({ onPick, busy }: { onPick: (repo: string) => void; busy: boolean }) {
+  const { t } = useTranslation();
+  const [query, setQuery] = useState('');
+  const [state, setState] = useState<RepoListState>({ status: 'loading' });
+
+  useEffect(() => {
+    let cancelled = false;
+    listGithubRepos().then(
+      ({ repos }) => {
+        if (!cancelled) setState({ status: 'ready', repos });
+      },
+      (error: unknown) => {
+        if (cancelled) return;
+        if (error instanceof ApiError && error.code === 'github_unauthenticated') {
+          setState({ status: 'unauthenticated', message: t('sidebar.newChatRepo.unauthenticated') });
+        } else {
+          setState({
+            status: 'error',
+            message: error instanceof Error ? error.message : t('errors.generic'),
+          });
+        }
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [t]);
+
+  return (
+    <div className="overflow-hidden rounded-md border border-border">
+      <RepoPickerList
+        state={state}
+        query={query}
+        onQueryChange={setQuery}
+        onPick={onPick}
+        busy={busy}
+        labels={{
+          search: t('sidebar.newChatRepo.search'),
+          loading: t('common.loading'),
+          empty: t('sidebar.newChatRepo.empty'),
+          recent: t('sidebar.newChatRepo.recent'),
+          all: t('sidebar.newChatRepo.all'),
+        }}
+      />
+    </div>
   );
 }

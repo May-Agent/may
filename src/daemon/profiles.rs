@@ -10,7 +10,7 @@ use skyzen::routing::Params;
 use skyzen::utils::{Json, State};
 
 use crate::db::{ChatDbError, CreateProfileParams, ProfileEnvironmentKind, UpdateProfileParams};
-use crate::profile::{ProfileInfo, ProfilePreferences, query_profile_sessions};
+use crate::profile::{ProfileInfo, ProfilePreferences, ProfileSessions, query_profile_sessions};
 use crate::ui_event_bus::UiEventTopics;
 
 use super::error::{
@@ -19,6 +19,19 @@ use super::error::{
 };
 use super::state::{ContainerPrepareStage, ContainerPrepareStatus, DaemonState};
 use super::types::ApiErrorCode;
+
+/// The profile's sessions with the ones running background work marked.
+///
+/// # Errors
+/// Returns [`ChatDbError`] on storage failure.
+pub(super) async fn load_profile_sessions(
+    state: &DaemonState,
+    profile_id: &str,
+) -> Result<ProfileSessions, ChatDbError> {
+    let mut sessions = query_profile_sessions(&state.db(), profile_id).await?;
+    sessions.mark_working(&state.session_background.busy_sessions().await);
+    Ok(sessions)
+}
 
 // ── Request / Response types ────────────────────────────────
 
@@ -468,7 +481,7 @@ pub(super) async fn get_profile_sessions(
         };
     }
 
-    let result = query_profile_sessions(&state.db(), &id)
+    let result = load_profile_sessions(&state, &id)
         .await
         .map_err(internal_error)?;
     json_ok_response(&result)

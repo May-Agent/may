@@ -36,7 +36,7 @@ export function createSession(payload?: {
   return apiPost<ApiSession>('/sessions', payload ?? {});
 }
 
-export type ReasoningEffortPatch = 'low' | 'medium' | 'high' | null;
+export type ReasoningEffortPatch = string | null;
 
 export interface UpdateSessionPatch {
   title?: string;

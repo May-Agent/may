@@ -121,6 +121,25 @@ pub struct ProfileSessions {
     pub archived: Vec<SessionSummary>,
 }
 
+impl ProfileSessions {
+    /// Marks the sessions in `busy` as working: they run a background
+    /// command or subagent the database does not know about.
+    pub fn mark_working(&mut self, busy: &std::collections::BTreeSet<String>) {
+        let sessions = self
+            .pinned
+            .iter_mut()
+            .flat_map(|item| match item {
+                PinnedItem::Session(session) => std::slice::from_mut(&mut **session).iter_mut(),
+                PinnedItem::Folder { sessions, .. } => sessions.iter_mut(),
+            })
+            .chain(self.regular.iter_mut())
+            .chain(self.archived.iter_mut());
+        for session in sessions {
+            session.working |= busy.contains(session.id.as_str());
+        }
+    }
+}
+
 /// Lightweight profile info (from DB model).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -358,7 +377,8 @@ pub async fn query_profile_sessions(
     let mut regular: Vec<SessionSummary> = Vec::new();
     let mut archived: Vec<SessionSummary> = Vec::new();
 
-    for summary in all_summaries {
+    for mut summary in all_summaries {
+        summary.working = summary.runtime.state.is_running();
         if summary.archived {
             archived.push(summary);
         } else if summary.pinned {

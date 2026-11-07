@@ -104,8 +104,6 @@ pub mod task_rows;
 pub mod task_trigger;
 /// The command a scheduled task's run uses to prompt its session.
 pub mod task_wake;
-/// Background task types and execution.
-pub mod tasks;
 /// Terminal commands exposed to the agent.
 pub mod terminal_commands;
 /// Permission handling for terminal command execution.

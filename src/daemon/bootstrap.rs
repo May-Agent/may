@@ -3,10 +3,10 @@ use std::sync::Arc;
 use skyzen::Result as SkyResult;
 use skyzen::utils::{Json, State};
 
-use crate::profile::query_profile_sessions;
-
 use super::config::{build_ui_config_response, list_skills_for_profile};
-use super::profiles::{ContainerPrepareError, ensure_profile_environment_ready};
+use super::profiles::{
+    ContainerPrepareError, ensure_profile_environment_ready, load_profile_sessions,
+};
 use super::sessions::list_api_sessions;
 use super::state::DaemonState;
 use super::types::{BootstrapProfileSessionsError, UiBootstrapResponse};
@@ -72,10 +72,8 @@ async fn load_default_profile_sessions(
     Option<crate::profile::ProfileSessions>,
     Option<BootstrapProfileSessionsError>,
 ) {
-    let db = state.db();
-
     match ensure_profile_environment_ready(&state, &profile_id, false).await {
-        Ok(()) => match query_profile_sessions(&db, &profile_id).await {
+        Ok(()) => match load_profile_sessions(&state, &profile_id).await {
             Ok(sessions) => (Some(sessions), None),
             Err(error) => unavailable_profile_sessions(&profile_id, None, error.to_string()),
         },

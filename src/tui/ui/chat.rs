@@ -2541,14 +2541,26 @@ pub(super) fn element_lines(
                 } else {
                     content.as_str()
                 };
-                for l in body.lines() {
-                    lines.push(Line::from(Span::styled(
-                        l.to_string(),
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::ITALIC),
-                    )));
+                let mut md_lines = markdown::render_markdown_with_positions(
+                    body,
+                    markdown::ImageSupport::Disabled,
+                    usize::from(width),
+                )
+                .lines;
+                while md_lines.last().is_some_and(|l| l.spans.is_empty()) {
+                    md_lines.pop();
                 }
+                let dim = Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC);
+                lines.extend(md_lines.into_iter().map(|line| {
+                    Line::from(
+                        line.spans
+                            .into_iter()
+                            .map(|span| Span::styled(span.content, span.style.patch(dim)))
+                            .collect::<Vec<_>>(),
+                    )
+                }));
             }
             lines.push(Line::from(""));
             if !content.is_empty() {
@@ -5714,6 +5726,53 @@ mod tests {
     }
 
     /// An expanded thinking block stays clickable — a click folds it back.
+    #[test]
+    fn expanded_thinking_renders_markdown_not_raw_syntax() {
+        let mut chat = ChatStream::new();
+        chat.push_thinking(
+            "先分析 the request:\n\n- 第一步 *check* config\n- 次のステップ **verify** 확인\n\n```rust\nlet x = 1;\n```",
+        );
+        chat.collapse_thinking();
+        chat.toggle_expanded("thinking-0");
+        let out = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
+        let text = out.join("\n");
+        assert!(text.contains("第一步"), "{text}");
+        assert!(text.contains("次のステップ"), "{text}");
+        assert!(text.contains("확인"), "{text}");
+        assert!(text.contains("let x = 1;"), "{text}");
+        assert!(!text.contains("```"), "{text}");
+        assert!(!text.contains("**"), "{text}");
+        assert!(!text.contains("*check*"), "{text}");
+
+        let elem = &chat.elements[0];
+        let lines = super::element_lines(
+            elem,
+            super::ElementState::of(elem, None, false, 0),
+            false,
+            "",
+            80,
+        )
+        .lines;
+        let verify = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.contains("verify"))
+            .expect("verify span");
+        assert!(
+            verify
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+        assert!(
+            verify
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::ITALIC)
+        );
+        assert_eq!(verify.style.fg, Some(Color::DarkGray));
+    }
+
     #[test]
     fn expanded_thinking_has_click_region() {
         let mut chat = ChatStream::new();

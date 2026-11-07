@@ -114,6 +114,9 @@ pub enum PrTokenSource {
     /// A fixed token, for tests.
     #[cfg(test)]
     Fixed(String),
+    /// No GitHub login, for tests.
+    #[cfg(test)]
+    Unauthenticated,
 }
 
 impl GitHubTokenSource for PrTokenSource {
@@ -122,6 +125,8 @@ impl GitHubTokenSource for PrTokenSource {
             Self::Gh(source) => source.token().await,
             #[cfg(test)]
             Self::Fixed(token) => Ok(token.clone()),
+            #[cfg(test)]
+            Self::Unauthenticated => Err(IssueError::GitHubAuth("not logged in".to_string())),
         }
     }
 }
