@@ -5954,3 +5954,49 @@ async fn a_failed_compaction_shows_its_cleanup_and_rerun() {
     server.stop().await;
     environment.release(&harness, &session_id).await;
 }
+
+/// `explore` runs the bundled explore subagent on the fast model and returns
+/// its result; the subagent's writes to the workspace, `tasks.md` and issues
+/// are refused.
+#[tokio::test]
+#[serial]
+async fn explore_runs_read_only_on_the_fast_model() {
+    let (files, mock) = run_subagent_probe(SubagentProbe {
+        setup: "printf -- '## Notes\\noriginal\\n' > tasks.md",
+        launch: "explore --prompt-file prompt.md",
+        child_script: "echo x > ../../workspace.txt; echo WORKSPACE_RC=$?; printf -- 'hacked\\n' >> ../../tasks.md; echo TASKS_RC=$?; issue create bug 'from explore' --body b; echo ISSUE_RC=$?; issue list >/dev/null; echo ISSUE_LIST_RC=$?",
+        final_script: "cp tasks.md tasks.before; echo MAIN_FINAL",
+    })
+    .await;
+
+    let requests = mock.agent_requests().await;
+    assert_eq!(
+        child_request_models(&requests),
+        [TIER_FAST_MODEL],
+        "explore runs on the fast model"
+    );
+    let result = files.get("sub.out");
+    assert!(
+        result.contains("Subagent 'explore' completed (fast tier"),
+        "the explore result comes back: {result}"
+    );
+    let outputs = child_probe_outputs(&mock).await;
+    assert_eq!(outputs.len(), 1, "{outputs:?}");
+    let code = |key: &str| -> i32 {
+        let start = outputs[0]
+            .find(key)
+            .unwrap_or_else(|| panic!("no {key} in {}", outputs[0]))
+            + key.len();
+        outputs[0][start..]
+            .split(|c: char| !c.is_ascii_digit())
+            .next()
+            .and_then(|digits| digits.parse().ok())
+            .unwrap_or_else(|| panic!("no code after {key} in {}", outputs[0]))
+    };
+    assert_ne!(code("WORKSPACE_RC="), 0, "{outputs:?}");
+    assert_ne!(code("TASKS_RC="), 0, "{outputs:?}");
+    assert_ne!(code("ISSUE_RC="), 0, "{outputs:?}");
+    assert_eq!(code("ISSUE_LIST_RC="), 0, "reads stay open: {outputs:?}");
+    assert!(!files.0.contains_key("workspace.txt"));
+    assert_eq!(files.get("tasks.before"), "## Notes\noriginal\n");
+}

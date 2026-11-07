@@ -12,6 +12,7 @@ use executor_core::DefaultExecutor;
 
 use crate::agent::ask_user_tool::{AskUserTool, WithdrawAskUserTool};
 use crate::agent::browser_tool::{BrowserBroker, BrowserTool};
+use crate::agent::explore_tool::{ExploreArgs, ExploreTool};
 use crate::agent::imagine::ImagineTool;
 use crate::agent::issue_tool::{IssueChangeNotifier, IssueTool, SubagentIssueTool};
 use crate::agent::notify_tool::{NotifyBroker, NotifyTool};
@@ -471,14 +472,24 @@ where
     let subagent_tracker = config.subagent_tracker;
     let fork_source = subagent_tool.fork_source();
     describe_tool(&mut descriptions, &subagent_tool);
+    describe_arguments::<ExploreArgs>(&mut descriptions, "explore");
+    let subagent_tool = Arc::new(subagent_tool);
     // Built for the main agent's terminal alone: a subagent has no `subagent`
-    // command.
+    // or `explore` command.
     builder.main_exclusive(|main| {
+        let explore_tool = subagent_tool.clone();
+        let explore_tracker = subagent_tracker.clone();
         main.configure_terminal_bound_usage_tool("subagent", move |binding| {
             TrackedSubagentTool::new(
                 subagent_tool.for_terminal(binding),
                 subagent_tracker.clone(),
             )
+        });
+        main.configure_terminal_bound_usage_tool("explore", move |binding| {
+            ExploreTool::new(TrackedSubagentTool::new(
+                explore_tool.for_terminal(binding),
+                explore_tracker.clone(),
+            ))
         });
     });
 
