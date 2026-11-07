@@ -342,6 +342,16 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             }
             Ok(None)
         }
+        AppEvent::ContextWindow { session_id, window } => {
+            if app
+                .session_manager
+                .current()
+                .is_some_and(|session| session.id.as_str() == session_id)
+            {
+                app.context_window = Some(window);
+            }
+            Ok(None)
+        }
         AppEvent::Status(message) => {
             app.set_status(message);
             Ok(None)

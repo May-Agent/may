@@ -399,6 +399,31 @@ pub fn effort_family_base(model_id: &str) -> String {
     model_id.to_string()
 }
 
+/// The context window of `model_id` on `provider_id`: what the provider
+/// reports in its model list, else the `aither_models` table (also looked up
+/// by effort family, so `o4-mini-high` resolves like `o4-mini`).
+#[must_use]
+pub fn resolve_context_window(
+    fetched: &[FetchedModel],
+    provider_id: &str,
+    model_id: &str,
+) -> Option<u32> {
+    let family = effort_family_base(model_id);
+    let reported = |wanted: &str| {
+        fetched
+            .iter()
+            .find(|model| model.provider_id == provider_id && model.id == wanted)
+            .and_then(|model| model.context_window)
+    };
+    let tabled = |wanted: &str| {
+        lookup_model_info(wanted).and_then(aither_models::ModelEntry::max_input_tokens)
+    };
+    reported(model_id)
+        .or_else(|| reported(&family))
+        .or_else(|| tabled(model_id))
+        .or_else(|| tabled(&family))
+}
+
 /// Whether two selector strings address the same selectable model.
 ///
 /// The provider ids must match and the model ids must collapse to the same
@@ -547,6 +572,56 @@ mod tests {
         assert_eq!(
             effort_ladder(&rungs, "relay", "gpt-x", Some(ProviderType::Google)),
             ["minimal", "low", "medium", "high"]
+        );
+    }
+
+    fn with_window(provider_id: &str, id: &str, window: u32) -> FetchedModel {
+        FetchedModel {
+            context_window: Some(window),
+            ..fetched(provider_id, id)
+        }
+    }
+
+    #[test]
+    fn a_provider_reported_window_resolves_a_model_the_table_lacks() {
+        let list = [with_window("relay", "relay-only-model", 262_144)];
+        assert_eq!(
+            super::resolve_context_window(&list, "relay", "relay-only-model"),
+            Some(262_144)
+        );
+        assert_eq!(
+            super::resolve_context_window(&list, "other", "relay-only-model"),
+            None
+        );
+    }
+
+    #[test]
+    fn the_provider_window_beats_the_table_and_the_table_fills_the_rest() {
+        let table = aither_models::lookup("gpt-4o")
+            .and_then(aither_models::ModelEntry::max_input_tokens)
+            .expect("the table lists gpt-4o");
+        assert_eq!(
+            super::resolve_context_window(&[], "relay", "gpt-4o"),
+            Some(table)
+        );
+        let list = [fetched("relay", "gpt-4o")];
+        assert_eq!(
+            super::resolve_context_window(&list, "relay", "gpt-4o"),
+            Some(table)
+        );
+        let list = [with_window("relay", "gpt-4o", 12_345)];
+        assert_eq!(
+            super::resolve_context_window(&list, "relay", "gpt-4o"),
+            Some(12_345)
+        );
+    }
+
+    #[test]
+    fn an_effort_rung_resolves_through_its_family() {
+        let list = [with_window("relay", "o4-mini", 4_321)];
+        assert_eq!(
+            super::resolve_context_window(&list, "relay", "o4-mini-high"),
+            Some(4_321)
         );
     }
 

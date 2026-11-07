@@ -255,6 +255,11 @@ impl<T: Clone + Send + Sync> RefreshableCache<T> {
         }
     }
 
+    /// The stored value of any age, without refreshing.
+    pub(crate) fn latest(&self) -> Option<T> {
+        self.inner.load_full().map(|cached| cached.value.clone())
+    }
+
     pub(crate) async fn get_or_refresh<F, Fut>(&self, refresh: F) -> T
     where
         F: FnOnce() -> Fut + Send,
@@ -489,6 +494,36 @@ impl DaemonState {
 
     pub(crate) fn db(&self) -> crate::db::ChatDb {
         self.db.clone()
+    }
+
+    /// The context window of `selector`: what its provider reports in the
+    /// fetched model list, else the `aither_models` table. The list is read
+    /// from the cache at any age; the network is touched only when the cache
+    /// holds no list and the table cannot answer.
+    pub(crate) async fn model_context_window(
+        &self,
+        selector: &crate::ModelSelector,
+    ) -> Option<u32> {
+        let resolve = |fetched: &[crate::models::FetchedModel]| {
+            crate::models::resolve_context_window(
+                fetched,
+                selector.provider_id(),
+                selector.model_id(),
+            )
+        };
+        let cached = self.fetched_models_cache.latest().unwrap_or_default();
+        if !cached.is_empty() {
+            return resolve(&cached);
+        }
+        if let Some(window) = resolve(&[]) {
+            return Some(window);
+        }
+        let config = (*self.config_snapshot()).clone();
+        let fetched = self
+            .fetched_models_cache
+            .get_or_refresh(move || async move { crate::models::fetch_all_models(&config).await })
+            .await;
+        resolve(&fetched)
     }
 
     pub(crate) fn config_snapshot(&self) -> Arc<MayConfig> {

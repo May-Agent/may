@@ -413,6 +413,14 @@ async fn forward_agent_frame(
             *current = Some(ForwardedTurn::new(events));
         }
         SessionAgentBody::Agent { event } => {
+            if let Some(window) = event.context_window() {
+                let _ = app_events
+                    .send(AppEvent::ContextWindow {
+                        session_id: frame.session_id,
+                        window,
+                    })
+                    .await;
+            }
             if let Some(turn) = current.as_mut() {
                 turn.agent(event, frame.at).await;
             }

@@ -204,6 +204,10 @@ pub enum WireAgentEvent {
     Usage {
         /// The usage.
         usage: Usage,
+        /// The model's context window as the daemon resolved it; clients
+        /// show usage against it and look nothing up themselves.
+        #[serde(default)]
+        context_window: Option<u32>,
     },
     /// A model response ended; `has_tool_calls` is false when the next
     /// text, if any, is a separate reply rather than a continuation.
@@ -238,9 +242,22 @@ pub enum WireAgentEvent {
 }
 
 impl WireAgentEvent {
-    /// The wire form of `event`, or `None` for events no UI renders.
+    /// The context window a usage event carries.
     #[must_use]
-    pub fn from_agent(event: Result<&AgentEvent, &AgentError>) -> Option<Self> {
+    pub const fn context_window(&self) -> Option<u32> {
+        match self {
+            Self::Usage { context_window, .. } => *context_window,
+            _ => None,
+        }
+    }
+
+    /// The wire form of `event`, or `None` for events no UI renders; a usage
+    /// event carries the model's `context_window`.
+    #[must_use]
+    pub fn from_agent(
+        event: Result<&AgentEvent, &AgentError>,
+        context_window: Option<u32>,
+    ) -> Option<Self> {
         let event = match event {
             Ok(event) => event,
             Err(error) => {
@@ -291,6 +308,7 @@ impl WireAgentEvent {
             },
             AgentEvent::Usage(usage) => Self::Usage {
                 usage: usage.clone(),
+                context_window,
             },
             AgentEvent::TurnComplete {
                 turn,
@@ -355,7 +373,7 @@ impl WireAgentEvent {
             Self::BuiltInToolResult { id, tool, result } => {
                 AgentEvent::BuiltInToolResult { id, tool, result }
             }
-            Self::Usage { usage } => AgentEvent::Usage(usage),
+            Self::Usage { usage, .. } => AgentEvent::Usage(usage),
             Self::TurnComplete {
                 turn,
                 has_tool_calls,
@@ -791,7 +809,7 @@ mod tests {
             name: "terminal".to_string(),
             result: ToolResult::text("done"),
         };
-        let wire = WireAgentEvent::from_agent(Ok(&event)).expect("rendered event");
+        let wire = WireAgentEvent::from_agent(Ok(&event), None).expect("rendered event");
         let json = serde_json::to_string(&wire).expect("serialize");
         let back: WireAgentEvent = serde_json::from_str(&json).expect("deserialize");
         let timed = back.into_timed(jiff::Timestamp::UNIX_EPOCH).expect("event");
@@ -807,7 +825,7 @@ mod tests {
             text: "全部完成。".to_string(),
             language: "cmn".to_string(),
         };
-        let wire = WireAgentEvent::from_agent(Ok(&event)).expect("rendered event");
+        let wire = WireAgentEvent::from_agent(Ok(&event), None).expect("rendered event");
         let json = serde_json::to_string(&wire).expect("serialize");
         assert!(json.contains("\"type\":\"reply_translated\""), "{json}");
         let back: WireAgentEvent = serde_json::from_str(&json).expect("deserialize");
@@ -829,7 +847,7 @@ mod tests {
             alerts_removed: 2,
             outputs_spilled: 3,
         };
-        let wire = WireAgentEvent::from_agent(Ok(&event)).expect("rendered event");
+        let wire = WireAgentEvent::from_agent(Ok(&event), None).expect("rendered event");
         let json = serde_json::to_string(&wire).expect("serialize");
         let back: WireAgentEvent = serde_json::from_str(&json).expect("deserialize");
         let timed = back.into_timed(jiff::Timestamp::UNIX_EPOCH).expect("event");
@@ -844,13 +862,27 @@ mod tests {
     }
 
     #[test]
+    fn a_usage_event_carries_the_daemons_context_window() {
+        let event = AgentEvent::Usage(aither_core::llm::Usage::default());
+        let wire = WireAgentEvent::from_agent(Ok(&event), Some(262_144)).expect("rendered event");
+        let json = serde_json::to_string(&wire).expect("serialize");
+        let back: WireAgentEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.context_window(), Some(262_144));
+        let bare = WireAgentEvent::from_agent(Ok(&event), None).expect("rendered event");
+        assert_eq!(bare.context_window(), None);
+    }
+
+    #[test]
     fn errors_come_back_as_errors() {
         let failure = aither_core::llm::Failure::transient()
             .with_retry_after(Some(std::time::Duration::from_secs(5)));
-        let wire = WireAgentEvent::from_agent(Err(&AgentError::Llm {
-            message: "overloaded".to_string(),
-            failure,
-        }))
+        let wire = WireAgentEvent::from_agent(
+            Err(&AgentError::Llm {
+                message: "overloaded".to_string(),
+                failure,
+            }),
+            None,
+        )
         .expect("rendered error");
         let back = wire.into_timed(jiff::Timestamp::UNIX_EPOCH);
         assert!(matches!(
