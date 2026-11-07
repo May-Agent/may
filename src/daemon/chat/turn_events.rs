@@ -259,6 +259,7 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
             AgentEvent::Reasoning(text) => {
                 self.log_first_agent_event("reasoning");
                 self.reasoning_text.push_str(&text);
+                self.turn_persister.push_reasoning(&text);
                 if !self.sink.on_reasoning(&text).await {
                     return Ok(ControlFlow::Break(TurnStop::Cancelled(
                         "client disconnected during reasoning stream",

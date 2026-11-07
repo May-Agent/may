@@ -195,6 +195,40 @@
     }
   }
 
+  /* A highlight sweeping across the title of a working session, left to right. */
+  .session-sweep {
+    background-image: linear-gradient(
+      90deg,
+      hsl(var(--muted-foreground)) 0%,
+      hsl(var(--muted-foreground)) 35%,
+      hsl(var(--foreground)) 50%,
+      hsl(var(--muted-foreground)) 65%,
+      hsl(var(--muted-foreground)) 100%
+    );
+    background-size: 300% 100%;
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    animation: session-sweep 1.8s linear infinite;
+  }
+
+  @keyframes session-sweep {
+    from {
+      background-position: 100% 0;
+    }
+    to {
+      background-position: 0% 0;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .session-sweep {
+      animation: none;
+      background-image: none;
+      color: inherit;
+    }
+  }
+
   .timeline-pulse {
     animation: timeline-pulse 1.6s ease-in-out infinite;
   }

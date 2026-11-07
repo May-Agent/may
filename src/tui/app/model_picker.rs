@@ -127,21 +127,10 @@ impl App {
         for model in &models {
             let base = crate::models::effort_family_base(&model.id);
             *families
-                .entry((model.provider_id.clone(), base.clone()))
+                .entry((model.provider_id.clone(), base))
                 .or_default() += 1;
-            if let Some(rung) = crate::models::effort_uid_token(&model.id) {
-                let rungs = self
-                    .family_effort_rungs
-                    .entry((model.provider_id.clone(), base))
-                    .or_default();
-                if !rungs.contains(&rung) {
-                    rungs.push(rung);
-                }
-            }
         }
-        for rungs in self.family_effort_rungs.values_mut() {
-            rungs.sort_by_key(|rung| crate::models::effort_rung_rank(rung));
-        }
+        crate::models::record_family_effort_rungs(&mut self.family_effort_rungs, &models);
         let family_base_of = |provider_id: &str, model_id: &str| {
             let base = crate::models::effort_family_base(model_id);
             families
@@ -415,25 +404,6 @@ fn resolve_model_query(list: &[String], query: &str) -> Option<String> {
     }
     let filtered = filter_model_list(list, query);
     (filtered.len() == 1).then(|| filtered[0].1.clone())
-}
-
-/// The reasoning-effort ladder a provider's wire protocol expresses. Every
-/// rung is concrete — the session's effort is the one it last selected, and
-/// "default" before any selection means medium, not a provider-decided
-/// level. Families outside a ladder still take it: vendors map what they can
-/// on their own API-compat layer and reject what a model does not have.
-pub(super) const fn effort_ladder_for(
-    provider_type: Option<crate::config::ProviderType>,
-) -> &'static [&'static str] {
-    use crate::config::ProviderType;
-    const OPENAI: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
-    const CLAUDE: &[&str] = &["none", "low", "medium", "high", "xhigh", "max"];
-    const GEMINI: &[&str] = &["minimal", "low", "medium", "high"];
-    match provider_type {
-        Some(ProviderType::Anthropic) => CLAUDE,
-        Some(ProviderType::Google) => GEMINI,
-        _ => OPENAI,
-    }
 }
 
 #[cfg(test)]

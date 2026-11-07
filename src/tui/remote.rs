@@ -199,6 +199,54 @@ async fn follow_index(client: DaemonClient, cwd: std::path::PathBuf, app_events:
     }
 }
 
+/// The `profile_sessions` event payload.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ProfileSessionsFrame {
+    profile_sessions: crate::profile::ProfileSessions,
+}
+
+/// Follow the session lists of `profile_id` while the task lives: the
+/// daemon pushes them whenever a session is archived, opened, starts
+/// working or stops.
+pub async fn follow_profile_sessions(
+    client: DaemonClient,
+    profile_id: String,
+    app_events: EventSender,
+) {
+    let query = {
+        let mut query = url::form_urlencoded::Serializer::new(String::new());
+        query
+            .append_pair("topics", "profile_sessions")
+            .append_pair("profileId", &profile_id);
+        query.finish()
+    };
+    loop {
+        match client.events(&query).await {
+            Ok(mut stream) => {
+                while let Ok(Some(event)) = stream.next().await {
+                    if event.kind != "profile_sessions" {
+                        continue;
+                    }
+                    let Ok(frame) = serde_json::from_str::<ProfileSessionsFrame>(&event.data)
+                    else {
+                        continue;
+                    };
+                    if app_events
+                        .send(AppEvent::ProfileSessionsPushed(frame.profile_sessions))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+            Err(error) => tracing::debug!(%error, "profile sessions stream unavailable"),
+        }
+        tokio::time::sleep(RECONNECT_DELAY).await;
+    }
+}
+
 /// The session's event query: a reopened stream names the last turn frame
 /// it saw (`after`), so the daemon sends only what came after it.
 fn events_query(session_id: &str, after: Option<&str>) -> String {

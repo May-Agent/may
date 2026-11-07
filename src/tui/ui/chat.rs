@@ -872,11 +872,12 @@ impl ChatStream {
             .rposition(|e| matches!(e, ChatElement::UserMessage { .. }))
             .map_or(self.fold_cursor, |i| (i + 1).max(self.fold_cursor));
         // The reply ends the turn: everything before its last block is work.
+        // A reply that is the turn's first element leaves nothing to fold.
         let end = self
             .elements
             .iter()
             .rposition(|e| matches!(e, ChatElement::AssistantText { .. }))
-            .filter(|index| *index > start)
+            .filter(|index| *index >= start)
             .unwrap_or(self.elements.len());
         if end <= start {
             return;
@@ -5531,6 +5532,30 @@ mod tests {
                 .iter()
                 .any(|element| matches!(element, ChatElement::WorkedFor { .. }))
         );
+    }
+
+    /// A turn whose reply is its only output keeps the reply visible and
+    /// gets no folded row: there is no work before it.
+    #[test]
+    fn a_reply_only_turn_keeps_its_reply_outside_the_fold() {
+        let mut chat = ChatStream::new();
+        chat.push_user("你知道吗 知っていますか 알아요?", Vec::new(), 0);
+        chat.push_text("知道。はい。네.");
+        chat.end_text();
+        chat.fold_turn_work(7);
+
+        assert!(
+            !chat
+                .elements
+                .iter()
+                .any(|element| matches!(element, ChatElement::WorkedFor { .. })),
+            "{:#?}",
+            chat.elements
+        );
+        assert!(matches!(
+            chat.elements.last(),
+            Some(ChatElement::AssistantText { content, .. }) if content == "知道。はい。네."
+        ));
     }
 
     #[test]

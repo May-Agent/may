@@ -643,7 +643,7 @@ impl ChatDb {
     pub async fn archive_session(&self, id: &str) -> Result<(), ChatDbError> {
         let runtime = self.load_session_runtime_summary(id).await?;
         if runtime.blocks_auto_archive() {
-            let reason = if runtime.state.is_executing() {
+            let reason = if runtime.state.blocks_auto_archive() {
                 format!("runtime state is {}", runtime.state.as_str())
             } else if runtime.plan_state.blocks_auto_archive() {
                 format!("plan state is {}", runtime.plan_state.as_str())
@@ -792,10 +792,14 @@ impl ChatDb {
         &self,
         cutoff: &str,
     ) -> Result<Vec<sessions::Model>, ChatDbError> {
+        // A runtime that changed since the cutoff is not idle long enough; an
+        // open `ask_user` question is not a reason to keep the session.
         let mut active_session_ids = query!(
             self.db,
-            "SELECT session_id FROM session_runtimes WHERE state != ?",
-            SessionRuntimeState::Idle.as_str()
+            "SELECT session_id FROM session_runtimes WHERE state NOT IN (?, ?) OR updated_at >= ?",
+            SessionRuntimeState::Idle.as_str(),
+            SessionRuntimeState::WaitingAskUser.as_str(),
+            cutoff
         )
         .fetch_all::<SessionIdRow>()
         .await?
@@ -816,16 +820,6 @@ impl ChatDb {
             query!(
                 self.db,
                 "SELECT session_id FROM session_pending_permissions"
-            )
-            .fetch_all::<SessionIdRow>()
-            .await?
-            .into_iter()
-            .map(|row| row.session_id),
-        );
-        active_session_ids.extend(
-            query!(
-                self.db,
-                "SELECT DISTINCT session_id FROM session_pending_ask_user_requests_v2"
             )
             .fetch_all::<SessionIdRow>()
             .await?

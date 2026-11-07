@@ -191,7 +191,7 @@ pub struct App {
     /// Effort rungs each fetched model family serves, keyed by
     /// `(provider_id, family base)` — the `/effort` popup shows a family's
     /// own ladder when the catalog reports one.
-    pub family_effort_rungs: std::collections::HashMap<(String, String), Vec<&'static str>>,
+    pub family_effort_rungs: crate::models::FamilyEffortRungs,
     /// When the current turn began; `None` while idle.
     pub turn_started_at: Option<std::time::Instant>,
     /// Selected index in the effort popup
@@ -308,8 +308,11 @@ pub struct App {
     pub profile_sessions: Option<ProfileSessions>,
     /// Selected profile index in `ProfileSelect` mode
     pub profile_selected: usize,
-    /// Whether the archived section is expanded in `SessionSelect`
-    pub archived_expanded: bool,
+    /// Which sessions `SessionSelect` lists.
+    pub session_view: super::state::SessionView,
+    /// The task following the daemon's pushed session lists of a profile
+    /// while `SessionSelect` is open.
+    profile_follow: Option<(String, tokio::task::JoinHandle<()>)>,
 
     /// Event sender for spawning background tasks
     pub event_tx: EventSender,
@@ -708,7 +711,8 @@ impl App {
             current_profile_id,
             profile_sessions: None,
             profile_selected: 0,
-            archived_expanded: false,
+            session_view: super::state::SessionView::default(),
+            profile_follow: None,
 
             event_tx,
             image_support,
@@ -2371,6 +2375,7 @@ impl App {
                         self.mode = AppMode::ProfileSelect;
                     } else {
                         // Only one profile, open session list directly
+                        self.session_view = super::state::SessionView::Recent;
                         self.load_session_list();
                     }
                     return Ok(None);
@@ -2559,6 +2564,7 @@ impl App {
                                 reasoning_effort: session.reasoning_effort,
                                 repo: session.repo,
                                 runtime: crate::session::SessionRuntimeSummary::default(),
+                                working: false,
                             })
                             .collect()
                     });
@@ -2572,12 +2578,18 @@ impl App {
     }
 
     /// Build a flat session list from profile sessions for navigation.
-    /// Pinned items come first, then regular, then archived (if expanded).
+    /// The recent view lists pinned items first, then regular sessions; the
+    /// archive view lists the archived ones.
     pub fn build_session_list_from_profile(&mut self) {
         let Some(ref ps) = self.profile_sessions else {
             self.session_list.clear();
             return;
         };
+
+        if self.session_view == super::state::SessionView::Archive {
+            self.session_list.clone_from(&ps.archived);
+            return;
+        }
 
         let mut list = Vec::new();
 
@@ -2593,11 +2605,6 @@ impl App {
 
         // Regular sessions
         list.extend(ps.regular.iter().cloned());
-
-        // Archived (only if expanded)
-        if self.archived_expanded {
-            list.extend(ps.archived.iter().cloned());
-        }
 
         self.session_list = list;
     }
@@ -2652,6 +2659,29 @@ impl App {
             .iter()
             .find(|p| p.id == pid)
             .map(|p| p.name.as_str())
+    }
+
+    /// Follows the daemon's pushed session lists of the current profile
+    /// while `SessionSelect` is open, and stops once it closes.
+    pub fn sync_profile_follow(&mut self) {
+        let wanted = match (&self.mode, &self.current_profile_id, &self.btw_daemon) {
+            (AppMode::SessionSelect, Some(profile_id), Some(_)) => Some(profile_id.clone()),
+            _ => None,
+        };
+        if self.profile_follow.as_ref().map(|(id, _)| id) == wanted.as_ref() {
+            return;
+        }
+        if let Some((_, task)) = self.profile_follow.take() {
+            task.abort();
+        }
+        if let (Some(profile_id), Some(client)) = (wanted, self.btw_daemon.clone()) {
+            let task = tokio::spawn(super::remote::follow_profile_sessions(
+                client,
+                profile_id.clone(),
+                self.event_tx.clone(),
+            ));
+            self.profile_follow = Some((profile_id, task));
+        }
     }
 
     /// Reload profile sessions asynchronously (used after pin/archive mutations).
@@ -3280,6 +3310,12 @@ impl App {
     fn execute_slash_command(&mut self, cmd: &str) -> Option<SendAction> {
         match cmd {
             "/session" => {
+                self.session_view = super::state::SessionView::Recent;
+                self.load_session_list();
+                None
+            }
+            "/archive" => {
+                self.session_view = super::state::SessionView::Archive;
                 self.load_session_list();
                 None
             }
@@ -3293,6 +3329,7 @@ impl App {
                         .unwrap_or(0);
                     self.mode = AppMode::ProfileSelect;
                 } else {
+                    self.session_view = super::state::SessionView::Recent;
                     self.load_session_list();
                 }
                 None
@@ -4327,21 +4364,21 @@ impl App {
     /// family's served rungs when the catalog reports them, else the
     /// provider protocol's generic ladder.
     pub fn effort_ladder_for_current(&self) -> Vec<&'static str> {
-        let family = self
+        let selector = self
             .current_model
             .as_deref()
-            .and_then(|model| model.parse::<crate::ModelSelector>().ok())
-            .map(|selector| {
-                (
-                    selector.provider_id().to_string(),
-                    crate::models::effort_family_base(selector.model_id()),
+            .and_then(|model| model.parse::<crate::ModelSelector>().ok());
+        selector.map_or_else(
+            || crate::models::provider_effort_ladder(self.current_provider_type()).to_vec(),
+            |selector| {
+                crate::models::effort_ladder(
+                    &self.family_effort_rungs,
+                    selector.provider_id(),
+                    selector.model_id(),
+                    self.current_provider_type(),
                 )
-            });
-        family
-            .and_then(|key| self.family_effort_rungs.get(&key).cloned())
-            .unwrap_or_else(|| {
-                model_picker::effort_ladder_for(self.current_provider_type()).to_vec()
-            })
+            },
+        )
     }
 
     /// The ladder index of [`Self::effective_effort`], falling back to the
@@ -4649,6 +4686,65 @@ mod tests {
             text: Some(text.to_string()),
         })
         .expect("suggestion event");
+    }
+
+    fn summary(id: &str, archived: bool, working: bool) -> crate::session::SessionSummary {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "title": format!("title of {id}"),
+            "pinned": false,
+            "archived": archived,
+            "message_count": 1,
+            "content_preview": "",
+            "working": working,
+        }))
+        .expect("summary")
+    }
+
+    fn session_screen(app: &mut App) -> Vec<String> {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).expect("terminal");
+        let frame = terminal
+            .draw(|frame| crate::tui::ui::render(frame, app))
+            .expect("draw");
+        crate::tui::ui::test_screen::buffer_screen(frame.buffer)
+    }
+
+    #[tokio::test]
+    async fn a_working_session_reads_working_in_the_session_list() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        app.session_list = vec![summary("busy", false, true), summary("calm", false, false)];
+        app.mode = crate::tui::AppMode::SessionSelect;
+
+        let screen = session_screen(&mut app).join("\n");
+        let busy = screen
+            .lines()
+            .find(|line| line.contains("title of busy"))
+            .expect("busy session listed");
+        assert!(busy.contains("Working..."), "{busy}");
+        let calm = screen
+            .lines()
+            .find(|line| line.contains("title of calm"))
+            .expect("calm session listed");
+        assert!(!calm.contains("Working..."), "{calm}");
+    }
+
+    #[tokio::test]
+    async fn the_archive_view_titles_the_popup() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        app.session_view = crate::tui::state::SessionView::Archive;
+        app.session_list = vec![summary("old", true, false)];
+        app.mode = crate::tui::AppMode::SessionSelect;
+
+        let screen = session_screen(&mut app).join("\n");
+        assert!(screen.contains("Archived sessions"), "{screen}");
+        assert!(screen.contains("title of old"), "{screen}");
+
+        app.session_view = crate::tui::state::SessionView::Recent;
+        let screen = session_screen(&mut app).join("\n");
+        assert!(!screen.contains("Archived sessions"), "{screen}");
     }
 
     fn press(app: &mut App, code: KeyCode) -> Option<SendAction> {

@@ -15,7 +15,8 @@ export type ApiErrorCode =
   | 'container_start_failed'
   | 'container_runtime_unavailable'
   | 'managed_podman_approval_required'
-  | 'location_unavailable';
+  | 'location_unavailable'
+  | 'github_unauthenticated';
 
 /** Semantic variant of a tool call — server-assigned, never re-inferred client-side. */
 export type ToolVariant =
@@ -328,16 +329,26 @@ export interface SseDone {
   seq: number;
   turnId: string;
   sessionId: string;
+  /** The reply, under the id of the first assistant message the turn stored. */
   assistant: ApiMessage;
+  /** The stored user message the turn answers, as the session's messages name it. */
+  userMessageId: string | null;
+  /** Every assistant message the turn stored, as the session's messages name them. */
+  messageIds: string[];
 }
 
-/** The turn paused for a browser takeover; carries the partial reply. */
+/**
+ * The turn paused for a browser takeover; carries the partial reply, which
+ * is absent when the pause came before the turn stored one.
+ */
 export interface SsePaused {
   kind: 'paused';
   seq: number;
   turnId: string;
   sessionId: string;
-  assistant: ApiMessage;
+  assistant: ApiMessage | null;
+  userMessageId: string | null;
+  messageIds: string[];
 }
 
 /** Last event of every turn, however it ended. */
@@ -451,6 +462,8 @@ export interface ProfileSessionSummary {
   updated_at?: string | null;
   profile_id?: string | null;
   repo?: string | null;
+  /** Something runs in the session: a turn, a background command or a subagent. */
+  working?: boolean;
 }
 
 export type ProfileSessionsPayload = {

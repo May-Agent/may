@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 import type { ApiMessage, ApiSession } from '../types';
 import { useSessionsStore } from './sessions';
 import { useTurnStore } from './turn';
+import { chatRows } from '../chat/rows';
 
 const originalFetch = globalThis.fetch;
 const encoder = new TextEncoder();
@@ -113,6 +114,8 @@ describe('turns are keyed by session', () => {
         seq: 3,
         turnId: 't1',
         sessionId: 'A',
+        userMessageId: null,
+        messageIds: ['a-1'],
         assistant: message('a-1', 'assistant', 'reply'),
       }),
     );
@@ -204,5 +207,88 @@ describe('a withdrawn turn', () => {
 
     expect(useSessionsStore.getState().messages.A).toEqual([]);
     expect(useTurnStore.getState().turns.A.restored).toBeNull();
+  });
+});
+
+describe('a finished turn keeps its components through a refresh', () => {
+  test('streamed messages take their stored ids, so the refreshed list reuses their rows', async () => {
+    const stored = [
+      { ...message('msg-7', 'user', '你好 こんにちは 안녕하세요'), attachments: [] },
+      message('msg-8', 'assistant', '我先查一下 調べます 확인할게요'),
+      message('msg-10', 'assistant', '完成 完了 완료'),
+    ];
+    const backend = installBackend({ A: session('A', []) });
+
+    await useSessionsStore.getState().open('A');
+    unwatchers.push(useTurnStore.getState().watch('A'));
+    await settle();
+    useSessionsStore.getState().appendMessage('A', {
+      ...message('local-1', 'user', stored[0]!.content),
+      attachments: [],
+    });
+    await useTurnStore.getState().send({ sessionId: 'A', content: stored[0]!.content });
+    const frames: Array<[string, Record<string, unknown>]> = [
+      ['start', { seq: 1, turnId: 't1', sessionId: 'A', assistantId: 'assistant-x' }],
+      ['text', { seq: 2, turnId: 't1', chunk: stored[1]!.content }],
+      [
+        'done',
+        {
+          seq: 3,
+          turnId: 't1',
+          sessionId: 'A',
+          userMessageId: 'msg-7',
+          messageIds: ['msg-8', 'msg-10'],
+          assistant: stored[1],
+        },
+      ],
+      ['end', { seq: 4, turnId: 't1', outcome: 'completed' }],
+    ];
+    for (const [event, data] of frames) backend.streams.A.enqueue(frame('A', event, data));
+    await settle();
+
+    const rowsOf = () =>
+      chatRows(useSessionsStore.getState().messages.A, useTurnStore.getState().turns.A.last).map(
+        ({ key, kind }) => ({ key, kind }),
+      );
+    const before = rowsOf();
+    expect(before).toEqual([
+      { key: 'msg-7', kind: 'user' },
+      { key: 'msg-8', kind: 'turn' },
+    ]);
+
+    // The refresh the session's changed `updated_at` triggers.
+    backend.sessions.A = session('A', stored);
+    await useSessionsStore.getState().refreshActive('A');
+
+    expect(rowsOf()).toEqual(before);
+  });
+
+  test('a pause before any reply settles the user message and adds no assistant message', async () => {
+    const backend = installBackend({ A: session('A', []) });
+    await useSessionsStore.getState().open('A');
+    unwatchers.push(useTurnStore.getState().watch('A'));
+    await settle();
+    useSessionsStore.getState().appendMessage('A', message('local-1', 'user', '你好 こんにちは 안녕하세요'));
+    await useTurnStore.getState().send({ sessionId: 'A', content: '你好' });
+    const frames: Array<[string, Record<string, unknown>]> = [
+      ['start', { seq: 1, turnId: 't1', sessionId: 'A', assistantId: 'assistant-x' }],
+      [
+        'paused',
+        {
+          seq: 2,
+          turnId: 't1',
+          sessionId: 'A',
+          userMessageId: 'msg-7',
+          messageIds: [],
+          assistant: null,
+        },
+      ],
+      ['end', { seq: 3, turnId: 't1', outcome: 'paused' }],
+    ];
+    for (const [event, data] of frames) backend.streams.A.enqueue(frame('A', event, data));
+    await settle();
+
+    expect(useSessionsStore.getState().messages.A.map((m) => m.id)).toEqual(['msg-7']);
+    expect(useTurnStore.getState().turns.A.active).toBeNull();
   });
 });

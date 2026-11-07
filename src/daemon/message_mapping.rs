@@ -10,6 +10,12 @@ use super::types::{
     ToolVariant,
 };
 
+/// The id a stored message row has on the wire: streamed turn events and the
+/// session's REST messages name the same row by it.
+pub(super) fn api_message_id(row_id: i32) -> String {
+    format!("msg-{row_id}")
+}
+
 /// Convert DB message rows to API messages, with native terminal execution tracking.
 ///
 /// Tool rows (non-terminal tools such as `web_search`, `browser`, `task`) are attached
@@ -26,7 +32,7 @@ pub(super) fn map_db_messages(
     let mut pending_tool_events: Vec<Value> = Vec::new();
     let mut last_assistant_in_turn: Option<usize> = None;
 
-    for (idx, msg) in db_messages.iter().enumerate() {
+    for msg in db_messages {
         let persisted = PersistedMessage::try_from(msg)?;
         match persisted.role {
             MessageRole::Tool => {
@@ -54,7 +60,7 @@ pub(super) fn map_db_messages(
 
                 let timestamp = persisted.require_timestamp()?.to_string();
                 out.push(ApiMessage {
-                    id: format!("msg-{idx}"),
+                    id: api_message_id(msg.id),
                     role: persisted.role.as_str().to_string(),
                     content: msg.content.clone(),
                     timestamp,
@@ -82,12 +88,12 @@ pub(super) fn map_db_messages(
                 };
 
                 let mut api_msg = ApiMessage {
-                    id: format!("msg-{idx}"),
+                    id: api_message_id(msg.id),
                     role: persisted.role.as_str().to_string(),
                     content: msg.content.clone(),
                     timestamp,
                     attachments: Vec::new(),
-                    thinking: None,
+                    thinking: msg.thinking.clone(),
                     is_streaming: Some(false),
                     is_thinking: Some(false),
                     tool_event,

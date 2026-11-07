@@ -25,6 +25,7 @@ import { endSleep, parseSleepCommand, startSleep } from '@/lib/api/sleep';
 import { useRuntimeStore } from '@/lib/stores/runtime';
 import { cn } from '@/lib/utils';
 import { formatGroupTime, startsGroup } from '@/lib/chat/time';
+import { chatRows, type ChatRow } from '@/lib/chat/rows';
 
 const STICKY_BOTTOM_THRESHOLD_PX = 48;
 const NO_MESSAGES: ApiMessage[] = [];
@@ -124,6 +125,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     active.reasoningEffort.toLowerCase() !== 'off';
   const lastTurnForActive =
     lastTurn && !lastTurn.error ? lastTurn : null;
+  const rows = chatRows(messages, lastTurnForActive);
 
   const handleSend = async (
     content: string,
@@ -215,11 +217,11 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     await send({ sessionId: sid, content, attachments });
   };
 
-  const renderMessage = (msg: ApiMessage) => {
-    if (msg.role === 'user') {
+  const renderMessage = ({ kind, message: msg }: ChatRow) => {
+    if (kind === 'user') {
       return <UserMessage content={msg.content} attachments={msg.attachments} />;
     }
-    if (lastTurnForActive && lastTurnForActive.assistantId === msg.id) {
+    if (kind === 'turn' && lastTurnForActive) {
       return (
         <AssistantTurn
           turn={lastTurnForActive}
@@ -255,16 +257,17 @@ export function ChatView({ sessionId }: { sessionId: string }) {
         aria-label={active.title || t('common.untitled')}
       >
         <div className="mx-auto w-full max-w-3xl space-y-6">
-          {messages.map((msg, i) => {
-            const stamp = startsGroup(messages[i - 1]?.timestamp, msg.timestamp) ? (
+          {rows.map((row, i) => {
+            const msg = row.message;
+            const stamp = startsGroup(rows[i - 1]?.message.timestamp, msg.timestamp) ? (
               <p className="pt-2 text-center text-[11px] text-muted-foreground">
                 <time dateTime={msg.timestamp}>{formatGroupTime(msg.timestamp, now)}</time>
               </p>
             ) : null;
             return (
-              <Fragment key={msg.id}>
+              <Fragment key={row.key}>
                 {stamp}
-                {renderMessage(msg)}
+                {renderMessage(row)}
               </Fragment>
             );
           })}

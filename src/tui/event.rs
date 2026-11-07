@@ -61,6 +61,8 @@ pub enum AppEvent {
     ProfilesLoaded(Result<Vec<ProfileInfo>, TuiError>),
     /// Profile sessions loaded (pinned/regular/archived groups)
     ProfileSessionsLoaded(Result<ProfileSessions, TuiError>),
+    /// The daemon pushed new profile sessions (archive, working state).
+    ProfileSessionsPushed(ProfileSessions),
 
     /// Background config save completed.
     ConfigSaved(Result<(), TuiError>),
@@ -219,6 +221,7 @@ impl AppEvent {
             Self::SkillDeleted(_) => "skill_deleted",
             Self::ProfilesLoaded(_) => "profiles_loaded",
             Self::ProfileSessionsLoaded(_) => "profile_sessions_loaded",
+            Self::ProfileSessionsPushed(_) => "profile_sessions_pushed",
             Self::ConfigSaved(_) => "config_saved",
             Self::EffortLoaded(_) => "effort_loaded",
             Self::EffortApplied(_) => "effort_applied",
