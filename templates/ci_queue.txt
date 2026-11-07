@@ -1,0 +1,8 @@
+{% if rows.is_empty() -%}
+No merge-queue waits are recorded for this session's PRs yet; one is recorded when a PR lands.
+{%- else -%}
+Merge-queue wait against run time, newest PR first:
+{% for row in rows -%}
+- PR #{{ row.pr_number }}: waited {{ row.wait }} in the queue after a {{ row.run }} run.
+{% endfor -%}
+{%- endif %}

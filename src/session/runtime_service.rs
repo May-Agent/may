@@ -167,6 +167,12 @@ impl SessionRuntimeService {
         self.db.clone()
     }
 
+    /// The bus the service publishes UI events on.
+    #[must_use]
+    pub fn ui_events(&self) -> UiEventBus {
+        self.ui_event_bus.clone()
+    }
+
     /// The running terminal's grant handle for `session_id`, when an agent
     /// currently carries it.
     ///

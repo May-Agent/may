@@ -3,6 +3,7 @@
 //! Single global database at `~/.may/history.db` containing all sessions and messages.
 
 mod cache_misses;
+mod ci;
 mod common;
 mod context_snapshot;
 pub mod entity;
@@ -35,6 +36,7 @@ use crate::PermissionHistoryMode;
 use sql as db_sql;
 
 pub use cache_misses::PromptCacheRequest;
+pub use ci::{CiBaselineRow, CiFindingRow, CiJobRow, CiPrRunRow, CiStepRow, CiTestRow, NewCiJob};
 pub use common::{
     AssistantCacheUsageSummary, ChatDbError, ContextDebugSnapshot, ContextDebugSnapshotMessage,
     CreateProfileParams, CreateScheduledTaskParams, MessageStatsParams, NetworkAccessLogParams,

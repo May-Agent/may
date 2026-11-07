@@ -22,6 +22,11 @@ export interface SessionTurnsOptions {
    */
   onBackground?: (snapshot: SessionBackground) => void;
   /**
+   * Also subscribe to the session's `session_warning` frames and hand each
+   * warning's text here.
+   */
+  onWarning?: (message: string) => void;
+  /**
    * Index of the last turn frame already received: a reopened stream sends
    * only the frames after it instead of replaying the turn in progress.
    */
@@ -50,7 +55,11 @@ export async function openSessionTurns(
     if (abort.aborted) controller.abort();
     else abort.addEventListener('abort', () => controller.abort(), { once: true });
   }
-  const topics = options.onBackground ? 'session_turn,session_background' : 'session_turn';
+  const topics = [
+    'session_turn',
+    ...(options.onBackground ? ['session_background'] : []),
+    ...(options.onWarning ? ['session_warning'] : []),
+  ].join(',');
   const params = new URLSearchParams({ topics, sessionId });
   if (options.after) params.set('after', options.after);
   const res = await fetch(apiSseUrl(`/events?${params.toString()}`), {
@@ -86,6 +95,11 @@ async function* turnEvents(
     if (event === 'session_background') {
       const snapshot = data as unknown as SessionBackground;
       if (snapshot.sessionId === sessionId) options.onBackground?.(snapshot);
+      continue;
+    }
+    if (event === 'session_warning') {
+      const warning = data as unknown as { sessionId: string; message: string };
+      if (warning.sessionId === sessionId) options.onWarning?.(warning.message);
       continue;
     }
     if (event !== 'session_turn') continue;

@@ -442,6 +442,18 @@ pub struct SuggestionFrame {
     pub text: Option<String>,
 }
 
+/// One frame of the `session_warning` event kind: something the user should
+/// know about the session's work, shown in the message stream and never
+/// part of the agent's context.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WarningFrame {
+    /// Session the warning belongs to.
+    pub session_id: String,
+    /// The warning text.
+    pub message: String,
+}
+
 /// One frame of the `session_recap` event kind.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

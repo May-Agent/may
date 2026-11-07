@@ -272,6 +272,63 @@ pub(super) async fn watch<U: Upstream + Sync, C: Clock + Sync>(
     }
 }
 
+/// Told once, the first time every check run of the PR has concluded.
+pub(super) trait ChecksObserver: Sync {
+    /// The PR's checks have finished.
+    fn finished(&self) -> impl Future<Output = ()> + Send;
+}
+
+/// An [`Upstream`] that tells `observer` when the PR's checks finish.
+pub(super) struct Observing<'a, U, O> {
+    upstream: &'a U,
+    observer: &'a O,
+    told: std::sync::atomic::AtomicBool,
+}
+
+impl<'a, U: Sync, O: ChecksObserver> Observing<'a, U, O> {
+    pub(super) const fn new(upstream: &'a U, observer: &'a O) -> Self {
+        Self {
+            upstream,
+            observer,
+            told: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Tells the observer now unless it was told already: the watch ended
+    /// before a snapshot showed the checks finished.
+    pub(super) async fn tell_if_unheard(&self) {
+        if !self.told.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            self.observer.finished().await;
+        }
+    }
+}
+
+impl Snapshot {
+    /// Whether the PR has check runs and every one has concluded.
+    fn checks_finished(&self) -> bool {
+        let mut runs = self.checks.iter().filter_map(|check| match check {
+            CheckContext::CheckRun { conclusion, .. } => Some(conclusion.is_some()),
+            CheckContext::StatusContext { .. } => None,
+        });
+        let first = runs.next();
+        first == Some(true) && runs.all(|concluded| concluded)
+    }
+}
+
+impl<U: Upstream + Sync, O: ChecksObserver> Upstream for Observing<'_, U, O> {
+    async fn snapshot(&self) -> Result<Snapshot, PrError> {
+        let snapshot = self.upstream.snapshot().await?;
+        if snapshot.checks_finished() {
+            self.tell_if_unheard().await;
+        }
+        Ok(snapshot)
+    }
+
+    fn expected_checks(&self) -> impl Future<Output = Result<Duration, PrError>> + Send {
+        self.upstream.expected_checks()
+    }
+}
+
 /// GitHub through its API, for one PR.
 pub(super) struct GithubPr<'a, T> {
     pub(super) api: &'a GitHubRest<T>,
@@ -660,6 +717,43 @@ mod tests {
         (outcome, clock, readers)
     }
 
+    struct Counter(std::sync::atomic::AtomicUsize);
+
+    impl ChecksObserver for Counter {
+        fn finished(&self) -> impl Future<Output = ()> + Send {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(())
+        }
+    }
+
+    #[test]
+    fn the_observer_is_told_once_when_every_check_run_has_concluded() {
+        let mut running = snapshot(PullRequestState::Open, None);
+        running.checks.push(CheckContext::CheckRun {
+            name: "test".to_string(),
+            details_url: None,
+            conclusion: None,
+            is_required: true,
+        });
+        let steps = vec![
+            (Duration::ZERO, running),
+            (minutes(2), snapshot(PullRequestState::Open, Some(1))),
+            (minutes(30), snapshot(PullRequestState::Merged, None)),
+        ];
+        let clock = VirtualClock::new();
+        let script = Script {
+            clock: &clock,
+            steps,
+            readers: Mutex::new(Vec::new()),
+        };
+        let counter = Counter(std::sync::atomic::AtomicUsize::new(0));
+        let observing = Observing::new(&script, &counter);
+        let outcome =
+            futures_lite::future::block_on(watch(&observing, &clock, 0, EXPECTED)).unwrap();
+        futures_lite::future::block_on(observing.tell_if_unheard());
+        assert_eq!(outcome, Outcome::Merged);
+        assert_eq!(counter.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
     #[test]
     fn a_pr_landing_after_thirty_minutes_in_the_merge_queue_is_merged() {
         let steps = vec![

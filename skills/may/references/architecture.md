@@ -44,6 +44,7 @@ Paths are relative to the May source checkout. `aither-sandbox` and `aither-agen
 - `src/terminal_commands.rs`: `PrContext` construction and `configure_terminal_bound_tool("pr", …)`.
 - `src/workspace.rs`: `ProjectConfig.checks` and `ProjectPr` (`backend`, `screen`, `auto_merge`, `require_review`).
 - `src/db/pr.rs` and `prs` / `pr_events` in `src/db/sql/chat_schema.sql`: PR rows and the event trail.
+- `src/ci/`: CI durations. `record.rs` (`Recorder`: GitHub jobs and steps through `github.rs`, baselines, local checks, queue wait, the finding), `timing.rs` (median, p90, trend, the two thresholds), `logs.rs` (cargo test, nextest and bun test log parsers), `report.rs` (the alert, warning and `ci` templates in `templates/ci_*.txt`). `pr/merge_watch.rs` `Observing` fires the recorder when a PR's checks finish. Tables `ci_jobs`, `ci_steps`, `ci_tests`, `ci_baselines`, `ci_pr_runs`, `ci_findings` in `src/db/ci.rs`. `src/agent/ci_alert.rs` hands a finding to the agent once; `src/agent/ci_tool.rs` is the `ci` command; the warning rides `/api/events` as `session_warning` (`daemon/events.rs`). The `ci-optimise` skill is in `skills/ci-optimise/`.
 - `src/agent/permission.rs`: `for_subagent` and `SUBAGENT_APPROVAL_TIMEOUT` (no parent-approval step). `aither-agent/src/specialized/task.rs`: `worktrees` and `commit_worktrees` grants.
 
 ## Search

@@ -354,6 +354,20 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             }
             Ok(None)
         }
+        AppEvent::Warning {
+            session_id,
+            message,
+        } => {
+            if app
+                .session_manager
+                .current()
+                .is_some_and(|session| session.id.as_str() == session_id)
+            {
+                app.chat.push_warning(&message);
+                app.scroll = usize::MAX;
+            }
+            Ok(None)
+        }
         AppEvent::ContextWindow { session_id, window } => {
             if app
                 .session_manager

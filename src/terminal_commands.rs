@@ -303,7 +303,18 @@ where
         github_api: crate::pr::PrContext::default_github_api(),
         task_events: Some(config.task_events.clone()),
         publish: config.publish_gate.clone(),
+        ci: config.ask_user.as_ref().map(|runtime| crate::pr::CiWatch {
+            may_dir: config.may_dir.clone(),
+            ui_events: runtime.ui_events(),
+        }),
     };
+    let ci_tool = crate::agent::ci_tool::CiTool::new(
+        config.db.clone(),
+        config.session_id.clone(),
+        config.may_dir.clone(),
+    );
+    describe_tool(&mut descriptions, &ci_tool);
+    builder.configure_tool(ci_tool);
     let mut pr_command = PrCommand::new(pr_context);
     if let Some(guard) = &config.languages {
         pr_command = pr_command.with_languages(guard.clone());

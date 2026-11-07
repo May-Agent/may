@@ -18,6 +18,7 @@ Typing sends: Enter sends the line. While the agent is working, Enter steers (in
 - `! command` runs a bash command in May's environment; its masked output is returned to the agent as the next message. Never type secrets there; use `/secret`.
 - Ctrl+V pastes (an image becomes an attachment); a multi-line or large paste becomes an attachment file.
 - Ctrl+B shows or hides the sidebar (tasks, issues, subagents, jobs; only on terminals at least 120 columns wide). Ctrl+N new session, Ctrl+P profile or session list, Ctrl+Left open questions, Ctrl+C clear / twice quit, Ctrl+Q quit. Up/Down browse input history or scroll the chat, PageUp/PageDown and the mouse wheel scroll, g/G jump to top/bottom, Esc clears the input, Esc twice (idle) opens rewind. Selected text is copied with Ctrl+C.
+- A warning for the user, such as an abnormally long CI job, appears in the stream with a warning icon in yellow; it is not part of the agent's context. The web UI shows it with an amber warning icon.
 - Dialogs appear for approvals: `unsafe` command permission, workspace access outside the sandbox, repository trust, `ask_user` questions, and a quit confirmation when a run is active. Tool calls can be opened for detail and images viewed full screen.
 
 ## Web UI

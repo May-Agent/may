@@ -245,7 +245,7 @@ describe('inspector store', () => {
     });
     const unwatch = useTurnStore.getState().watch('A');
     await settle();
-    expect(topics.split(',')).toEqual(['session_turn', 'session_background']);
+    expect(topics.split(',')).toEqual(['session_turn', 'session_background', 'session_warning']);
     const send = (sessionId: string, jobs: BackgroundJob[]) =>
       controller!.enqueue(
         encoder.encode(
