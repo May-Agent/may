@@ -83,7 +83,8 @@ struct Persisted {
     told: BTreeSet<String>,
     #[serde(skip)]
     reminders: u64,
-    #[serde(skip)]
+    /// When the last reminder was raised, Unix milliseconds; kept so the
+    /// spacing holds across restarts.
     last_reminded_ms: Option<i64>,
 }
 
@@ -276,6 +277,7 @@ impl SleepState {
         }
         inner.reminders += 1;
         inner.last_reminded_ms = Some(now.as_millisecond());
+        self.persist(&inner).await?;
         drop(inner);
         self.bus.publish(UiEventTopics::SLEEP);
         Ok(true)
@@ -291,8 +293,24 @@ impl SleepState {
 
     async fn persist(&self, inner: &Persisted) -> std::io::Result<()> {
         let text = serde_json::to_string(inner).map_err(std::io::Error::other)?;
-        async_fs::write(&self.path, text).await
+        let path = self.path.clone();
+        blocking::unblock(move || write_atomically(&path, text.as_bytes())).await
     }
+}
+
+/// Replaces `path` with `contents`: written and synced to a temporary file
+/// in the same directory, then renamed over it, so a crash leaves the old
+/// file or the new one whole.
+fn write_atomically(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let directory = path
+        .parent()
+        .expect("the sleep state file lives in a directory");
+    let mut file = tempfile::NamedTempFile::new_in(directory)?;
+    file.write_all(contents)?;
+    file.as_file().sync_all()?;
+    file.persist(path).map_err(|error| error.error)?;
+    Ok(())
 }
 
 /// Why a sleep operation failed.
@@ -634,6 +652,52 @@ mod tests {
                 .await
                 .unwrap(),
             "again the next night"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_write_cut_before_the_rename_keeps_the_previous_state() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (sleep, _) = state(dir.path()).await;
+        sleep.sleep("a", at(T0)).await.unwrap();
+        // A crash after a temporary file was started, before the rename.
+        std::fs::write(dir.path().join(".tmp-sleep-cut"), "{\"asleep\": tr").unwrap();
+
+        let (restarted, _) = state(dir.path()).await;
+        assert!(restarted.is_asleep());
+        assert_eq!(restarted.status().await.origin.as_deref(), Some("a"));
+        // Writes go on despite the leftover.
+        restarted.wake(at(T0)).await.unwrap();
+        let (again, _) = state(dir.path()).await;
+        assert!(!again.is_asleep());
+    }
+
+    #[tokio::test]
+    async fn a_reminder_is_not_repeated_after_a_restart_within_the_spacing() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (sleep, _) = state(dir.path()).await;
+        let utc = TimeZone::UTC;
+        slept_around_midnight(&sleep).await;
+        assert!(
+            sleep
+                .remind_if_due(at("2026-03-01T23:30:00Z"), &utc)
+                .await
+                .unwrap()
+        );
+
+        let (restarted, _) = state(dir.path()).await;
+        assert!(
+            !restarted
+                .remind_if_due(at("2026-03-01T23:40:00Z"), &utc)
+                .await
+                .unwrap(),
+            "inside the twelve hours"
+        );
+        assert!(
+            restarted
+                .remind_if_due(at("2026-03-02T23:35:00Z"), &utc)
+                .await
+                .unwrap()
         );
     }
 
