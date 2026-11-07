@@ -298,18 +298,19 @@ impl SleepState {
     }
 }
 
-/// Replaces `path` with `contents`: written and synced to a sibling file,
-/// then renamed over it, so a crash leaves the old file or the new one whole.
+/// Replaces `path` with `contents`: written and synced to a temporary file
+/// in the same directory, then renamed over it, so a crash leaves the old
+/// file or the new one whole.
 fn write_atomically(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    let mut temporary = path.as_os_str().to_owned();
-    temporary.push(".tmp");
-    let temporary = PathBuf::from(temporary);
-    let mut file = std::fs::File::create(&temporary)?;
+    let directory = path
+        .parent()
+        .expect("the sleep state file lives in a directory");
+    let mut file = tempfile::NamedTempFile::new_in(directory)?;
     file.write_all(contents)?;
-    file.sync_all()?;
-    drop(file);
-    std::fs::rename(&temporary, path)
+    file.as_file().sync_all()?;
+    file.persist(path).map_err(|error| error.error)?;
+    Ok(())
 }
 
 /// Why a sleep operation failed.
@@ -659,13 +660,13 @@ mod tests {
         let dir = tempfile::tempdir().expect("dir");
         let (sleep, _) = state(dir.path()).await;
         sleep.sleep("a", at(T0)).await.unwrap();
-        // A crash after the temporary file was started, before the rename.
-        std::fs::write(dir.path().join("sleep.json.tmp"), "{\"asleep\": tr").unwrap();
+        // A crash after a temporary file was started, before the rename.
+        std::fs::write(dir.path().join(".tmp-sleep-cut"), "{\"asleep\": tr").unwrap();
 
         let (restarted, _) = state(dir.path()).await;
         assert!(restarted.is_asleep());
         assert_eq!(restarted.status().await.origin.as_deref(), Some("a"));
-        // The next write replaces the stale temporary file.
+        // Writes go on despite the leftover.
         restarted.wake(at(T0)).await.unwrap();
         let (again, _) = state(dir.path()).await;
         assert!(!again.is_asleep());
