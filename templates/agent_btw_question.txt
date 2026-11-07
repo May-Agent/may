@@ -1,0 +1,6 @@
+<system-reminder>
+Another agent asks you a side question: agent "{{ sender }}" (id {{ sender_id }}), not the user. You answer it as a read-only fork of yourself: every command is refused, and nothing here reaches your own conversation. Answer from what your context already holds; your reply is the answer that agent receives.
+</system-reminder>
+<agent-btw from="{{ sender }}" id="{{ sender_id }}">
+{{ question }}
+</agent-btw>

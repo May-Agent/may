@@ -372,6 +372,9 @@ pub struct MayAgent {
     /// Model clone reserved for `/btw` side questions.
     btw_llm: ModelSlot<ProviderLlm>,
     subagent_tracker: crate::agent::subagent_tracker::SubagentTracker,
+    /// This agent's entry among the daemon's btw fork hosts, while it is the
+    /// session's agent.
+    _fork_registration: Option<crate::agent_link::ForkRegistration>,
 }
 
 /// The prompt cache of `session_id`'s agent resumed at `epoch`: the one
@@ -800,6 +803,15 @@ impl MayAgent {
                 config.session_id.as_str(),
                 config.cwd.clone(),
             ));
+        // Another agent's `btw` forks this agent from the requests it
+        // publishes, whether it is working or idle.
+        let fork_registration = config.agent_messaging.as_ref().map(|messaging| {
+            messaging.forks.register(
+                config.session_id.as_str(),
+                shared_terminal_commands.fork_source.clone(),
+                btw_llm.llm.clone(),
+            )
+        });
         if is_container {
             builder = Box::pin(builder.with_skills_readable_only(&skills_dir)).await?;
         } else {
@@ -875,6 +887,7 @@ impl MayAgent {
             subagent_runs,
             btw_llm,
             subagent_tracker,
+            _fork_registration: fork_registration,
         })
     }
 
@@ -1507,6 +1520,7 @@ pub async fn test_agent(
                 String::new(),
             ),
             subagent_tracker: crate::agent::subagent_tracker::SubagentTracker::default(),
+            _fork_registration: None,
         },
         temp,
     )

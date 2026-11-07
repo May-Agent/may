@@ -366,6 +366,17 @@ where
     }
 
     if let Some(messaging) = config.agent_messaging {
+        let mut btw =
+            crate::agent_link::BtwCommand::new(messaging.clone(), config.session_id.clone());
+        if let Some(guard) = &config.languages {
+            btw = btw.with_languages(guard.clone());
+        }
+        describe_arguments::<crate::agent_link::BtwArgs>(&mut descriptions, "btw");
+        // Built per terminal: the fork answering a question runs on a
+        // terminal launched from the asking agent's.
+        builder.main_only(|reserved| {
+            reserved.configure_terminal_bound_tool("btw", move |binding| btw.for_terminal(binding));
+        });
         let mut agent = crate::agent_link::AgentTool::new(
             messaging,
             config.session_id.clone(),
@@ -1056,6 +1067,7 @@ mod tests {
             cache_lifetime: crate::agent_link::CacheLifetimes::new(|_| {
                 crate::cache_lifetime::CacheLifetime::default()
             }),
+            forks: crate::agent_link::ForkHosts::default(),
         };
 
         let mut builder = ToolRegistryBuilder::new();
@@ -1103,6 +1115,8 @@ mod tests {
 
         assert!(!main.is_reserved("agent"));
         assert!(subagent.is_reserved("agent"));
+        assert!(!main.is_reserved("btw"));
+        assert!(subagent.is_reserved("btw"));
         for refused in [agent_list(&subagent).await, agent_send(&subagent).await] {
             assert!(!refused.ok, "{refused:?}");
             assert!(
