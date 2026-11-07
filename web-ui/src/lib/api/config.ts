@@ -152,6 +152,12 @@ export interface UiFullConfig {
   /** Omitted from a save, the setting is left as it is. */
   suggestions?: UiSuggestionsConfig;
   recap?: UiRecapConfig;
+  sessions?: UiSessionsConfig;
+}
+
+export interface UiSessionsConfig {
+  /** Hours a session stays listed after it went idle. */
+  recentHours: number;
 }
 
 export interface UiSshServerConfig {

@@ -1262,6 +1262,9 @@ pub struct MayConfig {
     /// Recap settings.
     #[serde(default)]
     pub recap: RecapConfig,
+    /// Session list settings.
+    #[serde(default)]
+    pub sessions: SessionsConfig,
     /// Communication and working languages.
     #[serde(default)]
     pub language: LanguageConfig,
@@ -1390,6 +1393,21 @@ impl Default for RecapConfig {
             auto: true,
             idle_minutes: 30,
         }
+    }
+}
+
+/// `[sessions]` section: which sessions the session lists show.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SessionsConfig {
+    /// Hours a session stays listed after it went idle; an idle, unpinned
+    /// session older than this is archived.
+    pub recent_hours: u64,
+}
+
+impl Default for SessionsConfig {
+    fn default() -> Self {
+        Self { recent_hours: 48 }
     }
 }
 
@@ -1714,6 +1732,7 @@ impl Default for MayConfig {
             suggestions: SuggestionsConfig::default(),
             sleep: SleepConfig::default(),
             recap: RecapConfig::default(),
+            sessions: SessionsConfig::default(),
             language: LanguageConfig::default(),
             context: ContextConfig::default(),
             time: TimeConfig::default(),

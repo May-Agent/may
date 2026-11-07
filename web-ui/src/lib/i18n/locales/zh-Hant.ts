@@ -61,6 +61,7 @@ export const zhHant: Messages = {
     pinned: '已釘選',
     recent: '最近',
     archived: '封存',
+    archivePage: '封存',
     newProfile: '新 Profile',
     pin: '釘選',
     unpin: '取消釘選',
@@ -195,6 +196,12 @@ export const zhHant: Messages = {
     waitingWorkspace: '等待工作區授權',
     waitingAskUser: '等待您的回覆',
     queued: '佇列中 {count} 則',
+    working: '處理中...',
+  },
+  archive: {
+    title: '封存',
+    description: '閒置超過近期期限的會話。開啟後會回到近期清單。',
+    empty: '沒有已封存的會話。',
   },
   browserLive: {
     panelTitle: '瀏覽器即時畫面',

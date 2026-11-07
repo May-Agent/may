@@ -438,6 +438,8 @@ export interface ProfileSessionSummary {
   updated_at?: string | null;
   profile_id?: string | null;
   repo?: string | null;
+  /** Something runs in the session: a turn, a background command or a subagent. */
+  working?: boolean;
 }
 
 export type ProfileSessionsPayload = {

@@ -7,6 +7,16 @@ use crate::session::PersistedSecretRequest;
 use crate::session::import::ForeignSessionSummary;
 use crate::workspace_request::WorkspaceRequest;
 
+/// Which sessions the session popup lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SessionView {
+    /// Pinned, running and recently used sessions (`/session`).
+    #[default]
+    Recent,
+    /// Archived sessions (`/archive`); opening one makes it recent again.
+    Archive,
+}
+
 /// Application mode.
 #[derive(Debug)]
 pub enum AppMode {

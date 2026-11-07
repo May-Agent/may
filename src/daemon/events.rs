@@ -10,7 +10,7 @@ use skyzen::utils::State;
 use tokio::sync::broadcast::error::{RecvError, TryRecvError};
 use tokio::time::MissedTickBehavior;
 
-use crate::profile::query_profile_sessions;
+use super::profiles::load_profile_sessions;
 use crate::ui_event_bus::UiEventTopics;
 
 use super::config::build_ui_config_response;
@@ -907,8 +907,7 @@ async fn emit_profile_sessions_if_changed(
     let Some(profile_id) = profile_filter else {
         return true;
     };
-    let db = state.db();
-    let profile_sessions = match query_profile_sessions(&db, profile_id).await {
+    let profile_sessions = match load_profile_sessions(state, profile_id).await {
         Ok(profile_sessions) => profile_sessions,
         Err(error) => {
             tracing::warn!(profile_id, error = %error, "failed to load profile sessions snapshot");

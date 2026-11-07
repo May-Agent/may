@@ -59,6 +59,7 @@ export const enUS = {
     pinned: 'Pinned',
     recent: 'Recent',
     archived: 'Archived',
+    archivePage: 'Archive',
     newProfile: 'New profile',
     pin: 'Pin',
     unpin: 'Unpin',
@@ -193,6 +194,12 @@ export const enUS = {
     waitingWorkspace: 'Workspace access required',
     waitingAskUser: 'Waiting for input',
     queued: '{count} queued',
+    working: 'Working...',
+  },
+  archive: {
+    title: 'Archive',
+    description: 'Sessions that stayed idle past the recent window. Opening one makes it recent again.',
+    empty: 'No archived sessions.',
   },
   browserTakeover: {
     active: 'You are controlling the browser — May is paused',

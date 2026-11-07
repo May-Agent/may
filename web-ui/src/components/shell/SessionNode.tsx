@@ -42,6 +42,8 @@ interface SessionNodeProps {
   inFolder?: boolean;
   indent?: boolean;
   repo?: string | null;
+  /** Something runs in the session; its title sweeps and it reads "Working...". */
+  working?: boolean;
 }
 
 /** One source-list row: the chat's title, its state, and an actions menu. */
@@ -54,7 +56,9 @@ export function SessionNode({
   inFolder,
   indent,
   repo,
+  working,
 }: SessionNodeProps) {
+  const { t } = useTranslation();
   const { profileId } = useActiveProfile();
   const href = profileId ? profileSessionPath(profileId, id) : `/s/${id}`;
   return (
@@ -68,7 +72,10 @@ export function SessionNode({
           indent && 'pl-7',
         )}
       >
-        <span className="flex-1 truncate">{title}</span>
+        <span className={cn('flex-1 truncate', working && 'session-sweep')}>{title}</span>
+        {working && (
+          <span className="shrink-0 text-[10px] text-muted-foreground">{t('runtime.working')}</span>
+        )}
         {repo && (
           <span className="max-w-24 truncate text-[10px] text-muted-foreground/70" title={repo}>
             {repoLabel(repo)}

@@ -61,6 +61,7 @@ export const ja: Messages = {
     pinned: 'ピン留め',
     recent: '最近',
     archived: 'アーカイブ',
+    archivePage: 'アーカイブ',
     newProfile: '新しいプロファイル',
     pin: 'ピン留め',
     unpin: 'ピン留めを解除',
@@ -195,6 +196,12 @@ export const ja: Messages = {
     waitingWorkspace: 'ワークスペース権限待ち',
     waitingAskUser: '入力待ち',
     queued: '{count} 件キュー',
+    working: '作業中...',
+  },
+  archive: {
+    title: 'アーカイブ',
+    description: '最近の期間を過ぎて使われていないセッションです。開くと最近のセッションに戻ります。',
+    empty: 'アーカイブされたセッションはありません。',
   },
   browserLive: {
     panelTitle: 'ブラウザライブ',

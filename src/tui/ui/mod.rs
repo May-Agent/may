@@ -12,6 +12,7 @@ mod layout;
 pub mod links;
 pub mod markdown;
 pub mod streaming_markdown;
+pub mod sweep;
 #[cfg(test)]
 pub(crate) mod test_screen;
 pub mod wrap;
