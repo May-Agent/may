@@ -706,6 +706,10 @@ impl MayAgent {
                             network_audit,
                             config.command_priority.process_priority(),
                             config.permission_approver.clone(),
+                            config
+                                .job_server
+                                .broker()
+                                .map_err(|e| MayAgentError::Sandbox(e.to_string()))?,
                         ),
                     )
                     .map_err(|e| MayAgentError::Sandbox(e.to_string()))?,

@@ -815,7 +815,24 @@ mod tests {
             heel::NetworkAuditLog::rolling_daily(root.join("audit"), 1).expect("audit log"),
             aither_sandbox::ProcessPriority::default(),
             approver,
+            job_broker(root),
         )
+    }
+
+    /// A broker over a small pool of its own under `root`.
+    fn job_broker(root: &Path) -> aither_sandbox::JobBroker {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        // Inside `root`, which the test's own directory removes; one pool
+        // per sandbox, as the root is shared by sandboxes of a test.
+        let dir = tempfile::tempdir_in(root).expect("pool dir").keep();
+        let pool = aither_sandbox::JobPool::create_fifo(dir.join("pool"), 1).expect("pool");
+        let (broker, service) =
+            aither_sandbox::job_broker_channel(pool, dir.join("commands")).expect("broker");
+        executor_core::Executor::spawn(&executor_core::DefaultExecutor, async move {
+            service.serve().await;
+        })
+        .detach();
+        broker
     }
 
     fn hosts(may_dir: &Path, connected: BTreeMap<String, AcpAgentConfig>) -> AcpHosts {
