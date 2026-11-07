@@ -30,7 +30,8 @@ aither-codex = { version = "0.23.0" }
 aither-models = { version = "0.23.0" }
 aither-mcp = { version = "0.23.0" }
 aither-browser = { version = "0.23.0" }
-# The forms the managed `sed` prints; a script's other `sed` calls are refused.
+# Decides which `sed` forms a script may run (`aither_sed::supports`); the host
+# `sed` runs them, and a script's other `sed` calls are refused.
 aither-sed = { version = "0.23.0", default-features = false }
 # Names acpsub's `TurnEnd::Stopped` reason, so it is the aither-acp acpsub
 # builds on.

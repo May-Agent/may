@@ -5,8 +5,8 @@
 //! it runs: one that kills processes by name or pattern, or is not valid
 //! shell and so cannot be checked for that; a foreground `sleep`; a re-read
 //! of files unchanged since their last read; and, in the managed bash, the
-//! host `grep`, `awk` and `find` and the `sed` forms the managed `sed` does
-//! not print. Each refusal names what to do instead.
+//! host `grep`, `awk` and `find` and the `sed` forms `aither_sed::supports`
+//! does not accept. Each refusal names what to do instead.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -334,7 +334,8 @@ const HOST_COMMANDS: [(&str, &str); 3] = [
 ];
 
 /// Refuses a script whose own shell runs `grep`, `awk` or `find`, or `sed`
-/// in a form other than the line ranges the managed `sed` prints.
+/// in a form `aither_sed::supports` does not accept (the line ranges); the
+/// allowed forms run the host `sed`.
 ///
 /// The rule binds the script's own shell, the way shell functions would: a
 /// command it runs by name, through `time` or `eval` included. A program
