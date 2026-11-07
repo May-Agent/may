@@ -3355,6 +3355,18 @@ fn agent_messaging(state: &Arc<DaemonState>) -> crate::agent_link::AgentMessagin
             },
         ),
         runtime_service: state.runtime_service.clone(),
+        cache_lifetime: {
+            let state = state.clone();
+            crate::agent_link::CacheLifetimes::new(move |provider_id: &str| {
+                state
+                    .config
+                    .load()
+                    .provider
+                    .get(provider_id)
+                    .map(|instance| instance.cache_lifetime)
+                    .unwrap_or_default()
+            })
+        },
     }
 }
 
