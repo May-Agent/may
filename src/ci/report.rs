@@ -202,17 +202,17 @@ mod tests {
             name: "test (ubuntu)".into(),
             conclusion: "success".into(),
             duration: Span(Duration::from_secs(52 * 60 + 10)),
-            baseline: Some(Span(Duration::from_secs(20 * 60))),
+            baseline: Some(Span(Duration::from_mins(20))),
             exceeded: vec![
                 Reason(Exceeded::Limit {
-                    limit: Duration::from_secs(40 * 60),
+                    limit: Duration::from_mins(40),
                 }),
                 Reason(Exceeded::Baseline {
-                    median: Duration::from_secs(20 * 60),
+                    median: Duration::from_mins(20),
                     multiple: 2.0,
                 }),
             ],
-            steps: vec![Timed::step("Run tests", Duration::from_secs(48 * 60))],
+            steps: vec![Timed::step("Run tests", Duration::from_mins(48))],
             tests: vec![Timed::test(&TestTiming {
                 kind: TestKind::Test,
                 name: "index::rebuild".into(),
@@ -225,7 +225,7 @@ mod tests {
     fn spans_read_in_the_largest_units() {
         assert_eq!(Span(Duration::from_secs(45)).to_string(), "45s");
         assert_eq!(Span(Duration::from_secs(723)).to_string(), "12m 03s");
-        assert_eq!(Span(Duration::from_secs(3720)).to_string(), "1h 02m");
+        assert_eq!(Span(Duration::from_mins(62)).to_string(), "1h 02m");
         assert_eq!(Span(Duration::from_millis(40)).to_string(), "40ms");
     }
 
@@ -290,7 +290,7 @@ mod tests {
                 workflow: "CI".into(),
                 name: "test".into(),
                 runs: 4,
-                latest: Span(Duration::from_secs(300)),
+                latest: Span(Duration::from_mins(5)),
                 median: Span(Duration::from_secs(280)),
                 p90: Span(Duration::from_secs(320)),
                 trend: TrendView(Trend::Slower),
@@ -307,8 +307,8 @@ mod tests {
         let queue = CiQueue {
             rows: vec![QueueRow {
                 pr_number: 3,
-                wait: Span(Duration::from_secs(900)),
-                run: Span(Duration::from_secs(300)),
+                wait: Span(Duration::from_mins(15)),
+                run: Span(Duration::from_mins(5)),
             }],
         }
         .render()

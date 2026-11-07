@@ -580,7 +580,7 @@ mod tests {
         assert!(db.add_ci_finding("s", 1, "abc", "w", "a").await.unwrap());
         assert!(!db.add_ci_finding("s", 1, "abc", "w2", "a2").await.unwrap());
         assert_eq!(db.take_ci_alerts("s").await.unwrap(), ["a"]);
-        assert!(db.take_ci_alerts("s").await.unwrap().is_empty());
+        assert_eq!(db.take_ci_alerts("s").await.unwrap(), [] as [String; 0]);
         assert_eq!(db.latest_ci_finding_id("s").await.unwrap(), 1);
         assert_eq!(db.ci_findings_after("s", 1).await.unwrap().len(), 0);
     }

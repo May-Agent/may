@@ -99,7 +99,7 @@ impl<A: Actions> Recorder<'_, A> {
                 .await;
             for ((job, duration), log) in timed.into_iter().zip(job_logs) {
                 let mut timings = log.as_deref().map(logs::parse).unwrap_or_default();
-                timings.sort_by(|a, b| b.millis.cmp(&a.millis));
+                timings.sort_by_key(|timing| std::cmp::Reverse(timing.millis));
                 timings.truncate(KEPT_TIMINGS);
                 let steps: Vec<(String, Duration)> = job
                     .steps
@@ -145,7 +145,7 @@ impl<A: Actions> Recorder<'_, A> {
     }
 }
 
-impl<A> Recorder<'_, A> {
+impl<A: Sync> Recorder<'_, A> {
     /// Records a local `[[projects]] checks` run that took `duration`, and
     /// judges it against the median of the last successful local runs.
     ///
@@ -303,7 +303,7 @@ impl<A: Actions> Recorder<'_, A> {
     }
 }
 
-impl<A> Recorder<'_, A> {
+impl<A: Sync> Recorder<'_, A> {
     /// Stores the job and returns its view when it ran abnormally long.
     async fn record(&self, _pr: &PrRow, job: NewCiJob) -> Result<Option<JobView>, CiError> {
         let baseline = self
@@ -366,7 +366,7 @@ fn workflow_name(run: &Run) -> String {
 
 fn slowest_steps(steps: &[(String, Duration)]) -> Vec<Timed> {
     let mut sorted: Vec<&(String, Duration)> = steps.iter().collect();
-    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    sorted.sort_by_key(|(_, duration)| std::cmp::Reverse(*duration));
     sorted
         .into_iter()
         .take(SHOWN_STEPS)
@@ -380,7 +380,6 @@ fn to_i64(value: u64) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use std::future::Future;
 
     use super::*;
     use crate::config::CiConfig;
@@ -392,26 +391,22 @@ mod tests {
         log: String,
     }
 
+    #[allow(clippy::unused_async_trait_impl)]
     impl Actions for Fake {
-        fn base_branch(&self) -> impl Future<Output = Result<String, CiError>> + Send {
-            async { Ok("dev".to_string()) }
+        async fn base_branch(&self) -> Result<String, CiError> {
+            Ok("dev".to_string())
         }
-        fn runs_for_sha(&self, _: &str) -> impl Future<Output = Result<Vec<Run>, CiError>> + Send {
-            async { Ok(self.runs.clone()) }
+        async fn runs_for_sha(&self, _: &str) -> Result<Vec<Run>, CiError> {
+            Ok(self.runs.clone())
         }
-        fn jobs(&self, run_id: u64) -> impl Future<Output = Result<Vec<Job>, CiError>> + Send {
-            async move { Ok(self.jobs.get(&run_id).cloned().unwrap_or_default()) }
+        async fn jobs(&self, run_id: u64) -> Result<Vec<Job>, CiError> {
+            Ok(self.jobs.get(&run_id).cloned().unwrap_or_default())
         }
-        fn successful_runs(
-            &self,
-            _: u64,
-            _: &str,
-            _: usize,
-        ) -> impl Future<Output = Result<Vec<Run>, CiError>> + Send {
-            async { Ok(self.history.clone()) }
+        async fn successful_runs(&self, _: u64, _: &str, _: usize) -> Result<Vec<Run>, CiError> {
+            Ok(self.history.clone())
         }
-        fn log(&self, _: u64) -> impl Future<Output = Result<String, CiError>> + Send {
-            async { Ok(self.log.clone()) }
+        async fn log(&self, _: u64) -> Result<String, CiError> {
+            Ok(self.log.clone())
         }
     }
 
@@ -511,11 +506,14 @@ mod tests {
         assert_eq!(alerts.len(), 1);
         assert!(alerts[0].contains("ci-optimise"));
         // The same commit observed again is not a new event.
-        assert!(recorder.observe_github(&pr, "abc").await.unwrap().is_none());
-        assert!(db.take_ci_alerts("s").await.unwrap().is_empty());
+        assert_eq!(recorder.observe_github(&pr, "abc").await.unwrap(), None);
+        assert_eq!(db.take_ci_alerts("s").await.unwrap(), [] as [String; 0]);
         let jobs = db.ci_jobs_for_pr(pr.id).await.unwrap();
         assert_eq!(jobs.len(), 1);
-        assert!(!db.ci_tests(jobs[0].id).await.unwrap().is_empty());
+        assert_eq!(
+            db.ci_tests(jobs[0].id).await.unwrap()[0].name,
+            "sample tests::slow_index_rebuild"
+        );
         assert_eq!(db.ci_steps(jobs[0].id).await.unwrap().len(), 1);
     }
 
@@ -546,8 +544,8 @@ mod tests {
             actions: &actions,
             limits: limits(),
         };
-        assert!(recorder.observe_github(&pr, "abc").await.unwrap().is_none());
-        assert!(db.take_ci_alerts("s").await.unwrap().is_empty());
+        assert_eq!(recorder.observe_github(&pr, "abc").await.unwrap(), None);
+        assert_eq!(db.take_ci_alerts("s").await.unwrap(), [] as [String; 0]);
         assert_eq!(db.ci_jobs_for_pr(pr.id).await.unwrap().len(), 1);
         let baseline = db
             .ci_baseline(pr.project_id, "CI", "test")

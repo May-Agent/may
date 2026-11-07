@@ -112,7 +112,7 @@ pub struct PrContext {
 }
 
 /// What recording a PR's CI durations needs beyond the database.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct CiWatch {
     /// The May home, whose `config.toml` holds the `[ci]` thresholds, read
     /// each time a PR's checks finish.
@@ -1330,7 +1330,7 @@ impl PrStore {
                 .publish(crate::ui_event_bus::UiEventTopics::SESSION_WARNING),
             Ok(None) => {}
             Err(error) => {
-                tracing::error!(%error, pr = pr.number, "recording the PR's CI durations failed")
+                tracing::error!(%error, pr = pr.number, "recording the PR's CI durations failed");
             }
         }
     }
@@ -1363,7 +1363,7 @@ impl PrStore {
                 .publish(crate::ui_event_bus::UiEventTopics::SESSION_WARNING),
             Ok(None) => {}
             Err(error) => {
-                tracing::error!(%error, pr = pr.number, "recording the local check's duration failed")
+                tracing::error!(%error, pr = pr.number, "recording the local check's duration failed");
             }
         }
     }

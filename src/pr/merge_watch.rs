@@ -285,7 +285,7 @@ pub(super) struct Observing<'a, U, O> {
     told: std::sync::atomic::AtomicBool,
 }
 
-impl<'a, U, O: ChecksObserver> Observing<'a, U, O> {
+impl<'a, U: Sync, O: ChecksObserver> Observing<'a, U, O> {
     pub(super) const fn new(upstream: &'a U, observer: &'a O) -> Self {
         Self {
             upstream,

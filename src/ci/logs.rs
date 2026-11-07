@@ -65,7 +65,7 @@ pub fn parse(log: &str) -> Vec<TestTiming> {
 #[must_use]
 pub fn slowest(timings: &[TestTiming], limit: usize) -> Vec<&TestTiming> {
     let mut sorted: Vec<&TestTiming> = timings.iter().collect();
-    sorted.sort_by(|a, b| b.millis.cmp(&a.millis));
+    sorted.sort_by_key(|timing| std::cmp::Reverse(timing.millis));
     sorted.truncate(limit);
     sorted
 }
@@ -81,11 +81,10 @@ fn clean(line: &str) -> String {
             while index < bytes.len() && !bytes[index].is_ascii_alphabetic() {
                 index += 1;
             }
-            index += 1;
         } else {
             kept.push(bytes[index]);
-            index += 1;
         }
+        index += 1;
     }
     let text = String::from_utf8_lossy(&kept).into_owned();
     match text.split_once(' ') {
@@ -109,10 +108,8 @@ fn duration_ms(text: &str) -> Option<u64> {
         (number, 1.0)
     } else if let Some(number) = text.strip_suffix("µs").or_else(|| text.strip_suffix("us")) {
         (number, 0.001)
-    } else if let Some(number) = text.strip_suffix('s') {
-        (number, 1000.0)
     } else {
-        return None;
+        (text.strip_suffix('s')?, 1000.0)
     };
     let value: f64 = number.trim().parse().ok()?;
     if !value.is_finite() || value < 0.0 {
@@ -375,6 +372,6 @@ mod tests {
 
     #[test]
     fn a_log_without_tests_has_no_timings() {
-        assert!(parse("Compiling foo\nFinished dev in 3s\n").is_empty());
+        assert_eq!(parse("Compiling foo\nFinished dev in 3s\n"), []);
     }
 }

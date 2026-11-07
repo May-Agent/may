@@ -86,7 +86,7 @@ pub fn p90(values: &[u64]) -> Option<u64> {
     let last = sorted.len().checked_sub(1)?;
     // Nearest rank: ceil(0.9 * n) as a 1-based index.
     let rank = (sorted.len() * 9).div_ceil(10).max(1);
-    sorted.get(rank - 1).or(sorted.get(last)).copied()
+    sorted.get(rank - 1).or_else(|| sorted.get(last)).copied()
 }
 
 /// Whether durations, oldest first, are getting slower, faster or staying
@@ -142,7 +142,7 @@ mod tests {
                 limit: Duration::from_secs(40 * MINUTE)
             }]
         );
-        assert!(judge(Duration::from_secs(40 * MINUTE), None, limits()).is_empty());
+        assert_eq!(judge(Duration::from_secs(40 * MINUTE), None, limits()), []);
     }
 
     #[test]
@@ -156,7 +156,10 @@ mod tests {
                 multiple: 2.0
             }]
         );
-        assert!(judge(Duration::from_secs(10 * MINUTE), baseline, limits()).is_empty());
+        assert_eq!(
+            judge(Duration::from_secs(10 * MINUTE), baseline, limits()),
+            []
+        );
     }
 
     #[test]

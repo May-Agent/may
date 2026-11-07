@@ -118,7 +118,7 @@ impl CiTool {
             .map(|row| Duration::from_secs(row.median_secs.unsigned_abs()));
         let duration = Duration::from_secs(job.duration_secs.unsigned_abs());
         let mut steps = self.db.ci_steps(job.id).await?;
-        steps.sort_by(|a, b| b.duration_secs.cmp(&a.duration_secs));
+        steps.sort_by_key(|step| std::cmp::Reverse(step.duration_secs));
         let tests = self.db.ci_tests(job.id).await?;
         Ok(JobView {
             workflow: job.workflow.clone(),
