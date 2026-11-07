@@ -46,6 +46,9 @@ pub enum ChatDbError {
         /// Number of items already pinned.
         current: i64,
     },
+    /// The default profile cannot be deleted.
+    #[error("The default profile cannot be deleted")]
+    DefaultProfileProtected,
     /// A PR in a terminal state (`merged` or `closed`) cannot be closed.
     #[error("PR is already {state}")]
     PrTerminal {
