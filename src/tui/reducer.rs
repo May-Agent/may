@@ -407,6 +407,20 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             }
             Ok(None)
         }
+        AppEvent::ProgressLoaded(report) => {
+            if let crate::tui::state::AppMode::Progress(state) = &mut app.mode {
+                state.loading = false;
+                state.report = Some(report);
+            }
+            Ok(None)
+        }
+        AppEvent::ProgressFailed(error) => {
+            if let crate::tui::state::AppMode::Progress(state) = &mut app.mode {
+                state.loading = false;
+                state.error = Some(error);
+            }
+            Ok(None)
+        }
         AppEvent::BashFinished(outcome) => {
             use std::fmt::Write as _;
 

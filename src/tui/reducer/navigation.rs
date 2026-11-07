@@ -518,6 +518,20 @@ pub fn handle_btw_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
     None
 }
 
+/// Keys inside the `/progress` overlay: scroll the report, Esc/q closes.
+pub fn handle_progress_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
+    let AppMode::Progress(state) = &mut app.mode else {
+        return None;
+    };
+    match code {
+        KeyCode::Esc | KeyCode::Char('q') => app.mode = AppMode::Chat,
+        KeyCode::Up | KeyCode::Char('k') => state.scroll = state.scroll.saturating_sub(1),
+        KeyCode::Down | KeyCode::Char('j') => state.scroll = state.scroll.saturating_add(1),
+        _ => {}
+    }
+    None
+}
+
 /// Zoomed image overlay: Esc closes it; a click outside the image is handled
 /// by the mouse handler.
 pub fn handle_image_view_key(app: &mut App, code: KeyCode) -> Option<SendAction> {

@@ -65,7 +65,8 @@ mod secret_question_tests;
 mod yolo_tests;
 
 pub use chat::{
-    BtwMessage, BtwRequest, BtwResponse, CompactResponse, ContextDumpResponse, RecapRecord,
+    BtwMessage, BtwRequest, BtwResponse, CompactResponse, ContextDumpResponse, ProgressReport,
+    RecapRecord,
 };
 pub use server::{DEFAULT_PORT, DaemonMode, parse_listen_args};
 pub(crate) use server::{start, sync_remote_access};

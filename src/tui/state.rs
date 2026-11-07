@@ -79,6 +79,8 @@ pub enum AppMode {
     JobDetail(JobDetailState),
     /// `/btw` side-question overlay: answered outside conversation history
     Btw(BtwState),
+    /// `/progress` overlay: the remaining work with a progress bar
+    Progress(ProgressState),
     /// Zoomed image overlay (click an inline image to open)
     ImageView(ImageViewState),
     /// Quit confirmation shown while the session's agent still runs
@@ -128,6 +130,7 @@ impl AppMode {
             Self::Jobs => "jobs",
             Self::JobDetail(_) => "job-detail",
             Self::Btw(_) => "btw",
+            Self::Progress(_) => "progress",
             Self::ImageView(_) => "image-view",
             Self::QuitConfirm(_) => "quit-confirm",
         }
@@ -156,6 +159,19 @@ pub struct BtwState {
     /// Failure text when the request failed.
     pub error: Option<String>,
     /// Scroll offset (lines) for long answers.
+    pub scroll: u16,
+}
+
+/// `/progress` overlay state: one request, then the report it returns.
+#[derive(Debug, Clone, Default)]
+pub struct ProgressState {
+    /// The request is in flight.
+    pub loading: bool,
+    /// The report once it arrived.
+    pub report: Option<crate::daemon::ProgressReport>,
+    /// Failure text when the request failed.
+    pub error: Option<String>,
+    /// Scroll offset (lines) for a long report.
     pub scroll: u16,
 }
 

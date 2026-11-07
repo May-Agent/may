@@ -181,6 +181,12 @@ pub enum AppEvent {
     /// The `/btw` request failed.
     BtwFailed(String),
 
+    // ─── /progress ─────────────────────────────────────────────────
+    /// The `/progress` report arrived.
+    ProgressLoaded(crate::daemon::ProgressReport),
+    /// The `/progress` request failed.
+    ProgressFailed(String),
+
     // ─── bash mode / secrets ───────────────────────────────────────
     /// A bash-mode command finished; output is already masked.
     BashFinished(Box<BashOutcome>),
@@ -236,6 +242,8 @@ impl AppEvent {
             Self::BtwDelta(_) => "btw_delta",
             Self::BtwFinished => "btw_finished",
             Self::BtwFailed(_) => "btw_failed",
+            Self::ProgressLoaded(_) => "progress_loaded",
+            Self::ProgressFailed(_) => "progress_failed",
             Self::BashFinished(_) => "bash_finished",
             Self::SecretStored { .. } => "secret_stored",
         }

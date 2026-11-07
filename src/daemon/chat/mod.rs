@@ -2,6 +2,7 @@ mod aux;
 mod background;
 mod hosts;
 mod hub;
+mod progress;
 mod recap;
 mod request_ledger;
 mod retry;
@@ -17,6 +18,7 @@ pub use hosts::{
     ParkedAgents, btw, compact_session, context_dump, context_report, release_agent, usage_report,
 };
 pub use hub::{TurnFrame, TurnHub, TurnSubscription};
+pub use progress::{ProgressReport, progress};
 pub use recap::{RecapRecord, RecapSchedules, recap_session};
 mod tool_dispatch;
 mod turn_events;

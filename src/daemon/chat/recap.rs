@@ -27,7 +27,7 @@ const SUMMARY_MAX_CHARS: usize = 700;
 const NEXT_ACTION_MAX_CHARS: usize = 200;
 /// Total user/assistant text the recap projection may hold, in Unicode
 /// scalar values; the newest exchanges are kept.
-const HISTORY_BUDGET: usize = 24_000;
+pub(super) const HISTORY_BUDGET: usize = 24_000;
 
 /// A catch-up note for a user returning to the session.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -195,10 +195,10 @@ pub(super) fn request_recap(state: &Arc<DaemonState>, session_id: &str, kind: Au
 }
 
 /// The conversation a recap summarises.
-struct RecapWindow<'a> {
+pub(super) struct RecapWindow<'a> {
     /// The newest user and assistant messages that fit the budget, oldest
     /// first.
-    conversation: Vec<(&'a MessageRole, &'a str)>,
+    pub(super) conversation: Vec<(&'a MessageRole, &'a str)>,
     /// Every user message of the session, in the window or not: what the
     /// recap covers once it is written.
     turns: usize,
@@ -208,7 +208,7 @@ struct RecapWindow<'a> {
 /// assistant rows only, newest first until `budget` Unicode scalar values
 /// are spent, restored to chronological order. Other rows never count
 /// against the budget.
-fn recap_window<'a>(
+pub(super) fn recap_window<'a>(
     history: impl DoubleEndedIterator<Item = (&'a MessageRole, &'a str)> + Clone,
     budget: usize,
 ) -> RecapWindow<'a> {
