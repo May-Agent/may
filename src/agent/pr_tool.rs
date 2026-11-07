@@ -198,17 +198,17 @@ impl Tool for PrTool {
         if self.role == CommandRole::Subagent
             && let Some(action) = args.write_action()
         {
-            return Ok(ToolResult::text(PrError::MainAgentOnly(action).to_string()));
+            return Err(PrError::MainAgentOnly(action).into());
         }
         // A call made inside a session clone means that clone's repository.
         let repo = args.repo_mut();
         if repo.is_none()
             && let Some(dir) = cx.working_dir()
         {
-            match self.store.clone_containing(std::path::Path::new(dir)).await {
-                Ok(found) => *repo = found,
-                Err(error) => return Ok(ToolResult::text(error.to_string())),
-            }
+            *repo = self
+                .store
+                .clone_containing(std::path::Path::new(dir))
+                .await?;
         }
         if let (
             Some(guard),
@@ -239,7 +239,8 @@ impl Tool for PrTool {
             PrArgs::Close { number, repo } => self.store.close(number, repo.as_deref()).await,
             PrArgs::Adopt { number, repo } => self.store.adopt(number, repo.as_deref()).await,
         };
-        Ok(result.map_or_else(|e| ToolResult::text(e.to_string()), ToolResult::text))
+        // A failed action is a failed command, so aither logs it at WARN.
+        Ok(ToolResult::text(result?))
     }
 }
 
@@ -324,7 +325,11 @@ mod tests {
                 "adopt",
             ),
         ] {
-            let refused = text(&tool.call(args, ToolContext::new()).await.unwrap());
+            let refused = tool
+                .call(args, ToolContext::new())
+                .await
+                .unwrap_err()
+                .to_string();
             assert!(
                 refused.contains(&format!("`pr {action}` is the main agent's")),
                 "{refused}"

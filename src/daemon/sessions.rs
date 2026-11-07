@@ -210,18 +210,25 @@ async fn issue_briefs(
                 title: Some(detail.title),
                 closed: matches!(detail.state, crate::issue::IssueState::Closed),
             },
-            Err(error) => {
-                tracing::debug!(%error, number, "issue lookup failed");
-                crate::tui::sidebar::IssueBrief {
-                    number,
-                    title: None,
-                    closed: false,
-                }
-            }
+            Err(error) => unresolved_issue_brief(number, &error),
         };
         briefs.push(brief);
     }
     Ok(briefs)
+}
+
+/// The brief shown for an issue whose lookup failed; the failure goes to the
+/// daemon log.
+pub(super) fn unresolved_issue_brief(
+    number: i64,
+    error: &dyn std::fmt::Display,
+) -> crate::tui::sidebar::IssueBrief {
+    tracing::warn!(%error, number, "issue lookup failed");
+    crate::tui::sidebar::IssueBrief {
+        number,
+        title: None,
+        closed: false,
+    }
 }
 
 pub(super) async fn get_session(
@@ -472,6 +479,7 @@ const fn map_llm_role(role: LlmRole) -> &'static str {
         LlmRole::Assistant => "assistant",
         LlmRole::System => "system",
         LlmRole::Tool => "tool",
+        LlmRole::Configuration => "configuration",
     }
 }
 
