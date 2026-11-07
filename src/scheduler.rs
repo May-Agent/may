@@ -63,6 +63,8 @@ pub struct TaskRuntime {
     /// The daemon's connectivity source; task terminals record the outages
     /// their commands ran through.
     connectivity: Option<aither_connectivity::Connectivity>,
+    /// The daemon's jobserver pool local task commands draw jobs from.
+    job_server: Option<crate::jobserver::JobServer>,
     /// Where a run's `wake` command stores its prompt.
     session_prompts: Option<crate::task_wake::SessionPrompts>,
     /// Where webhook signing secrets are read.
@@ -513,6 +515,7 @@ impl TaskRuntime {
             network_policy: Arc::new(ArcSwap::from_pointee(None)),
             active_tasks: Arc::new(ArcSwap::from_pointee(TaskCatalog::default())),
             connectivity: None,
+            job_server: None,
             session_prompts: None,
         };
         runtime.reload_active_tasks().await?;
@@ -535,6 +538,13 @@ impl TaskRuntime {
         session_prompts: crate::task_wake::SessionPrompts,
     ) -> Self {
         self.session_prompts = Some(session_prompts);
+        self
+    }
+
+    /// Share the daemon's jobserver pool with the commands of local tasks.
+    #[must_use]
+    pub fn with_job_server(mut self, job_server: crate::jobserver::JobServer) -> Self {
+        self.job_server = Some(job_server);
         self
     }
 
@@ -1516,24 +1526,40 @@ impl TaskRuntime {
         allow_network: bool,
         wake: Option<WakeScope<'_>>,
     ) -> Result<TerminalTool<SchedulerPermissionHandler, DefaultExecutor, Configured>, String> {
-        self.initialized_terminal_tool(
-            SchedulerPermissionHandler {
-                db: self.db.clone(),
-                ui_event_bus: self.ui_event_bus.clone(),
-                profile_id: profile_id.to_string(),
-                source,
-                allow_network,
-                network_policy: self.network_policy.load().as_ref().clone(),
-            },
-            script.host_working_dir.clone(),
-            ShellSessionRegistry::new(ShellRuntimeAvailability {
-                local: true,
-                container: false,
-                ssh: false,
-            }),
-            wake,
-        )
-        .await
+        let terminal_tool = self
+            .initialized_terminal_tool(
+                SchedulerPermissionHandler {
+                    db: self.db.clone(),
+                    ui_event_bus: self.ui_event_bus.clone(),
+                    profile_id: profile_id.to_string(),
+                    source,
+                    allow_network,
+                    network_policy: self.network_policy.load().as_ref().clone(),
+                },
+                script.host_working_dir.clone(),
+                ShellSessionRegistry::new(ShellRuntimeAvailability {
+                    local: true,
+                    container: false,
+                    ssh: false,
+                }),
+                wake,
+            )
+            .await?;
+        // Only local commands can open the pool; container tasks run without
+        // one until aither brokers tokens into containers.
+        match &self.job_server {
+            Some(job_server) => {
+                let connection = job_server.connect().map_err(|error| {
+                    init_terminal_tool_error("failed to connect to the jobserver: ", &error)
+                })?;
+                terminal_tool
+                    .with_jobserver_pool(connection.pool, connection.fifo_dir)
+                    .map_err(|error| {
+                        init_terminal_tool_error("failed to share the jobserver: ", &error)
+                    })
+            }
+            None => Ok(terminal_tool),
+        }
     }
 
     /// Starts the profile's container and builds a terminal that executes in

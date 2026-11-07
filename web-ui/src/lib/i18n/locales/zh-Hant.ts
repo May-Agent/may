@@ -461,6 +461,10 @@ export const zhHant: Messages = {
       low: '低',
       lowest: '最低',
       info: '降低優先權會改變資源競爭時的排程，但不會限制 CPU 用量。',
+      jobPool: '工作池大小',
+      jobPoolAuto: '自動（CPU 核心數）',
+      jobPoolInfo: '所有工作階段的建置可同時執行的工作數，也就是 jobserver 的權杖池。留空則使用 CPU 核心數。容器與 SSH 工作階段中的命令不計入。',
+      jobPoolInvalid: '工作池大小必須是不小於 1 的整數，或留空。',
     },
     stream: {
       title: '串流編解碼器',

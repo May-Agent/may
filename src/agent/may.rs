@@ -158,6 +158,9 @@ pub struct MayAgentConfig {
     pub tool_distribution: Arc<aither_sandbox::ToolDistribution>,
     /// Prepared tool environments kept across rebuilds of a session's agent.
     pub tool_environments: ToolEnvironmentCache,
+    /// The daemon's machine-wide jobserver pool; this agent's terminal and
+    /// its subagents' draw their jobs from it.
+    pub job_server: crate::jobserver::JobServer,
     /// Scheduling priority applied to commands this agent runs.
     pub command_priority: crate::config::CommandPriority,
     /// The LLM provider.
@@ -322,6 +325,8 @@ pub struct MayAgentSessionInput<'a> {
     pub tool_distribution: Arc<aither_sandbox::ToolDistribution>,
     /// Prepared tool environments kept across agent rebuilds.
     pub tool_environments: ToolEnvironmentCache,
+    /// The daemon's machine-wide jobserver pool.
+    pub job_server: crate::jobserver::JobServer,
     /// Which provider candidate this build should try (retry counter).
     pub provider_attempt: usize,
     /// The session's subagent handles; `None` starts fresh ones.
@@ -474,6 +479,20 @@ impl MayAgent {
                 crate::secrets::SecretStore::new(&config.may_dir),
                 config.session_id.as_str(),
             ));
+        // The pool reaches only local commands: aither fails container and
+        // SSH executions while a pool is configured, so those sessions run
+        // without one until aither brokers tokens into them.
+        let terminal_tool = if is_container || !config.ssh_servers.is_empty() {
+            terminal_tool
+        } else {
+            let connection = config
+                .job_server
+                .connect()
+                .map_err(|e| MayAgentError::Sandbox(e.to_string()))?;
+            terminal_tool
+                .with_jobserver_pool(connection.pool, connection.fifo_dir)
+                .map_err(|e| MayAgentError::Sandbox(e.to_string()))?
+        };
         let job_registry = terminal_tool.job_registry();
         let subagents = config.subagents.clone().unwrap_or_default();
         let subagent_runs = subagents.runs;
@@ -931,6 +950,7 @@ impl MayAgent {
             environment,
             tool_distribution,
             tool_environments,
+            job_server,
             provider_attempt,
             subagents,
             background_jobs,
@@ -990,6 +1010,7 @@ impl MayAgent {
             connectivity,
             tool_distribution,
             tool_environments,
+            job_server,
             command_priority: may_config.sandbox.command_priority,
             llm,
             model_id: selector.model_id().to_string(),

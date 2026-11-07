@@ -3728,6 +3728,7 @@ fn build_session_agent<'a>(
                 environment,
                 tool_distribution: state.tool_distribution.clone(),
                 tool_environments: state.tool_environments.clone(),
+                job_server: state.job_server.clone(),
                 provider_attempt,
                 prompt_cache_epoch: ctx.context_snapshot.as_ref().map_or(0, |snapshot| {
                     snapshot

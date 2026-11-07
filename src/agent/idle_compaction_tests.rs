@@ -216,6 +216,7 @@ pub struct SessionParts {
     workspace_broker: crate::workspace_request::WorkspaceRequestBroker,
     ask_user_broker: crate::ask_user::AskUserBroker,
     tool_environments: ToolEnvironmentCache,
+    job_server: crate::jobserver::JobServer,
     /// The host the session's load monitor reads: calm unless a test loads it.
     pub host: ScriptedHost,
     /// The rules the session imports, when a test makes it an import session.
@@ -235,6 +236,12 @@ impl SessionParts {
             .expect("open test db");
         let (workspace_broker, workspace_queue) = crate::workspace_request::channel();
         let (ask_user_broker, ask_user_queue) = crate::ask_user::channel();
+        let job_server = crate::jobserver::JobServer::start(
+            &dir.join(".may"),
+            crate::jobserver::default_pool_size(),
+        )
+        .await
+        .expect("test jobserver starts");
         Self {
             dir,
             db,
@@ -243,6 +250,7 @@ impl SessionParts {
             workspace_broker,
             ask_user_broker,
             tool_environments: ToolEnvironmentCache::spawn(),
+            job_server,
             host: ScriptedHost::default(),
             rules_import: None,
             _queues: (workspace_queue, ask_user_queue),
@@ -288,6 +296,7 @@ impl SessionParts {
                 &self.dir.join(".may/tool-fixtures"),
             )),
             tool_environments: self.tool_environments.clone(),
+            job_server: self.job_server.clone(),
             provider_attempt: 0,
             subagents: None,
             background_jobs: aither_agent::BackgroundJobPolicy::Await,

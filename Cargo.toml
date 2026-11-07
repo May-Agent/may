@@ -23,7 +23,7 @@ libc = "0.2.191"
 aither-core = { version = "0.21.0" }
 aither-agent = { version = "0.21.0", features = ["mcp", "webfetch", "skills", "connectivity", "languages"] }
 aither-connectivity = { version = "0.21.0" }
-aither-sandbox = { version = "0.21.0", features = ["code-folding", "connectivity"] }
+aither-sandbox = { version = "0.21.0", features = ["code-folding", "connectivity", "jobserver"] }
 aither-cloud = { version = "0.21.0" }
 aither-copilot = { version = "0.21.0" }
 aither-codex = { version = "0.21.0" }
