@@ -3367,6 +3367,7 @@ fn agent_messaging(state: &Arc<DaemonState>) -> crate::agent_link::AgentMessagin
                     .unwrap_or_default()
             })
         },
+        forks: state.agent_forks.clone(),
     }
 }
 

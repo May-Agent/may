@@ -318,6 +318,7 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
             .context("failed to identify the running build")?,
         turn_hub: Arc::new(super::chat::TurnHub::default()),
         parked_agents: super::chat::ParkedAgents::default(),
+        agent_forks: crate::agent_link::ForkHosts::default(),
         aux_tasks: super::chat::AuxTasks::default(),
         recap_schedules: super::chat::RecapSchedules::default(),
         session_background: super::chat::SessionBackgrounds::default(),

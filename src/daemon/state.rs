@@ -469,6 +469,9 @@ pub struct DaemonState {
     pub(crate) turn_hub: Arc<super::chat::TurnHub>,
     /// Each session's agent between turns.
     pub(crate) parked_agents: super::chat::ParkedAgents,
+    /// Each session agent's fork source and model, working or idle, for
+    /// `btw` questions from other agents.
+    pub(crate) agent_forks: crate::agent_link::ForkHosts,
     /// Each session's in-flight aux task (suggestion, recap), if any.
     pub(crate) aux_tasks: super::chat::AuxTasks,
     /// Each session's armed idle-recap timer, if any.
@@ -1329,6 +1332,7 @@ impl DaemonState {
             build_id: "test".to_string(),
             turn_hub: std::sync::Arc::new(super::chat::TurnHub::default()),
             parked_agents: super::chat::ParkedAgents::default(),
+            agent_forks: crate::agent_link::ForkHosts::default(),
             aux_tasks: super::chat::AuxTasks::default(),
             recap_schedules: super::chat::RecapSchedules::default(),
             session_background: super::chat::SessionBackgrounds::default(),
