@@ -18,7 +18,7 @@ use std::num::NonZeroUsize;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use aither_sandbox::{JobPool, JobserverError};
+use aither_sandbox::{JobBroker, JobPool, JobserverError, job_broker_channel};
 use async_io::Async;
 use executor_core::{DefaultExecutor, Executor};
 use futures_lite::future;
@@ -27,6 +27,28 @@ const TOKEN: u8 = b'+';
 
 /// Directory under the May home that holds the pool and the per-command fifos.
 const DIR: &str = "jobserver";
+
+/// Where the pool and the command fifos live under the May home.
+fn layout(may_dir: &Path) -> (PathBuf, PathBuf) {
+    let dir = may_dir.join(DIR);
+    (dir.join("pool"), dir.join("commands"))
+}
+
+/// Connects to the pool of the daemon running under `may_dir`.
+///
+/// For a client process whose commands draw from it. The daemon must be
+/// running: its start creates the pool, and a stale pool of a stopped daemon
+/// is replaced.
+///
+/// # Errors
+/// Returns an error when the pool fifo cannot be opened.
+pub fn connect_running(may_dir: &Path) -> Result<JobConnection, JobserverError> {
+    let (pool_path, fifo_dir) = layout(may_dir);
+    Ok(JobConnection {
+        pool: JobPool::fifo(&pool_path)?,
+        fifo_dir,
+    })
+}
 
 /// The pool size when none is configured: the host's available parallelism.
 #[must_use]
@@ -60,9 +82,8 @@ impl JobServer {
     /// # Errors
     /// Returns an error when the fifo cannot be created or opened.
     pub async fn start(may_dir: &Path, size: NonZeroUsize) -> Result<Self, JobserverError> {
+        let (pool_path, fifo_dir) = layout(may_dir);
         let dir = may_dir.join(DIR);
-        let pool_path = dir.join("pool");
-        let fifo_dir = dir.join("commands");
         let (read, write) = {
             let dir = dir.clone();
             let pool_path = pool_path.clone();
@@ -124,6 +145,33 @@ impl JobServer {
             pool: JobPool::fifo(&self.pool_path)?,
             fifo_dir: self.fifo_dir.clone(),
         })
+    }
+
+    /// Opens a broker for commands the caller starts itself, with its
+    /// service running on the global executor: the connection of one
+    /// terminal, for processes that do not run through a terminal tool.
+    ///
+    /// # Errors
+    /// Returns an error when the pool fifo cannot be opened or the broker
+    /// cannot be set up.
+    pub fn broker(&self) -> Result<JobBroker, JobserverError> {
+        let connection = self.connect()?;
+        let (broker, service) = job_broker_channel(connection.pool, connection.fifo_dir)?;
+        DefaultExecutor
+            .spawn(async move { service.serve().await })
+            .detach();
+        Ok(broker)
+    }
+
+    /// Tokens sitting in the pool fifo right now.
+    #[cfg(test)]
+    pub(crate) fn tokens_in_pool(&self) -> usize {
+        let pool = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&self.pool_path)
+            .unwrap();
+        usize::try_from(rustix::io::ioctl_fionread(&pool).unwrap()).unwrap()
     }
 
     /// Sets the pool size. Growth is immediate; shrinking completes as
@@ -202,7 +250,6 @@ impl Tokens {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aither_sandbox::job_broker_channel;
     use std::time::{Duration, Instant};
 
     /// Bytes buffered in a fifo opened for reading.
@@ -251,12 +298,7 @@ mod tests {
 
     /// One terminal tool's broker over a connection to the shared pool.
     fn terminal(server: &JobServer) -> aither_sandbox::JobBroker {
-        let connection = server.connect().unwrap();
-        let (broker, service) = job_broker_channel(connection.pool, connection.fifo_dir).unwrap();
-        DefaultExecutor
-            .spawn(async move { service.serve().await })
-            .detach();
-        broker
+        server.broker().unwrap()
     }
 
     fn observer(server: &JobServer) -> File {
