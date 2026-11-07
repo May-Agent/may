@@ -40,7 +40,13 @@ export type TurnSegment =
 export interface TurnState {
   turnId: string;
   sessionId: string;
+  /**
+   * Names the reply while it streams; once the turn is done, the id of its
+   * first stored assistant message, which the session's messages carry too.
+   */
   assistantId: string;
+  /** Ids of the assistant messages the finished turn stored. */
+  messageIds: string[];
   text: string;
   reasoning: string;
   /**
@@ -76,6 +82,7 @@ export function emptyTurn(
     turnId,
     sessionId,
     assistantId,
+    messageIds: [],
     text: '',
     reasoning: '',
     reasoningMs: null,
@@ -277,6 +284,8 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
           : state.segments;
       return {
         ...state,
+        assistantId: event.assistant.id,
+        messageIds: event.messageIds,
         text: finalText,
         segments,
         status: 'done',

@@ -169,6 +169,11 @@ pub struct SseDoneEvent {
     pub(crate) seq: u64,
     pub(crate) turn_id: String,
     pub(crate) session_id: String,
+    /// The stored user message the turn answers, named as REST names it.
+    pub(crate) user_message_id: Option<String>,
+    /// Every assistant message the turn stored, named as REST names them;
+    /// `assistant` carries the first.
+    pub(crate) message_ids: Vec<String>,
     pub(crate) assistant: ApiMessage,
 }
 

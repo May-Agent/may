@@ -329,7 +329,12 @@ export interface SseDone {
   seq: number;
   turnId: string;
   sessionId: string;
+  /** The reply, under the id of the first assistant message the turn stored. */
   assistant: ApiMessage;
+  /** The stored user message the turn answers, as the session's messages name it. */
+  userMessageId: string | null;
+  /** Every assistant message the turn stored, as the session's messages name them. */
+  messageIds: string[];
 }
 
 /** The turn paused for a browser takeover; carries the partial reply. */
@@ -339,6 +344,8 @@ export interface SsePaused {
   turnId: string;
   sessionId: string;
   assistant: ApiMessage;
+  userMessageId: string | null;
+  messageIds: string[];
 }
 
 /** Last event of every turn, however it ended. */

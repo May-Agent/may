@@ -66,6 +66,7 @@ use super::browser::ensure_browser_runtime_started;
 use super::error::internal_error;
 use super::error_chain::error_chain_text;
 use super::helpers::{RETRY_BACKOFF_MS, elapsed_ms_saturating, truncate_preview};
+use super::message_mapping::api_message_id;
 use super::model_resolution::resolve_default_model;
 use super::state::{DaemonState, UiToolQueues};
 use super::terminal_parsing::update_terminal_snapshot_from_tool_event;
@@ -844,7 +845,10 @@ fn log_first_text_event(
 /// Successful result from the shared agent loop.
 #[derive(Debug)]
 struct AgentRunResult {
-    assistant_id: String,
+    /// The stored row of the user message the turn answers, when it stored one.
+    user_message_id: Option<i32>,
+    /// The assistant rows the turn stored, oldest first.
+    assistant_message_ids: Vec<i32>,
     full_text: String,
     reasoning_text: String,
     terminal_snapshot: TerminalStateSnapshot,
@@ -854,9 +858,57 @@ struct AgentRunResult {
     elapsed_ms: u64,
 }
 
+/// The assistant rows a turn stored after `boundary`, the largest row id
+/// before it persisted anything.
+async fn stored_assistant_message_ids(
+    state: &Arc<DaemonState>,
+    session_id: &str,
+    boundary: i32,
+) -> Result<Vec<i32>, crate::db::ChatDbError> {
+    Ok(state
+        .db()
+        .get_messages_by_role(session_id, MessageRole::Assistant.as_str())
+        .await?
+        .into_iter()
+        .map(|row| row.id)
+        .filter(|id| *id > boundary)
+        .collect())
+}
+
+/// The turn's `done` event: the reply carries the id of the first assistant
+/// row the turn stored, the event the ids of all of them and of the user row,
+/// so a client names its streamed messages as the session's REST messages.
+fn done_event_from_run_result(
+    seq: u64,
+    turn_id: String,
+    session_id: String,
+    result: AgentRunResult,
+) -> SseDoneEvent {
+    let user_message_id = result.user_message_id.map(api_message_id);
+    let message_ids = result
+        .assistant_message_ids
+        .iter()
+        .copied()
+        .map(api_message_id)
+        .collect();
+    SseDoneEvent {
+        seq,
+        turn_id,
+        session_id,
+        user_message_id,
+        message_ids,
+        assistant: api_message_from_run_result(result),
+    }
+}
+
 fn api_message_from_run_result(result: AgentRunResult) -> ApiMessage {
+    let first = result
+        .assistant_message_ids
+        .first()
+        .copied()
+        .expect("a finished turn stores an assistant row");
     ApiMessage {
-        id: result.assistant_id,
+        id: api_message_id(first),
         role: "assistant".to_string(),
         content: result.full_text,
         timestamp: jiff::Timestamp::now().to_string(),
@@ -1959,6 +2011,8 @@ fn run_agent_loop<'a>(
 
                 // Flush the entire turn atomically
                 turn_persister.flush(&state.db()).await?;
+                let assistant_message_ids =
+                    stored_assistant_message_ids(state, session_id.as_str(), turn_boundary).await?;
                 clear_terminal_runtime_state(state, session_id.as_str()).await?;
 
                 record_request_log(
@@ -1970,7 +2024,8 @@ fn run_agent_loop<'a>(
 
                 return Err(AgentLoopError::BrowserTakeoverPaused(Box::new(
                     AgentRunResult {
-                        assistant_id,
+                        user_message_id: turn_user_message_id,
+                        assistant_message_ids,
                         full_text,
                         reasoning_text,
                         terminal_snapshot,
@@ -2181,6 +2236,8 @@ fn run_agent_loop<'a>(
 
             // Flush the entire turn atomically
             turn_persister.flush(&state.db()).await?;
+            let assistant_message_ids =
+                stored_assistant_message_ids(state, session_id.as_str(), turn_boundary).await?;
             clear_terminal_runtime_state(state, session_id.as_str()).await?;
 
             // Final sample carries the exact rate now that Usage has arrived.
@@ -2220,7 +2277,8 @@ fn run_agent_loop<'a>(
             );
 
             return Ok(AgentRunResult {
-                assistant_id,
+                user_message_id: turn_user_message_id,
+                assistant_message_ids,
                 full_text,
                 reasoning_text,
                 terminal_snapshot,
@@ -2351,12 +2409,12 @@ async fn run_published_turn(
     let response_session_id = req.session_id.clone();
     match result {
         Ok(result) => {
-            let done_event = SseDoneEvent {
-                seq: sink.next_seq(),
-                turn_id: sink.turn_id.clone(),
-                session_id: response_session_id.clone(),
-                assistant: api_message_from_run_result(result),
-            };
+            let done_event = done_event_from_run_result(
+                sink.next_seq(),
+                sink.turn_id.clone(),
+                response_session_id.clone(),
+                result,
+            );
             // Release the session before announcing the end of the turn, so
             // a client that sends its next message on `done` is never refused
             // as a concurrent run. Finishing continues the session under a
@@ -2373,12 +2431,12 @@ async fn run_published_turn(
             }
         }
         Err(AgentLoopError::BrowserTakeoverPaused(result)) => {
-            let done_event = SseDoneEvent {
-                seq: sink.next_seq(),
-                turn_id: sink.turn_id.clone(),
-                session_id: response_session_id.clone(),
-                assistant: api_message_from_run_result(*result),
-            };
+            let done_event = done_event_from_run_result(
+                sink.next_seq(),
+                sink.turn_id.clone(),
+                response_session_id.clone(),
+                *result,
+            );
             let continued = guard.finish(RunOutcome::Completed).await?;
             sink.finish(Some(("paused", &done_event)), crate::client::RunEnd::Paused);
             if let Some(continued) = continued {
@@ -5441,6 +5499,36 @@ mod tests {
             .filter(|item| format!("{:?}", item.message()).contains("the answer"))
             .count();
         assert_eq!(answers, 1, "the answer appears in context exactly once");
+    }
+
+    /// The ids a finished turn announces are the ids REST returns for the
+    /// messages the turn stored.
+    #[tokio::test]
+    async fn a_turns_done_event_names_its_messages_as_rest_does() {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let provider = stub_provider(vec![sse_text("答えは四十二。回答は42です。")]).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let state = failover_state(may_dir.path(), &provider, &provider).await;
+        let mut sink = TestSink::default();
+        let result = run_prompt_turn(&state, &mut sink)
+            .await
+            .expect("the turn completes");
+
+        let done = super::done_event_from_run_result(1, "turn".into(), "session".into(), result);
+        let rows = state.db().get_messages("session").await.expect("rows load");
+        let api = crate::daemon::message_mapping::map_db_messages(&rows).expect("rows map");
+        let rest_user = api
+            .iter()
+            .find(|message| message.role == "user")
+            .expect("the user message is stored");
+        let rest_assistants: Vec<&str> = api
+            .iter()
+            .filter(|message| message.role == "assistant")
+            .map(|message| message.id.as_str())
+            .collect();
+        assert_eq!(done.user_message_id.as_deref(), Some(rest_user.id.as_str()));
+        assert_eq!(done.message_ids, rest_assistants);
+        assert_eq!(done.assistant.id, rest_assistants[0]);
     }
 
     /// Seeding from UI history produces transcript seqs the agent itself

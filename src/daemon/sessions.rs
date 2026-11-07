@@ -111,7 +111,8 @@ pub(super) async fn append_session_history(
 
 /// `POST /api/sessions/{id}/rewind` — delete the session's stored history
 /// from the `index`-th stored row on, the truncation half of a client-side
-/// rewind. Clients index it because message row ids never cross the wire.
+/// rewind. Clients index it by position among the stored rows, which hidden
+/// and tool rows share with the messages they see.
 pub(super) async fn rewind_session(
     params: Params,
     Json(req): Json<RewindRequest>,
