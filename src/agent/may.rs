@@ -742,6 +742,10 @@ impl MayAgent {
                     runtime.clone(),
                     config.session_id.as_str(),
                 ))
+                .context_source(super::ci_alert::CiAlertContext::new(
+                    runtime.db(),
+                    config.session_id.as_str(),
+                ))
                 .blocker_resolver(super::ask_user_tool::AskUserBlockerResolver::new(
                     runtime,
                     config.session_id.as_str(),

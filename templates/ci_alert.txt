@@ -1,0 +1,11 @@
+PR #{{ pr_number }}'s checks finished with {{ jobs.len() }} abnormally long job{% if jobs.len() != 1 %}s{% endif %}:
+{% for job in jobs -%}
+- {{ job.workflow }} / {{ job.name }} ran {{ job.duration }}: {% for reason in job.exceeded %}{{ reason }}{% if !loop.last %}; {% endif %}{% endfor %}.
+{%- if !job.steps.is_empty() %}
+  Slowest steps: {% for step in job.steps %}{{ step.name }} ({{ step.duration }}){% if !loop.last %}, {% endif %}{% endfor %}.
+{%- endif %}
+{%- if !job.tests.is_empty() %}
+  Slowest tests: {% for test in job.tests %}{{ test.name }} ({{ test.duration }}){% if !loop.last %}, {% endif %}{% endfor %}.
+{%- endif %}
+{% endfor %}
+This slows verification and feedback and wastes compute. Act now to make the run faster, starting by reading the `ci-optimise` skill; `ci slow {{ pr_number }}` breaks the run down.

@@ -51,6 +51,8 @@ pub enum UiEventTopic {
     Sleep = 1 << 19,
     /// A popup waits on the user; attached terminals raise a notification.
     UserNotification = 1 << 20,
+    /// A session raised a warning for the user, such as an abnormally long CI job.
+    SessionWarning = 1 << 21,
 }
 
 impl UiEventTopic {
@@ -83,6 +85,7 @@ impl UiEventTopic {
             Self::SessionIssues => "session_issues",
             Self::Sleep => "sleep",
             Self::UserNotification => "user_notification",
+            Self::SessionWarning => "session_warning",
         }
     }
 }
@@ -113,6 +116,7 @@ impl FromStr for UiEventTopic {
             "session_issues" => Ok(Self::SessionIssues),
             "sleep" => Ok(Self::Sleep),
             "user_notification" => Ok(Self::UserNotification),
+            "session_warning" => Ok(Self::SessionWarning),
             _ => Err(UnknownUiEventTopic(value.to_string())),
         }
     }
@@ -167,6 +171,8 @@ impl UiEventTopics {
     pub const SLEEP: Self = Self(UiEventTopic::Sleep.bit());
     /// `user_notification` topic bit.
     pub const USER_NOTIFICATION: Self = Self(UiEventTopic::UserNotification.bit());
+    /// `session_warning` topic bit.
+    pub const SESSION_WARNING: Self = Self(UiEventTopic::SessionWarning.bit());
     /// Every topic.
     pub const ALL: Self = Self(
         Self::CONFIG.0

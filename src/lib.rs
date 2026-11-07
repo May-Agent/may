@@ -19,6 +19,7 @@ pub mod bundle;
 pub mod cache_lifetime;
 /// `ChatGPT` subscription OAuth flow.
 pub mod chatgpt;
+pub mod ci;
 /// Client of the May daemon over its unix socket.
 pub mod client;
 /// Configuration loading and types.
