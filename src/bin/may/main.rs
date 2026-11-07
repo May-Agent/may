@@ -1367,7 +1367,6 @@ where
                         if let Some(handle) = agent_handle.take() {
                             handle.cancel();
                         }
-                        app.restore_aborted_draft();
                         app.status = None;
                         // Clean up loading/streaming state before adding interrupt message
                         app.chat.collapse_thinking();

@@ -44,6 +44,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   const cancel = useTurnStore((s) => s.cancel);
   const retry = useTurnStore((s) => s.retry);
   const dismissError = useTurnStore((s) => s.dismissError);
+  const consumeRestored = useTurnStore((s) => s.consumeRestored);
   const watchTurns = useTurnStore((s) => s.watch);
   const config = useConfigStore((s) => s.config);
   const configLoaded = config !== null;
@@ -330,6 +331,8 @@ export function ChatView({ sessionId }: { sessionId: string }) {
             streaming={streaming}
             onSend={handleSend}
             onCancel={() => void cancel(sessionId)}
+            restored={sessionTurn?.restored ?? null}
+            onRestored={() => consumeRestored(sessionId)}
             sessionId={active.id}
             currentModel={active.model}
             currentReasoningEffort={active.reasoningEffort}

@@ -141,13 +141,6 @@ pub struct App {
     pub status: Option<StatusNotice>,
     /// Whether agent is currently processing
     pub processing: bool,
-    /// Whether the in-flight turn produced any model output — a turn
-    /// stopped before its first event returns the sent draft to the
-    /// input box instead of dropping it.
-    turn_had_output: bool,
-    /// The last message handed to the agent, kept until the next send so
-    /// an aborted-before-any-action turn can put it back into the input.
-    last_sent_input: Option<String>,
     /// Hidden context attached to the next send after a rewind: tells the
     /// agent the conversation was cut back while the world — open and
     /// merged PRs — stands as recorded.
@@ -631,8 +624,6 @@ impl App {
             content_height: AtomicUsize::new(0),
             view_height: AtomicUsize::new(0),
             mode,
-            turn_had_output: false,
-            last_sent_input: None,
             rewind_notice: None,
             queue: MessageQueue::new(),
             status,
@@ -3750,7 +3741,6 @@ impl App {
             return self.open_model_select(rest.trim());
         }
 
-        self.last_sent_input = Some(content.clone());
         let msg = PendingMessage {
             content,
             hidden_context_xml: self.rewind_notice.take(),
@@ -3767,23 +3757,24 @@ impl App {
         }
     }
 
-    /// A turn stopped before its first agent event puts the sent message
-    /// back into the input box — the usual "I sent a typo" recovery.
-    pub fn restore_aborted_draft(&mut self) {
-        if self.turn_had_output {
-            return;
-        }
-        if let Some(draft) = self.last_sent_input.take() {
-            self.input_char_count = draft.chars().count();
+    /// The daemon withdrew the latest turn, stopped before any tool call or
+    /// response text: its message and the turn's markers leave the chat.
+    /// The client that sent it gets its text and attachments back in the
+    /// input — the usual "I sent a typo" recovery. The session history is
+    /// reloaded without the message.
+    pub fn withdraw_turn(&mut self, content: String, own: bool) {
+        let attachments = self.chat.withdraw_last_prompt(&content);
+        if own {
+            self.input_char_count = content.chars().count();
             self.cursor = self.input_char_count;
-            self.input = draft;
+            self.input = content;
+            self.attachments = attachments.unwrap_or_default();
         }
     }
 
     /// Called when starting to process a message.
     pub fn start_processing(&mut self, msg: &PendingMessage) {
         self.processing = true;
-        self.turn_had_output = false;
         self.turn_started_at = Some(std::time::Instant::now());
         self.thinking_start = None;
         self.activity_phase = crate::tui::ui::chat::ActivityPhase::Thinking;
@@ -4094,9 +4085,6 @@ impl App {
     pub async fn handle_agent_event(&mut self, result: Result<TimedEvent, AgentError>) -> bool {
         match result {
             Ok(TimedEvent { event, .. }) => {
-                // Any event from the agent stream counts as the turn having
-                // acted — a stop before this point restores the sent draft.
-                self.turn_had_output = true;
                 match event {
                     AgentEvent::Text(chunk) => {
                         self.activity_phase = crate::tui::ui::chat::ActivityPhase::Working;

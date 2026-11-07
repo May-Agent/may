@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import type { ApiMessage, ChatRequestPayload, ChatStreamEvent } from '../types';
+import type { ApiAttachment, ApiMessage, ChatRequestPayload, ChatStreamEvent } from '../types';
 import { openSessionTurns, sendMessage, stopSession } from '../api/chat';
 import {
   applyEvent,
@@ -52,6 +52,16 @@ export interface SessionTurn {
   stopping: boolean;
   /** Payload of the most recent send, used to retry after an error. */
   lastPayload: ChatRequestPayload | null;
+  /** Whether this client sent the turn in progress. */
+  own: boolean;
+  /** A withdrawn message of this client's, waiting to return to the composer. */
+  restored: RestoredDraft | null;
+}
+
+/** The text and attachments of a message the daemon withdrew. */
+export interface RestoredDraft {
+  content: string;
+  attachments: ApiAttachment[];
 }
 
 const IDLE_TURN: SessionTurn = {
@@ -59,6 +69,8 @@ const IDLE_TURN: SessionTurn = {
   last: null,
   stopping: false,
   lastPayload: null,
+  own: false,
+  restored: null,
 };
 
 /** Wait before reopening a session's turn stream that dropped. */
@@ -77,6 +89,8 @@ interface TurnSliceState {
   cancel: (sessionId: string) => Promise<void>;
   retry: (sessionId: string) => Promise<void>;
   dismissError: (sessionId: string) => void;
+  /** The composer took the withdrawn draft back. */
+  consumeRestored: (sessionId: string) => void;
 }
 
 function errorTurn(base: TurnState | null, sessionId: string, err: unknown): TurnState {
@@ -134,11 +148,24 @@ export const useTurnStore = create<TurnSliceState>((set, get) => {
         patch(sessionId, (prev) => (prev.active ? { active: applyEvent(prev.active, evt) } : {}));
         finishWithReply(sessionId, evt.assistant);
         return;
+      case 'withdrawn':
+        // The message leaves the conversation; the client that sent it gets
+        // it back in the composer.
+        useSessionsStore.getState().withdrawUserMessage(sessionId, evt.content);
+        patch(sessionId, (prev) => ({
+          active: null,
+          last: null,
+          stopping: false,
+          restored: prev.own
+            ? { content: evt.content, attachments: evt.attachments }
+            : prev.restored,
+        }));
+        return;
       case 'end':
         patch(sessionId, (prev) =>
           prev.active
-            ? { active: null, last: applyEvent(prev.active, evt), stopping: false }
-            : { stopping: false },
+            ? { active: null, last: applyEvent(prev.active, evt), stopping: false, own: false }
+            : { stopping: false, own: false },
         );
         return;
       default:
@@ -212,6 +239,7 @@ export const useTurnStore = create<TurnSliceState>((set, get) => {
         last: null,
         stopping: false,
         lastPayload: payload,
+        own: true,
       }));
       try {
         await sendMessage(payload);
@@ -256,6 +284,10 @@ export const useTurnStore = create<TurnSliceState>((set, get) => {
 
     dismissError(sessionId) {
       patch(sessionId, () => ({ last: null }));
+    },
+
+    consumeRestored(sessionId) {
+      patch(sessionId, () => ({ restored: null }));
     },
   };
 });

@@ -96,12 +96,15 @@ struct ForwardedTurn {
     /// daemon writes the turn's rows after its agent completes, and the
     /// client re-reads the history as soon as it sees the turn complete.
     held_complete: Option<TuiEvent>,
+    /// This client sent the turn's message.
+    own: bool,
 }
 
 impl ForwardedTurn {
-    const fn new(events: Sender<TuiEvent>) -> Self {
+    const fn new(events: Sender<TuiEvent>, own: bool) -> Self {
         Self {
             events,
+            own,
             saw_error: false,
             held_complete: None,
         }
@@ -352,7 +355,9 @@ async fn forward_agent_frame(
             if let Some(message_id) = message_id {
                 let _ = app_events.try_send(AppEvent::TurnStarted { message_id });
             }
-            let events = shared.take_pending().unwrap_or_else(|| {
+            let pending = shared.take_pending();
+            let own = pending.is_some();
+            let events = pending.unwrap_or_else(|| {
                 let (events, rx) = unbounded();
                 let _ = foreign_tx.try_send(ForeignTurn {
                     handle: AgentHandle::new(rx, command_tx.clone()),
@@ -362,7 +367,14 @@ async fn forward_agent_frame(
                 });
                 events
             });
-            *current = Some(ForwardedTurn::new(events));
+            *current = Some(ForwardedTurn::new(events, own));
+        }
+        SessionAgentBody::Withdrawn { content, .. } => {
+            // The client that sent the message gets it back; the turn's
+            // handle may already be gone (the stop that caused this
+            // dropped it), so the app hears of it directly.
+            let own = current.as_ref().is_some_and(|turn| turn.own);
+            let _ = app_events.try_send(AppEvent::TurnWithdrawn { content, own });
         }
         SessionAgentBody::Agent { event } => {
             if let Some(turn) = current.as_mut() {
@@ -687,6 +699,48 @@ mod tests {
             foreign_rx.try_recv().is_ok(),
             "the new turn is a foreign turn"
         );
+    }
+
+    /// A withdrawn turn reaches the app with whether this client sent it,
+    /// even though the stop that caused it already dropped the turn's handle.
+    #[tokio::test]
+    async fn a_withdrawn_turn_tells_the_app_who_sent_it() {
+        for sent_here in [true, false] {
+            let shared = Shared::default();
+            let (events, _rx) = unbounded();
+            if sent_here {
+                shared.set_pending(events);
+            }
+            let (foreign_tx, _foreign_rx) = unbounded();
+            let (commands, _command_rx) = unbounded();
+            let (app_events, app_rx) = unbounded();
+            let mut current = None;
+            for body in [
+                SessionAgentBody::Start {
+                    content: Some("你好 こんにちは 안녕하세요".to_string()),
+                    message_id: None,
+                },
+                SessionAgentBody::Withdrawn {
+                    content: "你好 こんにちは 안녕하세요".to_string(),
+                    attachments: Vec::new(),
+                },
+            ] {
+                forward_agent_frame(
+                    frame("t1", body),
+                    &mut current,
+                    &shared,
+                    &foreign_tx,
+                    &commands,
+                    &app_events,
+                )
+                .await;
+            }
+            let Ok(AppEvent::TurnWithdrawn { content, own }) = app_rx.try_recv() else {
+                panic!("the app hears of the withdrawal");
+            };
+            assert_eq!(content, "你好 こんにちは 안녕하세요");
+            assert_eq!(own, sent_here);
+        }
     }
 
     /// The daemon writes a turn's rows after its agent completes and before

@@ -168,3 +168,41 @@ describe('turns are keyed by session', () => {
     expect(useTurnStore.getState().turns.A.stopping).toBe(false);
   });
 });
+
+describe('a withdrawn turn', () => {
+  const text = '你好 こんにちは 안녕하세요';
+  const withdrawn = (sessionId: string) => [
+    frame(sessionId, 'start', { seq: 1, turnId: 't1', sessionId, assistantId: 'a-1' }),
+    frame(sessionId, 'withdrawn', { seq: 2, turnId: 't1', content: text, attachments: [] }),
+    frame(sessionId, 'end', { seq: 3, turnId: 't1', outcome: 'cancelled' }),
+  ];
+
+  test('leaves the conversation and returns to the sender composer', async () => {
+    const backend = installBackend({ A: session('A', [message('a-u0', 'user', 'earlier')]) });
+    await useSessionsStore.getState().open('A');
+    unwatchers.push(useTurnStore.getState().watch('A'));
+    await settle();
+    useSessionsStore.getState().appendMessage('A', message('local-1', 'user', text));
+    await useTurnStore.getState().send({ sessionId: 'A', content: text });
+    for (const bytes of withdrawn('A')) backend.streams.A.enqueue(bytes);
+    await settle();
+
+    expect(useSessionsStore.getState().messages.A.map((m) => m.id)).toEqual(['a-u0']);
+    const turn = useTurnStore.getState().turns.A;
+    expect(turn.active).toBeNull();
+    expect(turn.last).toBeNull();
+    expect(turn.restored?.content).toBe(text);
+  });
+
+  test('is removed without a draft in a client that did not send it', async () => {
+    const backend = installBackend({ A: session('A', [message('a-u0', 'user', text)]) });
+    await useSessionsStore.getState().open('A');
+    unwatchers.push(useTurnStore.getState().watch('A'));
+    await settle();
+    for (const bytes of withdrawn('A')) backend.streams.A.enqueue(bytes);
+    await settle();
+
+    expect(useSessionsStore.getState().messages.A).toEqual([]);
+    expect(useTurnStore.getState().turns.A.restored).toBeNull();
+  });
+});
