@@ -303,64 +303,110 @@ async fn a_recipient_without_a_published_request_is_refused() {
     assert!(matches!(error, AgentLinkError::NoForkContext(_)), "{error}");
 }
 
-/// A side request answers from the context of a recipient that is in the
-/// middle of a turn, reflecting what the turn has added so far, and the
-/// recipient's turn sends the same requests it would have without it.
-#[tokio::test]
+/// What only the running turn adds to the recipient's context.
+const TURN_MARKER: &str = "TURN-MARKER-SENTINEL";
+
+/// A side request answers from the context of a recipient in the middle of
+/// a turn, holding what the turn added so far, and the recipient's turn
+/// sends the same requests it would have without it.
+///
+/// The turn's first request answers with a tool call carrying
+/// [`TURN_MARKER`]; its second request, which holds the marker, is held at
+/// the model until the side request is answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_side_request_reads_the_context_of_a_running_turn() {
     use futures_lite::StreamExt as _;
 
-    let stub = StubModel::spawn_scripted(SESSION_MODEL, |body| {
-        body.contains(QUESTION)
-            .then(|| StubReply::Text(ANSWER.to_string()))
+    let (open_gate, gate) = std::sync::mpsc::channel::<()>();
+    let gate = std::sync::Mutex::new(gate);
+    let (held_tx, mut held) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let stub = StubModel::spawn_scripted(SESSION_MODEL, move |body| {
+        if body.contains(QUESTION) {
+            return Some(StubReply::Text(ANSWER.to_string()));
+        }
+        if !body.contains("Keep working.") {
+            return None;
+        }
+        if body.contains(TURN_MARKER) {
+            // Held until the side request is answered. The reply script
+            // runs on a worker of the stub server, not on the test's.
+            held_tx.send(()).expect("the test waits for the request");
+            gate.lock()
+                .expect("gate")
+                .recv()
+                .expect("the gate is opened");
+            return None;
+        }
+        Some(StubReply::ToolCall {
+            name: "terminal",
+            arguments: serde_json::json!({
+                "description": TURN_MARKER,
+                "script": "echo working",
+                "mode": "sandboxed",
+                "timeout": 30,
+            }),
+        })
     })
     .await;
     let host = Host::new().await;
     let mut session = host.recipient(&stub).await;
     let session_id = session.parts.session_id.as_str().to_string();
 
-    let (answer, ()) = tokio::join!(
-        async {
-            let side = host
-                .messaging
-                .side_context(&session_id)
-                .await
-                .expect("the side request is allowed")
-                .expect("the recipient has a live agent");
-            let mut messages = side.messages;
-            messages.push(aither_core::llm::Message::user(QUESTION));
-            let mut answer = String::new();
-            let mut stream = std::pin::pin!(side.model.respond(messages.clone()));
-            while let Some(event) = stream.next().await {
-                if let aither_core::llm::Event::Text(text) = event.expect("the model answers") {
-                    answer.push_str(&text);
-                }
+    let side_request = async {
+        // The turn's second request is published before it is sent, so its
+        // arrival at the model means the context holds the marker.
+        tokio::time::timeout(std::time::Duration::from_secs(60), held.recv())
+            .await
+            .expect("the turn reaches its second request")
+            .expect("the stub holds the request");
+        let side = host
+            .messaging
+            .side_context(&session_id)
+            .await
+            .expect("the side request is allowed")
+            .expect("the recipient has a live agent");
+        let mut messages = side.messages;
+        messages.push(aither_core::llm::Message::user(QUESTION));
+        let mut answer = String::new();
+        let mut stream = std::pin::pin!(side.model.respond(messages));
+        while let Some(event) = stream.next().await {
+            if let aither_core::llm::Event::Text(text) = event.expect("the model answers") {
+                answer.push_str(&text);
             }
-            (answer, format!("{messages:?}"))
-        },
-        async {
-            let _ = session
-                .agent
-                .run("Keep working.", [])
-                .drive((), std::future::pending::<()>(), |(), _| async {
-                    std::ops::ControlFlow::Continue(())
-                })
-                .await
-                .expect("the recipient's turn runs");
         }
-    );
-    let (answer, context) = answer;
+        open_gate.send(()).expect("the turn waits at the gate");
+        answer
+    };
+    let (answer, ()) = tokio::join!(side_request, async {
+        let _ = session
+            .agent
+            .run("Keep working.", [])
+            .drive((), std::future::pending::<()>(), |(), _| async {
+                std::ops::ControlFlow::Continue(())
+            })
+            .await
+            .expect("the recipient's turn runs to completion");
+    });
     assert_eq!(answer, ANSWER);
+
+    let asked = requests_with(&stub, QUESTION).await;
+    assert_eq!(asked.len(), 1, "one side request");
     assert!(
-        context.contains(FACT) && context.contains("Say hello."),
-        "the side request holds the recipient's context: {context}"
+        asked[0].contains("Keep working.") && asked[0].contains(TURN_MARKER),
+        "the side request holds what the running turn added: {}",
+        asked[0]
     );
 
-    let own = requests_with(&stub, "Keep working.").await;
-    assert!(!own.is_empty(), "the recipient's turn reached the model");
+    let own = requests_with(&stub, "Keep working.")
+        .await
+        .into_iter()
+        .filter(|body| !body.contains(QUESTION))
+        .collect::<Vec<_>>();
+    assert_eq!(own.len(), 2, "the turn sent its two requests");
+    assert!(own[1].contains(TURN_MARKER));
     for body in own {
         assert!(
-            !body.contains(QUESTION) && !body.contains(ANSWER),
+            !body.contains(ANSWER) && !body.contains("agent-btw"),
             "the recipient's request carries the side request: {body}"
         );
     }
