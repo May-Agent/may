@@ -1,0 +1,49 @@
+# Tools and runtimes
+
+## The shell
+
+Terminal commands run in a managed GNU bash 5.3.20 (pinned for macOS arm64, Linux arm64 and Linux x86_64), not in the system `sh` or the user's login shell. It is started as `bash --noprofile --norc -c <script>`: no startup file is read, so a script behaves the same on every machine. Local sandboxed, `unsafe` host, SSH and container runs all use the managed bash (a container image carries the same pinned tools). Windows has no managed bash.
+
+Ahead of the script the shell defines functions, visible only to that shell and not to child processes: `grep`, `awk` and `find` fail with a message naming the replacement (`rg`; `python3` or `jq`; `fd`), and `sed` runs `aither-sed`, which only prints line ranges (`sed -n '2,3p' file`) and refuses everything else. A child process (a Makefile, a `python3 -c "import subprocess..."`) still reaches the system programs.
+
+## What May provides
+
+May embeds a hash-pinned tool distribution (`src/tools/tool-distribution-0.14.1.json`, the byte-exact release asset of aither's `patch-v0.14.1`). Artifacts are downloaded on first use from their upstream release URLs and verified against their SHA-256 before anything runs them.
+
+| command | what | version |
+| --- | --- | --- |
+| `bash` | the shell | 5.3.20 |
+| `rg` | ripgrep | 15.2.0 |
+| `ast-grep` | syntax-aware search | 0.45.3 |
+| `fd` | file finder | 10.5.0 |
+| `jq` | JSON | 1.8.2 |
+| `apply_patch` | contextual multi-file editing | 0.14.1 |
+| `aither-sed` | the `sed` function above | 0.14.1 |
+| `xargs` | uutils findutils | 0.11.0 |
+| coreutils (`ls`, `cat`, `cp`, `mv`, `rm`, `mkdir`, `head`, `sort`, `date`, `env`, `sha256sum`, `stat`, and the rest of the uutils utilities) | uutils coreutils multicall binary, each name a symlink to it; not `grep`, `sed`, `awk`, `find` | 0.12.0 |
+| `uv` | Python package and project manager | 0.13.7 |
+| `python3` | CPython installed by `uv` when the tools are prepared | 3.13.18 |
+
+Not every platform has every tool: macOS arm64, Linux arm64 and Linux x86_64 get all of them; Windows gets only `rg`, `ast-grep`, `jq` and `apply_patch`. Separately, `src/tools/host-programs.json` pins programs the harness itself runs (the repo-search daemon, `search`, version 0.0.12); they are never put on a command `PATH`.
+
+## Where they live
+
+- `~/.may/tools/artifacts/`: downloaded, hash-addressed artifacts.
+- `~/.may/tools/runtimes/<key>/`: the prepared runtime, executables in `<key>/bin`. `<key>` is a SHA-256 over the target platform and the name, version and digest of every tool plus the Python pin, so the whole distribution is one content-addressed directory: a new distribution gets a new directory. It is made read-only, verified on every reuse and rebuilt if its contents are invalid; creation is serialised by a lock file `~/.may/tools/runtimes/.<key>.lock`. Every session and every backend on the machine shares it.
+- `~/.may/tools/runtimes/uv/`: the one writable directory beside the runtimes, private to the user, holding `uv`'s cache (`cache/`) and the Pythons `uv` installs for projects (`python/`).
+
+## Why bash and python3 share a runtime directory
+
+The interpreter is installed into the same tree as the tools, under `<key>/bin/.python/<request>/`, and `<key>/bin/python3` is a relative link to it. Keeping it inside `bin` means the single read-only executable grant that every backend already gives the tools directory covers the whole interpreter, and one hash pins the shell, the tools and Python together. Because the tree is read-only, nothing installs into it; writable state goes to the separate `uv/` directory and to the session.
+
+## PATH and environment
+
+A session's `PATH` is the prepared directory `<key>/bin` first, then the host's own `PATH` (so `cargo`, `git`, `gh`, and anything else on the host stay reachable). Managed tools therefore win over a system tool of the same name (the system `python3`, `jq`, `rg`, `ls`, ... are shadowed); a host tool with no managed counterpart is found as usual. The terminal also sets `HOME` and `TMPDIR` to the session directory (`TMPDIR` to its `tmp/`), `XDG_CACHE_HOME` and `XDG_CONFIG_HOME` under it, and `PYTHONPATH` to start with the session's `skills/python`, followed by any inherited value.
+
+## Python projects and uv
+
+The environment exports `UV_CACHE_DIR=~/.may/tools/runtimes/uv/cache`, `UV_PYTHON_INSTALL_DIR=~/.may/tools/runtimes/uv/python` and `UV_PYTHON_PREFERENCE=system`. Effects:
+
+- `python3` is always the managed 3.13.18. A project that asks for no particular Python gets that interpreter from `PATH` through `uv` (`system` preference) instead of whichever interpreter `uv` last installed for another project.
+- A project's `.python-version` or `requires-python`, or an existing `.venv`, that the `PATH` interpreter does not satisfy is not refused: `uv` installs the requested Python into `UV_PYTHON_INSTALL_DIR` (shared by all sessions) or uses the one the `.venv` was built with. Use `uv venv`, `uv sync`, `uv run` and `uv pip` for project environments.
+- The first run of the first session downloads and verifies artifacts and installs Python, so it is slow; later sessions reuse the directory.

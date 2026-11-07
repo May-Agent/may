@@ -7,6 +7,18 @@ description: Facts about how May itself works (terminal, background jobs, daemon
 
 May is a daemon with clients. The daemon runs every agent loop, the task scheduler and search indexing; the TUI, one-shot runs (`may "<prompt>"`) and the web UI attach to it. This file states how the parts behave today. `references/architecture.md` lists where each part lives in the source.
 
+## Product reference
+
+What the user sees and sets. Read the file for the area a question touches.
+
+- `references/slash-commands.md`: every TUI slash command and what it does.
+- `references/configuration.md`: `~/.may/config.toml` settings, providers and setting up a model.
+- `references/clients.md`: the `may` command line, the TUI and the web UI.
+- `references/profiles.md`: profiles, pinning, folders and archiving.
+- `references/tools-and-runtimes.md`: the managed bash, the tools and Python May provides, PATH order and uv.
+- `references/sleep.md`: `/sleep`, waking and the health reminder.
+- `references/remote-access.md`: Tailscale remote access, allowed logins and Funnel.
+
 ## Terminal
 
 `terminal` runs a command in the session sandbox. `timeout` (seconds, at most 7200) is required; the command and its process tree are killed when it passes.
@@ -94,7 +106,7 @@ Work on a git repository happens in a clone inside the session, and `pr` lands i
 
 ## Context and compaction
 
-There is no `compact` tool you can call. The conversation is compacted into a handoff document in the background when usage passes the context policy's `compact_at` threshold, when the session has been idle until the provider's prompt cache (default one hour, the provider's `cache_lifetime` setting) is about to expire, or when the user runs `/compact`. The idle session's agent is kept between turns and reused unless something it was built from changed, so detached commands keep running. `/context` and `/btw` are answered without disturbing the conversation.
+The conversation is compacted into a handoff document in the background when you call the native `compact` tool, when usage passes the context policy's `compact_at` threshold, when the session has been idle until the provider's prompt cache (default one hour, the provider's `cache_lifetime` setting) is about to expire, or when the user runs `/compact`. The idle session's agent is kept between turns and reused unless something it was built from changed, so detached commands keep running. `/context` and `/btw` are answered without disturbing the conversation.
 
 ## Defects to know
 
