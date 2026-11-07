@@ -104,11 +104,11 @@ interface SessionsState {
   replaceMessage: (sessionId: string, msg: ApiMessage) => void;
   /**
    * A turn ended: the oldest not-yet-stored user message takes the id the
-   * daemon stored it under, and the reply joins under its stored id (or
-   * replaces the copy a refresh already fetched), so a later refresh updates
-   * both in place.
+   * daemon stored it under, and the reply, when the turn stored one, joins
+   * under its stored id (or replaces the copy a refresh already fetched), so
+   * a later refresh updates both in place.
    */
-  settleTurn: (sessionId: string, userMessageId: string | null, reply: ApiMessage) => void;
+  settleTurn: (sessionId: string, userMessageId: string | null, reply: ApiMessage | null) => void;
   updateRuntime: (id: string, runtime: Partial<SessionRuntimeSummary>) => void;
 }
 
@@ -402,9 +402,11 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
           list = list.map((m, i) => (i === index ? { ...m, id: userMessageId } : m));
         }
       }
-      list = list.some((m) => m.id === reply.id)
-        ? list.map((m) => (m.id === reply.id ? reply : m))
-        : [...list, reply];
+      if (reply !== null) {
+        list = list.some((m) => m.id === reply.id)
+          ? list.map((m) => (m.id === reply.id ? reply : m))
+          : [...list, reply];
+      }
       return { messages: { ...prev.messages, [sessionId]: list } };
     });
   },

@@ -224,4 +224,33 @@ describe('a finished turn keeps its components through a refresh', () => {
 
     expect(rowsOf()).toEqual(before);
   });
+
+  test('a pause before any reply settles the user message and adds no assistant message', async () => {
+    const backend = installBackend({ A: session('A', []) });
+    await useSessionsStore.getState().open('A');
+    unwatchers.push(useTurnStore.getState().watch('A'));
+    await settle();
+    useSessionsStore.getState().appendMessage('A', message('local-1', 'user', '你好 こんにちは 안녕하세요'));
+    await useTurnStore.getState().send({ sessionId: 'A', content: '你好' });
+    const frames: Array<[string, Record<string, unknown>]> = [
+      ['start', { seq: 1, turnId: 't1', sessionId: 'A', assistantId: 'assistant-x' }],
+      [
+        'paused',
+        {
+          seq: 2,
+          turnId: 't1',
+          sessionId: 'A',
+          userMessageId: 'msg-7',
+          messageIds: [],
+          assistant: null,
+        },
+      ],
+      ['end', { seq: 3, turnId: 't1', outcome: 'paused' }],
+    ];
+    for (const [event, data] of frames) backend.streams.A.enqueue(frame('A', event, data));
+    await settle();
+
+    expect(useSessionsStore.getState().messages.A.map((m) => m.id)).toEqual(['msg-7']);
+    expect(useTurnStore.getState().turns.A.active).toBeNull();
+  });
 });

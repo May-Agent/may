@@ -106,11 +106,15 @@ export const useTurnStore = create<TurnSliceState>((set, get) => {
 
   const finishWithReply = (
     sessionId: string,
-    assistant: ApiMessage,
+    assistant: ApiMessage | null,
     userMessageId: string | null,
   ) => {
     const finalActive = turnOf(sessionId).active;
     patch(sessionId, (prev) => ({ active: null, last: prev.active, stopping: false }));
+    if (assistant === null) {
+      useSessionsStore.getState().settleTurn(sessionId, userMessageId, null);
+      return;
+    }
     const toolEvent = synthesizeToolEvent(finalActive?.tools ?? []);
     const reasoning =
       typeof assistant.thinking === 'string' && assistant.thinking.length > 0

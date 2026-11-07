@@ -337,13 +337,16 @@ export interface SseDone {
   messageIds: string[];
 }
 
-/** The turn paused for a browser takeover; carries the partial reply. */
+/**
+ * The turn paused for a browser takeover; carries the partial reply, which
+ * is absent when the pause came before the turn stored one.
+ */
 export interface SsePaused {
   kind: 'paused';
   seq: number;
   turnId: string;
   sessionId: string;
-  assistant: ApiMessage;
+  assistant: ApiMessage | null;
   userMessageId: string | null;
   messageIds: string[];
 }

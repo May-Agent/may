@@ -74,7 +74,7 @@ use super::title_generation;
 use super::types::{
     ApiErrorCode, ApiMessage, ChatRequest, PendingMessageKind, RemovePendingMessageRequest,
     RequestLogEntry, RequestStats, SessionRuntimeResponse, SseChunkEvent, SseDoneEvent,
-    SseErrorEvent, SseHoldEvent, SseSpeedEvent, SseStartEvent, SseTodoUpdateEvent,
+    SseErrorEvent, SseHoldEvent, SsePausedEvent, SseSpeedEvent, SseStartEvent, SseTodoUpdateEvent,
     SseToolDeltaEvent, SseToolEndEvent, SseToolStartEvent, TerminalStateSnapshot, ToolEventRecord,
     ToolVariant,
 };
@@ -261,12 +261,16 @@ impl HubSink {
         }
     }
 
+    /// Ends the turn after publishing its closing `event` (`done` or
+    /// `paused`).
+    fn finish_with<T: Serialize>(&mut self, event: &str, data: &T, outcome: crate::client::RunEnd) {
+        self.publish_turn(event, data);
+        self.finish(outcome);
+    }
+
     /// Ends the turn: final frames go out, then late subscribers read the
     /// turn from history.
-    fn finish(&mut self, event: Option<(&str, &SseDoneEvent)>, outcome: crate::client::RunEnd) {
-        if let Some((event, done)) = event {
-            self.publish_turn(event, done);
-        }
+    fn finish(&mut self, outcome: crate::client::RunEnd) {
         let seq = self.next_seq();
         self.publish_turn(
             "end",
@@ -878,6 +882,9 @@ async fn stored_assistant_message_ids(
 /// The turn's `done` event: the reply carries the id of the first assistant
 /// row the turn stored, the event the ids of all of them and of the user row,
 /// so a client names its streamed messages as the session's REST messages.
+///
+/// A turn that ends normally always stored an assistant row: one with
+/// neither text nor tool activity fails as an empty response first.
 fn done_event_from_run_result(
     seq: u64,
     turn_id: String,
@@ -897,17 +904,41 @@ fn done_event_from_run_result(
         session_id,
         user_message_id,
         message_ids,
+        assistant: api_message_from_run_result(result)
+            .expect("a finished turn stores an assistant row"),
+    }
+}
+
+/// The turn's `paused` event. A takeover can pause the turn before it
+/// produced anything, so there may be no reply to carry.
+fn paused_event_from_run_result(
+    seq: u64,
+    turn_id: String,
+    session_id: String,
+    result: AgentRunResult,
+) -> SsePausedEvent {
+    let user_message_id = result.user_message_id.map(api_message_id);
+    let message_ids = result
+        .assistant_message_ids
+        .iter()
+        .copied()
+        .map(api_message_id)
+        .collect();
+    SsePausedEvent {
+        seq,
+        turn_id,
+        session_id,
+        user_message_id,
+        message_ids,
         assistant: api_message_from_run_result(result),
     }
 }
 
-fn api_message_from_run_result(result: AgentRunResult) -> ApiMessage {
-    let first = result
-        .assistant_message_ids
-        .first()
-        .copied()
-        .expect("a finished turn stores an assistant row");
-    ApiMessage {
+/// The reply under the id of the first assistant row the turn stored, or
+/// `None` when it stored none.
+fn api_message_from_run_result(result: AgentRunResult) -> Option<ApiMessage> {
+    let first = result.assistant_message_ids.first().copied()?;
+    Some(ApiMessage {
         id: api_message_id(first),
         role: "assistant".to_string(),
         content: result.full_text,
@@ -933,7 +964,7 @@ fn api_message_from_run_result(result: AgentRunResult) -> ApiMessage {
             elapsed_ms: Some(result.elapsed_ms),
         }),
         translation: None,
-    }
+    })
 }
 
 /// The response that refuses a client turn: a conflict when another run holds
@@ -2420,10 +2451,7 @@ async fn run_published_turn(
             // as a concurrent run. Finishing continues the session under a
             // new guard only when there is pending work to dispatch.
             let continued = guard.finish(RunOutcome::Completed).await?;
-            sink.finish(
-                Some(("done", &done_event)),
-                crate::client::RunEnd::Completed,
-            );
+            sink.finish_with("done", &done_event, crate::client::RunEnd::Completed);
             if let Some(continued) = continued {
                 spawn_continued_run(state.clone(), continued);
             } else {
@@ -2431,14 +2459,14 @@ async fn run_published_turn(
             }
         }
         Err(AgentLoopError::BrowserTakeoverPaused(result)) => {
-            let done_event = done_event_from_run_result(
+            let paused_event = paused_event_from_run_result(
                 sink.next_seq(),
                 sink.turn_id.clone(),
                 response_session_id.clone(),
                 *result,
             );
             let continued = guard.finish(RunOutcome::Completed).await?;
-            sink.finish(Some(("paused", &done_event)), crate::client::RunEnd::Paused);
+            sink.finish_with("paused", &paused_event, crate::client::RunEnd::Paused);
             if let Some(continued) = continued {
                 spawn_continued_run(state.clone(), continued);
             }
@@ -2446,11 +2474,11 @@ async fn run_published_turn(
         // Errors are already published through on_error in run_agent_loop.
         Err(AgentLoopError::Cancelled(_)) => {
             guard.finish_idle(RunOutcome::Cancelled).await?;
-            sink.finish(None, crate::client::RunEnd::Cancelled);
+            sink.finish(crate::client::RunEnd::Cancelled);
         }
         Err(_) => {
             guard.finish_idle(RunOutcome::Failed).await?;
-            sink.finish(None, crate::client::RunEnd::Failed);
+            sink.finish(crate::client::RunEnd::Failed);
         }
     }
     Ok(())
@@ -2490,25 +2518,25 @@ async fn run_chat_collect_with_receiver(
     .await;
     match result {
         Ok(_) => {
-            sink.finish(None, crate::client::RunEnd::Completed);
+            sink.finish(crate::client::RunEnd::Completed);
             Ok(TurnEnd::Completed)
         }
         Err(AgentLoopError::BrowserTakeoverPaused(_)) => {
-            sink.finish(None, crate::client::RunEnd::Paused);
+            sink.finish(crate::client::RunEnd::Paused);
             Ok(TurnEnd::Paused)
         }
         Err(AgentLoopError::Preparation(error)) => {
-            sink.finish(None, crate::client::RunEnd::Failed);
+            sink.finish(crate::client::RunEnd::Failed);
             Err(ChatCollectError::Preparation(error))
         }
         Err(AgentLoopError::Cancelled(reason)) => {
-            sink.finish(None, crate::client::RunEnd::Cancelled);
+            sink.finish(crate::client::RunEnd::Cancelled);
             Err(ChatCollectError::Sky(internal_error(
                 AgentLoopError::Cancelled(reason),
             )))
         }
         Err(other) => {
-            sink.finish(None, crate::client::RunEnd::Failed);
+            sink.finish(crate::client::RunEnd::Failed);
             Err(ChatCollectError::Sky(internal_error(other)))
         }
     }
@@ -5529,6 +5557,30 @@ mod tests {
         assert_eq!(done.user_message_id.as_deref(), Some(rest_user.id.as_str()));
         assert_eq!(done.message_ids, rest_assistants);
         assert_eq!(done.assistant.id, rest_assistants[0]);
+    }
+
+    /// A takeover can pause a turn before it stored any reply: the `paused`
+    /// event then carries no assistant message instead of failing.
+    #[test]
+    fn a_pause_before_any_output_announces_no_reply() {
+        let result = super::AgentRunResult {
+            user_message_id: Some(7),
+            assistant_message_ids: Vec::new(),
+            full_text: String::new(),
+            reasoning_text: String::new(),
+            terminal_snapshot: crate::daemon::types::TerminalStateSnapshot::default(),
+            usage: aither_core::llm::Usage::default(),
+            provider_id: "provider".to_string(),
+            model_context_window: None,
+            elapsed_ms: 0,
+        };
+        let paused =
+            super::paused_event_from_run_result(1, "turn".into(), "session".into(), result);
+        assert_eq!(paused.user_message_id.as_deref(), Some("msg-7"));
+        assert_eq!(paused.message_ids, Vec::<String>::new());
+        assert!(paused.assistant.is_none());
+        let json = serde_json::to_value(&paused).expect("the event serializes");
+        assert!(json["assistant"].is_null());
     }
 
     /// Seeding from UI history produces transcript seqs the agent itself

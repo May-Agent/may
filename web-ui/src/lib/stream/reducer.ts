@@ -276,7 +276,9 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
 
     case 'done':
     case 'paused': {
-      const finalText = event.assistant.content || state.text;
+      // A turn paused before it stored a reply has none to carry.
+      const reply = event.assistant;
+      const finalText = reply?.content || state.text;
       const hasTextSegment = state.segments.some((s) => s.kind === 'text');
       const segments =
         !hasTextSegment && finalText.length > 0
@@ -284,7 +286,7 @@ export function applyEvent(state: TurnState, event: ChatStreamEvent): TurnState 
           : state.segments;
       return {
         ...state,
-        assistantId: event.assistant.id,
+        assistantId: reply?.id ?? state.assistantId,
         messageIds: event.messageIds,
         text: finalText,
         segments,
