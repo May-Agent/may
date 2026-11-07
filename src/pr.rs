@@ -27,6 +27,8 @@ use crate::issue::IssueError;
 use crate::issue::github::{GhCliTokenSource, GitHubRest, GitHubTokenSource};
 use crate::repo_clone::{CloneRecord, CloneSandbox, SessionRepos, uncommitted_changes};
 
+mod merge_watch;
+
 /// Error type for `pr` operations.
 #[derive(Debug, thiserror::Error)]
 pub enum PrError {
@@ -866,12 +868,20 @@ impl PrStore {
             .external_number
             .ok_or_else(|| PrError::State("github PR missing its number".to_string()))?;
         let lock = land_lock(&resolved.record.repo_key);
+        let github = merge_watch::GithubPr {
+            api: &self.context.github_api,
+            owner_repo: &owner_repo,
+            number: external,
+        };
+        // Read before queueing: the bound and the removals that predate it.
+        let before = merge_watch::Upstream::snapshot(&github).await?;
+        let expected = merge_watch::Upstream::expected_checks(&github).await?;
         self.event(pr, "queued", None).await;
-        // Serialized land: queue + watch run inside one blocking call so
-        // the mutex guard never crosses an await.
-        let state = blocking::unblock({
+        // Serialized land: the lock covers queueing the PR, not the wait for
+        // it to land.
+        blocking::unblock({
             let owner_repo = owner_repo.clone();
-            move || -> Result<String, String> {
+            move || -> Result<(), String> {
                 let _guard = lock.lock().map_err(|_| "land lock poisoned".to_string())?;
                 gh(&[
                     "pr",
@@ -882,36 +892,22 @@ impl PrStore {
                     "--auto",
                     "--squash",
                 ])
-                .map_err(|e| e.to_string())?;
-                // Watch upstream until terminal: merged, closed, or timeout.
-                for _ in 0..60 {
-                    let out = gh(&[
-                        "pr",
-                        "view",
-                        &external.to_string(),
-                        "--repo",
-                        &owner_repo,
-                        "--json",
-                        "state",
-                    ])
-                    .map_err(|e| e.to_string())?;
-                    if let Some(state) = out
-                        .split('"')
-                        .nth(3)
-                        .map(str::to_string)
-                        .filter(|s| s != "OPEN")
-                    {
-                        return Ok(state);
-                    }
-                    std::thread::sleep(std::time::Duration::from_secs(10));
-                }
-                Err("still open after watching".to_string())
+                .map(drop)
+                .map_err(|e| e.to_string())
             }
         })
-        .await;
+        .await
+        .map_err(PrError::Gh)?;
+        let outcome = merge_watch::watch(
+            &github,
+            &merge_watch::SystemClock::new(),
+            before.removals,
+            expected,
+        )
+        .await?;
         let now = jiff::Timestamp::now().to_string();
-        match state.as_deref() {
-            Ok("MERGED") => {
+        match outcome {
+            merge_watch::Outcome::Merged => {
                 self.db()?
                     .update_pr(pr.id, "merged", Some(head_sha), None, Some(now.as_str()))
                     .await?;
@@ -930,20 +926,41 @@ impl PrStore {
                 .render()
                 .expect("the merge result renders"))
             }
-            Ok(other) => {
-                self.db()?
-                    .update_pr(pr.id, "closed", Some(head_sha), None, None)
-                    .await?;
-                self.event(pr, "closed", Some(other)).await;
-                self.task_event(pr, aither_agent::TaskEvent::PullRequestClosed);
-                Err(PrError::State(format!("upstream PR {other}")))
-            }
-            Err(reason) => {
-                self.db()?
-                    .update_pr(pr.id, "failed", Some(head_sha), None, None)
-                    .await?;
-                self.event(pr, "check_failed", Some(reason)).await;
-                Err(PrError::Gh(reason.clone()))
+            merge_watch::Outcome::Stopped(stopped) => {
+                let report = merge_watch::StoppedReport::new(pr.number, &stopped)
+                    .render()
+                    .expect("the watch report renders");
+                let report = report.trim_end().to_string();
+                match stopped {
+                    merge_watch::Stopped::Closed => {
+                        self.db()?
+                            .update_pr(pr.id, "closed", Some(head_sha), None, None)
+                            .await?;
+                        self.event(pr, "closed", Some(&report)).await;
+                        self.task_event(pr, aither_agent::TaskEvent::PullRequestClosed);
+                        Err(PrError::State(report))
+                    }
+                    merge_watch::Stopped::CheckFailed(_) => {
+                        self.db()?
+                            .update_pr(pr.id, "failed", Some(head_sha), None, None)
+                            .await?;
+                        self.event(pr, "check_failed", Some(&report)).await;
+                        Err(PrError::CheckFailed(report))
+                    }
+                    merge_watch::Stopped::Removed(_) => {
+                        self.db()?
+                            .update_pr(pr.id, "failed", Some(head_sha), None, None)
+                            .await?;
+                        self.event(pr, "removed_from_queue", Some(&report)).await;
+                        Err(PrError::State(report))
+                    }
+                    merge_watch::Stopped::TimedOut { .. } => {
+                        // Still queued: the state stays as it is, and
+                        // `pr merge` watches it again.
+                        self.event(pr, "watch_timeout", Some(&report)).await;
+                        Err(PrError::State(report))
+                    }
+                }
             }
         }
     }
