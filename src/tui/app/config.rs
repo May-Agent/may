@@ -187,6 +187,16 @@ impl App {
                             !self.config.preferences.show_decode_speed;
                         self.persist_config_background();
                     }
+                    3 => {
+                        // Edit the jobserver pool size; empty is automatic
+                        let current = self
+                            .config
+                            .sandbox
+                            .job_pool_size
+                            .map(|size| size.to_string())
+                            .unwrap_or_default();
+                        state.start_text_edit(&current);
+                    }
                     _ => {}
                 }
             }
@@ -508,19 +518,59 @@ impl App {
                     _ => {}
                 }
             }
-            ConfigSection::Preferences => {
-                if selected == 0 {
+            ConfigSection::Preferences => match selected {
+                0 => {
                     // Parse max_iterations
                     if let Ok(val) = value.parse::<usize>() {
                         self.config.max_iterations = val;
                     }
                 }
-            }
+                3 => return self.save_job_pool_edit(value.trim()),
+                _ => {}
+            },
         }
 
         self.config_state.cancel_edit();
         self.persist_config_background();
 
+        None
+    }
+
+    /// Saves the text edit of the jobserver pool size: empty is the host's
+    /// available parallelism. The daemon applies it to the running pool and
+    /// saves it; the config file is written here too when no daemon is
+    /// connected. Text that is not a positive number leaves the edit open
+    /// with the reason in the status line.
+    fn save_job_pool_edit(&mut self, value: &str) -> Option<SendAction> {
+        let size = if value.is_empty() {
+            None
+        } else if let Ok(size) = value.parse::<std::num::NonZeroUsize>() {
+            Some(size)
+        } else {
+            self.set_status("The jobserver pool size is a positive number, or empty");
+            return None;
+        };
+        self.config.sandbox.job_pool_size = size;
+        self.config_state.cancel_edit();
+        if let Some(client) = self.btw_daemon.clone() {
+            let body = crate::daemon::types::JobPoolRequest {
+                size: size.map(std::num::NonZeroUsize::get),
+            };
+            let tx = self.event_tx.clone();
+            executor_core::spawn(async move {
+                let result = client
+                    .put::<_, serde_json::Value>("/api/config/job-pool", &body)
+                    .await
+                    .map(|_| ())
+                    .map_err(crate::tui::error::TuiError::from);
+                let _ = tx
+                    .send(crate::tui::event::AppEvent::ConfigSaved(result))
+                    .await;
+            })
+            .detach();
+        } else {
+            self.persist_config_background();
+        }
         None
     }
 

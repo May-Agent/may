@@ -460,6 +460,10 @@ export const ja: Messages = {
       low: '低',
       lowest: '最低',
       info: '優先度を下げると競合時のスケジューリングが変わりますが、CPU 使用率を制限するものではありません。',
+      jobPool: 'ジョブプールのサイズ',
+      jobPoolAuto: '自動（CPU コア数）',
+      jobPoolInfo: 'すべてのセッションのビルドが同時に実行できるジョブ数で、jobserver のトークンプールです。空欄にすると CPU コア数を使います。コンテナーおよび SSH セッションのコマンドは数に含まれません。',
+      jobPoolInvalid: 'ジョブプールのサイズは 1 以上の整数か、空欄にしてください。',
     },
     stream: {
       title: 'ストリームのコーデック',

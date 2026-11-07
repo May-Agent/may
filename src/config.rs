@@ -1212,6 +1212,20 @@ pub struct SandboxConfig {
     /// Priority commands run at.
     #[serde(default)]
     pub command_priority: CommandPriority,
+    /// Jobserver tokens shared by every terminal on the machine; unset uses
+    /// the host's available parallelism. A change applies to the running
+    /// daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_pool_size: Option<std::num::NonZeroUsize>,
+}
+
+impl SandboxConfig {
+    /// The size of the machine-wide jobserver pool.
+    #[must_use]
+    pub fn job_pool_size(&self) -> std::num::NonZeroUsize {
+        self.job_pool_size
+            .unwrap_or_else(crate::jobserver::default_pool_size)
+    }
 }
 
 /// May agent configuration.
@@ -2285,6 +2299,27 @@ mod tests {
             toml::from_str::<MayConfig>(&document).is_err(),
             "an unknown priority must be rejected"
         );
+    }
+
+    #[test]
+    fn job_pool_size_defaults_to_available_parallelism_and_roundtrips() {
+        let config: MayConfig = toml::from_str("").expect("a config without sandbox parses");
+        assert_eq!(config.sandbox.job_pool_size, None);
+        assert_eq!(
+            config.sandbox.job_pool_size(),
+            std::thread::available_parallelism().expect("host reports its parallelism")
+        );
+
+        let config: MayConfig =
+            toml::from_str("[sandbox]\njob_pool_size = 6\n").expect("size parses");
+        assert_eq!(config.sandbox.job_pool_size().get(), 6);
+        let saved = toml::to_string(&config).expect("config serializes");
+        let reloaded: MayConfig = toml::from_str(&saved).expect("saved config parses");
+        assert_eq!(reloaded.sandbox.job_pool_size().get(), 6);
+
+        let unset = toml::to_string(&MayConfig::default()).expect("config serializes");
+        assert!(!unset.contains("job_pool_size"));
+        assert!(toml::from_str::<MayConfig>("[sandbox]\njob_pool_size = 0\n").is_err());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Loader2 } from 'lucide-react';
 import { toast } from 'sonner';
+import { JobPoolField } from './JobPoolField';
 import { SectionHeader } from './SectionHeader';
 import { Segmented } from '@/components/ui/segmented';
 import { useTranslation, type MessageKey } from '@/lib/i18n';
@@ -76,6 +77,7 @@ export function CommandPrioritySection() {
           <p className="mt-3 text-xs text-muted-foreground">
             {t('settings.execution.info')}
           </p>
+          <JobPoolField disabled={busy} />
         </>
       )}
     </section>

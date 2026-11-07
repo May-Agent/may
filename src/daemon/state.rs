@@ -448,6 +448,8 @@ pub struct DaemonState {
     pub(crate) tool_distribution: Arc<aither_sandbox::ToolDistribution>,
     /// Prepared tool environments reused by every agent rebuilt for a session.
     pub(crate) tool_environments: crate::agent::ToolEnvironmentCache,
+    /// The machine-wide jobserver pool every terminal draws its jobs from.
+    pub(crate) job_server: crate::jobserver::JobServer,
     pub(crate) may_dir: PathBuf,
     /// Wakes the search indexer after new messages land.
     pub(crate) search_index_wake_tx: async_channel::Sender<()>,
@@ -1364,6 +1366,12 @@ impl DaemonState {
             task_runtime,
             tool_distribution,
             tool_environments: crate::agent::ToolEnvironmentCache::spawn(),
+            job_server: crate::jobserver::JobServer::start(
+                may_dir,
+                crate::jobserver::default_pool_size(),
+            )
+            .await
+            .expect("test jobserver starts"),
             may_dir: may_dir.to_path_buf(),
             repo_search: crate::repo_search::RepoSearch::global(may_dir),
             search_index_wake_tx,
