@@ -104,9 +104,17 @@ export const useTurnStore = create<TurnSliceState>((set, get) => {
   /** Watchers by session id, counted so nested views share one stream. */
   const watchers = new Map<string, { count: number; controller: AbortController }>();
 
-  const finishWithReply = (sessionId: string, assistant: ApiMessage) => {
+  const finishWithReply = (
+    sessionId: string,
+    assistant: ApiMessage | null,
+    userMessageId: string | null,
+  ) => {
     const finalActive = turnOf(sessionId).active;
     patch(sessionId, (prev) => ({ active: null, last: prev.active, stopping: false }));
+    if (assistant === null) {
+      useSessionsStore.getState().settleTurn(sessionId, userMessageId, null);
+      return;
+    }
     const toolEvent = synthesizeToolEvent(finalActive?.tools ?? []);
     const reasoning =
       typeof assistant.thinking === 'string' && assistant.thinking.length > 0
@@ -114,7 +122,7 @@ export const useTurnStore = create<TurnSliceState>((set, get) => {
         : finalActive?.reasoning && finalActive.reasoning.length > 0
           ? finalActive.reasoning
           : assistant.thinking;
-    useSessionsStore.getState().appendMessage(sessionId, {
+    useSessionsStore.getState().settleTurn(sessionId, userMessageId, {
       ...assistant,
       toolEvent: toolEvent ?? assistant.toolEvent ?? null,
       thinking: reasoning,
@@ -132,7 +140,7 @@ export const useTurnStore = create<TurnSliceState>((set, get) => {
       case 'done':
       case 'paused':
         patch(sessionId, (prev) => (prev.active ? { active: applyEvent(prev.active, evt) } : {}));
-        finishWithReply(sessionId, evt.assistant);
+        finishWithReply(sessionId, evt.assistant, evt.userMessageId);
         return;
       case 'end':
         patch(sessionId, (prev) =>

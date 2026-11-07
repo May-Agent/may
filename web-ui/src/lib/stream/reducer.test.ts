@@ -230,6 +230,8 @@ describe('reducer', () => {
         seq: 3,
         turnId: 't1',
         sessionId: 's1',
+        userMessageId: null,
+        messageIds: ['a1'],
         assistant: {
           id: 'a1',
           role: 'assistant',

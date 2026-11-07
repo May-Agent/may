@@ -66,6 +66,7 @@ use super::browser::ensure_browser_runtime_started;
 use super::error::internal_error;
 use super::error_chain::error_chain_text;
 use super::helpers::{RETRY_BACKOFF_MS, elapsed_ms_saturating, truncate_preview};
+use super::message_mapping::api_message_id;
 use super::model_resolution::resolve_default_model;
 use super::state::{DaemonState, UiToolQueues};
 use super::terminal_parsing::update_terminal_snapshot_from_tool_event;
@@ -73,7 +74,7 @@ use super::title_generation;
 use super::types::{
     ApiErrorCode, ApiMessage, ChatRequest, PendingMessageKind, RemovePendingMessageRequest,
     RequestLogEntry, RequestStats, SessionRuntimeResponse, SseChunkEvent, SseDoneEvent,
-    SseErrorEvent, SseHoldEvent, SseSpeedEvent, SseStartEvent, SseTodoUpdateEvent,
+    SseErrorEvent, SseHoldEvent, SsePausedEvent, SseSpeedEvent, SseStartEvent, SseTodoUpdateEvent,
     SseToolDeltaEvent, SseToolEndEvent, SseToolStartEvent, TerminalStateSnapshot, ToolEventRecord,
     ToolVariant,
 };
@@ -260,12 +261,16 @@ impl HubSink {
         }
     }
 
+    /// Ends the turn after publishing its closing `event` (`done` or
+    /// `paused`).
+    fn finish_with<T: Serialize>(&mut self, event: &str, data: &T, outcome: crate::client::RunEnd) {
+        self.publish_turn(event, data);
+        self.finish(outcome);
+    }
+
     /// Ends the turn: final frames go out, then late subscribers read the
     /// turn from history.
-    fn finish(&mut self, event: Option<(&str, &SseDoneEvent)>, outcome: crate::client::RunEnd) {
-        if let Some((event, done)) = event {
-            self.publish_turn(event, done);
-        }
+    fn finish(&mut self, outcome: crate::client::RunEnd) {
         let seq = self.next_seq();
         self.publish_turn(
             "end",
@@ -848,7 +853,10 @@ fn log_first_text_event(
 /// Successful result from the shared agent loop.
 #[derive(Debug)]
 struct AgentRunResult {
-    assistant_id: String,
+    /// The stored row of the user message the turn answers, when it stored one.
+    user_message_id: Option<i32>,
+    /// The assistant rows the turn stored, oldest first.
+    assistant_message_ids: Vec<i32>,
     full_text: String,
     reasoning_text: String,
     terminal_snapshot: TerminalStateSnapshot,
@@ -858,9 +866,84 @@ struct AgentRunResult {
     elapsed_ms: u64,
 }
 
-fn api_message_from_run_result(result: AgentRunResult) -> ApiMessage {
-    ApiMessage {
-        id: result.assistant_id,
+/// The assistant rows a turn stored after `boundary`, the largest row id
+/// before it persisted anything.
+async fn stored_assistant_message_ids(
+    state: &Arc<DaemonState>,
+    session_id: &str,
+    boundary: i32,
+) -> Result<Vec<i32>, crate::db::ChatDbError> {
+    Ok(state
+        .db()
+        .get_messages_by_role(session_id, MessageRole::Assistant.as_str())
+        .await?
+        .into_iter()
+        .map(|row| row.id)
+        .filter(|id| *id > boundary)
+        .collect())
+}
+
+/// The turn's `done` event: the reply carries the id of the first assistant
+/// row the turn stored, the event the ids of all of them and of the user row,
+/// so a client names its streamed messages as the session's REST messages.
+///
+/// A turn that ends normally always stored an assistant row: one with
+/// neither text nor tool activity fails as an empty response first.
+fn done_event_from_run_result(
+    seq: u64,
+    turn_id: String,
+    session_id: String,
+    result: AgentRunResult,
+) -> SseDoneEvent {
+    let user_message_id = result.user_message_id.map(api_message_id);
+    let message_ids = result
+        .assistant_message_ids
+        .iter()
+        .copied()
+        .map(api_message_id)
+        .collect();
+    SseDoneEvent {
+        seq,
+        turn_id,
+        session_id,
+        user_message_id,
+        message_ids,
+        assistant: api_message_from_run_result(result)
+            .expect("a finished turn stores an assistant row"),
+    }
+}
+
+/// The turn's `paused` event. A takeover can pause the turn before it
+/// produced anything, so there may be no reply to carry.
+fn paused_event_from_run_result(
+    seq: u64,
+    turn_id: String,
+    session_id: String,
+    result: AgentRunResult,
+) -> SsePausedEvent {
+    let user_message_id = result.user_message_id.map(api_message_id);
+    let message_ids = result
+        .assistant_message_ids
+        .iter()
+        .copied()
+        .map(api_message_id)
+        .collect();
+    SsePausedEvent {
+        seq,
+        turn_id,
+        session_id,
+        user_message_id,
+        message_ids,
+        assistant: api_message_from_run_result(result),
+    }
+}
+
+/// The reply under the id of the first assistant row the turn stored, or
+/// `None` when it stored none.
+fn api_message_from_run_result(result: AgentRunResult) -> Option<ApiMessage> {
+    let first = result.assistant_message_ids.first().copied()?;
+    Some(ApiMessage {
+        id: api_message_id(first),
         role: "assistant".to_string(),
         content: result.full_text,
         timestamp: jiff::Timestamp::now().to_string(),
@@ -885,7 +968,7 @@ fn api_message_from_run_result(result: AgentRunResult) -> ApiMessage {
             elapsed_ms: Some(result.elapsed_ms),
         }),
         translation: None,
-    }
+    })
 }
 
 /// The response that refuses a client turn: a conflict when another run holds
@@ -1964,6 +2047,8 @@ fn run_agent_loop<'a>(
 
                 // Flush the entire turn atomically
                 turn_persister.flush(&state.db()).await?;
+                let assistant_message_ids =
+                    stored_assistant_message_ids(state, session_id.as_str(), turn_boundary).await?;
                 clear_terminal_runtime_state(state, session_id.as_str()).await?;
 
                 record_request_log(
@@ -1975,7 +2060,8 @@ fn run_agent_loop<'a>(
 
                 return Err(AgentLoopError::BrowserTakeoverPaused(Box::new(
                     AgentRunResult {
-                        assistant_id,
+                        user_message_id: turn_user_message_id,
+                        assistant_message_ids,
                         full_text,
                         reasoning_text,
                         terminal_snapshot,
@@ -2186,6 +2272,8 @@ fn run_agent_loop<'a>(
 
             // Flush the entire turn atomically
             turn_persister.flush(&state.db()).await?;
+            let assistant_message_ids =
+                stored_assistant_message_ids(state, session_id.as_str(), turn_boundary).await?;
             clear_terminal_runtime_state(state, session_id.as_str()).await?;
 
             // Final sample carries the exact rate now that Usage has arrived.
@@ -2225,7 +2313,8 @@ fn run_agent_loop<'a>(
             );
 
             return Ok(AgentRunResult {
-                assistant_id,
+                user_message_id: turn_user_message_id,
+                assistant_message_ids,
                 full_text,
                 reasoning_text,
                 terminal_snapshot,
@@ -2356,21 +2445,18 @@ async fn run_published_turn(
     let response_session_id = req.session_id.clone();
     match result {
         Ok(result) => {
-            let done_event = SseDoneEvent {
-                seq: sink.next_seq(),
-                turn_id: sink.turn_id.clone(),
-                session_id: response_session_id.clone(),
-                assistant: api_message_from_run_result(result),
-            };
+            let done_event = done_event_from_run_result(
+                sink.next_seq(),
+                sink.turn_id.clone(),
+                response_session_id.clone(),
+                result,
+            );
             // Release the session before announcing the end of the turn, so
             // a client that sends its next message on `done` is never refused
             // as a concurrent run. Finishing continues the session under a
             // new guard only when there is pending work to dispatch.
             let continued = guard.finish(RunOutcome::Completed).await?;
-            sink.finish(
-                Some(("done", &done_event)),
-                crate::client::RunEnd::Completed,
-            );
+            sink.finish_with("done", &done_event, crate::client::RunEnd::Completed);
             if let Some(continued) = continued {
                 spawn_continued_run(state.clone(), continued);
             } else {
@@ -2378,14 +2464,14 @@ async fn run_published_turn(
             }
         }
         Err(AgentLoopError::BrowserTakeoverPaused(result)) => {
-            let done_event = SseDoneEvent {
-                seq: sink.next_seq(),
-                turn_id: sink.turn_id.clone(),
-                session_id: response_session_id.clone(),
-                assistant: api_message_from_run_result(*result),
-            };
+            let paused_event = paused_event_from_run_result(
+                sink.next_seq(),
+                sink.turn_id.clone(),
+                response_session_id.clone(),
+                *result,
+            );
             let continued = guard.finish(RunOutcome::Completed).await?;
-            sink.finish(Some(("paused", &done_event)), crate::client::RunEnd::Paused);
+            sink.finish_with("paused", &paused_event, crate::client::RunEnd::Paused);
             if let Some(continued) = continued {
                 spawn_continued_run(state.clone(), continued);
             }
@@ -2393,11 +2479,11 @@ async fn run_published_turn(
         // Errors are already published through on_error in run_agent_loop.
         Err(AgentLoopError::Cancelled(_)) => {
             guard.finish_idle(RunOutcome::Cancelled).await?;
-            sink.finish(None, crate::client::RunEnd::Cancelled);
+            sink.finish(crate::client::RunEnd::Cancelled);
         }
         Err(_) => {
             guard.finish_idle(RunOutcome::Failed).await?;
-            sink.finish(None, crate::client::RunEnd::Failed);
+            sink.finish(crate::client::RunEnd::Failed);
         }
     }
     Ok(())
@@ -2437,25 +2523,25 @@ async fn run_chat_collect_with_receiver(
     .await;
     match result {
         Ok(_) => {
-            sink.finish(None, crate::client::RunEnd::Completed);
+            sink.finish(crate::client::RunEnd::Completed);
             Ok(TurnEnd::Completed)
         }
         Err(AgentLoopError::BrowserTakeoverPaused(_)) => {
-            sink.finish(None, crate::client::RunEnd::Paused);
+            sink.finish(crate::client::RunEnd::Paused);
             Ok(TurnEnd::Paused)
         }
         Err(AgentLoopError::Preparation(error)) => {
-            sink.finish(None, crate::client::RunEnd::Failed);
+            sink.finish(crate::client::RunEnd::Failed);
             Err(ChatCollectError::Preparation(error))
         }
         Err(AgentLoopError::Cancelled(reason)) => {
-            sink.finish(None, crate::client::RunEnd::Cancelled);
+            sink.finish(crate::client::RunEnd::Cancelled);
             Err(ChatCollectError::Sky(internal_error(
                 AgentLoopError::Cancelled(reason),
             )))
         }
         Err(other) => {
-            sink.finish(None, crate::client::RunEnd::Failed);
+            sink.finish(crate::client::RunEnd::Failed);
             Err(ChatCollectError::Sky(internal_error(other)))
         }
     }
@@ -4990,6 +5076,64 @@ mod tests {
         }
     }
 
+    /// `/sleep` cancels the suggestions in flight and clears the shown ones;
+    /// none is generated until the user wakes.
+    #[tokio::test]
+    async fn sleeping_clears_shown_suggestions_and_blocks_new_ones() {
+        use crate::daemon::sleep::{SleepRequest, start_sleep};
+        use skyzen::utils::{Json, State};
+
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let provider = stub_provider(vec![sse_text("Good night")]).await;
+        let unused = stub_provider(vec![sse_text("unused")]).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let state = failover_state(may_dir.path(), &provider, &unused).await;
+
+        // A composer is attached and shows a suggestion; another one is
+        // still being generated.
+        let subscription = state.turn_hub.subscribe("session", None);
+        state.turn_hub.publish(
+            "session",
+            "session_suggestion",
+            r#"{"requestId":1,"sessionId":"session","state":"ready","text":"run the tests"}"#
+                .into(),
+        );
+        let request_id = state.aux_tasks.start(
+            "session",
+            super::aux::AuxKind::Suggestion,
+            |_| std::future::pending(),
+            &state.tokio_handle,
+        );
+        let shown = subscription.next().await.expect("the shown suggestion");
+        assert_eq!(shown.len(), 1);
+
+        start_sleep(
+            Json(SleepRequest {
+                session_id: "session".to_string(),
+            }),
+            State(state.clone()),
+        )
+        .await
+        .expect("/sleep starts");
+        // The `/sleep` turn itself supersedes the composer; what the sleep
+        // state publishes on its own is what follows.
+        subscription.take_unread().expect("subscribed");
+        super::suggest::apply_settings(&state);
+
+        assert!(!state.aux_tasks.is_current("session", request_id));
+        let frames = subscription.take_unread().expect("subscribed");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].kind, "session_suggestion");
+        let cleared: serde_json::Value = serde_json::from_str(&frames[0].data).expect("json");
+        assert_eq!(cleared["state"], "cleared");
+        assert_eq!(cleared["sessionId"], "session");
+
+        // A turn that completes while asleep schedules nothing.
+        super::suggest::maybe_suggest(&state, "session");
+        assert!(!super::suggest::suggestions_allowed(&state));
+        assert!(!state.aux_tasks.is_current("session", request_id + 1));
+    }
+
     /// `/sleep` on a session whose turn is running succeeds and is taken by
     /// the session's next request, carrying the same requirements.
     #[tokio::test]
@@ -5443,6 +5587,60 @@ mod tests {
             .filter(|item| format!("{:?}", item.message()).contains("the answer"))
             .count();
         assert_eq!(answers, 1, "the answer appears in context exactly once");
+    }
+
+    /// The ids a finished turn announces are the ids REST returns for the
+    /// messages the turn stored.
+    #[tokio::test]
+    async fn a_turns_done_event_names_its_messages_as_rest_does() {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let provider = stub_provider(vec![sse_text("答えは四十二。回答は42です。")]).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let state = failover_state(may_dir.path(), &provider, &provider).await;
+        let mut sink = TestSink::default();
+        let result = run_prompt_turn(&state, &mut sink)
+            .await
+            .expect("the turn completes");
+
+        let done = super::done_event_from_run_result(1, "turn".into(), "session".into(), result);
+        let rows = state.db().get_messages("session").await.expect("rows load");
+        let api = crate::daemon::message_mapping::map_db_messages(&rows).expect("rows map");
+        let rest_user = api
+            .iter()
+            .find(|message| message.role == "user")
+            .expect("the user message is stored");
+        let rest_assistants: Vec<&str> = api
+            .iter()
+            .filter(|message| message.role == "assistant")
+            .map(|message| message.id.as_str())
+            .collect();
+        assert_eq!(done.user_message_id.as_deref(), Some(rest_user.id.as_str()));
+        assert_eq!(done.message_ids, rest_assistants);
+        assert_eq!(done.assistant.id, rest_assistants[0]);
+    }
+
+    /// A takeover can pause a turn before it stored any reply: the `paused`
+    /// event then carries no assistant message instead of failing.
+    #[test]
+    fn a_pause_before_any_output_announces_no_reply() {
+        let result = super::AgentRunResult {
+            user_message_id: Some(7),
+            assistant_message_ids: Vec::new(),
+            full_text: String::new(),
+            reasoning_text: String::new(),
+            terminal_snapshot: crate::daemon::types::TerminalStateSnapshot::default(),
+            usage: aither_core::llm::Usage::default(),
+            provider_id: "provider".to_string(),
+            model_context_window: None,
+            elapsed_ms: 0,
+        };
+        let paused =
+            super::paused_event_from_run_result(1, "turn".into(), "session".into(), result);
+        assert_eq!(paused.user_message_id.as_deref(), Some("msg-7"));
+        assert_eq!(paused.message_ids, Vec::<String>::new());
+        assert!(paused.assistant.is_none());
+        let json = serde_json::to_value(&paused).expect("the event serializes");
+        assert!(json["assistant"].is_null());
     }
 
     /// Seeding from UI history produces transcript seqs the agent itself

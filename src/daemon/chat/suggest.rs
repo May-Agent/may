@@ -85,16 +85,22 @@ pub(super) fn maybe_suggest(state: &Arc<DaemonState>, session_id: &str) {
     );
 }
 
-/// Applies the live `[suggestions]` setting: once disabled, every
-/// suggestion in flight is cancelled and its composer cleared.
+/// Applies the live `[suggestions]` setting and the sleep state: while
+/// suggestions are not allowed, every suggestion in flight is cancelled and
+/// every composer showing one is cleared.
 pub(super) fn apply_settings(state: &Arc<DaemonState>) {
-    if !suggestions_allowed(state) {
-        state
-            .aux_tasks
-            .cancel_kind(super::aux::AuxKind::Suggestion, |session_id| {
-                publish(state, session_id, 0, "cleared", None);
-            });
+    if suggestions_allowed(state) {
+        return;
     }
+    // Under the slot lock, so no in-flight result can follow the clearing.
+    state
+        .aux_tasks
+        .cancel_kind(super::aux::AuxKind::Suggestion, |_| {});
+    state
+        .turn_hub
+        .publish_to_subscribed("session_suggestion", |session_id| {
+            frame_data(session_id, 0, "cleared", None)
+        });
 }
 
 /// Cancels `session_id`'s in-flight suggestion, if any, and broadcasts
@@ -130,6 +136,23 @@ async fn generate(state: &Arc<DaemonState>, session_id: &str) -> Option<String> 
     }
 }
 
+fn frame_data(
+    session_id: &str,
+    request_id: u64,
+    frame_state: &'static str,
+    text: Option<&str>,
+) -> Arc<str> {
+    let frame = SuggestionFrame {
+        request_id,
+        session_id,
+        state: frame_state,
+        text,
+    };
+    serde_json::to_string(&frame)
+        .expect("suggestion frame serializes")
+        .into()
+}
+
 fn publish(
     state: &DaemonState,
     session_id: &str,
@@ -137,18 +160,11 @@ fn publish(
     frame_state: &'static str,
     text: Option<&str>,
 ) {
-    let frame = SuggestionFrame {
-        request_id,
+    state.turn_hub.publish(
         session_id,
-        state: frame_state,
-        text,
-    };
-    let data: Arc<str> = serde_json::to_string(&frame)
-        .expect("suggestion frame serializes")
-        .into();
-    state
-        .turn_hub
-        .publish(session_id, "session_suggestion", data);
+        "session_suggestion",
+        frame_data(session_id, request_id, frame_state, text),
+    );
 }
 
 #[cfg(test)]

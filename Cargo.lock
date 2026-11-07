@@ -11009,7 +11009,7 @@ dependencies = [
 [[package]]
 name = "waterkit-automation"
 version = "0.2.0"
-source = "git+https://github.com/water-rs/waterkit?branch=dev#d847617896965166097619b99a7669f013f21c2b"
+source = "git+https://github.com/water-rs/waterkit?branch=dev#1bd6e6f3295043dd8ab85c472f1ca2123337b751"
 dependencies = [
  "block2",
  "dispatch2",
@@ -11028,7 +11028,7 @@ dependencies = [
 [[package]]
 name = "waterkit-build"
 version = "0.2.0"
-source = "git+https://github.com/water-rs/waterkit?branch=dev#d847617896965166097619b99a7669f013f21c2b"
+source = "git+https://github.com/water-rs/waterkit?branch=dev#1bd6e6f3295043dd8ab85c472f1ca2123337b751"
 dependencies = [
  "futures-channel",
  "jni",
@@ -11039,7 +11039,7 @@ dependencies = [
 [[package]]
 name = "waterkit-core"
 version = "0.2.0"
-source = "git+https://github.com/water-rs/waterkit?branch=dev#d847617896965166097619b99a7669f013f21c2b"
+source = "git+https://github.com/water-rs/waterkit?branch=dev#1bd6e6f3295043dd8ab85c472f1ca2123337b751"
 dependencies = [
  "dispatch2",
  "executor-core",
@@ -11055,7 +11055,7 @@ dependencies = [
 [[package]]
 name = "waterkit-permission"
 version = "0.2.0"
-source = "git+https://github.com/water-rs/waterkit?branch=dev#d847617896965166097619b99a7669f013f21c2b"
+source = "git+https://github.com/water-rs/waterkit?branch=dev#1bd6e6f3295043dd8ab85c472f1ca2123337b751"
 dependencies = [
  "async-channel",
  "async-io",
@@ -11080,6 +11080,7 @@ dependencies = [
  "objc2-security",
  "serde",
  "serde_json",
+ "tempfile",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "waterkit-build",
@@ -11092,7 +11093,7 @@ dependencies = [
 [[package]]
 name = "waterkit-screen"
 version = "0.2.0"
-source = "git+https://github.com/water-rs/waterkit?branch=dev#d847617896965166097619b99a7669f013f21c2b"
+source = "git+https://github.com/water-rs/waterkit?branch=dev#1bd6e6f3295043dd8ab85c472f1ca2123337b751"
 dependencies = [
  "async-channel",
  "block2",
