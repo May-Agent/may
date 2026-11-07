@@ -462,8 +462,7 @@ impl RuntimeDeps {
             (session.id.clone(), session.history.messages().to_vec())
         };
 
-        app.init_session(&session_id, &messages, model.as_deref())
-            .await;
+        app.init_session(&session_id, &messages).await;
         *worker = None;
 
         let selected_model = SelectedModel::resolve(&app.config, model.as_deref())?;
@@ -533,8 +532,7 @@ impl RuntimeDeps {
         let session_model = session.model.clone();
         let messages: Vec<_> = session.history.messages().to_vec();
 
-        app.init_session(&session_id, &messages, session_model.as_deref())
-            .await;
+        app.init_session(&session_id, &messages).await;
         *worker = None;
 
         let selected_model = SelectedModel::resolve(&app.config, session_model.as_deref())?;
@@ -676,8 +674,7 @@ impl RuntimeDeps {
             .current()
             .map(|session| session.history.messages().to_vec())
             .unwrap_or_default();
-        app.init_session(&session_id, &messages, model.as_deref())
-            .await;
+        app.init_session(&session_id, &messages).await;
         app.chat.push_notice(&format!(
             "Imported {imported_count} messages from {} session {}",
             source.label(),

@@ -335,6 +335,9 @@ pub struct MayAgentSessionInput<'a> {
     /// The rules this session imports, for a session `/import-claude` or
     /// `/import-codex` opened.
     pub rules_import: Option<crate::rules_import::RulesImport>,
+    /// The model's context window as the daemon resolved it (provider
+    /// report, then the model table); the agent compacts against it.
+    pub model_context_window: Option<u32>,
 }
 
 type MayAgentInner = Agent<ProviderLlm, ProviderLlm, ProviderLlm, MayHooks>;
@@ -936,14 +939,16 @@ impl MayAgent {
             background_jobs,
             connectivity,
             rules_import,
+            model_context_window,
         } = input;
         let selector = super::provider::parse_model_selector(model)?;
         let redactor = crate::secrets::SecretRedactor::for_session(&may_dir, session_id.as_str());
         let resolved_provider =
             resolve_provider_runtime(may_config, &selector, provider_attempt, &redactor).await?;
         let provider_id = resolved_provider.provider_id;
-        let llm = resolved_provider.llm;
-        let model_info = aither_models::lookup(selector.model_id());
+        let llm = resolved_provider
+            .llm
+            .with_context_window(model_context_window);
         let request_parameters =
             super::provider::session_request_parameters(may_config, &selector, reasoning_effort);
 
@@ -1035,7 +1040,7 @@ impl MayAgent {
             timezone: may_config.time.user_timezone(),
             host_load: may_config.host_load.monitor_config(),
             host_reader: None,
-            model_context_window: model_info.and_then(aither_models::ModelEntry::max_input_tokens),
+            model_context_window,
             request_parameters,
             prompt_cache_epoch,
             db,

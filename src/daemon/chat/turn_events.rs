@@ -60,6 +60,8 @@ pub(super) struct TurnEvents<'t, 's, S> {
     /// `Some` while a model call is in its reasoning phase: the instant the
     /// phase began, measured as user-perceived wait.
     pub(super) reasoning_phase: Option<Instant>,
+    /// The model's context window, sent to clients with each usage.
+    pub(super) context_window: Option<u32>,
     /// The provider and model the turn's requests go to.
     pub(super) provider_id: &'t str,
     pub(super) model: &'t str,
@@ -180,7 +182,7 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                 "client disconnected during reasoning end",
             ));
         }
-        self.sink.on_agent_event(Ok(&event));
+        self.sink.on_agent_event(Ok(&event), self.context_window);
         match self.event(at, event).await {
             Ok(ControlFlow::Continue(())) => {}
             Ok(ControlFlow::Break(stop)) => return ControlFlow::Break(stop),

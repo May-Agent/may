@@ -46,7 +46,6 @@ use aither_core::llm::{
     Attachment as LlmAttachment, Message as LlmMessage, Role as LlmRole, ToolResult, Usage,
 };
 use aither_core::llm::{Failure, FailureKind};
-use aither_models::lookup as lookup_model_info;
 use aither_sandbox::{AnyContainerExec, BollardContainerExec, ContainerLaunchSpec};
 
 use crate::agent::MayAgent;
@@ -123,10 +122,12 @@ trait ChatSink {
     /// The run is prepared; `user_message_id` is the row of the user
     /// message it answers, when it stored one.
     fn on_prepared(&mut self, _user_message_id: Option<i32>) {}
-    /// Every agent event of the run, as the agent emitted it.
+    /// Every agent event of the run, as the agent emitted it, with the
+    /// model's context window.
     fn on_agent_event(
         &mut self,
         _event: Result<&aither_agent::AgentEvent, &aither_agent::AgentError>,
+        _context_window: Option<u32>,
     ) {
     }
     fn on_start(
@@ -392,8 +393,9 @@ impl ChatSink for HubSink {
     fn on_agent_event(
         &mut self,
         event: Result<&aither_agent::AgentEvent, &aither_agent::AgentError>,
+        context_window: Option<u32>,
     ) {
-        if let Some(event) = crate::client::WireAgentEvent::from_agent(event) {
+        if let Some(event) = crate::client::WireAgentEvent::from_agent(event, context_window) {
             self.publish_agent(crate::client::SessionAgentBody::Agent { event });
         }
     }
@@ -1786,7 +1788,7 @@ async fn drive_turn<S: ChatSink>(
             if let ControlFlow::Break(stop) = turn.close_reasoning_phase().await {
                 return Err(stop);
             }
-            turn.sink.on_agent_event(Err(&error));
+            turn.sink.on_agent_event(Err(&error), turn.context_window);
             Err(turn_events::TurnStop::Failed(error))
         }
     }
@@ -1943,10 +1945,7 @@ fn run_agent_loop<'a>(
             if let Some(hidden_context_xml) = hidden_context_xml {
                 turn_hidden_context_xml = Some(hidden_context_xml);
             }
-            let model_context_window = agent.model_context_window().or_else(|| {
-                lookup_model_info(crate::model_selector::selector_model_id(&current_model))
-                    .and_then(aither_models::ModelEntry::max_input_tokens)
-            });
+            let model_context_window = agent.model_context_window();
 
             let session_paths =
                 session_paths_for_session(state, profile_id.as_deref(), &session_id);
@@ -1979,6 +1978,7 @@ fn run_agent_loop<'a>(
                 started_at,
                 reasoning_display,
                 reasoning_phase: reasoning_display.then_some(started_at),
+                context_window: model_context_window,
                 provider_id: &provider_id,
                 model: &current_model,
                 request_prefix: None,
@@ -3681,6 +3681,11 @@ fn build_session_agent<'a>(
     Box::pin(async move {
         let (environment, location) = Box::pin(setup_agent_environment(state, ctx)).await?;
         let brokers = build_tool_brokers(state, &ctx.session_id);
+        let model_context_window = match ctx.current_model.parse::<crate::ModelSelector>() {
+            Ok(selector) => state.model_context_window(&selector).await,
+            // The build reports the invalid selector.
+            Err(_) => None,
+        };
 
         let mut agent = MayAgent::from_config_with_model_and_permissions(
             config,
@@ -3740,6 +3745,7 @@ fn build_session_agent<'a>(
                 background_jobs: aither_agent::BackgroundJobPolicy::Detach,
                 connectivity: state.connectivity.clone(),
                 rules_import: ctx.rules_import.clone(),
+                model_context_window,
             },
         )
         .await
@@ -4334,6 +4340,7 @@ mod tests {
         fn on_agent_event(
             &mut self,
             event: Result<&aither_agent::AgentEvent, &aither_agent::AgentError>,
+            _context_window: Option<u32>,
         ) {
             if matches!(event, Ok(aither_agent::AgentEvent::Text(text)) if text == WAKE_TEXT) {
                 self.wake_texts += 1;

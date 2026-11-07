@@ -293,6 +293,7 @@ impl SessionParts {
             background_jobs: aither_agent::BackgroundJobPolicy::Await,
             connectivity: aither_connectivity::Connectivity::manual(true).0,
             rules_import: self.rules_import.clone(),
+            model_context_window: None,
         }
     }
 }

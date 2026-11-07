@@ -164,6 +164,14 @@ pub enum AppEvent {
         /// The suggested next step, when the recap named one.
         next_action: Option<String>,
     },
+    /// A usage frame carried the context window the daemon resolved for the
+    /// session's model.
+    ContextWindow {
+        /// Session the window belongs to.
+        session_id: String,
+        /// The window in tokens.
+        window: u32,
+    },
     /// A kill request finished; `true` when the job accepted it.
     JobKilled {
         /// Process ID the kill targeted.
@@ -245,6 +253,7 @@ impl AppEvent {
             Self::Sleep(_) => "sleep",
             Self::PromptSuggestion { .. } => "prompt_suggestion",
             Self::Recap { .. } => "recap",
+            Self::ContextWindow { .. } => "context_window",
             Self::JobKilled { .. } => "job_killed",
             Self::JobDetailLoaded { .. } => "job_detail_loaded",
             Self::TerminalOutputs(_) => "terminal_outputs",

@@ -1853,12 +1853,7 @@ impl App {
     ///
     /// Panics if the session manager has no current session while a session is
     /// being initialized.
-    pub async fn init_session(
-        &mut self,
-        session_id: &SessionId,
-        messages: &[ChatMessage],
-        model: Option<&str>,
-    ) {
+    pub async fn init_session(&mut self, session_id: &SessionId, messages: &[ChatMessage]) {
         // Reset per-session UI state so /new starts from a clean screen in inline viewport mode.
         self.input.clear();
         self.cursor = 0;
@@ -1909,16 +1904,8 @@ impl App {
         // Reset usage tracking for new session
         self.usage = None;
 
-        // Set context window from model info
-        if let Some(model_name) = model {
-            if let Some(info) = aither_models::lookup(model_name) {
-                self.context_window = info.max_input_tokens();
-            } else {
-                self.context_window = None;
-            }
-        } else {
-            self.context_window = None;
-        }
+        // The daemon sends the window with the session's next usage.
+        self.context_window = None;
     }
 
     /// Handle an event. Returns Some(message) if user wants to send a message.
@@ -4454,15 +4441,12 @@ impl App {
 
     /// Set the current model being used.
     pub fn set_current_model(&mut self, model: &str) {
-        self.current_model = Some(model.to_string());
-        // Also update context window from model info
-        let lookup_model = model.parse::<crate::ModelSelector>().map_or_else(
-            |_| model.to_string(),
-            |selector| crate::models::effort_family_base(selector.model_id()),
-        );
-        if let Some(info) = aither_models::lookup(&lookup_model) {
-            self.context_window = info.max_input_tokens();
+        // The window belongs to the model: the daemon sends the new one
+        // with the next usage.
+        if self.current_model.as_deref() != Some(model) {
+            self.context_window = None;
         }
+        self.current_model = Some(model.to_string());
     }
 
     /// Get context usage information for display.
@@ -5046,6 +5030,48 @@ mod tests {
             Some(ChatElement::Recap { summary, next_action })
                 if summary == "Tests pass." && next_action.as_deref() == Some("Merge it.")
         ));
+    }
+
+    #[tokio::test]
+    async fn the_status_window_is_the_one_the_daemon_sent() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, id) = app_with_session(dir.path()).await;
+        app.usage = Some(aither_core::llm::Usage {
+            prompt_tokens: Some(1_000),
+            ..aither_core::llm::Usage::default()
+        });
+        // A model the table lacks: the client looks nothing up.
+        app.set_current_model("relay::relay-only-model");
+        assert_eq!(
+            app.context_usage(),
+            None,
+            "no window before the daemon sends one"
+        );
+
+        app.handle_event(AppEvent::ContextWindow {
+            session_id: "another-session".to_string(),
+            window: 1,
+        })
+        .expect("window frame");
+        assert_eq!(
+            app.context_usage(),
+            None,
+            "another session's window is ignored"
+        );
+
+        app.handle_event(AppEvent::ContextWindow {
+            session_id: id,
+            window: 262_144,
+        })
+        .expect("window frame");
+        assert_eq!(app.context_usage(), Some((1_000, 262_144)));
+
+        app.set_current_model("relay::another-model");
+        assert_eq!(
+            app.context_usage(),
+            None,
+            "a new model drops the old window"
+        );
     }
 
     #[tokio::test]
