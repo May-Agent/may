@@ -3,6 +3,7 @@
 
 use std::time::Duration;
 
+use ratatui::layout::Rect;
 use ratatui::style::Color;
 use terminal_colorsaurus::{QueryOptions, color_palette};
 
@@ -28,6 +29,17 @@ pub const fn padding(width: u16) -> u16 {
         H_PADDING
     } else {
         0
+    }
+}
+
+/// `area` with its horizontal padding taken off both sides.
+#[must_use]
+pub const fn inset(area: Rect) -> Rect {
+    let pad = padding(area.width);
+    Rect {
+        x: area.x + pad,
+        width: area.width - 2 * pad,
+        ..area
     }
 }
 

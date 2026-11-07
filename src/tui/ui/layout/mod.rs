@@ -161,12 +161,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     };
     // The chat, its selection, links and images live inside the horizontal
     // padding; the band paints across `chat_area`.
-    let pad = super::band::padding(chat_area.width);
-    let content_area = Rect {
-        x: chat_area.x + pad,
-        width: chat_area.width - 2 * pad,
-        ..chat_area
-    };
+    let content_area = super::band::inset(chat_area);
     app.chat_area = content_area;
 
     let running_shells = app
@@ -2907,12 +2902,7 @@ mod tests {
                         band_bg: None,
                     },
                 );
-                let pad = super::super::band::padding(area.width);
-                let content = Rect {
-                    x: area.x + pad,
-                    width: area.width - 2 * pad,
-                    ..area
-                };
+                let content = super::super::band::inset(area);
                 let runs = layout.link_runs(0, usize::from(area.height), content);
                 assert!(!runs.is_empty(), "the user message has link runs");
                 let hovered = runs[0].hit.id;

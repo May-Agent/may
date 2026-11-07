@@ -2747,12 +2747,7 @@ fn render_impl(
 
     // Chat, queue and band content share the padded column; the band
     // background reaches the column's edges.
-    let pad = band::padding(area.width);
-    let inner = Rect {
-        x: area.x + pad,
-        width: area.width - 2 * pad,
-        ..area
-    };
+    let inner = band::inset(area);
 
     let build_start = std::time::Instant::now();
     layout.sync(
@@ -6353,8 +6348,6 @@ mod tests {
     #[test]
     fn plain_rows_match_the_screen_structure() {
         use super::StatusContext;
-        let queued: [String; 0] = [];
-        let _ = queued;
         let status = StatusContext {
             model: "model",
             usage: None,
