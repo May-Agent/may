@@ -1251,6 +1251,8 @@ pub struct UiConfigResponse {
     pub(crate) max_iterations: usize,
     pub(crate) ui_font: String,
     pub(crate) ui_theme: String,
+    /// IANA name of the user's timezone (`[time] timezone`, else the host's).
+    pub(crate) timezone: String,
     pub(crate) full_config: UiFullConfig,
 }
 

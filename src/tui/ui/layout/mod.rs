@@ -201,6 +201,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                         .current()
                         .map(|session| session.id.as_str()),
                 ),
+                greeting: app
+                    .new_year
+                    .greeting()
+                    .then_some(crate::tui::new_year::GREETING),
             }),
             input_caret_active: matches!(app.mode, AppMode::Chat),
             queue_ctx: if queue_messages.is_empty() {
@@ -287,6 +291,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         render_image_view(frame, area, app);
     } else {
         app.image_view_area = None;
+    }
+
+    // Fireworks play over the chat and leave nothing behind: the next frame
+    // repaints the chat from its unchanged state.
+    if let Some(fireworks) = app.new_year.fireworks() {
+        fireworks.paint(frame.buffer_mut(), chat_area);
     }
 
     // Last, so a popup or image drawn over a link is left alone.

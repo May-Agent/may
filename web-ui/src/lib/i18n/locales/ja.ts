@@ -107,6 +107,12 @@ export const ja: Messages = {
     description: 'あなたの毎日を支える AI アシスタント。サイドバーからチャットを選ぶか、新しく始めましょう。',
     newChat: '新しいチャット',
   },
+  newYear: {
+    greeting: '新年あけましておめでとうございます！',
+    play: 'クリックで花火',
+    dismiss: 'あいさつを閉じる',
+    stop: 'どこかをクリックすると花火を止めます',
+  },
   composer: {
     placeholder: 'May にメッセージを送る',
     placeholderBusy: 'May が応答中です…',

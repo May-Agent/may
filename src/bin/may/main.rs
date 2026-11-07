@@ -1112,7 +1112,11 @@ where
             break;
         };
         if matches!(&event, Event::Terminal(e) if matches!(**e, AppEvent::Tick)) {
-            needs_draw = app.processing || last_draw.elapsed() >= std::time::Duration::from_secs(1);
+            // The fireworks redraw every tick, and once more on the tick
+            // that ends them so no spark stays on screen.
+            needs_draw = app.processing
+                || app.new_year.animating()
+                || last_draw.elapsed() >= std::time::Duration::from_secs(1);
         }
         let event_kind = match &event {
             Event::Terminal(e) => e.kind(),

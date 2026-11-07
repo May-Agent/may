@@ -107,6 +107,12 @@ export const zhHant: Messages = {
     description: '您的日常 AI 助手。從側邊欄選擇對話，或開啟一段新的交流。',
     newChat: '新對話',
   },
+  newYear: {
+    greeting: '新年快樂！',
+    play: '點擊觀賞煙火',
+    dismiss: '關閉祝賀',
+    stop: '點擊任意處停止煙火',
+  },
   composer: {
     placeholder: '向 May 提問',
     placeholderBusy: 'May 正在回覆…',

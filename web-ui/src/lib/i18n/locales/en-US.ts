@@ -105,6 +105,12 @@ export const enUS = {
     description: 'Your everyday assistant. Pick a chat from the sidebar or start something new.',
     newChat: 'New chat',
   },
+  newYear: {
+    greeting: 'Happy New Year!',
+    play: 'Click for fireworks',
+    dismiss: 'Dismiss greeting',
+    stop: 'Click anywhere to stop the fireworks',
+  },
   composer: {
     placeholder: 'Message May',
     placeholderBusy: 'May is responding…',
