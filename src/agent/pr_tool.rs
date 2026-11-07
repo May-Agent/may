@@ -7,6 +7,7 @@ use aither_sandbox::{CommandRole, TerminalBinding};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+use crate::issue::provenance::CallOrigin;
 use crate::pr::{PrContext, PrError, PrStore};
 use crate::repo_clone::CloneSandbox;
 
@@ -53,16 +54,19 @@ pub enum PrArgs {
     },
     /// Re-pin own PR `n` to the clone's current HEAD.
     Update {
-        /// PR number.
-        number: i64,
+        /// PR number, or `<repo>:<number>` outside the repository's clone.
+        #[schemars(with = "String")]
+        number: PrRef,
         /// Repo key or clone dir when several clones exist.
         #[serde(default)]
         repo: Option<String>,
     },
-    /// Merge PR `n` (checks → serialized land → cleanup); also retries.
+    /// Push the clone's pending commits, then merge PR `n` (checks →
+    /// serialized land → cleanup); also the retry after a rejection.
     Merge {
-        /// PR number.
-        number: i64,
+        /// PR number, or `<repo>:<number>` outside the repository's clone.
+        #[schemars(with = "String")]
+        number: PrRef,
         /// Repo key or clone dir when several clones exist.
         #[serde(default)]
         repo: Option<String>,
@@ -78,27 +82,62 @@ pub enum PrArgs {
     },
     /// Show one PR with its event trail.
     Show {
-        /// PR number.
-        number: i64,
+        /// PR number, or `<repo>:<number>` outside the repository's clone.
+        #[schemars(with = "String")]
+        number: PrRef,
         /// Repo key or clone dir when several clones exist.
         #[serde(default)]
         repo: Option<String>,
     },
     /// Take over a PR owned by a deleted (or other) session.
     Adopt {
-        /// PR number.
-        number: i64,
+        /// PR number, or `<repo>:<number>` outside the repository's clone.
+        #[schemars(with = "String")]
+        number: PrRef,
         /// `local:<path>` or `github:owner/repo`.
         repo: Option<String>,
     },
     /// Close an own, unmerged PR.
     Close {
-        /// PR number.
-        number: i64,
+        /// PR number, or `<repo>:<number>` outside the repository's clone.
+        #[schemars(with = "String")]
+        number: PrRef,
         /// Repo key or clone dir when several clones exist.
         #[serde(default)]
         repo: Option<String>,
     },
+}
+
+/// The PR a call names: its number, or `<repo>:<n>` when the call runs
+/// outside the repository's clone.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum PrRef {
+    /// A bare number.
+    Number(i64),
+    /// A number as text, qualified by its repository or not.
+    Text(String),
+}
+
+impl PrRef {
+    /// The number, and the repository the call names: the one this
+    /// reference qualifies, else `repo`.
+    ///
+    /// # Errors
+    /// Fails when the text holds no PR number.
+    fn with_repo(self, repo: Option<String>) -> Result<(i64, Option<String>), PrError> {
+        let text = match self {
+            Self::Number(number) => return Ok((number, repo)),
+            Self::Text(text) => text,
+        };
+        let (qualifier, digits) = text
+            .rsplit_once(':')
+            .map_or((None, text.as_str()), |(repo, digits)| (Some(repo), digits));
+        let number = digits.trim().parse().map_err(|_| {
+            PrError::State(format!("`{text}` is not a PR number or `<repo>:<number>`"))
+        })?;
+        Ok((number, qualifier.map(str::to_string).or(repo)))
+    }
 }
 
 /// Builds the `pr` command for each terminal that serves it.
@@ -219,6 +258,8 @@ impl Tool for PrTool {
         {
             guard.check_working(title, aither_agent::WorkingText::Public)?;
         }
+        // Every transition the call causes names its agent and tool call.
+        let store = self.store.with_origin(CallOrigin::from_context(&cx));
         let result = match args {
             PrArgs::Open {
                 title,
@@ -226,18 +267,31 @@ impl Tool for PrTool {
                 issue,
                 repo,
             } => {
-                self.store
+                store
                     .open(repo.as_deref(), title.as_deref(), issue, hold)
                     .await
             }
-            PrArgs::Update { number, repo } => self.store.update(number, repo.as_deref()).await,
-            PrArgs::Merge { number, repo } => self.store.merge(number, repo.as_deref()).await,
-            PrArgs::List { state, repo } => {
-                self.store.list(repo.as_deref(), state.as_deref()).await
-            }
-            PrArgs::Show { number, repo } => self.store.show(number, repo.as_deref()).await,
-            PrArgs::Close { number, repo } => self.store.close(number, repo.as_deref()).await,
-            PrArgs::Adopt { number, repo } => self.store.adopt(number, repo.as_deref()).await,
+            PrArgs::Update { number, repo } => match number.with_repo(repo) {
+                Ok((number, repo)) => store.update(number, repo.as_deref()).await,
+                Err(error) => Err(error),
+            },
+            PrArgs::Merge { number, repo } => match number.with_repo(repo) {
+                Ok((number, repo)) => store.merge(number, repo.as_deref()).await,
+                Err(error) => Err(error),
+            },
+            PrArgs::List { state, repo } => store.list(repo.as_deref(), state.as_deref()).await,
+            PrArgs::Show { number, repo } => match number.with_repo(repo) {
+                Ok((number, repo)) => store.show(number, repo.as_deref()).await,
+                Err(error) => Err(error),
+            },
+            PrArgs::Close { number, repo } => match number.with_repo(repo) {
+                Ok((number, repo)) => store.close(number, repo.as_deref()).await,
+                Err(error) => Err(error),
+            },
+            PrArgs::Adopt { number, repo } => match number.with_repo(repo) {
+                Ok((number, repo)) => store.adopt(number, repo.as_deref()).await,
+                Err(error) => Err(error),
+            },
         };
         Ok(result.map_or_else(|e| ToolResult::text(e.to_string()), ToolResult::text))
     }
@@ -247,7 +301,7 @@ impl Tool for PrTool {
 mod tests {
     use aither_core::llm::ToolContext;
 
-    use super::{CommandRole, PrArgs, PrStore, PrTool, Tool};
+    use super::{CommandRole, PrArgs, PrRef, PrStore, PrTool, Tool};
     use crate::pr::PrContext;
     use crate::repo_clone::test_sandbox::TestTerminal;
 
@@ -312,14 +366,14 @@ mod tests {
             ),
             (
                 PrArgs::Merge {
-                    number: 1,
+                    number: PrRef::Number(1),
                     repo: None,
                 },
                 "merge",
             ),
             (
                 PrArgs::Adopt {
-                    number: 1,
+                    number: PrRef::Number(1),
                     repo: None,
                 },
                 "adopt",
@@ -415,14 +469,33 @@ mod tests {
             assert!(!checkout.join(file).exists(), "edits stay in the clone");
         }
 
+        // The second repository's PR is opened held in its clone, then
+        // merged from outside every clone by its repository-qualified number.
+        let second_key = db
+            .list_repo_clones("s1")
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|c| Path::new(&c.source) == checkouts[1])
+            .unwrap()
+            .repo_key;
         for (index, (clone, file)) in work.iter().enumerate() {
+            let hold = index == 1;
             let open = PrArgs::Open {
                 title: None,
-                hold: false,
+                hold,
                 issue: None,
                 repo: None,
             };
-            let landed = text(&pr.call(open, at(clone)).await.unwrap());
+            let mut landed = text(&pr.call(open, at(clone)).await.unwrap());
+            if hold {
+                assert!(landed.contains("opened PR #1 (hold)"), "{landed}");
+                let merge = PrArgs::Merge {
+                    number: PrRef::Text(format!("{second_key}:1")),
+                    repo: None,
+                };
+                landed = text(&pr.call(merge, at(&session_root)).await.unwrap());
+            }
             assert!(landed.contains("merged PR #1 as "), "{landed}");
             assert!(checkouts[index].join(file).exists(), "{landed}");
             assert!(!clone.exists(), "the merge deletes its own clone");
@@ -432,5 +505,49 @@ mod tests {
             }
         }
         assert!(db.list_repo_clones("s1").await.unwrap().is_empty());
+
+        // `pr list` outside every clone shows the session's PRs in both
+        // repositories, each with its repository, and `pr show` still reads
+        // a merged PR once its clone is gone.
+        let listed = text(
+            &pr.call(
+                PrArgs::List {
+                    state: None,
+                    repo: None,
+                },
+                at(&session_root),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(listed.matches("PR #1 [merged]").count(), 2, "{listed}");
+        assert!(listed.contains(&second_key), "{listed}");
+        let shown = text(
+            &pr.call(
+                PrArgs::Show {
+                    number: PrRef::Text(format!("{second_key}:1")),
+                    repo: None,
+                },
+                at(&session_root),
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(shown.contains("PR #1 [merged]"), "{shown}");
+    }
+
+    /// `<repo>:<number>` splits on the last colon, so a repository identity
+    /// holding colons stays whole, and a bare number or text number has none.
+    #[test]
+    fn a_pr_reference_splits_on_its_last_colon() {
+        let split = |text: &str| PrRef::Text(text.to_string()).with_repo(None).unwrap();
+        assert_eq!(split("7"), (7, None));
+        assert_eq!(split("/r/.git:3"), (3, Some("/r/.git".to_string())));
+        assert_eq!(split("local:/r:12"), (12, Some("local:/r".to_string())));
+        assert_eq!(
+            PrRef::Number(4).with_repo(Some("x".to_string())).unwrap(),
+            (4, Some("x".to_string()))
+        );
+        assert!(PrRef::Text("repo:x".to_string()).with_repo(None).is_err());
     }
 }

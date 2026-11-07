@@ -66,11 +66,14 @@ pub struct PrEventRow {
     pub kind: String,
     /// Session that caused the transition.
     pub session_id: String,
-    /// `main`, `user` or `scheduler`.
+    /// `main`, `subagent:<name>`, `exec`, `user` or `scheduler`.
     pub agent_id: String,
-    /// History row of the tool call, when the caller's context could
-    /// resolve one — IPC commands do not see it yet.
+    /// History row of the assistant message holding the tool call that caused
+    /// the transition; `None` for a transition no tool call caused, or while
+    /// the session has not stored that message yet.
     pub message_id: Option<i64>,
+    /// Id of the tool call that caused the transition.
+    pub tool_call_id: Option<String>,
     /// Event payload: conflict files, failure excerpt, merge sha.
     pub detail: Option<String>,
     /// UTC time of the event.
@@ -321,18 +324,23 @@ impl ChatDb {
         kind: &str,
         session_id: &str,
         agent_id: &str,
-        message_id: Option<i64>,
+        tool_call_id: Option<&str>,
         detail: Option<&str>,
     ) -> Result<(), ChatDbError> {
         let now = jiff::Timestamp::now().to_string();
+        let message_id = match tool_call_id {
+            Some(call_id) => self.tool_call_message(session_id, call_id).await?,
+            None => None,
+        };
         query!(
             self.db,
-            "INSERT INTO pr_events (pr_id, kind, session_id, agent_id, message_id, detail, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO pr_events (pr_id, kind, session_id, agent_id, message_id, tool_call_id, detail, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             pr_id,
             kind,
             session_id,
             agent_id,
             message_id,
+            tool_call_id.map(str::to_owned),
             detail,
             now
         )
@@ -360,12 +368,48 @@ impl ChatDb {
     /// # Errors
     /// Fails on database errors.
     pub async fn pr_events(&self, pr_id: i64) -> Result<Vec<PrEventRow>, ChatDbError> {
+        // A session stores a turn's messages after its tool calls ran, so an
+        // event written during the call has no message yet: it is resolved
+        // here, once the history holds the call.
         Ok(query!(
             self.db,
-            "SELECT * FROM pr_events WHERE pr_id = ? ORDER BY id",
+            "SELECT e.id AS id, e.pr_id AS pr_id, e.kind AS kind, e.session_id AS session_id, e.agent_id AS agent_id, COALESCE(e.message_id, (SELECT m.id FROM messages m WHERE m.session_id = e.session_id AND m.role = 'assistant' AND m.tool_calls IS NOT NULL AND e.tool_call_id IS NOT NULL AND instr(m.tool_calls, e.tool_call_id) > 0 ORDER BY m.id LIMIT 1)) AS message_id, e.tool_call_id AS tool_call_id, e.detail AS detail, e.created_at AS created_at FROM pr_events e WHERE e.pr_id = ? ORDER BY e.id",
             pr_id
         )
         .fetch_all::<PrEventRow>()
         .await?)
+    }
+
+    /// The assistant message of `session_id` that holds tool call `call_id`,
+    /// once the session has stored it.
+    async fn tool_call_message(
+        &self,
+        session_id: &str,
+        call_id: &str,
+    ) -> Result<Option<i64>, ChatDbError> {
+        Ok(query!(
+            self.db,
+            "SELECT id AS value FROM messages WHERE session_id = ? AND role = 'assistant' AND tool_calls IS NOT NULL AND instr(tool_calls, ?) > 0 ORDER BY id LIMIT 1",
+            session_id,
+            call_id
+        )
+        .fetch_optional::<I64ValueRow>()
+        .await?
+        .map(|row| row.value))
+    }
+
+    /// The repository identity PR project `project_id` is keyed by.
+    ///
+    /// # Errors
+    /// Fails on database errors.
+    pub async fn project_repo_key(&self, project_id: i64) -> Result<Option<String>, ChatDbError> {
+        Ok(query!(
+            self.db,
+            "SELECT repo_key AS value FROM issue_projects WHERE id = ?",
+            project_id
+        )
+        .fetch_optional::<super::common::StringValueRow>()
+        .await?
+        .map(|row| row.value))
     }
 }

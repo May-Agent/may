@@ -107,6 +107,7 @@ impl ChatDb {
         Self::ensure_ask_user_secret_columns(&db).await?;
         Self::ensure_pending_permission_agent_id_column(&db).await?;
         Self::ensure_scheduled_task_columns(&db).await?;
+        Self::ensure_pr_event_columns(&db).await?;
         Self::ensure_session_context_snapshot_table(&db).await?;
         Self::ensure_pending_message_claim_columns(&db).await?;
         Self::ensure_session_run_layout(&db).await?;
@@ -221,6 +222,18 @@ impl ChatDb {
             )
             .execute()
             .await?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_pr_event_columns(db: &SkyDb) -> Result<(), ChatDbError> {
+        let columns = query!(db, "PRAGMA table_info(pr_events)")
+            .fetch_all::<SqliteTableInfoRow>()
+            .await?;
+        if !columns.iter().any(|column| column.name == "tool_call_id") {
+            query!(db, "ALTER TABLE pr_events ADD COLUMN tool_call_id TEXT")
+                .execute()
+                .await?;
         }
         Ok(())
     }

@@ -57,6 +57,18 @@ pub struct CallOrigin {
 }
 
 impl CallOrigin {
+    /// Who made the call: `main`, `subagent:<name>` or [`Self::EXEC_AGENT`].
+    #[must_use]
+    pub fn agent(&self) -> &str {
+        &self.agent
+    }
+
+    /// The model tool call behind the invocation, when it is one.
+    #[must_use]
+    pub fn tool_call_id(&self) -> Option<&str> {
+        self.tool_call_id.as_deref()
+    }
+
     /// Agent label recorded for an invocation that is no model tool call,
     /// such as a `may exec` script.
     pub const EXEC_AGENT: &'static str = "exec";

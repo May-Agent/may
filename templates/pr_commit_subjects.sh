@@ -1,1 +1,1 @@
-git log --reverse --format=%s {{ base }}..{{ head }}
+git log --reverse --format=%s {{ head }}{% if local %} --not --remotes{% else %} ^{{ base }}{% endif %}
