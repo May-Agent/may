@@ -215,6 +215,7 @@ impl AgentMessaging {
                 SubagentGrant::new(),
                 None,
                 Some(AnyCommandGate::new(ReadOnlyFork)),
+                None,
             )
             .await
             .map_err(|error| AgentLinkError::Fork(error.to_string()))?;

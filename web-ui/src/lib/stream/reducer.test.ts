@@ -174,17 +174,31 @@ describe('reducer', () => {
         kind: 'todo_update',
         seq: 2,
         turnId: 't1',
-        items: [
-          { text: 'step 1', checked: true },
-          { text: 'step 2', checked: false },
+        rows: [
+          { section: 'doing', text: 'step 1', blocking: null, references: [] },
+          { section: 'queued', text: 'step 2', blocking: 'q1', references: [] },
         ],
-        total: 2,
-        completed: 1,
+      },
+      { kind: 'todo_update', seq: 3, turnId: 't1', rows: [] },
+    ]);
+    expect(t.todo?.rows).toEqual([]);
+  });
+
+  test('todo_update carries rows with their section and blocking mark', () => {
+    const t = stream([
+      { kind: 'start', seq: 1, turnId: 't1', sessionId: 's1', assistantId: 'a1' },
+      {
+        kind: 'todo_update',
+        seq: 2,
+        turnId: 't1',
+        rows: [
+          { section: 'doing', text: 'step 1', blocking: null, references: [] },
+          { section: 'queued', text: 'step 2', blocking: 'q1', references: [] },
+        ],
       },
     ]);
-    expect(t.todo?.total).toBe(2);
-    expect(t.todo?.completed).toBe(1);
-    expect(t.todo?.items[0]?.checked).toBe(true);
+    expect(t.todo?.rows.map((row) => row.section)).toEqual(['doing', 'queued']);
+    expect(t.todo?.rows[1]?.blocking).toBe('q1');
   });
 
   test('error marks turn done and preserves retryable flag', () => {
@@ -392,6 +406,40 @@ describe('reducer', () => {
     expect(t.text).toBe('');
     expect(t.segments).toEqual([]);
     expect(t.hold).toMatchObject({ reason: 'retry', retry: 2 });
+  });
+
+  test('a retried response keeps the finished ones and drops its own thinking, text and tool', () => {
+    const summary = {};
+    const t = stream([
+      { kind: 'start', seq: 1, turnId: 't1', sessionId: 's1', assistantId: 'a1' },
+      { kind: 'reasoning', seq: 2, turnId: 't1', chunk: 'first thought ' },
+      { kind: 'text', seq: 3, turnId: 't1', chunk: 'Looking.' },
+      { kind: 'tool_start', seq: 4, turnId: 't1', id: 'c1', name: 'terminal', variant: 'terminal', arguments: '{}', summary },
+      { kind: 'tool_end', seq: 5, turnId: 't1', id: 'c1', name: 'terminal', variant: 'terminal', result: 'ok', summary },
+      { kind: 'reasoning', seq: 6, turnId: 't1', chunk: '考え中 ' },
+      { kind: 'text', seq: 7, turnId: 't1', chunk: 'half an ans' },
+      { kind: 'tool_delta', seq: 8, turnId: 't1', id: 'c2', name: 'terminal', variant: 'terminal', argumentsFragment: '{"c', summary },
+      { kind: 'retract', seq: 9, turnId: 't1' },
+      {
+        kind: 'hold',
+        seq: 10,
+        turnId: 't1',
+        reason: 'retry',
+        until: '2026-11-04T05:40:00Z',
+        message: 'stream broke',
+        retry: 1,
+      },
+    ] as ChatStreamEvent[]);
+    expect(t.text).toBe('Looking.');
+    expect(t.reasoning).toBe('first thought ');
+    expect(t.tools.map((tool) => tool.id)).toEqual(['c1']);
+    expect(t.segments.map((s) => s.kind)).toEqual(['text', 'tool']);
+    expect(t.hold).toMatchObject({ reason: 'retry', retry: 1 });
+
+    // The replacement streaming ends the wait.
+    const next = applyEvent(t, { kind: 'text', seq: 11, turnId: 't1', chunk: 'whole' });
+    expect(next.hold).toBeNull();
+    expect(next.text).toBe('Looking.whole');
   });
 
   test('a network hold carries no instant', () => {

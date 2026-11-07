@@ -517,6 +517,32 @@ impl<T: GitHubTokenSource> IssueStore for GitHubIssueStore<T> {
         })
     }
 
+    async fn status(&self, number: i64) -> Result<super::IssueStatus, IssueError> {
+        let issue_url = self.issue_url(number);
+        let blocked_by_url = format!("{issue_url}/dependencies/blocked_by");
+        let (issue, blocked_by) = futures_util::try_join!(
+            async {
+                self.request(Method::GET, issue_url, None)
+                    .await?
+                    .into_json::<GhIssueRef>()
+                    .await
+                    .map_err(|error| IssueError::GitHub(error.to_string()))
+            },
+            self.request_json_list(blocked_by_url),
+        )
+        .map_err(|error| match error {
+            IssueError::NotFound(_) => IssueError::NotFound(number),
+            other => other,
+        })?;
+        Ok(super::IssueStatus {
+            state: parse_state(&issue.state, number)?,
+            blocked_by: blocked_by
+                .into_iter()
+                .map(related_issue)
+                .collect::<Result<_, _>>()?,
+        })
+    }
+
     async fn list(
         &self,
         state: IssueListState,
@@ -717,7 +743,24 @@ fn next_page_url(link: &str) -> Option<String> {
 }
 
 fn related_issue(issue: GhIssueRef) -> Result<RelatedIssue, IssueError> {
+    // `https://api.github.com/repos/{owner}/{repo}`, on any API base.
+    let repository = issue
+        .repository_url
+        .rsplit_once("/repos/")
+        .map(|(_, repository)| repository)
+        .filter(|repository| {
+            repository.split_once('/').is_some_and(|(owner, repo)| {
+                !owner.is_empty() && !repo.is_empty() && !repo.contains('/')
+            })
+        })
+        .ok_or_else(|| {
+            IssueError::GitHub(format!(
+                "issue #{}: repository_url {} names no repository",
+                issue.number, issue.repository_url
+            ))
+        })?;
     Ok(RelatedIssue {
+        repository: Some(repository.to_string()),
         number: issue.number,
         title: issue.title,
         state: parse_state(&issue.state, issue.number)?,
@@ -756,6 +799,8 @@ struct GhIssueRef {
     number: i64,
     title: String,
     state: String,
+    /// The API URL of the repository the issue lives in.
+    repository_url: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -902,6 +947,7 @@ mod tests {
             "body": "body",
             "state": state,
             "labels": [],
+            "repository_url": "https://api.github.com/repos/o/r",
             "created_at": "2026-10-01T00:00:00Z",
             "updated_at": "2026-10-02T00:00:00Z",
         })

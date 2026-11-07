@@ -3926,10 +3926,9 @@ impl App {
             .session_paths(session.id.as_str(), session.profile_id.as_deref());
         match paths.tasks_content().await {
             Ok(content) => {
-                let checklist = crate::todo_parser::TodoChecklist::parse(
+                self.chat.set_todos(crate::task_rows::task_rows(
                     content.as_deref().unwrap_or_default(),
-                );
-                self.chat.set_todos(checklist.items);
+                ));
             }
             Err(error) => {
                 tracing::warn!(error = %error, "failed to read session tasks.md");
@@ -4165,6 +4164,14 @@ impl App {
         }
     }
 
+    /// The model response in flight is being sent again: drop what it
+    /// streamed, which the replacement does not continue.
+    pub fn retract_response(&mut self) {
+        self.chat.retract_response();
+        self.pending_tool_calls.retain(|_, pending| pending.started);
+        self.thinking_start = None;
+    }
+
     /// Handle an agent event. Returns true if stream ended.
     pub async fn handle_agent_event(&mut self, result: Result<TimedEvent, AgentError>) -> bool {
         match result {
@@ -4277,12 +4284,12 @@ impl App {
                     // by another in the same run (the harness re-prompting,
                     // a background command finishing): it starts a block of
                     // its own instead of being glued onto this one.
-                    AgentEvent::TurnComplete {
-                        has_tool_calls: false,
-                        ..
-                    } => {
-                        self.chat.end_text();
-                        self.decode_meter.note_boundary();
+                    AgentEvent::TurnComplete { has_tool_calls, .. } => {
+                        if !has_tool_calls {
+                            self.chat.end_text();
+                            self.decode_meter.note_boundary();
+                        }
+                        self.chat.seal_response();
                     }
                     AgentEvent::Complete { .. } => {
                         // Text was already streamed via AgentEvent::Text events

@@ -1239,7 +1239,7 @@ where
                         }
                     },
                     TuiEvent::Retract => {
-                        app.chat.retract_text();
+                        app.retract_response();
                         assistant_response.clear();
                     }
                     TuiEvent::Withdrawn { content, own } => {
