@@ -462,8 +462,7 @@ impl RuntimeDeps {
             (session.id.clone(), session.history.messages().to_vec())
         };
 
-        app.init_session(&session_id, &messages, model.as_deref())
-            .await;
+        app.init_session(&session_id, &messages).await;
         *worker = None;
 
         let selected_model = SelectedModel::resolve(&app.config, model.as_deref())?;
@@ -533,8 +532,7 @@ impl RuntimeDeps {
         let session_model = session.model.clone();
         let messages: Vec<_> = session.history.messages().to_vec();
 
-        app.init_session(&session_id, &messages, session_model.as_deref())
-            .await;
+        app.init_session(&session_id, &messages).await;
         *worker = None;
 
         let selected_model = SelectedModel::resolve(&app.config, session_model.as_deref())?;
@@ -676,8 +674,7 @@ impl RuntimeDeps {
             .current()
             .map(|session| session.history.messages().to_vec())
             .unwrap_or_default();
-        app.init_session(&session_id, &messages, model.as_deref())
-            .await;
+        app.init_session(&session_id, &messages).await;
         app.chat.push_notice(&format!(
             "Imported {imported_count} messages from {} session {}",
             source.label(),
@@ -1078,33 +1075,6 @@ impl RuntimeDeps {
     /// Always succeeds.
     pub const fn begin_run(&self, _app: &mut App) -> Result<bool, TuiRuntimeError> {
         Ok(true)
-    }
-
-    /// Push-notify the user that a new open question arrived, through the
-    /// daemon's notification service. Best effort: a rejected or unroutable
-    /// notification is logged, never fatal.
-    pub async fn notify_open_question(&self, session_id: &SessionId, question: &str) {
-        let Some(client) = self.daemon() else {
-            return;
-        };
-        match client
-            .post::<_, serde_json::Value>(
-                "/api/notifications",
-                &serde_json::json!({
-                    "title": "May has a question for you",
-                    "body": question,
-                    "sessionId": session_id.as_str(),
-                }),
-            )
-            .await
-        {
-            Ok(_) => {
-                tracing::debug!("open-question notification delivered");
-            }
-            Err(error) => {
-                tracing::warn!(error = %error, "failed to send open-question notification");
-            }
-        }
     }
 
     /// Commit the user's answers to an open question; the answer joins the

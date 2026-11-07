@@ -1,1 +1,1 @@
-The user is awake again. Questions you left open through ask_user are theirs to answer now; expect answers and ask directly when something needs them.
+The user is awake again: {% match cause %}{% when crate::sleep::WakeCause::SleepOff %}they ran /sleep off.{% when crate::sleep::WakeCause::UserWrote %}they came back and wrote to you.{% endmatch %} Questions you left open through ask_user are theirs to answer now; expect answers and ask directly when something needs them.

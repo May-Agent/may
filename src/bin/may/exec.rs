@@ -533,7 +533,6 @@ where
                 may_agent::AgentEnvironment::Local => TaskRuntimeKind::Local,
             },
             task_broker: Some(tool_dispatchers.task.clone()),
-            notify_broker: Some(tool_dispatchers.notify.clone()),
             tunnel_broker: Some(tool_dispatchers.tunnel.clone()),
             browser_broker: tool_dispatchers.browser.clone(),
             register_skills_broker: None,
@@ -545,6 +544,8 @@ where
             // exec has no UI reader; the tracker still records harmlessly.
             subagent_tracker: may_agent::agent::SubagentTracker::default(),
             issue_store,
+            // exec has no agent and so no `tasks.md` to follow its changes.
+            task_events: aither_agent::TaskEvents::new(),
             // `may exec` runs the user's own script: nobody to ask.
             publish_gate: None,
             workspace_config: may_agent::workspace::WorkspaceConfig::load(

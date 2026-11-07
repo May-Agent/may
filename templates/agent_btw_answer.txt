@@ -1,0 +1,4 @@
+"{{ recipient }}" answered from a read-only fork of its context; the question did not reach the agent itself.
+<agent-btw-answer from="{{ recipient }}" id="{{ recipient_id }}">
+{{ answer }}
+</agent-btw-answer>

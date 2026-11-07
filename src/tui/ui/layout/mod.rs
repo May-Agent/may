@@ -1,11 +1,13 @@
 //! Main layout for the TUI.
 
 mod config;
+mod effort;
 mod pickers;
 mod popups;
 mod sidebar;
 
 use self::config::render_config_screen;
+use self::effort::render_effort_select_popup;
 use self::pickers::{
     connect_picker_rows, render_connect_picker, render_file_picker_popup,
     render_profile_select_popup, render_resume_picker, render_session_popup,
@@ -346,7 +348,7 @@ fn sheet_height(app: &App, column: Rect) -> Option<u16> {
         AppMode::Help => (rows(HELP_TEXT.lines().count() + 2), pct(70)),
         AppMode::ToolDetail => (full, pct(80)),
         AppMode::ModelSelect => (rows(app.filtered_model_select().len() + 6).min(16), pct(60)),
-        AppMode::EffortSelect => (rows(4), pct(70)),
+        AppMode::EffortSelect => (rows(effort::ROWS + 1), pct(70)),
         AppMode::McpManage | AppMode::SshManage | AppMode::SkillManage => {
             (pct(60).max(12), pct(70))
         }
@@ -999,31 +1001,6 @@ fn render_model_select_popup(frame: &mut Frame, area: Rect, app: &App) {
         ])
     };
     frame.render_widget(Paragraph::new(vec![Line::from(""), footer_line]), chunks[2]);
-}
-
-/// Render the effort select popup: a single horizontal ladder, ←/→ steps
-/// the highlighted rung and applies immediately.
-fn render_effort_select_popup(frame: &mut Frame, area: Rect, app: &App) {
-    let mut spans = Vec::with_capacity(app.effort_ladder.len() + 2);
-    spans.push(Span::styled("◀ ", Style::default().fg(Color::DarkGray)));
-    for (idx, rung) in app.effort_ladder.iter().enumerate() {
-        let style = if idx == app.effort_index {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        spans.push(Span::styled(format!(" {rung} "), style));
-    }
-    spans.push(Span::styled(" ▶", Style::default().fg(Color::DarkGray)));
-    let paragraph = Paragraph::new(Line::from(spans)).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title("Reasoning effort"),
-    );
-    frame.render_widget(paragraph, area);
 }
 
 /// Render the rewind picker: the session's user prompts with the file
@@ -2861,6 +2838,7 @@ mod tests {
                 .expect("instant in range"),
             status,
             output_path: None,
+            place: aither_sandbox::JobPlace::Host,
         }
     }
 

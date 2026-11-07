@@ -303,6 +303,9 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             Ok(Some(SendAction::ReloadHistory))
         }
         AppEvent::HistoryStale => Ok(Some(SendAction::ReloadHistory)),
+        AppEvent::UserNotification(notification) => {
+            Ok(Some(SendAction::DesktopNotification(notification)))
+        }
         AppEvent::Sleep(status) => {
             if status.asleep != app.asleep {
                 app.asleep = status.asleep;
@@ -348,6 +351,16 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
                 } else {
                     app.chat.push_notice("Recap failed — try again");
                 }
+            }
+            Ok(None)
+        }
+        AppEvent::ContextWindow { session_id, window } => {
+            if app
+                .session_manager
+                .current()
+                .is_some_and(|session| session.id.as_str() == session_id)
+            {
+                app.context_window = Some(window);
             }
             Ok(None)
         }

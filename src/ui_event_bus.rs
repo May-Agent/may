@@ -49,6 +49,8 @@ pub enum UiEventTopic {
     SessionIssues = 1 << 18,
     /// The user's sleep state changed.
     Sleep = 1 << 19,
+    /// A popup waits on the user; attached terminals raise a notification.
+    UserNotification = 1 << 20,
 }
 
 impl UiEventTopic {
@@ -80,6 +82,7 @@ impl UiEventTopic {
             Self::SessionRecap => "session_recap",
             Self::SessionIssues => "session_issues",
             Self::Sleep => "sleep",
+            Self::UserNotification => "user_notification",
         }
     }
 }
@@ -109,6 +112,7 @@ impl FromStr for UiEventTopic {
             "session_recap" => Ok(Self::SessionRecap),
             "session_issues" => Ok(Self::SessionIssues),
             "sleep" => Ok(Self::Sleep),
+            "user_notification" => Ok(Self::UserNotification),
             _ => Err(UnknownUiEventTopic(value.to_string())),
         }
     }
@@ -161,6 +165,8 @@ impl UiEventTopics {
     pub const SESSION_ISSUES: Self = Self(UiEventTopic::SessionIssues.bit());
     /// `sleep` topic bit.
     pub const SLEEP: Self = Self(UiEventTopic::Sleep.bit());
+    /// `user_notification` topic bit.
+    pub const USER_NOTIFICATION: Self = Self(UiEventTopic::UserNotification.bit());
     /// Every topic.
     pub const ALL: Self = Self(
         Self::CONFIG.0

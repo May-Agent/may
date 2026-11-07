@@ -478,6 +478,25 @@ fn native_repo_clones_keep_the_host_path() {
 }
 
 #[test]
+fn the_wake_alert_says_how_the_sleep_ended() {
+    use crate::sleep::WakeCause;
+    use askama::Template;
+
+    let off = super::WakeAlert {
+        cause: WakeCause::SleepOff,
+    }
+    .render()
+    .expect("wake alert renders");
+    assert!(off.contains("they ran /sleep off"), "{off}");
+    let wrote = super::WakeAlert {
+        cause: WakeCause::UserWrote,
+    }
+    .render()
+    .expect("wake alert renders");
+    assert!(wrote.contains("they came back and wrote"), "{wrote}");
+}
+
+#[test]
 #[should_panic(expected = "outside the session directory")]
 fn container_clone_outside_the_session_directory_panics() {
     let dir = tempdir().expect("temp dir should be created");

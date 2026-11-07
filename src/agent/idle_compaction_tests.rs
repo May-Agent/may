@@ -63,6 +63,16 @@ impl StubModel {
     /// Like [`Self::spawn`], but `reply` may answer a request body with its
     /// own text; `None` leaves the default.
     pub async fn spawn_replying(model: &'static str, reply: fn(&str) -> Option<String>) -> Self {
+        Self::spawn_scripted(model, move |body| reply(body).map(StubReply::Text)).await
+    }
+
+    /// Like [`Self::spawn`], but `reply` may answer a request body with text
+    /// or a tool call; `None` leaves the default text.
+    pub async fn spawn_scripted(
+        model: &'static str,
+        reply: impl Fn(&str) -> Option<StubReply> + Send + Sync + 'static,
+    ) -> Self {
+        let reply: ReplyScript = Arc::new(reply);
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind stub model server");
@@ -72,9 +82,11 @@ impl StubModel {
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let served = served.clone();
+                let reply = reply.clone();
                 tokio::spawn(async move {
-                    let service =
-                        service_fn(move |request| answer(request, model, reply, served.clone()));
+                    let service = service_fn(move |request| {
+                        answer(request, model, reply.clone(), served.clone())
+                    });
                     let _ = http1::Builder::new()
                         .serve_connection(TokioIo::new(stream), service)
                         .await;
@@ -100,10 +112,25 @@ impl StubModel {
     }
 }
 
+/// What a scripted stub model answers each request body with; `None` is the
+/// default text.
+type ReplyScript = Arc<dyn Fn(&str) -> Option<StubReply> + Send + Sync>;
+
+/// What a scripted stub model answers one request with.
+pub enum StubReply {
+    /// Plain text.
+    Text(String),
+    /// One call of the tool `name` with JSON `arguments`.
+    ToolCall {
+        name: &'static str,
+        arguments: serde_json::Value,
+    },
+}
+
 async fn answer(
     request: Request<Incoming>,
     model: &'static str,
-    reply_to: fn(&str) -> Option<String>,
+    reply_to: ReplyScript,
     requests: Arc<tokio::sync::Mutex<Vec<String>>>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
     if request.method() == Method::GET && request.uri().path().ends_with("/models") {
@@ -127,31 +154,45 @@ async fn answer(
         .expect("stub model request body")
         .to_bytes();
     let text = String::from_utf8(body.to_vec()).expect("stub model request is UTF-8");
-    let content = if text.contains(COMPACTION_MARKER) {
-        serde_json::json!({
-            "current_task": "Greet the user.",
-            "key_decisions": [],
-            "errors_fixes": [],
-            "pending_work": [],
-            "recovery_hints": [],
-        })
-        .to_string()
+    let scripted = if text.contains(COMPACTION_MARKER) {
+        StubReply::Text(
+            serde_json::json!({
+                "current_task": "Greet the user.",
+                "key_decisions": [],
+                "errors_fixes": [],
+                "pending_work": [],
+                "recovery_hints": [],
+            })
+            .to_string(),
+        )
     } else {
-        reply_to(&text).unwrap_or_else(|| "Hello there.".to_string())
+        reply_to(&text).unwrap_or_else(|| StubReply::Text("Hello there.".to_string()))
     };
-    requests.lock().await.push(text);
+    let mut served = requests.lock().await;
+    let call = served.len();
+    served.push(text);
+    drop(served);
     let chunk = |delta: &serde_json::Value, finish: serde_json::Value| {
         format!(
             "data: {}\n\n",
             serde_json::json!({"choices": [{"delta": delta, "finish_reason": finish}]})
         )
     };
-    let stream = [
-        chunk(
-            &serde_json::json!({"content": content}),
-            serde_json::Value::Null,
+    let (delta, finish) = match scripted {
+        StubReply::Text(content) => (serde_json::json!({"content": content}), "stop"),
+        StubReply::ToolCall { name, arguments } => (
+            serde_json::json!({"tool_calls": [{
+                "index": 0,
+                "id": format!("call-{call}"),
+                "type": "function",
+                "function": {"name": name, "arguments": arguments.to_string()},
+            }]}),
+            "tool_calls",
         ),
-        chunk(&serde_json::json!({}), serde_json::Value::from("stop")),
+    };
+    let stream = [
+        chunk(&delta, serde_json::Value::Null),
+        chunk(&serde_json::json!({}), serde_json::Value::from(finish)),
         "data: [DONE]\n\n".to_string(),
     ]
     .concat();
@@ -210,7 +251,7 @@ impl aither_agent::HostReader for ScriptedHost {
 pub struct SessionParts {
     dir: std::path::PathBuf,
     pub db: crate::db::ChatDb,
-    pub(super) session_id: SessionId,
+    pub(crate) session_id: SessionId,
     /// The runtime the session persists its interactions through, when it has one.
     pub runtime: Option<Arc<crate::session::SessionRuntimeService>>,
     workspace_broker: crate::workspace_request::WorkspaceRequestBroker,
@@ -220,6 +261,8 @@ pub struct SessionParts {
     pub host: ScriptedHost,
     /// The rules the session imports, when a test makes it an import session.
     pub rules_import: Option<crate::rules_import::RulesImport>,
+    /// Messaging between main agents, when a test hosts several.
+    pub agent_messaging: Option<crate::agent_link::AgentMessaging>,
     // The brokers' receiving ends stay open for the life of the session.
     _queues: (
         crate::workspace_request::WorkspaceRequestQueue,
@@ -245,6 +288,7 @@ impl SessionParts {
             tool_environments: ToolEnvironmentCache::spawn(),
             host: ScriptedHost::default(),
             rules_import: None,
+            agent_messaging: None,
             _queues: (workspace_queue, ask_user_queue),
         }
     }
@@ -260,7 +304,7 @@ impl SessionParts {
             cwd,
             session_id: self.session_id.clone(),
             workspace_request_broker: self.workspace_broker.clone(),
-            agent_messaging: None,
+            agent_messaging: self.agent_messaging.clone(),
             ask_user_broker: self.ask_user_broker.clone(),
             db: self.db.clone(),
             model: "session::session-model",
@@ -278,7 +322,6 @@ impl SessionParts {
             plan_state: SessionPlanState::default(),
             location: None,
             task_broker: None,
-            notify_broker: None,
             tunnel_broker: None,
             browser_broker: None,
             acp_host: None,
@@ -293,6 +336,7 @@ impl SessionParts {
             background_jobs: aither_agent::BackgroundJobPolicy::Await,
             connectivity: aither_connectivity::Connectivity::manual(true).0,
             rules_import: self.rules_import.clone(),
+            model_context_window: None,
         }
     }
 }
@@ -341,10 +385,28 @@ impl Session {
         Self::start_with(config, true).await
     }
 
+    /// Starts a session whose agent is one of the main agents `messaging`
+    /// connects.
+    pub(crate) async fn start_with_messaging(
+        config: &MayConfig,
+        messaging: crate::agent_link::AgentMessaging,
+    ) -> Self {
+        Self::start_from(config, false, Some(messaging)).await
+    }
+
     async fn start_with(config: &MayConfig, with_runtime: bool) -> Self {
+        Self::start_from(config, with_runtime, None).await
+    }
+
+    async fn start_from(
+        config: &MayConfig,
+        with_runtime: bool,
+        agent_messaging: Option<crate::agent_link::AgentMessaging>,
+    ) -> Self {
         let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
         let temp = tempfile::tempdir().expect("tempdir");
         let mut parts = SessionParts::new(temp.path().to_path_buf()).await;
+        parts.agent_messaging = agent_messaging;
         if with_runtime {
             parts
                 .db

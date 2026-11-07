@@ -50,6 +50,7 @@ mod title_generation;
 mod tool_summary;
 mod tunnel;
 pub(crate) mod types;
+mod user_wait;
 
 #[cfg(test)]
 mod funnel_tests;
@@ -61,6 +62,8 @@ mod repo_clones_tests;
 mod response_tests;
 #[cfg(test)]
 mod secret_question_tests;
+#[cfg(test)]
+mod user_wait_tests;
 #[cfg(test)]
 mod yolo_tests;
 

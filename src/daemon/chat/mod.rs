@@ -27,8 +27,7 @@ mod turn_persister;
 mod warm_aux_tests;
 
 use self::tool_dispatch::{
-    handle_browser_request, handle_notify_request, handle_register_skills_request,
-    handle_task_request,
+    handle_browser_request, handle_register_skills_request, handle_task_request,
 };
 
 use std::future::Future;
@@ -46,7 +45,6 @@ use aither_core::llm::{
     Attachment as LlmAttachment, Message as LlmMessage, Role as LlmRole, ToolResult, Usage,
 };
 use aither_core::llm::{Failure, FailureKind};
-use aither_models::lookup as lookup_model_info;
 use aither_sandbox::{AnyContainerExec, BollardContainerExec, ContainerLaunchSpec};
 
 use crate::agent::MayAgent;
@@ -123,10 +121,12 @@ trait ChatSink {
     /// The run is prepared; `user_message_id` is the row of the user
     /// message it answers, when it stored one.
     fn on_prepared(&mut self, _user_message_id: Option<i32>) {}
-    /// Every agent event of the run, as the agent emitted it.
+    /// Every agent event of the run, as the agent emitted it, with the
+    /// model's context window.
     fn on_agent_event(
         &mut self,
         _event: Result<&aither_agent::AgentEvent, &aither_agent::AgentError>,
+        _context_window: Option<u32>,
     ) {
     }
     fn on_start(
@@ -175,7 +175,7 @@ trait ChatSink {
     ) -> impl Future<Output = bool> + Send;
     fn on_todo_update(
         &mut self,
-        checklist: &crate::todo_parser::TodoChecklist,
+        rows: Vec<crate::task_rows::TaskRow>,
     ) -> impl Future<Output = bool> + Send;
     fn on_speed(&mut self, tokens_per_second: f64) -> impl Future<Output = bool> + Send;
     /// The run waits for `reason` before it continues.
@@ -392,8 +392,9 @@ impl ChatSink for HubSink {
     fn on_agent_event(
         &mut self,
         event: Result<&aither_agent::AgentEvent, &aither_agent::AgentError>,
+        context_window: Option<u32>,
     ) {
-        if let Some(event) = crate::client::WireAgentEvent::from_agent(event) {
+        if let Some(event) = crate::client::WireAgentEvent::from_agent(event, context_window) {
             self.publish_agent(crate::client::SessionAgentBody::Agent { event });
         }
     }
@@ -525,9 +526,13 @@ impl ChatSink for HubSink {
         true
     }
 
-    async fn on_todo_update(&mut self, checklist: &crate::todo_parser::TodoChecklist) -> bool {
+    async fn on_todo_update(&mut self, rows: Vec<crate::task_rows::TaskRow>) -> bool {
         let seq = self.next_seq();
-        let event = SseTodoUpdateEvent::from_checklist(checklist, seq, self.turn_id.clone());
+        let event = SseTodoUpdateEvent {
+            seq,
+            turn_id: self.turn_id.clone(),
+            rows,
+        };
         self.publish_turn("todo_update", &event);
         true
     }
@@ -1669,7 +1674,6 @@ pub(super) async fn run_bash(
 pub(super) fn spawn_shared_tool_dispatchers(state: Arc<DaemonState>, queues: UiToolQueues) {
     let UiToolQueues {
         task,
-        notify,
         browser,
         register_skills,
         tunnel,
@@ -1680,16 +1684,6 @@ pub(super) fn spawn_shared_tool_dispatchers(state: Arc<DaemonState>, queues: UiT
     tokio_handle.spawn(async move {
         while let Some(request) = task.next().await {
             let result = Box::pin(handle_task_request(&task_state, request.args.clone())).await;
-            let _ = request.respond(result);
-        }
-    });
-
-    let notification_service = state.notification_service.clone();
-    let tokio_handle = state.tokio_handle.clone();
-    tokio_handle.spawn(async move {
-        while let Some(request) = notify.next().await {
-            let result =
-                handle_notify_request(notification_service.clone(), request.args.clone()).await;
             let _ = request.respond(result);
         }
     });
@@ -1782,7 +1776,7 @@ async fn drive_turn<S: ChatSink>(
             if let ControlFlow::Break(stop) = turn.close_reasoning_phase().await {
                 return Err(stop);
             }
-            turn.sink.on_agent_event(Err(&error));
+            turn.sink.on_agent_event(Err(&error), turn.context_window);
             Err(turn_events::TurnStop::Failed(error))
         }
     }
@@ -1939,10 +1933,7 @@ fn run_agent_loop<'a>(
             if let Some(hidden_context_xml) = hidden_context_xml {
                 turn_hidden_context_xml = Some(hidden_context_xml);
             }
-            let model_context_window = agent.model_context_window().or_else(|| {
-                lookup_model_info(crate::model_selector::selector_model_id(&current_model))
-                    .and_then(aither_models::ModelEntry::max_input_tokens)
-            });
+            let model_context_window = agent.model_context_window();
 
             let session_paths =
                 session_paths_for_session(state, profile_id.as_deref(), &session_id);
@@ -1975,6 +1966,7 @@ fn run_agent_loop<'a>(
                 started_at,
                 reasoning_display,
                 reasoning_phase: reasoning_display.then_some(started_at),
+                context_window: model_context_window,
                 provider_id: &provider_id,
                 model: &current_model,
                 request_prefix: None,
@@ -1994,6 +1986,7 @@ fn run_agent_loop<'a>(
                 last_event_at: None,
                 full_text: String::new(),
                 reasoning_text: String::new(),
+                reasoning_floor: 0,
                 terminal_snapshot: TerminalStateSnapshot::default(),
                 saw_tool_activity: false,
                 tool_arguments_by_id: std::collections::HashMap::new(),
@@ -2809,7 +2802,6 @@ struct ToolBrokers {
     workspace: crate::workspace_request::WorkspaceRequestBroker,
     ask_user: ask_user::AskUserBroker,
     task: crate::agent::task_tool::TaskBroker,
-    notify: crate::agent::notify_tool::NotifyBroker,
     browser: crate::agent::browser_tool::BrowserBroker,
     register_skills: crate::agent::register_tool::RegisterBroker,
     tunnel: crate::agent::tunnel_tool::TunnelBroker,
@@ -3509,7 +3501,6 @@ fn build_tool_brokers(state: &Arc<DaemonState>, session_id: &SessionId) -> ToolB
         workspace: spawn_workspace_forwarder(state, session_id),
         ask_user: spawn_ask_user_forwarder(state, session_id),
         task: state.tool_dispatchers.task.clone(),
-        notify: state.tool_dispatchers.notify.clone(),
         browser: state.tool_dispatchers.browser.clone(),
         register_skills: state.tool_dispatchers.register_skills.clone(),
         tunnel: state.tool_dispatchers.tunnel.clone(),
@@ -3541,6 +3532,7 @@ fn agent_messaging(state: &Arc<DaemonState>) -> crate::agent_link::AgentMessagin
                     .unwrap_or_default()
             })
         },
+        forks: state.agent_forks.clone(),
     }
 }
 
@@ -3676,6 +3668,11 @@ fn build_session_agent<'a>(
     Box::pin(async move {
         let (environment, location) = Box::pin(setup_agent_environment(state, ctx)).await?;
         let brokers = build_tool_brokers(state, &ctx.session_id);
+        let model_context_window = match ctx.current_model.parse::<crate::ModelSelector>() {
+            Ok(selector) => state.model_context_window(&selector).await,
+            // The build reports the invalid selector.
+            Err(_) => None,
+        };
 
         let mut agent = MayAgent::from_config_with_model_and_permissions(
             config,
@@ -3707,7 +3704,6 @@ fn build_session_agent<'a>(
                 plan_state: ctx.plan_state,
                 location,
                 task_broker: Some(brokers.task),
-                notify_broker: Some(brokers.notify),
                 tunnel_broker: Some(brokers.tunnel),
                 browser_broker: state.browser_manager().map(|_| brokers.browser),
                 acp_host: Some(state.acp_host.clone()),
@@ -3735,6 +3731,7 @@ fn build_session_agent<'a>(
                 background_jobs: aither_agent::BackgroundJobPolicy::Detach,
                 connectivity: state.connectivity.clone(),
                 rules_import: ctx.rules_import.clone(),
+                model_context_window,
             },
         )
         .await
@@ -3861,12 +3858,12 @@ async fn enforce_issue_ownership(
     }
 }
 
-/// Read tasks.md and return the parsed checklist if its content changed since the last check.
-/// The sink is responsible for wrapping it in the SSE envelope with `seq/turn_id`.
+/// Read tasks.md and return its rows if its content changed since the last check.
+/// The sink is responsible for wrapping them in the SSE envelope with `seq/turn_id`.
 async fn check_tasks_update(
     paths: &SessionPaths,
     last_hash: &mut Option<u64>,
-) -> Option<crate::todo_parser::TodoChecklist> {
+) -> Option<Vec<crate::task_rows::TaskRow>> {
     use std::hash::{Hash, Hasher};
 
     let content = match paths.tasks_content().await {
@@ -3886,11 +3883,8 @@ async fn check_tasks_update(
     }
     *last_hash = Some(hash);
 
-    let checklist = crate::todo_parser::TodoChecklist::parse(&content);
-    if checklist.is_empty() {
-        return None;
-    }
-    Some(checklist)
+    // An empty list is an update too: finishing work deletes its row.
+    Some(crate::task_rows::task_rows(&content))
 }
 
 async fn is_takeover_active_for_session(state: &DaemonState, session_id: &SessionId) -> bool {
@@ -4024,6 +4018,7 @@ mod tests {
                         messages: Vec::new(),
                     },
                     has_background_tasks: false,
+                    tasks: None,
                 },
                 applied_seq: 42,
                 updated_at: "2026-03-14T00:00:00Z".to_string(),
@@ -4256,15 +4251,19 @@ mod tests {
                 .is_none()
         );
 
-        // A model-side write produces the parsed checklist once.
-        async_fs::write(&tasks_path, "- [x] done\n- [ ] pending\n")
+        // A model-side write produces its rows once.
+        async_fs::write(
+            &tasks_path,
+            "## Doing\n- write report\n\n## Queued\n- ship it BLOCKING q1\n",
+        )
+        .await
+        .expect("tasks.md should be written");
+        let rows = super::check_tasks_update(&paths, &mut last_hash)
             .await
-            .expect("tasks.md should be written");
-        let checklist = super::check_tasks_update(&paths, &mut last_hash)
-            .await
-            .expect("a written tasks.md should produce a checklist");
-        assert_eq!(checklist.total(), 2);
-        assert_eq!(checklist.completed(), 1);
+            .expect("a written tasks.md should produce rows");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].section, crate::task_rows::TaskSection::Doing);
+        assert_eq!(rows[1].blocking.as_deref(), Some("q1"));
 
         // The same content is deduplicated by hash.
         assert!(
@@ -4273,25 +4272,14 @@ mod tests {
                 .is_none()
         );
 
-        // A further model-side write produces an updated checklist.
-        async_fs::write(&tasks_path, "- [ ] new task\n")
+        // Finishing the work deletes its row; the empty list is still an update.
+        async_fs::write(&tasks_path, "## Doing\n")
             .await
             .expect("tasks.md should be rewritten");
-        let checklist = super::check_tasks_update(&paths, &mut last_hash)
+        let rows = super::check_tasks_update(&paths, &mut last_hash)
             .await
-            .expect("a changed tasks.md should produce a new checklist");
-        assert_eq!(checklist.total(), 1);
-        assert_eq!(checklist.items[0].text, "new task");
-
-        // A document without checklist items produces no update.
-        async_fs::write(&tasks_path, "just prose\n")
-            .await
-            .expect("tasks.md should be rewritten");
-        assert!(
-            super::check_tasks_update(&paths, &mut last_hash)
-                .await
-                .is_none()
-        );
+            .expect("a changed tasks.md should produce an update");
+        assert_eq!(rows, Vec::<crate::task_rows::TaskRow>::new());
     }
 
     /// What a run told its clients about waiting and discarding text.
@@ -4338,6 +4326,7 @@ mod tests {
         fn on_agent_event(
             &mut self,
             event: Result<&aither_agent::AgentEvent, &aither_agent::AgentError>,
+            _context_window: Option<u32>,
         ) {
             if matches!(event, Ok(aither_agent::AgentEvent::Text(text)) if text == WAKE_TEXT) {
                 self.wake_texts += 1;
@@ -4382,7 +4371,7 @@ mod tests {
         }
         fn on_todo_update(
             &mut self,
-            _c: &crate::todo_parser::TodoChecklist,
+            _rows: Vec<crate::task_rows::TaskRow>,
         ) -> impl Future<Output = bool> + Send {
             std::future::ready(true)
         }

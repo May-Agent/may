@@ -22,7 +22,7 @@ use super::chat_layout::{self, ChatLayout};
 use super::markdown;
 use super::streaming_markdown::IMAGE_HEIGHT;
 use crate::agent::ContextReport;
-use crate::todo_parser::TodoChecklistItem;
+use crate::task_rows::{TaskRow, TaskSection};
 
 /// Status of a tool call.
 #[derive(Debug, Clone)]
@@ -216,6 +216,11 @@ impl ToolDisplay {
     pub fn expandable(&self) -> bool {
         match self {
             Self::Terminal { .. } => true,
+            Self::Action { chip: name, .. } | Self::Builtin { tool: name, .. }
+                if is_one_row_tool(name) =>
+            {
+                false
+            }
             Self::Action { detail, output, .. } => {
                 !detail.is_empty() || output.as_ref().is_some_and(|info| !info.output.is_empty())
             }
@@ -326,8 +331,8 @@ pub enum ChatElement {
     },
     /// Todo block
     TodoBlock {
-        /// Todo items.
-        items: Vec<TodoChecklistItem>,
+        /// The rows of `tasks.md`.
+        rows: Vec<TaskRow>,
     },
     /// Daemon-written catch-up card (persisted `recap` history row).
     Recap {
@@ -459,6 +464,10 @@ pub struct ChatStream {
     /// Elements before this index belong to already-folded turns and are
     /// never folded again.
     fold_cursor: usize,
+    /// Elements before this index belong to model responses that finished.
+    /// The elements from it on are the response in flight, which a retry
+    /// discards.
+    response_floor: usize,
     /// Base `http://host/tunnel` URL `<tunnel id>` tags resolve against.
     tunnel_base: String,
 }
@@ -546,6 +555,7 @@ impl ChatStream {
             attachments,
             history_index,
         });
+        self.seal_response();
     }
 
     /// Add an error message.
@@ -865,6 +875,9 @@ impl ChatStream {
     /// intermediate messages between them — into a single "Worked for" row.
     /// The turn's final reply stays visible, as do notices and reports.
     pub fn fold_turn_work(&mut self, seconds: u64) {
+        // A turn that ends on a thought never saw text or a call close it:
+        // a folded thought is finished, so its body can expand.
+        self.collapse_thinking();
         self.fold_cursor = self.fold_cursor.min(self.elements.len());
         let start = self
             .elements
@@ -890,7 +903,14 @@ impl ChatStream {
             .zip(self.revisions.splice(start..end, []))
             .partition(|(element, _)| matches!(element, ChatElement::Error { .. }));
         let mut at = start;
-        if !folded.is_empty() {
+        // A single item is its own row: a group around it hides nothing.
+        if let [_] = folded.as_slice() {
+            for (element, revision) in folded {
+                self.elements.insert(at, element);
+                self.revisions.insert(at, revision);
+                at += 1;
+            }
+        } else if !folded.is_empty() {
             let id = self.next_worked_id;
             self.next_worked_id += 1;
             self.elements.insert(
@@ -966,17 +986,30 @@ impl ChatStream {
         }
     }
 
-    /// Drop the text of the attempt being retried: the streaming text block
-    /// at the end of the stream, when there is one.
-    pub fn retract_text(&mut self) {
-        if matches!(
-            self.elements.last(),
-            Some(ChatElement::AssistantText {
-                streaming: true,
-                ..
-            })
-        ) {
-            self.pop_last();
+    /// Everything shown so far belongs to model responses that finished: a
+    /// retry discards only what streams after this.
+    pub const fn seal_response(&mut self) {
+        self.response_floor = self.elements.len();
+    }
+
+    /// Drop what the attempt being retried streamed: its text, its thinking
+    /// and the tool calls it began to stream or that the provider ran for
+    /// it. Tool calls that ran, and everything before the response in
+    /// flight, stay.
+    pub fn retract_response(&mut self) {
+        let floor = self.response_floor.min(self.elements.len());
+        let belongs_to_attempt = |element: &ChatElement| match element {
+            ChatElement::Thinking { .. } | ChatElement::AssistantText { .. } => true,
+            ChatElement::ToolCall { display, .. } => {
+                matches!(display, ToolDisplay::Builtin { .. }) || !display.is_complete()
+            }
+            _ => false,
+        };
+        for index in (floor..self.elements.len()).rev() {
+            if belongs_to_attempt(&self.elements[index]) {
+                self.elements.remove(index);
+                self.revisions.remove(index);
+            }
         }
     }
 
@@ -1053,11 +1086,24 @@ impl ChatStream {
         });
         if let Some(index) = found {
             if let ChatElement::ToolCall {
-                display: ToolDisplay::Builtin { status, output, .. },
+                display:
+                    ToolDisplay::Builtin {
+                        tool,
+                        detail,
+                        status,
+                        output,
+                        ..
+                    },
                 ..
             } = &mut self.elements[index]
             {
                 *status = ToolStatus::Done;
+                if detail.is_empty()
+                    && is_one_row_tool(tool)
+                    && let Some(query) = quoted_result(&result)
+                {
+                    *detail = query.to_string();
+                }
                 *output = Some(result);
             }
             self.touch(index);
@@ -1068,7 +1114,11 @@ impl ChatStream {
             id: id.to_string(),
             display: ToolDisplay::Builtin {
                 tool: tool.to_string(),
-                detail: String::new(),
+                detail: if is_one_row_tool(tool) {
+                    quoted_result(&result).unwrap_or_default().to_string()
+                } else {
+                    String::new()
+                },
                 status: ToolStatus::Done,
                 output: Some(result),
                 pinned: None,
@@ -1264,7 +1314,7 @@ impl ChatStream {
     }
 
     /// Set the todo block (replaces previous).
-    pub fn set_todos(&mut self, items: Vec<TodoChecklistItem>) {
+    pub fn set_todos(&mut self, rows: Vec<TaskRow>) {
         // Remove existing todo block
         let mut kept_revisions = Vec::with_capacity(self.revisions.len());
         for (elem, revision) in self.elements.iter().zip(&self.revisions) {
@@ -1276,8 +1326,8 @@ impl ChatStream {
             .retain(|e| !matches!(e, ChatElement::TodoBlock { .. }));
         self.revisions = kept_revisions;
         // Add new one at end
-        if !items.is_empty() {
-            self.push_element(ChatElement::TodoBlock { items });
+        if !rows.is_empty() {
+            self.push_element(ChatElement::TodoBlock { rows });
         }
     }
 
@@ -2409,22 +2459,53 @@ pub(super) fn element_lines(
         }
 
         ChatElement::TodoBlock { .. } if state.hide_todos => {}
-        ChatElement::TodoBlock { items } => {
+        ChatElement::TodoBlock { rows } => {
             lines.push(Line::from(Span::styled(
                 "[todo] ────────────────────────────",
                 Style::default().fg(Color::Green),
             )));
 
-            for item in items {
-                let (marker, style) = if item.checked {
-                    ("[x]", Style::default().fg(Color::DarkGray))
-                } else {
-                    ("[ ]", Style::default())
-                };
+            // Roots, compactly: the issues the session serves, on one line.
+            let roots: Vec<&str> = rows
+                .iter()
+                .filter(|row| row.section == TaskSection::Roots)
+                .filter_map(|row| row.text.lines().next())
+                .collect();
+            if !roots.is_empty() {
                 lines.push(Line::from(vec![
-                    Span::styled(format!("  {marker} "), style),
-                    Span::styled(item.text.clone(), style),
+                    Span::styled("  Roots ", Style::default().fg(Color::DarkGray)),
+                    Span::raw(roots.join(", ")),
                 ]));
+            }
+            for (section, title) in [
+                (TaskSection::Doing, "Doing"),
+                (TaskSection::Queued, "Queued"),
+            ] {
+                let mut section_rows = rows.iter().filter(|row| row.section == section).peekable();
+                if section_rows.peek().is_none() {
+                    continue;
+                }
+                lines.push(Line::from(Span::styled(
+                    format!("  {title}"),
+                    Style::default().fg(Color::DarkGray),
+                )));
+                for row in section_rows {
+                    let text = row.text.split_whitespace().collect::<Vec<_>>().join(" ");
+                    match &row.blocking {
+                        Some(what) => lines.push(Line::from(vec![
+                            Span::styled("    ⏸ ", Style::default().fg(Color::Red)),
+                            Span::raw(text),
+                            Span::styled(
+                                format!(" (blocked: {what})"),
+                                Style::default().fg(Color::Red),
+                            ),
+                        ])),
+                        None => lines.push(Line::from(vec![
+                            Span::styled("    ○ ", Style::default().fg(Color::Yellow)),
+                            Span::raw(text),
+                        ])),
+                    }
+                }
             }
 
             lines.push(Line::from(Span::styled(
@@ -3454,6 +3535,25 @@ fn tool_header_line(
     Line::from(spans)
 }
 
+/// Search and fetch calls are one headline row (`Searched "query"`,
+/// `Fetched url`) with nothing to unfold, whichever path renders them.
+fn is_one_row_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "websearch" | "web_search" | "google_search" | "webfetch" | "web_fetch"
+    )
+}
+
+/// The query or URL a hosted call's result repeats, when the provider
+/// announced the call before it knew it (the `OpenAI` Responses API does).
+fn quoted_result(result: &str) -> Option<&str> {
+    result
+        .trim()
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .filter(|inner| !inner.is_empty() && !inner.contains('\n'))
+}
+
 /// A tool headline as `(label, rest)`: hosted and IPC search names become
 /// `Searched "query"`, fetch becomes `Fetched url`, everything else keeps
 /// its `[name]` label.
@@ -4162,6 +4262,56 @@ mod tests {
         };
         assert_eq!(command, "echo hi");
         assert!(matches!(status, ToolStatus::Done));
+    }
+
+    /// A retried response leaves nothing of its broken attempt: its thinking,
+    /// text and streamed tool call go, while the finished response before it
+    /// stays.
+    #[test]
+    fn a_retracted_response_keeps_only_the_finished_ones() {
+        fn terminal(command: &str) -> ToolDisplay {
+            ToolDisplay::Terminal {
+                description: String::new(),
+                command: command.to_string(),
+                mode: TerminalExecutionMode::Default,
+                status: ToolStatus::Running,
+                output: None,
+                diffs: Vec::new(),
+                pinned: None,
+            }
+        }
+
+        let mut stream = ChatStream::new();
+        stream.push_user("go", Vec::new(), 0);
+        stream.push_text("first reply");
+        stream.upsert_tool_display("call-1".to_string(), terminal("ls"));
+        stream.update_tool_with_output("call-1", ToolStatus::Done, Some("a"));
+        stream.seal_response();
+
+        stream.push_thinking("考え中 생각 中");
+        stream.push_text("half an ans");
+        stream.upsert_tool_display("call-2".to_string(), terminal("ec"));
+        stream.retract_response();
+
+        let kinds: Vec<_> = stream
+            .elements()
+            .iter()
+            .map(|element| match element {
+                ChatElement::UserMessage { .. } => "user",
+                ChatElement::AssistantText { .. } => "text",
+                ChatElement::ToolCall { id, .. } => id.as_str(),
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, ["user", "text", "call-1"]);
+        assert_eq!(stream.elements().len(), stream.revisions.len());
+
+        // The replacement streams as if the attempt had never been.
+        stream.push_text("whole answer");
+        assert!(matches!(
+            stream.elements().last(),
+            Some(ChatElement::AssistantText { content, .. }) if content == "whole answer"
+        ));
     }
 
     /// The user's expansion pin and any attached diffs survive a display
@@ -5497,27 +5647,27 @@ mod tests {
         assert!(matches!(display.status(), ToolStatus::Failed(_)));
     }
 
-    /// A tasks.md document parsed into a checklist feeds the todo block —
-    /// the same path `refresh_todos` uses after tool calls and on session
-    /// load.
+    /// The rows of a tasks.md document feed the todo block — the same path
+    /// `refresh_todos` uses after tool calls and on session load.
     #[test]
-    fn set_todos_renders_parsed_session_checklist() {
-        let checklist =
-            crate::todo_parser::TodoChecklist::parse("- [x] write report\n- [ ] ship it\n");
+    fn set_todos_renders_parsed_session_rows() {
+        let rows = crate::task_rows::task_rows(
+            "## Doing\n- write report\n\n## Queued\n- ship it BLOCKING q1\n",
+        );
         let mut chat = ChatStream::new();
         chat.push_text("earlier content");
         chat.end_text();
-        chat.set_todos(checklist.items.clone());
+        chat.set_todos(rows.clone());
 
-        let items = chat
+        let shown = chat
             .elements()
             .iter()
             .find_map(|element| match element {
-                ChatElement::TodoBlock { items } => Some(items),
+                ChatElement::TodoBlock { rows } => Some(rows),
                 _ => None,
             })
-            .expect("a non-empty checklist should produce a todo block");
-        assert_eq!(items, &checklist.items);
+            .expect("a non-empty document should produce a todo block");
+        assert_eq!(shown, &rows);
 
         // A subsequent parse replaces the previous block rather than
         // stacking a second one.
@@ -5782,5 +5932,70 @@ mod tests {
         );
         assert_eq!(regions.len(), 1);
         assert_eq!(regions[0].element_id, "thinking-0");
+    }
+
+    /// Rows of the stream and how many of them click open.
+    fn rows_and_regions(chat: &ChatStream) -> (Vec<String>, usize) {
+        let mut regions = Vec::new();
+        let lines = build_plain_wrapped_lines_unified(
+            chat,
+            200,
+            None,
+            None,
+            None,
+            Some(&mut regions),
+            false,
+        );
+        (
+            lines.into_iter().filter(|l| !l.is_empty()).collect(),
+            regions.len(),
+        )
+    }
+
+    /// The `OpenAI` Responses API announces a hosted search before it knows
+    /// the query and repeats it, quoted, in the result.
+    #[test]
+    fn a_hosted_search_announced_without_its_query_is_one_row() {
+        let mut chat = ChatStream::new();
+        chat.push_builtin("ws_1".into(), "web_search".into(), String::new());
+        chat.finish_builtin("ws_1", "web_search", "\"Rust 异步 非同期 비동기\"".into());
+        chat.push_builtin("wf_1".into(), "web_fetch".into(), String::new());
+        chat.finish_builtin("wf_1", "web_fetch", "\"https://example.com/a\"".into());
+        // A result with no matching start is appended as a finished row.
+        chat.finish_builtin("ws_2", "web_search", "\"late query\"".into());
+
+        let (rows, regions) = rows_and_regions(&chat);
+        assert_eq!(
+            rows,
+            [
+                "  ✓ Searched \"Rust 异步 非同期 비동기\"",
+                "  ✓ Fetched https://example.com/a",
+                "  ✓ Searched \"late query\"",
+            ]
+        );
+        assert_eq!(regions, 0);
+    }
+
+    /// The IPC search and fetch rows carry arguments and results too, but
+    /// are one row all the same.
+    #[test]
+    fn an_inline_search_with_a_result_is_one_row() {
+        let mut chat = ChatStream::new();
+        chat.push_tool(
+            "s1".to_string(),
+            ToolDisplay::Action {
+                chip: "websearch".to_string(),
+                task_id: None,
+                summary: "may agent".to_string(),
+                detail: vec!["{\"query\":\"may agent\"}".to_string()],
+                status: ToolStatus::Running,
+                output: None,
+                pinned: None,
+            },
+        );
+        chat.update_tool_with_output("s1", ToolStatus::Done, Some("result one\nresult two"));
+        let (rows, regions) = rows_and_regions(&chat);
+        assert_eq!(rows, ["  ✓ Searched \"may agent\""]);
+        assert_eq!(regions, 0);
     }
 }

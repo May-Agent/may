@@ -174,6 +174,28 @@ mod tests {
     }
 
     #[test]
+    fn new_repo_skill_links_every_reference_file() {
+        let skill = SKILLS_DIR
+            .get_file("new-repo/SKILL.md")
+            .and_then(|file| file.contents_utf8())
+            .expect("new-repo/SKILL.md is bundled");
+        assert!(skill.starts_with("---\nname: new-repo\n"));
+        let references = SKILLS_DIR
+            .get_dir("new-repo/references")
+            .expect("new-repo/references is bundled");
+        let mut count = 0;
+        for file in references.files() {
+            let name = file.path().file_name().unwrap().to_string_lossy();
+            assert!(
+                skill.contains(&format!("references/{name}")),
+                "SKILL.md does not link {name}"
+            );
+            count += 1;
+        }
+        assert_eq!(count, 4);
+    }
+
+    #[test]
     fn bundled_skills_have_no_subagents_directory() {
         let mut dirs = Vec::new();
         collect_dirs(&SKILLS_DIR, &mut dirs);

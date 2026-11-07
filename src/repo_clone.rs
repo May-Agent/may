@@ -565,8 +565,9 @@ impl SessionRepos {
         Ok(dir)
     }
 
-    /// Clone `parent` into `child_dir` for a subagent run: a local clone
-    /// of the session clone that shares no file with it, so the run's base is always a commit
+    /// Clone `parent` into `child_dir` for a subagent run: a clone of the
+    /// session clone at its current commit that shares no file with it and
+    /// runs nothing `parent` configures, so the run's base is always a commit
     /// and its work is `git diff base..head`. Not registered — the parent
     /// session owns it and removes it with the run directory.
     ///
@@ -580,7 +581,7 @@ impl SessionRepos {
         if let Some(parent_dir) = child_dir.parent() {
             std::fs::create_dir_all(parent_dir)?;
         }
-        local_clone(&self.host, parent, child_dir).await?;
+        clone_untrusted(&self.host, parent, child_dir).await?;
         Ok(child_dir.to_path_buf())
     }
 
@@ -714,17 +715,40 @@ mod confined {
     }
 }
 
-/// Clone `source` into `target` copying its objects: the sandbox runs as the
-/// user's uid, so a hardlinked object made writable would change the source's
-/// inode too.
-async fn local_clone(host: &HostGit, source: &Path, target: &Path) -> Result<(), RepoCloneError> {
+/// Clone the agent-writable repository `source` into `target`, running
+/// nothing `source` configures on the host.
+///
+/// The clone goes through `git upload-pack` (`--no-local`), which copies no
+/// file of `source`: no hardlink to an object the sandbox could rewrite, no
+/// alternate it names, no symlink it plants. The configuration, hooks and
+/// attributes of `source` take no part in serving it (git reads
+/// `uploadpack.packObjectsHook` and the like from protected configuration
+/// only); the file system monitor is off for the whole command, no hook is
+/// installed in `target` and the hook path is void. `target` is the host's
+/// own new repository until the agent gets it.
+async fn clone_untrusted(
+    host: &HostGit,
+    source: &Path,
+    target: &Path,
+) -> Result<(), RepoCloneError> {
     let host = host.clone();
     let source = source.to_string_lossy().into_owned();
     let target = target.to_string_lossy().into_owned();
     blocking::unblock(move || {
         host.output(
             None,
-            &["clone", "--local", "--no-hardlinks", &source, &target],
+            &[
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "core.fsmonitor=false",
+                "clone",
+                "--no-local",
+                "--template=",
+                "--",
+                &source,
+                &target,
+            ],
         )
     })
     .await?;
@@ -853,10 +877,102 @@ pub(crate) mod test_sandbox {
             Self { terminal }
         }
 
+        /// What a terminal-bound command of this terminal is built from.
+        pub const fn binding(&self) -> &aither_sandbox::TerminalBinding {
+            self.terminal.binding()
+        }
+
         /// The terminal's sandbox, as a terminal-bound command gets it.
         pub fn sandbox(&self) -> CloneSandbox {
             CloneSandbox::new(self.terminal.binding().runner().clone())
         }
+    }
+
+    /// Every executable setting a repository can carry for itself, set in
+    /// `clone` the way an agent writing it could: each runs a script that
+    /// touches `host/<name>` (outside the sandbox) and `ran/<name>` inside
+    /// the session, so a marker in `host/` means it ran on the host. Returns
+    /// the `host/` directory.
+    pub fn arm_hostile_config(session_root: &Path, clone: &Path, outside: &Path) -> PathBuf {
+        let host = outside.join("host");
+        let ran = session_root.join("ran");
+        let scripts = session_root.join("hostile");
+        let hooks = scripts.join("hooks");
+        for dir in [&host, &ran, &hooks] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let script = |path: &Path, name: &str, tail: &str| {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::write(
+                path,
+                format!(
+                    "#!/bin/sh\ntouch '{}/{name}' 2>/dev/null\ntouch '{}/{name}' 2>/dev/null\n{tail}\n",
+                    host.display(),
+                    ran.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        // Repository-local hooks, both where git looks by default and under
+        // `core.hooksPath`.
+        for hook in [
+            "pre-commit",
+            "prepare-commit-msg",
+            "commit-msg",
+            "post-commit",
+            "post-checkout",
+            "post-merge",
+            "pre-push",
+            "pre-receive",
+            "update",
+            "post-update",
+            "push-to-checkout",
+            "reference-transaction",
+            "pre-auto-gc",
+            "post-index-change",
+        ] {
+            script(&hooks.join(hook), hook, "exit 0");
+            script(&clone.join(".git/hooks").join(hook), hook, "exit 0");
+        }
+        let mut settings = vec![(
+            "core.hooksPath".to_string(),
+            hooks.to_string_lossy().into_owned(),
+        )];
+        for (key, tail) in [
+            // Answers "no fsmonitor data", so git falls back to a scan.
+            ("core.fsmonitor", "exit 1"),
+            ("filter.hostile.clean", "cat"),
+            ("filter.hostile.smudge", "cat"),
+            ("uploadpack.packObjectsHook", "exec \"$@\""),
+            ("core.sshCommand", "exit 1"),
+            ("core.alternateRefsCommand", "exit 0"),
+            ("credential.helper", "exit 0"),
+            ("core.pager", "cat"),
+            ("core.editor", "exit 0"),
+            ("diff.external", "exit 0"),
+            ("gpg.program", "exit 1"),
+        ] {
+            let path = scripts.join(key);
+            script(&path, key, tail);
+            settings.push((key.to_string(), path.to_string_lossy().into_owned()));
+        }
+        settings.push(("filter.hostile.required".to_string(), "true".to_string()));
+        for (key, value) in settings {
+            super::git(Some(clone), &["config", &key, &value]).unwrap();
+        }
+        std::fs::write(clone.join(".gitattributes"), "* filter=hostile\n").unwrap();
+        host
+    }
+
+    /// Names of the markers in `dir`.
+    pub fn markers(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
     }
 }
 

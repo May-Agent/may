@@ -62,7 +62,6 @@ pub enum ToolVariant {
     WebFetch,
     Ask,
     Session,
-    Notify,
     Task,
     Generic,
 }
@@ -82,7 +81,6 @@ impl ToolVariant {
             "web_fetch" | "webfetch" => Self::WebFetch,
             "ask" => Self::Ask,
             "session" => Self::Session,
-            "notify" => Self::Notify,
             "task" => Self::Task,
             _ => Self::Generic,
         }
@@ -220,42 +218,8 @@ pub struct SseHoldEvent<'a> {
 pub struct SseTodoUpdateEvent {
     pub(crate) seq: u64,
     pub(crate) turn_id: String,
-    pub(crate) items: Vec<SseTodoItem>,
-    pub(crate) total: usize,
-    pub(crate) completed: usize,
-}
-
-#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
-pub struct SseTodoItem {
-    pub(crate) text: String,
-    pub(crate) checked: bool,
-}
-
-impl SseTodoUpdateEvent {
-    /// Build a todo-update payload with the given seq/turn context.
-    /// `From<&TodoChecklist>` was removed because the stream envelope
-    /// now carries ordering metadata that the checklist itself doesn't know.
-    #[must_use]
-    pub fn from_checklist(
-        checklist: &crate::todo_parser::TodoChecklist,
-        seq: u64,
-        turn_id: String,
-    ) -> Self {
-        Self {
-            seq,
-            turn_id,
-            items: checklist
-                .items
-                .iter()
-                .map(|item| SseTodoItem {
-                    text: item.text.clone(),
-                    checked: item.checked,
-                })
-                .collect(),
-            total: checklist.total(),
-            completed: checklist.completed(),
-        }
-    }
+    /// The rows of `tasks.md`'s row sections; empty once every row is gone.
+    pub(crate) rows: Vec<crate::task_rows::TaskRow>,
 }
 
 // ── Tool Event Records (stored in DB history) ───────────────
@@ -338,7 +302,6 @@ pub struct NotificationMailboxEntryResponse {
     pub(crate) delivered_at: Option<String>,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
-    pub(crate) has_callback: bool,
 }
 
 impl From<crate::db::entity::notification_mailbox::Model> for NotificationMailboxEntryResponse {
@@ -354,7 +317,6 @@ impl From<crate::db::entity::notification_mailbox::Model> for NotificationMailbo
             delivered_at: value.delivered_at,
             created_at: value.created_at,
             updated_at: value.updated_at,
-            has_callback: value.callback_context_xml.is_some() || value.callback_message.is_some(),
         }
     }
 }
@@ -363,18 +325,6 @@ impl From<crate::db::entity::notification_mailbox::Model> for NotificationMailbo
 #[serde(rename_all = "camelCase")]
 pub struct NotificationMailboxResponse {
     pub(crate) items: Vec<NotificationMailboxEntryResponse>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct NotificationCallbackResponse {
-    pub(crate) notification_id: String,
-    pub(crate) session_id: Option<String>,
-    pub(crate) profile_id: Option<String>,
-    pub(crate) has_callback: bool,
-    pub(crate) callback_consumed: bool,
-    pub(crate) callback_context_xml: Option<String>,
-    pub(crate) callback_message: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
@@ -494,6 +444,9 @@ pub struct SessionTasksPayload {
     pub(crate) content: String,
     #[serde(default)]
     pub(crate) plan_state: SessionPlanState,
+    /// The parsed rows of `content`; set by the daemon, ignored on save.
+    #[serde(default)]
+    pub(crate) rows: Vec<crate::task_rows::TaskRow>,
 }
 
 /// One `prs` row over the wire — the session's PR list entry.

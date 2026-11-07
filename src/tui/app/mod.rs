@@ -1856,12 +1856,7 @@ impl App {
     ///
     /// Panics if the session manager has no current session while a session is
     /// being initialized.
-    pub async fn init_session(
-        &mut self,
-        session_id: &SessionId,
-        messages: &[ChatMessage],
-        model: Option<&str>,
-    ) {
+    pub async fn init_session(&mut self, session_id: &SessionId, messages: &[ChatMessage]) {
         // Reset per-session UI state so /new starts from a clean screen in inline viewport mode.
         self.input.clear();
         self.cursor = 0;
@@ -1912,16 +1907,8 @@ impl App {
         // Reset usage tracking for new session
         self.usage = None;
 
-        // Set context window from model info
-        if let Some(model_name) = model {
-            if let Some(info) = aither_models::lookup(model_name) {
-                self.context_window = info.max_input_tokens();
-            } else {
-                self.context_window = None;
-            }
-        } else {
-            self.context_window = None;
-        }
+        // The daemon sends the window with the session's next usage.
+        self.context_window = None;
     }
 
     /// Handle an event. Returns Some(message) if user wants to send a message.
@@ -3955,10 +3942,9 @@ impl App {
             .session_paths(session.id.as_str(), session.profile_id.as_deref());
         match paths.tasks_content().await {
             Ok(content) => {
-                let checklist = crate::todo_parser::TodoChecklist::parse(
+                self.chat.set_todos(crate::task_rows::task_rows(
                     content.as_deref().unwrap_or_default(),
-                );
-                self.chat.set_todos(checklist.items);
+                ));
             }
             Err(error) => {
                 tracing::warn!(error = %error, "failed to read session tasks.md");
@@ -4194,6 +4180,14 @@ impl App {
         }
     }
 
+    /// The model response in flight is being sent again: drop what it
+    /// streamed, which the replacement does not continue.
+    pub fn retract_response(&mut self) {
+        self.chat.retract_response();
+        self.pending_tool_calls.retain(|_, pending| pending.started);
+        self.thinking_start = None;
+    }
+
     /// Handle an agent event. Returns true if stream ended.
     pub async fn handle_agent_event(&mut self, result: Result<TimedEvent, AgentError>) -> bool {
         match result {
@@ -4306,12 +4300,12 @@ impl App {
                     // by another in the same run (the harness re-prompting,
                     // a background command finishing): it starts a block of
                     // its own instead of being glued onto this one.
-                    AgentEvent::TurnComplete {
-                        has_tool_calls: false,
-                        ..
-                    } => {
-                        self.chat.end_text();
-                        self.decode_meter.note_boundary();
+                    AgentEvent::TurnComplete { has_tool_calls, .. } => {
+                        if !has_tool_calls {
+                            self.chat.end_text();
+                            self.decode_meter.note_boundary();
+                        }
+                        self.chat.seal_response();
                     }
                     AgentEvent::Complete { .. } => {
                         // Text was already streamed via AgentEvent::Text events
@@ -4422,7 +4416,7 @@ impl App {
         self.current_effort
             .as_deref()
             .or(self.config.last_effort.as_deref())
-            .unwrap_or("medium")
+            .unwrap_or(crate::models::DEFAULT_EFFORT)
     }
 
     /// The effort rungs `/effort` offers for the current model: the
@@ -4452,7 +4446,11 @@ impl App {
         self.effort_ladder
             .iter()
             .position(|rung| *rung == self.effective_effort())
-            .or_else(|| self.effort_ladder.iter().position(|rung| *rung == "medium"))
+            .or_else(|| {
+                self.effort_ladder
+                    .iter()
+                    .position(|rung| *rung == crate::models::DEFAULT_EFFORT)
+            })
             .unwrap_or(0)
     }
 
@@ -4472,15 +4470,12 @@ impl App {
 
     /// Set the current model being used.
     pub fn set_current_model(&mut self, model: &str) {
-        self.current_model = Some(model.to_string());
-        // Also update context window from model info
-        let lookup_model = model.parse::<crate::ModelSelector>().map_or_else(
-            |_| model.to_string(),
-            |selector| crate::models::effort_family_base(selector.model_id()),
-        );
-        if let Some(info) = aither_models::lookup(&lookup_model) {
-            self.context_window = info.max_input_tokens();
+        // The window belongs to the model: the daemon sends the new one
+        // with the next usage.
+        if self.current_model.as_deref() != Some(model) {
+            self.context_window = None;
         }
+        self.current_model = Some(model.to_string());
     }
 
     /// Get context usage information for display.
@@ -4539,6 +4534,9 @@ pub enum SendAction {
     /// Reload the session's history, which turns this client missed
     /// changed.
     ReloadHistory,
+    /// Raise a desktop notification through the terminal: a popup of some
+    /// session waits on the user.
+    DesktopNotification(Box<crate::notification::UserNotification>),
     /// Submit an ask-user response.
     RespondAskUser {
         /// ID of the pending ask-user request being answered.
@@ -5067,6 +5065,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_status_window_is_the_one_the_daemon_sent() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, id) = app_with_session(dir.path()).await;
+        app.usage = Some(aither_core::llm::Usage {
+            prompt_tokens: Some(1_000),
+            ..aither_core::llm::Usage::default()
+        });
+        // A model the table lacks: the client looks nothing up.
+        app.set_current_model("relay::relay-only-model");
+        assert_eq!(
+            app.context_usage(),
+            None,
+            "no window before the daemon sends one"
+        );
+
+        app.handle_event(AppEvent::ContextWindow {
+            session_id: "another-session".to_string(),
+            window: 1,
+        })
+        .expect("window frame");
+        assert_eq!(
+            app.context_usage(),
+            None,
+            "another session's window is ignored"
+        );
+
+        app.handle_event(AppEvent::ContextWindow {
+            session_id: id,
+            window: 262_144,
+        })
+        .expect("window frame");
+        assert_eq!(app.context_usage(), Some((1_000, 262_144)));
+
+        app.set_current_model("relay::another-model");
+        assert_eq!(
+            app.context_usage(),
+            None,
+            "a new model drops the old window"
+        );
+    }
+
+    #[tokio::test]
     async fn a_stored_recap_row_is_restored_as_a_card_when_history_reloads() {
         let dir = tempfile::tempdir().expect("dir");
         let (mut app, _id) = app_with_session(dir.path()).await;
@@ -5184,16 +5224,13 @@ mod tests {
             matches!(&elements[2], ChatElement::AssistantText { content, .. } if content == "None open.")
         );
         assert!(matches!(&elements[3], ChatElement::UserMessage { .. }));
-        let ChatElement::WorkedFor {
-            seconds,
-            elements: work,
-            ..
-        } = &elements[4]
-        else {
-            panic!("last turn is not folded: {:?}", elements[4]);
-        };
-        assert_eq!(*seconds, 10);
-        assert_eq!(commands(work), ["cat workspace.toml"]);
+        // A turn whose work is one command shows that command's own row.
+        assert_eq!(
+            commands(&elements[4..5]),
+            ["cat workspace.toml"],
+            "{:?}",
+            elements[4]
+        );
         assert!(
             matches!(&elements[5], ChatElement::AssistantText { content, .. } if content == "It is local.")
         );
@@ -5417,5 +5454,52 @@ mod tests {
         app.handle_key(KeyCode::Char('f'), KeyModifiers::CONTROL)
             .expect("key");
         assert!(!app.new_year.animating());
+    }
+
+    async fn effort_app(dir: &std::path::Path) -> App {
+        let (mut app, _) = app_with_session(dir).await;
+        app.current_effort = Some("medium".to_string());
+        app.effort_ladder = vec!["low", "medium", "high", "max"];
+        app.effort_index = app.effort_ladder_index();
+        app.mode = crate::tui::AppMode::EffortSelect;
+        app
+    }
+
+    #[tokio::test]
+    async fn effort_arrows_send_nothing_until_enter() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut app = effort_app(dir.path()).await;
+        assert!(press(&mut app, KeyCode::Right).is_none());
+        assert!(press(&mut app, KeyCode::Right).is_none());
+        assert!(press(&mut app, KeyCode::Left).is_none());
+        assert!(matches!(app.mode, crate::tui::AppMode::EffortSelect));
+        assert_eq!(app.current_effort.as_deref(), Some("medium"));
+        match press(&mut app, KeyCode::Enter) {
+            Some(SendAction::SetEffort(Some(effort))) => assert_eq!(effort, "high"),
+            _ => panic!("Enter must apply the highlighted level"),
+        }
+        assert!(matches!(app.mode, crate::tui::AppMode::Chat));
+    }
+
+    #[tokio::test]
+    async fn effort_escape_keeps_the_previous_effort() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut app = effort_app(dir.path()).await;
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
+        assert!(press(&mut app, KeyCode::Esc).is_none());
+        assert!(matches!(app.mode, crate::tui::AppMode::Chat));
+        assert_eq!(app.current_effort.as_deref(), Some("medium"));
+        assert_eq!(app.effective_effort(), "medium");
+    }
+
+    #[tokio::test]
+    async fn effort_panel_is_drawn_with_the_marker_under_the_heading() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut app = effort_app(dir.path()).await;
+        let screen = session_screen(&mut app).join("\n");
+        assert!(screen.contains("Effort"), "{screen}");
+        assert!(screen.contains("▲"), "{screen}");
+        assert!(screen.contains("Esc to cancel"), "{screen}");
     }
 }
