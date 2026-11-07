@@ -18,6 +18,7 @@ Paths are relative to the May source checkout. `aither-sandbox` and `aither-agen
 - `src/db/sql/chat_schema.sql` and `src/db/`: the SQLite schema behind `~/.may/history.db`.
 - `src/profile/mod.rs`: profiles (`daily`, `build`, `work` built in; one-shot and TUI use `build`).
 - `src/repo_clone.rs`: per-session repository clones under `repos/<slug>`.
+- `src/session/binding.rs`: `RepoBinding`, the session's repository binding stored in `sessions.repo` (`github:owner/repo` or `local:<repository identity>`; none for a repo-less chat), and the grouping helpers clients share. `src/repo_gate.rs`: `RepoGate`, run before a session's first turn by `gate_session_repo` in `src/daemon/chat/mod.rs` (asks the trust of a GitHub-bound session with no checkout, runs the checkout preflight in `src/repo_preflight.rs`, then binds the session).
 - `src/workspace.rs`: approved directories; the file is `workspace.toml` in the profile home.
 
 ## Terminal and sandbox
@@ -42,7 +43,8 @@ Paths are relative to the May source checkout. `aither-sandbox` and `aither-agen
 - `src/pr.rs`: `PrStore` (`resolve` clone choice and trust gate, `open`, `merge`, `merge_github`, `pull_sync`, `screen_outbound`), `check_pinned` (the project check on a throwaway checkout in the session's `tmp/`, in the sandbox), `push_pinned` (pushes from a bare repository in host scratch that fetched the commit), `land` (fetch `refs/may/<session>`, `merge-tree` preflight, overlap check, `--no-ff` merge), `gh` wrapper, `screen_with_llm`.
 - `src/agent/pr_tool.rs`: `PrCommand`, which builds the terminal-bound `PrTool` for each terminal (all subcommands for the main agent, `list` and `show` for a subagent); `src/agent/repo_tool.rs`: `repo trust`; `src/trust.rs`: trust levels.
 - `src/terminal_commands.rs`: `PrContext` construction and `configure_terminal_bound_tool("pr", …)`.
-- `src/workspace.rs`: `ProjectConfig.checks` and `ProjectPr` (`backend`, `screen`, `auto_merge`, `require_review`).
+- `src/workspace.rs`: `ProjectConfig.checks` and `ProjectPr` (`backend`, `screen`, `auto_merge`, `require_review`, `pull_sync`). A `[[projects]]` entry names a checkout by `path` or, for a GitHub repository trusted with no checkout, by `repository = "owner/repo"`. `pr.pull_sync = false` turns off the post-merge `git pull --ff-only` of every local checkout recorded for the repository (default on; failures are reported in the merge result and logged, never blocking): `src/pr/pull_sync.rs`.
+- A GitHub-bound session clones the remote and reads no local checkout; a local-bound one clones its checkout, and a clone based on the checkout's work in progress records the base commit in `session_repo_clones.base_sha`.
 - `src/db/pr.rs` and `prs` / `pr_events` in `src/db/sql/chat_schema.sql`: PR rows and the event trail.
 - `src/agent/permission.rs`: `for_subagent` and `SUBAGENT_APPROVAL_TIMEOUT` (no parent-approval step). `aither-agent/src/specialized/task.rs`: `worktrees` and `commit_worktrees` grants.
 
