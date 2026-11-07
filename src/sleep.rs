@@ -49,7 +49,7 @@ const MIN_HABIT_NIGHTS: usize = 5;
 const MAX_HABIT_DEVIATION_MINUTES: u32 = 60;
 
 /// Shifts a sleep time so that its local date names the night it belongs to
-/// (a night runs noon to noon, so 23:30 and 00:30 are two nights).
+/// (a night runs noon to noon, so 23:30 and the 00:30 after it are one night).
 const NIGHT_OFFSET: jiff::SignedDuration = jiff::SignedDuration::from_hours(12);
 
 /// Reminders are at least this far apart.
