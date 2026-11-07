@@ -226,6 +226,36 @@ impl TurnHub {
         published.notify(usize::MAX);
     }
 
+    /// Publishes a `kind` frame to every session that has a live
+    /// subscriber, `data_for` rendering each one's payload from its id.
+    pub(crate) fn publish_to_subscribed(
+        &self,
+        kind: &'static str,
+        data_for: impl Fn(&str) -> Arc<str>,
+    ) {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let published: Vec<_> = sessions
+            .iter_mut()
+            .filter(|(_, channel)| !channel.cursors.is_empty())
+            .map(|(session_id, channel)| {
+                channel.last_index += 1;
+                channel.frames.push_back(Arc::new(TurnFrame {
+                    index: channel.last_index,
+                    kind,
+                    data: data_for(session_id),
+                }));
+                channel.published.clone()
+            })
+            .collect();
+        drop(sessions);
+        for event in published {
+            event.notify(usize::MAX);
+        }
+    }
+
     /// Ends the session's turn; later subscribers read it from history.
     /// Subscriptions that have not read all of it still receive the rest.
     pub(crate) fn end_turn(&self, session_id: &str) {
