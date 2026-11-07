@@ -535,6 +535,52 @@ pub fn resolve_issue_store(
     )))
 }
 
+/// Resolve the issue store of a session bound to `binding`.
+///
+/// A GitHub binding uses the GitHub store when its project keeps issues on
+/// GitHub and the local store otherwise; a local binding always uses the
+/// local store, keyed by its repository identity. Without a binding the
+/// working directory decides ([`resolve_issue_store`]).
+///
+/// # Errors
+/// Returns [`IssueError::WorkspaceConfig`] when the workspace config cannot
+/// be loaded and [`IssueError::Identity`] when an unbound session's identity
+/// cannot be resolved.
+pub fn resolve_bound_issue_store(
+    binding: Option<&crate::session::RepoBinding>,
+    cwd: &Path,
+    workspace_config_path: &Path,
+    db: ChatDb,
+) -> Result<ResolvedIssueStore, IssueError> {
+    use crate::session::RepoBinding;
+    match binding {
+        None => resolve_issue_store(cwd, workspace_config_path, db),
+        Some(RepoBinding::Local(identity)) => Ok(ResolvedIssueStore::May(MayIssueStore::new(
+            db,
+            identity.display().to_string(),
+        ))),
+        Some(RepoBinding::Github(repository)) => {
+            let config = crate::workspace::WorkspaceConfig::load(workspace_config_path)?;
+            if let Some(crate::workspace::ProjectIssues::Github { repository }) = config
+                .project_for_github(repository)
+                .map(|project| &project.issues)
+            {
+                return Ok(ResolvedIssueStore::GitHub(GitHubIssueStore::new(
+                    repository.clone(),
+                    GhCliTokenSource,
+                )));
+            }
+            // Issues kept internal stay under the checkout's identity when
+            // there is one, so they do not move when a session is bound.
+            let key = repository_identity(cwd).map_or_else(
+                |_| format!("github:{repository}"),
+                |i| i.display().to_string(),
+            );
+            Ok(ResolvedIssueStore::May(MayIssueStore::new(db, key)))
+        }
+    }
+}
+
 /// The GitHub repository the workspace config assigns the project with
 /// `identity`, or `None` when the project has no entry or keeps its issues
 /// locally.
@@ -597,7 +643,8 @@ mod tests {
 
     fn github_project(path: std::path::PathBuf, repository: &str) -> ProjectConfig {
         ProjectConfig {
-            path,
+            path: Some(path),
+            repository: None,
             issues: ProjectIssues::Github {
                 repository: repository.parse().expect("owner/repo"),
             },

@@ -201,13 +201,84 @@ pub fn trust_for(
     repo_key: &Path,
     _worktree: &Path,
 ) -> Option<TrustLevel> {
-    let project = config.project_for_identity(repo_key)?;
-    Some(match (project.pr.backend.as_deref(), &project.issues) {
+    config.project_for_identity(repo_key).map(level_of)
+}
+
+/// The persisted trust for a GitHub repository, whether its `[[projects]]`
+/// entry holds a checkout or only the repository.
+#[must_use]
+pub fn trust_for_github(config: &WorkspaceConfig, owner_repo: &str) -> Option<TrustLevel> {
+    let repository = owner_repo.parse::<GitHubRepository>().ok()?;
+    config.project_for_github(&repository).map(level_of)
+}
+
+fn level_of(project: &ProjectConfig) -> TrustLevel {
+    match (project.pr.backend.as_deref(), &project.issues) {
         (Some("checkout"), _) => TrustLevel::Local,
         (Some("github"), ProjectIssues::Github { .. }) => TrustLevel::Full,
         (Some("github"), ProjectIssues::May) => TrustLevel::PrsOnly,
         _ => TrustLevel::LocalBranch,
-    })
+    }
+}
+
+/// Persist a trust decision for a GitHub repository with no local checkout.
+/// Only the levels that publish to GitHub apply: there is no checkout to
+/// clone locally or write.
+///
+/// # Errors
+/// Fails when the level does not publish to GitHub, `owner_repo` is not
+/// `owner/repo`, or the config cannot be read or written.
+pub fn persist_github(
+    config_path: &Path,
+    owner_repo: &str,
+    level: TrustLevel,
+) -> Result<(), WorkspaceConfigError> {
+    let invalid = |message: String| {
+        WorkspaceConfigError::Read(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            message,
+        ))
+    };
+    if !level.publishes_to_github() {
+        return Err(invalid(format!(
+            "{} needs a local checkout; {owner_repo} has none",
+            level.as_str()
+        )));
+    }
+    let repository = owner_repo
+        .parse::<GitHubRepository>()
+        .map_err(|e| invalid(e.to_string()))?;
+    let mut config = WorkspaceConfig::load(config_path)?;
+    let issues = if level == TrustLevel::Full {
+        ProjectIssues::Github {
+            repository: repository.clone(),
+        }
+    } else {
+        ProjectIssues::May
+    };
+    let screen = (level == TrustLevel::PrsOnly).then_some(true);
+    if let Some(entry) = config
+        .projects
+        .iter_mut()
+        .find(|p| p.covers_github(&repository))
+    {
+        entry.issues = issues;
+        entry.pr.backend = Some("github".to_string());
+        entry.pr.screen = screen;
+    } else {
+        config.projects.push(ProjectConfig {
+            path: None,
+            repository: Some(repository),
+            issues,
+            checks: None,
+            pr: ProjectPr {
+                backend: Some("github".to_string()),
+                screen,
+                ..ProjectPr::default()
+            },
+        });
+    }
+    config.save(config_path)
 }
 
 /// Persist a trust decision to `workspace.toml`.
@@ -250,6 +321,22 @@ pub fn persist(
         _ => None,
     };
     let screen = (level == TrustLevel::PrsOnly).then_some(true);
+    // A repository trusted before it had a checkout adopts this one.
+    let adopted = match kind {
+        Some(RepoKind::Github { owner_repo }) => owner_repo
+            .parse::<GitHubRepository>()
+            .ok()
+            .and_then(|repository| {
+                config
+                    .projects
+                    .iter()
+                    .position(|p| p.path.is_none() && p.repository.as_ref() == Some(&repository))
+            }),
+        _ => None,
+    };
+    if let Some(index) = adopted {
+        config.projects[index].path = Some(worktree.to_path_buf());
+    }
     if let Some(entry) = config
         .projects
         .iter_mut()
@@ -260,7 +347,8 @@ pub fn persist(
         entry.pr.screen = screen;
     } else {
         config.projects.push(ProjectConfig {
-            path: worktree.to_path_buf(),
+            path: Some(worktree.to_path_buf()),
+            repository: None,
             issues,
             checks: None,
             pr: ProjectPr {
@@ -285,6 +373,38 @@ pub(crate) fn config_at(dir: &Path, worktree: &Path, level: TrustLevel) -> Works
     let path = dir.join("workspace.toml");
     persist(&path, worktree, Some(&repo_kind(worktree)), level).expect("persist trust");
     WorkspaceConfig::load(&path).expect("load trust")
+}
+
+#[derive(askama::Template)]
+#[template(path = "repo_trust_remote_question.txt", escape = "none")]
+struct RemoteQuestionText<'a> {
+    owner_repo: &'a str,
+}
+
+/// The first-contact question for a GitHub repository with no local
+/// checkout: only the levels that publish to GitHub apply, and the answer
+/// is read with [`level_for_answer`].
+///
+/// # Panics
+/// Never: the template renders for every input.
+#[must_use]
+pub fn remote_question(owner_repo: &str) -> crate::ask_user::Question {
+    use askama::Template as _;
+    crate::ask_user::Question {
+        section: "repo-trust".to_string(),
+        question: RemoteQuestionText { owner_repo }
+            .render()
+            .expect("the remote trust question renders")
+            .trim()
+            .to_string(),
+        option: vec![
+            "full — Allow GitHub PRs and issues".to_string(),
+            "prs-only — GitHub PRs only; issues stay internal, published text is screened"
+                .to_string(),
+            "exit — Do not bind this repository".to_string(),
+        ],
+        multi_select: false,
+    }
 }
 
 /// The first-contact `ask_user` request for one repository.
@@ -391,7 +511,8 @@ mod tests {
     fn seed_project(config_path: &Path, repo: &Path) {
         let config = WorkspaceConfig {
             projects: vec![ProjectConfig {
-                path: repo.to_path_buf(),
+                path: Some(repo.to_path_buf()),
+                repository: None,
                 issues: ProjectIssues::May,
                 checks: Some("cargo test".to_string()),
                 pr: ProjectPr {
@@ -488,7 +609,8 @@ mod tests {
         let sub = repo.path().join("sub");
         std::fs::create_dir(&sub).expect("mkdir");
         let entry = |path: &Path| ProjectConfig {
-            path: path.to_path_buf(),
+            path: Some(path.to_path_buf()),
+            repository: None,
             issues: ProjectIssues::May,
             checks: None,
             pr: ProjectPr::default(),
@@ -512,7 +634,8 @@ mod tests {
         let repo = git_repo();
         let mut config = WorkspaceConfig::default();
         config.projects.push(ProjectConfig {
-            path: repo.path().to_path_buf(),
+            path: Some(repo.path().to_path_buf()),
+            repository: None,
             issues: ProjectIssues::May,
             checks: None,
             pr: ProjectPr {

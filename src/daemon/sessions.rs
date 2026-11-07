@@ -198,10 +198,17 @@ async fn issue_briefs(
     let store = SessionStore::new(MayHomePaths::new(state.may_dir.clone()));
     let sandbox_dir = store.sandbox_dir(&id, session.profile_id.as_deref());
     let workspace_config = crate::session::SessionPaths::new(sandbox_dir).workspace_config();
-    let issue_store =
-        blocking::unblock(move || crate::issue::resolve_issue_store(&cwd, &workspace_config, db))
-            .await
-            .map_err(internal_error)?;
+    let binding = session
+        .repo
+        .as_deref()
+        .map(crate::session::RepoBinding::parse)
+        .transpose()
+        .map_err(internal_error)?;
+    let issue_store = blocking::unblock(move || {
+        crate::issue::resolve_bound_issue_store(binding.as_ref(), &cwd, &workspace_config, db)
+    })
+    .await
+    .map_err(internal_error)?;
     let mut briefs = Vec::with_capacity(numbers.len());
     for number in numbers {
         let brief = match issue_store.get(number).await {

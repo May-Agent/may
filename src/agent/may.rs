@@ -596,27 +596,49 @@ impl MayAgent {
             config.db.clone(),
         );
         let mut repo_clones = Vec::new();
-        if let Some(worktree) = crate::repo_search::worktree_root(&config.cwd) {
-            // The first-contact trust decision picks the binding: full and
-            // prs-only clone the GitHub remote, local-branch clones the
-            // checkout locally; `local` writes the checkout; undecided binds
-            // nothing — the launch gate asks before the session starts.
-            match session_repos
-                .ensure_clone_of(
-                    &worktree,
-                    &workspace.config,
-                    &crate::session::MayHomePaths::new(config.may_dir.clone()).repo_staging_dir(),
-                )
-                .await
-            {
-                Ok(Some(clone_path)) => repo_clones.push(RepoCloneEntry {
-                    clone_path,
-                    source: crate::fs_utils::display_path(&worktree),
-                }),
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::warn!(%error, "failed to create session repo clone");
-                }
+        let staging = crate::session::MayHomePaths::new(config.may_dir.clone()).repo_staging_dir();
+        // The session's repository binding names the clone; a GitHub binding
+        // needs no checkout at all. Without one, the launch directory's
+        // repository decides.
+        let binding = match config.db.get_session(config.session_id.as_str()).await {
+            Ok(row) => row
+                .and_then(|row| row.repo)
+                .and_then(|stored| crate::session::RepoBinding::parse(&stored).ok()),
+            Err(error) => {
+                tracing::warn!(%error, "failed to read the session's repository binding");
+                None
+            }
+        };
+        let worktree = crate::repo_search::worktree_root(&config.cwd);
+        // The first-contact trust decision picks the clone: full and
+        // prs-only clone the GitHub remote, local-branch clones the checkout
+        // locally; `local` writes the checkout; undecided binds nothing — the
+        // session gate asks before the first turn.
+        let made = match (&binding, &worktree) {
+            (Some(binding), _) => {
+                session_repos
+                    .ensure_clone_of_binding(binding, &workspace.config, &staging)
+                    .await
+            }
+            (None, Some(worktree)) => {
+                session_repos
+                    .ensure_clone_of(worktree, &workspace.config, &staging)
+                    .await
+            }
+            (None, None) => Ok(None),
+        };
+        match made {
+            Ok(Some(clone_path)) => repo_clones.push(RepoCloneEntry {
+                clone_path,
+                source: match (&binding, &worktree) {
+                    (_, Some(worktree)) => crate::fs_utils::display_path(worktree),
+                    (Some(binding), None) => binding.clone_key(),
+                    (None, None) => unreachable!("a clone needs a binding or a checkout"),
+                },
+            }),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(%error, "failed to create session repo clone");
             }
         }
         if let Some(repo_clones) =
@@ -661,7 +683,8 @@ impl MayAgent {
         let ask_balanced = config.ask_models.balanced.clone();
         let ask_fast = config.ask_models.fast.clone();
 
-        let issue_store = crate::issue::resolve_issue_store(
+        let issue_store = crate::issue::resolve_bound_issue_store(
+            binding.as_ref(),
             &config.cwd,
             &session_paths.workspace_config(),
             config.db.clone(),

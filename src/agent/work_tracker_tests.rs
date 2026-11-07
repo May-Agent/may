@@ -200,6 +200,7 @@ async fn a_qualified_pr_reads_in_the_clone_of_its_repository() {
                 dir: dir.to_string(),
                 source: format!("https://github.com/{repo_key}.git"),
                 local: false,
+                base_sha: None,
             },
         )
         .await

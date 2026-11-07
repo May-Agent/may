@@ -90,7 +90,7 @@ CREATE TABLE IF NOT EXISTS pr_events (id INTEGER PRIMARY KEY AUTOINCREMENT, pr_i
 CREATE INDEX IF NOT EXISTS idx_pr_events_pr ON pr_events(pr_id);
 CREATE TABLE IF NOT EXISTS issue_provenance (id INTEGER PRIMARY KEY AUTOINCREMENT, backend TEXT NOT NULL, repository TEXT NOT NULL, issue_number INTEGER NOT NULL, comment_id INTEGER, action TEXT NOT NULL, detail TEXT, session_id TEXT NOT NULL, agent TEXT NOT NULL, tool_call_id TEXT, recorded_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_issue_provenance_issue ON issue_provenance(backend, repository, issue_number);
-CREATE TABLE IF NOT EXISTS session_repo_clones (session_id TEXT NOT NULL, repo_key TEXT NOT NULL, dir TEXT NOT NULL, source TEXT NOT NULL, local BOOLEAN NOT NULL, PRIMARY KEY (session_id, repo_key));
+CREATE TABLE IF NOT EXISTS session_repo_clones (session_id TEXT NOT NULL, repo_key TEXT NOT NULL, dir TEXT NOT NULL, source TEXT NOT NULL, local BOOLEAN NOT NULL, base_sha TEXT, PRIMARY KEY (session_id, repo_key));
 CREATE TABLE IF NOT EXISTS session_intervals (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, kind TEXT NOT NULL, start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_session_intervals_session ON session_intervals(session_id);
 CREATE TABLE IF NOT EXISTS prompt_cache_routes (session_id TEXT NOT NULL, provider_id TEXT NOT NULL, model TEXT NOT NULL, observed_at_ms INTEGER NOT NULL, cache_read_tokens INTEGER NOT NULL, cache_write_tokens INTEGER, chain BLOB NOT NULL, PRIMARY KEY (session_id, provider_id, model));
