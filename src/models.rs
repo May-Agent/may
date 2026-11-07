@@ -472,6 +472,9 @@ pub fn record_family_effort_rungs(rungs: &mut FamilyEffortRungs, models: &[Fetch
     }
 }
 
+/// The level a session uses before any selection.
+pub const DEFAULT_EFFORT: &str = "medium";
+
 /// The reasoning-effort ladder a provider's wire protocol expresses.
 ///
 /// Every rung is concrete — the session's effort is the one it last selected, and
