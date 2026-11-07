@@ -72,8 +72,20 @@ pub struct SleepStatus {
     pub reminders: u64,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+/// The version of the persisted file; a file of another version is dropped
+/// at load and the state starts fresh.
+const SLEEP_FORMAT: u32 = 1;
+
+/// Reads a persisted file's version before its shape is assumed.
+#[derive(Deserialize)]
+struct FormatHeader {
+    #[serde(default)]
+    format: u32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 struct Persisted {
+    format: u32,
     asleep: bool,
     origin: Option<String>,
     /// When the state began, Unix milliseconds.
@@ -82,13 +94,27 @@ struct Persisted {
     /// they woke.
     told: BTreeSet<String>,
     /// How the last sleep ended, told to each session with the wake.
-    #[serde(default)]
-    woke: Option<WakeCause>,
+    woke: WakeCause,
     #[serde(skip)]
     reminders: u64,
     /// When the last reminder was raised, Unix milliseconds; kept so the
     /// spacing holds across restarts.
     last_reminded_ms: Option<i64>,
+}
+
+impl Default for Persisted {
+    fn default() -> Self {
+        Self {
+            format: SLEEP_FORMAT,
+            asleep: false,
+            origin: None,
+            since_ms: None,
+            told: BTreeSet::new(),
+            woke: WakeCause::default(),
+            reminders: 0,
+            last_reminded_ms: None,
+        }
+    }
 }
 
 impl Persisted {
@@ -102,9 +128,10 @@ impl Persisted {
 }
 
 /// How a sleep ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WakeCause {
     /// The user ran `/sleep off`.
+    #[default]
     SleepOff,
     /// The user sent a message after sleeping at least [`MIN_SLEEP`].
     UserWrote,
@@ -142,8 +169,21 @@ impl SleepState {
     pub fn load(may_dir: &Path, bus: UiEventBus, db: ChatDb) -> Self {
         let path = may_dir.join(STATE_FILE);
         let persisted = match std::fs::read_to_string(&path) {
-            Ok(text) => serde_json::from_str::<Persisted>(&text)
-                .unwrap_or_else(|error| panic!("{} is not valid: {error}", path.display())),
+            Ok(text) => {
+                let header = serde_json::from_str::<FormatHeader>(&text)
+                    .unwrap_or_else(|error| panic!("{} is not valid: {error}", path.display()));
+                if header.format == SLEEP_FORMAT {
+                    serde_json::from_str::<Persisted>(&text)
+                        .unwrap_or_else(|error| panic!("{} is not valid: {error}", path.display()))
+                } else {
+                    tracing::info!(
+                        found = header.format,
+                        expected = SLEEP_FORMAT,
+                        "dropping the sleep state of another format"
+                    );
+                    Persisted::default()
+                }
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Persisted::default(),
             Err(error) => panic!("cannot read {}: {error}", path.display()),
         };
@@ -179,7 +219,6 @@ impl SleepState {
         inner.asleep = true;
         inner.origin = Some(origin.to_owned());
         inner.since_ms = Some(now.as_millisecond());
-        inner.woke = None;
         // The session that ran the command is told again even if it never
         // heard the previous wake.
         inner.told.remove(origin);
@@ -228,7 +267,7 @@ impl SleepState {
         inner.asleep = false;
         inner.origin = None;
         inner.since_ms = None;
-        inner.woke = Some(cause);
+        inner.woke = cause;
         self.commit(inner).await?;
         Ok(true)
     }
@@ -237,9 +276,6 @@ impl SleepState {
     ///
     /// # Errors
     /// When the state cannot be persisted.
-    ///
-    /// # Panics
-    /// When a session is owed a wake but the state records no cause.
     pub async fn take_notice(&self, session_id: &str) -> std::io::Result<Option<SleepNotice>> {
         let mut inner = self.inner.lock().await;
         let told = inner.told.contains(session_id);
@@ -252,7 +288,7 @@ impl SleepState {
             }
             (false, true) => {
                 inner.told.remove(session_id);
-                SleepNotice::Woke(inner.woke.expect("a wake records how the sleep ended"))
+                SleepNotice::Woke(inner.woke)
             }
             _ => return Ok(None),
         };
@@ -535,6 +571,19 @@ mod tests {
                 Some(SleepNotice::Woke(WakeCause::UserWrote))
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_file_of_an_older_format_loads_as_a_fresh_state() {
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::write(
+            dir.path().join(STATE_FILE),
+            r#"{"asleep":false,"origin":null,"since_ms":null,"told":["a"],"last_reminded_ms":null}"#,
+        )
+        .expect("write");
+        let (sleep, _) = state(dir.path()).await;
+        assert!(!sleep.is_asleep());
+        assert_eq!(sleep.take_notice("a").await.unwrap(), None);
     }
 
     #[tokio::test]
