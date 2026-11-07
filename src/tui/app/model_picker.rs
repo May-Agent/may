@@ -319,21 +319,24 @@ impl App {
         None
     }
 
-    /// Handle key in the effort select popup: ←/→ steps the ladder and
-    /// applies at once, Enter/Esc closes.
+    /// Handle key in the effort select panel: ←/→ moves the highlight
+    /// without applying it, Enter applies it and closes, Esc closes with the
+    /// effort unchanged.
     pub(super) fn handle_effort_select_key(&mut self, code: KeyCode) -> Option<SendAction> {
         match code {
             KeyCode::Left | KeyCode::Char('h') => {
                 self.effort_index = self.effort_index.saturating_sub(1);
-                return self.selected_effort();
             }
             KeyCode::Right | KeyCode::Char('l') => {
                 if self.effort_index + 1 < self.effort_ladder.len() {
                     self.effort_index += 1;
                 }
+            }
+            KeyCode::Enter => {
+                self.mode = AppMode::Chat;
                 return self.selected_effort();
             }
-            KeyCode::Enter | KeyCode::Esc => {
+            KeyCode::Esc => {
                 self.mode = AppMode::Chat;
             }
             _ => {}

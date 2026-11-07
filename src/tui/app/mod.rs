@@ -4393,7 +4393,7 @@ impl App {
         self.current_effort
             .as_deref()
             .or(self.config.last_effort.as_deref())
-            .unwrap_or("medium")
+            .unwrap_or(crate::models::DEFAULT_EFFORT)
     }
 
     /// The effort rungs `/effort` offers for the current model: the
@@ -4423,7 +4423,11 @@ impl App {
         self.effort_ladder
             .iter()
             .position(|rung| *rung == self.effective_effort())
-            .or_else(|| self.effort_ladder.iter().position(|rung| *rung == "medium"))
+            .or_else(|| {
+                self.effort_ladder
+                    .iter()
+                    .position(|rung| *rung == crate::models::DEFAULT_EFFORT)
+            })
             .unwrap_or(0)
     }
 
@@ -5263,5 +5267,52 @@ mod tests {
             app.mode,
             crate::tui::AppMode::PermissionConfirm(_)
         ));
+    }
+
+    async fn effort_app(dir: &std::path::Path) -> App {
+        let (mut app, _) = app_with_session(dir).await;
+        app.current_effort = Some("medium".to_string());
+        app.effort_ladder = vec!["low", "medium", "high", "max"];
+        app.effort_index = app.effort_ladder_index();
+        app.mode = crate::tui::AppMode::EffortSelect;
+        app
+    }
+
+    #[tokio::test]
+    async fn effort_arrows_send_nothing_until_enter() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut app = effort_app(dir.path()).await;
+        assert!(press(&mut app, KeyCode::Right).is_none());
+        assert!(press(&mut app, KeyCode::Right).is_none());
+        assert!(press(&mut app, KeyCode::Left).is_none());
+        assert!(matches!(app.mode, crate::tui::AppMode::EffortSelect));
+        assert_eq!(app.current_effort.as_deref(), Some("medium"));
+        match press(&mut app, KeyCode::Enter) {
+            Some(SendAction::SetEffort(Some(effort))) => assert_eq!(effort, "high"),
+            _ => panic!("Enter must apply the highlighted level"),
+        }
+        assert!(matches!(app.mode, crate::tui::AppMode::Chat));
+    }
+
+    #[tokio::test]
+    async fn effort_escape_keeps_the_previous_effort() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut app = effort_app(dir.path()).await;
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
+        assert!(press(&mut app, KeyCode::Esc).is_none());
+        assert!(matches!(app.mode, crate::tui::AppMode::Chat));
+        assert_eq!(app.current_effort.as_deref(), Some("medium"));
+        assert_eq!(app.effective_effort(), "medium");
+    }
+
+    #[tokio::test]
+    async fn effort_panel_is_drawn_with_the_marker_under_the_heading() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut app = effort_app(dir.path()).await;
+        let screen = session_screen(&mut app).join("\n");
+        assert!(screen.contains("Effort"), "{screen}");
+        assert!(screen.contains("▲"), "{screen}");
+        assert!(screen.contains("Esc to cancel"), "{screen}");
     }
 }
