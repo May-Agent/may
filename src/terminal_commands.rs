@@ -148,7 +148,8 @@ pub enum TerminalCommandsError {
     Signing(#[from] crate::commit_signing::SigningError),
 }
 
-/// Register every shared IPC command on the terminal tool's command registry.
+/// Register every shared IPC command on the terminal tool's command registry,
+/// and May's command policies on every script its terminals run.
 ///
 /// # Errors
 /// Returns the registry error when a command fails to register.
@@ -164,6 +165,7 @@ where
     LLM: LanguageModel + Clone + 'static,
 {
     let mut descriptions = Vec::new();
+    crate::command_policy::register(builder);
 
     if !config.request_parameters.hosted_web_fetch() {
         register_tool_with_description(builder, &mut descriptions, WebFetchTool::new());

@@ -4,7 +4,7 @@
 
 Terminal commands run in a managed GNU bash 5.3.20 (pinned for macOS arm64, Linux arm64 and Linux x86_64), not in the system `sh` or the user's login shell. It is started as `bash --noprofile --norc -c <script>`: no startup file is read, so a script behaves the same on every machine. Local sandboxed, `unsafe` host, SSH and container runs all use the managed bash (a container image carries the same pinned tools). Windows has no managed bash.
 
-Ahead of the script the shell defines functions, visible only to that shell and not to child processes: `grep`, `awk` and `find` fail with a message naming the replacement (`rg`; `python3` or `jq`; `fd`), and `sed` runs `aither-sed`, which only prints line ranges (`sed -n '2,3p' file`) and refuses everything else. A child process (a Makefile, a `python3 -c "import subprocess..."`) still reaches the system programs.
+Before a script runs, May refuses it when the script's own shell would run `grep`, `awk` or `find` (the refusal names the replacement: `rg`; `python3` or `jq`; `fd`), or `sed` in any form but the line ranges `aither-sed` prints (`sed -n '2,3p' file`). The rule binds only the script's own shell, `time` and `eval` included: a program named by path, run through a wrapper such as `env`, `xargs` or `command`, or by another shell (`sh -c`, a Makefile, a `python3 -c "import subprocess..."`) still reaches the system programs. A script that kills processes by name or pattern, a shell script that does not parse, a foreground `sleep`, and a script that only re-reads files unchanged since their last successful read are refused the same way.
 
 ## What May provides
 

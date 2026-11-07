@@ -702,6 +702,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aither-sed"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a67e156387cad8524310c73acde8d0c9a5c74015256db740eacc10dbdf4cb61"
+dependencies = [
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "aither-skills"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5723,6 +5732,7 @@ dependencies = [
  "aither-mcp 0.23.0",
  "aither-models",
  "aither-sandbox 0.23.0",
+ "aither-sed",
  "anyhow",
  "arboard",
  "arc-swap",

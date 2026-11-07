@@ -23,6 +23,8 @@ pub mod chatgpt;
 pub mod client;
 /// Configuration loading and types.
 pub mod command_output;
+/// May's rules on what a terminal script may run.
+pub mod command_policy;
 /// One virtual desktop per session — computer use.
 pub mod computer;
 pub mod config;
