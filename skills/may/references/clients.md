@@ -14,6 +14,7 @@ Every client is a front end of the one daemon; a turn started in one is visible 
 
 Typing sends: Enter sends the line. While the agent is working, Enter steers (interrupts the turn with the new message) and Tab queues the message to run after the turn. Tab also accepts a shown prompt suggestion. A turn stopped before any output puts the sent text back in the input.
 
+- Layout: the chat and the input share a two-column side margin. The input and the status line (`cwd · model · tok/s · index`, context size on the right) sit in one full-width band with a slightly different shade from the terminal background (lighter on dark themes, darker on light ones, read from the terminal at startup; the terminal's default background when it does not answer), one padding row above and below, one blank row between input and status, and one plain row between the chat and the band. Queued-message lines stay above the band.
 - `/` opens the slash palette (see `slash-commands.md`); `@` opens file-mention completion, inserting the path of a file from the working directory or sandbox.
 - `! command` runs a bash command in May's environment; its masked output is returned to the agent as the next message. Never type secrets there; use `/secret`.
 - Ctrl+V pastes (an image becomes an attachment); a multi-line or large paste becomes an attachment file.
