@@ -302,3 +302,66 @@ async fn a_recipient_without_a_published_request_is_refused() {
     let error = host.ask(QUESTION).await.expect_err("nothing to fork");
     assert!(matches!(error, AgentLinkError::NoForkContext(_)), "{error}");
 }
+
+/// A side request answers from the context of a recipient that is in the
+/// middle of a turn, reflecting what the turn has added so far, and the
+/// recipient's turn sends the same requests it would have without it.
+#[tokio::test]
+async fn a_side_request_reads_the_context_of_a_running_turn() {
+    use futures_lite::StreamExt as _;
+
+    let stub = StubModel::spawn_scripted(SESSION_MODEL, |body| {
+        body.contains(QUESTION)
+            .then(|| StubReply::Text(ANSWER.to_string()))
+    })
+    .await;
+    let host = Host::new().await;
+    let mut session = host.recipient(&stub).await;
+    let session_id = session.parts.session_id.as_str().to_string();
+
+    let (answer, ()) = tokio::join!(
+        async {
+            let side = host
+                .messaging
+                .side_context(&session_id)
+                .await
+                .expect("the side request is allowed")
+                .expect("the recipient has a live agent");
+            let mut messages = side.messages;
+            messages.push(aither_core::llm::Message::user(QUESTION));
+            let mut answer = String::new();
+            let mut stream = std::pin::pin!(side.model.respond(messages.clone()));
+            while let Some(event) = stream.next().await {
+                if let aither_core::llm::Event::Text(text) = event.expect("the model answers") {
+                    answer.push_str(&text);
+                }
+            }
+            (answer, format!("{messages:?}"))
+        },
+        async {
+            let _ = session
+                .agent
+                .run("Keep working.", [])
+                .drive((), std::future::pending::<()>(), |(), _| async {
+                    std::ops::ControlFlow::Continue(())
+                })
+                .await
+                .expect("the recipient's turn runs");
+        }
+    );
+    let (answer, context) = answer;
+    assert_eq!(answer, ANSWER);
+    assert!(
+        context.contains(FACT) && context.contains("Say hello."),
+        "the side request holds the recipient's context: {context}"
+    );
+
+    let own = requests_with(&stub, "Keep working.").await;
+    assert!(!own.is_empty(), "the recipient's turn reached the model");
+    for body in own {
+        assert!(
+            !body.contains(QUESTION) && !body.contains(ANSWER),
+            "the recipient's request carries the side request: {body}"
+        );
+    }
+}

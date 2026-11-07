@@ -131,6 +131,9 @@ pub struct SharedTerminalCommands {
     /// Where the main agent publishes its requests for the `subagent` command's
     /// `fork` kind; the main agent's builder must be given it.
     pub fork_source: aither_agent::ForkSource,
+    /// Receives the main agent's terminal launcher, which the read-only
+    /// forks answering side requests run their terminal on.
+    pub fork_launcher: crate::agent_link::ForkLauncher,
 }
 
 /// Why the shared terminal commands could not be registered.
@@ -362,9 +365,11 @@ where
         );
     }
 
+    let fork_launcher = crate::agent_link::ForkLauncher::default();
     if let Some(messaging) = config.agent_messaging {
         let mut btw =
-            crate::agent_link::BtwCommand::new(messaging.clone(), config.session_id.clone());
+            crate::agent_link::BtwCommand::new(messaging.clone(), config.session_id.clone())
+                .with_fork_launcher(fork_launcher.clone());
         if let Some(guard) = &config.languages {
             btw = btw.with_languages(guard.clone());
         }
@@ -492,6 +497,7 @@ where
     Ok(SharedTerminalCommands {
         descriptions,
         fork_source,
+        fork_launcher,
     })
 }
 
