@@ -12,7 +12,12 @@
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
-  <true/>
+  <{{ keep_alive }}/>
+  <key>EnvironmentVariables</key>
+  <dict>
+{% for (key, value) in environment %}    <key>{{ key }}</key>
+    <string>{{ value }}</string>
+{% endfor %}  </dict>
   <key>StandardOutPath</key>
   <string>{{ log }}</string>
   <key>StandardErrorPath</key>
