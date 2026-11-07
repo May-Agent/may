@@ -1182,6 +1182,7 @@ mod tests {
             working_dir: &work,
             worktrees: &[],
             commit_worktrees: &[],
+            working_copies: &[],
         };
         let open = || async {
             tokio::time::timeout(
@@ -1309,6 +1310,7 @@ mod tests {
                     working_dir: dir.path(),
                     worktrees,
                     commit_worktrees,
+                    working_copies: &[],
                 },
             )
             .await

@@ -9,7 +9,9 @@
 
 use std::time::{Duration, Instant};
 
-use aither_sandbox::{Delivery, JobInfo, JobStatus, TerminalMode};
+use aither_sandbox::{
+    Delivery, JobInfo, JobPlace, JobStatus, KillCause, MemoryDomain, ScriptLanguage, TerminalMode,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::agent::SubagentRunSnapshot;
@@ -34,11 +36,112 @@ pub enum WireJobStatus {
         /// Whether the agent has taken the completion.
         delivery: WireDelivery,
     },
-    /// Killed by the user.
+    /// Killed.
     Killed {
+        /// Why it was killed.
+        cause: WireKillCause,
         /// Whether the agent has taken the completion.
         delivery: WireDelivery,
     },
+}
+
+/// Why a job was killed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, skyzen::ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WireKillCause {
+    /// A request ended it.
+    User,
+    /// Its home environment ran out of memory and it was left running.
+    MemoryRunaway {
+        /// The tree's physical footprint when it was killed.
+        footprint_bytes: u64,
+        /// The memory of the domain it ran in.
+        capacity_bytes: u64,
+        /// The domain it ran in.
+        domain: WireMemoryDomain,
+    },
+}
+
+/// The memory a runaway job exhausted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WireMemoryDomain {
+    /// The machine the daemon runs on.
+    Machine,
+    /// The container the agent works in.
+    Container,
+}
+
+/// Where a job runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WireJobPlace {
+    /// A process of the machine the daemon runs on.
+    Host,
+    /// A process inside the container the agent works in.
+    Container,
+    /// A process on a remote host over SSH.
+    Remote,
+}
+
+impl From<KillCause> for WireKillCause {
+    fn from(cause: KillCause) -> Self {
+        match cause {
+            KillCause::User => Self::User,
+            KillCause::MemoryRunaway {
+                footprint_bytes,
+                capacity_bytes,
+                domain,
+            } => Self::MemoryRunaway {
+                footprint_bytes,
+                capacity_bytes,
+                domain: match domain {
+                    MemoryDomain::Machine => WireMemoryDomain::Machine,
+                    MemoryDomain::Container => WireMemoryDomain::Container,
+                },
+            },
+        }
+    }
+}
+
+impl From<WireKillCause> for KillCause {
+    fn from(cause: WireKillCause) -> Self {
+        match cause {
+            WireKillCause::User => Self::User,
+            WireKillCause::MemoryRunaway {
+                footprint_bytes,
+                capacity_bytes,
+                domain,
+            } => Self::MemoryRunaway {
+                footprint_bytes,
+                capacity_bytes,
+                domain: match domain {
+                    WireMemoryDomain::Machine => MemoryDomain::Machine,
+                    WireMemoryDomain::Container => MemoryDomain::Container,
+                },
+            },
+        }
+    }
+}
+
+impl From<JobPlace> for WireJobPlace {
+    fn from(place: JobPlace) -> Self {
+        match place {
+            JobPlace::Host => Self::Host,
+            JobPlace::Container => Self::Container,
+            JobPlace::Remote => Self::Remote,
+        }
+    }
+}
+
+impl From<WireJobPlace> for JobPlace {
+    fn from(place: WireJobPlace) -> Self {
+        match place {
+            WireJobPlace::Host => Self::Host,
+            WireJobPlace::Container => Self::Container,
+            WireJobPlace::Remote => Self::Remote,
+        }
+    }
 }
 
 /// Whether a finished job's completion has reached its agent.
@@ -84,7 +187,8 @@ impl From<&JobStatus> for WireJobStatus {
                 error: error.clone(),
                 delivery: (*delivery).into(),
             },
-            JobStatus::Killed { delivery } => Self::Killed {
+            JobStatus::Killed { cause, delivery } => Self::Killed {
+                cause: (*cause).into(),
                 delivery: (*delivery).into(),
             },
         }
@@ -106,7 +210,8 @@ impl From<WireJobStatus> for JobStatus {
                 error,
                 delivery: delivery.into(),
             },
-            WireJobStatus::Killed { delivery } => Self::Killed {
+            WireJobStatus::Killed { cause, delivery } => Self::Killed {
+                cause: cause.into(),
                 delivery: delivery.into(),
             },
         }
@@ -125,6 +230,11 @@ pub struct WireJob {
     pub execution_key: String,
     /// The script it runs.
     pub script: String,
+    /// The language of the script.
+    #[schema(value_type = String)]
+    pub language: ScriptLanguage,
+    /// Where it runs.
+    pub place: WireJobPlace,
     /// Permission mode.
     #[schema(value_type = String)]
     pub mode: TerminalMode,
@@ -156,6 +266,8 @@ impl From<&JobInfo> for WireJob {
             task_id: job.task_id.clone(),
             execution_key: job.execution_key.clone(),
             script: job.script.clone(),
+            language: job.language,
+            place: job.place.into(),
             mode: job.mode,
             elapsed_ms: elapsed_ms(job.started_at),
             status: (&job.status).into(),
@@ -171,6 +283,8 @@ impl From<WireJob> for JobInfo {
             task_id: job.task_id,
             execution_key: job.execution_key,
             script: job.script,
+            language: job.language,
+            place: job.place.into(),
             mode: job.mode,
             started_at: started_at(job.elapsed_ms),
             status: job.status.into(),
@@ -481,6 +595,8 @@ mod tests {
             task_id: "t".into(),
             execution_key: "k".into(),
             script: "sleep 1".into(),
+            language: ScriptLanguage::Shell,
+            place: WireJobPlace::Host,
             mode: TerminalMode::Sandboxed,
             elapsed_ms: 0,
             status,
@@ -507,6 +623,8 @@ mod tests {
             task_id: "t1".into(),
             execution_key: "k".into(),
             script: "sleep 30".into(),
+            language: ScriptLanguage::Shell,
+            place: JobPlace::Host,
             mode: TerminalMode::Sandboxed,
             started_at: Instant::now()
                 .checked_sub(Duration::from_secs(5))

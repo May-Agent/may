@@ -2765,6 +2765,8 @@ mod tests {
             task_id: "amber".to_string(),
             execution_key: String::new(),
             script: "true".to_string(),
+            language: aither_sandbox::ScriptLanguage::Shell,
+            place: aither_sandbox::JobPlace::Host,
             mode: aither_sandbox::TerminalMode::default(),
             started_at: std::time::Instant::now()
                 .checked_sub(std::time::Duration::from_secs(age_secs))

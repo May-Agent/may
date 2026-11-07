@@ -788,6 +788,7 @@ pub(crate) mod test_sandbox {
             &self,
             mode: TerminalMode,
             _script: &str,
+            _language: aither_sandbox::ScriptLanguage,
         ) -> impl Future<Output = Result<bool, PermissionError>> + Send {
             std::future::ready(Ok(matches!(mode, TerminalMode::Sandboxed)))
         }

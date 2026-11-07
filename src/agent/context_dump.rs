@@ -15,6 +15,7 @@ const fn role_label(role: Role) -> &'static str {
         Role::Assistant => "assistant",
         Role::System => "system",
         Role::Tool => "tool",
+        Role::Configuration => "configuration",
     }
 }
 

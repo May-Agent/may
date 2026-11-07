@@ -248,6 +248,7 @@ impl<O: Write, E: Write> OneShotOutput<O, E> {
             | AgentEvent::BuiltInToolResult { .. }
             | AgentEvent::ReplyTranslated { .. }
             | AgentEvent::PromptPrefix(_)
+            | AgentEvent::ResponseRetry { .. }
             | AgentEvent::Text(_) => Ok(()),
             AgentEvent::ToolCallStart {
                 id,

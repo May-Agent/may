@@ -158,11 +158,11 @@ async fn blocker_marks_hold_only_while_their_question_is_open() {
         .await
         .expect("the open question is withdrawn");
 
-    assert!(resolver.is_open(&open).await);
-    assert!(!resolver.is_open(&answered).await);
-    assert!(!resolver.is_open(&withdrawn).await);
-    assert!(resolver.is_open("waiting on the user").await);
-    assert!(resolver.is_open("never-issued-words").await);
+    assert_eq!(resolver.is_open(&open).await, Ok(true));
+    assert_eq!(resolver.is_open(&answered).await, Ok(false));
+    assert_eq!(resolver.is_open(&withdrawn).await, Ok(false));
+    assert_eq!(resolver.is_open("waiting on the user").await, Ok(true));
+    assert_eq!(resolver.is_open("never-issued-words").await, Ok(true));
 }
 
 /// `ask_user` persists the question and returns its request id with the

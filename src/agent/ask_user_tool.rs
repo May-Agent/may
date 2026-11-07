@@ -356,8 +356,15 @@ impl AskUserBlockerResolver {
 }
 
 impl aither_agent::TaskBlockerResolver for AskUserBlockerResolver {
-    async fn is_open(&self, mark: &str) -> bool {
+    async fn is_open(&self, mark: &str) -> Result<bool, aither_agent::TaskBlockerError> {
         let db = self.runtime.db();
+        let unavailable = |error: &dyn std::fmt::Display| {
+            tracing::error!(session_id = %self.session_id, %error, "failed to resolve a BLOCKING mark");
+            aither_agent::TaskBlockerError::Unavailable {
+                mark: mark.to_string(),
+                reason: error.to_string(),
+            }
+        };
         match db
             .session_ask_user_request_exists(&self.session_id, mark)
             .await
@@ -365,14 +372,10 @@ impl aither_agent::TaskBlockerResolver for AskUserBlockerResolver {
             Ok(true) => db
                 .pending_ask_user_request(mark)
                 .await
-                .is_ok_and(|pending| {
-                    pending.is_some_and(|pending| pending.session_id == self.session_id)
-                }),
-            Ok(false) => true,
-            Err(error) => {
-                tracing::error!(session_id = %self.session_id, %error, "failed to resolve a BLOCKING mark");
-                false
-            }
+                .map(|pending| pending.is_some_and(|pending| pending.session_id == self.session_id))
+                .map_err(|error| unavailable(&error)),
+            Ok(false) => Ok(true),
+            Err(error) => Err(unavailable(&error)),
         }
     }
 }

@@ -22,8 +22,9 @@ use super::{ChatDb, ChatDbError, query};
 /// 1 = every blob written before versioning existed (the pre-0.7 and 0.7
 /// shapes alike, which are indistinguishable without a recorded version).
 /// 2 = every `AgentCheckpoint` before context items carried their commit time.
-/// 3 = the current `AgentCheckpoint` shape, whose items persist `committed_at`.
-pub(super) const CONTEXT_SNAPSHOT_FORMAT: i64 = 3;
+/// 3 = every `AgentCheckpoint` before it carried the `tasks.md` state.
+/// 4 = the current `AgentCheckpoint` shape, which carries `tasks`.
+pub(super) const CONTEXT_SNAPSHOT_FORMAT: i64 = 4;
 
 /// Inputs for [`ChatDb::upsert_context_debug_snapshot`].
 #[derive(Debug)]
@@ -444,6 +445,7 @@ mod tests {
                 messages: vec![aither_core::llm::Message::user("hello")],
             },
             has_background_tasks: false,
+            tasks: None,
         }
     }
 
@@ -469,6 +471,7 @@ mod tests {
                 "context",
                 "context_window",
                 "has_background_tasks",
+                "tasks",
                 "tool_surface_hash"
             ]
         );
