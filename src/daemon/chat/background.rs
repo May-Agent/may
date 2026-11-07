@@ -192,6 +192,18 @@ impl SessionBackgrounds {
         }
     }
 
+    /// The sessions with background work: a command or subagent run in
+    /// flight, or a wake being served.
+    pub async fn busy_sessions(&self) -> std::collections::BTreeSet<String> {
+        let mut busy = std::collections::BTreeSet::new();
+        for session_id in self.session_ids() {
+            if self.snapshot(&session_id).await.will_resume() {
+                busy.insert(session_id);
+            }
+        }
+        busy
+    }
+
     fn session_ids(&self) -> Vec<String> {
         self.sessions().keys().cloned().collect()
     }
@@ -218,12 +230,17 @@ fn shape(snapshot: &SessionBackgroundSnapshot) -> Vec<(u64, String)> {
 pub fn spawn_watcher(state: Arc<DaemonState>, bus: UiEventBus) {
     state.tokio_handle.clone().spawn(async move {
         let mut last: HashMap<String, Vec<(u64, String)>> = HashMap::new();
+        let mut last_busy = std::collections::BTreeSet::new();
         loop {
             tokio::time::sleep(WATCH_INTERVAL).await;
             let mut publish = false;
+            let mut busy = std::collections::BTreeSet::new();
             for session_id in state.session_background.session_ids() {
                 let snapshot = state.session_background.snapshot(&session_id).await;
                 let shape = shape(&snapshot);
+                if snapshot.will_resume() {
+                    busy.insert(session_id.clone());
+                }
                 let running = snapshot
                     .jobs
                     .iter()
@@ -235,6 +252,11 @@ pub fn spawn_watcher(state: Arc<DaemonState>, bus: UiEventBus) {
             }
             if publish {
                 bus.publish(UiEventTopics::SESSION_BACKGROUND);
+            }
+            // The session lists mark the sessions with background work.
+            if busy != last_busy {
+                bus.publish(UiEventTopics::PROFILE_SESSIONS);
+                last_busy = busy;
             }
         }
     });

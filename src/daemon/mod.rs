@@ -10,6 +10,7 @@ pub mod lifecycle;
 pub mod serve;
 
 mod acp_agents;
+mod archive;
 mod artifact_pages;
 mod artifacts;
 mod attachments;

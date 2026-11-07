@@ -1625,6 +1625,15 @@ pub struct UiFullConfig {
     /// A save without the section leaves the setting as it is.
     #[serde(default)]
     pub(crate) recap: Option<UiRecapConfig>,
+    /// A save without the section leaves the setting as it is.
+    #[serde(default)]
+    pub(crate) sessions: Option<UiSessionsConfig>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct UiSessionsConfig {
+    pub(crate) recent_hours: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
