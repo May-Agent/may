@@ -56,6 +56,8 @@ export interface SessionTurn {
   own: boolean;
   /** A withdrawn message of this client's, waiting to return to the composer. */
   restored: RestoredDraft | null;
+  /** Warnings the daemon raised for the user while this view was open. */
+  warnings: string[];
 }
 
 /** The text and attachments of a message the daemon withdrew. */
@@ -71,6 +73,7 @@ const IDLE_TURN: SessionTurn = {
   lastPayload: null,
   own: false,
   restored: null,
+  warnings: [],
 };
 
 /** Wait before reopening a session's turn stream that dropped. */
@@ -193,6 +196,8 @@ export const useTurnStore = create<TurnSliceState>((set, get) => {
             after = id;
           },
           onBackground: (snapshot) => useInspectorStore.getState().applyBackground(snapshot),
+          onWarning: (message) =>
+            patch(sessionId, (prev) => ({ warnings: [...prev.warnings, message] })),
           onResync: () => {
             // Turn frames this client missed are gone: drop the turn it was
             // following and reload the session's messages.

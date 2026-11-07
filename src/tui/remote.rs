@@ -254,7 +254,7 @@ fn events_query(session_id: &str, after: Option<&str>) -> String {
     query
         .append_pair(
             "topics",
-            "session_agent,session_turn,session_background,session_runtime,session_index,session_suggestion,session_recap,session_issues,sleep,user_notification",
+            "session_agent,session_turn,session_background,session_runtime,session_index,session_suggestion,session_recap,session_issues,session_warning,sleep,user_notification",
         )
         .append_pair("sessionId", session_id);
     if let Some(after) = after {
@@ -331,6 +331,19 @@ async fn follow_session(
                                 state: frame.state,
                                 summary: frame.summary,
                                 next_action: frame.next_action,
+                            })
+                            .await;
+                    }
+                }
+                "session_warning" => {
+                    if let Ok(frame) =
+                        serde_json::from_str::<crate::client::WarningFrame>(&event.data)
+                    {
+                        let _ = forwarding
+                            .app_events
+                            .send(AppEvent::Warning {
+                                session_id: frame.session_id,
+                                message: frame.message,
                             })
                             .await;
                     }

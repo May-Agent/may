@@ -14,6 +14,7 @@ import { Composer } from './Composer';
 import { SessionHeader } from './SessionHeader';
 import { BrowserTakeoverBanner } from './BrowserTakeoverBanner';
 import { PlanBanner } from './PlanBanner';
+import { WarningMessage } from './WarningMessage';
 import { YoloToggle } from './YoloToggle';
 import { Button } from '@/components/ui/button';
 import { useTranslation } from '@/lib/i18n';
@@ -29,6 +30,7 @@ import { chatRows, type ChatRow } from '@/lib/chat/rows';
 
 const STICKY_BOTTOM_THRESHOLD_PX = 48;
 const NO_MESSAGES: ApiMessage[] = [];
+const NO_WARNINGS: string[] = [];
 
 export function ChatView({ sessionId }: { sessionId: string }) {
   const open = useSessionsStore((s) => s.open);
@@ -41,6 +43,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   const activeTurn = sessionTurn?.active ?? null;
   const stopping = sessionTurn?.stopping ?? false;
   const lastTurn = sessionTurn?.last ?? null;
+  const warnings = sessionTurn?.warnings ?? NO_WARNINGS;
   const send = useTurnStore((s) => s.send);
   const cancel = useTurnStore((s) => s.cancel);
   const retry = useTurnStore((s) => s.retry);
@@ -278,6 +281,9 @@ export function ChatView({ sessionId }: { sessionId: string }) {
               showDecodeSpeed={showDecodeSpeed}
             />
           )}
+          {warnings.map((warning, i) => (
+            <WarningMessage key={`${i}-${warning}`} message={warning} />
+          ))}
           {!activeTurn && lastTurn?.error && (
             <TurnErrorCard
               code={lastTurn.error.code}

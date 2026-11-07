@@ -102,6 +102,7 @@ pub(super) async fn stream_events(
     let mut notification_rx = state.notification_service.subscribe_user_notifications();
     let notification_subscribed = subscribed_topics.contains(UiEventTopics::USER_NOTIFICATION);
     let index_subscribed = subscribed_topics.contains(UiEventTopics::SESSION_INDEX);
+    let warning_subscribed = subscribed_topics.contains(UiEventTopics::SESSION_WARNING);
     // Live turn frames of the filtered session, replayed from the turn's
     // start for a client attaching mid-turn, or from the frame after the
     // last one it saw for a client reconnecting.
@@ -156,6 +157,17 @@ pub(super) async fn stream_events(
             cwd.clone(),
             Duration::ZERO,
         ));
+        // Warnings are transients: this client is sent the ones raised after
+        // it attached, each once.
+        let warnings_for = session_id.clone().filter(|_| warning_subscribed);
+        let mut warning_cursor = match &warnings_for {
+            Some(session_id) => state_cloned
+                .db()
+                .latest_ci_finding_id(session_id)
+                .await
+                .unwrap_or(0),
+            None => 0,
+        };
         let topics = async {
             loop {
                 tokio::select! {
@@ -195,6 +207,18 @@ pub(super) async fn stream_events(
                         }
                         if dirty_topics.is_empty() {
                             continue;
+                        }
+                        if let Some(session_id) = &warnings_for
+                            && dirty_topics.contains(UiEventTopics::SESSION_WARNING)
+                            && !send_new_warnings(
+                                &state_cloned,
+                                &sender,
+                                session_id,
+                                &mut warning_cursor,
+                            )
+                            .await
+                        {
+                            break;
                         }
                         if !emit_topics_if_changed(
                             &state_cloned,
@@ -245,6 +269,35 @@ pub(super) async fn stream_events(
     });
 
     Ok(sse)
+}
+
+/// Sends the warnings the session raised after `cursor` as `session_warning`
+/// events and moves the cursor past them. Returns `false` when the client is
+/// gone.
+async fn send_new_warnings(
+    state: &Arc<DaemonState>,
+    sender: &skyzen::responder::sse::Sender,
+    session_id: &str,
+    cursor: &mut i64,
+) -> bool {
+    let findings = match state.db().ci_findings_after(session_id, *cursor).await {
+        Ok(findings) => findings,
+        Err(error) => {
+            tracing::error!(%session_id, %error, "failed to load the session's warnings");
+            return true;
+        }
+    };
+    for finding in findings {
+        *cursor = finding.id;
+        let frame = crate::client::WarningFrame {
+            session_id: session_id.to_string(),
+            message: finding.warning,
+        };
+        if !send_event(sender, "session_warning", &frame).await {
+            return false;
+        }
+    }
+    true
 }
 
 /// Sends the session's turn frames for as long as the client reads them:

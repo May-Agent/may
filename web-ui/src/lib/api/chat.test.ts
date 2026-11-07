@@ -45,3 +45,21 @@ describe('openSessionTurns', () => {
     expect(kinds).toEqual(['start']);
   });
 });
+
+describe('session warnings', () => {
+  test('a session_warning frame of the session reaches onWarning and is subscribed to', async () => {
+    const urls: string[] = [];
+    serve(
+      'event: session_warning\ndata: {"sessionId":"s1","message":"PR #3: CI / test ran 52m 10s"}\n\n' +
+        'event: session_warning\ndata: {"sessionId":"other","message":"not mine"}\n\n',
+      urls,
+    );
+    const warnings: string[] = [];
+    const stream = await openSessionTurns('s1', undefined, {
+      onWarning: (message) => warnings.push(message),
+    });
+    for await (const event of stream.events) void event;
+    expect(urls[0]).toContain('topics=session_turn%2Csession_warning');
+    expect(warnings).toEqual(['PR #3: CI / test ran 52m 10s']);
+  });
+});

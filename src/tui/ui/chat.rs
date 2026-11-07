@@ -346,6 +346,12 @@ pub enum ChatElement {
         /// Error text shown in the stream.
         message: String,
     },
+    /// Warning for the user, such as an abnormally long CI job; never part
+    /// of the agent's context.
+    Warning {
+        /// Warning text shown in the stream.
+        message: String,
+    },
     /// Neutral system notice (e.g. rewind result)
     Notice {
         /// Notice text shown in the stream.
@@ -561,6 +567,14 @@ impl ChatStream {
     /// Add an error message.
     pub fn push_error(&mut self, message: &str) {
         self.push_element(ChatElement::Error {
+            message: message.to_string(),
+        });
+    }
+
+    /// Add a warning: a warning icon and yellow text.
+    pub fn push_warning(&mut self, message: &str) {
+        self.end_text();
+        self.push_element(ChatElement::Warning {
             message: message.to_string(),
         });
     }
@@ -2516,6 +2530,17 @@ pub(super) fn element_lines(
                 Span::styled("✗ ", Style::default().fg(Color::Red)),
                 Span::styled(message.clone(), Style::default().fg(Color::Red)),
             ]));
+            lines.push(Line::from(""));
+        }
+
+        ChatElement::Warning { message } => {
+            for (index, line) in message.lines().enumerate() {
+                let icon = if index == 0 { "⚠ " } else { "  " };
+                lines.push(Line::from(vec![
+                    Span::styled(icon, Style::default().fg(Color::Yellow)),
+                    Span::styled(line.to_string(), Style::default().fg(Color::Yellow)),
+                ]));
+            }
             lines.push(Line::from(""));
         }
 
@@ -5352,6 +5377,25 @@ mod tests {
             .map(String::as_str)
             .collect();
         assert_eq!(full, ["l1", "l2", "l3", "l4", "l5", "l6", "l7", "l8"]);
+    }
+
+    #[test]
+    fn a_warning_is_a_warning_icon_with_yellow_text() {
+        let mut chat = ChatStream::new();
+        chat.push_warning("PR #3: CI / test ran 52m 10s, past the 40m 00s limit.");
+        let elem = &chat.elements[0];
+        let lines = super::element_lines(
+            elem,
+            super::ElementState::of(elem, None, false, 0),
+            false,
+            "",
+            80,
+        )
+        .lines;
+        let spans = &lines[0].spans;
+        assert_eq!(spans[0].content, "⚠ ");
+        assert!(spans.iter().all(|s| s.style.fg == Some(Color::Yellow)));
+        assert!(spans[1].content.contains("past the 40m 00s limit"));
     }
 
     #[test]
