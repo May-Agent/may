@@ -5515,3 +5515,51 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod tool_reading_tests {
+    use std::sync::Arc;
+
+    use super::{ChatSink, HubSink, hub};
+    use crate::client::{SessionAgentBody, SessionAgentFrame};
+    use crate::daemon::tool_summary::{ToolSummary, project_tool_summary};
+    use crate::daemon::types::ToolVariant;
+
+    /// A TUI that attaches while a turn streams replays the reading of a
+    /// call that started before it attached.
+    #[test]
+    fn a_late_subscriber_replays_the_reading_of_a_started_call() {
+        let hub = Arc::new(hub::TurnHub::default());
+        hub.begin_turn("s");
+        let mut sink = HubSink {
+            hub: hub.clone(),
+            session_id: "s".to_string(),
+            content: None,
+            seq: 1,
+            turn_id: "t".to_string(),
+            run_announced: true,
+        };
+        let arguments = r#"{"description":"d","script":"cat a.rs"}"#;
+        let summary: ToolSummary = project_tool_summary(arguments, ToolVariant::Terminal);
+        assert!(futures_lite::future::block_on(
+            sink.on_tool_start("c1", "terminal", arguments, summary)
+        ));
+
+        let late = hub.subscribe("s", None);
+        let frames = late.take_unread().expect("the subscription is open");
+        let readings: Vec<_> = frames
+            .iter()
+            .filter(|frame| frame.kind == "session_agent")
+            .map(|frame| {
+                serde_json::from_str::<SessionAgentFrame>(&frame.data).expect("an agent frame")
+            })
+            .filter_map(|frame| match frame.body {
+                SessionAgentBody::ToolReading { call_id, reading } => Some((call_id, reading)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(readings.len(), 1);
+        assert_eq!(readings[0].0, "c1");
+        assert_eq!(readings[0].1.steps[0].line, "Read a.rs");
+    }
+}

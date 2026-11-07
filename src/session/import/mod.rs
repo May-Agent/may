@@ -324,6 +324,7 @@ pub(super) fn tool_end(
         reasoning: Vec::new(),
         tool_calls: Vec::new(),
         translation: None,
+        reading: None,
     }
 }
 
@@ -345,6 +346,7 @@ pub(super) const fn assistant_turn(
         reasoning,
         tool_calls,
         translation: None,
+        reading: None,
     }
 }
 
@@ -365,6 +367,7 @@ pub(super) const fn user_text(
         reasoning: Vec::new(),
         tool_calls: Vec::new(),
         translation: None,
+        reading: None,
     }
 }
 

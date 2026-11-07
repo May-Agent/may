@@ -82,7 +82,31 @@ pub(super) async fn get_session_history(
     let history = crate::session::load_history_from_db(&db, &id)
         .await
         .map_err(internal_error)?;
-    super::error::json_ok_response(&history.messages().to_vec())
+    let mut messages = history.messages().to_vec();
+    attach_readings(&mut messages);
+    super::error::json_ok_response(&messages)
+}
+
+/// Attach to every stored `terminal` call start the reading the daemon's
+/// tool summary gives its script, so a reloading client shows the same
+/// reading a live one received.
+pub(super) fn attach_readings(messages: &mut [crate::session::ChatMessage]) {
+    for message in messages {
+        if message.role != crate::session::MessageRole::Tool {
+            continue;
+        }
+        let Ok(crate::session::ToolEventRecord::Start {
+            name, arguments, ..
+        }) = serde_json::from_str(&message.content)
+        else {
+            continue;
+        };
+        message.reading = super::tool_summary::project_tool_summary(
+            &arguments,
+            super::types::ToolVariant::infer(&name),
+        )
+        .reading;
+    }
 }
 
 /// `POST /api/sessions/{id}/history` — append stored messages in the
@@ -844,4 +868,35 @@ pub(super) async fn delete_all_sessions(
         .map_err(internal_error)?;
     state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS | UiEventTopics::SESSION_RUNTIMES);
     Ok(Json(ApiHealth { ok: true }))
+}
+
+#[cfg(test)]
+mod history_reading_tests {
+    use crate::session::{ChatMessage, MessageRole, ToolEventRecord};
+
+    fn tool_row(record: &ToolEventRecord) -> ChatMessage {
+        let mut message = ChatMessage::user(serde_json::to_string(record).expect("record"));
+        message.role = MessageRole::Tool;
+        message
+    }
+
+    #[test]
+    fn served_history_carries_the_reading_of_a_stored_terminal_call() {
+        let start = ToolEventRecord::Start {
+            id: "c1".to_string(),
+            name: "terminal".to_string(),
+            arguments: r#"{"description":"d","script":"cat a.rs"}"#.to_string(),
+        };
+        let other = ToolEventRecord::Start {
+            id: "c2".to_string(),
+            name: "web_fetch".to_string(),
+            arguments: r#"{"url":"https://example.com"}"#.to_string(),
+        };
+        let mut messages = vec![tool_row(&start), tool_row(&other), ChatMessage::user("hi")];
+        super::attach_readings(&mut messages);
+        let reading = messages[0].reading.as_ref().expect("terminal call is read");
+        assert_eq!(reading.steps[0].line, "Read a.rs");
+        assert!(messages[1].reading.is_none());
+        assert!(messages[2].reading.is_none());
+    }
 }

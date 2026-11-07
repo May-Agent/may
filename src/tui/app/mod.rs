@@ -1758,7 +1758,15 @@ impl App {
                             // A stored call carries the arguments schema of
                             // the build that ran it, so it is read field by
                             // field rather than against today's schema.
-                            self.show_tool_start(id, parse_tool_start_partial(&name, &arguments));
+                            self.show_tool_start(
+                                id.clone(),
+                                parse_tool_start_partial(&name, &arguments),
+                            );
+                            // The daemon read the script when it served the
+                            // history; the client does not parse it again.
+                            if let Some(reading) = msg.reading.clone() {
+                                self.chat.set_tool_reading(&id, reading);
+                            }
                         }
                         Ok(crate::session::ToolEventRecord::End { id, result, .. }) => {
                             self.show_tool_end(&id, &result);
@@ -4874,6 +4882,44 @@ mod tests {
             Some(ChatElement::Recap { summary, next_action })
                 if summary == "Tests pass." && next_action.as_deref() == Some("Merge it.")
         ));
+    }
+
+    /// A reload shows an edit's diff from the reading the daemon served with
+    /// the history; the client does not parse the script again.
+    #[tokio::test]
+    async fn a_reloaded_edit_shows_the_reading_the_daemon_served() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        let script =
+            "apply_patch <<'P'\n*** Begin Patch\n*** Add File: b.txt\n+one\n*** End Patch\nP\n";
+        let arguments = serde_json::json!({ "description": "add b", "script": script }).to_string();
+        let start = crate::session::ToolEventRecord::Start {
+            id: "c1".to_string(),
+            name: "terminal".to_string(),
+            arguments: arguments.clone(),
+        };
+        let mut served = crate::ChatMessage::user(serde_json::to_string(&start).expect("start"));
+        served.role = MessageRole::Tool;
+        // As the daemon attaches it when it serves the history.
+        served.reading = Some(crate::command_reading::CommandReading::of(script));
+        app.render_history(&[crate::ChatMessage::user("hi"), served])
+            .await;
+        let Some(ChatElement::ToolCall {
+            display: crate::tui::ui::chat::ToolDisplay::Terminal { reading, .. },
+            ..
+        }) = app
+            .chat
+            .elements()
+            .iter()
+            .find(|element| matches!(element, ChatElement::ToolCall { .. }))
+        else {
+            panic!("the stored call is shown");
+        };
+        assert!(
+            reading
+                .as_ref()
+                .is_some_and(crate::command_reading::CommandReading::recognises_any)
+        );
     }
 
     #[tokio::test]

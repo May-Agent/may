@@ -93,6 +93,7 @@ impl TurnPersister {
                 reasoning: Vec::new(),
                 tool_calls: Vec::new(),
                 translation: msg.translation.clone(),
+                reading: None,
             };
             let row = db
                 .append_chat_message_as_run(&self.fence, &chat_msg)

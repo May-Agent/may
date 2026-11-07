@@ -277,6 +277,10 @@ pub struct ChatMessage {
     /// content above stays the original.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub translation: Option<MessageTranslation>,
+    /// How the daemon read the script of a stored `terminal` call start,
+    /// attached when the daemon serves the history; never stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reading: Option<crate::command_reading::CommandReading>,
 }
 
 /// A reply translated into the communication language for display.
@@ -318,6 +322,7 @@ impl ChatMessage {
             reasoning: Vec::new(),
             tool_calls: Vec::new(),
             translation: None,
+            reading: None,
         }
     }
 
@@ -334,6 +339,7 @@ impl ChatMessage {
             reasoning: Vec::new(),
             tool_calls: Vec::new(),
             translation: None,
+            reading: None,
         }
     }
 
@@ -354,6 +360,7 @@ impl ChatMessage {
             reasoning: Vec::new(),
             tool_calls: Vec::new(),
             translation: None,
+            reading: None,
         }
     }
 
@@ -370,6 +377,7 @@ impl ChatMessage {
             reasoning: Vec::new(),
             tool_calls: Vec::new(),
             translation: None,
+            reading: None,
         }
     }
 
@@ -390,6 +398,7 @@ impl ChatMessage {
             reasoning: Vec::new(),
             tool_calls: Vec::new(),
             translation: None,
+            reading: None,
         }
     }
 
@@ -409,6 +418,7 @@ impl ChatMessage {
             reasoning: Vec::new(),
             tool_calls: Vec::new(),
             translation: None,
+            reading: None,
         }
     }
 }
