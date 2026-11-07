@@ -165,6 +165,39 @@ async fn blocker_marks_hold_only_while_their_question_is_open() {
     assert_eq!(resolver.is_open("never-issued-words").await, Ok(true));
 }
 
+/// An answer to a question the agent asked reaches the session's `tasks.md`
+/// inbox, whichever agent build takes it.
+#[tokio::test]
+async fn an_answer_is_recorded_on_the_session_tasks_inbox() {
+    let fixture = Fixture::new().await;
+    let service = fixture.service().await;
+    let asked = ask(&service, which_database()).await;
+    service
+        .answer_ask_user(&asked, &[selected("", "SQLite")])
+        .await
+        .expect("the answer commits");
+
+    let sandbox = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        sandbox.path().join("tasks.md"),
+        format!("## Doing\n- pick a db BLOCKING {asked}\n"),
+    )
+    .expect("tasks.md");
+    let mut tasks =
+        aither_agent::TasksDocument::new(sandbox.path(), 60, service.task_events("session"));
+    aither_agent::ContextSource::on_request(&mut tasks, false).await;
+    let alert = aither_agent::ContextSource::on_tool_turn_end(&mut tasks)
+        .await
+        .expect("the row waiting on it is told");
+    assert!(
+        alert
+            .content()
+            .contains(&format!("Question {asked} was answered")),
+        "{}",
+        alert.content()
+    );
+}
+
 /// `ask_user` persists the question and returns its request id with the
 /// blocking instruction at once; no run is left waiting.
 #[tokio::test]

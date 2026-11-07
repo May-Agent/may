@@ -57,6 +57,12 @@ pub struct SessionRuntimeService {
     terminal_grants: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<String, aither_sandbox::TerminalGrants>>,
     >,
+    /// Session id → the inbox its main agent's `tasks.md` takes state
+    /// changes from. It outlives any one agent build, so an answer committed
+    /// while no agent runs reaches the next one.
+    task_events: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, aither_agent::TaskEvents>>,
+    >,
 }
 
 impl std::fmt::Debug for SessionRuntimeService {
@@ -79,7 +85,48 @@ impl SessionRuntimeService {
             terminal_grants: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            task_events: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         }
+    }
+
+    /// The `tasks.md` inbox of `session_id`'s main agent, created on first
+    /// use and shared by every build of it.
+    ///
+    /// # Panics
+    /// When the `task_events` lock is poisoned.
+    #[must_use]
+    pub fn task_events(&self, session_id: &str) -> aither_agent::TaskEvents {
+        self.task_events
+            .lock()
+            .expect("task_events poisoned")
+            .entry(session_id.to_string())
+            .or_default()
+            .clone()
+    }
+
+    /// Drops `session_id`'s `tasks.md` inbox, when the session is deleted.
+    ///
+    /// # Panics
+    /// When the `task_events` lock is poisoned.
+    pub fn forget_task_events(&self, session_id: &str) {
+        self.task_events
+            .lock()
+            .expect("task_events poisoned")
+            .remove(session_id);
+    }
+
+    /// Drops every session's `tasks.md` inbox — sessions were deleted
+    /// wholesale.
+    ///
+    /// # Panics
+    /// When the `task_events` lock is poisoned.
+    pub fn forget_all_task_events(&self) {
+        self.task_events
+            .lock()
+            .expect("task_events poisoned")
+            .clear();
     }
 
     /// Spawn the background tasks of run leases with `spawner`; see
@@ -582,6 +629,13 @@ impl SessionRuntimeService {
                 .await?
                 .map(|session_id| AskUserAnswer::AlreadyAnswered { session_id }));
         };
+        // A question the agent asked changes what `tasks.md` rows wait on; a
+        // prompt a run blocks on is no question of the agent's.
+        if !pending.blocking {
+            self.task_events(&pending.session_id).record(
+                aither_agent::TaskEvent::QuestionAnswered(request_id.to_string()),
+            );
+        }
         self.publish_ui(UiEventTopics::SESSION_RUNTIME | UiEventTopics::SESSION_RUNTIMES);
         Ok(Some(AskUserAnswer::Committed(committed)))
     }
@@ -742,6 +796,22 @@ impl SessionRuntimeService {
             self.publish_ui(UiEventTopics::SESSION_RUNTIME | UiEventTopics::SESSION_RUNTIMES);
         }
         Ok(pending)
+    }
+
+    /// Mark the takeover-ended alert pending again, for a turn that
+    /// consumed it and was withdrawn before the model saw it.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] on storage failure.
+    pub async fn restore_browser_takeover_alert_pending(
+        &self,
+        session_id: &str,
+    ) -> Result<(), crate::db::ChatDbError> {
+        self.db
+            .restore_browser_takeover_alert_pending(session_id)
+            .await?;
+        self.publish_ui(UiEventTopics::SESSION_RUNTIME | UiEventTopics::SESSION_RUNTIMES);
+        Ok(())
     }
 
     /// Persist terminal runtime state for a session.

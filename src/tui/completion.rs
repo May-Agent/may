@@ -31,6 +31,7 @@ pub enum CompletionMode {
 pub static SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/help", "Show commands and shortcuts"),
     ("/session", "Switch or create sessions"),
+    ("/archive", "Open an archived session"),
     ("/new", "Start a new session"),
     ("/profile", "Switch profile (Ctrl+P)"),
     ("/model", "Switch model for this session"),
@@ -62,6 +63,10 @@ pub static SLASH_COMMANDS: &[(&str, &str)] = &[
     (
         "/btw",
         "Ask a side question without touching conversation history",
+    ),
+    (
+        "/progress",
+        "Report the remaining work with a progress bar, without touching the conversation",
     ),
     (
         "/resume-codex",
@@ -441,7 +446,7 @@ mod tests {
     #[test]
     fn slash_prefix_still_accepts_enter() {
         let mut completion = Completion::new();
-        completion.start_slash("res");
+        completion.start_slash("resu");
         assert!(completion.has_matches());
         assert_eq!(
             completion.complete().map(|item| item.insert.as_str()),

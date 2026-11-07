@@ -102,6 +102,15 @@ interface SessionsState {
 
   appendMessage: (sessionId: string, msg: ApiMessage) => void;
   replaceMessage: (sessionId: string, msg: ApiMessage) => void;
+  /** Drop the latest user message whose text is `content`: a withdrawn turn's. */
+  withdrawUserMessage: (sessionId: string, content: string) => void;
+  /**
+   * A turn ended: the oldest not-yet-stored user message takes the id the
+   * daemon stored it under, and the reply, when the turn stored one, joins
+   * under its stored id (or replaces the copy a refresh already fetched), so
+   * a later refresh updates both in place.
+   */
+  settleTurn: (sessionId: string, userMessageId: string | null, reply: ApiMessage | null) => void;
   updateRuntime: (id: string, runtime: Partial<SessionRuntimeSummary>) => void;
 }
 
@@ -377,6 +386,17 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
     }));
   },
 
+  withdrawUserMessage(sessionId, content) {
+    set((prev) => {
+      const messages = prev.messages[sessionId] ?? [];
+      const at = messages.findLastIndex((m) => m.role === 'user' && m.content === content);
+      if (at < 0) return prev;
+      return {
+        messages: { ...prev.messages, [sessionId]: messages.filter((_, i) => i !== at) },
+      };
+    });
+  },
+
   replaceMessage(sessionId, msg) {
     set((prev) => ({
       messages: {
@@ -384,6 +404,24 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
         [sessionId]: (prev.messages[sessionId] ?? []).map((m) => (m.id === msg.id ? msg : m)),
       },
     }));
+  },
+
+  settleTurn(sessionId, userMessageId, reply) {
+    set((prev) => {
+      let list = prev.messages[sessionId] ?? [];
+      if (userMessageId !== null && !list.some((m) => m.id === userMessageId)) {
+        const index = list.findIndex((m) => m.role === 'user' && m.id.startsWith(LOCAL_PREFIX));
+        if (index >= 0) {
+          list = list.map((m, i) => (i === index ? { ...m, id: userMessageId } : m));
+        }
+      }
+      if (reply !== null) {
+        list = list.some((m) => m.id === reply.id)
+          ? list.map((m) => (m.id === reply.id ? reply : m))
+          : [...list, reply];
+      }
+      return { messages: { ...prev.messages, [sessionId]: list } };
+    });
   },
 
   updateRuntime(id, patch) {

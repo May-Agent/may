@@ -98,7 +98,6 @@ mod tests {
         .expect("the settings parse");
         assert_eq!(config.time.user_timezone().as_str(), "America/New_York");
         let monitor = config.host_load.monitor_config();
-        assert_eq!(monitor.load_threshold, aither_agent::MachineLoad(1.5));
         assert_eq!(monitor.start_after, Duration::from_secs(10));
         assert_eq!(monitor.high_load_foreground_wait, Duration::from_mins(2));
         assert_eq!(

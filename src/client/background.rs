@@ -10,7 +10,7 @@
 use std::time::{Duration, Instant};
 
 use aither_sandbox::{
-    Delivery, JobInfo, JobPlace, JobStatus, KillCause, MemoryDomain, ScriptLanguage, TerminalMode,
+    Delivery, JobInfo, JobPlace, JobStatus, KillCause, MemoryDomain, TerminalMode,
 };
 use serde::{Deserialize, Serialize};
 
@@ -49,9 +49,12 @@ pub enum WireJobStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, skyzen::ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum WireKillCause {
-    /// A request ended it.
+    /// A request ended it: `terminal_kill`, its time bound or the shutdown
+    /// of its terminal.
     User,
-    /// Its home environment ran out of memory and it was left running.
+    /// Its home environment ran out of memory and it ignored the final
+    /// warning.
+    #[serde(rename_all = "camelCase")]
     MemoryRunaway {
         /// The tree's physical footprint when it was killed.
         footprint_bytes: u64,
@@ -62,7 +65,7 @@ pub enum WireKillCause {
     },
 }
 
-/// The memory a runaway job exhausted.
+/// Which memory a job competes for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WireMemoryDomain {
@@ -75,12 +78,12 @@ pub enum WireMemoryDomain {
 /// Where a job runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum WireJobPlace {
-    /// A process of the machine the daemon runs on.
+pub enum WirePlace {
+    /// The machine the daemon runs on.
     Host,
-    /// A process inside the container the agent works in.
+    /// The container the agent works in.
     Container,
-    /// A process on a remote host over SSH.
+    /// A remote host over SSH.
     Remote,
 }
 
@@ -124,7 +127,7 @@ impl From<WireKillCause> for KillCause {
     }
 }
 
-impl From<JobPlace> for WireJobPlace {
+impl From<JobPlace> for WirePlace {
     fn from(place: JobPlace) -> Self {
         match place {
             JobPlace::Host => Self::Host,
@@ -134,12 +137,12 @@ impl From<JobPlace> for WireJobPlace {
     }
 }
 
-impl From<WireJobPlace> for JobPlace {
-    fn from(place: WireJobPlace) -> Self {
+impl From<WirePlace> for JobPlace {
+    fn from(place: WirePlace) -> Self {
         match place {
-            WireJobPlace::Host => Self::Host,
-            WireJobPlace::Container => Self::Container,
-            WireJobPlace::Remote => Self::Remote,
+            WirePlace::Host => Self::Host,
+            WirePlace::Container => Self::Container,
+            WirePlace::Remote => Self::Remote,
         }
     }
 }
@@ -230,11 +233,6 @@ pub struct WireJob {
     pub execution_key: String,
     /// The script it runs.
     pub script: String,
-    /// The language of the script.
-    #[schema(value_type = String)]
-    pub language: ScriptLanguage,
-    /// Where it runs.
-    pub place: WireJobPlace,
     /// Permission mode.
     #[schema(value_type = String)]
     pub mode: TerminalMode,
@@ -246,6 +244,8 @@ pub struct WireJob {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>)]
     pub output_path: Option<std::path::PathBuf>,
+    /// Where it runs.
+    pub place: WirePlace,
 }
 
 fn elapsed_ms(since: Instant) -> u64 {
@@ -266,12 +266,11 @@ impl From<&JobInfo> for WireJob {
             task_id: job.task_id.clone(),
             execution_key: job.execution_key.clone(),
             script: job.script.clone(),
-            language: job.language,
-            place: job.place.into(),
             mode: job.mode,
             elapsed_ms: elapsed_ms(job.started_at),
             status: (&job.status).into(),
             output_path: job.output_path.clone(),
+            place: job.place.into(),
         }
     }
 }
@@ -283,12 +282,11 @@ impl From<WireJob> for JobInfo {
             task_id: job.task_id,
             execution_key: job.execution_key,
             script: job.script,
-            language: job.language,
-            place: job.place.into(),
             mode: job.mode,
             started_at: started_at(job.elapsed_ms),
             status: job.status.into(),
             output_path: job.output_path,
+            place: job.place.into(),
         }
     }
 }
@@ -595,12 +593,11 @@ mod tests {
             task_id: "t".into(),
             execution_key: "k".into(),
             script: "sleep 1".into(),
-            language: ScriptLanguage::Shell,
-            place: WireJobPlace::Host,
             mode: TerminalMode::Sandboxed,
             elapsed_ms: 0,
             status,
             output_path: None,
+            place: WirePlace::Host,
         };
         let mut snapshot = SessionBackgroundSnapshot::default();
         assert!(!snapshot.will_resume());
@@ -623,8 +620,6 @@ mod tests {
             task_id: "t1".into(),
             execution_key: "k".into(),
             script: "sleep 30".into(),
-            language: ScriptLanguage::Shell,
-            place: JobPlace::Host,
             mode: TerminalMode::Sandboxed,
             started_at: Instant::now()
                 .checked_sub(Duration::from_secs(5))
@@ -634,6 +629,7 @@ mod tests {
                 delivery: Delivery::Pending,
             },
             output_path: None,
+            place: JobPlace::Host,
         };
         let wire: WireJob =
             serde_json::from_str(&serde_json::to_string(&WireJob::from(&job)).expect("serializes"))

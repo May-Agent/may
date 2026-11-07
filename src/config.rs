@@ -1262,6 +1262,9 @@ pub struct MayConfig {
     /// Recap settings.
     #[serde(default)]
     pub recap: RecapConfig,
+    /// Session list settings.
+    #[serde(default)]
+    pub sessions: SessionsConfig,
     /// Communication and working languages.
     #[serde(default)]
     pub language: LanguageConfig,
@@ -1390,6 +1393,21 @@ impl Default for RecapConfig {
             auto: true,
             idle_minutes: 30,
         }
+    }
+}
+
+/// `[sessions]` section: which sessions the session lists show.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct SessionsConfig {
+    /// Hours a session stays listed after it went idle; an idle, unpinned
+    /// session older than this is archived.
+    pub recent_hours: u64,
+}
+
+impl Default for SessionsConfig {
+    fn default() -> Self {
+        Self { recent_hours: 48 }
     }
 }
 
@@ -1593,8 +1611,11 @@ impl Default for AcpSettings {
 }
 
 /// `[host_load]` section: when the session agent is told the host is under
-/// high load, and how long the terminal's foreground
-/// window grows meanwhile. Durations are written as `"30s"`, `"1m"`.
+/// high load.
+///
+/// The terminal's foreground window grows meanwhile. Memory pressure is not
+/// configured here: aither's memory guard warns on the platform's own
+/// pressure levels. Durations are written as `"30s"`, `"1m"`.
 ///
 /// A change reaches a running session at its next turn.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -1695,6 +1716,7 @@ impl Default for MayConfig {
             suggestions: SuggestionsConfig::default(),
             sleep: SleepConfig::default(),
             recap: RecapConfig::default(),
+            sessions: SessionsConfig::default(),
             language: LanguageConfig::default(),
             context: ContextConfig::default(),
             time: TimeConfig::default(),

@@ -165,10 +165,7 @@ pub fn detect_cache_miss(
     let gap = Duration::from_millis(
         u64::try_from(current.at_ms.saturating_sub(previous.at_ms)).unwrap_or(0),
     );
-    let expired = match lifetime {
-        CacheLifetime::Limited(lifetime) => gap >= lifetime,
-        CacheLifetime::Permanent => false,
-    };
+    let expired = lifetime.expired_after(gap);
     let diverged = current.chain.first_divergence(&previous.chain);
     let cause = match diverged {
         Some(PrefixBlock::Tools) => CacheMissCause::ToolsChanged,

@@ -27,6 +27,11 @@ export function profilePath(profileId: string): string {
   return `/p/${encodeURIComponent(profileId)}`;
 }
 
+/** Build the URL for a profile's archive page. */
+export function profileArchivePath(profileId: string): string {
+  return `${profilePath(profileId)}/archive`;
+}
+
 /** Build the URL for a session under a profile. */
 export function profileSessionPath(profileId: string, sessionId: string): string {
   return `/p/${encodeURIComponent(profileId)}/s/${encodeURIComponent(sessionId)}`;

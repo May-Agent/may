@@ -27,7 +27,12 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             // Sweep a transient status notice whose deadline passed; the tick
             // cadence bounds how long an expired notice can linger.
             StatusNotice::clear_expired(&mut app.status, std::time::Instant::now());
-            if app.processing || app.index_loading {
+            app.sync_profile_follow();
+            if app.processing
+                || app.index_loading
+                || (matches!(app.mode, AppMode::SessionSelect)
+                    && app.session_list.iter().any(|session| session.working))
+            {
                 app.spinner_frame = app.spinner_frame.wrapping_add(1);
             }
             if app.processing {
@@ -203,6 +208,27 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             }
             Ok(None)
         }
+        AppEvent::ProfileSessionsPushed(ps) => {
+            // Same lists with newer state: the selection stays where it is.
+            if matches!(app.mode, AppMode::SessionSelect) {
+                let selected_id = app
+                    .filtered_sessions()
+                    .get(app.session_selected)
+                    .and_then(|(index, _)| app.session_list.get(*index))
+                    .map(|summary| summary.id.clone());
+                app.profile_sessions = Some(ps);
+                app.build_session_list_from_profile();
+                let filtered = app.filtered_sessions();
+                let kept = selected_id.and_then(|id| {
+                    filtered
+                        .iter()
+                        .position(|(index, _)| app.session_list[*index].id == id)
+                });
+                let last = filtered.len().saturating_sub(1);
+                app.session_selected = kept.unwrap_or_else(|| app.session_selected.min(last));
+            }
+            Ok(None)
+        }
         AppEvent::ConfigSaved(result) => {
             if let Err(error) = result {
                 app.chat
@@ -266,6 +292,10 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
         AppEvent::TurnStarted { message_id } => {
             app.request_prompt_mark(i64::from(message_id));
             Ok(None)
+        }
+        AppEvent::TurnWithdrawn { content, own } => {
+            app.withdraw_turn(content, own);
+            Ok(Some(SendAction::ReloadHistory))
         }
         AppEvent::HistoryStale => Ok(Some(SendAction::ReloadHistory)),
         AppEvent::Sleep(status) => {
@@ -377,6 +407,20 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             if let crate::tui::state::AppMode::Btw(state) = &mut app.mode {
                 state.loading = false;
                 state.done = true;
+                state.error = Some(error);
+            }
+            Ok(None)
+        }
+        AppEvent::ProgressLoaded(report) => {
+            if let crate::tui::state::AppMode::Progress(state) = &mut app.mode {
+                state.loading = false;
+                state.report = Some(report);
+            }
+            Ok(None)
+        }
+        AppEvent::ProgressFailed(error) => {
+            if let crate::tui::state::AppMode::Progress(state) = &mut app.mode {
+                state.loading = false;
                 state.error = Some(error);
             }
             Ok(None)

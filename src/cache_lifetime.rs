@@ -36,6 +36,15 @@ impl CacheLifetime {
     pub fn is_default(&self) -> bool {
         *self == Self::default()
     }
+
+    /// Whether a cache last touched `gap` ago has expired.
+    #[must_use]
+    pub fn expired_after(&self, gap: Duration) -> bool {
+        match self {
+            Self::Limited(lifetime) => gap >= *lifetime,
+            Self::Permanent => false,
+        }
+    }
 }
 
 impl From<CacheLifetime> for aither_agent::context::CacheLifetime {

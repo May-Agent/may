@@ -15,7 +15,7 @@ use self::popups::{render_mcp_popup, render_skill_popup, render_ssh_popup};
 use ratatui::{
     buffer::CellDiffOption,
     prelude::*,
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
+    widgets::{Block, Borders, Clear, LineGauge, List, ListItem, Paragraph},
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -27,7 +27,8 @@ use super::super::app::{App, ImageRegion};
 use super::super::completion::CompletionMode;
 use super::super::state::{
     AppMode, AskUserState, BtwState, ChatgptAuthStatus, CopilotAuthStatus, GrokAuthStatus,
-    JobDetailState, JobDetailTarget, LOGIN_PROVIDERS, OpenrouterAuthStatus, RewindState,
+    JobDetailState, JobDetailTarget, LOGIN_PROVIDERS, OpenrouterAuthStatus, ProgressState,
+    RewindState,
 };
 use super::chat::{self, InputContext, QueueContext, StatusContext, UnifiedRenderContext};
 
@@ -356,6 +357,7 @@ fn sheet_height(app: &App, column: Rect) -> Option<u16> {
         ),
         AppMode::JobDetail(_) => (pct(80), pct(80)),
         AppMode::Btw(state) => (if !state.loading && !state.done { 5 } else { 14 }, pct(60)),
+        AppMode::Progress(_) => (16, pct(60)),
         AppMode::PermissionConfirm(state) => (
             rows(confirm_body_rows(state.request.script.as_str(), column.width) + 8),
             pct(70),
@@ -424,6 +426,7 @@ fn render_sheet(frame: &mut Frame, sheet: Rect, app: &App) {
         AppMode::Jobs => render_jobs_panel(frame, sheet, app),
         AppMode::JobDetail(state) => render_job_detail(frame, sheet, state),
         AppMode::Btw(state) => render_btw_popup(frame, sheet, state),
+        AppMode::Progress(state) => render_progress_popup(frame, sheet, state),
         AppMode::PermissionConfirm(state) => render_permission_confirm(frame, sheet, state),
         AppMode::WorkspaceConfirm(state) => {
             render_workspace_confirm(frame, sheet, &state.path, &state.reason);
@@ -1379,6 +1382,83 @@ fn render_btw_popup(frame: &mut Frame, area: Rect, state: &BtwState) {
 
     let paragraph = WrappedParagraph::new(lines).scroll(state.scroll);
     frame.render_widget(paragraph, inner);
+}
+
+/// The report's groups in display order, with the heading of each.
+fn progress_groups(report: &crate::daemon::ProgressReport) -> [(&'static str, &[String]); 4] {
+    [
+        ("Waiting to land", &report.waiting_to_land),
+        ("Waiting on something else", &report.waiting_on_other),
+        ("Not started", &report.not_started),
+        ("Waiting on you", &report.waiting_on_user),
+    ]
+}
+
+fn render_progress_popup(frame: &mut Frame, area: Rect, state: &ProgressState) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title("progress (not in history)");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [bar_area, body_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(report) = &state.report {
+        let ratio = if report.total == 0 {
+            0.0
+        } else {
+            f64::from(report.done) / f64::from(report.total)
+        };
+        frame.render_widget(
+            LineGauge::default()
+                .label(format!("{}/{}", report.done, report.total))
+                .ratio(ratio)
+                .filled_style(Style::default().fg(Color::Green))
+                .unfilled_style(Style::default().fg(Color::DarkGray)),
+            bar_area,
+        );
+        for (heading, items) in progress_groups(report) {
+            if items.is_empty() {
+                continue;
+            }
+            if !lines.is_empty() {
+                lines.push(Line::from(""));
+            }
+            lines.push(Line::from(Span::styled(
+                heading,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            lines.extend(items.iter().map(|item| {
+                Line::from(Span::styled(
+                    format!("• {item}"),
+                    Style::default().fg(Color::White),
+                ))
+            }));
+        }
+    } else if state.loading {
+        lines.push(Line::from(Span::styled(
+            "thinking…",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    if let Some(error) = &state.error {
+        lines.push(Line::from(Span::styled(
+            format!("error: {error}"),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    if !state.loading {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Esc/q close · ↑↓ scroll",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    frame.render_widget(WrappedParagraph::new(lines).scroll(state.scroll), body_area);
 }
 
 /// Helper to create a centered rect.
@@ -2773,6 +2853,7 @@ mod tests {
                 .expect("instant in range"),
             status,
             output_path: None,
+            place: aither_sandbox::JobPlace::Host,
         }
     }
 
@@ -3322,6 +3403,63 @@ mod tests {
                 });
             }
         }
+    }
+
+    /// A structured report renders as a gauge over the grouped items.
+    #[test]
+    fn progress_report_renders_as_bar_and_grouped_items() {
+        let state = crate::tui::state::ProgressState {
+            report: Some(crate::daemon::ProgressReport {
+                done: 2,
+                total: 5,
+                waiting_to_land: vec!["合并 PR".to_string()],
+                waiting_on_other: vec![],
+                not_started: vec!["ドキュメントを更新する".to_string()],
+                waiting_on_user: vec!["릴리스 승인".to_string()],
+            }),
+            ..crate::tui::state::ProgressState::default()
+        };
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(60, 16)).unwrap();
+        terminal
+            .draw(|frame| super::render_progress_popup(frame, frame.area(), &state))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(rows[1].contains("2/5"), "the bar row: {:?}", rows[1]);
+        let filled = (0..buffer.area.width)
+            .filter(|&x| buffer[(x, 1)].fg == ratatui::style::Color::Green)
+            .count();
+        let unfilled = (0..buffer.area.width)
+            .filter(|&x| buffer[(x, 1)].fg == ratatui::style::Color::DarkGray)
+            .count();
+        assert!(
+            filled > 0 && unfilled > filled,
+            "2 of 5 fills under half the bar: {filled} of {}",
+            filled + unfilled
+        );
+        // A wide glyph's trailing cell reads back as a space: compare
+        // without whitespace.
+        let text: String = rows.join("\n").split_whitespace().collect();
+        for needle in [
+            "Waitingtoland",
+            "合并PR",
+            "Notstarted",
+            "ドキュメントを更新する",
+            "Waitingonyou",
+            "릴리스승인",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?}:\n{text}");
+        }
+        assert!(
+            !text.contains("Waitingonsomethingelse"),
+            "empty group hidden"
+        );
     }
 
     /// An `ask_user` question, drawn without a border of its own, wraps

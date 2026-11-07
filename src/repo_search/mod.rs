@@ -70,7 +70,8 @@ struct Inner {
     prepared: OnceCell<Prepared>,
     /// `true` once [`RepoSearch::retire`] ran. Every launch holds it shared
     /// while it may install agents, so a retirement waits for those in flight
-    /// and no launch installs after it.
+    /// and no launch installs after it. The binary is prepared before the
+    /// lock is taken, so a retirement never waits on the network.
     retired: async_lock::RwLock<bool>,
 }
 
@@ -131,11 +132,13 @@ impl RepoSearch {
     /// unreachable, and with [`RepoSearchError::Retired`] after
     /// [`RepoSearch::retire`].
     pub async fn client(&self) -> Result<Client, RepoSearchError> {
+        // Preparing the binary installs no agents, so it runs outside the
+        // lock: a retirement must not wait out a download's retries.
+        let prepared = self.prepared().await?;
         let retired = self.inner.retired.read().await;
         if *retired {
             return Err(RepoSearchError::Retired);
         }
-        let prepared = self.prepared().await?;
         let mut launcher = PlatformLauncher::user(prepared.program.clone())?;
         let report = launcher.prepare().await;
         let client = launcher::connect(&mut launcher, &prepared.hello, report, log_note).await?;

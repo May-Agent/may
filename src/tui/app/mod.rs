@@ -141,17 +141,14 @@ pub struct App {
     pub status: Option<StatusNotice>,
     /// Whether agent is currently processing
     pub processing: bool,
-    /// Whether the in-flight turn produced any model output — a turn
-    /// stopped before its first event returns the sent draft to the
-    /// input box instead of dropping it.
-    turn_had_output: bool,
-    /// The last message handed to the agent, kept until the next send so
-    /// an aborted-before-any-action turn can put it back into the input.
-    last_sent_input: Option<String>,
     /// Hidden context attached to the next send after a rewind: tells the
     /// agent the conversation was cut back while the world — open and
     /// merged PRs — stands as recorded.
     pub rewind_notice: Option<crate::xml::XmlBlock>,
+    /// The hidden context the latest send carried, kept client-side until
+    /// the next send: a withdrawn turn deletes its rows, so the sender
+    /// attaches it to the message it sends again.
+    sent_hidden_context: Option<crate::xml::XmlBlock>,
     /// File picker state (when in `FilePicker` mode)
     pub file_picker: Option<FilePicker>,
     /// Image manager for clipboard images
@@ -311,8 +308,11 @@ pub struct App {
     pub profile_sessions: Option<ProfileSessions>,
     /// Selected profile index in `ProfileSelect` mode
     pub profile_selected: usize,
-    /// Whether the archived section is expanded in `SessionSelect`
-    pub archived_expanded: bool,
+    /// Which sessions `SessionSelect` lists.
+    pub session_view: super::state::SessionView,
+    /// The task following the daemon's pushed session lists of a profile
+    /// while `SessionSelect` is open.
+    profile_follow: Option<(String, tokio::task::JoinHandle<()>)>,
 
     /// Event sender for spawning background tasks
     pub event_tx: EventSender,
@@ -631,9 +631,8 @@ impl App {
             content_height: AtomicUsize::new(0),
             view_height: AtomicUsize::new(0),
             mode,
-            turn_had_output: false,
-            last_sent_input: None,
             rewind_notice: None,
+            sent_hidden_context: None,
             queue: MessageQueue::new(),
             status,
             processing: false,
@@ -712,7 +711,8 @@ impl App {
             current_profile_id,
             profile_sessions: None,
             profile_selected: 0,
-            archived_expanded: false,
+            session_view: super::state::SessionView::default(),
+            profile_follow: None,
 
             event_tx,
             image_support,
@@ -1136,6 +1136,37 @@ impl App {
                     let _ = tx.send(AppEvent::BtwFailed(error.to_string())).await;
                 }
             }
+        })
+        .detach();
+    }
+
+    /// Open the `/progress` overlay and ask the daemon for the remaining
+    /// work. The request runs on the side: nothing touches the conversation.
+    pub fn open_progress(&mut self) {
+        let (Some(client), Some(session)) = (
+            self.btw_daemon.clone(),
+            self.session_manager
+                .current()
+                .filter(|session| session.persisted),
+        ) else {
+            self.chat
+                .push_notice("No model available for /progress — start a session first");
+            return;
+        };
+        let path = crate::client::session_path(session.id.as_str(), "/progress");
+        self.mode = AppMode::Progress(super::state::ProgressState {
+            loading: true,
+            ..super::state::ProgressState::default()
+        });
+        let tx = self.event_tx.clone();
+        spawn(async move {
+            let report: Result<crate::daemon::ProgressReport, _> =
+                client.post(&path, &serde_json::json!({})).await;
+            let event = match report {
+                Ok(report) => AppEvent::ProgressLoaded(report),
+                Err(error) => AppEvent::ProgressFailed(error.to_string()),
+            };
+            let _ = tx.send(event).await;
         })
         .detach();
     }
@@ -2375,6 +2406,7 @@ impl App {
                         self.mode = AppMode::ProfileSelect;
                     } else {
                         // Only one profile, open session list directly
+                        self.session_view = super::state::SessionView::Recent;
                         self.load_session_list();
                     }
                     return Ok(None);
@@ -2460,6 +2492,7 @@ impl App {
                 self, code,
             )),
             AppMode::Btw(_) => Ok(super::reducer::navigation::handle_btw_key(self, code)),
+            AppMode::Progress(_) => Ok(super::reducer::navigation::handle_progress_key(self, code)),
             AppMode::ImageView(_) => Ok(super::reducer::navigation::handle_image_view_key(
                 self, code,
             )),
@@ -2563,6 +2596,7 @@ impl App {
                                 reasoning_effort: session.reasoning_effort,
                                 repo: session.repo,
                                 runtime: crate::session::SessionRuntimeSummary::default(),
+                                working: false,
                             })
                             .collect()
                     });
@@ -2576,12 +2610,18 @@ impl App {
     }
 
     /// Build a flat session list from profile sessions for navigation.
-    /// Pinned items come first, then regular, then archived (if expanded).
+    /// The recent view lists pinned items first, then regular sessions; the
+    /// archive view lists the archived ones.
     pub fn build_session_list_from_profile(&mut self) {
         let Some(ref ps) = self.profile_sessions else {
             self.session_list.clear();
             return;
         };
+
+        if self.session_view == super::state::SessionView::Archive {
+            self.session_list.clone_from(&ps.archived);
+            return;
+        }
 
         let mut list = Vec::new();
 
@@ -2597,11 +2637,6 @@ impl App {
 
         // Regular sessions
         list.extend(ps.regular.iter().cloned());
-
-        // Archived (only if expanded)
-        if self.archived_expanded {
-            list.extend(ps.archived.iter().cloned());
-        }
 
         self.session_list = list;
     }
@@ -2656,6 +2691,29 @@ impl App {
             .iter()
             .find(|p| p.id == pid)
             .map(|p| p.name.as_str())
+    }
+
+    /// Follows the daemon's pushed session lists of the current profile
+    /// while `SessionSelect` is open, and stops once it closes.
+    pub fn sync_profile_follow(&mut self) {
+        let wanted = match (&self.mode, &self.current_profile_id, &self.btw_daemon) {
+            (AppMode::SessionSelect, Some(profile_id), Some(_)) => Some(profile_id.clone()),
+            _ => None,
+        };
+        if self.profile_follow.as_ref().map(|(id, _)| id) == wanted.as_ref() {
+            return;
+        }
+        if let Some((_, task)) = self.profile_follow.take() {
+            task.abort();
+        }
+        if let (Some(profile_id), Some(client)) = (wanted, self.btw_daemon.clone()) {
+            let task = tokio::spawn(super::remote::follow_profile_sessions(
+                client,
+                profile_id.clone(),
+                self.event_tx.clone(),
+            ));
+            self.profile_follow = Some((profile_id, task));
+        }
     }
 
     /// Reload profile sessions asynchronously (used after pin/archive mutations).
@@ -3284,6 +3342,12 @@ impl App {
     fn execute_slash_command(&mut self, cmd: &str) -> Option<SendAction> {
         match cmd {
             "/session" => {
+                self.session_view = super::state::SessionView::Recent;
+                self.load_session_list();
+                None
+            }
+            "/archive" => {
+                self.session_view = super::state::SessionView::Archive;
                 self.load_session_list();
                 None
             }
@@ -3297,6 +3361,7 @@ impl App {
                         .unwrap_or(0);
                     self.mode = AppMode::ProfileSelect;
                 } else {
+                    self.session_view = super::state::SessionView::Recent;
                     self.load_session_list();
                 }
                 None
@@ -3358,6 +3423,10 @@ impl App {
             "/questions" => Some(SendAction::OpenQuestions),
             "/btw" => {
                 self.open_btw();
+                None
+            }
+            "/progress" => {
+                self.open_progress();
                 None
             }
             "/resume-claude" => {
@@ -3750,10 +3819,10 @@ impl App {
             return self.open_model_select(rest.trim());
         }
 
-        self.last_sent_input = Some(content.clone());
+        self.sent_hidden_context = self.rewind_notice.take();
         let msg = PendingMessage {
             content,
-            hidden_context_xml: self.rewind_notice.take(),
+            hidden_context_xml: self.sent_hidden_context.clone(),
             attachments,
             queued_at: jiff::Timestamp::now(),
             delivery_mode,
@@ -3767,23 +3836,29 @@ impl App {
         }
     }
 
-    /// A turn stopped before its first agent event puts the sent message
-    /// back into the input box — the usual "I sent a typo" recovery.
-    pub fn restore_aborted_draft(&mut self) {
-        if self.turn_had_output {
-            return;
-        }
-        if let Some(draft) = self.last_sent_input.take() {
-            self.input_char_count = draft.chars().count();
+    /// The daemon withdrew the latest turn, stopped before any tool call or
+    /// response text: its message and the turn's markers leave the chat.
+    /// The client that sent it gets its text and attachments back in the
+    /// input — the usual "I sent a typo" recovery. The session history is
+    /// reloaded without the message.
+    pub fn withdraw_turn(&mut self, content: String, own: bool) {
+        let attachments = self.chat.withdraw_last_prompt(&content);
+        if own {
+            // The withdrawn message took its hidden context with it; a
+            // rewind since then supersedes it.
+            if self.rewind_notice.is_none() {
+                self.rewind_notice = self.sent_hidden_context.take();
+            }
+            self.input_char_count = content.chars().count();
             self.cursor = self.input_char_count;
-            self.input = draft;
+            self.input = content;
+            self.attachments = attachments.unwrap_or_default();
         }
     }
 
     /// Called when starting to process a message.
     pub fn start_processing(&mut self, msg: &PendingMessage) {
         self.processing = true;
-        self.turn_had_output = false;
         self.turn_started_at = Some(std::time::Instant::now());
         self.thinking_start = None;
         self.activity_phase = crate::tui::ui::chat::ActivityPhase::Thinking;
@@ -3851,10 +3926,9 @@ impl App {
             .session_paths(session.id.as_str(), session.profile_id.as_deref());
         match paths.tasks_content().await {
             Ok(content) => {
-                let checklist = crate::todo_parser::TodoChecklist::parse(
+                self.chat.set_todos(crate::task_rows::task_rows(
                     content.as_deref().unwrap_or_default(),
-                );
-                self.chat.set_todos(checklist.items);
+                ));
             }
             Err(error) => {
                 tracing::warn!(error = %error, "failed to read session tasks.md");
@@ -4090,13 +4164,18 @@ impl App {
         }
     }
 
+    /// The model response in flight is being sent again: drop what it
+    /// streamed, which the replacement does not continue.
+    pub fn retract_response(&mut self) {
+        self.chat.retract_response();
+        self.pending_tool_calls.retain(|_, pending| pending.started);
+        self.thinking_start = None;
+    }
+
     /// Handle an agent event. Returns true if stream ended.
     pub async fn handle_agent_event(&mut self, result: Result<TimedEvent, AgentError>) -> bool {
         match result {
             Ok(TimedEvent { event, .. }) => {
-                // Any event from the agent stream counts as the turn having
-                // acted — a stop before this point restores the sent draft.
-                self.turn_had_output = true;
                 match event {
                     AgentEvent::Text(chunk) => {
                         self.activity_phase = crate::tui::ui::chat::ActivityPhase::Working;
@@ -4205,12 +4284,12 @@ impl App {
                     // by another in the same run (the harness re-prompting,
                     // a background command finishing): it starts a block of
                     // its own instead of being glued onto this one.
-                    AgentEvent::TurnComplete {
-                        has_tool_calls: false,
-                        ..
-                    } => {
-                        self.chat.end_text();
-                        self.decode_meter.note_boundary();
+                    AgentEvent::TurnComplete { has_tool_calls, .. } => {
+                        if !has_tool_calls {
+                            self.chat.end_text();
+                            self.decode_meter.note_boundary();
+                        }
+                        self.chat.seal_response();
                     }
                     AgentEvent::Complete { .. } => {
                         // Text was already streamed via AgentEvent::Text events
@@ -4652,8 +4731,101 @@ mod tests {
         .expect("suggestion event");
     }
 
+    fn summary(id: &str, archived: bool, working: bool) -> crate::session::SessionSummary {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "title": format!("title of {id}"),
+            "pinned": false,
+            "archived": archived,
+            "message_count": 1,
+            "content_preview": "",
+            "working": working,
+        }))
+        .expect("summary")
+    }
+
+    fn session_screen(app: &mut App) -> Vec<String> {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).expect("terminal");
+        let frame = terminal
+            .draw(|frame| crate::tui::ui::render(frame, app))
+            .expect("draw");
+        crate::tui::ui::test_screen::buffer_screen(frame.buffer)
+    }
+
+    #[tokio::test]
+    async fn a_working_session_reads_working_in_the_session_list() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        app.session_list = vec![summary("busy", false, true), summary("calm", false, false)];
+        app.mode = crate::tui::AppMode::SessionSelect;
+
+        let screen = session_screen(&mut app).join("\n");
+        let busy = screen
+            .lines()
+            .find(|line| line.contains("title of busy"))
+            .expect("busy session listed");
+        assert!(busy.contains("Working..."), "{busy}");
+        let calm = screen
+            .lines()
+            .find(|line| line.contains("title of calm"))
+            .expect("calm session listed");
+        assert!(!calm.contains("Working..."), "{calm}");
+    }
+
+    #[tokio::test]
+    async fn the_archive_view_titles_the_popup() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        app.session_view = crate::tui::state::SessionView::Archive;
+        app.session_list = vec![summary("old", true, false)];
+        app.mode = crate::tui::AppMode::SessionSelect;
+
+        let screen = session_screen(&mut app).join("\n");
+        assert!(screen.contains("Archived sessions"), "{screen}");
+        assert!(screen.contains("title of old"), "{screen}");
+
+        app.session_view = crate::tui::state::SessionView::Recent;
+        let screen = session_screen(&mut app).join("\n");
+        assert!(!screen.contains("Archived sessions"), "{screen}");
+    }
+
     fn press(app: &mut App, code: KeyCode) -> Option<SendAction> {
         app.handle_key(code, KeyModifiers::NONE).expect("key")
+    }
+
+    /// A withdrawn message takes its hidden context with it; the sender puts
+    /// the rewind notice back so the message it sends again carries it.
+    #[tokio::test]
+    async fn a_withdrawn_message_returns_its_rewind_notice_to_the_sender() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        let text = "你好 こんにちは 안녕하세요";
+        let notice = crate::xml::XmlBlock::parse("The conversation was rewound.".to_string())
+            .expect("notice parses");
+        app.rewind_notice = Some(notice.clone());
+        for c in text.chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        let Some(SendAction::Send(sent)) = press(&mut app, KeyCode::Enter) else {
+            panic!("Enter sends the message");
+        };
+        assert_eq!(sent.hidden_context_xml, Some(notice.clone()));
+        assert!(app.rewind_notice.is_none(), "the send took the notice");
+
+        // Another client's withdrawn turn leaves this client's state alone.
+        app.withdraw_turn("someone else's".to_string(), false);
+        assert!(app.rewind_notice.is_none());
+
+        app.withdraw_turn(text.to_string(), true);
+        assert_eq!(app.input, text);
+        assert_eq!(app.rewind_notice, Some(notice.clone()));
+
+        let Some(SendAction::Send(again)) = press(&mut app, KeyCode::Enter) else {
+            panic!("Enter sends the restored message");
+        };
+        assert_eq!(again.content, text);
+        assert_eq!(again.hidden_context_xml, Some(notice));
     }
 
     #[tokio::test]

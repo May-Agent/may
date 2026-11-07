@@ -6,6 +6,8 @@
 //! request that reads less than its route had cached is appended to
 //! `cache_misses` with its cause.
 
+use std::time::Duration;
+
 use aither_agent::context::{PrefixChain, PromptPrefix};
 use aither_core::llm::Usage;
 
@@ -138,6 +140,35 @@ impl ChatDb {
         .await?;
         tx.commit().await?;
         Ok(miss)
+    }
+
+    /// Whether the prompt cache of `session_id` has gone cold at `now`: its
+    /// latest provider request is older than that provider's cache lifetime,
+    /// `lifetime_of` giving the lifetime for a provider id. A session that
+    /// has made no request has no cache to be cold.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn prompt_cache_is_cold(
+        &self,
+        session_id: &str,
+        now: jiff::Timestamp,
+        lifetime_of: impl FnOnce(&str) -> CacheLifetime,
+    ) -> Result<bool, ChatDbError> {
+        let routes = query!(
+            self.db,
+            "SELECT * FROM prompt_cache_routes WHERE session_id = ?",
+            session_id
+        )
+        .fetch_all::<prompt_cache_routes::Model>()
+        .await?;
+        let Some(latest) = routes.iter().max_by_key(|route| route.observed_at_ms) else {
+            return Ok(false);
+        };
+        let gap = Duration::from_millis(
+            u64::try_from(now.as_millisecond().saturating_sub(latest.observed_at_ms)).unwrap_or(0),
+        );
+        Ok(lifetime_of(&latest.provider_id).expired_after(gap))
     }
 
     /// Every recorded cache miss of one session, oldest first.

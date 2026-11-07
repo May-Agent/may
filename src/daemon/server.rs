@@ -330,7 +330,7 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
         .context("failed to resume persisted pending session runs")?;
 
     // Spawn background tasks
-    let _auto_archive = crate::tasks::spawn_auto_archive(db_for_archive.clone());
+    super::archive::spawn(state.clone());
     if let Some(ref cm) = state.container_manager {
         let _auto_stop = cm.spawn_auto_stop_task();
     }
@@ -480,6 +480,7 @@ fn api_routes() -> Route {
                         "/usage".at(super::chat::usage_report),
                         "/context-dump".post(super::chat::context_dump),
                         "/btw".post(super::chat::btw),
+                        "/progress".post(super::chat::progress),
                         "/agent".delete(super::chat::release_agent),
                     )),
                     Route::new((

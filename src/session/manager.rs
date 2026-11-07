@@ -174,6 +174,10 @@ pub struct SessionSummary {
         skip_serializing_if = "crate::session::SessionRuntimeSummary::is_empty"
     )]
     pub runtime: SessionRuntimeSummary,
+    /// Whether something runs in the session: a turn, a background command
+    /// or a subagent run. Set by the daemon when it lists sessions.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub working: bool,
 }
 
 /// Where a prompt-level rewind truncated the conversation.
@@ -217,6 +221,7 @@ impl SessionSummary {
             reasoning_effort: s.reasoning_effort,
             repo: s.repo,
             runtime: SessionRuntimeSummary::default(),
+            working: false,
         }
     }
 }

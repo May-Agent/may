@@ -26,8 +26,8 @@ use super::types::{
     LastModelRequest, McpCreateRequest, MemoryPayload, MemorySaveRequest, SkillInfoDto,
     SkillInstallRequest, SseHeartbeat, SshServerRequest, UiAppearanceConfig, UiBrowserConfig,
     UiConfigResponse, UiFullConfig, UiModelsConfig, UiNativeToolsConfig, UiPreferencesConfig,
-    UiProviderConfig, UiRecapConfig, UiRemoteAccessConfig, UiSandboxConfig, UiStreamConfig,
-    UiSuggestionsConfig,
+    UiProviderConfig, UiRecapConfig, UiRemoteAccessConfig, UiSandboxConfig, UiSessionsConfig,
+    UiStreamConfig, UiSuggestionsConfig,
 };
 use crate::computer::proto::{AgentRequest, AgentResponse};
 
@@ -180,6 +180,9 @@ pub(super) fn build_ui_full_config(config: &MayConfig) -> UiFullConfig {
         recap: Some(UiRecapConfig {
             auto: config.recap.auto,
             idle_minutes: config.recap.idle_minutes,
+        }),
+        sessions: Some(UiSessionsConfig {
+            recent_hours: config.sessions.recent_hours,
         }),
     }
 }
@@ -394,6 +397,9 @@ async fn run_save_full_config(state: Arc<DaemonState>, req: UiFullConfig) -> Sky
         if let Some(recap) = &req.recap {
             config.recap.auto = recap.auto;
             config.recap.idle_minutes = recap.idle_minutes;
+        }
+        if let Some(sessions) = &req.sessions {
+            config.sessions.recent_hours = sessions.recent_hours;
         }
     });
 

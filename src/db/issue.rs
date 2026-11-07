@@ -130,6 +130,7 @@ impl ChatDb {
         .into_iter()
         .map(|row| {
             Ok(RelatedIssue {
+                repository: None,
                 number: row.number,
                 title: row.title,
                 state: row.state.parse().map_err(|error: String| {

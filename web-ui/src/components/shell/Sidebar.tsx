@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react';
 import { Link, useLocation, useParams } from 'react-router-dom';
 import {
+  Archive,
   ChevronDown,
   ChevronRight,
   Github,
@@ -17,7 +18,8 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip
 import { useTranslation } from '@/lib/i18n';
 import { useUiStore } from '@/lib/stores/ui';
 import { useRuntimeStore } from '@/lib/stores/runtime';
-import { useActiveProfile } from '@/lib/profile/active';
+import { profileArchivePath, useActiveProfile } from '@/lib/profile/active';
+import { isWorking } from '@/lib/sessionLists';
 import { useNewChat } from '@/lib/useNewChat';
 import { shortcutAria, shortcutLabel } from '@/lib/shortcuts';
 import { FolderNode, SessionNode } from './SessionNode';
@@ -56,9 +58,9 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
   const totalActive = pinned.length + regular.length;
   const loading = activeProfileId !== null && scoped === null;
 
-  const [archiveOpen, setArchiveOpen] = useState(false);
   const [repoDialogOpen, setRepoDialogOpen] = useState(false);
   const settingsActive = location.pathname.startsWith('/settings');
+  const archiveActive = location.pathname.endsWith('/archive');
 
   // Sessions bound to a repository cluster under a collapsible group
   // header; repo-less sessions stay flat above the groups.
@@ -188,7 +190,7 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
               <Loader2 className="size-4 animate-spin" aria-hidden />
               {t('common.loading')}
             </div>
-          ) : totalActive === 0 && archived.length === 0 ? (
+          ) : totalActive === 0 ? (
             <div className="px-3 py-10 text-center text-[13px] text-muted-foreground">
               {t('sidebar.noSessionsInProfile')}
             </div>
@@ -206,6 +208,7 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
                         kind="pinned"
                         active={item.id === sessionId}
                         repo={item.repo}
+                        working={isWorking(item)}
                       />
                     ) : (
                       <FolderNode key={item.id} id={item.id} name={item.name} defaultOpen>
@@ -220,6 +223,7 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
                             inFolder
                             indent
                             repo={child.repo}
+                            working={isWorking(child)}
                           />
                         ))}
                       </FolderNode>
@@ -239,6 +243,7 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
                       kind="regular"
                       active={item.id === sessionId}
                       repo={item.repo}
+                      working={isWorking(item)}
                     />
                   ))}
                   {repoGroups.map(([repo, items]) => (
@@ -252,6 +257,7 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
                           kind="regular"
                           active={item.id === sessionId}
                           indent
+                          working={isWorking(item)}
                         />
                       ))}
                     </RepoGroup>
@@ -259,45 +265,28 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
                 </Section>
               )}
 
-              {archived.length > 0 && (
-                <div>
-                  <button
-                    type="button"
-                    onClick={() => setArchiveOpen((v) => !v)}
-                    className="flex h-7 w-full items-center gap-1 rounded-md px-2 text-xs font-medium text-muted-foreground hover:text-foreground touch:h-11"
-                    aria-expanded={archiveOpen}
-                  >
-                    {archiveOpen ? (
-                      <ChevronDown className="size-3.5" aria-hidden />
-                    ) : (
-                      <ChevronRight className="size-3.5" aria-hidden />
-                    )}
-                    <span>{t('sidebar.archived')}</span>
-                    <span className="ml-auto font-normal tabular-nums">{archived.length}</span>
-                  </button>
-                  {archiveOpen && (
-                    <ul className="mt-0.5 space-y-px">
-                      {archived.map((item) => (
-                        <SessionNode
-                          key={item.id}
-                          id={item.id}
-                          title={item.title || t('common.untitled')}
-                          runtime={item.runtime}
-                          kind="archived"
-                          active={item.id === sessionId}
-                          repo={item.repo}
-                        />
-                      ))}
-                    </ul>
-                  )}
-                </div>
-              )}
             </div>
           )}
         </nav>
       </ScrollArea>
 
       <div className="px-2 pt-1">
+        {activeProfileId && (
+          <Link
+            to={profileArchivePath(activeProfileId)}
+            aria-current={archiveActive ? 'page' : undefined}
+            className={cn(
+              'flex h-7 items-center gap-2 rounded-md px-2 text-[13px] font-medium text-muted-foreground hover:bg-accent hover:text-foreground touch:h-11',
+              archiveActive && 'bg-accent text-foreground',
+            )}
+          >
+            <Archive className="size-4" strokeWidth={1.75} aria-hidden />
+            <span className="flex-1">{t('sidebar.archivePage')}</span>
+            {archived.length > 0 && (
+              <span className="font-normal tabular-nums">{archived.length}</span>
+            )}
+          </Link>
+        )}
         <Link
           to="/settings"
           aria-current={settingsActive ? 'page' : undefined}

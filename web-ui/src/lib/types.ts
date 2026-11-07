@@ -301,18 +301,33 @@ export interface SseToolEnd {
   summary?: ToolSummary;
 }
 
-export interface SseTodoItem {
+/** A section of `tasks.md` that holds rows. */
+export type TaskSection = 'roots' | 'doing' | 'queued';
+
+/** An issue or pull request a row names. */
+export interface TaskReference {
+  /** `owner/repo` when the row writes one. */
+  repository: string | null;
+  number: number;
+  pullRequest: boolean;
+}
+
+/** One row of `Roots`, `Doing` or `Queued`, parsed by the daemon. */
+export interface TaskRow {
+  section: TaskSection;
+  /** Row text; continuation lines are joined by newlines. */
   text: string;
-  checked: boolean;
+  /** Payload of the row's `BLOCKING <what>` mark. */
+  blocking: string | null;
+  references: TaskReference[];
 }
 
 export interface SseTodoUpdate {
   kind: 'todo_update';
   seq: number;
   turnId: string;
-  items: SseTodoItem[];
-  total: number;
-  completed: number;
+  /** All rows of the document; empty once every row is deleted. */
+  rows: TaskRow[];
 }
 
 export interface SseError {
@@ -329,16 +344,26 @@ export interface SseDone {
   seq: number;
   turnId: string;
   sessionId: string;
+  /** The reply, under the id of the first assistant message the turn stored. */
   assistant: ApiMessage;
+  /** The stored user message the turn answers, as the session's messages name it. */
+  userMessageId: string | null;
+  /** Every assistant message the turn stored, as the session's messages name them. */
+  messageIds: string[];
 }
 
-/** The turn paused for a browser takeover; carries the partial reply. */
+/**
+ * The turn paused for a browser takeover; carries the partial reply, which
+ * is absent when the pause came before the turn stored one.
+ */
 export interface SsePaused {
   kind: 'paused';
   seq: number;
   turnId: string;
   sessionId: string;
-  assistant: ApiMessage;
+  assistant: ApiMessage | null;
+  userMessageId: string | null;
+  messageIds: string[];
 }
 
 /** Last event of every turn, however it ended. */
@@ -387,6 +412,19 @@ export interface SseRetract {
   turnId: string;
 }
 
+/**
+ * The turn was stopped before any tool call or response text: the daemon
+ * withdrew it, so its message left the conversation. The client that sent
+ * the message puts it back into its composer.
+ */
+export interface SseWithdrawn {
+  kind: 'withdrawn';
+  seq: number;
+  turnId: string;
+  content: string;
+  attachments: ApiAttachment[];
+}
+
 export type ChatStreamEvent =
   | SseStart
   | SseText
@@ -404,7 +442,8 @@ export type ChatStreamEvent =
   | SsePing
   | SseSpeed
   | SseHold
-  | SseRetract;
+  | SseRetract
+  | SseWithdrawn;
 
 // ── UI event stream /api/events ─────────────────────────────
 
@@ -438,6 +477,8 @@ export interface ProfileSessionSummary {
   updated_at?: string | null;
   profile_id?: string | null;
   repo?: string | null;
+  /** Something runs in the session: a turn, a background command or a subagent. */
+  working?: boolean;
 }
 
 export type ProfileSessionsPayload = {
@@ -515,6 +556,8 @@ export interface ArtifactDiagnosticsResponse {
 export interface SessionTasksPayload {
   content: string;
   planState: SessionPlanState;
+  /** Parsed rows of `content`; set by the daemon, ignored when saving. */
+  rows?: TaskRow[];
 }
 
 export interface SessionPlanStateRequest {

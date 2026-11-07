@@ -1239,8 +1239,12 @@ where
                         }
                     },
                     TuiEvent::Retract => {
-                        app.chat.retract_text();
+                        app.retract_response();
                         assistant_response.clear();
+                    }
+                    TuiEvent::Withdrawn { content, own } => {
+                        assistant_response.clear();
+                        app.withdraw_turn(content, own);
                     }
                     TuiEvent::Compacted(result) => match result {
                         Ok(Some(stats)) => {
@@ -1367,7 +1371,6 @@ where
                         if let Some(handle) = agent_handle.take() {
                             handle.cancel();
                         }
-                        app.restore_aborted_draft();
                         app.status = None;
                         // Clean up loading/streaming state before adding interrupt message
                         app.chat.collapse_thinking();

@@ -85,11 +85,11 @@ export function PlanBanner({ sessionId, planState }: PlanBannerProps) {
     try {
       if (isDraft) {
         useSessionsStore.getState().saveDraftPlan(sessionId, draft, 'draft');
-        setInspectorTasks(sessionId, draft, 'draft');
+        setInspectorTasks(sessionId, { content: draft }, 'draft');
       } else {
         const res = await putSessionTasks(sessionId, { content: draft, planState: 'draft' });
         setFetchedContent(res.content);
-        setInspectorTasks(sessionId, res.content, 'draft');
+        setInspectorTasks(sessionId, res, 'draft');
         updateRuntime(sessionId, { planState: 'draft' });
       }
       setEditing(false);
