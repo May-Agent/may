@@ -284,9 +284,9 @@ impl PublishGate {
         }
         .render()
         .unwrap_or_else(|error| panic!("failed to render the merge request: {error}"));
-        self.ask(text, OnTimeout::Deny)
-            .await
-            .map_err(PublishError::Denied)
+        // A project that asked for review gets a human: a yolo session's
+        // auto-approval does not stand in for one.
+        Self::verdict(self.approver.request_review(text).await).map_err(PublishError::Denied)
     }
 
     /// Apply the entry for `publication`: nothing, or a question whose
@@ -310,7 +310,14 @@ impl PublishGate {
 
     /// Put `text` to the user through the live-response machinery.
     async fn ask(&self, text: String, on_timeout: OnTimeout) -> Result<(), PublishDenied> {
-        let reason = match self.approver.request_publication(text, on_timeout).await {
+        Self::verdict(self.approver.request_publication(text, on_timeout).await)
+    }
+
+    /// The agent's view of the user's answer.
+    fn verdict(
+        answer: Result<bool, aither_sandbox::permission::PermissionError>,
+    ) -> Result<(), PublishDenied> {
+        let reason = match answer {
             Ok(true) => return Ok(()),
             Ok(false) => "the user denied it".to_string(),
             Err(error) => error.to_string(),

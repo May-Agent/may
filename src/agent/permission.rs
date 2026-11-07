@@ -423,6 +423,29 @@ impl PermissionApprover {
         .await
     }
 
+    /// Ask the user to review `text` and wait for the answer. Unlike every
+    /// other request, no yolo switch answers it: only the user does, and an
+    /// unanswered or unavailable request is denied.
+    ///
+    /// # Errors
+    /// Returns [`PermissionError`] when the request cannot be delivered, the
+    /// wait is interrupted, or it goes unanswered.
+    pub async fn request_review(&self, text: String) -> Result<bool, PermissionError> {
+        if let ApprovalMode::Unavailable { context } = self.approval_mode {
+            return Err(PermissionError::Denied(format!(
+                "review needs the user's answer, which is unavailable in {context}"
+            )));
+        }
+        self.wait(
+            PermissionRequestMode::Publish,
+            PermissionHistoryMode::Publish,
+            "review",
+            text,
+            OnTimeout::Deny,
+        )
+        .await
+    }
+
     /// Persist the request, surface it to the UI and wait for the answer.
     async fn wait(
         &self,

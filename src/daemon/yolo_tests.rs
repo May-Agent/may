@@ -250,3 +250,54 @@ async fn a_task_created_without_yolo_stays_unapproved() {
     assert_eq!(unchanged, created);
     assert!(!unchanged.approved);
 }
+
+/// A project that requires review gets the user's answer even in a yolo
+/// session: the merge request waits, and the answer decides it.
+#[tokio::test]
+async fn a_review_request_waits_for_the_user_in_a_yolo_session() {
+    for approve in [true, false] {
+        let fixture = Fixture::new().await;
+        fixture.yolo(true).await;
+        let gate = crate::agent::publish_approval::PublishGate::new(
+            Arc::new(arc_swap::ArcSwap::from_pointee(
+                crate::config::MayConfig::default(),
+            )),
+            fixture
+                .approver()
+                .with_approval_timeout(Duration::from_secs(60)),
+        );
+        let asking = tokio::spawn({
+            let gate = gate.clone();
+            async move { gate.approve_merge("/r/.git", 4, "title", "body").await }
+        });
+        let pending = loop {
+            let pending = gate.pending_requests();
+            if !pending.is_empty() {
+                break pending;
+            }
+            assert!(!asking.is_finished(), "yolo answered the review itself");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        assert!(gate.answer(&pending[0], approve));
+
+        assert_eq!(asking.await.expect("joins").is_ok(), approve);
+    }
+}
+
+/// Unlike a publication, an unanswered review is a refusal in a yolo
+/// session too.
+#[tokio::test]
+async fn an_unanswered_review_is_refused_in_a_yolo_session() {
+    let fixture = Fixture::new().await;
+    fixture.yolo(true).await;
+    let approver = fixture.approver();
+
+    assert!(approver.request_review("merge".to_string()).await.is_err());
+    assert!(
+        approver
+            .request_publication("publish".to_string(), crate::agent::OnTimeout::Deny)
+            .await
+            .expect("yolo grants a publication"),
+    );
+}
