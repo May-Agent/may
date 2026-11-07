@@ -298,6 +298,9 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             Ok(Some(SendAction::ReloadHistory))
         }
         AppEvent::HistoryStale => Ok(Some(SendAction::ReloadHistory)),
+        AppEvent::UserNotification(notification) => {
+            Ok(Some(SendAction::DesktopNotification(notification)))
+        }
         AppEvent::Sleep(status) => {
             if status.asleep != app.asleep {
                 app.asleep = status.asleep;

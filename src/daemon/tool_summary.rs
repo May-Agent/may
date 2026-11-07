@@ -22,7 +22,7 @@ use crate::daemon::types::ToolVariant;
 /// - `web_search` → `query`
 /// - `web_fetch` → `url`
 /// - browser → `action`, `target`
-/// - task / ask / session / notify / generic → `description`, `prompt` where applicable
+/// - task / ask / session / generic → `description`, `prompt` where applicable
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolSummary {
@@ -113,12 +113,7 @@ pub fn project_tool_summary(arguments_raw: &str, variant: ToolVariant) -> ToolSu
             target: pick(&value, "target").or_else(|| pick(&value, "url")),
             ..ToolSummary::default()
         },
-        ToolVariant::Task => ToolSummary {
-            description: pick(&value, "description"),
-            prompt: pick(&value, "prompt"),
-            ..ToolSummary::default()
-        },
-        ToolVariant::Ask | ToolVariant::Session | ToolVariant::Notify | ToolVariant::Generic => {
+        ToolVariant::Task | ToolVariant::Ask | ToolVariant::Session | ToolVariant::Generic => {
             ToolSummary {
                 description: pick(&value, "description"),
                 prompt: pick(&value, "prompt"),

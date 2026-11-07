@@ -877,6 +877,11 @@ pub(crate) mod test_sandbox {
             Self { terminal }
         }
 
+        /// What a terminal-bound command of this terminal is built from.
+        pub const fn binding(&self) -> &aither_sandbox::TerminalBinding {
+            self.terminal.binding()
+        }
+
         /// The terminal's sandbox, as a terminal-bound command gets it.
         pub fn sandbox(&self) -> CloneSandbox {
             CloneSandbox::new(self.terminal.binding().runner().clone())

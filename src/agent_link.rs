@@ -95,6 +95,30 @@ pub enum AgentLinkError {
     /// The recipient is idle past its prompt-cache lifetime.
     #[error("{}", cold_recipient_message(.0))]
     ColdRecipient(String),
+    /// The agent asked itself a btw question.
+    #[error("an agent cannot ask itself a btw question")]
+    AskSelf,
+    /// The btw question is empty.
+    #[error("the btw question is empty")]
+    EmptyQuestion,
+    /// A btw recipient is idle past its prompt-cache lifetime.
+    #[error("{}", cold_btw_recipient_message(.0))]
+    ColdBtwRecipient(String),
+    /// The btw recipient's agent has sent no request since it was built, so
+    /// there is no context to fork.
+    #[error(
+        "\"{0}\" has sent no request since its agent was started, so it has no context to answer from; ask again once it has worked"
+    )]
+    NoForkContext(String),
+    /// The btw recipient's context is too close to its compaction point to
+    /// hold a fork's question and answer.
+    #[error(
+        "\"{0}\" is about to compact its context, so a fork of it cannot answer; ask again after it compacts"
+    )]
+    NearCompaction(String),
+    /// The fork answering a btw question failed.
+    #[error("the fork answering the btw question failed: {0}")]
+    Fork(String),
     /// The delivery text could not be wrapped as hidden context.
     #[error(transparent)]
     Context(#[from] XmlBlockError),
@@ -269,6 +293,22 @@ pub struct AgentMessaging {
     pub runtime_service: Arc<SessionRuntimeService>,
     /// How long a provider id keeps the main conversation's cache warm.
     pub cache_lifetime: CacheLifetimes,
+    /// The fork source and model of every session agent, for `btw`.
+    pub forks: ForkHosts,
+}
+
+/// The live agent `target` (name or session id) addresses in `live`.
+fn addressed<'a>(live: &'a [AgentStatus], target: &str) -> Result<&'a AgentStatus, AgentLinkError> {
+    let mut matches = live
+        .iter()
+        .filter(|agent| agent.session_id == target || agent.name == target);
+    let recipient = matches
+        .next()
+        .ok_or_else(|| AgentLinkError::NoSuchAgent(target.to_string()))?;
+    if matches.next().is_some() {
+        return Err(AgentLinkError::AmbiguousAgent(target.to_string()));
+    }
+    Ok(recipient)
 }
 
 impl AgentMessaging {
@@ -298,7 +338,12 @@ impl AgentMessaging {
 
 /// Tag names that frame text for the recipient; text from another agent must
 /// not be able to open or close them.
-const FRAMING_TAGS: [&str; 3] = ["system-reminder", "agent-message", "task-message"];
+const FRAMING_TAGS: [&str; 4] = [
+    "system-reminder",
+    "agent-message",
+    "agent-btw",
+    "task-message",
+];
 
 /// Text written by another agent. Displaying it turns the `<` of any opening
 /// or closing `system-reminder` or `agent-message` tag into `&lt;`, so it can
@@ -365,6 +410,18 @@ fn cold_recipient_message(recipient: &str) -> String {
         .expect("cold recipient template must render")
 }
 
+#[derive(Template)]
+#[template(path = "agent_btw_cold.txt", escape = "none")]
+struct ColdBtwRecipientText<'a> {
+    recipient: &'a str,
+}
+
+fn cold_btw_recipient_message(recipient: &str) -> String {
+    ColdBtwRecipientText { recipient }
+        .render()
+        .expect("cold btw recipient template must render")
+}
+
 /// How long each provider keeps the main conversation's prompt cache warm,
 /// read live from the daemon's configuration.
 #[derive(Clone)]
@@ -423,15 +480,7 @@ impl AgentMessaging {
         body: &str,
     ) -> Result<String, AgentLinkError> {
         let live = self.directory.live().await?;
-        let mut matches = live
-            .iter()
-            .filter(|agent| agent.session_id == target || agent.name == target);
-        let recipient = matches
-            .next()
-            .ok_or_else(|| AgentLinkError::NoSuchAgent(target.to_string()))?;
-        if matches.next().is_some() {
-            return Err(AgentLinkError::AmbiguousAgent(target.to_string()));
-        }
+        let recipient = addressed(&live, target)?;
         if recipient.session_id == sender_session_id {
             return Err(AgentLinkError::SendToSelf);
         }
@@ -605,6 +654,10 @@ impl Tool for AgentTool {
         Ok(ToolResult::text(text))
     }
 }
+
+mod btw;
+
+pub use btw::{BtwAnswer, BtwArgs, BtwCommand, BtwTool, ForkHosts, ForkRegistration};
 
 #[cfg(test)]
 mod tests;

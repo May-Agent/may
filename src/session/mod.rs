@@ -20,6 +20,7 @@ pub mod runtime;
 mod runtime_service;
 mod store;
 pub(crate) mod tool_result_wire;
+mod user_wait;
 
 pub use context_snapshot::{
     PersistContextSnapshotError, PersistedContextSnapshot, checkpoint_from_hook,
@@ -51,3 +52,4 @@ pub use runtime::{
 };
 pub use runtime_service::{AnswerError, AskUserAnswer, ResolvedRequest, SessionRuntimeService};
 pub use store::{SandboxResourceLayout, SessionStore, StoreError};
+pub use user_wait::{UserAsk, UserWait};

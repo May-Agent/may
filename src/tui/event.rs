@@ -142,6 +142,9 @@ pub enum AppEvent {
     HistoryStale,
     /// The user's global sleep state, from the `sleep` event.
     Sleep(crate::sleep::SleepStatus),
+    /// A popup of some session waits on the user, from the
+    /// `user_notification` event.
+    UserNotification(Box<crate::notification::UserNotification>),
     /// A `session_suggestion` frame arrived: `text` is the new ghost text,
     /// `None` clears it.
     PromptSuggestion {
@@ -251,6 +254,7 @@ impl AppEvent {
             Self::TurnWithdrawn { .. } => "turn_withdrawn",
             Self::HistoryStale => "history_stale",
             Self::Sleep(_) => "sleep",
+            Self::UserNotification(_) => "user_notification",
             Self::PromptSuggestion { .. } => "prompt_suggestion",
             Self::Recap { .. } => "recap",
             Self::ContextWindow { .. } => "context_window",

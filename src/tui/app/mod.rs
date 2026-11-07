@@ -4505,6 +4505,9 @@ pub enum SendAction {
     /// Reload the session's history, which turns this client missed
     /// changed.
     ReloadHistory,
+    /// Raise a desktop notification through the terminal: a popup of some
+    /// session waits on the user.
+    DesktopNotification(Box<crate::notification::UserNotification>),
     /// Submit an ask-user response.
     RespondAskUser {
         /// ID of the pending ask-user request being answered.

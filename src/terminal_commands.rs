@@ -15,7 +15,6 @@ use crate::agent::browser_tool::{BrowserBroker, BrowserTool};
 use crate::agent::explore_tool::{ExploreArgs, ExploreTool};
 use crate::agent::imagine::ImagineTool;
 use crate::agent::issue_tool::{IssueChangeNotifier, IssueTool, SubagentIssueTool};
-use crate::agent::notify_tool::{NotifyBroker, NotifyTool};
 use crate::agent::pr_tool::{PrArgs, PrCommand};
 use crate::agent::register_tool::{RegisterBroker, RegisterTool, Skills};
 use crate::agent::repo_tool::{RepoContext, RepoTool, SubagentRepoTool};
@@ -71,8 +70,6 @@ pub struct SharedTerminalCommandConfig<LLM> {
     pub task_runtime: TaskRuntimeKind,
     /// Broker for scheduled-task commands.
     pub task_broker: Option<TaskBroker>,
-    /// Broker for `notify` notifications.
-    pub notify_broker: Option<NotifyBroker>,
     /// Broker for `tunnel` registrations.
     pub tunnel_broker: Option<crate::agent::tunnel_tool::TunnelBroker>,
     /// Broker for `browser` commands.
@@ -367,6 +364,17 @@ where
     }
 
     if let Some(messaging) = config.agent_messaging {
+        let mut btw =
+            crate::agent_link::BtwCommand::new(messaging.clone(), config.session_id.clone());
+        if let Some(guard) = &config.languages {
+            btw = btw.with_languages(guard.clone());
+        }
+        describe_arguments::<crate::agent_link::BtwArgs>(&mut descriptions, "btw");
+        // Built per terminal: the fork answering a question runs on a
+        // terminal launched from the asking agent's.
+        builder.main_only(|reserved| {
+            reserved.configure_terminal_bound_tool("btw", move |binding| btw.for_terminal(binding));
+        });
         let mut agent = crate::agent_link::AgentTool::new(
             messaging,
             config.session_id.clone(),
@@ -402,14 +410,6 @@ where
         );
         describe_tool(&mut descriptions, &task);
         builder.main_only(|reserved| reserved.configure_tool(task));
-    }
-
-    if let Some(notify_broker) = config.notify_broker {
-        register_tool_with_description(
-            builder,
-            &mut descriptions,
-            NotifyTool::new(Some(notify_broker)).for_session(config.session_id.clone()),
-        );
     }
 
     if let Some(tunnel_broker) = config.tunnel_broker {
@@ -685,7 +685,6 @@ mod tests {
                 }),
                 task_runtime: TaskRuntimeKind::Local,
                 task_broker: None,
-                notify_broker: None,
                 tunnel_broker: None,
                 browser_broker: None,
                 register_skills_broker: None,
@@ -747,7 +746,6 @@ mod tests {
                 imagine: None,
                 task_runtime: TaskRuntimeKind::Local,
                 task_broker: None,
-                notify_broker: None,
                 tunnel_broker: None,
                 browser_broker: None,
                 register_skills_broker: None,
@@ -809,7 +807,6 @@ mod tests {
                 imagine: None,
                 task_runtime: TaskRuntimeKind::Local,
                 task_broker: None,
-                notify_broker: None,
                 tunnel_broker: None,
                 browser_broker: None,
                 register_skills_broker: None,
@@ -865,7 +862,6 @@ mod tests {
                 imagine: None,
                 task_runtime: TaskRuntimeKind::Local,
                 task_broker: None,
-                notify_broker: None,
                 tunnel_broker: None,
                 browser_broker: None,
                 register_skills_broker: None,
@@ -917,7 +913,6 @@ mod tests {
                 imagine: None,
                 task_runtime: TaskRuntimeKind::Local,
                 task_broker: None,
-                notify_broker: None,
                 tunnel_broker: None,
                 browser_broker: None,
                 register_skills_broker: None,
@@ -1067,6 +1062,7 @@ mod tests {
             cache_lifetime: crate::agent_link::CacheLifetimes::new(|_| {
                 crate::cache_lifetime::CacheLifetime::default()
             }),
+            forks: crate::agent_link::ForkHosts::default(),
         };
 
         let mut builder = ToolRegistryBuilder::new();
@@ -1089,7 +1085,6 @@ mod tests {
                 imagine: None,
                 task_runtime: TaskRuntimeKind::Local,
                 task_broker: None,
-                notify_broker: None,
                 tunnel_broker: None,
                 browser_broker: None,
                 register_skills_broker: None,
@@ -1114,6 +1109,8 @@ mod tests {
 
         assert!(!main.is_reserved("agent"));
         assert!(subagent.is_reserved("agent"));
+        assert!(!main.is_reserved("btw"));
+        assert!(subagent.is_reserved("btw"));
         for refused in [agent_list(&subagent).await, agent_send(&subagent).await] {
             assert!(!refused.ok, "{refused:?}");
             assert!(
@@ -1171,7 +1168,6 @@ mod tests {
                 imagine: None,
                 task_runtime: TaskRuntimeKind::Local,
                 task_broker: Some(task_broker),
-                notify_broker: None,
                 tunnel_broker: None,
                 browser_broker: None,
                 register_skills_broker: None,
@@ -1224,7 +1220,6 @@ mod tests {
                 imagine: None,
                 task_runtime: TaskRuntimeKind::Local,
                 task_broker: None,
-                notify_broker: None,
                 tunnel_broker: None,
                 browser_broker: None,
                 register_skills_broker: None,
@@ -1281,7 +1276,6 @@ mod tests {
                 imagine: None,
                 task_runtime: runtime,
                 task_broker: None,
-                notify_broker: None,
                 tunnel_broker: None,
                 browser_broker: None,
                 register_skills_broker: None,
