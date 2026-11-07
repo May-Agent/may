@@ -382,8 +382,7 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
   withdrawUserMessage(sessionId, content) {
     set((prev) => {
       const messages = prev.messages[sessionId] ?? [];
-      let at = messages.length - 1;
-      while (at >= 0 && !(messages[at].role === 'user' && messages[at].content === content)) at--;
+      const at = messages.findLastIndex((m) => m.role === 'user' && m.content === content);
       if (at < 0) return prev;
       return {
         messages: { ...prev.messages, [sessionId]: messages.filter((_, i) => i !== at) },
