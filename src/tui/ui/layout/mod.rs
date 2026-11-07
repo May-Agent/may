@@ -335,7 +335,7 @@ fn sheet_height(app: &App, column: Rect) -> Option<u16> {
             .max(10),
             pct(60),
         ),
-        AppMode::Help => (rows(HELP_TEXT.lines().count() + 2), pct(70)),
+        AppMode::Help => (rows(help_text().lines().count() + 2), pct(70)),
         AppMode::ToolDetail => (full, pct(80)),
         AppMode::ModelSelect => (rows(app.filtered_model_select().len() + 6).min(16), pct(60)),
         AppMode::EffortSelect => (rows(effort::ROWS + 1), pct(70)),
@@ -688,15 +688,21 @@ pub(super) fn display_width_prefix(text: &str, char_count: usize) -> usize {
         .sum()
 }
 
-/// Help text content.
-const HELP_TEXT: &str = include_str!("../help.txt");
+/// The help sheet, rendered from the slash command table.
+fn help_text() -> String {
+    use askama::Template as _;
+    crate::tui::slash::HelpScreen::new()
+        .render()
+        .expect("the help template renders")
+}
 
 /// Render the help sheet; `scroll` rows of it are scrolled off the top.
 fn render_help_popup(frame: &mut Frame, area: Rect, scroll: u16) {
-    let max_scroll = u16::try_from(HELP_TEXT.lines().count())
+    let text = help_text();
+    let max_scroll = u16::try_from(text.lines().count())
         .unwrap_or(u16::MAX)
         .saturating_sub(area.height.saturating_sub(2));
-    let help = WrappedParagraph::new(HELP_TEXT)
+    let help = WrappedParagraph::new(text.as_str())
         .block(
             Block::default()
                 .borders(Borders::ALL)

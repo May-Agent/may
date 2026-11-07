@@ -4,7 +4,7 @@ These are TUI commands. The web UI has no slash palette: its composer treats onl
 
 ## How they are entered
 
-Typing `/` in the TUI input opens a palette filtered as you type. Enter on a palette item runs the command at once; the line never reaches the agent. A slash line sent without choosing from the palette is an ordinary message, except these forms that take arguments and are parsed from the typed line: `/compact [focus]`, `/context`, `/context dump`, `/model [query]`, `/connect [command args]`, `/resume-codex [query]`, `/resume-claude [query]`, `/import-claude`, `/import-codex`, `/secret KEY VALUE`, `/bug`. Choosing `/resume-codex` or `/secret` from the palette only puts the command in the input so arguments can be typed. `/clear` is listed in the TUI help screen but is not a command today.
+Typing `/` in the TUI input opens a palette filtered as you type. Enter on a palette item runs the command at once; the line never reaches the agent. A slash line sent without choosing from the palette is an ordinary message, except these forms that take arguments and are parsed from the typed line: `/compact [focus]`, `/context`, `/context dump`, `/model [query]`, `/connect [command args]`, `/resume-codex [query]`, `/resume-claude [query]`, `/import-claude`, `/import-codex`, `/secret KEY VALUE`, `/bug`. Choosing `/resume-codex` or `/secret` from the palette only puts the command in the input so arguments can be typed. The palette and the `/help` screen list the same commands, from one table.
 
 ## Sessions and profiles
 

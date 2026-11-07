@@ -33,6 +33,7 @@ use super::event::{AppEvent, EventSender};
 use super::file_diff::FileDiffHandle;
 use super::history::InputHistory;
 use super::queue::{Attachment, MessageQueue, PendingMessage};
+use super::slash::SlashCommand;
 use super::ui::chat::{ChatStream, ToolDisplay, clamp_column_by_width};
 use super::ui::file_picker::FilePicker;
 use crate::pasted_text::LARGE_PASTE_THRESHOLD;
@@ -2877,7 +2878,9 @@ impl App {
                             self.input.clear();
                             self.cursor = 0;
                             self.input_char_count = 0;
-                            return self.execute_slash_command(&cmd);
+                            let command = SlashCommand::from_name(&cmd)
+                                .expect("completion lists only table commands");
+                            return self.execute_slash_command(command);
                         }
 
                         // For file completion, insert into input
@@ -3326,20 +3329,20 @@ impl App {
     }
 
     /// Execute a slash command directly (from menu selection only).
-    fn execute_slash_command(&mut self, cmd: &str) -> Option<SendAction> {
-        match cmd {
-            "/session" => {
+    fn execute_slash_command(&mut self, command: SlashCommand) -> Option<SendAction> {
+        match command {
+            SlashCommand::Session => {
                 self.session_view = super::state::SessionView::Recent;
                 self.load_session_list();
                 None
             }
-            "/archive" => {
+            SlashCommand::Archive => {
                 self.session_view = super::state::SessionView::Archive;
                 self.load_session_list();
                 None
             }
-            "/new" => Some(SendAction::NewSession),
-            "/profile" => {
+            SlashCommand::New => Some(SendAction::NewSession),
+            SlashCommand::Profile => {
                 if self.profiles.len() > 1 {
                     self.profile_selected = self
                         .profiles
@@ -3353,7 +3356,7 @@ impl App {
                 }
                 None
             }
-            "/sandbox" => {
+            SlashCommand::Sandbox => {
                 if let Some(session) = self.session_manager.current() {
                     let sandbox_dir = &session.sandbox_dir;
                     #[cfg(target_os = "macos")]
@@ -3375,26 +3378,26 @@ impl App {
                 }
                 None
             }
-            "/help" => {
+            SlashCommand::Help => {
                 self.help_scroll = 0;
                 self.mode = AppMode::Help;
                 None
             }
-            "/config" => {
+            SlashCommand::Config => {
                 self.config_state = ConfigState::default();
                 self.config_state.load_providers(&self.config);
                 self.mode = AppMode::Config;
                 None
             }
-            "/model" => self.open_model_select(""),
-            "/effort" => {
+            SlashCommand::Model => self.open_model_select(""),
+            SlashCommand::Effort => {
                 self.effort_ladder = self.effort_ladder_for_current();
                 self.effort_index = self.effort_ladder_index();
                 self.mode = AppMode::EffortSelect;
                 self.fetch_current_effort();
                 None
             }
-            "/rewind" => {
+            SlashCommand::Rewind => {
                 if self.processing {
                     self.chat
                         .push_notice("Wait for the current turn to finish before rewinding");
@@ -3403,69 +3406,69 @@ impl App {
                 }
                 None
             }
-            "/jobs" => {
+            SlashCommand::Jobs => {
                 self.open_jobs();
                 None
             }
-            "/questions" => Some(SendAction::OpenQuestions),
-            "/btw" => {
+            SlashCommand::Questions => Some(SendAction::OpenQuestions),
+            SlashCommand::Btw => {
                 self.open_btw();
                 None
             }
-            "/progress" => {
+            SlashCommand::Progress => {
                 self.open_progress();
                 None
             }
-            "/resume-claude" => {
+            SlashCommand::ResumeClaude => {
                 self.open_resume_picker();
                 None
             }
-            "/import-claude" => Some(SendAction::RulesImport(
+            SlashCommand::ImportClaude => Some(SendAction::RulesImport(
                 crate::session::import::ForeignAgent::Claude,
             )),
-            "/import-codex" => Some(SendAction::RulesImport(
+            SlashCommand::ImportCodex => Some(SendAction::RulesImport(
                 crate::session::import::ForeignAgent::Codex,
             )),
-            "/connect" => {
+            SlashCommand::Connect => {
                 self.open_connect_picker();
                 None
             }
-            "/login" => {
+            SlashCommand::Login => {
                 self.login_selected = 0;
                 self.mode = AppMode::Login;
                 None
             }
-            "/resume-codex" | "/secret" => {
+            SlashCommand::ResumeCodex | SlashCommand::Secret => {
                 // These take arguments — leave the command in the input so
                 // the user can type them, rather than executing now.
-                self.input = format!("{cmd} ");
+                self.input = format!("{} ", command.name());
                 self.input_char_count = self.input.chars().count();
                 self.cursor = self.input_char_count;
                 None
             }
-            "/quit" => self.request_quit(),
-            "/compact" => Some(SendAction::Compact(None)),
-            "/recap" => Some(SendAction::Recap),
-            "/yolo" => Some(SendAction::ToggleYolo),
-            "/sleep" => Some(SendAction::Sleep),
-            "/sleep off" => Some(SendAction::Wake),
-            "/context" => Some(SendAction::ContextReport),
-            "/usage" => Some(SendAction::UsageReport),
-            "/context dump" => Some(SendAction::ContextDump),
-            "/bug" => Some(SendAction::BugReport),
-            "/mcp" => {
+            SlashCommand::Quit => self.request_quit(),
+            SlashCommand::Compact => Some(SendAction::Compact(None)),
+            SlashCommand::Recap => Some(SendAction::Recap),
+            SlashCommand::Yolo => Some(SendAction::ToggleYolo),
+            SlashCommand::Sleep => Some(SendAction::Sleep),
+            SlashCommand::SleepOff => Some(SendAction::Wake),
+            SlashCommand::Context => Some(SendAction::ContextReport),
+            SlashCommand::Usage => Some(SendAction::UsageReport),
+            SlashCommand::ContextDump => Some(SendAction::ContextDump),
+            SlashCommand::Bug => Some(SendAction::BugReport),
+            SlashCommand::Mcp => {
                 self.mode = AppMode::McpManage;
                 None
             }
-            "/ssh" => {
+            SlashCommand::Ssh => {
                 self.mode = AppMode::SshManage;
                 None
             }
-            "/permission" => {
+            SlashCommand::Permission => {
                 self.open_permission_gate();
                 None
             }
-            "/skill" => {
+            SlashCommand::Skill => {
                 let tx = self.event_tx.clone();
                 let may_dir = self.session_manager.may_dir().to_path_buf();
                 let profile_id = self
@@ -3487,7 +3490,6 @@ impl App {
                 self.set_status("Loading skills...");
                 None
             }
-            _ => None,
         }
     }
 
@@ -3737,16 +3739,16 @@ impl App {
         self.input_char_count = 0;
 
         let trimmed = content.trim();
-        if trimmed == "/context" && attachments.is_empty() {
+        if trimmed == SlashCommand::Context.name() && attachments.is_empty() {
             return Some(SendAction::ContextReport);
         }
-        if trimmed == "/context dump" && attachments.is_empty() {
+        if trimmed == SlashCommand::ContextDump.name() && attachments.is_empty() {
             return Some(SendAction::ContextDump);
         }
-        if trimmed == "/bug" && attachments.is_empty() {
+        if trimmed == SlashCommand::Bug.name() && attachments.is_empty() {
             return Some(SendAction::BugReport);
         }
-        if let Some(rest) = trimmed.strip_prefix("/compact")
+        if let Some(rest) = trimmed.strip_prefix(SlashCommand::Compact.name())
             && attachments.is_empty()
         {
             let focus = rest.trim();
@@ -3766,9 +3768,12 @@ impl App {
             return Some(SendAction::RulesImport(source));
         }
         for (cmd, source) in [
-            ("/resume-codex", crate::session::import::ForeignAgent::Codex),
             (
-                "/resume-claude",
+                SlashCommand::ResumeCodex.name(),
+                crate::session::import::ForeignAgent::Codex,
+            ),
+            (
+                SlashCommand::ResumeClaude.name(),
                 crate::session::import::ForeignAgent::Claude,
             ),
         ] {
@@ -3784,7 +3789,7 @@ impl App {
         // `/connect` opens the picker; `/connect <command> [args…]` connects
         // that command directly.
         if attachments.is_empty()
-            && let Some(rest) = trimmed.strip_prefix("/connect")
+            && let Some(rest) = trimmed.strip_prefix(SlashCommand::Connect.name())
             && (rest.is_empty() || rest.starts_with(char::is_whitespace))
         {
             if rest.trim().is_empty() {
@@ -3800,7 +3805,7 @@ impl App {
         // `/model` opens the picker and `/model <query>` searches it —
         // either way the line is a command, never a message to the agent.
         if attachments.is_empty()
-            && let Some(rest) = trimmed.strip_prefix("/model")
+            && let Some(rest) = trimmed.strip_prefix(SlashCommand::Model.name())
             && (rest.is_empty() || rest.starts_with(char::is_whitespace))
         {
             return self.open_model_select(rest.trim());

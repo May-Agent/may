@@ -32,6 +32,8 @@ pub mod remote;
 pub mod runtime;
 /// Right sidebar state: task tree, linked issues.
 pub mod sidebar;
+/// The table of slash commands completion, dispatch and help share.
+pub mod slash;
 /// UI mode and per-mode state types.
 pub mod state;
 /// Rendering layer for the TUI.
