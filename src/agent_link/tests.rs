@@ -2,7 +2,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::{Activity, AgentDirectory, AgentLinkError, AgentMessaging, parse_roots};
-use crate::db::{ChatDb, RunFence};
+use crate::cache_lifetime::CacheLifetime;
+use crate::db::{ChatDb, PromptCacheRequest, RunFence};
 use crate::session::{MayHomePaths, SessionRuntimeService, SessionRuntimeState};
 use crate::ui_event_bus::UiEventBus;
 
@@ -35,6 +36,7 @@ impl Host {
                 },
             ),
             runtime_service: runtime_service.clone(),
+            cache_lifetime: super::CacheLifetimes::new(|_| CacheLifetime::default()),
         };
         Self {
             may_dir,
@@ -248,6 +250,97 @@ async fn a_hostile_body_arrives_inside_the_single_agent_message_block() {
         "the injected close is escaped: {xml}"
     );
     assert!(xml.contains("&lt;/agent-message>"), "escaped: {xml}");
+}
+
+/// Records a provider request of `session_id` made `ago` before now.
+async fn request_made(host: &Host, session_id: &str, ago: std::time::Duration) {
+    let usage = aither_core::llm::Usage::new(100, 10).with_cache_tokens(0, 100);
+    let at = jiff::Timestamp::now() - jiff::SignedDuration::try_from(ago).expect("fits");
+    host.runtime_service
+        .db()
+        .observe_prompt_cache(PromptCacheRequest {
+            session_id,
+            provider_id: "anthropic",
+            model: "opus",
+            at,
+            usage: &usage,
+            prefix: aither_agent::context::PromptPrefix {
+                chain: aither_agent::context::PrefixChain::of(&[], &[]),
+                rewrites: aither_agent::context::PrefixRewrites::default(),
+                first_request: true,
+            },
+            lifetime: CacheLifetime::default(),
+        })
+        .await
+        .expect("request is recorded");
+}
+
+/// An idle recipient past its cache lifetime is refused and nothing is
+/// stored or woken.
+#[tokio::test]
+async fn a_send_to_an_idle_recipient_with_a_cold_cache_is_refused() {
+    let host = Host::new().await;
+    host.session("main", "main").await;
+    host.session("peer", "peer").await;
+    request_made(&host, "peer", std::time::Duration::from_hours(2)).await;
+
+    let error = host
+        .messaging
+        .send("main", "peer", "status?")
+        .await
+        .expect_err("a cold recipient is refused");
+    assert!(matches!(error, AgentLinkError::ColdRecipient(_)), "{error}");
+    assert!(error.to_string().contains("cache has gone cold"), "{error}");
+    assert!(
+        !host
+            .runtime_service
+            .get("peer")
+            .await
+            .expect("runtime")
+            .has_pending_messages()
+    );
+    assert!(host.wakes.try_recv().is_err(), "nothing is woken");
+}
+
+/// An idle recipient inside its cache lifetime gets the message as before.
+#[tokio::test]
+async fn a_send_to_an_idle_recipient_with_a_warm_cache_is_stored_and_woken() {
+    let host = Host::new().await;
+    host.session("main", "main").await;
+    host.session("peer", "peer").await;
+    request_made(&host, "peer", std::time::Duration::from_mins(10)).await;
+
+    host.messaging
+        .send("main", "peer", "status?")
+        .await
+        .expect("send");
+    assert_eq!(host.next_wake().await, "peer");
+    assert!(
+        host.runtime_service
+            .get("peer")
+            .await
+            .expect("runtime")
+            .has_pending_messages()
+    );
+}
+
+/// A working recipient is never cold, whatever its last request's age.
+#[tokio::test]
+async fn a_send_to_a_working_recipient_is_stored_even_past_the_lifetime() {
+    let host = Host::new().await;
+    host.session("main", "main").await;
+    host.session("busy", "busy").await;
+    request_made(&host, "busy", std::time::Duration::from_hours(2)).await;
+    host.runtime_service
+        .set_state("busy", SessionRuntimeState::Running)
+        .await
+        .expect("state persists");
+
+    host.messaging
+        .send("main", "busy", "ping")
+        .await
+        .expect("send");
+    assert_eq!(host.next_wake().await, "busy");
 }
 
 /// `## Roots` parsing: items under the heading until the next one.

@@ -129,6 +129,14 @@ pub enum AppEvent {
         /// Row id of the user message the turn answers.
         message_id: i32,
     },
+    /// The daemon withdrew the latest turn: it was stopped before any tool
+    /// call or response text, so its message left the conversation.
+    TurnWithdrawn {
+        /// The withdrawn message text.
+        content: String,
+        /// Whether this client sent it and gets it back in its input.
+        own: bool,
+    },
     /// The daemon dropped turn frames this client missed: the session's
     /// history must be reloaded.
     HistoryStale,
@@ -181,6 +189,12 @@ pub enum AppEvent {
     /// The `/btw` request failed.
     BtwFailed(String),
 
+    // ─── /progress ─────────────────────────────────────────────────
+    /// The `/progress` report arrived.
+    ProgressLoaded(crate::daemon::ProgressReport),
+    /// The `/progress` request failed.
+    ProgressFailed(String),
+
     // ─── bash mode / secrets ───────────────────────────────────────
     /// A bash-mode command finished; output is already masked.
     BashFinished(Box<BashOutcome>),
@@ -226,6 +240,7 @@ impl AppEvent {
             Self::SessionRuntime(_) => "session_runtime",
             Self::IndexCoverage(_) => "index_coverage",
             Self::TurnStarted { .. } => "turn_started",
+            Self::TurnWithdrawn { .. } => "turn_withdrawn",
             Self::HistoryStale => "history_stale",
             Self::Sleep(_) => "sleep",
             Self::PromptSuggestion { .. } => "prompt_suggestion",
@@ -236,6 +251,8 @@ impl AppEvent {
             Self::BtwDelta(_) => "btw_delta",
             Self::BtwFinished => "btw_finished",
             Self::BtwFailed(_) => "btw_failed",
+            Self::ProgressLoaded(_) => "progress_loaded",
+            Self::ProgressFailed(_) => "progress_failed",
             Self::BashFinished(_) => "bash_finished",
             Self::SecretStored { .. } => "secret_stored",
         }

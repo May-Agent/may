@@ -14,6 +14,7 @@ use askama::Template;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::cache_lifetime::CacheLifetime;
 use crate::db::ChatDbError;
 use crate::session::{
     MayHomePaths, PendingMessageState, PendingUserMessage, PendingUserMessageMode,
@@ -91,6 +92,9 @@ pub enum AgentLinkError {
         #[source]
         source: std::io::Error,
     },
+    /// The recipient is idle past its prompt-cache lifetime.
+    #[error("{}", cold_recipient_message(.0))]
+    ColdRecipient(String),
     /// The delivery text could not be wrapped as hidden context.
     #[error(transparent)]
     Context(#[from] XmlBlockError),
@@ -263,6 +267,33 @@ pub struct AgentMessaging {
     pub directory: AgentDirectory,
     /// Queue and runtime state of the shared `history.db`.
     pub runtime_service: Arc<SessionRuntimeService>,
+    /// How long a provider id keeps the main conversation's cache warm.
+    pub cache_lifetime: CacheLifetimes,
+}
+
+impl AgentMessaging {
+    /// Whether `session_id` is idle with a cold prompt cache, so that waking
+    /// it would pay for its whole prompt again. A working session is never
+    /// cold.
+    ///
+    /// # Errors
+    /// [`AgentLinkError`] on storage failure.
+    pub async fn is_cold(
+        &self,
+        session_id: &str,
+        activity: Activity,
+    ) -> Result<bool, AgentLinkError> {
+        if activity == Activity::Running {
+            return Ok(false);
+        }
+        Ok(self
+            .runtime_service
+            .db()
+            .prompt_cache_is_cold(session_id, jiff::Timestamp::now(), |provider| {
+                self.cache_lifetime.of(provider)
+            })
+            .await?)
+    }
 }
 
 /// Tag names that frame text for the recipient; text from another agent must
@@ -323,6 +354,41 @@ struct AgentMessageText<'a> {
 }
 
 #[derive(Template)]
+#[template(path = "agent_cold.txt", escape = "none")]
+struct ColdRecipientText<'a> {
+    recipient: &'a str,
+}
+
+fn cold_recipient_message(recipient: &str) -> String {
+    ColdRecipientText { recipient }
+        .render()
+        .expect("cold recipient template must render")
+}
+
+/// How long each provider keeps the main conversation's prompt cache warm,
+/// read live from the daemon's configuration.
+#[derive(Clone)]
+pub struct CacheLifetimes(Arc<dyn Fn(&str) -> CacheLifetime + Send + Sync>);
+
+impl CacheLifetimes {
+    /// Lifetimes looked up by provider id through `lookup`.
+    #[must_use]
+    pub fn new(lookup: impl Fn(&str) -> CacheLifetime + Send + Sync + 'static) -> Self {
+        Self(Arc::new(lookup))
+    }
+
+    fn of(&self, provider_id: &str) -> CacheLifetime {
+        (self.0)(provider_id)
+    }
+}
+
+impl std::fmt::Debug for CacheLifetimes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CacheLifetimes").finish_non_exhaustive()
+    }
+}
+
+#[derive(Template)]
 #[template(path = "agent_sent.txt", escape = "none")]
 struct AgentSentText<'a> {
     recipient: &'a str,
@@ -342,7 +408,8 @@ struct AgentListText {
 
 impl AgentMessaging {
     /// Store `body` in the queue of the live agent addressed by `target` (name
-    /// or session id) and wake it. Returns the recipient's name.
+    /// or session id) and wake it; an idle recipient whose prompt cache is
+    /// cold is refused and nothing is stored. Returns the recipient's name.
     ///
     /// # Errors
     /// See [`AgentLinkError`].
@@ -367,6 +434,12 @@ impl AgentMessaging {
         }
         if recipient.session_id == sender_session_id {
             return Err(AgentLinkError::SendToSelf);
+        }
+        if self
+            .is_cold(&recipient.session_id, recipient.activity)
+            .await?
+        {
+            return Err(AgentLinkError::ColdRecipient(recipient.name.clone()));
         }
         let sender = status_name(&self.runtime_service, sender_session_id).await?;
         let text = AgentMessageText {

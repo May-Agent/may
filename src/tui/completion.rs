@@ -65,6 +65,10 @@ pub static SLASH_COMMANDS: &[(&str, &str)] = &[
         "Ask a side question without touching conversation history",
     ),
     (
+        "/progress",
+        "Report the remaining work with a progress bar, without touching the conversation",
+    ),
+    (
         "/resume-codex",
         "Import a Codex transcript into a new session",
     ),
@@ -442,7 +446,7 @@ mod tests {
     #[test]
     fn slash_prefix_still_accepts_enter() {
         let mut completion = Completion::new();
-        completion.start_slash("res");
+        completion.start_slash("resu");
         assert!(completion.has_matches());
         assert_eq!(
             completion.complete().map(|item| item.insert.as_str()),

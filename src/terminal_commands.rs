@@ -1053,6 +1053,9 @@ mod tests {
                 },
             ),
             runtime_service: runtime_service.clone(),
+            cache_lifetime: crate::agent_link::CacheLifetimes::new(|_| {
+                crate::cache_lifetime::CacheLifetime::default()
+            }),
         };
 
         let mut builder = ToolRegistryBuilder::new();

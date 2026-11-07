@@ -480,6 +480,7 @@ fn api_routes() -> Route {
                         "/usage".at(super::chat::usage_report),
                         "/context-dump".post(super::chat::context_dump),
                         "/btw".post(super::chat::btw),
+                        "/progress".post(super::chat::progress),
                         "/agent".delete(super::chat::release_agent),
                     )),
                     Route::new((

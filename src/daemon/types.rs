@@ -711,7 +711,7 @@ pub struct MemoryPayload {
     pub(crate) content: String,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ApiAttachment {
     pub(crate) id: String,

@@ -100,6 +100,18 @@ pub(super) struct TurnEvents<'t, 's, S> {
     pub(super) first_text_seen: bool,
 }
 
+impl<S: ChatSink> TurnEvents<'_, '_, S> {
+    /// Whether the turn did anything beyond thinking: it started a tool
+    /// call or produced response text.
+    pub(super) const fn took_action(&self) -> bool {
+        self.saw_tool_activity
+            || self.first_visible_tool_seen
+            || self.first_text_seen
+            || !self.terminal_snapshot.executions.is_empty()
+            || !self.full_text.is_empty()
+    }
+}
+
 /// How long `provider_id` keeps the conversation's prompt cache warm.
 fn provider_cache_lifetime(
     state: &Arc<DaemonState>,
