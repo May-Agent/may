@@ -1,4 +1,4 @@
-import { apiGet, apiPost } from './client';
+import { apiGet } from './client';
 
 export interface NotificationMailboxEntry {
   id: string;
@@ -15,8 +15,4 @@ export interface NotificationMailboxResponse {
 
 export function getMailbox(): Promise<NotificationMailboxResponse> {
   return apiGet<NotificationMailboxResponse>('/notifications/mailbox');
-}
-
-export function fireNotificationCallback(id: string): Promise<void> {
-  return apiPost<void>(`/notifications/${encodeURIComponent(id)}/callback`, {});
 }

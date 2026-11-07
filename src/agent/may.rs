@@ -221,8 +221,6 @@ pub struct MayAgentConfig {
     pub location: Option<crate::location::LocationInfo>,
     /// Optional broker for `task` command requests.
     pub task_broker: Option<crate::agent::task_tool::TaskBroker>,
-    /// Optional broker for `notify` command requests.
-    pub notify_broker: Option<crate::agent::notify_tool::NotifyBroker>,
     /// Optional broker for `tunnel` command requests.
     pub tunnel_broker: Option<crate::agent::tunnel_tool::TunnelBroker>,
     /// Optional broker for `browser` command requests.
@@ -302,8 +300,6 @@ pub struct MayAgentSessionInput<'a> {
     pub location: Option<crate::location::LocationInfo>,
     /// Channel for scheduled-task create requests.
     pub task_broker: Option<crate::agent::task_tool::TaskBroker>,
-    /// Channel for notification requests.
-    pub notify_broker: Option<crate::agent::notify_tool::NotifyBroker>,
     /// Channel for tunnel registrations.
     pub tunnel_broker: Option<crate::agent::tunnel_tool::TunnelBroker>,
     /// The daemon's ACP hosts; connected ACP agents run on them, inside the
@@ -766,7 +762,6 @@ impl MayAgent {
                     AgentEnvironment::Local => TaskRuntimeKind::Local,
                 },
                 task_broker: config.task_broker.clone(),
-                notify_broker: config.notify_broker.clone(),
                 tunnel_broker: config.tunnel_broker.clone(),
                 browser_broker: config.browser_broker.clone(),
                 register_skills_broker: config.register_skills_broker.clone(),
@@ -937,7 +932,6 @@ impl MayAgent {
             plan_state,
             location,
             task_broker,
-            notify_broker,
             tunnel_broker,
             browser_broker,
             acp_host,
@@ -1043,7 +1037,6 @@ impl MayAgent {
             secrets,
             location,
             task_broker,
-            notify_broker,
             tunnel_broker,
             browser_broker,
             acp: acp_host,

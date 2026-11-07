@@ -177,34 +177,19 @@ fn task_notification_title(task_name: &str) -> String {
     format!("Task: {task_name}")
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum TaskCallbackStatus {
+#[derive(Debug, Clone, Copy)]
+enum TaskOutcome {
     Completed,
     Failed,
 }
 
-impl TaskCallbackStatus {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-        }
-    }
-
+impl TaskOutcome {
     const fn notification_body(self) -> &'static str {
         match self {
             Self::Completed => "Completed successfully",
             Self::Failed => "Execution failed",
         }
     }
-}
-
-fn task_notification_callback_message(task_name: &str, status: TaskCallbackStatus) -> String {
-    format!(
-        "Continue from scheduled task \"{task_name}\" ({}). Review the hidden task result and choose the next action.",
-        status.as_str()
-    )
 }
 
 fn task_script_failure(exit_code: i32, output: &str) -> String {
@@ -228,44 +213,6 @@ fn profile_workspace_key(profile: &profiles::Model) -> &str {
 
 fn container_profile_name(profile: &profiles::Model) -> String {
     format!("may-{}", profile_workspace_key(profile))
-}
-
-fn task_notification_callback_context(
-    task: &scheduled_tasks::Model,
-    status: TaskCallbackStatus,
-    summary: &str,
-) -> Option<crate::XmlBlock> {
-    task.session_id.as_ref()?;
-    let text = TaskCallbackReminder {
-        task_id: task.id.as_str(),
-        task_name: task.name.as_str(),
-        profile_id: task.profile_id.as_str(),
-        trigger_kind: task.trigger_kind.as_str(),
-        trigger_type: task.trigger_type.as_str(),
-        status: status.as_str(),
-        summary,
-    }
-    .render()
-    .expect("task callback reminder must render");
-    crate::XmlBlock::parse(text).ok()
-}
-
-fn task_notification_callback_payload(
-    task: &scheduled_tasks::Model,
-    status: TaskCallbackStatus,
-    summary: &str,
-) -> (Option<crate::XmlBlock>, Option<String>) {
-    if task.session_id.is_none() {
-        return (None, None);
-    }
-
-    (
-        task_notification_callback_context(task, status, summary),
-        Some(task_notification_callback_message(
-            task.name.as_str(),
-            status,
-        )),
-    )
 }
 
 const fn task_db_error(message: String) -> crate::db::ChatDbError {
@@ -412,18 +359,6 @@ struct TaskExecutionTask {
     profile_id: String,
     session_id: Option<String>,
     trigger: TaskTriggerResponse,
-}
-
-#[derive(Template)]
-#[template(path = "reminder_task_callback.txt", escape = "none")]
-struct TaskCallbackReminder<'a> {
-    task_id: &'a str,
-    task_name: &'a str,
-    profile_id: &'a str,
-    trigger_kind: &'a str,
-    trigger_type: &'a str,
-    status: &'a str,
-    summary: &'a str,
 }
 
 impl TaskExecutionEnvelope {
@@ -1121,21 +1056,12 @@ impl TaskRuntime {
                 }
 
                 if let Some(ref notifier) = self.notifier {
-                    let (callback_context_xml, callback_message) =
-                        task_notification_callback_payload(
-                            task,
-                            TaskCallbackStatus::Completed,
-                            truncated.as_str(),
-                        );
                     let payload = NotificationPayload {
                         notification_id: None,
                         title: task_notification_title(task.name.as_str()),
-                        body: TaskCallbackStatus::Completed
-                            .notification_body()
-                            .to_string(),
+                        body: TaskOutcome::Completed.notification_body().to_string(),
                         session_id: task.session_id.clone(),
-                        callback_context_xml,
-                        callback_message,
+                        profile_id: Some(task.profile_id.clone()),
                     };
                     if let Err(e) = notifier.send_payload(payload).await {
                         tracing::warn!(task_id = %task.id, error = %e, "Failed to send push notification");
@@ -1165,19 +1091,12 @@ impl TaskRuntime {
                 }
 
                 if let Some(ref notifier) = self.notifier {
-                    let (callback_context_xml, callback_message) =
-                        task_notification_callback_payload(
-                            task,
-                            TaskCallbackStatus::Failed,
-                            truncated.as_str(),
-                        );
                     let payload = NotificationPayload {
                         notification_id: None,
                         title: task_notification_title(task.name.as_str()),
-                        body: TaskCallbackStatus::Failed.notification_body().to_string(),
+                        body: TaskOutcome::Failed.notification_body().to_string(),
                         session_id: task.session_id.clone(),
-                        callback_context_xml,
-                        callback_message,
+                        profile_id: Some(task.profile_id.clone()),
                     };
                     if let Err(e) = notifier.send_payload(payload).await {
                         tracing::warn!(task_id = %task.id, error = %e, "Failed to send push notification");
@@ -1898,28 +1817,8 @@ mod tests {
         task_file_validation_command,
     };
     use aither_sandbox::{Configured, TerminalExecutionMode, TerminalTool};
-    use askama::Template;
     use executor_core::DefaultExecutor;
     use tempfile::tempdir;
-
-    #[test]
-    fn task_callback_reminder_states_the_outcome_and_summary() {
-        let text = super::TaskCallbackReminder {
-            task_id: "t1",
-            task_name: "Backup",
-            profile_id: "p1",
-            trigger_kind: "time",
-            trigger_type: "cron",
-            status: "failed",
-            summary: "disk full",
-        }
-        .render()
-        .expect("reminder must render");
-        assert_eq!(
-            text,
-            "<system-reminder>\nScheduled task \"Backup\" (id t1, profile p1, time trigger of type cron) failed.\nSummary:\ndisk full\n</system-reminder>"
-        );
-    }
 
     use crate::db::{ChatDb, CreateScheduledTaskParams, NetworkAccessSource};
     use crate::task_trigger::PersistedTaskTrigger;

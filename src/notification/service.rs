@@ -3,9 +3,9 @@
 use std::sync::Arc;
 
 use crate::db::ChatDb;
-use crate::notification::{NotificationManager, NotificationPayload};
+use crate::notification::{NotificationManager, NotificationPayload, UserNotification};
+use crate::session::UserWait;
 use crate::ui_event_bus::{UiEventBus, UiEventTopics};
-use crate::xml::XmlBlock;
 
 const MAILBOX_STATUS_PENDING: &str = "pending";
 const MAILBOX_STATUS_DELIVERED: &str = "delivered";
@@ -18,21 +18,64 @@ pub struct NotificationService {
     db: ChatDb,
     manager: Arc<NotificationManager>,
     ui_event_bus: UiEventBus,
+    /// Notifications for attached terminals, which raise their own.
+    user_notifications: tokio::sync::broadcast::Sender<UserNotification>,
 }
+
+/// Notifications buffered for a slow attached client.
+const USER_NOTIFICATION_CAPACITY: usize = 64;
 
 impl NotificationService {
     /// Create a service backed by the chat database, a push [`NotificationManager`],
     /// and the UI event bus used to publish mailbox changes.
     #[must_use]
-    pub const fn new(
-        db: ChatDb,
-        manager: Arc<NotificationManager>,
-        ui_event_bus: UiEventBus,
-    ) -> Self {
+    pub fn new(db: ChatDb, manager: Arc<NotificationManager>, ui_event_bus: UiEventBus) -> Self {
         Self {
             db,
             manager,
             ui_event_bus,
+            user_notifications: tokio::sync::broadcast::channel(USER_NOTIFICATION_CAPACITY).0,
+        }
+    }
+
+    /// The notifications for popups waiting on the user, from now on.
+    #[must_use]
+    pub fn subscribe_user_notifications(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<UserNotification> {
+        self.user_notifications.subscribe()
+    }
+
+    /// Notify the user that `wait` needs them: streamed to attached
+    /// terminals and pushed to subscribed browsers. A failure is logged and
+    /// never reaches the popup.
+    pub async fn notify_user_wait(&self, wait: &UserWait) {
+        let (title, profile_id) = match self.db.get_session(&wait.session_id).await {
+            Ok(Some(session)) => (session.title, session.profile_id),
+            Ok(None) => (None, None),
+            Err(error) => {
+                tracing::warn!(session_id = %wait.session_id, %error, "failed to look up the session to notify about");
+                (None, None)
+            }
+        };
+        let notification = UserNotification::new(wait, title.as_deref(), profile_id);
+        // No attached terminal is fine: browsers still get the push.
+        let _ = self.user_notifications.send(notification.clone());
+        let payload = NotificationPayload {
+            notification_id: None,
+            title: notification.title,
+            body: notification.body,
+            session_id: Some(notification.session_id),
+            profile_id: notification.profile_id,
+        };
+        match self.send_payload(payload).await {
+            Ok(0) => {
+                tracing::debug!(session_id = %wait.session_id, "no browser subscribed to the notification");
+            }
+            Ok(sent) => tracing::debug!(session_id = %wait.session_id, sent, "notification pushed"),
+            Err(error) => {
+                tracing::warn!(session_id = %wait.session_id, %error, "failed to push the notification");
+            }
         }
     }
 
@@ -84,8 +127,7 @@ impl NotificationService {
             title: title.to_string(),
             body: body.to_string(),
             session_id: None,
-            callback_context_xml: None,
-            callback_message: None,
+            profile_id: None,
         })
         .await
     }
@@ -165,8 +207,7 @@ impl NotificationService {
     /// # Errors
     ///
     /// Returns [`NotificationServiceError::Db`] when listing, claiming, or updating
-    /// mailbox entries fails, and [`NotificationServiceError::InvalidXml`] when a
-    /// stored callback context block fails to parse.
+    /// mailbox entries fails.
     pub async fn redeliver_pending(&self) -> Result<(), NotificationServiceError> {
         let pending = self.db.list_pending_notification_mailbox_entries().await?;
         for item in pending {
@@ -185,8 +226,7 @@ impl NotificationService {
                 title: item.title,
                 body: item.body,
                 session_id: item.session_id,
-                callback_context_xml: item.callback_context_xml.map(XmlBlock::parse).transpose()?,
-                callback_message: item.callback_message,
+                profile_id: item.profile_id,
             };
             let send_result = self.manager.send_payload(payload).await;
             match send_result {
@@ -239,9 +279,6 @@ pub enum NotificationServiceError {
     /// Database error.
     #[error("database error: {0}")]
     Db(#[from] crate::db::ChatDbError),
-    /// Invalid context xml block.
-    #[error("invalid context xml block: {0}")]
-    InvalidXml(#[from] crate::xml::XmlBlockError),
     /// Notification transport error.
     #[error("notification transport error: {0}")]
     Notification(#[from] crate::notification::NotificationError),

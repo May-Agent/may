@@ -182,7 +182,6 @@ export const zhHant: Messages = {
     webFetch: '擷取網頁',
     ask: '請教助理',
     session: '回顧對話',
-    notify: '傳送通知',
     task: '委派任務',
     generic: '處理中',
     output: '結果',

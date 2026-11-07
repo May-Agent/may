@@ -194,7 +194,6 @@ impl TitleGenerationQueue {
 #[derive(Debug, Clone)]
 pub struct UiToolDispatchers {
     pub(crate) task: TaskBroker,
-    pub(crate) notify: crate::agent::notify_tool::NotifyBroker,
     pub(crate) browser: BrowserBroker,
     pub(crate) register_skills: RegisterBroker,
     pub(crate) tunnel: crate::agent::tunnel_tool::TunnelBroker,
@@ -202,7 +201,6 @@ pub struct UiToolDispatchers {
 
 pub struct UiToolQueues {
     pub(crate) task: TaskQueue,
-    pub(crate) notify: crate::agent::notify_tool::NotifyQueue,
     pub(crate) browser: BrowserQueue,
     pub(crate) register_skills: RegisterQueue,
     pub(crate) tunnel: crate::agent::tunnel_tool::TunnelQueue,
@@ -210,7 +208,6 @@ pub struct UiToolQueues {
 
 pub fn tool_dispatch_channels() -> (UiToolDispatchers, UiToolQueues) {
     let (task, task_queue) = crate::agent::task_tool::channel();
-    let (notify, notify_queue) = crate::agent::notify_tool::channel();
     let (browser, browser_queue) = crate::agent::browser_tool::channel();
     let (register_skills, register_skills_queue) = crate::agent::register_tool::skills_channel();
     let (tunnel, tunnel_queue) = crate::agent::tunnel_tool::channel();
@@ -218,14 +215,12 @@ pub fn tool_dispatch_channels() -> (UiToolDispatchers, UiToolQueues) {
     (
         UiToolDispatchers {
             task,
-            notify,
             browser,
             register_skills,
             tunnel,
         },
         UiToolQueues {
             task: task_queue,
-            notify: notify_queue,
             browser: browser_queue,
             register_skills: register_skills_queue,
             tunnel: tunnel_queue,
@@ -921,6 +916,11 @@ impl AskUserApprover {
                 .await
             {
                 tracing::warn!(session_id = %session_id, error = %error, "failed to register ask-user request");
+            } else {
+                runtime_service.announce_user_wait(crate::session::UserWait {
+                    session_id: session_id.to_string(),
+                    ask: crate::session::UserAsk::question(&persisted_request),
+                });
             }
         }
 
@@ -1094,6 +1094,13 @@ impl WorkspaceApprover {
                 self.resolve(&request_id, true)
                     .await
                     .map_err(|error| WorkspaceApprovalError::YoloGrant(Box::new(error)))?;
+            } else {
+                runtime_service.announce_user_wait(crate::session::UserWait {
+                    session_id: session_id.to_string(),
+                    ask: crate::session::UserAsk::Workspace {
+                        path: request.path.clone(),
+                    },
+                });
             }
         }
 

@@ -14,7 +14,6 @@ use crate::agent::ask_user_tool::{AskUserTool, WithdrawAskUserTool};
 use crate::agent::browser_tool::{BrowserBroker, BrowserTool};
 use crate::agent::imagine::ImagineTool;
 use crate::agent::issue_tool::{IssueChangeNotifier, IssueTool, SubagentIssueTool};
-use crate::agent::notify_tool::{NotifyBroker, NotifyTool};
 use crate::agent::pr_tool::{PrArgs, PrCommand};
 use crate::agent::register_tool::{RegisterBroker, RegisterTool, Skills};
 use crate::agent::repo_tool::{RepoContext, RepoTool, SubagentRepoTool};
@@ -70,8 +69,6 @@ pub struct SharedTerminalCommandConfig<LLM> {
     pub task_runtime: TaskRuntimeKind,
     /// Broker for scheduled-task commands.
     pub task_broker: Option<TaskBroker>,
-    /// Broker for `notify` notifications.
-    pub notify_broker: Option<NotifyBroker>,
     /// Broker for `tunnel` registrations.
     pub tunnel_broker: Option<crate::agent::tunnel_tool::TunnelBroker>,
     /// Broker for `browser` commands.
@@ -414,14 +411,6 @@ where
         builder.main_only(|reserved| reserved.configure_tool(task));
     }
 
-    if let Some(notify_broker) = config.notify_broker {
-        register_tool_with_description(
-            builder,
-            &mut descriptions,
-            NotifyTool::new(Some(notify_broker)).for_session(config.session_id.clone()),
-        );
-    }
-
     if let Some(tunnel_broker) = config.tunnel_broker {
         register_tool_with_description(
             builder,
@@ -685,7 +674,6 @@ mod tests {
                 }),
                 task_runtime: TaskRuntimeKind::Local,
                 task_broker: None,
-                notify_broker: None,
                 tunnel_broker: None,
                 browser_broker: None,
                 register_skills_broker: None,
@@ -747,7 +735,6 @@ mod tests {
                 imagine: None,
                 task_runtime: TaskRuntimeKind::Local,
                 task_broker: None,
-                notify_broker: None,
                 tunnel_broker: None,
                 browser_broker: None,
                 register_skills_broker: None,
@@ -809,7 +796,6 @@ mod tests {
                 imagine: None,
                 task_runtime: TaskRuntimeKind::Local,
                 task_broker: None,
-                notify_broker: None,
                 tunnel_broker: None,
                 browser_broker: None,
                 register_skills_broker: None,
@@ -865,7 +851,6 @@ mod tests {
                 imagine: None,
                 task_runtime: TaskRuntimeKind::Local,
                 task_broker: None,
-                notify_broker: None,
                 tunnel_broker: None,
                 browser_broker: None,
                 register_skills_broker: None,
@@ -917,7 +902,6 @@ mod tests {
                 imagine: None,
                 task_runtime: TaskRuntimeKind::Local,
                 task_broker: None,
-                notify_broker: None,
                 tunnel_broker: None,
                 browser_broker: None,
                 register_skills_broker: None,
@@ -1090,7 +1074,6 @@ mod tests {
                 imagine: None,
                 task_runtime: TaskRuntimeKind::Local,
                 task_broker: None,
-                notify_broker: None,
                 tunnel_broker: None,
                 browser_broker: None,
                 register_skills_broker: None,
@@ -1174,7 +1157,6 @@ mod tests {
                 imagine: None,
                 task_runtime: TaskRuntimeKind::Local,
                 task_broker: Some(task_broker),
-                notify_broker: None,
                 tunnel_broker: None,
                 browser_broker: None,
                 register_skills_broker: None,
@@ -1227,7 +1209,6 @@ mod tests {
                 imagine: None,
                 task_runtime: TaskRuntimeKind::Local,
                 task_broker: None,
-                notify_broker: None,
                 tunnel_broker: None,
                 browser_broker: None,
                 register_skills_broker: None,
@@ -1284,7 +1265,6 @@ mod tests {
                 imagine: None,
                 task_runtime: runtime,
                 task_broker: None,
-                notify_broker: None,
                 tunnel_broker: None,
                 browser_broker: None,
                 register_skills_broker: None,
