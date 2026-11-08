@@ -3990,7 +3990,7 @@ async fn stream_stop_mid_response_persists_partial_assistant_text(environment: C
     sleep(Duration::from_millis(450)).await;
 
     let stop_response = client
-        .post(format!(
+        .delete(format!(
             "{}/api/sessions/{}/turns/current",
             server.base_url, session_id
         ))
