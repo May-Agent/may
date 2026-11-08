@@ -1736,7 +1736,8 @@ where
                                     .map(|_| effort)
                                     .map_err(may_agent::tui::error::TuiError::from);
                                 let _ = tx.send(AppEvent::EffortApplied(result)).await;
-                            });
+                            })
+                            .detach();
                         }
                     }
                     Some(SendAction::OpenChatgptAuthUrl { url, code }) => {
