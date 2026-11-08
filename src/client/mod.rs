@@ -15,7 +15,7 @@ pub use wire::{
     CreateSessionRequest, HoldReason, IndexCoverage, PermissionPollItem, RecapFrame, RewindRequest,
     RunEnd, SessionAgentBody, SessionAgentFrame, SessionIndexSnapshot, SessionIssuesFrame,
     SessionRuntimeEvent, SessionRuntimeSnapshot, SuggestionFrame, UpdateSessionRequest,
-    WarningFrame, WireAgentError, WireAgentEvent, WirePr, WireSession,
+    WarningFrame, WireAgentError, WireAgentEvent, WirePr, WirePrChecks, WireSession,
 };
 
 use std::path::PathBuf;

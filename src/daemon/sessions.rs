@@ -1,11 +1,13 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
+use futures_util::StreamExt;
 use skyzen::routing::Params;
 use skyzen::utils::{Json, State};
 use skyzen::{Error as SkyError, Result as SkyResult, StatusCode};
 
 use crate::db::ProfileEnvironmentKind;
+use crate::pr::merge_watch::Upstream;
 use crate::session::{
     MayHomePaths, SandboxResourceLayout, SessionId, SessionStore, list_summaries_from_db,
 };
@@ -344,8 +346,20 @@ pub(super) async fn get_session_prs(
         .list_session_prs(&id)
         .await
         .map_err(internal_error)?;
+    // Live checks ride the same payload: every open GitHub PR gets one
+    // GraphQL snapshot of its head rollup, best-effort — a slow or dead
+    // GitHub must not hold up the list itself. `buffered` keeps the row
+    // order so each summary zips back onto its own PR.
+    let mut check_reads = Vec::with_capacity(rows.len());
+    for row in &rows {
+        check_reads.push(pr_check_summary(&state, row));
+    }
+    let summaries = futures_util::stream::iter(check_reads)
+        .buffered(4)
+        .collect::<Vec<_>>()
+        .await;
     let mut prs = Vec::with_capacity(rows.len());
-    for row in rows {
+    for (row, summary) in rows.into_iter().zip(summaries) {
         let events = state
             .db()
             .pr_events(row.id)
@@ -369,10 +383,45 @@ pub(super) async fn get_session_prs(
             created_at: row.created_at,
             updated_at: row.updated_at,
             merged_at: row.merged_at,
+            checks: summary.map(|s| super::types::ApiPrChecks {
+                pending: s.pending,
+                passed: s.passed,
+                failed: s.failed,
+            }),
             events,
         });
     }
     Ok(Json(prs))
+}
+
+/// One GraphQL snapshot of a live GitHub PR's check rollup; `None` for
+/// local/may-backend PRs, landed states, and failed reads.
+async fn pr_check_summary(
+    state: &DaemonState,
+    row: &crate::db::PrRow,
+) -> Option<crate::pr::merge_watch::CheckSummary> {
+    let live = row.backend == "github"
+        && matches!(row.state.as_str(), "open" | "checks_pending" | "merging")
+        && row.external_number.is_some();
+    if !live {
+        return None;
+    }
+    let repo_key = state
+        .db()
+        .repo_key_of_project(row.project_id)
+        .await
+        .ok()
+        .flatten()?;
+    let github = crate::pr::merge_watch::GithubPr {
+        api: &state.github_api,
+        owner_repo: &repo_key,
+        number: row.external_number?,
+    };
+    github
+        .snapshot()
+        .await
+        .ok()
+        .map(|snapshot| snapshot.check_summary())
 }
 
 /// Atomically set the plan state for a session without touching task content.

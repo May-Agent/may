@@ -473,8 +473,23 @@ pub struct ApiPr {
     pub(crate) updated_at: String,
     /// Merge timestamp, when merged.
     pub(crate) merged_at: Option<String>,
+    /// Live check rollup of the PR's head, queried from GitHub for an open
+    /// GitHub PR; `None` for other backends and landed states.
+    pub(crate) checks: Option<ApiPrChecks>,
     /// Recent transition events, oldest first.
     pub(crate) events: Vec<ApiPrEvent>,
+}
+
+/// How many of a PR's checks sit in each state — the rollup GitHub shows.
+#[derive(Debug, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiPrChecks {
+    /// Still running or not yet reported.
+    pub(crate) pending: u32,
+    /// Concluded successfully (neutral and skipped included).
+    pub(crate) passed: u32,
+    /// Failed, timed out, cancelled or errored.
+    pub(crate) failed: u32,
 }
 
 /// One `pr_events` row over the wire.

@@ -813,8 +813,23 @@ pub struct WirePr {
     /// Whether the PR merges itself once checks pass.
     #[serde(default)]
     pub auto_merge: bool,
+    /// Live check rollup of the PR's head, when the daemon read one.
+    #[serde(default)]
+    pub checks: Option<WirePrChecks>,
     /// Latest update timestamp.
     pub updated_at: String,
+}
+
+/// How many of a PR's checks sit in each state — the rollup GitHub shows.
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WirePrChecks {
+    /// Still running or not yet reported.
+    pub pending: u32,
+    /// Concluded successfully.
+    pub passed: u32,
+    /// Failed, timed out, cancelled or errored.
+    pub failed: u32,
 }
 
 #[cfg(test)]
