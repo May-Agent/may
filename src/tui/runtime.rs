@@ -1141,8 +1141,8 @@ impl RuntimeDeps {
             return committed_or_not_open(
                 client
                     .post::<_, serde_json::Value>(
-                        &format!("/api/interactions/{id}", id = req.id),
-                        &serde_json::json!({ "id": request_id, "answers": answers_json(answers) }),
+                        &format!("/api/interactions/{request_id}"),
+                        &serde_json::json!({ "kind": "askUser", "answers": answers_json(answers) }),
                     )
                     .await,
             );
@@ -1168,8 +1168,8 @@ impl RuntimeDeps {
         let committed = committed_or_not_open(
             client
                 .post::<_, serde_json::Value>(
-                    &format!("/api/interactions/{id}", id = req.id),
-                    &serde_json::json!({ "id": request_id, "answers": answers_json(answers) }),
+                    &format!("/api/interactions/{request_id}"),
+                    &serde_json::json!({ "kind": "askUser", "answers": answers_json(answers) }),
                 )
                 .await,
         )?;
@@ -1194,8 +1194,8 @@ impl RuntimeDeps {
         if let Some(client) = &self.daemon {
             let _: serde_json::Value = client
                 .post(
-                    &format!("/api/interactions/{id}", id = req.id),
-                    &serde_json::json!({ "id": request_id, "approved": approved }),
+                    &format!("/api/interactions/{request_id}"),
+                    &serde_json::json!({ "kind": "workspace", "approved": approved }),
                 )
                 .await?;
             return Ok(ResponseCommit::Committed);
@@ -1219,8 +1219,8 @@ impl RuntimeDeps {
         if let Some(client) = &self.daemon {
             let _: serde_json::Value = client
                 .post(
-                    &format!("/api/interactions/{id}", id = req.id),
-                    &serde_json::json!({ "id": request_id, "approved": approved }),
+                    &format!("/api/interactions/{request_id}"),
+                    &serde_json::json!({ "kind": "permission", "approved": approved }),
                 )
                 .await?;
             return Ok(());
