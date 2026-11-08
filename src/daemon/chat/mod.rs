@@ -999,7 +999,6 @@ fn api_message_from_run_result(result: AgentRunResult) -> Option<ApiMessage> {
         is_streaming: Some(false),
         is_thinking: Some(false),
         tool_event: None,
-        terminal_executions: result.terminal_snapshot.all_executions(),
         stats: Some(RequestStats {
             provider_id: Some(result.provider_id),
             prompt_tokens: result.usage.prompt_tokens,

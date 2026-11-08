@@ -796,8 +796,6 @@ pub struct ApiMessage {
     #[serde(default)]
     pub(crate) tool_event: Option<serde_json::Value>,
     #[serde(default)]
-    pub(crate) terminal_executions: Vec<ApiTerminalExecution>,
-    #[serde(default)]
     pub(crate) stats: Option<RequestStats>,
     /// The display translation of `content`, when the reply was not in the
     /// communication language; `content` stays the original.
@@ -823,8 +821,6 @@ pub struct ApiSession {
     pub(crate) title: String,
     pub(crate) last_modified: String,
     pub(crate) preview: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) messages: Vec<ApiMessage>,
     pub(crate) profile_id: Option<String>,
     pub(crate) model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -841,11 +837,7 @@ pub struct ApiSession {
 
 impl ApiSession {
     /// Build an [`ApiSession`] from a [`SessionSummary`] with a resolved model.
-    pub(crate) fn from_summary(
-        summary: crate::session::SessionSummary,
-        model: String,
-        messages: Vec<ApiMessage>,
-    ) -> Self {
+    pub(crate) fn from_summary(summary: crate::session::SessionSummary, model: String) -> Self {
         let last_modified = summary
             .updated_at
             .map_or_else(|| jiff::Timestamp::now().to_string(), |t| t.to_string());
@@ -859,7 +851,6 @@ impl ApiSession {
             title: summary.title.unwrap_or_else(|| "New Chat".to_string()),
             last_modified,
             preview,
-            messages,
             profile_id: summary.profile_id,
             model,
             reasoning_effort: summary.reasoning_effort.clone(),
@@ -876,7 +867,6 @@ impl ApiSession {
             title: "New Chat".to_string(),
             last_modified: jiff::Timestamp::now().to_string(),
             preview: "New conversation started".to_string(),
-            messages: Vec::new(),
             profile_id,
             model,
             reasoning_effort: None,
@@ -910,14 +900,9 @@ pub struct CreateSessionRequest {
 #[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RewindRequest {
-    /// Index into the session's stored message list where the cut starts;
-    /// it and every row after it are deleted.
-    #[serde(default)]
-    pub(crate) index: Option<usize>,
     /// Transcript entry id (a `user` entry) where the cut starts; hidden
     /// context directly before it is cut too.
-    #[serde(default)]
-    pub(crate) entry_id: Option<String>,
+    pub(crate) entry_id: String,
 }
 
 #[derive(Debug, serde::Deserialize, skyzen::ToSchema)]

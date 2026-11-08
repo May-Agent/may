@@ -426,8 +426,8 @@ fn api_routes() -> Route {
     use super::remote_access::{get_remote_access_status, start_remote_access, stop_remote_access};
     use super::sessions::{
         append_session_history, create_session, delete_all_sessions, delete_session, get_session,
-        get_session_context_debug, get_session_history, get_session_prs, get_session_tasks,
-        list_sessions, lookup_issues, rewind_session, save_session_tasks, set_session_plan_state,
+        get_session_context_debug, get_session_prs, get_session_tasks, list_sessions,
+        lookup_issues, rewind_session, save_session_tasks, set_session_plan_state,
         set_session_yolo, update_session,
     };
     use super::sleep::{end_sleep, get_sleep, start_sleep};
@@ -459,7 +459,6 @@ fn api_routes() -> Route {
                         "".put(update_session),
                         "".delete(delete_session),
                         "/events".at(super::session_events::stream_session_events),
-                        "/history".at(get_session_history),
                         "/history".post(append_session_history),
                         "/attachments".post(super::attachments::post_attachment),
                         "/files/{*path}".at(super::attachments::get_session_file),

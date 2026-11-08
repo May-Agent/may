@@ -4,10 +4,8 @@ use serde_json::{Value, json};
 
 use crate::session::{MessageRole, PersistedMessage, PersistedMessageError};
 
-use super::terminal_parsing::update_terminal_snapshot_from_tool_event;
 use super::types::{
-    ApiMessage, ApiTranslation, RequestStats, SkillInfoDto, TerminalStateSnapshot, ToolEventRecord,
-    ToolVariant,
+    ApiMessage, ApiTranslation, RequestStats, SkillInfoDto, ToolEventRecord, ToolVariant,
 };
 
 /// The id a stored message row has on the wire: streamed turn events and the
@@ -28,7 +26,6 @@ pub(super) fn map_db_messages(
     db_messages: &[crate::db::entity::messages::Model],
 ) -> Result<Vec<ApiMessage>, PersistedMessageError> {
     let mut out = Vec::new();
-    let mut snapshot = TerminalStateSnapshot::default();
     let mut pending_tool_events: Vec<Value> = Vec::new();
     let mut last_assistant_in_turn: Option<usize> = None;
 
@@ -37,7 +34,6 @@ pub(super) fn map_db_messages(
         match persisted.role {
             MessageRole::Tool => {
                 if let Ok(record) = serde_json::from_str::<ToolEventRecord>(&msg.content) {
-                    update_terminal_snapshot_from_tool_event(&mut snapshot, &record);
                     pending_tool_events
                         .push(tool_event_to_api_json(&record, pending_tool_events.len()));
                 }
@@ -71,7 +67,6 @@ pub(super) fn map_db_messages(
                     is_streaming: Some(false),
                     is_thinking: Some(false),
                     tool_event: None,
-                    terminal_executions: Vec::new(),
                     stats: map_db_message_stats(msg),
                     translation: None,
                 });
@@ -97,16 +92,9 @@ pub(super) fn map_db_messages(
                     is_streaming: Some(false),
                     is_thinking: Some(false),
                     tool_event,
-                    terminal_executions: Vec::new(),
                     stats: map_db_message_stats(msg),
                     translation: persisted_translation(msg)?,
                 };
-
-                if persisted.role == MessageRole::Assistant
-                    && (!snapshot.executions.is_empty() || !snapshot.running_by_call_id.is_empty())
-                {
-                    api_msg.terminal_executions = snapshot.all_executions();
-                }
 
                 out.push(api_msg);
                 if persisted.role == MessageRole::Assistant {
