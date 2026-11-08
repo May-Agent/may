@@ -123,7 +123,22 @@ pub(super) async fn rewind_session(
     let id = params.get("id").map_err(bad_request_error)?.to_string();
     let db = state.db();
     let rows = db.get_messages(&id).await.map_err(internal_error)?;
-    let Some(row) = rows.get(req.index) else {
+    let index = match (req.index, req.entry_id.as_deref()) {
+        (Some(index), None) => index,
+        (None, Some(entry_id)) => {
+            let history = crate::session::load_history_from_db(&db, &id)
+                .await
+                .map_err(internal_error)?;
+            let entries = super::transcript::build_entries(history.messages());
+            super::transcript::entry_cut_index(&rows, &entries, entry_id)?
+        }
+        _ => {
+            return Err(bad_request_error(
+                "exactly one of `index` or `entryId` is required",
+            ));
+        }
+    };
+    let Some(row) = rows.get(index) else {
         return Err(bad_request_error("rewind index out of range"));
     };
     let cut_id = i64::from(row.id);
