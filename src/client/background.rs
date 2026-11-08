@@ -246,6 +246,9 @@ pub struct WireJob {
     pub output_path: Option<std::path::PathBuf>,
     /// Where it runs.
     pub place: WirePlace,
+    /// The language of `script`.
+    #[schema(value_type = String)]
+    pub language: aither_sandbox::ScriptLanguage,
 }
 
 fn elapsed_ms(since: Instant) -> u64 {
@@ -271,6 +274,7 @@ impl From<&JobInfo> for WireJob {
             status: (&job.status).into(),
             output_path: job.output_path.clone(),
             place: job.place.into(),
+            language: job.language,
         }
     }
 }
@@ -287,6 +291,7 @@ impl From<WireJob> for JobInfo {
             status: job.status.into(),
             output_path: job.output_path,
             place: job.place.into(),
+            language: job.language,
         }
     }
 }
@@ -598,6 +603,7 @@ mod tests {
             status,
             output_path: None,
             place: WirePlace::Host,
+            language: aither_sandbox::ScriptLanguage::Shell,
         };
         let mut snapshot = SessionBackgroundSnapshot::default();
         assert!(!snapshot.will_resume());
@@ -621,6 +627,7 @@ mod tests {
             execution_key: "k".into(),
             script: "sleep 30".into(),
             mode: TerminalMode::Sandboxed,
+            language: aither_sandbox::ScriptLanguage::Shell,
             started_at: Instant::now()
                 .checked_sub(Duration::from_secs(5))
                 .expect("clock"),

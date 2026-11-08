@@ -25,7 +25,7 @@ use super::{ChatDb, ChatDbError, query};
 /// 3 = every `AgentCheckpoint` before it carried what the conversation holds
 /// of `tasks.md`.
 /// 4 = the current `AgentCheckpoint` shape, with its `tasks` field.
-pub(super) const CONTEXT_SNAPSHOT_FORMAT: i64 = 4;
+pub(super) const CONTEXT_SNAPSHOT_FORMAT: i64 = 5;
 
 /// Inputs for [`ChatDb::upsert_context_debug_snapshot`].
 #[derive(Debug)]
@@ -446,7 +446,7 @@ mod tests {
                 messages: vec![aither_core::llm::Message::user("hello")],
             },
             has_background_tasks: false,
-            tasks: None,
+            document: None,
         }
     }
 
@@ -471,8 +471,8 @@ mod tests {
             [
                 "context",
                 "context_window",
+                "document",
                 "has_background_tasks",
-                "tasks",
                 "tool_surface_hash"
             ]
         );

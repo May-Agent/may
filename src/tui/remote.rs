@@ -896,6 +896,7 @@ mod tests {
             execution_key: "k".to_string(),
             script: "sleep 1".to_string(),
             mode: aither_sandbox::TerminalMode::Sandboxed,
+            language: aither_sandbox::ScriptLanguage::Shell,
             elapsed_ms: 0,
             status: crate::client::background::WireJobStatus::Running,
             output_path: None,

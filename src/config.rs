@@ -814,10 +814,7 @@ pub fn check_acp_agent_name(name: &str) -> Result<(), ConfigError> {
         Err(_) => return reject("a name holds only ASCII letters, digits, `-` and `_`"),
         Ok(()) => {}
     }
-    if aither_agent::BUNDLED_SUBAGENTS
-        .iter()
-        .any(|bundled| bundled.name == name)
-    {
+    if crate::bundle::BUNDLED_SUBAGENT_NAMES.contains(&name) {
         return reject("the name belongs to a built-in subagent type");
     }
     Ok(())

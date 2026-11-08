@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
-use aither_agent::tasks::{RelatedWork, WorkComment, WorkKind, WorkStatus};
+use aither_agent::working_document::{RelatedWork, WorkComment, WorkKind, WorkStatus};
 use aither_agent::{WorkItem, WorkRef, WorkState, WorkTrackerError};
 
 use crate::db::{ChatDb, PrRow};

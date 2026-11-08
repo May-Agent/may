@@ -786,7 +786,7 @@ async fn next_command(
             IdleStep::Background(wake) => {
                 // The wake is recorded in the agent's context; a wake that
                 // needs the model asks the host for a run.
-                if wake.needs_model
+                if wake.starts_run
                     && let Some(background) = background_wakes
                 {
                     let _ = background.wakes.try_send(wake);

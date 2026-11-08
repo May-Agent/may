@@ -216,8 +216,11 @@ impl Tool for PrTool {
                 title: Some(title), ..
             },
         ) = (&self.languages, &args)
+            && let Err(refusal) = guard.check_working(title, aither_agent::WorkingText::Public)
         {
-            guard.check_working(title, aither_agent::WorkingText::Public)?;
+            return Ok(ToolResult::error(
+                aither_agent::AnyNotices::default().language_refusal(&refusal),
+            ));
         }
         let result = match args {
             PrArgs::Open {

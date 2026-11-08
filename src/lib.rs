@@ -153,3 +153,16 @@ pub use terminal_permission_handler::TerminalPermissionHandler;
 pub use workspace::{Workspace, WorkspaceConfig};
 pub use workspace_request::{WorkspaceRequest, WorkspaceRequestBroker, WorkspaceRequestQueue};
 pub use xml::{XmlBlock, XmlBlockError};
+
+/// Test support shared by the crate's `#[cfg(test)]` code.
+#[cfg(test)]
+mod test_support {
+    /// An output store in `dir` with the default model-facing id allocator.
+    pub async fn test_output_store(
+        dir: impl Into<std::path::PathBuf>,
+    ) -> aither_sandbox::OutputStore {
+        aither_sandbox::OutputStore::new(dir, aither_core::ids::AnyIdAllocator::default())
+            .await
+            .expect("outputs store")
+    }
+}
