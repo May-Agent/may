@@ -167,23 +167,25 @@ fn task_rows(rows: &[TaskRow], width: usize) -> (Vec<Line<'static>>, Option<usiz
 
 fn issue_row(issue: &IssueBrief, width: usize) -> Line<'static> {
     let number = format!("#{} ", issue.number);
-    let (state, state_style) = match (&issue.title, issue.closed) {
+    // GitHub-style state icon: a green circle for open, a dark check for
+    // closed, nothing while the lookup is still pending.
+    let (icon, icon_style) = match (&issue.title, issue.closed) {
         // Not found (yet): no state to claim.
         (None, _) => ("", Style::default()),
-        (Some(_), true) => ("closed", Style::default().fg(Color::DarkGray)),
-        (Some(_), false) => ("open", Style::default().fg(Color::Green)),
+        (Some(_), true) => ("✓", Style::default().fg(Color::DarkGray)),
+        (Some(_), false) => ("●", Style::default().fg(Color::Green)),
     };
-    let title_width = width.saturating_sub(number.width() + state.width() + 1);
+    let title_width = width.saturating_sub(number.width() + icon.width() + 1);
     let title = issue
         .title
         .as_deref()
         .map_or_else(|| "…".to_string(), |title| truncate(title, title_width));
-    let pad = width.saturating_sub(number.width() + title.width() + state.width());
+    let pad = width.saturating_sub(number.width() + title.width() + icon.width());
     Line::from(vec![
         Span::styled(number, Style::default().fg(Color::Magenta)),
         Span::raw(title),
         Span::raw(" ".repeat(pad.max(1))),
-        Span::styled(state, state_style),
+        Span::styled(icon, icon_style),
     ])
 }
 
@@ -376,7 +378,16 @@ pub(super) fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
         tasks.push(Line::from(""));
         tasks.push(heading("Pull requests".to_string()));
         for pr in open_prs {
-            tasks.push(dim(format!("  #{} {} — {}", pr.number, pr.title, pr.state)));
+            let number = format!("#{} ", pr.number);
+            let title_width = width.saturating_sub(number.width() + 1);
+            let title = truncate(&pr.title, title_width);
+            let pad = width.saturating_sub(number.width() + title.width() + 1);
+            tasks.push(Line::from(vec![
+                Span::styled(number, Style::default().fg(Color::Magenta)),
+                Span::raw(title),
+                Span::raw(" ".repeat(pad.max(1))),
+                Span::styled("●", Style::default().fg(Color::Green)),
+            ]));
         }
     }
 
