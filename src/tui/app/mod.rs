@@ -3857,6 +3857,31 @@ impl App {
         {
             return self.open_model_select(rest.trim());
         }
+        // `/btw` opens the side-question overlay and `/btw <question>`
+        // asks it at once — either way the line is a command, never a
+        // message to the agent.
+        if attachments.is_empty()
+            && let Some(rest) = trimmed.strip_prefix(SlashCommand::Btw.name())
+            && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+        {
+            let question = rest.trim();
+            self.open_btw();
+            if !question.is_empty()
+                && let AppMode::Btw(state) = &mut self.mode
+            {
+                state.input = question.to_string();
+                self.submit_btw();
+            }
+            return None;
+        }
+        // `/progress` is a side request too: never a message to the agent.
+        if attachments.is_empty()
+            && let Some(rest) = trimmed.strip_prefix(SlashCommand::Progress.name())
+            && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+        {
+            self.open_progress();
+            return None;
+        }
 
         self.sent_hidden_context = self.rewind_notice.take();
         let msg = PendingMessage {
