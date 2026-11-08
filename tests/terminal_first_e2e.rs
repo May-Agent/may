@@ -1962,7 +1962,7 @@ async fn send_turn(
         .send()
         .await?;
     let sent = client
-        .post(format!("{base_url}/api/sessions/{session_id}/messages"))
+        .post(format!("{base_url}/api/sessions/{session_id}/turns"))
         .json(body)
         .send()
         .await?;
@@ -3991,7 +3991,7 @@ async fn stream_stop_mid_response_persists_partial_assistant_text(environment: C
 
     let stop_response = client
         .post(format!(
-            "{}/api/sessions/{}/stop",
+            "{}/api/sessions/{}/turns/current",
             server.base_url, session_id
         ))
         .send()

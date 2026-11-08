@@ -1,4 +1,4 @@
-import { apiGet, apiPut } from './client';
+import { apiGet, apiPatch, apiPut } from './client';
 import type {
   SessionTasksPayload,
   SessionPlanState,
@@ -24,12 +24,12 @@ export function putSessionPlanState(
   sessionId: string,
   planState: SessionPlanState,
 ): Promise<SessionPlanStateResponse> {
-  return apiPut<SessionPlanStateResponse>(
+  return apiPatch<ApiSession>(
     `/sessions/${encodeURIComponent(sessionId)}/tasks/plan-state`,
     { planState },
   );
 }
 export function putSessionYolo(sessionId: string, yolo: boolean): Promise<SessionYoloResponse> {
-  return apiPut<SessionYoloResponse>(`/sessions/${encodeURIComponent(sessionId)}/yolo`, { yolo });
+  return apiPatch<ApiSession>(`/sessions/${encodeURIComponent(sessionId)}`, { yolo });
 }
 

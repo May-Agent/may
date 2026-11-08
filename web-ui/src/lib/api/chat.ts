@@ -4,7 +4,7 @@ import { markAuthRequired } from '../stores/authGate';
 
 /** Start a turn; it streams through the session's event stream. */
 export async function sendMessage(payload: ChatRequestPayload): Promise<void> {
-  const res = await fetch(`/api/sessions/${encodeURIComponent(payload.sessionId)}/messages`, {
+  const res = await fetch(`/api/sessions/${encodeURIComponent(payload.sessionId)}/turns`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
@@ -21,7 +21,7 @@ export async function sendMessage(payload: ChatRequestPayload): Promise<void> {
 }
 
 export async function enqueueMessage(payload: ChatRequestPayload): Promise<void> {
-  const res = await fetch('/api/chat/enqueue', {
+  const res = await fetch(`/api/sessions/${encodeURIComponent(payload.sessionId)}/turns`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
@@ -33,7 +33,7 @@ export async function enqueueMessage(payload: ChatRequestPayload): Promise<void>
 }
 
 export async function stopSession(sessionId: string): Promise<void> {
-  const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/stop`, {
+  const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/turns/current`, {
     method: 'POST',
   });
   if (!res.ok) throw new ApiError('internal_error', 'stop failed', res.status);

@@ -1797,11 +1797,8 @@ where
                             (Some(client), Some(session_id)) => {
                                 let enable = !app.session_runtime.yolo;
                                 let put = client
-                                    .put::<_, serde_json::Value>(
-                                        &may_agent::client::session_path(
-                                            session_id.as_str(),
-                                            "/yolo",
-                                        ),
+                                    .patch::<_, serde_json::Value>(
+                                        &format!("/api/sessions/{session_id}"),
                                         &serde_json::json!({ "yolo": enable }),
                                     )
                                     .await;
@@ -1856,7 +1853,7 @@ where
                                     .post::<_, serde_json::Value>(
                                         &may_agent::client::session_path(
                                             session_id.as_str(),
-                                            "/recap",
+                                            "/actions/recap",
                                         ),
                                         &serde_json::json!({}),
                                     )

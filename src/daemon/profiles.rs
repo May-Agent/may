@@ -55,7 +55,7 @@ const fn default_env() -> ProfileEnvironmentKind {
     ProfileEnvironmentKind::Local
 }
 
-fn map_profile_error(err: ChatDbError) -> skyzen::Error {
+pub(super) fn map_profile_error(err: ChatDbError) -> skyzen::Error {
     match err {
         ChatDbError::PinnedLimitExceeded { .. }
         | ChatDbError::InvalidProfileEnvironment(_)
@@ -560,60 +560,6 @@ pub(super) async fn delete_folder(
     let db = state.db();
 
     db.delete_folder(&id).await.map_err(internal_error)?;
-    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
-    Ok(Json(super::types::API_OK))
-}
-
-// ── Session pin/archive/move endpoints ──────────────────────
-
-pub(super) async fn pin_session(
-    params: Params,
-    State(state): State<Arc<DaemonState>>,
-) -> SkyResult<Json<super::types::ApiHealth>> {
-    let id = params.get("id").map_err(bad_request_error)?.to_string();
-
-    let db = state.db();
-
-    db.pin_session(&id).await.map_err(map_profile_error)?;
-    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
-    Ok(Json(super::types::API_OK))
-}
-
-pub(super) async fn unpin_session(
-    params: Params,
-    State(state): State<Arc<DaemonState>>,
-) -> SkyResult<Json<super::types::ApiHealth>> {
-    let id = params.get("id").map_err(bad_request_error)?.to_string();
-
-    let db = state.db();
-
-    db.unpin_session(&id).await.map_err(internal_error)?;
-    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
-    Ok(Json(super::types::API_OK))
-}
-
-pub(super) async fn archive_session(
-    params: Params,
-    State(state): State<Arc<DaemonState>>,
-) -> SkyResult<Json<super::types::ApiHealth>> {
-    let id = params.get("id").map_err(bad_request_error)?.to_string();
-
-    let db = state.db();
-
-    db.archive_session(&id).await.map_err(internal_error)?;
-    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
-    Ok(Json(super::types::API_OK))
-}
-
-pub(super) async fn unarchive_session(
-    params: Params,
-    State(state): State<Arc<DaemonState>>,
-) -> SkyResult<Json<super::types::ApiHealth>> {
-    let id = params.get("id").map_err(bad_request_error)?.to_string();
-
-    let db = state.db();
-
-    db.unarchive_session(&id).await.map_err(internal_error)?;
     state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
     Ok(Json(super::types::API_OK))
 }

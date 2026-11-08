@@ -1084,10 +1084,10 @@ impl RuntimeDeps {
                 )
                 .await?,
                 "hiddenContextXml": message.hidden_context_xml.as_ref().map(ToString::to_string),
-                "deliveryMode": message.delivery_mode,
+                "mode": match message.delivery_mode.as_str() { "queue" => "queue", _ => "steer" },
             });
             if let Err(error) = client
-                .post::<_, serde_json::Value>("/api/chat/enqueue", &body)
+                .post::<_, serde_json::Value>(&format!("/api/sessions/{session_id}/turns"), &body)
                 .await
             {
                 app.sync_queue_from_runtime();

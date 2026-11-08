@@ -703,7 +703,7 @@ async fn run_commands(
             }
             WorkerCommand::Cancel => {
                 let stopped: Result<serde_json::Value, _> = client
-                    .post(&session_path(&session_id, "/stop"), &serde_json::json!({}))
+                    .delete(&session_path(&session_id, "/turns/current"))
                     .await;
                 if let Err(error) = stopped {
                     tracing::warn!(%error, "failed to stop the daemon turn");
@@ -712,7 +712,7 @@ async fn run_commands(
             WorkerCommand::Compact { focus, event_tx } => {
                 let result: Result<CompactResponse, _> = client
                     .post(
-                        &session_path(&session_id, "/compact"),
+                        &session_path(&session_id, "/actions/compact"),
                         &serde_json::json!({ "focus": focus }),
                     )
                     .await;
@@ -759,7 +759,7 @@ async fn run_commands(
             WorkerCommand::ContextDump { event_tx } => {
                 let result: Result<ContextDumpResponse, _> = client
                     .post(
-                        &session_path(&session_id, "/context-dump"),
+                        &session_path(&session_id, "/actions/context-dump"),
                         &serde_json::json!({}),
                     )
                     .await;
@@ -828,7 +828,7 @@ async fn send_turn(
         "hiddenContextXml": turn.hidden_context_xml,
     });
     let sent: Result<serde_json::Value, _> = client
-        .post(&session_path(session_id, "/messages"), &body)
+        .post(&session_path(session_id, "/turns"), &body)
         .await;
     if let Err(error) = sent
         && shared.take_pending().is_some()

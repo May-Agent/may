@@ -229,12 +229,11 @@ pub struct CompactResponse {
 }
 
 /// `POST /api/sessions/{id}/compact`.
-pub async fn compact_session(
-    params: Params,
-    Json(req): Json<CompactRequest>,
-    State(state): State<Arc<DaemonState>>,
+pub async fn compact_inner(
+    state: &Arc<DaemonState>,
+    session_id: &str,
+    req: CompactRequest,
 ) -> SkyResult<Json<CompactResponse>> {
-    let session_id = session_id_param(&params)?;
     let worker = idle_agent(&state, &session_id).await?;
     match answer(worker.compact(req.focus)).await {
         Some(TuiEvent::Compacted(Ok(result))) => Ok(Json(CompactResponse {
@@ -331,11 +330,10 @@ pub struct ContextDumpResponse {
 
 /// `POST /api/sessions/{id}/context-dump`: writes the assembled context to
 /// the session's `outputs/context-dump.md`.
-pub async fn context_dump(
-    params: Params,
-    State(state): State<Arc<DaemonState>>,
+pub async fn context_dump_inner(
+    state: &Arc<DaemonState>,
+    session_id: &str,
 ) -> SkyResult<Json<ContextDumpResponse>> {
-    let session_id = session_id_param(&params)?;
     let worker = idle_agent(&state, &session_id).await?;
     let dump = match answer(worker.context_dump()).await {
         Some(TuiEvent::ContextDump(Ok(dump))) => dump,
@@ -384,15 +382,14 @@ pub struct BtwResponse {
 
 /// `POST /api/sessions/{id}/btw`: answers a side question with the
 /// session's model, outside the conversation.
-pub async fn btw(
-    params: Params,
-    Json(req): Json<BtwRequest>,
-    State(state): State<Arc<DaemonState>>,
+pub async fn btw_inner(
+    state: &Arc<DaemonState>,
+    session_id: &str,
+    req: BtwRequest,
 ) -> SkyResult<Json<BtwResponse>> {
     use aither_core::llm::Message;
     use futures_lite::StreamExt as _;
 
-    let session_id = session_id_param(&params)?;
     let mut messages = req
         .messages
         .into_iter()

@@ -868,6 +868,49 @@ impl ChatDb {
         self.load_session_runtime_summary(session_id).await
     }
 
+    /// Remove the pending entry whose row id is `entry_id`, whichever
+    /// delivery mode it was stored under.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or a missing entry.
+    pub async fn remove_pending_message_by_id(
+        &self,
+        session_id: &str,
+        entry_id: i64,
+    ) -> Result<SessionRuntimeSummary, ChatDbError> {
+        query!(
+            self.db,
+            "SELECT id FROM session_pending_message_entries WHERE id = ? AND session_id = ? AND state != 'committed'",
+            entry_id,
+            session_id
+        )
+        .fetch_one::<I64ValueRow>()
+        .await
+        .map_err(|_| {
+            row_not_found(format!(
+                "pending entry {entry_id} not found for session {session_id}"
+            ))
+        })?;
+        let mut tx = self.db.begin().await?;
+        query!(
+            tx,
+            "DELETE FROM session_pending_message_attachments WHERE message_id = ?",
+            entry_id
+        )
+        .execute()
+        .await?;
+        query!(
+            tx,
+            "DELETE FROM session_pending_message_entries WHERE id = ? AND session_id = ? AND state != 'committed'",
+            entry_id,
+            session_id
+        )
+        .execute()
+        .await?;
+        tx.commit().await?;
+        self.load_session_runtime_summary(session_id).await
+    }
+
     /// Remove a queued message by its position in the queue.
     ///
     /// # Errors

@@ -15,11 +15,12 @@ pub use background::{
 };
 pub use hosts::{BtwMessage, BtwRequest, BtwResponse, CompactResponse, ContextDumpResponse};
 pub use hosts::{
-    ParkedAgents, btw, compact_session, context_dump, context_report, release_agent, usage_report,
+    ParkedAgents, btw_inner, compact_inner, context_dump_inner, context_report, release_agent,
+    usage_report,
 };
 pub use hub::TurnHub;
-pub use progress::{ProgressReport, progress};
-pub use recap::{RecapRecord, RecapSchedules, recap_session};
+pub use progress::{ProgressReport, progress_inner};
+pub use recap::{RecapRecord, RecapSchedules, recap_inner};
 mod tool_dispatch;
 mod turn_events;
 mod turn_persister;
@@ -1498,7 +1499,7 @@ pub(super) async fn remove_pending_message(
     Ok(Json(runtime.into()))
 }
 
-pub(super) async fn stop_session_run(
+async fn stop_session_run_impl(
     params: skyzen::routing::Params,
     State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<SessionRuntimeResponse>> {
@@ -1532,23 +1533,48 @@ pub(super) async fn stop_session_run(
     Ok(Json(runtime.into()))
 }
 
-/// `POST /api/sessions/{id}/messages`: starts a turn and returns at once.
+/// `POST /api/sessions/{id}/turns`: one user message, delivered the way
+/// `req.mode` says — `start` runs it now, `steer` interrupts the running
+/// turn, `queue` runs it after.
 ///
 /// The turn runs in the daemon and streams to every client of the session
-/// over `/api/events` (`session_turn` / `session_agent`); a client that
-/// disconnects does not stop it.
-pub(super) async fn send_message(
+/// over `/api/sessions/{id}/events`; a client that disconnects does not
+/// stop it.
+pub(super) async fn post_turn(
     params: skyzen::routing::Params,
-    Json(mut req): Json<ChatRequest>,
+    Json(req): Json<super::types::TurnRequest>,
     State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<SessionRuntimeResponse>> {
     let session_id = params
         .get("id")
         .map_err(super::error::bad_request_error)?
         .to_string();
-    req.session_id.clone_from(&session_id);
     wake_on_user_message(&state).await?;
-    start_prompt_turn(&state, req).await.map(Json)
+    let chat = ChatRequest {
+        session_id: session_id.clone(),
+        content: req.content,
+        attachments: req.attachments,
+        hidden_context_xml: req.hidden_context_xml,
+        delivery_mode: match req.mode {
+            super::types::TurnMode::Start => crate::session::PendingUserMessageMode::Steer,
+            super::types::TurnMode::Steer => crate::session::PendingUserMessageMode::Steer,
+            super::types::TurnMode::Queue => crate::session::PendingUserMessageMode::Queue,
+        },
+        pending_entry_id: req.pending_entry_id,
+    };
+    match req.mode {
+        super::types::TurnMode::Start => start_prompt_turn(&state, chat).await.map(Json),
+        _ => enqueue_pending(&state, chat).await.map(Json),
+    }
+}
+
+/// `DELETE /api/sessions/{id}/turns/current`: stops the session's running
+/// turn, if any.
+pub(super) async fn delete_current_turn(
+    params: skyzen::routing::Params,
+    state: State<Arc<DaemonState>>,
+) -> SkyResult<Json<SessionRuntimeResponse>> {
+    stop_session_run_impl(params, state).await
 }
 
 /// A message from the user ends the sleep state when it began an hour or
@@ -1621,6 +1647,65 @@ async fn tell_sleep_state(state: &DaemonState, session_id: &str, agent: &mut May
     }
 }
 
+/// `POST /api/sessions/{id}/actions/{name}`: the session verbs — `compact`,
+/// `recap`, `bash`, `btw`, `progress`, `context-dump`, `rewind` — dispatched
+/// to the same logic their old named routes ran. Bodies and responses are
+/// unchanged; an unknown name is a 404.
+pub(super) async fn post_session_action(
+    params: skyzen::routing::Params,
+    Json(body): Json<serde_json::Value>,
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<skyzen::Response> {
+    let session_id = params
+        .get("id")
+        .map_err(super::error::bad_request_error)?
+        .to_string();
+    let name = params
+        .get("name")
+        .map_err(super::error::bad_request_error)?
+        .to_string();
+    fn parse<T: serde::de::DeserializeOwned>(body: &serde_json::Value) -> SkyResult<T> {
+        serde_json::from_value(body.clone()).map_err(super::error::bad_request_error)
+    }
+    match name.as_str() {
+        "compact" => {
+            let req: hosts::CompactRequest = parse(&body)?;
+            hosts::compact_inner(&state, &session_id, req)
+                .await
+                .and_then(|json| super::error::json_ok_response(&json.0))
+        }
+        "recap" => recap::recap_inner(&state, &session_id)
+            .await
+            .and_then(|json| super::error::json_ok_response(&json.0)),
+        "bash" => {
+            let req: crate::daemon::types::BashRequest = parse(&body)?;
+            run_bash(&state, &session_id, req)
+                .await
+                .and_then(|json| super::error::json_ok_response(&json.0))
+        }
+        "btw" => {
+            let req: hosts::BtwRequest = parse(&body)?;
+            hosts::btw_inner(&state, &session_id, req)
+                .await
+                .and_then(|json| super::error::json_ok_response(&json.0))
+        }
+        "progress" => progress::progress_inner(&state, &session_id)
+            .await
+            .and_then(|json| super::error::json_ok_response(&json.0)),
+        "context-dump" => hosts::context_dump_inner(&state, &session_id)
+            .await
+            .and_then(|json| super::error::json_ok_response(&json.0)),
+        "rewind" => {
+            let req: super::types::RewindRequest = parse(&body)?;
+            super::sessions::rewind_inner(&state, &session_id, &req)
+                .await
+                .and_then(|json| super::error::json_ok_response(&json.0))
+        }
+        _ => Err(skyzen::Error::msg(format!("unknown action {name}"))
+            .set_status(skyzen::StatusCode::NOT_FOUND)),
+    }
+}
+
 /// `POST /api/sessions/{id}/bash`: run a `!` command for the user.
 ///
 /// Runs on the user's behalf in the session's cwd — keychain secrets
@@ -1628,14 +1713,10 @@ async fn tell_sleep_state(state: &DaemonState, session_id: &str, agent: &mut May
 /// uses. The caller turns the masked outcome into the agent-facing
 /// transcript.
 pub(super) async fn run_bash(
-    params: skyzen::routing::Params,
-    Json(req): Json<crate::daemon::types::BashRequest>,
-    State(state): State<Arc<DaemonState>>,
+    state: &Arc<DaemonState>,
+    session_id: &str,
+    req: crate::daemon::types::BashRequest,
 ) -> SkyResult<Json<crate::daemon::types::BashResponse>> {
-    let session_id = params
-        .get("id")
-        .map_err(super::error::bad_request_error)?
-        .to_string();
     let command = req.command.trim().to_string();
     if command.is_empty() {
         return Err(super::error::bad_request_error("empty bash command"));

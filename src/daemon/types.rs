@@ -924,6 +924,40 @@ pub struct UpdateSessionRequest {
     pub(crate) non_interactive: Option<bool>,
 }
 
+/// `PATCH /api/sessions/{id}` body: every field optional, all validated
+/// before anything is applied.
+#[derive(Debug, Default, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionPatch {
+    #[serde(default)]
+    pub(crate) title: Option<String>,
+    #[serde(default)]
+    pub(crate) model: Option<String>,
+    /// Tri-state like `reasoning_effort` below: absent leaves, `null` clears.
+    #[serde(default)]
+    pub(crate) cwd: Option<String>,
+    /// Tri-state reasoning-effort patch.
+    #[serde(default, deserialize_with = "deserialize_present_patch")]
+    pub(crate) reasoning_effort: Option<NullableStringPatch>,
+    /// Tri-state repo binding patch.
+    #[serde(default, deserialize_with = "deserialize_present_patch")]
+    pub(crate) repo: Option<NullableStringPatch>,
+    /// One-shot/non-interactive flag.
+    #[serde(default)]
+    pub(crate) non_interactive: Option<bool>,
+    #[serde(default)]
+    pub(crate) pinned: Option<bool>,
+    #[serde(default)]
+    pub(crate) archived: Option<bool>,
+    /// Tri-state folder patch: absent leaves, `null` moves out of folders.
+    #[serde(default, deserialize_with = "deserialize_present_patch")]
+    pub(crate) folder_id: Option<NullableStringPatch>,
+    #[serde(default)]
+    pub(crate) yolo: Option<bool>,
+    #[serde(default)]
+    pub(crate) plan_state: Option<SessionPlanState>,
+}
+
 /// Deserialize a field that is present in the body, keeping an explicit `null`
 /// as [`NullableStringPatch::Null`]; serde's `Option` impl would otherwise
 /// collapse it into `None`, which means "absent".
@@ -963,6 +997,45 @@ pub struct ChatRequest {
     /// Queue entry claimed for this run; committed with the user append.
     #[serde(default)]
     pub(crate) pending_entry_id: Option<i64>,
+}
+
+/// `POST /api/sessions/{id}/turns` body: one message, delivered the way
+/// `mode` says.
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnRequest {
+    pub(crate) content: String,
+    #[serde(default)]
+    pub(crate) attachments: Vec<ApiAttachment>,
+    /// Structured hidden context fragment for the next turn.
+    #[serde(default)]
+    pub(crate) hidden_context_xml: Option<XmlBlock>,
+    /// `start` runs the message now (the default); `steer` interrupts the
+    /// running turn; `queue` runs it after.
+    #[serde(default)]
+    pub(crate) mode: TurnMode,
+    /// Queue entry claimed for this run; committed with the user append.
+    #[serde(default)]
+    pub(crate) pending_entry_id: Option<i64>,
+}
+
+/// How `POST /api/sessions/{id}/turns` delivers its message.
+#[derive(Debug, Default, Clone, Copy, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnMode {
+    #[default]
+    Start,
+    Steer,
+    Queue,
+}
+
+/// `GET /api/sessions/{id}/queue` response: the session's pending user
+/// messages, immediate first then queued, oldest first.
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionQueueResponse {
+    #[serde(default)]
+    pub(crate) entries: Vec<PendingUserMessage>,
 }
 
 /// `POST /api/sessions/{id}/bash` payload.
@@ -1188,6 +1261,23 @@ impl From<crate::session::SessionRuntimeSummary> for SessionRuntimeResponse {
 pub struct PermissionRespondRequest {
     pub(crate) id: String,
     pub(crate) approved: bool,
+}
+
+/// `POST /api/interactions/{id}` body: which pending interaction the id
+/// names and its answer.
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum InteractionRespondRequest {
+    Permission {
+        approved: bool,
+    },
+    Workspace {
+        approved: bool,
+    },
+    #[serde(rename_all = "camelCase")]
+    AskUser {
+        answers: Vec<crate::daemon::state::UiQuestionAnswer>,
+    },
 }
 
 #[derive(Debug, serde::Deserialize, skyzen::ToSchema)]

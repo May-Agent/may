@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use skyzen::Result as SkyResult;
+use skyzen::routing::Params;
 use skyzen::utils::{Json, State};
 
 use super::error::{bad_request_error, internal_error};
@@ -32,16 +33,41 @@ async fn resume_after_decision(
     .map_err(internal_error)
 }
 
+/// `POST /api/interactions/{id}`: `id` names the pending request; `kind`
+/// names which approver answers it. Every response commits first (the
+/// request cleared by its id, the answer in the history); only then is the
+/// waiting run woken or the session resumed. A commit that fails is
+/// returned and wakes nothing.
+pub(super) async fn respond_interaction(
+    params: Params,
+    Json(req): Json<super::types::InteractionRespondRequest>,
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<SessionRuntimeResponse>> {
+    let id = params.get("id").map_err(bad_request_error)?.to_string();
+    match req {
+        super::types::InteractionRespondRequest::Permission { approved } => {
+            resolve_permission(&state, &id, approved).await
+        }
+        super::types::InteractionRespondRequest::Workspace { approved } => {
+            resolve_workspace(&state, &id, approved).await
+        }
+        super::types::InteractionRespondRequest::AskUser { answers } => {
+            resolve_ask_user(&state, &id, answers).await
+        }
+    }
+}
+
 /// Every response commits first (the request cleared by its id, the answer
 /// in the history); only then is the waiting run woken or the session
 /// resumed. A commit that fails is returned and wakes nothing.
-pub(super) async fn respond_permission_request(
-    Json(req): Json<PermissionRespondRequest>,
-    State(state): State<Arc<DaemonState>>,
+async fn resolve_permission(
+    state: &Arc<DaemonState>,
+    id: &str,
+    approved: bool,
 ) -> SkyResult<Json<SessionRuntimeResponse>> {
     let resolved = state
         .permission_approver
-        .resolve(&req.id, req.approved)
+        .resolve(id, approved)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| bad_request_error("permission request not found or already resolved"))?;
@@ -52,12 +78,12 @@ pub(super) async fn respond_permission_request(
             .await
             .map_err(internal_error)?
     } else {
-        tracing::warn!(request_id = %req.id, session_id = %resolved.session_id, "permission response arrived without a live waiter");
+        tracing::warn!(request_id = %id, session_id = %resolved.session_id, "permission response arrived without a live waiter");
         resume_after_decision(
             &state,
             &resolved.session_id,
             super::chat::ResumeRequestKind::Permission,
-            req.approved,
+            approved,
         )
         .await?
     };
@@ -92,13 +118,14 @@ fn ask_user_respond_error(error: AskUserRespondError) -> skyzen::Error {
     }
 }
 
-pub(super) async fn respond_ask_user_request(
-    Json(req): Json<AskUserRespondRequest>,
-    State(state): State<Arc<DaemonState>>,
+async fn resolve_ask_user(
+    state: &Arc<DaemonState>,
+    id: &str,
+    answers: Vec<crate::daemon::state::UiQuestionAnswer>,
 ) -> SkyResult<Json<SessionRuntimeResponse>> {
     let resolved = state
         .ask_user_approver
-        .respond(&req.id, req.answers)
+        .respond(id, answers)
         .await
         .map_err(ask_user_respond_error)?
         .ok_or_else(ask_user_not_open_error)?;
@@ -118,9 +145,9 @@ pub(super) async fn respond_ask_user_request(
             runtime
         }
         AskUserOutcome::Resume { approved } => {
-            tracing::warn!(request_id = %req.id, session_id = %resolved.session_id, "authorization answer arrived without a live waiter");
+            tracing::warn!(request_id = %id, session_id = %resolved.session_id, "authorization answer arrived without a live waiter");
             resume_after_decision(
-                &state,
+                state,
                 &resolved.session_id,
                 super::chat::ResumeRequestKind::Authorization,
                 approved,
@@ -132,13 +159,14 @@ pub(super) async fn respond_ask_user_request(
     Ok(Json(runtime.into()))
 }
 
-pub(super) async fn respond_workspace_request(
-    Json(req): Json<WorkspaceRespondRequest>,
-    State(state): State<Arc<DaemonState>>,
+async fn resolve_workspace(
+    state: &Arc<DaemonState>,
+    id: &str,
+    approved: bool,
 ) -> SkyResult<Json<SessionRuntimeResponse>> {
     let resolved = state
         .workspace_approver
-        .resolve(&req.id, req.approved)
+        .resolve(id, approved)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| bad_request_error("workspace request not found or already resolved"))?;
@@ -149,12 +177,12 @@ pub(super) async fn respond_workspace_request(
             .await
             .map_err(internal_error)?
     } else {
-        tracing::warn!(request_id = %req.id, session_id = %resolved.session_id, "workspace response arrived without a live waiter");
+        tracing::warn!(request_id = %id, session_id = %resolved.session_id, "workspace response arrived without a live waiter");
         resume_after_decision(
             &state,
             &resolved.session_id,
             super::chat::ResumeRequestKind::Workspace,
-            req.approved,
+            approved,
         )
         .await?
     };

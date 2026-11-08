@@ -1127,7 +1127,7 @@ impl App {
         ) else {
             return;
         };
-        let path = crate::client::session_path(session.id.as_str(), "/btw");
+        let path = crate::client::session_path(session.id.as_str(), "/actions/btw");
         if let AppMode::Btw(state) = &mut self.mode {
             state.loading = true;
         }
@@ -1162,7 +1162,7 @@ impl App {
                 .push_notice("No model available for /progress — start a session first");
             return;
         };
-        let path = crate::client::session_path(session.id.as_str(), "/progress");
+        let path = crate::client::session_path(session.id.as_str(), "/actions/progress");
         self.mode = AppMode::Progress(super::state::ProgressState {
             loading: true,
             ..super::state::ProgressState::default()
