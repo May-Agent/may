@@ -2797,9 +2797,18 @@ fn render_inline_images(
             continue;
         }
 
-        // Get the cached image state
+        // Get the cached image state. A miss or a failed fetch leaves the
+        // reserved rows blank: draw the caption there so the block is a
+        // placeholder, not a void.
         let Some(state) = image_cache.get_mut(&placement.key) else {
-            // Image not yet fetched
+            let y = chat_area.y + u16::try_from(top.max(0)).unwrap_or(0);
+            frame.buffer_mut().set_stringn(
+                chat_area.x + indent,
+                y,
+                format!("▏image · {}", placement.caption),
+                usize::from(width),
+                Style::default().fg(Color::DarkGray),
+            );
             continue;
         };
 

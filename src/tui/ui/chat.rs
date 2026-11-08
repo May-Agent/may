@@ -1440,13 +1440,27 @@ fn artifact_tag_text(content: &str) -> std::borrow::Cow<'_, str> {
             continue;
         };
         out.push_str(&rest[..start]);
-        out.push_str("**artifact:** `");
-        out.push_str(path);
-        out.push('`');
+        // Image artifacts render through the markdown-image pipeline:
+        // `image_fetch_targets` resolves the sandbox-relative path.
+        if is_image_artifact(path) {
+            out.push_str("![artifact](");
+            out.push_str(path);
+            out.push(')');
+        } else {
+            out.push_str("**artifact:** `");
+            out.push_str(path);
+            out.push('`');
+        }
         rest = &after[end + 2..];
     }
     out.push_str(rest);
     std::borrow::Cow::Owned(out)
+}
+
+/// The artifact path names a raster image the TUI can decode.
+fn is_image_artifact(path: &str) -> bool {
+    let lower = path.rsplit('.').next().unwrap_or("");
+    matches!(lower, "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp") && path.len() > lower.len() + 1
 }
 
 /// Input rendering context for combined view.

@@ -163,7 +163,10 @@ impl Entry {
             images,
             collapsible,
             sub_regions,
-            markdown_images: matches!(elem, ChatElement::AssistantText { .. }),
+            markdown_images: matches!(
+                elem,
+                ChatElement::AssistantText { .. } | ChatElement::WorkedFor { .. }
+            ),
             link_targets: link_targets.unwrap_or_default(),
             marked,
             user: matches!(elem, ChatElement::UserMessage { .. }),
