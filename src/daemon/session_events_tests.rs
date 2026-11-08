@@ -263,6 +263,27 @@ async fn a_cursor_from_another_epoch_gets_a_reset_then_live_events() {
 }
 
 #[tokio::test]
+async fn a_foreign_epoch_cursors_reset_is_the_first_event_even_with_frames_queued() {
+    let state = state().await;
+    session(&state, SESSION).await;
+    let router = build_router(state.clone(), DaemonMode::Rest, None);
+
+    // A frame buffered right at subscribe time still lands after `reset`.
+    publish_turn_frame(&state, SESSION, r#"{"seq":"queued"}"#);
+    let mut stream = Stream::open(
+        &router,
+        &format!("/api/sessions/{SESSION}/events?after=1.2"),
+    )
+    .await;
+    publish_turn_frame(&state, SESSION, r#"{"seq":"racing"}"#);
+    let reset = stream.next().await;
+    assert_eq!(reset.kind, "reset", "{:?}", reset.data);
+    let event = stream.next().await;
+    assert_eq!(event.kind, "session_turn");
+    assert_eq!(event.data, r#"{"seq":"racing"}"#);
+}
+
+#[tokio::test]
 async fn the_same_runtime_value_publishes_once_to_every_subscriber() {
     let state = state().await;
     session(&state, SESSION).await;
