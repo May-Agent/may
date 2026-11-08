@@ -2879,7 +2879,9 @@ fn render_impl(
 
     // The band background: every cell of the band's rows and of user
     // message rows — padding columns and trailing space included.
-    // Cells with a background of their own keep it.
+    // Cells with a background of their own keep it. The band span runs to
+    // the content's end even when it is scrolled out of view, so each
+    // span's rows clamp to the window.
     if let Some(bg) = band_bg {
         let mut spans = layout.user_rows_in(top, view_height);
         if let Some(start) = band_start {
@@ -2887,7 +2889,7 @@ fn render_impl(
             spans.push((first, element_rows + tail_rows));
         }
         for (first, last) in spans {
-            for row in first..last {
+            for row in first.max(top)..last.min(top + view_height) {
                 let y = area.y + u16::try_from(top_padding + row - top).unwrap_or(u16::MAX);
                 for x in area.x..area.x + area.width {
                     let cell = &mut frame.buffer_mut()[(x, y)];
@@ -6177,6 +6179,19 @@ mod tests {
         input: &str,
         queued: &[String],
     ) -> BandFrame {
+        draw_band_at(chat, width, height, input, queued, usize::MAX)
+    }
+
+    /// `draw_band` at an explicit document-row scroll instead of the
+    /// follow-bottom sentinel.
+    fn draw_band_at(
+        chat: &ChatStream,
+        width: u16,
+        height: u16,
+        input: &str,
+        queued: &[String],
+        scroll: usize,
+    ) -> BandFrame {
         use super::{StatusContext, UnifiedRenderContext, render_unified};
         use ratatui::{Terminal, backend::TestBackend};
 
@@ -6191,7 +6206,7 @@ mod tests {
                     area,
                     chat,
                     &mut layout,
-                    usize::MAX,
+                    scroll,
                     UnifiedRenderContext {
                         selected_tool: None,
                         content_height_out: None,
@@ -6321,6 +6336,24 @@ mod tests {
             .find(|&y| row_text(&frame.buf, y).contains("last chat row"))
             .expect("reply row");
         assert!(row_has_no_band(&frame.buf, reply));
+    }
+
+    /// Scrolled up, the band's tail sits below the window; painting its
+    /// unclamped rows indexed outside the buffer and panicked (#871).
+    #[test]
+    fn a_scrolled_band_below_the_viewport_stays_inside_the_buffer() {
+        let mut chat = ChatStream::new();
+        for i in 0..20usize {
+            chat.push_user(&format!("message {i}"), Vec::new(), i);
+            chat.push_text("reply");
+            chat.end_text();
+        }
+        let frame = draw_band_at(&chat, 80, 20, "draft", &[], 5);
+        // The band is out of view; a visible user message still draws it.
+        let user = (0..20)
+            .find(|&y| row_text(&frame.buf, y).contains("> message"))
+            .expect("a user message row in view");
+        assert!(row_has_band(&frame.buf, user));
     }
 
     #[test]
