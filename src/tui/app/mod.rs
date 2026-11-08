@@ -257,7 +257,8 @@ pub struct App {
     pub pending_paste_results: std::collections::VecDeque<PendingPaste>,
     /// Pending attachment jobs (clipboard read / download)
     pub pending_attachment_jobs: usize,
-    /// Cumulative token usage for current session
+    /// Latest request's token usage; `prompt_tokens` is the status bar's
+    /// context footprint since every request resends the whole context
     pub usage: Option<aither_core::llm::Usage>,
     /// Decode-speed measurement for the streaming response
     pub decode_meter: crate::decode_meter::DecodeMeter,
@@ -4333,12 +4334,7 @@ impl App {
                     }
                     AgentEvent::Usage(u) => {
                         self.decode_meter.note_usage(u.completion_tokens);
-                        // Accumulate token usage
-                        if let Some(ref mut usage) = self.usage {
-                            usage.accumulate(&u);
-                        } else {
-                            self.usage = Some(u);
-                        }
+                        self.usage = Some(u);
                     }
                     AgentEvent::CompactionRecovery {
                         error,
@@ -4730,7 +4726,10 @@ fn btw_message(role: &str, content: impl Into<String>) -> crate::daemon::BtwMess
 #[cfg(test)]
 mod tests {
     use super::utf8_complete_len;
-    use super::{App, AppEvent, KeyCode, KeyModifiers, MayConfig, MessageRole, SendAction};
+    use super::{
+        AgentEvent, App, AppEvent, KeyCode, KeyModifiers, MayConfig, MessageRole, SendAction,
+        TimedEvent,
+    };
     use crate::session::SessionManager;
     use crate::tui::ui::chat::ChatElement;
 
@@ -5112,6 +5111,29 @@ mod tests {
             app.context_usage(),
             None,
             "a new model drops the old window"
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_events_keep_the_latest_request_not_their_sum() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        let usage = |prompt_tokens| {
+            Ok(TimedEvent {
+                at: "2026-11-07T00:00:00Z".parse().expect("time"),
+                event: AgentEvent::Usage(aither_core::llm::Usage {
+                    prompt_tokens: Some(prompt_tokens),
+                    ..aither_core::llm::Usage::default()
+                }),
+            })
+        };
+        app.handle_agent_event(usage(40_000)).await;
+        app.handle_agent_event(usage(45_000)).await;
+        assert_eq!(
+            app.usage.and_then(|u| u.prompt_tokens),
+            Some(45_000),
+            "each request resends the whole context, so prompt_tokens is \
+             the latest request's footprint, not a running total"
         );
     }
 
