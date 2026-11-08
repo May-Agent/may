@@ -290,6 +290,11 @@ impl std::ops::BitOr<Self> for UiEventTopic {
 #[derive(Debug, Clone)]
 pub struct UiEventBus {
     tx: broadcast::Sender<UiEventTopics>,
+    /// Producer side of the session-change channel feeding
+    /// `/api/sessions/{id}/events`; the daemon wires it at construction.
+    session_changes: std::sync::Arc<
+        std::sync::Mutex<Option<crate::daemon::session_events::SessionChangeSender>>,
+    >,
 }
 
 impl UiEventBus {
@@ -297,7 +302,10 @@ impl UiEventBus {
     #[must_use]
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(UI_EVENT_BUS_CAPACITY);
-        Self { tx }
+        Self {
+            tx,
+            session_changes: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
     }
 
     /// Subscribe to topic notifications.
@@ -312,6 +320,35 @@ impl UiEventBus {
             return;
         }
         let _ = self.tx.send(topics);
+    }
+
+    /// Wire the session-change channel; called once where the daemon's
+    /// [`DaemonState`] is built.
+    pub(crate) fn set_session_changes(
+        &self,
+        tx: crate::daemon::session_events::SessionChangeSender,
+    ) {
+        *self
+            .session_changes
+            .lock()
+            .expect("session-change sender lock is poisoned") = Some(tx);
+    }
+
+    /// Queue `kind` for the session's diff publisher on
+    /// `/api/sessions/{id}/events`; a no-op where no daemon wired it.
+    pub(crate) fn publish_session_change(
+        &self,
+        session_id: &str,
+        kind: crate::daemon::session_events::SessionChange,
+    ) {
+        let tx = self
+            .session_changes
+            .lock()
+            .expect("session-change sender lock is poisoned")
+            .clone();
+        if let Some(tx) = tx {
+            crate::daemon::session_events::notify_change(&tx, session_id, kind);
+        }
     }
 }
 

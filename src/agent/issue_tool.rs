@@ -305,18 +305,31 @@ struct IssueSearchText<'a> {
 /// Tells connected clients that an issue changed, so the issues they show
 /// are looked up again.
 #[derive(Clone)]
-pub struct IssueChangeNotifier(std::sync::Arc<crate::session::SessionRuntimeService>);
+pub struct IssueChangeNotifier {
+    runtime: std::sync::Arc<crate::session::SessionRuntimeService>,
+    session_id: String,
+}
 
 impl IssueChangeNotifier {
     /// Publish through the daemon's runtime service.
     #[must_use]
-    pub const fn new(runtime: std::sync::Arc<crate::session::SessionRuntimeService>) -> Self {
-        Self(runtime)
+    pub fn new(
+        runtime: std::sync::Arc<crate::session::SessionRuntimeService>,
+        session_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            runtime,
+            session_id: session_id.into(),
+        }
     }
 
     fn notify(&self) {
-        self.0
+        self.runtime
             .publish_ui_events(crate::ui_event_bus::UiEventTopics::SESSION_ISSUES);
+        self.runtime.publish_session_change(
+            &self.session_id,
+            crate::daemon::session_events::SessionChange::Issues,
+        );
     }
 }
 
@@ -1459,8 +1472,8 @@ mod tests {
         let provenance = IssueProvenance::new(db.clone(), "test".to_string());
         let store = crate::issue::MayIssueStore::new(db, "test".to_string());
         let seed = store.create("seed", "body", &[]).await.expect("seed issue");
-        let tool =
-            IssueTool::new(store, provenance).with_changes(IssueChangeNotifier::new(runtime));
+        let tool = IssueTool::new(store, provenance)
+            .with_changes(IssueChangeNotifier::new(runtime, "test"));
 
         tool.call(
             IssueArgs::View {

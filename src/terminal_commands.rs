@@ -242,7 +242,8 @@ where
         issue_tool = issue_tool.with_languages(guard.clone());
     }
     if let Some(runtime) = config.ask_user.clone() {
-        issue_tool = issue_tool.with_changes(IssueChangeNotifier::new(runtime));
+        issue_tool =
+            issue_tool.with_changes(IssueChangeNotifier::new(runtime, config.session_id.clone()));
     }
     let mut subagent_issue_tool = SubagentIssueTool::new(config.issue_store, provenance)
         .with_search(issue_search)

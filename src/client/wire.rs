@@ -790,6 +790,10 @@ pub struct WireSession {
     /// Repository binding, if any.
     #[serde(default)]
     pub repo: Option<String>,
+    /// `?after=` cursor for `/api/sessions/{id}/events`; present on
+    /// `GET /api/sessions/{id}` only.
+    #[serde(default)]
+    pub cursor: Option<String>,
 }
 
 /// One session PR over the wire, mirroring the daemon's `ApiPr`.

@@ -1325,9 +1325,15 @@ impl PrStore {
             limits,
         };
         match recorder.observe_github(pr, head_sha).await {
-            Ok(Some(_)) => watch
-                .ui_events
-                .publish(crate::ui_event_bus::UiEventTopics::SESSION_WARNING),
+            Ok(Some(_)) => {
+                watch
+                    .ui_events
+                    .publish(crate::ui_event_bus::UiEventTopics::SESSION_WARNING);
+                watch.ui_events.publish_session_change(
+                    &pr.session_id,
+                    crate::daemon::session_events::SessionChange::Warning,
+                );
+            }
             Ok(None) => {}
             Err(error) => {
                 tracing::error!(%error, pr = pr.number, "recording the PR's CI durations failed");
@@ -1358,9 +1364,15 @@ impl PrStore {
             .observe_local(pr, head_sha, command, started, duration, success)
             .await
         {
-            Ok(Some(_)) => watch
-                .ui_events
-                .publish(crate::ui_event_bus::UiEventTopics::SESSION_WARNING),
+            Ok(Some(_)) => {
+                watch
+                    .ui_events
+                    .publish(crate::ui_event_bus::UiEventTopics::SESSION_WARNING);
+                watch.ui_events.publish_session_change(
+                    &pr.session_id,
+                    crate::daemon::session_events::SessionChange::Warning,
+                );
+            }
             Ok(None) => {}
             Err(error) => {
                 tracing::error!(%error, pr = pr.number, "recording the local check's duration failed");
