@@ -2884,6 +2884,19 @@ fn render_impl(
     // span's rows clamp to the window.
     if let Some(bg) = band_bg {
         let mut spans = layout.user_rows_in(top, view_height);
+        // A blank row right above a user message is its top padding —
+        // fold it in so the block breathes like the band's own padding.
+        for span in &mut spans {
+            if span.0 <= top {
+                continue;
+            }
+            let y = area.y + u16::try_from(top_padding + span.0 - 1 - top).unwrap_or(u16::MAX);
+            let blank =
+                (area.x..area.x + area.width).all(|x| frame.buffer_mut()[(x, y)].symbol() == " ");
+            if blank {
+                span.0 -= 1;
+            }
+        }
         if let Some(start) = band_start {
             let first = element_rows + tail_starts.get(start).copied().unwrap_or(0);
             spans.push((first, element_rows + tail_rows));
@@ -6334,6 +6347,30 @@ mod tests {
         // The assistant reply below keeps the terminal background.
         let reply = (0..20)
             .find(|&y| row_text(&frame.buf, y).contains("last chat row"))
+            .expect("reply row");
+        assert!(row_has_no_band(&frame.buf, reply));
+    }
+
+    /// A blank row directly above the message is its top padding: it
+    /// draws the band too, so the block breathes like the input band.
+    /// A non-blank row above is never shaded.
+    #[test]
+    fn a_blank_row_above_a_user_message_is_its_padding() {
+        let mut chat = ChatStream::new();
+        chat.push_text("first reply");
+        chat.end_text();
+        chat.push_user("hello", Vec::new(), 1);
+        chat.push_text("next reply");
+        chat.end_text();
+        let frame = draw_band(&chat, 80, 20, "draft", &[]);
+        let user = (0..20)
+            .find(|&y| row_text(&frame.buf, y).contains("> hello"))
+            .expect("user message row");
+        assert!(row_text(&frame.buf, user - 1).trim().is_empty());
+        assert!(row_has_band(&frame.buf, user - 1), "padding row above");
+        assert!(row_has_band(&frame.buf, user + 1), "padding row below");
+        let reply = (0..20)
+            .find(|&y| row_text(&frame.buf, y).contains("first reply"))
             .expect("reply row");
         assert!(row_has_no_band(&frame.buf, reply));
     }
