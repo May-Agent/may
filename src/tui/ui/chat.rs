@@ -6366,7 +6366,7 @@ mod tests {
         let user = (0..20)
             .find(|&y| row_text(&frame.buf, y).contains("> hello"))
             .expect("user message row");
-        assert!(row_text(&frame.buf, user - 1).trim().is_empty());
+        assert_eq!(row_text(&frame.buf, user - 1).trim(), "");
         assert!(row_has_band(&frame.buf, user - 1), "padding row above");
         assert!(row_has_band(&frame.buf, user + 1), "padding row below");
         let reply = (0..20)
