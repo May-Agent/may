@@ -112,7 +112,7 @@ May is a terminal-based AI assistant built as an application layer on the **aith
 - `serve.rs`: hyper accept loops (unix socket, TCP) calling skyzen's `Router::go`
 - `lifecycle.rs`: `ensure_running` (auto-spawn, build-id replacement), service install/uninstall, stop
 - `server.rs`: `start` builds `DaemonState`, the REST/SSE router and background workers
-- `chat/mod.rs`: the one turn runner (`run_agent_loop`); `chat/hub.rs` `TurnHub` fans a session's turn out as `session_turn` / `session_agent` events, with replay of the turn in progress for late subscribers
+- `chat/mod.rs`: the one turn runner (`run_agent_loop`); `chat/hub.rs` `TurnHub` numbers a session's events (`session_turn`, `session_agent`, deltas) for `/api/sessions/{id}/events`; a subscriber continues after its cursor
 - `chat/hosts.rs`: the session's idle agent between turns: the next turn continues with it unless what it was built from changed (`agent_build_key`), so the prompt cache stays warm and detached background commands keep running; it answers `/compact`, `/context`, `/btw`, and a detached command that finishes resumes the session (`start_background_turn`)
 - `chat/background.rs`: each session's terminal jobs and subagent runs across agent rebuilds; REST under `/api/sessions/{id}/background|jobs|subagents`, pushed as `session_background`
 - `remote_access.rs`: Tailscale serve
@@ -159,7 +159,7 @@ Do not treat `.txt` or `.md` files as the canonical session persistence layer.
 
 ### Event Loop Architecture
 
-Turns run in the daemon. A client sends with `POST /api/sessions/{id}/messages` (it returns at once) and follows the turn on `/api/events?topics=session_agent,session_turn&sessionId=…`; every attached client sees the same events.
+Turns run in the daemon. A client sends with `POST /api/sessions/{id}/messages` (it returns at once) and follows the turn on `/api/sessions/{id}/events`; every attached client sees the same events.
 
 ```
 TUI main loop:

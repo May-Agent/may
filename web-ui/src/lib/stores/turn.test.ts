@@ -42,14 +42,23 @@ function installBackend(sessions: Record<string, ApiSession>): Backend {
   const backend: Backend = { sessions, streams: {}, sent: [], stopped: [] };
   globalThis.fetch = mock(async (input: RequestInfo | URL) => {
     const url = String(input);
-    if (url.startsWith('/api/events?')) {
-      const sessionId = new URLSearchParams(url.slice(url.indexOf('?') + 1)).get('sessionId')!;
+    const events = /^\/api\/sessions\/([^/]+)\/events/.exec(url);
+    if (events) {
+      const sessionId = decodeURIComponent(events[1]);
       const body = new ReadableStream<Uint8Array>({
         start(controller) {
           backend.streams[sessionId] = controller;
         },
       });
       return new Response(body, { status: 200 });
+    }
+    const background = /^\/api\/sessions\/([^/]+)\/background$/.exec(url);
+    if (background) {
+      const sessionId = decodeURIComponent(background[1]);
+      return new Response(
+        JSON.stringify({ sessionId, jobs: [], subagents: [] }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      );
     }
     const send = /^\/api\/sessions\/([^/]+)\/messages$/.exec(url);
     if (send) {
@@ -290,5 +299,77 @@ describe('a finished turn keeps its components through a refresh', () => {
 
     expect(useSessionsStore.getState().messages.A.map((m) => m.id)).toEqual(['msg-7']);
     expect(useTurnStore.getState().turns.A.active).toBeNull();
+  });
+});
+
+describe('the session stream', () => {
+  const event = (kind: string, data: Record<string, unknown>, id?: string) =>
+    encoder.encode(
+      `${id ? `id: ${id}\n` : ''}event: ${kind}\ndata: ${JSON.stringify(data)}\n\n`,
+    );
+
+  test('a reset drops the open turn and reloads the session', async () => {
+    const backend = installBackend({ A: session('A', []) });
+    await useSessionsStore.getState().open('A');
+    unwatchers.push(useTurnStore.getState().watch('A'));
+    await settle();
+    backend.streams.A.enqueue(
+      frame('A', 'start', { seq: 1, turnId: 't1', sessionId: 'A', assistantId: 'a-1' }),
+    );
+    await settle();
+    expect(useTurnStore.getState().turns.A.active).not.toBeNull();
+
+    backend.sessions.A = session('A', [message('u-1', 'user', 'later')]);
+    backend.streams.A.enqueue(event('reset', { sessionId: 'A' }, '9.1'));
+    await settle();
+
+    expect(useTurnStore.getState().turns.A.active).toBeNull();
+    expect(useSessionsStore.getState().messages.A.map((m) => m.id)).toEqual(['u-1']);
+  });
+
+  test('a turn whose prompt is already in history is not rendered twice', async () => {
+    const backend = installBackend({
+      A: session('A', [message('msg-7', 'user', 'earlier'), message('a-1', 'assistant', 'done')]),
+    });
+    await useSessionsStore.getState().open('A');
+    unwatchers.push(useTurnStore.getState().watch('A'));
+    await settle();
+
+    // The turn ended between the session read's cursor and its messages
+    // arriving: its frames replay on the stream.
+    backend.streams.A.enqueue(
+      event('session_agent', {
+        sessionId: 'A',
+        turnId: 't1',
+        at: '2026-01-01T00:00:00Z',
+        body: { kind: 'start', messageId: 7 },
+      }),
+    );
+    backend.streams.A.enqueue(
+      frame('A', 'start', { seq: 1, turnId: 't1', sessionId: 'A', assistantId: 'a-1' }),
+    );
+    backend.streams.A.enqueue(frame('A', 'text', { seq: 2, turnId: 't1', chunk: 'dup' }));
+    backend.streams.A.enqueue(
+      frame('A', 'end', { seq: 3, turnId: 't1', outcome: 'completed' }),
+    );
+    await settle();
+
+    expect(useTurnStore.getState().turns.A?.active ?? null).toBeNull();
+    expect(useSessionsStore.getState().messages.A.map((m) => m.id)).toEqual(['msg-7', 'a-1']);
+
+    // A turn that is not in history still streams normally.
+    backend.streams.A.enqueue(
+      event('session_agent', {
+        sessionId: 'A',
+        turnId: 't2',
+        at: '2026-01-01T00:00:00Z',
+        body: { kind: 'start', messageId: 9 },
+      }),
+    );
+    backend.streams.A.enqueue(
+      frame('A', 'start', { seq: 4, turnId: 't2', sessionId: 'A', assistantId: 'a-2' }),
+    );
+    await settle();
+    expect(useTurnStore.getState().turns.A.active).not.toBeNull();
   });
 });

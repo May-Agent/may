@@ -20,8 +20,8 @@ use super::state::DaemonState;
 use super::types::{
     BrowserStatusEventPayload, NetworkAccessLogEntryResponse, NetworkAccessLogsResponse,
     NotificationMailboxEntryResponse, NotificationMailboxResponse, ProfileSessionsEventPayload,
-    RemoteAccessEventPayload, RequestLogsResponse, SessionRuntimeEventPayload,
-    SessionRuntimeSnapshotItem, SessionRuntimesEventPayload, SseHeartbeat,
+    RemoteAccessEventPayload, RequestLogsResponse, SessionRuntimeSnapshotItem,
+    SessionRuntimesEventPayload, SseHeartbeat,
 };
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
@@ -37,10 +37,6 @@ pub(super) struct EventsQuery {
     profile_id: Option<String>,
     #[serde(default)]
     topics: Option<String>,
-    /// Index (SSE `id`) of the last turn frame the client saw: a client that
-    /// reconnects receives only the frames after it.
-    #[serde(default)]
-    after: Option<u64>,
     /// Launch cwd when there is no session yet; `session_index` covers its
     /// worktree.
     #[serde(default)]
@@ -55,15 +51,11 @@ struct EventSignatures {
     network_access_logs: String,
     container_prepare: String,
     browser_status: String,
-    session_runtime: String,
     session_runtimes: String,
     profile_sessions: String,
     remote_access: String,
     sleep: String,
-    session_background: String,
-    session_artifacts: String,
     session_index: String,
-    session_issues: String,
 }
 
 pub(super) async fn stream_events(
@@ -102,24 +94,6 @@ pub(super) async fn stream_events(
     let mut notification_rx = state.notification_service.subscribe_user_notifications();
     let notification_subscribed = subscribed_topics.contains(UiEventTopics::USER_NOTIFICATION);
     let index_subscribed = subscribed_topics.contains(UiEventTopics::SESSION_INDEX);
-    let warning_subscribed = subscribed_topics.contains(UiEventTopics::SESSION_WARNING);
-    // Live turn frames of the filtered session, replayed from the turn's
-    // start for a client attaching mid-turn, or from the frame after the
-    // last one it saw for a client reconnecting.
-    let turn_kinds = TurnKinds {
-        turn: subscribed_topics.contains(UiEventTopics::SESSION_TURN),
-        agent: subscribed_topics.contains(UiEventTopics::SESSION_AGENT),
-        suggestion: subscribed_topics.contains(UiEventTopics::SESSION_SUGGESTION),
-        recap: subscribed_topics.contains(UiEventTopics::SESSION_RECAP),
-    };
-    // Subscribed now, so no frame published while the opening snapshot is
-    // built is missed.
-    let turns = session_id
-        .as_deref()
-        .filter(|_| {
-            turn_kinds.turn || turn_kinds.agent || turn_kinds.suggestion || turn_kinds.recap
-        })
-        .map(|session_id| state.turn_hub.subscribe(session_id, query.after));
     let cwd = query
         .cwd
         .as_deref()
@@ -136,7 +110,6 @@ pub(super) async fn stream_events(
         if !emit_topics_if_changed(
             &state_cloned,
             &sender,
-            session_id.as_deref(),
             profile_id.as_deref(),
             subscribed_topics,
             &mut signatures,
@@ -146,9 +119,6 @@ pub(super) async fn stream_events(
             return;
         }
 
-        // Turn frames go out on their own: nothing the snapshot topics wait
-        // on delays them. The stream ends when either side's send fails.
-        let forward = forward_turns(turns, turn_kinds, &sender, session_id.as_deref());
         // Index coverage asks repo-search, which can take minutes to
         // answer; the poll runs beside the loop, never inside an arm.
         let mut index_poll = Box::pin(session_index_snapshot(
@@ -157,17 +127,6 @@ pub(super) async fn stream_events(
             cwd.clone(),
             Duration::ZERO,
         ));
-        // Warnings are transients: this client is sent the ones raised after
-        // it attached, each once.
-        let warnings_for = session_id.clone().filter(|_| warning_subscribed);
-        let mut warning_cursor = match &warnings_for {
-            Some(session_id) => state_cloned
-                .db()
-                .latest_ci_finding_id(session_id)
-                .await
-                .unwrap_or(0),
-            None => 0,
-        };
         let topics = async {
             loop {
                 tokio::select! {
@@ -208,22 +167,9 @@ pub(super) async fn stream_events(
                         if dirty_topics.is_empty() {
                             continue;
                         }
-                        if let Some(session_id) = &warnings_for
-                            && dirty_topics.contains(UiEventTopics::SESSION_WARNING)
-                            && !send_new_warnings(
-                                &state_cloned,
-                                &sender,
-                                session_id,
-                                &mut warning_cursor,
-                            )
-                            .await
-                        {
-                            break;
-                        }
                         if !emit_topics_if_changed(
                             &state_cloned,
                             &sender,
-                            session_id.as_deref(),
                             profile_id.as_deref(),
                             dirty_topics,
                             &mut signatures,
@@ -265,123 +211,15 @@ pub(super) async fn stream_events(
                 }
             }
         };
-        futures_lite::future::or(forward, topics).await;
+        topics.await;
     });
 
     Ok(sse)
 }
 
-/// Sends the warnings the session raised after `cursor` as `session_warning`
-/// events and moves the cursor past them. Returns `false` when the client is
-/// gone.
-async fn send_new_warnings(
-    state: &Arc<DaemonState>,
-    sender: &skyzen::responder::sse::Sender,
-    session_id: &str,
-    cursor: &mut i64,
-) -> bool {
-    let findings = match state.db().ci_findings_after(session_id, *cursor).await {
-        Ok(findings) => findings,
-        Err(error) => {
-            tracing::error!(%session_id, %error, "failed to load the session's warnings");
-            return true;
-        }
-    };
-    for finding in findings {
-        *cursor = finding.id;
-        let frame = crate::client::WarningFrame {
-            session_id: session_id.to_string(),
-            message: finding.warning,
-        };
-        if !send_event(sender, "session_warning", &frame).await {
-            return false;
-        }
-    }
-    true
-}
-
-/// Sends the session's turn frames for as long as the client reads them:
-/// a resync first when the frames after the client's last one are gone,
-/// then every frame, however far behind the client falls within the turn
-/// in progress and the one before it. Returns when a send fails or the hub
-/// closes the subscription for falling further behind, which ends the
-/// stream: the client reconnects and reloads the session. Never returns
-/// without a subscription.
-async fn forward_turns(
-    turns: Option<super::chat::TurnSubscription>,
-    kinds: TurnKinds,
-    sender: &skyzen::responder::sse::Sender,
-    session_id: Option<&str>,
-) {
-    let Some(turns) = turns else {
-        return std::future::pending().await;
-    };
-    if turns.gap && !send_resync(sender, session_id).await {
-        return;
-    }
-    while let Some(frames) = turns.next().await {
-        for frame in frames {
-            if kinds.wants(&frame) && !send_frame(sender, &frame).await {
-                return;
-            }
-        }
-    }
-}
-
-/// Which live turn kinds a subscriber asked for.
-#[derive(Debug, Clone, Copy)]
-struct TurnKinds {
-    turn: bool,
-    agent: bool,
-    suggestion: bool,
-    recap: bool,
-}
-
-impl TurnKinds {
-    fn wants(self, frame: &super::chat::TurnFrame) -> bool {
-        match frame.kind {
-            "session_turn" => self.turn,
-            "session_agent" => self.agent,
-            "session_suggestion" => self.suggestion,
-            "session_recap" => self.recap,
-            _ => false,
-        }
-    }
-}
-
-/// Tells a client that turn frames it missed are gone and it must reload
-/// the session; the turn in progress follows from its start.
-#[derive(Debug, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SessionResync<'a> {
-    session_id: &'a str,
-}
-
-async fn send_frame(
-    sender: &skyzen::responder::sse::Sender,
-    frame: &super::chat::TurnFrame,
-) -> bool {
-    sender
-        .send(
-            skyzen::responder::sse::Event::data(&frame.data)
-                .event(frame.kind)
-                .id(frame.index.to_string()),
-        )
-        .await
-        .is_ok()
-}
-
-async fn send_resync(sender: &skyzen::responder::sse::Sender, session_id: Option<&str>) -> bool {
-    let resync = SessionResync {
-        session_id: session_id.unwrap_or_default(),
-    };
-    send_event(sender, "session_resync", &resync).await
-}
-
 async fn emit_topics_if_changed(
     state: &Arc<DaemonState>,
     sender: &skyzen::responder::sse::Sender,
-    session_filter: Option<&str>,
     profile_filter: Option<&str>,
     topics: UiEventTopics,
     signatures: &mut EventSignatures,
@@ -423,17 +261,6 @@ async fn emit_topics_if_changed(
     {
         return false;
     }
-    if topics.contains(UiEventTopics::SESSION_RUNTIME)
-        && !emit_session_runtime_if_changed(
-            state,
-            sender,
-            session_filter,
-            &mut signatures.session_runtime,
-        )
-        .await
-    {
-        return false;
-    }
     if topics.contains(UiEventTopics::SESSION_RUNTIMES)
         && !emit_session_runtimes_if_changed(
             state,
@@ -465,131 +292,6 @@ async fn emit_topics_if_changed(
         && !emit_sleep_if_changed(state, sender, &mut signatures.sleep).await
     {
         return false;
-    }
-    if topics.contains(UiEventTopics::SESSION_BACKGROUND)
-        && !emit_session_background_if_changed(
-            state,
-            sender,
-            session_filter,
-            &mut signatures.session_background,
-        )
-        .await
-    {
-        return false;
-    }
-    if topics.contains(UiEventTopics::SESSION_ARTIFACTS)
-        && !emit_session_artifacts_if_changed(
-            state,
-            sender,
-            session_filter,
-            &mut signatures.session_artifacts,
-        )
-        .await
-    {
-        return false;
-    }
-    if topics.contains(UiEventTopics::SESSION_ISSUES)
-        && !emit_session_issues_if_changed(
-            state,
-            sender,
-            session_filter,
-            &mut signatures.session_issues,
-        )
-        .await
-    {
-        return false;
-    }
-    true
-}
-
-/// The issues the filtered session's tasks link, as their store reports
-/// them now: a rename, close or reopen reaches the sidebar through this.
-async fn emit_session_issues_if_changed(
-    state: &Arc<DaemonState>,
-    sender: &skyzen::responder::sse::Sender,
-    session_filter: Option<&str>,
-    last_sig: &mut String,
-) -> bool {
-    let Some(session_id) = session_filter else {
-        return true;
-    };
-    let paths = match super::helpers::load_session_paths(state, session_id).await {
-        Ok(paths) => paths,
-        Err(error) => {
-            tracing::debug!(session_id, %error, "no session paths for linked issues");
-            return true;
-        }
-    };
-    let issues = match super::sessions::linked_issue_briefs(state, session_id, &paths).await {
-        Ok(issues) => issues,
-        Err(error) => {
-            tracing::warn!(session_id, %error, "failed to look up linked issues");
-            return true;
-        }
-    };
-    let frame = crate::client::SessionIssuesFrame {
-        session_id: session_id.to_string(),
-        issues,
-    };
-    let sig = serde_json::to_string(&frame).expect("issues frame serializes");
-    if sig != *last_sig {
-        if !send_event(sender, "session_issues", &frame).await {
-            return false;
-        }
-        *last_sig = sig;
-    }
-    true
-}
-
-/// The filtered session's `artifacts/` directory listing.
-async fn emit_session_artifacts_if_changed(
-    state: &Arc<DaemonState>,
-    sender: &skyzen::responder::sse::Sender,
-    session_filter: Option<&str>,
-    last_sig: &mut String,
-) -> bool {
-    let Some(session_id) = session_filter else {
-        return true;
-    };
-    let artifacts = match super::artifacts::collect_session_artifacts(state, session_id).await {
-        Ok(artifacts) => artifacts,
-        Err(error) => {
-            tracing::warn!(session_id, error = %error, "failed to collect session artifacts");
-            return true;
-        }
-    };
-    let sig = super::artifacts::artifacts_signature(&artifacts);
-    if sig != *last_sig {
-        let payload = super::types::SessionArtifactsEventPayload {
-            session_id: session_id.to_string(),
-            artifacts,
-        };
-        if !send_event(sender, "session_artifacts", &payload).await {
-            return false;
-        }
-        *last_sig = sig;
-    }
-    true
-}
-
-/// The filtered session's background jobs and subagent runs.
-async fn emit_session_background_if_changed(
-    state: &Arc<DaemonState>,
-    sender: &skyzen::responder::sse::Sender,
-    session_filter: Option<&str>,
-    last_sig: &mut String,
-) -> bool {
-    let Some(session_id) = session_filter else {
-        return true;
-    };
-    let payload = state.session_background.snapshot(session_id).await;
-    if let Ok(sig) = serde_json::to_string(&payload)
-        && sig != *last_sig
-    {
-        if !send_event(sender, "session_background", &payload).await {
-            return false;
-        }
-        *last_sig = sig;
     }
     true
 }
@@ -859,37 +561,6 @@ async fn emit_container_prepare_if_changed(
         && sig != *last_sig
     {
         if !send_event(sender, "container_prepare", &payload).await {
-            return false;
-        }
-        *last_sig = sig;
-    }
-    true
-}
-
-async fn emit_session_runtime_if_changed(
-    state: &Arc<DaemonState>,
-    sender: &skyzen::responder::sse::Sender,
-    session_filter: Option<&str>,
-    last_sig: &mut String,
-) -> bool {
-    let Some(session_id) = session_filter else {
-        return true;
-    };
-    let runtime = match state.runtime_service.get(session_id).await {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            tracing::warn!(session_id, error = %error, "failed to load session runtime");
-            return true;
-        }
-    };
-    let payload = SessionRuntimeEventPayload {
-        session_id: session_id.to_string(),
-        runtime: runtime.into(),
-    };
-    if let Ok(sig) = serde_json::to_string(&payload)
-        && sig != *last_sig
-    {
-        if !send_event(sender, "session_runtime", &payload).await {
             return false;
         }
         *last_sig = sig;

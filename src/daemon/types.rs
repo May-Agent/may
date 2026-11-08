@@ -1295,13 +1295,6 @@ impl Default for SessionRuntimeResponse {
 
 #[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct SessionRuntimeEventPayload {
-    pub(crate) session_id: String,
-    pub(crate) runtime: SessionRuntimeResponse,
-}
-
-#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct SessionRuntimeSnapshotItem {
     pub(crate) session_id: String,
     pub(crate) runtime: SessionRuntimeResponse,
@@ -1332,13 +1325,6 @@ pub struct ArtifactEntry {
 #[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionArtifactsResponse {
-    pub(crate) artifacts: Vec<ArtifactEntry>,
-}
-
-#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionArtifactsEventPayload {
-    pub(crate) session_id: String,
     pub(crate) artifacts: Vec<ArtifactEntry>,
 }
 

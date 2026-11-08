@@ -17,7 +17,7 @@ pub use hosts::{BtwMessage, BtwRequest, BtwResponse, CompactResponse, ContextDum
 pub use hosts::{
     ParkedAgents, btw, compact_session, context_dump, context_report, release_agent, usage_report,
 };
-pub use hub::{TurnFrame, TurnHub, TurnSubscription};
+pub use hub::TurnHub;
 pub use progress::{ProgressReport, progress};
 pub use recap::{RecapRecord, RecapSchedules, recap_session};
 mod tool_dispatch;
@@ -5196,7 +5196,7 @@ mod tests {
 
         // A composer is attached and shows a suggestion; another one is
         // still being generated.
-        let subscription = state.turn_hub.subscribe("session", None);
+        let subscription = state.turn_hub.subscribe_live("session");
         state.turn_hub.publish(
             "session",
             "session_suggestion",

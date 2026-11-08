@@ -32,7 +32,7 @@ export interface SubagentRun {
 
 /**
  * A session's background work: `GET /api/sessions/{id}/background` and the
- * `session_background` event of `/api/events`.
+ * stream's `job.*`/`subagent.*` deltas on `/api/sessions/{id}/events`.
  */
 export interface SessionBackground {
   sessionId: string;

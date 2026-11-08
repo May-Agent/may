@@ -130,7 +130,7 @@ pub(super) async fn stream_session_events(
         .map_or_else(
             || (state.turn_hub.subscribe_live(&session_id), after.is_some()),
             |index| {
-                let subscription = state.turn_hub.subscribe(&session_id, Some(index));
+                let subscription = state.turn_hub.subscribe(&session_id, index);
                 if subscription.gap {
                     drop(subscription);
                     (state.turn_hub.subscribe_live(&session_id), true)

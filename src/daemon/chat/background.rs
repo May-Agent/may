@@ -253,7 +253,6 @@ pub fn spawn_watcher(state: Arc<DaemonState>, bus: UiEventBus) {
                 last.insert(session_id, shape);
             }
             if !changed.is_empty() {
-                bus.publish(UiEventTopics::SESSION_BACKGROUND);
                 for session_id in changed {
                     bus.publish_session_change(
                         &session_id,
@@ -343,9 +342,6 @@ pub async fn kill_job(
         None => false,
     };
     if ok {
-        state
-            .ui_event_bus
-            .publish(UiEventTopics::SESSION_BACKGROUND);
         state.publish_session_change(
             &session_id,
             crate::daemon::session_events::SessionChange::Background,
