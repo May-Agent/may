@@ -1732,7 +1732,7 @@ where
                             let tx = app.event_tx.clone();
                             spawn(async move {
                                 let result = client
-                                    .put::<_, serde_json::Value>(
+                                    .patch::<_, serde_json::Value>(
                                         &format!("/api/sessions/{}", session_id.as_str()),
                                         &serde_json::json!({"reasoningEffort": effort}),
                                     )
