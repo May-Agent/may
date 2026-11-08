@@ -35,6 +35,17 @@ fn main() {
     );
 
     let status = Command::new("bun")
+        .args(["install", "--frozen-lockfile"])
+        .current_dir("web-ui")
+        .status()
+        .unwrap_or_else(|err| panic!("failed to run bun install for web-ui: {err}"));
+
+    assert!(
+        status.success(),
+        "bun install --frozen-lockfile failed in web-ui; cannot embed dist assets"
+    );
+
+    let status = Command::new("bun")
         .arg("run")
         .arg("build")
         .current_dir("web-ui")
