@@ -840,9 +840,10 @@ mod tests {
     }
 }
 
-/// Rebuilds the `ChatMessage` list a session's transcript entries stand
-/// for — the inverse of the daemon's row→entry folding. A `toolCall`
-/// becomes its stored start record plus an end/stopped record, so
+/// Rebuilds `ChatMessage` rows from transcript entries (the inverse of
+/// the daemon's folding).
+///
+/// A `toolCall` becomes its start record plus an end/stopped record, so
 /// rendering, export and injection replay the same rows.
 #[must_use]
 pub fn chat_messages_from_transcript(
@@ -850,19 +851,19 @@ pub fn chat_messages_from_transcript(
 ) -> Vec<ChatMessage> {
     use crate::client::WireTranscriptEntry as E;
 
-    fn timestamp(ts: &Option<String>) -> Option<Timestamp> {
-        ts.as_deref().and_then(|t| t.parse().ok())
+    fn timestamp(ts: Option<&str>) -> Option<Timestamp> {
+        ts.and_then(|t| t.parse().ok())
     }
     fn row_id(id: &str) -> Option<i32> {
         id.parse().ok()
     }
-    fn base(row: &str, role: MessageRole, content: String, ts: Option<String>) -> ChatMessage {
+    fn base(row: &str, role: MessageRole, content: String, ts: Option<&str>) -> ChatMessage {
         ChatMessage {
             id: row_id(row),
             role,
             content,
             attachments: Vec::new(),
-            timestamp: timestamp(&ts),
+            timestamp: timestamp(ts),
             tool_call_id: None,
             stats: None,
             reasoning: Vec::new(),
@@ -882,7 +883,7 @@ pub fn chat_messages_from_transcript(
                 attachments,
             } => messages.push(ChatMessage {
                 attachments: attachments.clone(),
-                ..base(id, MessageRole::User, text.clone(), ts.clone())
+                ..base(id, MessageRole::User, text.clone(), ts.as_deref())
             }),
             E::Assistant {
                 id,
@@ -896,7 +897,7 @@ pub fn chat_messages_from_transcript(
                     thinking: thinking.clone(),
                     translation: translation.clone(),
                     stats: stats.clone(),
-                    ..base(id, MessageRole::Assistant, text.clone(), ts.clone())
+                    ..base(id, MessageRole::Assistant, text.clone(), ts.as_deref())
                 });
             }
             E::ToolCall {
@@ -919,7 +920,7 @@ pub fn chat_messages_from_transcript(
                         id,
                         MessageRole::Tool,
                         serde_json::to_string(&start).unwrap_or_default(),
-                        ts.clone(),
+                        ts.as_deref(),
                     )
                 });
                 let end = match (status.as_str(), result) {
@@ -942,7 +943,7 @@ pub fn chat_messages_from_transcript(
                             "",
                             MessageRole::Tool,
                             serde_json::to_string(&end).unwrap_or_default(),
-                            ts.clone(),
+                            ts.as_deref(),
                         )
                     });
                 }
@@ -958,7 +959,7 @@ pub fn chat_messages_from_transcript(
                     "workspace" => MessageRole::WorkspaceRequest,
                     _ => MessageRole::AskUserRequest,
                 };
-                messages.push(base(id, role, content.clone(), ts.clone()));
+                messages.push(base(id, role, content.clone(), ts.as_deref()));
             }
             E::InteractionResponse {
                 id,
@@ -971,7 +972,7 @@ pub fn chat_messages_from_transcript(
                     "workspace" => MessageRole::WorkspaceResponse,
                     _ => MessageRole::AskUserResponse,
                 };
-                messages.push(base(id, role, content.clone(), ts.clone()));
+                messages.push(base(id, role, content.clone(), ts.as_deref()));
             }
             E::HiddenContext {
                 id,
@@ -982,7 +983,7 @@ pub fn chat_messages_from_transcript(
                     id,
                     MessageRole::HiddenContext,
                     text.clone(),
-                    ts.clone(),
+                    ts.as_deref(),
                 ));
             }
             E::Recap {
@@ -990,14 +991,14 @@ pub fn chat_messages_from_transcript(
                 timestamp: ts,
                 content,
             } => {
-                messages.push(base(id, MessageRole::Recap, content.clone(), ts.clone()));
+                messages.push(base(id, MessageRole::Recap, content.clone(), ts.as_deref()));
             }
             E::System {
                 id,
                 timestamp: ts,
                 text,
             } => {
-                messages.push(base(id, MessageRole::System, text.clone(), ts.clone()));
+                messages.push(base(id, MessageRole::System, text.clone(), ts.as_deref()));
             }
         }
     }
@@ -1034,7 +1035,7 @@ mod transcript_tests {
                 name: "terminal".into(),
                 arguments: "{}".into(),
                 status: "done".into(),
-                result: Some(result.clone()),
+                result: Some(result),
             },
             crate::client::WireTranscriptEntry::ToolCall {
                 id: "4".into(),

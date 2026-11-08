@@ -753,6 +753,10 @@ impl SessionManager {
     /// [`SessionError::NotFound`] when `prompt_index` does not point at a
     /// user message or the persisted rows diverge from the in-memory
     /// history, or [`SessionError`] on persistence failure.
+    ///
+    /// # Panics
+    /// Panics when the stored user row lacks its id; persisted history
+    /// rows always carry it.
     pub async fn rewind_to_prompt(
         &mut self,
         prompt_index: usize,
