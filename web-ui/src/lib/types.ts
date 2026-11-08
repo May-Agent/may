@@ -54,14 +54,6 @@ export interface ApiAttachment {
 export type TerminalCommandMode = 'default' | 'sandboxed' | 'unsafe' | 'ssh';
 export type TerminalExecutionStatus = 'running' | 'done' | 'failed' | 'stopped';
 
-export interface ApiTerminalExecution {
-  id: string;
-  description: string;
-  input: string;
-  output?: string | null;
-  status: TerminalExecutionStatus;
-  mode: TerminalCommandMode;
-}
 
 export interface RequestStats {
   providerId?: string | null;
@@ -96,7 +88,6 @@ export interface ApiMessage {
   isStreaming?: boolean | null;
   isThinking?: boolean | null;
   toolEvent?: unknown;
-  terminalExecutions?: ApiTerminalExecution[];
   stats?: RequestStats | null;
 }
 
@@ -187,7 +178,6 @@ export interface ApiSession {
   title: string;
   lastModified: string;
   preview: string;
-  messages?: ApiMessage[];
   profileId: string | null;
   model: string;
   reasoningEffort?: string | null;

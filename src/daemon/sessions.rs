@@ -15,7 +15,6 @@ use crate::ui_event_bus::UiEventTopics;
 use aither_core::llm::{Message as LlmMessage, Role as LlmRole};
 
 use super::error::{bad_request_error, internal_error, internal_error_message};
-use super::message_mapping::map_db_messages;
 use super::model_resolution::{
     persist_last_effort, persist_last_model, preferred_advanced_model, resolve_default_model,
 };
@@ -67,24 +66,10 @@ pub(super) async fn list_api_sessions(
         let model = resolve_default_model(&config, s.model.clone()).ok_or_else(|| {
             internal_error_message(format!("no model resolved for session {}", s.id.as_str()))
         })?;
-        sessions.push(ApiSession::from_summary(s, model, Vec::new()));
+        sessions.push(ApiSession::from_summary(s, model));
     }
 
     Ok(sessions)
-}
-
-/// `GET /api/sessions/{id}/history` — the session's stored messages in the
-/// clients' own `ChatMessage` shape, so a reload replays history losslessly.
-pub(super) async fn get_session_history(
-    params: Params,
-    State(state): State<Arc<DaemonState>>,
-) -> SkyResult<skyzen::Response> {
-    let id = params.get("id").map_err(bad_request_error)?.to_string();
-    let db = state.db();
-    let history = crate::session::load_history_from_db(&db, &id)
-        .await
-        .map_err(internal_error)?;
-    super::error::json_ok_response(&history.messages().to_vec())
 }
 
 /// `POST /api/sessions/{id}/history` — append stored messages in the
@@ -123,20 +108,12 @@ pub(super) async fn rewind_session(
     let id = params.get("id").map_err(bad_request_error)?.to_string();
     let db = state.db();
     let rows = db.get_messages(&id).await.map_err(internal_error)?;
-    let index = match (req.index, req.entry_id.as_deref()) {
-        (Some(index), None) => index,
-        (None, Some(entry_id)) => {
-            let history = crate::session::load_history_from_db(&db, &id)
-                .await
-                .map_err(internal_error)?;
-            let entries = super::transcript::build_entries(history.messages());
-            super::transcript::entry_cut_index(&rows, &entries, entry_id)?
-        }
-        _ => {
-            return Err(bad_request_error(
-                "exactly one of `index` or `entryId` is required",
-            ));
-        }
+    let index = {
+        let history = crate::session::load_history_from_db(&db, &id)
+            .await
+            .map_err(internal_error)?;
+        let entries = super::transcript::build_entries(history.messages());
+        super::transcript::entry_cut_index(&rows, &entries, &req.entry_id)?
     };
     let Some(row) = rows.get(index) else {
         return Err(bad_request_error("rewind index out of range"));
@@ -266,10 +243,9 @@ pub(super) async fn get_session(
         tokio::join!(db.get_session_runtime(&id), db.get_messages(&id),);
     summary.runtime = runtime_result.map_err(internal_error)?.unwrap_or_default();
     let model = resolve_session_model(&state, &id, summary.model.clone())?;
-    let db_messages = messages_result.map_err(internal_error)?;
-    let messages = map_db_messages(&db_messages).map_err(internal_error)?;
+    let _ = messages_result.map_err(internal_error)?;
 
-    let mut session = ApiSession::from_summary(summary, model, messages);
+    let mut session = ApiSession::from_summary(summary, model);
     session.cursor = Some(cursor);
     Ok(Json(session))
 }
@@ -775,7 +751,6 @@ pub(super) async fn update_session(
             .preview
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| "New conversation started".to_string()),
-        messages: Vec::new(),
         profile_id: session.profile_id,
         model,
         reasoning_effort: next_effort,

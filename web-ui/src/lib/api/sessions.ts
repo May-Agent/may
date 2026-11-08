@@ -1,3 +1,4 @@
+import type { TranscriptPage } from '../transcript';
 import type { ApiSession, ApiMessage } from '../types';
 import { apiDelete, apiGet, apiPost } from './client';
 
@@ -13,6 +14,10 @@ export interface SessionListResponse {
 
 export function listSessions(): Promise<SessionListResponse> {
   return apiGet<SessionListResponse>('/sessions');
+}
+
+export function getTranscript(id: string): Promise<TranscriptPage> {
+  return apiGet<TranscriptPage>(`/sessions/${id}/transcript`);
 }
 
 export function getSession(id: string): Promise<ApiSession> {

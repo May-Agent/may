@@ -2459,18 +2459,17 @@ async fn get_runtime(client: &reqwest::Client, server: &RunningDaemon, session_i
         .expect("runtime response should be valid JSON")
 }
 
-fn extract_assistant_messages(session_payload: &Value) -> Vec<String> {
-    session_payload
-        .get("messages")
+fn extract_assistant_messages(transcript: &Value) -> Vec<String> {
+    transcript
+        .get("entries")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|message| {
-            let role = message.get("role")?.as_str()?;
-            if role != "assistant" {
+        .filter_map(|entry| {
+            if entry.get("kind")?.as_str()? != "assistant" {
                 return None;
             }
-            message.get("content")?.as_str().map(ToOwned::to_owned)
+            entry.get("text")?.as_str().map(ToOwned::to_owned)
         })
         .collect()
 }
@@ -4012,17 +4011,20 @@ async fn stream_stop_mid_response_persists_partial_assistant_text(environment: C
 
     wait_for_runtime_state_clear(&client, &server, &session_id, Duration::from_secs(10)).await;
 
-    let session_response = client
-        .get(format!("{}/api/sessions/{}", server.base_url, session_id))
+    let transcript_response = client
+        .get(format!(
+            "{}/api/sessions/{}/transcript",
+            server.base_url, session_id
+        ))
         .send()
         .await
-        .expect("get session after cancel should succeed");
-    let session_response = expect_status(&server.log, session_response, StatusCode::OK).await;
-    let session_payload: Value = session_response
+        .expect("get transcript after cancel should succeed");
+    let transcript_response = expect_status(&server.log, transcript_response, StatusCode::OK).await;
+    let transcript: Value = transcript_response
         .json()
         .await
-        .expect("session payload after cancel should be valid JSON");
-    let assistant_messages = extract_assistant_messages(&session_payload);
+        .expect("transcript after cancel should be valid JSON");
+    let assistant_messages = extract_assistant_messages(&transcript);
     assert!(
         assistant_messages
             .iter()
@@ -4430,20 +4432,23 @@ async fn ui_chat_turn_survives_upstream_overload_on_its_own_provider() {
     assert_eq!(holds, 1, "the turn's retry announces its wait: {events:?}");
     assert_eq!(mock.agent_requests().await.len(), FAILURES + 1);
 
-    let session = client
-        .get(format!("{}/api/sessions/{session_id}", server.base_url))
+    let transcript = client
+        .get(format!(
+            "{}/api/sessions/{session_id}/transcript",
+            server.base_url
+        ))
         .send()
         .await
-        .expect("get session request should succeed");
-    let session: Value = expect_status(&server.log, session, StatusCode::OK)
+        .expect("get transcript request should succeed");
+    let transcript: Value = expect_status(&server.log, transcript, StatusCode::OK)
         .await
         .json()
         .await
-        .expect("session should be valid JSON");
+        .expect("transcript should be valid JSON");
     assert_eq!(
-        extract_assistant_messages(&session),
+        extract_assistant_messages(&transcript),
         vec!["recovered answer".to_string()],
-        "the failed attempts leave nothing in history: {session}"
+        "the failed attempts leave nothing in history: {transcript}"
     );
 
     server.stop().await;

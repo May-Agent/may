@@ -7,13 +7,26 @@ import { chatRows } from '../chat/rows';
 const originalFetch = globalThis.fetch;
 const encoder = new TextEncoder();
 
-function session(id: string, messages: ApiMessage[]): ApiSession {
+function session(id: string, messages: ApiMessage[]): ApiSession & { entries: unknown[] } {
+  const entries = messages.map((m) => ({
+    kind: m.role,
+    id: m.id.replace(/^msg-/, ''),
+    text: m.content,
+    attachments: m.attachments,
+    timestamp: m.timestamp,
+    thinking: m.thinking,
+    stats: m.stats,
+    translation: m.translation,
+  }));
+  return { ...apiSession(id), entries } as ApiSession & { entries: unknown[] };
+}
+
+function apiSession(id: string): ApiSession {
   return {
     id,
     title: id,
     lastModified: '2026-01-01T00:00:00Z',
     preview: '',
-    messages,
     profileId: null,
     model: 'm',
     runtime: {},
@@ -70,9 +83,18 @@ function installBackend(sessions: Record<string, ApiSession>): Backend {
       backend.stopped.push(decodeURIComponent(stop[1]));
       return new Response('{}', { status: 200 });
     }
+    const transcript = /^\/api\/sessions\/([^/]+)\/transcript$/.exec(url);
+    if (transcript) {
+      const s = backend.sessions[decodeURIComponent(transcript[1])] as unknown as { entries: unknown[] };
+      return new Response(JSON.stringify({ entries: s.entries ?? [], hasMore: false, cursor: '1.0' }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
     const get = /^\/api\/sessions\/([^/]+)$/.exec(url);
     if (get) {
-      return new Response(JSON.stringify(backend.sessions[decodeURIComponent(get[1])]), {
+      const { entries: _, ...rest } = backend.sessions[decodeURIComponent(get[1])] as unknown as { entries?: unknown[] };
+      return new Response(JSON.stringify(rest), {
         status: 200,
         headers: { 'Content-Type': 'application/json' },
       });
@@ -100,8 +122,8 @@ afterEach(() => {
 describe('turns are keyed by session', () => {
   test('a turn finishing after a session switch lands only in its own session', async () => {
     const backend = installBackend({
-      A: session('A', [message('a-u0', 'user', 'earlier')]),
-      B: session('B', [message('b-u0', 'user', 'hello')]),
+      A: session('A', [message('msg-a-u0', 'user', 'earlier')]),
+      B: session('B', [message('msg-b-u0', 'user', 'hello')]),
     });
 
     await useSessionsStore.getState().open('A');
@@ -110,7 +132,7 @@ describe('turns are keyed by session', () => {
     await useTurnStore.getState().send({ sessionId: 'A', content: 'go' });
     expect(backend.sent).toEqual(['A']);
     backend.streams.A.enqueue(
-      frame('A', 'start', { seq: 1, turnId: 't1', sessionId: 'A', assistantId: 'a-1' }),
+      frame('A', 'start', { seq: 1, turnId: 't1', sessionId: 'A', assistantId: 'msg-a-1' }),
     );
 
     await useSessionsStore.getState().open('B');
@@ -124,8 +146,8 @@ describe('turns are keyed by session', () => {
         turnId: 't1',
         sessionId: 'A',
         userMessageId: null,
-        messageIds: ['a-1'],
-        assistant: message('a-1', 'assistant', 'reply'),
+        messageIds: ['msg-a-1'],
+        assistant: message('msg-a-1', 'assistant', 'reply'),
       }),
     );
     backend.streams.A.enqueue(
@@ -135,8 +157,8 @@ describe('turns are keyed by session', () => {
 
     const { messages } = useSessionsStore.getState();
     expect(messages.B).toBe(bBefore);
-    expect(messages.B.map((m) => m.id)).toEqual(['b-u0']);
-    expect(messages.A.map((m) => m.id)).toEqual(['a-u0', 'a-1']);
+    expect(messages.B.map((m) => m.id)).toEqual(['msg-b-u0']);
+    expect(messages.A.map((m) => m.id)).toEqual(['msg-a-u0', 'msg-a-1']);
     expect(useTurnStore.getState().turns.B).toBeUndefined();
     expect(useTurnStore.getState().turns.A.active).toBeNull();
   });
@@ -168,7 +190,7 @@ describe('turns are keyed by session', () => {
     await settle();
     await useTurnStore.getState().send({ sessionId: 'A', content: 'go' });
     backend.streams.A.enqueue(
-      frame('A', 'start', { seq: 1, turnId: 't1', sessionId: 'A', assistantId: 'a-1' }),
+      frame('A', 'start', { seq: 1, turnId: 't1', sessionId: 'A', assistantId: 'msg-a-1' }),
     );
     await settle();
 
@@ -184,13 +206,13 @@ describe('turns are keyed by session', () => {
 describe('a withdrawn turn', () => {
   const text = '你好 こんにちは 안녕하세요';
   const withdrawn = (sessionId: string) => [
-    frame(sessionId, 'start', { seq: 1, turnId: 't1', sessionId, assistantId: 'a-1' }),
+    frame(sessionId, 'start', { seq: 1, turnId: 't1', sessionId, assistantId: 'msg-a-1' }),
     frame(sessionId, 'withdrawn', { seq: 2, turnId: 't1', content: text, attachments: [] }),
     frame(sessionId, 'end', { seq: 3, turnId: 't1', outcome: 'cancelled' }),
   ];
 
   test('leaves the conversation and returns to the sender composer', async () => {
-    const backend = installBackend({ A: session('A', [message('a-u0', 'user', 'earlier')]) });
+    const backend = installBackend({ A: session('A', [message('msg-a-u0', 'user', 'earlier')]) });
     await useSessionsStore.getState().open('A');
     unwatchers.push(useTurnStore.getState().watch('A'));
     await settle();
@@ -199,7 +221,7 @@ describe('a withdrawn turn', () => {
     for (const bytes of withdrawn('A')) backend.streams.A.enqueue(bytes);
     await settle();
 
-    expect(useSessionsStore.getState().messages.A.map((m) => m.id)).toEqual(['a-u0']);
+    expect(useSessionsStore.getState().messages.A.map((m) => m.id)).toEqual(['msg-a-u0']);
     const turn = useTurnStore.getState().turns.A;
     expect(turn.active).toBeNull();
     expect(turn.last).toBeNull();
@@ -207,7 +229,7 @@ describe('a withdrawn turn', () => {
   });
 
   test('is removed without a draft in a client that did not send it', async () => {
-    const backend = installBackend({ A: session('A', [message('a-u0', 'user', text)]) });
+    const backend = installBackend({ A: session('A', [message('msg-a-u0', 'user', text)]) });
     await useSessionsStore.getState().open('A');
     unwatchers.push(useTurnStore.getState().watch('A'));
     await settle();
@@ -314,7 +336,7 @@ describe('the session stream', () => {
     unwatchers.push(useTurnStore.getState().watch('A'));
     await settle();
     backend.streams.A.enqueue(
-      frame('A', 'start', { seq: 1, turnId: 't1', sessionId: 'A', assistantId: 'a-1' }),
+      frame('A', 'start', { seq: 1, turnId: 't1', sessionId: 'A', assistantId: 'msg-a-1' }),
     );
     await settle();
     expect(useTurnStore.getState().turns.A.active).not.toBeNull();
@@ -324,12 +346,12 @@ describe('the session stream', () => {
     await settle();
 
     expect(useTurnStore.getState().turns.A.active).toBeNull();
-    expect(useSessionsStore.getState().messages.A.map((m) => m.id)).toEqual(['u-1']);
+    expect(useSessionsStore.getState().messages.A.map((m) => m.id)).toEqual(['msg-u-1']);
   });
 
   test('a turn whose prompt is already in history is not rendered twice', async () => {
     const backend = installBackend({
-      A: session('A', [message('msg-7', 'user', 'earlier'), message('a-1', 'assistant', 'done')]),
+      A: session('A', [message('msg-7', 'user', 'earlier'), message('msg-a-1', 'assistant', 'done')]),
     });
     await useSessionsStore.getState().open('A');
     unwatchers.push(useTurnStore.getState().watch('A'));
@@ -346,7 +368,7 @@ describe('the session stream', () => {
       }),
     );
     backend.streams.A.enqueue(
-      frame('A', 'start', { seq: 1, turnId: 't1', sessionId: 'A', assistantId: 'a-1' }),
+      frame('A', 'start', { seq: 1, turnId: 't1', sessionId: 'A', assistantId: 'msg-a-1' }),
     );
     backend.streams.A.enqueue(frame('A', 'text', { seq: 2, turnId: 't1', chunk: 'dup' }));
     backend.streams.A.enqueue(
@@ -355,7 +377,7 @@ describe('the session stream', () => {
     await settle();
 
     expect(useTurnStore.getState().turns.A?.active ?? null).toBeNull();
-    expect(useSessionsStore.getState().messages.A.map((m) => m.id)).toEqual(['msg-7', 'a-1']);
+    expect(useSessionsStore.getState().messages.A.map((m) => m.id)).toEqual(['msg-7', 'msg-a-1']);
 
     // A turn that is not in history still streams normally.
     backend.streams.A.enqueue(

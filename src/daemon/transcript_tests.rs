@@ -244,7 +244,7 @@ async fn remaining_ids(state: &DaemonState) -> Vec<i32> {
 }
 
 #[tokio::test]
-async fn rewind_by_entry_id_cuts_the_same_rows_as_rewind_by_index() {
+async fn rewind_by_entry_id_cuts_the_prompt_and_its_hidden_context() {
     let at = Timestamp::now();
     let hidden = ChatMessage {
         id: None,
@@ -290,33 +290,74 @@ async fn rewind_by_entry_id_cuts_the_same_rows_as_rewind_by_index() {
 
     let state_b = state().await;
     let row_ids = seed(&state_b, &rows).await;
+    assert_eq!(
+        remaining_ids(&state_a).await,
+        vec![row_ids[0], row_ids[1]],
+        "the prompt and the hidden context before it are cut"
+    );
     let router_b = build_router(state_b.clone(), DaemonMode::Rest, None);
-    router_b
+
+    // A non-user entryId is a 400.
+    let bad = router_b
+        .go(hyper::Request::builder()
+            .method("POST")
+            .uri(format!("/api/sessions/{SESSION}/rewind"))
+            .header("content-type", "application/json")
+            .body(skyzen::Body::from(json!({"entryId": "999999"}).to_string()))
+            .expect("request"))
+        .await;
+    if let Ok(r) = bad {
+        assert_eq!(r.status(), StatusCode::BAD_REQUEST);
+    }
+}
+
+#[tokio::test]
+async fn the_session_read_no_longer_embeds_messages() {
+    let state = state().await;
+    seed(&state, &sample_rows()).await;
+    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let response = router
+        .go(hyper::Request::builder()
+            .method("GET")
+            .uri(format!("/api/sessions/{SESSION}"))
+            .body(skyzen::Body::empty())
+            .expect("request"))
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value =
+        serde_json::from_str(&response.into_body().into_string().await.expect("body"))
+            .expect("json");
+    assert!(body.get("messages").is_none(), "{body}");
+    assert!(body.get("cursor").is_some(), "{body}");
+}
+
+#[tokio::test]
+async fn the_history_get_is_gone_and_rewind_index_is_rejected() {
+    let state = state().await;
+    seed(&state, &sample_rows()).await;
+    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let history = router
+        .go(hyper::Request::builder()
+            .method("GET")
+            .uri(format!("/api/sessions/{SESSION}/history"))
+            .body(skyzen::Body::empty())
+            .expect("request"))
+        .await;
+    if let Ok(r) = history {
+        assert!(
+            r.status() == StatusCode::NOT_FOUND || r.status() == StatusCode::METHOD_NOT_ALLOWED
+        );
+    }
+    let rewind = router
         .go(hyper::Request::builder()
             .method("POST")
             .uri(format!("/api/sessions/{SESSION}/rewind"))
             .header("content-type", "application/json")
             .body(skyzen::Body::from(json!({"index": 2}).to_string()))
             .expect("request"))
-        .await
-        .expect("rewind");
-
-    let remaining = remaining_ids(&state_b).await;
-    assert_eq!(remaining, vec![row_ids[0], row_ids[1]]);
-    assert_eq!(remaining_ids(&state_a).await.len(), remaining.len());
-
-    // Both selectors at once is a 400, as is a non-user entryId.
-    let both = router_b
-        .go(hyper::Request::builder()
-            .method("POST")
-            .uri(format!("/api/sessions/{SESSION}/rewind"))
-            .header("content-type", "application/json")
-            .body(skyzen::Body::from(
-                json!({"index": 0, "entryId": entry_id}).to_string(),
-            ))
-            .expect("request"))
         .await;
-    if let Ok(r) = both {
+    if let Ok(r) = rewind {
         assert_eq!(r.status(), StatusCode::BAD_REQUEST);
     }
 }
