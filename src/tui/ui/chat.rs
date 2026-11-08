@@ -2863,18 +2863,23 @@ fn render_impl(
         .scroll((u16::try_from(skip).unwrap_or(u16::MAX), 0))
         .render(body, frame.buffer_mut());
 
-    // The band background: every cell of the band's rows, the padding
-    // columns and trailing space included. Cells with a background of their
-    // own keep it.
-    if let (Some(bg), Some(start)) = (band_bg, band_start) {
-        let first = element_rows + tail_starts.get(start).copied().unwrap_or(0);
-        let last = element_rows + tail_rows;
-        for row in first.max(top)..last.min(top + view_height) {
-            let y = area.y + u16::try_from(top_padding + row - top).unwrap_or(u16::MAX);
-            for x in area.x..area.x + area.width {
-                let cell = &mut frame.buffer_mut()[(x, y)];
-                if cell.bg == Color::Reset {
-                    cell.set_bg(bg);
+    // The band background: every cell of the band's rows and of user
+    // message rows — padding columns and trailing space included.
+    // Cells with a background of their own keep it.
+    if let Some(bg) = band_bg {
+        let mut spans = layout.user_rows_in(top, view_height);
+        if let Some(start) = band_start {
+            let first = element_rows + tail_starts.get(start).copied().unwrap_or(0);
+            spans.push((first, element_rows + tail_rows));
+        }
+        for (first, last) in spans {
+            for row in first..last {
+                let y = area.y + u16::try_from(top_padding + row - top).unwrap_or(u16::MAX);
+                for x in area.x..area.x + area.width {
+                    let cell = &mut frame.buffer_mut()[(x, y)];
+                    if cell.bg == Color::Reset {
+                        cell.set_bg(bg);
+                    }
                 }
             }
         }
@@ -3002,7 +3007,7 @@ fn char_to_byte_index(s: &str, char_idx: usize) -> usize {
     s.char_indices().nth(char_idx).map_or(s.len(), |(i, _)| i)
 }
 
-/// Style of the leading `!` chip while the composer is in bash mode.
+/// Style of the leading `!` while the composer is in bash mode.
 const BANG_PROMPT_STYLE: Style = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
 
 /// `true` when the composer input is a bash-mode (`!`) command — the same
@@ -3050,12 +3055,10 @@ fn input_caret_line(ctx: &InputContext<'_>) -> Line<'static> {
     let mut spans = Vec::new();
     let bash = bash_mode(ctx.input);
 
-    // Prompt — `!` occupies the prompt cell in bash mode instead of sitting
-    // inside the text next to `>`.
+    // The composer has no `>` prompt marker: input starts flush left and
+    // a leading `!` gets the bash-mode highlight instead of a prompt cell.
     if bash {
         spans.push(Span::styled("! ", BANG_PROMPT_STYLE));
-    } else {
-        spans.push(Span::styled("> ", Style::default().fg(Color::Cyan)));
     }
 
     // Render image attachments
@@ -5299,7 +5302,12 @@ mod tests {
         );
         assert_eq!(positions.len(), 1);
         let prompt = lines.last().expect("input line");
-        assert_eq!(prompt.spans[0].content, "> ");
+        let text: String = prompt
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(text, "[image] send it");
     }
 
     #[test]
@@ -6253,7 +6261,7 @@ mod tests {
         assert!(status.trim_end().ends_with("(5%)"), "{status:?}");
         assert!(row_has_band(buf, last - 2) && row_text(buf, last - 2).trim().is_empty());
         assert!(row_has_band(buf, last - 3));
-        assert_eq!(row_text(buf, last - 3).trim_end(), "  > draft");
+        assert_eq!(row_text(buf, last - 3).trim_end(), "  draft");
         assert!(row_has_band(buf, last - 4) && row_text(buf, last - 4).trim().is_empty());
         // One plain margin row, then chat text with no band.
         assert!(row_has_no_band(buf, last - 5));
@@ -6284,7 +6292,21 @@ mod tests {
         let chat_row = row_text(&frame.buf, 12);
         assert_eq!(chat_row.find('H'), Some(2), "{chat_row:?}");
         let input_row = row_text(&frame.buf, 16);
-        assert_eq!(input_row.find('>'), Some(2));
+        assert_eq!(input_row.find('d'), Some(2));
+    }
+
+    #[test]
+    fn user_message_rows_fill_the_band_background() {
+        let frame = draw_band(&sample_chat(), 80, 20, "draft", &[]);
+        let user = (0..20)
+            .find(|&y| row_text(&frame.buf, y).contains("> hello"))
+            .expect("user message row");
+        assert!(row_has_band(&frame.buf, user));
+        // The assistant reply below keeps the terminal background.
+        let reply = (0..20)
+            .find(|&y| row_text(&frame.buf, y).contains("last chat row"))
+            .expect("reply row");
+        assert!(row_has_no_band(&frame.buf, reply));
     }
 
     #[test]
@@ -6305,16 +6327,16 @@ mod tests {
     #[test]
     fn caret_sits_after_the_typed_text() {
         let frame = draw_band(&sample_chat(), 80, 20, "draft", &[]);
-        // "> draft" starts at column 2; the caret follows the last char.
-        assert_eq!((frame.cursor.x, frame.cursor.y), (2 + 2 + 5, 16), "caret");
+        // "draft" starts at column 2 (band padding); the caret follows the last char.
+        assert_eq!((frame.cursor.x, frame.cursor.y), (2 + 5, 16), "caret");
     }
 
     #[test]
     fn caret_follows_wrapped_input() {
         let text = "x".repeat(50);
         let frame = draw_band(&sample_chat(), 40, 20, &text, &[]);
-        // Content is 36 wide: "> " + 34 x on the first row, 16 on the next.
-        assert_eq!((frame.cursor.x, frame.cursor.y), (2 + 16, 16));
+        // Content is 36 wide: 36 x fill the first row, 14 wrap to the next.
+        assert_eq!((frame.cursor.x, frame.cursor.y), (2 + 14, 16));
         assert!(row_has_band(&frame.buf, 16));
     }
 
@@ -6338,7 +6360,7 @@ mod tests {
         let buf = &frame.buf;
         assert!(row_has_band(buf, 19), "bottom padding row");
         let input = (0..20)
-            .find(|&y| row_text(buf, y).starts_with("> ab"))
+            .find(|&y| row_text(buf, y).starts_with("ab"))
             .expect("input row at column 0");
         assert!(row_has_band(buf, input));
         assert!(row_has_band(buf, input - 1), "top padding row");
@@ -6383,10 +6405,43 @@ mod tests {
             false,
         );
         let n = rows.len();
-        assert_eq!(&rows[n - 6..n - 3], ["", "", "> hi"]);
+        assert_eq!(&rows[n - 6..n - 3], ["", "", "hi"]);
         assert_eq!(rows[n - 3], "");
         assert!(rows[n - 2].starts_with("~ · model"));
         assert_eq!(rows[n - 1], "");
+    }
+
+    /// Render a sample screen and write every cell as JSON lines to
+    /// `MAY_FRAME_DUMP` (symbol, fg, bg) — the input for the frame-to-PNG
+    /// preview script.
+    #[test]
+    #[ignore = "writes the frame JSON for visual preview"]
+    fn dump_frame_json() {
+        use std::fmt::Write as _;
+        let mut chat = ChatStream::new();
+        chat.push_user("帮我做一个变更，合入dev，去掉`>`", Vec::new(), 1);
+        chat.push_text("好的，我已经把输入框的 `>` 提示符去掉了：\n\n- 普通输入现在顶格显示\n- bash 模式仍然保留 `!` 高亮");
+        chat.end_text();
+        chat.push_user("第二条消息，看看背景填充效果", Vec::new(), 2);
+        chat.push_text("这是第二条回复。");
+        chat.end_text();
+        let frame = draw_band(&chat, 80, 24, "draft message", &[]);
+        let path = std::env::var("MAY_FRAME_DUMP").unwrap_or_else(|_| "frame.jsonl".into());
+        let mut out = String::new();
+        for y in 0..frame.buf.area.height {
+            for x in 0..frame.buf.area.width {
+                let cell = &frame.buf[(x, y)];
+                let _ = writeln!(
+                    out,
+                    "{{\"x\":{x},\"y\":{y},\"s\":{:?},\"fg\":\"{:?}\",\"bg\":\"{:?}\"}}",
+                    cell.symbol(),
+                    cell.fg,
+                    cell.bg
+                );
+            }
+        }
+        std::fs::write(&path, out).unwrap();
+        eprintln!("wrote {path}");
     }
 
     #[test]
