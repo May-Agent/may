@@ -1084,10 +1084,7 @@ mod tests {
             check_run("test", None, true),
         ];
         let summary = snap.check_summary();
-        assert_eq!(
-            (summary.passed, summary.pending, summary.failed),
-            (2, 1, 0)
-        );
+        assert_eq!((summary.passed, summary.pending, summary.failed), (2, 1, 0));
     }
 
     #[test]
@@ -1098,20 +1095,14 @@ mod tests {
             check_run("coverage", Some(CheckConclusion::Failure), false),
         ];
         let summary = snap.check_summary();
-        assert_eq!(
-            (summary.passed, summary.pending, summary.failed),
-            (1, 0, 0)
-        );
+        assert_eq!((summary.passed, summary.pending, summary.failed), (1, 0, 0));
         // With nothing required, every context counts.
         snap.checks = vec![
             check_run("coverage", Some(CheckConclusion::Failure), false),
             status_context("ci/test", StatusState::Pending, false),
         ];
         let summary = snap.check_summary();
-        assert_eq!(
-            (summary.passed, summary.pending, summary.failed),
-            (0, 1, 1)
-        );
+        assert_eq!((summary.passed, summary.pending, summary.failed), (0, 1, 1));
     }
 
     #[test]
@@ -1126,9 +1117,6 @@ mod tests {
             status_context("ci/web", StatusState::Error, true),
         ];
         let summary = snap.check_summary();
-        assert_eq!(
-            (summary.passed, summary.pending, summary.failed),
-            (1, 1, 2)
-        );
+        assert_eq!((summary.passed, summary.pending, summary.failed), (1, 1, 2));
     }
 }
