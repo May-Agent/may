@@ -119,6 +119,9 @@ pub struct Session {
     pub persisted: bool,
     /// Repository the session is bound to, when one was named at launch.
     pub repo: Option<String>,
+    /// Cursor `GET /api/sessions/{id}` reported at load, for the session
+    /// events stream to continue from. `None` for a new session.
+    pub events_cursor: Option<String>,
 }
 
 impl Session {
@@ -591,6 +594,7 @@ impl SessionManager {
             updated_at: now,
             persisted: false,
             repo: self.pending_repo.take(),
+            events_cursor: None,
         };
 
         self.current = Some(session);
@@ -712,6 +716,7 @@ impl SessionManager {
             updated_at,
             persisted: true,
             repo: None,
+            events_cursor: api.cursor,
         };
         *self.current.insert(session).history.messages_mut() = messages;
 

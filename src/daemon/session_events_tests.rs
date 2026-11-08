@@ -375,3 +375,28 @@ fn a_diff_reports_new_and_changed_items_then_removals() {
         "equal sets are quiet"
     );
 }
+
+#[tokio::test]
+async fn the_issues_route_answers_the_list_the_stream_reports() {
+    let state = state().await;
+    session(&state, SESSION).await;
+    // `resolve_issue_store` canonicalizes the session's working directory.
+    let sandbox =
+        crate::session::SessionStore::new(crate::session::MayHomePaths::new(state.may_dir.clone()))
+            .sandbox_dir(SESSION, None);
+    std::fs::create_dir_all(&sandbox).expect("session sandbox dir");
+    let router = build_router(state.clone(), DaemonMode::Rest, None);
+
+    let response = router
+        .go(request("GET", &format!("/api/sessions/{SESSION}/issues")))
+        .await
+        .expect("the router answers");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = http_body_util::BodyExt::collect(response.into_body())
+        .await
+        .expect("body collects")
+        .to_bytes();
+    let frame: serde_json::Value = serde_json::from_slice(&body).expect("issues json");
+    assert_eq!(frame["sessionId"], SESSION);
+    assert!(frame["issues"].is_array(), "the issues list");
+}

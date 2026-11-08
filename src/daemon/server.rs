@@ -506,6 +506,7 @@ fn api_routes() -> Route {
                     )),
                     Route::new((
                         "/background".at(super::chat::get_background),
+                        "/issues".at(super::session_events::get_session_issues),
                         "/jobs/read".at(super::chat::read_job),
                         "/jobs/{pid}".at(super::chat::get_job),
                         "/jobs/{pid}/kill".post(super::chat::kill_job),
