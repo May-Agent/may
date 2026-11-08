@@ -27,7 +27,7 @@ use crate::issue::IssueError;
 use crate::issue::github::{GhCliTokenSource, GitHubRest, GitHubTokenSource};
 use crate::repo_clone::{CloneRecord, CloneSandbox, SessionRepos, uncommitted_changes};
 
-mod merge_watch;
+pub(crate) mod merge_watch;
 
 /// Error type for `pr` operations.
 #[derive(Debug, thiserror::Error)]
@@ -746,6 +746,34 @@ impl PrStore {
         );
         if let Some(sha) = &pr.merge_commit_sha {
             let _ = std::fmt::Write::write_fmt(&mut out, format_args!("\nmerge {sha}"));
+        }
+        // The live check rollup for a GitHub PR still in flight — one
+        // snapshot, best-effort, skipped for the may backend and for
+        // states GitHub no longer reports checks on.
+        if pr.backend == "github"
+            && matches!(pr.state.as_str(), "open" | "checks_pending" | "merging")
+            && let (Some(owner_repo), Some(external)) = (
+                github_owner_repo(&resolved.record.source),
+                pr.external_number,
+            )
+        {
+            let github = merge_watch::GithubPr {
+                api: &self.context.github_api,
+                owner_repo: &owner_repo,
+                number: external,
+            };
+            if let Ok(summary) = merge_watch::Upstream::snapshot(&github)
+                .await
+                .map(|snapshot| snapshot.check_summary())
+            {
+                let _ = std::fmt::Write::write_fmt(
+                    &mut out,
+                    format_args!(
+                        "\nchecks {} passed · {} pending · {} failed",
+                        summary.passed, summary.pending, summary.failed
+                    ),
+                );
+            }
         }
         for e in events {
             let _ = std::fmt::Write::write_fmt(
