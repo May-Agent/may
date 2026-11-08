@@ -68,6 +68,10 @@ const fn default_list_state() -> IssueListState {
 /// - `issue edit <number> [--title t] [--body b] [--state open|closed]`
 /// - `issue comment <number> <body>` — on a repository the user does not own,
 ///   waits for the user's approval unless the user opened the issue
+///
+/// `--body`/`<body>` take the text literally: a `\n` in it stays a literal
+/// backslash-n. Write real newlines with `printf`, `$'...\n...'` or a
+/// heredoc.
 /// - `issue close <number>` (reopen with `edit --state open`)
 /// - `issue label <number> [--add name ...] [--remove name ...]`
 /// - `issue blocked-by <number> [--add n ...] [--remove n ...]` — the issue
@@ -83,7 +87,8 @@ pub enum IssueArgs {
         kind: IssueKind,
         /// Issue title.
         title: String,
-        /// Issue body (markdown).
+        /// Issue body (markdown). Literal: a `\n` in it stays a backslash-n;
+        /// pass real newlines (`printf`, `$'...\n...'`, heredoc).
         #[serde(default)]
         body: Option<String>,
         /// Labels to apply.
@@ -156,7 +161,8 @@ pub enum IssueArgs {
         /// New title.
         #[serde(default)]
         title: Option<String>,
-        /// New body.
+        /// New body. Literal: a `\n` in it stays a backslash-n; pass real
+        /// newlines (`printf`, `$'...\n...'`, heredoc).
         #[serde(default)]
         body: Option<String>,
         /// New state (`open` reopens, `closed` closes).
@@ -167,7 +173,8 @@ pub enum IssueArgs {
     Comment {
         /// Issue number.
         number: i64,
-        /// Comment body.
+        /// Comment body. Literal: a `\n` in it stays a backslash-n; pass real
+        /// newlines (`printf`, `$'...\n...'`, heredoc).
         body: String,
     },
     /// Close an issue.
