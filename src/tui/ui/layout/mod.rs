@@ -182,7 +182,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let status_message = app
         .status_text()
         .map(str::to_string)
-        .or_else(|| app.hovered_link().map(|hit| hit.uri));
+        .or_else(|| app.hovered_link().map(|hit| hit.display()));
 
     // Render everything in a single unified scrollable area
     app.frame_stats.chat = chat::render_unified(
