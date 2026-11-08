@@ -5676,14 +5676,18 @@ async fn agent_frames(
     SseReader::new(response)
 }
 
-/// The next turn frame of `reader`, skipping heartbeats.
+/// The next `session_agent` frame of `reader` — the kind the old
+/// `topics=session_agent` subscription delivered — or a `reset`. Other
+/// session frames (turns, suggestions, jobs) share the stream now and are
+/// skipped here; the reader's cursor bookkeeping still uses the last frame
+/// it read, so a reconnect loses nothing.
 async fn next_turn_frame(reader: &mut SseReader) -> TestSseEvent {
     loop {
         let event = tokio::time::timeout(Duration::from_secs(20), reader.next_event())
             .await
             .expect("a frame should arrive")
             .expect("the stream should stay open");
-        if event.event != "heartbeat" {
+        if event.event == "session_agent" || event.event == "reset" {
             return event;
         }
     }
