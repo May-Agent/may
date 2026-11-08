@@ -53,6 +53,9 @@ mod tasks;
 mod terminal_parsing;
 mod title_generation;
 mod tool_summary;
+mod transcript;
+#[cfg(test)]
+mod transcript_tests;
 mod tunnel;
 pub(crate) mod types;
 mod user_wait;

@@ -463,6 +463,7 @@ fn api_routes() -> Route {
                         "/history".post(append_session_history),
                         "/attachments".post(super::attachments::post_attachment),
                         "/files/{*path}".at(super::attachments::get_session_file),
+                        "/transcript".at(super::transcript::get_transcript),
                         "/rewind".post(rewind_session),
                         "/issues/lookup".post(lookup_issues),
                     )),

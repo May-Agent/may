@@ -912,7 +912,12 @@ pub struct CreateSessionRequest {
 pub struct RewindRequest {
     /// Index into the session's stored message list where the cut starts;
     /// it and every row after it are deleted.
-    pub(crate) index: usize,
+    #[serde(default)]
+    pub(crate) index: Option<usize>,
+    /// Transcript entry id (a `user` entry) where the cut starts; hidden
+    /// context directly before it is cut too.
+    #[serde(default)]
+    pub(crate) entry_id: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
