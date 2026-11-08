@@ -249,10 +249,10 @@ impl SessionRuntimeService {
         self.ui_event_bus.publish(topics);
     }
 
-    /// A `SESSION_RUNTIME`/`SESSION_RUNTIMES` invalidation plus the matching
-    /// notice to the session's diff stream on `/api/sessions/{id}/events`.
+    /// A `SESSION_RUNTIMES` invalidation plus the matching notice to the
+    /// session's diff stream on `/api/sessions/{id}/events`.
     fn publish_runtime_change(&self, session_id: &str) {
-        self.publish_ui(UiEventTopics::SESSION_RUNTIME | UiEventTopics::SESSION_RUNTIMES);
+        self.publish_ui(UiEventTopics::SESSION_RUNTIMES);
         self.ui_event_bus.publish_session_change(
             session_id,
             crate::daemon::session_events::SessionChange::Runtime,
@@ -777,11 +777,7 @@ impl SessionRuntimeService {
         session_id: &str,
     ) -> Result<SessionRuntimeSummary, crate::db::ChatDbError> {
         let summary = self.db.set_browser_takeover_owner(session_id).await?;
-        self.publish_ui(
-            UiEventTopics::SESSION_RUNTIME
-                | UiEventTopics::SESSION_RUNTIMES
-                | UiEventTopics::BROWSER_STATUS,
-        );
+        self.publish_ui(UiEventTopics::SESSION_RUNTIMES | UiEventTopics::BROWSER_STATUS);
         self.ui_event_bus.publish_session_change(
             session_id,
             crate::daemon::session_events::SessionChange::Runtime,
@@ -798,11 +794,7 @@ impl SessionRuntimeService {
         session_id: &str,
     ) -> Result<SessionRuntimeSummary, crate::db::ChatDbError> {
         let summary = self.db.clear_browser_takeover_owner(session_id).await?;
-        self.publish_ui(
-            UiEventTopics::SESSION_RUNTIME
-                | UiEventTopics::SESSION_RUNTIMES
-                | UiEventTopics::BROWSER_STATUS,
-        );
+        self.publish_ui(UiEventTopics::SESSION_RUNTIMES | UiEventTopics::BROWSER_STATUS);
         self.ui_event_bus.publish_session_change(
             session_id,
             crate::daemon::session_events::SessionChange::Runtime,

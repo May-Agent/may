@@ -134,14 +134,6 @@ pub(super) async fn collect_session_artifacts(
     Ok(entries)
 }
 
-pub(super) fn artifacts_signature(entries: &[ArtifactEntry]) -> String {
-    entries
-        .iter()
-        .map(|e| format!("{}:{}:{}", e.path, e.fingerprint, e.is_html))
-        .collect::<Vec<_>>()
-        .join("|")
-}
-
 pub(super) async fn resolve_scoped_path(
     scope_root: &Path,
     relative_path: PathBuf,
@@ -1469,7 +1461,6 @@ pub(super) fn spawn_artifact_watcher(state: &Arc<DaemonState>) {
                     }
                 }
                 () = &mut quiet, if !dirty.is_empty() => {
-                    bus.publish(crate::ui_event_bus::UiEventTopics::SESSION_ARTIFACTS);
                     for session_id in std::mem::take(&mut dirty) {
                         bus.publish_session_change(
                             &session_id,

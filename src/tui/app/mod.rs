@@ -4427,8 +4427,8 @@ impl App {
         )
     }
 
-    /// Mirror the daemon's pending-message queue from the last
-    /// `session_runtime` snapshot, so an enqueued message keeps a
+    /// Mirror the daemon's pending-message queue from the last runtime
+    /// snapshot, so an enqueued message keeps a
     /// `[steer]`/`[queue]` preview until the turn it starts renders it.
     pub fn sync_queue_from_runtime(&mut self) {
         let runtime = &self.session_runtime;

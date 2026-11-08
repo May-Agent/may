@@ -115,11 +115,8 @@ impl SessionRuns {
     }
 
     fn publish_runtime_change(&self, session_id: &str) {
-        self.ui_event_bus.publish(
-            UiEventTopics::SESSION_RUNTIME
-                | UiEventTopics::SESSION_RUNTIMES
-                | UiEventTopics::PROFILE_SESSIONS,
-        );
+        self.ui_event_bus
+            .publish(UiEventTopics::SESSION_RUNTIMES | UiEventTopics::PROFILE_SESSIONS);
         self.ui_event_bus.publish_session_change(
             session_id,
             crate::daemon::session_events::SessionChange::Runtime,

@@ -1022,7 +1022,7 @@ impl RuntimeDeps {
         message: PendingMessage,
     ) -> Result<(), TuiRuntimeError> {
         // The local queue mirrors the message for display until the daemon
-        // dispatches it, and the next `session_runtime` snapshot makes it
+        // dispatches it, and the next `runtime.changed` frame makes it
         // authoritative.
         app.queue.enqueue(message.clone());
         self.post_enqueue(app, &message).await

@@ -400,3 +400,14 @@ async fn the_issues_route_answers_the_list_the_stream_reports() {
     assert_eq!(frame["sessionId"], SESSION);
     assert!(frame["issues"].is_array(), "the issues list");
 }
+
+#[tokio::test]
+async fn a_removed_session_topic_is_rejected_on_the_shared_stream() {
+    let state = state().await;
+    let router = build_router(state.clone(), DaemonMode::Rest, None);
+    let error = router
+        .go(request("GET", "/api/events?topics=session_turn"))
+        .await
+        .expect_err("a removed topic name is unknown");
+    assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+}

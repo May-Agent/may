@@ -324,8 +324,6 @@ impl IssueChangeNotifier {
     }
 
     fn notify(&self) {
-        self.runtime
-            .publish_ui_events(crate::ui_event_bus::UiEventTopics::SESSION_ISSUES);
         self.runtime.publish_session_change(
             &self.session_id,
             crate::daemon::session_events::SessionChange::Issues,
@@ -1467,6 +1465,8 @@ mod tests {
             .expect("chat db should open");
         let bus = crate::ui_event_bus::UiEventBus::new();
         let mut events = bus.subscribe();
+        let (changes_tx, changes_rx) = async_channel::unbounded();
+        bus.set_session_changes(changes_tx);
         let runtime =
             std::sync::Arc::new(crate::session::SessionRuntimeService::new(db.clone(), bus));
         let provenance = IssueProvenance::new(db.clone(), "test".to_string());
@@ -1497,9 +1497,14 @@ mod tests {
         )
         .await
         .expect("rename");
+        assert!(events.try_recv().is_err(), "the topics bus is quiet");
+        let notice = changes_rx
+            .try_recv()
+            .expect("the rename is announced to the session stream");
+        assert_eq!(notice.session_id, "test");
         assert_eq!(
-            events.try_recv().expect("the rename is announced"),
-            crate::ui_event_bus::UiEventTopics::SESSION_ISSUES
+            notice.kind,
+            crate::daemon::session_events::SessionChange::Issues
         );
     }
 

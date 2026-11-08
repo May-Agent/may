@@ -1326,9 +1326,6 @@ impl PrStore {
         };
         match recorder.observe_github(pr, head_sha).await {
             Ok(Some(_)) => {
-                watch
-                    .ui_events
-                    .publish(crate::ui_event_bus::UiEventTopics::SESSION_WARNING);
                 watch.ui_events.publish_session_change(
                     &pr.session_id,
                     crate::daemon::session_events::SessionChange::Warning,
@@ -1365,9 +1362,6 @@ impl PrStore {
             .await
         {
             Ok(Some(_)) => {
-                watch
-                    .ui_events
-                    .publish(crate::ui_event_bus::UiEventTopics::SESSION_WARNING);
                 watch.ui_events.publish_session_change(
                     &pr.session_id,
                     crate::daemon::session_events::SessionChange::Warning,

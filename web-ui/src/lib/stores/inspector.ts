@@ -56,7 +56,7 @@ interface InspectorState {
     planState: SessionPlanState,
   ) => void;
   loadBackground: (sessionId: string) => Promise<void>;
-  /** Apply a `session_background` snapshot. */
+  /** Apply a session background snapshot. */
   applyBackground: (snapshot: SessionBackground) => void;
   killJob: (sessionId: string, pid: number) => Promise<void>;
   stopSubagent: (sessionId: string, runId: number) => Promise<void>;

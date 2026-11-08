@@ -17,7 +17,7 @@ import {
   artifactRuntimePreviewUrl,
   listArtifacts,
 } from '@/lib/api/artifacts';
-import { openUiEventStream } from '@/lib/api/events';
+import { applyArtifactDelta, watchSessionEvents } from '@/lib/api/sessionEvents';
 import { useTranslation } from '@/lib/i18n';
 import { isDraftSessionId } from '@/lib/stores/sessions';
 import type { ArtifactEntry } from '@/lib/types';
@@ -62,28 +62,17 @@ export function ArtifactsDrawer({ sessionId, open, onOpenChange, initialPath = n
     };
     void load();
 
-    const controller = new AbortController();
-    (async () => {
-      try {
-        const handle = await openUiEventStream(['session_artifacts'], {
-          sessionId,
-          abort: controller.signal,
-        });
-        for await (const evt of handle.events) {
-          if (cancelled) break;
-          if (evt.kind === 'session_artifacts') {
-            setEntries(evt.payload.artifacts);
-            setLoading(false);
-          }
-        }
-      } catch {
-        // stream aborted
-      }
-    })();
+    const unwatch = watchSessionEvents(sessionId, undefined, (kind, data) => {
+      if (cancelled) return;
+      setEntries((prev) => {
+        const next = [...prev];
+        return applyArtifactDelta(next, kind, data) ? next : prev;
+      });
+    });
 
     return () => {
       cancelled = true;
-      controller.abort();
+      unwatch();
     };
   }, [sessionId, open, initialPath]);
 
