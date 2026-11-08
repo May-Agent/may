@@ -986,7 +986,7 @@ impl RuntimeDeps {
                 });
             }
             let _: serde_json::Value = client
-                .put(&format!("/api/sessions/{}", session_id.as_str()), &body)
+                .patch(&format!("/api/sessions/{}", session_id.as_str()), &body)
                 .await
                 .map_err(TuiRuntimeError::from)?;
             Ok(crate::tui::remote::spawn_remote_worker(
@@ -1141,7 +1141,7 @@ impl RuntimeDeps {
             return committed_or_not_open(
                 client
                     .post::<_, serde_json::Value>(
-                        "/api/ask-user/respond",
+                        &format!("/api/interactions/{id}", id = req.id),
                         &serde_json::json!({ "id": request_id, "answers": answers_json(answers) }),
                     )
                     .await,
@@ -1168,7 +1168,7 @@ impl RuntimeDeps {
         let committed = committed_or_not_open(
             client
                 .post::<_, serde_json::Value>(
-                    "/api/ask-user/respond",
+                    &format!("/api/interactions/{id}", id = req.id),
                     &serde_json::json!({ "id": request_id, "answers": answers_json(answers) }),
                 )
                 .await,
@@ -1194,7 +1194,7 @@ impl RuntimeDeps {
         if let Some(client) = &self.daemon {
             let _: serde_json::Value = client
                 .post(
-                    "/api/workspace/respond",
+                    &format!("/api/interactions/{id}", id = req.id),
                     &serde_json::json!({ "id": request_id, "approved": approved }),
                 )
                 .await?;
@@ -1219,7 +1219,7 @@ impl RuntimeDeps {
         if let Some(client) = &self.daemon {
             let _: serde_json::Value = client
                 .post(
-                    "/api/permissions/respond",
+                    &format!("/api/interactions/{id}", id = req.id),
                     &serde_json::json!({ "id": request_id, "approved": approved }),
                 )
                 .await?;

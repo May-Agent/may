@@ -3075,7 +3075,7 @@ async fn ui_session_crud_round_trip_matches_api_contract() {
     assert!(contains);
 
     let update_response = client
-        .put(format!("{}/api/sessions/{session_id}", server.base_url))
+        .patch(format!("{}/api/sessions/{session_id}", server.base_url))
         .json(&serde_json::json!({
             "title": "Terminal first test",
             "model": TEST_SELECTOR
@@ -4868,9 +4868,9 @@ async fn answer_open_question(
     value: &str,
 ) {
     let response = client
-        .post(format!("{}/api/ask-user/respond", server.base_url))
+        .post(format!("{}/api/interactions/{request_id}", server.base_url))
         .json(&serde_json::json!({
-            "id": request_id,
+            "kind": "askUser",
             "answers": [{
                 "section": "",
                 "answer": { "kind": "selected", "values": [value] }
