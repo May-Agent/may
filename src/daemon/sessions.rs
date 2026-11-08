@@ -230,6 +230,10 @@ pub(super) async fn get_session(
 ) -> SkyResult<Json<ApiSession>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
+    // The cursor must precede every read so nothing between it and the
+    // client's `?after=` subscription is lost.
+    let cursor = state.session_cursor(&id);
+
     let db = state.db();
 
     let db_session = db
@@ -248,7 +252,9 @@ pub(super) async fn get_session(
     let db_messages = messages_result.map_err(internal_error)?;
     let messages = map_db_messages(&db_messages).map_err(internal_error)?;
 
-    Ok(Json(ApiSession::from_summary(summary, model, messages)))
+    let mut session = ApiSession::from_summary(summary, model, messages);
+    session.cursor = Some(cursor);
+    Ok(Json(session))
 }
 
 pub(super) async fn get_session_context_debug(
@@ -711,6 +717,7 @@ pub(super) async fn update_session(
         reasoning_effort: next_effort,
         runtime: runtime.into(),
         repo: next_repo,
+        cursor: None,
     }))
 }
 

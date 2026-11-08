@@ -33,6 +33,10 @@ pub struct TurnFrame {
     pub(crate) data: Arc<str>,
 }
 
+/// Frames kept for late subscribers, bounded so a cursor older than the
+/// buffer hits the gap path and its client resyncs.
+const MAX_KEPT_FRAMES: usize = 1024;
+
 #[derive(Debug)]
 struct SessionChannel {
     /// Kept frames, oldest first, with consecutive indices: those a late
@@ -46,6 +50,9 @@ struct SessionChannel {
     last_index: u64,
     /// Index of the first frame of the latest turn to begin; 0 before any.
     turn_start: u64,
+    /// A turn is publishing frames; set by `begin_turn`, cleared by
+    /// `end_turn`.
+    turn_open: bool,
     /// Index of the last frame each live subscription read, by its id. A
     /// closed subscription has none.
     cursors: HashMap<u64, u64>,
@@ -61,6 +68,7 @@ impl SessionChannel {
             replay_from: 1,
             last_index: 0,
             turn_start: 0,
+            turn_open: false,
             cursors: HashMap::new(),
             next_subscription: 0,
             published: Arc::new(Event::new()),
@@ -77,6 +85,7 @@ impl SessionChannel {
     /// at most this turn and the one before it; one with unread frames from
     /// before the previous turn began is closed and its frames released.
     fn begin_turn(&mut self, session_id: &str) {
+        self.turn_open = true;
         let previous_start = self.turn_start;
         self.turn_start = self.last_index + 1;
         let last_index = self.last_index;
@@ -118,6 +127,25 @@ impl SessionChannel {
         self.frames
             .front()
             .map_or(self.last_index + 1, |frame| frame.index)
+    }
+
+    /// Drops frames past [`MAX_KEPT_FRAMES`] only once every live
+    /// subscription already read them — a lagging one misses nothing — and
+    /// moves the replay start to the oldest frame left so a late
+    /// subscriber's cursor older than the buffer is a gap, not a hole.
+    fn cap(&mut self) {
+        let read = self
+            .cursors
+            .values()
+            .min()
+            .copied()
+            .unwrap_or(self.last_index);
+        while self.frames.len() > MAX_KEPT_FRAMES
+            && self.frames.front().is_some_and(|frame| frame.index <= read)
+        {
+            self.frames.pop_front();
+        }
+        self.replay_from = self.replay_from.max(self.first_kept());
     }
 }
 
@@ -221,6 +249,7 @@ impl TurnHub {
                 kind,
                 data,
             }));
+            channel.cap();
             channel.published.clone()
         });
         published.notify(usize::MAX);
@@ -247,6 +276,7 @@ impl TurnHub {
                     kind,
                     data: data_for(session_id),
                 }));
+                channel.cap();
                 channel.published.clone()
             })
             .collect();
@@ -259,7 +289,40 @@ impl TurnHub {
     /// Ends the session's turn; later subscribers read it from history.
     /// Subscriptions that have not read all of it still receive the rest.
     pub(crate) fn end_turn(&self, session_id: &str) {
-        self.with_session(session_id, SessionChannel::restart_replay);
+        self.with_session(session_id, |channel| {
+            channel.turn_open = false;
+            channel.restart_replay();
+        });
+    }
+
+    /// The index a subscriber naming it as `after` continues from to see a
+    /// turn in progress from its first frame — or the newest index when no
+    /// turn runs, 0 when the session has no frames yet.
+    pub(crate) fn cursor_index(&self, session_id: &str) -> u64 {
+        self.with_session(session_id, |channel| {
+            if channel.turn_open {
+                channel.replay_from - 1
+            } else {
+                channel.last_index
+            }
+        })
+    }
+
+    /// Subscribes at the newest frame: nothing already published replays.
+    pub(crate) fn subscribe_live(self: &Arc<Self>, session_id: &str) -> TurnSubscription {
+        let (id, published) = self.with_session(session_id, |channel| {
+            let id = channel.next_subscription;
+            channel.next_subscription += 1;
+            channel.cursors.insert(id, channel.last_index);
+            (id, channel.published.clone())
+        });
+        TurnSubscription {
+            hub: self.clone(),
+            session_id: session_id.to_string(),
+            id,
+            published,
+            gap: false,
+        }
     }
 
     /// Subscribes to `session_id`. `after` is the index of the last frame

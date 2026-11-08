@@ -41,6 +41,9 @@ mod rules_import;
 mod server;
 #[cfg(test)]
 mod session_directory_tests;
+pub(crate) mod session_events;
+#[cfg(test)]
+mod session_events_tests;
 mod sessions;
 mod sleep;
 mod state;

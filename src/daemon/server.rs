@@ -177,6 +177,8 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
     let (title_generation_queue, title_generation_rx) =
         crate::daemon::state::TitleGenerationQueue::new();
     let ui_event_bus = crate::ui_event_bus::UiEventBus::new();
+    let (session_change_tx, session_change_rx) = async_channel::unbounded();
+    ui_event_bus.set_session_changes(session_change_tx.clone());
     // Request handlers acquire runs from outside the tokio runtime, so the
     // lease tasks are spawned on its handle.
     let lease_handle = tokio::runtime::Handle::current();
@@ -329,7 +331,17 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
         session_background: super::chat::SessionBackgrounds::default(),
         tunnels: Arc::new(super::tunnel::TunnelRegistry::new()),
         connectivity,
+        session_events_epoch: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| {
+                u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+            }),
+        session_change_tx,
+        session_change_rx,
+        session_publisher_once: std::sync::Once::new(),
     });
+
+    state.ensure_session_publisher();
 
     super::chat::resume_pending_follow_up_runs(state.clone())
         .await
@@ -445,6 +457,7 @@ fn api_routes() -> Route {
                         "".at(get_session),
                         "".put(update_session),
                         "".delete(delete_session),
+                        "/events".at(super::session_events::stream_session_events),
                         "/history".at(get_session_history),
                         "/history".post(append_session_history),
                         "/rewind".post(rewind_session),

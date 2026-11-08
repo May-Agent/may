@@ -233,7 +233,7 @@ pub fn spawn_watcher(state: Arc<DaemonState>, bus: UiEventBus) {
         let mut last_busy = std::collections::BTreeSet::new();
         loop {
             tokio::time::sleep(WATCH_INTERVAL).await;
-            let mut publish = false;
+            let mut changed = std::collections::BTreeSet::new();
             let mut busy = std::collections::BTreeSet::new();
             for session_id in state.session_background.session_ids() {
                 let snapshot = state.session_background.snapshot(&session_id).await;
@@ -247,11 +247,19 @@ pub fn spawn_watcher(state: Arc<DaemonState>, bus: UiEventBus) {
                     .any(|job| job.status == crate::client::background::WireJobStatus::Running)
                     || !snapshot.subagents.is_empty();
                 // Running work changes every second (elapsed time, tokens).
-                publish |= running || last.get(&session_id) != Some(&shape);
+                if running || last.get(&session_id) != Some(&shape) {
+                    changed.insert(session_id.clone());
+                }
                 last.insert(session_id, shape);
             }
-            if publish {
+            if !changed.is_empty() {
                 bus.publish(UiEventTopics::SESSION_BACKGROUND);
+                for session_id in changed {
+                    bus.publish_session_change(
+                        &session_id,
+                        crate::daemon::session_events::SessionChange::Background,
+                    );
+                }
             }
             // The session lists mark the sessions with background work.
             if busy != last_busy {
@@ -338,6 +346,10 @@ pub async fn kill_job(
         state
             .ui_event_bus
             .publish(UiEventTopics::SESSION_BACKGROUND);
+        state.publish_session_change(
+            &session_id,
+            crate::daemon::session_events::SessionChange::Background,
+        );
     }
     Ok(Json(KillJobResponse { ok }))
 }

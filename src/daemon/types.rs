@@ -820,6 +820,10 @@ pub struct ApiSession {
     /// Repository the session is bound to, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) repo: Option<String>,
+    /// `GET /api/sessions/{id}` only: the `?after=` cursor for
+    /// `/api/sessions/{id}/events`, read before the session itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cursor: Option<String>,
 }
 
 impl ApiSession {
@@ -848,6 +852,7 @@ impl ApiSession {
             reasoning_effort: summary.reasoning_effort.clone(),
             runtime: summary.runtime.clone().into(),
             repo: summary.repo.clone(),
+            cursor: None,
         }
     }
 
@@ -864,6 +869,7 @@ impl ApiSession {
             reasoning_effort: None,
             runtime: crate::session::SessionRuntimeSummary::default().into(),
             repo: None,
+            cursor: None,
         }
     }
 }
@@ -1298,7 +1304,7 @@ pub struct ProfileSessionsEventPayload {
     pub(crate) profile_sessions: crate::profile::ProfileSessions,
 }
 
-#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ArtifactEntry {
     pub(crate) path: String,
