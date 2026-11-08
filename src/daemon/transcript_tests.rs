@@ -281,7 +281,7 @@ async fn rewind_by_entry_id_cuts_the_prompt_and_its_hidden_context() {
     router_a
         .go(hyper::Request::builder()
             .method("POST")
-            .uri(format!("/api/sessions/{SESSION}/rewind"))
+            .uri(format!("/api/sessions/{SESSION}/actions/rewind"))
             .header("content-type", "application/json")
             .body(skyzen::Body::from(json!({"entryId": entry_id}).to_string()))
             .expect("request"))
@@ -301,7 +301,7 @@ async fn rewind_by_entry_id_cuts_the_prompt_and_its_hidden_context() {
     let bad = router_b
         .go(hyper::Request::builder()
             .method("POST")
-            .uri(format!("/api/sessions/{SESSION}/rewind"))
+            .uri(format!("/api/sessions/{SESSION}/actions/rewind"))
             .header("content-type", "application/json")
             .body(skyzen::Body::from(json!({"entryId": "999999"}).to_string()))
             .expect("request"))
@@ -352,7 +352,7 @@ async fn the_history_get_is_gone_and_rewind_index_is_rejected() {
     let rewind = router
         .go(hyper::Request::builder()
             .method("POST")
-            .uri(format!("/api/sessions/{SESSION}/rewind"))
+            .uri(format!("/api/sessions/{SESSION}/actions/rewind"))
             .header("content-type", "application/json")
             .body(skyzen::Body::from(json!({"index": 2}).to_string()))
             .expect("request"))

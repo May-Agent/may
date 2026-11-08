@@ -9,8 +9,7 @@ use std::time::Duration;
 use askama::Template;
 use serde::{Deserialize, Serialize};
 use skyzen::Result as SkyResult;
-use skyzen::routing::Params;
-use skyzen::utils::{Json, State};
+use skyzen::utils::Json;
 
 use crate::daemon::error::{internal_error, internal_error_message};
 use crate::daemon::state::DaemonState;
@@ -91,12 +90,11 @@ fn validated(report: ProgressReport) -> Result<ProgressReport, super::aux::AuxEr
 
 /// `POST /api/sessions/{id}/progress`: the remaining work of the session,
 /// generated on the side.
-pub async fn progress(
-    params: Params,
-    State(state): State<Arc<DaemonState>>,
+pub async fn progress_inner(
+    state: &Arc<DaemonState>,
+    session_id: &str,
 ) -> SkyResult<Json<ProgressReport>> {
-    let session_id = super::hosts::session_id_param(&params)?;
-    report(&state, &session_id).await.map(Json)
+    report(state, session_id).await.map(Json)
 }
 
 /// Generates the remaining-work report of `session_id`.

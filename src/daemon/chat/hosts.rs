@@ -229,13 +229,12 @@ pub struct CompactResponse {
 }
 
 /// `POST /api/sessions/{id}/compact`.
-pub async fn compact_session(
-    params: Params,
-    Json(req): Json<CompactRequest>,
-    State(state): State<Arc<DaemonState>>,
+pub async fn compact_inner(
+    state: &Arc<DaemonState>,
+    session_id: &str,
+    req: CompactRequest,
 ) -> SkyResult<Json<CompactResponse>> {
-    let session_id = session_id_param(&params)?;
-    let worker = idle_agent(&state, &session_id).await?;
+    let worker = idle_agent(state, session_id).await?;
     match answer(worker.compact(req.focus)).await {
         Some(TuiEvent::Compacted(Ok(result))) => Ok(Json(CompactResponse {
             compacted: result.is_some(),
@@ -331,19 +330,18 @@ pub struct ContextDumpResponse {
 
 /// `POST /api/sessions/{id}/context-dump`: writes the assembled context to
 /// the session's `outputs/context-dump.md`.
-pub async fn context_dump(
-    params: Params,
-    State(state): State<Arc<DaemonState>>,
+pub async fn context_dump_inner(
+    state: &Arc<DaemonState>,
+    session_id: &str,
 ) -> SkyResult<Json<ContextDumpResponse>> {
-    let session_id = session_id_param(&params)?;
-    let worker = idle_agent(&state, &session_id).await?;
+    let worker = idle_agent(state, session_id).await?;
     let dump = match answer(worker.context_dump()).await {
         Some(TuiEvent::ContextDump(Ok(dump))) => dump,
         Some(TuiEvent::ContextDump(Err(error))) => return Err(internal_error(error)),
         _ => return Err(internal_error_message("the agent gave no context dump")),
     };
     let text = dump.render();
-    let paths = crate::daemon::helpers::load_session_paths(&state, &session_id).await?;
+    let paths = crate::daemon::helpers::load_session_paths(state, session_id).await?;
     let dir = paths.outputs_dir();
     async_fs::create_dir_all(&dir)
         .await
@@ -384,15 +382,14 @@ pub struct BtwResponse {
 
 /// `POST /api/sessions/{id}/btw`: answers a side question with the
 /// session's model, outside the conversation.
-pub async fn btw(
-    params: Params,
-    Json(req): Json<BtwRequest>,
-    State(state): State<Arc<DaemonState>>,
+pub async fn btw_inner(
+    state: &Arc<DaemonState>,
+    session_id: &str,
+    req: BtwRequest,
 ) -> SkyResult<Json<BtwResponse>> {
     use aither_core::llm::Message;
     use futures_lite::StreamExt as _;
 
-    let session_id = session_id_param(&params)?;
     let mut messages = req
         .messages
         .into_iter()
@@ -402,7 +399,7 @@ pub async fn btw(
             _ => Message::user(message.content),
         })
         .collect::<Vec<_>>();
-    let side = super::aux::side_context(&state, &session_id)
+    let side = super::aux::side_context(state, session_id)
         .await
         .map_err(internal_error)?;
     let llm = if let Some(side) = side {
@@ -419,7 +416,7 @@ pub async fn btw(
         messages.extend(question);
         side.model
     } else {
-        let worker = idle_agent(&state, &session_id).await?;
+        let worker = idle_agent(state, session_id).await?;
         worker.side_model().await.map_err(internal_error_message)?
     };
     let mut answer = String::new();

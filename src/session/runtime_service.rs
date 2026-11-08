@@ -486,6 +486,23 @@ impl SessionRuntimeService {
         Ok(summary)
     }
 
+    /// Drop the pending entry `entry_id`, whichever kind it is.
+    ///
+    /// # Errors
+    /// Returns [`crate::db::ChatDbError`] on storage failure or a missing entry.
+    pub async fn remove_pending_entry(
+        &self,
+        session_id: &str,
+        entry_id: i64,
+    ) -> Result<SessionRuntimeSummary, crate::db::ChatDbError> {
+        let summary = self
+            .db
+            .remove_pending_message_by_id(session_id, entry_id)
+            .await?;
+        self.publish_runtime_change(session_id);
+        Ok(summary)
+    }
+
     /// Remove the queued message at `index`.
     ///
     /// # Errors

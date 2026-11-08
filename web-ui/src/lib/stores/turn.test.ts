@@ -73,7 +73,7 @@ function installBackend(sessions: Record<string, ApiSession>): Backend {
         { status: 200, headers: { 'Content-Type': 'application/json' } },
       );
     }
-    const send = /^\/api\/sessions\/([^/]+)\/messages$/.exec(url);
+    const send = /^\/api\/sessions\/([^/]+)\/turns$/.exec(url);
     if (send) {
       backend.sent.push(decodeURIComponent(send[1]));
       return new Response('{}', { status: 200 });

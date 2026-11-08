@@ -791,7 +791,7 @@ impl SessionManager {
             .to_string();
         let user_message_id: i64 = daemon
             .post(
-                &format!("/api/sessions/{session_id}/rewind"),
+                &format!("/api/sessions/{session_id}/actions/rewind"),
                 &crate::client::RewindRequest { entry_id },
             )
             .await?;
@@ -848,7 +848,7 @@ impl SessionManager {
         session.history.metadata.title = Some(title.clone());
 
         let _: crate::client::WireSession = daemon
-            .put(
+            .patch(
                 &format!("/api/sessions/{}", session.id.as_str()),
                 &crate::client::UpdateSessionRequest {
                     title: Some(title),
@@ -872,7 +872,7 @@ impl SessionManager {
         session.history.metadata.model = Some(model.clone());
 
         let _: crate::client::WireSession = daemon
-            .put(
+            .patch(
                 &format!("/api/sessions/{}", session.id.as_str()),
                 &crate::client::UpdateSessionRequest {
                     model: Some(model),

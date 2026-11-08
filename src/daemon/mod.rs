@@ -42,6 +42,8 @@ mod remote_access;
 mod rules_import;
 mod server;
 #[cfg(test)]
+mod session_commands_tests;
+#[cfg(test)]
 mod session_directory_tests;
 pub(crate) mod session_events;
 #[cfg(test)]

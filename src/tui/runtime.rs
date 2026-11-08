@@ -986,7 +986,7 @@ impl RuntimeDeps {
                 });
             }
             let _: serde_json::Value = client
-                .put(&format!("/api/sessions/{}", session_id.as_str()), &body)
+                .patch(&format!("/api/sessions/{}", session_id.as_str()), &body)
                 .await
                 .map_err(TuiRuntimeError::from)?;
             Ok(crate::tui::remote::spawn_remote_worker(
@@ -1084,10 +1084,10 @@ impl RuntimeDeps {
                 )
                 .await?,
                 "hiddenContextXml": message.hidden_context_xml.as_ref().map(ToString::to_string),
-                "deliveryMode": message.delivery_mode,
+                "mode": match message.delivery_mode.as_str() { "queue" => "queue", _ => "steer" },
             });
             if let Err(error) = client
-                .post::<_, serde_json::Value>("/api/chat/enqueue", &body)
+                .post::<_, serde_json::Value>(&format!("/api/sessions/{session_id}/turns"), &body)
                 .await
             {
                 app.sync_queue_from_runtime();
@@ -1141,8 +1141,8 @@ impl RuntimeDeps {
             return committed_or_not_open(
                 client
                     .post::<_, serde_json::Value>(
-                        "/api/ask-user/respond",
-                        &serde_json::json!({ "id": request_id, "answers": answers_json(answers) }),
+                        &format!("/api/interactions/{request_id}"),
+                        &serde_json::json!({ "kind": "askUser", "answers": answers_json(answers) }),
                     )
                     .await,
             );
@@ -1168,8 +1168,8 @@ impl RuntimeDeps {
         let committed = committed_or_not_open(
             client
                 .post::<_, serde_json::Value>(
-                    "/api/ask-user/respond",
-                    &serde_json::json!({ "id": request_id, "answers": answers_json(answers) }),
+                    &format!("/api/interactions/{request_id}"),
+                    &serde_json::json!({ "kind": "askUser", "answers": answers_json(answers) }),
                 )
                 .await,
         )?;
@@ -1194,8 +1194,8 @@ impl RuntimeDeps {
         if let Some(client) = &self.daemon {
             let _: serde_json::Value = client
                 .post(
-                    "/api/workspace/respond",
-                    &serde_json::json!({ "id": request_id, "approved": approved }),
+                    &format!("/api/interactions/{request_id}"),
+                    &serde_json::json!({ "kind": "workspace", "approved": approved }),
                 )
                 .await?;
             return Ok(ResponseCommit::Committed);
@@ -1219,8 +1219,8 @@ impl RuntimeDeps {
         if let Some(client) = &self.daemon {
             let _: serde_json::Value = client
                 .post(
-                    "/api/permissions/respond",
-                    &serde_json::json!({ "id": request_id, "approved": approved }),
+                    &format!("/api/interactions/{request_id}"),
+                    &serde_json::json!({ "kind": "permission", "approved": approved }),
                 )
                 .await?;
             return Ok(());

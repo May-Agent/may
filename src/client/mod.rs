@@ -241,6 +241,19 @@ impl DaemonClient {
             .await
     }
 
+    /// `PATCH path` with a JSON body, decoding the JSON answer.
+    ///
+    /// # Errors
+    /// Fails when the daemon is unreachable or refuses the request.
+    pub async fn patch<B: Serialize + Sync, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T, DaemonClientError> {
+        self.json(hyper::Method::PATCH, path, Some(serde_json::to_vec(body)?))
+            .await
+    }
+
     /// `DELETE path`, decoding the JSON answer.
     ///
     /// # Errors

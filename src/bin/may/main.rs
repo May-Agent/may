@@ -1422,10 +1422,10 @@ where
                             (runtime_deps.daemon(), app.session_manager.current())
                         {
                             let stopped: Result<serde_json::Value, _> = client
-                                .post(
-                                    &may_agent::client::session_path(session.id.as_str(), "/stop"),
-                                    &serde_json::json!({}),
-                                )
+                                .delete(&may_agent::client::session_path(
+                                    session.id.as_str(),
+                                    "/turns/current",
+                                ))
                                 .await;
                             if let Err(error) = stopped {
                                 tracing::warn!(%error, "failed to stop the session's run before quitting");
@@ -1732,7 +1732,7 @@ where
                             let tx = app.event_tx.clone();
                             spawn(async move {
                                 let result = client
-                                    .put::<_, serde_json::Value>(
+                                    .patch::<_, serde_json::Value>(
                                         &format!("/api/sessions/{}", session_id.as_str()),
                                         &serde_json::json!({"reasoningEffort": effort}),
                                     )
@@ -1797,11 +1797,8 @@ where
                             (Some(client), Some(session_id)) => {
                                 let enable = !app.session_runtime.yolo;
                                 let put = client
-                                    .put::<_, serde_json::Value>(
-                                        &may_agent::client::session_path(
-                                            session_id.as_str(),
-                                            "/yolo",
-                                        ),
+                                    .patch::<_, serde_json::Value>(
+                                        &format!("/api/sessions/{session_id}"),
                                         &serde_json::json!({ "yolo": enable }),
                                     )
                                     .await;
@@ -1856,7 +1853,7 @@ where
                                     .post::<_, serde_json::Value>(
                                         &may_agent::client::session_path(
                                             session_id.as_str(),
-                                            "/recap",
+                                            "/actions/recap",
                                         ),
                                         &serde_json::json!({}),
                                     )

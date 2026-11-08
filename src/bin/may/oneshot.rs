@@ -256,7 +256,7 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
     runtime_deps
         .daemon()
         .ok_or_else(|| anyhow::anyhow!("the May daemon is not attached"))?
-        .put::<_, serde_json::Value>(
+        .patch::<_, serde_json::Value>(
             &format!("/api/sessions/{}", session_id.as_str()),
             &may_agent::client::UpdateSessionRequest {
                 non_interactive: Some(true),
