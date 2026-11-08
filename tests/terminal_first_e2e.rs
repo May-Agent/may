@@ -5761,7 +5761,8 @@ async fn a_reconnecting_client_continues_after_the_last_frame_it_saw() {
     assert!(events.iter().any(|(kind, _)| kind == "done"), "{events:?}");
 
     // The turn ended: frames after the first one are gone for good.
-    let mut stale = agent_frames(&client, &server, &session_id, Some(frame_cursor(&seen[0]))).await;
+    // A cursor the hub cannot continue from — a foreign epoch — gets `reset`.
+    let mut stale = agent_frames(&client, &server, &session_id, Some("1.0".to_string())).await;
     let resync = next_turn_frame(&mut stale).await;
     assert_eq!(resync.event, "reset", "{resync:?}");
     server.stop().await;
