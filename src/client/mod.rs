@@ -159,6 +159,58 @@ impl DaemonClient {
             .await
     }
 
+    /// `POST path` with a raw body and explicit content type, decoding the
+    /// JSON answer. Used by the attachment upload route.
+    ///
+    /// # Errors
+    /// Fails when the daemon is unreachable or refuses the request.
+    pub async fn post_raw<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: Vec<u8>,
+        content_type: &str,
+    ) -> Result<T, DaemonClientError> {
+        let stream = tokio::net::UnixStream::connect(&self.socket)
+            .await
+            .map_err(|source| DaemonClientError::Unreachable {
+                socket: self.socket.clone(),
+                source,
+            })?;
+        let (mut sender, connection) =
+            hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
+        tokio::spawn(async move {
+            if let Err(error) = connection.await {
+                tracing::debug!(%error, "daemon connection closed");
+            }
+        });
+        let request = hyper::Request::builder()
+            .method(hyper::Method::POST)
+            .uri(path)
+            .header(hyper::header::HOST, "may-daemon")
+            .header(hyper::header::CONTENT_TYPE, content_type)
+            .body(Full::new(Bytes::from(body)))?;
+        let response = sender.send_request(request).await?;
+        let status = response.status();
+        let bytes = response.into_body().collect().await?.to_bytes();
+        if !status.is_success() {
+            return Err(DaemonClientError::Status {
+                path: path.to_string(),
+                status,
+                message: String::from_utf8_lossy(&bytes).trim().to_string(),
+            });
+        }
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    /// `GET path`, returning the raw response bytes.
+    ///
+    /// # Errors
+    /// Fails when the daemon is unreachable or refuses the request.
+    pub async fn get_bytes(&self, path: &str) -> Result<Vec<u8>, DaemonClientError> {
+        let response = self.send(hyper::Method::GET, path, None).await?;
+        Ok(response.into_body().collect().await?.to_bytes().to_vec())
+    }
+
     /// `PUT path` with a JSON body, decoding the JSON answer.
     ///
     /// # Errors

@@ -31,6 +31,8 @@ mod github_repos_tests;
 mod helpers;
 mod interaction;
 pub use interaction::ASK_USER_NOT_OPEN;
+#[cfg(test)]
+mod attachments_tests;
 mod local_url_mapper;
 mod message_mapping;
 mod model_resolution;

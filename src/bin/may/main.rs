@@ -1018,8 +1018,11 @@ where
             match runtime_deps.begin_queued_run(app)? {
                 QueuedRunStart::Started(msg) => {
                     busy_elsewhere_notified = false;
-                    agent_handle =
-                        Some(runtime_deps.start_agent_task(app, w, msg, &mut pending_title_gen)?);
+                    agent_handle = Some(
+                        runtime_deps
+                            .start_agent_task(app, w, msg, &mut pending_title_gen)
+                            .await?,
+                    );
                     assistant_response.clear();
                     continue;
                 }
@@ -1525,7 +1528,8 @@ where
                             // The worker is still being built: show the turn
                             // now and send it as soon as the worker exists.
                             let turn =
-                                RuntimeDeps::show_agent_turn(app, msg, &mut pending_title_gen)?;
+                                RuntimeDeps::show_agent_turn(app, msg, &mut pending_title_gen)
+                                    .await?;
                             held_turn = Some(HeldTurn {
                                 turn: Some(turn),
                                 behind: Vec::new(),
@@ -1539,7 +1543,7 @@ where
                                     w,
                                     msg,
                                     &mut pending_title_gen,
-                                )?);
+                                ).await?);
                                 assistant_response.clear();
                             } else {
                                 app.chat.push_notice(

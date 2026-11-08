@@ -1757,14 +1757,20 @@ impl App {
             turn.note(msg);
             match msg.role {
                 MessageRole::User => {
-                    let restored = futures_util::future::join_all(msg.attachments.iter().map(
-                        |att| async move {
-                            super::runtime::tui_attachment_from_persisted(att.clone())
+                    let daemon = self.session_manager.daemon_handle().ok();
+                    let restored =
+                        futures_util::future::join_all(msg.attachments.iter().map(|att| {
+                            let daemon = daemon.clone();
+                            async move {
+                                super::runtime::tui_attachment_from_persisted(
+                                    daemon.as_ref(),
+                                    att.clone(),
+                                )
                                 .await
                                 .map_err(|error| (att.name.clone(), error))
-                        },
-                    ))
-                    .await;
+                            }
+                        }))
+                        .await;
                     let mut attachments = Vec::with_capacity(restored.len());
                     for result in restored {
                         match result {

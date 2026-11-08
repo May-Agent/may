@@ -186,7 +186,7 @@ impl ChatDb {
                         name: attachment.name,
                         attachment_type: parse_attachment_kind(&attachment.attachment_type)?,
                         url: attachment.url,
-                        upload_data_url: attachment.upload_data_url,
+
                         text_content: attachment.text_content,
                     })
                 })
@@ -690,14 +690,13 @@ impl ChatDb {
         for (ordinal, attachment) in message.attachments.iter().enumerate() {
             query!(
                 tx,
-                "INSERT INTO session_pending_message_attachments (message_id, ordinal, attachment_id, name, attachment_type, url, upload_data_url, text_content) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO session_pending_message_attachments (message_id, ordinal, attachment_id, name, attachment_type, url, upload_data_url, text_content) VALUES (?, ?, ?, ?, ?, ?, NULL, ?)",
                 message_id,
                 i64::try_from(ordinal).map_err(|error| overflow_error("pending attachment ordinal", &error))?,
                 attachment.id.as_str(),
                 attachment.name.as_str(),
                 attachment.attachment_type.as_str(),
                 attachment.url.as_str(),
-                attachment.upload_data_url.as_deref(),
                 attachment.text_content.as_deref()
             )
             .execute()

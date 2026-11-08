@@ -652,24 +652,8 @@ fn replay_user_message(
 fn attachment_url(
     attachment: &super::runtime::PersistedAttachment,
 ) -> Result<url::Url, HistoryReplayError> {
-    if let Some(url) = attachment
-        .upload_data_url
-        .as_deref()
-        .and_then(|raw| url::Url::parse(raw).ok())
-    {
-        return Ok(url);
-    }
-    let url = url::Url::parse(&attachment.url)
-        .map_err(|error| invalid_attachment(attachment, format!("invalid url: {error}")))?;
-    let file_gone = url.to_file_path().is_ok_and(|path| !path.exists());
-    if !file_gone {
-        return Ok(url);
-    }
-    attachment
-        .upload_data_url
-        .as_deref()
-        .and_then(|raw| url::Url::parse(raw).ok())
-        .ok_or_else(|| invalid_attachment(attachment, "file missing and no stored bytes"))
+    url::Url::parse(&attachment.url)
+        .map_err(|error| invalid_attachment(attachment, format!("invalid url: {error}")))
 }
 
 fn attachment_media_type(
