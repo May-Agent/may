@@ -839,3 +839,260 @@ mod tests {
         ));
     }
 }
+
+/// Rebuilds the `ChatMessage` list a session's transcript entries stand
+/// for — the inverse of the daemon's row→entry folding. A `toolCall`
+/// becomes its stored start record plus an end/stopped record, so
+/// rendering, export and injection replay the same rows.
+#[must_use]
+pub fn chat_messages_from_transcript(
+    entries: &[crate::client::WireTranscriptEntry],
+) -> Vec<ChatMessage> {
+    use crate::client::WireTranscriptEntry as E;
+
+    fn timestamp(ts: &Option<String>) -> Option<Timestamp> {
+        ts.as_deref().and_then(|t| t.parse().ok())
+    }
+    fn row_id(id: &str) -> Option<i32> {
+        id.parse().ok()
+    }
+    fn base(row: &str, role: MessageRole, content: String, ts: Option<String>) -> ChatMessage {
+        ChatMessage {
+            id: row_id(row),
+            role,
+            content,
+            attachments: Vec::new(),
+            timestamp: timestamp(&ts),
+            tool_call_id: None,
+            stats: None,
+            reasoning: Vec::new(),
+            tool_calls: Vec::new(),
+            translation: None,
+            thinking: None,
+        }
+    }
+
+    let mut messages = Vec::new();
+    for entry in entries {
+        match entry {
+            E::User {
+                id,
+                timestamp: ts,
+                text,
+                attachments,
+            } => messages.push(ChatMessage {
+                attachments: attachments.clone(),
+                ..base(id, MessageRole::User, text.clone(), ts.clone())
+            }),
+            E::Assistant {
+                id,
+                timestamp: ts,
+                text,
+                thinking,
+                translation,
+                stats,
+            } => {
+                messages.push(ChatMessage {
+                    thinking: thinking.clone(),
+                    translation: translation.clone(),
+                    stats: stats.clone(),
+                    ..base(id, MessageRole::Assistant, text.clone(), ts.clone())
+                });
+            }
+            E::ToolCall {
+                id,
+                timestamp: ts,
+                call_id,
+                name,
+                arguments,
+                status,
+                result,
+            } => {
+                let start = ToolEventRecord::Start {
+                    id: call_id.clone(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                };
+                messages.push(ChatMessage {
+                    tool_call_id: Some(call_id.clone()),
+                    ..base(
+                        id,
+                        MessageRole::Tool,
+                        serde_json::to_string(&start).unwrap_or_default(),
+                        ts.clone(),
+                    )
+                });
+                let end = match (status.as_str(), result) {
+                    ("done", Some(result)) => Some(ToolEventRecord::End {
+                        id: call_id.clone(),
+                        name: name.clone(),
+                        result: result.clone(),
+                    }),
+                    ("stopped", _) => Some(ToolEventRecord::Stopped {
+                        id: call_id.clone(),
+                        name: name.clone(),
+                    }),
+                    _ => None,
+                };
+                if let Some(end) = end {
+                    messages.push(ChatMessage {
+                        id: None,
+                        tool_call_id: Some(call_id.clone()),
+                        ..base(
+                            "",
+                            MessageRole::Tool,
+                            serde_json::to_string(&end).unwrap_or_default(),
+                            ts.clone(),
+                        )
+                    });
+                }
+            }
+            E::InteractionRequest {
+                id,
+                timestamp: ts,
+                interaction,
+                content,
+            } => {
+                let role = match interaction.as_str() {
+                    "permission" => MessageRole::PermissionRequest,
+                    "workspace" => MessageRole::WorkspaceRequest,
+                    _ => MessageRole::AskUserRequest,
+                };
+                messages.push(base(id, role, content.clone(), ts.clone()));
+            }
+            E::InteractionResponse {
+                id,
+                timestamp: ts,
+                interaction,
+                content,
+            } => {
+                let role = match interaction.as_str() {
+                    "permission" => MessageRole::PermissionResponse,
+                    "workspace" => MessageRole::WorkspaceResponse,
+                    _ => MessageRole::AskUserResponse,
+                };
+                messages.push(base(id, role, content.clone(), ts.clone()));
+            }
+            E::HiddenContext {
+                id,
+                timestamp: ts,
+                text,
+            } => {
+                messages.push(base(
+                    id,
+                    MessageRole::HiddenContext,
+                    text.clone(),
+                    ts.clone(),
+                ));
+            }
+            E::Recap {
+                id,
+                timestamp: ts,
+                content,
+            } => {
+                messages.push(base(id, MessageRole::Recap, content.clone(), ts.clone()));
+            }
+            E::System {
+                id,
+                timestamp: ts,
+                text,
+            } => {
+                messages.push(base(id, MessageRole::System, text.clone(), ts.clone()));
+            }
+        }
+    }
+    messages
+}
+
+#[cfg(test)]
+mod transcript_tests {
+    use super::*;
+
+    #[test]
+    fn transcript_entries_fold_back_into_the_same_rows() {
+        let at = "2025-01-01T00:00:00Z".to_string();
+        let result = aither_core::llm::ToolResult::text("done!");
+        let entries = vec![
+            crate::client::WireTranscriptEntry::User {
+                id: "1".into(),
+                timestamp: Some(at.clone()),
+                text: "hi".into(),
+                attachments: Vec::new(),
+            },
+            crate::client::WireTranscriptEntry::Assistant {
+                id: "2".into(),
+                timestamp: Some(at.clone()),
+                text: "hello".into(),
+                thinking: None,
+                translation: None,
+                stats: None,
+            },
+            crate::client::WireTranscriptEntry::ToolCall {
+                id: "3".into(),
+                timestamp: Some(at.clone()),
+                call_id: "c1".into(),
+                name: "terminal".into(),
+                arguments: "{}".into(),
+                status: "done".into(),
+                result: Some(result.clone()),
+            },
+            crate::client::WireTranscriptEntry::ToolCall {
+                id: "4".into(),
+                timestamp: Some(at.clone()),
+                call_id: "c2".into(),
+                name: "monitor".into(),
+                arguments: "{}".into(),
+                status: "stopped".into(),
+                result: None,
+            },
+            crate::client::WireTranscriptEntry::ToolCall {
+                id: "5".into(),
+                timestamp: Some(at.clone()),
+                call_id: "c3".into(),
+                name: "read".into(),
+                arguments: "{}".into(),
+                status: "running".into(),
+                result: None,
+            },
+            crate::client::WireTranscriptEntry::HiddenContext {
+                id: "6".into(),
+                timestamp: Some(at),
+                text: "ctx".into(),
+            },
+        ];
+
+        let messages = chat_messages_from_transcript(&entries);
+        assert_eq!(messages.len(), 8);
+        assert_eq!(messages[0].role, MessageRole::User);
+        assert_eq!(messages[0].id, Some(1));
+        assert_eq!(messages[0].content, "hi");
+        assert_eq!(messages[1].role, MessageRole::Assistant);
+
+        // The done call's rows parse back as its Start and End records.
+        let start: ToolEventRecord =
+            serde_json::from_str(&messages[2].content).expect("start record");
+        assert!(matches!(start, ToolEventRecord::Start { ref id, .. } if id == "c1"));
+        let end: ToolEventRecord = serde_json::from_str(&messages[3].content).expect("end record");
+        assert!(matches!(end, ToolEventRecord::End { ref id, .. } if id == "c1"));
+
+        // Stopped: Start + Stopped; running: Start only.
+        let stopped: ToolEventRecord =
+            serde_json::from_str(&messages[5].content).expect("stopped record");
+        assert!(matches!(stopped, ToolEventRecord::Stopped { ref id, .. } if id == "c2"));
+        let running: ToolEventRecord =
+            serde_json::from_str(&messages[6].content).expect("running start");
+        assert!(matches!(running, ToolEventRecord::Start { ref id, .. } if id == "c3"));
+
+        assert_eq!(messages[7].role, MessageRole::HiddenContext);
+        assert_eq!(messages[7].id, Some(6));
+    }
+
+    #[test]
+    fn rewind_requests_the_user_entry_id() {
+        let body = serde_json::to_string(&crate::client::RewindRequest {
+            entry_id: "7".into(),
+        })
+        .expect("serialize");
+        assert_eq!(body, "{\"entryId\":\"7\"}");
+    }
+}

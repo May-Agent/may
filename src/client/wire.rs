@@ -831,8 +831,119 @@ pub struct UpdateSessionRequest {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RewindRequest {
-    /// Index into the session's stored message list where the cut starts.
-    pub index: usize,
+    /// Transcript entry id of the user message where the cut starts.
+    pub entry_id: String,
+}
+
+/// `GET /api/sessions/{id}/transcript` response: a page of folded
+/// transcript entries; `hasMore`/`cursor` are unused by the TUI today.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WireTranscriptPage {
+    /// Entries, oldest first.
+    pub entries: Vec<WireTranscriptEntry>,
+}
+
+/// One transcript entry; `kind` tags the variant.
+#[derive(Debug, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum WireTranscriptEntry {
+    /// User prompt.
+    User {
+        /// Stored row id of the entry's first row, as a decimal string.
+        id: String,
+        /// RFC3339 timestamp.
+        timestamp: Option<String>,
+        /// Prompt text.
+        text: String,
+        /// Attachments, as the daemon records them.
+        attachments: Vec<crate::session::PersistedAttachment>,
+    },
+    /// Assistant reply.
+    Assistant {
+        /// Stored row id.
+        id: String,
+        /// RFC3339 timestamp.
+        timestamp: Option<String>,
+        /// Reply text.
+        text: String,
+        /// Thinking transcript, when present.
+        thinking: Option<String>,
+        /// Display translation, when present.
+        translation: Option<crate::session::history::MessageTranslation>,
+        /// Token stats, when present.
+        stats: Option<crate::session::ChatMessageStats>,
+    },
+    /// Tool call, merged from its start and end rows.
+    ToolCall {
+        /// Stored row id of the call's start record.
+        id: String,
+        /// RFC3339 timestamp.
+        timestamp: Option<String>,
+        /// Tool call id.
+        call_id: String,
+        /// Tool name.
+        name: String,
+        /// Raw JSON arguments.
+        arguments: String,
+        /// `running`, `done` or `stopped`.
+        status: String,
+        /// Stored result, when finished.
+        result: Option<aither_core::llm::ToolResult>,
+    },
+    /// An agent question or permission/workspace request.
+    InteractionRequest {
+        /// Stored row id.
+        id: String,
+        /// RFC3339 timestamp.
+        timestamp: Option<String>,
+        /// `askUser`, `permission` or `workspace`.
+        interaction: String,
+        /// Stored content.
+        content: String,
+    },
+    /// The user's answer to an interaction request.
+    InteractionResponse {
+        /// Stored row id.
+        id: String,
+        /// RFC3339 timestamp.
+        timestamp: Option<String>,
+        /// `askUser`, `permission` or `workspace`.
+        interaction: String,
+        /// Stored content.
+        content: String,
+    },
+    /// Hidden per-turn context.
+    HiddenContext {
+        /// Stored row id.
+        id: String,
+        /// RFC3339 timestamp.
+        timestamp: Option<String>,
+        /// Stored content.
+        text: String,
+    },
+    /// Daemon-generated catch-up summary.
+    Recap {
+        /// Stored row id.
+        id: String,
+        /// RFC3339 timestamp.
+        timestamp: Option<String>,
+        /// Stored content.
+        content: String,
+    },
+    /// System row.
+    System {
+        /// Stored row id.
+        id: String,
+        /// RFC3339 timestamp.
+        timestamp: Option<String>,
+        /// Stored content.
+        text: String,
+    },
 }
 
 /// One `GET /api/sessions/{id}` response, the fields a client session needs.

@@ -17,7 +17,7 @@ pub use wire::{
     SessionAgentBody, SessionAgentFrame, SessionIndexSnapshot, SessionIssuesFrame,
     SessionRuntimeEvent, SessionRuntimeSnapshot, SubagentRemovedFrame, SubagentUpsertedFrame,
     SuggestionFrame, UpdateSessionRequest, WarningFrame, WireAgentError, WireAgentEvent, WirePr,
-    WirePrChecks, WireSession,
+    WirePrChecks, WireSession, WireTranscriptEntry, WireTranscriptPage,
 };
 
 use std::path::PathBuf;
@@ -142,6 +142,23 @@ impl DaemonClient {
     ///
     /// # Errors
     /// Fails when the daemon is unreachable or refuses the request.
+    /// `GET /api/sessions/{id}/transcript` — the session's folded
+    /// transcript entries, oldest first.
+    ///
+    /// # Errors
+    /// Returns [`DaemonClientError`] when the request or decoding fails.
+    pub async fn get_transcript(
+        &self,
+        session_id: &str,
+    ) -> Result<WireTranscriptPage, DaemonClientError> {
+        self.get(&format!("/api/sessions/{session_id}/transcript"))
+            .await
+    }
+
+    /// `GET path`, decoding the JSON answer.
+    ///
+    /// # Errors
+    /// Fails when the daemon is unreachable or the body is not `T`.
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, DaemonClientError> {
         self.json(hyper::Method::GET, path, None).await
     }
