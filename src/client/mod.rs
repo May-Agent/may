@@ -17,7 +17,7 @@ pub use wire::{
     SessionAgentBody, SessionAgentFrame, SessionIndexSnapshot, SessionIssuesFrame,
     SessionRuntimeEvent, SessionRuntimeSnapshot, SubagentRemovedFrame, SubagentUpsertedFrame,
     SuggestionFrame, UpdateSessionRequest, WarningFrame, WireAgentError, WireAgentEvent, WirePr,
-    WireSession,
+    WirePrChecks, WireSession,
 };
 
 use std::path::PathBuf;
