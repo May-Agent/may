@@ -72,20 +72,6 @@ pub(super) async fn list_api_sessions(
     Ok(sessions)
 }
 
-/// `GET /api/sessions/{id}/history` — the session's stored messages in the
-/// clients' own `ChatMessage` shape, so a reload replays history losslessly.
-pub(super) async fn get_session_history(
-    params: Params,
-    State(state): State<Arc<DaemonState>>,
-) -> SkyResult<skyzen::Response> {
-    let id = params.get("id").map_err(bad_request_error)?.to_string();
-    let db = state.db();
-    let history = crate::session::load_history_from_db(&db, &id)
-        .await
-        .map_err(internal_error)?;
-    super::error::json_ok_response(&history.messages().to_vec())
-}
-
 /// `POST /api/sessions/{id}/history` — append stored messages in the
 /// clients' `ChatMessage` shape, for flows that inject history without a
 /// turn (transcript import).

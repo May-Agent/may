@@ -18,6 +18,18 @@ export interface TranscriptEntry {
   interaction?: string;
 }
 
+function inferVariant(name?: string): string {
+  switch (name) {
+    case 'websearch': return 'web_search';
+    case 'webfetch': return 'web_fetch';
+    case 'terminal': case 'terminal_input': case 'terminal_kill':
+    case 'terminal_read': case 'browser': case 'web_search':
+    case 'web_fetch': case 'ask': case 'session': case 'task':
+      return name!;
+    default: return 'generic';
+  }
+}
+
 export interface TranscriptPage {
   entries: TranscriptEntry[];
   hasMore: boolean;
@@ -54,7 +66,7 @@ export function foldTranscript(entries: TranscriptEntry[]): ApiMessage[] {
           role: 'user',
           content: entry.text ?? '',
           attachments: entry.attachments ?? [],
-          timestamp: entry.timestamp ?? undefined,
+          timestamp: entry.timestamp ?? '',
         });
         break;
       case 'assistant': {
@@ -65,7 +77,7 @@ export function foldTranscript(entries: TranscriptEntry[]): ApiMessage[] {
           thinking: entry.thinking ?? undefined,
           translation: entry.translation ?? undefined,
           stats: entry.stats ?? undefined,
-          timestamp: entry.timestamp ?? undefined,
+          timestamp: entry.timestamp ?? '',
           toolEvent: pendingTools.length > 0 ? pendingTools : undefined,
         };
         pendingTools = [];
@@ -79,6 +91,7 @@ export function foldTranscript(entries: TranscriptEntry[]): ApiMessage[] {
           stage: 'start',
           id: entry.callId,
           name: entry.name,
+          variant: inferVariant(entry.name),
           arguments: entry.arguments,
           seq: seq++,
         });
@@ -87,6 +100,7 @@ export function foldTranscript(entries: TranscriptEntry[]): ApiMessage[] {
             stage: 'end',
             id: entry.callId,
             name: entry.name,
+            variant: inferVariant(entry.name),
             result:
               entry.status === 'stopped'
                 ? { kind: 'text', text: 'Stopped by the user before it finished.' }

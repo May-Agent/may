@@ -10,6 +10,7 @@ import {
   createSession,
   deleteSession,
   getSession,
+  getTranscript,
   listSessions,
   updateSession,
   unarchiveSession,
@@ -17,6 +18,7 @@ import {
   type UpdateSessionPatch,
 } from '../api/sessions';
 import { putSessionTasks } from '../api/tasks';
+import { foldTranscript } from '../transcript';
 import { useConfigStore } from './config';
 
 const DRAFT_PREFIX = 'draft_';
@@ -202,7 +204,6 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
       title: 'New Chat',
       lastModified: new Date().toISOString(),
       preview: '',
-      messages: [],
       profileId: profileId ?? null,
       model: useConfigStore.getState().config?.fullConfig.lastModel ?? '',
       reasoningEffort: null,

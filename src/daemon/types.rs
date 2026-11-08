@@ -770,14 +770,6 @@ pub struct TerminalStateSnapshot {
     pub(crate) running_by_call_id: std::collections::HashMap<String, ApiTerminalExecution>,
 }
 
-impl TerminalStateSnapshot {
-    pub(crate) fn all_executions(&self) -> Vec<ApiTerminalExecution> {
-        let mut executions = self.executions.clone();
-        executions.extend(self.running_by_call_id.values().cloned());
-        executions
-    }
-}
-
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ApiMessage {
