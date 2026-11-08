@@ -507,6 +507,7 @@ impl RuntimeDeps {
             session_id,
             selected_model,
             reasoning_effort,
+            None,
         )
         .map(Some)
     }
@@ -530,13 +531,21 @@ impl RuntimeDeps {
         let sandbox_dir = session.sandbox_dir.clone();
         let session_id = session.id.clone();
         let session_model = session.model.clone();
+        let events_cursor = session.events_cursor.clone();
         let messages: Vec<_> = session.history.messages().to_vec();
 
         app.init_session(&session_id, &messages).await;
         *worker = None;
 
         let selected_model = SelectedModel::resolve(&app.config, session_model.as_deref())?;
-        self.begin_worker_build(app, sandbox_dir, session_id, selected_model, None)
+        self.begin_worker_build(
+            app,
+            sandbox_dir,
+            session_id,
+            selected_model,
+            None,
+            events_cursor,
+        )
     }
 
     /// Import a foreign agent's global rules and skills: the daemon copies
@@ -683,7 +692,7 @@ impl RuntimeDeps {
         *worker = None;
 
         let selected_model = SelectedModel::resolve(&app.config, model.as_deref())?;
-        self.begin_worker_build(app, sandbox_dir, session_id, selected_model, None)
+        self.begin_worker_build(app, sandbox_dir, session_id, selected_model, None, None)
     }
 
     /// Starts building a worker for the current session on `model`; the
@@ -710,6 +719,7 @@ impl RuntimeDeps {
             session_id,
             SelectedModel::new(model)?,
             None,
+            None,
         )
     }
 
@@ -727,7 +737,7 @@ impl RuntimeDeps {
         let sandbox_dir = session.sandbox_dir.clone();
         let session_id = session.id.clone();
         let selected_model = SelectedModel::resolve(&app.config, session.model.as_deref())?;
-        self.begin_worker_build(app, sandbox_dir, session_id, selected_model, None)
+        self.begin_worker_build(app, sandbox_dir, session_id, selected_model, None, None)
     }
 
     /// Installs a worker finished by `build` as the current session's worker.
@@ -916,18 +926,21 @@ impl RuntimeDeps {
 
         *worker = None;
         let selected_model = SelectedModel::resolve(&app.config, model.as_deref())?;
-        self.begin_worker_build(app, sandbox_dir, session_id, selected_model, None)
+        self.begin_worker_build(app, sandbox_dir, session_id, selected_model, None, None)
     }
 
     /// A worker for `session_id` whose agent runs in the daemon. The model,
     /// reasoning effort and working directory the daemon runs the session
-    /// with are recorded on the session first.
+    /// with are recorded on the session first. `events_cursor` is the
+    /// cursor `GET /api/sessions/{id}` reported when the session loaded —
+    /// the point its event stream resumes from.
     fn begin_remote_worker(
         app: &App,
         client: crate::client::DaemonClient,
         session_id: SessionId,
         model: SelectedModel,
         reasoning_effort: Option<ReasoningEffort>,
+        events_cursor: Option<String>,
     ) -> PendingWorkerBuild {
         let cwd = app.cwd.display().to_string();
         let model_id = model.as_str().to_string();
@@ -958,6 +971,7 @@ impl RuntimeDeps {
                 client,
                 session_id.as_str().to_string(),
                 app_events,
+                events_cursor,
             ))
         });
         PendingWorkerBuild {
@@ -974,6 +988,7 @@ impl RuntimeDeps {
         session_id: SessionId,
         model: SelectedModel,
         reasoning_effort: Option<ReasoningEffort>,
+        events_cursor: Option<String>,
     ) -> Result<PendingWorkerBuild, TuiRuntimeError> {
         if let Some(client) = self.daemon.clone() {
             return Ok(Self::begin_remote_worker(
@@ -982,6 +997,7 @@ impl RuntimeDeps {
                 session_id,
                 model,
                 reasoning_effort,
+                events_cursor,
             ));
         }
         Ok(Self::begin_remote_worker(
@@ -992,6 +1008,7 @@ impl RuntimeDeps {
             session_id,
             model,
             reasoning_effort,
+            events_cursor,
         ))
     }
 

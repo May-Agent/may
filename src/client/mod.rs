@@ -12,10 +12,12 @@ mod wire;
 
 pub use sse::{ServerEvent, SseParser};
 pub use wire::{
-    CreateSessionRequest, HoldReason, IndexCoverage, PermissionPollItem, RecapFrame, RewindRequest,
-    RunEnd, SessionAgentBody, SessionAgentFrame, SessionIndexSnapshot, SessionIssuesFrame,
-    SessionRuntimeEvent, SessionRuntimeSnapshot, SuggestionFrame, UpdateSessionRequest,
-    WarningFrame, WireAgentError, WireAgentEvent, WirePr, WireSession,
+    CreateSessionRequest, HoldReason, IndexCoverage, IssueRemovedFrame, IssueUpsertedFrame,
+    JobRemovedFrame, JobUpsertedFrame, PermissionPollItem, RecapFrame, RewindRequest, RunEnd,
+    SessionAgentBody, SessionAgentFrame, SessionIndexSnapshot, SessionIssuesFrame,
+    SessionRuntimeEvent, SessionRuntimeSnapshot, SubagentRemovedFrame, SubagentUpsertedFrame,
+    SuggestionFrame, UpdateSessionRequest, WarningFrame, WireAgentError, WireAgentEvent, WirePr,
+    WireSession,
 };
 
 use std::path::PathBuf;
@@ -205,12 +207,43 @@ impl DaemonClient {
     pub async fn events(&self, query: &str) -> Result<EventStream, DaemonClientError> {
         let mut path = String::from("/api/events?");
         path.push_str(query);
-        let response = self.send(hyper::Method::GET, &path, None).await?;
+        self.stream(&path).await
+    }
+
+    /// Opens `/api/sessions/{id}/events`; `after` is the cursor the stream
+    /// continues from.
+    ///
+    /// # Errors
+    /// Fails when the daemon is unreachable or refuses the subscription.
+    pub async fn session_events(
+        &self,
+        session_id: &str,
+        after: Option<&str>,
+    ) -> Result<EventStream, DaemonClientError> {
+        let path = session_events_url(session_id, after);
+        self.stream(&path).await
+    }
+
+    async fn stream(&self, path: &str) -> Result<EventStream, DaemonClientError> {
+        let response = self.send(hyper::Method::GET, path, None).await?;
         Ok(EventStream {
             body: response.into_body(),
             parser: SseParser::default(),
         })
     }
+}
+
+/// The `/api/sessions/{id}/events` path `session_events` opens: `after` is
+/// URL-encoded like every other query the client builds.
+fn session_events_url(session_id: &str, after: Option<&str>) -> String {
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    if let Some(after) = after {
+        query.append_pair("after", after);
+    }
+    let mut path = session_path(session_id, "/events");
+    path.push('?');
+    path.push_str(&query.finish());
+    path
 }
 
 /// Server events of one `/api/events` subscription.
@@ -239,5 +272,28 @@ impl EventStream {
                 None => return Ok(None),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::session_events_url;
+
+    #[test]
+    fn a_resumed_session_stream_names_its_cursor() {
+        assert_eq!(
+            session_events_url("s 1", Some("42.7")),
+            "/api/sessions/s 1/events?after=42.7"
+        );
+        assert_eq!(
+            session_events_url("s", Some("a/b?c=d")),
+            "/api/sessions/s/events?after=a%2Fb%3Fc%3Dd",
+            "the cursor is URL-encoded"
+        );
+        assert_eq!(
+            session_events_url("s", None),
+            "/api/sessions/s/events?",
+            "a new session passes no after"
+        );
     }
 }

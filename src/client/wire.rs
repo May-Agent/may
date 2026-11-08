@@ -576,13 +576,78 @@ pub struct SessionIndexSnapshot {
 
 /// One `session_issues` event: the issues the session's tasks link, as the
 /// issue store reports them now.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionIssuesFrame {
     /// Session the issues are linked from.
     pub session_id: String,
     /// One brief per linked issue.
     pub issues: Vec<crate::tui::sidebar::IssueBrief>,
+}
+
+/// One `job.upserted` event: a job new to or changed in the session's
+/// background snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobUpsertedFrame {
+    /// Session the job belongs to.
+    pub session_id: String,
+    /// The job as it stands now.
+    pub job: super::background::WireJob,
+}
+
+/// One `job.removed` event: a job gone from the session's background
+/// snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobRemovedFrame {
+    /// Session the job belonged to.
+    pub session_id: String,
+    /// The removed job's pid.
+    pub pid: u32,
+}
+
+/// One `subagent.upserted` event: a subagent run new to or changed in the
+/// session's background snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentUpsertedFrame {
+    /// Session the run belongs to.
+    pub session_id: String,
+    /// The run as it stands now.
+    pub subagent: super::background::WireSubagentRun,
+}
+
+/// One `subagent.removed` event: a subagent run gone from the session's
+/// background snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentRemovedFrame {
+    /// Session the run belonged to.
+    pub session_id: String,
+    /// The removed run's id.
+    pub run_id: u64,
+}
+
+/// One `issue.upserted` event: a linked issue new to or changed in the
+/// session's list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IssueUpsertedFrame {
+    /// Session the issue is linked from.
+    pub session_id: String,
+    /// The issue as it stands now.
+    pub issue: crate::tui::sidebar::IssueBrief,
+}
+
+/// One `issue.removed` event: a linked issue gone from the session's list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IssueRemovedFrame {
+    /// Session the issue was linked from.
+    pub session_id: String,
+    /// The removed issue's number.
+    pub key: i64,
 }
 
 /// How much of a worktree index carries a vector.

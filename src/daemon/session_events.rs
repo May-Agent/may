@@ -23,7 +23,7 @@ use skyzen::extract::Query;
 use skyzen::header::{HeaderMap, HeaderName};
 use skyzen::responder::Sse;
 use skyzen::routing::Params;
-use skyzen::utils::State;
+use skyzen::utils::{Json, State};
 
 use super::error::bad_request_error;
 use super::helpers::send_event;
@@ -482,6 +482,28 @@ async fn publish_piece(
             }
         }
     }
+}
+
+/// `GET /api/sessions/{id}/issues`: the linked-issue list the
+/// `session_issues` snapshot and `issue.*` deltas track, for the stream's
+/// initial read.
+pub(super) async fn get_session_issues(
+    params: Params,
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<crate::client::SessionIssuesFrame>> {
+    let session_id = params.get("id").map_err(bad_request_error)?.to_string();
+    if session_id.is_empty() {
+        return Err(bad_request_error("session id is required"));
+    }
+    let issues = load_session_issues(&state, &session_id)
+        .await
+        .ok_or_else(|| {
+            super::error::internal_error_message("no session paths for linked issues")
+        })?;
+    Ok(Json(crate::client::SessionIssuesFrame {
+        session_id,
+        issues,
+    }))
 }
 
 async fn load_session_issues(state: &DaemonState, session_id: &str) -> Option<Vec<IssueBrief>> {
