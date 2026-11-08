@@ -9,6 +9,7 @@ use anyhow::{Context, anyhow};
 #[cfg(feature = "ui")]
 use skyzen::EmbeddedStaticDir;
 use skyzen::Result as SkyResult;
+use skyzen::middleware::CompressionMiddleware;
 use skyzen::routing::{CreateRouteNode, Route, Router};
 use skyzen::utils::{Json, State};
 
@@ -647,7 +648,9 @@ pub(super) fn build_router(
     mode: DaemonMode,
     auth: Option<Vec<Box<dyn super::auth::IdentitySource>>>,
 ) -> Router {
-    let api = "/api".route(api_routes());
+    let api = "/api"
+        .route(api_routes())
+        .with(CompressionMiddleware::new());
     let tunnel = tunnel_routes();
     let artifact_pages = "/profile".route(artifact_page_routes());
     let fallback = super::tunnel::TunnelRefererFallback::new(state.clone());

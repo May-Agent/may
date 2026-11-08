@@ -53,6 +53,8 @@ pub(crate) mod types;
 mod user_wait;
 
 #[cfg(test)]
+mod compression_tests;
+#[cfg(test)]
 mod funnel_tests;
 #[cfg(test)]
 mod paths_tests;
