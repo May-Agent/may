@@ -2431,6 +2431,19 @@ impl App {
             return Ok(None);
         }
 
+        // Cmd+Enter (Ctrl where Cmd cannot reach the app) opens the link
+        // under the pointer, as the same-modified click does.
+        if matches!(self.mode, AppMode::Chat)
+            && super::ui::links::dispatch_enter(
+                self.link_opener.as_ref(),
+                code,
+                modifiers,
+                self.hovered_link().as_ref(),
+            )
+        {
+            return Ok(None);
+        }
+
         // Reset quit confirmation on any other input
         if self.quit_pending {
             self.quit_pending = false;
@@ -4879,6 +4892,25 @@ mod tests {
             .expect("key");
         press(&mut app, KeyCode::Char('b'));
         assert_eq!(app.input, "Ab", "plain and shifted characters still type");
+    }
+
+    /// An Enter carrying Ctrl or Cmd is a link-open request, not a submit:
+    /// with no link under the pointer it does nothing.
+    #[tokio::test]
+    async fn a_modified_enter_never_sends() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        for c in "draft".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        for modifier in [KeyModifiers::SUPER, KeyModifiers::CONTROL] {
+            assert!(
+                app.handle_key(KeyCode::Enter, modifier)
+                    .expect("key")
+                    .is_none()
+            );
+        }
+        assert_eq!(app.input, "draft", "a modified Enter sends nothing");
     }
 
     #[tokio::test]
