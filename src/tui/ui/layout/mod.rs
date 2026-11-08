@@ -2853,6 +2853,7 @@ mod tests {
             execution_key: String::new(),
             script: "true".to_string(),
             mode: aither_sandbox::TerminalMode::default(),
+            language: aither_sandbox::ScriptLanguage::Shell,
             started_at: std::time::Instant::now()
                 .checked_sub(std::time::Duration::from_secs(age_secs))
                 .expect("instant in range"),

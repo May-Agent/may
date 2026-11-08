@@ -53,7 +53,7 @@ struct TerminalInputScript<'a> {
 #[derive(Template)]
 #[template(path = "test_terminal_read.sh", escape = "none")]
 struct TerminalReadScript<'a> {
-    task_id: &'a str,
+    output_file: &'a str,
 }
 
 #[derive(Clone)]
@@ -381,6 +381,7 @@ struct MockScenarioState {
     scenario: MockChatScenario,
     request_index: usize,
     task_id: Option<String>,
+    output_file: Option<String>,
     /// Set once a probe script served its final response, so the test can
     /// wait for a turn the job's completion resumed on its own.
     probe_done: bool,
@@ -400,6 +401,7 @@ impl MockScenarioState {
             scenario,
             request_index: 0,
             task_id: None,
+            output_file: None,
             probe_done: false,
             probe_steps: 0,
             compactions: 0,
@@ -609,6 +611,11 @@ impl MockScenarioState {
                             "terminal tool result did not include a task_id".to_string()
                         })?;
                     self.task_id = Some(task_id.clone());
+                    self.output_file = Some(
+                        terminal_output_file_from_latest_tool_output(request).ok_or_else(|| {
+                            "terminal tool result did not include an output file".to_string()
+                        })?,
+                    );
                     let script = TerminalInputScript { task_id: &task_id }
                         .render()
                         .map_err(|error| error.to_string())?;
@@ -637,13 +644,18 @@ impl MockScenarioState {
                     if tool_output_reports_failure(&input_result) {
                         return Err(format!("terminal input IPC command failed: {input_result}"));
                     }
-                    let task_id = self
-                        .task_id
+                    // Aither forgets a finished task once its completion
+                    // reaches the model, so the id reads as unknown; the
+                    // job's output lives in its stored file.
+                    let output_file = self
+                        .output_file
                         .clone()
-                        .ok_or_else(|| "terminal task_id was not captured".to_string())?;
-                    let script = TerminalReadScript { task_id: &task_id }
-                        .render()
-                        .map_err(|error| error.to_string())?;
+                        .ok_or_else(|| "terminal output file was not captured".to_string())?;
+                    let script = TerminalReadScript {
+                        output_file: &output_file,
+                    }
+                    .render()
+                    .map_err(|error| error.to_string())?;
                     MockHttpResponse::sse(vec![
                         delayed_sse_frame(
                             tool_call_chunk(
@@ -1014,7 +1026,7 @@ fn tasks_injection(request: &Value) -> Option<&str> {
         .as_array()?
         .iter()
         .filter_map(|message| message.get("content").and_then(Value::as_str))
-        .rfind(|content| content.starts_with("<tasks_document>"))
+        .rfind(|content| content.starts_with("<working_document>"))
 }
 
 fn verify_native_tool_surface(request: &Value) -> Result<(), String> {
@@ -2144,6 +2156,14 @@ fn terminal_task_id_from_latest_tool_output(request: &Value) -> Option<String> {
     let start = output.find(marker)? + marker.len();
     let end = output[start..].find('\'')?;
     Some(output[start..start + end].to_string())
+}
+
+fn terminal_output_file_from_latest_tool_output(request: &Value) -> Option<String> {
+    let output = latest_tool_output(request)?;
+    let marker = "being written to ";
+    let start = output.find(marker)? + marker.len();
+    let end = output[start..].find(' ')? + start;
+    Some(output[start..end].to_string())
 }
 /// Return `response` when it carries `expected`, otherwise fail with its body
 /// and the server's logs, which carry the cause of a redacted 5xx body.

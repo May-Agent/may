@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use aither_sandbox::TerminalMode;
 use aither_sandbox::permission::{NoopPermissionHandler, PermissionError, PermissionHandler};
+use aither_sandbox::{ScriptLanguage, TerminalMode};
 
 use crate::agent::PermissionApprover;
 use crate::db::{NetworkAccessLogParams, NetworkAccessMode, NetworkAccessSource};
@@ -120,10 +120,15 @@ impl TerminalPermissionHandler {
 }
 
 impl PermissionHandler for TerminalPermissionHandler {
-    async fn check(&self, mode: TerminalMode, script: &str) -> Result<bool, PermissionError> {
+    async fn check(
+        &self,
+        mode: TerminalMode,
+        script: &str,
+        language: ScriptLanguage,
+    ) -> Result<bool, PermissionError> {
         match &self.approver {
-            Some(approver) => approver.check(mode, script).await,
-            None => NoopPermissionHandler.check(mode, script).await,
+            Some(approver) => approver.check(mode, script, language).await,
+            None => NoopPermissionHandler.check(mode, script, language).await,
         }
     }
 
@@ -169,12 +174,21 @@ impl PermissionHandler for TerminalPermissionHandler {
         })
     }
 
-    async fn will_wait_for_approval(&self, mode: TerminalMode, script: &str) -> bool {
+    async fn will_wait_for_approval(
+        &self,
+        mode: TerminalMode,
+        script: &str,
+        language: ScriptLanguage,
+    ) -> bool {
         match &self.approver {
-            Some(approver) => approver.will_wait_for_approval(mode, script).await,
+            Some(approver) => {
+                approver
+                    .will_wait_for_approval(mode, script, language)
+                    .await
+            }
             None => {
                 NoopPermissionHandler
-                    .will_wait_for_approval(mode, script)
+                    .will_wait_for_approval(mode, script, language)
                     .await
             }
         }

@@ -781,14 +781,11 @@ pub async fn build_capabilities(
         })
         .collect::<Vec<_>>();
 
-    let mut subagents: Vec<CatalogSubagent> = aither_agent::BUNDLED_SUBAGENTS
-        .iter()
-        .map(|bundled| {
-            let definition = bundled.definition();
-            CatalogSubagent {
-                id: definition.name,
-                description: definition.description,
-            }
+    let mut subagents: Vec<CatalogSubagent> = crate::bundle::bundled_subagents()
+        .into_iter()
+        .map(|definition| CatalogSubagent {
+            id: definition.name,
+            description: definition.description,
         })
         .collect();
     subagents.push(CatalogSubagent {

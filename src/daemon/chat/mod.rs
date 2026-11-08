@@ -2694,6 +2694,7 @@ const fn map_llm_role(role: LlmRole) -> &'static str {
         LlmRole::User => "user",
         LlmRole::Assistant => "assistant",
         LlmRole::System => "system",
+        LlmRole::Configuration => "configuration",
         LlmRole::Tool => "tool",
     }
 }
@@ -4050,7 +4051,7 @@ mod tests {
                         messages: Vec::new(),
                     },
                     has_background_tasks: false,
-                    tasks: None,
+                    document: None,
                 },
                 applied_seq: 42,
                 updated_at: "2026-03-14T00:00:00Z".to_string(),

@@ -193,6 +193,7 @@ pub const fn block_kind(block: PrefixBlock) -> &'static str {
         PrefixBlock::Tools => "tools",
         PrefixBlock::Message { role, .. } => match role {
             Role::System => "system",
+            Role::Configuration => "configuration",
             Role::User => "user",
             Role::Assistant => "assistant",
             Role::Tool => "tool",

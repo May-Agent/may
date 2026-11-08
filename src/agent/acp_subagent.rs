@@ -1265,7 +1265,9 @@ mod tests {
         );
         let tool = acp
             .register(
-                SubagentTool::new(NoLlm, dir.path().join("subagents")).with_base_dir(dir.path()),
+                SubagentTool::new(NoLlm)
+                    .with_definitions(crate::bundle::bundled_subagents())
+                    .with_base_dir(dir.path()),
             )
             .expect("the name is free");
         assert!(
@@ -1290,9 +1292,13 @@ mod tests {
         assert!(text.contains("ab"), "the agent's reply comes back: {text}");
 
         let id = text
-            .split(|c: char| !c.is_ascii_digit())
-            .find_map(|word| word.parse::<u64>().ok())
-            .expect("the result carries the continuation id");
+            .split("subagent resume --id ")
+            .nth(1)
+            .expect("the result carries the continuation id")
+            .split('`')
+            .next()
+            .expect("split yields a first part")
+            .to_string();
         let again = tokio::time::timeout(
             Duration::from_secs(60),
             call_text(
@@ -1300,7 +1306,7 @@ mod tests {
                 SubagentArgs {
                     name: "resume".to_string(),
                     prompt_file: prompt.to_string_lossy().into_owned(),
-                    id: Some(id),
+                    id: Some(id.clone()),
                     agent: None,
                     worktrees: Vec::new(),
                     commit_worktrees: Vec::new(),
@@ -1353,7 +1359,7 @@ mod tests {
             BTreeMap::from([("explore".to_string(), fake_connection())]),
         );
         let error = acp
-            .register(SubagentTool::new(NoLlm, dir.path().join("subagents")))
+            .register(SubagentTool::new(NoLlm).with_definitions(crate::bundle::bundled_subagents()))
             .map(|_| ())
             .expect_err("the built-in type keeps its name");
         assert!(error.to_string().contains("built-in"), "{error}");

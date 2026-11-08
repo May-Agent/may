@@ -329,10 +329,14 @@ async fn a_job_added_then_removed_upserts_then_removes() {
     state
         .session_background
         .add_job_registry(SESSION, registry.clone());
+    let task_id = aither_core::ids::AnyIdAllocator::default()
+        .lease()
+        .expect("a free task id");
+    let task_id_word = task_id.to_string();
     registry
         .register(
             1234,
-            "task-1",
+            &task_id,
             "exec-1",
             "sleep 60",
             aither_sandbox::TerminalMode::Sandboxed,
@@ -352,7 +356,7 @@ async fn a_job_added_then_removed_upserts_then_removes() {
     // The finished registry falls out of the snapshot once its completion
     // is taken and it is no longer the newest: the job leaves as a removal.
     registry.complete(1234, 0, None).await;
-    let taken = registry.owe_completion("task-1", Ok(0)).await;
+    let taken = registry.owe_completion(&task_id_word, Ok(0)).await;
     drop(taken);
     let (next, next_service) = aither_sandbox::job_registry::job_registry_channel();
     tokio::spawn(next_service.serve());

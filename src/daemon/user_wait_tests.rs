@@ -8,8 +8,8 @@ use std::time::Duration;
 use aither_agent::ask_user::{AskUserArgs, AskUserRequest, AskUserRequestPayload};
 use aither_agent::workspace_request::RequestWorkspaceArgs;
 use aither_core::llm::{Tool, ToolContext};
-use aither_sandbox::TerminalMode;
 use aither_sandbox::permission::PermissionHandler;
+use aither_sandbox::{ScriptLanguage, TerminalMode};
 use base64::Engine;
 use p256::elliptic_curve::rand_core::{OsRng, RngCore};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -75,7 +75,9 @@ impl Fixture {
 async fn an_unsafe_command_approval_announces_the_command() {
     let mut fixture = Fixture::new().await;
     let approver = fixture.approver();
-    let _ = approver.check(TerminalMode::Unsafe, "make install").await;
+    let _ = approver
+        .check(TerminalMode::Unsafe, "make install", ScriptLanguage::Shell)
+        .await;
 
     assert_eq!(
         fixture.announced().await,

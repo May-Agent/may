@@ -48,6 +48,8 @@ pub enum ExecError {
     RegisterCommands(may_agent::TerminalCommandsError),
     #[error("failed to read the current working directory: {0}")]
     CurrentDir(std::io::Error),
+    #[error("failed to create the session outputs store: {0}")]
+    Outputs(std::io::Error),
     #[error("failed to resolve the session issue backend: {0}")]
     ResolveIssueBackend(may_agent::issue::IssueError),
     #[error("failed to load workspace config: {0}")]
@@ -152,6 +154,7 @@ pub async fn run_exec(args: ExecArgs) -> Result<i32, ExecError> {
     let started = terminal_tool
         .run_background(TerminalArgs {
             description: "execute the requested shell command".to_string(),
+            language: aither_sandbox::ScriptLanguage::Shell,
             script: args.script,
             mode: shell_mode,
             ssh_server_id: args.ssh_server_id,
@@ -545,7 +548,7 @@ where
             subagent_tracker: may_agent::agent::SubagentTracker::default(),
             issue_store,
             // exec has no agent and so no `tasks.md` to follow its changes.
-            task_events: aither_agent::TaskEvents::new(),
+            task_events: aither_agent::WorkEvents::new(),
             // `may exec` runs the user's own script: nobody to ask.
             publish_gate: None,
             workspace_config: may_agent::workspace::WorkspaceConfig::load(
@@ -561,9 +564,16 @@ where
     )
     .await
     .map_err(ExecError::RegisterCommands)?;
-    Ok(Arc::new(builder.build(
-        SessionPaths::new(context.sandbox_dir.clone()).outputs_dir(),
-    )))
+    Ok(Arc::new(
+        builder.build(
+            aither_sandbox::OutputStore::new(
+                SessionPaths::new(context.sandbox_dir.clone()).outputs_dir(),
+                aither_core::ids::AnyIdAllocator::default(),
+            )
+            .await
+            .map_err(ExecError::Outputs)?,
+        ),
+    ))
 }
 
 /// Resolves `server_id` among the SSH servers attached to the session's profile.
