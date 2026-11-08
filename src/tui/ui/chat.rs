@@ -6417,6 +6417,7 @@ mod tests {
     #[test]
     #[ignore = "writes the frame JSON for visual preview"]
     fn dump_frame_json() {
+        use std::fmt::Write as _;
         let mut chat = ChatStream::new();
         chat.push_user("帮我做一个变更，合入dev，去掉`>`", Vec::new(), 1);
         chat.push_text("好的，我已经把输入框的 `>` 提示符去掉了：\n\n- 普通输入现在顶格显示\n- bash 模式仍然保留 `!` 高亮");
@@ -6430,12 +6431,13 @@ mod tests {
         for y in 0..frame.buf.area.height {
             for x in 0..frame.buf.area.width {
                 let cell = &frame.buf[(x, y)];
-                out.push_str(&format!(
-                    "{{\"x\":{x},\"y\":{y},\"s\":{:?},\"fg\":\"{:?}\",\"bg\":\"{:?}\"}}\n",
+                let _ = writeln!(
+                    out,
+                    "{{\"x\":{x},\"y\":{y},\"s\":{:?},\"fg\":\"{:?}\",\"bg\":\"{:?}\"}}",
                     cell.symbol(),
                     cell.fg,
                     cell.bg
-                ));
+                );
             }
         }
         std::fs::write(&path, out).unwrap();
