@@ -1945,8 +1945,8 @@ struct TestSseEvent {
 }
 
 /// Starts a turn the way every client does: subscribes to the session's
-/// `session_turn` frames on `/api/events`, then `POST`s the message. Returns
-/// the event stream, or the refused `POST`'s response.
+/// `session_turn` frames on `/api/sessions/{id}/events`, then `POST`s the
+/// message. Returns the event stream, or the refused `POST`'s response.
 async fn send_turn(
     client: &reqwest::Client,
     base_url: &str,
@@ -1958,11 +1958,7 @@ async fn send_turn(
         .expect("turn body names its session")
         .to_string();
     let events = client
-        .get(format!("{base_url}/api/events"))
-        .query(&[
-            ("topics", "session_turn"),
-            ("sessionId", session_id.as_str()),
-        ])
+        .get(format!("{base_url}/api/sessions/{session_id}/events"))
         .send()
         .await?;
     let sent = client
@@ -5481,6 +5477,20 @@ async fn a_background_job_is_listed_pushed_and_killable_over_the_api() {
         .prepare(&harness, &client, &server)
         .await;
     let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+    // The session stream replays deltas published after this cursor.
+    let session: Value = client
+        .get(format!("{}/api/sessions/{session_id}", server.base_url))
+        .send()
+        .await
+        .expect("session request should succeed")
+        .json()
+        .await
+        .expect("session JSON");
+    let cursor = session
+        .get("cursor")
+        .and_then(Value::as_str)
+        .expect("the session read carries its event cursor")
+        .to_string();
 
     // The turn ends with the model's reply; its job keeps running.
     let turn = send_turn(
@@ -5506,27 +5516,35 @@ async fn a_background_job_is_listed_pushed_and_killable_over_the_api() {
         server.log.contents().await
     );
 
-    // The event stream carries the same snapshot.
+    // The session stream reports the job as a `job.upserted` delta.
     let events = client
-        .get(format!("{}/api/events", server.base_url))
-        .query(&[
-            ("topics", "session_background"),
-            ("sessionId", session_id.as_str()),
-        ])
+        .get(format!(
+            "{}/api/sessions/{session_id}/events?after={cursor}",
+            server.base_url
+        ))
         .send()
         .await
         .expect("event stream should open");
     let mut reader = SseReader::new(events);
-    let event = tokio::time::timeout(Duration::from_secs(10), reader.next_event())
-        .await
-        .expect("a session_background event should arrive")
-        .expect("the stream should stay open");
-    assert_eq!(event.event, "session_background");
-    let snapshot: Value = serde_json::from_str(&event.data).expect("snapshot JSON");
-    let pid = background_job(&snapshot, BACKGROUND_JOB_SCRIPT)
-        .and_then(|job| job.get("pid"))
-        .and_then(Value::as_u64)
-        .unwrap_or_else(|| panic!("the event should list the job: {snapshot}"));
+    let pid = loop {
+        let event = tokio::time::timeout(Duration::from_secs(10), reader.next_event())
+            .await
+            .expect("a job.upserted event should arrive")
+            .expect("the stream should stay open");
+        if event.event != "job.upserted" {
+            continue;
+        }
+        let delta: Value = serde_json::from_str(&event.data).expect("upsert JSON");
+        let Some(pid) = delta
+            .get("job")
+            .filter(|job| job.get("script").and_then(Value::as_str) == Some(BACKGROUND_JOB_SCRIPT))
+            .and_then(|job| job.get("pid"))
+            .and_then(Value::as_u64)
+        else {
+            continue;
+        };
+        break pid;
+    };
 
     let response = client
         .post(format!(
@@ -5595,11 +5613,10 @@ async fn a_background_job_finishing_after_its_turn_resumes_the_session() {
 
     // The resumed turn shows up on the session's stream.
     let stream = client
-        .get(format!("{}/api/events", server.base_url))
-        .query(&[
-            ("topics", "session_turn"),
-            ("sessionId", session_id.as_str()),
-        ])
+        .get(format!(
+            "{}/api/sessions/{session_id}/events",
+            server.base_url
+        ))
         .send()
         .await
         .expect("event stream should open");
@@ -5639,24 +5656,20 @@ async fn a_background_job_finishing_after_its_turn_resumes_the_session() {
     server.stop().await;
 }
 
-/// Opens the session's `session_agent` stream, continuing after frame
-/// `after` when given.
+/// Opens the session's events stream, continuing after the cursor `after`
+/// when given. Frames of every kind arrive; readers pick their own.
 async fn agent_frames(
     client: &reqwest::Client,
     server: &RunningDaemon,
     session_id: &str,
-    after: Option<u64>,
+    after: Option<String>,
 ) -> SseReader {
-    let mut query = vec![
-        ("topics", "session_agent".to_string()),
-        ("sessionId", session_id.to_string()),
-    ];
+    let mut url = format!("{}/api/sessions/{session_id}/events", server.base_url);
     if let Some(after) = after {
-        query.push(("after", after.to_string()));
+        url = format!("{url}?after={after}");
     }
     let response = client
-        .get(format!("{}/api/events", server.base_url))
-        .query(&query)
+        .get(url)
         .send()
         .await
         .expect("event stream should open");
@@ -5676,11 +5689,19 @@ async fn next_turn_frame(reader: &mut SseReader) -> TestSseEvent {
     }
 }
 
+fn frame_cursor(event: &TestSseEvent) -> String {
+    event
+        .id
+        .clone()
+        .unwrap_or_else(|| panic!("frames carry their cursor: {event:?}"))
+}
+
 fn frame_index(event: &TestSseEvent) -> u64 {
     event
         .id
         .as_deref()
-        .and_then(|id| id.parse().ok())
+        .and_then(|id| id.rsplit_once('.'))
+        .and_then(|(_, index)| index.parse().ok())
         .unwrap_or_else(|| panic!("turn frames carry their index: {event:?}"))
 }
 
@@ -5719,15 +5740,16 @@ async fn a_reconnecting_client_continues_after_the_last_frame_it_saw() {
         seen.push(next_turn_frame(&mut first).await);
     }
     assert!(seen[0].data.contains("\"start\""), "{:?}", seen[0]);
-    let last_seen = frame_index(seen.last().expect("frames were read"));
+    let last_seen = frame_cursor(seen.last().expect("frames were read"));
+    let last_index = frame_index(seen.last().expect("frames were read"));
     drop(first);
 
     let mut reopened = agent_frames(&client, &server, &session_id, Some(last_seen)).await;
     let next = next_turn_frame(&mut reopened).await;
-    // Indices count every turn frame; this stream asked for agent frames
-    // only, so the next one may skip the indices of the others.
+    // Indices count every frame on the session stream; the next agent
+    // frame may skip the indices of the kinds this test filtered out.
     assert!(
-        frame_index(&next) > last_seen,
+        frame_index(&next) > last_index,
         "the reopened stream continues after the last frame seen: {next:?}"
     );
     assert!(
@@ -5739,9 +5761,9 @@ async fn a_reconnecting_client_continues_after_the_last_frame_it_saw() {
     assert!(events.iter().any(|(kind, _)| kind == "done"), "{events:?}");
 
     // The turn ended: frames after the first one are gone for good.
-    let mut stale = agent_frames(&client, &server, &session_id, Some(frame_index(&seen[0]))).await;
+    let mut stale = agent_frames(&client, &server, &session_id, Some(frame_cursor(&seen[0]))).await;
     let resync = next_turn_frame(&mut stale).await;
-    assert_eq!(resync.event, "session_resync", "{resync:?}");
+    assert_eq!(resync.event, "reset", "{resync:?}");
     server.stop().await;
 }
 
