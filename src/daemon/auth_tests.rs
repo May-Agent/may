@@ -73,8 +73,8 @@ async fn status(router: &skyzen::routing::Router, request: Request) -> StatusCod
 const API_PATHS: [(&str, &str); 5] = [
     ("GET", "/api/health"),
     ("GET", "/api/config"),
-    ("POST", "/api/chat/enqueue"),
-    ("POST", "/api/permissions/respond"),
+    ("POST", "/api/interactions/some-id"),
+    ("DELETE", "/api/sessions/some-id/turns/current"),
     ("GET", "/api/events"),
 ];
 

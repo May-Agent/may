@@ -504,32 +504,6 @@ pub struct ApiPrEvent {
     pub(crate) created_at: String,
 }
 
-#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionPlanStateRequest {
-    pub(crate) plan_state: SessionPlanState,
-}
-
-/// `PUT /api/sessions/{id}/yolo` body.
-#[derive(Debug, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionYoloRequest {
-    pub(crate) yolo: bool,
-}
-
-/// The yolo switch after the update.
-#[derive(Debug, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionYoloResponse {
-    pub(crate) yolo: bool,
-}
-
-#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionPlanStateResponse {
-    pub(crate) plan_state: SessionPlanState,
-}
-
 #[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ApiHealth {
@@ -897,33 +871,6 @@ pub struct RewindRequest {
     pub(crate) entry_id: String,
 }
 
-#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct UpdateSessionRequest {
-    #[serde(default)]
-    pub(crate) title: Option<String>,
-    #[serde(default)]
-    pub(crate) model: Option<String>,
-    /// Tri-state reasoning-effort patch:
-    /// field absent → `None` (leave DB untouched);
-    /// field present + `null` → `Some(NullableStringPatch::Null)` (clear to NULL);
-    /// field present + string → `Some(NullableStringPatch::Set(s))` (set).
-    #[serde(default, deserialize_with = "deserialize_present_patch")]
-    pub(crate) reasoning_effort: Option<NullableStringPatch>,
-    /// Host directory the session works in; the worktree it belongs to is
-    /// touched for repo usage when set.
-    #[serde(default)]
-    pub(crate) cwd: Option<String>,
-    /// Repository to bind: `owner/repo`, a local path, `null` clears the
-    /// binding; absent leaves it untouched.
-    #[serde(default, deserialize_with = "deserialize_present_patch")]
-    pub(crate) repo: Option<NullableStringPatch>,
-    /// One-shot/non-interactive flag: set to refuse permission prompts
-    /// instead of asking.
-    #[serde(default)]
-    pub(crate) non_interactive: Option<bool>,
-}
-
 /// `PATCH /api/sessions/{id}` body: every field optional, all validated
 /// before anything is applied.
 #[derive(Debug, Default, serde::Deserialize, skyzen::ToSchema)]
@@ -1056,21 +1003,6 @@ pub struct BashResponse {
     pub(crate) exit_code: i32,
     pub(crate) had_secret: bool,
     pub(crate) error: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct RemovePendingMessageRequest {
-    pub(crate) kind: PendingMessageKind,
-    #[serde(default)]
-    pub(crate) index: Option<usize>,
-}
-
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum PendingMessageKind {
-    PendingImmediate,
-    Queued,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
@@ -1256,13 +1188,6 @@ impl From<crate::session::SessionRuntimeSummary> for SessionRuntimeResponse {
     }
 }
 
-#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct PermissionRespondRequest {
-    pub(crate) id: String,
-    pub(crate) approved: bool,
-}
-
 /// `POST /api/interactions/{id}` body: which pending interaction the id
 /// names and its answer.
 #[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
@@ -1278,13 +1203,6 @@ pub enum InteractionRespondRequest {
     AskUser {
         answers: Vec<crate::daemon::state::UiQuestionAnswer>,
     },
-}
-
-#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct WorkspaceRespondRequest {
-    pub(crate) id: String,
-    pub(crate) approved: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
@@ -1815,11 +1733,11 @@ pub struct LocalUrlMapResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{NullableStringPatch, UpdateSessionRequest};
+    use super::{NullableStringPatch, SessionPatch};
 
     fn reasoning_effort(body: &str) -> Option<NullableStringPatch> {
-        serde_json::from_str::<UpdateSessionRequest>(body)
-            .expect("update request parses")
+        serde_json::from_str::<SessionPatch>(body)
+            .expect("patch parses")
             .reasoning_effort
     }
 

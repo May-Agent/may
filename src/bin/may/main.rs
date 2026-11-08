@@ -1422,10 +1422,10 @@ where
                             (runtime_deps.daemon(), app.session_manager.current())
                         {
                             let stopped: Result<serde_json::Value, _> = client
-                                .post(
-                                    &may_agent::client::session_path(session.id.as_str(), "/stop"),
-                                    &serde_json::json!({}),
-                                )
+                                .delete(&may_agent::client::session_path(
+                                    session.id.as_str(),
+                                    "/turns/current",
+                                ))
                                 .await;
                             if let Err(error) = stopped {
                                 tracing::warn!(%error, "failed to stop the session's run before quitting");

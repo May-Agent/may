@@ -878,19 +878,17 @@ impl ChatDb {
         session_id: &str,
         entry_id: i64,
     ) -> Result<SessionRuntimeSummary, ChatDbError> {
-        query!(
-            self.db,
-            "SELECT id FROM session_pending_message_entries WHERE id = ? AND session_id = ? AND state != 'committed'",
-            entry_id,
-            session_id
-        )
-        .fetch_one::<I64ValueRow>()
-        .await
-        .map_err(|_| {
-            row_not_found(format!(
+        let runtime = self.load_session_runtime_summary(session_id).await?;
+        let found = runtime
+            .pending_immediate
+            .iter()
+            .chain(runtime.queued_messages.iter())
+            .any(|message| message.id == Some(entry_id));
+        if !found {
+            return Err(row_not_found(format!(
                 "pending entry {entry_id} not found for session {session_id}"
-            ))
-        })?;
+            )));
+        }
         let mut tx = self.db.begin().await?;
         query!(
             tx,

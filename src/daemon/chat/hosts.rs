@@ -234,7 +234,7 @@ pub async fn compact_inner(
     session_id: &str,
     req: CompactRequest,
 ) -> SkyResult<Json<CompactResponse>> {
-    let worker = idle_agent(&state, &session_id).await?;
+    let worker = idle_agent(state, session_id).await?;
     match answer(worker.compact(req.focus)).await {
         Some(TuiEvent::Compacted(Ok(result))) => Ok(Json(CompactResponse {
             compacted: result.is_some(),
@@ -334,14 +334,14 @@ pub async fn context_dump_inner(
     state: &Arc<DaemonState>,
     session_id: &str,
 ) -> SkyResult<Json<ContextDumpResponse>> {
-    let worker = idle_agent(&state, &session_id).await?;
+    let worker = idle_agent(state, session_id).await?;
     let dump = match answer(worker.context_dump()).await {
         Some(TuiEvent::ContextDump(Ok(dump))) => dump,
         Some(TuiEvent::ContextDump(Err(error))) => return Err(internal_error(error)),
         _ => return Err(internal_error_message("the agent gave no context dump")),
     };
     let text = dump.render();
-    let paths = crate::daemon::helpers::load_session_paths(&state, &session_id).await?;
+    let paths = crate::daemon::helpers::load_session_paths(state, session_id).await?;
     let dir = paths.outputs_dir();
     async_fs::create_dir_all(&dir)
         .await
@@ -399,7 +399,7 @@ pub async fn btw_inner(
             _ => Message::user(message.content),
         })
         .collect::<Vec<_>>();
-    let side = super::aux::side_context(&state, &session_id)
+    let side = super::aux::side_context(state, session_id)
         .await
         .map_err(internal_error)?;
     let llm = if let Some(side) = side {
@@ -416,7 +416,7 @@ pub async fn btw_inner(
         messages.extend(question);
         side.model
     } else {
-        let worker = idle_agent(&state, &session_id).await?;
+        let worker = idle_agent(state, session_id).await?;
         worker.side_model().await.map_err(internal_error_message)?
     };
     let mut answer = String::new();

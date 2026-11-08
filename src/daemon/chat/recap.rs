@@ -12,8 +12,7 @@ use aither_agent::CacheWarmth;
 use askama::Template;
 use serde::{Deserialize, Serialize};
 use skyzen::Result as SkyResult;
-use skyzen::routing::Params;
-use skyzen::utils::{Json, State};
+use skyzen::utils::Json;
 
 use super::aux::AuxKind;
 use crate::daemon::state::DaemonState;

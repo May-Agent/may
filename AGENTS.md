@@ -159,7 +159,7 @@ Do not treat `.txt` or `.md` files as the canonical session persistence layer.
 
 ### Event Loop Architecture
 
-Turns run in the daemon. A client sends with `POST /api/sessions/{id}/messages` (it returns at once) and follows the turn on `/api/sessions/{id}/events`; every attached client sees the same events.
+Turns run in the daemon. A client sends with `POST /api/sessions/{id}/turns` (it returns at once) and follows the turn on `/api/sessions/{id}/events`; every attached client sees the same events.
 
 ```
 TUI main loop:

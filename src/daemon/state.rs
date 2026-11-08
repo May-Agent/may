@@ -705,13 +705,6 @@ pub struct UiQuestionAnswer {
     pub(crate) answer: UiAnswerInput,
 }
 
-#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct AskUserRespondRequest {
-    pub(crate) id: String,
-    pub(crate) answers: Vec<UiQuestionAnswer>,
-}
-
 /// What resolving a question did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AskUserOutcome {

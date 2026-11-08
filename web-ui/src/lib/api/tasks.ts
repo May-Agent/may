@@ -1,9 +1,8 @@
 import { apiGet, apiPatch, apiPut } from './client';
 import type {
+  ApiSession,
   SessionTasksPayload,
   SessionPlanState,
-  SessionPlanStateResponse,
-  SessionYoloResponse,
 } from '../types';
 
 export function getSessionTasks(sessionId: string): Promise<SessionTasksPayload> {
@@ -23,13 +22,10 @@ export function putSessionTasks(
 export function putSessionPlanState(
   sessionId: string,
   planState: SessionPlanState,
-): Promise<SessionPlanStateResponse> {
-  return apiPatch<ApiSession>(
-    `/sessions/${encodeURIComponent(sessionId)}/tasks/plan-state`,
-    { planState },
-  );
+): Promise<ApiSession> {
+  return apiPatch<ApiSession>(`/sessions/${encodeURIComponent(sessionId)}`, { planState });
 }
-export function putSessionYolo(sessionId: string, yolo: boolean): Promise<SessionYoloResponse> {
+export function putSessionYolo(sessionId: string, yolo: boolean): Promise<ApiSession> {
   return apiPatch<ApiSession>(`/sessions/${encodeURIComponent(sessionId)}`, { yolo });
 }
 

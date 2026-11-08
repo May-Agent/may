@@ -9,8 +9,7 @@ use std::time::Duration;
 use askama::Template;
 use serde::{Deserialize, Serialize};
 use skyzen::Result as SkyResult;
-use skyzen::routing::Params;
-use skyzen::utils::{Json, State};
+use skyzen::utils::Json;
 
 use crate::daemon::error::{internal_error, internal_error_message};
 use crate::daemon::state::DaemonState;

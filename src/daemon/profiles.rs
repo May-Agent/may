@@ -300,12 +300,6 @@ pub(super) struct UpdateFolderRequest {
 
 #[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct MoveToFolderRequest {
-    pub folder_id: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub(super) struct SetProfileRemoteServersRequest {
     pub server_names: Vec<String>,
 }
@@ -560,22 +554,6 @@ pub(super) async fn delete_folder(
     let db = state.db();
 
     db.delete_folder(&id).await.map_err(internal_error)?;
-    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
-    Ok(Json(super::types::API_OK))
-}
-
-pub(super) async fn move_to_folder(
-    params: Params,
-    Json(req): Json<MoveToFolderRequest>,
-    State(state): State<Arc<DaemonState>>,
-) -> SkyResult<Json<super::types::ApiHealth>> {
-    let id = params.get("id").map_err(bad_request_error)?.to_string();
-
-    let db = state.db();
-
-    db.move_session_to_folder(&id, req.folder_id.as_deref())
-        .await
-        .map_err(map_profile_error)?;
     state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
     Ok(Json(super::types::API_OK))
 }

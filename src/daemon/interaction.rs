@@ -5,8 +5,8 @@ use skyzen::routing::Params;
 use skyzen::utils::{Json, State};
 
 use super::error::{bad_request_error, internal_error};
-use super::state::{AskUserOutcome, AskUserRespondError, AskUserRespondRequest, DaemonState};
-use super::types::{PermissionRespondRequest, SessionRuntimeResponse, WorkspaceRespondRequest};
+use super::state::{AskUserOutcome, AskUserRespondError, DaemonState};
+use super::types::SessionRuntimeResponse;
 use crate::session::AnswerError;
 
 /// Resume a session whose run is gone with the decision it was waiting for.
@@ -80,7 +80,7 @@ async fn resolve_permission(
     } else {
         tracing::warn!(request_id = %id, session_id = %resolved.session_id, "permission response arrived without a live waiter");
         resume_after_decision(
-            &state,
+            state,
             &resolved.session_id,
             super::chat::ResumeRequestKind::Permission,
             approved,
@@ -179,7 +179,7 @@ async fn resolve_workspace(
     } else {
         tracing::warn!(request_id = %id, session_id = %resolved.session_id, "workspace response arrived without a live waiter");
         resume_after_decision(
-            &state,
+            state,
             &resolved.session_id,
             super::chat::ResumeRequestKind::Workspace,
             approved,

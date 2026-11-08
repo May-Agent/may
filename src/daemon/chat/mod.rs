@@ -14,13 +14,10 @@ pub use background::{
     cancel_subagent, cancel_subagents, get_background, get_job, kill_job, read_job,
 };
 pub use hosts::{BtwMessage, BtwRequest, BtwResponse, CompactResponse, ContextDumpResponse};
-pub use hosts::{
-    ParkedAgents, btw_inner, compact_inner, context_dump_inner, context_report, release_agent,
-    usage_report,
-};
+pub use hosts::{ParkedAgents, context_report, release_agent, usage_report};
 pub use hub::TurnHub;
-pub use progress::{ProgressReport, progress_inner};
-pub use recap::{RecapRecord, RecapSchedules, recap_inner};
+pub use progress::ProgressReport;
+pub use recap::{RecapRecord, RecapSchedules};
 mod tool_dispatch;
 mod turn_events;
 mod turn_persister;
@@ -73,11 +70,10 @@ use super::state::{DaemonState, UiToolQueues};
 use super::terminal_parsing::update_terminal_snapshot_from_tool_event;
 use super::title_generation;
 use super::types::{
-    ApiAttachment, ApiErrorCode, ApiMessage, ChatRequest, PendingMessageKind,
-    RemovePendingMessageRequest, RequestLogEntry, RequestStats, SessionRuntimeResponse,
-    SseChunkEvent, SseDoneEvent, SseErrorEvent, SseHoldEvent, SsePausedEvent, SseSpeedEvent,
-    SseStartEvent, SseTodoUpdateEvent, SseToolDeltaEvent, SseToolEndEvent, SseToolStartEvent,
-    TerminalStateSnapshot, ToolEventRecord, ToolVariant,
+    ApiAttachment, ApiErrorCode, ApiMessage, ChatRequest, RequestLogEntry, RequestStats,
+    SessionRuntimeResponse, SseChunkEvent, SseDoneEvent, SseErrorEvent, SseHoldEvent,
+    SsePausedEvent, SseSpeedEvent, SseStartEvent, SseTodoUpdateEvent, SseToolDeltaEvent,
+    SseToolEndEvent, SseToolStartEvent, TerminalStateSnapshot, ToolEventRecord, ToolVariant,
 };
 use crate::decode_meter::DecodeMeter;
 
@@ -1421,19 +1417,6 @@ async fn record_request_log(state: &Arc<DaemonState>, entry: RequestLogEntry) {
     state.notify_ui_events(UiEventTopics::REQUEST_LOGS);
 }
 
-// NOTE: the public `POST /api/chat` non-streaming handler has been removed.
-// All client-facing chat interaction now flows through `POST /api/chat/stream`
-// so there is a single protocol path. `run_chat_collect_with_receiver` below is
-// kept for internal follow-up queue dispatch where no SSE client is attached.
-
-pub(super) async fn enqueue_chat(
-    Json(req): Json<ChatRequest>,
-    State(state): State<Arc<DaemonState>>,
-) -> SkyResult<Json<SessionRuntimeResponse>> {
-    wake_on_user_message(&state).await?;
-    enqueue_pending(&state, req).await.map(Json)
-}
-
 /// Hands `req` to the session as a pending message: the running turn takes
 /// it as `req.delivery_mode` says, and an idle session starts a turn for it.
 async fn enqueue_pending(
@@ -1468,35 +1451,6 @@ pub(super) async fn deliver_user_message(
     } else {
         enqueue_pending(state, req).await
     }
-}
-
-pub(super) async fn remove_pending_message(
-    params: skyzen::routing::Params,
-    Json(req): Json<RemovePendingMessageRequest>,
-    State(state): State<Arc<DaemonState>>,
-) -> SkyResult<Json<SessionRuntimeResponse>> {
-    let session_id = params
-        .get("id")
-        .map_err(super::error::bad_request_error)?
-        .to_string();
-    let runtime = match req.kind {
-        PendingMessageKind::PendingImmediate => state
-            .runtime_service
-            .remove_pending_immediate(&session_id)
-            .await
-            .map_err(internal_error)?,
-        PendingMessageKind::Queued => state
-            .runtime_service
-            .remove_queued_at(
-                &session_id,
-                req.index.ok_or_else(|| {
-                    super::error::bad_request_error("index is required for queued removal")
-                })?,
-            )
-            .await
-            .map_err(internal_error)?,
-    };
-    Ok(Json(runtime.into()))
 }
 
 async fn stop_session_run_impl(
@@ -1556,9 +1510,10 @@ pub(super) async fn post_turn(
         attachments: req.attachments,
         hidden_context_xml: req.hidden_context_xml,
         delivery_mode: match req.mode {
-            super::types::TurnMode::Start => crate::session::PendingUserMessageMode::Steer,
-            super::types::TurnMode::Steer => crate::session::PendingUserMessageMode::Steer,
             super::types::TurnMode::Queue => crate::session::PendingUserMessageMode::Queue,
+            super::types::TurnMode::Start | super::types::TurnMode::Steer => {
+                crate::session::PendingUserMessageMode::Steer
+            }
         },
         pending_entry_id: req.pending_entry_id,
     };
@@ -1647,6 +1602,10 @@ async fn tell_sleep_state(state: &DaemonState, session_id: &str, agent: &mut May
     }
 }
 
+fn parse_action_body<T: serde::de::DeserializeOwned>(body: &serde_json::Value) -> SkyResult<T> {
+    serde_json::from_value(body.clone()).map_err(super::error::bad_request_error)
+}
+
 /// `POST /api/sessions/{id}/actions/{name}`: the session verbs — `compact`,
 /// `recap`, `bash`, `btw`, `progress`, `context-dump`, `rewind` — dispatched
 /// to the same logic their old named routes ran. Bodies and responses are
@@ -1664,12 +1623,9 @@ pub(super) async fn post_session_action(
         .get("name")
         .map_err(super::error::bad_request_error)?
         .to_string();
-    fn parse<T: serde::de::DeserializeOwned>(body: &serde_json::Value) -> SkyResult<T> {
-        serde_json::from_value(body.clone()).map_err(super::error::bad_request_error)
-    }
     match name.as_str() {
         "compact" => {
-            let req: hosts::CompactRequest = parse(&body)?;
+            let req: hosts::CompactRequest = parse_action_body(&body)?;
             hosts::compact_inner(&state, &session_id, req)
                 .await
                 .and_then(|json| super::error::json_ok_response(&json.0))
@@ -1678,13 +1634,13 @@ pub(super) async fn post_session_action(
             .await
             .and_then(|json| super::error::json_ok_response(&json.0)),
         "bash" => {
-            let req: crate::daemon::types::BashRequest = parse(&body)?;
+            let req: crate::daemon::types::BashRequest = parse_action_body(&body)?;
             run_bash(&state, &session_id, req)
                 .await
                 .and_then(|json| super::error::json_ok_response(&json.0))
         }
         "btw" => {
-            let req: hosts::BtwRequest = parse(&body)?;
+            let req: hosts::BtwRequest = parse_action_body(&body)?;
             hosts::btw_inner(&state, &session_id, req)
                 .await
                 .and_then(|json| super::error::json_ok_response(&json.0))
@@ -1696,7 +1652,7 @@ pub(super) async fn post_session_action(
             .await
             .and_then(|json| super::error::json_ok_response(&json.0)),
         "rewind" => {
-            let req: super::types::RewindRequest = parse(&body)?;
+            let req: super::types::RewindRequest = parse_action_body(&body)?;
             super::sessions::rewind_inner(&state, &session_id, &req)
                 .await
                 .and_then(|json| super::error::json_ok_response(&json.0))
@@ -1723,7 +1679,7 @@ pub(super) async fn run_bash(
     }
     let session = state
         .db()
-        .get_session(&session_id)
+        .get_session(session_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| super::error::bad_request_error("session not found"))?;
@@ -4975,12 +4931,7 @@ mod tests {
             delivery_mode: crate::session::PendingUserMessageMode::Queue,
             pending_entry_id: None,
         };
-        super::enqueue_chat(
-            skyzen::utils::Json(req),
-            skyzen::utils::State(state.clone()),
-        )
-        .await
-        .expect("enqueue");
+        super::enqueue_pending(&state, req).await.expect("enqueue");
         tokio::time::timeout(std::time::Duration::from_secs(20), async {
             while !state.recap_schedules.is_armed("session") {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;

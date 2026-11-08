@@ -110,7 +110,7 @@ describe('draft sessions', () => {
 
     await useSessionsStore.getState().materialize(draft.id);
 
-    expect(calls.methods).toEqual(['POST', 'PUT']);
+    expect(calls.methods).toEqual(['POST', 'PATCH']);
     expect(calls.bodies[0]).toContain('"model":"provider::other"');
     expect(calls.bodies[1]).toContain('"title":"Renamed"');
     expect(calls.bodies[1]).toContain('"reasoningEffort":"high"');

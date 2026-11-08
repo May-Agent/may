@@ -1,5 +1,5 @@
 import type { TranscriptPage } from '../transcript';
-import type { ApiSession, ApiMessage } from '../types';
+import type { ApiSession } from '../types';
 import { apiDelete, apiGet, apiPatch, apiPost } from './client';
 
 export interface SessionListResponse {
@@ -22,14 +22,6 @@ export function getTranscript(id: string): Promise<TranscriptPage> {
 
 export function getSession(id: string): Promise<ApiSession> {
   return apiGet<ApiSession>(`/sessions/${encodeURIComponent(id)}`);
-}
-
-export interface SessionMessagesResponse {
-  items: ApiMessage[];
-}
-
-export function getSessionMessages(id: string): Promise<SessionMessagesResponse> {
-  return apiGet<SessionMessagesResponse>(`/sessions/${encodeURIComponent(id)}/messages`);
 }
 
 export function createSession(payload?: {

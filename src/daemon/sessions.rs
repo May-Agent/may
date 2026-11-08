@@ -21,9 +21,8 @@ use super::model_resolution::{
 use super::state::DaemonState;
 use super::types::{
     ApiHealth, ApiPr, ApiPrEvent, ApiSession, ContextDebugMessage, CreateSessionRequest,
-    NullableStringPatch, RewindRequest, SessionContextDebugResponse,
-    SessionContextWindowMetricsResponse, SessionContextWindowSnapshotResponse,
-    SessionPlanStateRequest, SessionPlanStateResponse, SessionTasksPayload, UpdateSessionRequest,
+    RewindRequest, SessionContextDebugResponse, SessionContextWindowMetricsResponse,
+    SessionContextWindowSnapshotResponse, SessionTasksPayload,
 };
 
 fn session_not_found_error(session_id: &str) -> SkyError {
@@ -106,9 +105,9 @@ pub(super) async fn rewind_inner(
     req: &RewindRequest,
 ) -> SkyResult<Json<i64>> {
     let db = state.db();
-    let rows = db.get_messages(&id).await.map_err(internal_error)?;
+    let rows = db.get_messages(id).await.map_err(internal_error)?;
     let index = {
-        let history = crate::session::load_history_from_db(&db, &id)
+        let history = crate::session::load_history_from_db(&db, id)
             .await
             .map_err(internal_error)?;
         let entries = super::transcript::build_entries(history.messages());
@@ -118,17 +117,17 @@ pub(super) async fn rewind_inner(
         return Err(bad_request_error("rewind index out of range"));
     };
     let cut_id = i64::from(row.id);
-    db.delete_messages_from(&id, cut_id)
+    db.delete_messages_from(id, cut_id)
         .await
         .map_err(internal_error)?;
     // The audit log is append-only: every PR this session opened keeps a
     // `rewound` event so its history records that the conversation was
     // cut back while the proposal itself still stands.
-    if let Ok(prs) = db.list_session_prs(&id).await {
+    if let Ok(prs) = db.list_session_prs(id).await {
         let detail = format!("history rewound to message {cut_id}");
         for pr in prs {
             let _ = db
-                .add_pr_event(pr.id, "rewound", &id, "user", None, Some(&detail))
+                .add_pr_event(pr.id, "rewound", id, "user", None, Some(&detail))
                 .await;
         }
     }
@@ -422,24 +421,6 @@ async fn pr_check_summary(
 
 /// Atomically set the plan state for a session without touching task content.
 ///
-/// This is what the UI uses to toggle plan mode (enter/approve/reopen); it
-/// avoids the fetch-then-save race of the generic `save_session_tasks` path.
-pub(super) async fn set_session_plan_state(
-    params: Params,
-    Json(payload): Json<SessionPlanStateRequest>,
-    State(state): State<Arc<DaemonState>>,
-) -> SkyResult<Json<SessionPlanStateResponse>> {
-    let id = params.get("id").map_err(bad_request_error)?.to_string();
-    let runtime = state
-        .runtime_service
-        .set_plan_state(&id, payload.plan_state)
-        .await
-        .map_err(internal_error)?;
-    Ok(Json(SessionPlanStateResponse {
-        plan_state: runtime.plan_state,
-    }))
-}
-
 /// Set the session's yolo switch; it applies to the next approval request.
 pub(super) async fn save_session_tasks(
     params: Params,
@@ -804,7 +785,12 @@ pub(super) async fn remove_queue_entry(
         .runtime_service
         .remove_pending_entry(&id, entry_id)
         .await
-        .map_err(internal_error)?;
+        .map_err(|error| match error {
+            crate::db::ChatDbError::RowNotFound(message) => {
+                skyzen::Error::msg(message).set_status(skyzen::StatusCode::NOT_FOUND)
+            }
+            error => internal_error(error),
+        })?;
     Ok(Json(super::types::SessionRuntimeResponse::from(runtime)))
 }
 
@@ -887,7 +873,7 @@ pub(super) async fn patch_session(
     if let Some(model) = req.model.as_deref()
         && session.model.as_deref() != Some(model)
     {
-        persist_last_model(&state, &model.to_string())
+        persist_last_model(&state, model)
             .await
             .map_err(internal_error)?;
     }
@@ -923,8 +909,10 @@ pub(super) async fn patch_session(
             .await
             .map_err(internal_error)?;
     }
-    if let Some(pinned) = req.pinned {
-        if pinned != session.pinned {
+    if let Some(pinned) = req.pinned
+        && pinned != session.pinned
+    {
+        {
             if pinned {
                 db.pin_session(&id)
                     .await
@@ -945,8 +933,10 @@ pub(super) async fn patch_session(
             .await
             .map_err(super::profiles::map_profile_error)?;
     }
-    if let Some(archived) = req.archived {
-        if archived != session.archived {
+    if let Some(archived) = req.archived
+        && archived != session.archived
+    {
+        {
             if archived {
                 db.archive_session(&id).await.map_err(internal_error)?;
             } else {
