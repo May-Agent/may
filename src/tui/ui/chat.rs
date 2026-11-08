@@ -1460,8 +1460,7 @@ fn artifact_tag_text(content: &str) -> std::borrow::Cow<'_, str> {
 /// The artifact path names a raster image the TUI can decode.
 fn is_image_artifact(path: &str) -> bool {
     let lower = path.rsplit('.').next().unwrap_or("");
-    matches!(lower, "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp")
-        && path.len() > lower.len() + 1
+    matches!(lower, "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp") && path.len() > lower.len() + 1
 }
 
 /// Input rendering context for combined view.
