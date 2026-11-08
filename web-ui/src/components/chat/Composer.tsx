@@ -4,6 +4,7 @@ import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 import { useTranslation } from '@/lib/i18n';
 import type { ApiAttachment, AttachmentKind } from '@/lib/types';
+import { uploadAttachment } from '@/lib/api/artifacts';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { ModelPicker } from './ModelPicker';
 import { ThinkingPicker } from './ThinkingPicker';
@@ -31,26 +32,13 @@ function detectKind(mime: string): AttachmentKind {
   return 'file';
 }
 
-async function fileToAttachment(file: File): Promise<ApiAttachment> {
+async function fileToAttachment(sessionId: string, file: File): Promise<ApiAttachment> {
+  const record = await uploadAttachment(sessionId, file);
   const kind = detectKind(file.type || '');
-  const reader = new FileReader();
-  const dataUrl = await new Promise<string>((resolve, reject) => {
-    reader.onerror = () => reject(reader.error);
-    reader.onload = () => resolve(reader.result as string);
-    reader.readAsDataURL(file);
-  });
-  let textContent: string | null = null;
   if (kind === 'text' && file.size < 256 * 1024) {
-    textContent = await file.text();
+    record.textContent = await file.text();
   }
-  return {
-    id: `att-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
-    name: file.name,
-    type: kind,
-    url: dataUrl,
-    uploadDataUrl: dataUrl,
-    textContent,
-  };
+  return record;
 }
 
 export function Composer({
@@ -102,7 +90,7 @@ export function Composer({
 
   const addFiles = async (files: FileList | File[]) => {
     const list = Array.from(files);
-    const mapped = await Promise.all(list.map(fileToAttachment));
+    const mapped = await Promise.all(list.map((file) => fileToAttachment(sessionId, file)));
     setAttachments((prev) => [...prev, ...mapped]);
   };
 

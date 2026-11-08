@@ -48,7 +48,6 @@ export interface ApiAttachment {
   name: string;
   type: AttachmentKind;
   url: string;
-  uploadDataUrl?: string | null;
   textContent?: string | null;
 }
 

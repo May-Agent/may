@@ -1043,7 +1043,6 @@ fn persisted_attachments(
             name: attachment.name,
             attachment_type: attachment.attachment_type,
             url: attachment.url,
-            upload_data_url: attachment.upload_data_url,
             text_content: attachment.text_content,
         })
         .collect()
@@ -1076,7 +1075,6 @@ pub fn api_attachments_from_persisted(
             name: attachment.name,
             attachment_type: attachment.attachment_type,
             url: attachment.url,
-            upload_data_url: attachment.upload_data_url,
             text_content: attachment.text_content,
         })
         .collect()

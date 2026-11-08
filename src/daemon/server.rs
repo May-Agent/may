@@ -461,6 +461,8 @@ fn api_routes() -> Route {
                         "/events".at(super::session_events::stream_session_events),
                         "/history".at(get_session_history),
                         "/history".post(append_session_history),
+                        "/attachments".post(super::attachments::post_attachment),
+                        "/files/{*path}".at(super::attachments::get_session_file),
                         "/rewind".post(rewind_session),
                         "/issues/lookup".post(lookup_issues),
                     )),

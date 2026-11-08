@@ -719,8 +719,6 @@ pub struct ApiAttachment {
     pub(crate) attachment_type: AttachmentKind,
     pub(crate) url: String,
     #[serde(default)]
-    pub(crate) upload_data_url: Option<String>,
-    #[serde(default)]
     pub(crate) text_content: Option<String>,
 }
 
