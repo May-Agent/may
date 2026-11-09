@@ -3208,8 +3208,8 @@ async fn ui_chat_tasks_file_is_the_canonical_todo_document() {
     assert_eq!(
         rows(updates[0]),
         Some(serde_json::json!([
-            { "section": "doing", "text": "write report", "blocking": null, "references": [] },
-            { "section": "queued", "text": "ship it", "blocking": null, "references": [] },
+            { "section": "doing", "title": "write report", "detail": "", "blocking": null, "references": [] },
+            { "section": "queued", "title": "ship it", "detail": "", "blocking": null, "references": [] },
         ])),
         "todo_update should carry the parsed tasks.md rows: {:?}",
         updates[0]
