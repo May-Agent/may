@@ -1,5 +1,5 @@
 name: Restore test downloads
-description: Restore the pinned artifacts the terminal E2E suite and the sandbox unit tests download from GitHub releases (the managed baseline tools with their prepared runtimes, and the container heel), keyed on the pins, and export MAY_TEST_CACHE so the tests use the restored directory. The caller saves both caches after its tests with actions/cache/save and the outputs below.
+description: Restore the pinned artifacts the terminal E2E suite and the sandbox unit tests download from GitHub releases (the managed baseline tools with their prepared runtimes, the repo-search host program, and the container heel), keyed on the pins, and export MAY_TEST_CACHE so the tests use the restored directory. The caller saves each cache after its tests with actions/cache/save and the outputs below.
 outputs:
   tools-path:
     description: Directory holding the baseline tool artifacts and prepared runtimes.
@@ -10,6 +10,15 @@ outputs:
   tools-hit:
     description: "'true' when the baseline tools were restored exactly."
     value: ${{ steps.tools.outputs.cache-hit }}
+  host-programs-path:
+    description: Directory holding the pinned host programs (the repo-search binary).
+    value: ${{ steps.key.outputs.host-programs-path }}
+  host-programs-key:
+    description: Cache key of the host programs.
+    value: ${{ steps.key.outputs.host-programs-key }}
+  host-programs-hit:
+    description: "'true' when the host programs were restored exactly."
+    value: ${{ steps.host-programs.outputs.cache-hit }}
   heel-path:
     description: Directory holding the pinned container heel.
     value: ${{ steps.key.outputs.heel-path }}
@@ -30,6 +39,9 @@ runs:
         # The manifest pins every baseline artifact and the interpreter uv
         # installs into a prepared runtime, so its hash keys the directory.
         tools="$(cat src/tools/tool-distribution-*.json | digest | cut -d' ' -f1)"
+        # The manifest pins the host programs the suite prepares in its
+        # shared cache.
+        host_programs="$(digest src/tools/host-programs.json | cut -d' ' -f1)"
         # The tag and digests pinning the container heel live in the E2E
         # suite; the suite fails on a restored file whose digest differs.
         heel="$(grep -E '^const CONTAINER_HEEL_RELEASE_TAG|^    sha256:' tests/terminal_first_e2e.rs | digest | cut -d' ' -f1)"
@@ -38,6 +50,8 @@ runs:
         {
           echo "tools-key=may-tools-${RUNNER_OS}-${RUNNER_ARCH}-${tools}"
           echo "tools-path=${root}/may-tools"
+          echo "host-programs-key=host-programs-${RUNNER_OS}-${RUNNER_ARCH}-${host_programs}"
+          echo "host-programs-path=${root}/host-programs"
           echo "heel-key=container-heel-${RUNNER_OS}-${RUNNER_ARCH}-${heel}"
           echo "heel-path=${root}/container-heel"
         } >> "${GITHUB_OUTPUT}"
@@ -47,6 +61,11 @@ runs:
       with:
         path: ${{ steps.key.outputs.tools-path }}
         key: ${{ steps.key.outputs.tools-key }}
+    - id: host-programs
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ steps.key.outputs.host-programs-path }}
+        key: ${{ steps.key.outputs.host-programs-key }}
     - id: heel
       uses: actions/cache/restore@v4
       with:
