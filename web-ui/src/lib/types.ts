@@ -307,8 +307,10 @@ export interface TaskReference {
 /** One row of `Roots`, `Doing` or `Queued`, parsed by the daemon. */
 export interface TaskRow {
   section: TaskSection;
-  /** Row text; continuation lines are joined by newlines. */
-  text: string;
+  /** First line of the row; the sidebar shows this alone. */
+  title: string;
+  /** Detail lines joined by newlines; empty when the row has none. */
+  detail: string;
   /** Payload of the row's `BLOCKING <what>` mark. */
   blocking: string | null;
   references: TaskReference[];

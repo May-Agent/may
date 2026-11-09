@@ -19,9 +19,23 @@ pub const WORKSPACE_IMAGE_REPOSITORY: &str = "ghcr.io/may-agent/may-workspace";
 
 /// Top-level context entries CI generates for the workspace build. Their
 /// content is identified by the hash's other inputs (the pinned tool
-/// distribution and the heel library version), so staging rewrites must not
-/// move the reference.
-const GENERATED_WORKSPACE_ENTRIES: &[&str] = &["heel", "tools"];
+/// distribution, the `tasks` sources and the heel library version), so
+/// staging rewrites must not move the reference.
+const GENERATED_WORKSPACE_ENTRIES: &[&str] = &["heel", "tasks", "tools"];
+
+/// The files, relative to the repository, the `tasks` binary the workspace
+/// image carries is built from; a change to one moves the workspace
+/// reference.
+pub const TASKS_SOURCES: &[&str] = &[
+    "src/bin/tasks/main.rs",
+    "src/tasks_md/mod.rs",
+    "src/tasks_md/edit.rs",
+    "src/tasks_md/schema.rs",
+    "templates/tasks_command_usage.txt",
+    "templates/tasks_command_refused.txt",
+    "templates/tasks_command_done.txt",
+    "templates/tasks_violation.txt",
+];
 
 /// The `<repository>:<content tag>` reference of the base image whose build
 /// context is `context_dir`: every file under the context, by sorted
@@ -40,8 +54,9 @@ pub fn base_image_ref(context_dir: &Path) -> io::Result<String> {
 /// The `<repository>:<content tag>` reference of the workspace image.
 ///
 /// Named by the base reference it layers on, the `context_dir` files minus
-/// the generated `heel`/`tools` entries, the tool distribution manifest
-/// bytes and the heel library version pinning the staged binary.
+/// the generated `heel`/`tools`/`tasks` entries, the tool distribution
+/// manifest bytes, the sources the `tasks` binary is built from and the heel
+/// library version pinning the staged binary.
 ///
 /// # Errors
 /// Returns an IO error when the context cannot be read.
@@ -49,6 +64,7 @@ pub fn workspace_image_ref(
     context_dir: &Path,
     base_ref: &str,
     tool_distribution: &[u8],
+    repository: &Path,
     heel_lib_version: &str,
 ) -> io::Result<String> {
     let mut hasher = Sha256::new();
@@ -62,6 +78,10 @@ pub fn workspace_image_ref(
     }
     feed(&mut hasher, b"tool-distribution");
     feed(&mut hasher, tool_distribution);
+    feed(&mut hasher, b"tasks-sources");
+    for relative in TASKS_SOURCES {
+        feed_file(&mut hasher, repository, Path::new(relative))?;
+    }
     feed(&mut hasher, b"heel-lib-version");
     feed(&mut hasher, heel_lib_version.as_bytes());
     Ok(format!(
@@ -173,8 +193,22 @@ mod tests {
     fn workspace_ref_follows_every_input_but_the_generated_entries() {
         let context = tempfile::tempdir().expect("context");
         write_context(context.path());
-        let fixture =
-            || workspace_image_ref(context.path(), "base:ref", b"manifest", "1.0.0").unwrap();
+        let repository = tempfile::tempdir().expect("repository");
+        for source in TASKS_SOURCES {
+            let path = repository.path().join(source);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "source").unwrap();
+        }
+        let fixture = || {
+            workspace_image_ref(
+                context.path(),
+                "base:ref",
+                b"manifest",
+                repository.path(),
+                "1.0.0",
+            )
+            .unwrap()
+        };
         let before = fixture();
         assert!(before.starts_with(&format!("{WORKSPACE_IMAGE_REPOSITORY}:")));
 
@@ -184,10 +218,18 @@ mod tests {
             ("base:ref", b"manifest".as_slice(), "1.0.1"),
         ] {
             assert_ne!(
-                workspace_image_ref(context.path(), base, manifest, version).unwrap(),
+                workspace_image_ref(context.path(), base, manifest, repository.path(), version)
+                    .unwrap(),
                 before,
             );
         }
+
+        // The sources of the `tasks` binary are inputs too.
+        let source = repository.path().join(TASKS_SOURCES[1]);
+        fs::write(&source, "edited").unwrap();
+        assert_ne!(fixture(), before);
+        fs::write(&source, "source").unwrap();
+        assert_eq!(fixture(), before);
 
         fs::write(context.path().join("Dockerfile"), "FROM scratch\nRUN x\n").unwrap();
         assert_ne!(fixture(), before);
@@ -196,6 +238,7 @@ mod tests {
         // Generated staging output never moves the reference.
         fs::create_dir_all(context.path().join("tools").join("key")).unwrap();
         fs::write(context.path().join("heel"), "binary").unwrap();
+        fs::write(context.path().join("tasks"), "binary").unwrap();
         fs::write(context.path().join("tools").join("key").join("rg"), "tool").unwrap();
         assert_eq!(fixture(), before);
         assert_eq!(

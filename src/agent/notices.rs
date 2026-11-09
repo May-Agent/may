@@ -33,9 +33,10 @@ impl SandboxNotices for MayNotices {}
 
 impl Notices for MayNotices {
     fn working_document(&self, shown: &DocumentShown<'_>) -> String {
+        let numbered = shown.content.map(crate::tasks_md::numbered);
         TasksDocumentTemplate {
             document: shown.document,
-            content: shown.content,
+            content: numbered.as_deref(),
             changes: shown.changes,
             trees: shown.trees,
         }
@@ -81,6 +82,20 @@ mod tests {
             items,
             held,
         })
+    }
+
+    #[test]
+    fn the_shown_document_numbers_its_rows() {
+        let text = MayNotices.working_document(&DocumentShown {
+            document: "tasks.md",
+            content: Some("## Doing\n- wire it\n  detail\n\n## Queued\n- 写文档\n"),
+            changes: None,
+            trees: None,
+        });
+        assert_eq!(
+            text,
+            "<tasks_document>\nContents of tasks.md:\n## Doing\n1. wire it\n  detail\n\n## Queued\n2. 写文档\n\n</tasks_document>"
+        );
     }
 
     #[test]

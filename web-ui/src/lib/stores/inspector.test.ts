@@ -122,7 +122,8 @@ describe('inspector store', () => {
     const rows: TaskRow[] = [
       {
         section: 'doing',
-        text: 'Two (#4)',
+        title: 'Two (#4)',
+        detail: '',
         blocking: null,
         references: [{ repository: null, number: 4, pullRequest: false }],
       },
@@ -148,7 +149,7 @@ describe('inspector store', () => {
       return json({
         content: `## Doing\n- v${served}\n`,
         planState: 'draft',
-        rows: [{ section: 'doing', text: `v${served}`, blocking: null, references: [] }],
+        rows: [{ section: 'doing', title: `v${served}`, detail: '', blocking: null, references: [] }],
       });
     });
     const first = useInspectorStore.getState().loadTasks('A');
@@ -158,7 +159,7 @@ describe('inspector store', () => {
     release();
     await first;
     expect(calls.urls).toHaveLength(2);
-    expect(useInspectorStore.getState().sessions.A.tasks?.rows[0].text).toBe('v2');
+    expect(useInspectorStore.getState().sessions.A.tasks?.rows[0].title).toBe('v2');
   });
 
   test('a failed tasks load keeps the last document and reports the error', async () => {

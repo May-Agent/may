@@ -2532,7 +2532,7 @@ pub(super) fn element_lines(
             let roots: Vec<&str> = rows
                 .iter()
                 .filter(|row| row.section == TaskSection::Roots)
-                .filter_map(|row| row.text.lines().next())
+                .map(|row| row.title.as_str())
                 .collect();
             if !roots.is_empty() {
                 lines.push(Line::from(vec![
@@ -2553,7 +2553,7 @@ pub(super) fn element_lines(
                     Style::default().fg(Color::DarkGray),
                 )));
                 for row in section_rows {
-                    let text = row.text.split_whitespace().collect::<Vec<_>>().join(" ");
+                    let text = row.title.split_whitespace().collect::<Vec<_>>().join(" ");
                     match &row.blocking {
                         Some(what) => lines.push(Line::from(vec![
                             Span::styled("    ⏸ ", Style::default().fg(Color::Red)),

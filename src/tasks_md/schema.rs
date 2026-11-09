@@ -93,7 +93,7 @@ struct ViolationTemplate<'a> {
     violation: &'a Violation,
 }
 
-fn problem(violation: &LineViolation) -> String {
+pub(super) fn violation_sentence(violation: &LineViolation) -> String {
     ViolationTemplate {
         line: violation.line,
         violation: &violation.violation,
@@ -120,7 +120,7 @@ impl DocumentSchema for TasksSchema {
             document.push_root(root);
         }
         for violation in file.violations() {
-            document.push_problem(problem(violation));
+            document.push_problem(violation_sentence(violation));
         }
         let limit = self.limit.get();
         if file.lines() > limit {
@@ -213,6 +213,18 @@ mod tests {
             document.problems(),
             ["Line 5 of tasks.md is a checkbox; rows are not ticked, a finished row is deleted."]
         );
+    }
+
+    #[test]
+    fn a_row_is_a_title_with_detail_and_its_mark_may_sit_in_the_detail() {
+        let document =
+            TasksSchema::default().parse("## Doing\n- wire it\n  see #12\n  BLOCKING req-7\n");
+        let row = &document.rows()[0];
+        assert_eq!(row.summary(), "wire it");
+        assert_eq!(row.text(), "wire it\nsee #12\nBLOCKING req-7");
+        assert_eq!(row.blocker(), Some("req-7"));
+        assert_eq!(row.references().len(), 1);
+        assert!(row.is_open());
     }
 
     #[test]

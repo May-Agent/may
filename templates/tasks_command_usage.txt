@@ -1,0 +1,11 @@
+{% if let Some(problem) = problem %}{% match problem %}{% when Usage::NoCommand %}No subcommand given.{% when Usage::UnknownCommand(name) %}`{{ name }}` is no tasks subcommand.{% when Usage::BadRow(given) %}{% if given.is_empty() %}A row number is missing.{% else %}`{{ given }}` is not a row number; rows are numbered from 1 as in the document.{% endif %}{% when Usage::UnknownFlag(flag) %}This subcommand takes no `{{ flag }}`.{% when Usage::MissingValue(flag) %}`{{ flag }}` needs a value.{% when Usage::MissingTitle %}`add` needs `--title`.{% when Usage::BadSection(given) %}`{{ given }}` is no section for a row; use roots, doing or queued.{% when Usage::MissingText %}This subcommand needs text.{% when Usage::Unexpected(extra) %}Unexpected argument `{{ extra }}`.{% endmatch %}
+{% endif %}Usage: tasks <subcommand>
+  add --title <title> [--detail <line>]... [--section roots|doing|queued]   add a row (default section queued)
+  start <n>                       move a Queued row to Doing
+  finish <n>                      delete a finished row
+  block <n> <what>                mark a row BLOCKING <what>
+  unblock <n>                     remove the mark
+  edit <n> [--title <title>] [--detail <line>]... [--clear-detail]   rewrite a row; --detail replaces its detail lines
+  note <text>                     append to Notes
+  decide <text>                   append to Decisions
+  list                            show the numbered document

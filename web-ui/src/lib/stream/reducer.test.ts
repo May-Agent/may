@@ -175,8 +175,8 @@ describe('reducer', () => {
         seq: 2,
         turnId: 't1',
         rows: [
-          { section: 'doing', text: 'step 1', blocking: null, references: [] },
-          { section: 'queued', text: 'step 2', blocking: 'q1', references: [] },
+          { section: 'doing', title: 'step 1', detail: '', blocking: null, references: [] },
+          { section: 'queued', title: 'step 2', detail: '', blocking: 'q1', references: [] },
         ],
       },
       { kind: 'todo_update', seq: 3, turnId: 't1', rows: [] },
@@ -192,8 +192,8 @@ describe('reducer', () => {
         seq: 2,
         turnId: 't1',
         rows: [
-          { section: 'doing', text: 'step 1', blocking: null, references: [] },
-          { section: 'queued', text: 'step 2', blocking: 'q1', references: [] },
+          { section: 'doing', title: 'step 1', detail: '', blocking: null, references: [] },
+          { section: 'queued', title: 'step 2', detail: '', blocking: 'q1', references: [] },
         ],
       },
     ]);

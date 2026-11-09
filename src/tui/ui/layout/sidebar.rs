@@ -147,7 +147,7 @@ fn task_rows(rows: &[TaskRow], width: usize) -> (Vec<Line<'static>>, Option<usiz
             } else {
                 ("○ ", Style::default().fg(Color::Yellow))
             };
-            let mut text = row.text.split_whitespace().collect::<Vec<_>>().join(" ");
+            let mut text = row.title.split_whitespace().collect::<Vec<_>>().join(" ");
             if let Some(what) = &row.blocking {
                 text = format!("{text} (blocked: {what})");
             }
@@ -447,6 +447,27 @@ mod tests {
             vec!["修复图", "片渲染", "问题"]
         );
         assert_eq!(wrap_hanging("", 6, 0), vec![""]);
+    }
+
+    #[test]
+    fn the_sidebar_shows_each_rows_title_and_not_its_detail() {
+        let rows = crate::task_rows::task_rows(
+            "## Doing\n- wire the command\n  the detail never shows\n- ask scope\n  BLOCKING q9\n\n## Queued\n- 写文档 ドキュメント 문서\n  詳細は表示しない\n",
+        );
+        let (lines, first_open) = super::task_rows(&rows, 60);
+        let shown: Vec<String> = lines.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            shown,
+            vec![
+                "Doing",
+                "○ wire the command",
+                "⏸ ask scope (blocked: q9)",
+                "",
+                "Queued",
+                "○ 写文档 ドキュメント 문서",
+            ]
+        );
+        assert_eq!(first_open, Some(1));
     }
 
     #[test]
