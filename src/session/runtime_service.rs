@@ -611,6 +611,7 @@ impl SessionRuntimeService {
     }
 
     /// Persist an open question: the agent asked it and no run waits on it.
+    /// Returns the word the model knows the question by.
     ///
     /// # Errors
     /// Returns [`crate::db::ChatDbError`] on storage failure.
@@ -618,10 +619,10 @@ impl SessionRuntimeService {
         &self,
         session_id: &str,
         request: &PersistedAskUserRequest,
-    ) -> Result<(), crate::db::ChatDbError> {
-        self.db.open_ask_user_question(session_id, request).await?;
+    ) -> Result<String, crate::db::ChatDbError> {
+        let word = self.db.open_ask_user_question(session_id, request).await?;
         self.publish_runtime_change(session_id);
-        Ok(())
+        Ok(word)
     }
 
     /// Withdraw an open question. Returns whether it was still open.
@@ -671,13 +672,26 @@ impl SessionRuntimeService {
                 .map(|session_id| AskUserAnswer::AlreadyAnswered { session_id }));
         };
         super::open_questions::check_answers(&pending.request, answers)?;
+        // The word the model knows an open question by; a prompt a run blocks
+        // on never reaches the model as a question.
+        let word = if pending.blocking {
+            None
+        } else {
+            Some(
+                self.db
+                    .alias::<crate::model_ids::QuestionAlias>(request_id)
+                    .await?,
+            )
+        };
         let committed = self
             .db
             .commit_ask_user_answer(
                 request_id,
                 answers,
-                (!pending.blocking).then_some(|request: &PersistedAskUserRequest| {
-                    super::open_questions::answer_delivery(request, answers)
+                word.as_deref().map(|word| {
+                    move |request: &PersistedAskUserRequest| {
+                        super::open_questions::answer_delivery(request, word, answers)
+                    }
                 }),
             )
             .await?;
@@ -691,10 +705,9 @@ impl SessionRuntimeService {
         };
         // A question the agent asked changes what `tasks.md` rows wait on; a
         // prompt a run blocks on is no question of the agent's.
-        if !pending.blocking {
-            self.task_events(&pending.session_id).record(
-                aither_agent::WorkEvent::QuestionAnswered(request_id.to_string()),
-            );
+        if let Some(word) = word {
+            self.task_events(&pending.session_id)
+                .record(aither_agent::WorkEvent::QuestionAnswered(word));
         }
         self.publish_runtime_change(&pending.session_id);
         Ok(Some(AskUserAnswer::Committed(committed)))
@@ -735,9 +748,13 @@ impl SessionRuntimeService {
         session_id: &str,
         answers: &[crate::ask_user::QuestionAnswer],
     ) -> Result<SessionRuntimeSummary, crate::db::ChatDbError> {
+        let word = self
+            .db
+            .word_of::<crate::model_ids::QuestionAlias>(&request.id)
+            .await?;
         self.enqueue(
             session_id,
-            super::open_questions::answer_delivery(request, answers),
+            super::open_questions::answer_delivery(request, &word, answers),
             PendingUserMessageMode::Steer,
         )
         .await

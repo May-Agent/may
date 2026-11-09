@@ -13,6 +13,7 @@ mod issue_search;
 mod logs;
 mod memory;
 mod message;
+mod model_alias;
 mod notification;
 mod open_questions;
 mod pr;
@@ -74,6 +75,8 @@ pub(super) use query;
 #[derive(Debug, Clone)]
 pub struct ChatDb {
     pub(super) db: SkyDb,
+    /// The model-facing ids of the daemon this database serves.
+    namespace: model_alias::ModelNamespace,
     /// Test seam: suspends a run claim or finish at its await.
     #[cfg(test)]
     pub(crate) run_gates: session_run::RunGates,
@@ -121,8 +124,10 @@ impl ChatDb {
         Self::ensure_session_interval_triggers(&db).await?;
         Self::migrate_notification_mailbox(&db).await?;
         Self::migrate_attachment_upload_urls(&db, db_path).await?;
+        let namespace = model_alias::ModelNamespace::restore(&db).await?;
         Ok(Self {
             db,
+            namespace,
             #[cfg(test)]
             run_gates: session_run::RunGates::default(),
         })

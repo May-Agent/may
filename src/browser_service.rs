@@ -45,6 +45,9 @@ pub enum BrowserCapturePersistError {
 /// Persist a browser page capture (screenshot and text) into the session's
 /// artifact directory and return the snapshot record.
 ///
+/// A screenshot file is named by a word of `ids`, the daemon's model-facing
+/// namespace.
+///
 /// # Errors
 ///
 /// Returns [`BrowserCapturePersistError`] when the artifact directory
@@ -53,11 +56,12 @@ pub enum BrowserCapturePersistError {
 pub async fn persist_browser_page_capture(
     session_id: &str,
     session_paths: &SessionPaths,
+    ids: &aither_core::AnyIdAllocator,
     capture: BrowserPageCapture,
 ) -> Result<BrowserPageSnapshot, BrowserCapturePersistError> {
     let screenshot = match capture.screenshot {
         Some(screenshot) => {
-            Some(persist_browser_screenshot(session_id, session_paths, screenshot).await?)
+            Some(persist_browser_screenshot(session_id, session_paths, ids, screenshot).await?)
         }
         None => None,
     };
@@ -71,6 +75,7 @@ pub async fn persist_browser_page_capture(
 async fn persist_browser_screenshot(
     session_id: &str,
     session_paths: &SessionPaths,
+    ids: &aither_core::AnyIdAllocator,
     screenshot: BrowserCapturedScreenshot,
 ) -> Result<BrowserArtifactScreenshot, BrowserCapturePersistError> {
     let extension = screenshot_extension(screenshot.mime_type.as_str())?;
@@ -79,15 +84,18 @@ async fn persist_browser_screenshot(
         .await
         .map_err(|source| BrowserCapturePersistError::CreateArtifactDirectory { source })?;
 
-    let filename = format!("snapshot-{}.{}", crate::id::new(), extension);
-    let relative_artifact_path = format!("browser/{filename}");
-    let absolute_artifact_path = browser_artifacts_dir.join(&filename);
     let screenshot_bytes = base64::engine::general_purpose::STANDARD
         .decode(screenshot.data_base64.as_bytes())
         .map_err(|source| BrowserCapturePersistError::DecodeScreenshot { source })?;
-    tokio::fs::write(&absolute_artifact_path, screenshot_bytes)
-        .await
-        .map_err(|source| BrowserCapturePersistError::WriteArtifact { source })?;
+    let filename = crate::model_ids::write_word_file(
+        ids,
+        &browser_artifacts_dir,
+        extension,
+        &screenshot_bytes,
+    )
+    .await
+    .map_err(|source| BrowserCapturePersistError::WriteArtifact { source })?;
+    let relative_artifact_path = format!("browser/{filename}");
 
     Ok(BrowserArtifactScreenshot {
         mime_type: screenshot.mime_type,
@@ -156,18 +164,15 @@ mod tests {
             }),
         };
 
-        let snapshot = persist_browser_page_capture("session-1", &session_paths, capture)
+        let ids = aither_core::AnyIdAllocator::new(aither_core::WordAllocator::new(["river"]));
+        let snapshot = persist_browser_page_capture("session-1", &session_paths, &ids, capture)
             .await
             .expect("browser capture should persist");
         let screenshot = snapshot
             .screenshot
             .expect("screenshot artifact metadata should exist");
 
-        assert!(
-            screenshot
-                .artifact_path
-                .starts_with("artifacts/browser/snapshot-")
-        );
+        assert_eq!(screenshot.artifact_path, "artifacts/browser/river.png");
         assert_eq!(
             screenshot.api_path,
             format!(

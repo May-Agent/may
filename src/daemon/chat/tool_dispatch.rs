@@ -109,9 +109,14 @@ pub(super) async fn handle_browser_request(
             let session_paths = load_session_paths(state, session_id.as_str())
                 .await
                 .map_err(|error| BrowserToolError::request_failed(error.to_string()))?;
-            let page = persist_browser_page_capture(session_id.as_str(), &session_paths, capture)
-                .await
-                .map_err(|error| BrowserToolError::request_failed(error.to_string()))?;
+            let page = persist_browser_page_capture(
+                session_id.as_str(),
+                &session_paths,
+                state.db().model_ids(),
+                capture,
+            )
+            .await
+            .map_err(|error| BrowserToolError::request_failed(error.to_string()))?;
             Ok(crate::agent::browser_tool::BrowserResult {
                 running: true,
                 cdp_endpoint: browser_manager.cdp_endpoint(),

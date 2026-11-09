@@ -25,7 +25,7 @@ use askama::Template;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use super::{Activity, AgentLinkError, AgentMessaging, AttributeText, UntrustedText, status_name};
+use super::{Activity, AgentLinkError, AgentMessaging, AttributeText, UntrustedText, name_and_id};
 use crate::agent::{ModelSlot, ProviderLlm};
 
 /// The subagent name a btw fork's tool calls carry.
@@ -252,7 +252,7 @@ struct BtwAnswerText<'a> {
 pub struct BtwAnswer {
     /// The recipient's name.
     pub recipient: String,
-    /// The recipient's session id.
+    /// The word the model knows the recipient by.
     pub recipient_id: String,
     /// What the fork answered.
     pub answer: String,
@@ -300,10 +300,10 @@ impl AgentMessaging {
         if !snapshot.allows_fork() {
             return Err(AgentLinkError::NearCompaction(recipient.name.clone()));
         }
-        let sender = status_name(&self.runtime_service, sender_session_id).await?;
+        let (sender, sender_id) = name_and_id(&self.runtime_service, sender_session_id).await?;
         let prompt = BtwQuestionText {
             sender: AttributeText(&sender),
-            sender_id: AttributeText(sender_session_id),
+            sender_id: AttributeText(&sender_id),
             question: UntrustedText(question),
         }
         .render()
@@ -317,7 +317,7 @@ impl AgentMessaging {
         };
         Ok(BtwAnswer {
             recipient: recipient.name.clone(),
-            recipient_id: recipient.session_id.clone(),
+            recipient_id: recipient.id.clone(),
             answer,
         })
     }
@@ -345,7 +345,7 @@ impl AgentMessaging {
         let Some(launcher) = host.launcher.0.get().cloned() else {
             return Ok(None);
         };
-        let name = status_name(&self.runtime_service, session_id).await?;
+        let (name, _) = name_and_id(&self.runtime_service, session_id).await?;
         let activity = if self.runtime_service.get(session_id).await?.state.is_idle() {
             Activity::Idle
         } else {

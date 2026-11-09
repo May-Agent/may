@@ -1398,6 +1398,7 @@ impl ChatDb {
             sessions = query!(tx, statement, id, id).execute().await?.rows_written;
         }
         tx.commit().await?;
+        self.retire_ended_aliases().await?;
         Ok(sessions)
     }
 

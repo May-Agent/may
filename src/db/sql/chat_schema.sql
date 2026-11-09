@@ -106,3 +106,6 @@ CREATE TABLE IF NOT EXISTS ci_baselines (project_id INTEGER NOT NULL, workflow T
 CREATE TABLE IF NOT EXISTS ci_pr_runs (pr_id INTEGER PRIMARY KEY, queue_wait_secs INTEGER NOT NULL, run_secs INTEGER NOT NULL, recorded_at_ms INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS ci_findings (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, pr_id INTEGER NOT NULL, head_sha TEXT NOT NULL, warning TEXT NOT NULL, alert TEXT NOT NULL, alerted BOOLEAN NOT NULL DEFAULT 0, created_at_ms INTEGER NOT NULL, UNIQUE (pr_id, head_sha));
 CREATE INDEX IF NOT EXISTS idx_ci_findings_session ON ci_findings(session_id, id);
+CREATE TABLE IF NOT EXISTS model_aliases (kind TEXT NOT NULL, target TEXT NOT NULL, word TEXT NOT NULL, live BOOLEAN NOT NULL, PRIMARY KEY (kind, target));
+CREATE UNIQUE INDEX IF NOT EXISTS idx_model_aliases_live_word ON model_aliases(word) WHERE live = 1;
+CREATE INDEX IF NOT EXISTS idx_model_aliases_word ON model_aliases(kind, word);

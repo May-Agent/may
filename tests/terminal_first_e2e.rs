@@ -4997,8 +4997,10 @@ async fn ask_user_after_the_run_ended_delivers_the_answer_to_a_new_run() {
         sleep(Duration::from_millis(100)).await;
     };
     assert!(
-        delivered.contains(&request_id) && delivered.contains("Answer: PostgreSQL"),
-        "the follow-up request must carry the request id and the answer: {delivered}"
+        delivered.contains("answered your ask_user question")
+            && !delivered.contains(&request_id)
+            && delivered.contains("Answer: PostgreSQL"),
+        "the follow-up request must name the question by its word and carry the answer: {delivered}"
     );
     wait_for_runtime_condition(
         &client,
@@ -5084,8 +5086,10 @@ async fn ask_user_answered_mid_run_reaches_the_next_request_of_that_run() {
         "the request already in flight predates the answer"
     );
     assert!(
-        next.contains(&request_id) && next.contains("Answer: PostgreSQL"),
-        "the next request must carry the request id and the answer: {next}"
+        next.contains("answered your ask_user question")
+            && !next.contains(&request_id)
+            && next.contains("Answer: PostgreSQL"),
+        "the next request must name the question by its word and carry the answer: {next}"
     );
 
     server.stop().await;

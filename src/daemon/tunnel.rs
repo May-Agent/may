@@ -4,7 +4,8 @@
 //! tailnet, LAN).
 //!
 //! Tunnels live in memory and die with the daemon; they are dropped when
-//! their session is deleted.
+//! their session is deleted. Each is named by a word of the daemon's
+//! model-facing namespace, which goes back to it when the tunnel is dropped.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -45,7 +46,7 @@ pub struct TunnelEntry {
 enum TunnelCommand {
     Register {
         entry: TunnelEntry,
-        reply: oneshot::Sender<String>,
+        reply: oneshot::Sender<Result<String, aither_core::IdsExhausted>>,
     },
     Resolve {
         id: String,
@@ -70,25 +71,27 @@ impl fmt::Debug for TunnelRegistry {
 }
 
 impl TunnelRegistry {
-    pub fn new() -> Self {
+    /// A registry naming each tunnel by a word leased from `ids`, the
+    /// daemon's model-facing namespace, for as long as the tunnel lives.
+    pub fn new(ids: aither_core::AnyIdAllocator) -> Self {
         let (command_tx, mut command_rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
-            let mut entries: HashMap<String, TunnelEntry> = HashMap::new();
+            let mut entries: HashMap<String, (aither_core::IdLease, TunnelEntry)> = HashMap::new();
             while let Some(command) = command_rx.recv().await {
                 match command {
                     TunnelCommand::Register { entry, reply } => {
-                        let mut id = crate::id::new();
-                        while entries.contains_key(&id) {
-                            id = crate::id::new();
-                        }
-                        entries.insert(id.clone(), entry);
-                        let _ = reply.send(id);
+                        let registered = ids.lease().map(|lease| {
+                            let id = lease.to_string();
+                            entries.insert(id.clone(), (lease, entry));
+                            id
+                        });
+                        let _ = reply.send(registered);
                     }
                     TunnelCommand::Resolve { id, reply } => {
-                        let _ = reply.send(entries.get(&id).cloned());
+                        let _ = reply.send(entries.get(&id).map(|(_, entry)| entry.clone()));
                     }
                     TunnelCommand::RemoveSession { session_id } => {
-                        entries.retain(|_, entry| entry.session_id != session_id);
+                        entries.retain(|_, (_, entry)| entry.session_id != session_id);
                     }
                     TunnelCommand::RemoveAll => entries.clear(),
                 }
@@ -103,7 +106,7 @@ impl TunnelRegistry {
         reply_rx.await.ok()
     }
 
-    pub async fn register(&self, entry: TunnelEntry) -> String {
+    pub async fn register(&self, entry: TunnelEntry) -> Result<String, aither_core::IdsExhausted> {
         self.ask(|reply| TunnelCommand::Register { entry, reply })
             .await
             .expect("tunnel registry actor is alive for the daemon's lifetime")
@@ -208,7 +211,8 @@ pub async fn handle_tunnel_request(
             session_id: request.session_id,
             url: url.clone(),
         })
-        .await;
+        .await
+        .map_err(|error| error.to_string())?;
     let path = format!("/tunnel/{id}/");
     let local_url = state.remote_access_manager.local_addr().map_or_else(
         || format!("http://127.0.0.1:{}{path}", super::server::DEFAULT_PORT),

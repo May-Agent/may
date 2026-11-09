@@ -177,7 +177,7 @@ impl ChatDb {
         query!(self.db, "DELETE FROM scheduled_tasks WHERE id = ?", id)
             .execute()
             .await?;
-        Ok(())
+        self.retire_ended_aliases().await
     }
 
     /// Store a task created by `session_id` approved and enabled when the

@@ -698,8 +698,13 @@ impl TaskRuntime {
             .map_err(|error| prefixed_error("failed to decode persisted task trigger: ", &error))?
             .response(model.run_at.clone(), model.cron_expression.clone());
 
+        let task_id = self
+            .db
+            .alias::<crate::model_ids::TaskAlias>(&model.id)
+            .await
+            .map_err(|error| prefixed_error("failed to name the scheduled task: ", &error))?;
         Ok(TaskCreateResult {
-            task_id: model.id,
+            task_id,
             profile_id: model.profile_id,
             trigger,
             approved: model.approved,
@@ -2543,7 +2548,16 @@ mod tests {
         let prompt = host.stored_prompt("main").await;
         assert!(prompt.content.is_empty(), "it is not the user's text");
         let xml = prompt.hidden_context_xml.expect("task delivery");
-        assert!(xml.contains("task-1"), "the task id is named: {xml}");
+        let word = host
+            .runtime_service
+            .db()
+            .alias::<crate::model_ids::TaskAlias>(&task.id)
+            .await
+            .expect("the task has a word");
+        assert!(
+            xml.contains(&format!("task=\"{word}\"")) && !xml.contains(&task.id),
+            "the task is named by its word: {xml}"
+        );
         assert!(xml.contains("Nightly check"), "the task is named: {xml}");
         assert!(xml.contains("check the backups"), "the prompt: {xml}");
     }

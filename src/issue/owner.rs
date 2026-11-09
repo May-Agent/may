@@ -18,8 +18,9 @@ use crate::agent_link::{AgentDirectory, AgentLinkError, AgentTasks, AttributeTex
 /// The agent whose `tasks.md` lists an issue.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssueOwner {
-    /// Session the agent runs; `agent send` addresses it by this id.
-    pub session_id: String,
+    /// The word the model knows the agent by; `agent send` addresses it by
+    /// this id.
+    pub id: String,
     /// The agent's name.
     pub name: String,
 }
@@ -271,7 +272,7 @@ impl IssueOwners {
             let key = store.search_key();
             claims.push(Claims {
                 owner: IssueOwner {
-                    session_id: agent.status.session_id.clone(),
+                    id: agent.status.id.clone(),
                     name: agent.status.name.clone(),
                 },
                 numbers: numbers_in(tasks, &key),

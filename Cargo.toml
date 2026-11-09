@@ -221,6 +221,8 @@ sha2 = "0.10"
 
 [dev-dependencies]
 serial_test = "3"
+# Checks that every model-facing id word is one o200k_base token.
+tiktoken = { version = "4.1.2", default-features = false, features = ["vocab-o200k_base"] }
 tokio-test = "0.4"
 
 [workspace.lints]

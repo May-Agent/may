@@ -332,7 +332,9 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
         aux_tasks: super::chat::AuxTasks::default(),
         recap_schedules: super::chat::RecapSchedules::default(),
         session_background: super::chat::SessionBackgrounds::default(),
-        tunnels: Arc::new(super::tunnel::TunnelRegistry::new()),
+        tunnels: Arc::new(super::tunnel::TunnelRegistry::new(
+            db_for_archive.model_ids().clone(),
+        )),
         connectivity,
         session_events_epoch: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

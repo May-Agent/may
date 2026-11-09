@@ -10,6 +10,7 @@ pub const SESSION_DELETE: &str = include_str!("session_delete.sql");
 pub const SEARCH_OUTBOX_SCHEMA: &str = include_str!("search_outbox.sql");
 pub const SESSION_INTERVALS_SCHEMA: &str = include_str!("session_intervals.sql");
 pub const SEARCH_OUTBOX_BACKFILL: &str = include_str!("search_outbox_backfill.sql");
+pub const MODEL_ALIASES_RETIRE_ENDED: &str = include_str!("model_aliases_retire_ended.sql");
 
 /// Statements separated by a blank line, for scripts whose statements contain
 /// `;` themselves (trigger bodies).

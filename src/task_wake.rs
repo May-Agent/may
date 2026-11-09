@@ -114,8 +114,13 @@ impl SessionPrompts {
         task_name: &str,
         body: &str,
     ) -> Result<(), TaskWakeError> {
+        let word = self
+            .runtime_service
+            .db()
+            .alias::<crate::model_ids::TaskAlias>(task_id)
+            .await?;
         let text = TaskPromptText {
-            task_id: AttributeText(task_id),
+            task_id: AttributeText(&word),
             task_name: AttributeText(task_name),
             body: UntrustedText(body),
         }

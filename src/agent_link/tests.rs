@@ -55,6 +55,15 @@ impl Host {
             .expect("session is created");
     }
 
+    /// The word the model knows the agent of `session_id` by.
+    async fn alias(&self, session_id: &str) -> String {
+        self.runtime_service
+            .db()
+            .alias::<crate::model_ids::AgentAlias>(session_id)
+            .await
+            .expect("the agent has a word")
+    }
+
     fn session_dir(&self, session_id: &str) -> PathBuf {
         MayHomePaths::new(self.may_dir.path().to_path_buf())
             .session_paths(session_id)
@@ -110,6 +119,8 @@ async fn list_shows_every_non_archived_session_with_its_state() {
     );
     let beta = &live[1];
     assert_eq!(beta.session_id, "b1");
+    assert_eq!(beta.id, host.alias("b1").await, "listed by its word");
+    assert_ne!(live[0].id, beta.id, "live agents never share a word");
     assert_eq!(beta.cwd, PathBuf::from("/work/b1"));
     assert_eq!(beta.activity, Activity::Running);
     assert_eq!(
@@ -155,8 +166,9 @@ async fn a_send_enqueues_the_message_and_wakes_the_recipient() {
         xml.contains("not from the user"),
         "the message says it is not the user's: {xml}"
     );
+    let main = host.alias("main").await;
     assert!(
-        xml.contains("agent send main <prompt-file>"),
+        xml.contains(&format!("agent send {main} <prompt-file>")),
         "the reply route names the sender's id: {xml}"
     );
 }
@@ -207,14 +219,20 @@ async fn sending_is_refused_for_unknown_ambiguous_and_own_names() {
         host.messaging.send("main", "main", "hi").await,
         Err(AgentLinkError::SendToSelf)
     ));
-    // By id an ambiguous name still resolves exactly.
+    // By id an ambiguous name still resolves exactly; the session id is no
+    // address the model knows.
+    let p2 = host.alias("p2").await;
     assert_eq!(
         host.messaging
-            .send("main", "p2", "hi")
+            .send("main", &p2, "hi")
             .await
             .expect("id send"),
         "twin"
     );
+    assert!(matches!(
+        host.messaging.send("main", "p2", "hi").await,
+        Err(AgentLinkError::NoSuchAgent(_))
+    ));
 }
 
 /// Hostile framing tags in a body arrive escaped inside the delivery.

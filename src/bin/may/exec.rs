@@ -413,6 +413,7 @@ async fn build_exec_terminal_tool(
         )
         .await
         .map_err(ExecError::CreateTerminalTool)?
+        .with_id_allocator(context.db.model_ids().clone())
         .with_network_audit_log(
             aither_sandbox::open_network_audit_log(
                 context

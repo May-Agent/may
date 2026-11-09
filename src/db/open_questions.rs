@@ -11,6 +11,7 @@
 //! session queue. A failure rolls all of it back.
 
 use crate::ask_user::{AnswerValue, Question, QuestionAnswer};
+use crate::model_ids::QuestionAlias;
 use crate::session::{PendingUserMessage, PersistedAskUserQuestion, PersistedAskUserRequest};
 
 use super::common::{
@@ -58,30 +59,30 @@ pub(super) fn history_questions(questions: &[PersistedAskUserQuestion]) -> Vec<Q
 
 impl ChatDb {
     /// Persist `request` as an open question of `session_id`, with its
-    /// history entry, in one transaction.
+    /// history entry, in one transaction. Returns the word the model knows
+    /// the question by.
     ///
     /// # Errors
-    /// Returns [`ChatDbError`] on storage failure.
+    /// Returns [`ChatDbError`] on storage failure or when every model-facing
+    /// id is leased.
     pub async fn open_ask_user_question(
         &self,
         session_id: &str,
         request: &PersistedAskUserRequest,
-    ) -> Result<(), ChatDbError> {
-        {
-            let mut tx = self.db.begin().await?;
-            self.insert_pending_ask_user_in_tx(&mut tx, session_id, request, false)
-                .await?;
-            self.append_ask_user_request_message_in_tx(
-                &mut tx,
-                session_id,
-                request.id.as_str(),
-                &history_questions(&request.questions),
-                None,
-            )
+    ) -> Result<String, ChatDbError> {
+        let mut tx = self.db.begin().await?;
+        self.insert_pending_ask_user_in_tx(&mut tx, session_id, request, false)
             .await?;
-            tx.commit().await?;
-            Ok(())
-        }
+        self.append_ask_user_request_message_in_tx(
+            &mut tx,
+            session_id,
+            request.id.as_str(),
+            &history_questions(&request.questions),
+            None,
+        )
+        .await?;
+        tx.commit().await?;
+        self.alias::<QuestionAlias>(&request.id).await
     }
 
     /// Withdraw an open question of `session_id`. Returns whether it was
@@ -122,6 +123,9 @@ impl ChatDb {
             .await?;
         }
         tx.commit().await?;
+        if withdrawn {
+            self.retire_ended_aliases().await?;
+        }
         Ok(withdrawn)
     }
 
@@ -432,6 +436,7 @@ impl ChatDb {
                 false
             };
             tx.commit().await?;
+            self.retire_ended_aliases().await?;
             Ok(Some(CommittedAskUserAnswer {
                 session_id: pending.session_id,
                 blocking: pending.blocking,
@@ -459,7 +464,7 @@ impl ChatDb {
             query!(tx, sql, request_id).execute().await?;
         }
         tx.commit().await?;
-        Ok(())
+        self.retire_ended_aliases().await
     }
 
     /// Commit a permission decision: the pending request `request_id` is

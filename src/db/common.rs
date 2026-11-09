@@ -55,6 +55,13 @@ pub enum ChatDbError {
         /// The terminal state the PR is in.
         state: String,
     },
+    /// Every model-facing id is leased.
+    #[error(transparent)]
+    IdsExhausted(#[from] aither_core::IdsExhausted),
+    /// A stored model-facing alias could not be leased again on open: two
+    /// live aliases share its word, or it left the word list.
+    #[error("the stored model-facing alias could not be restored: {0}")]
+    AliasUnavailable(#[from] aither_core::WordUnavailable),
 }
 
 impl From<SkyDbError> for ChatDbError {

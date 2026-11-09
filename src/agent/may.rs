@@ -485,6 +485,9 @@ impl MayAgent {
             )
             .await
             .map_err(|e| MayAgentError::Sandbox(e.to_string()))?
+            // Job ids, stored outputs and subagent ids share the daemon's
+            // one namespace with every other model-facing id.
+            .with_id_allocator(config.db.model_ids().clone())
             .with_network_audit_log(network_audit.clone())
             .with_process_priority(config.command_priority.process_priority())
             .with_readable_paths(readable)

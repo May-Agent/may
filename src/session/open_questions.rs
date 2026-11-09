@@ -85,7 +85,8 @@ pub fn check_answers(
     Ok(())
 }
 
-/// The steer message that tells the agent `answers` to `request`.
+/// The steer message that tells the agent `answers` to `request`, which it
+/// knows by `word`.
 ///
 /// # Panics
 /// Panics if the answers were not checked with [`check_answers`], or the
@@ -93,6 +94,7 @@ pub fn check_answers(
 #[must_use]
 pub fn answer_delivery(
     request: &PersistedAskUserRequest,
+    word: &str,
     answers: &[QuestionAnswer],
 ) -> PendingUserMessage {
     assert_eq!(
@@ -101,7 +103,7 @@ pub fn answer_delivery(
         "answers must be checked against the question before delivery"
     );
     let text = AnswerDelivery {
-        request_id: request.id.as_str(),
+        request_id: word,
         entries: request
             .questions
             .iter()

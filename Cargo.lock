@@ -5828,6 +5828,7 @@ dependencies = [
  "tempfile",
  "terminal-colorsaurus",
  "thiserror 2.0.21",
+ "tiktoken",
  "tokio",
  "tokio-test",
  "toml 0.8.23",

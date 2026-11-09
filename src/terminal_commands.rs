@@ -203,7 +203,7 @@ where
         builder,
         &mut descriptions,
         SessionTool::new(
-            config.may_dir.clone(),
+            config.db.clone(),
             config.session_id.clone(),
             Some(SearchIndexer::new(
                 config.db.clone(),
@@ -422,6 +422,7 @@ where
             ImagineTool {
                 generator: imagine.generator,
                 artifacts_dir: imagine.artifacts_dir,
+                ids: config.db.model_ids().clone(),
             },
         );
     }
