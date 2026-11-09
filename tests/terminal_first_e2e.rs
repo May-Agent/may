@@ -1026,7 +1026,7 @@ fn tasks_injection(request: &Value) -> Option<&str> {
         .as_array()?
         .iter()
         .filter_map(|message| message.get("content").and_then(Value::as_str))
-        .rfind(|content| content.starts_with("<working_document>"))
+        .rfind(|content| content.starts_with("<tasks_document>"))
 }
 
 fn verify_native_tool_surface(request: &Value) -> Result<(), String> {
