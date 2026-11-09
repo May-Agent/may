@@ -13,7 +13,11 @@ SHORTCUTS
                 subagents, jobs; terminals >= 120 cols)
   Ctrl+c        Quit
   Up/Down       History / Scroll chat
-  Mouse wheel   Scroll chat
+  Mouse wheel   Scroll chat (the sidebar when over it)
+  Alt+Up/Down   Scroll the sidebar
+  Alt+e         Sidebar: open every section, list and detail
+  Click         Sidebar: fold a section, list all of "… N more",
+                show a task row's detail
   g             Top
   G             Bottom
   Esc           Clear input

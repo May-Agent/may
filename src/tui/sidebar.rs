@@ -8,7 +8,32 @@
 //! `#<number>`; named issues are looked up in the session's issue store for
 //! their title and state.
 
+use std::collections::HashSet;
+
 use crate::task_rows::TaskRow;
+
+/// Every collapsible section.
+const ALL_SECTIONS: [SidebarSection; 7] = [
+    SidebarSection::Doing,
+    SidebarSection::Queued,
+    SidebarSection::Issues,
+    SidebarSection::PullRequests,
+    SidebarSection::Changes,
+    SidebarSection::Subagents,
+    SidebarSection::Jobs,
+];
+
+/// The key a task row's detail state is kept under: its first line.
+#[must_use]
+pub fn task_key(row: &TaskRow) -> String {
+    row.text
+        .lines()
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 /// Terminal width from which the sidebar is shown.
 pub const SIDEBAR_MIN_TERMINAL_WIDTH: u16 = 120;
@@ -40,9 +65,64 @@ pub struct IssueBrief {
     pub closed: bool,
 }
 
+/// A section of the sidebar that collapses under its heading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SidebarSection {
+    /// Tasks in progress.
+    Doing,
+    /// Tasks waiting their turn.
+    Queued,
+    /// Issues the task rows name.
+    Issues,
+    /// The session's live pull requests.
+    PullRequests,
+    /// File changes per workspace root.
+    Changes,
+    /// Running subagents.
+    Subagents,
+    /// Background terminal jobs.
+    Jobs,
+}
+
+/// What a click on a sidebar row acts on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SidebarHit {
+    /// A section heading: collapses or expands the section.
+    Heading(SidebarSection),
+    /// A `… N more` row: lists every entry of the section, or folds it again.
+    More(SidebarSection),
+    /// A task row with a detail: shows or hides the detail. Keyed by the
+    /// row's first line, which survives a re-read of `tasks.md`.
+    Task(String),
+}
+
+/// What the last frame drew, so input can act on it.
+#[derive(Debug, Default)]
+pub struct SidebarView {
+    /// Rows of the screen the click targets sit on.
+    pub hits: Vec<(u16, SidebarHit)>,
+    /// How far the body can scroll.
+    pub max_scroll: usize,
+}
+
 /// Sidebar state kept by the app.
 #[derive(Debug)]
 pub struct SidebarState {
+    /// Screen rect the sidebar occupied last frame (mouse mapping); empty
+    /// while it is hidden.
+    pub area: ratatui::layout::Rect,
+    /// Rows scrolled off the top of the body (everything below the title).
+    pub scroll: usize,
+    /// Sections folded under their heading.
+    pub collapsed: HashSet<SidebarSection>,
+    /// Sections listing every entry instead of their first few.
+    pub listed_all: HashSet<SidebarSection>,
+    /// Task rows showing their detail.
+    pub detailed: HashSet<String>,
+    /// Every section open, every list and every detail shown.
+    pub expand_all: bool,
+    /// What the last frame drew.
+    pub view: SidebarView,
     /// User toggle (`Ctrl+B`); the sidebar also needs a wide terminal.
     pub enabled: bool,
     /// Session the task tree belongs to.
@@ -62,6 +142,13 @@ pub struct SidebarState {
 impl Default for SidebarState {
     fn default() -> Self {
         Self {
+            area: ratatui::layout::Rect::default(),
+            scroll: 0,
+            collapsed: HashSet::new(),
+            listed_all: HashSet::new(),
+            detailed: HashSet::new(),
+            expand_all: false,
+            view: SidebarView::default(),
             enabled: true,
             session_id: None,
             title: None,
@@ -141,8 +228,94 @@ impl SidebarState {
         }
     }
 
+    /// Whether the body overflows, so the wheel and keys scroll it.
+    #[must_use]
+    pub const fn scrollable(&self) -> bool {
+        self.view.max_scroll > 0
+    }
+
+    /// Scroll the body up by `rows`.
+    pub fn scroll_up(&mut self, rows: usize) {
+        self.scroll = self.scroll.min(self.view.max_scroll).saturating_sub(rows);
+    }
+
+    /// Scroll the body down by `rows`, stopping at its end.
+    pub fn scroll_down(&mut self, rows: usize) {
+        self.scroll = self.scroll.saturating_add(rows).min(self.view.max_scroll);
+    }
+
+    /// Whether `section` is folded under its heading.
+    #[must_use]
+    pub fn is_collapsed(&self, section: SidebarSection) -> bool {
+        self.collapsed.contains(&section)
+    }
+
+    /// Whether `section` lists every entry.
+    #[must_use]
+    pub fn lists_all(&self, section: SidebarSection) -> bool {
+        self.expand_all || self.listed_all.contains(&section)
+    }
+
+    /// Whether the task row keyed `key` shows its detail.
+    #[must_use]
+    pub fn shows_detail(&self, key: &str) -> bool {
+        self.expand_all || self.detailed.contains(key)
+    }
+
+    /// Open every section and show every entry and detail, or fold the
+    /// lists and details back.
+    pub fn toggle_expand_all(&mut self) {
+        self.expand_all = !self.expand_all;
+        if self.expand_all {
+            self.collapsed.clear();
+        }
+    }
+
+    /// Act on a click at screen row `row`.
+    pub fn click(&mut self, row: u16) {
+        let Some(hit) = self
+            .view
+            .hits
+            .iter()
+            .find_map(|(y, hit)| (*y == row).then(|| hit.clone()))
+        else {
+            return;
+        };
+        match hit {
+            SidebarHit::Heading(section) => {
+                if !self.collapsed.remove(&section) {
+                    self.collapsed.insert(section);
+                }
+            }
+            SidebarHit::More(section) => {
+                if self.expand_all {
+                    self.expand_all = false;
+                    self.listed_all.extend(ALL_SECTIONS);
+                    self.listed_all.remove(&section);
+                } else if !self.listed_all.remove(&section) {
+                    self.listed_all.insert(section);
+                }
+            }
+            SidebarHit::Task(key) => {
+                if self.expand_all {
+                    self.expand_all = false;
+                    self.detailed
+                        .extend(self.tasks.iter().flatten().map(task_key));
+                    self.detailed.remove(&key);
+                } else if !self.detailed.remove(&key) {
+                    self.detailed.insert(key);
+                }
+            }
+        }
+    }
+
     /// Forget everything about the previous session.
     pub fn reset(&mut self) {
+        self.scroll = 0;
+        self.collapsed.clear();
+        self.listed_all.clear();
+        self.detailed.clear();
+        self.expand_all = false;
         self.session_id = None;
         self.title = None;
         self.tasks = None;
