@@ -354,6 +354,12 @@ pub enum ChatElement {
         /// Warning text shown in the stream.
         message: String,
     },
+    /// Welcome header: logo, name, version and working directory. Always
+    /// the first element of a stream.
+    Welcome {
+        /// Working directory as shown, home written `~`.
+        cwd: String,
+    },
     /// Neutral system notice (e.g. rewind result)
     Notice {
         /// Notice text shown in the stream.
@@ -564,6 +570,18 @@ impl ChatStream {
             history_index,
         });
         self.seal_response();
+    }
+
+    /// Start the stream with the welcome header showing `cwd`.
+    ///
+    /// # Panics
+    /// When the stream already holds elements: the header only ever opens it.
+    pub fn push_welcome(&mut self, cwd: String) {
+        assert!(
+            self.elements.is_empty(),
+            "the welcome header must be the first element"
+        );
+        self.push_element(ChatElement::Welcome { cwd });
     }
 
     /// Add an error message.
@@ -2351,7 +2369,7 @@ fn last_lines(text: &str, n: usize) -> &str {
 }
 
 /// Suffix of `text` whose display width is at most `max_width`.
-fn suffix_max_width(text: &str, max_width: usize) -> &str {
+pub(super) fn suffix_max_width(text: &str, max_width: usize) -> &str {
     if max_width == 0 || text.is_empty() {
         return "";
     }
@@ -2596,6 +2614,10 @@ pub(super) fn element_lines(
                 ]));
             }
             lines.push(Line::from(""));
+        }
+
+        ChatElement::Welcome { cwd } => {
+            lines.extend(super::welcome::welcome_lines(cwd, width));
         }
 
         ChatElement::Notice { message } => {
