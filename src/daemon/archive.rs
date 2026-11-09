@@ -174,6 +174,7 @@ mod tests {
                     script: "ls".into(),
                     session_id: Some("permission".into()),
                     agent_id: None,
+                    reading: None,
                 },
             }),
         )

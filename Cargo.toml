@@ -27,6 +27,9 @@ libc = "0.2.191"
 aither-core = { version = "0.26.0" }
 aither-agent = { version = "0.26.0", features = ["mcp", "webfetch", "skills", "connectivity", "languages"] }
 aither-connectivity = { version = "0.26.0" }
+# The parser the harness applies `apply_patch` with; a call's reading uses it
+# to place each hunk in the file it edits.
+aither-patch = { version = "0.26.0" }
 aither-sandbox = { version = "0.26.0", features = ["code-folding", "connectivity", "jobserver"] }
 aither-cloud = { version = "0.26.0" }
 aither-copilot = { version = "0.26.0" }
@@ -41,7 +44,7 @@ aither-openai = { version = "0.26.0", default-features = false, features = ["tok
 aither-sed = { version = "0.26.0", default-features = false }
 # Names acpsub's `TurnEnd::Stopped` reason, so it is the aither-acp acpsub
 # builds on.
-aither-acp = { version = "0.24.0" }
+aither-acp = { version = "0.26.0" }
 # The sandbox ACP agents and their terminal commands run in; the version
 # aither-sandbox builds its own sandboxes with.
 heel = { version = "0.9.1", default-features = false }
@@ -177,6 +180,9 @@ fd-lock = "4.0.4"
 
 # Templating
 askama = "0.16"
+
+# Shell parsing: terminal calls are read before they run
+brush-parser = { version = "0.3.0", default-features = false }
 
 # Embedded resources
 include_dir = "0.7"

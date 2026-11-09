@@ -277,6 +277,10 @@ pub struct ChatMessage {
     /// content above stays the original.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub translation: Option<MessageTranslation>,
+    /// How the daemon read the script of a stored `terminal` call start,
+    /// attached when the daemon serves the history; never stored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reading: Option<crate::command_reading::CommandReading>,
     /// The reasoning text streamed before an assistant message, kept for
     /// display. Never part of the model's context: provider reasoning state
     /// lives in `reasoning`.
@@ -323,6 +327,7 @@ impl ChatMessage {
             reasoning: Vec::new(),
             tool_calls: Vec::new(),
             translation: None,
+            reading: None,
             thinking: None,
         }
     }
@@ -340,6 +345,7 @@ impl ChatMessage {
             reasoning: Vec::new(),
             tool_calls: Vec::new(),
             translation: None,
+            reading: None,
             thinking: None,
         }
     }
@@ -361,6 +367,7 @@ impl ChatMessage {
             reasoning: Vec::new(),
             tool_calls: Vec::new(),
             translation: None,
+            reading: None,
             thinking: None,
         }
     }
@@ -378,6 +385,7 @@ impl ChatMessage {
             reasoning: Vec::new(),
             tool_calls: Vec::new(),
             translation: None,
+            reading: None,
             thinking: None,
         }
     }
@@ -399,6 +407,7 @@ impl ChatMessage {
             reasoning: Vec::new(),
             tool_calls: Vec::new(),
             translation: None,
+            reading: None,
             thinking: None,
         }
     }
@@ -419,6 +428,7 @@ impl ChatMessage {
             reasoning: Vec::new(),
             tool_calls: Vec::new(),
             translation: None,
+            reading: None,
             thinking: None,
         }
     }
@@ -869,6 +879,7 @@ pub fn chat_messages_from_transcript(
             reasoning: Vec::new(),
             tool_calls: Vec::new(),
             translation: None,
+            reading: None,
             thinking: None,
         }
     }
