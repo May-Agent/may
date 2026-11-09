@@ -3101,7 +3101,7 @@ mod tests {
         assert!(shown.iter().any(|row| row.contains(IMAGE_MARK)));
 
         // Cut by the top edge: caption only, no protocol cells.
-        let (shown, regions) = draw(&mut terminal, &chat, &mut layout, &mut cache, 5);
+        let (shown, regions) = draw(&mut terminal, &chat, &mut layout, &mut cache, 6);
         assert!(regions.is_empty());
         assert!(
             !shown.iter().any(|row| row.contains(IMAGE_MARK)),
