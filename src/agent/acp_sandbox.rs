@@ -14,7 +14,7 @@
 //! running agent keeps the grants it started with, as a running terminal
 //! command does.
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -86,7 +86,14 @@ pub struct SessionSandbox<N> {
     jobs: Option<JobBroker>,
     /// The tool distribution's `heel`, which runs the sandbox's supervisor.
     heel: HeelBinary,
+    /// The session's managed tools directory, which leads the `PATH` of the
+    /// commands the agent runs. A scratch sandbox runs no such command.
+    tools: Option<ManagedTools>,
 }
+
+/// The `bin` directory of the session's prepared tools, set once the session
+/// terminal has prepared them; the sandbox is built before that.
+pub type ManagedTools = Arc<OnceLock<PathBuf>>;
 
 impl<N> std::fmt::Debug for SessionSandbox<N> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -111,12 +118,14 @@ impl SessionSandbox<SessionPolicy> {
         approver: Option<PermissionApprover>,
         jobs: JobBroker,
         heel: HeelBinary,
+        tools: ManagedTools,
     ) -> Self {
         Self {
             root,
             launch_dir: None,
             jobs: Some(jobs),
             heel,
+            tools: Some(tools),
             grants,
             network: Audited::new(
                 SessionNetwork {
@@ -145,6 +154,7 @@ impl SessionSandbox<DenyAll> {
             approver: None,
             jobs: None,
             heel,
+            tools: None,
         }
     }
 }
@@ -161,6 +171,36 @@ type AcpChild = heel::Child;
 /// as aither gives May's own commands.
 #[cfg(target_os = "linux")]
 const SUPERVISED_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+impl<N> SessionSandbox<N> {
+    /// The managed tools directory a command of the agent runs with; the
+    /// agent itself runs on the host's tools. A session's terminal prepares
+    /// the tools before it can start a connection, so none is a bug.
+    fn managed_bin(&self, process: &Process) -> io::Result<Option<PathBuf>> {
+        match (process, &self.tools) {
+            (Process::Terminal, Some(tools)) => tools
+                .get()
+                .map(|bin| canonical(bin).map(Some))
+                .unwrap_or_else(|| {
+                    Err(io::Error::other(
+                        "the session's managed tools are not prepared",
+                    ))
+                }),
+            _ => Ok(None),
+        }
+    }
+
+    /// The `PATH` of `process`: the managed tools first for a command of
+    /// the agent, then the host's.
+    fn search_path(&self, process: &Process) -> io::Result<OsString> {
+        let host = std::env::var_os("PATH").unwrap_or_default();
+        let paths = self
+            .managed_bin(process)?
+            .into_iter()
+            .chain(std::env::split_paths(&host));
+        std::env::join_paths(paths).map_err(io::Error::other)
+    }
+}
 
 impl<N: NetworkPolicy + Clone> SessionSandbox<N> {
     /// The sandbox a process of `spec` starts in, with the grants of this
@@ -186,17 +226,25 @@ impl<N: NetworkPolicy + Clone> SessionSandbox<N> {
         // its own name (`cargo` is a link to `rustup`, which dispatches on
         // it). A grant never names a link, so its target is what the sandbox
         // may execute.
-        let program = resolve_program(&spec.program, cwd)?;
+        let search_path = self.search_path(process)?;
+        let program = resolve_program(&spec.program, &search_path, cwd)?;
         let target = canonical(&program)?;
         let links = process.link_dirs(&program)?;
         let scripts = process.named_files(spec, cwd);
         let toolchains = toolchain_homes();
+        let managed = self.managed_bin(process)?;
         let grants = snapshot
             .writable
             .iter()
             .map(|path| (path, Access::WRITE | Access::EXEC))
             .chain(snapshot.readable.iter().map(|path| (path, Access::READ)))
             .chain(std::iter::once((&target, Access::EXEC)))
+            // The managed tools a command of the agent runs.
+            .chain(
+                managed
+                    .iter()
+                    .map(|path| (path, Access::READ | Access::EXEC)),
+            )
             .chain(links.iter().map(|path| (path, Access::READ)))
             .chain(scripts.iter().map(|path| (path, Access::READ)))
             // The command writes the tokens it is done with back to its fifo.
@@ -222,7 +270,7 @@ impl<N: NetworkPolicy + Clone> SessionSandbox<N> {
             .collect::<io::Result<Vec<_>>>()?;
         let tmp = root.join("tmp");
         async_fs::create_dir_all(&tmp).await?;
-        let environment = base_environment(&root, &tmp, &toolchains, process)?;
+        let environment = base_environment(&root, &tmp, &toolchains, process, search_path)?;
         let config = SandboxConfig::builder()
             .network(self.network.clone())
             .working_dir(root)
@@ -345,6 +393,7 @@ fn base_environment(
     tmp: &Path,
     toolchains: &[(&'static str, PathBuf)],
     process: &Process,
+    search_path: OsString,
 ) -> io::Result<Vec<(&'static str, String)>> {
     let homes: Vec<(&'static str, OsString)> = match process {
         Process::Agent { .. } => vec![("HOME", canonical(&real_home()?)?.into_os_string())],
@@ -354,9 +403,7 @@ fn base_environment(
             ("XDG_CONFIG_HOME", root.join(".config").into_os_string()),
         ],
     };
-    std::env::var_os("PATH")
-        .map(|path| ("PATH", path))
-        .into_iter()
+    std::iter::once(("PATH", search_path))
         .chain(
             ["TMPDIR", "TMP", "TEMP"]
                 .into_iter()
@@ -420,8 +467,8 @@ fn resolved(path: &Path) -> io::Result<ResolvedPath> {
 
 /// The file a command name starts, as the host's `PATH` finds it from `cwd`,
 /// where the sandbox's own search path would not. A link stays a link.
-fn resolve_program(program: &str, cwd: &Path) -> io::Result<PathBuf> {
-    which::which_in(program, std::env::var_os("PATH"), cwd).map_err(|error| {
+fn resolve_program(program: &str, search_path: &OsStr, cwd: &Path) -> io::Result<PathBuf> {
+    which::which_in(program, Some(search_path), cwd).map_err(|error| {
         io::Error::new(
             io::ErrorKind::NotFound,
             format!("cannot find the program `{program}`: {error}"),
@@ -825,6 +872,7 @@ mod tests {
             None,
             server.broker().expect("pool broker"),
             heel,
+            crate::repo_clone::test_sandbox::managed_tools().await,
         )
     }
 
@@ -875,6 +923,43 @@ mod tests {
                 "the tokens did not return to the pool"
             );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A command the agent runs through ACP finds the managed shell and
+    /// Python before the host's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_acp_terminal_command_runs_the_managed_tools() {
+        let (_pool_dir, server) = pool(1).await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().join("session");
+        let sandbox = session_sandbox(&root, &server).await;
+        let report = root.join("tmp/resolved");
+        let executor = SandboxExecutor::new(
+            Arc::new(ArcSwap::from_pointee(sandbox)),
+            Arc::<ArcSwap<MayConfig>>::default(),
+        );
+        let spec = SpawnSpec {
+            program: "bash".to_string(),
+            args: vec![
+                "-c".to_string(),
+                format!("command -v bash python3 > {}", report.display()),
+            ],
+            env: std::collections::BTreeMap::new(),
+            cwd: root.clone(),
+        };
+        let command = executor.spawn_terminal(spec).await.expect("command starts");
+        let status =
+            tokio::time::timeout(std::time::Duration::from_secs(30), command.control.wait())
+                .await
+                .expect("the command ends")
+                .expect("its status");
+        assert!(status.success(), "{status:?}");
+        let resolved = std::fs::read_to_string(&report).expect("the command reported");
+        let lines: Vec<_> = resolved.lines().collect();
+        assert_eq!(lines.len(), 2, "{resolved}");
+        for line in lines {
+            assert!(line.contains("/runtimes/"), "{line} is not a managed copy");
         }
     }
 

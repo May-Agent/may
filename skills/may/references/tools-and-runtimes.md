@@ -40,6 +40,12 @@ The interpreter is installed into the same tree as the tools, under `<key>/bin/.
 
 A session's `PATH` is the prepared directory `<key>/bin` first, then the host's own `PATH` (so `cargo`, `git`, `gh`, and anything else on the host stay reachable). Managed tools therefore win over a system tool of the same name (the system `python3`, `jq`, `rg`, `ls`, ... are shadowed); a host tool with no managed counterpart is found as usual. The terminal also sets `HOME` and `TMPDIR` to the session directory (`TMPDIR` to its `tmp/`), `XDG_CACHE_HOME` and `XDG_CONFIG_HOME` under it, and `PYTHONPATH` to start with the session's `skills/python`, followed by any inherited value.
 
+Commands a connected ACP agent runs through ACP `terminal/*` get the same `PATH`: the session's managed directory first, then the host's, and the managed directory is readable and executable in their sandbox. The agent's own process keeps the host `PATH`. `may exec` and scheduled commands prepare the same tools as a session's terminal.
+
+## Read policy
+
+A sandboxed command reads everywhere on the machine except credential stores and keys (for example `~/.ssh`, `~/.config/gh` and keychain items); it writes only the session directory and granted workdirs. A command that needs a denied path or the host environment as it is runs as an `unsafe` command with the user's approval.
+
 ## Python projects and uv
 
 The environment exports `UV_CACHE_DIR=~/.may/tools/runtimes/uv/cache`, `UV_PYTHON_INSTALL_DIR=~/.may/tools/runtimes/uv/python` and `UV_PYTHON_PREFERENCE=system`. Effects:
