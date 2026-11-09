@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use askama::Template;
 
-use super::{IssueError, IssueState, IssueStore, ResolvedIssueStore, resolve_issue_store};
+use super::{IssueError, IssueState, IssueStore, ResolvedIssueStore, resolve_bound_issue_store};
 use crate::agent_link::{AgentDirectory, AgentLinkError, AgentTasks, AttributeText};
 
 /// The agent whose `tasks.md` lists an issue.
@@ -238,8 +238,12 @@ impl IssueOwners {
     async fn store_of(&self, agent: &AgentTasks) -> Result<ResolvedIssueStore, IssueError> {
         let cwd: PathBuf = agent.status.cwd.clone();
         let workspace_config = agent.workspace_config.clone();
+        let binding = agent.binding.clone();
         let db = self.directory.db();
-        blocking::unblock(move || resolve_issue_store(&cwd, &workspace_config, db)).await
+        blocking::unblock(move || {
+            resolve_bound_issue_store(binding.as_ref(), &cwd, &workspace_config, db)
+        })
+        .await
     }
 
     /// What each agent lists. An agent whose backend cannot be resolved (its

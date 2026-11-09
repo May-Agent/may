@@ -190,10 +190,17 @@ async fn issue_briefs(
     let store = SessionStore::new(MayHomePaths::new(state.may_dir.clone()));
     let sandbox_dir = store.sandbox_dir(&id, session.profile_id.as_deref());
     let workspace_config = crate::session::SessionPaths::new(sandbox_dir).workspace_config();
-    let issue_store =
-        blocking::unblock(move || crate::issue::resolve_issue_store(&cwd, &workspace_config, db))
-            .await
-            .map_err(internal_error)?;
+    let binding = session
+        .repo
+        .as_deref()
+        .map(crate::session::RepoBinding::parse)
+        .transpose()
+        .map_err(internal_error)?;
+    let issue_store = blocking::unblock(move || {
+        crate::issue::resolve_bound_issue_store(binding.as_ref(), &cwd, &workspace_config, db)
+    })
+    .await
+    .map_err(internal_error)?;
     let mut briefs = Vec::with_capacity(numbers.len());
     for number in numbers {
         let brief = match issue_store.get(number).await {
@@ -600,6 +607,13 @@ pub(super) fn resolve_repo_binding(spec: Option<&str>) -> Result<Option<String>,
     let Some(spec) = spec.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(None);
     };
+    // The stored `local:<identity>` form is the daemon's own identity format
+    // for a local repository, which clients echo back from a session's group.
+    if spec.starts_with("local:") {
+        return crate::session::RepoBinding::parse(spec)
+            .map(|binding| Some(binding.to_stored()))
+            .map_err(|error| error.to_string());
+    }
     let github = spec.strip_prefix("github:").unwrap_or(spec);
     let looks_like_github = {
         let mut parts = github.split('/');

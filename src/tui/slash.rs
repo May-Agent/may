@@ -104,7 +104,11 @@ impl SlashCommand {
             Self::Help => ("/help", "", "Show commands and shortcuts"),
             Self::Session => ("/session", "", "Switch or create sessions"),
             Self::Archive => ("/archive", "", "Open an archived session"),
-            Self::New => ("/new", "", "Start a new session"),
+            Self::New => (
+                "/new",
+                "[owner/repo|path]",
+                "Start a new session, optionally on a repository",
+            ),
             Self::Profile => ("/profile", "", "Switch profile (Ctrl+P)"),
             Self::Model => ("/model", "[query]", "Switch model for this session"),
             Self::Effort => ("/effort", "", "Adjust reasoning effort for this session"),

@@ -1,0 +1,1 @@
+checkout — Base on this checkout, uncommitted and untracked files included{% if loses_github %}; the checkout is also stale, so GitHub issues and PRs are lost and May's own are used{% endif %}
