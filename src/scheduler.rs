@@ -2330,6 +2330,7 @@ mod tests {
             let runtime_service = Arc::new(crate::session::SessionRuntimeService::new(
                 db.clone(),
                 crate::ui_event_bus::UiEventBus::new(),
+                crate::session::MayHomePaths::new(may_dir.clone()),
             ));
             let (wake_tx, wakes) = async_channel::unbounded();
             let runtime = TaskRuntime::load(

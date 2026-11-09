@@ -1,0 +1,8 @@
+{% match self -%}
+{% when Self::Failed { pr_number, names } -%}
+PR #{{ pr_number }}'s checks failed: {% for name in names %}{{ name }}{% if !loop.last %}, {% endif %}{% endfor %}. `pr show {{ pr_number }}` lists the error lines of their logs.
+{%- when Self::Passed { pr_number, total } -%}
+All {{ total }} check{% if *total != 1 %}s{% endif %} of PR #{{ pr_number }} passed.
+{%- when Self::Unreadable { pr_number, error } -%}
+PR #{{ pr_number }}'s checks could not be read from GitHub ({{ error }}); `pr show {{ pr_number }}` retries the query.
+{%- endmatch %}

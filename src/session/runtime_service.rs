@@ -43,12 +43,50 @@ pub enum AskUserAnswer {
     },
 }
 
+/// The rows of the `tasks.md` at `path` that mark `request_id` `BLOCKING`
+/// and would lose the mark; none when the file is absent, unreadable or the
+/// result would be malformed.
+async fn unblocked_rows(
+    path: &std::path::Path,
+    request_id: &str,
+) -> Vec<crate::tasks_md::edit::Unblocked> {
+    let content = match async_fs::read_to_string(path).await {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => {
+            tracing::error!(path = %path.display(), %error, "failed to read tasks.md for an answered question");
+            return Vec::new();
+        }
+    };
+    match crate::tasks_md::edit::clear_question(&content, request_id) {
+        Ok(cleared) => cleared.rows,
+        Err(error) => {
+            tracing::error!(path = %path.display(), ?error, "an answered question's marks cannot be removed from tasks.md");
+            Vec::new()
+        }
+    }
+}
+
+/// Removes the `BLOCKING <request_id>` marks from the `tasks.md` at `path`.
+async fn clear_marks(path: std::path::PathBuf, request_id: String) {
+    let cleared = blocking::unblock(move || {
+        crate::tasks_md::edit::clear_question_in(&path, &request_id).map_err(|error| (path, error))
+    })
+    .await;
+    if let Err((path, error)) = cleared {
+        tracing::error!(path = %path.display(), %error, "failed to remove an answered question's marks from tasks.md");
+    }
+}
+
 /// Persists session runtime state and publishes UI events for changes.
 #[derive(Clone)]
 pub struct SessionRuntimeService {
     db: ChatDb,
     ui_event_bus: UiEventBus,
     runs: SessionRuns,
+    /// The May home the session directories are under; an answered
+    /// question's marks are removed from the `tasks.md` there.
+    home: super::MayHomePaths,
     /// Agent id → owning session, for every agent the daemon has seen:
     /// the address map agent-to-agent messaging routes through.
     agents: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
@@ -78,14 +116,16 @@ impl std::fmt::Debug for SessionRuntimeService {
 }
 
 impl SessionRuntimeService {
-    /// Create the service over `db`, publishing change events on `ui_event_bus`.
+    /// Create the service over `db`, publishing change events on
+    /// `ui_event_bus`, with the sessions' directories under `home`.
     #[must_use]
-    pub fn new(db: ChatDb, ui_event_bus: UiEventBus) -> Self {
+    pub fn new(db: ChatDb, ui_event_bus: UiEventBus, home: super::MayHomePaths) -> Self {
         let runs = SessionRuns::new(db.clone(), ui_event_bus.clone());
         Self {
             db,
             ui_event_bus,
             runs,
+            home,
             agents: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             terminal_grants: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
@@ -671,13 +711,34 @@ impl SessionRuntimeService {
                 .map(|session_id| AskUserAnswer::AlreadyAnswered { session_id }));
         };
         super::open_questions::check_answers(&pending.request, answers)?;
+        // The rows of the session's `tasks.md` that wait on the question: the
+        // reminder names them, and their marks go once the answer is
+        // committed. A prompt a run blocks on marks no row.
+        let tasks_path = if pending.blocking {
+            None
+        } else {
+            let session = self.db.get_session(&pending.session_id).await?;
+            let paths = session.and_then(|session| session.profile_id).map_or_else(
+                || self.home.session_paths(&pending.session_id),
+                |profile| {
+                    self.home
+                        .profile_home(&profile)
+                        .session_paths(&pending.session_id)
+                },
+            );
+            Some(paths.tasks_path())
+        };
+        let unblocked = match &tasks_path {
+            Some(path) => unblocked_rows(path, request_id).await,
+            None => Vec::new(),
+        };
         let committed = self
             .db
             .commit_ask_user_answer(
                 request_id,
                 answers,
                 (!pending.blocking).then_some(|request: &PersistedAskUserRequest| {
-                    super::open_questions::answer_delivery(request, answers)
+                    super::open_questions::answer_delivery(request, answers, &unblocked)
                 }),
             )
             .await?;
@@ -692,6 +753,11 @@ impl SessionRuntimeService {
         // A question the agent asked changes what `tasks.md` rows wait on; a
         // prompt a run blocks on is no question of the agent's.
         if !pending.blocking {
+            if let Some(path) = tasks_path {
+                // Before the event is recorded, so the document no longer
+                // names the question when its end is judged.
+                clear_marks(path, request_id.to_string()).await;
+            }
             self.task_events(&pending.session_id).record(
                 aither_agent::WorkEvent::QuestionAnswered(request_id.to_string()),
             );
@@ -737,7 +803,7 @@ impl SessionRuntimeService {
     ) -> Result<SessionRuntimeSummary, crate::db::ChatDbError> {
         self.enqueue(
             session_id,
-            super::open_questions::answer_delivery(request, answers),
+            super::open_questions::answer_delivery(request, answers, &[]),
             PendingUserMessageMode::Steer,
         )
         .await

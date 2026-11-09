@@ -277,7 +277,7 @@ fn pr_icon(pr: &crate::client::WirePr) -> (&'static str, Style) {
     if pr.state == "merging" {
         return ("●", Style::default().fg(Color::Green));
     }
-    match pr.checks {
+    match &pr.checks {
         Some(c) if c.failed > 0 => ("●", Style::default().fg(Color::Red)),
         Some(c) if c.pending > 0 => ("●", Style::default().fg(Color::Yellow)),
         Some(_) => ("✓", Style::default().fg(Color::Green)),
@@ -285,18 +285,105 @@ fn pr_icon(pr: &crate::client::WirePr) -> (&'static str, Style) {
     }
 }
 
-fn pr_row(pr: &crate::client::WirePr, width: usize) -> Line<'static> {
+/// A PR row and, once expanded, its checks. A row with checks (or a failed
+/// read to show) folds: its collapsed form carries the finished-of-total
+/// figure.
+fn pr_rows(
+    body: &mut Body,
+    state: &SidebarState,
+    pr: &crate::client::WirePr,
+    width: usize,
+    now: jiff::Timestamp,
+) {
     let (icon, icon_style) = pr_icon(pr);
+    let foldable =
+        pr.checks.as_ref().is_some_and(|c| !c.items.is_empty()) || pr.checks_error.is_some();
+    let open = foldable && state.shows_checks(pr.number);
+    let lead = match (foldable, open) {
+        (false, _) => "  ",
+        (true, true) => "▾ ",
+        (true, false) => "▸ ",
+    };
     let number = format!("#{} ", pr.number);
-    let title_width = width.saturating_sub(number.width() + icon.width() + 1);
+    let progress = pr
+        .checks
+        .as_ref()
+        .filter(|c| c.total() > 0)
+        .map(|c| format!("{}/{} ", c.finished(), c.total()))
+        .unwrap_or_default();
+    let title_width =
+        width.saturating_sub(lead.width() + number.width() + progress.width() + icon.width() + 1);
     let title = truncate(&pr.title, title_width);
-    let pad = width.saturating_sub(number.width() + title.width() + icon.width());
-    Line::from(vec![
+    let pad = width.saturating_sub(
+        lead.width() + number.width() + title.width() + progress.width() + icon.width(),
+    );
+    let line = Line::from(vec![
+        Span::styled(lead, Style::default().fg(Color::DarkGray)),
         Span::styled(number, Style::default().fg(Color::Magenta)),
         Span::raw(title),
         Span::raw(" ".repeat(pad.max(1))),
+        Span::styled(progress, Style::default().fg(Color::DarkGray)),
         Span::styled(icon, icon_style),
-    ])
+    ]);
+    if !foldable {
+        body.push(line);
+        return;
+    }
+    body.push_hit(line, SidebarHit::Pr(pr.number));
+    if !open {
+        return;
+    }
+    if let Some(error) = &pr.checks_error {
+        for part in wrap_hanging(
+            &format!("checks unreadable: {error}"),
+            width.saturating_sub(4),
+            0,
+        ) {
+            body.push_hit(
+                Line::from(Span::styled(
+                    format!("    {part}"),
+                    Style::default().fg(Color::Red),
+                )),
+                SidebarHit::Pr(pr.number),
+            );
+        }
+    }
+    for check in pr.checks.iter().flat_map(|c| &c.items) {
+        let (mark, style) = match check.state.as_str() {
+            "passed" => ("✓", Style::default().fg(Color::Green)),
+            "failed" => ("✗", Style::default().fg(Color::Red)),
+            "running" => ("●", Style::default().fg(Color::Yellow)),
+            _ => ("○", Style::default().fg(Color::DarkGray)),
+        };
+        let time = check
+            .duration_secs(now)
+            .map(format_elapsed)
+            .unwrap_or_default();
+        let name_width = width.saturating_sub(4 + 2 + time.width() + 1);
+        let name = truncate(&check.name, name_width);
+        let pad = width.saturating_sub(4 + 2 + name.width() + time.width());
+        body.push_hit(
+            Line::from(vec![
+                Span::raw("    "),
+                Span::styled(format!("{mark} "), style),
+                Span::raw(name),
+                Span::raw(" ".repeat(pad.max(1))),
+                Span::styled(time, Style::default().fg(Color::DarkGray)),
+            ]),
+            SidebarHit::Pr(pr.number),
+        );
+        if check.state == "failed"
+            && let Some(url) = &check.url
+        {
+            body.push_hit(
+                dim(format!(
+                    "      {}",
+                    truncate_tail(url, width.saturating_sub(6))
+                )),
+                SidebarHit::Pr(pr.number),
+            );
+        }
+    }
 }
 
 fn changes(body: &mut Body, app: &App, width: usize) {
@@ -479,8 +566,9 @@ fn build_body(app: &App, width: usize) -> Body {
     if !live_prs.is_empty() {
         body.gap();
         if body.heading(state, SidebarSection::PullRequests, "Pull requests") {
+            let now = jiff::Timestamp::now();
             for pr in live_prs {
-                body.push(pr_row(pr, width));
+                pr_rows(&mut body, state, pr, width, now);
             }
         }
     }
@@ -579,7 +667,8 @@ pub(super) fn render_sidebar(frame: &mut Frame, area: Rect, app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::{pr_icon, truncate, wrap_hanging};
-    use crate::client::{WirePr, WirePrChecks};
+    use crate::client::{WirePr, WirePrCheck, WirePrChecks};
+    use unicode_width::UnicodeWidthStr;
 
     #[test]
     fn wrap_hanging_wraps_by_display_width() {
@@ -613,7 +702,8 @@ mod tests {
             vec![
                 "▾ Doing",
                 "○ wire the command ▸",
-                "⏸ ask scope (blocked: q9) ▸",
+                // Its BLOCKING line is the title's mark, so nothing is left to expand.
+                "⏸ ask scope (blocked: q9)",
                 "",
                 "▾ Queued",
                 "○ 写文档 ドキュメント 문서 ▸",
@@ -630,7 +720,7 @@ mod tests {
             vec![
                 "▾ Doing",
                 "○ wire the command ▸",
-                "⏸ ask scope (blocked: q9) ▸",
+                "⏸ ask scope (blocked: q9)",
                 "",
                 "▾ Queued",
                 "○ 写文档 ドキュメント 문서 ▾",
@@ -657,8 +747,101 @@ mod tests {
             issue_number: None,
             auto_merge: false,
             checks,
+            checks_error: None,
             updated_at: String::new(),
         }
+    }
+
+    fn rollup(pending: u32, passed: u32, failed: u32) -> WirePrChecks {
+        WirePrChecks {
+            pending,
+            passed,
+            failed,
+            items: Vec::new(),
+        }
+    }
+
+    fn check(
+        name: &str,
+        state: &str,
+        started: Option<&str>,
+        finished: Option<&str>,
+    ) -> WirePrCheck {
+        WirePrCheck {
+            name: name.to_string(),
+            state: state.to_string(),
+            started_at: started.map(|t| t.parse().unwrap()),
+            finished_at: finished.map(|t| t.parse().unwrap()),
+            url: (state == "failed")
+                .then(|| "https://github.com/o/r/actions/runs/9/job/8".to_string()),
+        }
+    }
+
+    #[test]
+    fn a_pr_row_folds_into_its_checks_with_state_duration_and_progress() {
+        use crate::tui::sidebar::SidebarState;
+
+        let mut pr = wire_pr(
+            "open",
+            Some(WirePrChecks {
+                items: vec![
+                    check(
+                        "fmt",
+                        "passed",
+                        Some("2026-11-09T10:00:00Z"),
+                        Some("2026-11-09T10:00:42Z"),
+                    ),
+                    check(
+                        "测试 テスト 테스트",
+                        "failed",
+                        Some("2026-11-09T10:00:00Z"),
+                        Some("2026-11-09T10:02:05Z"),
+                    ),
+                    check("clippy", "running", Some("2026-11-09T10:00:00Z"), None),
+                    check("docs", "queued", None, None),
+                ],
+                ..rollup(2, 1, 1)
+            }),
+        );
+        pr.title = "wire it".to_string();
+        let now: jiff::Timestamp = "2026-11-09T10:03:00Z".parse().unwrap();
+        let render = |state: &SidebarState, pr: &WirePr| -> Vec<String> {
+            let mut body = super::Body::default();
+            super::pr_rows(&mut body, state, pr, 40, now);
+            let lines: Vec<String> = body.lines.iter().map(ToString::to_string).collect();
+            // Every row fits the sidebar; runs of padding collapse so the
+            // assertions read the content.
+            assert!(lines.iter().all(|line| line.width() <= 40), "{lines:?}");
+            lines
+                .iter()
+                .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+                .collect()
+        };
+
+        let mut state = SidebarState::default();
+        assert_eq!(render(&state, &pr), vec!["▸ #1 wire it 2/4 ●"]);
+        state.checked.insert(1);
+        assert_eq!(
+            render(&state, &pr),
+            vec![
+                "▾ #1 wire it 2/4 ●",
+                "✓ fmt 42s",
+                "✗ 测试 テスト 테스트 2m05s",
+                "…thub.com/o/r/actions/runs/9/job/8",
+                "● clippy 3m00s",
+                "○ docs",
+            ]
+        );
+
+        // A failed read is stated on the expanded row.
+        pr.checks = None;
+        pr.checks_error = Some("GitHub 502".to_string());
+        state.checked.insert(1);
+        assert!(
+            render(&state, &pr)
+                .iter()
+                .any(|line| line.contains("checks unreadable: GitHub 502"))
+        );
     }
 
     #[test]
@@ -668,45 +851,13 @@ mod tests {
         // No rollup read yet: the neutral open dot.
         assert_eq!(pr_icon(&wire_pr("open", None)).0, "●");
         // Merging overrides whatever the checks say.
-        assert_eq!(
-            pr_icon(&wire_pr(
-                "merging",
-                Some(WirePrChecks {
-                    pending: 2,
-                    passed: 0,
-                    failed: 0,
-                }),
-            ))
-            .0,
-            "●"
-        );
+        assert_eq!(pr_icon(&wire_pr("merging", Some(rollup(2, 0, 0)))).0, "●");
         // Failure beats pending; pending beats all-passed.
-        let (icon, style) = pr_icon(&wire_pr(
-            "open",
-            Some(WirePrChecks {
-                pending: 1,
-                passed: 0,
-                failed: 1,
-            }),
-        ));
+        let (icon, style) = pr_icon(&wire_pr("open", Some(rollup(1, 0, 1))));
         assert_eq!((icon, style.fg), ("●", Some(Color::Red)));
-        let (icon, style) = pr_icon(&wire_pr(
-            "open",
-            Some(WirePrChecks {
-                pending: 1,
-                passed: 3,
-                failed: 0,
-            }),
-        ));
+        let (icon, style) = pr_icon(&wire_pr("open", Some(rollup(1, 3, 0))));
         assert_eq!((icon, style.fg), ("●", Some(Color::Yellow)));
-        let (icon, style) = pr_icon(&wire_pr(
-            "open",
-            Some(WirePrChecks {
-                pending: 0,
-                passed: 4,
-                failed: 0,
-            }),
-        ));
+        let (icon, style) = pr_icon(&wire_pr("open", Some(rollup(0, 4, 0))));
         assert_eq!((icon, style.fg), ("✓", Some(Color::Green)));
     }
 }

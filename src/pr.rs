@@ -27,6 +27,7 @@ use crate::issue::IssueError;
 use crate::issue::github::{GhCliTokenSource, GitHubRest, GitHubTokenSource};
 use crate::repo_clone::{CloneRecord, CloneSandbox, SessionRepos, uncommitted_changes};
 
+pub(crate) mod checks;
 pub(crate) mod merge_watch;
 mod pull_sync;
 
@@ -821,18 +822,23 @@ impl PrStore {
                 owner_repo: &owner_repo,
                 number: external,
             };
-            if let Ok(summary) = merge_watch::Upstream::snapshot(&github)
-                .await
-                .map(|snapshot| snapshot.check_summary())
-            {
-                let _ = std::fmt::Write::write_fmt(
-                    &mut out,
-                    format_args!(
-                        "\nchecks {} passed · {} pending · {} failed",
-                        summary.passed, summary.pending, summary.failed
-                    ),
-                );
-            }
+            let section = match merge_watch::Upstream::snapshot(&github).await {
+                Ok(snapshot) => {
+                    let report = checks::ChecksReport::of(&snapshot);
+                    let failures = checks::failure_details(&owner_repo, external, &report).await;
+                    checks::ChecksSection::Read(checks::ReadChecks::new(&report, failures))
+                }
+                Err(error) => checks::ChecksSection::Unreadable(error.to_string()),
+            };
+            let _ = std::fmt::Write::write_fmt(
+                &mut out,
+                format_args!(
+                    "\n{}",
+                    section
+                        .render()
+                        .map_err(|e| PrError::State(e.to_string()))?
+                ),
+            );
         }
         for e in events {
             let _ = std::fmt::Write::write_fmt(
