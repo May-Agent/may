@@ -458,18 +458,6 @@ pub async fn initialize_session_persistence(
 ) -> Result<(SessionStore, ChatDb, String), SessionError> {
     let store = initialize_session_dirs(may_dir).await?;
     let db = ChatDb::open(&home_paths_db(may_dir)).await?;
-    // Migrate the retired DB-backed global memory into the file store once.
-    let memory_file = MayHomePaths::new(may_dir.to_path_buf()).memory_file();
-    if let Ok(Some(content)) = db.get_global_memory().await
-        && !content.trim().is_empty()
-        && async_fs::read_to_string(&memory_file)
-            .await
-            .unwrap_or_default()
-            .trim()
-            .is_empty()
-    {
-        async_fs::write(&memory_file, &content).await?;
-    }
     let default_profile_id = db.ensure_default_profiles().await?;
     for profile in db.list_profiles().await? {
         store.sync_profile_scoped_resources(&profile.id).await?;
