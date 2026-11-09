@@ -26,6 +26,8 @@ pub mod client;
 pub mod command_output;
 /// May's rules on what a terminal script may run.
 pub mod command_policy;
+/// How a terminal call's script is read before it runs.
+pub mod command_reading;
 /// One virtual desktop per session — computer use.
 pub mod computer;
 pub mod config;

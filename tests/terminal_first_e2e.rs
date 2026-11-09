@@ -6037,6 +6037,107 @@ async fn exec_commands_draw_from_the_daemons_job_pool() {
     let harness = TestHarness::new(&mock.base_url()).await;
     prepare_oneshot_home(&harness).await;
     let session = harness.create_session().await;
+    set_job_pool_size(&harness, POOL).await;
+
+    let held = tokens_held_by_exec_probe(&harness, &session.id, &session.sandbox_dir).await;
+    let stop = Command::new(may_binary_path())
+        .args(["daemon", "stop"])
+        .env("HOME", harness.home_path())
+        .output()
+        .await
+        .expect("may daemon stop should run");
+    assert!(stop.status.success(), "daemon stop failed");
+    assert_eq!(
+        held,
+        POOL.to_string(),
+        "the command drew exactly the daemon pool's tokens"
+    );
+}
+
+/// A container session's commands draw from the same machine-wide pool as
+/// local ones: while a container command holds every token, a local command
+/// gets none.
+#[tokio::test]
+#[serial]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "container runtimes are expected only on Linux"
+)]
+async fn container_and_local_commands_share_the_daemons_job_pool() {
+    const POOL: i64 = 3;
+    let mock = MockOpenAiServer::spawn(MockChatScenario::StartsBackgroundJob(
+        "python3 /workspace/tmp/job_probe.py /workspace/tmp/held",
+    ))
+    .await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    set_job_pool_size(&harness, POOL).await;
+    let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
+    let client = reqwest::Client::new();
+    let environment = ChatEnvironment::Container
+        .prepare(&harness, &client, &server)
+        .await;
+    let container_session =
+        create_session_via_api(&client, &server, environment.profile_id()).await;
+    let container_sandbox = SessionStore::new(MayHomePaths::new(harness.may_dir.clone()))
+        .sandbox_dir(&container_session, Some(environment.profile_id()));
+    tokio::fs::create_dir_all(container_sandbox.join("tmp"))
+        .await
+        .expect("container session tmp should be created");
+    tokio::fs::write(
+        container_sandbox.join("tmp/job_probe.py"),
+        include_str!("fixtures/job_probe.py"),
+    )
+    .await
+    .expect("probe should be written");
+
+    // The turn ends with the model's reply; the probe keeps its tokens.
+    let turn = send_turn(
+        &client,
+        &server.base_url,
+        &serde_json::json!({ "sessionId": container_session, "content": "start the job" }),
+    )
+    .await
+    .expect("turn request should succeed");
+    let turn = expect_status(&server.log, turn, StatusCode::OK).await;
+    collect_turn_events(turn, "the container probe turn", &server.log).await;
+    let report = container_sandbox.join("tmp/held");
+    let deadline = Instant::now() + Duration::from_secs(30) + environment.first_turn_allowance();
+    while !report.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the container probe never reported; server logs:\n{}",
+            server.log.contents().await
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        tokio::fs::read_to_string(&report)
+            .await
+            .expect("container probe report should be readable")
+            .trim(),
+        POOL.to_string(),
+        "the container command drew every token of the daemon pool"
+    );
+
+    let local = ChatEnvironment::Local
+        .prepare(&harness, &client, &server)
+        .await;
+    let local_session = create_session_via_api(&client, &server, local.profile_id()).await;
+    let local_sandbox = SessionStore::new(MayHomePaths::new(harness.may_dir.clone()))
+        .sandbox_dir(&local_session, Some(local.profile_id()));
+    let held = tokens_held_by_exec_probe(&harness, &local_session, &local_sandbox).await;
+    assert_eq!(
+        held, "0",
+        "a local command got tokens the container command holds"
+    );
+
+    server.stop().await;
+    environment.release(&harness, &container_session).await;
+}
+
+/// Sets `[sandbox] job_pool_size` in the harness's config before a daemon
+/// starts.
+async fn set_job_pool_size(harness: &TestHarness, size: i64) {
     let config_path = harness.home_path().join(".may/config.toml");
     let mut config: toml::Table = toml::from_str(
         &tokio::fs::read_to_string(&config_path)
@@ -6049,25 +6150,35 @@ async fn exec_commands_draw_from_the_daemons_job_pool() {
         .or_insert_with(|| toml::Value::Table(toml::Table::new()))
         .as_table_mut()
         .expect("sandbox is a table");
-    sandbox.insert("job_pool_size".into(), toml::Value::Integer(POOL));
+    sandbox.insert("job_pool_size".into(), toml::Value::Integer(size));
     tokio::fs::write(
         &config_path,
         toml::to_string(&config).expect("test config should serialize"),
     )
     .await
     .expect("test config should be written");
+}
 
+/// Runs the job probe through `may exec` in the local session `session_id`
+/// and returns how many tokens it could take from the daemon's pool.
+async fn tokens_held_by_exec_probe(
+    harness: &TestHarness,
+    session_id: &str,
+    sandbox_dir: &Path,
+) -> String {
     // The sandbox reads only the session's own files.
-    let probe = session.sandbox_dir.join("tmp/job_probe.py");
+    tokio::fs::create_dir_all(sandbox_dir.join("tmp"))
+        .await
+        .expect("session tmp should be created");
+    let probe = sandbox_dir.join("tmp/job_probe.py");
     tokio::fs::write(&probe, include_str!("fixtures/job_probe.py"))
         .await
         .expect("probe should be written");
-    let report = session.sandbox_dir.join("tmp/held");
-    let binary = may_binary_path();
-    let output = Command::new(&binary)
+    let report = sandbox_dir.join("tmp/held");
+    let output = Command::new(may_binary_path())
         .arg("exec")
         .arg("--session")
-        .arg(&session.id)
+        .arg(session_id)
         .arg("--mode")
         .arg("sandboxed")
         .arg("--timeout")
@@ -6085,23 +6196,12 @@ async fn exec_commands_draw_from_the_daemons_job_pool() {
         .output()
         .await
         .expect("may exec should run");
-    let stop = Command::new(&binary)
-        .args(["daemon", "stop"])
-        .env("HOME", harness.home_path())
-        .output()
-        .await
-        .expect("may daemon stop should run");
-    assert!(stop.status.success(), "daemon stop failed");
     assert!(
         output.status.success(),
         "exec failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout).trim(),
-        POOL.to_string(),
-        "the command drew exactly the daemon pool's tokens"
-    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
 /// `explore` runs the bundled explore subagent on the fast model and returns

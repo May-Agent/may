@@ -159,12 +159,12 @@ async fn stop_in_each_waiting_state_ends_idle_with_the_run_released() {
                         "session",
                         Some(PersistedPermissionRequest {
                             id: "permission".to_string(),
-                            request: PersistedPermissionRequestPayload {
-                                mode: PermissionRequestMode::Default,
-                                script: "echo hi".to_string(),
-                                session_id: Some("session".to_string()),
-                                agent_id: None,
-                            },
+                            request: PersistedPermissionRequestPayload::new(
+                                PermissionRequestMode::Default,
+                                "echo hi".to_string(),
+                                Some("session".to_string()),
+                                None,
+                            ),
                         }),
                     )
                     .await
@@ -345,12 +345,12 @@ async fn recovery_settles_sessions_a_dead_run_left_owned() {
             "stale",
             Some(PersistedPermissionRequest {
                 id: "permission".to_string(),
-                request: PersistedPermissionRequestPayload {
-                    mode: PermissionRequestMode::Default,
-                    script: "echo hi".to_string(),
-                    session_id: Some("stale".to_string()),
-                    agent_id: None,
-                },
+                request: PersistedPermissionRequestPayload::new(
+                    PermissionRequestMode::Default,
+                    "echo hi".to_string(),
+                    Some("stale".to_string()),
+                    None,
+                ),
             }),
         )
         .await

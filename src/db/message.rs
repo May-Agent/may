@@ -8,6 +8,7 @@
 
 use crate::PermissionHistoryMode;
 use crate::ask_user::AnswerValue;
+use crate::command_reading::CommandReading;
 use crate::session::{ChatMessage, ChatMessageStats, MessageRole};
 
 use super::common::{
@@ -259,8 +260,14 @@ impl ChatDb {
         request_id: &str,
         mode: PermissionHistoryMode,
         script: &str,
+        reading: Option<&CommandReading>,
         timestamp: Option<&str>,
     ) -> Result<messages::Model, ChatDbError> {
+        // The audit record keeps how May read the script next to the script.
+        let reading = reading
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| ChatDbError::Storage(error.to_string()))?;
         let mut tx = self.db.begin().await?;
         let message = self
             .append_structured_message_in_tx(
@@ -272,11 +279,12 @@ impl ChatDb {
             .await?;
         query!(
             tx,
-            "INSERT INTO message_permission_requests (message_id, request_id, mode, script) VALUES (?, ?, ?, ?)",
+            "INSERT INTO message_permission_requests (message_id, request_id, mode, script, reading) VALUES (?, ?, ?, ?, ?)",
             message.id,
             request_id,
             mode.as_str(),
-            script
+            script,
+            reading
         )
         .execute()
         .await?;
@@ -294,10 +302,18 @@ impl ChatDb {
         session_id: &str,
         mode: PermissionHistoryMode,
         script: &str,
+        reading: Option<&CommandReading>,
     ) -> Result<(), ChatDbError> {
         let request_id = crate::id::new();
-        self.append_permission_request_message(session_id, &request_id, mode, script, None)
-            .await?;
+        self.append_permission_request_message(
+            session_id,
+            &request_id,
+            mode,
+            script,
+            reading,
+            None,
+        )
+        .await?;
         self.append_permission_response_message(session_id, &request_id, true, None)
             .await?;
         Ok(())

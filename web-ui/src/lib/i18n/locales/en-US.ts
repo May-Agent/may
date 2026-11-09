@@ -297,6 +297,8 @@ export const enUS = {
       modeSandboxed: 'Isolated',
       modeUnsafe: 'Elevated',
       modeRemote: 'Remote',
+      showScript: 'Show raw script',
+      showReading: 'Show what it does',
     },
     workspace: {
       title: 'Workspace access required',

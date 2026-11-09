@@ -616,6 +616,14 @@ async fn forward_agent_frame(
                 let _ = turn.events.send(TuiEvent::ReasoningEnd { seconds }).await;
             }
         }
+        SessionAgentBody::ToolReading { call_id, reading } => {
+            if let Some(turn) = current.as_mut() {
+                let _ = turn
+                    .events
+                    .send(TuiEvent::ToolReading { call_id, reading })
+                    .await;
+            }
+        }
         SessionAgentBody::Hold { reason, message } => {
             if let Some(turn) = current.as_mut() {
                 let _ = turn.events.send(TuiEvent::Hold { reason, message }).await;

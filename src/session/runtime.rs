@@ -660,4 +660,29 @@ pub struct PersistedPermissionRequestPayload {
     /// subagents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
+    /// How May reads the script, for the approval prompt; absent for a
+    /// request that covers no script.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reading: Option<crate::command_reading::CommandReading>,
+}
+
+impl PersistedPermissionRequestPayload {
+    /// A request for `script`, read the way the approval prompt shows it.
+    #[must_use]
+    pub fn new(
+        mode: PermissionRequestMode,
+        script: String,
+        session_id: Option<String>,
+        agent_id: Option<String>,
+    ) -> Self {
+        let reading = (mode != PermissionRequestMode::Publish)
+            .then(|| crate::command_reading::CommandReading::of(&script));
+        Self {
+            mode,
+            script,
+            session_id,
+            agent_id,
+            reading,
+        }
+    }
 }

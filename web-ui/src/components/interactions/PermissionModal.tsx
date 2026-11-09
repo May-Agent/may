@@ -6,6 +6,8 @@ import { respondPermission } from '@/lib/api/interactions';
 import { useTranslation, type MessageKey } from '@/lib/i18n';
 import { ShieldAlert, ShieldCheck, Shield } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { recognisesAny } from '@/lib/commandReading';
+import { PermissionBody } from './PermissionBody';
 
 const MODE_LABEL: Record<TerminalCommandMode, MessageKey> = {
   default: 'modals.permission.modeDefault',
@@ -35,6 +37,7 @@ interface PermissionModalProps {
 export function PermissionModal({ request }: PermissionModalProps) {
   const { t } = useTranslation();
   const [busy, setBusy] = useState(false);
+  const [showScript, setShowScript] = useState(false);
   if (!request) return null;
   const mode = request.mode as TerminalCommandMode;
   const ModeIcon = MODE_ICON[mode] ?? Shield;
@@ -61,9 +64,16 @@ export function PermissionModal({ request }: PermissionModalProps) {
           <div className="text-xs uppercase tracking-wider text-muted-foreground">
             {t('modals.permission.command')}
           </div>
-          <pre className="rounded-md border border-border bg-muted/40 px-3 py-2 text-xs font-mono whitespace-pre-wrap break-all">
-            {request.script}
-          </pre>
+          <PermissionBody request={request} showScript={showScript} />
+          {recognisesAny(request.reading) && (
+            <button
+              type="button"
+              className="text-xs text-muted-foreground underline-offset-2 hover:underline"
+              onClick={() => setShowScript((shown) => !shown)}
+            >
+              {t(showScript ? 'modals.permission.showReading' : 'modals.permission.showScript')}
+            </button>
+          )}
           <div className={cn('flex items-center gap-1.5 text-xs', modeColorClass)}>
             <ModeIcon className="size-3.5" />
             <span className="text-muted-foreground">{t('modals.permission.mode')}:</span>

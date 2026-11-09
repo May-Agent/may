@@ -380,6 +380,7 @@ pub async fn load_history_from_db(
             reasoning,
             tool_calls,
             translation,
+            reading: None,
             thinking: msg.thinking,
         });
     }
