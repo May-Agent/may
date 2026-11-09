@@ -13,6 +13,10 @@ pub struct RepoUsage {
     pub last_used_at: i64,
     /// Number of recorded uses.
     pub use_count: i64,
+    /// `owner/repo` of the checkout's GitHub `origin` when it was last used;
+    /// `None` for a checkout without one and for records from before this
+    /// was kept.
+    pub owner_repo: Option<String>,
 }
 
 impl RepoUsage {
@@ -41,15 +45,28 @@ impl ChatDb {
     /// # Errors
     /// Returns [`ChatDbError`] when the upsert fails.
     pub async fn touch_repo_usage_at(&self, worktree: &Path, at: i64) -> Result<(), ChatDbError> {
+        // Reading the remote runs git: off the executor. A checkout without a
+        // GitHub `origin` keeps whatever repository it was recorded under.
+        let owner_repo = {
+            let worktree = worktree.to_path_buf();
+            blocking::unblock(move || match crate::trust::repo_kind(&worktree) {
+                crate::trust::RepoKind::Github { owner_repo } => Some(owner_repo),
+                crate::trust::RepoKind::Git => None,
+            })
+            .await
+        };
         self.db
             .query(
-                "INSERT INTO repo_usage (worktree, last_used_at, use_count) VALUES (?, ?, 1) \
+                "INSERT INTO repo_usage (worktree, last_used_at, use_count, owner_repo) \
+                 VALUES (?, ?, 1, ?) \
                  ON CONFLICT(worktree) DO UPDATE SET \
                  last_used_at = MAX(last_used_at, excluded.last_used_at), \
-                 use_count = use_count + 1",
+                 use_count = use_count + 1, \
+                 owner_repo = COALESCE(excluded.owner_repo, owner_repo)",
             )
             .bind(worktree.display().to_string())
             .bind(at)
+            .bind(owner_repo)
             .execute()
             .await?;
         Ok(())
@@ -63,7 +80,8 @@ impl ChatDb {
         Ok(self
             .db
             .query(
-                "SELECT worktree, last_used_at, use_count FROM repo_usage WHERE last_used_at >= ?",
+                "SELECT worktree, last_used_at, use_count, owner_repo FROM repo_usage \
+                 WHERE last_used_at >= ?",
             )
             .bind(since)
             .fetch_all::<RepoUsage>()
@@ -94,5 +112,37 @@ impl ChatDb {
             .execute()
             .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::db::ChatDb;
+
+    /// A database from before `owner_repo` was kept gains the column when it
+    /// opens, and its records read back without a repository.
+    #[tokio::test]
+    async fn a_database_without_the_owner_column_is_migrated() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        let db = ChatDb::open(&path).await.unwrap();
+        db.db
+            .query("ALTER TABLE repo_usage DROP COLUMN owner_repo")
+            .execute()
+            .await
+            .unwrap();
+        db.db
+            .query(
+                "INSERT INTO repo_usage (worktree, last_used_at, use_count) VALUES ('/old', 1, 1)",
+            )
+            .execute()
+            .await
+            .unwrap();
+        drop(db);
+
+        let db = ChatDb::open(&path).await.unwrap();
+        let usage = db.repo_usage_since(0).await.unwrap();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].owner_repo, None);
     }
 }

@@ -105,6 +105,7 @@ impl ChatDb {
         Self::ensure_profile_preference_columns(&db).await?;
         Self::ensure_session_columns(&db).await?;
         Self::ensure_repo_clone_base_column(&db).await?;
+        Self::ensure_repo_usage_owner_column(&db).await?;
         Self::ensure_message_columns(&db).await?;
         Self::ensure_ask_user_blocking_column(&db).await?;
         Self::ensure_ask_user_secret_columns(&db).await?;
@@ -150,6 +151,20 @@ impl ChatDb {
             )
             .execute()
             .await?;
+        }
+        Ok(())
+    }
+
+    /// A used checkout records the GitHub repository it belonged to, so the
+    /// post-merge sync can still name it once its directory is gone.
+    async fn ensure_repo_usage_owner_column(db: &SkyDb) -> Result<(), ChatDbError> {
+        let columns = query!(db, "SELECT name FROM pragma_table_info('repo_usage')")
+            .fetch_all::<SqliteTableInfoRow>()
+            .await?;
+        if !columns.iter().any(|column| column.name == "owner_repo") {
+            query!(db, "ALTER TABLE repo_usage ADD COLUMN owner_repo TEXT")
+                .execute()
+                .await?;
         }
         Ok(())
     }
