@@ -88,6 +88,8 @@ pub enum SidebarHit {
     /// A task row with a detail: shows or hides the detail. Keyed by the
     /// row's first line, which survives a re-read of `tasks.md`.
     Task(String),
+    /// A PR row with checks: shows or hides them. Keyed by the PR number.
+    Pr(i64),
 }
 
 /// What the last frame drew, so input can act on it.
@@ -113,6 +115,8 @@ pub struct SidebarState {
     pub listed_all: HashSet<SidebarSection>,
     /// Task rows showing their detail.
     pub detailed: HashSet<String>,
+    /// PR rows (by number) showing their checks.
+    pub checked: HashSet<i64>,
     /// Every section open, every list and every detail shown.
     pub expand_all: bool,
     /// What the last frame drew.
@@ -141,6 +145,7 @@ impl Default for SidebarState {
             collapsed: HashSet::new(),
             listed_all: HashSet::new(),
             detailed: HashSet::new(),
+            checked: HashSet::new(),
             expand_all: false,
             view: SidebarView::default(),
             enabled: true,
@@ -256,6 +261,12 @@ impl SidebarState {
         self.expand_all || self.detailed.contains(key)
     }
 
+    /// Whether the PR numbered `number` shows its checks.
+    #[must_use]
+    pub fn shows_checks(&self, number: i64) -> bool {
+        self.expand_all || self.checked.contains(&number)
+    }
+
     /// Open every section and show every entry and detail, or fold the
     /// lists and details back.
     pub fn toggle_expand_all(&mut self) {
@@ -300,6 +311,15 @@ impl SidebarState {
                     self.detailed.insert(key);
                 }
             }
+            SidebarHit::Pr(number) => {
+                if self.expand_all {
+                    self.expand_all = false;
+                    self.checked.extend(self.prs.iter().map(|pr| pr.number));
+                    self.checked.remove(&number);
+                } else if !self.checked.remove(&number) {
+                    self.checked.insert(number);
+                }
+            }
         }
     }
 
@@ -309,6 +329,7 @@ impl SidebarState {
         self.collapsed.clear();
         self.listed_all.clear();
         self.detailed.clear();
+        self.checked.clear();
         self.expand_all = false;
         self.session_id = None;
         self.title = None;

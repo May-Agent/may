@@ -1,0 +1,18 @@
+{% match self -%}
+{% when Self::Read(read) -%}
+checks: {{ read.finished }} of {{ read.total }} finished, {{ read.passed }} passed, {{ read.pending }} running or queued, {{ read.failed }} failed
+{%- for failure in read.failures %}
+failed {{ failure.name }}{% if let Some(url) = failure.url %} ({{ url }}){% endif %}
+{%- match failure.log %}
+{%- when LogExcerpt::Lines(lines) %}:
+{%- for line in lines %}
+> {{ line }}
+{%- endfor %}
+{%- when LogExcerpt::NoErrorLines %}: its log has no error line
+{%- when LogExcerpt::Unavailable(reason) %}: its log could not be read ({{ reason }})
+{%- when LogExcerpt::NoLog %}: it is not an Actions job, so it has no log
+{%- endmatch %}
+{%- endfor %}
+{%- when Self::Unreadable(error) -%}
+checks: could not be read from GitHub ({{ error }})
+{%- endmatch %}

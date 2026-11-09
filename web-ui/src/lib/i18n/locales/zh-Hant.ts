@@ -589,6 +589,23 @@ export const zhHant: Messages = {
     killConfirmBody: '程序會被終止，已寫入的輸出會保留。',
     stopping: '正在停止…',
     loadFailed: '無法載入：{message}',
+    pullRequests: 'Pull request',
+    prProgress: '{total} 項檢查中已完成 {finished} 項',
+    prRollup: {
+      unknown: '尚未讀取檢查',
+      merging: '位於合併佇列中',
+      running: '檢查執行中',
+      failed: '有檢查失敗',
+      passed: '所有檢查皆已通過',
+    },
+    prCheck: {
+      queued: '排隊中',
+      running: '執行中',
+      passed: '通過',
+      failed: '失敗',
+    },
+    prCheckDetail: '在 GitHub 上開啟 {name}',
+    prChecksUnreadable: '無法從 GitHub 讀取檢查：{message}',
   },
   sleep: {
     asleep: '你正在睡覺：代理會繼續工作並累積問題。傳送 /sleep off 結束。',
