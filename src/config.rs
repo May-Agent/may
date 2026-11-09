@@ -100,6 +100,9 @@ pub enum ConfigError {
     /// Invalid browser config.
     #[error("invalid browser config: {0}")]
     InvalidBrowserConfig(String),
+    /// Invalid `[ci]` config.
+    #[error("invalid ci config: {0}")]
+    InvalidCiConfig(String),
     /// A provider instance already exists under the ID with a different type.
     #[error(
         "provider `{id}` is configured as {actual:?}, not {expected:?}; refusing to overwrite it"
@@ -811,10 +814,7 @@ pub fn check_acp_agent_name(name: &str) -> Result<(), ConfigError> {
         Err(_) => return reject("a name holds only ASCII letters, digits, `-` and `_`"),
         Ok(()) => {}
     }
-    if aither_agent::BUNDLED_SUBAGENTS
-        .iter()
-        .any(|bundled| bundled.name == name)
-    {
+    if crate::bundle::BUNDLED_SUBAGENT_NAMES.contains(&name) {
         return reject("the name belongs to a built-in subagent type");
     }
     Ok(())
@@ -1276,6 +1276,9 @@ pub struct MayConfig {
     /// Recap settings.
     #[serde(default)]
     pub recap: RecapConfig,
+    /// CI duration thresholds.
+    #[serde(default)]
+    pub ci: CiConfig,
     /// Session list settings.
     #[serde(default)]
     pub sessions: SessionsConfig,
@@ -1406,6 +1409,49 @@ impl Default for RecapConfig {
         Self {
             auto: true,
             idle_minutes: 30,
+        }
+    }
+}
+
+/// `[ci]` section: when a CI job counts as abnormally long. Read when a PR's
+/// checks finish, so a change applies to the next run without a restart.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct CiConfig {
+    /// Minutes after which any job is abnormally long: the point where a
+    /// waiting agent's prompt cache goes cold.
+    pub max_job_minutes: u64,
+    /// A job is abnormally long when it runs past this multiple of its
+    /// baseline, the median of its last successful runs on the base branch.
+    pub baseline_multiple: f64,
+}
+
+impl CiConfig {
+    /// Check both thresholds can be exceeded.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::InvalidCiConfig`] when the limit is zero or the
+    /// multiple is not a finite number above 1.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.max_job_minutes == 0 {
+            return Err(ConfigError::InvalidCiConfig(
+                "ci.max_job_minutes must be above 0".to_string(),
+            ));
+        }
+        if !self.baseline_multiple.is_finite() || self.baseline_multiple <= 1.0 {
+            return Err(ConfigError::InvalidCiConfig(
+                "ci.baseline_multiple must be a number above 1".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for CiConfig {
+    fn default() -> Self {
+        Self {
+            max_job_minutes: 40,
+            baseline_multiple: 2.0,
         }
     }
 }
@@ -1730,6 +1776,7 @@ impl Default for MayConfig {
             suggestions: SuggestionsConfig::default(),
             sleep: SleepConfig::default(),
             recap: RecapConfig::default(),
+            ci: CiConfig::default(),
             sessions: SessionsConfig::default(),
             language: LanguageConfig::default(),
             context: ContextConfig::default(),
@@ -1835,6 +1882,7 @@ impl MayConfig {
     /// Returns [`ConfigError`] when any section contains an invalid value.
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.browser.validate()?;
+        self.ci.validate()?;
         for (id, instance) in &self.provider {
             instance.validate(id)?;
         }

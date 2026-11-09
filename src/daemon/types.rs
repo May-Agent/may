@@ -473,8 +473,23 @@ pub struct ApiPr {
     pub(crate) updated_at: String,
     /// Merge timestamp, when merged.
     pub(crate) merged_at: Option<String>,
+    /// Live check rollup of the PR's head, queried from GitHub for an open
+    /// GitHub PR; `None` for other backends and landed states.
+    pub(crate) checks: Option<ApiPrChecks>,
     /// Recent transition events, oldest first.
     pub(crate) events: Vec<ApiPrEvent>,
+}
+
+/// How many of a PR's checks sit in each state — the rollup GitHub shows.
+#[derive(Debug, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiPrChecks {
+    /// Still running or not yet reported.
+    pub(crate) pending: u32,
+    /// Concluded successfully (neutral and skipped included).
+    pub(crate) passed: u32,
+    /// Failed, timed out, cancelled or errored.
+    pub(crate) failed: u32,
 }
 
 /// One `pr_events` row over the wire.
@@ -487,32 +502,6 @@ pub struct ApiPrEvent {
     pub(crate) detail: Option<String>,
     /// UTC time.
     pub(crate) created_at: String,
-}
-
-#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionPlanStateRequest {
-    pub(crate) plan_state: SessionPlanState,
-}
-
-/// `PUT /api/sessions/{id}/yolo` body.
-#[derive(Debug, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionYoloRequest {
-    pub(crate) yolo: bool,
-}
-
-/// The yolo switch after the update.
-#[derive(Debug, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionYoloResponse {
-    pub(crate) yolo: bool,
-}
-
-#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionPlanStateResponse {
-    pub(crate) plan_state: SessionPlanState,
 }
 
 #[derive(Debug, serde::Serialize, skyzen::ToSchema)]
@@ -704,8 +693,6 @@ pub struct ApiAttachment {
     pub(crate) attachment_type: AttachmentKind,
     pub(crate) url: String,
     #[serde(default)]
-    pub(crate) upload_data_url: Option<String>,
-    #[serde(default)]
     pub(crate) text_content: Option<String>,
 }
 
@@ -757,14 +744,6 @@ pub struct TerminalStateSnapshot {
     pub(crate) running_by_call_id: std::collections::HashMap<String, ApiTerminalExecution>,
 }
 
-impl TerminalStateSnapshot {
-    pub(crate) fn all_executions(&self) -> Vec<ApiTerminalExecution> {
-        let mut executions = self.executions.clone();
-        executions.extend(self.running_by_call_id.values().cloned());
-        executions
-    }
-}
-
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ApiMessage {
@@ -782,8 +761,6 @@ pub struct ApiMessage {
     pub(crate) is_thinking: Option<bool>,
     #[serde(default)]
     pub(crate) tool_event: Option<serde_json::Value>,
-    #[serde(default)]
-    pub(crate) terminal_executions: Vec<ApiTerminalExecution>,
     #[serde(default)]
     pub(crate) stats: Option<RequestStats>,
     /// The display translation of `content`, when the reply was not in the
@@ -810,8 +787,6 @@ pub struct ApiSession {
     pub(crate) title: String,
     pub(crate) last_modified: String,
     pub(crate) preview: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub(crate) messages: Vec<ApiMessage>,
     pub(crate) profile_id: Option<String>,
     pub(crate) model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -820,15 +795,15 @@ pub struct ApiSession {
     /// Repository the session is bound to, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) repo: Option<String>,
+    /// `GET /api/sessions/{id}` only: the `?after=` cursor for
+    /// `/api/sessions/{id}/events`, read before the session itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cursor: Option<String>,
 }
 
 impl ApiSession {
     /// Build an [`ApiSession`] from a [`SessionSummary`] with a resolved model.
-    pub(crate) fn from_summary(
-        summary: crate::session::SessionSummary,
-        model: String,
-        messages: Vec<ApiMessage>,
-    ) -> Self {
+    pub(crate) fn from_summary(summary: crate::session::SessionSummary, model: String) -> Self {
         let last_modified = summary
             .updated_at
             .map_or_else(|| jiff::Timestamp::now().to_string(), |t| t.to_string());
@@ -842,12 +817,12 @@ impl ApiSession {
             title: summary.title.unwrap_or_else(|| "New Chat".to_string()),
             last_modified,
             preview,
-            messages,
             profile_id: summary.profile_id,
             model,
             reasoning_effort: summary.reasoning_effort.clone(),
             runtime: summary.runtime.clone().into(),
             repo: summary.repo.clone(),
+            cursor: None,
         }
     }
 
@@ -858,12 +833,12 @@ impl ApiSession {
             title: "New Chat".to_string(),
             last_modified: jiff::Timestamp::now().to_string(),
             preview: "New conversation started".to_string(),
-            messages: Vec::new(),
             profile_id,
             model,
             reasoning_effort: None,
             runtime: crate::session::SessionRuntimeSummary::default().into(),
             repo: None,
+            cursor: None,
         }
     }
 }
@@ -891,36 +866,43 @@ pub struct CreateSessionRequest {
 #[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct RewindRequest {
-    /// Index into the session's stored message list where the cut starts;
-    /// it and every row after it are deleted.
-    pub(crate) index: usize,
+    /// Transcript entry id (a `user` entry) where the cut starts; hidden
+    /// context directly before it is cut too.
+    pub(crate) entry_id: String,
 }
 
-#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
+/// `PATCH /api/sessions/{id}` body: every field optional, all validated
+/// before anything is applied.
+#[derive(Debug, Default, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct UpdateSessionRequest {
+pub struct SessionPatch {
     #[serde(default)]
     pub(crate) title: Option<String>,
     #[serde(default)]
     pub(crate) model: Option<String>,
-    /// Tri-state reasoning-effort patch:
-    /// field absent → `None` (leave DB untouched);
-    /// field present + `null` → `Some(NullableStringPatch::Null)` (clear to NULL);
-    /// field present + string → `Some(NullableStringPatch::Set(s))` (set).
-    #[serde(default, deserialize_with = "deserialize_present_patch")]
-    pub(crate) reasoning_effort: Option<NullableStringPatch>,
-    /// Host directory the session works in; the worktree it belongs to is
-    /// touched for repo usage when set.
+    /// Tri-state like `reasoning_effort` below: absent leaves, `null` clears.
     #[serde(default)]
     pub(crate) cwd: Option<String>,
-    /// Repository to bind: `owner/repo`, a local path, `null` clears the
-    /// binding; absent leaves it untouched.
+    /// Tri-state reasoning-effort patch.
+    #[serde(default, deserialize_with = "deserialize_present_patch")]
+    pub(crate) reasoning_effort: Option<NullableStringPatch>,
+    /// Tri-state repo binding patch.
     #[serde(default, deserialize_with = "deserialize_present_patch")]
     pub(crate) repo: Option<NullableStringPatch>,
-    /// One-shot/non-interactive flag: set to refuse permission prompts
-    /// instead of asking.
+    /// One-shot/non-interactive flag.
     #[serde(default)]
     pub(crate) non_interactive: Option<bool>,
+    #[serde(default)]
+    pub(crate) pinned: Option<bool>,
+    #[serde(default)]
+    pub(crate) archived: Option<bool>,
+    /// Tri-state folder patch: absent leaves, `null` moves out of folders.
+    #[serde(default, deserialize_with = "deserialize_present_patch")]
+    pub(crate) folder_id: Option<NullableStringPatch>,
+    #[serde(default)]
+    pub(crate) yolo: Option<bool>,
+    #[serde(default)]
+    pub(crate) plan_state: Option<SessionPlanState>,
 }
 
 /// Deserialize a field that is present in the body, keeping an explicit `null`
@@ -964,6 +946,45 @@ pub struct ChatRequest {
     pub(crate) pending_entry_id: Option<i64>,
 }
 
+/// `POST /api/sessions/{id}/turns` body: one message, delivered the way
+/// `mode` says.
+#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnRequest {
+    pub(crate) content: String,
+    #[serde(default)]
+    pub(crate) attachments: Vec<ApiAttachment>,
+    /// Structured hidden context fragment for the next turn.
+    #[serde(default)]
+    pub(crate) hidden_context_xml: Option<XmlBlock>,
+    /// `start` runs the message now (the default); `steer` interrupts the
+    /// running turn; `queue` runs it after.
+    #[serde(default)]
+    pub(crate) mode: TurnMode,
+    /// Queue entry claimed for this run; committed with the user append.
+    #[serde(default)]
+    pub(crate) pending_entry_id: Option<i64>,
+}
+
+/// How `POST /api/sessions/{id}/turns` delivers its message.
+#[derive(Debug, Default, Clone, Copy, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnMode {
+    #[default]
+    Start,
+    Steer,
+    Queue,
+}
+
+/// `GET /api/sessions/{id}/queue` response: the session's pending user
+/// messages, immediate first then queued, oldest first.
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionQueueResponse {
+    #[serde(default)]
+    pub(crate) entries: Vec<PendingUserMessage>,
+}
+
 /// `POST /api/sessions/{id}/bash` payload.
 #[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -982,21 +1003,6 @@ pub struct BashResponse {
     pub(crate) exit_code: i32,
     pub(crate) had_secret: bool,
     pub(crate) error: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct RemovePendingMessageRequest {
-    pub(crate) kind: PendingMessageKind,
-    #[serde(default)]
-    pub(crate) index: Option<usize>,
-}
-
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum PendingMessageKind {
-    PendingImmediate,
-    Queued,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
@@ -1182,18 +1188,21 @@ impl From<crate::session::SessionRuntimeSummary> for SessionRuntimeResponse {
     }
 }
 
+/// `POST /api/interactions/{id}` body: which pending interaction the id
+/// names and its answer.
 #[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct PermissionRespondRequest {
-    pub(crate) id: String,
-    pub(crate) approved: bool,
-}
-
-#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct WorkspaceRespondRequest {
-    pub(crate) id: String,
-    pub(crate) approved: bool,
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum InteractionRespondRequest {
+    Permission {
+        approved: bool,
+    },
+    Workspace {
+        approved: bool,
+    },
+    #[serde(rename_all = "camelCase")]
+    AskUser {
+        answers: Vec<crate::daemon::state::UiQuestionAnswer>,
+    },
 }
 
 #[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
@@ -1274,13 +1283,6 @@ impl Default for SessionRuntimeResponse {
 
 #[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
-pub struct SessionRuntimeEventPayload {
-    pub(crate) session_id: String,
-    pub(crate) runtime: SessionRuntimeResponse,
-}
-
-#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub struct SessionRuntimeSnapshotItem {
     pub(crate) session_id: String,
     pub(crate) runtime: SessionRuntimeResponse,
@@ -1298,7 +1300,7 @@ pub struct ProfileSessionsEventPayload {
     pub(crate) profile_sessions: crate::profile::ProfileSessions,
 }
 
-#[derive(Debug, Clone, serde::Serialize, skyzen::ToSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ArtifactEntry {
     pub(crate) path: String,
@@ -1311,13 +1313,6 @@ pub struct ArtifactEntry {
 #[derive(Debug, serde::Serialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionArtifactsResponse {
-    pub(crate) artifacts: Vec<ArtifactEntry>,
-}
-
-#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionArtifactsEventPayload {
-    pub(crate) session_id: String,
     pub(crate) artifacts: Vec<ArtifactEntry>,
 }
 
@@ -1738,11 +1733,11 @@ pub struct LocalUrlMapResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{NullableStringPatch, UpdateSessionRequest};
+    use super::{NullableStringPatch, SessionPatch};
 
     fn reasoning_effort(body: &str) -> Option<NullableStringPatch> {
-        serde_json::from_str::<UpdateSessionRequest>(body)
-            .expect("update request parses")
+        serde_json::from_str::<SessionPatch>(body)
+            .expect("patch parses")
             .reasoning_effort
     }
 

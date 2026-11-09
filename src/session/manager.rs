@@ -122,6 +122,9 @@ pub struct Session {
     /// The host directory the session works in; `None` for a repo-less chat
     /// and for a session started directly on a GitHub repository.
     pub cwd: Option<PathBuf>,
+    /// Cursor `GET /api/sessions/{id}` reported at load, for the session
+    /// events stream to continue from. `None` for a new session.
+    pub events_cursor: Option<String>,
 }
 
 /// How a client starts its sessions.
@@ -659,6 +662,7 @@ impl SessionManager {
             persisted: false,
             repo,
             cwd,
+            events_cursor: None,
         };
 
         self.current = Some(session);
@@ -729,10 +733,13 @@ impl SessionManager {
         let Some(session_id) = self.current.as_ref().map(|session| session.id.clone()) else {
             return Ok(());
         };
-        let messages: Vec<ChatMessage> = self
-            .daemon()?
-            .get(&format!("/api/sessions/{}/history", session_id.as_str()))
-            .await?;
+        let messages: Vec<ChatMessage> = super::chat_messages_from_transcript(
+            &self
+                .daemon()?
+                .get_transcript(session_id.as_str())
+                .await?
+                .entries,
+        );
         if let Some(session) = self.current.as_mut()
             && session.id == session_id
         {
@@ -765,9 +772,9 @@ impl SessionManager {
             .unwrap_or_else(|_| Timestamp::now());
         let created_at = updated_at;
 
-        let messages: Vec<ChatMessage> = daemon
-            .get(&format!("/api/sessions/{}/history", id.as_str()))
-            .await?;
+        let messages: Vec<ChatMessage> = super::chat_messages_from_transcript(
+            &daemon.get_transcript(id.as_str()).await?.entries,
+        );
         let history = ChatHistory::default();
         let sandbox_dir = self.store.sandbox_dir(id.as_str(), profile_id.as_deref());
         let session = Session {
@@ -782,6 +789,7 @@ impl SessionManager {
             persisted: true,
             repo: None,
             cwd: None,
+            events_cursor: api.cursor,
         };
         *self.current.insert(session).history.messages_mut() = messages;
 
@@ -815,6 +823,10 @@ impl SessionManager {
     /// [`SessionError::NotFound`] when `prompt_index` does not point at a
     /// user message or the persisted rows diverge from the in-memory
     /// history, or [`SessionError`] on persistence failure.
+    ///
+    /// # Panics
+    /// Panics when the stored user row lacks its id; persisted history
+    /// rows always carry it.
     pub async fn rewind_to_prompt(
         &mut self,
         prompt_index: usize,
@@ -843,10 +855,14 @@ impl SessionManager {
             cut -= 1;
         }
 
+        let entry_id = session.history.messages()[prompt_index]
+            .id
+            .expect("stored rows carry their id")
+            .to_string();
         let user_message_id: i64 = daemon
             .post(
-                &format!("/api/sessions/{session_id}/rewind"),
-                &crate::client::RewindRequest { index: cut },
+                &format!("/api/sessions/{session_id}/actions/rewind"),
+                &crate::client::RewindRequest { entry_id },
             )
             .await?;
         session.history.messages_mut().truncate(cut);
@@ -902,7 +918,7 @@ impl SessionManager {
         session.history.metadata.title = Some(title.clone());
 
         let _: crate::client::WireSession = daemon
-            .put(
+            .patch(
                 &format!("/api/sessions/{}", session.id.as_str()),
                 &crate::client::UpdateSessionRequest {
                     title: Some(title),
@@ -926,7 +942,7 @@ impl SessionManager {
         session.history.metadata.model = Some(model.clone());
 
         let _: crate::client::WireSession = daemon
-            .put(
+            .patch(
                 &format!("/api/sessions/{}", session.id.as_str()),
                 &crate::client::UpdateSessionRequest {
                     model: Some(model),

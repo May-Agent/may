@@ -41,7 +41,7 @@ pub fn handle_session_select_key(app: &mut App, code: KeyCode) -> Option<SendAct
                     executor_core::spawn(async move {
                         if let Err(error) = client
                             .post::<_, serde_json::Value>(
-                                &format!("/api/sessions/{session_id}/unarchive"),
+                                &format!("/api/sessions/{session_id}"),
                                 &serde_json::json!({}),
                             )
                             .await
@@ -245,11 +245,10 @@ fn toggle_pin(app: &mut App) {
     let profile_id = app.current_profile_id.clone();
 
     executor_core::spawn(async move {
-        let action = if is_pinned { "unpin" } else { "pin" };
         if let Err(e) = client
-            .post::<_, serde_json::Value>(
-                &format!("/api/sessions/{session_id}/{action}"),
-                &serde_json::json!({}),
+            .patch::<_, serde_json::Value>(
+                &format!("/api/sessions/{session_id}"),
+                &serde_json::json!({ "pinned": !is_pinned }),
             )
             .await
         {
@@ -295,11 +294,10 @@ fn toggle_archive(app: &mut App) {
     let profile_id = app.current_profile_id.clone();
 
     executor_core::spawn(async move {
-        let action = if is_archived { "unarchive" } else { "archive" };
         if let Err(e) = client
-            .post::<_, serde_json::Value>(
-                &format!("/api/sessions/{session_id}/{action}"),
-                &serde_json::json!({}),
+            .patch::<_, serde_json::Value>(
+                &format!("/api/sessions/{session_id}"),
+                &serde_json::json!({ "archived": !is_archived }),
             )
             .await
         {

@@ -159,7 +159,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         height: column.height - sheet_area.map_or(0, |sheet| sheet.height),
         ..column
     };
-    app.chat_area = chat_area;
+    // The chat, its selection, links and images live inside the horizontal
+    // padding; the band paints across `chat_area`.
+    let content_area = super::band::inset(chat_area);
+    app.chat_area = content_area;
 
     let running_shells = app
         .jobs
@@ -179,7 +182,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let status_message = app
         .status_text()
         .map(str::to_string)
-        .or_else(|| app.hovered_link().map(|hit| hit.uri));
+        .or_else(|| app.hovered_link().map(|hit| hit.display()));
 
     // Render everything in a single unified scrollable area
     app.frame_stats.chat = chat::render_unified(
@@ -242,6 +245,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             hide_todos: sidebar_area.is_some(),
             image_positions_out: Some(&mut image_positions),
             spinner_frame: app.spinner_frame,
+            band_bg: app.band_bg,
         },
     );
     // The plain mirror is read back from the cached layout on demand.
@@ -249,7 +253,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     let t = std::time::Instant::now();
     if app.selection.is_some() {
-        render_text_selection_overlay(frame, chat_area, app);
+        render_text_selection_overlay(frame, content_area, app);
     }
 
     // Render images as overlays at their scroll-adjusted positions. Images
@@ -263,12 +267,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         && !matches!(app.mode, AppMode::ImageView(_))
     {
         let mut occluders: Vec<Rect> = Vec::new();
-        if let Some(rect) = completion_overlay_rect(app, chat_area) {
+        if let Some(rect) = completion_overlay_rect(app, content_area) {
             occluders.push(rect);
         }
         render_inline_images(
             frame,
-            chat_area,
+            content_area,
             &mut app.image_cache,
             &mut app.image_regions,
             &image_positions,
@@ -285,7 +289,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     // Render completion overlay if active (always on top)
     if app.completion.is_active() && !app.completion.is_empty() {
-        render_completion_overlay(frame, chat_area, app);
+        render_completion_overlay(frame, content_area, app);
     }
 
     // The zoomed image overlay sits above everything else.
@@ -298,7 +302,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // Fireworks play over the chat and leave nothing behind: the next frame
     // repaints the chat from its unchanged state.
     if let Some(fireworks) = app.new_year.fireworks() {
-        fireworks.paint(frame.buffer_mut(), chat_area);
+        fireworks.paint(frame.buffer_mut(), content_area);
     }
 
     // Last, so a popup or image drawn over a link is left alone.
@@ -306,7 +310,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         let top = app.effective_scroll();
         let runs = app
             .chat_layout
-            .link_runs(top, chat_area.height as usize, chat_area);
+            .link_runs(top, content_area.height as usize, content_area);
         let hovered = app.hovered_link().map(|hit| hit.id);
         super::links::paint(frame.buffer_mut(), &runs, hovered);
     }
@@ -2729,8 +2733,9 @@ fn completion_overlay_rect(app: &App, area: Rect) -> Option<Rect> {
     }
     let item_count = app.completion.len().min(COMPLETION_MAX_ITEMS);
     let height = u16::try_from(item_count + 2).unwrap_or(u16::MAX); // +2 for borders
-    // Near the bottom, leaving 2 lines for input/status.
-    let y = area.y + area.height.saturating_sub(height + 2);
+    // Near the bottom, above the band: its padding rows, the input line,
+    // the blank row and the status line.
+    let y = area.y + area.height.saturating_sub(height + 5);
     Some(Rect {
         x: area.x,
         y,
@@ -2792,9 +2797,18 @@ fn render_inline_images(
             continue;
         }
 
-        // Get the cached image state
+        // Get the cached image state. A miss or a failed fetch leaves the
+        // reserved rows blank: draw the caption there so the block is a
+        // placeholder, not a void.
         let Some(state) = image_cache.get_mut(&placement.key) else {
-            // Image not yet fetched
+            let y = chat_area.y + u16::try_from(top.max(0)).unwrap_or(0);
+            frame.buffer_mut().set_stringn(
+                chat_area.x + indent,
+                y,
+                format!("▏image · {}", placement.caption),
+                usize::from(width),
+                Style::default().fg(Color::DarkGray),
+            );
             continue;
         };
 
@@ -2839,6 +2853,7 @@ mod tests {
             execution_key: String::new(),
             script: "true".to_string(),
             mode: aither_sandbox::TerminalMode::default(),
+            language: aither_sandbox::ScriptLanguage::Shell,
             started_at: std::time::Instant::now()
                 .checked_sub(std::time::Duration::from_secs(age_secs))
                 .expect("instant in range"),
@@ -2894,9 +2909,11 @@ mod tests {
                         hide_todos: false,
                         image_positions_out: None,
                         spinner_frame: 0,
+                        band_bg: None,
                     },
                 );
-                let runs = layout.link_runs(0, usize::from(area.height), area);
+                let content = super::super::band::inset(area);
+                let runs = layout.link_runs(0, usize::from(area.height), content);
                 assert!(!runs.is_empty(), "the user message has link runs");
                 let hovered = runs[0].hit.id;
                 super::super::links::paint(frame.buffer_mut(), &runs, Some(hovered));
@@ -3045,6 +3062,7 @@ mod tests {
                         hide_todos: false,
                         image_positions_out: Some(&mut placements),
                         spinner_frame: 0,
+                        band_bg: None,
                     },
                 );
                 render_inline_images(frame, area, cache, &mut regions, &placements, &[]);
@@ -3232,6 +3250,7 @@ mod tests {
                         hide_todos: false,
                         image_positions_out: Some(&mut placements),
                         spinner_frame: 0,
+                        band_bg: None,
                     },
                 );
                 let occluder = Rect::new(0, 4, 50, 3);

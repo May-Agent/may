@@ -10,9 +10,7 @@
 //! alongside the messages. Numbers are estimates at ~4 bytes per token,
 //! the same heuristic the agent uses for its own context budgeting.
 
-use aither_agent::{
-    ContextPolicy, ContextWindowMetrics, ContextWindowPhase, Handoff, InstructionSlot,
-};
+use aither_agent::{ContextPolicy, ContextWindowMetrics, ContextWindowPhase, InstructionSlot};
 use aither_core::llm::tool::ToolDefinition;
 
 use super::runtime_context::tag;
@@ -188,10 +186,7 @@ impl ContextReport {
             .iter()
             .map(|message| message.content().len())
             .sum::<usize>()
-            + context.handoff().map_or(0, |handoff| match handoff {
-                Handoff::Text(text) => text.len(),
-                Handoff::Document(document) => document.render_markdown().len(),
-            });
+            + context.handoff().map_or(0, |handoff| handoff.text().len());
 
         let categories = [
             (ContextCategory::SystemPrompt, system_prompt_chars, None),

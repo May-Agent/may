@@ -17,6 +17,34 @@ use crate::session::SessionPaths;
 // Embed the skills directory at compile time
 static SKILLS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/skills");
 
+// The subagent definitions may ships: aither 0.24 left bundled subagents to
+// the embedder.
+static SUBAGENTS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/subagents");
+
+/// The names of the bundled subagent types, in catalog order.
+pub const BUNDLED_SUBAGENT_NAMES: [&str; 6] =
+    ["explore", "research", "audit", "review", "plan", "general"];
+
+/// The bundled subagent definitions, parsed once per call site.
+///
+/// # Panics
+///
+/// Panics when a bundled definition is invalid.
+#[must_use]
+pub fn bundled_subagents() -> Vec<aither_agent::SubagentDefinition> {
+    BUNDLED_SUBAGENT_NAMES
+        .iter()
+        .map(|name| {
+            let file = SUBAGENTS_DIR
+                .get_file(format!("{name}.toml"))
+                .unwrap_or_else(|| panic!("bundled subagent {name} is embedded"));
+            let source = file.contents_utf8().expect("subagent TOML is UTF-8");
+            aither_agent::SubagentDefinition::parse(source)
+                .unwrap_or_else(|error| panic!("bundled subagent '{name}': {error}"))
+        })
+        .collect()
+}
+
 /// Bundle extraction error.
 #[derive(Debug, thiserror::Error)]
 pub enum BundleError {
@@ -44,7 +72,7 @@ impl Bundle {
         // Built-in resources must stay in lockstep with the running binary.
         // Always overwrite bundled content to avoid stale skills after upgrades.
         Self::extract_dir_overwrite(&SKILLS_DIR, &skills_dir).await?;
-        aither_agent::install_bundled_subagents(&Self::subagents_dir(may_dir)).await?;
+        Self::extract_dir_overwrite(&SUBAGENTS_DIR, &Self::subagents_dir(may_dir)).await?;
 
         Ok(())
     }

@@ -31,6 +31,8 @@ mod github_repos_tests;
 mod helpers;
 mod interaction;
 pub use interaction::ASK_USER_NOT_OPEN;
+#[cfg(test)]
+mod attachments_tests;
 mod local_url_mapper;
 mod message_mapping;
 mod model_resolution;
@@ -40,7 +42,12 @@ mod remote_access;
 mod rules_import;
 mod server;
 #[cfg(test)]
+mod session_commands_tests;
+#[cfg(test)]
 mod session_directory_tests;
+pub(crate) mod session_events;
+#[cfg(test)]
+mod session_events_tests;
 mod sessions;
 mod sleep;
 mod state;
@@ -48,10 +55,15 @@ mod tasks;
 mod terminal_parsing;
 mod title_generation;
 mod tool_summary;
+mod transcript;
+#[cfg(test)]
+mod transcript_tests;
 mod tunnel;
 pub(crate) mod types;
 mod user_wait;
 
+#[cfg(test)]
+mod compression_tests;
 #[cfg(test)]
 mod funnel_tests;
 #[cfg(test)]

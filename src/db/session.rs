@@ -186,7 +186,7 @@ impl ChatDb {
                         name: attachment.name,
                         attachment_type: parse_attachment_kind(&attachment.attachment_type)?,
                         url: attachment.url,
-                        upload_data_url: attachment.upload_data_url,
+
                         text_content: attachment.text_content,
                     })
                 })
@@ -690,14 +690,13 @@ impl ChatDb {
         for (ordinal, attachment) in message.attachments.iter().enumerate() {
             query!(
                 tx,
-                "INSERT INTO session_pending_message_attachments (message_id, ordinal, attachment_id, name, attachment_type, url, upload_data_url, text_content) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO session_pending_message_attachments (message_id, ordinal, attachment_id, name, attachment_type, url, upload_data_url, text_content) VALUES (?, ?, ?, ?, ?, ?, NULL, ?)",
                 message_id,
                 i64::try_from(ordinal).map_err(|error| overflow_error("pending attachment ordinal", &error))?,
                 attachment.id.as_str(),
                 attachment.name.as_str(),
                 attachment.attachment_type.as_str(),
                 attachment.url.as_str(),
-                attachment.upload_data_url.as_deref(),
                 attachment.text_content.as_deref()
             )
             .execute()
@@ -861,6 +860,47 @@ impl ChatDb {
         query!(
             tx,
             "DELETE FROM session_pending_message_entries WHERE session_id = ?",
+            session_id
+        )
+        .execute()
+        .await?;
+        tx.commit().await?;
+        self.load_session_runtime_summary(session_id).await
+    }
+
+    /// Remove the pending entry whose row id is `entry_id`, whichever
+    /// delivery mode it was stored under.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or a missing entry.
+    pub async fn remove_pending_message_by_id(
+        &self,
+        session_id: &str,
+        entry_id: i64,
+    ) -> Result<SessionRuntimeSummary, ChatDbError> {
+        let runtime = self.load_session_runtime_summary(session_id).await?;
+        let found = runtime
+            .pending_immediate
+            .iter()
+            .chain(runtime.queued_messages.iter())
+            .any(|message| message.id == Some(entry_id));
+        if !found {
+            return Err(row_not_found(format!(
+                "pending entry {entry_id} not found for session {session_id}"
+            )));
+        }
+        let mut tx = self.db.begin().await?;
+        query!(
+            tx,
+            "DELETE FROM session_pending_message_attachments WHERE message_id = ?",
+            entry_id
+        )
+        .execute()
+        .await?;
+        query!(
+            tx,
+            "DELETE FROM session_pending_message_entries WHERE id = ? AND session_id = ? AND state != 'committed'",
+            entry_id,
             session_id
         )
         .execute()
@@ -1518,10 +1558,11 @@ mod tests {
 
     /// Audit and history tables that name a session but outlive it, and the
     /// search outbox, whose triggers queue index removals for deleted messages.
-    const RETAINED_ON_DELETE: [&str; 10] = [
+    const RETAINED_ON_DELETE: [&str; 11] = [
         "search_outbox",
         "prs",
         "pr_events",
+        "ci_jobs",
         "issue_provenance",
         "request_logs",
         "cache_misses",

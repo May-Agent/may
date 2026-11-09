@@ -21,8 +21,6 @@ pub enum UiEventTopic {
     ContainerPrepare = 1 << 4,
     /// Browser/session status changed.
     BrowserStatus = 1 << 5,
-    /// A single session's runtime state changed.
-    SessionRuntime = 1 << 6,
     /// Session runtime summaries changed.
     SessionRuntimes = 1 << 7,
     /// A profile's session list changed.
@@ -31,22 +29,8 @@ pub enum UiEventTopic {
     RemoteAccess = 1 << 9,
     /// Browser process lifecycle changed.
     BrowserLifecycle = 1 << 10,
-    /// Live chat events of a session's turn, as the web UI renders them.
-    SessionTurn = 1 << 11,
-    /// Live agent events of a session's turn, as the TUI renders them.
-    SessionAgent = 1 << 12,
-    /// A session's background jobs or subagent runs changed.
-    SessionBackground = 1 << 13,
-    /// A session's artifacts directory changed.
-    SessionArtifacts = 1 << 14,
     /// A session's worktree index coverage changed.
     SessionIndex = 1 << 15,
-    /// A session's prompt suggestion state changed.
-    SessionSuggestion = 1 << 16,
-    /// A session's recap card was generated.
-    SessionRecap = 1 << 17,
-    /// An issue a session may link changed.
-    SessionIssues = 1 << 18,
     /// The user's sleep state changed.
     Sleep = 1 << 19,
     /// A popup waits on the user; attached terminals raise a notification.
@@ -68,19 +52,11 @@ impl UiEventTopic {
             Self::NetworkAccessLogs => "network_access_logs",
             Self::ContainerPrepare => "container_prepare",
             Self::BrowserStatus => "browser_status",
-            Self::SessionRuntime => "session_runtime",
             Self::SessionRuntimes => "session_runtimes",
             Self::ProfileSessions => "profile_sessions",
             Self::RemoteAccess => "remote_access",
             Self::BrowserLifecycle => "browser_lifecycle",
-            Self::SessionTurn => "session_turn",
-            Self::SessionAgent => "session_agent",
-            Self::SessionBackground => "session_background",
-            Self::SessionArtifacts => "session_artifacts",
             Self::SessionIndex => "session_index",
-            Self::SessionSuggestion => "session_suggestion",
-            Self::SessionRecap => "session_recap",
-            Self::SessionIssues => "session_issues",
             Self::Sleep => "sleep",
             Self::UserNotification => "user_notification",
         }
@@ -98,19 +74,11 @@ impl FromStr for UiEventTopic {
             "network_access_logs" => Ok(Self::NetworkAccessLogs),
             "container_prepare" => Ok(Self::ContainerPrepare),
             "browser_status" => Ok(Self::BrowserStatus),
-            "session_runtime" => Ok(Self::SessionRuntime),
             "session_runtimes" => Ok(Self::SessionRuntimes),
             "profile_sessions" => Ok(Self::ProfileSessions),
             "remote_access" => Ok(Self::RemoteAccess),
             "browser_lifecycle" => Ok(Self::BrowserLifecycle),
-            "session_turn" => Ok(Self::SessionTurn),
-            "session_agent" => Ok(Self::SessionAgent),
-            "session_background" => Ok(Self::SessionBackground),
-            "session_artifacts" => Ok(Self::SessionArtifacts),
             "session_index" => Ok(Self::SessionIndex),
-            "session_suggestion" => Ok(Self::SessionSuggestion),
-            "session_recap" => Ok(Self::SessionRecap),
-            "session_issues" => Ok(Self::SessionIssues),
             "sleep" => Ok(Self::Sleep),
             "user_notification" => Ok(Self::UserNotification),
             _ => Err(UnknownUiEventTopic(value.to_string())),
@@ -137,8 +105,6 @@ impl UiEventTopics {
     pub const CONTAINER_PREPARE: Self = Self(UiEventTopic::ContainerPrepare.bit());
     /// `browser_status` topic.
     pub const BROWSER_STATUS: Self = Self(UiEventTopic::BrowserStatus.bit());
-    /// `session_runtime` topic.
-    pub const SESSION_RUNTIME: Self = Self(UiEventTopic::SessionRuntime.bit());
     /// `session_runtimes` topic.
     pub const SESSION_RUNTIMES: Self = Self(UiEventTopic::SessionRuntimes.bit());
     /// `profile_sessions` topic.
@@ -147,22 +113,8 @@ impl UiEventTopics {
     pub const REMOTE_ACCESS: Self = Self(UiEventTopic::RemoteAccess.bit());
     /// `browser_lifecycle` topic.
     pub const BROWSER_LIFECYCLE: Self = Self(UiEventTopic::BrowserLifecycle.bit());
-    /// `session_turn` topic.
-    pub const SESSION_TURN: Self = Self(UiEventTopic::SessionTurn.bit());
-    /// `session_agent` topic.
-    pub const SESSION_AGENT: Self = Self(UiEventTopic::SessionAgent.bit());
-    /// `session_background` topic.
-    pub const SESSION_BACKGROUND: Self = Self(UiEventTopic::SessionBackground.bit());
-    /// `session_artifacts` topic.
-    pub const SESSION_ARTIFACTS: Self = Self(UiEventTopic::SessionArtifacts.bit());
     /// `session_index` topic.
     pub const SESSION_INDEX: Self = Self(UiEventTopic::SessionIndex.bit());
-    /// `session_suggestion` topic bit.
-    pub const SESSION_SUGGESTION: Self = Self(UiEventTopic::SessionSuggestion.bit());
-    /// `session_recap` topic bit.
-    pub const SESSION_RECAP: Self = Self(UiEventTopic::SessionRecap.bit());
-    /// `session_issues` topic bit.
-    pub const SESSION_ISSUES: Self = Self(UiEventTopic::SessionIssues.bit());
     /// `sleep` topic bit.
     pub const SLEEP: Self = Self(UiEventTopic::Sleep.bit());
     /// `user_notification` topic bit.
@@ -175,17 +127,11 @@ impl UiEventTopics {
             | Self::NETWORK_ACCESS_LOGS.0
             | Self::CONTAINER_PREPARE.0
             | Self::BROWSER_STATUS.0
-            | Self::SESSION_RUNTIME.0
             | Self::SESSION_RUNTIMES.0
             | Self::PROFILE_SESSIONS.0
             | Self::REMOTE_ACCESS.0
             | Self::BROWSER_LIFECYCLE.0
-            | Self::SESSION_TURN.0
-            | Self::SESSION_BACKGROUND.0
-            | Self::SESSION_ARTIFACTS.0
             | Self::SESSION_INDEX.0
-            | Self::SESSION_RECAP.0
-            | Self::SESSION_ISSUES.0
             | Self::SLEEP.0,
     );
 
@@ -284,6 +230,11 @@ impl std::ops::BitOr<Self> for UiEventTopic {
 #[derive(Debug, Clone)]
 pub struct UiEventBus {
     tx: broadcast::Sender<UiEventTopics>,
+    /// Producer side of the session-change channel feeding
+    /// `/api/sessions/{id}/events`; the daemon wires it at construction.
+    session_changes: std::sync::Arc<
+        std::sync::Mutex<Option<crate::daemon::session_events::SessionChangeSender>>,
+    >,
 }
 
 impl UiEventBus {
@@ -291,7 +242,10 @@ impl UiEventBus {
     #[must_use]
     pub fn new() -> Self {
         let (tx, _) = broadcast::channel(UI_EVENT_BUS_CAPACITY);
-        Self { tx }
+        Self {
+            tx,
+            session_changes: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }
     }
 
     /// Subscribe to topic notifications.
@@ -306,6 +260,35 @@ impl UiEventBus {
             return;
         }
         let _ = self.tx.send(topics);
+    }
+
+    /// Wire the session-change channel; called once where the daemon's
+    /// [`DaemonState`] is built.
+    pub(crate) fn set_session_changes(
+        &self,
+        tx: crate::daemon::session_events::SessionChangeSender,
+    ) {
+        *self
+            .session_changes
+            .lock()
+            .expect("session-change sender lock is poisoned") = Some(tx);
+    }
+
+    /// Queue `kind` for the session's diff publisher on
+    /// `/api/sessions/{id}/events`; a no-op where no daemon wired it.
+    pub(crate) fn publish_session_change(
+        &self,
+        session_id: &str,
+        kind: crate::daemon::session_events::SessionChange,
+    ) {
+        let tx = self
+            .session_changes
+            .lock()
+            .expect("session-change sender lock is poisoned")
+            .clone();
+        if let Some(tx) = tx {
+            crate::daemon::session_events::notify_change(&tx, session_id, kind);
+        }
     }
 }
 

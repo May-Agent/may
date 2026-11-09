@@ -20,7 +20,7 @@ use crate::agent::ask_user_tool::{
 };
 use crate::db::ChatDb;
 use crate::ui_event_bus::UiEventBus;
-use aither_agent::TaskBlockerResolver;
+use aither_agent::BlockerResolver;
 
 /// Upper bound on any single wait in this module.
 const WAIT_BOUND: Duration = Duration::from_secs(20);
@@ -183,8 +183,11 @@ async fn an_answer_is_recorded_on_the_session_tasks_inbox() {
         format!("## Doing\n- pick a db BLOCKING {asked}\n"),
     )
     .expect("tasks.md");
-    let mut tasks =
-        aither_agent::TasksDocument::new(sandbox.path(), 60, service.task_events("session"));
+    let mut tasks = aither_agent::WorkingDocument::new(
+        &aither_agent::DocumentSpec::new("tasks.md", crate::task_rows::TasksSchema),
+        sandbox.path(),
+        service.task_events("session"),
+    );
     aither_agent::ContextSource::on_request(&mut tasks, false).await;
     let alert = aither_agent::ContextSource::on_tool_turn_end(&mut tasks)
         .await

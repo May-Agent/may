@@ -53,7 +53,7 @@ struct TerminalInputScript<'a> {
 #[derive(Template)]
 #[template(path = "test_terminal_read.sh", escape = "none")]
 struct TerminalReadScript<'a> {
-    task_id: &'a str,
+    output_file: &'a str,
 }
 
 #[derive(Clone)]
@@ -381,6 +381,7 @@ struct MockScenarioState {
     scenario: MockChatScenario,
     request_index: usize,
     task_id: Option<String>,
+    output_file: Option<String>,
     /// Set once a probe script served its final response, so the test can
     /// wait for a turn the job's completion resumed on its own.
     probe_done: bool,
@@ -400,6 +401,7 @@ impl MockScenarioState {
             scenario,
             request_index: 0,
             task_id: None,
+            output_file: None,
             probe_done: false,
             probe_steps: 0,
             compactions: 0,
@@ -609,6 +611,11 @@ impl MockScenarioState {
                             "terminal tool result did not include a task_id".to_string()
                         })?;
                     self.task_id = Some(task_id.clone());
+                    self.output_file = Some(
+                        terminal_output_file_from_latest_tool_output(request).ok_or_else(|| {
+                            "terminal tool result did not include an output file".to_string()
+                        })?,
+                    );
                     let script = TerminalInputScript { task_id: &task_id }
                         .render()
                         .map_err(|error| error.to_string())?;
@@ -637,13 +644,18 @@ impl MockScenarioState {
                     if tool_output_reports_failure(&input_result) {
                         return Err(format!("terminal input IPC command failed: {input_result}"));
                     }
-                    let task_id = self
-                        .task_id
+                    // Aither forgets a finished task once its completion
+                    // reaches the model, so the id reads as unknown; the
+                    // job's output lives in its stored file.
+                    let output_file = self
+                        .output_file
                         .clone()
-                        .ok_or_else(|| "terminal task_id was not captured".to_string())?;
-                    let script = TerminalReadScript { task_id: &task_id }
-                        .render()
-                        .map_err(|error| error.to_string())?;
+                        .ok_or_else(|| "terminal output file was not captured".to_string())?;
+                    let script = TerminalReadScript {
+                        output_file: &output_file,
+                    }
+                    .render()
+                    .map_err(|error| error.to_string())?;
                     MockHttpResponse::sse(vec![
                         delayed_sse_frame(
                             tool_call_chunk(
@@ -1014,7 +1026,7 @@ fn tasks_injection(request: &Value) -> Option<&str> {
         .as_array()?
         .iter()
         .filter_map(|message| message.get("content").and_then(Value::as_str))
-        .rfind(|content| content.starts_with("<tasks_document>"))
+        .rfind(|content| content.starts_with("<working_document>"))
 }
 
 fn verify_native_tool_surface(request: &Value) -> Result<(), String> {
@@ -1945,8 +1957,8 @@ struct TestSseEvent {
 }
 
 /// Starts a turn the way every client does: subscribes to the session's
-/// `session_turn` frames on `/api/events`, then `POST`s the message. Returns
-/// the event stream, or the refused `POST`'s response.
+/// `session_turn` frames on `/api/sessions/{id}/events`, then `POST`s the
+/// message. Returns the event stream, or the refused `POST`'s response.
 async fn send_turn(
     client: &reqwest::Client,
     base_url: &str,
@@ -1958,15 +1970,11 @@ async fn send_turn(
         .expect("turn body names its session")
         .to_string();
     let events = client
-        .get(format!("{base_url}/api/events"))
-        .query(&[
-            ("topics", "session_turn"),
-            ("sessionId", session_id.as_str()),
-        ])
+        .get(format!("{base_url}/api/sessions/{session_id}/events"))
         .send()
         .await?;
     let sent = client
-        .post(format!("{base_url}/api/sessions/{session_id}/messages"))
+        .post(format!("{base_url}/api/sessions/{session_id}/turns"))
         .json(body)
         .send()
         .await?;
@@ -2148,6 +2156,14 @@ fn terminal_task_id_from_latest_tool_output(request: &Value) -> Option<String> {
     let start = output.find(marker)? + marker.len();
     let end = output[start..].find('\'')?;
     Some(output[start..start + end].to_string())
+}
+
+fn terminal_output_file_from_latest_tool_output(request: &Value) -> Option<String> {
+    let output = latest_tool_output(request)?;
+    let marker = "being written to ";
+    let start = output.find(marker)? + marker.len();
+    let end = output[start..].find(' ')? + start;
+    Some(output[start..end].to_string())
 }
 /// Return `response` when it carries `expected`, otherwise fail with its body
 /// and the server's logs, which carry the cause of a redacted 5xx body.
@@ -2463,18 +2479,17 @@ async fn get_runtime(client: &reqwest::Client, server: &RunningDaemon, session_i
         .expect("runtime response should be valid JSON")
 }
 
-fn extract_assistant_messages(session_payload: &Value) -> Vec<String> {
-    session_payload
-        .get("messages")
+fn extract_assistant_messages(transcript: &Value) -> Vec<String> {
+    transcript
+        .get("entries")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|message| {
-            let role = message.get("role")?.as_str()?;
-            if role != "assistant" {
+        .filter_map(|entry| {
+            if entry.get("kind")?.as_str()? != "assistant" {
                 return None;
             }
-            message.get("content")?.as_str().map(ToOwned::to_owned)
+            entry.get("text")?.as_str().map(ToOwned::to_owned)
         })
         .collect()
 }
@@ -3080,7 +3095,7 @@ async fn ui_session_crud_round_trip_matches_api_contract() {
     assert!(contains);
 
     let update_response = client
-        .put(format!("{}/api/sessions/{session_id}", server.base_url))
+        .patch(format!("{}/api/sessions/{session_id}", server.base_url))
         .json(&serde_json::json!({
             "title": "Terminal first test",
             "model": TEST_SELECTOR
@@ -3995,8 +4010,8 @@ async fn stream_stop_mid_response_persists_partial_assistant_text(environment: C
     sleep(Duration::from_millis(450)).await;
 
     let stop_response = client
-        .post(format!(
-            "{}/api/sessions/{}/stop",
+        .delete(format!(
+            "{}/api/sessions/{}/turns/current",
             server.base_url, session_id
         ))
         .send()
@@ -4016,17 +4031,20 @@ async fn stream_stop_mid_response_persists_partial_assistant_text(environment: C
 
     wait_for_runtime_state_clear(&client, &server, &session_id, Duration::from_secs(10)).await;
 
-    let session_response = client
-        .get(format!("{}/api/sessions/{}", server.base_url, session_id))
+    let transcript_response = client
+        .get(format!(
+            "{}/api/sessions/{}/transcript",
+            server.base_url, session_id
+        ))
         .send()
         .await
-        .expect("get session after cancel should succeed");
-    let session_response = expect_status(&server.log, session_response, StatusCode::OK).await;
-    let session_payload: Value = session_response
+        .expect("get transcript after cancel should succeed");
+    let transcript_response = expect_status(&server.log, transcript_response, StatusCode::OK).await;
+    let transcript: Value = transcript_response
         .json()
         .await
-        .expect("session payload after cancel should be valid JSON");
-    let assistant_messages = extract_assistant_messages(&session_payload);
+        .expect("transcript after cancel should be valid JSON");
+    let assistant_messages = extract_assistant_messages(&transcript);
     assert!(
         assistant_messages
             .iter()
@@ -4434,20 +4452,23 @@ async fn ui_chat_turn_survives_upstream_overload_on_its_own_provider() {
     assert_eq!(holds, 1, "the turn's retry announces its wait: {events:?}");
     assert_eq!(mock.agent_requests().await.len(), FAILURES + 1);
 
-    let session = client
-        .get(format!("{}/api/sessions/{session_id}", server.base_url))
+    let transcript = client
+        .get(format!(
+            "{}/api/sessions/{session_id}/transcript",
+            server.base_url
+        ))
         .send()
         .await
-        .expect("get session request should succeed");
-    let session: Value = expect_status(&server.log, session, StatusCode::OK)
+        .expect("get transcript request should succeed");
+    let transcript: Value = expect_status(&server.log, transcript, StatusCode::OK)
         .await
         .json()
         .await
-        .expect("session should be valid JSON");
+        .expect("transcript should be valid JSON");
     assert_eq!(
-        extract_assistant_messages(&session),
+        extract_assistant_messages(&transcript),
         vec!["recovered answer".to_string()],
-        "the failed attempts leave nothing in history: {session}"
+        "the failed attempts leave nothing in history: {transcript}"
     );
 
     server.stop().await;
@@ -4867,9 +4888,9 @@ async fn answer_open_question(
     value: &str,
 ) {
     let response = client
-        .post(format!("{}/api/ask-user/respond", server.base_url))
+        .post(format!("{}/api/interactions/{request_id}", server.base_url))
         .json(&serde_json::json!({
-            "id": request_id,
+            "kind": "askUser",
             "answers": [{
                 "section": "",
                 "answer": { "kind": "selected", "values": [value] }
@@ -5481,6 +5502,20 @@ async fn a_background_job_is_listed_pushed_and_killable_over_the_api() {
         .prepare(&harness, &client, &server)
         .await;
     let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+    // The session stream replays deltas published after this cursor.
+    let session: Value = client
+        .get(format!("{}/api/sessions/{session_id}", server.base_url))
+        .send()
+        .await
+        .expect("session request should succeed")
+        .json()
+        .await
+        .expect("session JSON");
+    let cursor = session
+        .get("cursor")
+        .and_then(Value::as_str)
+        .expect("the session read carries its event cursor")
+        .to_string();
 
     // The turn ends with the model's reply; its job keeps running.
     let turn = send_turn(
@@ -5506,27 +5541,35 @@ async fn a_background_job_is_listed_pushed_and_killable_over_the_api() {
         server.log.contents().await
     );
 
-    // The event stream carries the same snapshot.
+    // The session stream reports the job as a `job.upserted` delta.
     let events = client
-        .get(format!("{}/api/events", server.base_url))
-        .query(&[
-            ("topics", "session_background"),
-            ("sessionId", session_id.as_str()),
-        ])
+        .get(format!(
+            "{}/api/sessions/{session_id}/events?after={cursor}",
+            server.base_url
+        ))
         .send()
         .await
         .expect("event stream should open");
     let mut reader = SseReader::new(events);
-    let event = tokio::time::timeout(Duration::from_secs(10), reader.next_event())
-        .await
-        .expect("a session_background event should arrive")
-        .expect("the stream should stay open");
-    assert_eq!(event.event, "session_background");
-    let snapshot: Value = serde_json::from_str(&event.data).expect("snapshot JSON");
-    let pid = background_job(&snapshot, BACKGROUND_JOB_SCRIPT)
-        .and_then(|job| job.get("pid"))
-        .and_then(Value::as_u64)
-        .unwrap_or_else(|| panic!("the event should list the job: {snapshot}"));
+    let pid = loop {
+        let event = tokio::time::timeout(Duration::from_secs(10), reader.next_event())
+            .await
+            .expect("a job.upserted event should arrive")
+            .expect("the stream should stay open");
+        if event.event != "job.upserted" {
+            continue;
+        }
+        let delta: Value = serde_json::from_str(&event.data).expect("upsert JSON");
+        let Some(pid) = delta
+            .get("job")
+            .filter(|job| job.get("script").and_then(Value::as_str) == Some(BACKGROUND_JOB_SCRIPT))
+            .and_then(|job| job.get("pid"))
+            .and_then(Value::as_u64)
+        else {
+            continue;
+        };
+        break pid;
+    };
 
     let response = client
         .post(format!(
@@ -5595,11 +5638,10 @@ async fn a_background_job_finishing_after_its_turn_resumes_the_session() {
 
     // The resumed turn shows up on the session's stream.
     let stream = client
-        .get(format!("{}/api/events", server.base_url))
-        .query(&[
-            ("topics", "session_turn"),
-            ("sessionId", session_id.as_str()),
-        ])
+        .get(format!(
+            "{}/api/sessions/{session_id}/events",
+            server.base_url
+        ))
         .send()
         .await
         .expect("event stream should open");
@@ -5639,48 +5681,56 @@ async fn a_background_job_finishing_after_its_turn_resumes_the_session() {
     server.stop().await;
 }
 
-/// Opens the session's `session_agent` stream, continuing after frame
-/// `after` when given.
+/// Opens the session's events stream, continuing after the cursor `after`
+/// when given. Frames of every kind arrive; readers pick their own.
 async fn agent_frames(
     client: &reqwest::Client,
     server: &RunningDaemon,
     session_id: &str,
-    after: Option<u64>,
+    after: Option<String>,
 ) -> SseReader {
-    let mut query = vec![
-        ("topics", "session_agent".to_string()),
-        ("sessionId", session_id.to_string()),
-    ];
+    let mut url = format!("{}/api/sessions/{session_id}/events", server.base_url);
     if let Some(after) = after {
-        query.push(("after", after.to_string()));
+        url = format!("{url}?after={after}");
     }
     let response = client
-        .get(format!("{}/api/events", server.base_url))
-        .query(&query)
+        .get(url)
         .send()
         .await
         .expect("event stream should open");
     SseReader::new(response)
 }
 
-/// The next turn frame of `reader`, skipping heartbeats.
+/// The next `session_agent` frame of `reader` — the kind the old
+/// `topics=session_agent` subscription delivered — or a `reset`. Other
+/// session frames (turns, suggestions, jobs) share the stream now and are
+/// skipped here; the reader's cursor bookkeeping still uses the last frame
+/// it read, so a reconnect loses nothing.
 async fn next_turn_frame(reader: &mut SseReader) -> TestSseEvent {
     loop {
         let event = tokio::time::timeout(Duration::from_secs(20), reader.next_event())
             .await
             .expect("a frame should arrive")
             .expect("the stream should stay open");
-        if event.event != "heartbeat" {
+        if event.event == "session_agent" || event.event == "reset" {
             return event;
         }
     }
+}
+
+fn frame_cursor(event: &TestSseEvent) -> String {
+    event
+        .id
+        .clone()
+        .unwrap_or_else(|| panic!("frames carry their cursor: {event:?}"))
 }
 
 fn frame_index(event: &TestSseEvent) -> u64 {
     event
         .id
         .as_deref()
-        .and_then(|id| id.parse().ok())
+        .and_then(|id| id.rsplit_once('.'))
+        .and_then(|(_, index)| index.parse().ok())
         .unwrap_or_else(|| panic!("turn frames carry their index: {event:?}"))
 }
 
@@ -5719,15 +5769,16 @@ async fn a_reconnecting_client_continues_after_the_last_frame_it_saw() {
         seen.push(next_turn_frame(&mut first).await);
     }
     assert!(seen[0].data.contains("\"start\""), "{:?}", seen[0]);
-    let last_seen = frame_index(seen.last().expect("frames were read"));
+    let last_seen = frame_cursor(seen.last().expect("frames were read"));
+    let last_index = frame_index(seen.last().expect("frames were read"));
     drop(first);
 
     let mut reopened = agent_frames(&client, &server, &session_id, Some(last_seen)).await;
     let next = next_turn_frame(&mut reopened).await;
-    // Indices count every turn frame; this stream asked for agent frames
-    // only, so the next one may skip the indices of the others.
+    // Indices count every frame on the session stream; the next agent
+    // frame may skip the indices of the kinds this test filtered out.
     assert!(
-        frame_index(&next) > last_seen,
+        frame_index(&next) > last_index,
         "the reopened stream continues after the last frame seen: {next:?}"
     );
     assert!(
@@ -5739,9 +5790,10 @@ async fn a_reconnecting_client_continues_after_the_last_frame_it_saw() {
     assert!(events.iter().any(|(kind, _)| kind == "done"), "{events:?}");
 
     // The turn ended: frames after the first one are gone for good.
-    let mut stale = agent_frames(&client, &server, &session_id, Some(frame_index(&seen[0]))).await;
+    // A cursor the hub cannot continue from — a foreign epoch — gets `reset`.
+    let mut stale = agent_frames(&client, &server, &session_id, Some("1.0".to_string())).await;
     let resync = next_turn_frame(&mut stale).await;
-    assert_eq!(resync.event, "session_resync", "{resync:?}");
+    assert_eq!(resync.event, "reset", "{resync:?}");
     server.stop().await;
 }
 

@@ -257,7 +257,8 @@ pub struct App {
     pub pending_paste_results: std::collections::VecDeque<PendingPaste>,
     /// Pending attachment jobs (clipboard read / download)
     pub pending_attachment_jobs: usize,
-    /// Cumulative token usage for current session
+    /// Latest request's token usage; `prompt_tokens` is the status bar's
+    /// context footprint since every request resends the whole context
     pub usage: Option<aither_core::llm::Usage>,
     /// Decode-speed measurement for the streaming response
     pub decode_meter: crate::decode_meter::DecodeMeter,
@@ -321,6 +322,9 @@ pub struct App {
     pub event_tx: EventSender,
     /// Terminal image rendering support (None if terminal doesn't support graphics)
     pub image_support: Option<super::ui::image::TerminalImageSupport>,
+    /// Background of the input band, queried from the terminal at startup;
+    /// `None` keeps the terminal's default background.
+    pub band_bg: Option<ratatui::style::Color>,
     /// Image cache: URL -> fetched image state (for terminal image rendering)
     pub image_cache: ahash::AHashMap<String, super::ui::image::ImageState>,
     /// URLs currently being fetched (to avoid duplicate requests)
@@ -735,6 +739,7 @@ impl App {
             btw_daemon: None,
             sidebar: super::sidebar::SidebarState::default(),
             chat_area: ratatui::layout::Rect::default(),
+            band_bg: None,
             jobs: Vec::new(),
             jobs_selected: 0,
             subagents: Vec::new(),
@@ -1122,7 +1127,7 @@ impl App {
         ) else {
             return;
         };
-        let path = crate::client::session_path(session.id.as_str(), "/btw");
+        let path = crate::client::session_path(session.id.as_str(), "/actions/btw");
         if let AppMode::Btw(state) = &mut self.mode {
             state.loading = true;
         }
@@ -1157,7 +1162,7 @@ impl App {
                 .push_notice("No model available for /progress — start a session first");
             return;
         };
-        let path = crate::client::session_path(session.id.as_str(), "/progress");
+        let path = crate::client::session_path(session.id.as_str(), "/actions/progress");
         self.mode = AppMode::Progress(super::state::ProgressState {
             loading: true,
             ..super::state::ProgressState::default()
@@ -1752,14 +1757,20 @@ impl App {
             turn.note(msg);
             match msg.role {
                 MessageRole::User => {
-                    let restored = futures_util::future::join_all(msg.attachments.iter().map(
-                        |att| async move {
-                            super::runtime::tui_attachment_from_persisted(att.clone())
+                    let daemon = self.session_manager.daemon_handle().ok();
+                    let restored =
+                        futures_util::future::join_all(msg.attachments.iter().map(|att| {
+                            let daemon = daemon.clone();
+                            async move {
+                                super::runtime::tui_attachment_from_persisted(
+                                    daemon.as_ref(),
+                                    att.clone(),
+                                )
                                 .await
                                 .map_err(|error| (att.name.clone(), error))
-                        },
-                    ))
-                    .await;
+                            }
+                        }))
+                        .await;
                     let mut attachments = Vec::with_capacity(restored.len());
                     for result in restored {
                         match result {
@@ -2423,6 +2434,19 @@ impl App {
         // Ctrl+V.
         if modifiers.contains(KeyModifiers::SUPER) && matches!(code, KeyCode::Char('v' | 'V')) {
             self.handle_paste();
+            return Ok(None);
+        }
+
+        // Cmd+Enter (Ctrl where Cmd cannot reach the app) opens the link
+        // under the pointer, as the same-modified click does.
+        if matches!(self.mode, AppMode::Chat)
+            && super::ui::links::dispatch_enter(
+                self.link_opener.as_ref(),
+                code,
+                modifiers,
+                self.hovered_link().as_ref(),
+            )
+        {
             return Ok(None);
         }
 
@@ -3842,6 +3866,31 @@ impl App {
         {
             return self.open_model_select(rest.trim());
         }
+        // `/btw` opens the side-question overlay and `/btw <question>`
+        // asks it at once — either way the line is a command, never a
+        // message to the agent.
+        if attachments.is_empty()
+            && let Some(rest) = trimmed.strip_prefix(SlashCommand::Btw.name())
+            && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+        {
+            let question = rest.trim();
+            self.open_btw();
+            if !question.is_empty()
+                && let AppMode::Btw(state) = &mut self.mode
+            {
+                state.input = question.to_string();
+                self.submit_btw();
+            }
+            return None;
+        }
+        // `/progress` is a side request too: never a message to the agent.
+        if attachments.is_empty()
+            && let Some(rest) = trimmed.strip_prefix(SlashCommand::Progress.name())
+            && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+        {
+            self.open_progress();
+            return None;
+        }
 
         self.sent_hidden_context = self.rewind_notice.take();
         let msg = PendingMessage {
@@ -4332,12 +4381,7 @@ impl App {
                     }
                     AgentEvent::Usage(u) => {
                         self.decode_meter.note_usage(u.completion_tokens);
-                        // Accumulate token usage
-                        if let Some(ref mut usage) = self.usage {
-                            usage.accumulate(&u);
-                        } else {
-                            self.usage = Some(u);
-                        }
+                        self.usage = Some(u);
                     }
                     AgentEvent::CompactionRecovery {
                         error,
@@ -4392,8 +4436,8 @@ impl App {
         )
     }
 
-    /// Mirror the daemon's pending-message queue from the last
-    /// `session_runtime` snapshot, so an enqueued message keeps a
+    /// Mirror the daemon's pending-message queue from the last runtime
+    /// snapshot, so an enqueued message keeps a
     /// `[steer]`/`[queue]` preview until the turn it starts renders it.
     pub fn sync_queue_from_runtime(&mut self) {
         let runtime = &self.session_runtime;
@@ -4729,7 +4773,10 @@ fn btw_message(role: &str, content: impl Into<String>) -> crate::daemon::BtwMess
 #[cfg(test)]
 mod tests {
     use super::utf8_complete_len;
-    use super::{App, AppEvent, KeyCode, KeyModifiers, MayConfig, MessageRole, SendAction};
+    use super::{
+        AgentEvent, App, AppEvent, KeyCode, KeyModifiers, MayConfig, MessageRole, SendAction,
+        TimedEvent,
+    };
     use crate::session::SessionManager;
     use crate::tui::ui::chat::ChatElement;
 
@@ -4879,6 +4926,25 @@ mod tests {
             .expect("key");
         press(&mut app, KeyCode::Char('b'));
         assert_eq!(app.input, "Ab", "plain and shifted characters still type");
+    }
+
+    /// An Enter carrying Ctrl or Cmd is a link-open request, not a submit:
+    /// with no link under the pointer it does nothing.
+    #[tokio::test]
+    async fn a_modified_enter_never_sends() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        for c in "draft".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        for modifier in [KeyModifiers::SUPER, KeyModifiers::CONTROL] {
+            assert!(
+                app.handle_key(KeyCode::Enter, modifier)
+                    .expect("key")
+                    .is_none()
+            );
+        }
+        assert_eq!(app.input, "draft", "a modified Enter sends nothing");
     }
 
     #[tokio::test]
@@ -5111,6 +5177,29 @@ mod tests {
             app.context_usage(),
             None,
             "a new model drops the old window"
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_events_keep_the_latest_request_not_their_sum() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        let usage = |prompt_tokens| {
+            Ok(TimedEvent {
+                at: "2026-11-07T00:00:00Z".parse().expect("time"),
+                event: AgentEvent::Usage(aither_core::llm::Usage {
+                    prompt_tokens: Some(prompt_tokens),
+                    ..aither_core::llm::Usage::default()
+                }),
+            })
+        };
+        app.handle_agent_event(usage(40_000)).await;
+        app.handle_agent_event(usage(45_000)).await;
+        assert_eq!(
+            app.usage.and_then(|u| u.prompt_tokens),
+            Some(45_000),
+            "each request resends the whole context, so prompt_tokens is \
+             the latest request's footprint, not a running total"
         );
     }
 

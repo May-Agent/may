@@ -40,6 +40,7 @@ Anthropic and Google use their own wire formats; every other type speaks the Ope
 - `[language]`: `communication` (language of replies, questions and recaps; unset follows the user's messages) and `working` (language written for others such as issue text; English when unset). Values are an English or native name or an ISO 639-3 code; an unknown name is rejected.
 - `[time] timezone`: IANA name; unset follows the host.
 - `[suggestions] enabled` (default true): a completed turn schedules a suggested next prompt shown as ghost text; Tab accepts it in the TUI.
+- `[ci]`: when a CI job counts as abnormally long, read each time a PR's checks finish. `max_job_minutes` (default 40) is the absolute limit; `baseline_multiple` (default 2.0, above 1) is the multiple of the job's baseline, the median of its last successful base-branch runs. A job past either gets one alert to the agent and one warning to the user.
 - `[recap]`: `auto` (default true) gives an idle session a catch-up card, `idle_minutes` (default 30) is the inactivity before it.
 - `[sleep] reminder` (default true): see `sleep.md`.
 - `[sessions] recent_hours` (default 48): idle time before a session is archived (see `profiles.md`).

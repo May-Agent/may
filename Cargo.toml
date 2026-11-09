@@ -20,22 +20,22 @@ gstreamer = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
 [dependencies]
 libc = "0.2.191"
 # Aither framework
-aither-core = { version = "0.21.0" }
-aither-agent = { version = "0.21.0", features = ["mcp", "webfetch", "skills", "connectivity", "languages"] }
-aither-connectivity = { version = "0.21.0" }
-aither-sandbox = { version = "0.21.0", features = ["code-folding", "connectivity", "jobserver"] }
-aither-cloud = { version = "0.21.0" }
-aither-copilot = { version = "0.21.0" }
-aither-codex = { version = "0.21.0" }
-aither-models = { version = "0.21.0" }
-aither-mcp = { version = "0.21.0" }
-aither-browser = { version = "0.21.0" }
+aither-core = { version = "0.24.0" }
+aither-agent = { version = "0.24.0", features = ["mcp", "webfetch", "skills", "connectivity", "languages"] }
+aither-connectivity = { version = "0.24.0" }
+aither-sandbox = { version = "0.24.0", features = ["code-folding", "connectivity", "jobserver"] }
+aither-cloud = { version = "0.24.0" }
+aither-copilot = { version = "0.24.0" }
+aither-codex = { version = "0.24.0" }
+aither-models = { version = "0.24.0" }
+aither-mcp = { version = "0.24.0" }
+aither-browser = { version = "0.24.0" }
 # Names acpsub's `TurnEnd::Stopped` reason, so it is the aither-acp acpsub
 # builds on.
-aither-acp = { version = "0.21.0" }
+aither-acp = { version = "0.24.0" }
 # The sandbox ACP agents and their terminal commands run in; the version
 # aither-sandbox builds its own sandboxes with.
-heel = { version = "0.9.0", default-features = false }
+heel = { version = "0.9.1", default-features = false }
 
 # ACP agents as subagents (`/connect`); its CLI and second SQLite stay off.
 acpsub = { git = "https://github.com/lexoliu/acpsub", branch = "dev", default-features = false }
@@ -66,6 +66,7 @@ humantime = { version = "2.4", default-features = false }
 async-net = "2"
 async-channel = "2"
 blocking = "1"
+terminal-colorsaurus = { version = "1.0.3", default-features = false }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

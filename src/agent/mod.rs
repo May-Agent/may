@@ -7,6 +7,8 @@ mod agents_md;
 pub(crate) mod ask_user_tool;
 pub(crate) mod browser_tool;
 pub mod cache_miss;
+pub(crate) mod ci_alert;
+pub(crate) mod ci_tool;
 #[cfg(test)]
 mod compact_tool_tests;
 #[cfg(test)]

@@ -105,6 +105,9 @@ struct Entry {
     /// `lines` with their links tagged, scratch-rendered instead of
     /// `lines` when the element has links.
     marked: Option<Vec<Line<'static>>>,
+    /// The element is a user message — its rows draw the band
+    /// background.
+    user: bool,
     /// Scratch render, built on first use (at build for linked elements).
     scratch: OnceLock<Scratch>,
 }
@@ -160,9 +163,13 @@ impl Entry {
             images,
             collapsible,
             sub_regions,
-            markdown_images: matches!(elem, ChatElement::AssistantText { .. }),
+            markdown_images: matches!(
+                elem,
+                ChatElement::AssistantText { .. } | ChatElement::WorkedFor { .. }
+            ),
             link_targets: link_targets.unwrap_or_default(),
             marked,
+            user: matches!(elem, ChatElement::UserMessage { .. }),
             scratch: OnceLock::new(),
         };
         // Link cells are needed every frame: find them now, with the
@@ -348,6 +355,25 @@ impl ChatLayout {
             }
         }
         (out, skip)
+    }
+
+    /// Doc-row ranges of the user messages overlapping `[top, top +
+    /// height)` — the rows that draw the band background.
+    #[must_use]
+    pub fn user_rows_in(&self, top: usize, height: usize) -> Vec<(usize, usize)> {
+        let bottom = top.saturating_add(height);
+        let mut out = Vec::new();
+        for (index, entry) in self.entries.iter().enumerate() {
+            if !entry.user {
+                continue;
+            }
+            let start = self.offsets[index];
+            let end = start + entry.rows;
+            if end > top && start < bottom {
+                out.push((start.max(top), end.min(bottom)));
+            }
+        }
+        out
     }
 
     /// Image blocks of the elements overlapping document rows

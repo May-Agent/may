@@ -48,21 +48,12 @@ export interface ApiAttachment {
   name: string;
   type: AttachmentKind;
   url: string;
-  uploadDataUrl?: string | null;
   textContent?: string | null;
 }
 
 export type TerminalCommandMode = 'default' | 'sandboxed' | 'unsafe' | 'ssh';
 export type TerminalExecutionStatus = 'running' | 'done' | 'failed' | 'stopped';
 
-export interface ApiTerminalExecution {
-  id: string;
-  description: string;
-  input: string;
-  output?: string | null;
-  status: TerminalExecutionStatus;
-  mode: TerminalCommandMode;
-}
 
 export interface RequestStats {
   providerId?: string | null;
@@ -97,7 +88,6 @@ export interface ApiMessage {
   isStreaming?: boolean | null;
   isThinking?: boolean | null;
   toolEvent?: unknown;
-  terminalExecutions?: ApiTerminalExecution[];
   stats?: RequestStats | null;
 }
 
@@ -188,12 +178,13 @@ export interface ApiSession {
   title: string;
   lastModified: string;
   preview: string;
-  messages?: ApiMessage[];
   profileId: string | null;
   model: string;
   reasoningEffort?: string | null;
   runtime: SessionRuntimeSummary;
   repo?: string | null;
+  /** Cursor the session's event stream resumes from. */
+  cursor?: string;
 }
 
 export interface ChatRequestPayload {
@@ -204,7 +195,7 @@ export interface ChatRequestPayload {
   deliveryMode?: PendingUserMessageMode;
 }
 
-// ── Turn events: `session_turn` frames on /api/events ───────
+// ── Turn events: `session_turn` frames on the session stream ─
 
 export interface SseStart {
   kind: 'start';
@@ -512,15 +503,13 @@ export type UiEvent =
   | { kind: 'browser_status'; payload: BrowserStatusPayload }
   | { kind: 'browser_lifecycle'; payload: BrowserLifecycleEvent }
   | { kind: 'profile_sessions'; payload: ProfileSessionsPayload }
-  | { kind: 'session_runtime'; payload: SessionRuntimePayload }
   | { kind: 'session_runtimes'; payload: SessionRuntimesPayload }
   | { kind: 'container_prepare'; payload: unknown }
   | { kind: 'remote_access'; payload: { status: RemoteAccessStatusResponse } }
   | { kind: 'sleep'; payload: SleepStatus }
   | { kind: 'request_logs'; payload: RequestLogsResponse }
   | { kind: 'notification_mailbox'; payload: unknown }
-  | { kind: 'network_access_logs'; payload: NetworkAccessLogsResponse }
-  | { kind: 'session_artifacts'; payload: SessionArtifactsPayload };
+  | { kind: 'network_access_logs'; payload: NetworkAccessLogsResponse };
 
 // ── Artifacts ──────────────────────────────────────────────
 
@@ -533,11 +522,6 @@ export interface ArtifactEntry {
 }
 
 export interface SessionArtifactsResponse {
-  artifacts: ArtifactEntry[];
-}
-
-export interface SessionArtifactsPayload {
-  sessionId: string;
   artifacts: ArtifactEntry[];
 }
 

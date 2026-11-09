@@ -301,7 +301,6 @@ fn image_attachment(
             url: format!("file://{name}"),
             name,
             attachment_type: AttachmentKind::Image,
-            upload_data_url: None,
             text_content: None,
         };
     }
@@ -314,7 +313,6 @@ fn image_attachment(
             .to_string(),
         attachment_type: AttachmentKind::Image,
         url: url.to_string(),
-        upload_data_url: None,
         text_content: None,
     }
 }

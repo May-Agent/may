@@ -780,6 +780,10 @@ impl MayAgent {
                     runtime.clone(),
                     config.session_id.as_str(),
                 ))
+                .context_source(super::ci_alert::CiAlertContext::new(
+                    runtime.db(),
+                    config.session_id.as_str(),
+                ))
                 .blocker_resolver(super::ask_user_tool::AskUserBlockerResolver::new(
                     runtime,
                     config.session_id.as_str(),
@@ -796,7 +800,7 @@ impl MayAgent {
         // committed between agent builds still reach `tasks.md`.
         let task_events = hook_runtime
             .as_ref()
-            .map_or_else(aither_agent::TaskEvents::new, |runtime| {
+            .map_or_else(aither_agent::WorkEvents::new, |runtime| {
                 runtime.task_events(config.session_id.as_str())
             });
         let shared_terminal_commands = Box::pin(register_shared_terminal_commands(
@@ -847,7 +851,14 @@ impl MayAgent {
             .fork_source(shared_terminal_commands.fork_source.clone())
             // `tasks.md` follows what the commands above record, and reads
             // the state of the issues and PRs its rows name.
-            .task_events(task_events)
+            .work_events(task_events)
+            .working_document(aither_agent::DocumentSpec::new(
+                "tasks.md",
+                crate::task_rows::TasksSchema,
+            ))
+            .stop_hook(aither_agent::AnyStopHook::new(
+                crate::task_rows::HoldOpenTasks,
+            ))
             .work_tracker(super::work_tracker::MayWorkTracker::new(
                 issue_store.clone(),
                 config.db.clone(),
@@ -1509,10 +1520,7 @@ pub async fn generate_session_title(
 /// Rendered markdown of the context's active handoff, if any — the text
 /// `AGENTS.md` links are extracted from.
 fn handoff_markdown(context: &aither_agent::Context) -> Option<String> {
-    match context.handoff()? {
-        aither_agent::Handoff::Text(text) => Some(text.clone()),
-        aither_agent::Handoff::Document(document) => Some(document.render_markdown()),
-    }
+    Some(context.handoff()?.text().to_string())
 }
 
 fn truncate_at_char_boundary(input: &str, max_chars: usize) -> &str {

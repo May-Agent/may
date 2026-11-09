@@ -30,7 +30,7 @@ pub fn linked_issues(rows: &[TaskRow]) -> Vec<i64> {
 }
 
 /// A linked issue as the sidebar shows it.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 pub struct IssueBrief {
     /// Issue number.
     pub number: i64,

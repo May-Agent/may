@@ -10,6 +10,7 @@ import {
   createSession,
   deleteSession,
   getSession,
+  getTranscript,
   listSessions,
   updateSession,
   unarchiveSession,
@@ -17,6 +18,7 @@ import {
   type UpdateSessionPatch,
 } from '../api/sessions';
 import { putSessionTasks } from '../api/tasks';
+import { foldTranscript } from '../transcript';
 import { useConfigStore } from './config';
 
 const DRAFT_PREFIX = 'draft_';
@@ -156,12 +158,13 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
     set({ loading: true, error: null });
     try {
       const session = await getSession(id);
+      const transcript = foldTranscript((await getTranscript(id)).entries);
       if (generation !== activeRequestGeneration) return;
       set({
         active: session,
         messages: {
           ...get().messages,
-          [id]: mergePendingLocal(session.messages ?? [], get().messages[id] ?? []),
+          [id]: mergePendingLocal(transcript, get().messages[id] ?? []),
         },
         loading: false,
       });
@@ -176,6 +179,7 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
     const generation = ++activeRequestGeneration;
     try {
       const session = await getSession(id);
+      const transcript = foldTranscript((await getTranscript(id)).entries);
       if (generation !== activeRequestGeneration) return;
       set((prev) => {
         if (prev.active?.id !== id) return prev;
@@ -183,7 +187,7 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
           active: session,
           messages: {
             ...prev.messages,
-            [id]: mergePendingLocal(session.messages ?? [], prev.messages[id] ?? []),
+            [id]: mergePendingLocal(transcript, prev.messages[id] ?? []),
           },
         };
       });
@@ -200,7 +204,6 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
       title: 'New Chat',
       lastModified: new Date().toISOString(),
       preview: '',
-      messages: [],
       profileId: profileId ?? null,
       model: useConfigStore.getState().config?.fullConfig.lastModel ?? '',
       reasoningEffort: null,

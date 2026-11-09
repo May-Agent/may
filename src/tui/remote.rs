@@ -62,11 +62,18 @@ pub fn spawn_remote_worker(
     client: DaemonClient,
     session_id: String,
     app_events: EventSender,
+    events_cursor: Option<String>,
 ) -> AgentWorker {
     let (command_tx, command_rx) = unbounded::<WorkerCommand>();
     let (foreign_tx, foreign_rx) = unbounded::<ForeignTurn>();
     let shared = Arc::new(Shared::default());
     let background = RemoteBackground::new(client.clone(), session_id.clone());
+    tokio::spawn(follow_session_globals(
+        client.clone(),
+        session_id.clone(),
+        shared.clone(),
+        app_events.clone(),
+    ));
     tokio::spawn(follow_session(
         client.clone(),
         session_id.clone(),
@@ -76,6 +83,7 @@ pub fn spawn_remote_worker(
             command_tx: command_tx.clone(),
             app_events,
         },
+        events_cursor,
     ));
     tokio::spawn(run_commands(client, session_id, shared, command_rx));
     AgentWorker::remote(command_tx, foreign_rx, background)
@@ -247,20 +255,197 @@ pub async fn follow_profile_sessions(
     }
 }
 
-/// The session's event query: a reopened stream names the last turn frame
-/// it saw (`after`), so the daemon sends only what came after it.
-fn events_query(session_id: &str, after: Option<&str>) -> String {
+/// The session's `/api/events` query: only the topics that did not move to
+/// the session stream.
+fn globals_query(session_id: &str) -> String {
     let mut query = url::form_urlencoded::Serializer::new(String::new());
     query
-        .append_pair(
-            "topics",
-            "session_agent,session_turn,session_background,session_runtime,session_index,session_suggestion,session_recap,session_issues,sleep,user_notification",
-        )
+        .append_pair("topics", "sleep,user_notification,session_index")
         .append_pair("sessionId", session_id);
-    if let Some(after) = after {
-        query.append_pair("after", after);
-    }
     query.finish()
+}
+
+/// The session-wide topics the session stream does not carry: sleep
+/// status, notifications to the user and index coverage.
+async fn follow_session_globals(
+    client: DaemonClient,
+    session_id: String,
+    shared: Arc<Shared>,
+    app_events: EventSender,
+) {
+    let query = globals_query(&session_id);
+    while !shared.stopped.load(Ordering::Acquire) {
+        let mut stream = match client.events(&query).await {
+            Ok(stream) => stream,
+            Err(error) => {
+                tracing::debug!(%error, "session event stream unavailable");
+                tokio::time::sleep(RECONNECT_DELAY).await;
+                continue;
+            }
+        };
+        while let Ok(Some(event)) = stream.next().await {
+            if shared.stopped.load(Ordering::Acquire) {
+                return;
+            }
+            match event.kind.as_str() {
+                "user_notification" => {
+                    if let Ok(notification) =
+                        serde_json::from_str::<crate::notification::UserNotification>(&event.data)
+                    {
+                        let _ = app_events
+                            .send(AppEvent::UserNotification(Box::new(notification)))
+                            .await;
+                    }
+                }
+                "sleep" => {
+                    if let Ok(status) =
+                        serde_json::from_str::<crate::sleep::SleepStatus>(&event.data)
+                    {
+                        let _ = app_events.send(AppEvent::Sleep(status)).await;
+                    }
+                }
+                "session_index" => {
+                    if let Ok(snapshot) = serde_json::from_str::<SessionIndexSnapshot>(&event.data)
+                    {
+                        let _ = app_events.send(AppEvent::IndexCoverage(snapshot)).await;
+                    }
+                }
+                _ => {}
+            }
+        }
+        tokio::time::sleep(RECONNECT_DELAY).await;
+    }
+}
+
+/// What the session stream's deltas are applied to: the background
+/// snapshot and linked-issue list the REST reads seeded.
+#[derive(Default)]
+struct StreamState {
+    background: SessionBackgroundSnapshot,
+    issues: Vec<crate::tui::sidebar::IssueBrief>,
+}
+
+impl StreamState {
+    /// The `AppEvent` the background state now yields.
+    fn background_event(&self) -> AppEvent {
+        let (jobs, subagents) = self.background.clone().into_parts();
+        AppEvent::BackgroundLoaded { jobs, subagents }
+    }
+
+    /// The `AppEvent` the issue list now yields.
+    fn issues_event(&self, session_id: &str) -> AppEvent {
+        AppEvent::SidebarIssues {
+            session_id: session_id.to_string(),
+            issues: self.issues.clone(),
+        }
+    }
+}
+
+/// Replaces the item `key` names in `items`, or appends it.
+fn upsert<T, K: Eq>(items: &mut Vec<T>, item: T, key: impl Fn(&T) -> K) {
+    let item_key = key(&item);
+    match items.iter_mut().find(|old| key(old) == item_key) {
+        Some(old) => *old = item,
+        None => items.push(item),
+    }
+}
+
+/// The `AppEvent` one `runtime.changed`, `warning`, `reset`, `job.*`,
+/// `subagent.*` or `issue.*` frame maps to, applying the delta to `state`
+/// first. Turn, suggestion and recap frames dispatch elsewhere.
+fn stream_app_event(kind: &str, data: &str, state: &mut StreamState) -> Option<AppEvent> {
+    match kind {
+        "runtime.changed" => serde_json::from_str::<crate::client::SessionRuntimeEvent>(data)
+            .ok()
+            .map(|event| AppEvent::SessionRuntime(Box::new(event))),
+        "warning" => serde_json::from_str::<crate::client::WarningFrame>(data)
+            .ok()
+            .map(|frame| AppEvent::Warning {
+                session_id: frame.session_id,
+                message: frame.message,
+            }),
+        "reset" => Some(AppEvent::HistoryStale),
+        "job.upserted" => serde_json::from_str::<crate::client::JobUpsertedFrame>(data)
+            .ok()
+            .map(|frame| {
+                upsert(&mut state.background.jobs, frame.job, |job| job.pid);
+                state.background_event()
+            }),
+        "job.removed" => serde_json::from_str::<crate::client::JobRemovedFrame>(data)
+            .ok()
+            .map(|frame| {
+                state.background.jobs.retain(|job| job.pid != frame.pid);
+                state.background_event()
+            }),
+        "subagent.upserted" => serde_json::from_str::<crate::client::SubagentUpsertedFrame>(data)
+            .ok()
+            .map(|frame| {
+                upsert(&mut state.background.subagents, frame.subagent, |run| {
+                    run.run_id
+                });
+                state.background_event()
+            }),
+        "subagent.removed" => serde_json::from_str::<crate::client::SubagentRemovedFrame>(data)
+            .ok()
+            .map(|frame| {
+                state
+                    .background
+                    .subagents
+                    .retain(|run| run.run_id != frame.run_id);
+                state.background_event()
+            }),
+        "issue.upserted" => serde_json::from_str::<crate::client::IssueUpsertedFrame>(data)
+            .ok()
+            .map(|frame| {
+                let session_id = frame.session_id;
+                upsert(&mut state.issues, frame.issue, |issue| issue.number);
+                state.issues_event(&session_id)
+            }),
+        "issue.removed" => serde_json::from_str::<crate::client::IssueRemovedFrame>(data)
+            .ok()
+            .map(|frame| {
+                state.issues.retain(|issue| issue.number != frame.key);
+                state.issues_event(&frame.session_id)
+            }),
+        _ => None,
+    }
+}
+
+/// The opening state snapshots used to carry: the runtime, background and
+/// issues the session stream's deltas apply to, read once per attach.
+async fn load_initial_state(
+    client: &DaemonClient,
+    session_id: &str,
+    state: &mut StreamState,
+    app_events: &EventSender,
+) {
+    if let Ok(runtime) = client
+        .get::<crate::client::SessionRuntimeSnapshot>(&session_path(session_id, "/runtime"))
+        .await
+    {
+        let _ = app_events
+            .send(AppEvent::SessionRuntime(Box::new(
+                crate::client::SessionRuntimeEvent {
+                    session_id: session_id.to_string(),
+                    runtime,
+                },
+            )))
+            .await;
+    }
+    if let Ok(background) = client
+        .get::<SessionBackgroundSnapshot>(&session_path(session_id, "/background"))
+        .await
+    {
+        state.background = background;
+        let _ = app_events.send(state.background_event()).await;
+    }
+    if let Ok(frame) = client
+        .get::<crate::client::SessionIssuesFrame>(&session_path(session_id, "/issues"))
+        .await
+    {
+        state.issues = frame.issues;
+        let _ = app_events.send(state.issues_event(&frame.session_id)).await;
+    }
 }
 
 async fn follow_session(
@@ -268,13 +453,19 @@ async fn follow_session(
     session_id: String,
     shared: Arc<Shared>,
     forwarding: Forwarding,
+    events_cursor: Option<String>,
 ) {
     let mut current: Option<ForwardedTurn> = None;
-    // Index of the last turn frame received, for resuming a dropped stream.
-    let mut last_frame: Option<String> = None;
+    let mut state = StreamState::default();
+    // Cursor the stream continues from: the resume cursor first, then the
+    // last frame id received.
+    let mut last_frame: Option<String> = events_cursor;
     while !shared.stopped.load(Ordering::Acquire) {
-        let query = events_query(&session_id, last_frame.as_deref());
-        let mut stream = match client.events(&query).await {
+        load_initial_state(&client, &session_id, &mut state, &forwarding.app_events).await;
+        let mut stream = match client
+            .session_events(&session_id, last_frame.as_deref())
+            .await
+        {
             Ok(stream) => stream,
             Err(error) => {
                 tracing::debug!(%error, "session event stream unavailable");
@@ -335,76 +526,24 @@ async fn follow_session(
                             .await;
                     }
                 }
-                "user_notification" => {
-                    if let Ok(notification) =
-                        serde_json::from_str::<crate::notification::UserNotification>(&event.data)
-                    {
-                        let _ = forwarding
-                            .app_events
-                            .send(AppEvent::UserNotification(Box::new(notification)))
-                            .await;
-                    }
-                }
-                "sleep" => {
-                    if let Ok(status) =
-                        serde_json::from_str::<crate::sleep::SleepStatus>(&event.data)
-                    {
-                        let _ = forwarding.app_events.send(AppEvent::Sleep(status)).await;
-                    }
-                }
-                "session_runtime" => {
-                    if let Ok(snapshot) =
-                        serde_json::from_str::<crate::client::SessionRuntimeEvent>(&event.data)
-                    {
-                        let _ = forwarding
-                            .app_events
-                            .send(AppEvent::SessionRuntime(Box::new(snapshot)))
-                            .await;
-                    }
-                }
                 // Frames this client missed are gone: the turn it followed
                 // ended unseen. The turn in progress, if any, follows from
                 // its start.
-                "session_resync" => {
+                "reset" => {
                     if let Some(turn) = current.take() {
                         turn.end().await;
                     }
-                    let _ = forwarding.app_events.send(AppEvent::HistoryStale).await;
-                }
-                "session_background" => {
-                    if let Ok(snapshot) =
-                        serde_json::from_str::<SessionBackgroundSnapshot>(&event.data)
+                    if let Some(app_event) = stream_app_event(&event.kind, &event.data, &mut state)
                     {
-                        let (jobs, subagents) = snapshot.into_parts();
-                        let _ = forwarding
-                            .app_events
-                            .send(AppEvent::BackgroundLoaded { jobs, subagents })
-                            .await;
+                        let _ = forwarding.app_events.send(app_event).await;
                     }
                 }
-                "session_issues" => {
-                    if let Ok(frame) =
-                        serde_json::from_str::<crate::client::SessionIssuesFrame>(&event.data)
+                _ => {
+                    if let Some(app_event) = stream_app_event(&event.kind, &event.data, &mut state)
                     {
-                        let _ = forwarding
-                            .app_events
-                            .send(AppEvent::SidebarIssues {
-                                session_id: frame.session_id,
-                                issues: frame.issues,
-                            })
-                            .await;
+                        let _ = forwarding.app_events.send(app_event).await;
                     }
                 }
-                "session_index" => {
-                    if let Ok(snapshot) = serde_json::from_str::<SessionIndexSnapshot>(&event.data)
-                    {
-                        let _ = forwarding
-                            .app_events
-                            .send(AppEvent::IndexCoverage(snapshot))
-                            .await;
-                    }
-                }
-                _ => {}
             }
         }
         // The turn in progress keeps its handle: the reopened stream
@@ -564,7 +703,7 @@ async fn run_commands(
             }
             WorkerCommand::Cancel => {
                 let stopped: Result<serde_json::Value, _> = client
-                    .post(&session_path(&session_id, "/stop"), &serde_json::json!({}))
+                    .delete(&session_path(&session_id, "/turns/current"))
                     .await;
                 if let Err(error) = stopped {
                     tracing::warn!(%error, "failed to stop the daemon turn");
@@ -573,7 +712,7 @@ async fn run_commands(
             WorkerCommand::Compact { focus, event_tx } => {
                 let result: Result<CompactResponse, _> = client
                     .post(
-                        &session_path(&session_id, "/compact"),
+                        &session_path(&session_id, "/actions/compact"),
                         &serde_json::json!({ "focus": focus }),
                     )
                     .await;
@@ -620,7 +759,7 @@ async fn run_commands(
             WorkerCommand::ContextDump { event_tx } => {
                 let result: Result<ContextDumpResponse, _> = client
                     .post(
-                        &session_path(&session_id, "/context-dump"),
+                        &session_path(&session_id, "/actions/context-dump"),
                         &serde_json::json!({}),
                     )
                     .await;
@@ -689,7 +828,7 @@ async fn send_turn(
         "hiddenContextXml": turn.hidden_context_xml,
     });
     let sent: Result<serde_json::Value, _> = client
-        .post(&session_path(session_id, "/messages"), &body)
+        .post(&session_path(session_id, "/turns"), &body)
         .await;
     if let Err(error) = sent
         && shared.take_pending().is_some()
@@ -737,12 +876,106 @@ mod tests {
     }
 
     #[test]
-    fn a_reopened_stream_names_the_last_frame_it_saw() {
-        let first = events_query("s 1", None);
-        assert!(!first.contains("after="), "{first}");
-        let reopened = events_query("s 1", Some("42"));
-        assert!(reopened.ends_with("&after=42"), "{reopened}");
-        assert!(reopened.contains("sessionId=s+1"), "{reopened}");
+    fn the_globals_query_keeps_only_the_unmoved_topics() {
+        let query = globals_query("s 1");
+        assert!(query.contains("sessionId=s+1"), "{query}");
+        assert!(
+            query.contains("sleep%2Cuser_notification%2Csession_index"),
+            "{query}"
+        );
+        assert!(!query.contains("after="), "{query}");
+        assert!(!query.contains("session_runtime"), "{query}");
+    }
+
+    #[test]
+    fn a_job_upserted_then_removed_leaves_the_background_unchanged() {
+        let mut state = StreamState::default();
+        let job = crate::client::background::WireJob {
+            pid: 42,
+            task_id: "t".to_string(),
+            execution_key: "k".to_string(),
+            script: "sleep 1".to_string(),
+            mode: aither_sandbox::TerminalMode::Sandboxed,
+            language: aither_sandbox::ScriptLanguage::Shell,
+            elapsed_ms: 0,
+            status: crate::client::background::WireJobStatus::Running,
+            output_path: None,
+            place: crate::client::background::WirePlace::Host,
+        };
+        let upserted = stream_app_event(
+            "job.upserted",
+            &serde_json::to_string(&crate::client::JobUpsertedFrame {
+                session_id: "s".to_string(),
+                job: job.clone(),
+            })
+            .expect("frame serializes"),
+            &mut state,
+        );
+        let Some(AppEvent::BackgroundLoaded { jobs, .. }) = upserted else {
+            panic!("upsert yields a background event");
+        };
+        assert_eq!(jobs.len(), 1, "the upserted job joins the state");
+        assert_eq!(state.background.jobs, vec![job]);
+
+        let removed = stream_app_event(
+            "job.removed",
+            &serde_json::to_string(&crate::client::JobRemovedFrame {
+                session_id: "s".to_string(),
+                pid: 42,
+            })
+            .expect("frame serializes"),
+            &mut state,
+        );
+        let Some(AppEvent::BackgroundLoaded { jobs, .. }) = removed else {
+            panic!("remove yields a background event");
+        };
+        assert!(jobs.is_empty() && state.background.jobs.is_empty());
+    }
+
+    #[test]
+    fn an_issue_upserted_then_removed_leaves_the_list_unchanged() {
+        let mut state = StreamState::default();
+        let issue = crate::tui::sidebar::IssueBrief {
+            number: 7,
+            title: Some("bug".to_string()),
+            closed: false,
+        };
+        let upserted = stream_app_event(
+            "issue.upserted",
+            &serde_json::to_string(&crate::client::IssueUpsertedFrame {
+                session_id: "s".to_string(),
+                issue: issue.clone(),
+            })
+            .expect("frame serializes"),
+            &mut state,
+        );
+        let Some(AppEvent::SidebarIssues { issues, .. }) = upserted else {
+            panic!("upsert yields an issues event");
+        };
+        assert_eq!(issues, vec![issue]);
+
+        let removed = stream_app_event(
+            "issue.removed",
+            &serde_json::to_string(&crate::client::IssueRemovedFrame {
+                session_id: "s".to_string(),
+                key: 7,
+            })
+            .expect("frame serializes"),
+            &mut state,
+        );
+        let Some(AppEvent::SidebarIssues { issues, .. }) = removed else {
+            panic!("remove yields an issues event");
+        };
+        assert!(issues.is_empty() && state.issues.is_empty());
+    }
+
+    #[test]
+    fn a_reset_event_stales_the_history() {
+        let mut state = StreamState::default();
+        assert!(matches!(
+            stream_app_event("reset", r#"{"sessionId":"s"}"#, &mut state),
+            Some(AppEvent::HistoryStale)
+        ));
     }
 
     /// A turn whose end the client missed completes when the next one

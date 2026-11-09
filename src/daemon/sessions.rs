@@ -1,11 +1,13 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
+use futures_util::StreamExt;
 use skyzen::routing::Params;
 use skyzen::utils::{Json, State};
 use skyzen::{Error as SkyError, Result as SkyResult, StatusCode};
 
 use crate::db::ProfileEnvironmentKind;
+use crate::pr::merge_watch::Upstream;
 use crate::session::{
     MayHomePaths, SandboxResourceLayout, SessionId, SessionStore, list_summaries_from_db,
 };
@@ -13,16 +15,14 @@ use crate::ui_event_bus::UiEventTopics;
 use aither_core::llm::{Message as LlmMessage, Role as LlmRole};
 
 use super::error::{bad_request_error, internal_error, internal_error_message};
-use super::message_mapping::map_db_messages;
 use super::model_resolution::{
     persist_last_effort, persist_last_model, preferred_advanced_model, resolve_default_model,
 };
 use super::state::DaemonState;
 use super::types::{
     ApiHealth, ApiPr, ApiPrEvent, ApiSession, ContextDebugMessage, CreateSessionRequest,
-    NullableStringPatch, RewindRequest, SessionContextDebugResponse,
-    SessionContextWindowMetricsResponse, SessionContextWindowSnapshotResponse,
-    SessionPlanStateRequest, SessionPlanStateResponse, SessionTasksPayload, UpdateSessionRequest,
+    RewindRequest, SessionContextDebugResponse, SessionContextWindowMetricsResponse,
+    SessionContextWindowSnapshotResponse, SessionTasksPayload,
 };
 
 fn session_not_found_error(session_id: &str) -> SkyError {
@@ -65,24 +65,10 @@ pub(super) async fn list_api_sessions(
         let model = resolve_default_model(&config, s.model.clone()).ok_or_else(|| {
             internal_error_message(format!("no model resolved for session {}", s.id.as_str()))
         })?;
-        sessions.push(ApiSession::from_summary(s, model, Vec::new()));
+        sessions.push(ApiSession::from_summary(s, model));
     }
 
     Ok(sessions)
-}
-
-/// `GET /api/sessions/{id}/history` — the session's stored messages in the
-/// clients' own `ChatMessage` shape, so a reload replays history losslessly.
-pub(super) async fn get_session_history(
-    params: Params,
-    State(state): State<Arc<DaemonState>>,
-) -> SkyResult<skyzen::Response> {
-    let id = params.get("id").map_err(bad_request_error)?.to_string();
-    let db = state.db();
-    let history = crate::session::load_history_from_db(&db, &id)
-        .await
-        .map_err(internal_error)?;
-    super::error::json_ok_response(&history.messages().to_vec())
 }
 
 /// `POST /api/sessions/{id}/history` — append stored messages in the
@@ -113,29 +99,35 @@ pub(super) async fn append_session_history(
 /// from the `index`-th stored row on, the truncation half of a client-side
 /// rewind. Clients index it by position among the stored rows, which hidden
 /// and tool rows share with the messages they see.
-pub(super) async fn rewind_session(
-    params: Params,
-    Json(req): Json<RewindRequest>,
-    State(state): State<Arc<DaemonState>>,
+pub(super) async fn rewind_inner(
+    state: &Arc<DaemonState>,
+    id: &str,
+    req: &RewindRequest,
 ) -> SkyResult<Json<i64>> {
-    let id = params.get("id").map_err(bad_request_error)?.to_string();
     let db = state.db();
-    let rows = db.get_messages(&id).await.map_err(internal_error)?;
-    let Some(row) = rows.get(req.index) else {
+    let rows = db.get_messages(id).await.map_err(internal_error)?;
+    let index = {
+        let history = crate::session::load_history_from_db(&db, id)
+            .await
+            .map_err(internal_error)?;
+        let entries = super::transcript::build_entries(history.messages());
+        super::transcript::entry_cut_index(&rows, &entries, &req.entry_id)?
+    };
+    let Some(row) = rows.get(index) else {
         return Err(bad_request_error("rewind index out of range"));
     };
     let cut_id = i64::from(row.id);
-    db.delete_messages_from(&id, cut_id)
+    db.delete_messages_from(id, cut_id)
         .await
         .map_err(internal_error)?;
     // The audit log is append-only: every PR this session opened keeps a
     // `rewound` event so its history records that the conversation was
     // cut back while the proposal itself still stands.
-    if let Ok(prs) = db.list_session_prs(&id).await {
+    if let Ok(prs) = db.list_session_prs(id).await {
         let detail = format!("history rewound to message {cut_id}");
         for pr in prs {
             let _ = db
-                .add_pr_event(pr.id, "rewound", &id, "user", None, Some(&detail))
+                .add_pr_event(pr.id, "rewound", id, "user", None, Some(&detail))
                 .await;
         }
     }
@@ -237,6 +229,10 @@ pub(super) async fn get_session(
 ) -> SkyResult<Json<ApiSession>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
 
+    // The cursor must precede every read so nothing between it and the
+    // client's `?after=` subscription is lost.
+    let cursor = state.session_cursor(&id);
+
     let db = state.db();
 
     let db_session = db
@@ -252,10 +248,11 @@ pub(super) async fn get_session(
         tokio::join!(db.get_session_runtime(&id), db.get_messages(&id),);
     summary.runtime = runtime_result.map_err(internal_error)?.unwrap_or_default();
     let model = resolve_session_model(&state, &id, summary.model.clone())?;
-    let db_messages = messages_result.map_err(internal_error)?;
-    let messages = map_db_messages(&db_messages).map_err(internal_error)?;
+    let _ = messages_result.map_err(internal_error)?;
 
-    Ok(Json(ApiSession::from_summary(summary, model, messages)))
+    let mut session = ApiSession::from_summary(summary, model);
+    session.cursor = Some(cursor);
+    Ok(Json(session))
 }
 
 pub(super) async fn get_session_context_debug(
@@ -351,8 +348,20 @@ pub(super) async fn get_session_prs(
         .list_session_prs(&id)
         .await
         .map_err(internal_error)?;
+    // Live checks ride the same payload: every open GitHub PR gets one
+    // GraphQL snapshot of its head rollup, best-effort — a slow or dead
+    // GitHub must not hold up the list itself. `buffered` keeps the row
+    // order so each summary zips back onto its own PR.
+    let mut check_reads = Vec::with_capacity(rows.len());
+    for row in &rows {
+        check_reads.push(pr_check_summary(&state, row));
+    }
+    let summaries = futures_util::stream::iter(check_reads)
+        .buffered(4)
+        .collect::<Vec<_>>()
+        .await;
     let mut prs = Vec::with_capacity(rows.len());
-    for row in rows {
+    for (row, summary) in rows.into_iter().zip(summaries) {
         let events = state
             .db()
             .pr_events(row.id)
@@ -376,49 +385,50 @@ pub(super) async fn get_session_prs(
             created_at: row.created_at,
             updated_at: row.updated_at,
             merged_at: row.merged_at,
+            checks: summary.map(|s| super::types::ApiPrChecks {
+                pending: s.pending,
+                passed: s.passed,
+                failed: s.failed,
+            }),
             events,
         });
     }
     Ok(Json(prs))
 }
 
+/// One GraphQL snapshot of a live GitHub PR's check rollup; `None` for
+/// local/may-backend PRs, landed states, and failed reads.
+async fn pr_check_summary(
+    state: &DaemonState,
+    row: &crate::db::PrRow,
+) -> Option<crate::pr::merge_watch::CheckSummary> {
+    let live = row.backend == "github"
+        && matches!(row.state.as_str(), "open" | "checks_pending" | "merging")
+        && row.external_number.is_some();
+    if !live {
+        return None;
+    }
+    let repo_key = state
+        .db()
+        .repo_key_of_project(row.project_id)
+        .await
+        .ok()
+        .flatten()?;
+    let github = crate::pr::merge_watch::GithubPr {
+        api: &state.github_api,
+        owner_repo: &repo_key,
+        number: row.external_number?,
+    };
+    github
+        .snapshot()
+        .await
+        .ok()
+        .map(|snapshot| snapshot.check_summary())
+}
+
 /// Atomically set the plan state for a session without touching task content.
 ///
-/// This is what the UI uses to toggle plan mode (enter/approve/reopen); it
-/// avoids the fetch-then-save race of the generic `save_session_tasks` path.
-pub(super) async fn set_session_plan_state(
-    params: Params,
-    Json(payload): Json<SessionPlanStateRequest>,
-    State(state): State<Arc<DaemonState>>,
-) -> SkyResult<Json<SessionPlanStateResponse>> {
-    let id = params.get("id").map_err(bad_request_error)?.to_string();
-    let runtime = state
-        .runtime_service
-        .set_plan_state(&id, payload.plan_state)
-        .await
-        .map_err(internal_error)?;
-    Ok(Json(SessionPlanStateResponse {
-        plan_state: runtime.plan_state,
-    }))
-}
-
 /// Set the session's yolo switch; it applies to the next approval request.
-pub(super) async fn set_session_yolo(
-    params: Params,
-    Json(payload): Json<super::types::SessionYoloRequest>,
-    State(state): State<Arc<DaemonState>>,
-) -> SkyResult<Json<super::types::SessionYoloResponse>> {
-    let id = params.get("id").map_err(bad_request_error)?.to_string();
-    let runtime = state
-        .runtime_service
-        .set_yolo(&id, payload.yolo)
-        .await
-        .map_err(internal_error)?;
-    Ok(Json(super::types::SessionYoloResponse {
-        yolo: runtime.yolo,
-    }))
-}
-
 pub(super) async fn save_session_tasks(
     params: Params,
     Json(payload): Json<SessionTasksPayload>,
@@ -480,6 +490,7 @@ const fn map_llm_role(role: LlmRole) -> &'static str {
         LlmRole::User => "user",
         LlmRole::Assistant => "assistant",
         LlmRole::System => "system",
+        LlmRole::Configuration => "configuration",
         LlmRole::Tool => "tool",
     }
 }
@@ -610,115 +621,6 @@ pub(super) fn resolve_repo_binding(spec: Option<&str>) -> Result<Option<String>,
         return Ok(Some(format!("github:{github}")));
     }
     Err(format!("invalid repo spec '{spec}'"))
-}
-
-pub(super) async fn update_session(
-    params: Params,
-    Json(req): Json<UpdateSessionRequest>,
-    State(state): State<Arc<DaemonState>>,
-) -> SkyResult<Json<ApiSession>> {
-    let id = params.get("id").map_err(bad_request_error)?.to_string();
-    let db = state.db();
-    let session = db
-        .get_session(&id)
-        .await
-        .map_err(internal_error)?
-        .ok_or_else(|| session_not_found_error(&id))?;
-
-    let mut model_to_persist: Option<String> = None;
-    let requested_title = req.title.clone();
-    let requested_model = req.model.clone();
-    let requested_effort_patch = req.reasoning_effort.clone();
-    let next_title = requested_title.clone().or_else(|| session.title.clone());
-    let next_model = requested_model.clone().or_else(|| session.model.clone());
-    let next_effort = match requested_effort_patch.as_ref() {
-        Some(NullableStringPatch::Null) => None,
-        Some(NullableStringPatch::Set(value)) => Some(value.clone()),
-        None => session.reasoning_effort.clone(),
-    };
-
-    if let Some(model) = next_model.clone()
-        && session.model.as_deref() != Some(model.as_str())
-    {
-        model_to_persist = Some(model);
-    }
-
-    let effort_patch_ref = requested_effort_patch.as_ref().map(|inner| match inner {
-        NullableStringPatch::Null => None,
-        NullableStringPatch::Set(value) => Some(value.as_str()),
-    });
-
-    db.update_session(
-        &id,
-        requested_title.as_deref(),
-        requested_model.as_deref(),
-        effort_patch_ref,
-    )
-    .await
-    .map_err(internal_error)?;
-
-    if let Some(model) = model_to_persist {
-        persist_last_model(&state, &model)
-            .await
-            .map_err(internal_error)?;
-    }
-    if let Some(NullableStringPatch::Set(effort)) = requested_effort_patch.as_ref() {
-        persist_last_effort(&state, effort)
-            .await
-            .map_err(internal_error)?;
-    }
-    if let Some(cwd) = req
-        .cwd
-        .as_deref()
-        .map(str::trim)
-        .filter(|cwd| !cwd.is_empty())
-    {
-        db.set_session_cwd(&id, cwd).await.map_err(internal_error)?;
-        if let Some(worktree) = crate::repo_search::worktree_root(std::path::Path::new(cwd)) {
-            let _ = db.touch_repo_usage(&worktree).await;
-        }
-    }
-    let mut next_repo = session.repo.clone();
-    if let Some(patch) = req.repo.clone() {
-        next_repo = match patch {
-            crate::daemon::types::NullableStringPatch::Null => None,
-            crate::daemon::types::NullableStringPatch::Set(spec) => {
-                resolve_repo_binding(Some(spec.as_str())).map_err(bad_request_error)?
-            }
-        };
-        db.set_session_repo(&id, next_repo.as_deref())
-            .await
-            .map_err(internal_error)?;
-    }
-    if req.non_interactive == Some(true) {
-        db.set_session_non_interactive(&id)
-            .await
-            .map_err(internal_error)?;
-    }
-
-    let model = resolve_session_model(&state, session.id.as_str(), next_model.clone())?;
-    let runtime = state
-        .runtime_service
-        .get(&id)
-        .await
-        .map_err(internal_error)?;
-    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
-
-    Ok(Json(ApiSession {
-        id,
-        title: next_title.unwrap_or_else(|| "New Chat".to_string()),
-        last_modified: jiff::Timestamp::now().to_string(),
-        preview: session
-            .preview
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| "New conversation started".to_string()),
-        messages: Vec::new(),
-        profile_id: session.profile_id,
-        model,
-        reasoning_effort: next_effort,
-        runtime: runtime.into(),
-        repo: next_repo,
-    }))
 }
 
 pub(super) async fn delete_session(
@@ -855,4 +757,235 @@ pub(super) async fn delete_all_sessions(
         .map_err(internal_error)?;
     state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS | UiEventTopics::SESSION_RUNTIMES);
     Ok(Json(ApiHealth { ok: true }))
+}
+
+/// `GET /api/sessions/{id}/queue`: the session's pending user messages —
+/// the immediate one first, then queued oldest-first.
+pub(super) async fn get_session_queue(
+    params: Params,
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<super::types::SessionQueueResponse>> {
+    let id = params.get("id").map_err(bad_request_error)?.to_string();
+    let runtime = state
+        .runtime_service
+        .get(&id)
+        .await
+        .map_err(internal_error)?;
+    let mut entries = Vec::new();
+    entries.extend(runtime.pending_immediate);
+    entries.extend(runtime.queued_messages);
+    Ok(Json(super::types::SessionQueueResponse { entries }))
+}
+
+/// `DELETE /api/sessions/{id}/queue/{entryId}`: drop one pending entry by
+/// its id, whichever kind it is.
+pub(super) async fn remove_queue_entry(
+    params: Params,
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<super::types::SessionRuntimeResponse>> {
+    let id = params.get("id").map_err(bad_request_error)?.to_string();
+    let entry_id = params
+        .get("entryId")
+        .map_err(bad_request_error)?
+        .parse::<i64>()
+        .map_err(|_| bad_request_error("queue entry id must be a number"))?;
+    let runtime = state
+        .runtime_service
+        .remove_pending_entry(&id, entry_id)
+        .await
+        .map_err(|error| match error {
+            crate::db::ChatDbError::RowNotFound(message) => {
+                skyzen::Error::msg(message).set_status(skyzen::StatusCode::NOT_FOUND)
+            }
+            error => internal_error(error),
+        })?;
+    Ok(Json(super::types::SessionRuntimeResponse::from(runtime)))
+}
+
+/// `PATCH /api/sessions/{id}`: apply any subset of session fields. Every
+/// field is validated before anything is written; the response is the same
+/// `ApiSession` `GET` returns, with a fresh `?after=` cursor.
+pub(super) async fn patch_session(
+    params: Params,
+    Json(req): Json<super::types::SessionPatch>,
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<ApiSession>> {
+    let id = params.get("id").map_err(bad_request_error)?.to_string();
+    let db = state.db();
+    let session = db
+        .get_session(&id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| session_not_found_error(&id))?;
+
+    // ── Validate everything up front: nothing is written until the whole
+    // patch is known to apply. ──
+    if let Some(model) = req.model.as_deref()
+        && resolve_default_model(&state.config_snapshot(), Some(model.to_string())).is_none()
+    {
+        return Err(bad_request_error(format!("unknown model {model}")));
+    }
+    if let Some(super::types::NullableStringPatch::Set(spec)) = req.repo.as_ref() {
+        resolve_repo_binding(Some(spec.as_str())).map_err(bad_request_error)?;
+    }
+    let next_pinned = req.pinned.unwrap_or(session.pinned);
+    let next_archived = req.archived.unwrap_or(session.archived);
+    let next_folder = match req.folder_id.as_ref() {
+        Some(super::types::NullableStringPatch::Null) => None,
+        Some(super::types::NullableStringPatch::Set(folder)) => Some(folder.clone()),
+        None => session.folder_id.clone(),
+    };
+    if let Some(folder_id) = next_folder.as_deref() {
+        if next_archived {
+            return Err(bad_request_error(
+                "cannot move an archived session into a pinned folder",
+            ));
+        }
+        if !next_pinned {
+            return Err(bad_request_error(
+                "cannot move an unpinned session into a pinned folder",
+            ));
+        }
+        let profile_id = session.profile_id.as_deref().ok_or_else(|| {
+            super::error::internal_error_message("session has no profile for folders")
+        })?;
+        let folders = db.list_folders(profile_id).await.map_err(internal_error)?;
+        if !folders.iter().any(|folder| folder.id == folder_id) {
+            return Err(bad_request_error(format!("unknown folder {folder_id}")));
+        }
+    }
+
+    // ── Apply. ──
+    let list_visible_changed = req.title.is_some()
+        || req.model.is_some()
+        || req.reasoning_effort.is_some()
+        || req.repo.is_some()
+        || req.pinned.is_some()
+        || req.archived.is_some()
+        || req.folder_id.is_some();
+
+    let effort_patch = req.reasoning_effort.as_ref().map(|patch| match patch {
+        super::types::NullableStringPatch::Null => None,
+        super::types::NullableStringPatch::Set(value) => Some(value.as_str()),
+    });
+    if req.title.is_some() || req.model.is_some() || effort_patch.is_some() {
+        db.update_session(
+            &id,
+            req.title.as_deref(),
+            req.model.as_deref(),
+            effort_patch,
+        )
+        .await
+        .map_err(internal_error)?;
+    }
+    if let Some(model) = req.model.as_deref()
+        && session.model.as_deref() != Some(model)
+    {
+        persist_last_model(&state, model)
+            .await
+            .map_err(internal_error)?;
+    }
+    if let Some(super::types::NullableStringPatch::Set(effort)) = req.reasoning_effort.as_ref() {
+        persist_last_effort(&state, effort)
+            .await
+            .map_err(internal_error)?;
+    }
+    if let Some(cwd) = req
+        .cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|cwd| !cwd.is_empty())
+    {
+        db.set_session_cwd(&id, cwd).await.map_err(internal_error)?;
+        if let Some(worktree) = crate::repo_search::worktree_root(std::path::Path::new(cwd)) {
+            let _ = db.touch_repo_usage(&worktree).await;
+        }
+    }
+    if let Some(patch) = req.repo.as_ref() {
+        let next_repo = match patch {
+            super::types::NullableStringPatch::Null => None,
+            super::types::NullableStringPatch::Set(spec) => {
+                resolve_repo_binding(Some(spec.as_str())).map_err(bad_request_error)?
+            }
+        };
+        db.set_session_repo(&id, next_repo.as_deref())
+            .await
+            .map_err(internal_error)?;
+    }
+    if req.non_interactive == Some(true) {
+        db.set_session_non_interactive(&id)
+            .await
+            .map_err(internal_error)?;
+    }
+    if let Some(pinned) = req.pinned
+        && pinned != session.pinned
+    {
+        {
+            if pinned {
+                db.pin_session(&id)
+                    .await
+                    .map_err(super::profiles::map_profile_error)?;
+            } else {
+                db.unpin_session(&id).await.map_err(internal_error)?;
+            }
+        }
+    }
+    if let Some(folder_patch) = req.folder_id.as_ref()
+        && next_folder.as_deref() != session.folder_id.as_deref()
+    {
+        let target = match folder_patch {
+            super::types::NullableStringPatch::Null => None,
+            super::types::NullableStringPatch::Set(folder) => Some(folder.as_str()),
+        };
+        db.move_session_to_folder(&id, target)
+            .await
+            .map_err(super::profiles::map_profile_error)?;
+    }
+    if let Some(archived) = req.archived
+        && archived != session.archived
+    {
+        {
+            if archived {
+                db.archive_session(&id).await.map_err(internal_error)?;
+            } else {
+                db.unarchive_session(&id).await.map_err(internal_error)?;
+            }
+        }
+    }
+    if let Some(yolo) = req.yolo {
+        state
+            .runtime_service
+            .set_yolo(&id, yolo)
+            .await
+            .map_err(internal_error)?;
+    }
+    if let Some(plan_state) = req.plan_state {
+        state
+            .runtime_service
+            .set_plan_state(&id, plan_state)
+            .await
+            .map_err(internal_error)?;
+    }
+
+    if list_visible_changed {
+        state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
+    }
+
+    // Respond like `get_session`: cursor first, then the fresh row.
+    let cursor = state.session_cursor(&id);
+    let db_session = db
+        .get_session(&id)
+        .await
+        .map_err(internal_error)?
+        .ok_or_else(|| session_not_found_error(&id))?;
+    let mut summary = crate::session::SessionSummary::from_db_model(db_session);
+    summary.runtime = db
+        .get_session_runtime(&id)
+        .await
+        .map_err(internal_error)?
+        .unwrap_or_default();
+    let model = resolve_session_model(&state, &id, summary.model.clone())?;
+    let mut patched = ApiSession::from_summary(summary, model);
+    patched.cursor = Some(cursor);
+    Ok(Json(patched))
 }

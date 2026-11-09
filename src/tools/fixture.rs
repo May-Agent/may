@@ -110,6 +110,7 @@ pub fn fixture_distribution(dir: &Path) -> ToolDistribution {
                 "target": target_json,
                 "url": url::Url::from_file_path(&path).expect("absolute fixture path"),
                 "sha256": sha256_hex(bytes.as_bytes()),
+                "size": bytes.len(),
                 "encoding": {"format": "executable"},
             })
         })

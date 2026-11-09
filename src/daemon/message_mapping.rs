@@ -1,14 +1,14 @@
 //! DB message → API message mapping.
 
+#[cfg(test)]
 use serde_json::{Value, json};
 
+#[cfg(test)]
 use crate::session::{MessageRole, PersistedMessage, PersistedMessageError};
 
-use super::terminal_parsing::update_terminal_snapshot_from_tool_event;
-use super::types::{
-    ApiMessage, ApiTranslation, RequestStats, SkillInfoDto, TerminalStateSnapshot, ToolEventRecord,
-    ToolVariant,
-};
+use super::types::SkillInfoDto;
+#[cfg(test)]
+use super::types::{ApiMessage, ApiTranslation, RequestStats, ToolEventRecord, ToolVariant};
 
 /// The id a stored message row has on the wire: streamed turn events and the
 /// session's REST messages name the same row by it.
@@ -24,11 +24,11 @@ pub(super) fn api_message_id(row_id: i32) -> String {
 /// FOLLOWING assistant (the one about to speak); trailing tools that follow an
 /// assistant attach to that preceding assistant. This preserves chronological
 /// text↔tool interleave when the UI re-renders.
+#[cfg(test)]
 pub(super) fn map_db_messages(
     db_messages: &[crate::db::entity::messages::Model],
 ) -> Result<Vec<ApiMessage>, PersistedMessageError> {
     let mut out = Vec::new();
-    let mut snapshot = TerminalStateSnapshot::default();
     let mut pending_tool_events: Vec<Value> = Vec::new();
     let mut last_assistant_in_turn: Option<usize> = None;
 
@@ -37,7 +37,6 @@ pub(super) fn map_db_messages(
         match persisted.role {
             MessageRole::Tool => {
                 if let Ok(record) = serde_json::from_str::<ToolEventRecord>(&msg.content) {
-                    update_terminal_snapshot_from_tool_event(&mut snapshot, &record);
                     pending_tool_events
                         .push(tool_event_to_api_json(&record, pending_tool_events.len()));
                 }
@@ -71,7 +70,6 @@ pub(super) fn map_db_messages(
                     is_streaming: Some(false),
                     is_thinking: Some(false),
                     tool_event: None,
-                    terminal_executions: Vec::new(),
                     stats: map_db_message_stats(msg),
                     translation: None,
                 });
@@ -87,7 +85,7 @@ pub(super) fn map_db_messages(
                     None
                 };
 
-                let mut api_msg = ApiMessage {
+                let api_msg = ApiMessage {
                     id: api_message_id(msg.id),
                     role: persisted.role.as_str().to_string(),
                     content: msg.content.clone(),
@@ -97,16 +95,9 @@ pub(super) fn map_db_messages(
                     is_streaming: Some(false),
                     is_thinking: Some(false),
                     tool_event,
-                    terminal_executions: Vec::new(),
                     stats: map_db_message_stats(msg),
                     translation: persisted_translation(msg)?,
                 };
-
-                if persisted.role == MessageRole::Assistant
-                    && (!snapshot.executions.is_empty() || !snapshot.running_by_call_id.is_empty())
-                {
-                    api_msg.terminal_executions = snapshot.all_executions();
-                }
 
                 out.push(api_msg);
                 if persisted.role == MessageRole::Assistant {
@@ -122,6 +113,7 @@ pub(super) fn map_db_messages(
 }
 
 /// The display translation stored with `msg`, if it has one.
+#[cfg(test)]
 fn persisted_translation(
     msg: &crate::db::entity::messages::Model,
 ) -> Result<Option<ApiTranslation>, PersistedMessageError> {
@@ -146,6 +138,7 @@ fn persisted_translation(
 /// Flush tools that followed an assistant inside the just-ended turn onto that
 /// assistant. Called on turn boundary (user row) and at end of iteration.
 /// Tools with no assistant to attach to in the current turn are dropped.
+#[cfg(test)]
 fn flush_trailing_tools_in_turn(
     out: &mut [ApiMessage],
     pending: &mut Vec<Value>,
@@ -178,6 +171,7 @@ fn flush_trailing_tools_in_turn(
 /// for the API shape that the frontend's persisted-assistant renderer
 /// expects. Summary is projected server-side so refresh and live stream
 /// surface identical labels.
+#[cfg(test)]
 fn tool_event_to_api_json(record: &ToolEventRecord, seq: usize) -> Value {
     match record {
         ToolEventRecord::Start {
@@ -218,6 +212,7 @@ fn tool_event_to_api_json(record: &ToolEventRecord, seq: usize) -> Value {
     }
 }
 
+#[cfg(test)]
 fn map_db_message_stats(msg: &crate::db::entity::messages::Model) -> Option<RequestStats> {
     let prompt_tokens = msg.prompt_tokens.and_then(|v| u32::try_from(v).ok());
     let completion_tokens = msg.completion_tokens.and_then(|v| u32::try_from(v).ok());

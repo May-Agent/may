@@ -3,6 +3,7 @@
 //! Single global database at `~/.may/history.db` containing all sessions and messages.
 
 mod cache_misses;
+mod ci;
 mod common;
 mod context_snapshot;
 pub mod entity;
@@ -35,6 +36,7 @@ use crate::PermissionHistoryMode;
 use sql as db_sql;
 
 pub use cache_misses::PromptCacheRequest;
+pub use ci::{CiBaselineRow, CiFindingRow, CiJobRow, CiPrRunRow, CiStepRow, CiTestRow, NewCiJob};
 pub use common::{
     AssistantCacheUsageSummary, ChatDbError, ContextDebugSnapshot, ContextDebugSnapshotMessage,
     CreateProfileParams, CreateScheduledTaskParams, MessageStatsParams, NetworkAccessLogParams,
@@ -117,6 +119,7 @@ impl ChatDb {
         Self::ensure_search_outbox(&db).await?;
         Self::ensure_session_interval_triggers(&db).await?;
         Self::migrate_notification_mailbox(&db).await?;
+        Self::migrate_attachment_upload_urls(&db, db_path).await?;
         Ok(Self {
             db,
             #[cfg(test)]
@@ -371,6 +374,117 @@ impl ChatDb {
             count,
             "migrated legacy remote profiles to local home + attached SSH servers",
         );
+        Ok(())
+    }
+
+    /// Idempotent data migration: uploaded attachments once carried their
+    /// bytes as a base64 `uploadDataUrl` in `messages.attachments` and in
+    /// `session_pending_message_attachments.upload_data_url`. The daemon
+    /// already stores each upload under the session's `files/`; this strips
+    /// the inline bytes and points the attachment URL at the file route,
+    /// decoding and writing the file when it never landed on disk.
+    async fn migrate_attachment_upload_urls(
+        db: &SkyDb,
+        db_path: &std::path::Path,
+    ) -> Result<(), ChatDbError> {
+        let Some(may_dir) = db_path.parent() else {
+            return Ok(());
+        };
+        let home = crate::session::layout::MayHomePaths::new(may_dir.to_path_buf());
+
+        let rows = query!(
+            db,
+            "SELECT id, session_id, attachments FROM messages WHERE attachments LIKE '%uploadDataUrl%'"
+        )
+        .fetch_all::<MigrationMessageRow>()
+        .await?;
+        for row in rows {
+            let Ok(mut attachments) =
+                serde_json::from_str::<Vec<serde_json::Value>>(&row.attachments)
+            else {
+                continue;
+            };
+            let mut touched = false;
+            for attachment in &mut attachments {
+                let Some(data_url) = attachment
+                    .get("uploadDataUrl")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                else {
+                    continue;
+                };
+                match migrate_one_attachment(db, &home, &row.session_id, attachment, &data_url)
+                    .await
+                {
+                    Ok(()) => touched = true,
+                    Err(error) => {
+                        tracing::warn!(
+                            row_id = row.id,
+                            session_id = %row.session_id,
+                            %error,
+                            "attachment migration skipped; kept its inline bytes for a retry"
+                        );
+                    }
+                }
+            }
+            if touched {
+                query!(
+                    db,
+                    "UPDATE messages SET attachments = ? WHERE id = ?",
+                    serde_json::to_string(&attachments)
+                        .map_err(|e| ChatDbError::Storage(e.to_string()))?,
+                    row.id
+                )
+                .execute()
+                .await?;
+            }
+        }
+
+        let pending = query!(
+            db,
+            "SELECT a.message_id, a.ordinal, a.name, a.url, a.upload_data_url, m.session_id FROM session_pending_message_attachments a JOIN session_pending_message_entries m ON m.id = a.message_id WHERE a.upload_data_url IS NOT NULL"
+        )
+        .fetch_all::<MigrationPendingRow>()
+        .await?;
+        for row in pending {
+            let new_url = async {
+                let files_dir = session_files_dir_for_migration(db, &home, &row.session_id).await?;
+                let preferred = if row.url.starts_with("files/") {
+                    row.url.clone()
+                } else {
+                    let name = row.name.rsplit('/').next().unwrap_or(&row.name);
+                    format!("files/{name}")
+                };
+                let bytes = decode_data_url_for_migration(&row.upload_data_url)
+                    .ok_or_else(|| ChatDbError::Storage("invalid data URL".to_string()))?;
+                store_upload_for_migration(&files_dir, &preferred, &bytes).await?;
+                Ok::<String, ChatDbError>(attachment_file_url(
+                    &row.session_id,
+                    preferred.strip_prefix("files/").unwrap_or(&preferred),
+                ))
+            };
+            match new_url.await {
+                Ok(new_url) => {
+                    query!(
+                        db,
+                        "UPDATE session_pending_message_attachments SET upload_data_url = NULL, url = ? WHERE message_id = ? AND ordinal = ?",
+                        new_url,
+                        row.message_id,
+                        row.ordinal
+                    )
+                    .execute()
+                    .await?;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        message_id = row.message_id,
+                        session_id = %row.session_id,
+                        %error,
+                        "pending attachment migration skipped; kept its inline bytes for a retry"
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
@@ -776,6 +890,121 @@ impl ChatDb {
             })
             .collect()
     }
+}
+
+#[derive(serde::Deserialize, skyzen::FromRow)]
+struct MigrationProfileRow {
+    profile_id: Option<String>,
+}
+
+#[derive(serde::Deserialize, skyzen::FromRow)]
+struct MigrationMessageRow {
+    id: i64,
+    session_id: String,
+    attachments: String,
+}
+
+#[derive(serde::Deserialize, skyzen::FromRow)]
+struct MigrationPendingRow {
+    message_id: i64,
+    ordinal: i64,
+    name: String,
+    url: String,
+    upload_data_url: String,
+    session_id: String,
+}
+
+async fn session_files_dir_for_migration(
+    db: &SkyDb,
+    home: &crate::session::layout::MayHomePaths,
+    session_id: &str,
+) -> Result<std::path::PathBuf, ChatDbError> {
+    let row = query!(
+        db,
+        "SELECT profile_id FROM sessions WHERE id = ?",
+        session_id
+    )
+    .fetch_optional::<MigrationProfileRow>()
+    .await?;
+    let paths = row.and_then(|row| row.profile_id).as_deref().map_or_else(
+        || home.session_paths(session_id),
+        |p| home.profile_home(p).session_paths(session_id),
+    );
+    Ok(paths.files_dir())
+}
+
+async fn store_upload_for_migration(
+    files_dir: &std::path::Path,
+    preferred: &str,
+    bytes: &[u8],
+) -> Result<String, ChatDbError> {
+    let relative = preferred
+        .strip_prefix("files/")
+        .unwrap_or(preferred)
+        .to_string();
+    let target = files_dir.join(&relative);
+    let write = async_fs::metadata(&target)
+        .await
+        .map_or(true, |meta| meta.len() != bytes.len() as u64);
+    if write {
+        if let Some(parent) = target.parent() {
+            async_fs::create_dir_all(parent)
+                .await
+                .map_err(|error| ChatDbError::Storage(error.to_string()))?;
+        }
+        async_fs::write(&target, bytes)
+            .await
+            .map_err(|error| ChatDbError::Storage(error.to_string()))?;
+    }
+    Ok(relative)
+}
+
+fn decode_data_url_for_migration(data_url: &str) -> Option<Vec<u8>> {
+    let (header, data) = data_url.split_once(',')?;
+    if !header.starts_with("data:") || !header.ends_with(";base64") {
+        return None;
+    }
+    base64::engine::Engine::decode(&base64::engine::general_purpose::STANDARD, data).ok()
+}
+
+async fn migrate_one_attachment(
+    db: &SkyDb,
+    home: &crate::session::layout::MayHomePaths,
+    session_id: &str,
+    attachment: &mut serde_json::Value,
+    data_url: &str,
+) -> Result<(), ChatDbError> {
+    let files_dir = session_files_dir_for_migration(db, home, session_id).await?;
+    let url = attachment
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let preferred = if url.starts_with("files/") {
+        url.to_string()
+    } else {
+        let name = attachment
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|n| n.rsplit('/').next().map(str::to_string))
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "upload.bin".to_string());
+        format!("files/{name}")
+    };
+    let bytes = decode_data_url_for_migration(data_url)
+        .ok_or_else(|| ChatDbError::Storage("invalid data URL".to_string()))?;
+    store_upload_for_migration(&files_dir, &preferred, &bytes).await?;
+    attachment["url"] = serde_json::Value::String(attachment_file_url(
+        session_id,
+        preferred.strip_prefix("files/").unwrap_or(&preferred),
+    ));
+    if let Some(object) = attachment.as_object_mut() {
+        object.remove("uploadDataUrl");
+    }
+    Ok(())
+}
+
+fn attachment_file_url(session_id: &str, relative: &str) -> String {
+    format!("/api/sessions/{session_id}/files/{relative}")
 }
 
 const PREVIEW_MAX_CHARS: usize = 100;
@@ -2233,6 +2462,128 @@ mod tests {
                 .count(),
             1,
             "the committed input lands in the transcript exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_attachment_migration_strips_upload_bytes_and_writes_the_file() {
+        #[derive(serde::Deserialize, skyzen::FromRow)]
+        struct Row {
+            attachments: String,
+        }
+        let dir = tempdir().expect("temp dir should be created");
+        let db_path = dir.path().join("history.db");
+        let db = ChatDb::open(&db_path).await.expect("db opens");
+        db.create_session("s", Some("s"), Some("m"))
+            .await
+            .expect("session");
+        let attachments = serde_json::json!([{
+            "id": "a1",
+            "name": "shot.png",
+            "type": "image",
+            "url": "files/shot.png",
+            "uploadDataUrl": "data:image/png;base64,aGVsbG8=",
+        }])
+        .to_string();
+        query!(
+            db.db,
+            "INSERT INTO messages (session_id, role, content, timestamp, tool_call_id, provider_id, prompt_tokens, completion_tokens, total_tokens, cache_read_tokens, cache_write_tokens, context_window, elapsed_ms, attachments, reasoning, tool_calls, translation, thinking) VALUES ('s', 'user', 'hi', '2024-01-01', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, NULL, NULL, NULL, NULL)",
+            attachments.as_str()
+        )
+        .execute()
+        .await
+        .expect("insert");
+        drop(db);
+
+        let db = ChatDb::open(&db_path).await.expect("db reopens");
+        let rows = query!(db.db, "SELECT attachments FROM messages")
+            .fetch_all::<Row>()
+            .await
+            .expect("rows");
+        assert!(!rows[0].attachments.contains("uploadDataUrl"));
+        let url = serde_json::from_str::<Vec<serde_json::Value>>(&rows[0].attachments)
+            .expect("json")
+            .remove(0)["url"]
+            .as_str()
+            .expect("url")
+            .to_string();
+        assert!(url.starts_with("/api/sessions/s/files/"), "{url}");
+        let file = dir
+            .path()
+            .join("sessions")
+            .join("s")
+            .join("files")
+            .join("shot.png");
+        assert_eq!(std::fs::read(&file).expect("file"), b"hello");
+
+        drop(db);
+        let db = ChatDb::open(&db_path).await.expect("third open is a no-op");
+        let rows = query!(db.db, "SELECT attachments FROM messages")
+            .fetch_all::<Row>()
+            .await
+            .expect("rows");
+        assert!(!rows[0].attachments.contains("uploadDataUrl"));
+    }
+
+    #[tokio::test]
+    async fn the_attachment_migration_skips_an_undecodable_row_and_migrates_the_rest() {
+        #[derive(serde::Deserialize, skyzen::FromRow)]
+        struct Row {
+            attachments: String,
+        }
+        let dir = tempdir().expect("temp dir should be created");
+        let db_path = dir.path().join("history.db");
+        let db = ChatDb::open(&db_path).await.expect("db opens");
+        db.create_session("s", Some("s"), Some("m"))
+            .await
+            .expect("session");
+        let good = serde_json::json!([{
+            "id": "a1", "name": "shot.png", "type": "image",
+            "url": "files/shot.png", "uploadDataUrl": "data:image/png;base64,aGVsbG8=",
+        }])
+        .to_string();
+        let bad = serde_json::json!([{
+            "id": "a2", "name": "bad.png", "type": "image",
+            "url": "files/bad.png", "uploadDataUrl": "data:image/png;base64,%%%not-base64%%%",
+        }])
+        .to_string();
+        for attachments in [&good, &bad] {
+            query!(
+                db.db,
+                "INSERT INTO messages (session_id, role, content, timestamp, tool_call_id, provider_id, prompt_tokens, completion_tokens, total_tokens, cache_read_tokens, cache_write_tokens, context_window, elapsed_ms, attachments, reasoning, tool_calls, translation, thinking) VALUES ('s', 'user', 'hi', '2024-01-01', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, NULL, NULL, NULL, NULL)",
+                attachments.as_str()
+            )
+            .execute()
+            .await
+            .expect("insert");
+        }
+        drop(db);
+
+        let db = ChatDb::open(&db_path)
+            .await
+            .expect("db reopens despite the bad row");
+        let rows = query!(db.db, "SELECT attachments FROM messages")
+            .fetch_all::<Row>()
+            .await
+            .expect("rows");
+        assert_eq!(rows.len(), 2);
+        assert!(
+            !rows[0].attachments.contains("uploadDataUrl"),
+            "valid row migrated"
+        );
+        assert!(
+            rows[1].attachments.contains("uploadDataUrl"),
+            "bad row kept its bytes"
+        );
+        assert!(
+            std::fs::read(
+                dir.path()
+                    .join("sessions")
+                    .join("s")
+                    .join("files")
+                    .join("shot.png")
+            )
+            .is_ok()
         );
     }
 }
