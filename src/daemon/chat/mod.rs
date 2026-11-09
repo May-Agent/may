@@ -2919,6 +2919,10 @@ struct SessionContext {
     /// transcript store records them.
     seed_messages: Vec<LlmMessage>,
     context_snapshot: Option<crate::session::PersistedContextSnapshot>,
+    /// The user messages and hidden context stored after the snapshot was
+    /// written: the input of a turn whose run ended before its first
+    /// checkpoint, which a restored agent has not seen.
+    uncheckpointed_input: Vec<LlmMessage>,
     hidden_context_xml: Option<String>,
     profile_persona: Option<String>,
     profile_memories: Option<crate::memory::ProfileMemories>,
@@ -3315,6 +3319,24 @@ async fn resolve_session_context(
     } else {
         None
     };
+    // `history` holds the rows stored before this turn's own: a user message
+    // the previous run stored but never checkpointed is among them.
+    let uncheckpointed_input = match context_snapshot.as_ref() {
+        Some(snapshot) => {
+            let written = snapshot
+                .updated_at
+                .parse::<jiff::Timestamp>()
+                .map_err(|error| {
+                    UiChatPreparationError::LoadContextSnapshot(crate::db::ChatDbError::Storage(
+                        format!("invalid context snapshot timestamp: {error}"),
+                    ))
+                })?;
+            history
+                .input_messages_after(written)
+                .map_err(UiChatPreparationError::HistoryReplay)?
+        }
+        None => Vec::new(),
+    };
 
     let mut hidden_context_parts = Vec::<String>::new();
     // A claimed entry with no visible input commits with the first hidden
@@ -3497,6 +3519,7 @@ async fn resolve_session_context(
         transcript,
         seed_messages,
         context_snapshot,
+        uncheckpointed_input,
         hidden_context_xml: (!hidden_context_parts.is_empty())
             .then(|| hidden_context_parts.join("\n\n")),
         profile_persona,
@@ -4012,6 +4035,9 @@ fn build_session_agent<'a>(
                 .iter()
                 .filter(|(seq, _)| *seq > snapshot.applied_seq)
             {
+                agent.push_message(message.clone());
+            }
+            for message in &ctx.uncheckpointed_input {
                 agent.push_message(message.clone());
             }
         } else if ctx.transcript.is_empty() && !ctx.seed_messages.is_empty() {
