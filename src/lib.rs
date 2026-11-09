@@ -61,7 +61,7 @@ pub mod log_ring;
 pub mod mcp;
 /// Profile memory extraction and injection.
 pub mod memory;
-/// The one namespace of model-facing ids.
+/// Model-facing ids: session names and each session's pool of words.
 pub mod model_ids;
 /// Model selection and filtering helpers.
 pub mod model_selector;

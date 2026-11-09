@@ -14,7 +14,6 @@ use askama::Template;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::model_ids::QuestionAlias;
 use crate::secrets::{SecretScope, SecretStore};
 use crate::session::{
     PersistedAskUserQuestion, PersistedAskUserRequest, PersistedSecretRequest,
@@ -64,16 +63,10 @@ struct WithdrawnText<'a> {
     request_id: &'a str,
 }
 
-/// An open request with the word the model knows it by.
-struct OpenRequest {
-    word: String,
-    request: PersistedAskUserRequest,
-}
-
 #[derive(Template)]
 #[template(path = "context_open_questions.txt", escape = "none")]
 struct OpenQuestionsText<'a> {
-    requests: &'a [OpenRequest],
+    requests: &'a [crate::db::NamedAskUserQuestion],
 }
 
 /// Asks the user a question without waiting for the answer.
@@ -353,7 +346,7 @@ impl Tool for WithdrawAskUserTool {
         let request_id = self
             .runtime
             .db()
-            .resolve_alias::<QuestionAlias>(&args.request_id)
+            .open_ask_user_question_named(&self.session_id, &args.request_id)
             .await
             .map_err(AskUserToolError::Withdraw)?;
         let withdrawn = match request_id {
@@ -411,35 +404,22 @@ impl aither_agent::BlockerResolver for AskUserBlockerResolver {
             reason: error.to_string(),
         };
         let db = self.runtime.db();
-        // A mark names a question by the word the model knows it by; every
-        // question the word named counts, so a mark on one answered since
-        // stops blocking.
-        let named = db
-            .named_by::<QuestionAlias>(mark)
+        // A mark names a question by the word the model knows it by.
+        if db
+            .open_ask_user_question_named(&self.session_id, mark)
             .await
-            .map_err(unavailable)?;
-        let mut asked = false;
-        for request_id in named {
-            if !db
-                .session_ask_user_request_exists(&self.session_id, &request_id)
-                .await
-                .map_err(unavailable)?
-            {
-                continue;
-            }
-            asked = true;
-            if db
-                .pending_ask_user_request(&request_id)
-                .await
-                .map_err(unavailable)?
-                .is_some_and(|pending| pending.session_id == self.session_id)
-            {
-                return Ok(true);
-            }
+            .map_err(unavailable)?
+            .is_some()
+        {
+            return Ok(true);
         }
-        // A payload no question of this session carries is free text the
-        // harness cannot check, and holds.
-        Ok(!asked)
+        // A word that named a question of this session answered or withdrawn
+        // since stops blocking; a payload no question of this session
+        // carried is free text the harness cannot check, and holds.
+        Ok(!db
+            .session_ask_user_word_asked(&self.session_id, mark)
+            .await
+            .map_err(unavailable)?)
     }
 }
 
@@ -464,18 +444,12 @@ impl OpenQuestionsContext {
 
 impl ContextSource for OpenQuestionsContext {
     async fn render(&self) -> Option<Block> {
-        let db = self.runtime.db();
-        let open = async {
-            let mut open = Vec::new();
-            for request in db.open_ask_user_questions(&self.session_id).await? {
-                open.push(OpenRequest {
-                    word: db.alias::<QuestionAlias>(&request.id).await?,
-                    request,
-                });
-            }
-            Ok::<_, crate::db::ChatDbError>(open)
-        };
-        let open = match open.await {
+        let open = match self
+            .runtime
+            .db()
+            .named_open_ask_user_questions(&self.session_id)
+            .await
+        {
             Ok(open) => open,
             Err(error) => {
                 tracing::error!(session_id = %self.session_id, %error, "failed to load open questions for the request context");

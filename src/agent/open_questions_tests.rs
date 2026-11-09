@@ -45,8 +45,9 @@ async fn ask(session: &Session, text: &str) -> (String, String) {
         .expect("the new question is open");
     let word = runtime
         .db()
-        .alias::<crate::model_ids::QuestionAlias>(&id)
+        .open_ask_user_question_word(&id)
         .await
+        .expect("the question loads")
         .expect("the question has a word");
     (id, word)
 }

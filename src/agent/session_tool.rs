@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use aither_core::llm::{Tool, ToolResult};
 use askama::Template;
@@ -7,7 +8,6 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::db::{ChatDb, IndexedMessageRow};
-use crate::model_ids::AgentAlias;
 use crate::repo_search::indexer::{
     IndexerError, SESSIONS_COLLECTION, SearchIndexer, parse_message_doc_id,
 };
@@ -107,12 +107,9 @@ const fn default_limit() -> usize {
 }
 
 /// `session` tool: natural-language search and inspection over session history.
-///
-/// A session that is not archived is a live agent, shown and addressed by its
-/// model-facing alias; an archived one by its session id.
 #[derive(Debug, Clone)]
 pub struct SessionTool {
-    db: ChatDb,
+    may_dir: PathBuf,
     current_session_id: String,
     index: Option<SessionSearchIndex>,
 }
@@ -196,18 +193,22 @@ enum SessionCommandInput {
 }
 
 impl SessionTool {
-    /// Bind the tool to a session of `db`; `index` serves `session search`.
+    /// Bind the tool to a session; `index` serves `session search`.
     #[must_use]
     pub const fn new(
-        db: ChatDb,
+        may_dir: PathBuf,
         current_session_id: String,
         index: Option<SessionSearchIndex>,
     ) -> Self {
         Self {
-            db,
+            may_dir,
             current_session_id,
             index,
         }
+    }
+
+    fn db_path(&self) -> PathBuf {
+        self.may_dir.join("history.db")
     }
 
     async fn normalize_args(
@@ -218,76 +219,15 @@ impl SessionTool {
             current_session_id: self.current_session_id.clone(),
         };
 
-        let plan = if let Some(command) = args.command.take() {
+        if let Some(command) = args.command.take() {
             let tokens = split_command_form_tokens(&command, "session")?;
-            build_execution_plan(args, SessionCommandInput::Tokens(tokens), &defaults)?
-        } else {
-            build_execution_plan(args, SessionCommandInput::RawQuery, &defaults)?
-        };
-        let plan = resolve_plan_sessions(&self.db, plan).await?;
-        resolve_implicit_session_lookup(&self.db, plan).await
+            let plan = build_execution_plan(args, SessionCommandInput::Tokens(tokens), &defaults)?;
+            return resolve_implicit_session_lookup(self.db_path(), plan).await;
+        }
+
+        let plan = build_execution_plan(args, SessionCommandInput::RawQuery, &defaults)?;
+        resolve_implicit_session_lookup(self.db_path(), plan).await
     }
-}
-
-/// The session `given` names: a live agent's alias, or a session id.
-async fn resolve_session(db: &ChatDb, given: String) -> Result<String, SessionToolError> {
-    Ok(db
-        .resolve_alias::<AgentAlias>(&given)
-        .await?
-        .unwrap_or(given))
-}
-
-/// `plan` with every session it names by alias named by its session id.
-async fn resolve_plan_sessions(
-    db: &ChatDb,
-    plan: SessionExecutionPlan,
-) -> Result<SessionExecutionPlan, SessionToolError> {
-    Ok(match plan {
-        SessionExecutionPlan::Search(mut args) => {
-            if let Some(session_id) = args.session_id.take() {
-                args.session_id = Some(resolve_session(db, session_id).await?);
-            }
-            if let Some(session_id) = args.exclude_session_id.take() {
-                args.exclude_session_id = Some(resolve_session(db, session_id).await?);
-            }
-            SessionExecutionPlan::Search(args)
-        }
-        SessionExecutionPlan::Inspect(request) => {
-            SessionExecutionPlan::Inspect(SessionInspectRequest {
-                session_id: resolve_session(db, request.session_id).await?,
-            })
-        }
-        SessionExecutionPlan::Messages(request) => {
-            SessionExecutionPlan::Messages(SessionMessagesRequest {
-                session_id: resolve_session(db, request.session_id).await?,
-            })
-        }
-        list @ SessionExecutionPlan::List(_) => list,
-    })
-}
-
-/// The id the model is shown for a session: a live agent's alias, an
-/// archived session's id.
-async fn shown_session_id(
-    db: &ChatDb,
-    session_id: &str,
-    archived: bool,
-) -> Result<String, SessionToolError> {
-    if archived {
-        return Ok(session_id.to_string());
-    }
-    Ok(db.alias::<AgentAlias>(session_id).await?)
-}
-
-/// The summary the model reads of `session`.
-async fn summary_view(
-    db: &ChatDb,
-    session: crate::db::entity::sessions::Model,
-) -> Result<SessionSummaryView, SessionToolError> {
-    let shown = shown_session_id(db, &session.id, session.archived).await?;
-    let mut view = SessionSummaryView::from(session);
-    view.session_id = shown;
-    Ok(view)
 }
 
 impl Tool for SessionTool {
@@ -305,7 +245,7 @@ impl Tool for SessionTool {
     ) -> aither_core::Result<Self::Res> {
         let plan = self.normalize_args(arguments).await?;
         execute_plan(
-            &self.db,
+            self.db_path(),
             self.index.as_ref(),
             self.current_session_id.clone(),
             plan,
@@ -327,7 +267,7 @@ fn normalize_common_args(mut args: SessionArgs) -> SessionArgs {
 }
 
 async fn execute_plan(
-    db: &ChatDb,
+    db_path: PathBuf,
     index: Option<&SessionSearchIndex>,
     current_session_id: String,
     plan: SessionExecutionPlan,
@@ -335,16 +275,15 @@ async fn execute_plan(
     match plan {
         SessionExecutionPlan::Search(args) => {
             let index = index.ok_or(SessionToolError::NoIndex)?;
-            execute_search(db, index, &current_session_id, args).await
+            execute_search(index, &current_session_id, args).await
         }
-        SessionExecutionPlan::Inspect(request) => execute_inspect(db, request).await,
-        SessionExecutionPlan::Messages(request) => execute_messages(db, request).await,
-        SessionExecutionPlan::List(request) => execute_list(db, request).await,
+        SessionExecutionPlan::Inspect(request) => execute_inspect(db_path, request).await,
+        SessionExecutionPlan::Messages(request) => execute_messages(db_path, request).await,
+        SessionExecutionPlan::List(request) => execute_list(db_path, request).await,
     }
 }
 
 async fn execute_search(
-    db: &ChatDb,
     index: &SessionSearchIndex,
     current_session_id: &str,
     args: SessionArgs,
@@ -381,20 +320,9 @@ async fn execute_search(
         .collect();
 
     let total_matches = rows.len();
-    let mut rows = drop_rows_already_in_context(index.db(), current_session_id, rows).await?;
+    let rows = drop_rows_already_in_context(index.db(), current_session_id, rows).await?;
     if total_matches > 0 && rows.is_empty() {
         return Err(SessionToolError::AllResultsAlreadyInContext);
-    }
-    let mut shown: HashMap<String, String> = HashMap::new();
-    for row in &mut rows {
-        let id = if let Some(id) = shown.get(&row.session_id) {
-            id.clone()
-        } else {
-            let id = shown_session_id(db, &row.session_id, row.archived).await?;
-            shown.insert(row.session_id.clone(), id.clone());
-            id
-        };
-        row.session_id = id;
     }
     Ok(finalize_rows_with_total(&rows, total_matches, &args))
 }
@@ -531,9 +459,10 @@ struct SessionSearchSessionsText {
 }
 
 async fn execute_inspect(
-    db: &ChatDb,
+    db_path: PathBuf,
     request: SessionInspectRequest,
 ) -> Result<ToolResult, SessionToolError> {
+    let db = ChatDb::open(&db_path).await?;
     let session = db.get_session(&request.session_id).await?.ok_or_else(|| {
         SessionToolError::SessionNotFound {
             session_id: request.session_id.clone(),
@@ -555,7 +484,7 @@ async fn execute_inspect(
         .map(SessionMessageView::from);
 
     let text = SessionInspectText {
-        session: summary_view(db, session).await?,
+        session: SessionSummaryView::from(session),
         final_assistant_message,
         final_user_message,
         latest_message,
@@ -566,9 +495,10 @@ async fn execute_inspect(
 }
 
 async fn execute_messages(
-    db: &ChatDb,
+    db_path: PathBuf,
     request: SessionMessagesRequest,
 ) -> Result<ToolResult, SessionToolError> {
+    let db = ChatDb::open(&db_path).await?;
     let session = db.get_session(&request.session_id).await?.ok_or_else(|| {
         SessionToolError::SessionNotFound {
             session_id: request.session_id.clone(),
@@ -582,7 +512,7 @@ async fn execute_messages(
         .collect::<Vec<_>>();
 
     let text = SessionMessagesText {
-        session: summary_view(db, session).await?,
+        session: SessionSummaryView::from(session),
         messages,
     }
     .render()
@@ -591,9 +521,10 @@ async fn execute_messages(
 }
 
 async fn execute_list(
-    db: &ChatDb,
+    db_path: PathBuf,
     request: SessionListRequest,
 ) -> Result<ToolResult, SessionToolError> {
+    let db = ChatDb::open(&db_path).await?;
     let lowered_title = request.title_contains.as_deref().map(str::to_lowercase);
     let mut sessions = db
         .list_sessions()
@@ -637,14 +568,12 @@ async fn execute_list(
         .collect::<Vec<_>>();
     sessions.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
     let total_matches = sessions.len();
-    let mut results = Vec::new();
-    for session in sessions
+    let results = sessions
         .into_iter()
         .skip(request.offset)
         .take(request.limit)
-    {
-        results.push(summary_view(db, session).await?);
-    }
+        .map(SessionSummaryView::from)
+        .collect::<Vec<_>>();
 
     let text = SessionListText {
         total_matches,
@@ -709,19 +638,19 @@ fn build_execution_plan(
 }
 
 async fn resolve_implicit_session_lookup(
-    db: &ChatDb,
+    db_path: PathBuf,
     plan: SessionExecutionPlan,
 ) -> Result<SessionExecutionPlan, SessionToolError> {
     let SessionExecutionPlan::Search(args) = plan else {
         return Ok(plan);
     };
-    let Some(candidate) = implicit_session_lookup_candidate(&args) else {
+    let Some(session_id) = implicit_session_lookup_candidate(&args) else {
         return Ok(SessionExecutionPlan::Search(args));
     };
-    let session_id = resolve_session(db, candidate.to_string()).await?;
-    if db.get_session(&session_id).await?.is_some() {
+    let db = ChatDb::open(&db_path).await?;
+    if db.get_session(session_id).await?.is_some() {
         return Ok(SessionExecutionPlan::Inspect(SessionInspectRequest {
-            session_id,
+            session_id: session_id.to_string(),
         }));
     }
     Ok(SessionExecutionPlan::Search(args))
@@ -1238,7 +1167,7 @@ mod tests {
         let mut args = base_args();
         args.query = "abc123".to_string();
 
-        let plan = resolve_implicit_session_lookup(&db, SessionExecutionPlan::Search(args))
+        let plan = resolve_implicit_session_lookup(db_path, SessionExecutionPlan::Search(args))
             .await
             .expect("implicit inspect should resolve");
 
@@ -1246,47 +1175,18 @@ mod tests {
             panic!("expected inspect plan");
         };
         assert_eq!(request.session_id, "abc123");
-    }
-
-    #[tokio::test]
-    async fn a_live_agents_alias_names_its_session() {
-        let temp = tempdir().expect("tempdir");
-        let db = ChatDb::open(&temp.path().join("history.db"))
-            .await
-            .expect("db should open");
-        db.create_session("abc123", Some("session"), Some("gpt-5"))
-            .await
-            .expect("session should be created");
-        let alias = db.alias::<AgentAlias>("abc123").await.expect("alias");
-
-        let mut args = base_args();
-        args.query.clone_from(&alias);
-        let plan = resolve_implicit_session_lookup(&db, SessionExecutionPlan::Search(args))
-            .await
-            .expect("implicit inspect should resolve");
-        let SessionExecutionPlan::Inspect(request) = plan else {
-            panic!("expected inspect plan");
-        };
-        assert_eq!(request.session_id, "abc123");
-
-        let session = db.get_session("abc123").await.unwrap().unwrap();
-        assert_eq!(
-            summary_view(&db, session).await.unwrap().session_id,
-            alias,
-            "a live session is shown by its alias"
-        );
     }
 
     #[tokio::test]
     async fn single_token_query_stays_search_when_session_missing() {
         let temp = tempdir().expect("tempdir");
         let db_path = temp.path().join("history.db");
-        let db = ChatDb::open(&db_path).await.expect("db should open");
+        let _db = ChatDb::open(&db_path).await.expect("db should open");
 
         let mut args = base_args();
         args.query = "abc123".to_string();
 
-        let plan = resolve_implicit_session_lookup(&db, SessionExecutionPlan::Search(args))
+        let plan = resolve_implicit_session_lookup(db_path, SessionExecutionPlan::Search(args))
             .await
             .expect("search should remain valid");
 

@@ -288,7 +288,7 @@ impl SessionParts {
         Self {
             dir,
             db,
-            session_id: SessionId::new(),
+            session_id: SessionId::from_string("amber-river"),
             runtime: None,
             workspace_broker,
             ask_user_broker,

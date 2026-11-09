@@ -69,14 +69,6 @@ impl Host {
         }
     }
 
-    /// The word the model knows the agent of `session_id` by.
-    async fn alias(&self, session_id: &str) -> String {
-        self.db
-            .alias::<crate::model_ids::AgentAlias>(session_id)
-            .await
-            .expect("the agent has a word")
-    }
-
     fn store_for(&self, repo_key: &str) -> MayIssueStore {
         MayIssueStore::new(self.db.clone(), repo_key.to_string())
     }
@@ -114,8 +106,7 @@ impl Host {
 async fn an_issue_in_a_tasks_md_is_owned_by_its_agent() {
     let host = Host::new().await;
     let number = host.issue;
-    let a1 = host.alias("a1").await;
-    let owned_by_a = |text: &str| owned_by(text, &a1);
+    let owned_by_a = |text: &str| text.contains("alpha") && text.contains("a1");
 
     let owner = host.issue(IssueArgs::Owner { number, repo: None }).await;
     assert!(owner.contains("has no owner"), "{owner}");
@@ -159,9 +150,8 @@ async fn a_second_agent_cannot_take_an_owned_issue_until_the_owner_drops_it() {
         panic!("taking an owned issue is refused");
     };
     let error = owned.to_string();
-    let a1 = host.alias("a1").await;
     assert!(
-        error.contains("alpha") && error.contains(&format!("(id {a1})")),
+        error.contains("alpha") && error.contains("(id a1)"),
         "{error}"
     );
     assert_eq!(host.read_tasks("b1"), "## Open\n", "the change is reverted");
@@ -175,11 +165,7 @@ async fn a_second_agent_cannot_take_an_owned_issue_until_the_owner_drops_it() {
         .expect("the owner dropped the issue");
     assert!(host.read_tasks("b1").contains(&format!("#{number}")));
     let answer = host.issue(IssueArgs::Owner { number, repo: None }).await;
-    let b1 = host.alias("b1").await;
-    assert!(
-        answer.contains("beta") && answer.contains(&format!("(id {b1})")),
-        "{answer}"
-    );
+    assert!(answer.contains("beta") && answer.contains("b1"), "{answer}");
 }
 
 /// `--repo <path>` reads another local repository's may issues; ownership is
@@ -189,7 +175,6 @@ async fn a_second_agent_cannot_take_an_owned_issue_until_the_owner_drops_it() {
 async fn a_local_repository_target_reads_its_issues_and_its_own_ownership() {
     let host = Host::new().await;
     let number = host.issue;
-    let a1 = host.alias("a1").await;
     host.write_tasks("a1", &format!("## Open\n- #{number} doing: x\n"));
 
     let other = tempfile::tempdir().expect("other repository");
@@ -226,7 +211,7 @@ async fn a_local_repository_target_reads_its_issues_and_its_own_ownership() {
         })
         .await;
     assert!(
-        viewed.contains("in the other repository") && !owned_by(&viewed, &a1),
+        viewed.contains("in the other repository") && !owned_by(&viewed),
         "{viewed}"
     );
     let owner = host
@@ -239,7 +224,7 @@ async fn a_local_repository_target_reads_its_issues_and_its_own_ownership() {
 
     // The session's own issue is still owned, and still cannot be taken.
     let own = host.issue(IssueArgs::Owner { number, repo: None }).await;
-    assert!(owned_by(&own, &a1), "{own}");
+    assert!(owned_by(&own), "{own}");
     let mut accepted = None;
     host.write_tasks("b1", "## Open\n");
     host.owners
@@ -253,9 +238,8 @@ async fn a_local_repository_target_reads_its_issues_and_its_own_ownership() {
     ));
 }
 
-/// Whether `text` names agent "alpha" as the owner, by its word `id`.
-fn owned_by(text: &str, id: &str) -> bool {
-    text.contains("alpha") && text.contains(&format!("id {id})"))
+fn owned_by(text: &str) -> bool {
+    text.contains("alpha") && text.contains("a1")
 }
 
 #[test]

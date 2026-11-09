@@ -45,8 +45,8 @@ pub enum BrowserCapturePersistError {
 /// Persist a browser page capture (screenshot and text) into the session's
 /// artifact directory and return the snapshot record.
 ///
-/// A screenshot file is named by a word of `ids`, the daemon's model-facing
-/// namespace.
+/// A screenshot file is named by a word of `ids`, the session's pool of
+/// model-facing ids.
 ///
 /// # Errors
 ///

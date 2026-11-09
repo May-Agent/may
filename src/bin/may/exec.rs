@@ -60,6 +60,8 @@ pub enum ExecError {
     CompileNetworkPolicy(aither_sandbox::NetworkPolicyError),
     #[error("failed to create terminal tool: {0}")]
     CreateTerminalTool(aither_sandbox::TerminalError),
+    #[error("failed to restore the session's model-facing ids: {0}")]
+    SessionIds(may_agent::db::ChatDbError),
     #[error("failed to start the May daemon: {0}")]
     StartDaemon(may_agent::daemon::lifecycle::LifecycleError),
     #[error("failed to connect to the daemon's jobserver pool: {0}")]
@@ -397,6 +399,11 @@ async fn build_exec_terminal_tool(
         .compile()
         .map_err(ExecError::CompileNetworkPolicy)?;
 
+    let session_ids = context
+        .db
+        .session_ids(context.session_id.as_str())
+        .await
+        .map_err(ExecError::SessionIds)?;
     let terminal_tool: TerminalTool<TerminalPermissionHandler, executor_core::DefaultExecutor> =
         TerminalTool::new_exact(
             &context.sandbox_dir,
@@ -413,7 +420,7 @@ async fn build_exec_terminal_tool(
         )
         .await
         .map_err(ExecError::CreateTerminalTool)?
-        .with_id_allocator(context.db.model_ids().clone())
+        .with_id_allocator(session_ids.allocator().clone())
         .with_network_audit_log(
             aither_sandbox::open_network_audit_log(
                 context

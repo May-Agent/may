@@ -45,7 +45,7 @@ pub struct ImagineArgs {
 pub struct ImagineTool {
     pub(crate) generator: Option<ImageGeneratorConfig>,
     pub(crate) artifacts_dir: PathBuf,
-    /// The daemon's model-facing namespace, which names each image.
+    /// The session's pool of model-facing ids, which names each image.
     pub(crate) ids: aither_core::AnyIdAllocator,
 }
 

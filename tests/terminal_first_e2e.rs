@@ -1481,7 +1481,11 @@ impl TestHarness {
             .expect("profile lookup should succeed")
             .unwrap_or_else(|| panic!("default profile `{profile_slug}` should exist"))
             .id;
-        let session_id = SessionId::new().to_string();
+        let session_id = db
+            .issue_session_name()
+            .await
+            .expect("a session name")
+            .to_string();
         store
             .create_session_dirs(
                 &session_id,

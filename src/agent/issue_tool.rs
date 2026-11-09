@@ -946,7 +946,13 @@ fn render_list(summaries: &[IssueSummary], owners: Option<&OwnerIndex>) -> Strin
         let owner = owners
             .filter(|_| summary.state == IssueState::Open)
             .and_then(|owners| owners.get(summary.number))
-            .map(|owner| format!(" (owner: {}, id {})", owner.display_name(), owner.id))
+            .map(|owner| {
+                format!(
+                    " (owner: {}, id {})",
+                    owner.display_name(),
+                    owner.session_id
+                )
+            })
             .unwrap_or_default();
         let _ = writeln!(
             out,
@@ -987,7 +993,7 @@ fn render_detail(
             out,
             "owner: agent \"{}\" (id {})",
             owner.display_name(),
-            owner.id
+            owner.session_id
         );
     }
     if let Some(marks) = marks {

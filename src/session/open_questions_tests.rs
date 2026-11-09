@@ -19,7 +19,6 @@ use crate::agent::ask_user_tool::{
     WithdrawAskUserTool,
 };
 use crate::db::ChatDb;
-use crate::model_ids::QuestionAlias;
 use crate::ui_event_bus::UiEventBus;
 use aither_agent::BlockerResolver;
 
@@ -130,8 +129,9 @@ async fn ask(service: &Arc<SessionRuntimeService>, args: AskUserArgs) -> Asked {
     for request in &open {
         let word = service
             .db()
-            .alias::<QuestionAlias>(&request.id)
+            .open_ask_user_question_word(&request.id)
             .await
+            .expect("the question loads")
             .expect("an open question has a word");
         if text.contains(&format!("Question {word} is open")) {
             assert!(
@@ -250,8 +250,9 @@ async fn ask_user_returns_its_request_id_without_waiting() {
     let open = &runtime.open_questions[0];
     let word = service
         .db()
-        .alias::<QuestionAlias>(&open.id)
+        .open_ask_user_question_word(&open.id)
         .await
+        .expect("the question loads")
         .expect("the question has a word");
     assert!(
         text.contains(&format!("BLOCKING {word}")),

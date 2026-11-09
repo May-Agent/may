@@ -16,7 +16,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::cache_lifetime::CacheLifetime;
 use crate::db::ChatDbError;
-use crate::model_ids::AgentAlias;
 use crate::session::{
     MayHomePaths, PendingMessageState, PendingUserMessage, PendingUserMessageMode,
     SessionDirectory, SessionRuntimeService,
@@ -50,8 +49,6 @@ impl std::fmt::Display for Activity {
 pub struct AgentStatus {
     /// Session the agent runs.
     pub session_id: String,
-    /// The word the model knows the agent by: an alias of its session id.
-    pub id: String,
     /// Session's display name.
     pub name: String,
     /// Directory the agent was started in.
@@ -199,17 +196,11 @@ impl AgentDirectory {
                 .as_deref()
                 .map(crate::session::RepoBinding::parse)
                 .transpose()?;
-            let id = self
-                .runtime_service
-                .db()
-                .alias::<AgentAlias>(&session.id)
-                .await?;
             live.push(AgentTasks {
                 binding,
                 status: AgentStatus {
-                    name: session.title.clone().unwrap_or_else(|| id.clone()),
+                    name: session.title.clone().unwrap_or_else(|| session.id.clone()),
                     session_id: session.id.clone(),
-                    id,
                     cwd: SessionDirectory::of(&session, &self.may_dir).into_path(),
                     activity: if state.is_idle() {
                         Activity::Idle
@@ -279,19 +270,16 @@ pub(crate) struct AgentTasks {
     pub(crate) tasks: Option<String>,
 }
 
-/// The name and the model-facing id of the agent running `session_id`.
-async fn name_and_id(
+async fn status_name(
     runtime_service: &SessionRuntimeService,
     session_id: &str,
-) -> Result<(String, String), AgentLinkError> {
-    let db = runtime_service.db();
-    let id = db.alias::<AgentAlias>(session_id).await?;
-    let name = db
+) -> Result<String, AgentLinkError> {
+    Ok(runtime_service
+        .db()
         .get_session(session_id)
         .await?
         .and_then(|session| session.title)
-        .unwrap_or_else(|| id.clone());
-    Ok((name, id))
+        .unwrap_or_else(|| session_id.to_string()))
 }
 
 /// The list items of the `## Roots` section of a `tasks.md`.
@@ -320,11 +308,11 @@ pub struct AgentMessaging {
     pub forks: ForkHosts,
 }
 
-/// The live agent `target` (name or id) addresses in `live`.
+/// The live agent `target` (name or session id) addresses in `live`.
 fn addressed<'a>(live: &'a [AgentStatus], target: &str) -> Result<&'a AgentStatus, AgentLinkError> {
     let mut matches = live
         .iter()
-        .filter(|agent| agent.id == target || agent.name == target);
+        .filter(|agent| agent.session_id == target || agent.name == target);
     let recipient = matches
         .next()
         .ok_or_else(|| AgentLinkError::NoSuchAgent(target.to_string()))?;
@@ -513,10 +501,10 @@ impl AgentMessaging {
         {
             return Err(AgentLinkError::ColdRecipient(recipient.name.clone()));
         }
-        let (sender, sender_id) = name_and_id(&self.runtime_service, sender_session_id).await?;
+        let sender = status_name(&self.runtime_service, sender_session_id).await?;
         let text = AgentMessageText {
             sender: AttributeText(&sender),
-            sender_id: AttributeText(&sender_id),
+            sender_id: AttributeText(sender_session_id),
             body: UntrustedText(body),
         }
         .render()

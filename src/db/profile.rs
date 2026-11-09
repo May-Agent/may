@@ -670,8 +670,7 @@ impl ChatDb {
         query!(self.db, "UPDATE sessions SET archived = TRUE, pinned = FALSE, folder_id = NULL, pin_sort_order = NULL WHERE id = ?", id)
             .execute()
             .await?;
-        // An archived session is no live agent.
-        self.retire_ended_aliases().await
+        Ok(())
     }
 
     /// Unarchive (reopen) a session.

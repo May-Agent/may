@@ -13,7 +13,6 @@ mod issue_search;
 mod logs;
 mod memory;
 mod message;
-mod model_alias;
 mod notification;
 mod open_questions;
 mod pr;
@@ -22,6 +21,7 @@ mod repo_clone;
 mod repo_usage;
 mod search_outbox;
 mod session;
+mod session_ids;
 mod session_intervals;
 mod session_run;
 mod sleep_log;
@@ -49,7 +49,7 @@ pub use context_snapshot::ContextDebugSnapshotWrite;
 pub use issue_provenance::{IssueProvenanceRecord, NewIssueProvenance, UserMessageAt};
 pub use issue_search::IssueSearchDoc;
 pub use message::MessageMeta;
-pub use open_questions::{CommittedAskUserAnswer, PendingAskUserQuestion};
+pub use open_questions::{CommittedAskUserAnswer, NamedAskUserQuestion, PendingAskUserQuestion};
 pub use pr::{PrEventRow, PrRow};
 pub use repo_clone::RepoCloneRow;
 pub use repo_usage::RepoUsage;
@@ -75,8 +75,8 @@ pub(super) use query;
 #[derive(Debug, Clone)]
 pub struct ChatDb {
     pub(super) db: SkyDb,
-    /// The model-facing ids of the daemon this database serves.
-    namespace: model_alias::ModelNamespace,
+    /// Each session's pool of model-facing ids.
+    session_pools: session_ids::SessionPools,
     /// Test seam: suspends a run claim or finish at its await.
     #[cfg(test)]
     pub(crate) run_gates: session_run::RunGates,
@@ -124,10 +124,9 @@ impl ChatDb {
         Self::ensure_session_interval_triggers(&db).await?;
         Self::migrate_notification_mailbox(&db).await?;
         Self::migrate_attachment_upload_urls(&db, db_path).await?;
-        let namespace = model_alias::ModelNamespace::restore(&db).await?;
         Ok(Self {
             db,
-            namespace,
+            session_pools: session_ids::SessionPools::default(),
             #[cfg(test)]
             run_gates: session_run::RunGates::default(),
         })

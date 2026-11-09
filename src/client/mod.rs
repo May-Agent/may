@@ -13,11 +13,11 @@ mod wire;
 pub use sse::{ServerEvent, SseParser};
 pub use wire::{
     CreateSessionRequest, HoldReason, IndexCoverage, IssueRemovedFrame, IssueUpsertedFrame,
-    JobRemovedFrame, JobUpsertedFrame, PermissionPollItem, RecapFrame, RewindRequest, RunEnd,
-    SessionAgentBody, SessionAgentFrame, SessionIndexSnapshot, SessionIssuesFrame,
-    SessionRuntimeEvent, SessionRuntimeSnapshot, SubagentRemovedFrame, SubagentUpsertedFrame,
-    SuggestionFrame, UpdateSessionRequest, WarningFrame, WireAgentError, WireAgentEvent, WirePr,
-    WirePrChecks, WireSession, WireTranscriptEntry, WireTranscriptPage,
+    IssuedSessionName, JobRemovedFrame, JobUpsertedFrame, PermissionPollItem, RecapFrame,
+    RewindRequest, RunEnd, SessionAgentBody, SessionAgentFrame, SessionIndexSnapshot,
+    SessionIssuesFrame, SessionRuntimeEvent, SessionRuntimeSnapshot, SubagentRemovedFrame,
+    SubagentUpsertedFrame, SuggestionFrame, UpdateSessionRequest, WarningFrame, WireAgentError,
+    WireAgentEvent, WirePr, WirePrChecks, WireSession, WireTranscriptEntry, WireTranscriptPage,
 };
 
 use std::path::PathBuf;

@@ -74,8 +74,17 @@ impl ChatDb {
         profile_id: Option<&str>,
     ) -> Result<sessions::Model, ChatDbError> {
         let now = jiff::Timestamp::now().to_string();
+        let mut tx = self.db.begin().await?;
+        // Every session's name is recorded, so the generator never issues it.
         query!(
-            self.db,
+            tx,
+            "INSERT INTO session_names (name) VALUES (?) ON CONFLICT(name) DO NOTHING",
+            id
+        )
+        .execute()
+        .await?;
+        query!(
+            tx,
             "INSERT INTO sessions (id, title, model, preview, message_count, profile_id, pinned, archived, folder_id, pin_sort_order, created_at, updated_at, reasoning_effort) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             id,
             title,
@@ -93,6 +102,7 @@ impl ChatDb {
         )
         .execute()
         .await?;
+        tx.commit().await?;
         self.get_session(id)
             .await?
             .ok_or_else(|| session_not_found_db_error(id))
@@ -1398,7 +1408,7 @@ impl ChatDb {
             sessions = query!(tx, statement, id, id).execute().await?.rows_written;
         }
         tx.commit().await?;
-        self.retire_ended_aliases().await?;
+        self.forget_session_ids(id);
         Ok(sessions)
     }
 

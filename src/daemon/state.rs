@@ -1353,8 +1353,6 @@ impl DaemonState {
         );
         let live_limits = crate::agent::LiveLimits::of(&config);
         let config = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(config));
-        let tunnels =
-            std::sync::Arc::new(super::tunnel::TunnelRegistry::new(db.model_ids().clone()));
         Ok(Self {
             acp_host: std::sync::Arc::new(crate::agent::acp_subagent::AcpHosts::new(
                 config.clone(),
@@ -1424,7 +1422,7 @@ impl DaemonState {
             aux_tasks: super::chat::AuxTasks::default(),
             recap_schedules: super::chat::RecapSchedules::default(),
             session_background: super::chat::SessionBackgrounds::default(),
-            tunnels,
+            tunnels: std::sync::Arc::new(super::tunnel::TunnelRegistry::new()),
             connectivity,
             session_events_epoch: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

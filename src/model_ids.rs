@@ -1,27 +1,132 @@
-//! The one namespace of model-facing ids.
+//! Model-facing ids: the names the model reads and types back.
 //!
-//! Every id the model reads or types back — a background job, a stored
-//! output, a finished subagent, an agent, an `ask_user` question, a tunnel, a
-//! scheduled task, a saved snapshot — is one word of [`WORDS`], each a common
-//! English word that is a single `o200k_base` token with or without a leading
-//! space. All of them are leased from the one allocator the daemon's
-//! [`ChatDb`](crate::db::ChatDb) holds, so no two live ids share a word
-//! whatever their kinds.
+//! There are two spaces of them, disjoint by construction:
 //!
-//! An id that also names something outside the model (a database row, a
-//! session sandbox) keeps its internal id there, and its word is an alias:
-//! [`AliasKind`] names the kinds whose aliases the database keeps, so they
-//! name the same thing across daemon restarts.
+//! - A **session name** names a session and the main agent running it. It is
+//!   [`SESSION_NAME_WORDS`] words of [`WORDS`] joined by `-`, issued once by
+//!   the daemon's one global generator
+//!   ([`ChatDb::issue_session_name`](crate::db::ChatDb::issue_session_name)),
+//!   never changed and never issued again.
+//! - Every other id — a background job, a stored output, a subagent, an
+//!   `ask_user` question, a tunnel, a scheduled task, a saved snapshot or
+//!   image — is one word of [`WORDS`], leased from the pool of the session it
+//!   belongs to ([`SessionIds`]). No two live ids of one session share a
+//!   word, whatever their kinds.
+//!
+//! A pool word is one or more lowercase letters (aither refuses any other
+//! lease), and a session name always holds a `-`, so no per-session id ever
+//! equals a session name.
+//!
+//! Each word of [`WORDS`] is a common English word that is a single
+//! `o200k_base` token with or without a leading space.
 
-use aither_core::{AnyIdAllocator, WordAllocator};
+use std::collections::HashMap;
+use std::sync::Mutex;
 
-/// The words model-facing ids are leased from, one per line.
+use aither_core::{AnyIdAllocator, IdLease, IdsExhausted, WordAllocator, WordUnavailable};
+
+/// The words model-facing ids are made of, one per line.
 const WORDS: &str = include_str!("model_ids/words.txt");
 
-/// A fresh namespace over [`WORDS`] with no word leased.
+/// How many words a session name joins.
+pub const SESSION_NAME_WORDS: u32 = 2;
+
+/// What joins the words of a session name. No pool word holds it.
+const SESSION_NAME_SEPARATOR: char = '-';
+
+/// How many distinct session names the generator can issue.
+///
+/// # Panics
+/// Never: the word list is far smaller than `u64` can count.
 #[must_use]
-pub fn allocator() -> AnyIdAllocator {
-    AnyIdAllocator::new(WordAllocator::new(WORDS.lines()))
+pub fn session_name_capacity() -> u64 {
+    let words = u64::try_from(WORDS.lines().count()).expect("the word count fits in u64");
+    words.pow(SESSION_NAME_WORDS)
+}
+
+/// A candidate session name drawn from `rng`: [`SESSION_NAME_WORDS`] words of
+/// [`WORDS`] joined by `-`. The generator issues it only if no session was
+/// ever named by it.
+#[must_use]
+pub fn draw_session_name(rng: &mut fastrand::Rng) -> String {
+    let words: Vec<&str> = WORDS.lines().collect();
+    let mut name = String::new();
+    for index in 0..SESSION_NAME_WORDS {
+        if index > 0 {
+            name.push(SESSION_NAME_SEPARATOR);
+        }
+        name.push_str(words[rng.usize(..words.len())]);
+    }
+    name
+}
+
+/// The model-facing ids of one session.
+///
+/// It is the pool the session's terminals, subagents, questions, tunnels and
+/// scheduled tasks lease their words from, and holds the leases of the ones
+/// the database keeps (open questions, scheduled tasks).
+pub struct SessionIds {
+    ids: AnyIdAllocator,
+    /// Leases of the session's stored ids, by word.
+    stored: Mutex<HashMap<String, IdLease>>,
+}
+
+impl std::fmt::Debug for SessionIds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionIds").finish_non_exhaustive()
+    }
+}
+
+impl SessionIds {
+    /// A pool over [`WORDS`] in which the words of the session's stored ids,
+    /// `stored`, are leased.
+    ///
+    /// # Errors
+    /// [`WordUnavailable`] when a stored word is not in [`WORDS`] or two
+    /// stored ids share one.
+    pub fn restore(stored: impl IntoIterator<Item = String>) -> Result<Self, WordUnavailable> {
+        let ids = AnyIdAllocator::new(WordAllocator::new(WORDS.lines()));
+        let mut leases = HashMap::new();
+        for word in stored {
+            let lease = ids.claim(&word)?;
+            leases.insert(word, lease);
+        }
+        Ok(Self {
+            ids,
+            stored: Mutex::new(leases),
+        })
+    }
+
+    /// The allocator the session's terminals lease from.
+    #[must_use]
+    pub const fn allocator(&self) -> &AnyIdAllocator {
+        &self.ids
+    }
+
+    /// Leases a word no live id of the session holds.
+    ///
+    /// # Errors
+    /// [`IdsExhausted`] when every word is leased.
+    pub fn lease(&self) -> Result<IdLease, IdsExhausted> {
+        self.ids.lease()
+    }
+
+    /// Keeps `lease` for an id the database now stores, until
+    /// [`release`](Self::release) names its word.
+    pub fn keep(&self, lease: IdLease) {
+        self.stored_ids().insert(lease.to_string(), lease);
+    }
+
+    /// Ends the lease of the stored id `word`: what it named left the
+    /// database.
+    pub fn release(&self, word: &str) {
+        let released = self.stored_ids().remove(word);
+        drop(released);
+    }
+
+    fn stored_ids(&self) -> std::sync::MutexGuard<'_, HashMap<String, IdLease>> {
+        self.stored.lock().expect("session id leases lock poisoned")
+    }
 }
 
 /// Writes `data` to a new file of `dir` named `<word>.<ext>`, returning the
@@ -80,37 +185,6 @@ pub async fn write_word_file(
     Ok(name)
 }
 
-/// A kind of thing whose model-facing word is an alias the database keeps
-/// for as long as the thing can be addressed.
-pub trait AliasKind {
-    /// The kind's name in the `model_aliases` table.
-    const KIND: &'static str;
-}
-
-/// A live main agent, aliasing its session id.
-#[derive(Debug, Clone, Copy)]
-pub struct AgentAlias;
-
-impl AliasKind for AgentAlias {
-    const KIND: &'static str = "agent";
-}
-
-/// An open `ask_user` question, aliasing its request id.
-#[derive(Debug, Clone, Copy)]
-pub struct QuestionAlias;
-
-impl AliasKind for QuestionAlias {
-    const KIND: &'static str = "question";
-}
-
-/// A scheduled task, aliasing its task id.
-#[derive(Debug, Clone, Copy)]
-pub struct TaskAlias;
-
-impl AliasKind for TaskAlias {
-    const KIND: &'static str = "task";
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -142,18 +216,58 @@ mod tests {
                 .iter()
                 .all(|word| word.len() >= 3 && word.bytes().all(|byte| byte.is_ascii_lowercase()))
         );
-        // Building the allocator checks every word's shape again.
-        let _ = allocator();
+        // Building a pool checks every word's shape again.
+        let _ = SessionIds::restore([]).expect("a pool");
     }
 
     #[test]
-    fn live_leases_never_share_a_word() {
-        let ids = allocator();
+    fn live_ids_of_a_session_never_share_a_word() {
+        let ids = SessionIds::restore([]).expect("a pool");
         let leases: Vec<_> = (0..WORDS.lines().count())
             .map(|_| ids.lease().expect("a free word"))
             .collect();
-        let distinct: BTreeSet<_> = leases.iter().map(aither_core::IdLease::as_str).collect();
+        let distinct: BTreeSet<_> = leases.iter().map(IdLease::as_str).collect();
         assert_eq!(distinct.len(), leases.len());
         assert!(ids.lease().is_err(), "every word is leased");
+    }
+
+    #[test]
+    fn no_pool_word_is_a_session_name() {
+        let mut rng = fastrand::Rng::with_seed(842);
+        let ids = SessionIds::restore([]).expect("a pool");
+        let words: BTreeSet<String> = (0..WORDS.lines().count())
+            .map(|_| ids.lease().expect("a free word").to_string())
+            .collect();
+        for _ in 0..1000 {
+            let name = draw_session_name(&mut rng);
+            assert_eq!(
+                name.split(SESSION_NAME_SEPARATOR).count(),
+                usize::try_from(SESSION_NAME_WORDS).expect("a small count")
+            );
+            assert!(!words.contains(&name), "{name} is a pool word");
+        }
+        assert!(
+            words
+                .iter()
+                .all(|word| !word.contains(SESSION_NAME_SEPARATOR))
+        );
+        assert!(session_name_capacity() > 1_000_000);
+    }
+
+    #[test]
+    fn a_stored_word_stays_leased_until_released() {
+        let ids = SessionIds::restore(["river".to_string()]).expect("a pool");
+        assert!(
+            ids.allocator().claim("river").is_err(),
+            "restored as leased"
+        );
+        ids.release("river");
+        let again = ids.allocator().claim("river").expect("released");
+        ids.keep(again);
+        assert!(ids.allocator().claim("river").is_err(), "kept");
+        assert!(
+            SessionIds::restore(["river".to_string(), "river".to_string()]).is_err(),
+            "two stored ids never share a word"
+        );
     }
 }

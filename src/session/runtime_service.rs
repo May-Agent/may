@@ -674,15 +674,7 @@ impl SessionRuntimeService {
         super::open_questions::check_answers(&pending.request, answers)?;
         // The word the model knows an open question by; a prompt a run blocks
         // on never reaches the model as a question.
-        let word = if pending.blocking {
-            None
-        } else {
-            Some(
-                self.db
-                    .alias::<crate::model_ids::QuestionAlias>(request_id)
-                    .await?,
-            )
-        };
+        let word = pending.word.clone();
         let committed = self
             .db
             .commit_ask_user_answer(
@@ -735,29 +727,6 @@ impl SessionRuntimeService {
         request_id: &str,
     ) -> Result<Option<bool>, crate::db::ChatDbError> {
         self.db.committed_workspace_decision(request_id).await
-    }
-
-    /// Queue the delivery of an answer whose live waiter was gone by the time
-    /// it was woken.
-    ///
-    /// # Errors
-    /// Returns [`crate::db::ChatDbError`] on storage failure.
-    pub async fn deliver_ask_user_answer(
-        &self,
-        request: &PersistedAskUserRequest,
-        session_id: &str,
-        answers: &[crate::ask_user::QuestionAnswer],
-    ) -> Result<SessionRuntimeSummary, crate::db::ChatDbError> {
-        let word = self
-            .db
-            .word_of::<crate::model_ids::QuestionAlias>(&request.id)
-            .await?;
-        self.enqueue(
-            session_id,
-            super::open_questions::answer_delivery(request, &word, answers),
-            PendingUserMessageMode::Steer,
-        )
-        .await
     }
 
     /// Commit a permission decision, clearing the pending request by its id.

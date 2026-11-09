@@ -160,15 +160,8 @@ pub async fn build_session_mentions(
                 .take(4)
                 .map(|message| truncate_preview_with_limit(&message.content, 160))
                 .collect::<Vec<_>>();
-            // A live session is a live agent the model knows by its alias.
-            let id = if session.archived {
-                session.id
-            } else {
-                db.alias::<crate::model_ids::AgentAlias>(&session.id)
-                    .await?
-            };
             entries.push(SessionMention {
-                id,
+                id: session.id,
                 title,
                 model,
                 recent_user_messages,

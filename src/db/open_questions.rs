@@ -11,7 +11,6 @@
 //! session queue. A failure rolls all of it back.
 
 use crate::ask_user::{AnswerValue, Question, QuestionAnswer};
-use crate::model_ids::QuestionAlias;
 use crate::session::{PendingUserMessage, PersistedAskUserQuestion, PersistedAskUserRequest};
 
 use super::common::{
@@ -21,6 +20,21 @@ use super::common::{
 };
 use super::{ChatDb, ChatDbError, query};
 
+/// An open question and the word the model knows it by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedAskUserQuestion {
+    /// The word of the session's pool naming the question.
+    pub word: String,
+    /// The question.
+    pub request: PersistedAskUserRequest,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
+struct NamedRequestRow {
+    request_id: String,
+    word: Option<String>,
+}
+
 /// A question still waiting for its answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingAskUserQuestion {
@@ -28,6 +42,9 @@ pub struct PendingAskUserQuestion {
     pub session_id: String,
     /// Whether a run is waiting on the prompt.
     pub blocking: bool,
+    /// The word the model knows an open question by; a prompt a run blocks
+    /// on has none.
+    pub word: Option<String>,
     /// The question.
     pub request: PersistedAskUserRequest,
 }
@@ -70,19 +87,138 @@ impl ChatDb {
         session_id: &str,
         request: &PersistedAskUserRequest,
     ) -> Result<String, ChatDbError> {
+        let ids = self.session_ids(session_id).await?;
+        let lease = ids.lease()?;
         let mut tx = self.db.begin().await?;
         self.insert_pending_ask_user_in_tx(&mut tx, session_id, request, false)
             .await?;
-        self.append_ask_user_request_message_in_tx(
-            &mut tx,
-            session_id,
-            request.id.as_str(),
-            &history_questions(&request.questions),
-            None,
+        let message = self
+            .append_ask_user_request_message_in_tx(
+                &mut tx,
+                session_id,
+                request.id.as_str(),
+                &history_questions(&request.questions),
+                None,
+            )
+            .await?;
+        query!(
+            tx,
+            "UPDATE session_pending_ask_user_requests_v2 SET word = ? WHERE request_id = ?",
+            lease.as_str(),
+            request.id.as_str()
         )
+        .execute()
+        .await?;
+        query!(
+            tx,
+            "UPDATE message_ask_user_requests SET word = ? WHERE message_id = ?",
+            lease.as_str(),
+            message.id
+        )
+        .execute()
         .await?;
         tx.commit().await?;
-        self.alias::<QuestionAlias>(&request.id).await
+        let word = lease.to_string();
+        ids.keep(lease);
+        Ok(word)
+    }
+
+    /// The open question of `session_id` the model knows by `word`.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn open_ask_user_question_named(
+        &self,
+        session_id: &str,
+        word: &str,
+    ) -> Result<Option<String>, ChatDbError> {
+        Ok(query!(
+            self.db,
+            "SELECT request_id FROM session_pending_ask_user_requests_v2 WHERE session_id = ? AND word = ? AND blocking = 0",
+            session_id,
+            word
+        )
+        .fetch_optional::<PendingAskUserRequestRow>()
+        .await?
+        .map(|row| row.request_id))
+    }
+
+    /// The word the model knows the open question `request_id` by.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn open_ask_user_question_word(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<String>, ChatDbError> {
+        Ok(query!(
+            self.db,
+            "SELECT request_id, word FROM session_pending_ask_user_requests_v2 WHERE request_id = ? AND blocking = 0",
+            request_id
+        )
+        .fetch_optional::<NamedRequestRow>()
+        .await?
+        .and_then(|row| row.word))
+    }
+
+    /// Whether the model ever knew a question of `session_id` by `word`,
+    /// whatever became of it — open, answered or withdrawn.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure.
+    pub async fn session_ask_user_word_asked(
+        &self,
+        session_id: &str,
+        word: &str,
+    ) -> Result<bool, ChatDbError> {
+        Ok(query!(
+            self.db,
+            "SELECT m.session_id AS session_id FROM message_ask_user_requests r JOIN messages m ON m.id = r.message_id WHERE r.word = ? AND m.session_id = ? LIMIT 1",
+            word,
+            session_id
+        )
+        .fetch_optional::<PendingPermissionLookup>()
+        .await?
+        .is_some())
+    }
+
+    /// The open questions of `session_id` with the words the model knows
+    /// them by, oldest first.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure, or an open question stored
+    /// without its word.
+    pub async fn named_open_ask_user_questions(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<NamedAskUserQuestion>, ChatDbError> {
+        let mut tx = self.db.begin().await?;
+        let requests = query!(
+            tx,
+            "SELECT request_id, word FROM session_pending_ask_user_requests_v2 WHERE session_id = ? AND blocking = 0 ORDER BY created_at ASC, rowid ASC",
+            session_id
+        )
+        .fetch_all::<NamedRequestRow>()
+        .await?;
+        let mut open = Vec::with_capacity(requests.len());
+        for row in requests {
+            let word = row.word.ok_or_else(|| {
+                super::common::storage_error(format!(
+                    "open question {} has no word",
+                    row.request_id
+                ))
+            })?;
+            let request = Self::load_ask_user_request_in_tx(
+                &mut tx,
+                PendingAskUserRequestRow {
+                    request_id: row.request_id,
+                },
+            )
+            .await?;
+            open.push(NamedAskUserQuestion { word, request });
+        }
+        tx.commit().await?;
+        Ok(open)
     }
 
     /// Withdraw an open question of `session_id`. Returns whether it was
@@ -99,14 +235,13 @@ impl ChatDb {
         let mut tx = self.db.begin().await?;
         let withdrawn = query!(
             tx,
-            "DELETE FROM session_pending_ask_user_requests_v2 WHERE request_id = ? AND session_id = ? AND blocking = 0 RETURNING session_id, blocking",
+            "DELETE FROM session_pending_ask_user_requests_v2 WHERE request_id = ? AND session_id = ? AND blocking = 0 RETURNING session_id, blocking, word",
             request_id,
             session_id
         )
         .fetch_optional::<PendingAskUserLookup>()
-        .await?
-        .is_some();
-        if withdrawn {
+        .await?;
+        if withdrawn.is_some() {
             query!(
                 tx,
                 "DELETE FROM session_pending_ask_user_question_options_v2 WHERE request_id = ?",
@@ -123,10 +258,10 @@ impl ChatDb {
             .await?;
         }
         tx.commit().await?;
-        if withdrawn {
-            self.retire_ended_aliases().await?;
-        }
-        Ok(withdrawn)
+        Ok(withdrawn.is_some_and(|withdrawn| {
+            self.release_lookup_word(&withdrawn);
+            true
+        }))
     }
 
     /// The open questions of `session_id`, oldest first, read in one
@@ -296,27 +431,6 @@ impl ChatDb {
         .map(|row| row.approved))
     }
 
-    /// Whether `request_id` was issued as an `ask_user` request of
-    /// `session_id`, whatever became of it — open, answered or withdrawn.
-    ///
-    /// # Errors
-    /// Returns [`ChatDbError`] on storage failure.
-    pub async fn session_ask_user_request_exists(
-        &self,
-        session_id: &str,
-        request_id: &str,
-    ) -> Result<bool, ChatDbError> {
-        Ok(query!(
-            self.db,
-            "SELECT m.session_id AS session_id FROM message_ask_user_requests r JOIN messages m ON m.id = r.message_id WHERE r.request_id = ? AND m.session_id = ? LIMIT 1",
-            request_id,
-            session_id
-        )
-        .fetch_optional::<PendingPermissionLookup>()
-        .await?
-        .is_some())
-    }
-
     /// The pending question `request_id` and the session it belongs to, or
     /// `None` when it is not pending: answered, withdrawn or never asked.
     ///
@@ -329,7 +443,7 @@ impl ChatDb {
         let mut tx = self.db.begin().await?;
         let Some(lookup) = query!(
             tx,
-            "SELECT session_id, blocking FROM session_pending_ask_user_requests_v2 WHERE request_id = ? LIMIT 1",
+            "SELECT session_id, blocking, word FROM session_pending_ask_user_requests_v2 WHERE request_id = ? LIMIT 1",
             request_id
         )
         .fetch_optional::<PendingAskUserLookup>()
@@ -349,6 +463,7 @@ impl ChatDb {
         Ok(Some(PendingAskUserQuestion {
             session_id: lookup.session_id,
             blocking: lookup.blocking,
+            word: lookup.word,
             request,
         }))
     }
@@ -375,7 +490,7 @@ impl ChatDb {
             let mut tx = self.db.begin().await?;
             let Some(pending) = query!(
                 tx,
-                "DELETE FROM session_pending_ask_user_requests_v2 WHERE request_id = ? RETURNING session_id, blocking",
+                "DELETE FROM session_pending_ask_user_requests_v2 WHERE request_id = ? RETURNING session_id, blocking, word",
                 request_id
             )
             .fetch_optional::<PendingAskUserLookup>()
@@ -436,7 +551,7 @@ impl ChatDb {
                 false
             };
             tx.commit().await?;
-            self.retire_ended_aliases().await?;
+            self.release_lookup_word(&pending);
             Ok(Some(CommittedAskUserAnswer {
                 session_id: pending.session_id,
                 blocking: pending.blocking,
@@ -459,12 +574,28 @@ impl ChatDb {
         for sql in [
             "DELETE FROM session_pending_ask_user_question_options_v2 WHERE request_id = ?",
             "DELETE FROM session_pending_ask_user_questions_v2 WHERE request_id = ?",
-            "DELETE FROM session_pending_ask_user_requests_v2 WHERE request_id = ?",
         ] {
             query!(tx, sql, request_id).execute().await?;
         }
+        let cleared = query!(
+            tx,
+            "DELETE FROM session_pending_ask_user_requests_v2 WHERE request_id = ? RETURNING session_id, blocking, word",
+            request_id
+        )
+        .fetch_optional::<PendingAskUserLookup>()
+        .await?;
         tx.commit().await?;
-        self.retire_ended_aliases().await
+        if let Some(cleared) = cleared {
+            self.release_lookup_word(&cleared);
+        }
+        Ok(())
+    }
+
+    /// Ends the lease of the word of a question that left the pending set.
+    fn release_lookup_word(&self, lookup: &PendingAskUserLookup) {
+        if let Some(word) = &lookup.word {
+            self.release_session_word(&lookup.session_id, word);
+        }
     }
 
     /// Commit a permission decision: the pending request `request_id` is

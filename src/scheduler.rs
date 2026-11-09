@@ -605,6 +605,9 @@ impl TaskRuntime {
     ///
     /// # Errors
     /// Returns an error message when the payload is malformed, script validation fails, or the insert errors.
+    ///
+    /// # Panics
+    /// Never: a task bound to a session is named by a word of its pool.
     pub async fn create_task_from_tool_request(
         &self,
         request: TaskCreateRequest,
@@ -698,11 +701,9 @@ impl TaskRuntime {
             .map_err(|error| prefixed_error("failed to decode persisted task trigger: ", &error))?
             .response(model.run_at.clone(), model.cron_expression.clone());
 
-        let task_id = self
-            .db
-            .alias::<crate::model_ids::TaskAlias>(&model.id)
-            .await
-            .map_err(|error| prefixed_error("failed to name the scheduled task: ", &error))?;
+        let task_id = model
+            .word
+            .expect("a task bound to a session is named by a word of its pool");
         Ok(TaskCreateResult {
             task_id,
             profile_id: model.profile_id,
@@ -2548,12 +2549,7 @@ mod tests {
         let prompt = host.stored_prompt("main").await;
         assert!(prompt.content.is_empty(), "it is not the user's text");
         let xml = prompt.hidden_context_xml.expect("task delivery");
-        let word = host
-            .runtime_service
-            .db()
-            .alias::<crate::model_ids::TaskAlias>(&task.id)
-            .await
-            .expect("the task has a word");
+        let word = task.word.clone().expect("the task has a word");
         assert!(
             xml.contains(&format!("task=\"{word}\"")) && !xml.contains(&task.id),
             "the task is named by its word: {xml}"

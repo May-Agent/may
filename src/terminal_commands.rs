@@ -151,6 +151,9 @@ pub enum TerminalCommandsError {
     /// would go out unsigned.
     #[error(transparent)]
     Signing(#[from] crate::commit_signing::SigningError),
+    /// The session's pool of model-facing ids could not be built.
+    #[error(transparent)]
+    SessionIds(#[from] crate::db::ChatDbError),
 }
 
 /// Register every shared IPC command on the terminal tool's command registry,
@@ -203,7 +206,7 @@ where
         builder,
         &mut descriptions,
         SessionTool::new(
-            config.db.clone(),
+            config.may_dir.clone(),
             config.session_id.clone(),
             Some(SearchIndexer::new(
                 config.db.clone(),
@@ -422,7 +425,12 @@ where
             ImagineTool {
                 generator: imagine.generator,
                 artifacts_dir: imagine.artifacts_dir,
-                ids: config.db.model_ids().clone(),
+                ids: config
+                    .db
+                    .session_ids(&config.session_id)
+                    .await?
+                    .allocator()
+                    .clone(),
             },
         );
     }
