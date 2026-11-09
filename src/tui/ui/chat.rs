@@ -918,6 +918,26 @@ impl ChatStream {
             .zip(self.revisions.splice(start..end, []))
             .partition(|(element, _)| matches!(element, ChatElement::Error { .. }));
         let mut at = start;
+        // The previous turn left no result of its own (it was interrupted,
+        // resumed by a background command or ended on a question): its row
+        // takes this turn's work, so no two rows stand next to each other.
+        let mut folded = folded;
+        if let Some(index) = start.checked_sub(1)
+            && !folded.is_empty()
+            && let ChatElement::WorkedFor {
+                seconds: total,
+                elements,
+                ..
+            } = &mut self.elements[index]
+        {
+            *total += seconds;
+            elements.extend(
+                std::mem::take(&mut folded)
+                    .into_iter()
+                    .map(|(element, _)| element),
+            );
+            self.touch(index);
+        }
         // A single item is its own row: a group around it hides nothing.
         if let [_] = folded.as_slice() {
             for (element, revision) in folded {
@@ -5974,6 +5994,107 @@ mod tests {
             chat.elements.last(),
             Some(ChatElement::AssistantText { content, .. }) if content == "知道。はい。네."
         ));
+    }
+
+    fn work_turn(chat: &mut ChatStream, label: &str) {
+        chat.push_thinking(&format!("{label} thought"));
+        chat.push_tool(
+            format!("tool-{label}"),
+            ToolDisplay::Terminal {
+                description: String::new(),
+                command: format!("echo {label}"),
+                mode: TerminalExecutionMode::Default,
+                status: ToolStatus::Done,
+                output: None,
+                diffs: Vec::new(),
+                pinned: None,
+            },
+        );
+    }
+
+    fn worked_rows(chat: &ChatStream) -> Vec<(u64, usize)> {
+        let mut adjacent = false;
+        let mut previous_was_row = false;
+        let mut rows = Vec::new();
+        for element in &chat.elements {
+            if let ChatElement::WorkedFor {
+                seconds, elements, ..
+            } = element
+            {
+                adjacent |= previous_was_row;
+                previous_was_row = true;
+                rows.push((*seconds, elements.len()));
+            } else {
+                previous_was_row = false;
+            }
+        }
+        assert!(!adjacent, "two Worked for rows are adjacent: {rows:?}");
+        rows
+    }
+
+    /// Turns that end without a reply of their own (interrupted, resumed
+    /// by a background command, ended on a question) fold into one row
+    /// that the next result follows.
+    #[test]
+    fn resultless_turns_fold_into_one_row_before_the_next_result() {
+        // An interrupted turn, a background-resumed turn (no user message)
+        // and a turn ending on a question, then a normal turn.
+        let mut chat = ChatStream::new();
+        chat.push_user("実行して 运行 실행", Vec::new(), 0);
+        work_turn(&mut chat, "a");
+        chat.fold_turn_work(1800);
+        work_turn(&mut chat, "b");
+        chat.fold_turn_work(250);
+        work_turn(&mut chat, "c");
+        chat.fold_turn_work(5);
+        work_turn(&mut chat, "d");
+        chat.push_text("done 完成 완료");
+        chat.end_text();
+        chat.fold_turn_work(10);
+
+        assert_eq!(worked_rows(&chat), vec![(1800 + 250 + 5 + 10, 8)]);
+        assert!(matches!(
+            chat.elements.last(),
+            Some(ChatElement::AssistantText { .. })
+        ));
+
+        chat.toggle_expanded("work-0");
+        let open = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
+        for label in ["a", "b", "c", "d"] {
+            assert!(
+                open.iter().any(|l| l.contains(&format!("{label} thought"))
+                    || l.contains(&format!("echo {label}"))),
+                "{label} missing: {open:?}"
+            );
+        }
+    }
+
+    /// An interrupted run ends on its marker; the earlier resultless
+    /// turn folds with the interrupted turn's work ahead of it.
+    #[test]
+    fn interrupted_turn_after_resultless_turn_shares_one_row() {
+        let mut chat = ChatStream::new();
+        chat.push_user("hi", Vec::new(), 0);
+        work_turn(&mut chat, "a");
+        chat.fold_turn_work(1821);
+        work_turn(&mut chat, "b");
+        chat.push_text("\n\n[Interrupted]");
+        chat.end_text();
+        chat.fold_turn_work(250);
+        assert_eq!(worked_rows(&chat), vec![(2071, 4)]);
+    }
+
+    /// A turn with its own user message keeps its own row.
+    #[test]
+    fn separate_user_turns_keep_separate_rows() {
+        let mut chat = ChatStream::new();
+        chat.push_user("one", Vec::new(), 0);
+        work_turn(&mut chat, "a");
+        chat.fold_turn_work(3);
+        chat.push_user("two", Vec::new(), 1);
+        work_turn(&mut chat, "b");
+        chat.fold_turn_work(4);
+        assert_eq!(worked_rows(&chat), vec![(3, 2), (4, 2)]);
     }
 
     #[test]
