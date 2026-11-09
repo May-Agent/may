@@ -12,3 +12,11 @@ The remote branch {{ branch }} was deleted.
 {% when RemoteBranch::NotDeleted with (branch, reason) -%}
 The remote branch {{ branch }} was not deleted: {{ reason }}
 {% endmatch -%}
+{% for checkout in pull_sync -%}
+{% match checkout.failure -%}
+{% when Some with (reason) -%}
+The checkout {{ checkout.path }} was not synced: {{ reason }}
+{% when None -%}
+The checkout {{ checkout.path }} was synced.
+{% endmatch -%}
+{% endfor -%}

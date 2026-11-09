@@ -423,6 +423,8 @@ pub struct DaemonState {
     pub(crate) tool_dispatchers: UiToolDispatchers,
     pub(crate) fetched_models_cache: RefreshableCache<Vec<crate::models::FetchedModel>>,
     pub(crate) config: Arc<ArcSwap<MayConfig>>,
+    /// The limits every agent is built with, moved by each config change.
+    pub(crate) live_limits: crate::agent::LiveLimits,
     pub(crate) ui_event_bus: UiEventBus,
     pub(crate) container_prepare: ContainerPrepareTracker,
     pub(crate) container_manager: Option<Arc<crate::container::lifecycle::ContainerManager>>,
@@ -1349,6 +1351,7 @@ impl DaemonState {
             .await?
             .with_secret_store(SecretStore::in_memory(may_dir)),
         );
+        let live_limits = crate::agent::LiveLimits::of(&config);
         let config = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(config));
         Ok(Self {
             acp_host: std::sync::Arc::new(crate::agent::acp_subagent::AcpHosts::new(
@@ -1377,6 +1380,7 @@ impl DaemonState {
             tool_dispatchers,
             fetched_models_cache: RefreshableCache::new(Duration::from_secs(20)),
             config,
+            live_limits,
             ui_event_bus: ui_event_bus.clone(),
             container_prepare: ContainerPrepareTracker::new(ui_event_bus.clone()),
             container_manager: None,

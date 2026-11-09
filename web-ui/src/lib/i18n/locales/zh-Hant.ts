@@ -54,6 +54,7 @@ export const zhHant: Messages = {
       all: '你的 repo',
       unauthenticated: '此機器尚未登入 GitHub。請執行 `gh auth login` 後重新開啟此清單。',
     },
+    newChatInRepo: '在 {repo} 開始新對話',
     sessions: '會話',
     noSessions: '尚無會話',
     noSessionsInProfile: '這個 Profile 還沒有任何對話。',

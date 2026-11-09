@@ -35,6 +35,9 @@ pub enum ApiErrorCode {
     UnknownSshServer,
     /// The host has no usable GitHub login.
     GithubUnauthenticated,
+    /// The user declined, at the session's repository question, to work where
+    /// the session starts. The turn did not run; nothing failed.
+    RepoDeclined,
 }
 
 /// Structured error body with a machine-readable `code` and human-readable `error` message.

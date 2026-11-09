@@ -149,6 +149,36 @@ impl RepoTool {
     pub const fn new(context: RepoContext) -> Self {
         Self { context }
     }
+
+    /// Persist `level` for the repository of `worktree` and bind the session
+    /// to it at once, replacing a binding the earlier decision gave. The
+    /// decision also changes the workspace configuration, which the daemon's
+    /// agent fingerprint covers, so the next turn rebuilds the agent whether
+    /// or not the binding moved.
+    async fn set_trust(&self, worktree: &Path, level: TrustLevel) -> String {
+        let (config, worktree) = (config_path(&self.context), worktree.to_path_buf());
+        let bound = blocking::unblock(move || {
+            let kind = trust::repo_kind(&worktree);
+            trust::persist(&config, &worktree, Some(&kind), level)
+                .map_err(|error| format!("failed to persist: {error}"))?;
+            crate::session::RepoBinding::for_trust(&worktree, level)
+                .map_err(|error| format!("repository identity: {error}"))
+        })
+        .await;
+        let binding = match bound {
+            Ok(binding) => binding,
+            Err(message) => return message,
+        };
+        match self
+            .context
+            .db
+            .set_session_repo(&self.context.session_id, Some(&binding.to_stored()))
+            .await
+        {
+            Ok(()) => format!("trust set: {}", level.as_str()),
+            Err(error) => format!("trust set, but the session could not be bound: {error}"),
+        }
+    }
 }
 
 fn worktree_and_key(dir: &Path) -> Result<(PathBuf, PathBuf), String> {
@@ -186,32 +216,21 @@ impl Tool for RepoTool {
                     Ok(v) => v,
                     Err(e) => return Ok(ToolResult::text(e)),
                 };
-                set.map_or_else(
-                    || {
+                let Some(value) = set else {
+                    return Ok(ToolResult::text(
                         trust::trust_for(&self.context.workspace_config, &key, &worktree)
                             .map_or_else(
                                 || "trust undecided — the launch gate asks on startup; `repo trust set` decides it here".to_string(),
                                 |level| format!("trust: {}", level.as_str()),
-                            )
-                    },
-                    |value| {
-                        TrustLevel::parse(&value).map_or_else(
-                            || "level must be full, prs-only, local-branch or local".to_string(),
-                            |level| {
-                                let kind = trust::repo_kind(&worktree);
-                                match trust::persist(
-                                    &config_path(&self.context),
-                                    &worktree,
-                                    Some(&kind),
-                                    level,
-                                ) {
-                                    Ok(()) => format!("trust set: {}", level.as_str()),
-                                    Err(e) => format!("failed to persist: {e}"),
-                                }
-                            },
-                        )
-                    },
-                )
+                            ),
+                    ));
+                };
+                let Some(level) = TrustLevel::parse(&value) else {
+                    return Ok(ToolResult::text(
+                        "level must be full, prs-only, local-branch or local".to_string(),
+                    ));
+                };
+                self.set_trust(&worktree, level).await
             }
         }))
     }

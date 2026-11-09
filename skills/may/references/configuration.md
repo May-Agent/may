@@ -36,7 +36,7 @@ Anthropic and Google use their own wire formats; every other type speaks the Ope
 ## Agent behaviour
 
 - `max_iterations`: iterations per query, 0 (default) is unlimited.
-- `[context]`: auto-compaction. The point is `min(window * compact_at, compact_ceiling)` tokens; defaults `compact_at = 0.8`, `compact_ceiling = 400000`, `start_distance = 50000` (background compaction starts that many tokens before the point), `safe_buffer = 5000` (the agent pauses to let compaction finish), `warn_distance = 80000` (the agent is told once to save its work and compact).
+- `[context]`: auto-compaction. The agent pauses to let compaction finish at `min(window - handoff_reserve, compact_ceiling)` tokens; defaults `handoff_reserve = 20000` (tokens kept free for the compaction request and the handoff, whatever the window), `compact_ceiling = 400000`, `start_distance = 50000` (background compaction starts that many tokens before that point), `warn_distance = 80000` (the agent is told once to save its work and compact), `count_distance = 30000` (a model that counts through a provider endpoint is asked for an exact count within that many tokens of the warn point).
 - `[language]`: `communication` (language of replies, questions and recaps; unset follows the user's messages) and `working` (language written for others such as issue text; English when unset). Values are an English or native name or an ISO 639-3 code; an unknown name is rejected.
 - `[time] timezone`: IANA name; unset follows the host.
 - `[suggestions] enabled` (default true): a completed turn schedules a suggested next prompt shown as ghost text; Tab accepts it in the TUI.
@@ -48,6 +48,8 @@ Anthropic and Google use their own wire formats; every other type speaks the Ope
 - `[issue_approval]`: what publishing asks of the user, each `none`, `auto` (prompt approved if unanswered) or `required` (denied if unanswered). Defaults: `external_issue`, `external_pull_request`, `external_comment` = required; `bug` = none; `feature` = auto; `performance` = none. Owned repositories and comments on issues or PRs the user or agent opened are never prompted.
 - `[sandbox] command_priority`: `normal` (default), `low` (nice 10) or `lowest` (nice 19, background I/O) for local and container commands; SSH is unaffected.
 - `[host_load]`: when the agent is told the host is under memory pressure or load: `memory_threshold` (`warning` default or `critical`), `load_threshold`, and durations `start_after`, `end_after`, `poll_interval`, `high_load_foreground_wait` written as `"30s"`, `"1m"`; defaults come from aither. A change reaches a session at its next turn.
+- `[tasks]`: `line_limit` (default 60), the lines an agent's `tasks.md`, a subagent's included, may hold before the agent is asked to rewrite it. A change applies to running sessions at once.
+- `[disk]`: free bytes of the home environment's volume below which the agent is told the disk is low: `yellow_free_bytes` (default 10 GiB), `red_free_bytes` (5 GiB) and `final_free_bytes` (3 GiB). A change applies to running sessions at once.
 
 ## Connections
 

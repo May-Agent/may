@@ -16,6 +16,10 @@ pub struct RepoCloneRow {
     pub source: String,
     /// Whether the clone came from a local checkout.
     pub local: bool,
+    /// The commit the clone's work stacks on when it was based on its
+    /// checkout's work in progress; `None` when it starts at the source's
+    /// own HEAD.
+    pub base_sha: Option<String>,
 }
 
 impl ChatDb {
@@ -29,7 +33,7 @@ impl ChatDb {
     ) -> Result<Vec<RepoCloneRow>, ChatDbError> {
         Ok(query!(
             self.db,
-            "SELECT repo_key, dir, source, local FROM session_repo_clones WHERE session_id = ? ORDER BY rowid",
+            "SELECT repo_key, dir, source, local, base_sha FROM session_repo_clones WHERE session_id = ? ORDER BY rowid",
             session_id
         )
         .fetch_all::<RepoCloneRow>()
@@ -48,12 +52,13 @@ impl ChatDb {
     ) -> Result<(), ChatDbError> {
         query!(
             self.db,
-            "INSERT INTO session_repo_clones (session_id, repo_key, dir, source, local) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO session_repo_clones (session_id, repo_key, dir, source, local, base_sha) VALUES (?, ?, ?, ?, ?, ?)",
             session_id,
             row.repo_key.as_str(),
             row.dir.as_str(),
             row.source.as_str(),
-            row.local
+            row.local,
+            row.base_sha.as_deref()
         )
         .execute()
         .await?;

@@ -93,7 +93,8 @@ impl AutoIndexer {
         for entry in hot_set(usage, now) {
             let path = entry.path();
             if worktree_root(&path).as_ref() != Some(&path) {
-                let _ = self.db.forget_repo_usage(&path).await;
+                // The record stays until it expires: the post-merge sync
+                // reports a checkout that is gone.
                 self.touched.remove(&path);
                 continue;
             }
@@ -159,6 +160,7 @@ mod tests {
             worktree: worktree.to_string(),
             last_used_at,
             use_count,
+            owner_repo: None,
         }
     }
 

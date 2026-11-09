@@ -445,7 +445,7 @@ mod tests {
     async fn registry_with_job(pid: u32, _task_id: &str) -> (JobRegistry, String) {
         let (registry, service) = aither_sandbox::job_registry_channel();
         tokio::spawn(service.serve());
-        let task_id = aither_core::ids::AnyIdAllocator::default()
+        let task_id = aither_core::AnyIdAllocator::default()
             .lease()
             .expect("a free task id");
         let word = task_id.to_string();

@@ -68,6 +68,9 @@ pub enum AgentLinkError {
     /// `tasks.md` could not be read.
     #[error("failed to read tasks.md: {0}")]
     Tasks(#[source] std::io::Error),
+    /// A session's stored repository binding is malformed.
+    #[error(transparent)]
+    Binding(#[from] crate::session::BindingError),
     /// No live agent matches the name.
     #[error("no live agent named \"{0}\"; run `agent list`")]
     NoSuchAgent(String),
@@ -188,7 +191,13 @@ impl AgentDirectory {
             );
             let tasks = paths.tasks_content().await.map_err(AgentLinkError::Tasks)?;
             let state = self.runtime_service.get(&session.id).await?.state;
+            let binding = session
+                .repo
+                .as_deref()
+                .map(crate::session::RepoBinding::parse)
+                .transpose()?;
             live.push(AgentTasks {
+                binding,
                 status: AgentStatus {
                     name: session.title.clone().unwrap_or_else(|| session.id.clone()),
                     session_id: session.id.clone(),
@@ -252,6 +261,8 @@ impl AgentDirectory {
 #[derive(Debug, Clone)]
 pub(crate) struct AgentTasks {
     pub(crate) status: AgentStatus,
+    /// The repository the session is bound to, if it is.
+    pub(crate) binding: Option<crate::session::RepoBinding>,
     /// The session's `workspace.toml`.
     pub(crate) workspace_config: PathBuf,
     pub(crate) tasks_path: PathBuf,
@@ -637,13 +648,10 @@ impl Tool for AgentTool {
                 if body.trim().is_empty() {
                     return Err(AgentLinkError::EmptyMessage(path).into());
                 }
-                if let Some(guard) = &self.languages
-                    && let Err(refusal) =
-                        guard.check_working(body.trim(), aither_agent::WorkingText::Internal)
-                {
-                    return Ok(ToolResult::error(
-                        aither_agent::AnyNotices::default().language_refusal(&refusal),
-                    ));
+                if let Some(guard) = &self.languages {
+                    guard
+                        .check_working(body.trim(), aither_agent::WorkingText::Internal)
+                        .map_err(crate::agent::notices::language_refused)?;
                 }
                 let recipient = self
                     .messaging

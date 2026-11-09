@@ -4,11 +4,11 @@ These are TUI commands. The web UI has no slash palette: its composer treats onl
 
 ## How they are entered
 
-Typing `/` in the TUI input opens a palette filtered as you type. Enter on a palette item runs the command at once; the line never reaches the agent. A slash line sent without choosing from the palette is an ordinary message, except these forms that take arguments and are parsed from the typed line: `/compact [focus]`, `/context`, `/context dump`, `/model [query]`, `/connect [command args]`, `/resume-codex [query]`, `/resume-claude [query]`, `/import-claude`, `/import-codex`, `/secret KEY VALUE`, `/bug`. Choosing `/resume-codex` or `/secret` from the palette only puts the command in the input so arguments can be typed. The palette and the `/help` screen list the same commands, from one table.
+Typing `/` in the TUI input opens a palette filtered as you type. Enter on a palette item runs the command at once; the line never reaches the agent. A slash line sent without choosing from the palette is an ordinary message, except these forms that take arguments and are parsed from the typed line: `/new <owner/repo or path>`, `/compact [focus]`, `/context`, `/context dump`, `/model [query]`, `/connect [command args]`, `/resume-codex [query]`, `/resume-claude [query]`, `/import-claude`, `/import-codex`, `/secret KEY VALUE`, `/bug`. Choosing `/resume-codex` or `/secret` from the palette only puts the command in the input so arguments can be typed. The palette and the `/help` screen list the same commands, from one table.
 
 ## Sessions and profiles
 
-- `/new` starts a new session (also Ctrl+N).
+- `/new` starts a new session (also Ctrl+N). `/new <owner/repo or path>` starts it directly on that repository, like `may --repo`.
 - `/session` opens the recent-session list (search by typing; Enter opens; Tab / Shift+Tab switch profile when more than one exists). `/archive` opens the archived list; opening an archived session unarchives it.
 - `/profile` opens the profile picker (also Ctrl+P); with a single profile it opens the session list instead. See `profiles.md`.
 - `/rewind` opens a picker of the session's earlier prompts (also Esc twice when idle). Choosing one truncates the conversation to before that prompt and puts its text and attachments back in the input for editing; "(current)" cancels. Refused with a notice while a turn is running, and when there are no prompts.

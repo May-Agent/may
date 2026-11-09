@@ -1264,11 +1264,7 @@ mod tests {
             BTreeMap::from([("fake".to_string(), fake_connection())]),
         );
         let tool = acp
-            .register(
-                SubagentTool::new(NoLlm)
-                    .with_definitions(crate::bundle::bundled_subagents())
-                    .with_base_dir(dir.path()),
-            )
+            .register(SubagentTool::new(NoLlm).with_base_dir(dir.path()))
             .expect("the name is free");
         assert!(
             tool.usage().await.contains("- fake: a scripted ACP agent"),
@@ -1292,12 +1288,10 @@ mod tests {
         assert!(text.contains("ab"), "the agent's reply comes back: {text}");
 
         let id = text
-            .split("subagent resume --id ")
-            .nth(1)
+            .split_once("--id ")
+            .and_then(|(_, rest)| rest.split(|c: char| !c.is_ascii_lowercase()).next())
+            .filter(|word| !word.is_empty())
             .expect("the result carries the continuation id")
-            .split('`')
-            .next()
-            .expect("split yields a first part")
             .to_string();
         let again = tokio::time::timeout(
             Duration::from_secs(60),
@@ -1359,7 +1353,7 @@ mod tests {
             BTreeMap::from([("explore".to_string(), fake_connection())]),
         );
         let error = acp
-            .register(SubagentTool::new(NoLlm).with_definitions(crate::bundle::bundled_subagents()))
+            .register(SubagentTool::new(NoLlm))
             .map(|_| ())
             .expect_err("the built-in type keeps its name");
         assert!(error.to_string().contains("built-in"), "{error}");

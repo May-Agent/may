@@ -14,7 +14,7 @@ use aither_cloud::{
 };
 use aither_core::LanguageModel;
 use aither_core::llm::{
-    Event as LlmEvent, LLMRequest,
+    Event as LlmEvent, GenerateError, LLMRequest, TokenCounting,
     model::{Ability, Parameters, Profile as ModelProfile, ReasoningEffort},
 };
 use futures_lite::{Stream, StreamExt as _};
@@ -73,9 +73,10 @@ fn resolve_model_selector(
 /// with the secret's name before the request reaches the inner model.
 ///
 /// The secrets are read when each request is sent, so one added mid-session
-/// applies from its next request. Only `respond` is forwarded: every other
-/// entry point of the trait (tool-carrying and structured requests) is
-/// defined in terms of it, so no request can bypass the redaction.
+/// applies from its next request. `respond` and the endpoint token count
+/// redact the request they send; every other entry point of the trait
+/// (tool-carrying and structured requests) is defined in terms of `respond`,
+/// so no request can bypass the redaction.
 #[derive(Debug, Clone)]
 pub struct RedactedModel<M> {
     inner: M,
@@ -131,6 +132,28 @@ where
             profile.context_length = window;
         }
         Ok(profile)
+    }
+
+    fn token_counting(&self) -> TokenCounting {
+        self.inner.token_counting()
+    }
+
+    /// Counts the redacted request: an endpoint count sends it to the
+    /// provider.
+    fn count_tokens(
+        &self,
+        request: &LLMRequest,
+    ) -> impl Future<Output = Result<Option<u32>, GenerateError<M::Error>>> + Send {
+        let mut request = request.clone();
+        async move {
+            self.redactor.current().await.redact_request(&mut request);
+            self.inner.count_tokens(&request).await
+        }
+    }
+
+    /// Counts model output, which holds no secret to redact.
+    fn count_text(&self, text: &str) -> Option<u32> {
+        self.inner.count_text(text)
     }
 }
 

@@ -463,12 +463,10 @@ impl Tool for BtwTool {
         if question.is_empty() {
             return Err(AgentLinkError::EmptyQuestion.into());
         }
-        if let Some(guard) = &self.command.languages
-            && let Err(refusal) = guard.check_working(question, aither_agent::WorkingText::Internal)
-        {
-            return Ok(ToolResult::error(
-                aither_agent::AnyNotices::default().language_refusal(&refusal),
-            ));
+        if let Some(guard) = &self.command.languages {
+            guard
+                .check_working(question, aither_agent::WorkingText::Internal)
+                .map_err(crate::agent::notices::language_refused)?;
         }
         let answer = self
             .command
