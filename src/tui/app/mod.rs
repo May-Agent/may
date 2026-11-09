@@ -4237,10 +4237,15 @@ impl App {
                 summary,
                 arguments,
             } => ToolDisplay::Action {
+                // A compaction takes no arguments and has nothing to expand.
+                detail: if name == super::agent_event_adapter::COMPACT_TOOL {
+                    Vec::new()
+                } else {
+                    pretty_arguments(&arguments)
+                },
                 chip: name,
                 task_id: None,
                 summary,
-                detail: pretty_arguments(&arguments),
                 status: super::ui::chat::ToolStatus::Running,
                 output: None,
                 pinned: None,

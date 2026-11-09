@@ -17,6 +17,7 @@ use ratatui::{
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use super::super::agent_event_adapter::COMPACT_TOOL;
 use super::super::queue::Attachment;
 use super::band;
 use super::chat_layout::{self, ChatLayout};
@@ -1185,6 +1186,14 @@ impl ChatStream {
                             image: None,
                         });
                     }
+                }
+                ToolDisplay::Action {
+                    status: s, chip, ..
+                } if chip == COMPACT_TOOL => {
+                    // A compaction is a status row with nothing to expand, so
+                    // its result text is not kept; a refusal arrives as a
+                    // failed status from the tool's typed error.
+                    *s = status;
                 }
                 ToolDisplay::Action {
                     status: s,
@@ -3722,6 +3731,7 @@ fn semantic_headline(name: &str, summary: &str) -> (String, String) {
             },
         ),
         "webfetch" | "web_fetch" => ("Fetched".to_string(), summary.to_string()),
+        COMPACT_TOOL => ("Compaction".to_string(), String::new()),
         _ => (format!("[{name}]"), summary.to_string()),
     }
 }
@@ -6773,5 +6783,46 @@ mod tests {
                 .collect();
             println!("{line}");
         }
+    }
+
+    fn compact_row(status: ToolStatus, result: Option<&str>) -> (Vec<String>, usize) {
+        let mut chat = ChatStream::new();
+        chat.push_tool(
+            "c1".to_string(),
+            ToolDisplay::Action {
+                chip: "compact".to_string(),
+                task_id: None,
+                summary: String::new(),
+                detail: Vec::new(),
+                status: ToolStatus::Running,
+                output: None,
+                pinned: None,
+            },
+        );
+        chat.update_tool_with_output("c1", status, result);
+        rows_and_regions(&chat)
+    }
+
+    /// A compaction is one status row: a tick when it started, a cross
+    /// with the refusal when the tool returned its typed error, and nothing
+    /// to expand either way.
+    #[test]
+    fn a_compaction_is_a_one_line_status_row() {
+        let (rows, regions) = compact_row(
+            ToolStatus::Done,
+            Some("Compaction started in the background."),
+        );
+        assert_eq!(rows, ["  ✓ Compaction"]);
+        assert_eq!(regions, 0);
+
+        let (rows, regions) = compact_row(
+            ToolStatus::Failed("Nothing was started: the context is too small.".to_string()),
+            None,
+        );
+        assert_eq!(
+            rows,
+            ["  ✗ Compaction — failed: Nothing was started: the context is too small."]
+        );
+        assert_eq!(regions, 0);
     }
 }
