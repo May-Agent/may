@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use ignore::WalkBuilder;
 use nucleo::{Config, Nucleo, Utf32String};
 
+use super::slash::SlashCommand;
+
 /// A completion item.
 #[derive(Debug, Clone)]
 pub struct CompletionItem {
@@ -26,79 +28,6 @@ pub enum CompletionMode {
     /// File mention completion (@).
     File,
 }
-
-/// Slash command definitions.
-pub static SLASH_COMMANDS: &[(&str, &str)] = &[
-    ("/help", "Show commands and shortcuts"),
-    ("/session", "Switch or create sessions"),
-    ("/new", "Start a new session"),
-    ("/profile", "Switch profile (Ctrl+P)"),
-    ("/model", "Switch model for this session"),
-    ("/effort", "Adjust reasoning effort for this session"),
-    ("/sandbox", "Open sandbox folder in Finder"),
-    ("/compact", "Compact conversation history"),
-    ("/recap", "Catch-up summary of this session"),
-    ("/context", "Show context window usage"),
-    ("/usage", "Show session API usage and cost"),
-    (
-        "/context dump",
-        "Dump the verbatim assembled context to a file",
-    ),
-    (
-        "/rewind",
-        "Rewind to an earlier prompt (conversation, optionally code too)",
-    ),
-    ("/jobs", "Background jobs and running subagents"),
-    ("/questions", "Answer the questions the agent left open"),
-    (
-        "/yolo",
-        "Toggle granting every approval request in this session",
-    ),
-    (
-        "/sleep",
-        "Tell every session you are asleep: agents keep working and collect questions",
-    ),
-    ("/sleep off", "End the sleep state"),
-    (
-        "/btw",
-        "Ask a side question without touching conversation history",
-    ),
-    (
-        "/resume-codex",
-        "Import a Codex transcript into a new session",
-    ),
-    (
-        "/resume-claude",
-        "Import a Claude Code session (opens picker)",
-    ),
-    (
-        "/import-claude",
-        "Import Claude Code's global rules and skills",
-    ),
-    ("/import-codex", "Import Codex's global rules and skills"),
-    (
-        "/secret",
-        "Store a secret in the OS keychain (injected into shell env)",
-    ),
-    (
-        "/connect",
-        "Use an installed ACP agent as a subagent (or /connect <command> [args])",
-    ),
-    ("/mcp", "Manage MCP servers"),
-    ("/ssh", "Manage preconfigured SSH servers"),
-    ("/skill", "Manage installed skills"),
-    ("/permission", "Re-decide the launch directory's access"),
-    ("/config", "Open configuration"),
-    (
-        "/login",
-        "Sign in to a provider account (OpenAI, Grok, OpenRouter)",
-    ),
-    (
-        "/bug",
-        "Save a bug snapshot (recent logs + session info) to ~/.may/bugs",
-    ),
-    ("/quit", "Exit May"),
-];
 
 /// Completion state.
 pub struct Completion {
@@ -253,21 +182,25 @@ impl Completion {
     /// Update slash command items based on query.
     fn update_slash_items(&mut self) {
         let query_lower = self.query.to_lowercase();
-        self.items = SLASH_COMMANDS
-            .iter()
-            .filter(|(cmd, _)| {
-                if query_lower.is_empty() {
-                    true
-                } else {
-                    cmd.to_lowercase().contains(&query_lower)
-                }
+        self.items = SlashCommand::ALL
+            .into_iter()
+            .map(SlashCommand::spec)
+            .filter(|spec| {
+                query_lower.is_empty() || spec.name.to_lowercase().contains(&query_lower)
             })
-            .map(|(cmd, desc)| CompletionItem {
-                label: cmd.to_string(),
-                insert: cmd.to_string(),
-                description: desc.to_string(),
+            .map(|spec| CompletionItem {
+                label: spec.name.to_string(),
+                insert: spec.name.to_string(),
+                description: spec.description.to_string(),
             })
             .collect();
+    }
+
+    /// The labels of the current items.
+    #[cfg(test)]
+    #[must_use]
+    pub fn labels(&self) -> Vec<&str> {
+        self.items.iter().map(|item| item.label.as_str()).collect()
     }
 
     /// Initialize file matcher with files from directories.
@@ -441,7 +374,7 @@ mod tests {
     #[test]
     fn slash_prefix_still_accepts_enter() {
         let mut completion = Completion::new();
-        completion.start_slash("res");
+        completion.start_slash("resu");
         assert!(completion.has_matches());
         assert_eq!(
             completion.complete().map(|item| item.insert.as_str()),

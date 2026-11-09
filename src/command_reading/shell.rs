@@ -1,5 +1,7 @@
 //! Walks the parsed script and turns each command into a step.
 
+use std::path::Path;
+
 use brush_parser::ast::{
     AndOrList, Command, CommandPrefixOrSuffixItem, IoFileRedirectKind, IoFileRedirectTarget,
     IoHereDocument, IoRedirect, Pipeline, PipelineOperator, SeparatorOperator, SimpleCommand,
@@ -38,7 +40,7 @@ struct Simple {
     stdin: Option<String>,
 }
 
-pub(super) fn read(script: &str) -> CommandReading {
+pub(super) fn read(script: &str, dir: Option<&Path>) -> CommandReading {
     let parsed = Parser::new(
         script.as_bytes(),
         &ParserOptions::default(),
@@ -61,7 +63,7 @@ pub(super) fn read(script: &str) -> CommandReading {
             if matches!(item.1, SeparatorOperator::Async) {
                 steps.push(unknown(link, item.0.to_string()));
             } else {
-                and_or(&item.0, link, &mut steps);
+                and_or(&item.0, link, dir, &mut steps);
             }
         }
     }
@@ -72,18 +74,18 @@ fn unknown(link: Link, source: String) -> Step {
     Step::new(link, Intent::Unknown { source })
 }
 
-fn and_or(list: &AndOrList, first: Link, steps: &mut Vec<Step>) {
+fn and_or(list: &AndOrList, first: Link, dir: Option<&Path>, steps: &mut Vec<Step>) {
     for (index, (operator, pipeline)) in list.iter().enumerate() {
         let link = match (index, operator) {
             (0, _) => first,
             (_, PipelineOperator::And) => Link::And,
             (_, PipelineOperator::Or) => Link::Or,
         };
-        self::pipeline(pipeline, link, steps);
+        self::pipeline(pipeline, link, dir, steps);
     }
 }
 
-fn pipeline(pipeline: &Pipeline, first: Link, steps: &mut Vec<Step>) {
+fn pipeline(pipeline: &Pipeline, first: Link, dir: Option<&Path>, steps: &mut Vec<Step>) {
     if pipeline.bang || pipeline.timed.is_some() {
         steps.push(unknown(first, pipeline.to_string()));
         return;
@@ -108,7 +110,7 @@ fn pipeline(pipeline: &Pipeline, first: Link, steps: &mut Vec<Step>) {
             && sink.stdin.is_none()
             && let Some(text) = &feed.stdin
         {
-            let intent = patch::parse(text).map_or_else(
+            let intent = patch::parse(text, dir).map_or_else(
                 || Intent::Unknown {
                     source: format!("{} | {}", pipeline.seq[index], pipeline.seq[index + 1]),
                 },
@@ -119,7 +121,7 @@ fn pipeline(pipeline: &Pipeline, first: Link, steps: &mut Vec<Step>) {
             continue;
         }
         let intents = stages[index].as_ref().and_then(|simple| {
-            recognise::recognise(&simple.name, &simple.args, simple.stdin.as_deref())
+            recognise::recognise(&simple.name, &simple.args, simple.stdin.as_deref(), dir)
         });
         match intents {
             Some(intents) => {

@@ -3,12 +3,9 @@
 use std::sync::Arc;
 
 use skyzen::Result as SkyResult;
-use skyzen::routing::Params;
 use skyzen::utils::{Json, State};
 
-use crate::ui_event_bus::UiEventTopics;
-
-use super::error::{bad_request_error, internal_error};
+use super::error::internal_error;
 use super::state::DaemonState;
 
 // ── Request/response types ──────────────────────────────
@@ -31,15 +28,6 @@ pub(super) struct SubscribeRequest {
 #[serde(rename_all = "camelCase")]
 pub(super) struct UnsubscribeRequest {
     pub endpoint: String,
-}
-
-#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub(super) struct SendNotificationRequest {
-    pub title: String,
-    pub body: String,
-    #[serde(default)]
-    pub session_id: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
@@ -98,31 +86,6 @@ pub(super) async fn unsubscribe(
     Ok(Json(super::types::API_OK))
 }
 
-/// POST /api/notifications — dispatch a notification with an optional
-/// session association; clients use it for open-question nudges.
-pub(super) async fn send_notification(
-    Json(req): Json<SendNotificationRequest>,
-    State(state): State<Arc<DaemonState>>,
-) -> SkyResult<Json<super::types::NotificationSentResponse>> {
-    let sent = state
-        .notification_service
-        .send_payload(crate::notification::NotificationPayload {
-            notification_id: None,
-            title: req.title,
-            body: req.body,
-            session_id: req.session_id,
-            callback_context_xml: None,
-            callback_message: None,
-        })
-        .await
-        .map_err(internal_error)?;
-
-    Ok(Json(super::types::NotificationSentResponse {
-        ok: true,
-        sent,
-    }))
-}
-
 /// POST /api/push/test — send a test notification to all subscribers.
 pub(super) async fn test_notification(
     Json(req): Json<TestNotificationRequest>,
@@ -152,89 +115,6 @@ pub(super) async fn list_notification_mailbox(
         .map(super::types::NotificationMailboxEntryResponse::from)
         .collect();
     Ok(Json(super::types::NotificationMailboxResponse { items }))
-}
-
-pub(super) async fn consume_notification_callback(
-    params: Params,
-    State(state): State<Arc<DaemonState>>,
-) -> SkyResult<Json<super::types::NotificationCallbackResponse>> {
-    let id = params.get("id").map_err(bad_request_error)?.to_string();
-    let callback = state
-        .db()
-        .consume_notification_callback(&id)
-        .await
-        .map_err(|error| match error {
-            crate::db::ChatDbError::RowNotFound(_) => {
-                skyzen::Error::msg("notification mailbox entry not found")
-                    .set_status(skyzen::StatusCode::NOT_FOUND)
-            }
-            other => internal_error(other),
-        })?;
-    state.notify_ui_events(UiEventTopics::NOTIFICATION_MAILBOX);
-
-    let mut target_session_id = callback.session_id.clone();
-    if callback.callback_consumed && callback.has_callback {
-        let source_session_id = callback.session_id.as_deref().ok_or_else(|| {
-            bad_request_error("notification callback is missing its source session")
-        })?;
-        let source = state
-            .db()
-            .get_session(source_session_id)
-            .await
-            .map_err(internal_error)?
-            .ok_or_else(|| bad_request_error("notification callback source session not found"))?;
-        let profile_id = callback
-            .profile_id
-            .as_deref()
-            .or(source.profile_id.as_deref())
-            .ok_or_else(|| bad_request_error("notification callback source profile not found"))?;
-        let model = source
-            .model
-            .as_deref()
-            .ok_or_else(|| bad_request_error("notification callback source model not found"))?;
-        let new_session_id =
-            super::sessions::create_session_for_profile(&state, None, Some(profile_id), model)
-                .await?;
-        let now = jiff::Timestamp::now().to_string();
-        if let Some(context) = callback.callback_context_xml.as_deref() {
-            state
-                .db()
-                .append_message(
-                    &new_session_id,
-                    crate::session::MessageRole::System,
-                    context,
-                    Some(now.as_str()),
-                    crate::db::MessageMeta::default(),
-                )
-                .await
-                .map_err(internal_error)?;
-        }
-        if let Some(welcome) = callback.callback_message.as_deref() {
-            state
-                .db()
-                .append_message(
-                    &new_session_id,
-                    crate::session::MessageRole::Assistant,
-                    welcome,
-                    Some(now.as_str()),
-                    crate::db::MessageMeta::default(),
-                )
-                .await
-                .map_err(internal_error)?;
-        }
-        target_session_id = Some(new_session_id);
-        state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS | UiEventTopics::SESSION_RUNTIMES);
-    }
-
-    Ok(Json(super::types::NotificationCallbackResponse {
-        notification_id: callback.id,
-        session_id: target_session_id,
-        profile_id: callback.profile_id,
-        has_callback: callback.has_callback,
-        callback_consumed: callback.callback_consumed,
-        callback_context_xml: callback.callback_context_xml,
-        callback_message: callback.callback_message,
-    }))
 }
 
 pub(super) async fn list_network_access_logs(

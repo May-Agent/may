@@ -77,7 +77,11 @@ pub(super) async fn start_sleep(
 pub(super) async fn end_sleep(
     State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<SleepStatus>> {
-    state.sleep.wake().await.map_err(internal_error)?;
+    state
+        .sleep
+        .wake(jiff::Timestamp::now())
+        .await
+        .map_err(internal_error)?;
     Ok(Json(state.sleep.status().await))
 }
 

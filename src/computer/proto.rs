@@ -11,6 +11,9 @@ use crate::config::StreamCodec;
 pub enum AgentRequest {
     /// TCC grant state of the agent process.
     Preflight,
+    /// Raise the system prompts for the missing grants. The agent runs from
+    /// its app bundle, which is where TCC credits a request.
+    RequestPermissions,
     /// Create the session's display if needed; report its id and size.
     EnsureDisplay { session_id: String },
     /// Destroy the session's display (session ended).

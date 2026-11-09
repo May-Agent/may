@@ -4,14 +4,21 @@
 //! literal where it matters, or a shape it was not written for returns
 //! `None`, and the command stays unknown.
 
+use std::path::Path;
+
 use super::shell::Arg;
 use super::{BuildTool, Intent, ListTool, ReadRange, SearchTool, patch};
 
-pub(super) fn recognise(name: &str, args: &[Arg], stdin: Option<&str>) -> Option<Vec<Intent>> {
+pub(super) fn recognise(
+    name: &str,
+    args: &[Arg],
+    stdin: Option<&str>,
+    dir: Option<&Path>,
+) -> Option<Vec<Intent>> {
     if name == "apply_patch" {
         return match (args, stdin) {
             ([], Some(text)) => Some(vec![Intent::Edit {
-                files: patch::parse(text)?,
+                files: patch::parse(text, dir)?,
             }]),
             _ => None,
         };

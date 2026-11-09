@@ -51,7 +51,13 @@ jobs:
         if: runner.os == 'Linux' && runner.arch == 'X64'
         run: sudo apt-get update && sudo apt-get install -y nasm
       - id: refs
-        run: cargo run --locked --example container_image -- refs >> "$GITHUB_OUTPUT"
+        run: cargo run --locked --example container_image --timings -- refs >> "$GITHUB_OUTPUT"
+      - name: Upload cargo timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-timings-container-image-refs
+          path: target/cargo-timings/
 
   base:
     needs: refs
@@ -167,7 +173,13 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y nasm
       - name: Stage the workspace context
         if: steps.exists.outputs.exists != 'true'
-        run: cargo run --locked --example container_image -- stage ${{ matrix.arch }} ./container/workspace
+        run: cargo run --locked --example container_image --timings -- stage ${{ matrix.arch }} ./container/workspace
+      - name: Upload cargo timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-timings-container-image-stage-${{ matrix.arch }}
+          path: target/cargo-timings/
       - name: Build and push linux/${{ matrix.arch }}
         if: env.CAN_PUSH == 'true' && steps.exists.outputs.exists != 'true'
         run: |

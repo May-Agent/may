@@ -3,6 +3,7 @@
 //! Single global database at `~/.may/history.db` containing all sessions and messages.
 
 mod cache_misses;
+mod ci;
 mod common;
 mod context_snapshot;
 pub mod entity;
@@ -35,12 +36,13 @@ use crate::PermissionHistoryMode;
 use sql as db_sql;
 
 pub use cache_misses::PromptCacheRequest;
+pub use ci::{CiBaselineRow, CiFindingRow, CiJobRow, CiPrRunRow, CiStepRow, CiTestRow, NewCiJob};
 pub use common::{
     AssistantCacheUsageSummary, ChatDbError, ContextDebugSnapshot, ContextDebugSnapshotMessage,
     CreateProfileParams, CreateScheduledTaskParams, MessageStatsParams, NetworkAccessLogParams,
-    NetworkAccessMode, NetworkAccessSource, NotificationCallbackConsumeResult,
-    PendingWorkspaceLookup, ProfileEnvironmentKind, RequestLogParams, SessionContextSnapshotUpsert,
-    StoredSessionContextSnapshot, TranscriptEntry, UpdateProfileParams, UpdateScheduledTaskParams,
+    NetworkAccessMode, NetworkAccessSource, PendingWorkspaceLookup, ProfileEnvironmentKind,
+    RequestLogParams, SessionContextSnapshotUpsert, StoredSessionContextSnapshot, TranscriptEntry,
+    UpdateProfileParams, UpdateScheduledTaskParams,
 };
 pub use context_snapshot::ContextDebugSnapshotWrite;
 pub use issue_provenance::{IssueProvenanceRecord, NewIssueProvenance, UserMessageAt};
@@ -57,7 +59,7 @@ pub use session_run::RunFence;
 use common::{
     AskUserRequestMessageRow, AskUserRequestQuestionOptionRow, AskUserRequestQuestionRow,
     I64ValueRow, PermissionRequestMessageRow, SnapshotMigrationRow, SqliteTableInfoRow,
-    db_custom_error, overflow_error, row_not_found, storage_error, to_i32, to_i64_from_u64,
+    db_custom_error, overflow_error, storage_error, to_i32, to_i64_from_u64,
 };
 
 macro_rules! query {
@@ -102,6 +104,8 @@ impl ChatDb {
         Self::initialize_schema(&db).await?;
         Self::ensure_profile_preference_columns(&db).await?;
         Self::ensure_session_columns(&db).await?;
+        Self::ensure_repo_clone_base_column(&db).await?;
+        Self::ensure_repo_usage_owner_column(&db).await?;
         Self::ensure_message_columns(&db).await?;
         Self::ensure_ask_user_blocking_column(&db).await?;
         Self::ensure_ask_user_secret_columns(&db).await?;
@@ -116,6 +120,8 @@ impl ChatDb {
         Self::migrate_removed_waiting_terminal_input(&db).await?;
         Self::ensure_search_outbox(&db).await?;
         Self::ensure_session_interval_triggers(&db).await?;
+        Self::migrate_notification_mailbox(&db).await?;
+        Self::migrate_attachment_upload_urls(&db, db_path).await?;
         Ok(Self {
             db,
             #[cfg(test)]
@@ -127,6 +133,40 @@ impl ChatDb {
     #[cfg(test)]
     pub(crate) async fn execute_for_test(&self, sql: &str) -> Result<(), ChatDbError> {
         query!(self.db, sql).execute().await?;
+        Ok(())
+    }
+
+    /// A clone based on its checkout's work in progress records the base
+    /// commit its session's work stacks on.
+    async fn ensure_repo_clone_base_column(db: &SkyDb) -> Result<(), ChatDbError> {
+        let columns = query!(
+            db,
+            "SELECT name FROM pragma_table_info('session_repo_clones')"
+        )
+        .fetch_all::<SqliteTableInfoRow>()
+        .await?;
+        if !columns.iter().any(|column| column.name == "base_sha") {
+            query!(
+                db,
+                "ALTER TABLE session_repo_clones ADD COLUMN base_sha TEXT"
+            )
+            .execute()
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// A used checkout records the GitHub repository it belonged to, so the
+    /// post-merge sync can still name it once its directory is gone.
+    async fn ensure_repo_usage_owner_column(db: &SkyDb) -> Result<(), ChatDbError> {
+        let columns = query!(db, "SELECT name FROM pragma_table_info('repo_usage')")
+            .fetch_all::<SqliteTableInfoRow>()
+            .await?;
+        if !columns.iter().any(|column| column.name == "owner_repo") {
+            query!(db, "ALTER TABLE repo_usage ADD COLUMN owner_repo TEXT")
+                .execute()
+                .await?;
+        }
         Ok(())
     }
 
@@ -308,7 +348,13 @@ impl ChatDb {
             .map(|column| column.name.as_str())
             .collect::<std::collections::BTreeSet<_>>();
 
-        for column in ["attachments", "reasoning", "tool_calls", "translation"] {
+        for column in [
+            "attachments",
+            "reasoning",
+            "tool_calls",
+            "translation",
+            "thinking",
+        ] {
             if !existing.contains(column) {
                 let sql = format!("ALTER TABLE messages ADD COLUMN {column} TEXT");
                 query!(db, sql.as_str()).execute().await?;
@@ -365,6 +411,117 @@ impl ChatDb {
         Ok(())
     }
 
+    /// Idempotent data migration: uploaded attachments once carried their
+    /// bytes as a base64 `uploadDataUrl` in `messages.attachments` and in
+    /// `session_pending_message_attachments.upload_data_url`. The daemon
+    /// already stores each upload under the session's `files/`; this strips
+    /// the inline bytes and points the attachment URL at the file route,
+    /// decoding and writing the file when it never landed on disk.
+    async fn migrate_attachment_upload_urls(
+        db: &SkyDb,
+        db_path: &std::path::Path,
+    ) -> Result<(), ChatDbError> {
+        let Some(may_dir) = db_path.parent() else {
+            return Ok(());
+        };
+        let home = crate::session::layout::MayHomePaths::new(may_dir.to_path_buf());
+
+        let rows = query!(
+            db,
+            "SELECT id, session_id, attachments FROM messages WHERE attachments LIKE '%uploadDataUrl%'"
+        )
+        .fetch_all::<MigrationMessageRow>()
+        .await?;
+        for row in rows {
+            let Ok(mut attachments) =
+                serde_json::from_str::<Vec<serde_json::Value>>(&row.attachments)
+            else {
+                continue;
+            };
+            let mut touched = false;
+            for attachment in &mut attachments {
+                let Some(data_url) = attachment
+                    .get("uploadDataUrl")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                else {
+                    continue;
+                };
+                match migrate_one_attachment(db, &home, &row.session_id, attachment, &data_url)
+                    .await
+                {
+                    Ok(()) => touched = true,
+                    Err(error) => {
+                        tracing::warn!(
+                            row_id = row.id,
+                            session_id = %row.session_id,
+                            %error,
+                            "attachment migration skipped; kept its inline bytes for a retry"
+                        );
+                    }
+                }
+            }
+            if touched {
+                query!(
+                    db,
+                    "UPDATE messages SET attachments = ? WHERE id = ?",
+                    serde_json::to_string(&attachments)
+                        .map_err(|e| ChatDbError::Storage(e.to_string()))?,
+                    row.id
+                )
+                .execute()
+                .await?;
+            }
+        }
+
+        let pending = query!(
+            db,
+            "SELECT a.message_id, a.ordinal, a.name, a.url, a.upload_data_url, m.session_id FROM session_pending_message_attachments a JOIN session_pending_message_entries m ON m.id = a.message_id WHERE a.upload_data_url IS NOT NULL"
+        )
+        .fetch_all::<MigrationPendingRow>()
+        .await?;
+        for row in pending {
+            let new_url = async {
+                let files_dir = session_files_dir_for_migration(db, &home, &row.session_id).await?;
+                let preferred = if row.url.starts_with("files/") {
+                    row.url.clone()
+                } else {
+                    let name = row.name.rsplit('/').next().unwrap_or(&row.name);
+                    format!("files/{name}")
+                };
+                let bytes = decode_data_url_for_migration(&row.upload_data_url)
+                    .ok_or_else(|| ChatDbError::Storage("invalid data URL".to_string()))?;
+                store_upload_for_migration(&files_dir, &preferred, &bytes).await?;
+                Ok::<String, ChatDbError>(attachment_file_url(
+                    &row.session_id,
+                    preferred.strip_prefix("files/").unwrap_or(&preferred),
+                ))
+            };
+            match new_url.await {
+                Ok(new_url) => {
+                    query!(
+                        db,
+                        "UPDATE session_pending_message_attachments SET upload_data_url = NULL, url = ? WHERE message_id = ? AND ordinal = ?",
+                        new_url,
+                        row.message_id,
+                        row.ordinal
+                    )
+                    .execute()
+                    .await?;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        message_id = row.message_id,
+                        session_id = %row.session_id,
+                        %error,
+                        "pending attachment migration skipped; kept its inline bytes for a retry"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Idempotent data migration: `waiting_terminal_input` was removed as a
     /// session runtime state. A session stored in it has no running turn, so
     /// it loads as idle with its terminal metadata cleared, as restart
@@ -373,6 +530,40 @@ impl ChatDb {
         query!(
             db,
             "UPDATE session_runtimes SET state = 'idle', terminal_task_id = NULL, terminal_output_file = NULL, terminal_output_preview = NULL, terminal_input_notice = NULL, terminal_background_reason = NULL WHERE state = 'waiting_terminal_input'"
+        )
+        .execute()
+        .await?;
+        Ok(())
+    }
+
+    /// The notification mailbox lost its callback columns with the `notify`
+    /// command and gained the profile a notification opens in. A row stored
+    /// as `opened` or mid-delivery is a delivered one.
+    async fn migrate_notification_mailbox(db: &SkyDb) -> Result<(), ChatDbError> {
+        let columns = query!(db, "PRAGMA table_info(notification_mailbox)")
+            .fetch_all::<SqliteTableInfoRow>()
+            .await?;
+        let existing = columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        if !existing.contains("profile_id") {
+            query!(
+                db,
+                "ALTER TABLE notification_mailbox ADD COLUMN profile_id TEXT"
+            )
+            .execute()
+            .await?;
+        }
+        for column in ["callback_context_xml", "callback_message"] {
+            if existing.contains(column) {
+                let sql = format!("ALTER TABLE notification_mailbox DROP COLUMN {column}");
+                query!(db, sql.as_str()).execute().await?;
+            }
+        }
+        query!(
+            db,
+            "UPDATE notification_mailbox SET status = 'delivered' WHERE status IN ('opened', 'delivering')"
         )
         .execute()
         .await?;
@@ -733,6 +924,121 @@ impl ChatDb {
             })
             .collect()
     }
+}
+
+#[derive(serde::Deserialize, skyzen::FromRow)]
+struct MigrationProfileRow {
+    profile_id: Option<String>,
+}
+
+#[derive(serde::Deserialize, skyzen::FromRow)]
+struct MigrationMessageRow {
+    id: i64,
+    session_id: String,
+    attachments: String,
+}
+
+#[derive(serde::Deserialize, skyzen::FromRow)]
+struct MigrationPendingRow {
+    message_id: i64,
+    ordinal: i64,
+    name: String,
+    url: String,
+    upload_data_url: String,
+    session_id: String,
+}
+
+async fn session_files_dir_for_migration(
+    db: &SkyDb,
+    home: &crate::session::layout::MayHomePaths,
+    session_id: &str,
+) -> Result<std::path::PathBuf, ChatDbError> {
+    let row = query!(
+        db,
+        "SELECT profile_id FROM sessions WHERE id = ?",
+        session_id
+    )
+    .fetch_optional::<MigrationProfileRow>()
+    .await?;
+    let paths = row.and_then(|row| row.profile_id).as_deref().map_or_else(
+        || home.session_paths(session_id),
+        |p| home.profile_home(p).session_paths(session_id),
+    );
+    Ok(paths.files_dir())
+}
+
+async fn store_upload_for_migration(
+    files_dir: &std::path::Path,
+    preferred: &str,
+    bytes: &[u8],
+) -> Result<String, ChatDbError> {
+    let relative = preferred
+        .strip_prefix("files/")
+        .unwrap_or(preferred)
+        .to_string();
+    let target = files_dir.join(&relative);
+    let write = async_fs::metadata(&target)
+        .await
+        .map_or(true, |meta| meta.len() != bytes.len() as u64);
+    if write {
+        if let Some(parent) = target.parent() {
+            async_fs::create_dir_all(parent)
+                .await
+                .map_err(|error| ChatDbError::Storage(error.to_string()))?;
+        }
+        async_fs::write(&target, bytes)
+            .await
+            .map_err(|error| ChatDbError::Storage(error.to_string()))?;
+    }
+    Ok(relative)
+}
+
+fn decode_data_url_for_migration(data_url: &str) -> Option<Vec<u8>> {
+    let (header, data) = data_url.split_once(',')?;
+    if !header.starts_with("data:") || !header.ends_with(";base64") {
+        return None;
+    }
+    base64::engine::Engine::decode(&base64::engine::general_purpose::STANDARD, data).ok()
+}
+
+async fn migrate_one_attachment(
+    db: &SkyDb,
+    home: &crate::session::layout::MayHomePaths,
+    session_id: &str,
+    attachment: &mut serde_json::Value,
+    data_url: &str,
+) -> Result<(), ChatDbError> {
+    let files_dir = session_files_dir_for_migration(db, home, session_id).await?;
+    let url = attachment
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let preferred = if url.starts_with("files/") {
+        url.to_string()
+    } else {
+        let name = attachment
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|n| n.rsplit('/').next().map(str::to_string))
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "upload.bin".to_string());
+        format!("files/{name}")
+    };
+    let bytes = decode_data_url_for_migration(data_url)
+        .ok_or_else(|| ChatDbError::Storage("invalid data URL".to_string()))?;
+    store_upload_for_migration(&files_dir, &preferred, &bytes).await?;
+    attachment["url"] = serde_json::Value::String(attachment_file_url(
+        session_id,
+        preferred.strip_prefix("files/").unwrap_or(&preferred),
+    ));
+    if let Some(object) = attachment.as_object_mut() {
+        object.remove("uploadDataUrl");
+    }
+    Ok(())
+}
+
+fn attachment_file_url(session_id: &str, relative: &str) -> String {
+    format!("/api/sessions/{session_id}/files/{relative}")
 }
 
 const PREVIEW_MAX_CHARS: usize = 100;
@@ -1414,6 +1720,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deleting_a_profile_moves_its_sessions_to_the_default_profile() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db should initialize successfully");
+        let default_id = db
+            .ensure_default_profiles()
+            .await
+            .expect("default profiles should exist");
+        db.create_profile(CreateProfileParams {
+            id: "doomed",
+            name: "Doomed",
+            environment: ProfileEnvironmentKind::Local,
+            slug: None,
+            icon: None,
+            persona: None,
+            preferences: None,
+            location_aware: false,
+        })
+        .await
+        .expect("profile should be created");
+        db.create_session_in_profile("s1", Some("one"), None, Some("doomed"))
+            .await
+            .expect("session should be created");
+
+        db.delete_profile("doomed")
+            .await
+            .expect("a non-default profile can be deleted");
+
+        assert!(
+            db.get_profile("doomed")
+                .await
+                .expect("profile query")
+                .is_none()
+        );
+        let session = db
+            .get_session("s1")
+            .await
+            .expect("session query")
+            .expect("session survives");
+        assert_eq!(session.profile_id.as_deref(), Some(default_id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn the_default_profile_cannot_be_deleted() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db should initialize successfully");
+        let default_id = db
+            .ensure_default_profiles()
+            .await
+            .expect("default profiles should exist");
+
+        let error = db
+            .delete_profile(&default_id)
+            .await
+            .expect_err("the default profile is protected");
+        assert!(matches!(
+            error,
+            crate::db::ChatDbError::DefaultProfileProtected
+        ));
+        assert!(
+            db.get_profile(&default_id)
+                .await
+                .expect("profile query")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
     async fn profile_remote_attachments_round_trip() {
         let dir = tempdir().expect("temp dir should be created");
         let db_path = dir.path().join("history.db");
@@ -1733,43 +2110,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn notification_callback_consumes_only_once() {
+    async fn a_mailbox_with_callback_columns_migrates() {
         let dir = tempdir().expect("temp dir should be created");
         let db_path = dir.path().join("history.db");
         let db = ChatDb::open(&db_path)
             .await
             .expect("db should initialize successfully");
+        for sql in [
+            "DROP TABLE notification_mailbox",
+            "CREATE TABLE notification_mailbox (id TEXT PRIMARY KEY, title TEXT NOT NULL, body TEXT NOT NULL, session_id TEXT, callback_context_xml TEXT, callback_message TEXT, status TEXT NOT NULL, sent_count INTEGER NOT NULL, last_error TEXT, delivered_at TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)",
+            "INSERT INTO notification_mailbox VALUES ('n1', 'Task', 'Done', 's1', '<x/>', 'Follow up', 'opened', 1, NULL, NULL, 'a', 'a')",
+        ] {
+            db.execute_for_test(sql).await.expect("old mailbox");
+        }
+        drop(db);
 
-        let payload = crate::notification::NotificationPayload {
-            notification_id: Some("notification-1".to_string()),
-            title: "Task".to_string(),
-            body: "Completed".to_string(),
-            session_id: Some("session-1".to_string()),
-            callback_context_xml: Some(
-                crate::XmlBlock::parse("<system-reminder><status>ok</status></system-reminder>")
-                    .expect("callback XML should parse"),
-            ),
-            callback_message: Some("Follow up".to_string()),
-        };
-        db.create_notification_mailbox_entry("notification-1", &payload, "delivered")
+        let db = ChatDb::open(&db_path).await.expect("reopen migrates");
+        let columns = query!(db.db, "PRAGMA table_info(notification_mailbox)")
+            .fetch_all::<super::common::SqliteTableInfoRow>()
             .await
-            .expect("mailbox entry should persist");
-
-        let first = db
-            .consume_notification_callback("notification-1")
+            .expect("columns")
+            .into_iter()
+            .map(|column| column.name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            columns,
+            [
+                "id",
+                "title",
+                "body",
+                "session_id",
+                "status",
+                "sent_count",
+                "last_error",
+                "delivered_at",
+                "created_at",
+                "updated_at",
+                "profile_id",
+            ]
+        );
+        let status = query!(db.db, "SELECT status AS value FROM notification_mailbox")
+            .fetch_all::<super::common::StringValueRow>()
             .await
-            .expect("first callback consume should succeed");
-        assert!(first.has_callback);
-        assert!(first.callback_consumed);
-        assert_eq!(first.callback_message.as_deref(), Some("Follow up"));
-
-        let second = db
-            .consume_notification_callback("notification-1")
-            .await
-            .expect("second callback consume should succeed");
-        assert!(second.has_callback);
-        assert!(!second.callback_consumed);
-        assert_eq!(second.callback_message.as_deref(), Some("Follow up"));
+            .expect("status");
+        assert_eq!(status.len(), 1);
+        assert_eq!(status[0].value, "delivered");
     }
 
     #[tokio::test]
@@ -2155,6 +2540,128 @@ mod tests {
                 .count(),
             1,
             "the committed input lands in the transcript exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_attachment_migration_strips_upload_bytes_and_writes_the_file() {
+        #[derive(serde::Deserialize, skyzen::FromRow)]
+        struct Row {
+            attachments: String,
+        }
+        let dir = tempdir().expect("temp dir should be created");
+        let db_path = dir.path().join("history.db");
+        let db = ChatDb::open(&db_path).await.expect("db opens");
+        db.create_session("s", Some("s"), Some("m"))
+            .await
+            .expect("session");
+        let attachments = serde_json::json!([{
+            "id": "a1",
+            "name": "shot.png",
+            "type": "image",
+            "url": "files/shot.png",
+            "uploadDataUrl": "data:image/png;base64,aGVsbG8=",
+        }])
+        .to_string();
+        query!(
+            db.db,
+            "INSERT INTO messages (session_id, role, content, timestamp, tool_call_id, provider_id, prompt_tokens, completion_tokens, total_tokens, cache_read_tokens, cache_write_tokens, context_window, elapsed_ms, attachments, reasoning, tool_calls, translation, thinking) VALUES ('s', 'user', 'hi', '2024-01-01', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, NULL, NULL, NULL, NULL)",
+            attachments.as_str()
+        )
+        .execute()
+        .await
+        .expect("insert");
+        drop(db);
+
+        let db = ChatDb::open(&db_path).await.expect("db reopens");
+        let rows = query!(db.db, "SELECT attachments FROM messages")
+            .fetch_all::<Row>()
+            .await
+            .expect("rows");
+        assert!(!rows[0].attachments.contains("uploadDataUrl"));
+        let url = serde_json::from_str::<Vec<serde_json::Value>>(&rows[0].attachments)
+            .expect("json")
+            .remove(0)["url"]
+            .as_str()
+            .expect("url")
+            .to_string();
+        assert!(url.starts_with("/api/sessions/s/files/"), "{url}");
+        let file = dir
+            .path()
+            .join("sessions")
+            .join("s")
+            .join("files")
+            .join("shot.png");
+        assert_eq!(std::fs::read(&file).expect("file"), b"hello");
+
+        drop(db);
+        let db = ChatDb::open(&db_path).await.expect("third open is a no-op");
+        let rows = query!(db.db, "SELECT attachments FROM messages")
+            .fetch_all::<Row>()
+            .await
+            .expect("rows");
+        assert!(!rows[0].attachments.contains("uploadDataUrl"));
+    }
+
+    #[tokio::test]
+    async fn the_attachment_migration_skips_an_undecodable_row_and_migrates_the_rest() {
+        #[derive(serde::Deserialize, skyzen::FromRow)]
+        struct Row {
+            attachments: String,
+        }
+        let dir = tempdir().expect("temp dir should be created");
+        let db_path = dir.path().join("history.db");
+        let db = ChatDb::open(&db_path).await.expect("db opens");
+        db.create_session("s", Some("s"), Some("m"))
+            .await
+            .expect("session");
+        let good = serde_json::json!([{
+            "id": "a1", "name": "shot.png", "type": "image",
+            "url": "files/shot.png", "uploadDataUrl": "data:image/png;base64,aGVsbG8=",
+        }])
+        .to_string();
+        let bad = serde_json::json!([{
+            "id": "a2", "name": "bad.png", "type": "image",
+            "url": "files/bad.png", "uploadDataUrl": "data:image/png;base64,%%%not-base64%%%",
+        }])
+        .to_string();
+        for attachments in [&good, &bad] {
+            query!(
+                db.db,
+                "INSERT INTO messages (session_id, role, content, timestamp, tool_call_id, provider_id, prompt_tokens, completion_tokens, total_tokens, cache_read_tokens, cache_write_tokens, context_window, elapsed_ms, attachments, reasoning, tool_calls, translation, thinking) VALUES ('s', 'user', 'hi', '2024-01-01', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, NULL, NULL, NULL, NULL)",
+                attachments.as_str()
+            )
+            .execute()
+            .await
+            .expect("insert");
+        }
+        drop(db);
+
+        let db = ChatDb::open(&db_path)
+            .await
+            .expect("db reopens despite the bad row");
+        let rows = query!(db.db, "SELECT attachments FROM messages")
+            .fetch_all::<Row>()
+            .await
+            .expect("rows");
+        assert_eq!(rows.len(), 2);
+        assert!(
+            !rows[0].attachments.contains("uploadDataUrl"),
+            "valid row migrated"
+        );
+        assert!(
+            rows[1].attachments.contains("uploadDataUrl"),
+            "bad row kept its bytes"
+        );
+        assert!(
+            std::fs::read(
+                dir.path()
+                    .join("sessions")
+                    .join("s")
+                    .join("files")
+                    .join("shot.png")
+            )
+            .is_ok()
         );
     }
 }

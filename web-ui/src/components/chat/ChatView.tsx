@@ -1,5 +1,5 @@
 import { Fragment, useCallback, useEffect, useRef, useState } from 'react';
-import { AlertCircle, AlertTriangle, ArrowDown, Loader2, Moon, RotateCw, X } from 'lucide-react';
+import { AlertCircle, AlertTriangle, ArrowDown, Info, Loader2, Moon, RotateCw, X } from 'lucide-react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { toast } from 'sonner';
 import { isDraftSessionId, useSessionsStore } from '@/lib/stores/sessions';
@@ -11,9 +11,11 @@ import { AssistantTurn } from './AssistantTurn';
 import { UserMessage } from './UserMessage';
 import { PersistedAssistant } from './PersistedAssistant';
 import { Composer } from './Composer';
+import { NewYearBanner } from './NewYearBanner';
 import { SessionHeader } from './SessionHeader';
 import { BrowserTakeoverBanner } from './BrowserTakeoverBanner';
 import { PlanBanner } from './PlanBanner';
+import { WarningMessage } from './WarningMessage';
 import { YoloToggle } from './YoloToggle';
 import { Button } from '@/components/ui/button';
 import { useTranslation } from '@/lib/i18n';
@@ -25,9 +27,11 @@ import { endSleep, parseSleepCommand, startSleep } from '@/lib/api/sleep';
 import { useRuntimeStore } from '@/lib/stores/runtime';
 import { cn } from '@/lib/utils';
 import { formatGroupTime, startsGroup } from '@/lib/chat/time';
+import { chatRows, type ChatRow } from '@/lib/chat/rows';
 
 const STICKY_BOTTOM_THRESHOLD_PX = 48;
 const NO_MESSAGES: ApiMessage[] = [];
+const NO_WARNINGS: string[] = [];
 
 export function ChatView({ sessionId }: { sessionId: string }) {
   const open = useSessionsStore((s) => s.open);
@@ -40,10 +44,12 @@ export function ChatView({ sessionId }: { sessionId: string }) {
   const activeTurn = sessionTurn?.active ?? null;
   const stopping = sessionTurn?.stopping ?? false;
   const lastTurn = sessionTurn?.last ?? null;
+  const warnings = sessionTurn?.warnings ?? NO_WARNINGS;
   const send = useTurnStore((s) => s.send);
   const cancel = useTurnStore((s) => s.cancel);
   const retry = useTurnStore((s) => s.retry);
   const dismissError = useTurnStore((s) => s.dismissError);
+  const consumeRestored = useTurnStore((s) => s.consumeRestored);
   const watchTurns = useTurnStore((s) => s.watch);
   const config = useConfigStore((s) => s.config);
   const configLoaded = config !== null;
@@ -123,6 +129,7 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     active.reasoningEffort.toLowerCase() !== 'off';
   const lastTurnForActive =
     lastTurn && !lastTurn.error ? lastTurn : null;
+  const rows = chatRows(messages, lastTurnForActive);
 
   const handleSend = async (
     content: string,
@@ -214,11 +221,11 @@ export function ChatView({ sessionId }: { sessionId: string }) {
     await send({ sessionId: sid, content, attachments });
   };
 
-  const renderMessage = (msg: ApiMessage) => {
-    if (msg.role === 'user') {
+  const renderMessage = ({ kind, message: msg }: ChatRow) => {
+    if (kind === 'user') {
       return <UserMessage content={msg.content} attachments={msg.attachments} />;
     }
-    if (lastTurnForActive && lastTurnForActive.assistantId === msg.id) {
+    if (kind === 'turn' && lastTurnForActive) {
       return (
         <AssistantTurn
           turn={lastTurnForActive}
@@ -254,16 +261,17 @@ export function ChatView({ sessionId }: { sessionId: string }) {
         aria-label={active.title || t('common.untitled')}
       >
         <div className="mx-auto w-full max-w-3xl space-y-6">
-          {messages.map((msg, i) => {
-            const stamp = startsGroup(messages[i - 1]?.timestamp, msg.timestamp) ? (
+          {rows.map((row, i) => {
+            const msg = row.message;
+            const stamp = startsGroup(rows[i - 1]?.message.timestamp, msg.timestamp) ? (
               <p className="pt-2 text-center text-[11px] text-muted-foreground">
                 <time dateTime={msg.timestamp}>{formatGroupTime(msg.timestamp, now)}</time>
               </p>
             ) : null;
             return (
-              <Fragment key={msg.id}>
+              <Fragment key={row.key}>
                 {stamp}
-                {renderMessage(msg)}
+                {renderMessage(row)}
               </Fragment>
             );
           })}
@@ -274,6 +282,9 @@ export function ChatView({ sessionId }: { sessionId: string }) {
               showDecodeSpeed={showDecodeSpeed}
             />
           )}
+          {warnings.map((warning, i) => (
+            <WarningMessage key={`${i}-${warning}`} message={warning} />
+          ))}
           {!activeTurn && lastTurn?.error && (
             <TurnErrorCard
               code={lastTurn.error.code}
@@ -325,11 +336,14 @@ export function ChatView({ sessionId }: { sessionId: string }) {
                 : t('composer.bashFailed', { error: bashStatus.error })}
             </div>
           )}
+          {config && <NewYearBanner timeZone={config.timezone} now={now} />}
           <Composer
             disabled={!configUsable}
             streaming={streaming}
             onSend={handleSend}
             onCancel={() => void cancel(sessionId)}
+            restored={sessionTurn?.restored ?? null}
+            onRestored={() => consumeRestored(sessionId)}
             sessionId={active.id}
             currentModel={active.model}
             currentReasoningEffort={active.reasoningEffort}
@@ -350,11 +364,24 @@ interface TurnErrorCardProps {
 
 function TurnErrorCard({ code, message, retryable, onRetry, onDismiss }: TurnErrorCardProps) {
   const { t } = useTranslation();
+  // Declining the session's repository question is the user's choice, not a failure.
+  const declined = code === 'repo_declined';
   return (
-    <div className="flex items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/5 px-3 py-2.5 text-sm text-destructive">
-      <AlertCircle className="mt-0.5 size-4 shrink-0" />
+    <div
+      className={cn(
+        'flex items-start gap-2 rounded-lg border px-3 py-2.5 text-sm',
+        declined
+          ? 'border-border bg-muted/40 text-muted-foreground'
+          : 'border-destructive/40 bg-destructive/5 text-destructive',
+      )}
+    >
+      {declined ? (
+        <Info className="mt-0.5 size-4 shrink-0" />
+      ) : (
+        <AlertCircle className="mt-0.5 size-4 shrink-0" />
+      )}
       <div className="flex-1 min-w-0">
-        <div className="font-medium">{humanizeErrorCode(code)}</div>
+        {!declined && <div className="font-medium">{humanizeErrorCode(code)}</div>}
         <div className="text-xs opacity-80 break-words">{message}</div>
       </div>
       <div className="flex items-center gap-1 shrink-0">

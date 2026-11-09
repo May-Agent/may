@@ -2,6 +2,7 @@ mod aux;
 mod background;
 mod hosts;
 mod hub;
+mod progress;
 mod recap;
 mod request_ledger;
 mod retry;
@@ -13,11 +14,10 @@ pub use background::{
     cancel_subagent, cancel_subagents, get_background, get_job, kill_job, read_job,
 };
 pub use hosts::{BtwMessage, BtwRequest, BtwResponse, CompactResponse, ContextDumpResponse};
-pub use hosts::{
-    ParkedAgents, btw, compact_session, context_dump, context_report, release_agent, usage_report,
-};
-pub use hub::{TurnFrame, TurnHub, TurnSubscription};
-pub use recap::{RecapRecord, RecapSchedules, recap_session};
+pub use hosts::{ParkedAgents, context_report, release_agent, usage_report};
+pub use hub::TurnHub;
+pub use progress::ProgressReport;
+pub use recap::{RecapRecord, RecapSchedules};
 mod tool_dispatch;
 mod turn_events;
 mod turn_persister;
@@ -25,8 +25,7 @@ mod turn_persister;
 mod warm_aux_tests;
 
 use self::tool_dispatch::{
-    handle_browser_request, handle_notify_request, handle_register_skills_request,
-    handle_task_request,
+    handle_browser_request, handle_register_skills_request, handle_task_request,
 };
 
 use std::future::Future;
@@ -44,7 +43,6 @@ use aither_core::llm::{
     Attachment as LlmAttachment, Message as LlmMessage, Role as LlmRole, ToolResult, Usage,
 };
 use aither_core::llm::{Failure, FailureKind};
-use aither_models::lookup as lookup_model_info;
 use aither_sandbox::{AnyContainerExec, BollardContainerExec, ContainerLaunchSpec};
 
 use crate::agent::MayAgent;
@@ -66,16 +64,16 @@ use super::browser::ensure_browser_runtime_started;
 use super::error::internal_error;
 use super::error_chain::error_chain_text;
 use super::helpers::{RETRY_BACKOFF_MS, elapsed_ms_saturating, truncate_preview};
+use super::message_mapping::api_message_id;
 use super::model_resolution::resolve_default_model;
 use super::state::{DaemonState, UiToolQueues};
 use super::terminal_parsing::update_terminal_snapshot_from_tool_event;
 use super::title_generation;
 use super::types::{
-    ApiErrorCode, ApiMessage, ChatRequest, PendingMessageKind, RemovePendingMessageRequest,
-    RequestLogEntry, RequestStats, SessionRuntimeResponse, SseChunkEvent, SseDoneEvent,
-    SseErrorEvent, SseHoldEvent, SseSpeedEvent, SseStartEvent, SseTodoUpdateEvent,
-    SseToolDeltaEvent, SseToolEndEvent, SseToolStartEvent, TerminalStateSnapshot, ToolEventRecord,
-    ToolVariant,
+    ApiAttachment, ApiErrorCode, ApiMessage, ChatRequest, RequestLogEntry, RequestStats,
+    SessionRuntimeResponse, SseChunkEvent, SseDoneEvent, SseErrorEvent, SseHoldEvent,
+    SsePausedEvent, SseSpeedEvent, SseStartEvent, SseTodoUpdateEvent, SseToolDeltaEvent,
+    SseToolEndEvent, SseToolStartEvent, TerminalStateSnapshot, ToolEventRecord, ToolVariant,
 };
 use crate::decode_meter::DecodeMeter;
 
@@ -120,10 +118,12 @@ trait ChatSink {
     /// The run is prepared; `user_message_id` is the row of the user
     /// message it answers, when it stored one.
     fn on_prepared(&mut self, _user_message_id: Option<i32>) {}
-    /// Every agent event of the run, as the agent emitted it.
+    /// Every agent event of the run, as the agent emitted it, with the
+    /// model's context window.
     fn on_agent_event(
         &mut self,
         _event: Result<&aither_agent::AgentEvent, &aither_agent::AgentError>,
+        _context_window: Option<u32>,
     ) {
     }
     fn on_start(
@@ -172,7 +172,7 @@ trait ChatSink {
     ) -> impl Future<Output = bool> + Send;
     fn on_todo_update(
         &mut self,
-        checklist: &crate::todo_parser::TodoChecklist,
+        rows: Vec<crate::task_rows::TaskRow>,
     ) -> impl Future<Output = bool> + Send;
     fn on_speed(&mut self, tokens_per_second: f64) -> impl Future<Output = bool> + Send;
     /// The run waits for `reason` before it continues.
@@ -187,6 +187,15 @@ trait ChatSink {
     /// failed and the prompt is resubmitted.
     fn on_retract(&mut self) -> impl Future<Output = bool> + Send {
         async { true }
+    }
+    /// The turn was stopped before any tool call or response text and is
+    /// withdrawn: its message left stored history and the agent's context.
+    fn on_withdrawn(
+        &mut self,
+        _content: &str,
+        _attachments: &[ApiAttachment],
+    ) -> impl Future<Output = ()> + Send {
+        async {}
     }
     fn on_error(
         &mut self,
@@ -260,12 +269,16 @@ impl HubSink {
         }
     }
 
+    /// Ends the turn after publishing its closing `event` (`done` or
+    /// `paused`).
+    fn finish_with<T: Serialize>(&mut self, event: &str, data: &T, outcome: crate::client::RunEnd) {
+        self.publish_turn(event, data);
+        self.finish(outcome);
+    }
+
     /// Ends the turn: final frames go out, then late subscribers read the
     /// turn from history.
-    fn finish(&mut self, event: Option<(&str, &SseDoneEvent)>, outcome: crate::client::RunEnd) {
-        if let Some((event, done)) = event {
-            self.publish_turn(event, done);
-        }
+    fn finish(&mut self, outcome: crate::client::RunEnd) {
         let seq = self.next_seq();
         self.publish_turn(
             "end",
@@ -298,6 +311,17 @@ struct SseTranslatedEvent<'a> {
 struct SseRetractEvent<'a> {
     seq: u64,
     turn_id: &'a str,
+}
+
+/// `session_turn` frame withdrawing the turn: the message it answered left
+/// the conversation, and the sender gets its text and attachments back.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SseWithdrawnEvent<'a> {
+    seq: u64,
+    turn_id: &'a str,
+    content: &'a str,
+    attachments: &'a [ApiAttachment],
 }
 
 /// `session_turn` frame closing a reasoning phase: `seconds` is its length
@@ -365,8 +389,9 @@ impl ChatSink for HubSink {
     fn on_agent_event(
         &mut self,
         event: Result<&aither_agent::AgentEvent, &aither_agent::AgentError>,
+        context_window: Option<u32>,
     ) {
-        if let Some(event) = crate::client::WireAgentEvent::from_agent(event) {
+        if let Some(event) = crate::client::WireAgentEvent::from_agent(event, context_window) {
             self.publish_agent(crate::client::SessionAgentBody::Agent { event });
         }
     }
@@ -504,9 +529,13 @@ impl ChatSink for HubSink {
         true
     }
 
-    async fn on_todo_update(&mut self, checklist: &crate::todo_parser::TodoChecklist) -> bool {
+    async fn on_todo_update(&mut self, rows: Vec<crate::task_rows::TaskRow>) -> bool {
         let seq = self.next_seq();
-        let event = SseTodoUpdateEvent::from_checklist(checklist, seq, self.turn_id.clone());
+        let event = SseTodoUpdateEvent {
+            seq,
+            turn_id: self.turn_id.clone(),
+            rows,
+        };
         self.publish_turn("todo_update", &event);
         true
     }
@@ -540,6 +569,23 @@ impl ChatSink for HubSink {
             message: message.to_string(),
         });
         true
+    }
+
+    async fn on_withdrawn(&mut self, content: &str, attachments: &[ApiAttachment]) {
+        let seq = self.next_seq();
+        self.publish_turn(
+            "withdrawn",
+            &SseWithdrawnEvent {
+                seq,
+                turn_id: &self.turn_id,
+                content,
+                attachments,
+            },
+        );
+        self.publish_agent(crate::client::SessionAgentBody::Withdrawn {
+            content: content.to_string(),
+            attachments: attachments.to_vec(),
+        });
     }
 
     async fn on_retract(&mut self) -> bool {
@@ -617,9 +663,12 @@ async fn wait_or_cancel(guard: &SessionRunGuard, wait: Duration) -> Result<(), &
     }
 }
 
+/// Why a run the user stopped reports it ended.
+const USER_CANCELLED: &str = "run cancelled by user";
+
 const fn cancellation_reason_of<E>(cancel: &Result<CancelReason, E>) -> &'static str {
     match cancel {
-        Ok(CancelReason::User) => "run cancelled by user",
+        Ok(CancelReason::User) => USER_CANCELLED,
         Ok(CancelReason::DaemonRestarting) => "run interrupted: the daemon is restarting",
         Err(_) => "run cancellation channel closed unexpectedly",
     }
@@ -850,19 +899,96 @@ fn log_first_text_event(
 /// Successful result from the shared agent loop.
 #[derive(Debug)]
 struct AgentRunResult {
-    assistant_id: String,
+    /// The stored row of the user message the turn answers, when it stored one.
+    user_message_id: Option<i32>,
+    /// The assistant rows the turn stored, oldest first.
+    assistant_message_ids: Vec<i32>,
     full_text: String,
     reasoning_text: String,
-    terminal_snapshot: TerminalStateSnapshot,
     usage: Usage,
     provider_id: String,
     model_context_window: Option<u32>,
     elapsed_ms: u64,
 }
 
-fn api_message_from_run_result(result: AgentRunResult) -> ApiMessage {
-    ApiMessage {
-        id: result.assistant_id,
+/// The assistant rows a turn stored after `boundary`, the largest row id
+/// before it persisted anything.
+async fn stored_assistant_message_ids(
+    state: &Arc<DaemonState>,
+    session_id: &str,
+    boundary: i32,
+) -> Result<Vec<i32>, crate::db::ChatDbError> {
+    Ok(state
+        .db()
+        .get_messages_by_role(session_id, MessageRole::Assistant.as_str())
+        .await?
+        .into_iter()
+        .map(|row| row.id)
+        .filter(|id| *id > boundary)
+        .collect())
+}
+
+/// The turn's `done` event: the reply carries the id of the first assistant
+/// row the turn stored, the event the ids of all of them and of the user row,
+/// so a client names its streamed messages as the session's REST messages.
+///
+/// A turn that ends normally always stored an assistant row: one with
+/// neither text nor tool activity fails as an empty response first.
+fn done_event_from_run_result(
+    seq: u64,
+    turn_id: String,
+    session_id: String,
+    result: AgentRunResult,
+) -> SseDoneEvent {
+    let user_message_id = result.user_message_id.map(api_message_id);
+    let message_ids = result
+        .assistant_message_ids
+        .iter()
+        .copied()
+        .map(api_message_id)
+        .collect();
+    SseDoneEvent {
+        seq,
+        turn_id,
+        session_id,
+        user_message_id,
+        message_ids,
+        assistant: api_message_from_run_result(result)
+            .expect("a finished turn stores an assistant row"),
+    }
+}
+
+/// The turn's `paused` event. A takeover can pause the turn before it
+/// produced anything, so there may be no reply to carry.
+fn paused_event_from_run_result(
+    seq: u64,
+    turn_id: String,
+    session_id: String,
+    result: AgentRunResult,
+) -> SsePausedEvent {
+    let user_message_id = result.user_message_id.map(api_message_id);
+    let message_ids = result
+        .assistant_message_ids
+        .iter()
+        .copied()
+        .map(api_message_id)
+        .collect();
+    SsePausedEvent {
+        seq,
+        turn_id,
+        session_id,
+        user_message_id,
+        message_ids,
+        assistant: api_message_from_run_result(result),
+    }
+}
+
+/// The reply under the id of the first assistant row the turn stored, or
+/// `None` when it stored none.
+fn api_message_from_run_result(result: AgentRunResult) -> Option<ApiMessage> {
+    let first = result.assistant_message_ids.first().copied()?;
+    Some(ApiMessage {
+        id: api_message_id(first),
         role: "assistant".to_string(),
         content: result.full_text,
         timestamp: jiff::Timestamp::now().to_string(),
@@ -875,7 +1001,6 @@ fn api_message_from_run_result(result: AgentRunResult) -> ApiMessage {
         is_streaming: Some(false),
         is_thinking: Some(false),
         tool_event: None,
-        terminal_executions: result.terminal_snapshot.all_executions(),
         stats: Some(RequestStats {
             provider_id: Some(result.provider_id),
             prompt_tokens: result.usage.prompt_tokens,
@@ -887,7 +1012,7 @@ fn api_message_from_run_result(result: AgentRunResult) -> ApiMessage {
             elapsed_ms: Some(result.elapsed_ms),
         }),
         translation: None,
-    }
+    })
 }
 
 /// The response that refuses a client turn: a conflict when another run holds
@@ -919,7 +1044,6 @@ fn persisted_attachments(
             name: attachment.name,
             attachment_type: attachment.attachment_type,
             url: attachment.url,
-            upload_data_url: attachment.upload_data_url,
             text_content: attachment.text_content,
         })
         .collect()
@@ -952,7 +1076,6 @@ pub fn api_attachments_from_persisted(
             name: attachment.name,
             attachment_type: attachment.attachment_type,
             url: attachment.url,
-            upload_data_url: attachment.upload_data_url,
             text_content: attachment.text_content,
         })
         .collect()
@@ -1300,19 +1423,6 @@ async fn record_request_log(state: &Arc<DaemonState>, entry: RequestLogEntry) {
     state.notify_ui_events(UiEventTopics::REQUEST_LOGS);
 }
 
-// NOTE: the public `POST /api/chat` non-streaming handler has been removed.
-// All client-facing chat interaction now flows through `POST /api/chat/stream`
-// so there is a single protocol path. `run_chat_collect_with_receiver` below is
-// kept for internal follow-up queue dispatch where no SSE client is attached.
-
-pub(super) async fn enqueue_chat(
-    Json(req): Json<ChatRequest>,
-    State(state): State<Arc<DaemonState>>,
-) -> SkyResult<Json<SessionRuntimeResponse>> {
-    wake_on_user_message(&state).await?;
-    enqueue_pending(&state, req).await.map(Json)
-}
-
 /// Hands `req` to the session as a pending message: the running turn takes
 /// it as `req.delivery_mode` says, and an idle session starts a turn for it.
 async fn enqueue_pending(
@@ -1349,36 +1459,7 @@ pub(super) async fn deliver_user_message(
     }
 }
 
-pub(super) async fn remove_pending_message(
-    params: skyzen::routing::Params,
-    Json(req): Json<RemovePendingMessageRequest>,
-    State(state): State<Arc<DaemonState>>,
-) -> SkyResult<Json<SessionRuntimeResponse>> {
-    let session_id = params
-        .get("id")
-        .map_err(super::error::bad_request_error)?
-        .to_string();
-    let runtime = match req.kind {
-        PendingMessageKind::PendingImmediate => state
-            .runtime_service
-            .remove_pending_immediate(&session_id)
-            .await
-            .map_err(internal_error)?,
-        PendingMessageKind::Queued => state
-            .runtime_service
-            .remove_queued_at(
-                &session_id,
-                req.index.ok_or_else(|| {
-                    super::error::bad_request_error("index is required for queued removal")
-                })?,
-            )
-            .await
-            .map_err(internal_error)?,
-    };
-    Ok(Json(runtime.into()))
-}
-
-pub(super) async fn stop_session_run(
+async fn stop_session_run_impl(
     params: skyzen::routing::Params,
     State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<SessionRuntimeResponse>> {
@@ -1412,23 +1493,49 @@ pub(super) async fn stop_session_run(
     Ok(Json(runtime.into()))
 }
 
-/// `POST /api/sessions/{id}/messages`: starts a turn and returns at once.
+/// `POST /api/sessions/{id}/turns`: one user message, delivered the way
+/// `req.mode` says — `start` runs it now, `steer` interrupts the running
+/// turn, `queue` runs it after.
 ///
 /// The turn runs in the daemon and streams to every client of the session
-/// over `/api/events` (`session_turn` / `session_agent`); a client that
-/// disconnects does not stop it.
-pub(super) async fn send_message(
+/// over `/api/sessions/{id}/events`; a client that disconnects does not
+/// stop it.
+pub(super) async fn post_turn(
     params: skyzen::routing::Params,
-    Json(mut req): Json<ChatRequest>,
+    Json(req): Json<super::types::TurnRequest>,
     State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<SessionRuntimeResponse>> {
     let session_id = params
         .get("id")
         .map_err(super::error::bad_request_error)?
         .to_string();
-    req.session_id.clone_from(&session_id);
     wake_on_user_message(&state).await?;
-    start_prompt_turn(&state, req).await.map(Json)
+    let chat = ChatRequest {
+        session_id: session_id.clone(),
+        content: req.content,
+        attachments: req.attachments,
+        hidden_context_xml: req.hidden_context_xml,
+        delivery_mode: match req.mode {
+            super::types::TurnMode::Queue => crate::session::PendingUserMessageMode::Queue,
+            super::types::TurnMode::Start | super::types::TurnMode::Steer => {
+                crate::session::PendingUserMessageMode::Steer
+            }
+        },
+        pending_entry_id: req.pending_entry_id,
+    };
+    match req.mode {
+        super::types::TurnMode::Start => start_prompt_turn(&state, chat).await.map(Json),
+        _ => enqueue_pending(&state, chat).await.map(Json),
+    }
+}
+
+/// `DELETE /api/sessions/{id}/turns/current`: stops the session's running
+/// turn, if any.
+pub(super) async fn delete_current_turn(
+    params: skyzen::routing::Params,
+    state: State<Arc<DaemonState>>,
+) -> SkyResult<Json<SessionRuntimeResponse>> {
+    stop_session_run_impl(params, state).await
 }
 
 /// A message from the user ends the sleep state when it began an hour or
@@ -1501,6 +1608,66 @@ async fn tell_sleep_state(state: &DaemonState, session_id: &str, agent: &mut May
     }
 }
 
+fn parse_action_body<T: serde::de::DeserializeOwned>(body: &serde_json::Value) -> SkyResult<T> {
+    serde_json::from_value(body.clone()).map_err(super::error::bad_request_error)
+}
+
+/// `POST /api/sessions/{id}/actions/{name}`: the session verbs — `compact`,
+/// `recap`, `bash`, `btw`, `progress`, `context-dump`, `rewind` — dispatched
+/// to the same logic their old named routes ran. Bodies and responses are
+/// unchanged; an unknown name is a 404.
+pub(super) async fn post_session_action(
+    params: skyzen::routing::Params,
+    Json(body): Json<serde_json::Value>,
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<skyzen::Response> {
+    let session_id = params
+        .get("id")
+        .map_err(super::error::bad_request_error)?
+        .to_string();
+    let name = params
+        .get("name")
+        .map_err(super::error::bad_request_error)?
+        .to_string();
+    match name.as_str() {
+        "compact" => {
+            let req: hosts::CompactRequest = parse_action_body(&body)?;
+            hosts::compact_inner(&state, &session_id, req)
+                .await
+                .and_then(|json| super::error::json_ok_response(&json.0))
+        }
+        "recap" => recap::recap_inner(&state, &session_id)
+            .await
+            .and_then(|json| super::error::json_ok_response(&json.0)),
+        "bash" => {
+            let req: crate::daemon::types::BashRequest = parse_action_body(&body)?;
+            run_bash(&state, &session_id, req)
+                .await
+                .and_then(|json| super::error::json_ok_response(&json.0))
+        }
+        "btw" => {
+            let req: hosts::BtwRequest = parse_action_body(&body)?;
+            hosts::btw_inner(&state, &session_id, req)
+                .await
+                .and_then(|json| super::error::json_ok_response(&json.0))
+        }
+        "progress" => progress::progress_inner(&state, &session_id)
+            .await
+            .and_then(|json| super::error::json_ok_response(&json.0)),
+        "context-dump" => hosts::context_dump_inner(&state, &session_id)
+            .await
+            .and_then(|json| super::error::json_ok_response(&json.0)),
+        "rewind" => {
+            let req: super::types::RewindRequest = parse_action_body(&body)?;
+            super::sessions::rewind_inner(&state, &session_id, &req)
+                .await
+                .and_then(|json| super::error::json_ok_response(&json.0))
+        }
+        _ => Err(skyzen::Error::msg(format!("unknown action {name}"))
+            .set_status(skyzen::StatusCode::NOT_FOUND)),
+    }
+}
+
 /// `POST /api/sessions/{id}/bash`: run a `!` command for the user.
 ///
 /// Runs on the user's behalf in the session's cwd — keychain secrets
@@ -1508,21 +1675,17 @@ async fn tell_sleep_state(state: &DaemonState, session_id: &str, agent: &mut May
 /// uses. The caller turns the masked outcome into the agent-facing
 /// transcript.
 pub(super) async fn run_bash(
-    params: skyzen::routing::Params,
-    Json(req): Json<crate::daemon::types::BashRequest>,
-    State(state): State<Arc<DaemonState>>,
+    state: &Arc<DaemonState>,
+    session_id: &str,
+    req: crate::daemon::types::BashRequest,
 ) -> SkyResult<Json<crate::daemon::types::BashResponse>> {
-    let session_id = params
-        .get("id")
-        .map_err(super::error::bad_request_error)?
-        .to_string();
     let command = req.command.trim().to_string();
     if command.is_empty() {
         return Err(super::error::bad_request_error("empty bash command"));
     }
     let session = state
         .db()
-        .get_session(&session_id)
+        .get_session(session_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| super::error::bad_request_error("session not found"))?;
@@ -1550,7 +1713,6 @@ pub(super) async fn run_bash(
 pub(super) fn spawn_shared_tool_dispatchers(state: Arc<DaemonState>, queues: UiToolQueues) {
     let UiToolQueues {
         task,
-        notify,
         browser,
         register_skills,
         tunnel,
@@ -1561,16 +1723,6 @@ pub(super) fn spawn_shared_tool_dispatchers(state: Arc<DaemonState>, queues: UiT
     tokio_handle.spawn(async move {
         while let Some(request) = task.next().await {
             let result = Box::pin(handle_task_request(&task_state, request.args.clone())).await;
-            let _ = request.respond(result);
-        }
-    });
-
-    let notification_service = state.notification_service.clone();
-    let tokio_handle = state.tokio_handle.clone();
-    tokio_handle.spawn(async move {
-        while let Some(request) = notify.next().await {
-            let result =
-                handle_notify_request(notification_service.clone(), request.args.clone()).await;
             let _ = request.respond(result);
         }
     });
@@ -1663,7 +1815,7 @@ async fn drive_turn<S: ChatSink>(
             if let ControlFlow::Break(stop) = turn.close_reasoning_phase().await {
                 return Err(stop);
             }
-            turn.sink.on_agent_event(Err(&error));
+            turn.sink.on_agent_event(Err(&error), turn.context_window);
             Err(turn_events::TurnStop::Failed(error))
         }
     }
@@ -1705,6 +1857,9 @@ fn run_agent_loop<'a>(
         let mut turn_hidden_context_xml: Option<String> = None;
         // The stored user message, from the first attempt.
         let mut turn_user_message_id: Option<i32> = None;
+        // Whether the turn consumed the pending takeover-ended alert, which
+        // a withdrawal gives back.
+        let mut turn_consumed_takeover_alert = false;
         // The largest history row id before this turn persists anything. A
         // retry that resubmits the prompt rebuilds context only up to it,
         // so the rows the turn itself wrote are not fed back alongside the
@@ -1753,7 +1908,9 @@ fn run_agent_loop<'a>(
                 provider_candidate_count,
                 build_key,
                 user_message_id,
+                takeover_alert_consumed,
                 reasoning_effort,
+                cwd,
             } = match prepare_agent_for_request(
                 state,
                 req,
@@ -1811,14 +1968,12 @@ fn run_agent_loop<'a>(
             if user_message_id.is_some() {
                 turn_user_message_id = user_message_id;
             }
+            turn_consumed_takeover_alert |= takeover_alert_consumed;
             sink.on_prepared(turn_user_message_id);
             if let Some(hidden_context_xml) = hidden_context_xml {
                 turn_hidden_context_xml = Some(hidden_context_xml);
             }
-            let model_context_window = agent.model_context_window().or_else(|| {
-                lookup_model_info(crate::model_selector::selector_model_id(&current_model))
-                    .and_then(aither_models::ModelEntry::max_input_tokens)
-            });
+            let model_context_window = agent.model_context_window();
 
             let session_paths =
                 session_paths_for_session(state, profile_id.as_deref(), &session_id);
@@ -1848,9 +2003,11 @@ fn run_agent_loop<'a>(
                 session_id: &session_id,
                 assistant_id: assistant_id.as_str(),
                 session_paths: &session_paths,
+                workdir: &cwd,
                 started_at,
                 reasoning_display,
                 reasoning_phase: reasoning_display.then_some(started_at),
+                context_window: model_context_window,
                 provider_id: &provider_id,
                 model: &current_model,
                 request_prefix: None,
@@ -1863,6 +2020,7 @@ fn run_agent_loop<'a>(
                     Instant::now(),
                 ),
                 decode_meter: DecodeMeter::default(),
+                counting_model: agent.counting_model(),
                 last_speed_emit: None,
                 segment_text: String::new(),
                 segment_at: None,
@@ -1870,6 +2028,7 @@ fn run_agent_loop<'a>(
                 last_event_at: None,
                 full_text: String::new(),
                 reasoning_text: String::new(),
+                reasoning_floor: 0,
                 terminal_snapshot: TerminalStateSnapshot::default(),
                 saw_tool_activity: false,
                 tool_arguments_by_id: std::collections::HashMap::new(),
@@ -1897,6 +2056,7 @@ fn run_agent_loop<'a>(
                 },
             )
             .await;
+            let took_action = turn.took_action();
             let turn_events::TurnEvents {
                 sink: _,
                 usage,
@@ -1965,6 +2125,8 @@ fn run_agent_loop<'a>(
 
                 // Flush the entire turn atomically
                 turn_persister.flush(&state.db()).await?;
+                let assistant_message_ids =
+                    stored_assistant_message_ids(state, session_id.as_str(), turn_boundary).await?;
                 clear_terminal_runtime_state(state, session_id.as_str()).await?;
 
                 record_request_log(
@@ -1976,10 +2138,10 @@ fn run_agent_loop<'a>(
 
                 return Err(AgentLoopError::BrowserTakeoverPaused(Box::new(
                     AgentRunResult {
-                        assistant_id,
+                        user_message_id: turn_user_message_id,
+                        assistant_message_ids,
                         full_text,
                         reasoning_text,
-                        terminal_snapshot,
                         usage,
                         provider_id,
                         model_context_window,
@@ -2145,7 +2307,44 @@ fn run_agent_loop<'a>(
             }
 
             if let Some(reason) = cancellation_reason {
-                if reason == "run cancelled by user" {
+                if reason == USER_CANCELLED {
+                    // Background completions wait for the user's next input.
+                    agent.interrupt();
+                }
+                // A user stop before any tool call or response text
+                // withdraws the turn. A message taken from the queue is not
+                // withdrawn: no client holds it to put back.
+                if reason == USER_CANCELLED
+                    && !took_action
+                    && !kind.is_resume()
+                    && req.pending_entry_id.is_none()
+                    && turn_user_message_id.is_some()
+                {
+                    // The rows the turn added, the user message and the
+                    // hidden context before it. The model transcript holds
+                    // nothing of the turn: checkpoints are written only at
+                    // a tool-cycle boundary or a finished run, and this
+                    // run reached neither. The agent is dropped with the
+                    // cancelled run, so the next turn rebuilds its context
+                    // from that transcript.
+                    state
+                        .db()
+                        .delete_messages_from(session_id.as_str(), i64::from(turn_boundary) + 1)
+                        .await?;
+                    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
+                    // The alert's row went with the turn; the model has yet
+                    // to see it, so the next turn delivers it.
+                    if turn_consumed_takeover_alert {
+                        state
+                            .runtime_service
+                            .restore_browser_takeover_alert_pending(session_id.as_str())
+                            .await?;
+                    }
+                    sink.on_withdrawn(&req.content, &req.attachments).await;
+                    record_request_log(state, ledger.interrupted(Instant::now(), reason)).await;
+                    return Err(AgentLoopError::Cancelled(reason));
+                }
+                if reason == USER_CANCELLED {
                     let killed = agent.kill_running_terminal_jobs().await;
                     tracing::info!(
                         session_id = %session_id,
@@ -2187,6 +2386,8 @@ fn run_agent_loop<'a>(
 
             // Flush the entire turn atomically
             turn_persister.flush(&state.db()).await?;
+            let assistant_message_ids =
+                stored_assistant_message_ids(state, session_id.as_str(), turn_boundary).await?;
             clear_terminal_runtime_state(state, session_id.as_str()).await?;
 
             // Final sample carries the exact rate now that Usage has arrived.
@@ -2226,10 +2427,10 @@ fn run_agent_loop<'a>(
             );
 
             return Ok(AgentRunResult {
-                assistant_id,
+                user_message_id: turn_user_message_id,
+                assistant_message_ids,
                 full_text,
                 reasoning_text,
-                terminal_snapshot,
                 usage,
                 provider_id,
                 model_context_window,
@@ -2357,21 +2558,18 @@ async fn run_published_turn(
     let response_session_id = req.session_id.clone();
     match result {
         Ok(result) => {
-            let done_event = SseDoneEvent {
-                seq: sink.next_seq(),
-                turn_id: sink.turn_id.clone(),
-                session_id: response_session_id.clone(),
-                assistant: api_message_from_run_result(result),
-            };
+            let done_event = done_event_from_run_result(
+                sink.next_seq(),
+                sink.turn_id.clone(),
+                response_session_id.clone(),
+                result,
+            );
             // Release the session before announcing the end of the turn, so
             // a client that sends its next message on `done` is never refused
             // as a concurrent run. Finishing continues the session under a
             // new guard only when there is pending work to dispatch.
             let continued = guard.finish(RunOutcome::Completed).await?;
-            sink.finish(
-                Some(("done", &done_event)),
-                crate::client::RunEnd::Completed,
-            );
+            sink.finish_with("done", &done_event, crate::client::RunEnd::Completed);
             if let Some(continued) = continued {
                 spawn_continued_run(state.clone(), continued);
             } else {
@@ -2379,14 +2577,14 @@ async fn run_published_turn(
             }
         }
         Err(AgentLoopError::BrowserTakeoverPaused(result)) => {
-            let done_event = SseDoneEvent {
-                seq: sink.next_seq(),
-                turn_id: sink.turn_id.clone(),
-                session_id: response_session_id.clone(),
-                assistant: api_message_from_run_result(*result),
-            };
+            let paused_event = paused_event_from_run_result(
+                sink.next_seq(),
+                sink.turn_id.clone(),
+                response_session_id.clone(),
+                *result,
+            );
             let continued = guard.finish(RunOutcome::Completed).await?;
-            sink.finish(Some(("paused", &done_event)), crate::client::RunEnd::Paused);
+            sink.finish_with("paused", &paused_event, crate::client::RunEnd::Paused);
             if let Some(continued) = continued {
                 spawn_continued_run(state.clone(), continued);
             }
@@ -2394,11 +2592,11 @@ async fn run_published_turn(
         // Errors are already published through on_error in run_agent_loop.
         Err(AgentLoopError::Cancelled(_)) => {
             guard.finish_idle(RunOutcome::Cancelled).await?;
-            sink.finish(None, crate::client::RunEnd::Cancelled);
+            sink.finish(crate::client::RunEnd::Cancelled);
         }
         Err(_) => {
             guard.finish_idle(RunOutcome::Failed).await?;
-            sink.finish(None, crate::client::RunEnd::Failed);
+            sink.finish(crate::client::RunEnd::Failed);
         }
     }
     Ok(())
@@ -2438,25 +2636,25 @@ async fn run_chat_collect_with_receiver(
     .await;
     match result {
         Ok(_) => {
-            sink.finish(None, crate::client::RunEnd::Completed);
+            sink.finish(crate::client::RunEnd::Completed);
             Ok(TurnEnd::Completed)
         }
         Err(AgentLoopError::BrowserTakeoverPaused(_)) => {
-            sink.finish(None, crate::client::RunEnd::Paused);
+            sink.finish(crate::client::RunEnd::Paused);
             Ok(TurnEnd::Paused)
         }
         Err(AgentLoopError::Preparation(error)) => {
-            sink.finish(None, crate::client::RunEnd::Failed);
+            sink.finish(crate::client::RunEnd::Failed);
             Err(ChatCollectError::Preparation(error))
         }
         Err(AgentLoopError::Cancelled(reason)) => {
-            sink.finish(None, crate::client::RunEnd::Cancelled);
+            sink.finish(crate::client::RunEnd::Cancelled);
             Err(ChatCollectError::Sky(internal_error(
                 AgentLoopError::Cancelled(reason),
             )))
         }
         Err(other) => {
-            sink.finish(None, crate::client::RunEnd::Failed);
+            sink.finish(crate::client::RunEnd::Failed);
             Err(ChatCollectError::Sky(internal_error(other)))
         }
     }
@@ -2509,6 +2707,7 @@ const fn map_llm_role(role: LlmRole) -> &'static str {
         LlmRole::User => "user",
         LlmRole::Assistant => "assistant",
         LlmRole::System => "system",
+        LlmRole::Configuration => "configuration",
         LlmRole::Tool => "tool",
     }
 }
@@ -2593,6 +2792,8 @@ fn enqueue_event_triggered_tasks(
 struct SessionContext {
     /// Row id of the user message this turn stored, when it stored one.
     user_message_id: Option<i32>,
+    /// Whether preparing the turn consumed the pending takeover-ended alert.
+    takeover_alert_consumed: bool,
     session_id: SessionId,
     current_model: String,
     provider_candidate_count: usize,
@@ -2636,15 +2837,18 @@ struct PreparedAgent {
     build_key: u64,
     /// Row id of the user message this turn stored, when it stored one.
     user_message_id: Option<i32>,
+    /// Whether preparing the turn consumed the pending takeover-ended alert.
+    takeover_alert_consumed: bool,
     /// Reasoning effort resolved for this turn's requests.
     reasoning_effort: Option<aither_core::llm::model::ReasoningEffort>,
+    /// Where the agent's terminal commands run.
+    cwd: std::path::PathBuf,
 }
 
 struct ToolBrokers {
     workspace: crate::workspace_request::WorkspaceRequestBroker,
     ask_user: ask_user::AskUserBroker,
     task: crate::agent::task_tool::TaskBroker,
-    notify: crate::agent::notify_tool::NotifyBroker,
     browser: crate::agent::browser_tool::BrowserBroker,
     register_skills: crate::agent::register_tool::RegisterBroker,
     tunnel: crate::agent::tunnel_tool::TunnelBroker,
@@ -2716,6 +2920,81 @@ enum UiChatPreparationError {
     PreviewRequest(#[source] aither_agent::AgentError),
     #[error("failed to persist context debug snapshot: {0}")]
     PersistContextDebugSnapshot(#[source] crate::db::ChatDbError),
+    #[error("failed to bind the session to its repository: {0}")]
+    RepoGate(#[source] crate::repo_gate::GateError),
+    #[error("the session did not start: it was not allowed to work in this repository")]
+    RepoGateDeclined,
+}
+
+/// Puts the session gate's questions to the user through the session's
+/// `ask_user` channel, so every attached client shows them.
+struct SessionAsker {
+    broker: ask_user::AskUserBroker,
+    session_id: String,
+}
+
+impl crate::repo_gate::Asker for SessionAsker {
+    async fn ask(
+        &self,
+        question: ask_user::Question,
+    ) -> Result<Vec<ask_user::QuestionAnswer>, crate::repo_gate::GateError> {
+        self.broker
+            .request(ask_user::AskUserRequestPayload {
+                session_id: self.session_id.clone(),
+                request: ask_user::AskUserArgs {
+                    question: None,
+                    option: Vec::new(),
+                    multi_select: false,
+                    questions: vec![question],
+                },
+            })
+            .await
+            .map_err(|error| crate::repo_gate::GateError::Ask(error.to_string()))
+    }
+}
+
+/// Binds the session to its repository and runs the checkout preflight
+/// before its first turn builds an agent.
+async fn gate_session_repo(
+    state: &Arc<DaemonState>,
+    session_id: &str,
+) -> Result<(), UiChatPreparationError> {
+    let session_id = SessionId::from_string(session_id.to_string());
+    let session_id = &session_id;
+    let db = state.db();
+    let Some(row) = db
+        .get_session(session_id.as_str())
+        .await
+        .map_err(UiChatPreparationError::LoadSession)?
+    else {
+        return Ok(());
+    };
+    let home = MayHomePaths::new(state.may_dir.clone());
+    let sandbox =
+        SessionStore::new(home.clone()).sandbox_dir(session_id.as_str(), row.profile_id.as_deref());
+    let config_path = crate::session::SessionPaths::new(sandbox.clone()).workspace_config();
+    let staging = home.repo_staging_dir();
+    let asker = SessionAsker {
+        broker: spawn_ask_user_forwarder(state, session_id),
+        session_id: session_id.as_str().to_string(),
+    };
+    let host = crate::host_git::HostGit::inherit();
+    let verdict = crate::repo_gate::RepoGate {
+        db: &db,
+        host: &host,
+        asker: &asker,
+        config_path: &config_path,
+        session_root: &sandbox,
+        staging: &staging,
+        remote: "origin",
+    }
+    .run(session_id.as_str())
+    .await
+    .map_err(UiChatPreparationError::RepoGate)?;
+    match verdict {
+        crate::repo_gate::Verdict::Proceed => Ok(()),
+        crate::repo_gate::Verdict::Exit => Err(UiChatPreparationError::RepoGateDeclined),
+    }
 }
 
 impl UiChatPreparationError {
@@ -2735,6 +3014,7 @@ impl UiChatPreparationError {
             Self::EnsureContainerImage(_) => ApiErrorCode::ContainerPullFailed,
             Self::StartContainer(_) => ApiErrorCode::ContainerStartFailed,
             Self::LoadLocation(_) => ApiErrorCode::LocationUnavailable,
+            Self::RepoGateDeclined => ApiErrorCode::RepoDeclined,
             Self::LoadSession(_)
             | Self::LoadHistory(_)
             | Self::LoadProfile(_)
@@ -2753,6 +3033,7 @@ impl UiChatPreparationError {
             | Self::PreviewRequest(_)
             | Self::PersistContextDebugSnapshot(_)
             | Self::HistoryReplay(_)
+            | Self::RepoGate(_)
             | Self::NothingToResume => ApiErrorCode::InternalError,
         }
     }
@@ -2936,7 +3217,9 @@ async fn resolve_session_context(
     let mut hidden_commit_entry = req
         .pending_entry_id
         .filter(|_| persist_user_message && !request_has_visible_user_input(req));
-    if persist_user_message && take_over_alert_pending(state, &session_id).await {
+    let takeover_alert_consumed =
+        persist_user_message && take_over_alert_pending(state, &session_id).await;
+    if takeover_alert_consumed {
         push_hidden_context_part(
             &db,
             fence,
@@ -3076,6 +3359,7 @@ async fn resolve_session_context(
 
     Ok(SessionContext {
         user_message_id,
+        takeover_alert_consumed,
         session_id,
         current_model,
         provider_candidate_count,
@@ -3341,7 +3625,6 @@ fn build_tool_brokers(state: &Arc<DaemonState>, session_id: &SessionId) -> ToolB
         workspace: spawn_workspace_forwarder(state, session_id),
         ask_user: spawn_ask_user_forwarder(state, session_id),
         task: state.tool_dispatchers.task.clone(),
-        notify: state.tool_dispatchers.notify.clone(),
         browser: state.tool_dispatchers.browser.clone(),
         register_skills: state.tool_dispatchers.register_skills.clone(),
         tunnel: state.tool_dispatchers.tunnel.clone(),
@@ -3361,6 +3644,19 @@ fn agent_messaging(state: &Arc<DaemonState>) -> crate::agent_link::AgentMessagin
             },
         ),
         runtime_service: state.runtime_service.clone(),
+        cache_lifetime: {
+            let state = state.clone();
+            crate::agent_link::CacheLifetimes::new(move |provider_id: &str| {
+                state
+                    .config
+                    .load()
+                    .provider
+                    .get(provider_id)
+                    .map(|instance| instance.cache_lifetime)
+                    .unwrap_or_default()
+            })
+        },
+        forks: state.agent_forks.clone(),
     }
 }
 
@@ -3388,6 +3684,9 @@ fn prepare_agent_for_request<'a>(
     kind: &'a TurnKind,
 ) -> Pin<Box<impl Future<Output = Result<PreparedAgent, UiChatPreparationError>> + 'a>> {
     Box::pin(async move {
+        if !kind.is_resume() {
+            gate_session_repo(state, &req.session_id).await?;
+        }
         let ctx = Box::pin(resolve_session_context(
             state,
             req,
@@ -3478,7 +3777,9 @@ fn prepare_agent_for_request<'a>(
             provider_candidate_count: ctx.provider_candidate_count,
             build_key,
             user_message_id: ctx.user_message_id,
+            takeover_alert_consumed: ctx.takeover_alert_consumed,
             reasoning_effort: ctx.reasoning_effort,
+            cwd: ctx.cwd,
         })
     })
 }
@@ -3495,6 +3796,11 @@ fn build_session_agent<'a>(
     Box::pin(async move {
         let (environment, location) = Box::pin(setup_agent_environment(state, ctx)).await?;
         let brokers = build_tool_brokers(state, &ctx.session_id);
+        let model_context_window = match ctx.current_model.parse::<crate::ModelSelector>() {
+            Ok(selector) => state.model_context_window(&selector).await,
+            // The build reports the invalid selector.
+            Err(_) => None,
+        };
 
         let mut agent = MayAgent::from_config_with_model_and_permissions(
             config,
@@ -3526,7 +3832,6 @@ fn build_session_agent<'a>(
                 plan_state: ctx.plan_state,
                 location,
                 task_broker: Some(brokers.task),
-                notify_broker: Some(brokers.notify),
                 tunnel_broker: Some(brokers.tunnel),
                 browser_broker: state.browser_manager().map(|_| brokers.browser),
                 acp_host: Some(state.acp_host.clone()),
@@ -3542,6 +3847,7 @@ fn build_session_agent<'a>(
                 environment,
                 tool_distribution: state.tool_distribution.clone(),
                 tool_environments: state.tool_environments.clone(),
+                job_server: state.job_server.clone(),
                 provider_attempt,
                 prompt_cache_epoch: ctx.context_snapshot.as_ref().map_or(0, |snapshot| {
                     snapshot
@@ -3554,6 +3860,8 @@ fn build_session_agent<'a>(
                 background_jobs: aither_agent::BackgroundJobPolicy::Detach,
                 connectivity: state.connectivity.clone(),
                 rules_import: ctx.rules_import.clone(),
+                limits: state.live_limits.clone(),
+                model_context_window,
             },
         )
         .await
@@ -3680,12 +3988,12 @@ async fn enforce_issue_ownership(
     }
 }
 
-/// Read tasks.md and return the parsed checklist if its content changed since the last check.
-/// The sink is responsible for wrapping it in the SSE envelope with `seq/turn_id`.
+/// Read tasks.md and return its rows if its content changed since the last check.
+/// The sink is responsible for wrapping them in the SSE envelope with `seq/turn_id`.
 async fn check_tasks_update(
     paths: &SessionPaths,
     last_hash: &mut Option<u64>,
-) -> Option<crate::todo_parser::TodoChecklist> {
+) -> Option<Vec<crate::task_rows::TaskRow>> {
     use std::hash::{Hash, Hasher};
 
     let content = match paths.tasks_content().await {
@@ -3705,11 +4013,8 @@ async fn check_tasks_update(
     }
     *last_hash = Some(hash);
 
-    let checklist = crate::todo_parser::TodoChecklist::parse(&content);
-    if checklist.is_empty() {
-        return None;
-    }
-    Some(checklist)
+    // An empty list is an update too: finishing work deletes its row.
+    Some(crate::task_rows::task_rows(&content))
 }
 
 async fn is_takeover_active_for_session(state: &DaemonState, session_id: &SessionId) -> bool {
@@ -3843,6 +4148,7 @@ mod tests {
                         messages: Vec::new(),
                     },
                     has_background_tasks: false,
+                    document: None,
                 },
                 applied_seq: 42,
                 updated_at: "2026-03-14T00:00:00Z".to_string(),
@@ -4075,15 +4381,19 @@ mod tests {
                 .is_none()
         );
 
-        // A model-side write produces the parsed checklist once.
-        async_fs::write(&tasks_path, "- [x] done\n- [ ] pending\n")
+        // A model-side write produces its rows once.
+        async_fs::write(
+            &tasks_path,
+            "## Doing\n- write report\n\n## Queued\n- ship it BLOCKING q1\n",
+        )
+        .await
+        .expect("tasks.md should be written");
+        let rows = super::check_tasks_update(&paths, &mut last_hash)
             .await
-            .expect("tasks.md should be written");
-        let checklist = super::check_tasks_update(&paths, &mut last_hash)
-            .await
-            .expect("a written tasks.md should produce a checklist");
-        assert_eq!(checklist.total(), 2);
-        assert_eq!(checklist.completed(), 1);
+            .expect("a written tasks.md should produce rows");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].section, crate::task_rows::TaskSection::Doing);
+        assert_eq!(rows[1].blocking.as_deref(), Some("q1"));
 
         // The same content is deduplicated by hash.
         assert!(
@@ -4092,25 +4402,14 @@ mod tests {
                 .is_none()
         );
 
-        // A further model-side write produces an updated checklist.
-        async_fs::write(&tasks_path, "- [ ] new task\n")
+        // Finishing the work deletes its row; the empty list is still an update.
+        async_fs::write(&tasks_path, "## Doing\n")
             .await
             .expect("tasks.md should be rewritten");
-        let checklist = super::check_tasks_update(&paths, &mut last_hash)
+        let rows = super::check_tasks_update(&paths, &mut last_hash)
             .await
-            .expect("a changed tasks.md should produce a new checklist");
-        assert_eq!(checklist.total(), 1);
-        assert_eq!(checklist.items[0].text, "new task");
-
-        // A document without checklist items produces no update.
-        async_fs::write(&tasks_path, "just prose\n")
-            .await
-            .expect("tasks.md should be rewritten");
-        assert!(
-            super::check_tasks_update(&paths, &mut last_hash)
-                .await
-                .is_none()
-        );
+            .expect("a changed tasks.md should produce an update");
+        assert_eq!(rows, Vec::<crate::task_rows::TaskRow>::new());
     }
 
     /// What a run told its clients about waiting and discarding text.
@@ -4127,6 +4426,8 @@ mod tests {
         notes: Option<async_channel::Sender<Note>>,
         /// How many times the run showed the text `WAKE_TEXT` as an agent event.
         wake_texts: usize,
+        /// The message texts the run withdrew.
+        withdrawn: Vec<String>,
     }
 
     /// The text of the background event a test resume turn opens with.
@@ -4155,6 +4456,7 @@ mod tests {
         fn on_agent_event(
             &mut self,
             event: Result<&aither_agent::AgentEvent, &aither_agent::AgentError>,
+            _context_window: Option<u32>,
         ) {
             if matches!(event, Ok(aither_agent::AgentEvent::Text(text)) if text == WAKE_TEXT) {
                 self.wake_texts += 1;
@@ -4199,7 +4501,7 @@ mod tests {
         }
         fn on_todo_update(
             &mut self,
-            _c: &crate::todo_parser::TodoChecklist,
+            _rows: Vec<crate::task_rows::TaskRow>,
         ) -> impl Future<Output = bool> + Send {
             std::future::ready(true)
         }
@@ -4217,6 +4519,14 @@ mod tests {
         fn on_retract(&mut self) -> impl Future<Output = bool> + Send {
             self.note(Note::Retract);
             std::future::ready(true)
+        }
+        fn on_withdrawn(
+            &mut self,
+            content: &str,
+            _attachments: &[crate::daemon::types::ApiAttachment],
+        ) -> impl Future<Output = ()> + Send {
+            self.withdrawn.push(content.to_string());
+            std::future::ready(())
         }
         fn on_error(
             &mut self,
@@ -4352,7 +4662,9 @@ mod tests {
                         let headers = String::from_utf8_lossy(&buf[..head_end]);
                         if headers.starts_with("GET /v1/models") {
                             let _ = socket
-                                .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                                .write_all(
+                                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                                )
                                 .await;
                             return;
                         }
@@ -4426,7 +4738,7 @@ mod tests {
                         body => ("HTTP/1.1 200 OK", body.to_string()),
                     };
                     let wire = format!(
-                        "{status}\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{body_out}",
+                        "{status}\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body_out}",
                         body_out.len()
                     );
                     let _ = socket.write_all(wire.as_bytes()).await;
@@ -4717,12 +5029,7 @@ mod tests {
             delivery_mode: crate::session::PendingUserMessageMode::Queue,
             pending_entry_id: None,
         };
-        super::enqueue_chat(
-            skyzen::utils::Json(req),
-            skyzen::utils::State(state.clone()),
-        )
-        .await
-        .expect("enqueue");
+        super::enqueue_pending(&state, req).await.expect("enqueue");
         tokio::time::timeout(std::time::Duration::from_secs(20), async {
             while !state.recap_schedules.is_armed("session") {
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -4998,6 +5305,64 @@ mod tests {
         }
     }
 
+    /// `/sleep` cancels the suggestions in flight and clears the shown ones;
+    /// none is generated until the user wakes.
+    #[tokio::test]
+    async fn sleeping_clears_shown_suggestions_and_blocks_new_ones() {
+        use crate::daemon::sleep::{SleepRequest, start_sleep};
+        use skyzen::utils::{Json, State};
+
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let provider = stub_provider(vec![sse_text("Good night")]).await;
+        let unused = stub_provider(vec![sse_text("unused")]).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let state = failover_state(may_dir.path(), &provider, &unused).await;
+
+        // A composer is attached and shows a suggestion; another one is
+        // still being generated.
+        let subscription = state.turn_hub.subscribe_live("session");
+        state.turn_hub.publish(
+            "session",
+            "session_suggestion",
+            r#"{"requestId":1,"sessionId":"session","state":"ready","text":"run the tests"}"#
+                .into(),
+        );
+        let request_id = state.aux_tasks.start(
+            "session",
+            super::aux::AuxKind::Suggestion,
+            |_| std::future::pending(),
+            &state.tokio_handle,
+        );
+        let shown = subscription.next().await.expect("the shown suggestion");
+        assert_eq!(shown.len(), 1);
+
+        start_sleep(
+            Json(SleepRequest {
+                session_id: "session".to_string(),
+            }),
+            State(state.clone()),
+        )
+        .await
+        .expect("/sleep starts");
+        // The `/sleep` turn itself supersedes the composer; what the sleep
+        // state publishes on its own is what follows.
+        subscription.take_unread().expect("subscribed");
+        super::suggest::apply_settings(&state);
+
+        assert!(!state.aux_tasks.is_current("session", request_id));
+        let frames = subscription.take_unread().expect("subscribed");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].kind, "session_suggestion");
+        let cleared: serde_json::Value = serde_json::from_str(&frames[0].data).expect("json");
+        assert_eq!(cleared["state"], "cleared");
+        assert_eq!(cleared["sessionId"], "session");
+
+        // A turn that completes while asleep schedules nothing.
+        super::suggest::maybe_suggest(&state, "session");
+        assert!(!super::suggest::suggestions_allowed(&state));
+        assert!(!state.aux_tasks.is_current("session", request_id + 1));
+    }
+
     /// `/sleep` on a session whose turn is running succeeds and is taken by
     /// the session's next request, carrying the same requirements.
     #[tokio::test]
@@ -5129,7 +5494,13 @@ mod tests {
 
         // The health reminder is raised for the user and reaches no agent.
         let now = jiff::Timestamp::now();
-        state.db().record_sleep(now).await.expect("sleep log");
+        for nights_ago in 1..=5 {
+            state
+                .db()
+                .record_sleep(now - jiff::SignedDuration::from_hours(24 * nights_ago))
+                .await
+                .expect("sleep log");
+        }
         assert!(
             state
                 .sleep
@@ -5447,6 +5818,59 @@ mod tests {
         assert_eq!(answers, 1, "the answer appears in context exactly once");
     }
 
+    /// The ids a finished turn announces are the ids REST returns for the
+    /// messages the turn stored.
+    #[tokio::test]
+    async fn a_turns_done_event_names_its_messages_as_rest_does() {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let provider = stub_provider(vec![sse_text("答えは四十二。回答は42です。")]).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let state = failover_state(may_dir.path(), &provider, &provider).await;
+        let mut sink = TestSink::default();
+        let result = run_prompt_turn(&state, &mut sink)
+            .await
+            .expect("the turn completes");
+
+        let done = super::done_event_from_run_result(1, "turn".into(), "session".into(), result);
+        let rows = state.db().get_messages("session").await.expect("rows load");
+        let api = crate::daemon::message_mapping::map_db_messages(&rows).expect("rows map");
+        let rest_user = api
+            .iter()
+            .find(|message| message.role == "user")
+            .expect("the user message is stored");
+        let rest_assistants: Vec<&str> = api
+            .iter()
+            .filter(|message| message.role == "assistant")
+            .map(|message| message.id.as_str())
+            .collect();
+        assert_eq!(done.user_message_id.as_deref(), Some(rest_user.id.as_str()));
+        assert_eq!(done.message_ids, rest_assistants);
+        assert_eq!(done.assistant.id, rest_assistants[0]);
+    }
+
+    /// A takeover can pause a turn before it stored any reply: the `paused`
+    /// event then carries no assistant message instead of failing.
+    #[test]
+    fn a_pause_before_any_output_announces_no_reply() {
+        let result = super::AgentRunResult {
+            user_message_id: Some(7),
+            assistant_message_ids: Vec::new(),
+            full_text: String::new(),
+            reasoning_text: String::new(),
+            usage: aither_core::llm::Usage::default(),
+            provider_id: "provider".to_string(),
+            model_context_window: None,
+            elapsed_ms: 0,
+        };
+        let paused =
+            super::paused_event_from_run_result(1, "turn".into(), "session".into(), result);
+        assert_eq!(paused.user_message_id.as_deref(), Some("msg-7"));
+        assert_eq!(paused.message_ids, Vec::<String>::new());
+        assert!(paused.assistant.is_none());
+        let json = serde_json::to_value(&paused).expect("the event serializes");
+        assert!(json["assistant"].is_null());
+    }
+
     /// Seeding from UI history produces transcript seqs the agent itself
     /// assigned — the stored entries and the agent's own checkpoint agree.
     #[tokio::test]
@@ -5514,6 +5938,217 @@ mod tests {
             );
         }
     }
+
+    /// Stops a turn whose provider stream opens with `partial` and then
+    /// stalls, once the run has had time to take it in.
+    async fn stop_stalled_turn(
+        partial: String,
+    ) -> (
+        std::sync::Arc<DaemonState>,
+        TestSink,
+        Result<super::AgentRunResult, super::AgentLoopError>,
+        tempfile::TempDir,
+    ) {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let provider = stub_provider(vec![format!("stall:{partial}")]).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let state = failover_state(may_dir.path(), &provider, &provider).await;
+        let mut sink = TestSink::default();
+        let stop = async {
+            last_body(&provider, 1).await;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            assert!(
+                state
+                    .runtime_service
+                    .runs()
+                    .cancel("session", crate::session::CancelReason::User),
+                "the run is live"
+            );
+        };
+        let (result, ()) = tokio::join!(run_prompt_turn(&state, &mut sink), stop);
+        (state, sink, result, may_dir)
+    }
+
+    fn user_rows(history: &crate::session::ChatHistory) -> Vec<String> {
+        history
+            .messages()
+            .iter()
+            .filter(|m| matches!(m.role, super::MessageRole::User))
+            .map(|m| m.content.clone())
+            .collect()
+    }
+
+    /// A stop before any tool call or response text withdraws the turn:
+    /// stored history, the model transcript and an agent rebuilt for the next
+    /// turn hold nothing of the message.
+    #[tokio::test]
+    async fn a_stop_during_thinking_withdraws_the_turn() {
+        let thinking = sse_chunk(
+            &serde_json::json!({
+                "choices": [{"index": 0, "delta": {"reasoning_content": "let me think"}}]
+            })
+            .to_string(),
+        );
+        let (state, sink, result, _dir) = stop_stalled_turn(thinking).await;
+        assert!(
+            matches!(result, Err(super::AgentLoopError::Cancelled(_))),
+            "the turn was stopped"
+        );
+        assert_eq!(sink.withdrawn, vec!["hello".to_string()]);
+
+        let history = crate::session::load_history_from_db(&state.db(), "session")
+            .await
+            .expect("history");
+        assert!(user_rows(&history).is_empty(), "no user row remains");
+        assert!(
+            history.messages().is_empty(),
+            "nothing the turn added remains"
+        );
+
+        let entries = state
+            .db()
+            .transcript_entries_after("session", -1)
+            .await
+            .expect("transcript");
+        assert!(
+            entries.iter().all(|entry| !format!(
+                "{:?}",
+                rmp_serde::from_slice::<aither_core::llm::Message>(&entry.message_blob)
+            )
+            .contains("hello")),
+            "the model transcript holds nothing of the message"
+        );
+
+        // The next turn's agent, rebuilt from storage.
+        let guard = state
+            .runtime_service
+            .runs()
+            .acquire("session")
+            .await
+            .expect("acquire run");
+        let req = ChatRequest {
+            session_id: "session".to_string(),
+            content: String::new(),
+            attachments: Vec::new(),
+            hidden_context_xml: None,
+            delivery_mode: crate::session::PendingUserMessageMode::default(),
+            pending_entry_id: None,
+        };
+        let config = state.config_snapshot();
+        let ctx = resolve_session_context(&state, &req, guard.fence(), false, true, None)
+            .await
+            .expect("context resolves");
+        let mut agent = build_session_agent(&state, &config, &ctx, guard.fence(), 0)
+            .await
+            .expect("agent builds from storage");
+        let checkpoint = agent.export_checkpoint().await.expect("checkpoint");
+        assert!(
+            checkpoint
+                .context
+                .items()
+                .iter()
+                .all(|item| !format!("{:?}", item.message()).contains("hello")),
+            "the agent's context holds nothing of the message"
+        );
+    }
+
+    /// The takeover-ended alert a withdrawn turn consumed is still pending:
+    /// its row left with the turn, and the next turn's request carries it.
+    #[tokio::test]
+    async fn a_withdrawn_turn_gives_back_the_takeover_alert() {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let thinking = sse_chunk(
+            &serde_json::json!({
+                "choices": [{"index": 0, "delta": {"reasoning_content": "let me think"}}]
+            })
+            .to_string(),
+        );
+        let provider = stub_provider(vec![format!("stall:{thinking}"), sse_text("ok")]).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let state = failover_state(may_dir.path(), &provider, &provider).await;
+        // The session's browser takeover ended, so the alert is pending.
+        state
+            .runtime_service
+            .restore_browser_takeover_alert_pending("session")
+            .await
+            .expect("alert marked pending");
+
+        let alert = super::browser_takeover_alert();
+        let first_line = alert.lines().next().expect("the alert has text");
+        let escaped = serde_json::to_string(first_line).expect("encodes");
+        let fragment = escaped.trim_matches('"');
+
+        let mut sink = TestSink::default();
+        let stop = async {
+            let body = last_body(&provider, 1).await;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            assert!(
+                state
+                    .runtime_service
+                    .runs()
+                    .cancel("session", crate::session::CancelReason::User),
+                "the run is live"
+            );
+            body
+        };
+        let (result, withdrawn_body) = tokio::join!(run_prompt_turn(&state, &mut sink), stop);
+        assert!(matches!(result, Err(super::AgentLoopError::Cancelled(_))));
+        assert_eq!(sink.withdrawn, vec!["hello".to_string()]);
+        assert!(
+            withdrawn_body.contains(fragment),
+            "the withdrawn turn consumed the alert"
+        );
+
+        let mut next = TestSink::default();
+        run_prompt_turn(&state, &mut next)
+            .await
+            .expect("the next turn completes");
+        let body = last_body(&provider, 1).await;
+        assert!(
+            body.contains(fragment),
+            "the next request carries the alert"
+        );
+    }
+
+    /// A stop after response text keeps the message: only a turn that did
+    /// nothing but think is withdrawn.
+    #[tokio::test]
+    async fn a_stop_after_response_text_keeps_the_message() {
+        let text = sse_chunk(
+            &serde_json::json!({
+                "choices": [{"index": 0, "delta": {"content": "half an ans"}}]
+            })
+            .to_string(),
+        );
+        let (state, sink, result, _dir) = stop_stalled_turn(text).await;
+        assert!(matches!(result, Err(super::AgentLoopError::Cancelled(_))));
+        assert_eq!(sink.withdrawn, Vec::<String>::new());
+        let history = crate::session::load_history_from_db(&state.db(), "session")
+            .await
+            .expect("history");
+        assert_eq!(user_rows(&history), vec!["hello".to_string()]);
+    }
+
+    /// A stop after a tool call began keeps the message too.
+    #[tokio::test]
+    async fn a_stop_after_a_tool_call_keeps_the_message() {
+        let call = sse_chunk(
+            &serde_json::json!({
+                "choices": [{"index": 0, "delta": {"tool_calls": [{
+                    "index": 0, "id": "call_1", "type": "function",
+                    "function": {"name": "terminal", "arguments": "{\"command\":"}
+                }]}}]
+            })
+            .to_string(),
+        );
+        let (state, sink, result, _dir) = stop_stalled_turn(call).await;
+        assert!(matches!(result, Err(super::AgentLoopError::Cancelled(_))));
+        assert_eq!(sink.withdrawn, Vec::<String>::new());
+        let history = crate::session::load_history_from_db(&state.db(), "session")
+            .await
+            .expect("history");
+        assert_eq!(user_rows(&history), vec!["hello".to_string()]);
+    }
 }
 
 #[cfg(test)]
@@ -5545,7 +6180,7 @@ mod tool_reading_tests {
             sink.on_tool_start("c1", "terminal", arguments, summary)
         ));
 
-        let late = hub.subscribe("s", None);
+        let late = hub.subscribe("s", 0);
         let frames = late.take_unread().expect("the subscription is open");
         let readings: Vec<_> = frames
             .iter()

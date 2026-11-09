@@ -1,8 +1,10 @@
 import { useMemo, useState } from 'react';
 import { Link, useLocation, useParams } from 'react-router-dom';
 import {
+  Archive,
   ChevronDown,
   ChevronRight,
+  Folder,
   Github,
   Loader2,
   PanelLeftClose,
@@ -17,11 +19,12 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip
 import { useTranslation } from '@/lib/i18n';
 import { useUiStore } from '@/lib/stores/ui';
 import { useRuntimeStore } from '@/lib/stores/runtime';
-import { useActiveProfile } from '@/lib/profile/active';
+import { profileArchivePath, useActiveProfile } from '@/lib/profile/active';
+import { isWorking } from '@/lib/sessionLists';
 import { useNewChat } from '@/lib/useNewChat';
 import { shortcutAria, shortcutLabel } from '@/lib/shortcuts';
 import { FolderNode, SessionNode } from './SessionNode';
-import { repoLabel } from '@/lib/repo';
+import { githubBinding, groupByRepo, parseRepo, repoLabel } from '@/lib/repo';
 import { NewChatRepoDialog } from './NewChatRepoDialog';
 import { ProfileSwitcher } from './ProfileSwitcher';
 import { NotificationBell } from './NotificationBell';
@@ -56,51 +59,16 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
   const totalActive = pinned.length + regular.length;
   const loading = activeProfileId !== null && scoped === null;
 
-  const [archiveOpen, setArchiveOpen] = useState(false);
   const [repoDialogOpen, setRepoDialogOpen] = useState(false);
   const settingsActive = location.pathname.startsWith('/settings');
-
-  // GitHub repos already bound to sessions, offered as quick picks in the
-  // "new chat in repo" dialog.
-  const knownGithubRepos = useMemo(() => {
-    const seen = new Set<string>();
-    const collect = (repo: string | null | undefined) => {
-      if (repo?.startsWith('github:')) seen.add(repo.slice(7));
-    };
-    for (const item of [
-      ...(scoped?.pinned ?? []),
-      ...(scoped?.regular ?? []),
-      ...(scoped?.archived ?? []),
-    ]) {
-      if ('sessions' in item) {
-        for (const child of item.sessions) collect(child.repo);
-      } else {
-        collect(item.repo);
-      }
-    }
-    return [...seen].sort();
-  }, [scoped]);
+  const archiveActive = location.pathname.endsWith('/archive');
 
   // Sessions bound to a repository cluster under a collapsible group
   // header; repo-less sessions stay flat above the groups.
-  const [regularNoRepo, repoGroups] = useMemo(() => {
-    const regular = scoped?.regular ?? [];
-    const flat: typeof regular = [];
-    const groups = new Map<string, typeof regular>();
-    for (const item of regular) {
-      if (item.repo) {
-        const list = groups.get(item.repo) ?? [];
-        list.push(item);
-        groups.set(item.repo, list);
-      } else {
-        flat.push(item);
-      }
-    }
-    const sorted = [...groups.entries()].sort(([a], [b]) =>
-      repoLabel(a).localeCompare(repoLabel(b)),
-    );
-    return [flat, sorted] as const;
-  }, [scoped]);
+  const { flat: regularNoRepo, groups: repoGroups } = useMemo(
+    () => groupByRepo(scoped?.regular ?? []),
+    [scoped],
+  );
 
   return (
     <aside
@@ -192,11 +160,10 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
       <NewChatRepoDialog
         open={repoDialogOpen}
         onOpenChange={setRepoDialogOpen}
-        knownRepos={knownGithubRepos}
         busy={creating}
-        onSubmit={(repo) => {
+        onPick={(repo) => {
           setRepoDialogOpen(false);
-          void startNewChat({ repo: `github:${repo}` });
+          void startNewChat({ repo: githubBinding(repo) });
         }}
       />
 
@@ -210,7 +177,7 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
               <Loader2 className="size-4 animate-spin" aria-hidden />
               {t('common.loading')}
             </div>
-          ) : totalActive === 0 && archived.length === 0 ? (
+          ) : totalActive === 0 ? (
             <div className="px-3 py-10 text-center text-[13px] text-muted-foreground">
               {t('sidebar.noSessionsInProfile')}
             </div>
@@ -228,6 +195,7 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
                         kind="pinned"
                         active={item.id === sessionId}
                         repo={item.repo}
+                        working={isWorking(item)}
                       />
                     ) : (
                       <FolderNode key={item.id} id={item.id} name={item.name} defaultOpen>
@@ -242,6 +210,7 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
                             inFolder
                             indent
                             repo={child.repo}
+                            working={isWorking(child)}
                           />
                         ))}
                       </FolderNode>
@@ -261,10 +230,17 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
                       kind="regular"
                       active={item.id === sessionId}
                       repo={item.repo}
+                      working={isWorking(item)}
                     />
                   ))}
                   {repoGroups.map(([repo, items]) => (
-                    <RepoGroup key={repo} repo={repo} count={items.length}>
+                    <RepoGroup
+                      key={repo}
+                      repo={repo}
+                      count={items.length}
+                      disabled={!canCreate}
+                      onNewChat={() => void startNewChat({ repo })}
+                    >
                       {items.map((item) => (
                         <SessionNode
                           key={item.id}
@@ -274,6 +250,7 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
                           kind="regular"
                           active={item.id === sessionId}
                           indent
+                          working={isWorking(item)}
                         />
                       ))}
                     </RepoGroup>
@@ -281,45 +258,28 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
                 </Section>
               )}
 
-              {archived.length > 0 && (
-                <div>
-                  <button
-                    type="button"
-                    onClick={() => setArchiveOpen((v) => !v)}
-                    className="flex h-7 w-full items-center gap-1 rounded-md px-2 text-xs font-medium text-muted-foreground hover:text-foreground touch:h-11"
-                    aria-expanded={archiveOpen}
-                  >
-                    {archiveOpen ? (
-                      <ChevronDown className="size-3.5" aria-hidden />
-                    ) : (
-                      <ChevronRight className="size-3.5" aria-hidden />
-                    )}
-                    <span>{t('sidebar.archived')}</span>
-                    <span className="ml-auto font-normal tabular-nums">{archived.length}</span>
-                  </button>
-                  {archiveOpen && (
-                    <ul className="mt-0.5 space-y-px">
-                      {archived.map((item) => (
-                        <SessionNode
-                          key={item.id}
-                          id={item.id}
-                          title={item.title || t('common.untitled')}
-                          runtime={item.runtime}
-                          kind="archived"
-                          active={item.id === sessionId}
-                          repo={item.repo}
-                        />
-                      ))}
-                    </ul>
-                  )}
-                </div>
-              )}
             </div>
           )}
         </nav>
       </ScrollArea>
 
       <div className="px-2 pt-1">
+        {activeProfileId && (
+          <Link
+            to={profileArchivePath(activeProfileId)}
+            aria-current={archiveActive ? 'page' : undefined}
+            className={cn(
+              'flex h-7 items-center gap-2 rounded-md px-2 text-[13px] font-medium text-muted-foreground hover:bg-accent hover:text-foreground touch:h-11',
+              archiveActive && 'bg-accent text-foreground',
+            )}
+          >
+            <Archive className="size-4" strokeWidth={1.75} aria-hidden />
+            <span className="flex-1">{t('sidebar.archivePage')}</span>
+            {archived.length > 0 && (
+              <span className="font-normal tabular-nums">{archived.length}</span>
+            )}
+          </Link>
+        )}
         <Link
           to="/settings"
           aria-current={settingsActive ? 'page' : undefined}
@@ -355,30 +315,57 @@ function Section({ label, children }: SectionProps) {
 interface RepoGroupProps {
   repo: string;
   count: number;
+  disabled: boolean;
+  /** Start a new chat bound to this project. */
+  onNewChat: () => void;
   children: React.ReactNode;
 }
 
-/** Collapsible header binding the sessions of one repository together. */
-function RepoGroup({ repo, count, children }: RepoGroupProps) {
+/**
+ * Collapsible header binding the sessions of one repository together: the
+ * GitHub logo and `owner/repo` for a GitHub project (never a path), the
+ * checkout's path for a local one, and a button for a new chat under it.
+ */
+function RepoGroup({ repo, count, disabled, onNewChat, children }: RepoGroupProps) {
+  const { t } = useTranslation();
   const [open, setOpen] = useState(true);
+  const label = repoLabel(repo);
+  const github = parseRepo(repo).kind === 'github';
   return (
     <li>
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        className="flex h-7 w-full items-center gap-1 rounded-md px-2 text-xs font-medium text-muted-foreground hover:text-foreground touch:h-11"
-        aria-expanded={open}
-      >
-        {open ? (
-          <ChevronDown className="size-3.5" aria-hidden />
-        ) : (
-          <ChevronRight className="size-3.5" aria-hidden />
-        )}
-        <span className="truncate" title={repo}>
-          {repoLabel(repo)}
-        </span>
-        <span className="ml-auto font-normal tabular-nums">{count}</span>
-      </button>
+      <div className="group/repo flex h-7 items-center rounded-md text-xs font-medium text-muted-foreground hover:text-foreground touch:h-11">
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          className="flex h-full min-w-0 flex-1 items-center gap-1 px-2"
+          aria-expanded={open}
+        >
+          {open ? (
+            <ChevronDown className="size-3.5 shrink-0" aria-hidden />
+          ) : (
+            <ChevronRight className="size-3.5 shrink-0" aria-hidden />
+          )}
+          {github ? (
+            <Github className="size-3.5 shrink-0" aria-hidden />
+          ) : (
+            <Folder className="size-3.5 shrink-0" aria-hidden />
+          )}
+          <span className="truncate" title={label}>
+            {label}
+          </span>
+          <span className="ml-auto font-normal tabular-nums">{count}</span>
+        </button>
+        <button
+          type="button"
+          onClick={onNewChat}
+          disabled={disabled}
+          aria-label={t('sidebar.newChatInRepo', { repo: label })}
+          title={t('sidebar.newChatInRepo', { repo: label })}
+          className="mr-1 flex size-5 shrink-0 items-center justify-center rounded hover:bg-accent disabled:opacity-50 touch:size-9"
+        >
+          <Plus className="size-3.5" aria-hidden />
+        </button>
+      </div>
       {open && <ul className="space-y-px">{children}</ul>}
     </li>
   );

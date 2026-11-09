@@ -10,7 +10,7 @@ use skyzen::routing::Params;
 use skyzen::utils::{Json, State};
 
 use crate::db::{ChatDbError, CreateProfileParams, ProfileEnvironmentKind, UpdateProfileParams};
-use crate::profile::{ProfileInfo, ProfilePreferences, query_profile_sessions};
+use crate::profile::{ProfileInfo, ProfilePreferences, ProfileSessions, query_profile_sessions};
 use crate::ui_event_bus::UiEventTopics;
 
 use super::error::{
@@ -19,6 +19,19 @@ use super::error::{
 };
 use super::state::{ContainerPrepareStage, ContainerPrepareStatus, DaemonState};
 use super::types::ApiErrorCode;
+
+/// The profile's sessions with the ones running background work marked.
+///
+/// # Errors
+/// Returns [`ChatDbError`] on storage failure.
+pub(super) async fn load_profile_sessions(
+    state: &DaemonState,
+    profile_id: &str,
+) -> Result<ProfileSessions, ChatDbError> {
+    let mut sessions = query_profile_sessions(&state.db(), profile_id).await?;
+    sessions.mark_working(&state.session_background.busy_sessions().await);
+    Ok(sessions)
+}
 
 // ── Request / Response types ────────────────────────────────
 
@@ -42,11 +55,11 @@ const fn default_env() -> ProfileEnvironmentKind {
     ProfileEnvironmentKind::Local
 }
 
-fn map_profile_error(err: ChatDbError) -> skyzen::Error {
+pub(super) fn map_profile_error(err: ChatDbError) -> skyzen::Error {
     match err {
-        ChatDbError::PinnedLimitExceeded { .. } | ChatDbError::InvalidProfileEnvironment(_) => {
-            bad_request_error(err)
-        }
+        ChatDbError::PinnedLimitExceeded { .. }
+        | ChatDbError::InvalidProfileEnvironment(_)
+        | ChatDbError::DefaultProfileProtected => bad_request_error(err),
         _ => internal_error(err),
     }
 }
@@ -287,12 +300,6 @@ pub(super) struct UpdateFolderRequest {
 
 #[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct MoveToFolderRequest {
-    pub folder_id: Option<String>,
-}
-
-#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
 pub(super) struct SetProfileRemoteServersRequest {
     pub server_names: Vec<String>,
 }
@@ -393,7 +400,7 @@ pub(super) async fn delete_profile(
 
     let db = state.db();
 
-    db.delete_profile(&id).await.map_err(internal_error)?;
+    db.delete_profile(&id).await.map_err(map_profile_error)?;
     super::remote_access::sync_remote_access_from_state(&state)
         .await
         .map_err(internal_error)?;
@@ -468,7 +475,7 @@ pub(super) async fn get_profile_sessions(
         };
     }
 
-    let result = query_profile_sessions(&state.db(), &id)
+    let result = load_profile_sessions(&state, &id)
         .await
         .map_err(internal_error)?;
     json_ok_response(&result)
@@ -547,76 +554,6 @@ pub(super) async fn delete_folder(
     let db = state.db();
 
     db.delete_folder(&id).await.map_err(internal_error)?;
-    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
-    Ok(Json(super::types::API_OK))
-}
-
-// ── Session pin/archive/move endpoints ──────────────────────
-
-pub(super) async fn pin_session(
-    params: Params,
-    State(state): State<Arc<DaemonState>>,
-) -> SkyResult<Json<super::types::ApiHealth>> {
-    let id = params.get("id").map_err(bad_request_error)?.to_string();
-
-    let db = state.db();
-
-    db.pin_session(&id).await.map_err(map_profile_error)?;
-    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
-    Ok(Json(super::types::API_OK))
-}
-
-pub(super) async fn unpin_session(
-    params: Params,
-    State(state): State<Arc<DaemonState>>,
-) -> SkyResult<Json<super::types::ApiHealth>> {
-    let id = params.get("id").map_err(bad_request_error)?.to_string();
-
-    let db = state.db();
-
-    db.unpin_session(&id).await.map_err(internal_error)?;
-    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
-    Ok(Json(super::types::API_OK))
-}
-
-pub(super) async fn archive_session(
-    params: Params,
-    State(state): State<Arc<DaemonState>>,
-) -> SkyResult<Json<super::types::ApiHealth>> {
-    let id = params.get("id").map_err(bad_request_error)?.to_string();
-
-    let db = state.db();
-
-    db.archive_session(&id).await.map_err(internal_error)?;
-    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
-    Ok(Json(super::types::API_OK))
-}
-
-pub(super) async fn unarchive_session(
-    params: Params,
-    State(state): State<Arc<DaemonState>>,
-) -> SkyResult<Json<super::types::ApiHealth>> {
-    let id = params.get("id").map_err(bad_request_error)?.to_string();
-
-    let db = state.db();
-
-    db.unarchive_session(&id).await.map_err(internal_error)?;
-    state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
-    Ok(Json(super::types::API_OK))
-}
-
-pub(super) async fn move_to_folder(
-    params: Params,
-    Json(req): Json<MoveToFolderRequest>,
-    State(state): State<Arc<DaemonState>>,
-) -> SkyResult<Json<super::types::ApiHealth>> {
-    let id = params.get("id").map_err(bad_request_error)?.to_string();
-
-    let db = state.db();
-
-    db.move_session_to_folder(&id, req.folder_id.as_deref())
-        .await
-        .map_err(map_profile_error)?;
     state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
     Ok(Json(super::types::API_OK))
 }

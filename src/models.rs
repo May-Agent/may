@@ -399,6 +399,31 @@ pub fn effort_family_base(model_id: &str) -> String {
     model_id.to_string()
 }
 
+/// The context window of `model_id` on `provider_id`: what the provider
+/// reports in its model list, else the `aither_models` table (also looked up
+/// by effort family, so `o4-mini-high` resolves like `o4-mini`).
+#[must_use]
+pub fn resolve_context_window(
+    fetched: &[FetchedModel],
+    provider_id: &str,
+    model_id: &str,
+) -> Option<u32> {
+    let family = effort_family_base(model_id);
+    let reported = |wanted: &str| {
+        fetched
+            .iter()
+            .find(|model| model.provider_id == provider_id && model.id == wanted)
+            .and_then(|model| model.context_window)
+    };
+    let tabled = |wanted: &str| {
+        lookup_model_info(wanted).and_then(aither_models::ModelEntry::max_input_tokens)
+    };
+    reported(model_id)
+        .or_else(|| reported(&family))
+        .or_else(|| tabled(model_id))
+        .or_else(|| tabled(&family))
+}
+
 /// Whether two selector strings address the same selectable model.
 ///
 /// The provider ids must match and the model ids must collapse to the same
@@ -449,9 +474,159 @@ pub fn effort_uid_token(model_id: &str) -> Option<&'static str> {
     None
 }
 
+/// The effort rungs a catalog serves per `(provider id, family base)`, in
+/// canonical order.
+pub type FamilyEffortRungs = std::collections::HashMap<(String, String), Vec<&'static str>>;
+
+/// Record the rungs the catalog encodes in model uids into `rungs`, keeping
+/// each family's rungs sorted and unique.
+pub fn record_family_effort_rungs(rungs: &mut FamilyEffortRungs, models: &[FetchedModel]) {
+    for model in models {
+        let Some(rung) = effort_uid_token(&model.id) else {
+            continue;
+        };
+        let family = rungs
+            .entry((model.provider_id.clone(), effort_family_base(&model.id)))
+            .or_default();
+        if !family.contains(&rung) {
+            family.push(rung);
+        }
+    }
+    for family in rungs.values_mut() {
+        family.sort_by_key(|rung| effort_rung_rank(rung));
+    }
+}
+
+/// The level a session uses before any selection.
+pub const DEFAULT_EFFORT: &str = "medium";
+
+/// The reasoning-effort ladder a provider's wire protocol expresses.
+///
+/// Every rung is concrete — the session's effort is the one it last selected, and
+/// "default" before any selection means medium, not a provider-decided
+/// level. Families outside a ladder still take it: vendors map what they can
+/// on their own API-compat layer and reject what a model does not have.
+#[must_use]
+pub const fn provider_effort_ladder(
+    provider_type: Option<ProviderType>,
+) -> &'static [&'static str] {
+    const OPENAI: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+    const CLAUDE: &[&str] = &["none", "low", "medium", "high", "xhigh", "max"];
+    const GEMINI: &[&str] = &["minimal", "low", "medium", "high"];
+    match provider_type {
+        Some(ProviderType::Anthropic) => CLAUDE,
+        Some(ProviderType::Google) => GEMINI,
+        _ => OPENAI,
+    }
+}
+
+/// The effort rungs offered for `model_id` on `provider_id`: the family's
+/// served rungs when the catalog reports them, else the provider protocol's
+/// generic ladder.
+#[must_use]
+pub fn effort_ladder(
+    family_rungs: &FamilyEffortRungs,
+    provider_id: &str,
+    model_id: &str,
+    provider_type: Option<ProviderType>,
+) -> Vec<&'static str> {
+    family_rungs
+        .get(&(provider_id.to_string(), effort_family_base(model_id)))
+        .cloned()
+        .unwrap_or_else(|| provider_effort_ladder(provider_type).to_vec())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{effort_rung_rank, same_selectable_model};
+    use super::{
+        FamilyEffortRungs, FetchedModel, ProviderType, effort_ladder, effort_rung_rank,
+        record_family_effort_rungs, same_selectable_model,
+    };
+
+    fn fetched(provider_id: &str, id: &str) -> FetchedModel {
+        FetchedModel {
+            id: id.to_string(),
+            nickname: id.to_string(),
+            context_window: None,
+            abilities: Vec::new(),
+            provider_id: provider_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn family_rungs_are_sorted_and_the_catalog_beats_the_provider_ladder() {
+        let mut rungs = FamilyEffortRungs::new();
+        record_family_effort_rungs(
+            &mut rungs,
+            &[
+                fetched("relay", "o4-mini-high"),
+                fetched("relay", "o4-mini-low"),
+                fetched("relay", "o4-mini-high"),
+            ],
+        );
+        assert_eq!(
+            effort_ladder(&rungs, "relay", "o4-mini", None),
+            ["low", "high"]
+        );
+        assert_eq!(
+            effort_ladder(&rungs, "relay", "o4-mini-low", None),
+            ["low", "high"]
+        );
+        assert_eq!(
+            effort_ladder(&rungs, "relay", "gpt-x", Some(ProviderType::Google)),
+            ["minimal", "low", "medium", "high"]
+        );
+    }
+
+    fn with_window(provider_id: &str, id: &str, window: u32) -> FetchedModel {
+        FetchedModel {
+            context_window: Some(window),
+            ..fetched(provider_id, id)
+        }
+    }
+
+    #[test]
+    fn a_provider_reported_window_resolves_a_model_the_table_lacks() {
+        let list = [with_window("relay", "relay-only-model", 262_144)];
+        assert_eq!(
+            super::resolve_context_window(&list, "relay", "relay-only-model"),
+            Some(262_144)
+        );
+        assert_eq!(
+            super::resolve_context_window(&list, "other", "relay-only-model"),
+            None
+        );
+    }
+
+    #[test]
+    fn the_provider_window_beats_the_table_and_the_table_fills_the_rest() {
+        let table = aither_models::lookup("gpt-4o")
+            .and_then(aither_models::ModelEntry::max_input_tokens)
+            .expect("the table lists gpt-4o");
+        assert_eq!(
+            super::resolve_context_window(&[], "relay", "gpt-4o"),
+            Some(table)
+        );
+        let list = [fetched("relay", "gpt-4o")];
+        assert_eq!(
+            super::resolve_context_window(&list, "relay", "gpt-4o"),
+            Some(table)
+        );
+        let list = [with_window("relay", "gpt-4o", 12_345)];
+        assert_eq!(
+            super::resolve_context_window(&list, "relay", "gpt-4o"),
+            Some(12_345)
+        );
+    }
+
+    #[test]
+    fn an_effort_rung_resolves_through_its_family() {
+        let list = [with_window("relay", "o4-mini", 4_321)];
+        assert_eq!(
+            super::resolve_context_window(&list, "relay", "o4-mini-high"),
+            Some(4_321)
+        );
+    }
 
     #[test]
     fn same_model_matches_across_effort_rungs_on_one_provider() {

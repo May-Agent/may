@@ -10,6 +10,7 @@ pub mod lifecycle;
 pub mod serve;
 
 mod acp_agents;
+mod archive;
 mod artifact_pages;
 mod artifacts;
 mod attachments;
@@ -24,9 +25,14 @@ mod config;
 mod error;
 mod error_chain;
 mod events;
+mod github_repos;
+#[cfg(test)]
+mod github_repos_tests;
 mod helpers;
 mod interaction;
 pub use interaction::ASK_USER_NOT_OPEN;
+#[cfg(test)]
+mod attachments_tests;
 mod local_url_mapper;
 mod message_mapping;
 mod model_resolution;
@@ -36,7 +42,12 @@ mod remote_access;
 mod rules_import;
 mod server;
 #[cfg(test)]
+mod session_commands_tests;
+#[cfg(test)]
 mod session_directory_tests;
+pub(crate) mod session_events;
+#[cfg(test)]
+mod session_events_tests;
 mod sessions;
 mod sleep;
 mod state;
@@ -44,11 +55,19 @@ mod tasks;
 mod terminal_parsing;
 mod title_generation;
 mod tool_summary;
+mod transcript;
+#[cfg(test)]
+mod transcript_tests;
 mod tunnel;
 pub(crate) mod types;
+mod user_wait;
 
 #[cfg(test)]
+mod compression_tests;
+#[cfg(test)]
 mod funnel_tests;
+#[cfg(test)]
+mod issue_brief_tests;
 #[cfg(test)]
 mod paths_tests;
 #[cfg(test)]
@@ -58,10 +77,13 @@ mod response_tests;
 #[cfg(test)]
 mod secret_question_tests;
 #[cfg(test)]
+mod user_wait_tests;
+#[cfg(test)]
 mod yolo_tests;
 
 pub use chat::{
-    BtwMessage, BtwRequest, BtwResponse, CompactResponse, ContextDumpResponse, RecapRecord,
+    BtwMessage, BtwRequest, BtwResponse, CompactResponse, ContextDumpResponse, ProgressReport,
+    RecapRecord,
 };
 pub use server::{DEFAULT_PORT, DaemonMode, parse_listen_args};
 pub(crate) use server::{start, sync_remote_access};
@@ -442,11 +464,20 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
         loop {
             match config_events.recv().await {
                 Ok(topics) if topics.contains(UiEventTopics::CONFIG) => {
+                    config_state
+                        .live_limits
+                        .apply(&config_state.config_snapshot());
                     extra
                         .reconcile(&config_state.config_snapshot().daemon.listen)
                         .await;
                 }
-                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                // A lagged receiver may have missed the change.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    config_state
+                        .live_limits
+                        .apply(&config_state.config_snapshot());
+                }
+                Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
         }

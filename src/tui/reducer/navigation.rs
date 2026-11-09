@@ -33,6 +33,24 @@ pub fn handle_session_select_key(app: &mut App, code: KeyCode) -> Option<SendAct
                 && let Some(summary) = app.session_list.get(*original_idx)
             {
                 let id = summary.id.clone();
+                // Opening an archived session makes it recent again.
+                if summary.archived
+                    && let Some(client) = app.btw_daemon.clone()
+                {
+                    let session_id = id.as_str().to_string();
+                    executor_core::spawn(async move {
+                        if let Err(error) = client
+                            .post::<_, serde_json::Value>(
+                                &format!("/api/sessions/{session_id}"),
+                                &serde_json::json!({}),
+                            )
+                            .await
+                        {
+                            tracing::warn!(%session_id, %error, "failed to unarchive opened session");
+                        }
+                    })
+                    .detach();
+                }
                 app.mode = AppMode::Chat;
                 return Some(SendAction::LoadSession(id));
             }
@@ -47,7 +65,6 @@ pub fn handle_session_select_key(app: &mut App, code: KeyCode) -> Option<SendAct
                     .unwrap_or(0);
                 let next_idx = (current_idx + 1) % app.profiles.len();
                 set_active_profile(app, app.profiles[next_idx].id.clone());
-                app.archived_expanded = false;
                 app.refresh_profile_sessions();
                 app.set_status("Switching profile...");
             }
@@ -66,7 +83,6 @@ pub fn handle_session_select_key(app: &mut App, code: KeyCode) -> Option<SendAct
                     current_idx - 1
                 };
                 set_active_profile(app, app.profiles[next_idx].id.clone());
-                app.archived_expanded = false;
                 app.refresh_profile_sessions();
                 app.set_status("Switching profile...");
             }
@@ -95,6 +111,21 @@ pub fn handle_session_select_key(app: &mut App, code: KeyCode) -> Option<SendAct
                         app.mode = AppMode::Chat;
                         return Some(SendAction::NewSession);
                     }
+                    'N' => {
+                        // A new chat under the highlighted session's project.
+                        let binding = filtered
+                            .get(app.session_selected)
+                            .and_then(|(_, summary)| summary.repo.as_deref())
+                            .and_then(|stored| crate::session::RepoBinding::parse(stored).ok());
+                        let Some(binding) = binding else {
+                            app.set_status("That session belongs to no project");
+                            return None;
+                        };
+                        app.session_manager
+                            .set_launch(crate::session::SessionLaunch::Repo(binding.launch_spec()));
+                        app.mode = AppMode::Chat;
+                        return Some(SendAction::NewSession);
+                    }
                     'p' => {
                         // Toggle pin/unpin for selected session
                         toggle_pin(app);
@@ -103,18 +134,6 @@ pub fn handle_session_select_key(app: &mut App, code: KeyCode) -> Option<SendAct
                     'a' => {
                         // Toggle archive/unarchive for selected session
                         toggle_archive(app);
-                        return None;
-                    }
-                    'e' => {
-                        // Toggle archived section expansion
-                        if app.profile_sessions.is_some() {
-                            app.archived_expanded = !app.archived_expanded;
-                            app.build_session_list_from_profile();
-                            // Clamp selection if it went out of range
-                            if app.session_selected >= app.session_list.len() {
-                                app.session_selected = app.session_list.len().saturating_sub(1);
-                            }
-                        }
                         return None;
                     }
                     'd' => {
@@ -226,11 +245,10 @@ fn toggle_pin(app: &mut App) {
     let profile_id = app.current_profile_id.clone();
 
     executor_core::spawn(async move {
-        let action = if is_pinned { "unpin" } else { "pin" };
         if let Err(e) = client
-            .post::<_, serde_json::Value>(
-                &format!("/api/sessions/{session_id}/{action}"),
-                &serde_json::json!({}),
+            .patch::<_, serde_json::Value>(
+                &format!("/api/sessions/{session_id}"),
+                &serde_json::json!({ "pinned": !is_pinned }),
             )
             .await
         {
@@ -276,11 +294,10 @@ fn toggle_archive(app: &mut App) {
     let profile_id = app.current_profile_id.clone();
 
     executor_core::spawn(async move {
-        let action = if is_archived { "unarchive" } else { "archive" };
         if let Err(e) = client
-            .post::<_, serde_json::Value>(
-                &format!("/api/sessions/{session_id}/{action}"),
-                &serde_json::json!({}),
+            .patch::<_, serde_json::Value>(
+                &format!("/api/sessions/{session_id}"),
+                &serde_json::json!({ "archived": !is_archived }),
             )
             .await
         {
@@ -327,7 +344,7 @@ pub fn handle_profile_select_key(app: &mut App, code: KeyCode) -> Option<SendAct
         KeyCode::Enter => {
             if let Some(profile) = app.profiles.get(app.profile_selected) {
                 set_active_profile(app, profile.id.clone());
-                app.archived_expanded = false;
+                app.session_view = crate::tui::state::SessionView::Recent;
                 // Load sessions for selected profile then switch to SessionSelect
                 app.load_session_list();
             }
@@ -509,6 +526,20 @@ pub fn handle_btw_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
         KeyCode::Down | KeyCode::Char('j') if !awaiting_question => {
             state.scroll = state.scroll.saturating_add(1);
         }
+        _ => {}
+    }
+    None
+}
+
+/// Keys inside the `/progress` overlay: scroll the report, Esc/q closes.
+pub fn handle_progress_key(app: &mut App, code: KeyCode) -> Option<SendAction> {
+    let AppMode::Progress(state) = &mut app.mode else {
+        return None;
+    };
+    match code {
+        KeyCode::Esc | KeyCode::Char('q') => app.mode = AppMode::Chat,
+        KeyCode::Up | KeyCode::Char('k') => state.scroll = state.scroll.saturating_sub(1),
+        KeyCode::Down | KeyCode::Char('j') => state.scroll = state.scroll.saturating_add(1),
         _ => {}
     }
     None

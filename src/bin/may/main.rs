@@ -121,10 +121,25 @@ fn tokio_runtime() -> io::Result<tokio::runtime::Runtime> {
         .build()
 }
 
-fn main() -> anyhow::Result<()> {
-    tokio_runtime()
-        .context("failed to build the tokio runtime")?
-        .block_on(async_main())
+fn main() -> anyhow::Result<std::process::ExitCode> {
+    // The permission helper instances the computer agent launches run this
+    // same executable; they do their work and exit before anything else.
+    #[cfg(target_os = "macos")]
+    if let Some(code) = waterkit_permission::run_helper_entry_if_requested() {
+        return Ok(code);
+    }
+    let runtime = tokio_runtime().context("failed to build the tokio runtime")?;
+    // The computer agent's main thread services the run loop virtual
+    // displays are built on; everything else runs on a thread of its own.
+    #[cfg(target_os = "macos")]
+    if matches!(parse_cli_mode_from_env(), CliMode::ComputerAgent { .. }) {
+        may_agent::computer::main_thread::host(WORKER_STACK_BYTES, move || {
+            runtime.block_on(async_main())
+        })?;
+        return Ok(std::process::ExitCode::SUCCESS);
+    }
+    runtime.block_on(async_main())?;
+    Ok(std::process::ExitCode::SUCCESS)
 }
 
 /// Points this process's stderr at `path`, appending, so panics and the
@@ -230,9 +245,9 @@ async fn async_main() -> anyhow::Result<()> {
         CliMode::Resume(args) => Some(args.clone()),
         _ => None,
     };
-    let tui_repo = match &cli_mode {
-        CliMode::Tui(args) => args.repo.clone(),
-        _ => None,
+    let tui_launch = match &cli_mode {
+        CliMode::Tui(args) => args.launch.clone(),
+        _ => may_agent::session::SessionLaunch::default(),
     };
     match cli_mode {
         CliMode::Help(help_text) => {
@@ -266,21 +281,6 @@ async fn async_main() -> anyhow::Result<()> {
                 return Err(anyhow::Error::msg("computer-agent needs macOS"));
             }
         }
-        CliMode::ComputerAgentProbe(request) => {
-            #[cfg(target_os = "macos")]
-            {
-                use std::io::Write;
-                let report =
-                    serde_json::to_vec(&may_agent::computer::permissions::probe(request).await)?;
-                std::io::stdout().write_all(&report)?;
-                return Ok(());
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                let _ = request;
-                return Err(anyhow::Error::msg("computer-agent-probe needs macOS"));
-            }
-        }
         CliMode::Browser(args) => std::process::exit(run_browser(args).await?),
         CliMode::Exec(args) => std::process::exit(Box::pin(run_exec(args)).await?),
         CliMode::OneShot(args) => return run_oneshot(args).await,
@@ -308,6 +308,10 @@ async fn async_main() -> anyhow::Result<()> {
         default_hook(panic_info);
     }));
 
+    // The band colour comes from the terminal's own colours: asked once,
+    // on a blocking thread so the runtime keeps turning, before raw mode.
+    let band_bg = blocking::unblock(may_agent::tui::ui::band::query_band_color).await;
+
     // Detect terminal image support (must be before raw mode)
     let image_support = may_agent::tui::ui::image::TerminalImageSupport::detect();
 
@@ -325,7 +329,15 @@ async fn async_main() -> anyhow::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Create app and run
-    let result = run_app(&mut terminal, image_support, log_ring, resume, tui_repo).await;
+    let result = run_app(
+        &mut terminal,
+        image_support,
+        band_bg,
+        log_ring,
+        resume,
+        tui_launch,
+    )
+    .await;
 
     // Cleanup terminal
     disable_raw_mode()?;
@@ -376,16 +388,18 @@ struct ExitSummary {
 async fn run_app<B: Backend>(
     terminal: &mut Terminal<B>,
     image_support: Option<may_agent::tui::ui::image::TerminalImageSupport>,
+    band_bg: Option<ratatui::style::Color>,
     log_ring: may_agent::log_ring::LogRingHandle,
     resume: Option<cli::ResumeArgs>,
-    tui_repo: Option<String>,
+    tui_launch: may_agent::session::SessionLaunch,
 ) -> anyhow::Result<Option<ExitSummary>>
 where
     B::Error: Send + Sync + 'static,
 {
     let mut events = EventHandler::new();
     let mut app = App::new(events.sender(), image_support).await?;
-    app.session_manager.set_pending_repo(tui_repo);
+    app.band_bg = band_bg;
+    app.session_manager.set_launch(tui_launch);
     let mut worker: Option<AgentWorker> = None;
 
     tracing::info!("=== MAY STARTUP - channels created ===");
@@ -616,14 +630,20 @@ struct RepoTrust {
 
 /// The launch gate for a session that will run in `profile_id`: a repository
 /// launch asks for its trust level, any other launch asks for the
-/// write-grant. Both read and persist that profile's `workspace.toml`.
+/// write-grant. Both read and persist that profile's `workspace.toml`. A
+/// session that works in no directory — a repo-less chat, or a start on
+/// `owner/repo` — has no launch gate here; the daemon asks the repository's
+/// trust when the session starts.
 fn startup_gate_check(
     app: &App,
     profile_id: Option<&str>,
 ) -> Result<Option<StartupGate>, may_agent::workspace::WorkspaceConfigError> {
+    let Some(dir) = app.session_manager.launch_cwd(&app.cwd) else {
+        return Ok(None);
+    };
     gate_check(
         app.session_manager.may_dir(),
-        &app.cwd,
+        &dir,
         profile_id,
         &app.profiles,
     )
@@ -955,19 +975,6 @@ where
         let had_none = app.open_question_count == 0;
         app.open_question_count = open.len();
         if had_none && let Some(first) = open.into_iter().next() {
-            let question_text = first
-                .questions
-                .first()
-                .map_or("A new question is waiting", |q| q.question.as_str());
-            if let Some(session_id) = app
-                .session_manager
-                .current()
-                .map(|session| session.id.clone())
-            {
-                runtime_deps
-                    .notify_open_question(&session_id, question_text)
-                    .await;
-            }
             let _ = io::stdout()
                 .write_all(b"\x07")
                 .and_then(|()| io::stdout().flush());
@@ -1017,8 +1024,11 @@ where
             match runtime_deps.begin_queued_run(app)? {
                 QueuedRunStart::Started(msg) => {
                     busy_elsewhere_notified = false;
-                    agent_handle =
-                        Some(runtime_deps.start_agent_task(app, w, msg, &mut pending_title_gen)?);
+                    agent_handle = Some(
+                        runtime_deps
+                            .start_agent_task(app, w, msg, &mut pending_title_gen)
+                            .await?,
+                    );
                     assistant_response.clear();
                     continue;
                 }
@@ -1112,7 +1122,11 @@ where
             break;
         };
         if matches!(&event, Event::Terminal(e) if matches!(**e, AppEvent::Tick)) {
-            needs_draw = app.processing || last_draw.elapsed() >= std::time::Duration::from_secs(1);
+            // The fireworks redraw every tick, and once more on the tick
+            // that ends them so no spark stays on screen.
+            needs_draw = app.processing
+                || app.new_year.animating()
+                || last_draw.elapsed() >= std::time::Duration::from_secs(1);
         }
         let event_kind = match &event {
             Event::Terminal(e) => e.kind(),
@@ -1242,8 +1256,12 @@ where
                         }
                     },
                     TuiEvent::Retract => {
-                        app.chat.retract_text();
+                        app.retract_response();
                         assistant_response.clear();
+                    }
+                    TuiEvent::Withdrawn { content, own } => {
+                        assistant_response.clear();
+                        app.withdraw_turn(content, own);
                     }
                     TuiEvent::Compacted(result) => match result {
                         Ok(Some(stats)) => {
@@ -1267,6 +1285,18 @@ where
                                 &mut pending_title_gen,
                                 &assistant_response,
                                 RunOutcome::Completed,
+                            )
+                            .await;
+                    }
+                    TuiEvent::Declined(message) => {
+                        app.chat.push_notice(&message);
+                        runtime_deps
+                            .finish_agent_task(
+                                app,
+                                &mut agent_handle,
+                                &mut pending_title_gen,
+                                &assistant_response,
+                                RunOutcome::Cancelled,
                             )
                             .await;
                     }
@@ -1370,7 +1400,6 @@ where
                         if let Some(handle) = agent_handle.take() {
                             handle.cancel();
                         }
-                        app.restore_aborted_draft();
                         app.status = None;
                         // Clean up loading/streaming state before adding interrupt message
                         app.chat.collapse_thinking();
@@ -1414,10 +1443,10 @@ where
                             (runtime_deps.daemon(), app.session_manager.current())
                         {
                             let stopped: Result<serde_json::Value, _> = client
-                                .post(
-                                    &may_agent::client::session_path(session.id.as_str(), "/stop"),
-                                    &serde_json::json!({}),
-                                )
+                                .delete(&may_agent::client::session_path(
+                                    session.id.as_str(),
+                                    "/turns/current",
+                                ))
                                 .await;
                             if let Err(error) = stopped {
                                 tracing::warn!(%error, "failed to stop the session's run before quitting");
@@ -1520,7 +1549,8 @@ where
                             // The worker is still being built: show the turn
                             // now and send it as soon as the worker exists.
                             let turn =
-                                RuntimeDeps::show_agent_turn(app, msg, &mut pending_title_gen)?;
+                                RuntimeDeps::show_agent_turn(app, msg, &mut pending_title_gen)
+                                    .await?;
                             held_turn = Some(HeldTurn {
                                 turn: Some(turn),
                                 behind: Vec::new(),
@@ -1534,7 +1564,7 @@ where
                                     w,
                                     msg,
                                     &mut pending_title_gen,
-                                )?);
+                                ).await?);
                                 assistant_response.clear();
                             } else {
                                 app.chat.push_notice(
@@ -1632,6 +1662,23 @@ where
                     Some(SendAction::ReloadHistory) => {
                         app.reload_chat().await;
                     }
+                    Some(SendAction::DesktopNotification(notification)) => {
+                        // The terminal write stays off the event loop; a
+                        // failure never reaches the popup.
+                        let protocol = may_agent::tui::desktop_notification::Protocol::detect(
+                            std::env::var("TERM_PROGRAM").ok().as_deref(),
+                            std::env::var("TERM").ok().as_deref(),
+                        );
+                        blocking::unblock(move || {
+                            if let Err(error) = may_agent::tui::desktop_notification::raise(
+                                &notification,
+                                protocol,
+                            ) {
+                                tracing::warn!(%error, "failed to raise the desktop notification");
+                            }
+                        })
+                        .detach();
+                    }
                     Some(SendAction::OpenQuestions) => {
                         let open = app.session_runtime.open_questions.clone();
                         if open.is_empty() {
@@ -1706,7 +1753,7 @@ where
                             let tx = app.event_tx.clone();
                             spawn(async move {
                                 let result = client
-                                    .put::<_, serde_json::Value>(
+                                    .patch::<_, serde_json::Value>(
                                         &format!("/api/sessions/{}", session_id.as_str()),
                                         &serde_json::json!({"reasoningEffort": effort}),
                                     )
@@ -1714,7 +1761,8 @@ where
                                     .map(|_| effort)
                                     .map_err(may_agent::tui::error::TuiError::from);
                                 let _ = tx.send(AppEvent::EffortApplied(result)).await;
-                            });
+                            })
+                            .detach();
                         }
                     }
                     Some(SendAction::OpenChatgptAuthUrl { url, code }) => {
@@ -1770,11 +1818,8 @@ where
                             (Some(client), Some(session_id)) => {
                                 let enable = !app.session_runtime.yolo;
                                 let put = client
-                                    .put::<_, serde_json::Value>(
-                                        &may_agent::client::session_path(
-                                            session_id.as_str(),
-                                            "/yolo",
-                                        ),
+                                    .patch::<_, serde_json::Value>(
+                                        &format!("/api/sessions/{session_id}"),
                                         &serde_json::json!({ "yolo": enable }),
                                     )
                                     .await;
@@ -1829,7 +1874,7 @@ where
                                     .post::<_, serde_json::Value>(
                                         &may_agent::client::session_path(
                                             session_id.as_str(),
-                                            "/recap",
+                                            "/actions/recap",
                                         ),
                                         &serde_json::json!({}),
                                     )

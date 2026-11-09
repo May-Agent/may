@@ -7,18 +7,18 @@ import {
 } from '../api/background';
 import { getSessionTasks } from '../api/tasks';
 import { isDraftSessionId, useSessionsStore } from './sessions';
-import { parseTaskTree, type TaskTree } from '../tasks/taskTree';
 import {
   NO_STOP_REQUESTS,
   settleStopRequests,
   type StopRequests,
 } from '../inspector/model';
-import type { SessionPlanState } from '../types';
+import type { SessionPlanState, TaskRow } from '../types';
 
 export interface SessionTasks {
-  /** Raw `tasks.md`, kept for the editor; the inspector renders `tree`. */
+  /** Raw `tasks.md`, kept for the editor; the inspector renders `rows`. */
   content: string;
-  tree: TaskTree;
+  /** The daemon's parse of `content`. */
+  rows: TaskRow[];
   planState: SessionPlanState;
 }
 
@@ -46,10 +46,17 @@ interface InspectorState {
 
   /** Fetch tasks.md; overlapping calls coalesce into one follow-up fetch. */
   loadTasks: (sessionId: string) => Promise<void>;
-  /** Store a tasks document the client itself just saved. */
-  setTasks: (sessionId: string, content: string, planState: SessionPlanState) => void;
+  /**
+   * Store a tasks document the client itself just saved. `rows` are the
+   * daemon's parse of it; a draft session has no daemon yet, so none.
+   */
+  setTasks: (
+    sessionId: string,
+    document: { content: string; rows?: TaskRow[] },
+    planState: SessionPlanState,
+  ) => void;
   loadBackground: (sessionId: string) => Promise<void>;
-  /** Apply a `session_background` snapshot. */
+  /** Apply a session background snapshot. */
   applyBackground: (snapshot: SessionBackground) => void;
   killJob: (sessionId: string, pid: number) => Promise<void>;
   stopSubagent: (sessionId: string, runId: number) => Promise<void>;
@@ -70,10 +77,14 @@ export const useInspectorStore = create<InspectorState>((set, get) => {
   /** Sessions with a tasks fetch in flight, and whether another is owed. */
   const inflight = new Map<string, { again: boolean }>();
 
-  const tasksOf = (content: string, planState: SessionPlanState): SessionTasks => ({
+  const tasksOf = (
+    content: string,
+    rows: TaskRow[] | undefined,
+    planState: SessionPlanState,
+  ): SessionTasks => ({
     content,
     planState,
-    tree: parseTaskTree(content),
+    rows: rows ?? [],
   });
 
   return {
@@ -86,6 +97,7 @@ export const useInspectorStore = create<InspectorState>((set, get) => {
         patch(sessionId, () => ({
           tasks: tasksOf(
             record?.planContent ?? '',
+            undefined,
             record?.session.runtime?.planState ?? 'disabled',
           ),
           tasksError: null,
@@ -106,7 +118,7 @@ export const useInspectorStore = create<InspectorState>((set, get) => {
           try {
             const res = await getSessionTasks(sessionId);
             patch(sessionId, () => ({
-              tasks: tasksOf(res.content ?? '', res.planState),
+              tasks: tasksOf(res.content ?? '', res.rows, res.planState),
               tasksError: null,
             }));
           } catch (err) {
@@ -119,8 +131,11 @@ export const useInspectorStore = create<InspectorState>((set, get) => {
       }
     },
 
-    setTasks(sessionId, content, planState) {
-      patch(sessionId, () => ({ tasks: tasksOf(content, planState), tasksError: null }));
+    setTasks(sessionId, document, planState) {
+      patch(sessionId, () => ({
+        tasks: tasksOf(document.content, document.rows, planState),
+        tasksError: null,
+      }));
     },
 
     async loadBackground(sessionId) {

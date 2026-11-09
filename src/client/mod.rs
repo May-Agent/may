@@ -12,10 +12,12 @@ mod wire;
 
 pub use sse::{ServerEvent, SseParser};
 pub use wire::{
-    CreateSessionRequest, HoldReason, IndexCoverage, PermissionPollItem, RecapFrame, RewindRequest,
-    RunEnd, SessionAgentBody, SessionAgentFrame, SessionIndexSnapshot, SessionIssuesFrame,
-    SessionRuntimeEvent, SessionRuntimeSnapshot, SuggestionFrame, UpdateSessionRequest,
-    WireAgentError, WireAgentEvent, WirePr, WireSession,
+    CreateSessionRequest, HoldReason, IndexCoverage, IssueRemovedFrame, IssueUpsertedFrame,
+    JobRemovedFrame, JobUpsertedFrame, PermissionPollItem, RecapFrame, RewindRequest, RunEnd,
+    SessionAgentBody, SessionAgentFrame, SessionIndexSnapshot, SessionIssuesFrame,
+    SessionRuntimeEvent, SessionRuntimeSnapshot, SubagentRemovedFrame, SubagentUpsertedFrame,
+    SuggestionFrame, UpdateSessionRequest, WarningFrame, WireAgentError, WireAgentEvent, WirePr,
+    WirePrChecks, WireSession, WireTranscriptEntry, WireTranscriptPage,
 };
 
 use std::path::PathBuf;
@@ -140,6 +142,23 @@ impl DaemonClient {
     ///
     /// # Errors
     /// Fails when the daemon is unreachable or refuses the request.
+    /// `GET /api/sessions/{id}/transcript` — the session's folded
+    /// transcript entries, oldest first.
+    ///
+    /// # Errors
+    /// Returns [`DaemonClientError`] when the request or decoding fails.
+    pub async fn get_transcript(
+        &self,
+        session_id: &str,
+    ) -> Result<WireTranscriptPage, DaemonClientError> {
+        self.get(&format!("/api/sessions/{session_id}/transcript"))
+            .await
+    }
+
+    /// `GET path`, decoding the JSON answer.
+    ///
+    /// # Errors
+    /// Fails when the daemon is unreachable or the body is not `T`.
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, DaemonClientError> {
         self.json(hyper::Method::GET, path, None).await
     }
@@ -157,6 +176,58 @@ impl DaemonClient {
             .await
     }
 
+    /// `POST path` with a raw body and explicit content type, decoding the
+    /// JSON answer. Used by the attachment upload route.
+    ///
+    /// # Errors
+    /// Fails when the daemon is unreachable or refuses the request.
+    pub async fn post_raw<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: Vec<u8>,
+        content_type: &str,
+    ) -> Result<T, DaemonClientError> {
+        let stream = tokio::net::UnixStream::connect(&self.socket)
+            .await
+            .map_err(|source| DaemonClientError::Unreachable {
+                socket: self.socket.clone(),
+                source,
+            })?;
+        let (mut sender, connection) =
+            hyper::client::conn::http1::handshake(TokioIo::new(stream)).await?;
+        tokio::spawn(async move {
+            if let Err(error) = connection.await {
+                tracing::debug!(%error, "daemon connection closed");
+            }
+        });
+        let request = hyper::Request::builder()
+            .method(hyper::Method::POST)
+            .uri(path)
+            .header(hyper::header::HOST, "may-daemon")
+            .header(hyper::header::CONTENT_TYPE, content_type)
+            .body(Full::new(Bytes::from(body)))?;
+        let response = sender.send_request(request).await?;
+        let status = response.status();
+        let bytes = response.into_body().collect().await?.to_bytes();
+        if !status.is_success() {
+            return Err(DaemonClientError::Status {
+                path: path.to_string(),
+                status,
+                message: String::from_utf8_lossy(&bytes).trim().to_string(),
+            });
+        }
+        Ok(serde_json::from_slice(&bytes)?)
+    }
+
+    /// `GET path`, returning the raw response bytes.
+    ///
+    /// # Errors
+    /// Fails when the daemon is unreachable or refuses the request.
+    pub async fn get_bytes(&self, path: &str) -> Result<Vec<u8>, DaemonClientError> {
+        let response = self.send(hyper::Method::GET, path, None).await?;
+        Ok(response.into_body().collect().await?.to_bytes().to_vec())
+    }
+
     /// `PUT path` with a JSON body, decoding the JSON answer.
     ///
     /// # Errors
@@ -167,6 +238,19 @@ impl DaemonClient {
         body: &B,
     ) -> Result<T, DaemonClientError> {
         self.json(hyper::Method::PUT, path, Some(serde_json::to_vec(body)?))
+            .await
+    }
+
+    /// `PATCH path` with a JSON body, decoding the JSON answer.
+    ///
+    /// # Errors
+    /// Fails when the daemon is unreachable or refuses the request.
+    pub async fn patch<B: Serialize + Sync, T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T, DaemonClientError> {
+        self.json(hyper::Method::PATCH, path, Some(serde_json::to_vec(body)?))
             .await
     }
 
@@ -205,12 +289,43 @@ impl DaemonClient {
     pub async fn events(&self, query: &str) -> Result<EventStream, DaemonClientError> {
         let mut path = String::from("/api/events?");
         path.push_str(query);
-        let response = self.send(hyper::Method::GET, &path, None).await?;
+        self.stream(&path).await
+    }
+
+    /// Opens `/api/sessions/{id}/events`; `after` is the cursor the stream
+    /// continues from.
+    ///
+    /// # Errors
+    /// Fails when the daemon is unreachable or refuses the subscription.
+    pub async fn session_events(
+        &self,
+        session_id: &str,
+        after: Option<&str>,
+    ) -> Result<EventStream, DaemonClientError> {
+        let path = session_events_url(session_id, after);
+        self.stream(&path).await
+    }
+
+    async fn stream(&self, path: &str) -> Result<EventStream, DaemonClientError> {
+        let response = self.send(hyper::Method::GET, path, None).await?;
         Ok(EventStream {
             body: response.into_body(),
             parser: SseParser::default(),
         })
     }
+}
+
+/// The `/api/sessions/{id}/events` path `session_events` opens: `after` is
+/// URL-encoded like every other query the client builds.
+fn session_events_url(session_id: &str, after: Option<&str>) -> String {
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    if let Some(after) = after {
+        query.append_pair("after", after);
+    }
+    let mut path = session_path(session_id, "/events");
+    path.push('?');
+    path.push_str(&query.finish());
+    path
 }
 
 /// Server events of one `/api/events` subscription.
@@ -239,5 +354,28 @@ impl EventStream {
                 None => return Ok(None),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::session_events_url;
+
+    #[test]
+    fn a_resumed_session_stream_names_its_cursor() {
+        assert_eq!(
+            session_events_url("s 1", Some("42.7")),
+            "/api/sessions/s 1/events?after=42.7"
+        );
+        assert_eq!(
+            session_events_url("s", Some("a/b?c=d")),
+            "/api/sessions/s/events?after=a%2Fb%3Fc%3Dd",
+            "the cursor is URL-encoded"
+        );
+        assert_eq!(
+            session_events_url("s", None),
+            "/api/sessions/s/events?",
+            "a new session passes no after"
+        );
     }
 }

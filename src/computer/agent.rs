@@ -6,7 +6,6 @@
 //! Accessibility grants per process at launch, and a helper the daemon
 //! respawns picks up a fresh grant while the daemon itself never restarts.
 
-use std::collections::HashMap;
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -15,19 +14,26 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
-use super::input::{self, InputState};
+use waterkit_permission::{Permission, PermissionError, PermissionStatus};
+
 use super::proto::{AgentRequest, AgentResponse};
 use super::stream::OfferError;
-use super::{SessionDisplay, SessionDisplays, SessionStreams, permissions, screenshot};
+use super::{SessionDisplays, SessionStreams, screenshot};
 
 /// Everything the agent holds across requests.
 struct AgentState {
-    displays: SessionDisplays,
-    streams: SessionStreams,
-    /// One input context per session — shared by the viewer's
-    /// `DataChannel` and the agent `computer` command so focus/drag
-    /// state stays coherent.
-    inputs: HashMap<String, Arc<Mutex<InputState>>>,
+    /// Held across a display's creation, which waits on the main thread, so
+    /// two asks for one session create one display.
+    displays: async_lock::Mutex<SessionDisplays>,
+    streams: Mutex<SessionStreams>,
+}
+
+impl AgentState {
+    fn streams(&self) -> std::sync::MutexGuard<'_, SessionStreams> {
+        self.streams
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 /// How often a running helper checks that its socket is still the one in
@@ -60,11 +66,10 @@ async fn serve_watching(may_dir: &Path, watch_interval: Duration) -> Result<(), 
     let bound_inode = std::fs::metadata(&sock)
         .map_err(|e| format!("stat {}: {e}", sock.display()))?
         .ino();
-    let state = Arc::new(Mutex::new(AgentState {
-        displays: SessionDisplays::default(),
-        streams: SessionStreams::default(),
-        inputs: HashMap::new(),
-    }));
+    let state = Arc::new(AgentState {
+        displays: async_lock::Mutex::new(SessionDisplays::default()),
+        streams: Mutex::new(SessionStreams::default()),
+    });
     let mut watch = tokio::time::interval(watch_interval);
     loop {
         let conn = tokio::select! {
@@ -90,7 +95,7 @@ async fn serve_watching(may_dir: &Path, watch_interval: Duration) -> Result<(), 
             let mut line = String::new();
             let response = match BufReader::new(&mut reader).read_line(&mut line).await {
                 Ok(_) => match serde_json::from_str(&line) {
-                    Ok(request) => dispatch_inner(request, state).await,
+                    Ok(request) => dispatch(request, &state).await,
                     Err(e) => AgentResponse::Error {
                         error: format!("bad request: {e}"),
                     },
@@ -107,63 +112,69 @@ async fn serve_watching(may_dir: &Path, watch_interval: Duration) -> Result<(), 
     }
 }
 
-fn input_state(state: &AgentState, session_id: &str) -> Arc<Mutex<InputState>> {
-    state.inputs.get(session_id).cloned().unwrap_or_default()
+/// The helper's grants as a fresh process reads them.
+async fn preflight() -> AgentResponse {
+    let (screen_recording, accessibility) = futures_lite::future::zip(
+        waterkit_permission::check(Permission::ScreenRecording),
+        waterkit_permission::check(Permission::Accessibility),
+    )
+    .await;
+    AgentResponse::Permissions {
+        screen_recording: screen_recording == PermissionStatus::Granted,
+        accessibility: accessibility == PermissionStatus::Granted,
+    }
 }
 
-fn input_state_mut(state: &mut AgentState, session_id: &str) -> Arc<Mutex<InputState>> {
-    state
-        .inputs
-        .entry(session_id.to_owned())
-        .or_default()
-        .clone()
+/// Raises the system prompts for the grants the helper lacks. Each request
+/// answers once its prompt is up, while the user may still be deciding.
+///
+/// From macOS 15 the first capture that bypasses the system window picker
+/// is what makes `replayd` ask for a one-time consent, so once Screen
+/// Recording is granted the direct-capture consent is requested too.
+async fn request_permissions() -> Result<(), PermissionError> {
+    waterkit_permission::request(Permission::Accessibility).await?;
+    let screen_recording = waterkit_permission::request(Permission::ScreenRecording).await?;
+    if screen_recording == PermissionStatus::Granted {
+        waterkit_permission::request(Permission::DirectScreenCapture).await?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::significant_drop_tightening)]
-async fn dispatch_inner(request: AgentRequest, state: Arc<Mutex<AgentState>>) -> AgentResponse {
+async fn dispatch(request: AgentRequest, state: &AgentState) -> AgentResponse {
     match request {
-        AgentRequest::Preflight => match blocking::unblock(permissions::fresh_grants).await {
-            Ok(grants) => AgentResponse::Permissions {
-                screen_recording: grants.screen_recording,
-                accessibility: grants.accessibility,
+        AgentRequest::Preflight => preflight().await,
+        AgentRequest::RequestPermissions => match request_permissions().await {
+            Ok(()) => AgentResponse::Ok,
+            Err(e) => AgentResponse::Error {
+                error: e.to_string(),
             },
-            Err(error) => AgentResponse::Error { error },
         },
         AgentRequest::EnsureDisplay { session_id } => {
-            let result = {
-                let mut state = state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                state
-                    .displays
-                    .acquire(&session_id)
-                    .map(|d| (d.display_id(), d.size()))
-            };
-            match result {
-                Ok((display_id, (width, height))) => AgentResponse::Display {
-                    display_id,
-                    width,
-                    height,
-                },
+            match state.displays.lock().await.acquire(&session_id).await {
+                Ok(display) => {
+                    let (width, height) = display.size();
+                    AgentResponse::Display {
+                        display_id: display.display_id(),
+                        width,
+                        height,
+                    }
+                }
                 Err(e) => AgentResponse::Error {
                     error: e.to_string(),
                 },
             }
         }
         AgentRequest::ReleaseDisplay { session_id } => {
-            let mut state = state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state.streams.release(&session_id);
-            state.displays.release(&session_id);
-            state.inputs.remove(&session_id);
+            state.streams().release(&session_id);
+            state.displays.lock().await.release(&session_id);
             AgentResponse::Ok
         }
         AgentRequest::Screenshot { session_id } => {
             let display_id = state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .displays
+                .lock()
+                .await
                 .get(&session_id)
                 .map(|d| (d.display_id(), d.size()));
             let Some((display_id, size)) = display_id else {
@@ -179,12 +190,7 @@ async fn dispatch_inner(request: AgentRequest, state: Arc<Mutex<AgentState>>) ->
             }
         }
         AgentRequest::SetStreamCodec { codec } => {
-            let streams = {
-                let state = state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                state.streams.all()
-            };
+            let streams = state.streams().all();
             for stream in streams {
                 if let Err(e) = stream.restart(codec).await {
                     return AgentResponse::Error {
@@ -195,24 +201,16 @@ async fn dispatch_inner(request: AgentRequest, state: Arc<Mutex<AgentState>>) ->
             AgentResponse::Ok
         }
         AgentRequest::StartStream { session_id, codec } => {
-            let (display, stream, inputs) = {
-                let mut state = state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                match state.displays.acquire(&session_id) {
-                    Ok(display) => {
-                        let stream = state.streams.stream(&session_id);
-                        let inputs = input_state_mut(&mut state, &session_id);
-                        (display, stream, inputs)
-                    }
-                    Err(e) => {
-                        return AgentResponse::Error {
-                            error: e.to_string(),
-                        };
-                    }
+            let display = match state.displays.lock().await.acquire(&session_id).await {
+                Ok(display) => display,
+                Err(e) => {
+                    return AgentResponse::Error {
+                        error: e.to_string(),
+                    };
                 }
             };
-            match stream.start(display, inputs, codec).await {
+            let stream = state.streams().stream(&session_id);
+            match stream.start(display, codec).await {
                 Ok(()) => AgentResponse::Ok,
                 Err(e) => AgentResponse::Error {
                     error: e.to_string(),
@@ -220,19 +218,11 @@ async fn dispatch_inner(request: AgentRequest, state: Arc<Mutex<AgentState>>) ->
             }
         }
         AgentRequest::StopStream { session_id } => {
-            let mut state = state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state.streams.release(&session_id);
+            state.streams().release(&session_id);
             AgentResponse::Ok
         }
         AgentRequest::StreamRunning { session_id } => {
-            let stream = {
-                let state = state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                state.streams.get(&session_id)
-            };
+            let stream = state.streams().get(&session_id);
             let running = match stream {
                 Some(stream) => stream.is_running().await,
                 None => false,
@@ -240,12 +230,7 @@ async fn dispatch_inner(request: AgentRequest, state: Arc<Mutex<AgentState>>) ->
             AgentResponse::Flag { value: running }
         }
         AgentRequest::Offer { session_id, sdp } => {
-            let stream = {
-                let state = state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                state.streams.get(&session_id)
-            };
+            let stream = state.streams().get(&session_id);
             match stream {
                 Some(stream) => match stream.handle_offer(sdp).await {
                     Ok(answer) => AgentResponse::Sdp { sdp: answer },
@@ -262,12 +247,7 @@ async fn dispatch_inner(request: AgentRequest, state: Arc<Mutex<AgentState>>) ->
             }
         }
         AgentRequest::SetTakeover { session_id, active } => {
-            let stream = {
-                let state = state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                state.streams.get(&session_id)
-            };
+            let stream = state.streams().get(&session_id);
             stream.map_or_else(
                 || AgentResponse::Error {
                     error: "the desktop stream is not running".to_owned(),
@@ -278,41 +258,27 @@ async fn dispatch_inner(request: AgentRequest, state: Arc<Mutex<AgentState>>) ->
                 },
             )
         }
-        AgentRequest::TakeoverActive { session_id } => {
-            let state = state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            AgentResponse::Flag {
-                value: state
-                    .streams
-                    .get(&session_id)
-                    .is_some_and(|s| s.takeover_active()),
-            }
-        }
+        AgentRequest::TakeoverActive { session_id } => AgentResponse::Flag {
+            value: state
+                .streams()
+                .get(&session_id)
+                .is_some_and(|s| s.takeover_active()),
+        },
         AgentRequest::Input {
             session_id,
             message,
         } => {
-            let (display_id, inputs) = {
-                let state = state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                (
-                    state.displays.get(&session_id).map(|d| d.display_id()),
-                    input_state(&state, &session_id),
-                )
-            };
-            let Some(display_id) = display_id else {
+            let display = state.displays.lock().await.get(&session_id);
+            let Some(display) = display else {
                 return AgentResponse::Error {
                     error: "the session has no desktop".to_owned(),
                 };
             };
-            let mut guard = inputs
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match input::post_input(display_id, message, &mut guard) {
+            match display.post_input(message).await {
                 Ok(()) => AgentResponse::Ok,
-                Err(e) => AgentResponse::Error { error: e },
+                Err(e) => AgentResponse::Error {
+                    error: e.to_string(),
+                },
             }
         }
     }

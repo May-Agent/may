@@ -13,6 +13,8 @@ mod patch;
 mod recognise;
 mod shell;
 
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 
 pub use patch::{DiffLine, DiffOp, FileChange, FileEdit, Hunk};
@@ -179,7 +181,25 @@ impl CommandReading {
     /// Reads `script`. A script that does not parse is one unknown step.
     #[must_use]
     pub fn of(script: &str) -> Self {
-        shell::read(script)
+        shell::read(script, None)
+    }
+
+    /// Reads `script` as it runs in `dir`: the files an `apply_patch` updates
+    /// are read from there to give each hunk its absolute line numbers.
+    /// Reads files, so it runs off the event loop.
+    #[must_use]
+    pub fn of_in(script: &str, dir: &Path) -> Self {
+        shell::read(script, Some(dir))
+    }
+
+    /// Whether a step edits a file in place, so reading the script in the
+    /// directory it runs in adds line numbers.
+    #[must_use]
+    pub fn updates_files(&self) -> bool {
+        self.steps.iter().any(|step| {
+            matches!(&step.intent, Intent::Edit { files }
+                if files.iter().any(|file| matches!(&file.change, FileChange::Update { hunks, .. } if !hunks.is_empty())))
+        })
     }
 
     /// Whether any step is something May recognised; a reading without one

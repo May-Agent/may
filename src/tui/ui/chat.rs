@@ -18,6 +18,7 @@ use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::super::queue::Attachment;
+use super::band;
 use super::chat_layout::{self, ChatLayout};
 use super::markdown;
 use super::streaming_markdown::IMAGE_HEIGHT;
@@ -25,7 +26,7 @@ use crate::agent::ContextReport;
 use crate::command_reading::{
     CommandReading, DiffLine, DiffOp, FileChange, FileEdit, Intent, Link,
 };
-use crate::todo_parser::TodoChecklistItem;
+use crate::task_rows::{TaskRow, TaskSection};
 
 /// Status of a tool call.
 #[derive(Debug, Clone)]
@@ -222,6 +223,11 @@ impl ToolDisplay {
     pub fn expandable(&self) -> bool {
         match self {
             Self::Terminal { .. } => true,
+            Self::Action { chip: name, .. } | Self::Builtin { tool: name, .. }
+                if is_one_row_tool(name) =>
+            {
+                false
+            }
             Self::Action { detail, output, .. } => {
                 !detail.is_empty() || output.as_ref().is_some_and(|info| !info.output.is_empty())
             }
@@ -332,8 +338,8 @@ pub enum ChatElement {
     },
     /// Todo block
     TodoBlock {
-        /// Todo items.
-        items: Vec<TodoChecklistItem>,
+        /// The rows of `tasks.md`.
+        rows: Vec<TaskRow>,
     },
     /// Daemon-written catch-up card (persisted `recap` history row).
     Recap {
@@ -345,6 +351,12 @@ pub enum ChatElement {
     /// Error message
     Error {
         /// Error text shown in the stream.
+        message: String,
+    },
+    /// Warning for the user, such as an abnormally long CI job; never part
+    /// of the agent's context.
+    Warning {
+        /// Warning text shown in the stream.
         message: String,
     },
     /// Neutral system notice (e.g. rewind result)
@@ -465,6 +477,10 @@ pub struct ChatStream {
     /// Elements before this index belong to already-folded turns and are
     /// never folded again.
     fold_cursor: usize,
+    /// Elements before this index belong to model responses that finished.
+    /// The elements from it on are the response in flight, which a retry
+    /// discards.
+    response_floor: usize,
     /// Base `http://host/tunnel` URL `<tunnel id>` tags resolve against.
     tunnel_base: String,
 }
@@ -552,11 +568,20 @@ impl ChatStream {
             attachments,
             history_index,
         });
+        self.seal_response();
     }
 
     /// Add an error message.
     pub fn push_error(&mut self, message: &str) {
         self.push_element(ChatElement::Error {
+            message: message.to_string(),
+        });
+    }
+
+    /// Add a warning: a warning icon and yellow text.
+    pub fn push_warning(&mut self, message: &str) {
+        self.end_text();
+        self.push_element(ChatElement::Warning {
             message: message.to_string(),
         });
     }
@@ -676,6 +701,22 @@ impl ChatStream {
         self.elements.truncate(pos);
         self.revisions.truncate(pos);
         true
+    }
+
+    /// Drop the latest user message whose text is `content`, with everything
+    /// after it (the turn's output and markers) — the stream's half of a
+    /// withdrawn turn. Returns that message's attachments, `None` when no
+    /// such message is shown.
+    pub fn withdraw_last_prompt(&mut self, content: &str) -> Option<Vec<Attachment>> {
+        let pos = self.elements.iter().rposition(
+            |elem| matches!(elem, ChatElement::UserMessage { content: shown, .. } if shown == content),
+        )?;
+        let removed = self.elements.drain(pos..).next();
+        self.revisions.truncate(pos);
+        match removed {
+            Some(ChatElement::UserMessage { attachments, .. }) => Some(attachments),
+            _ => unreachable!("rposition matched a user message"),
+        }
     }
 
     fn pop_last(&mut self) {
@@ -855,6 +896,9 @@ impl ChatStream {
     /// intermediate messages between them — into a single "Worked for" row.
     /// The turn's final reply stays visible, as do notices and reports.
     pub fn fold_turn_work(&mut self, seconds: u64) {
+        // A turn that ends on a thought never saw text or a call close it:
+        // a folded thought is finished, so its body can expand.
+        self.collapse_thinking();
         self.fold_cursor = self.fold_cursor.min(self.elements.len());
         let start = self
             .elements
@@ -862,11 +906,12 @@ impl ChatStream {
             .rposition(|e| matches!(e, ChatElement::UserMessage { .. }))
             .map_or(self.fold_cursor, |i| (i + 1).max(self.fold_cursor));
         // The reply ends the turn: everything before its last block is work.
+        // A reply that is the turn's first element leaves nothing to fold.
         let end = self
             .elements
             .iter()
             .rposition(|e| matches!(e, ChatElement::AssistantText { .. }))
-            .filter(|index| *index > start)
+            .filter(|index| *index >= start)
             .unwrap_or(self.elements.len());
         if end <= start {
             return;
@@ -879,7 +924,14 @@ impl ChatStream {
             .zip(self.revisions.splice(start..end, []))
             .partition(|(element, _)| matches!(element, ChatElement::Error { .. }));
         let mut at = start;
-        if !folded.is_empty() {
+        // A single item is its own row: a group around it hides nothing.
+        if let [_] = folded.as_slice() {
+            for (element, revision) in folded {
+                self.elements.insert(at, element);
+                self.revisions.insert(at, revision);
+                at += 1;
+            }
+        } else if !folded.is_empty() {
             let id = self.next_worked_id;
             self.next_worked_id += 1;
             self.elements.insert(
@@ -955,17 +1007,30 @@ impl ChatStream {
         }
     }
 
-    /// Drop the text of the attempt being retried: the streaming text block
-    /// at the end of the stream, when there is one.
-    pub fn retract_text(&mut self) {
-        if matches!(
-            self.elements.last(),
-            Some(ChatElement::AssistantText {
-                streaming: true,
-                ..
-            })
-        ) {
-            self.pop_last();
+    /// Everything shown so far belongs to model responses that finished: a
+    /// retry discards only what streams after this.
+    pub const fn seal_response(&mut self) {
+        self.response_floor = self.elements.len();
+    }
+
+    /// Drop what the attempt being retried streamed: its text, its thinking
+    /// and the tool calls it began to stream or that the provider ran for
+    /// it. Tool calls that ran, and everything before the response in
+    /// flight, stay.
+    pub fn retract_response(&mut self) {
+        let floor = self.response_floor.min(self.elements.len());
+        let belongs_to_attempt = |element: &ChatElement| match element {
+            ChatElement::Thinking { .. } | ChatElement::AssistantText { .. } => true,
+            ChatElement::ToolCall { display, .. } => {
+                matches!(display, ToolDisplay::Builtin { .. }) || !display.is_complete()
+            }
+            _ => false,
+        };
+        for index in (floor..self.elements.len()).rev() {
+            if belongs_to_attempt(&self.elements[index]) {
+                self.elements.remove(index);
+                self.revisions.remove(index);
+            }
         }
     }
 
@@ -1057,11 +1122,24 @@ impl ChatStream {
         });
         if let Some(index) = found {
             if let ChatElement::ToolCall {
-                display: ToolDisplay::Builtin { status, output, .. },
+                display:
+                    ToolDisplay::Builtin {
+                        tool,
+                        detail,
+                        status,
+                        output,
+                        ..
+                    },
                 ..
             } = &mut self.elements[index]
             {
                 *status = ToolStatus::Done;
+                if detail.is_empty()
+                    && is_one_row_tool(tool)
+                    && let Some(query) = quoted_result(&result)
+                {
+                    *detail = query.to_string();
+                }
                 *output = Some(result);
             }
             self.touch(index);
@@ -1072,7 +1150,11 @@ impl ChatStream {
             id: id.to_string(),
             display: ToolDisplay::Builtin {
                 tool: tool.to_string(),
-                detail: String::new(),
+                detail: if is_one_row_tool(tool) {
+                    quoted_result(&result).unwrap_or_default().to_string()
+                } else {
+                    String::new()
+                },
                 status: ToolStatus::Done,
                 output: Some(result),
                 pinned: None,
@@ -1268,7 +1350,7 @@ impl ChatStream {
     }
 
     /// Set the todo block (replaces previous).
-    pub fn set_todos(&mut self, items: Vec<TodoChecklistItem>) {
+    pub fn set_todos(&mut self, rows: Vec<TaskRow>) {
         // Remove existing todo block
         let mut kept_revisions = Vec::with_capacity(self.revisions.len());
         for (elem, revision) in self.elements.iter().zip(&self.revisions) {
@@ -1280,8 +1362,8 @@ impl ChatStream {
             .retain(|e| !matches!(e, ChatElement::TodoBlock { .. }));
         self.revisions = kept_revisions;
         // Add new one at end
-        if !items.is_empty() {
-            self.push_element(ChatElement::TodoBlock { items });
+        if !rows.is_empty() {
+            self.push_element(ChatElement::TodoBlock { rows });
         }
     }
 
@@ -1379,13 +1461,27 @@ fn artifact_tag_text(content: &str) -> std::borrow::Cow<'_, str> {
             continue;
         };
         out.push_str(&rest[..start]);
-        out.push_str("**artifact:** `");
-        out.push_str(path);
-        out.push('`');
+        // Image artifacts render through the markdown-image pipeline:
+        // `image_fetch_targets` resolves the sandbox-relative path.
+        if is_image_artifact(path) {
+            out.push_str("![artifact](");
+            out.push_str(path);
+            out.push(')');
+        } else {
+            out.push_str("**artifact:** `");
+            out.push_str(path);
+            out.push('`');
+        }
         rest = &after[end + 2..];
     }
     out.push_str(rest);
     std::borrow::Cow::Owned(out)
+}
+
+/// The artifact path names a raster image the TUI can decode.
+fn is_image_artifact(path: &str) -> bool {
+    let lower = path.rsplit('.').next().unwrap_or("");
+    matches!(lower, "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp") && path.len() > lower.len() + 1
 }
 
 /// Input rendering context for combined view.
@@ -1399,6 +1495,8 @@ pub struct InputContext<'a> {
     pub attachments: &'a [Attachment],
     /// Ghost text suggested for the empty input; `None` hides it.
     pub suggestion: Option<&'a str>,
+    /// Greeting line drawn directly above the input line.
+    pub greeting: Option<&'a str>,
 }
 
 /// What the run is doing right now, for the activity line above the
@@ -1531,6 +1629,9 @@ pub struct UnifiedRenderContext<'a> {
     pub image_positions_out: Option<&'a mut Vec<ImagePlacement>>,
     /// Animation frame counter for running tool calls' status spinners.
     pub spinner_frame: usize,
+    /// Background of the input band, from the terminal's own colours;
+    /// `None` keeps the terminal's default background.
+    pub band_bg: Option<Color>,
 }
 
 impl<'a> From<UnifiedRenderContext<'a>> for RenderContext<'a> {
@@ -1547,6 +1648,7 @@ impl<'a> From<UnifiedRenderContext<'a>> for RenderContext<'a> {
             hide_todos: ctx.hide_todos,
             image_positions_out: ctx.image_positions_out,
             spinner_frame: ctx.spinner_frame,
+            band_bg: ctx.band_bg,
         }
     }
 }
@@ -1572,7 +1674,7 @@ pub fn build_plain_wrapped_lines_unified(
     chat: &ChatStream,
     width: u16,
     queue_ctx: Option<&QueueContext<'_>>,
-    input_ctx: Option<InputContext<'_>>,
+    input_ctx: Option<&InputContext<'_>>,
     status_ctx: Option<&StatusContext<'_>>,
     regions_out: Option<&mut Vec<ClickRegion>>,
     images_supported: bool,
@@ -1580,29 +1682,29 @@ pub fn build_plain_wrapped_lines_unified(
     if width == 0 {
         return Vec::new();
     }
+    // Columns are relative to the content area: the horizontal padding is
+    // left out, the rows are the ones the screen shows.
+    let inner = width - 2 * band::padding(width);
     let mut layout = ChatLayout::default();
-    layout.sync(chat, width, images_supported, false, None, 0);
+    layout.sync(chat, inner, images_supported, false, None, 0);
     let mut out: Vec<String> = (0..layout.element_rows())
         .map(|row| layout.plain_line(row).unwrap_or_default().to_string())
         .collect();
 
-    let mut tail: Vec<Line<'static>> = Vec::new();
-    if let Some(ctx) = queue_ctx
-        && !ctx.messages.is_empty()
-    {
-        render_queue_lines(&mut tail, ctx, width);
-    }
-    if let Some(ctx) = input_ctx {
-        render_input_line(&mut tail, &ctx, width, images_supported, None);
-    }
-    if let Some(ctx) = status_ctx {
-        render_status_line(&mut tail, ctx, width as usize);
-    }
+    let tail = build_tail(
+        queue_ctx,
+        input_ctx,
+        status_ctx,
+        inner,
+        images_supported,
+        false,
+    );
     let rows = tail
+        .lines
         .iter()
-        .map(|line| chat_layout::line_rows(line, width))
+        .map(|line| chat_layout::line_rows(line, inner))
         .sum();
-    out.extend(chat_layout::plain_rows(&tail, width, rows));
+    out.extend(chat_layout::plain_rows(&tail.lines, inner, rows));
 
     if let Some(slot) = regions_out {
         *slot = layout.collapse_regions();
@@ -1981,9 +2083,8 @@ fn context_report_lines(report: &ContextReport) -> Vec<Line<'static>> {
     ]));
     lines.push(Line::from(vec![Span::styled(
         format!(
-            "  compaction starts at {} · pauses at {} · auto-compacts at {}",
+            "  compaction starts at {} · pauses at {}",
             format_number(report.compact_start_tokens),
-            format_number(report.compact_pause_tokens),
             format_number(report.compact_tokens),
         ),
         dim,
@@ -2078,6 +2179,8 @@ struct RenderContext<'a> {
     image_positions_out: Option<&'a mut Vec<ImagePlacement>>,
     /// Animation frame counter shared with the status-bar spinner.
     spinner_frame: usize,
+    /// Background of the input band; `None` keeps the terminal's own.
+    band_bg: Option<Color>,
 }
 
 /// How one element renders this frame, beyond its own content.
@@ -2408,22 +2511,53 @@ pub(super) fn element_lines(
         }
 
         ChatElement::TodoBlock { .. } if state.hide_todos => {}
-        ChatElement::TodoBlock { items } => {
+        ChatElement::TodoBlock { rows } => {
             lines.push(Line::from(Span::styled(
                 "[todo] ────────────────────────────",
                 Style::default().fg(Color::Green),
             )));
 
-            for item in items {
-                let (marker, style) = if item.checked {
-                    ("[x]", Style::default().fg(Color::DarkGray))
-                } else {
-                    ("[ ]", Style::default())
-                };
+            // Roots, compactly: the issues the session serves, on one line.
+            let roots: Vec<&str> = rows
+                .iter()
+                .filter(|row| row.section == TaskSection::Roots)
+                .filter_map(|row| row.text.lines().next())
+                .collect();
+            if !roots.is_empty() {
                 lines.push(Line::from(vec![
-                    Span::styled(format!("  {marker} "), style),
-                    Span::styled(item.text.clone(), style),
+                    Span::styled("  Roots ", Style::default().fg(Color::DarkGray)),
+                    Span::raw(roots.join(", ")),
                 ]));
+            }
+            for (section, title) in [
+                (TaskSection::Doing, "Doing"),
+                (TaskSection::Queued, "Queued"),
+            ] {
+                let mut section_rows = rows.iter().filter(|row| row.section == section).peekable();
+                if section_rows.peek().is_none() {
+                    continue;
+                }
+                lines.push(Line::from(Span::styled(
+                    format!("  {title}"),
+                    Style::default().fg(Color::DarkGray),
+                )));
+                for row in section_rows {
+                    let text = row.text.split_whitespace().collect::<Vec<_>>().join(" ");
+                    match &row.blocking {
+                        Some(what) => lines.push(Line::from(vec![
+                            Span::styled("    ⏸ ", Style::default().fg(Color::Red)),
+                            Span::raw(text),
+                            Span::styled(
+                                format!(" (blocked: {what})"),
+                                Style::default().fg(Color::Red),
+                            ),
+                        ])),
+                        None => lines.push(Line::from(vec![
+                            Span::styled("    ○ ", Style::default().fg(Color::Yellow)),
+                            Span::raw(text),
+                        ])),
+                    }
+                }
             }
 
             lines.push(Line::from(Span::styled(
@@ -2439,6 +2573,17 @@ pub(super) fn element_lines(
                 Span::styled("✗ ", Style::default().fg(Color::Red)),
                 Span::styled(message.clone(), Style::default().fg(Color::Red)),
             ]));
+            lines.push(Line::from(""));
+        }
+
+        ChatElement::Warning { message } => {
+            for (index, line) in message.lines().enumerate() {
+                let icon = if index == 0 { "⚠ " } else { "  " };
+                lines.push(Line::from(vec![
+                    Span::styled(icon, Style::default().fg(Color::Yellow)),
+                    Span::styled(line.to_string(), Style::default().fg(Color::Yellow)),
+                ]));
+            }
             lines.push(Line::from(""));
         }
 
@@ -2513,14 +2658,26 @@ pub(super) fn element_lines(
                 } else {
                     content.as_str()
                 };
-                for l in body.lines() {
-                    lines.push(Line::from(Span::styled(
-                        l.to_string(),
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::ITALIC),
-                    )));
+                let mut md_lines = markdown::render_markdown_with_positions(
+                    body,
+                    markdown::ImageSupport::Disabled,
+                    usize::from(width),
+                )
+                .lines;
+                while md_lines.last().is_some_and(|l| l.spans.is_empty()) {
+                    md_lines.pop();
                 }
+                let dim = Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC);
+                lines.extend(md_lines.into_iter().map(|line| {
+                    Line::from(
+                        line.spans
+                            .into_iter()
+                            .map(|span| Span::styled(span.content, span.style.patch(dim)))
+                            .collect::<Vec<_>>(),
+                    )
+                }));
             }
             lines.push(Line::from(""));
             if !content.is_empty() {
@@ -2619,12 +2776,17 @@ fn render_impl(
         hide_todos,
         image_positions_out,
         spinner_frame,
+        band_bg,
     } = ctx;
+
+    // Chat, queue and band content share the padded column; the band
+    // background reaches the column's edges.
+    let inner = band::inset(area);
 
     let build_start = std::time::Instant::now();
     layout.sync(
         chat,
-        area.width,
+        inner.width,
         images_supported,
         hide_todos,
         selected_tool,
@@ -2632,31 +2794,23 @@ fn render_impl(
     );
     stats.elements = layout.rebuilt();
 
-    // Tail: queue indicator, input line (with attachment previews), status.
-    let mut tail: Vec<Line<'_>> = Vec::new();
-    let mut tail_images: Vec<(String, usize, String)> = Vec::new();
-    if let Some(ref ctx) = queue_ctx
-        && !ctx.messages.is_empty()
-    {
-        render_queue_lines(&mut tail, ctx, area.width);
-    }
-    let mut input_line_idx = None;
-    let mut caret_line = None;
-    if let Some(ctx) = input_ctx {
-        if input_caret_active {
-            caret_line = Some(input_caret_line(&ctx));
-        }
-        input_line_idx = Some(render_input_line(
-            &mut tail,
-            &ctx,
-            area.width,
-            images_supported,
-            Some(&mut tail_images),
-        ));
-    }
-    if let Some(ref ctx) = status_ctx {
-        render_status_line(&mut tail, ctx, area.width as usize);
-    }
+    // Tail: queue indicator, then the band (input line with attachment
+    // previews, status line).
+    let Tail {
+        lines: tail,
+        band_start,
+        greeting_idx: greeting_line_idx,
+        input_idx: input_line_idx,
+        caret_line,
+        images: tail_images,
+    } = build_tail(
+        queue_ctx.as_ref(),
+        input_ctx.as_ref(),
+        status_ctx.as_ref(),
+        inner.width,
+        images_supported,
+        input_caret_active,
+    );
     stats.lines_build = build_start.elapsed();
 
     let wrap_start = std::time::Instant::now();
@@ -2664,7 +2818,7 @@ fn render_impl(
     let mut tail_rows = 0usize;
     for line in &tail {
         tail_starts.push(tail_rows);
-        tail_rows += chat_layout::line_rows(line, area.width);
+        tail_rows += chat_layout::line_rows(line, inner.width);
     }
     let element_rows = layout.element_rows();
     let content_height = element_rows + tail_rows;
@@ -2732,30 +2886,70 @@ fn render_impl(
     let widget_start = std::time::Instant::now();
     frame.render_widget(Clear, area);
     let body = Rect {
-        y: area.y + u16::try_from(top_padding).unwrap_or(0),
-        height: area
+        y: inner.y + u16::try_from(top_padding).unwrap_or(0),
+        height: inner
             .height
             .saturating_sub(u16::try_from(top_padding).unwrap_or(0)),
-        ..area
+        ..inner
     };
     // Rows come pre-wrapped so none reaches past the column (see `wrap`).
-    Paragraph::new(super::wrap::wrap_lines(&lines, area.width))
+    Paragraph::new(super::wrap::wrap_lines(&lines, inner.width))
         .scroll((u16::try_from(skip).unwrap_or(u16::MAX), 0))
         .render(body, frame.buffer_mut());
 
+    // The band background: every cell of the band's rows and of user
+    // message rows — padding columns and trailing space included.
+    // Cells with a background of their own keep it. The band span runs to
+    // the content's end even when it is scrolled out of view, so each
+    // span's rows clamp to the window.
+    if let Some(bg) = band_bg {
+        let mut spans = layout.user_rows_in(top, view_height);
+        // A blank row right above a user message is its top padding —
+        // fold it in so the block breathes like the band's own padding.
+        for span in &mut spans {
+            if span.0 <= top {
+                continue;
+            }
+            let y = area.y + u16::try_from(top_padding + span.0 - 1 - top).unwrap_or(u16::MAX);
+            let blank =
+                (area.x..area.x + area.width).all(|x| frame.buffer_mut()[(x, y)].symbol() == " ");
+            if blank {
+                span.0 -= 1;
+            }
+        }
+        if let Some(start) = band_start {
+            let first = element_rows + tail_starts.get(start).copied().unwrap_or(0);
+            spans.push((first, element_rows + tail_rows));
+        }
+        for (first, last) in spans {
+            for row in first.max(top)..last.min(top + view_height) {
+                let y = area.y + u16::try_from(top_padding + row - top).unwrap_or(u16::MAX);
+                for x in area.x..area.x + area.width {
+                    let cell = &mut frame.buffer_mut()[(x, y)];
+                    if cell.bg == Color::Reset {
+                        cell.set_bg(bg);
+                    }
+                }
+            }
+        }
+    }
+
     // Plain mirror of the tail, for selection.
-    layout.set_tail_plain(chat_layout::plain_rows(&tail, area.width, tail_rows));
+    layout.set_tail_plain(chat_layout::plain_rows(&tail, inner.width, tail_rows));
+    layout.set_greeting_row(
+        greeting_line_idx.map(|index| element_rows + tail_starts.get(index).copied().unwrap_or(0)),
+    );
     layout.set_input_span(input_line_idx.map(|index| {
         (
             element_rows + tail_starts.get(index).copied().unwrap_or(0),
-            chat_layout::line_rows(&tail[index], area.width),
+            chat_layout::line_rows(&tail[index], inner.width),
         )
     }));
 
     // Anchor the terminal cursor on the caret cell so IME composition and
     // its candidate window track the real insertion point.
     if let (Some(caret_line), Some(input_idx)) = (caret_line, input_line_idx)
-        && let Some((cx, cy)) = wrapped_tail_cell(&caret_line, area.width)
+        && let Some((cx, cy)) = wrapped_tail_cell(&caret_line, inner.width)
     {
         let caret_row = top_padding
             + element_rows
@@ -2763,7 +2957,7 @@ fn render_impl(
             + usize::from(cy);
         if caret_row >= top && caret_row - top < usize::from(area.height) {
             frame.set_cursor_position((
-                area.x + cx,
+                inner.x + cx,
                 area.y + u16::try_from(caret_row - top).unwrap_or(u16::MAX),
             ));
         }
@@ -2772,12 +2966,97 @@ fn render_impl(
     stats
 }
 
+/// The rows below the chat, built for one frame.
+struct Tail {
+    lines: Vec<Line<'static>>,
+    /// Index in `lines` of the band's first (padding) row; the band runs to
+    /// the last row. `None` when there is no band.
+    band_start: Option<usize>,
+    greeting_idx: Option<usize>,
+    input_idx: Option<usize>,
+    /// The input up to the caret, when the caret owns the terminal cursor.
+    caret_line: Option<Line<'static>>,
+    /// Attached image blocks: `(key, index in lines, caption)`.
+    images: Vec<(String, usize, String)>,
+}
+
+/// Build the tail at the content `width`: queue lines, one plain margin row,
+/// then the band — a padding row, the greeting and input line(s), a blank
+/// row, the status line and a padding row. A band without an input or a
+/// status line leaves out the blank row.
+fn build_tail(
+    queue_ctx: Option<&QueueContext<'_>>,
+    input_ctx: Option<&InputContext<'_>>,
+    status_ctx: Option<&StatusContext<'_>>,
+    width: u16,
+    images_supported: bool,
+    caret_active: bool,
+) -> Tail {
+    let mut lines: Vec<Line<'_>> = Vec::new();
+    let mut images = Vec::new();
+    if let Some(ctx) = queue_ctx
+        && !ctx.messages.is_empty()
+    {
+        render_queue_lines(&mut lines, ctx, width);
+    }
+    let mut band_start = None;
+    let (mut greeting_idx, mut input_idx, mut caret_line) = (None, None, None);
+    if input_ctx.is_some() || status_ctx.is_some() {
+        lines.push(Line::from(""));
+        band_start = Some(lines.len());
+        lines.push(Line::from(""));
+    }
+    if let Some(ctx) = input_ctx {
+        if let Some(text) = ctx.greeting {
+            greeting_idx = Some(lines.len());
+            lines.push(greeting_line(text));
+        }
+        if caret_active {
+            caret_line = Some(input_caret_line(ctx));
+        }
+        input_idx = Some(render_input_line(
+            &mut lines,
+            ctx,
+            width,
+            images_supported,
+            Some(&mut images),
+        ));
+    }
+    if let Some(ctx) = status_ctx {
+        if input_ctx.is_some() {
+            lines.push(Line::from(""));
+        }
+        render_status_line(&mut lines, ctx, usize::from(width));
+    }
+    if band_start.is_some() {
+        lines.push(Line::from(""));
+    }
+    Tail {
+        lines: lines.into_iter().map(line_into_static).collect(),
+        band_start,
+        greeting_idx,
+        input_idx,
+        caret_line,
+        images,
+    }
+}
+
+/// The New Year greeting drawn above the input line.
+fn greeting_line(text: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        text.to_string(),
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
 /// Convert a character index to a byte index in a string.
 fn char_to_byte_index(s: &str, char_idx: usize) -> usize {
     s.char_indices().nth(char_idx).map_or(s.len(), |(i, _)| i)
 }
 
-/// Style of the leading `!` chip while the composer is in bash mode.
+/// Style of the leading `!` while the composer is in bash mode.
 const BANG_PROMPT_STYLE: Style = Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD);
 
 /// `true` when the composer input is a bash-mode (`!`) command — the same
@@ -2825,12 +3104,10 @@ fn input_caret_line(ctx: &InputContext<'_>) -> Line<'static> {
     let mut spans = Vec::new();
     let bash = bash_mode(ctx.input);
 
-    // Prompt — `!` occupies the prompt cell in bash mode instead of sitting
-    // inside the text next to `>`.
+    // The composer has no `>` prompt marker: input starts flush left and
+    // a leading `!` gets the bash-mode highlight instead of a prompt cell.
     if bash {
         spans.push(Span::styled("! ", BANG_PROMPT_STYLE));
-    } else {
-        spans.push(Span::styled("> ", Style::default().fg(Color::Cyan)));
     }
 
     // Render image attachments
@@ -3260,7 +3537,7 @@ fn format_status_usage(
             warn: None,
         };
     };
-    let compact = policy.compact_point(u32::try_from(window).unwrap_or(u32::MAX));
+    let compact = policy.pause_point(u32::try_from(window).unwrap_or(u32::MAX));
     if compact == 0 {
         return StatusUsage {
             usage: used,
@@ -3421,6 +3698,25 @@ fn tool_header_line(
         spans.push(Span::styled(suffix, style));
     }
     Line::from(spans)
+}
+
+/// Search and fetch calls are one headline row (`Searched "query"`,
+/// `Fetched url`) with nothing to unfold, whichever path renders them.
+fn is_one_row_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "websearch" | "web_search" | "google_search" | "webfetch" | "web_fetch"
+    )
+}
+
+/// The query or URL a hosted call's result repeats, when the provider
+/// announced the call before it knew it (the `OpenAI` Responses API does).
+fn quoted_result(result: &str) -> Option<&str> {
+    result
+        .trim()
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .filter(|inner| !inner.is_empty() && !inner.contains('\n'))
 }
 
 /// A tool headline as `(label, rest)`: hosted and IPC search names become
@@ -4090,7 +4386,7 @@ mod tests {
     fn status_usage_is_used_over_autocompact_window() {
         let window = 200_000_u64;
         let policy = aither_agent::ContextPolicy::default();
-        let compact = policy.compact_point(u32::try_from(window).unwrap());
+        let compact = policy.pause_point(u32::try_from(window).unwrap());
         let used = compact / 4;
         let line = format_status_usage(u64::try_from(used).unwrap(), Some(window), &policy);
         #[allow(clippy::cast_precision_loss)]
@@ -4110,7 +4406,7 @@ mod tests {
     fn status_usage_warns_within_ten_percent_of_autocompact() {
         let window = 200_000_u64;
         let policy = aither_agent::ContextPolicy::default();
-        let compact = policy.compact_point(u32::try_from(window).unwrap());
+        let compact = policy.pause_point(u32::try_from(window).unwrap());
         let used = compact - compact / 20;
         let line = format_status_usage(u64::try_from(used).unwrap(), Some(window), &policy);
         assert_eq!(line.warn.as_deref(), Some("5% to auto-compact"));
@@ -4120,7 +4416,7 @@ mod tests {
     fn status_usage_omits_warn_at_ten_percent_remaining() {
         let window = 200_000_u64;
         let policy = aither_agent::ContextPolicy::default();
-        let compact = policy.compact_point(u32::try_from(window).unwrap());
+        let compact = policy.pause_point(u32::try_from(window).unwrap());
         let used = compact - compact / 10;
         let line = format_status_usage(u64::try_from(used).unwrap(), Some(window), &policy);
         assert!(line.warn.is_none());
@@ -4130,7 +4426,7 @@ mod tests {
     fn status_usage_warns_at_zero_headroom() {
         let window = 200_000_u64;
         let policy = aither_agent::ContextPolicy::default();
-        let compact = policy.compact_point(u32::try_from(window).unwrap());
+        let compact = policy.pause_point(u32::try_from(window).unwrap());
         let line = format_status_usage(u64::try_from(compact).unwrap(), Some(window), &policy);
         assert_eq!(line.warn.as_deref(), Some("0% to auto-compact"));
     }
@@ -4320,6 +4616,57 @@ mod tests {
         };
         assert_eq!(command, "echo hi");
         assert!(matches!(status, ToolStatus::Done));
+    }
+
+    /// A retried response leaves nothing of its broken attempt: its thinking,
+    /// text and streamed tool call go, while the finished response before it
+    /// stays.
+    #[test]
+    fn a_retracted_response_keeps_only_the_finished_ones() {
+        fn terminal(command: &str) -> ToolDisplay {
+            ToolDisplay::Terminal {
+                description: String::new(),
+                command: command.to_string(),
+                mode: TerminalExecutionMode::Default,
+                reading: None,
+                status: ToolStatus::Running,
+                output: None,
+                diffs: Vec::new(),
+                pinned: None,
+            }
+        }
+
+        let mut stream = ChatStream::new();
+        stream.push_user("go", Vec::new(), 0);
+        stream.push_text("first reply");
+        stream.upsert_tool_display("call-1".to_string(), terminal("ls"));
+        stream.update_tool_with_output("call-1", ToolStatus::Done, Some("a"));
+        stream.seal_response();
+
+        stream.push_thinking("考え中 생각 中");
+        stream.push_text("half an ans");
+        stream.upsert_tool_display("call-2".to_string(), terminal("ec"));
+        stream.retract_response();
+
+        let kinds: Vec<_> = stream
+            .elements()
+            .iter()
+            .map(|element| match element {
+                ChatElement::UserMessage { .. } => "user",
+                ChatElement::AssistantText { .. } => "text",
+                ChatElement::ToolCall { id, .. } => id.as_str(),
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, ["user", "text", "call-1"]);
+        assert_eq!(stream.elements().len(), stream.revisions.len());
+
+        // The replacement streams as if the attempt had never been.
+        stream.push_text("whole answer");
+        assert!(matches!(
+            stream.elements().last(),
+            Some(ChatElement::AssistantText { content, .. }) if content == "whole answer"
+        ));
     }
 
     /// The user's expansion pin and any attached diffs survive a display
@@ -4527,6 +4874,7 @@ mod tests {
                             cursor: 5,
                             attachments: &[],
                             suggestion: None,
+                            greeting: None,
                         }),
                         input_caret_active: true,
                         queue_ctx: None,
@@ -4552,6 +4900,7 @@ mod tests {
                         hide_todos: false,
                         image_positions_out: None,
                         spinner_frame: 0,
+                        band_bg: None,
                     },
                 );
                 truth = Some(frame.buffer_mut().clone());
@@ -4624,6 +4973,27 @@ mod tests {
     /// or whole, every table row on screen has its borders at the
     /// header's columns, one rule is drawn, and no cell text spills onto
     /// a row outside the table.
+    /// A withdrawn turn takes its user bubble and everything the turn
+    /// showed after it; earlier prompts stay.
+    #[test]
+    fn withdrawing_a_prompt_removes_its_bubble_and_markers() {
+        let mut chat = ChatStream::new();
+        chat.push_user("earlier", Vec::new(), 0);
+        chat.push_text("answer");
+        chat.end_text();
+        chat.push_user("你好 こんにちは 안녕하세요", Vec::new(), 2);
+        chat.push_text("\n\n[Interrupted]");
+        chat.end_text();
+
+        assert!(chat.withdraw_last_prompt("never sent").is_none());
+        let attachments = chat.withdraw_last_prompt("你好 こんにちは 안녕하세요");
+        assert_eq!(attachments.map(|a| a.len()), Some(0));
+        let targets = chat.rewind_targets();
+        assert_eq!(targets.len(), 1, "only the earlier prompt remains");
+        assert_eq!(targets[0].content, "earlier");
+        assert_eq!(chat.elements.len(), 2, "the earlier prompt and its answer");
+    }
+
     #[test]
     fn wide_table_reply_stays_aligned_on_screen() {
         use crate::tui::ui::test_screen::ScreenBackend as TestBackend;
@@ -4644,7 +5014,11 @@ mod tests {
         }
         chat.end_text();
         let screen = draw_unified(&mut terminal, &chat, &mut layout, usize::MAX);
-        let rows = crate::tui::ui::test_screen::buffer_screen(&screen);
+        // Drop the horizontal padding.
+        let rows: Vec<String> = crate::tui::ui::test_screen::buffer_screen(&screen)
+            .into_iter()
+            .map(|row| row.chars().skip(2).collect())
+            .collect();
         let first = rows
             .iter()
             .position(|r| r.starts_with('│'))
@@ -4820,8 +5194,10 @@ mod tests {
             let screen = draw_unified(&mut terminal, &chat, &mut layout, scroll);
             for y in 0..height {
                 let mut text = String::new();
-                let mut x = 0;
-                while x < width {
+                // The chat sits inside the horizontal padding.
+                let pad = super::band::padding(width);
+                let mut x = pad;
+                while x < width - pad {
                     let symbol = screen[(x, y)].symbol();
                     text.push_str(symbol);
                     x += u16::try_from(unicode_width::UnicodeWidthStr::width(symbol).max(1))
@@ -4836,6 +5212,7 @@ mod tests {
         }
 
         // And the mirror itself matches the whole document wrapped at once.
+        let inner = width - 2 * super::band::padding(width);
         let mut lines = Vec::new();
         for (index, elem) in chat.active_elements().iter().enumerate() {
             let _ = index;
@@ -4845,20 +5222,20 @@ mod tests {
                     super::ElementState::of(elem, None, false, 0),
                     true,
                     "http://localhost:8787/tunnel",
-                    width,
+                    inner,
                 )
                 .lines,
             );
         }
         let element_rows = layout.element_rows();
-        let area = Rect::new(0, 0, width, u16::try_from(element_rows).unwrap());
+        let area = Rect::new(0, 0, inner, u16::try_from(element_rows).unwrap());
         let mut buf = Buffer::empty(area);
-        Paragraph::new(crate::tui::ui::wrap::wrap_lines(&lines, width)).render(area, &mut buf);
+        Paragraph::new(crate::tui::ui::wrap::wrap_lines(&lines, inner)).render(area, &mut buf);
         for (row, expected) in doc.iter().enumerate().take(element_rows) {
             let y = u16::try_from(row).unwrap();
             let mut text = String::new();
             let mut x = 0;
-            while x < width {
+            while x < inner {
                 let symbol = buf[(x, y)].symbol();
                 text.push_str(symbol);
                 x += u16::try_from(unicode_width::UnicodeWidthStr::width(symbol).max(1)).unwrap();
@@ -4921,16 +5298,29 @@ mod tests {
 
     #[test]
     fn an_edit_renders_as_a_numbered_diff_before_it_runs() {
-        let rows = call_rows(&read_call(
-            "apply_patch <<'P'\n*** Begin Patch\n*** Update File: src/a.rs\n@@ fn main\n keep\n-old line\n+new line\n*** Add File: b.txt\n+one\n*** End Patch\nP\n",
-        ));
+        let dir = tempfile::tempdir().expect("dir");
+        std::fs::create_dir(dir.path().join("src")).expect("src");
+        std::fs::write(
+            dir.path().join("src/a.rs"),
+            "fn main() {\n    keep\n    old line\n}\n",
+        )
+        .expect("file");
+        let script = "apply_patch <<'P'\n*** Begin Patch\n*** Update File: src/a.rs\n@@ fn main() {\n     keep\n-    old line\n+    new line\n*** Add File: b.txt\n+one\n*** End Patch\nP\n";
+        let mut display = read_call(script);
+        if let ToolDisplay::Terminal { reading, .. } = &mut display {
+            *reading = Some(crate::command_reading::CommandReading::of_in(
+                script,
+                dir.path(),
+            ));
+        }
+        let rows = call_rows(&display);
         assert_eq!(rows[0], "▾ ⠋ work");
         assert_eq!(rows[1], "Edit 2 files");
         assert_eq!(rows[2], "  ~ src/a.rs");
-        assert_eq!(rows[3], "  @@ fn main");
-        assert_eq!(rows[4], "     1    1   keep");
-        assert_eq!(rows[5], "     2      - old line");
-        assert_eq!(rows[6], "          2 + new line");
+        assert_eq!(rows[3], "  @@ fn main() {");
+        assert_eq!(rows[4], "     2    2       keep");
+        assert_eq!(rows[5], "     3      -     old line");
+        assert_eq!(rows[6], "          3 +     new line");
         assert_eq!(rows[7], "  + b.txt (new file)");
         assert_eq!(rows[8], "          1 + one");
         assert!(
@@ -5268,6 +5658,7 @@ mod tests {
             cursor: 7,
             attachments: &attachments,
             suggestion: None,
+            greeting: None,
         };
         let mut lines: Vec<Line> = Vec::new();
         let mut positions = Vec::new();
@@ -5281,7 +5672,12 @@ mod tests {
         );
         assert_eq!(positions.len(), 1);
         let prompt = lines.last().expect("input line");
-        assert_eq!(prompt.spans[0].content, "> ");
+        let text: String = prompt
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(text, "[image] send it");
     }
 
     #[test]
@@ -5292,6 +5688,7 @@ mod tests {
             cursor: 7,
             attachments: &attachments,
             suggestion: None,
+            greeting: None,
         };
         let mut lines: Vec<Line> = Vec::new();
         render_input_line(&mut lines, &ctx, 80, false, None);
@@ -5312,6 +5709,7 @@ mod tests {
             cursor: 0,
             attachments: &[],
             suggestion: Some("run the tests"),
+            greeting: None,
         };
         let mut lines: Vec<Line> = Vec::new();
         render_input_line(&mut lines, &ctx, 80, false, None);
@@ -5326,6 +5724,7 @@ mod tests {
             input: "h",
             cursor: 1,
             suggestion: None,
+            greeting: None,
             ..ctx
         };
         let mut lines: Vec<Line> = Vec::new();
@@ -5344,6 +5743,7 @@ mod tests {
             cursor: 7,
             attachments: &[],
             suggestion: None,
+            greeting: None,
         };
         let mut lines: Vec<Line> = Vec::new();
         let index = render_input_line(&mut lines, &ctx, 80, false, None);
@@ -5369,6 +5769,7 @@ mod tests {
             cursor: 19,
             attachments: &[],
             suggestion: None,
+            greeting: None,
         };
         let mut lines: Vec<Line> = Vec::new();
         render_input_line(&mut lines, &ctx, 80, false, None);
@@ -5480,6 +5881,25 @@ mod tests {
             .map(String::as_str)
             .collect();
         assert_eq!(full, ["l1", "l2", "l3", "l4", "l5", "l6", "l7", "l8"]);
+    }
+
+    #[test]
+    fn a_warning_is_a_warning_icon_with_yellow_text() {
+        let mut chat = ChatStream::new();
+        chat.push_warning("PR #3: CI / test ran 52m 10s, past the 40m 00s limit.");
+        let elem = &chat.elements[0];
+        let lines = super::element_lines(
+            elem,
+            super::ElementState::of(elem, None, false, 0),
+            false,
+            "",
+            80,
+        )
+        .lines;
+        let spans = &lines[0].spans;
+        assert_eq!(spans[0].content, "⚠ ");
+        assert!(spans.iter().all(|s| s.style.fg == Some(Color::Yellow)));
+        assert!(spans[1].content.contains("past the 40m 00s limit"));
     }
 
     #[test]
@@ -5745,27 +6165,27 @@ mod tests {
         assert!(matches!(display.status(), ToolStatus::Failed(_)));
     }
 
-    /// A tasks.md document parsed into a checklist feeds the todo block —
-    /// the same path `refresh_todos` uses after tool calls and on session
-    /// load.
+    /// The rows of a tasks.md document feed the todo block — the same path
+    /// `refresh_todos` uses after tool calls and on session load.
     #[test]
-    fn set_todos_renders_parsed_session_checklist() {
-        let checklist =
-            crate::todo_parser::TodoChecklist::parse("- [x] write report\n- [ ] ship it\n");
+    fn set_todos_renders_parsed_session_rows() {
+        let rows = crate::task_rows::task_rows(
+            "## Doing\n- write report\n\n## Queued\n- ship it BLOCKING q1\n",
+        );
         let mut chat = ChatStream::new();
         chat.push_text("earlier content");
         chat.end_text();
-        chat.set_todos(checklist.items.clone());
+        chat.set_todos(rows.clone());
 
-        let items = chat
+        let shown = chat
             .elements()
             .iter()
             .find_map(|element| match element {
-                ChatElement::TodoBlock { items } => Some(items),
+                ChatElement::TodoBlock { rows } => Some(rows),
                 _ => None,
             })
-            .expect("a non-empty checklist should produce a todo block");
-        assert_eq!(items, &checklist.items);
+            .expect("a non-empty document should produce a todo block");
+        assert_eq!(shown, &rows);
 
         // A subsequent parse replaces the previous block rather than
         // stacking a second one.
@@ -5810,6 +6230,30 @@ mod tests {
                 .iter()
                 .any(|element| matches!(element, ChatElement::WorkedFor { .. }))
         );
+    }
+
+    /// A turn whose reply is its only output keeps the reply visible and
+    /// gets no folded row: there is no work before it.
+    #[test]
+    fn a_reply_only_turn_keeps_its_reply_outside_the_fold() {
+        let mut chat = ChatStream::new();
+        chat.push_user("你知道吗 知っていますか 알아요?", Vec::new(), 0);
+        chat.push_text("知道。はい。네.");
+        chat.end_text();
+        chat.fold_turn_work(7);
+
+        assert!(
+            !chat
+                .elements
+                .iter()
+                .any(|element| matches!(element, ChatElement::WorkedFor { .. })),
+            "{:#?}",
+            chat.elements
+        );
+        assert!(matches!(
+            chat.elements.last(),
+            Some(ChatElement::AssistantText { content, .. }) if content == "知道。はい。네."
+        ));
     }
 
     #[test]
@@ -5946,6 +6390,53 @@ mod tests {
 
     /// An expanded thinking block stays clickable — a click folds it back.
     #[test]
+    fn expanded_thinking_renders_markdown_not_raw_syntax() {
+        let mut chat = ChatStream::new();
+        chat.push_thinking(
+            "先分析 the request:\n\n- 第一步 *check* config\n- 次のステップ **verify** 확인\n\n```rust\nlet x = 1;\n```",
+        );
+        chat.collapse_thinking();
+        chat.toggle_expanded("thinking-0");
+        let out = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
+        let text = out.join("\n");
+        assert!(text.contains("第一步"), "{text}");
+        assert!(text.contains("次のステップ"), "{text}");
+        assert!(text.contains("확인"), "{text}");
+        assert!(text.contains("let x = 1;"), "{text}");
+        assert!(!text.contains("```"), "{text}");
+        assert!(!text.contains("**"), "{text}");
+        assert!(!text.contains("*check*"), "{text}");
+
+        let elem = &chat.elements[0];
+        let lines = super::element_lines(
+            elem,
+            super::ElementState::of(elem, None, false, 0),
+            false,
+            "",
+            80,
+        )
+        .lines;
+        let verify = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.contains("verify"))
+            .expect("verify span");
+        assert!(
+            verify
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::BOLD)
+        );
+        assert!(
+            verify
+                .style
+                .add_modifier
+                .contains(ratatui::style::Modifier::ITALIC)
+        );
+        assert_eq!(verify.style.fg, Some(Color::DarkGray));
+    }
+
+    #[test]
     fn expanded_thinking_has_click_region() {
         let mut chat = ChatStream::new();
         chat.push_thinking("step one");
@@ -5961,5 +6452,441 @@ mod tests {
         );
         assert_eq!(regions.len(), 1);
         assert_eq!(regions[0].element_id, "thinking-0");
+    }
+
+    /// Rows of the stream and how many of them click open.
+    fn rows_and_regions(chat: &ChatStream) -> (Vec<String>, usize) {
+        let mut regions = Vec::new();
+        let lines = build_plain_wrapped_lines_unified(
+            chat,
+            200,
+            None,
+            None,
+            None,
+            Some(&mut regions),
+            false,
+        );
+        (
+            lines.into_iter().filter(|l| !l.is_empty()).collect(),
+            regions.len(),
+        )
+    }
+
+    /// The `OpenAI` Responses API announces a hosted search before it knows
+    /// the query and repeats it, quoted, in the result.
+    #[test]
+    fn a_hosted_search_announced_without_its_query_is_one_row() {
+        let mut chat = ChatStream::new();
+        chat.push_builtin("ws_1".into(), "web_search".into(), String::new());
+        chat.finish_builtin("ws_1", "web_search", "\"Rust 异步 非同期 비동기\"".into());
+        chat.push_builtin("wf_1".into(), "web_fetch".into(), String::new());
+        chat.finish_builtin("wf_1", "web_fetch", "\"https://example.com/a\"".into());
+        // A result with no matching start is appended as a finished row.
+        chat.finish_builtin("ws_2", "web_search", "\"late query\"".into());
+
+        let (rows, regions) = rows_and_regions(&chat);
+        assert_eq!(
+            rows,
+            [
+                "  ✓ Searched \"Rust 异步 非同期 비동기\"",
+                "  ✓ Fetched https://example.com/a",
+                "  ✓ Searched \"late query\"",
+            ]
+        );
+        assert_eq!(regions, 0);
+    }
+
+    /// The IPC search and fetch rows carry arguments and results too, but
+    /// are one row all the same.
+    #[test]
+    fn an_inline_search_with_a_result_is_one_row() {
+        let mut chat = ChatStream::new();
+        chat.push_tool(
+            "s1".to_string(),
+            ToolDisplay::Action {
+                chip: "websearch".to_string(),
+                task_id: None,
+                summary: "may agent".to_string(),
+                detail: vec!["{\"query\":\"may agent\"}".to_string()],
+                status: ToolStatus::Running,
+                output: None,
+                pinned: None,
+            },
+        );
+        chat.update_tool_with_output("s1", ToolStatus::Done, Some("result one\nresult two"));
+        let (rows, regions) = rows_and_regions(&chat);
+        assert_eq!(rows, ["  ✓ Searched \"may agent\""]);
+        assert_eq!(regions, 0);
+    }
+
+    /// The input band as drawn on a screen: frame buffer, cursor and the
+    /// first and last band row.
+    struct BandFrame {
+        buf: ratatui::buffer::Buffer,
+        cursor: ratatui::layout::Position,
+    }
+
+    const BAND_BG: Color = Color::Rgb(30, 30, 30);
+
+    fn draw_band(
+        chat: &ChatStream,
+        width: u16,
+        height: u16,
+        input: &str,
+        queued: &[String],
+    ) -> BandFrame {
+        draw_band_at(chat, width, height, input, queued, usize::MAX)
+    }
+
+    /// `draw_band` at an explicit document-row scroll instead of the
+    /// follow-bottom sentinel.
+    fn draw_band_at(
+        chat: &ChatStream,
+        width: u16,
+        height: u16,
+        input: &str,
+        queued: &[String],
+        scroll: usize,
+    ) -> BandFrame {
+        use super::{StatusContext, UnifiedRenderContext, render_unified};
+        use ratatui::{Terminal, backend::TestBackend};
+
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let mut layout = super::ChatLayout::default();
+        let mut buf = None;
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                render_unified(
+                    frame,
+                    area,
+                    chat,
+                    &mut layout,
+                    scroll,
+                    UnifiedRenderContext {
+                        selected_tool: None,
+                        content_height_out: None,
+                        view_height_out: None,
+                        input_ctx: Some(InputContext {
+                            input,
+                            cursor: input.chars().count(),
+                            attachments: &[],
+                            suggestion: None,
+                            greeting: None,
+                        }),
+                        input_caret_active: true,
+                        queue_ctx: (!queued.is_empty())
+                            .then_some(super::QueueContext { messages: queued }),
+                        status_ctx: Some(StatusContext {
+                            model: "model",
+                            usage: Some((4_800, Some(120_000))),
+                            context_policy: aither_agent::ContextPolicy::default(),
+                            queue_count: 0,
+                            open_questions: 0,
+                            yolo: false,
+                            shells: 0,
+                            subagents: 0,
+                            decode_rate: None,
+                            status_message: None,
+                            cwd: "~/may",
+                            activity: None,
+                            spinner_frame: 0,
+                            index_coverage: None,
+                            index_failed: false,
+                            index_loading: false,
+                        }),
+                        images_supported: false,
+                        hide_todos: false,
+                        image_positions_out: None,
+                        spinner_frame: 0,
+                        band_bg: Some(BAND_BG),
+                    },
+                );
+                buf = Some(frame.buffer_mut().clone());
+            })
+            .unwrap();
+        let cursor = terminal.get_cursor_position().unwrap();
+        BandFrame {
+            buf: buf.unwrap(),
+            cursor,
+        }
+    }
+
+    fn row_text(buf: &ratatui::buffer::Buffer, y: u16) -> String {
+        (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect()
+    }
+
+    fn row_has_band(buf: &ratatui::buffer::Buffer, y: u16) -> bool {
+        (0..buf.area.width).all(|x| buf[(x, y)].bg == BAND_BG)
+    }
+
+    fn row_has_no_band(buf: &ratatui::buffer::Buffer, y: u16) -> bool {
+        (0..buf.area.width).all(|x| buf[(x, y)].bg != BAND_BG)
+    }
+
+    fn sample_chat() -> ChatStream {
+        let mut chat = ChatStream::new();
+        chat.push_user("hello", Vec::new(), 0);
+        chat.push_text("Hi there, this is the last chat row.");
+        chat.end_text();
+        chat
+    }
+
+    #[test]
+    fn band_rows_come_in_order_with_a_plain_margin_above() {
+        let frame = draw_band(&sample_chat(), 80, 20, "draft", &[]);
+        let buf = &frame.buf;
+        // Bottom up: pad, status, blank, input, pad, margin, chat.
+        let last = 19;
+        assert!(row_has_band(buf, last), "bottom padding row");
+        assert_eq!(row_text(buf, last).trim(), "");
+        let status = row_text(buf, last - 1);
+        assert!(row_has_band(buf, last - 1));
+        assert!(status.starts_with("  ~/may"), "{status:?}");
+        assert!(status.trim_end().ends_with("(5%)"), "{status:?}");
+        assert!(row_has_band(buf, last - 2) && row_text(buf, last - 2).trim().is_empty());
+        assert!(row_has_band(buf, last - 3));
+        assert_eq!(row_text(buf, last - 3).trim_end(), "  draft");
+        assert!(row_has_band(buf, last - 4) && row_text(buf, last - 4).trim().is_empty());
+        // One plain margin row, then chat text with no band.
+        assert!(row_has_no_band(buf, last - 5));
+        assert_eq!(row_text(buf, last - 5).trim(), "");
+        // The reply's own trailing blank row, then its last text row.
+        assert!(row_has_no_band(buf, last - 6));
+        assert!(row_has_no_band(buf, last - 7));
+        assert!(row_text(buf, last - 7).contains("last chat row"));
+    }
+
+    #[test]
+    fn band_keeps_two_columns_of_padding_on_both_sides() {
+        let frame = draw_band(&sample_chat(), 80, 20, "draft", &[]);
+        let buf = &frame.buf;
+        for y in 14..=19 {
+            let text = row_text(buf, y);
+            assert!(text.starts_with("  "), "left padding of row {y}");
+            assert!(text.ends_with("  "), "right padding of row {y}");
+        }
+        // The context size ends two columns before the right edge.
+        let status = row_text(buf, 18);
+        assert_eq!(status.trim_end().chars().count(), 78, "{status:?}");
+    }
+
+    #[test]
+    fn chat_text_lines_up_with_the_input() {
+        let frame = draw_band(&sample_chat(), 80, 20, "draft", &[]);
+        let chat_row = row_text(&frame.buf, 12);
+        assert_eq!(chat_row.find('H'), Some(2), "{chat_row:?}");
+        let input_row = row_text(&frame.buf, 16);
+        assert_eq!(input_row.find('d'), Some(2));
+    }
+
+    #[test]
+    fn user_message_rows_fill_the_band_background() {
+        let frame = draw_band(&sample_chat(), 80, 20, "draft", &[]);
+        let user = (0..20)
+            .find(|&y| row_text(&frame.buf, y).contains("> hello"))
+            .expect("user message row");
+        assert!(row_has_band(&frame.buf, user));
+        // The assistant reply below keeps the terminal background.
+        let reply = (0..20)
+            .find(|&y| row_text(&frame.buf, y).contains("last chat row"))
+            .expect("reply row");
+        assert!(row_has_no_band(&frame.buf, reply));
+    }
+
+    /// A blank row directly above the message is its top padding: it
+    /// draws the band too, so the block breathes like the input band.
+    /// A non-blank row above is never shaded.
+    #[test]
+    fn a_blank_row_above_a_user_message_is_its_padding() {
+        let mut chat = ChatStream::new();
+        chat.push_text("first reply");
+        chat.end_text();
+        chat.push_user("hello", Vec::new(), 1);
+        chat.push_text("next reply");
+        chat.end_text();
+        let frame = draw_band(&chat, 80, 20, "draft", &[]);
+        let user = (0..20)
+            .find(|&y| row_text(&frame.buf, y).contains("> hello"))
+            .expect("user message row");
+        assert_eq!(row_text(&frame.buf, user - 1).trim(), "");
+        assert!(row_has_band(&frame.buf, user - 1), "padding row above");
+        assert!(row_has_band(&frame.buf, user + 1), "padding row below");
+        let reply = (0..20)
+            .find(|&y| row_text(&frame.buf, y).contains("first reply"))
+            .expect("reply row");
+        assert!(row_has_no_band(&frame.buf, reply));
+    }
+
+    /// Scrolled up, the band's tail sits below the window; painting its
+    /// unclamped rows indexed outside the buffer and panicked (#871).
+    #[test]
+    fn a_scrolled_band_below_the_viewport_stays_inside_the_buffer() {
+        let mut chat = ChatStream::new();
+        for i in 0..20usize {
+            chat.push_user(&format!("message {i}"), Vec::new(), i);
+            chat.push_text("reply");
+            chat.end_text();
+        }
+        let frame = draw_band_at(&chat, 80, 20, "draft", &[], 5);
+        // The band is out of view; a visible user message still draws it.
+        let user = (0..20)
+            .find(|&y| row_text(&frame.buf, y).contains("> message"))
+            .expect("a user message row in view");
+        assert!(row_has_band(&frame.buf, user));
+    }
+
+    #[test]
+    fn chat_wraps_inside_the_margins() {
+        let mut chat = ChatStream::new();
+        chat.push_text(&"word ".repeat(40));
+        chat.end_text();
+        let frame = draw_band(&chat, 40, 20, "", &[]);
+        for y in 0..13 {
+            let text = row_text(&frame.buf, y);
+            assert!(
+                text.starts_with("  ") && text.ends_with("  "),
+                "row {y}: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn caret_sits_after_the_typed_text() {
+        let frame = draw_band(&sample_chat(), 80, 20, "draft", &[]);
+        // "draft" starts at column 2 (band padding); the caret follows the last char.
+        assert_eq!((frame.cursor.x, frame.cursor.y), (2 + 5, 16), "caret");
+    }
+
+    #[test]
+    fn caret_follows_wrapped_input() {
+        let text = "x".repeat(50);
+        let frame = draw_band(&sample_chat(), 40, 20, &text, &[]);
+        // Content is 36 wide: 36 x fill the first row, 14 wrap to the next.
+        assert_eq!((frame.cursor.x, frame.cursor.y), (2 + 14, 16));
+        assert!(row_has_band(&frame.buf, 16));
+    }
+
+    #[test]
+    fn queue_lines_stay_above_the_band() {
+        let queued = vec!["later".to_string()];
+        let frame = draw_band(&sample_chat(), 80, 24, "", &queued);
+        let buf = &frame.buf;
+        let queue_row = (0..24)
+            .find(|&y| row_text(buf, y).contains("Queued"))
+            .expect("queue header");
+        assert!(row_has_no_band(buf, queue_row));
+        // Header, one message, margin row, then the band.
+        assert!(row_has_no_band(buf, queue_row + 2));
+        assert!(row_has_band(buf, queue_row + 3));
+    }
+
+    #[test]
+    fn narrow_width_drops_padding_but_keeps_the_band() {
+        let frame = draw_band(&sample_chat(), 8, 20, "ab", &[]);
+        let buf = &frame.buf;
+        assert!(row_has_band(buf, 19), "bottom padding row");
+        let input = (0..20)
+            .find(|&y| row_text(buf, y).starts_with("ab"))
+            .expect("input row at column 0");
+        assert!(row_has_band(buf, input));
+        assert!(row_has_band(buf, input - 1), "top padding row");
+        assert!(row_has_no_band(buf, input - 2), "margin row");
+    }
+
+    #[test]
+    fn plain_rows_match_the_screen_structure() {
+        use super::StatusContext;
+        let status = StatusContext {
+            model: "model",
+            usage: None,
+            context_policy: aither_agent::ContextPolicy::default(),
+            queue_count: 0,
+            open_questions: 0,
+            yolo: false,
+            shells: 0,
+            subagents: 0,
+            decode_rate: None,
+            status_message: None,
+            cwd: "~",
+            activity: None,
+            spinner_frame: 0,
+            index_coverage: None,
+            index_failed: false,
+            index_loading: false,
+        };
+        let input = InputContext {
+            input: "hi",
+            cursor: 2,
+            attachments: &[],
+            suggestion: None,
+            greeting: None,
+        };
+        let rows = build_plain_wrapped_lines_unified(
+            &sample_chat(),
+            80,
+            None,
+            Some(&input),
+            Some(&status),
+            None,
+            false,
+        );
+        let n = rows.len();
+        assert_eq!(&rows[n - 6..n - 3], ["", "", "hi"]);
+        assert_eq!(rows[n - 3], "");
+        assert!(rows[n - 2].starts_with("~ · model"));
+        assert_eq!(rows[n - 1], "");
+    }
+
+    /// Render a sample screen and write every cell as JSON lines to
+    /// `MAY_FRAME_DUMP` (symbol, fg, bg) — the input for the frame-to-PNG
+    /// preview script.
+    #[test]
+    #[ignore = "writes the frame JSON for visual preview"]
+    fn dump_frame_json() {
+        use std::fmt::Write as _;
+        let mut chat = ChatStream::new();
+        chat.push_user("帮我做一个变更，合入dev，去掉`>`", Vec::new(), 1);
+        chat.push_text("好的，我已经把输入框的 `>` 提示符去掉了：\n\n- 普通输入现在顶格显示\n- bash 模式仍然保留 `!` 高亮");
+        chat.end_text();
+        chat.push_user("第二条消息，看看背景填充效果", Vec::new(), 2);
+        chat.push_text("这是第二条回复。");
+        chat.end_text();
+        let frame = draw_band(&chat, 80, 24, "draft message", &[]);
+        let path = std::env::var("MAY_FRAME_DUMP").unwrap_or_else(|_| "frame.jsonl".into());
+        let mut out = String::new();
+        for y in 0..frame.buf.area.height {
+            for x in 0..frame.buf.area.width {
+                let cell = &frame.buf[(x, y)];
+                let _ = writeln!(
+                    out,
+                    "{{\"x\":{x},\"y\":{y},\"s\":{:?},\"fg\":\"{:?}\",\"bg\":\"{:?}\"}}",
+                    cell.symbol(),
+                    cell.fg,
+                    cell.bg
+                );
+            }
+        }
+        std::fs::write(&path, out).unwrap();
+        eprintln!("wrote {path}");
+    }
+
+    #[test]
+    #[ignore = "prints one frame for eyeballing"]
+    fn dump_band_frame() {
+        let frame = draw_band(&sample_chat(), 80, 14, "draft", &[]);
+        for y in 0..14 {
+            let line: String = (0..80)
+                .map(|x| {
+                    let cell = &frame.buf[(x, y)];
+                    if cell.symbol() == " " && cell.bg == BAND_BG {
+                        "░"
+                    } else {
+                        cell.symbol()
+                    }
+                })
+                .collect();
+            println!("{line}");
+        }
     }
 }

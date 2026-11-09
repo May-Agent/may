@@ -1,11 +1,13 @@
 //! Main layout for the TUI.
 
 mod config;
+mod effort;
 mod pickers;
 mod popups;
 mod sidebar;
 
 use self::config::render_config_screen;
+use self::effort::render_effort_select_popup;
 use self::pickers::{
     connect_picker_rows, render_connect_picker, render_file_picker_popup,
     render_profile_select_popup, render_resume_picker, render_session_popup,
@@ -15,7 +17,7 @@ use self::popups::{render_mcp_popup, render_skill_popup, render_ssh_popup};
 use ratatui::{
     buffer::CellDiffOption,
     prelude::*,
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
+    widgets::{Block, Borders, Clear, LineGauge, List, ListItem, Paragraph},
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -27,7 +29,8 @@ use super::super::app::{App, ImageRegion};
 use super::super::completion::CompletionMode;
 use super::super::state::{
     AppMode, AskUserState, BtwState, ChatgptAuthStatus, CopilotAuthStatus, GrokAuthStatus,
-    JobDetailState, JobDetailTarget, LOGIN_PROVIDERS, OpenrouterAuthStatus, RewindState,
+    JobDetailState, JobDetailTarget, LOGIN_PROVIDERS, OpenrouterAuthStatus, ProgressState,
+    RewindState,
 };
 use super::chat::{self, InputContext, QueueContext, StatusContext, UnifiedRenderContext};
 
@@ -156,7 +159,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         height: column.height - sheet_area.map_or(0, |sheet| sheet.height),
         ..column
     };
-    app.chat_area = chat_area;
+    // The chat, its selection, links and images live inside the horizontal
+    // padding; the band paints across `chat_area`.
+    let content_area = super::band::inset(chat_area);
+    app.chat_area = content_area;
 
     let running_shells = app
         .jobs
@@ -176,7 +182,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     let status_message = app
         .status_text()
         .map(str::to_string)
-        .or_else(|| app.hovered_link().map(|hit| hit.uri));
+        .or_else(|| app.hovered_link().map(|hit| hit.display()));
 
     // Render everything in a single unified scrollable area
     app.frame_stats.chat = chat::render_unified(
@@ -200,6 +206,10 @@ pub fn render(frame: &mut Frame, app: &mut App) {
                         .current()
                         .map(|session| session.id.as_str()),
                 ),
+                greeting: app
+                    .new_year
+                    .greeting()
+                    .then_some(crate::tui::new_year::GREETING),
             }),
             input_caret_active: matches!(app.mode, AppMode::Chat),
             queue_ctx: if queue_messages.is_empty() {
@@ -235,6 +245,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
             hide_todos: sidebar_area.is_some(),
             image_positions_out: Some(&mut image_positions),
             spinner_frame: app.spinner_frame,
+            band_bg: app.band_bg,
         },
     );
     // The plain mirror is read back from the cached layout on demand.
@@ -242,7 +253,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     let t = std::time::Instant::now();
     if app.selection.is_some() {
-        render_text_selection_overlay(frame, chat_area, app);
+        render_text_selection_overlay(frame, content_area, app);
     }
 
     // Render images as overlays at their scroll-adjusted positions. Images
@@ -256,12 +267,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         && !matches!(app.mode, AppMode::ImageView(_))
     {
         let mut occluders: Vec<Rect> = Vec::new();
-        if let Some(rect) = completion_overlay_rect(app, chat_area) {
+        if let Some(rect) = completion_overlay_rect(app, content_area) {
             occluders.push(rect);
         }
         render_inline_images(
             frame,
-            chat_area,
+            content_area,
             &mut app.image_cache,
             &mut app.image_regions,
             &image_positions,
@@ -278,7 +289,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     // Render completion overlay if active (always on top)
     if app.completion.is_active() && !app.completion.is_empty() {
-        render_completion_overlay(frame, chat_area, app);
+        render_completion_overlay(frame, content_area, app);
     }
 
     // The zoomed image overlay sits above everything else.
@@ -288,12 +299,18 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         app.image_view_area = None;
     }
 
+    // Fireworks play over the chat and leave nothing behind: the next frame
+    // repaints the chat from its unchanged state.
+    if let Some(fireworks) = app.new_year.fireworks() {
+        fireworks.paint(frame.buffer_mut(), content_area);
+    }
+
     // Last, so a popup or image drawn over a link is left alone.
     if matches!(app.mode, AppMode::Chat) {
         let top = app.effective_scroll();
         let runs = app
             .chat_layout
-            .link_runs(top, chat_area.height as usize, chat_area);
+            .link_runs(top, content_area.height as usize, content_area);
         let hovered = app.hovered_link().map(|hit| hit.id);
         super::links::paint(frame.buffer_mut(), &runs, hovered);
     }
@@ -332,10 +349,10 @@ fn sheet_height(app: &App, column: Rect) -> Option<u16> {
             .max(10),
             pct(60),
         ),
-        AppMode::Help => (rows(HELP_TEXT.lines().count() + 2), pct(70)),
+        AppMode::Help => (rows(help_text().lines().count() + 2), pct(70)),
         AppMode::ToolDetail => (full, pct(80)),
         AppMode::ModelSelect => (rows(app.filtered_model_select().len() + 6).min(16), pct(60)),
-        AppMode::EffortSelect => (rows(4), pct(70)),
+        AppMode::EffortSelect => (rows(effort::ROWS + 1), pct(70)),
         AppMode::McpManage | AppMode::SshManage | AppMode::SkillManage => {
             (pct(60).max(12), pct(70))
         }
@@ -356,6 +373,7 @@ fn sheet_height(app: &App, column: Rect) -> Option<u16> {
         ),
         AppMode::JobDetail(_) => (pct(80), pct(80)),
         AppMode::Btw(state) => (if !state.loading && !state.done { 5 } else { 14 }, pct(60)),
+        AppMode::Progress(_) => (16, pct(60)),
         AppMode::PermissionConfirm(state) => (
             rows(
                 state.shown_reading().map_or_else(
@@ -429,6 +447,7 @@ fn render_sheet(frame: &mut Frame, sheet: Rect, app: &App) {
         AppMode::Jobs => render_jobs_panel(frame, sheet, app),
         AppMode::JobDetail(state) => render_job_detail(frame, sheet, state),
         AppMode::Btw(state) => render_btw_popup(frame, sheet, state),
+        AppMode::Progress(state) => render_progress_popup(frame, sheet, state),
         AppMode::PermissionConfirm(state) => render_permission_confirm(frame, sheet, state),
         AppMode::WorkspaceConfirm(state) => {
             render_workspace_confirm(frame, sheet, &state.path, &state.reason);
@@ -688,15 +707,21 @@ pub(super) fn display_width_prefix(text: &str, char_count: usize) -> usize {
         .sum()
 }
 
-/// Help text content.
-const HELP_TEXT: &str = include_str!("../help.txt");
+/// The help sheet, rendered from the slash command table.
+fn help_text() -> String {
+    use askama::Template as _;
+    crate::tui::slash::HelpScreen::new()
+        .render()
+        .expect("the help template renders")
+}
 
 /// Render the help sheet; `scroll` rows of it are scrolled off the top.
 fn render_help_popup(frame: &mut Frame, area: Rect, scroll: u16) {
-    let max_scroll = u16::try_from(HELP_TEXT.lines().count())
+    let text = help_text();
+    let max_scroll = u16::try_from(text.lines().count())
         .unwrap_or(u16::MAX)
         .saturating_sub(area.height.saturating_sub(2));
-    let help = WrappedParagraph::new(HELP_TEXT)
+    let help = WrappedParagraph::new(text.as_str())
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -991,31 +1016,6 @@ fn render_model_select_popup(frame: &mut Frame, area: Rect, app: &App) {
         ])
     };
     frame.render_widget(Paragraph::new(vec![Line::from(""), footer_line]), chunks[2]);
-}
-
-/// Render the effort select popup: a single horizontal ladder, ←/→ steps
-/// the highlighted rung and applies immediately.
-fn render_effort_select_popup(frame: &mut Frame, area: Rect, app: &App) {
-    let mut spans = Vec::with_capacity(app.effort_ladder.len() + 2);
-    spans.push(Span::styled("◀ ", Style::default().fg(Color::DarkGray)));
-    for (idx, rung) in app.effort_ladder.iter().enumerate() {
-        let style = if idx == app.effort_index {
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        spans.push(Span::styled(format!(" {rung} "), style));
-    }
-    spans.push(Span::styled(" ▶", Style::default().fg(Color::DarkGray)));
-    let paragraph = Paragraph::new(Line::from(spans)).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title("Reasoning effort"),
-    );
-    frame.render_widget(paragraph, area);
 }
 
 /// Render the rewind picker: the session's user prompts with the file
@@ -1384,6 +1384,83 @@ fn render_btw_popup(frame: &mut Frame, area: Rect, state: &BtwState) {
 
     let paragraph = WrappedParagraph::new(lines).scroll(state.scroll);
     frame.render_widget(paragraph, inner);
+}
+
+/// The report's groups in display order, with the heading of each.
+fn progress_groups(report: &crate::daemon::ProgressReport) -> [(&'static str, &[String]); 4] {
+    [
+        ("Waiting to land", &report.waiting_to_land),
+        ("Waiting on something else", &report.waiting_on_other),
+        ("Not started", &report.not_started),
+        ("Waiting on you", &report.waiting_on_user),
+    ]
+}
+
+fn render_progress_popup(frame: &mut Frame, area: Rect, state: &ProgressState) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title("progress (not in history)");
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let [bar_area, body_area] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(inner);
+
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(report) = &state.report {
+        let ratio = if report.total == 0 {
+            0.0
+        } else {
+            f64::from(report.done) / f64::from(report.total)
+        };
+        frame.render_widget(
+            LineGauge::default()
+                .label(format!("{}/{}", report.done, report.total))
+                .ratio(ratio)
+                .filled_style(Style::default().fg(Color::Green))
+                .unfilled_style(Style::default().fg(Color::DarkGray)),
+            bar_area,
+        );
+        for (heading, items) in progress_groups(report) {
+            if items.is_empty() {
+                continue;
+            }
+            if !lines.is_empty() {
+                lines.push(Line::from(""));
+            }
+            lines.push(Line::from(Span::styled(
+                heading,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            lines.extend(items.iter().map(|item| {
+                Line::from(Span::styled(
+                    format!("• {item}"),
+                    Style::default().fg(Color::White),
+                ))
+            }));
+        }
+    } else if state.loading {
+        lines.push(Line::from(Span::styled(
+            "thinking…",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    if let Some(error) = &state.error {
+        lines.push(Line::from(Span::styled(
+            format!("error: {error}"),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    if !state.loading {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Esc/q close · ↑↓ scroll",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    frame.render_widget(WrappedParagraph::new(lines).scroll(state.scroll), body_area);
 }
 
 /// Helper to create a centered rect.
@@ -2690,8 +2767,9 @@ fn completion_overlay_rect(app: &App, area: Rect) -> Option<Rect> {
     }
     let item_count = app.completion.len().min(COMPLETION_MAX_ITEMS);
     let height = u16::try_from(item_count + 2).unwrap_or(u16::MAX); // +2 for borders
-    // Near the bottom, leaving 2 lines for input/status.
-    let y = area.y + area.height.saturating_sub(height + 2);
+    // Near the bottom, above the band: its padding rows, the input line,
+    // the blank row and the status line.
+    let y = area.y + area.height.saturating_sub(height + 5);
     Some(Rect {
         x: area.x,
         y,
@@ -2753,9 +2831,18 @@ fn render_inline_images(
             continue;
         }
 
-        // Get the cached image state
+        // Get the cached image state. A miss or a failed fetch leaves the
+        // reserved rows blank: draw the caption there so the block is a
+        // placeholder, not a void.
         let Some(state) = image_cache.get_mut(&placement.key) else {
-            // Image not yet fetched
+            let y = chat_area.y + u16::try_from(top.max(0)).unwrap_or(0);
+            frame.buffer_mut().set_stringn(
+                chat_area.x + indent,
+                y,
+                format!("▏image · {}", placement.caption),
+                usize::from(width),
+                Style::default().fg(Color::DarkGray),
+            );
             continue;
         };
 
@@ -2799,6 +2886,8 @@ mod tests {
             task_id: "amber".to_string(),
             execution_key: String::new(),
             script: "true".to_string(),
+            language: aither_sandbox::ScriptLanguage::Shell,
+            place: aither_sandbox::JobPlace::Host,
             mode: aither_sandbox::TerminalMode::default(),
             started_at: std::time::Instant::now()
                 .checked_sub(std::time::Duration::from_secs(age_secs))
@@ -2854,9 +2943,11 @@ mod tests {
                         hide_todos: false,
                         image_positions_out: None,
                         spinner_frame: 0,
+                        band_bg: None,
                     },
                 );
-                let runs = layout.link_runs(0, usize::from(area.height), area);
+                let content = super::super::band::inset(area);
+                let runs = layout.link_runs(0, usize::from(area.height), content);
                 assert!(!runs.is_empty(), "the user message has link runs");
                 let hovered = runs[0].hit.id;
                 super::super::links::paint(frame.buffer_mut(), &runs, Some(hovered));
@@ -3005,6 +3096,7 @@ mod tests {
                         hide_todos: false,
                         image_positions_out: Some(&mut placements),
                         spinner_frame: 0,
+                        band_bg: None,
                     },
                 );
                 render_inline_images(frame, area, cache, &mut regions, &placements, &[]);
@@ -3192,6 +3284,7 @@ mod tests {
                         hide_todos: false,
                         image_positions_out: Some(&mut placements),
                         spinner_frame: 0,
+                        band_bg: None,
                     },
                 );
                 let occluder = Rect::new(0, 4, 50, 3);
@@ -3354,6 +3447,63 @@ mod tests {
                 });
             }
         }
+    }
+
+    /// A structured report renders as a gauge over the grouped items.
+    #[test]
+    fn progress_report_renders_as_bar_and_grouped_items() {
+        let state = crate::tui::state::ProgressState {
+            report: Some(crate::daemon::ProgressReport {
+                done: 2,
+                total: 5,
+                waiting_to_land: vec!["合并 PR".to_string()],
+                waiting_on_other: vec![],
+                not_started: vec!["ドキュメントを更新する".to_string()],
+                waiting_on_user: vec!["릴리스 승인".to_string()],
+            }),
+            ..crate::tui::state::ProgressState::default()
+        };
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(60, 16)).unwrap();
+        terminal
+            .draw(|frame| super::render_progress_popup(frame, frame.area(), &state))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(rows[1].contains("2/5"), "the bar row: {:?}", rows[1]);
+        let filled = (0..buffer.area.width)
+            .filter(|&x| buffer[(x, 1)].fg == ratatui::style::Color::Green)
+            .count();
+        let unfilled = (0..buffer.area.width)
+            .filter(|&x| buffer[(x, 1)].fg == ratatui::style::Color::DarkGray)
+            .count();
+        assert!(
+            filled > 0 && unfilled > filled,
+            "2 of 5 fills under half the bar: {filled} of {}",
+            filled + unfilled
+        );
+        // A wide glyph's trailing cell reads back as a space: compare
+        // without whitespace.
+        let text: String = rows.join("\n").split_whitespace().collect();
+        for needle in [
+            "Waitingtoland",
+            "合并PR",
+            "Notstarted",
+            "ドキュメントを更新する",
+            "Waitingonyou",
+            "릴리스승인",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?}:\n{text}");
+        }
+        assert!(
+            !text.contains("Waitingonsomethingelse"),
+            "empty group hidden"
+        );
     }
 
     /// An `ask_user` question, drawn without a border of its own, wraps

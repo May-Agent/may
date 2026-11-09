@@ -1,14 +1,8 @@
 import { useEffect, useState } from 'react';
 import { Bell } from 'lucide-react';
-import { toast } from 'sonner';
-import { Button } from '@/components/ui/button';
 import { SectionHeader } from './SectionHeader';
 import { useTranslation } from '@/lib/i18n';
-import {
-  fireNotificationCallback,
-  getMailbox,
-  type NotificationMailboxEntry,
-} from '@/lib/api/notifications';
+import { getMailbox, type NotificationMailboxEntry } from '@/lib/api/notifications';
 import { useFormatRelativeTime } from '@/lib/utils';
 
 export function NotificationsSection() {
@@ -16,17 +10,6 @@ export function NotificationsSection() {
   const formatRelative = useFormatRelativeTime();
   const [items, setItems] = useState<NotificationMailboxEntry[]>([]);
   const [loading, setLoading] = useState(true);
-  const [busy, setBusy] = useState(false);
-
-  const refresh = async () => {
-    setLoading(true);
-    try {
-      const res = await getMailbox();
-      setItems(res.items);
-    } finally {
-      setLoading(false);
-    }
-  };
 
   useEffect(() => {
     let cancelled = false;
@@ -41,20 +24,6 @@ export function NotificationsSection() {
       cancelled = true;
     };
   }, []);
-
-  const ack = async (id: string) => {
-    setBusy(true);
-    try {
-      await fireNotificationCallback(id);
-      await refresh();
-    } catch (err) {
-      toast.error(t('errors.generic'), {
-        description: err instanceof Error ? err.message : undefined,
-      });
-    } finally {
-      setBusy(false);
-    }
-  };
 
   return (
     <section>
@@ -84,9 +53,6 @@ export function NotificationsSection() {
                   {formatRelative(n.createdAt)} · {n.status}
                 </div>
               </div>
-              <Button size="sm" variant="ghost" disabled={busy} onClick={() => ack(n.id)}>
-                {t('common.done')}
-              </Button>
             </li>
           ))}
         </ul>

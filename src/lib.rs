@@ -19,10 +19,13 @@ pub mod bundle;
 pub mod cache_lifetime;
 /// `ChatGPT` subscription OAuth flow.
 pub mod chatgpt;
+pub mod ci;
 /// Client of the May daemon over its unix socket.
 pub mod client;
 /// Configuration loading and types.
 pub mod command_output;
+/// May's rules on what a terminal script may run.
+pub mod command_policy;
 /// How a terminal call's script is read before it runs.
 pub mod command_reading;
 /// One virtual desktop per session — computer use.
@@ -50,6 +53,8 @@ pub mod host_git;
 mod id;
 /// Issue tracking: may issues by default, GitHub when configured.
 pub mod issue;
+/// The machine-wide jobserver token pool shared by every terminal.
+pub mod jobserver;
 mod live_response;
 /// Location lookup for location-aware profiles.
 pub mod location;
@@ -81,6 +86,8 @@ pub mod prompt_mentions;
 mod quota;
 /// Per-session repository clones inside the session sandbox.
 pub mod repo_clone;
+pub mod repo_gate;
+pub mod repo_preflight;
 /// repo-search daemon: code, session and issue search.
 pub mod repo_search;
 /// `/import-claude` and `/import-codex`: another agent's global rules and
@@ -100,18 +107,18 @@ pub mod skill;
 pub mod sleep;
 /// Startup validation of configuration files.
 pub mod startup;
+/// The rows of `tasks.md` as clients see them.
+pub mod task_rows;
 /// Scheduled-task trigger definitions.
 pub mod task_trigger;
 /// The command a scheduled task's run uses to prompt its session.
 pub mod task_wake;
-/// Background task types and execution.
-pub mod tasks;
+/// `tasks.md`: its format and the harness that keeps it current.
+pub mod tasks_md;
 /// Terminal commands exposed to the agent.
 pub mod terminal_commands;
 /// Permission handling for terminal command execution.
 pub mod terminal_permission_handler;
-/// Todo checklist parsing from agent output.
-pub mod todo_parser;
 /// Tool request dispatch to session handlers.
 pub mod tool_dispatch;
 /// Miscellaneous tool helpers.
@@ -154,3 +161,16 @@ pub use terminal_permission_handler::TerminalPermissionHandler;
 pub use workspace::{Workspace, WorkspaceConfig};
 pub use workspace_request::{WorkspaceRequest, WorkspaceRequestBroker, WorkspaceRequestQueue};
 pub use xml::{XmlBlock, XmlBlockError};
+
+/// Test support shared by the crate's `#[cfg(test)]` code.
+#[cfg(test)]
+mod test_support {
+    /// An output store in `dir` with the default model-facing id allocator.
+    pub async fn test_output_store(
+        dir: impl Into<std::path::PathBuf>,
+    ) -> aither_sandbox::OutputStore {
+        aither_sandbox::OutputStore::new(dir, aither_core::AnyIdAllocator::default())
+            .await
+            .expect("outputs store")
+    }
+}

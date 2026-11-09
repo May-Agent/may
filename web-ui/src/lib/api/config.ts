@@ -121,6 +121,8 @@ export type CommandPriority = 'normal' | 'low' | 'lowest';
 
 export interface UiSandboxConfig {
   commandPriority: CommandPriority;
+  /** Jobserver tokens shared by every terminal; null is the host's available parallelism. */
+  jobPoolSize: number | null;
 }
 
 export type StreamCodec = 'auto' | 'h264' | 'av1';
@@ -152,6 +154,12 @@ export interface UiFullConfig {
   /** Omitted from a save, the setting is left as it is. */
   suggestions?: UiSuggestionsConfig;
   recap?: UiRecapConfig;
+  sessions?: UiSessionsConfig;
+}
+
+export interface UiSessionsConfig {
+  /** Hours a session stays listed after it went idle. */
+  recentHours: number;
 }
 
 export interface UiSshServerConfig {
@@ -164,6 +172,8 @@ export interface UiConfigResponse {
   maxIterations: number;
   uiFont: string;
   uiTheme: string;
+  /** IANA name of the user's timezone (`[time] timezone`). */
+  timezone: string;
   fullConfig: UiFullConfig;
 }
 

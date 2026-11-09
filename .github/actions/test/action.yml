@@ -1,0 +1,82 @@
+name: Test
+description: Build and test the workspace on the runner it runs on. The check job names are fixed by the ruleset, so each runner has a job of its own around these steps.
+runs:
+  using: composite
+  steps:
+    # A rebuilt merge queue deletes its old group branches but leaves their
+    # runs queued; such a run ends here instead of holding a runner.
+    - name: Stop a superseded merge group
+      if: github.event_name == 'merge_group'
+      shell: bash
+      run: |
+        if ! git ls-remote --exit-code "https://github.com/${{ github.repository }}" "${{ github.ref }}" > /dev/null; then
+          echo "::error::${{ github.ref }} no longer exists; the merge queue superseded this group"
+          exit 1
+        fi
+    - name: Free runner disk
+      if: runner.os == 'Linux'
+      shell: bash
+      run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+    - uses: dtolnay/rust-toolchain@stable
+    # Only dev saves; a PR or merge-group cache lives in a scope nothing else
+    # restores, and its size evicts dev's under the cache limit.
+    - uses: Swatinem/rust-cache@v2
+      with:
+        save-if: ${{ github.ref == 'refs/heads/dev' }}
+    # rust-cache prunes the files under target/tmp but keeps its directories,
+    # so a restored cache holds an empty skeleton of the tests' shared tool
+    # cache that the tests would take for a prepared one.
+    - name: Drop restored test scratch
+      shell: bash
+      run: |
+        chmod -R u+w target/tmp 2>/dev/null || true
+        rm -rf target/tmp
+    - uses: ./.github/actions/install-heel
+    # The pinned tool artifacts, their prepared runtimes and the container
+    # heel the tests download from GitHub releases on a miss.
+    - id: downloads
+      uses: ./.github/actions/restore-test-downloads
+    # rav1e's x86_64 assembly is built with nasm.
+    - name: Install nasm
+      if: runner.os == 'Linux' && runner.arch == 'X64'
+      shell: bash
+      run: sudo apt-get update && sudo apt-get install -y nasm
+    - name: cargo build
+      shell: bash
+      run: cargo build --locked --all-targets --timings
+    # The dev push keeps its debug may for testing without a local build. It is
+    # packed as a tarball because artifacts drop the executable bit.
+    - name: Pack the debug may
+      if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
+      shell: bash
+      run: tar -czf may-debug.tar.gz -C target/debug may
+    - name: Upload the debug may
+      if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
+      uses: actions/upload-artifact@v4
+      with:
+        name: may-debug-${{ runner.os == 'macOS' && 'macos' || 'linux' }}-${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+        path: may-debug.tar.gz
+        retention-days: 7
+    # The merge queue already tested the tree a push to dev lands, so that
+    # push only builds, to seed dev's caches; it still tests when the test
+    # downloads missed, since the tests are what fetch them.
+    - name: cargo test
+      if: github.event_name != 'push' || steps.downloads.outputs.tools-hit != 'true' || steps.downloads.outputs.heel-hit != 'true'
+      shell: bash
+      run: cargo test --locked --all-targets --timings
+    - name: Upload cargo timings
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: cargo-timings-${{ github.job }}
+        path: target/cargo-timings/
+    - if: success() && steps.downloads.outputs.tools-hit != 'true' && github.ref == 'refs/heads/dev'
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ steps.downloads.outputs.tools-path }}
+        key: ${{ steps.downloads.outputs.tools-key }}
+    - if: success() && steps.downloads.outputs.heel-hit != 'true' && github.ref == 'refs/heads/dev'
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ steps.downloads.outputs.heel-path }}
+        key: ${{ steps.downloads.outputs.heel-key }}

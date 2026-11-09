@@ -1,0 +1,1 @@
+Nothing was sent: "{{ recipient }}" is idle and its prompt cache has gone cold, so a message would wake it into a turn that pays for its whole prompt again. The message was not stored and the agent was not woken.

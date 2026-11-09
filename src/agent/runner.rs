@@ -86,6 +86,17 @@ pub enum TuiEvent {
     /// The text streamed so far is discarded: the attempt failed and the
     /// prompt is resubmitted.
     Retract,
+    /// The daemon withdrew the turn: it was stopped before any tool call or
+    /// response text, so its message left the conversation.
+    Withdrawn {
+        /// The withdrawn message text.
+        content: String,
+        /// Whether this client sent it and gets it back in its input.
+        own: bool,
+    },
+    /// The user declined, at the session's repository question, to work
+    /// where the session starts: the turn did not run, and nothing failed.
+    Declined(String),
     /// Agent stream completed (ready for next prompt).
     Complete,
     /// Agent encountered a fatal error.
@@ -785,8 +796,8 @@ async fn next_command(
             IdleStep::Command(command) => return command,
             IdleStep::Background(wake) => {
                 // The wake is recorded in the agent's context; a wake that
-                // needs the model asks the host for a run.
-                if wake.needs_model
+                // starts a run asks the host for one.
+                if wake.starts_run
                     && let Some(background) = background_wakes
                 {
                     let _ = background.wakes.try_send(wake);
@@ -1023,6 +1034,9 @@ async fn run_agent_prompt(
         }
         WorkOutcome::Finished(Ok(ControlFlow::Break(PromptStop::Stopped)))
         | WorkOutcome::Cancelled => {
+            // The user stopped the run: background completions wait for
+            // their next input.
+            agent.interrupt();
             // Completion after cancel lets the TUI know processing stopped.
             let _ = event_tx.send(TuiEvent::Complete).await;
             return WorkOutcome::Cancelled;
@@ -1096,7 +1110,9 @@ mod tests {
                         .is_some_and(|line| line.contains("/models"))
                     {
                         let _ = socket
-                            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                            .write_all(
+                                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                            )
                             .await;
                         return;
                     }
@@ -1136,10 +1152,16 @@ mod tests {
         let baseline = context_report(&worker, TIMEOUT).await;
 
         let compact_handle = worker.compact(None);
-        tokio::time::timeout(TIMEOUT, request_rx.recv())
-            .await
-            .expect("compact request never reached the stub server")
-            .expect("stub server request channel closed");
+        match tokio::time::timeout(TIMEOUT, request_rx.recv()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => panic!("stub server request channel closed: {error}"),
+            Err(_) => {
+                let event = tokio::time::timeout(TIMEOUT, compact_handle.recv()).await;
+                panic!(
+                    "compact request never reached the stub server; the compaction sent {event:?}"
+                );
+            }
+        }
 
         compact_handle.cancel();
         match tokio::time::timeout(TIMEOUT, compact_handle.recv()).await {

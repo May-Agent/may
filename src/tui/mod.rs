@@ -10,6 +10,8 @@ pub mod clipboard;
 pub mod completion;
 /// The `/connect` picker for ACP agents.
 pub mod connect;
+/// Desktop notifications raised through the terminal.
+pub mod desktop_notification;
 /// TUI error type and result alias.
 pub mod error;
 /// Terminal event polling and app event channel.
@@ -18,6 +20,8 @@ pub mod event;
 pub mod file_diff;
 /// Persistent input history.
 pub mod history;
+/// New Year greeting and fireworks.
+pub mod new_year;
 /// Jank instrumentation (frame/loop timing for stall reports).
 pub mod perf;
 /// Pending message and attachment types.
@@ -30,6 +34,8 @@ pub mod remote;
 pub mod runtime;
 /// Right sidebar state: task tree, linked issues.
 pub mod sidebar;
+/// The table of slash commands completion, dispatch and help share.
+pub mod slash;
 /// UI mode and per-mode state types.
 pub mod state;
 /// Rendering layer for the TUI.

@@ -20,7 +20,7 @@ export function YoloToggle({ sessionId, yolo }: YoloToggleProps) {
     setBusy(true);
     try {
       const res = await putSessionYolo(sessionId, next);
-      updateRuntime(sessionId, { yolo: res.yolo });
+      updateRuntime(sessionId, { yolo: res.runtime.yolo });
     } catch (error) {
       toast.error(
         t('yolo.failed', { message: error instanceof Error ? error.message : String(error) }),

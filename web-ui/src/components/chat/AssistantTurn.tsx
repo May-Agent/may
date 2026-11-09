@@ -7,6 +7,7 @@ import { BrowserCard } from './BrowserCard';
 import { MessageActions } from './MessageActions';
 import { groupBrowserRuns } from '@/lib/browser/activity';
 import { TodoBlock } from './TodoBlock';
+import { openCount } from '@/lib/tasks/rows';
 import { useTranslation } from '@/lib/i18n';
 
 interface AssistantTurnProps {
@@ -76,9 +77,7 @@ export function AssistantTurn({
         if (!tool) return null;
         return <ToolCard key={tool.id} tool={tool} />;
       })}
-      {turn.todo && (
-        <TodoBlock items={turn.todo.items} total={turn.todo.total} completed={turn.todo.completed} />
-      )}
+      {turn.todo && <TodoBlock rows={turn.todo.rows} />}
       {!streaming && (
         <MessageActions
           className="-ml-1"
@@ -104,7 +103,7 @@ export function AssistantTurn({
           </span>
         </div>
       )}
-      {streaming && !hasAnySegment && !turn.todo && !turn.reasoning && !turn.hold && (
+      {streaming && !hasAnySegment && !(turn.todo && openCount(turn.todo.rows) > 0) && !turn.reasoning && !turn.hold && (
         <div className="flex items-center gap-2 text-sm text-muted-foreground">
           {reasoningEnabled ? (
             <span className="shimmer-text">{t('chat.thinking')}…</span>
@@ -114,10 +113,18 @@ export function AssistantTurn({
         </div>
       )}
       {turn.error && (
-        <div className="flex items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+        <div
+          className={
+            turn.error.code === 'repo_declined'
+              ? 'flex items-start gap-2 rounded-lg border border-border bg-muted/40 px-3 py-2 text-sm text-muted-foreground'
+              : 'flex items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive'
+          }
+        >
           <AlertCircle className="mt-0.5 size-4 shrink-0" />
           <div>
-            <div className="font-medium">{turn.error.code}</div>
+            {turn.error.code !== 'repo_declined' && (
+              <div className="font-medium">{turn.error.code}</div>
+            )}
             <div className="text-xs opacity-80">{turn.error.message}</div>
           </div>
         </div>

@@ -192,6 +192,18 @@ impl SessionBackgrounds {
         }
     }
 
+    /// The sessions with background work: a command or subagent run in
+    /// flight, or a wake being served.
+    pub async fn busy_sessions(&self) -> std::collections::BTreeSet<String> {
+        let mut busy = std::collections::BTreeSet::new();
+        for session_id in self.session_ids() {
+            if self.snapshot(&session_id).await.will_resume() {
+                busy.insert(session_id);
+            }
+        }
+        busy
+    }
+
     fn session_ids(&self) -> Vec<String> {
         self.sessions().keys().cloned().collect()
     }
@@ -218,23 +230,40 @@ fn shape(snapshot: &SessionBackgroundSnapshot) -> Vec<(u64, String)> {
 pub fn spawn_watcher(state: Arc<DaemonState>, bus: UiEventBus) {
     state.tokio_handle.clone().spawn(async move {
         let mut last: HashMap<String, Vec<(u64, String)>> = HashMap::new();
+        let mut last_busy = std::collections::BTreeSet::new();
         loop {
             tokio::time::sleep(WATCH_INTERVAL).await;
-            let mut publish = false;
+            let mut changed = std::collections::BTreeSet::new();
+            let mut busy = std::collections::BTreeSet::new();
             for session_id in state.session_background.session_ids() {
                 let snapshot = state.session_background.snapshot(&session_id).await;
                 let shape = shape(&snapshot);
+                if snapshot.will_resume() {
+                    busy.insert(session_id.clone());
+                }
                 let running = snapshot
                     .jobs
                     .iter()
                     .any(|job| job.status == crate::client::background::WireJobStatus::Running)
                     || !snapshot.subagents.is_empty();
                 // Running work changes every second (elapsed time, tokens).
-                publish |= running || last.get(&session_id) != Some(&shape);
+                if running || last.get(&session_id) != Some(&shape) {
+                    changed.insert(session_id.clone());
+                }
                 last.insert(session_id, shape);
             }
-            if publish {
-                bus.publish(UiEventTopics::SESSION_BACKGROUND);
+            if !changed.is_empty() {
+                for session_id in changed {
+                    bus.publish_session_change(
+                        &session_id,
+                        crate::daemon::session_events::SessionChange::Background,
+                    );
+                }
+            }
+            // The session lists mark the sessions with background work.
+            if busy != last_busy {
+                bus.publish(UiEventTopics::PROFILE_SESSIONS);
+                last_busy = busy;
             }
         }
     });
@@ -313,9 +342,10 @@ pub async fn kill_job(
         None => false,
     };
     if ok {
-        state
-            .ui_event_bus
-            .publish(UiEventTopics::SESSION_BACKGROUND);
+        state.publish_session_change(
+            &session_id,
+            crate::daemon::session_events::SessionChange::Background,
+        );
     }
     Ok(Json(KillJobResponse { ok }))
 }
@@ -412,28 +442,32 @@ mod tests {
     use super::*;
     use aither_sandbox::TerminalMode;
 
-    async fn registry_with_job(pid: u32, task_id: &str) -> JobRegistry {
+    async fn registry_with_job(pid: u32, _task_id: &str) -> (JobRegistry, String) {
         let (registry, service) = aither_sandbox::job_registry_channel();
         tokio::spawn(service.serve());
+        let task_id = aither_core::AnyIdAllocator::default()
+            .lease()
+            .expect("a free task id");
+        let word = task_id.to_string();
         registry
             .register(
                 pid,
-                task_id,
+                &task_id,
                 "key",
                 "sleep 30",
                 TerminalMode::Sandboxed,
                 None,
             )
             .await;
-        registry
+        (registry, word)
     }
 
     #[tokio::test]
     async fn earlier_agents_jobs_stay_listed_while_they_run() {
         let backgrounds = SessionBackgrounds::default();
-        let old = registry_with_job(10, "t-old").await;
+        let (old, old_id) = registry_with_job(10, "t-old").await;
         backgrounds.add_job_registry("s", old.clone());
-        let new = registry_with_job(11, "t-new").await;
+        let (new, _) = registry_with_job(11, "t-new").await;
         backgrounds.add_job_registry("s", new);
 
         let pids: Vec<u32> = backgrounds
@@ -453,7 +487,7 @@ mod tests {
             .map(|job| job.pid)
             .collect();
         assert_eq!(pids, vec![10, 11], "its completion is still owed");
-        drop(old.owe_completion("t-old", Ok(0)).await);
+        drop(old.owe_completion(&old_id, Ok(0)).await);
         let pids: Vec<u32> = backgrounds
             .jobs("s")
             .await
@@ -471,7 +505,7 @@ mod tests {
     #[tokio::test]
     async fn a_finished_job_reads_as_resuming_until_its_completion_is_taken() {
         let backgrounds = SessionBackgrounds::default();
-        let registry = registry_with_job(20, "t-owed").await;
+        let (registry, owed_id) = registry_with_job(20, "t-owed").await;
         backgrounds.add_job_registry("s", registry.clone());
         assert!(backgrounds.snapshot("s").await.will_resume(), "it runs");
 
@@ -481,7 +515,7 @@ mod tests {
         assert!(snapshot.resuming, "{snapshot:?}");
 
         let owed = registry
-            .owe_completion("t-owed", Ok(0))
+            .owe_completion(&owed_id, Ok(0))
             .await
             .expect("the job is registered");
         assert!(backgrounds.snapshot("s").await.resuming);

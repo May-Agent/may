@@ -12,8 +12,7 @@ use aither_agent::CacheWarmth;
 use askama::Template;
 use serde::{Deserialize, Serialize};
 use skyzen::Result as SkyResult;
-use skyzen::routing::Params;
-use skyzen::utils::{Json, State};
+use skyzen::utils::Json;
 
 use super::aux::AuxKind;
 use crate::daemon::state::DaemonState;
@@ -110,12 +109,11 @@ pub struct RecapResponse {
 
 /// `POST /api/sessions/{id}/recap`: schedules a recap; the card arrives as
 /// a `session_recap` frame once generation finishes.
-pub async fn recap_session(
-    params: Params,
-    State(state): State<Arc<DaemonState>>,
+pub async fn recap_inner(
+    state: &Arc<DaemonState>,
+    session_id: &str,
 ) -> SkyResult<Json<RecapResponse>> {
-    let session_id = super::hosts::session_id_param(&params)?;
-    begin_recap(&state, &session_id).await.map(Json)
+    begin_recap(state, session_id).await.map(Json)
 }
 
 /// Starts a manual recap, or refuses it while a turn runs: the turn holds

@@ -27,6 +27,7 @@ cargo run --bin may -- daemon install    # launchd agent / systemd user unit
 
 - It listens on the unix socket `~/.may/daemon.sock` (mode 0600, used by the TUI and one-shot runs) and on TCP `127.0.0.1:8787` (`[daemon] port`) — the local listener, trusting the machine's own user. A second remote listener on `127.0.0.1:0` serves the same routes behind an identity layer; `[daemon] listen` adds more addresses applied live; a non-loopback one is served directly and identifies each peer through tailscaled's `WhoIs`.
 - `~/.may/daemon.lock` keeps it single-instance. Every client starts it on demand and replaces it when its build id differs from the client's, so after a rebuild the next `cargo run` restarts it.
+- Any `may` invocation outside the test harness, `--version` included, runs with `HOME` set to a fresh temporary directory: a client run against the real `~/.may` replaces the user's running daemon.
 - Remote access is `tailscale serve` in front of the remote listener (`[remote_access]`): every remote request needs a trusted identity — a listed `Tailscale-User-Login` today — or gets a 401. The one public entry is `[remote_access] funnel`: `tailscale funnel --set-path` exposes `/api/tasks/webhook` through a separate loopback listener whose router holds the webhook route alone (`build_webhook_router`); deliveries authenticate by token and signature.
 
 ## Fast Web UI + Rust API Iteration Workflow
@@ -101,9 +102,15 @@ May is a terminal-based AI assistant built as an application layer on the **aith
 
 **`src/agent/`** - MayAgent wrapper
 - `may.rs`: Wraps `aither_agent::Agent`: skill and subagent registration, compaction model, host load monitor, permission handling, and session context
-- `runtime_context.rs`: renders the session system prompt, one typed template per section under `templates/prompt/` in the order `tag::layout` gives, with memory, `AGENTS.md` and workdirs last as aither external-content blocks; `permission.rs`: `PermissionApprover` for `unsafe` mode; `*_tool.rs`: the IPC commands (`ask_user`, `issue`, `pr`, `repo`, `session`, `task`, `notify`, `tunnel`, `browser`, `computer`, `register-skills`)
+- `runtime_context.rs`: renders the session system prompt, one typed template per section under `templates/prompt/` in the order `tag::layout` gives, with memory, `AGENTS.md` and workdirs last as aither external-content blocks; `permission.rs`: `PermissionApprover` for `unsafe` mode; `*_tool.rs`: the IPC commands (`ask_user`, `issue`, `pr`, `repo`, `session`, `task`, `tunnel`, `browser`, `computer`, `register-skills`)
 
 **`src/terminal_commands.rs`** - `register_shared_terminal_commands`, which registers every IPC command; `src/terminal_permission_handler.rs` applies the network policy and audit log
+
+**`src/command_policy/`** - aither command policies that refuse a terminal script before it runs (kill by name, foreground `sleep`, unchanged re-reads and, in the managed bash, host `grep`/`awk`/`find` and `sed` forms `aither_sed::supports` rejects); `register` installs them
+
+**`src/tasks_md/`** - `tasks.md` as an aither working document: the parser, `schema.rs` with the schema, the stop rule and the line limit
+
+**`src/agent/notices.rs`** - `MayNotices`, May's wording of aither's alerts, notices and refusals, `tasks.md` alerts included
 
 **Other top-level modules** - `agent_link` (main agents on one machine exchange messages), `computer` (a virtual desktop per session), `container` (container sandbox), `db` (SQLite persistence: `~/.may/history.db`), `issue` (May and GitHub issue backends), `pr` (session-owned PRs), `repo_clone` (per-session repository clones), `profile` (profiles), `memory` (profile memory extraction), `mcp`, `notification` (web push), `scheduler` and `task_trigger` (scheduled tasks), `skill` (skill management), `heel` (managed sandbox binary), `cache_lifetime` (provider prompt-cache lifetime)
 
@@ -112,7 +119,7 @@ May is a terminal-based AI assistant built as an application layer on the **aith
 - `serve.rs`: hyper accept loops (unix socket, TCP) calling skyzen's `Router::go`
 - `lifecycle.rs`: `ensure_running` (auto-spawn, build-id replacement), service install/uninstall, stop
 - `server.rs`: `start` builds `DaemonState`, the REST/SSE router and background workers
-- `chat/mod.rs`: the one turn runner (`run_agent_loop`); `chat/hub.rs` `TurnHub` fans a session's turn out as `session_turn` / `session_agent` events, with replay of the turn in progress for late subscribers
+- `chat/mod.rs`: the one turn runner (`run_agent_loop`); `chat/hub.rs` `TurnHub` numbers a session's events (`session_turn`, `session_agent`, deltas) for `/api/sessions/{id}/events`; a subscriber continues after its cursor
 - `chat/hosts.rs`: the session's idle agent between turns: the next turn continues with it unless what it was built from changed (`agent_build_key`), so the prompt cache stays warm and detached background commands keep running; it answers `/compact`, `/context`, `/btw`, and a detached command that finishes resumes the session (`start_background_turn`)
 - `chat/background.rs`: each session's terminal jobs and subagent runs across agent rebuilds; REST under `/api/sessions/{id}/background|jobs|subagents`, pushed as `session_background`
 - `remote_access.rs`: Tailscale serve
@@ -147,7 +154,7 @@ May is a terminal-based AI assistant built as an application layer on the **aith
 - Workdirs: User-approved directories with read/write (stored in the profile's `workspace.toml`, `~/.may/profiles/<profile>/workspace.toml`)
 
 **`src/bundle/`** - Embedded resources
-- Skills in `skills/` are embedded with `include_dir!`; subagent types (`explore`, `plan`, `research`, `fork`) are aither built-ins, not files
+- Skills in `skills/` are embedded with `include_dir!`; the subagent definitions in `subagents/` are embedded the same way and handed to the subagent tool (`Bundle::subagent_definitions`), while `fork` is built in
 - Written (overwriting) to `~/.may/skills/` at startup, copied into each profile's `skills/`, and linked into the session sandbox as `skills`; container sessions mount it
 
 ### Session Storage Format
@@ -159,7 +166,7 @@ Do not treat `.txt` or `.md` files as the canonical session persistence layer.
 
 ### Event Loop Architecture
 
-Turns run in the daemon. A client sends with `POST /api/sessions/{id}/messages` (it returns at once) and follows the turn on `/api/events?topics=session_agent,session_turn&sessionId=…`; every attached client sees the same events.
+Turns run in the daemon. A client sends with `POST /api/sessions/{id}/turns` (it returns at once) and follows the turn on `/api/sessions/{id}/events`; every attached client sees the same events.
 
 ```
 TUI main loop:
@@ -204,6 +211,7 @@ Do not leave high-frequency capabilities as ad-hoc shell snippets the agent has 
 - Do not inject implementer-facing constraints, Codex instructions, AGENTS.md rules, or user instructions that are only meant for the coding agent into the runtime agent context.
 - When tuning prompts or runtime context, only include information the runtime agent must know to act correctly in that session. Keep framework-authoring notes and meta guidance in code/comments/docs instead of the agent prompt.
 - Do not inject generic prompting slogans or obvious meta advice into agent context. If a sentence does not change concrete runtime behavior, remove it.
+- The system prompt holds only what every session needs; guidance that applies only under a condition lives in a built-in skill under `skills/`, which the agent loads when the condition holds.
 - Runtime prompt/context rendering must use static typed template inputs. Do not branch on enabled/disabled states to hand-build prompt strings in Rust and then pass those strings into templates.
 - Text the model reads — tool results, notices, alerts and reminders — is natural language rendered from a typed template; no serializer output (JSON, XML) reaches the model, except data a command or an external tool itself produced and the schema of output the model must emit.
 - Prefer runtime-agnostic async primitives. Do not introduce new `tokio::*` filesystem, timer, task, process, or networking usage when an existing runtime-neutral abstraction already fits this codebase (for example `async_fs`, `futures-lite`, `blocking`, `zenwave`, or existing executor abstractions). If a path must work outside a Tokio reactor, keep it Tokio-free.
@@ -216,7 +224,8 @@ Do not leave high-frequency capabilities as ad-hoc shell snippets the agent has 
 - Never drop thinking blocks when a path exists that keeps them valid; dropping them noticeably degrades the model.
 - An unanswered `ask_user` question is no authorization: the agent never decides it itself, and the harness never pushes the agent onward while every open task is blocked.
 - Subagents stay inside the main agent's authority: they may read issues but never change them, never modify `tasks.md`, never ask the user, and never push or open a pull request; anything that reaches outside goes back to the main agent. A subagent may commit only when authorized, and the main agent reviews every such commit. The harness enforces this; the prompt does not carry it.
-- Harness mechanisms (context, compaction, terminal, subagents) live in aither; may configures and wires them.
+- aither provides the simplest, most general agent loop and exposes every capability for may to customise. It carries no terminal-first architecture and no product policy: the terminal tool and its shell, IPC commands, prompt and alert wording, and other product behaviour live in may.
 - **Home environment.** A session's home environment is where its agent works: where its tool-call results are stored and its IPC commands execute, and where its subagent, skills and memories directories and `AGENTS.md` live. The session's transcript is not part of it; the daemon keeps it in its one database. Memory and disk pressure handling exists to keep the harness itself running, so it protects the home environment and nothing else. A local session's home environment is the whole memory and disk of the machine the daemon runs on; a container session's adds the container's own limits. A remote environment is never a home environment: a session using one is based on a home session, and the remote side's memory and disk impose nothing. An I/O failure from exhausting the home environment, a crashed container runtime included, is handled and recovered from so a long-running agent survives it.
 - Every wait the user sees shows a loading indicator, downloading or preparing tools and environments included; nothing leaves the user on a blank or frozen screen.
 - **Web UI transport split — one SSE, REST for everything else.** The web UI must shape its server boundary as: (1) a single unidirectional SSE stream (`/api/events`) carries all server-pushed state and updates, multiplexed by event `kind`; (2) every other one-shot interaction is a REST call. Add a second SSE channel only when it makes the architecture noticeably cleaner (e.g. an isolated, transient per-task event firehose with a different lifecycle from the main stream); otherwise add a new event `kind` to the existing stream. Do not introduce WebSocket, long-poll, or duplicate SSE endpoints for ordinary state replication. Server-pushed cache invalidations (model lists, config changes, etc.) ride the existing stream as new event kinds.
+- A change to a user-facing feature updates the product reference in `skills/may/references/` in the same PR.

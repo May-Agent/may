@@ -9,8 +9,9 @@ use ratatui::{
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::super::chat::{format_elapsed, format_number};
+use crate::task_rows::{TaskRow, TaskSection};
 use crate::tui::app::App;
-use crate::tui::sidebar::{IssueBrief, TaskTree};
+use crate::tui::sidebar::IssueBrief;
 
 /// Rows kept for each background section when tasks compete for space.
 const BACKGROUND_ROWS: usize = 6;
@@ -118,59 +119,90 @@ fn home_label(path: &std::path::Path) -> String {
 }
 
 /// Rows of the task tree, plus the row of the first open task.
-fn task_rows(tree: &TaskTree, width: usize) -> (Vec<Line<'static>>, Option<usize>) {
-    let mut rows = Vec::new();
+/// The open work grouped under its section's heading, plus the line of the
+/// first row of `Doing` (or of the first section when nothing is doing).
+/// Roots are not listed here: the issues they name appear under "Issues".
+fn task_rows(rows: &[TaskRow], width: usize) -> (Vec<Line<'static>>, Option<usize>) {
+    let mut lines = Vec::new();
     let mut first_open = None;
-    for node in &tree.nodes {
-        let indent = 2 * node.depth.min(6);
-        let (marker, marker_style, text_style) = if node.done {
-            (
-                "✓ ",
-                Style::default().fg(Color::Green),
-                Style::default().fg(Color::DarkGray),
-            )
-        } else {
-            ("○ ", Style::default().fg(Color::Yellow), Style::default())
-        };
-        if !node.done && first_open.is_none() {
-            first_open = Some(rows.len());
+    for (section, title) in [
+        (TaskSection::Doing, "Doing"),
+        (TaskSection::Queued, "Queued"),
+    ] {
+        let mut section_rows = rows.iter().filter(|row| row.section == section).peekable();
+        if section_rows.peek().is_none() {
+            continue;
         }
-        let text_width = width.saturating_sub(indent + 2);
-        for (index, part) in wrap_hanging(&node.text, text_width, 0)
-            .into_iter()
-            .enumerate()
-        {
-            let lead = if index == 0 { marker } else { "  " };
-            rows.push(Line::from(vec![
-                Span::raw(" ".repeat(indent)),
-                Span::styled(lead, marker_style),
-                Span::styled(part, text_style),
-            ]));
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+        lines.push(heading(title.to_string()));
+        for row in section_rows {
+            if first_open.is_none() {
+                first_open = Some(lines.len());
+            }
+            let (marker, marker_style) = if row.blocking.is_some() {
+                ("⏸ ", Style::default().fg(Color::Red))
+            } else {
+                ("○ ", Style::default().fg(Color::Yellow))
+            };
+            let mut text = row.text.split_whitespace().collect::<Vec<_>>().join(" ");
+            if let Some(what) = &row.blocking {
+                text = format!("{text} (blocked: {what})");
+            }
+            for (index, part) in wrap_hanging(&text, width.saturating_sub(2), 0)
+                .into_iter()
+                .enumerate()
+            {
+                let lead = if index == 0 { marker } else { "  " };
+                lines.push(Line::from(vec![
+                    Span::styled(lead, marker_style),
+                    Span::raw(part),
+                ]));
+            }
         }
     }
-    (rows, first_open)
+    (lines, first_open)
 }
 
 fn issue_row(issue: &IssueBrief, width: usize) -> Line<'static> {
     let number = format!("#{} ", issue.number);
-    let (state, state_style) = match (&issue.title, issue.closed) {
+    // GitHub-style state icon: a green circle for open, a dark check for
+    // closed, nothing while the lookup is still pending.
+    let (icon, icon_style) = match (&issue.title, issue.closed) {
         // Not found (yet): no state to claim.
         (None, _) => ("", Style::default()),
-        (Some(_), true) => ("closed", Style::default().fg(Color::DarkGray)),
-        (Some(_), false) => ("open", Style::default().fg(Color::Green)),
+        (Some(_), true) => ("✓", Style::default().fg(Color::DarkGray)),
+        (Some(_), false) => ("●", Style::default().fg(Color::Green)),
     };
-    let title_width = width.saturating_sub(number.width() + state.width() + 1);
+    let title_width = width.saturating_sub(number.width() + icon.width() + 1);
     let title = issue
         .title
         .as_deref()
         .map_or_else(|| "…".to_string(), |title| truncate(title, title_width));
-    let pad = width.saturating_sub(number.width() + title.width() + state.width());
+    let pad = width.saturating_sub(number.width() + title.width() + icon.width());
     Line::from(vec![
         Span::styled(number, Style::default().fg(Color::Magenta)),
         Span::raw(title),
         Span::raw(" ".repeat(pad.max(1))),
-        Span::styled(state, state_style),
+        Span::styled(icon, icon_style),
     ])
+}
+
+/// Check-rollup icon for a live PR row: GitHub's own traffic light —
+/// red while any check failed, yellow while some still run, green when
+/// all passed. `merging` overrides with green; no rollup read yet shows
+/// the neutral open dot.
+fn pr_icon(pr: &crate::client::WirePr) -> (&'static str, Style) {
+    if pr.state == "merging" {
+        return ("●", Style::default().fg(Color::Green));
+    }
+    match pr.checks {
+        Some(c) if c.failed > 0 => ("●", Style::default().fg(Color::Red)),
+        Some(c) if c.pending > 0 => ("●", Style::default().fg(Color::Yellow)),
+        Some(_) => ("✓", Style::default().fg(Color::Green)),
+        None => ("●", Style::default().fg(Color::Green)),
+    }
 }
 
 /// Render the sidebar into `area`.
@@ -332,12 +364,10 @@ pub(super) fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
     let mut tasks: Vec<Line<'static>> = Vec::new();
     let mut first_open = None;
     match &app.sidebar.tasks {
-        Some(tree) if !tree.nodes.is_empty() => {
-            let (done, total) = tree.progress();
-            tasks.push(heading(format!("Tasks {done}/{total}")));
-            let (rows, open) = task_rows(tree, width);
-            first_open = open.map(|row| row + 1);
-            tasks.extend(rows);
+        Some(rows) if rows.iter().any(|row| row.section.is_open_work()) => {
+            let (lines, open) = task_rows(rows, width);
+            first_open = open;
+            tasks.extend(lines);
         }
         _ => {
             tasks.push(heading("Tasks".to_string()));
@@ -354,17 +384,27 @@ pub(super) fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
                 .map(|issue| issue_row(issue, width)),
         );
     }
-    let open_prs: Vec<_> = app
+    let live_prs: Vec<_> = app
         .sidebar
         .prs
         .iter()
-        .filter(|pr| pr.state == "open")
+        .filter(|pr| matches!(pr.state.as_str(), "open" | "checks_pending" | "merging"))
         .collect();
-    if !open_prs.is_empty() {
+    if !live_prs.is_empty() {
         tasks.push(Line::from(""));
         tasks.push(heading("Pull requests".to_string()));
-        for pr in open_prs {
-            tasks.push(dim(format!("  #{} {} — {}", pr.number, pr.title, pr.state)));
+        for pr in live_prs {
+            let (icon, icon_style) = pr_icon(pr);
+            let number = format!("#{} ", pr.number);
+            let title_width = width.saturating_sub(number.width() + icon.width() + 1);
+            let title = truncate(&pr.title, title_width);
+            let pad = width.saturating_sub(number.width() + title.width() + icon.width());
+            tasks.push(Line::from(vec![
+                Span::styled(number, Style::default().fg(Color::Magenta)),
+                Span::raw(title),
+                Span::raw(" ".repeat(pad.max(1))),
+                Span::styled(icon, icon_style),
+            ]));
         }
     }
 
@@ -399,7 +439,8 @@ pub(super) fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
 
 #[cfg(test)]
 mod tests {
-    use super::{truncate, wrap_hanging};
+    use super::{pr_icon, truncate, wrap_hanging};
+    use crate::client::{WirePr, WirePrChecks};
 
     #[test]
     fn wrap_hanging_wraps_by_display_width() {
@@ -419,5 +460,68 @@ mod tests {
         assert_eq!(truncate("cargo test --lib", 9), "cargo te…");
         assert_eq!(truncate("short", 9), "short");
         assert_eq!(truncate("终端渲染逻辑", 7), "终端渲…");
+    }
+
+    fn wire_pr(state: &str, checks: Option<WirePrChecks>) -> WirePr {
+        WirePr {
+            number: 1,
+            title: "title".to_string(),
+            state: state.to_string(),
+            backend: "github".to_string(),
+            external_number: Some(1),
+            issue_number: None,
+            auto_merge: false,
+            checks,
+            updated_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn the_pr_row_icon_follows_the_check_rollup() {
+        use ratatui::style::Color;
+
+        // No rollup read yet: the neutral open dot.
+        assert_eq!(pr_icon(&wire_pr("open", None)).0, "●");
+        // Merging overrides whatever the checks say.
+        assert_eq!(
+            pr_icon(&wire_pr(
+                "merging",
+                Some(WirePrChecks {
+                    pending: 2,
+                    passed: 0,
+                    failed: 0,
+                }),
+            ))
+            .0,
+            "●"
+        );
+        // Failure beats pending; pending beats all-passed.
+        let (icon, style) = pr_icon(&wire_pr(
+            "open",
+            Some(WirePrChecks {
+                pending: 1,
+                passed: 0,
+                failed: 1,
+            }),
+        ));
+        assert_eq!((icon, style.fg), ("●", Some(Color::Red)));
+        let (icon, style) = pr_icon(&wire_pr(
+            "open",
+            Some(WirePrChecks {
+                pending: 1,
+                passed: 3,
+                failed: 0,
+            }),
+        ));
+        assert_eq!((icon, style.fg), ("●", Some(Color::Yellow)));
+        let (icon, style) = pr_icon(&wire_pr(
+            "open",
+            Some(WirePrChecks {
+                pending: 0,
+                passed: 4,
+                failed: 0,
+            }),
+        ));
+        assert_eq!((icon, style.fg), ("✓", Some(Color::Green)));
     }
 }

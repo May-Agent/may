@@ -6,3 +6,4 @@ ask_user --questions '[{"section":"database","question":"Which DB?","option":["P
 To obtain a credential, never ask for the value as plain text: mark the question secret with its environment variable name and scope (in --questions: "secret":{"name":"DEPLOY_TOKEN","scope":"session"}):
 ask_user "Deploy token?" --secret DEPLOY_TOKEN --secret-scope session
 The user is asked only for the value, which is stored and reaches your terminal commands as $DEPLOY_TOKEN. Scope session keeps it to this session and deletes it with the session, global makes it available to every session. A secret question has no options; you are told only that the secret was stored or that the user declined.
+The question and option text are literal: a `\n` in them stays a backslash-n. Write real newlines with `printf`, `$'...\n...'` or a heredoc.

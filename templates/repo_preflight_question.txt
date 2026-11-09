@@ -1,0 +1,1 @@
+The checkout {{ checkout }} of {{ owner_repo }} {% if dirty %}has uncommitted changes{% endif %}{% if dirty && remote != Remote::Current %} and {% endif %}{% match remote %}{% when Remote::Current %}{% when Remote::Behind %}is behind the remote{% when Remote::Diverged %}has diverged from the remote{% endmatch %}. How should the session start?

@@ -6,7 +6,15 @@ use aither_core::llm::Attachment as LlmAttachment;
 use aither_models::{Ability, lookup as lookup_model_info};
 use askama::Template;
 use base64::Engine;
-use skyzen::Result as SkyResult;
+use std::sync::Arc;
+
+use serde::Deserialize;
+use skyzen::extract::Query;
+use skyzen::header::HeaderMap;
+use skyzen::http_kit::utils::Bytes;
+use skyzen::routing::Params;
+use skyzen::utils::{Json, State};
+use skyzen::{Error as SkyError, Result as SkyResult, StatusCode};
 
 use crate::agent::generate_session_title;
 use crate::session::AttachmentKind;
@@ -104,38 +112,23 @@ pub(super) async fn build_prompt_and_attachments(
         let supported = required_modality
             .as_ref()
             .is_none_or(|modality| modality_support.supports(modality));
-        let upload_data_url = attachment.upload_data_url.as_deref().or_else(|| {
-            attachment
-                .url
-                .starts_with("data:")
-                .then_some(attachment.url.as_str())
-        });
-        let uploaded = match upload_data_url {
-            Some(data_url) => {
-                save_upload_data_url(state, &req.session_id, attachment, data_url).await?
-            }
-            None => None,
-        };
-
         if !supported {
-            let relative_path = match uploaded.as_ref() {
-                Some((_, relative_path)) => Some(relative_path.clone()),
-                None if !attachment.url.trim().is_empty() => {
-                    let source = resolve_native_attachment_source(
-                        state,
-                        &req.session_id,
-                        attachment.url.as_str(),
-                        &mut canonical_session_root,
-                    )
-                    .await?;
-                    let Some(relative_path) = source.relative_path else {
-                        return Err(bad_request_error(
-                            "Unsupported remote modality must be uploaded so May can preserve it",
-                        ));
-                    };
-                    Some(relative_path)
-                }
-                None => None,
+            let relative_path = if attachment.url.trim().is_empty() {
+                None
+            } else {
+                let source = resolve_native_attachment_source(
+                    state,
+                    &req.session_id,
+                    attachment.url.as_str(),
+                    &mut canonical_session_root,
+                )
+                .await?;
+                let Some(relative_path) = source.relative_path else {
+                    return Err(bad_request_error(
+                        "Unsupported remote modality must be uploaded so May can preserve it",
+                    ));
+                };
+                Some(relative_path)
             };
             offloaded_xml_items.push(build_offloaded_attachment(
                 attachment,
@@ -147,36 +140,6 @@ pub(super) async fn build_prompt_and_attachments(
             ));
             if let Some(text) = &attachment.text_content {
                 prompt_sections.push(PromptSection::OffloadedText(text.clone()));
-            }
-            continue;
-        }
-
-        if let Some((saved_path, relative_path)) = uploaded {
-            xml_items.push(PromptAttachment {
-                name: attachment.name.clone(),
-                kind: attachment.attachment_type,
-                path: Some(relative_path),
-            });
-
-            if let Some(modality) = required_modality.as_ref() {
-                let media_type = resolve_attachment_media_type(
-                    attachment,
-                    modality,
-                    upload_data_url,
-                    Some(saved_path.as_path()),
-                    None,
-                )?;
-                let url = match (modality, inline_images) {
-                    (AttachmentModality::Vision, true) => {
-                        let data_url =
-                            upload_data_url.expect("an uploaded attachment carried a data URL");
-                        url::Url::parse(data_url).map_err(|error| {
-                            bad_request_error(format!("invalid attachment data URL: {error}"))
-                        })?
-                    }
-                    _ => path_to_file_url(saved_path.as_path())?,
-                };
-                attachments.push(LlmAttachment::new(url, media_type));
             }
             continue;
         }
@@ -290,6 +253,21 @@ async fn resolve_native_attachment_source(
                 "unsupported multimodal attachment URL scheme '{scheme}'"
             ))),
         };
+    }
+
+    if let Some(rest) = trimmed
+        .strip_prefix("/api/sessions/")
+        .and_then(|rest| rest.split_once("/files/").map(|(_, rel)| rel))
+    {
+        let files_dir = load_session_paths(state, session_id).await?.files_dir();
+        let rel = parse_safe_relative_path(rest, "attachment path")?;
+        return resolve_session_file_source(
+            state,
+            session_id,
+            files_dir.join(rel),
+            canonical_session_root,
+        )
+        .await;
     }
 
     let relative_path = parse_safe_relative_path(trimmed, "attachment path")?;
@@ -632,48 +610,6 @@ fn build_offloaded_attachment(
     }
 }
 
-// ── Upload helpers ───────────────────────────────────────────
-
-async fn save_upload_data_url(
-    state: &DaemonState,
-    session_id: &str,
-    attachment: &ApiAttachment,
-    data_url: &str,
-) -> SkyResult<Option<(PathBuf, String)>> {
-    let Some((header, data)) = data_url.split_once(',') else {
-        return Ok(None);
-    };
-
-    if !header.starts_with("data:") {
-        return Ok(None);
-    }
-    if !header.ends_with(";base64") {
-        return Err(bad_request_error(
-            "attachment data URL must use base64 encoding",
-        ));
-    }
-
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(data)
-        .map_err(bad_request_error)?;
-
-    let ext = guess_extension(header, &attachment.name);
-    let base_name = sanitize_upload_stem(&attachment.name);
-    let (path, relative_path) = allocate_upload_path(state, session_id, &base_name, &ext).await?;
-
-    if let Some(parent) = path.parent() {
-        async_fs::create_dir_all(parent)
-            .await
-            .map_err(internal_error)?;
-    }
-
-    async_fs::write(&path, bytes)
-        .await
-        .map_err(internal_error)?;
-
-    Ok(Some((path, relative_path)))
-}
-
 async fn save_large_pasted_text(
     state: &DaemonState,
     session_id: &str,
@@ -747,28 +683,6 @@ async fn allocate_upload_path(
     Ok((path, ["files/", file_name.as_str()].concat()))
 }
 
-fn guess_extension(data_url_header: &str, fallback_name: &str) -> String {
-    // Extract MIME type from data URL header (e.g. "data:image/png;base64,")
-    let mime_str = data_url_header
-        .strip_prefix("data:")
-        .and_then(|s| s.split(';').next())
-        .unwrap_or("");
-
-    if !mime_str.is_empty()
-        && let Some(ext) =
-            mime_guess::get_mime_extensions_str(mime_str).and_then(|exts| exts.first())
-    {
-        return (*ext).to_string();
-    }
-
-    Path::new(fallback_name)
-        .extension()
-        .and_then(|e| e.to_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or("bin")
-        .to_string()
-}
-
 fn sanitize_upload_stem(raw: &str) -> String {
     let stem = Path::new(raw)
         .file_stem()
@@ -803,7 +717,7 @@ mod tests {
             name: name.to_string(),
             attachment_type,
             url: String::new(),
-            upload_data_url: None,
+
             text_content: None,
         }
     }
@@ -911,5 +825,185 @@ mod tests {
     fn text_attachment_has_no_native_modality() {
         assert!(AttachmentModality::for_attachment_type(AttachmentKind::Text).is_none());
         assert!(AttachmentModality::for_attachment_type(AttachmentKind::Document).is_none());
+    }
+}
+
+#[derive(Debug, Deserialize, skyzen::ToSchema)]
+pub(super) struct AttachmentUploadQuery {
+    #[serde(default)]
+    name: String,
+}
+
+/// `POST /api/sessions/{id}/attachments?name=` — store raw upload bytes under
+/// the session's `files/` and return the attachment record clients then send
+/// with a message.
+pub(super) async fn post_attachment(
+    params: Params,
+    Query(query): Query<AttachmentUploadQuery>,
+    headers: HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+    body: Bytes,
+) -> SkyResult<Json<ApiAttachment>> {
+    let session_id = params.get("id").map_err(bad_request_error)?.to_string();
+    let name = query.name.trim().to_string();
+    if name.is_empty() {
+        return Err(bad_request_error("attachment name is required"));
+    }
+    let content_type = headers
+        .get(skyzen::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let bytes = body;
+
+    let ext = mime_guess::get_mime_extensions_str(content_type.split(';').next().unwrap_or(""))
+        .and_then(|exts| exts.first().map(|e| (*e).to_string()))
+        .or_else(|| {
+            Path::new(&name)
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| "bin".to_string());
+    let base_name = sanitize_upload_stem(&name);
+    let (path, relative_path) = allocate_upload_path(&state, &session_id, &base_name, &ext).await?;
+    if let Some(parent) = path.parent() {
+        async_fs::create_dir_all(parent)
+            .await
+            .map_err(internal_error)?;
+    }
+    async_fs::write(&path, &bytes)
+        .await
+        .map_err(internal_error)?;
+
+    Ok(Json(ApiAttachment {
+        id: crate::id::new(),
+        name,
+        attachment_type: attachment_kind_for_mime(&content_type),
+        url: session_file_url(
+            &session_id,
+            relative_path
+                .strip_prefix("files/")
+                .unwrap_or(&relative_path),
+        ),
+        text_content: None,
+    }))
+}
+
+/// `GET /api/sessions/{id}/files/{*path}` — serve a file stored under the
+/// session's `files/` directory. Upload names carry a timestamped suffix, so
+/// the bytes a name addresses never change.
+pub(super) async fn get_session_file(
+    params: Params,
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<skyzen::Response> {
+    let session_id = params.get("id").map_err(bad_request_error)?.to_string();
+    let wildcard = params.get("path").map_err(bad_request_error)?;
+    let relative = parse_safe_relative_path(wildcard, "file path")?;
+    let files_dir = load_session_paths(&state, &session_id).await?.files_dir();
+    let canonical_root = async_fs::canonicalize(&files_dir)
+        .await
+        .map_err(internal_error)?;
+    let candidate = files_dir.join(&relative);
+    let canonical = async_fs::canonicalize(&candidate)
+        .await
+        .map_err(|_| SkyError::msg("file not found").set_status(StatusCode::NOT_FOUND))?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err(bad_request_error(
+            "file path escapes the session files directory",
+        ));
+    }
+    let bytes = async_fs::read(&canonical).await.map_err(internal_error)?;
+    let mime = mime_guess::from_path(&canonical).first_or_octet_stream();
+    let mut response = skyzen::Response::new(skyzen::Body::from(bytes));
+    response.headers_mut().insert(
+        skyzen::header::CONTENT_TYPE,
+        mime.as_ref().parse().map_err(internal_error)?,
+    );
+    response.headers_mut().insert(
+        skyzen::header::CACHE_CONTROL,
+        "public, max-age=31536000, immutable"
+            .parse()
+            .map_err(internal_error)?,
+    );
+    Ok(response)
+}
+
+/// The daemon-relative URL a stored session file is served at.
+pub(super) fn session_file_url(session_id: &str, relative_path: &str) -> String {
+    format!("/api/sessions/{session_id}/files/{relative_path}")
+}
+
+fn attachment_kind_for_mime(content_type: &str) -> AttachmentKind {
+    let mime = content_type.split(';').next().unwrap_or("").trim();
+    if mime.starts_with("image/") {
+        AttachmentKind::Image
+    } else if mime == "application/pdf" {
+        AttachmentKind::Pdf
+    } else if mime.starts_with("audio/") {
+        AttachmentKind::Audio
+    } else if mime.starts_with("text/") {
+        AttachmentKind::Document
+    } else {
+        AttachmentKind::File
+    }
+}
+
+#[cfg(test)]
+mod file_route_tests {
+    use std::sync::Arc;
+
+    use std::str::FromStr as _;
+
+    use super::*;
+    use crate::config::MayConfig;
+    use crate::daemon::state::DaemonState;
+
+    async fn state() -> (Arc<DaemonState>, tempfile::TempDir) {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let state = DaemonState::for_test(dir.path(), MayConfig::default())
+            .await
+            .expect("daemon state");
+        (Arc::new(state), dir)
+    }
+
+    #[tokio::test]
+    async fn a_session_file_url_resolves_to_the_stored_file() {
+        let (state, dir) = state().await;
+        state
+            .db()
+            .create_session("s", Some("s"), Some("m"))
+            .await
+            .expect("session");
+        let files_dir = load_session_paths(&state, "s")
+            .await
+            .expect("paths")
+            .files_dir();
+        async_fs::create_dir_all(&files_dir).await.expect("mkdir");
+        async_fs::write(files_dir.join("a.png"), b"png")
+            .await
+            .expect("write");
+
+        let mut root = None;
+        let source =
+            resolve_native_attachment_source(&state, "s", "/api/sessions/s/files/a.png", &mut root)
+                .await
+                .expect("resolves");
+        let local_path = source.local_path.clone().expect("local path");
+        assert_eq!(
+            local_path,
+            async_fs::canonicalize(files_dir.join("a.png"))
+                .await
+                .expect("canonical")
+        );
+        let url = file_to_data_url(
+            source.local_path.as_ref().expect("path"),
+            &mime::Mime::from_str("image/png").expect("mime"),
+        )
+        .await
+        .expect("data url");
+        assert!(url.as_str().starts_with("data:image/png;base64,"), "{url}");
+        drop(dir);
     }
 }

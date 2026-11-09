@@ -430,10 +430,12 @@ pub struct SleepAlert {
     greet: bool,
 }
 
-/// Durable alert telling the agent the user woke.
+/// Durable alert telling the agent the user woke and how.
 #[derive(Template)]
 #[template(path = "alert_wake.txt", escape = "none")]
-pub struct WakeAlert;
+pub struct WakeAlert {
+    cause: crate::sleep::WakeCause,
+}
 
 impl RuntimeSystemContext {
     /// Records what the user's sleep state changed to as a durable alert.
@@ -445,8 +447,8 @@ impl RuntimeSystemContext {
             crate::sleep::SleepNotice::Asleep { greet } => {
                 context.push_alert(&SleepAlert { greet });
             }
-            crate::sleep::SleepNotice::Woke => {
-                context.push_alert(&WakeAlert);
+            crate::sleep::SleepNotice::Woke(cause) => {
+                context.push_alert(&WakeAlert { cause });
             }
         }
     }
@@ -704,11 +706,18 @@ pub fn build_environment(
 #[template(path = "prompt/terminal.md", escape = "none")]
 struct TerminalTemplate {
     session_dir: String,
+    /// Whether scripts run in the managed bash, which May's command policy
+    /// confines to `rg`, `fd` and line-range `sed`.
+    managed_bash: bool,
 }
 
 /// The terminal section: how to run commands.
 pub fn build_terminal(environment: &AgentEnvironment, session_paths: &SessionPaths) -> String {
     TerminalTemplate {
+        managed_bash: crate::command_policy::runs_managed_bash(matches!(
+            environment,
+            AgentEnvironment::Container { .. }
+        )),
         session_dir: sandbox_visible_path(environment, session_paths, session_paths.root()),
     }
     .render()
@@ -779,14 +788,11 @@ pub async fn build_capabilities(
         })
         .collect::<Vec<_>>();
 
-    let mut subagents: Vec<CatalogSubagent> = aither_agent::BUNDLED_SUBAGENTS
-        .iter()
-        .map(|bundled| {
-            let definition = bundled.definition();
-            CatalogSubagent {
-                id: definition.name,
-                description: definition.description,
-            }
+    let mut subagents: Vec<CatalogSubagent> = crate::bundle::Bundle::subagent_definitions()
+        .into_iter()
+        .map(|definition| CatalogSubagent {
+            id: definition.name,
+            description: definition.description,
         })
         .collect();
     subagents.push(CatalogSubagent {

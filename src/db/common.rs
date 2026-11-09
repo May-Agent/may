@@ -46,6 +46,9 @@ pub enum ChatDbError {
         /// Number of items already pinned.
         current: i64,
     },
+    /// The default profile cannot be deleted.
+    #[error("The default profile cannot be deleted")]
+    DefaultProfileProtected,
     /// A PR in a terminal state (`merged` or `closed`) cannot be closed.
     #[error("PR is already {state}")]
     PrTerminal {
@@ -353,7 +356,6 @@ pub(super) struct PendingMessageAttachmentRow {
     pub(super) name: String,
     pub(super) attachment_type: String,
     pub(super) url: String,
-    pub(super) upload_data_url: Option<String>,
     pub(super) text_content: Option<String>,
 }
 
@@ -480,25 +482,6 @@ pub struct ContextDebugSnapshotMessage {
     pub tool_call_id: Option<String>,
     /// Names of tool calls the message issued.
     pub tool_call_names: Vec<String>,
-}
-
-/// Outcome of consuming a notification's pending callback.
-#[derive(Debug, Clone)]
-pub struct NotificationCallbackConsumeResult {
-    /// Notification id that was consumed.
-    pub id: String,
-    /// Session the notification belongs to, if any.
-    pub session_id: Option<String>,
-    /// Profile the notification belongs to, if any.
-    pub profile_id: Option<String>,
-    /// Serialized context fragment attached to the callback.
-    pub callback_context_xml: Option<String>,
-    /// Callback message text delivered to the session.
-    pub callback_message: Option<String>,
-    /// Whether a callback was registered for the notification.
-    pub has_callback: bool,
-    /// Whether the callback had already been consumed.
-    pub callback_consumed: bool,
 }
 
 pub(super) struct DefaultProfile<'a> {

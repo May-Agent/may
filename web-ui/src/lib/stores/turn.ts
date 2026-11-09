@@ -1,6 +1,14 @@
 import { create } from 'zustand';
-import type { ApiMessage, ChatRequestPayload, ChatStreamEvent } from '../types';
-import { openSessionTurns, sendMessage, stopSession } from '../api/chat';
+import type { ApiAttachment, ApiMessage, ChatRequestPayload, ChatStreamEvent } from '../types';
+import { sendMessage, stopSession } from '../api/chat';
+import {
+  applyBackgroundDelta,
+  watchSessionEvents,
+  type BackgroundState,
+  type SessionAgentFrame,
+  type SessionTurnFrame,
+} from '../api/sessionEvents';
+import { getSessionBackground, type SessionBackground } from '../api/background';
 import {
   applyEvent,
   emptyTurn,
@@ -52,6 +60,18 @@ export interface SessionTurn {
   stopping: boolean;
   /** Payload of the most recent send, used to retry after an error. */
   lastPayload: ChatRequestPayload | null;
+  /** Whether this client sent the turn in progress. */
+  own: boolean;
+  /** A withdrawn message of this client's, waiting to return to the composer. */
+  restored: RestoredDraft | null;
+  /** Warnings the daemon raised for the user while this view was open. */
+  warnings: string[];
+}
+
+/** The text and attachments of a message the daemon withdrew. */
+export interface RestoredDraft {
+  content: string;
+  attachments: ApiAttachment[];
 }
 
 const IDLE_TURN: SessionTurn = {
@@ -59,10 +79,10 @@ const IDLE_TURN: SessionTurn = {
   last: null,
   stopping: false,
   lastPayload: null,
+  own: false,
+  restored: null,
+  warnings: [],
 };
-
-/** Wait before reopening a session's turn stream that dropped. */
-const RECONNECT_DELAY_MS = 1000;
 
 interface TurnSliceState {
   /** Turns keyed by the id of the session that owns them. */
@@ -77,6 +97,8 @@ interface TurnSliceState {
   cancel: (sessionId: string) => Promise<void>;
   retry: (sessionId: string) => Promise<void>;
   dismissError: (sessionId: string) => void;
+  /** The composer took the withdrawn draft back. */
+  consumeRestored: (sessionId: string) => void;
 }
 
 function errorTurn(base: TurnState | null, sessionId: string, err: unknown): TurnState {
@@ -102,11 +124,19 @@ export const useTurnStore = create<TurnSliceState>((set, get) => {
     });
 
   /** Watchers by session id, counted so nested views share one stream. */
-  const watchers = new Map<string, { count: number; controller: AbortController }>();
+  const watchers = new Map<string, { count: number; unwatch: () => void }>();
 
-  const finishWithReply = (sessionId: string, assistant: ApiMessage) => {
+  const finishWithReply = (
+    sessionId: string,
+    assistant: ApiMessage | null,
+    userMessageId: string | null,
+  ) => {
     const finalActive = turnOf(sessionId).active;
     patch(sessionId, (prev) => ({ active: null, last: prev.active, stopping: false }));
+    if (assistant === null) {
+      useSessionsStore.getState().settleTurn(sessionId, userMessageId, null);
+      return;
+    }
     const toolEvent = synthesizeToolEvent(finalActive?.tools ?? []);
     const reasoning =
       typeof assistant.thinking === 'string' && assistant.thinking.length > 0
@@ -114,7 +144,7 @@ export const useTurnStore = create<TurnSliceState>((set, get) => {
         : finalActive?.reasoning && finalActive.reasoning.length > 0
           ? finalActive.reasoning
           : assistant.thinking;
-    useSessionsStore.getState().appendMessage(sessionId, {
+    useSessionsStore.getState().settleTurn(sessionId, userMessageId, {
       ...assistant,
       toolEvent: toolEvent ?? assistant.toolEvent ?? null,
       thinking: reasoning,
@@ -132,13 +162,26 @@ export const useTurnStore = create<TurnSliceState>((set, get) => {
       case 'done':
       case 'paused':
         patch(sessionId, (prev) => (prev.active ? { active: applyEvent(prev.active, evt) } : {}));
-        finishWithReply(sessionId, evt.assistant);
+        finishWithReply(sessionId, evt.assistant, evt.userMessageId);
+        return;
+      case 'withdrawn':
+        // The message leaves the conversation; the client that sent it gets
+        // it back in the composer.
+        useSessionsStore.getState().withdrawUserMessage(sessionId, evt.content);
+        patch(sessionId, (prev) => ({
+          active: null,
+          last: null,
+          stopping: false,
+          restored: prev.own
+            ? { content: evt.content, attachments: evt.attachments }
+            : prev.restored,
+        }));
         return;
       case 'end':
         patch(sessionId, (prev) =>
           prev.active
-            ? { active: null, last: applyEvent(prev.active, evt), stopping: false }
-            : { stopping: false },
+            ? { active: null, last: applyEvent(prev.active, evt), stopping: false, own: false }
+            : { stopping: false, own: false },
         );
         return;
       default:
@@ -146,33 +189,96 @@ export const useTurnStore = create<TurnSliceState>((set, get) => {
     }
   };
 
-  const follow = async (sessionId: string, signal: AbortSignal) => {
-    // Index of the last turn frame received: a reopened stream continues
-    // from the frame after it, so nothing replays twice.
-    let after: string | undefined;
-    while (!signal.aborted) {
-      try {
-        const stream = await openSessionTurns(sessionId, signal, {
-          after,
-          onFrameId: (id) => {
-            after = id;
-          },
-          onBackground: (snapshot) => useInspectorStore.getState().applyBackground(snapshot),
-          onResync: () => {
-            // Turn frames this client missed are gone: drop the turn it was
-            // following and reload the session's messages.
-            patch(sessionId, () => ({ active: null, stopping: false }));
-            void useSessionsStore.getState().refreshActive(sessionId);
-          },
-        });
-        for await (const evt of stream.events) handle(sessionId, evt);
-      } catch (err) {
-        if (signal.aborted) return;
-        console.warn('session turn stream dropped', err);
+  /**
+   * The stream's `reset` says frames this client missed are gone: drop the
+   * turn it was following and reload the session's messages.
+   */
+  const resync = (sessionId: string) => {
+    patch(sessionId, () => ({ active: null, stopping: false }));
+    void useSessionsStore.getState().refreshActive(sessionId);
+  };
+
+  /**
+   * Follow `sessionId`'s events on the shared session stream. The session
+   * read's `cursor` resumes the stream where the read left off; the REST
+   * background snapshot seeds the state `job.*`/`subagent.*` deltas apply
+   * to.
+   */
+  const follow = (sessionId: string) => {
+    let closed = false;
+    let unwatch: (() => void) | undefined;
+    const background: BackgroundState = { jobs: [], subagents: [] };
+    // Turns whose prompt is already in the loaded history: a turn that
+    // ended between the session read's cursor and its messages arriving
+    // replays on the stream; showing it would duplicate the history rows.
+    const suppressedTurns = new Set<string>();
+    const emitBackground = () => {
+      const snapshot: SessionBackground = {
+        sessionId,
+        jobs: background.jobs,
+        subagents: background.subagents,
+      };
+      useInspectorStore.getState().applyBackground(snapshot);
+    };
+    const onEvent = (kind: string, data: Record<string, unknown>) => {
+      switch (kind) {
+        case 'session_agent': {
+          const frame = data as unknown as SessionAgentFrame;
+          const messageId = frame.body?.messageId;
+          if (frame.body?.kind === 'start' && messageId != null) {
+            const messages = useSessionsStore.getState().messages[sessionId] ?? [];
+            if (messages.some((m) => m.id === `msg-${messageId}`)) {
+              suppressedTurns.add(frame.turnId);
+            }
+          }
+          return;
+        }
+        case 'session_turn': {
+          const frame = data as unknown as SessionTurnFrame;
+          if (frame.sessionId !== sessionId || !frame.data) return;
+          const turnId = frame.data.turnId as string | undefined;
+          if (turnId != null && suppressedTurns.has(turnId)) {
+            if (frame.event === 'end') suppressedTurns.delete(turnId);
+            return;
+          }
+          handle(sessionId, { ...frame.data, kind: frame.event } as unknown as ChatStreamEvent);
+          return;
+        }
+        case 'warning': {
+          const { message } = data as { message: string };
+          patch(sessionId, (prev) => ({ warnings: [...prev.warnings, message] }));
+          return;
+        }
+        case 'reset':
+          resync(sessionId);
+          return;
+        default:
+          if (applyBackgroundDelta(background, kind, data)) emitBackground();
       }
-      if (signal.aborted) return;
-      await new Promise((resolve) => setTimeout(resolve, RECONNECT_DELAY_MS));
-    }
+    };
+    void (async () => {
+      // The session read's cursor is the stream's resume point; a later
+      // refresh may have moved it, so the latest one wins.
+      const cursor =
+        useSessionsStore.getState().active?.id === sessionId
+          ? useSessionsStore.getState().active?.cursor
+          : undefined;
+      try {
+        const snapshot = await getSessionBackground(sessionId);
+        if (closed) return;
+        background.jobs = snapshot.jobs;
+        background.subagents = snapshot.subagents;
+        useInspectorStore.getState().applyBackground(snapshot);
+      } catch {
+        // The REST read failed; deltas still apply on the empty snapshot.
+      }
+      if (closed) return;
+      unwatch = watchSessionEvents(sessionId, cursor, (kind, data) => onEvent(kind, data));
+    })();
+    return () => {
+      closed = true;
+      unwatch?.();
+    };
   };
 
   const ensureWatched = (sessionId: string) => {
@@ -187,16 +293,14 @@ export const useTurnStore = create<TurnSliceState>((set, get) => {
       if (existing) {
         existing.count += 1;
       } else {
-        const controller = new AbortController();
-        watchers.set(sessionId, { count: 1, controller });
-        void follow(sessionId, controller.signal);
+        watchers.set(sessionId, { count: 1, unwatch: follow(sessionId) });
       }
       return () => {
         const watcher = watchers.get(sessionId);
         if (!watcher) return;
         watcher.count -= 1;
         if (watcher.count <= 0) {
-          watcher.controller.abort();
+          watcher.unwatch();
           watchers.delete(sessionId);
         }
       };
@@ -212,6 +316,7 @@ export const useTurnStore = create<TurnSliceState>((set, get) => {
         last: null,
         stopping: false,
         lastPayload: payload,
+        own: true,
       }));
       try {
         await sendMessage(payload);
@@ -256,6 +361,10 @@ export const useTurnStore = create<TurnSliceState>((set, get) => {
 
     dismissError(sessionId) {
       patch(sessionId, () => ({ last: null }));
+    },
+
+    consumeRestored(sessionId) {
+      patch(sessionId, () => ({ restored: null }));
     },
   };
 });

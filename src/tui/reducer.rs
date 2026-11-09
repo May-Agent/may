@@ -27,7 +27,17 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             // Sweep a transient status notice whose deadline passed; the tick
             // cadence bounds how long an expired notice can linger.
             StatusNotice::clear_expired(&mut app.status, std::time::Instant::now());
-            if app.processing || app.index_loading {
+            app.sync_profile_follow();
+            if app.new_year.check_due(std::time::Instant::now()) {
+                let zone = crate::tui::new_year::user_zone(&app.config.time);
+                app.new_year.set_date(jiff::Timestamp::now(), &zone);
+            }
+            app.new_year.tick();
+            if app.processing
+                || app.index_loading
+                || (matches!(app.mode, AppMode::SessionSelect)
+                    && app.session_list.iter().any(|session| session.working))
+            {
                 app.spinner_frame = app.spinner_frame.wrapping_add(1);
             }
             if app.processing {
@@ -38,7 +48,7 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
                 // output + file-diff previews.
                 app.poll_live_output();
             }
-            // The jobs list and subagent runs arrive as `session_background`
+            // The jobs list and subagent runs arrive as `BackgroundLoaded`
             // events while anything runs; nothing to poll for them here.
             // Same cadence for an open job/subagent detail view.
             if let AppMode::JobDetail(state) = &app.mode
@@ -203,6 +213,27 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             }
             Ok(None)
         }
+        AppEvent::ProfileSessionsPushed(ps) => {
+            // Same lists with newer state: the selection stays where it is.
+            if matches!(app.mode, AppMode::SessionSelect) {
+                let selected_id = app
+                    .filtered_sessions()
+                    .get(app.session_selected)
+                    .and_then(|(index, _)| app.session_list.get(*index))
+                    .map(|summary| summary.id.clone());
+                app.profile_sessions = Some(ps);
+                app.build_session_list_from_profile();
+                let filtered = app.filtered_sessions();
+                let kept = selected_id.and_then(|id| {
+                    filtered
+                        .iter()
+                        .position(|(index, _)| app.session_list[*index].id == id)
+                });
+                let last = filtered.len().saturating_sub(1);
+                app.session_selected = kept.unwrap_or_else(|| app.session_selected.min(last));
+            }
+            Ok(None)
+        }
         AppEvent::ConfigSaved(result) => {
             if let Err(error) = result {
                 app.chat
@@ -267,7 +298,14 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             app.request_prompt_mark(i64::from(message_id));
             Ok(None)
         }
+        AppEvent::TurnWithdrawn { content, own } => {
+            app.withdraw_turn(content, own);
+            Ok(Some(SendAction::ReloadHistory))
+        }
         AppEvent::HistoryStale => Ok(Some(SendAction::ReloadHistory)),
+        AppEvent::UserNotification(notification) => {
+            Ok(Some(SendAction::DesktopNotification(notification)))
+        }
         AppEvent::Sleep(status) => {
             if status.asleep != app.asleep {
                 app.asleep = status.asleep;
@@ -313,6 +351,30 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
                 } else {
                     app.chat.push_notice("Recap failed — try again");
                 }
+            }
+            Ok(None)
+        }
+        AppEvent::Warning {
+            session_id,
+            message,
+        } => {
+            if app
+                .session_manager
+                .current()
+                .is_some_and(|session| session.id.as_str() == session_id)
+            {
+                app.chat.push_warning(&message);
+                app.scroll = usize::MAX;
+            }
+            Ok(None)
+        }
+        AppEvent::ContextWindow { session_id, window } => {
+            if app
+                .session_manager
+                .current()
+                .is_some_and(|session| session.id.as_str() == session_id)
+            {
+                app.context_window = Some(window);
             }
             Ok(None)
         }
@@ -377,6 +439,20 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             if let crate::tui::state::AppMode::Btw(state) = &mut app.mode {
                 state.loading = false;
                 state.done = true;
+                state.error = Some(error);
+            }
+            Ok(None)
+        }
+        AppEvent::ProgressLoaded(report) => {
+            if let crate::tui::state::AppMode::Progress(state) = &mut app.mode {
+                state.loading = false;
+                state.report = Some(report);
+            }
+            Ok(None)
+        }
+        AppEvent::ProgressFailed(error) => {
+            if let crate::tui::state::AppMode::Progress(state) = &mut app.mode {
+                state.loading = false;
                 state.error = Some(error);
             }
             Ok(None)

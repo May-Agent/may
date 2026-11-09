@@ -1,4 +1,5 @@
-import { apiGet, apiPost } from './client';
+import { apiGet, apiPost, apiSseUrl } from './client';
+import type { ApiAttachment } from '../types';
 import type {
   ArtifactDiagnosticsResponse,
   SessionArtifactsResponse,
@@ -68,4 +69,16 @@ export function artifactPageUrl(sessionId: string, path: string, profileId = '-'
 
 export function artifactDownloadUrl(sessionId: string, path: string, profileId = '-'): string {
   return `${artifactPageUrl(sessionId, path, profileId)}?download`;
+}
+
+/** Upload raw bytes for an attachment; returns the record to send with a message. */
+export async function uploadAttachment(sessionId: string, file: File): Promise<ApiAttachment> {
+  const response = await fetch(
+    apiSseUrl(`/sessions/${sessionId}/attachments?name=${encodeURIComponent(file.name)}`),
+    { method: 'POST', headers: { 'content-type': file.type || 'application/octet-stream' }, body: file },
+  );
+  if (!response.ok) {
+    throw new Error(`attachment upload failed: ${response.status}`);
+  }
+  return (await response.json()) as ApiAttachment;
 }

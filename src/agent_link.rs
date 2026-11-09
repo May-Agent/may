@@ -14,6 +14,7 @@ use askama::Template;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::cache_lifetime::CacheLifetime;
 use crate::db::ChatDbError;
 use crate::session::{
     MayHomePaths, PendingMessageState, PendingUserMessage, PendingUserMessageMode,
@@ -67,6 +68,9 @@ pub enum AgentLinkError {
     /// `tasks.md` could not be read.
     #[error("failed to read tasks.md: {0}")]
     Tasks(#[source] std::io::Error),
+    /// A session's stored repository binding is malformed.
+    #[error(transparent)]
+    Binding(#[from] crate::session::BindingError),
     /// No live agent matches the name.
     #[error("no live agent named \"{0}\"; run `agent list`")]
     NoSuchAgent(String),
@@ -91,6 +95,33 @@ pub enum AgentLinkError {
         #[source]
         source: std::io::Error,
     },
+    /// The recipient is idle past its prompt-cache lifetime.
+    #[error("{}", cold_recipient_message(.0))]
+    ColdRecipient(String),
+    /// The agent asked itself a btw question.
+    #[error("an agent cannot ask itself a btw question")]
+    AskSelf,
+    /// The btw question is empty.
+    #[error("the btw question is empty")]
+    EmptyQuestion,
+    /// A btw recipient is idle past its prompt-cache lifetime.
+    #[error("{}", cold_btw_recipient_message(.0))]
+    ColdBtwRecipient(String),
+    /// The btw recipient's agent has sent no request since it was built, so
+    /// there is no context to fork.
+    #[error(
+        "\"{0}\" has sent no request since its agent was started, so it has no context to answer from; ask again once it has worked"
+    )]
+    NoForkContext(String),
+    /// The btw recipient's context is too close to its compaction point to
+    /// hold a fork's question and answer.
+    #[error(
+        "\"{0}\" is about to compact its context, so a fork of it cannot answer; ask again after it compacts"
+    )]
+    NearCompaction(String),
+    /// The fork answering a btw question failed.
+    #[error("the fork answering the btw question failed: {0}")]
+    Fork(String),
     /// The delivery text could not be wrapped as hidden context.
     #[error(transparent)]
     Context(#[from] XmlBlockError),
@@ -160,7 +191,13 @@ impl AgentDirectory {
             );
             let tasks = paths.tasks_content().await.map_err(AgentLinkError::Tasks)?;
             let state = self.runtime_service.get(&session.id).await?.state;
+            let binding = session
+                .repo
+                .as_deref()
+                .map(crate::session::RepoBinding::parse)
+                .transpose()?;
             live.push(AgentTasks {
+                binding,
                 status: AgentStatus {
                     name: session.title.clone().unwrap_or_else(|| session.id.clone()),
                     session_id: session.id.clone(),
@@ -224,6 +261,8 @@ impl AgentDirectory {
 #[derive(Debug, Clone)]
 pub(crate) struct AgentTasks {
     pub(crate) status: AgentStatus,
+    /// The repository the session is bound to, if it is.
+    pub(crate) binding: Option<crate::session::RepoBinding>,
     /// The session's `workspace.toml`.
     pub(crate) workspace_config: PathBuf,
     pub(crate) tasks_path: PathBuf,
@@ -263,11 +302,59 @@ pub struct AgentMessaging {
     pub directory: AgentDirectory,
     /// Queue and runtime state of the shared `history.db`.
     pub runtime_service: Arc<SessionRuntimeService>,
+    /// How long a provider id keeps the main conversation's cache warm.
+    pub cache_lifetime: CacheLifetimes,
+    /// The fork source and model of every session agent, for `btw`.
+    pub forks: ForkHosts,
+}
+
+/// The live agent `target` (name or session id) addresses in `live`.
+fn addressed<'a>(live: &'a [AgentStatus], target: &str) -> Result<&'a AgentStatus, AgentLinkError> {
+    let mut matches = live
+        .iter()
+        .filter(|agent| agent.session_id == target || agent.name == target);
+    let recipient = matches
+        .next()
+        .ok_or_else(|| AgentLinkError::NoSuchAgent(target.to_string()))?;
+    if matches.next().is_some() {
+        return Err(AgentLinkError::AmbiguousAgent(target.to_string()));
+    }
+    Ok(recipient)
+}
+
+impl AgentMessaging {
+    /// Whether `session_id` is idle with a cold prompt cache, so that waking
+    /// it would pay for its whole prompt again. A working session is never
+    /// cold.
+    ///
+    /// # Errors
+    /// [`AgentLinkError`] on storage failure.
+    pub async fn is_cold(
+        &self,
+        session_id: &str,
+        activity: Activity,
+    ) -> Result<bool, AgentLinkError> {
+        if activity == Activity::Running {
+            return Ok(false);
+        }
+        Ok(self
+            .runtime_service
+            .db()
+            .prompt_cache_is_cold(session_id, jiff::Timestamp::now(), |provider| {
+                self.cache_lifetime.of(provider)
+            })
+            .await?)
+    }
 }
 
 /// Tag names that frame text for the recipient; text from another agent must
 /// not be able to open or close them.
-const FRAMING_TAGS: [&str; 3] = ["system-reminder", "agent-message", "task-message"];
+const FRAMING_TAGS: [&str; 4] = [
+    "system-reminder",
+    "agent-message",
+    "agent-btw",
+    "task-message",
+];
 
 /// Text written by another agent. Displaying it turns the `<` of any opening
 /// or closing `system-reminder` or `agent-message` tag into `&lt;`, so it can
@@ -323,6 +410,53 @@ struct AgentMessageText<'a> {
 }
 
 #[derive(Template)]
+#[template(path = "agent_cold.txt", escape = "none")]
+struct ColdRecipientText<'a> {
+    recipient: &'a str,
+}
+
+fn cold_recipient_message(recipient: &str) -> String {
+    ColdRecipientText { recipient }
+        .render()
+        .expect("cold recipient template must render")
+}
+
+#[derive(Template)]
+#[template(path = "agent_btw_cold.txt", escape = "none")]
+struct ColdBtwRecipientText<'a> {
+    recipient: &'a str,
+}
+
+fn cold_btw_recipient_message(recipient: &str) -> String {
+    ColdBtwRecipientText { recipient }
+        .render()
+        .expect("cold btw recipient template must render")
+}
+
+/// How long each provider keeps the main conversation's prompt cache warm,
+/// read live from the daemon's configuration.
+#[derive(Clone)]
+pub struct CacheLifetimes(Arc<dyn Fn(&str) -> CacheLifetime + Send + Sync>);
+
+impl CacheLifetimes {
+    /// Lifetimes looked up by provider id through `lookup`.
+    #[must_use]
+    pub fn new(lookup: impl Fn(&str) -> CacheLifetime + Send + Sync + 'static) -> Self {
+        Self(Arc::new(lookup))
+    }
+
+    fn of(&self, provider_id: &str) -> CacheLifetime {
+        (self.0)(provider_id)
+    }
+}
+
+impl std::fmt::Debug for CacheLifetimes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CacheLifetimes").finish_non_exhaustive()
+    }
+}
+
+#[derive(Template)]
 #[template(path = "agent_sent.txt", escape = "none")]
 struct AgentSentText<'a> {
     recipient: &'a str,
@@ -342,7 +476,8 @@ struct AgentListText {
 
 impl AgentMessaging {
     /// Store `body` in the queue of the live agent addressed by `target` (name
-    /// or session id) and wake it. Returns the recipient's name.
+    /// or session id) and wake it; an idle recipient whose prompt cache is
+    /// cold is refused and nothing is stored. Returns the recipient's name.
     ///
     /// # Errors
     /// See [`AgentLinkError`].
@@ -356,17 +491,15 @@ impl AgentMessaging {
         body: &str,
     ) -> Result<String, AgentLinkError> {
         let live = self.directory.live().await?;
-        let mut matches = live
-            .iter()
-            .filter(|agent| agent.session_id == target || agent.name == target);
-        let recipient = matches
-            .next()
-            .ok_or_else(|| AgentLinkError::NoSuchAgent(target.to_string()))?;
-        if matches.next().is_some() {
-            return Err(AgentLinkError::AmbiguousAgent(target.to_string()));
-        }
+        let recipient = addressed(&live, target)?;
         if recipient.session_id == sender_session_id {
             return Err(AgentLinkError::SendToSelf);
+        }
+        if self
+            .is_cold(&recipient.session_id, recipient.activity)
+            .await?
+        {
+            return Err(AgentLinkError::ColdRecipient(recipient.name.clone()));
         }
         let sender = status_name(&self.runtime_service, sender_session_id).await?;
         let text = AgentMessageText {
@@ -516,7 +649,9 @@ impl Tool for AgentTool {
                     return Err(AgentLinkError::EmptyMessage(path).into());
                 }
                 if let Some(guard) = &self.languages {
-                    guard.check_working(body.trim(), aither_agent::WorkingText::Internal)?;
+                    guard
+                        .check_working(body.trim(), aither_agent::WorkingText::Internal)
+                        .map_err(crate::agent::notices::language_refused)?;
                 }
                 let recipient = self
                     .messaging
@@ -532,6 +667,12 @@ impl Tool for AgentTool {
         Ok(ToolResult::text(text))
     }
 }
+
+mod btw;
+
+pub use btw::{
+    BtwAnswer, BtwArgs, BtwCommand, BtwTool, ForkHosts, ForkLauncher, ForkRegistration, SideContext,
+};
 
 #[cfg(test)]
 mod tests;

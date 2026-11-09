@@ -51,7 +51,7 @@ impl Host {
     async fn bash_runs_in(&self, id: &str, dir: &Path) -> bool {
         let status = self
             .post(
-                &format!("/api/sessions/{id}/bash"),
+                &format!("/api/sessions/{id}/actions/bash"),
                 r#"{"command":"touch ran-here"}"#,
             )
             .await;
@@ -95,6 +95,15 @@ async fn a_session_without_a_directory_runs_in_its_sandbox() {
         StatusCode::OK,
         "a repo-less session answers the sidebar lookup"
     );
+}
+
+#[test]
+fn the_stored_local_form_is_accepted_as_a_repo_spec() {
+    assert_eq!(
+        resolve_repo_binding(Some("local:/work/app/.git")),
+        Ok(Some("local:/work/app/.git".to_string()))
+    );
+    assert!(resolve_repo_binding(Some("local:")).is_err());
 }
 
 #[tokio::test]

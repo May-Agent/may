@@ -13,7 +13,8 @@ use jiff::Timestamp;
 
 use super::super::super::app::App;
 use crate::tui::connect::{ConnectStage, ConnectState};
-use crate::tui::state::ResumePickerState;
+use crate::tui::state::{ResumePickerState, SessionView};
+use crate::tui::ui::sweep::sweep_spans;
 
 /// Render session selection popup with profile sections.
 pub(super) fn render_session_popup(frame: &mut Frame, area: Rect, app: &App) {
@@ -30,11 +31,15 @@ pub(super) fn render_session_popup(frame: &mut Frame, area: Rect, app: &App) {
         .current_profile_name()
         .map(|n| format!(" [{n}]"))
         .unwrap_or_default();
+    let heading = match app.session_view {
+        SessionView::Recent => "Sessions",
+        SessionView::Archive => "Archived sessions",
+    };
     let title = if app.session_search.is_empty() {
-        format!("Sessions{} ({})", profile_label, app.session_list.len())
+        format!("{heading}{} ({})", profile_label, app.session_list.len())
     } else {
         format!(
-            "Sessions{} ({}/{})",
+            "{heading}{} ({}/{})",
             profile_label,
             filtered_len,
             app.session_list.len()
@@ -129,7 +134,12 @@ pub(super) fn render_session_popup(frame: &mut Frame, area: Rect, app: &App) {
     let mut session_lines = Vec::new();
 
     if filtered.is_empty() {
-        if app.session_list.is_empty() {
+        if app.session_list.is_empty() && app.session_view == SessionView::Archive {
+            session_lines.push(Line::from(Span::styled(
+                "No archived sessions.",
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else if app.session_list.is_empty() {
             session_lines.push(Line::from(Span::styled(
                 "No sessions.",
                 Style::default().fg(Color::DarkGray),
@@ -155,6 +165,7 @@ pub(super) fn render_session_popup(frame: &mut Frame, area: Rect, app: &App) {
 
         // Track section transitions for rendering headers
         let mut prev_section: Option<&str> = None;
+        let mut prev_repo: Option<&str> = None;
 
         for (display_idx, (_original_idx, summary)) in filtered
             .iter()
@@ -212,6 +223,27 @@ pub(super) fn render_session_popup(frame: &mut Frame, area: Rect, app: &App) {
                             .add_modifier(ratatui::style::Modifier::BOLD),
                     )));
                     prev_section = Some(section);
+                    prev_repo = None;
+                }
+                // Regular sessions run in project groups: a header names the
+                // project, GitHub ones by `owner/repo` and local ones by path.
+                if section == "regular" && summary.repo.as_deref() != prev_repo {
+                    if let Some(repo) = summary.repo.as_deref() {
+                        let github = repo.starts_with("github:");
+                        session_lines.push(Line::from(vec![
+                            Span::styled(
+                                if github { "  GitHub " } else { "  " },
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                            Span::styled(
+                                crate::session::project_label(repo),
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(ratatui::style::Modifier::BOLD),
+                            ),
+                        ]));
+                    }
+                    prev_repo = summary.repo.as_deref();
                 }
             }
 
@@ -250,7 +282,7 @@ pub(super) fn render_session_popup(frame: &mut Frame, area: Rect, app: &App) {
                 Style::default()
             };
 
-            let line = Line::from(vec![
+            let mut spans = vec![
                 Span::styled(
                     prefix,
                     if selected {
@@ -260,46 +292,40 @@ pub(super) fn render_session_popup(frame: &mut Frame, area: Rect, app: &App) {
                     },
                 ),
                 Span::styled(indicator, indicator_style),
-                Span::styled(display_name, name_style),
-                Span::styled(
-                    format!(" ({} messages)", summary.message_count),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                if is_current {
-                    Span::styled(" (current)", Style::default().fg(Color::Green))
-                } else {
-                    Span::raw("")
-                },
-            ]);
-            session_lines.push(line);
+            ];
+            if summary.working {
+                // The highlight sweeps along the title while the session works.
+                spans.extend(sweep_spans(
+                    display_name,
+                    app.spinner_frame,
+                    name_style.fg(Color::DarkGray),
+                    name_style.fg(Color::White),
+                ));
+            } else {
+                spans.push(Span::styled(display_name, name_style));
+            }
+            spans.push(Span::styled(
+                format!(" ({} messages)", summary.message_count),
+                Style::default().fg(Color::DarkGray),
+            ));
+            if summary.working {
+                spans.push(Span::styled(
+                    " Working...",
+                    Style::default().fg(Color::Cyan),
+                ));
+            }
+            if is_current {
+                spans.push(Span::styled(
+                    " (current)",
+                    Style::default().fg(Color::Green),
+                ));
+            }
+            session_lines.push(Line::from(spans));
 
             // Show search match preview
             if selected && !app.session_search.is_empty() {
                 render_search_preview(&mut session_lines, summary, &app.session_search);
             }
-        }
-
-        // Archived section collapsed indicator
-        if has_profile
-            && app.session_search.is_empty()
-            && !app.archived_expanded
-            && app
-                .profile_sessions
-                .as_ref()
-                .is_some_and(|ps| !ps.archived.is_empty())
-        {
-            let count = app
-                .profile_sessions
-                .as_ref()
-                .map_or(0, |ps| ps.archived.len());
-            session_lines.push(Line::from(Span::styled(
-                "  ────────────────────────",
-                Style::default().fg(Color::DarkGray),
-            )));
-            session_lines.push(Line::from(Span::styled(
-                format!("  Archived ({count}) [press 'e' to expand]"),
-                Style::default().fg(Color::DarkGray),
-            )));
         }
 
         let shown_end = scroll + visible_height;
@@ -334,7 +360,13 @@ pub(super) fn render_session_popup(frame: &mut Frame, area: Rect, app: &App) {
                 Span::styled("Pin", Style::default().fg(Color::White)),
                 Span::raw(" "),
                 Span::styled("[a] ", Style::default().fg(Color::Cyan)),
-                Span::styled("Archive", Style::default().fg(Color::White)),
+                Span::styled(
+                    match app.session_view {
+                        SessionView::Recent => "Archive",
+                        SessionView::Archive => "Unarchive",
+                    },
+                    Style::default().fg(Color::White),
+                ),
             ]);
         }
         if has_profile_tabs {
