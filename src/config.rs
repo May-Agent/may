@@ -92,11 +92,6 @@ pub enum ConfigError {
     /// Failed to serialize config.
     #[error("Failed to serialize config: {0}")]
     Serialize(#[from] toml::ser::Error),
-    /// Legacy `[playwright]` config section found; it must be renamed to `[browser]`.
-    #[error(
-        "legacy config section `[playwright]` is no longer supported; rename it to `[browser]`"
-    )]
-    LegacyPlaywrightSection,
     /// Invalid browser config.
     #[error("invalid browser config: {0}")]
     InvalidBrowserConfig(String),
@@ -1911,7 +1906,6 @@ impl MayConfig {
     pub async fn load_from(path: &Path) -> Result<Self, ConfigError> {
         match async_fs::read_to_string(path).await {
             Ok(content) => {
-                reject_legacy_config_sections(&content)?;
                 let config: Self = toml::from_str(&content)?;
                 config.validate()?;
                 Ok(config)
@@ -2157,14 +2151,6 @@ impl MayConfig {
         models.dedup_by(|a, b| a.selector == b.selector);
         models
     }
-}
-
-fn reject_legacy_config_sections(content: &str) -> Result<(), ConfigError> {
-    let document = toml::from_str::<toml::Value>(content).map_err(ConfigError::Parse)?;
-    if document.get("playwright").is_some() {
-        return Err(ConfigError::LegacyPlaywrightSection);
-    }
-    Ok(())
 }
 
 /// An available model from a configured provider.

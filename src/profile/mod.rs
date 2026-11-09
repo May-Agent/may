@@ -448,7 +448,6 @@ mod tests {
             environment: environment.to_string(),
             container_id: None,
             persona: None,
-            remote_ssh_server_id: None,
             location_aware: false,
             pinned_limit: 10,
             sort_order: 0,
@@ -466,13 +465,5 @@ mod tests {
         assert!(matches!(info.environment.kind(), ProfileEnvironment::Local));
         assert_eq!(info.environment.as_db_str(), "local");
         assert_eq!(info.remote_attachments, [] as [std::string::String; 0]);
-    }
-
-    #[test]
-    fn profile_info_rejects_legacy_remote_environment() {
-        let error = ProfileInfo::from_db_parts(make_profile_model("remote"), None, Vec::new())
-            .expect_err("legacy remote environment must not deserialize");
-        let message = error.to_string();
-        assert!(message.contains("remote"), "unexpected error: {message}");
     }
 }

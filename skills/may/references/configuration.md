@@ -56,8 +56,7 @@ Anthropic and Google use their own wire formats; every other type speaks the Ope
 
 - `[[ssh_servers]]` entries `name` and `target` (`user@host[:port]`); attach to profiles (see `profiles.md`).
 - `[acp_agents.<name>]` (written by `/connect`): `command`, `args`, `env`, `model`, `mode`, `description`, `grants`. The name must be ASCII letters, digits, `-`, `_` and not a built-in subagent name. `[acp] trial_limit` (default `"60s"`) bounds the handshake.
-- `[browser]`: `enabled` (default false), `backend` (`managed` or `remote_cdp`, the latter requires `remote_cdp_endpoint`), `port` (39222), `stealth_enabled` (true), screencast tuning (`screencast_jpeg_quality` 80, `screencast_max_width` 1920, `screencast_max_height` 1200, `every_nth_frame` 2, `encoder_initial_bitrate_kbps` 4000) and `system_profile` (`path`, `copy_on_first_use`) to seed the browser from a Chromium profile on first launch. A legacy `[playwright]` section is rejected; rename it to `[browser]`.
-- `[stream] codec`: `auto` (default; hardware H.264 else software AV1), `h264` or `av1` for browser and desktop streams.
+- `[browser]`: `enabled` (default false), `backend` (`managed` or `remote_cdp`, the latter requires `remote_cdp_endpoint`), `port` (39222), `stealth_enabled` (true), screencast tuning (`screencast_jpeg_quality` 80, `screencast_max_width` 1920, `screencast_max_height` 1200, `every_nth_frame` 2, `encoder_initial_bitrate_kbps` 4000) and `system_profile` (`path`, `copy_on_first_use`) to seed the browser from a Chromium profile on first launch.- `[stream] codec`: `auto` (default; hardware H.264 else software AV1), `h264` or `av1` for browser and desktop streams.
 - `[computer] signing_identity`: codesign identity for the macOS desktop helper.
 - `[daemon]`: `port` (default 8787) and `listen` (extra addresses, applied live). `[remote_access]`: see `remote-access.md`.
 - `[appearance]`: `font` (default Inter) and `theme` (default `system`), used by the web UI.
