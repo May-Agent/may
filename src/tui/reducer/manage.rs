@@ -271,6 +271,11 @@ pub fn handle_permission_confirm_key(app: &mut App, code: KeyCode) -> Option<Sen
                 });
             }
         }
+        KeyCode::Char('s' | 'S') | KeyCode::Tab => {
+            if let crate::tui::state::AppMode::PermissionConfirm(state) = &mut app.mode {
+                state.show_script = !state.show_script;
+            }
+        }
         KeyCode::Char('n' | 'N') | KeyCode::Esc => {
             let mode = std::mem::replace(&mut app.mode, crate::tui::state::AppMode::Chat);
             if let crate::tui::state::AppMode::PermissionConfirm(state) = mode {

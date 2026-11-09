@@ -517,6 +517,20 @@ pub struct PermissionConfirmState {
     pub request_id: String,
     /// The permission request being confirmed.
     pub request: crate::session::PersistedPermissionRequestPayload,
+    /// Whether the raw script shows instead of the reading.
+    pub show_script: bool,
+}
+
+impl PermissionConfirmState {
+    /// The reading the dialog shows, unless the raw script was asked for
+    /// or May recognised nothing in the script.
+    #[must_use]
+    pub fn shown_reading(&self) -> Option<&crate::command_reading::CommandReading> {
+        self.request
+            .reading
+            .as_ref()
+            .filter(|reading| reading.recognises_any() && !self.show_script)
+    }
 }
 
 /// Status of Copilot OAuth authentication flow.

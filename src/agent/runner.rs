@@ -68,6 +68,14 @@ pub enum TuiEvent {
         /// Seconds the phase lasted. Sub-second phases keep the fraction.
         seconds: f64,
     },
+    /// The daemon read a terminal call's script; sent right after the
+    /// call's `ToolCallStart`.
+    ToolReading {
+        /// The call the reading belongs to.
+        call_id: String,
+        /// How the daemon read the call's script.
+        reading: crate::command_reading::CommandReading,
+    },
     /// The daemon parked the run.
     Hold {
         /// What the run waits for.

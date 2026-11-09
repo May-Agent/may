@@ -1094,12 +1094,12 @@ mod tests {
             session_id,
             Some(PersistedPermissionRequest {
                 id: "perm-1".to_string(),
-                request: PersistedPermissionRequestPayload {
-                    mode: PermissionRequestMode::Default,
-                    script: "echo hi".to_string(),
-                    session_id: Some(session_id.to_string()),
-                    agent_id: None,
-                },
+                request: PersistedPermissionRequestPayload::new(
+                    PermissionRequestMode::Default,
+                    "echo hi".to_string(),
+                    Some(session_id.to_string()),
+                    None,
+                ),
             }),
         )
         .await
@@ -1178,12 +1178,12 @@ mod tests {
             session_id,
             Some(PersistedPermissionRequest {
                 id: "perm-1".to_string(),
-                request: PersistedPermissionRequestPayload {
-                    mode: PermissionRequestMode::Default,
-                    script: "echo hi".to_string(),
-                    session_id: Some(session_id.to_string()),
-                    agent_id: None,
-                },
+                request: PersistedPermissionRequestPayload::new(
+                    PermissionRequestMode::Default,
+                    "echo hi".to_string(),
+                    Some(session_id.to_string()),
+                    None,
+                ),
             }),
         )
         .await
@@ -1288,6 +1288,50 @@ mod tests {
             .await
             .expect("journal mode should be readable");
         assert_eq!(mode.journal_mode, "wal");
+    }
+
+    /// The audit record of a permission request keeps how May read the
+    /// script next to the script.
+    #[tokio::test]
+    async fn a_permission_request_is_audited_with_its_reading() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db should initialize successfully");
+        db.create_session("s", Some("t"), Some("m"))
+            .await
+            .expect("session should be created");
+        let script = "cat src/lib.rs";
+        let reading = crate::command_reading::CommandReading::of(script);
+        db.append_permission_request_message(
+            "s",
+            "r1",
+            crate::PermissionHistoryMode::Unsafe,
+            script,
+            Some(&reading),
+            None,
+        )
+        .await
+        .expect("request should be recorded");
+        let row = query!(
+            db.db,
+            "SELECT script, reading FROM message_permission_requests WHERE request_id = ?",
+            "r1"
+        )
+        .fetch_one::<AuditedRequest>()
+        .await
+        .expect("audit row should be readable");
+        assert_eq!(row.script, script);
+        let stored: crate::command_reading::CommandReading =
+            serde_json::from_str(&row.reading.expect("reading is recorded"))
+                .expect("reading is stored as the wire form");
+        assert_eq!(stored, reading);
+    }
+
+    #[derive(Debug, serde::Deserialize, skyzen::FromRow)]
+    struct AuditedRequest {
+        script: String,
+        reading: Option<String>,
     }
 
     #[derive(Debug, serde::Deserialize, skyzen::FromRow)]
