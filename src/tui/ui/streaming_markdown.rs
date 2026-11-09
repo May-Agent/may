@@ -298,10 +298,7 @@ impl StreamingMarkdown {
                 self.push_inline_span(Span::raw(text));
             }
             ParseEvent::InlineCode(code) => {
-                self.push_inline_span(Span::styled(
-                    code,
-                    Style::default().fg(Color::Yellow).bg(Color::DarkGray),
-                ));
+                self.push_inline_span(Span::styled(code, Style::default().fg(Color::Yellow)));
             }
             ParseEvent::Bold(text) => {
                 self.push_inline_span(Span::styled(
@@ -654,7 +651,7 @@ fn render_inline_element(elem: streamdown_parser::InlineElement) -> Span<'static
     match elem {
         streamdown_parser::InlineElement::Text(t) => Span::raw(t),
         streamdown_parser::InlineElement::Code(c) => {
-            Span::styled(c, Style::default().fg(Color::Yellow).bg(Color::DarkGray))
+            Span::styled(c, Style::default().fg(Color::Yellow))
         }
         streamdown_parser::InlineElement::Bold(t) => {
             Span::styled(t, Style::default().add_modifier(Modifier::BOLD))

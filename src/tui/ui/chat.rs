@@ -4696,6 +4696,11 @@ mod tests {
             crate::tui::ui::test_screen::buffer_screen(&truth),
             "the terminal shows something other than the rendered frame"
         );
+        assert_eq!(
+            terminal.backend().backgrounds(),
+            crate::tui::ui::test_screen::buffer_backgrounds(&truth),
+            "the terminal paints backgrounds other than the rendered frame's"
+        );
         truth
     }
 
@@ -4734,6 +4739,68 @@ mod tests {
         let whole_screen = draw_unified(&mut fresh, &whole, &mut fresh_layout, usize::MAX);
 
         assert_eq!(streamed_screen, whole_screen);
+    }
+
+    /// Cells of `buf` with a background, as `(x, y)`.
+    fn cells_with_background(buf: &ratatui::buffer::Buffer) -> Vec<(u16, u16)> {
+        let area = buf.area;
+        let mut found = Vec::new();
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                if buf[(x, y)].bg != ratatui::style::Color::Reset {
+                    found.push((x, y));
+                }
+            }
+        }
+        found
+    }
+
+    const CODE_REPLY: &str = "## 改动说明\n\n- 新增 `ContextBudget` 并在每次 `message_delta` 到达时调用 `calibrate`，路径是 `/Users/lexoliu/Coding/aither`，这一行足够长以便换行。\n- 另一项 `calibrate` 之后接中文，再接 English words 和 `a b` 以及更多的内容让它再换一行\n\n结尾段落包含 `message_delta`。";
+
+    /// A reply of CJK and Latin prose with wrapped inline code, streamed
+    /// in, resized and scrolled: every frame's screen, backgrounds
+    /// included, is what the frame rendered, and no cell carries a
+    /// background.
+    #[test]
+    fn inline_code_reply_leaves_no_stray_cells_across_frames() {
+        use crate::tui::ui::test_screen::ScreenBackend as TestBackend;
+        use ratatui::Terminal;
+
+        for width in [30u16, 41, 48, 57, 80] {
+            let mut chat = ChatStream::new();
+            chat.push_user("说明", Vec::new(), 0);
+            let mut terminal = Terminal::new(TestBackend::new(width, 14)).unwrap();
+            let mut layout = super::ChatLayout::default();
+            let mut rest = CODE_REPLY;
+            while !rest.is_empty() {
+                let split = rest.char_indices().nth(5).map_or(rest.len(), |(i, _)| i);
+                let (chunk, tail) = rest.split_at(split);
+                chat.push_text(chunk);
+                let frame = draw_unified(&mut terminal, &chat, &mut layout, usize::MAX);
+                let stray = cells_with_background(&frame);
+                assert!(stray.is_empty(), "w={width} after {chunk:?}: {stray:?}");
+                rest = tail;
+            }
+            chat.end_text();
+            for scroll in [0, 3, 1, usize::MAX, 2] {
+                let frame = draw_unified(&mut terminal, &chat, &mut layout, scroll);
+                assert!(
+                    cells_with_background(&frame).is_empty(),
+                    "w={width} scroll={scroll}"
+                );
+            }
+            for resized in [width + 7, width.saturating_sub(9).max(12), width] {
+                terminal.backend_mut().resize(resized, 14);
+                terminal
+                    .resize(ratatui::layout::Rect::new(0, 0, resized, 14))
+                    .unwrap();
+                let frame = draw_unified(&mut terminal, &chat, &mut layout, usize::MAX);
+                assert!(
+                    cells_with_background(&frame).is_empty(),
+                    "w={width} resized={resized}"
+                );
+            }
+        }
     }
 
     /// A three-column table of CJK cells and a long inline code span,
