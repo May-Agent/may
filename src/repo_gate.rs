@@ -485,7 +485,11 @@ mod tests {
         }
 
         async fn run(&self, asker: &Scripted) -> Verdict {
-            let host = HostGit::from_file("/dev/null");
+            // The user's git configuration: the work-in-progress commit needs
+            // an author.
+            let config = self.root().join("gitconfig");
+            std::fs::write(&config, "[user]\n\tname = t\n\temail = t@t\n").unwrap();
+            let host = HostGit::from_file(config);
             let staging = self.root().join("staging");
             let remote = self.origin.to_str().unwrap().to_string();
             RepoGate {
