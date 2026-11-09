@@ -9,6 +9,7 @@ use anyhow::{Context, anyhow};
 #[cfg(feature = "ui")]
 use skyzen::EmbeddedStaticDir;
 use skyzen::Result as SkyResult;
+use skyzen::middleware::CompressionMiddleware;
 use skyzen::routing::{CreateRouteNode, Route, Router};
 use skyzen::utils::{Json, State};
 
@@ -177,6 +178,8 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
     let (title_generation_queue, title_generation_rx) =
         crate::daemon::state::TitleGenerationQueue::new();
     let ui_event_bus = crate::ui_event_bus::UiEventBus::new();
+    let (session_change_tx, session_change_rx) = async_channel::unbounded();
+    ui_event_bus.set_session_changes(session_change_tx.clone());
     // Request handlers acquire runs from outside the tokio runtime, so the
     // lease tasks are spawned on its handle.
     let lease_handle = tokio::runtime::Handle::current();
@@ -239,6 +242,9 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
         .redeliver_pending()
         .await
         .map_err(|e| anyhow!(e.to_string()))?;
+    let job_server = crate::jobserver::JobServer::start(&may_dir, config.sandbox.job_pool_size())
+        .await
+        .context("failed to create the jobserver pool")?;
     // Prompts that task runs store for their sessions; dispatched once the
     // daemon state exists.
     let (task_wake_tx, task_wake_rx) = async_channel::unbounded::<String>();
@@ -254,6 +260,7 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
     .with_network_policy(&config.preferences.network_policy)
     .map_err(|error| anyhow!(error))?
     .with_connectivity(connectivity.clone())
+    .with_job_server(job_server.clone())
     .with_session_prompts(crate::task_wake::SessionPrompts::new(
         runtime_service.clone(),
         task_wake_tx,
@@ -265,6 +272,7 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
     let container_prepare = super::state::ContainerPrepareTracker::new(ui_event_bus.clone());
     let (search_index_wake_tx, search_index_wake) = async_channel::bounded(1);
 
+    let live_limits = crate::agent::LiveLimits::of(&config);
     let config = Arc::new(arc_swap::ArcSwap::from_pointee(config));
     let acp_host = Arc::new(crate::agent::acp_subagent::AcpHosts::new(
         config.clone(),
@@ -285,6 +293,7 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
         tool_dispatchers,
         fetched_models_cache: super::state::RefreshableCache::new(Duration::from_secs(20)),
         config: config.clone(),
+        live_limits,
         ui_event_bus: ui_event_bus.clone(),
         container_prepare,
         container_manager,
@@ -307,6 +316,7 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
         task_runtime: task_runtime.clone(),
         tool_distribution,
         tool_environments: crate::agent::ToolEnvironmentCache::spawn(),
+        job_server,
         repo_search: crate::repo_search::RepoSearch::global(&may_dir),
         may_dir,
         search_index_wake_tx,
@@ -318,12 +328,23 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
             .context("failed to identify the running build")?,
         turn_hub: Arc::new(super::chat::TurnHub::default()),
         parked_agents: super::chat::ParkedAgents::default(),
+        agent_forks: crate::agent_link::ForkHosts::default(),
         aux_tasks: super::chat::AuxTasks::default(),
         recap_schedules: super::chat::RecapSchedules::default(),
         session_background: super::chat::SessionBackgrounds::default(),
         tunnels: Arc::new(super::tunnel::TunnelRegistry::new()),
         connectivity,
+        session_events_epoch: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| {
+                u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+            }),
+        session_change_tx,
+        session_change_rx,
+        session_publisher_once: std::sync::Once::new(),
     });
+
+    state.ensure_session_publisher();
 
     super::chat::resume_pending_follow_up_runs(state.clone())
         .await
@@ -336,6 +357,7 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
     }
     super::chat::spawn_shared_tool_dispatchers(state.clone(), tool_queues);
     super::title_generation::spawn_worker(state.clone(), title_generation_rx);
+    super::user_wait::spawn_notifier(&state);
     super::chat::spawn_background_watcher(state.clone(), state.ui_event_bus.clone());
     super::chat::spawn_task_wake_dispatcher(state.clone(), task_wake_rx);
     let scheduler = crate::scheduler::TaskScheduler::new(task_runtime);
@@ -382,33 +404,28 @@ fn api_routes() -> Route {
         browser_offer, browser_resize_viewport, browser_start, browser_status, browser_stop,
         browser_takeover_start, browser_takeover_stop,
     };
-    use super::chat::{enqueue_chat, remove_pending_message, send_message, stop_session_run};
+
     use super::config::{
         add_mcp_server, add_ssh_server, copilot_logout, copilot_start, copilot_status,
         copilot_stream, delete_skill, get_memory, get_ui_config, install_skill, list_mcp_servers,
         list_skills, reconnect_mcp_server, remove_mcp_server, remove_ssh_server, save_full_config,
-        save_memory, set_last_model,
+        save_memory, set_job_pool, set_last_model,
     };
     use super::events::stream_events;
-    use super::interaction::{
-        respond_ask_user_request, respond_permission_request, respond_workspace_request,
-    };
     use super::notifications::{
-        consume_notification_callback, get_vapid_key, list_network_access_logs,
-        list_notification_mailbox, send_notification, subscribe, test_notification, unsubscribe,
+        get_vapid_key, list_network_access_logs, list_notification_mailbox, subscribe,
+        test_notification, unsubscribe,
     };
     use super::profiles::{
-        archive_session, create_folder, create_profile, delete_folder, delete_profile,
-        get_profile_remote_servers, get_profile_sessions, list_profiles, move_to_folder,
-        pin_session, set_profile_remote_servers, unarchive_session, unpin_session, update_folder,
+        create_folder, create_profile, delete_folder, delete_profile, get_profile_remote_servers,
+        get_profile_sessions, list_profiles, set_profile_remote_servers, update_folder,
         update_profile,
     };
     use super::remote_access::{get_remote_access_status, start_remote_access, stop_remote_access};
     use super::sessions::{
         append_session_history, create_session, delete_all_sessions, delete_session, get_session,
-        get_session_context_debug, get_session_history, get_session_prs, get_session_tasks,
-        list_sessions, lookup_issues, rewind_session, save_session_tasks, set_session_plan_state,
-        set_session_yolo, update_session,
+        get_session_context_debug, get_session_prs, get_session_queue, get_session_tasks,
+        list_sessions, lookup_issues, patch_session, remove_queue_entry, save_session_tasks,
     };
     use super::sleep::{end_sleep, get_sleep, start_sleep};
     use super::tasks::{
@@ -436,11 +453,18 @@ fn api_routes() -> Route {
                 "/{id}".route(Route::new((
                     Route::new((
                         "".at(get_session),
-                        "".put(update_session),
+                        "".patch(patch_session),
                         "".delete(delete_session),
-                        "/history".at(get_session_history),
+                        "/events".at(super::session_events::stream_session_events),
                         "/history".post(append_session_history),
-                        "/rewind".post(rewind_session),
+                        "/attachments".post(super::attachments::post_attachment),
+                        "/files/{*path}".at(super::attachments::get_session_file),
+                        "/transcript".at(super::transcript::get_transcript),
+                        "/queue".at(get_session_queue),
+                        "/queue/{entryId}".delete(remove_queue_entry),
+                        "/turns".post(super::chat::post_turn),
+                        "/turns/current".delete(super::chat::delete_current_turn),
+                        "/actions/{name}".post(super::chat::post_session_action),
                         "/issues/lookup".post(lookup_issues),
                     )),
                     Route::new((
@@ -448,13 +472,7 @@ fn api_routes() -> Route {
                         "/prs".at(get_session_prs),
                         "/repo-clones".at(super::sessions::get_session_repo_clones),
                         "/tasks".put(save_session_tasks),
-                        "/tasks/plan-state".put(set_session_plan_state),
-                        "/yolo".put(set_session_yolo),
-                        "/stop".post(stop_session_run),
-                        "/runtime".route(Route::new((
-                            "".at(get_session_runtime),
-                            "/pending".delete(remove_pending_message),
-                        ))),
+                        "/runtime".at(get_session_runtime),
                         "/context-debug".at(get_session_context_debug),
                         "/artifacts".at(list_session_artifacts),
                         "/artifacts/preview".at(get_artifact_preview),
@@ -472,19 +490,13 @@ fn api_routes() -> Route {
                         "/takeover/stop".post(super::computer::computer_takeover_stop),
                     ))),)),
                     Route::new((
-                        "/messages".post(send_message),
-                        "/bash".post(super::chat::run_bash),
-                        "/compact".post(super::chat::compact_session),
-                        "/recap".post(super::chat::recap_session),
                         "/context-report".at(super::chat::context_report),
                         "/usage".at(super::chat::usage_report),
-                        "/context-dump".post(super::chat::context_dump),
-                        "/btw".post(super::chat::btw),
-                        "/progress".post(super::chat::progress),
                         "/agent".delete(super::chat::release_agent),
                     )),
                     Route::new((
                         "/background".at(super::chat::get_background),
+                        "/issues".at(super::session_events::get_session_issues),
                         "/jobs/read".at(super::chat::read_job),
                         "/jobs/{pid}".at(super::chat::get_job),
                         "/jobs/{pid}/kill".post(super::chat::kill_job),
@@ -494,11 +506,6 @@ fn api_routes() -> Route {
                     Route::new((
                         "/artifacts/runtime/preview".at(get_artifact_runtime_preview),
                         "/artifacts/diagnostics".post(report_artifact_diagnostics),
-                        "/pin".post(pin_session),
-                        "/unpin".post(unpin_session),
-                        "/archive".post(archive_session),
-                        "/unarchive".post(unarchive_session),
-                        "/move-to-folder".post(move_to_folder),
                     )),
                 ))),
             ))),
@@ -518,14 +525,14 @@ fn api_routes() -> Route {
                 "/{id}".put(update_folder),
                 "/{id}".delete(delete_folder),
             ))),
-            "/chat".route(Route::new(("/enqueue".post(enqueue_chat),))),
-            "/permissions".route(Route::new(("/respond".post(respond_permission_request),))),
-            "/workspace".route(Route::new(("/respond".post(respond_workspace_request),))),
-            "/ask-user".route(Route::new(("/respond".post(respond_ask_user_request),))),
+            "/interactions".route(Route::new((
+                "/{id}".post(super::interaction::respond_interaction),
+            ))),
             "/config".route(Route::new((
                 "".at(get_ui_config),
                 "/full".post(save_full_config),
                 "/last-model".post(set_last_model),
+                "/job-pool".put(set_job_pool),
             ))),
         )),
         Route::new((
@@ -597,9 +604,7 @@ fn api_routes() -> Route {
                 "/test".post(test_notification),
             ))),
             "/notifications".route(Route::new((
-                "".post(send_notification),
                 "/mailbox".at(list_notification_mailbox),
-                "/{id}/callback".post(consume_notification_callback),
                 "/network-access".at(list_network_access_logs),
             ))),
         )),
@@ -641,7 +646,9 @@ pub(super) fn build_router(
     mode: DaemonMode,
     auth: Option<Vec<Box<dyn super::auth::IdentitySource>>>,
 ) -> Router {
-    let api = "/api".route(api_routes());
+    let api = "/api"
+        .route(api_routes())
+        .with(CompressionMiddleware::new());
     let tunnel = tunnel_routes();
     let artifact_pages = "/profile".route(artifact_page_routes());
     let fallback = super::tunnel::TunnelRefererFallback::new(state.clone());

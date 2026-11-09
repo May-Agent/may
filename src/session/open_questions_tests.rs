@@ -20,7 +20,7 @@ use crate::agent::ask_user_tool::{
 };
 use crate::db::ChatDb;
 use crate::ui_event_bus::UiEventBus;
-use aither_agent::TaskBlockerResolver;
+use aither_agent::BlockerResolver;
 
 /// Upper bound on any single wait in this module.
 const WAIT_BOUND: Duration = Duration::from_secs(20);
@@ -158,11 +158,44 @@ async fn blocker_marks_hold_only_while_their_question_is_open() {
         .await
         .expect("the open question is withdrawn");
 
-    assert!(resolver.is_open(&open).await);
-    assert!(!resolver.is_open(&answered).await);
-    assert!(!resolver.is_open(&withdrawn).await);
-    assert!(resolver.is_open("waiting on the user").await);
-    assert!(resolver.is_open("never-issued-words").await);
+    assert_eq!(resolver.is_open(&open).await, Ok(true));
+    assert_eq!(resolver.is_open(&answered).await, Ok(false));
+    assert_eq!(resolver.is_open(&withdrawn).await, Ok(false));
+    assert_eq!(resolver.is_open("waiting on the user").await, Ok(true));
+    assert_eq!(resolver.is_open("never-issued-words").await, Ok(true));
+}
+
+/// An answer to a question the agent asked reaches the session's `tasks.md`
+/// inbox, whichever agent build takes it.
+#[tokio::test]
+async fn an_answer_is_recorded_on_the_session_tasks_inbox() {
+    let fixture = Fixture::new().await;
+    let service = fixture.service().await;
+    let asked = ask(&service, which_database()).await;
+    service
+        .answer_ask_user(&asked, &[selected("", "SQLite")])
+        .await
+        .expect("the answer commits");
+
+    let sandbox = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        sandbox.path().join("tasks.md"),
+        format!("## Doing\n- pick a db BLOCKING {asked}\n"),
+    )
+    .expect("tasks.md");
+    let mut tasks =
+        crate::tasks_md::schema::working_document(sandbox.path(), service.task_events("session"));
+    aither_agent::ContextSource::on_request(&mut tasks, false).await;
+    let alert = aither_agent::ContextSource::on_tool_turn_end(&mut tasks)
+        .await
+        .expect("the row waiting on it is told");
+    assert!(
+        alert
+            .content()
+            .contains(&format!("Question {asked} was answered")),
+        "{}",
+        alert.content()
+    );
 }
 
 /// `ask_user` persists the question and returns its request id with the

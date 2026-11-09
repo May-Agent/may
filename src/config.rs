@@ -100,6 +100,9 @@ pub enum ConfigError {
     /// Invalid browser config.
     #[error("invalid browser config: {0}")]
     InvalidBrowserConfig(String),
+    /// Invalid `[ci]` config.
+    #[error("invalid ci config: {0}")]
+    InvalidCiConfig(String),
     /// A provider instance already exists under the ID with a different type.
     #[error(
         "provider `{id}` is configured as {actual:?}, not {expected:?}; refusing to overwrite it"
@@ -811,7 +814,7 @@ pub fn check_acp_agent_name(name: &str) -> Result<(), ConfigError> {
         Err(_) => return reject("a name holds only ASCII letters, digits, `-` and `_`"),
         Ok(()) => {}
     }
-    if aither_agent::BUNDLED_SUBAGENTS
+    if crate::bundle::Bundle::subagent_definitions()
         .iter()
         .any(|bundled| bundled.name == name)
     {
@@ -1212,6 +1215,20 @@ pub struct SandboxConfig {
     /// Priority commands run at.
     #[serde(default)]
     pub command_priority: CommandPriority,
+    /// Jobserver tokens shared by every terminal on the machine; unset uses
+    /// the host's available parallelism. A change applies to the running
+    /// daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_pool_size: Option<std::num::NonZeroUsize>,
+}
+
+impl SandboxConfig {
+    /// The size of the machine-wide jobserver pool.
+    #[must_use]
+    pub fn job_pool_size(&self) -> std::num::NonZeroUsize {
+        self.job_pool_size
+            .unwrap_or_else(crate::jobserver::default_pool_size)
+    }
 }
 
 /// May agent configuration.
@@ -1262,6 +1279,9 @@ pub struct MayConfig {
     /// Recap settings.
     #[serde(default)]
     pub recap: RecapConfig,
+    /// CI duration thresholds.
+    #[serde(default)]
+    pub ci: CiConfig,
     /// Session list settings.
     #[serde(default)]
     pub sessions: SessionsConfig,
@@ -1277,6 +1297,12 @@ pub struct MayConfig {
     /// When host memory pressure and machine load count as high.
     #[serde(default)]
     pub host_load: HostLoadSettings,
+    /// When free disk space counts as low.
+    #[serde(default)]
+    pub disk: DiskSettings,
+    /// How long an agent's `tasks.md` may grow.
+    #[serde(default)]
+    pub tasks: TasksSettings,
     /// How long `/connect` waits on a candidate ACP agent.
     #[serde(default)]
     pub acp: AcpSettings,
@@ -1396,6 +1422,49 @@ impl Default for RecapConfig {
     }
 }
 
+/// `[ci]` section: when a CI job counts as abnormally long. Read when a PR's
+/// checks finish, so a change applies to the next run without a restart.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct CiConfig {
+    /// Minutes after which any job is abnormally long: the point where a
+    /// waiting agent's prompt cache goes cold.
+    pub max_job_minutes: u64,
+    /// A job is abnormally long when it runs past this multiple of its
+    /// baseline, the median of its last successful runs on the base branch.
+    pub baseline_multiple: f64,
+}
+
+impl CiConfig {
+    /// Check both thresholds can be exceeded.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError::InvalidCiConfig`] when the limit is zero or the
+    /// multiple is not a finite number above 1.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.max_job_minutes == 0 {
+            return Err(ConfigError::InvalidCiConfig(
+                "ci.max_job_minutes must be above 0".to_string(),
+            ));
+        }
+        if !self.baseline_multiple.is_finite() || self.baseline_multiple <= 1.0 {
+            return Err(ConfigError::InvalidCiConfig(
+                "ci.baseline_multiple must be a number above 1".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for CiConfig {
+    fn default() -> Self {
+        Self {
+            max_job_minutes: 40,
+            baseline_multiple: 2.0,
+        }
+    }
+}
+
 /// `[sessions]` section: which sessions the session lists show.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -1463,37 +1532,38 @@ impl LanguageConfig {
 
 /// `[context]` section: when a session's conversation is compacted.
 ///
-/// The auto-compact point is `min(window * compact_at, compact_ceiling)`
+/// The pause point is `min(window - handoff_reserve, compact_ceiling)`
 /// tokens; the distances are token counts before it. aither applies them, and
 /// a change reaches running sessions at their next turn.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct ContextConfig {
-    /// Fraction of the model window at which the conversation is compacted.
-    pub compact_at: f32,
+    /// Tokens kept free below the window for the compaction request and the
+    /// handoff the model writes; it does not grow with the window.
+    pub handoff_reserve: usize,
     /// Most tokens the conversation may hold before it is compacted,
     /// whatever the window.
     pub compact_ceiling: usize,
-    /// Tokens before the auto-compact point at which compaction starts in
-    /// the background while the run keeps streaming.
+    /// Tokens before the pause point at which compaction starts in the
+    /// background while the run keeps streaming.
     pub start_distance: usize,
-    /// Tokens before the auto-compact point at which the agent pauses to
-    /// finish compaction.
-    pub safe_buffer: usize,
-    /// Tokens before the auto-compact point at which the agent is told once
-    /// to save its work and call `compact` itself.
+    /// Tokens before the pause point at which the agent is told once to save
+    /// its work and call `compact` itself.
     pub warn_distance: usize,
+    /// Tokens before the warn point from which a model that counts through a
+    /// provider endpoint is asked for an exact count.
+    pub count_distance: usize,
 }
 
 impl Default for ContextConfig {
     fn default() -> Self {
         let policy = aither_agent::ContextPolicy::default();
         Self {
-            compact_at: policy.compact_at,
+            handoff_reserve: policy.handoff_reserve,
             compact_ceiling: policy.compact_ceiling,
             start_distance: policy.start_distance,
-            safe_buffer: policy.safe_buffer,
             warn_distance: policy.warn_distance,
+            count_distance: policy.count_distance,
         }
     }
 }
@@ -1504,11 +1574,11 @@ impl ContextConfig {
     #[must_use]
     pub fn policy(&self) -> aither_agent::ContextPolicy {
         aither_agent::ContextPolicy {
-            compact_at: self.compact_at,
+            handoff_reserve: self.handoff_reserve,
             compact_ceiling: self.compact_ceiling,
             start_distance: self.start_distance,
-            safe_buffer: self.safe_buffer,
             warn_distance: self.warn_distance,
+            count_distance: self.count_distance,
             ..aither_agent::ContextPolicy::default()
         }
     }
@@ -1589,18 +1659,6 @@ impl fmt::Display for TimeZoneName {
     }
 }
 
-/// Memory pressure at which the host counts as pressed.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum MemoryPressureThreshold {
-    /// The host is reclaiming memory (`kern.memorystatus_vm_pressure_level`
-    /// warn on macOS).
-    #[default]
-    Warning,
-    /// The host is thrashing.
-    Critical,
-}
-
 /// `[acp]` section: the bounds `/connect` puts on a candidate ACP agent.
 /// Durations are written as `"30s"`, `"1m"`. A change applies to the next
 /// `/connect`.
@@ -1623,15 +1681,16 @@ impl Default for AcpSettings {
 }
 
 /// `[host_load]` section: when the session agent is told the host is under
-/// memory pressure or high load, and how long the terminal's foreground
-/// window grows meanwhile. Durations are written as `"30s"`, `"1m"`.
+/// high load.
+///
+/// The terminal's foreground window grows meanwhile. Memory pressure is not
+/// configured here: aither's memory guard warns on the platform's own
+/// pressure levels. Durations are written as `"30s"`, `"1m"`.
 ///
 /// A change reaches a running session at its next turn.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct HostLoadSettings {
-    /// Memory pressure at or above which the host counts as pressed.
-    pub memory_threshold: MemoryPressureThreshold,
     /// Machine load at or above which the host counts as loaded: on macOS
     /// the load average per core, on Linux the share of the last ten
     /// seconds runnable tasks waited for a CPU.
@@ -1654,7 +1713,6 @@ impl Default for HostLoadSettings {
     fn default() -> Self {
         let defaults = aither_agent::HostLoadConfig::new();
         Self {
-            memory_threshold: MemoryPressureThreshold::Warning,
             load_threshold: defaults.load_threshold.0,
             start_after: defaults.start_after,
             end_after: defaults.end_after,
@@ -1669,15 +1727,58 @@ impl HostLoadSettings {
     #[must_use]
     pub const fn monitor_config(&self) -> aither_agent::HostLoadConfig {
         aither_agent::HostLoadConfig::new()
-            .memory_threshold(match self.memory_threshold {
-                MemoryPressureThreshold::Warning => aither_agent::MemoryPressure::Warning,
-                MemoryPressureThreshold::Critical => aither_agent::MemoryPressure::Critical,
-            })
             .load_threshold(aither_agent::MachineLoad(self.load_threshold))
             .start_after(self.start_after)
             .end_after(self.end_after)
             .poll_interval(self.poll_interval)
             .high_load_foreground_wait(self.high_load_foreground_wait)
+    }
+}
+
+/// `[disk]` section: how little free space the home environment's volume may
+/// have before the agent is told, in bytes.
+///
+/// The defaults are aither's: yellow below 10 GiB free, red below 5 GiB and
+/// final below 3 GiB. A change applies to running sessions at once.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct DiskSettings {
+    /// Free bytes below which the disk is at the yellow level.
+    pub yellow_free_bytes: u64,
+    /// Free bytes below which the disk is at the red level.
+    pub red_free_bytes: u64,
+    /// Free bytes below which the disk is at the final level.
+    pub final_free_bytes: u64,
+}
+
+impl DiskSettings {
+    const GIB: u64 = 1024 * 1024 * 1024;
+}
+
+impl Default for DiskSettings {
+    fn default() -> Self {
+        Self {
+            yellow_free_bytes: 10 * Self::GIB,
+            red_free_bytes: 5 * Self::GIB,
+            final_free_bytes: 3 * Self::GIB,
+        }
+    }
+}
+
+/// `[tasks]` section: the `tasks.md` every agent keeps, a subagent's in its
+/// own space. A change applies to running sessions at once.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct TasksSettings {
+    /// Lines `tasks.md` may hold before the agent is asked to rewrite it.
+    pub line_limit: usize,
+}
+
+impl Default for TasksSettings {
+    fn default() -> Self {
+        Self {
+            line_limit: crate::tasks_md::schema::DEFAULT_LINE_LIMIT,
+        }
     }
 }
 
@@ -1732,11 +1833,14 @@ impl Default for MayConfig {
             suggestions: SuggestionsConfig::default(),
             sleep: SleepConfig::default(),
             recap: RecapConfig::default(),
+            ci: CiConfig::default(),
             sessions: SessionsConfig::default(),
             language: LanguageConfig::default(),
             context: ContextConfig::default(),
             time: TimeConfig::default(),
             host_load: HostLoadSettings::default(),
+            disk: DiskSettings::default(),
+            tasks: TasksSettings::default(),
             acp: AcpSettings::default(),
             last_model: None,
             last_effort: None,
@@ -1837,6 +1941,7 @@ impl MayConfig {
     /// Returns [`ConfigError`] when any section contains an invalid value.
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.browser.validate()?;
+        self.ci.validate()?;
         for (id, instance) in &self.provider {
             instance.validate(id)?;
         }
@@ -2301,6 +2406,27 @@ mod tests {
             toml::from_str::<MayConfig>(&document).is_err(),
             "an unknown priority must be rejected"
         );
+    }
+
+    #[test]
+    fn job_pool_size_defaults_to_available_parallelism_and_roundtrips() {
+        let config: MayConfig = toml::from_str("").expect("a config without sandbox parses");
+        assert_eq!(config.sandbox.job_pool_size, None);
+        assert_eq!(
+            config.sandbox.job_pool_size(),
+            std::thread::available_parallelism().expect("host reports its parallelism")
+        );
+
+        let config: MayConfig =
+            toml::from_str("[sandbox]\njob_pool_size = 6\n").expect("size parses");
+        assert_eq!(config.sandbox.job_pool_size().get(), 6);
+        let saved = toml::to_string(&config).expect("config serializes");
+        let reloaded: MayConfig = toml::from_str(&saved).expect("saved config parses");
+        assert_eq!(reloaded.sandbox.job_pool_size().get(), 6);
+
+        let unset = toml::to_string(&MayConfig::default()).expect("config serializes");
+        assert!(!unset.contains("job_pool_size"));
+        assert!(toml::from_str::<MayConfig>("[sandbox]\njob_pool_size = 0\n").is_err());
     }
 
     #[test]

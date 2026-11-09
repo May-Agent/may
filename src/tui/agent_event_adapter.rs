@@ -102,18 +102,6 @@ pub enum ToolEndKind {
 /// Name of the native `compact` tool.
 pub const COMPACT_TOOL: &str = "compact";
 
-/// Prefix of the `compact` tool's result when it started a compaction; any
-/// other result is the reason the call was refused.
-const COMPACTION_STARTED: &str = "Compaction started";
-
-/// The reason a `compact` call was refused, or `None` when it started a
-/// compaction.
-#[must_use]
-pub fn compaction_refusal(result_text: &str) -> Option<String> {
-    let text = result_text.trim();
-    (!text.starts_with(COMPACTION_STARTED)).then(|| text.to_string())
-}
-
 /// Parse tool-call start payload into a minimal start event.
 ///
 /// # Panics

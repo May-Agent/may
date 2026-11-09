@@ -348,6 +348,17 @@ pub enum AcpError {
         /// The subagent type.
         agent: String,
     },
+    /// The run's space holds several working copies, and the agent works in
+    /// exactly one directory.
+    #[error(
+        "the ACP agent `{agent}` works in one directory, but its space holds {count} working copies"
+    )]
+    WorkingCopies {
+        /// The subagent type.
+        agent: String,
+        /// How many working copies the space holds.
+        count: usize,
+    },
     /// The session this agent would run for was deleted.
     #[error("the session was deleted, so the ACP agent `{agent}` cannot start for it")]
     SessionDeleted {
@@ -423,6 +434,18 @@ impl ExternalSubagent for AcpSubagent {
                 agent: self.agent.clone(),
             });
         }
+        // The agent works in the one working copy its space was prepared
+        // with, else where it was launched.
+        let working_dir = match start.working_copies {
+            [] => start.working_dir,
+            [copy] => copy.as_path(),
+            copies => {
+                return Err(AcpError::WorkingCopies {
+                    agent: self.agent.clone(),
+                    count: copies.len(),
+                });
+            }
+        };
         // Held while the agent starts, so a retiring host ends it too.
         let retired = self.lease.read_arc().await;
         if *retired {
@@ -430,7 +453,7 @@ impl ExternalSubagent for AcpSubagent {
                 agent: self.agent.clone(),
             });
         }
-        let mut spec = SessionSpec::new(&self.agent, start.working_dir);
+        let mut spec = SessionSpec::new(&self.agent, working_dir);
         spec.model.clone_from(&self.model);
         spec.mode.clone_from(&self.mode);
         spec.permission = Some(PermissionPolicy::Deny);
@@ -1182,6 +1205,7 @@ mod tests {
             working_dir: &work,
             worktrees: &[],
             commit_worktrees: &[],
+            working_copies: &[],
         };
         let open = || async {
             tokio::time::timeout(
@@ -1240,9 +1264,7 @@ mod tests {
             BTreeMap::from([("fake".to_string(), fake_connection())]),
         );
         let tool = acp
-            .register(
-                SubagentTool::new(NoLlm, dir.path().join("subagents")).with_base_dir(dir.path()),
-            )
+            .register(SubagentTool::new(NoLlm).with_base_dir(dir.path()))
             .expect("the name is free");
         assert!(
             tool.usage().await.contains("- fake: a scripted ACP agent"),
@@ -1266,9 +1288,11 @@ mod tests {
         assert!(text.contains("ab"), "the agent's reply comes back: {text}");
 
         let id = text
-            .split(|c: char| !c.is_ascii_digit())
-            .find_map(|word| word.parse::<u64>().ok())
-            .expect("the result carries the continuation id");
+            .split_once("--id ")
+            .and_then(|(_, rest)| rest.split(|c: char| !c.is_ascii_lowercase()).next())
+            .filter(|word| !word.is_empty())
+            .expect("the result carries the continuation id")
+            .to_string();
         let again = tokio::time::timeout(
             Duration::from_secs(60),
             call_text(
@@ -1276,7 +1300,7 @@ mod tests {
                 SubagentArgs {
                     name: "resume".to_string(),
                     prompt_file: prompt.to_string_lossy().into_owned(),
-                    id: Some(id),
+                    id: Some(id.clone()),
                     agent: None,
                     worktrees: Vec::new(),
                     commit_worktrees: Vec::new(),
@@ -1309,6 +1333,7 @@ mod tests {
                     working_dir: dir.path(),
                     worktrees,
                     commit_worktrees,
+                    working_copies: &[],
                 },
             )
             .await
@@ -1328,7 +1353,7 @@ mod tests {
             BTreeMap::from([("explore".to_string(), fake_connection())]),
         );
         let error = acp
-            .register(SubagentTool::new(NoLlm, dir.path().join("subagents")))
+            .register(SubagentTool::new(NoLlm))
             .map(|_| ())
             .expect_err("the built-in type keeps its name");
         assert!(error.to_string().contains("built-in"), "{error}");

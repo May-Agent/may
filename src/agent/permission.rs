@@ -10,7 +10,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use aither_sandbox::{
-    TerminalMode,
+    ScriptLanguage, TerminalMode,
     permission::{PermissionError, PermissionHandler},
 };
 
@@ -459,6 +459,10 @@ impl PermissionApprover {
             let db = runtime_service.db();
             Self::append_request_history(&db, &session_id, &request_id, history, &payload.script)
                 .await?;
+            runtime_service.announce_user_wait(crate::session::UserWait {
+                session_id: session_id.clone(),
+                ask: crate::session::UserAsk::permission(mode, &payload.script),
+            });
         }
 
         if let Ok(decision) = tokio::time::timeout(self.timeout, rx.recv()).await {
@@ -536,7 +540,12 @@ impl Default for PermissionApprover {
 }
 
 impl PermissionHandler for PermissionApprover {
-    async fn check(&self, mode: TerminalMode, script: &str) -> Result<bool, PermissionError> {
+    async fn check(
+        &self,
+        mode: TerminalMode,
+        script: &str,
+        _language: ScriptLanguage,
+    ) -> Result<bool, PermissionError> {
         match mode {
             TerminalMode::Sandboxed => Ok(true),
             TerminalMode::Unsafe => {
@@ -557,7 +566,12 @@ impl PermissionHandler for PermissionApprover {
         std::future::ready(true)
     }
 
-    async fn will_wait_for_approval(&self, mode: TerminalMode, _script: &str) -> bool {
+    async fn will_wait_for_approval(
+        &self,
+        mode: TerminalMode,
+        _script: &str,
+        _language: ScriptLanguage,
+    ) -> bool {
         !matches!(self.approval_mode, ApprovalMode::Unavailable { .. })
             && matches!(mode, TerminalMode::Unsafe)
             && !self.yolo().await.unwrap_or_else(|error| {

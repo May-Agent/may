@@ -71,7 +71,6 @@ const SUBSCRIBED_TOPICS = [
   'browser_status',
   'browser_lifecycle',
   'profile_sessions',
-  'session_runtime',
   'session_runtimes',
   'remote_access',
   'sleep',
@@ -208,18 +207,6 @@ export const useRuntimeStore = create<RuntimeState>((set, get) => ({
               const profileSessions = evt.payload.profileSessions;
               set({ profileSessions });
               refreshChangedActiveSession(profileSessions);
-              break;
-            }
-            case 'session_runtime': {
-              const { sessionId, runtime } = evt.payload;
-              set((prev) => {
-                const runtimes = { ...prev.runtimes, [sessionId]: runtime };
-                return {
-                  runtimes,
-                  profileSessions: updateProfileSessionRuntimes(prev.profileSessions, runtimes),
-                };
-              });
-              useSessionsStore.getState().updateRuntime(sessionId, runtime);
               break;
             }
             case 'session_runtimes': {

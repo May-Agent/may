@@ -1,5 +1,4 @@
 use aither_core::llm::model::ReasoningEffort;
-use base64::Engine;
 use executor_core::spawn;
 
 use crate::agent::{AgentHandle, AgentWorker};
@@ -205,25 +204,39 @@ fn answers_json(answers: &[QuestionAnswer]) -> serde_json::Value {
     )
 }
 
-fn persisted_attachment_from_tui(
+async fn persisted_attachment_from_tui(
+    client: &crate::client::DaemonClient,
+    session_id: &str,
     attachment: &Attachment,
 ) -> Result<crate::session::PersistedAttachment, TuiRuntimeError> {
     let id = crate::id::new();
     match attachment {
-        Attachment::Image { path, data } => Ok(crate::session::PersistedAttachment {
-            id,
-            name: file_name_or_default(path, "image.png"),
-            attachment_type: AttachmentKind::Image,
-            url: file_url(path)?,
-            upload_data_url: Some(image_data_url(path, data)),
-            text_content: None,
-        }),
+        Attachment::Image { path, data } => {
+            let name = file_name_or_default(path, "image.png");
+            let mime = mime_guess::from_path(path).first_or_octet_stream();
+            let record: crate::session::PersistedAttachment = client
+                .post_raw(
+                    &format!(
+                        "/api/sessions/{session_id}/attachments?name={}",
+                        urlencoding(&name)
+                    ),
+                    data.clone(),
+                    mime.as_ref(),
+                )
+                .await?;
+            Ok(crate::session::PersistedAttachment {
+                id,
+                name,
+                attachment_type: AttachmentKind::Image,
+                url: record.url,
+                text_content: None,
+            })
+        }
         Attachment::FileReference { path } => Ok(crate::session::PersistedAttachment {
             id,
             name: file_name_or_default(path, "file"),
             attachment_type: AttachmentKind::File,
             url: file_url(path)?,
-            upload_data_url: None,
             text_content: None,
         }),
         Attachment::PastedText {
@@ -241,26 +254,35 @@ fn persisted_attachment_from_tui(
                 .map(|path| file_url(path))
                 .transpose()?
                 .unwrap_or_else(|| "may://inline-text".to_string()),
-            upload_data_url: None,
             text_content: Some(content.clone()),
         }),
     }
 }
 
 pub(super) async fn tui_attachment_from_persisted(
+    client: Option<&crate::client::DaemonClient>,
     attachment: crate::session::PersistedAttachment,
 ) -> Result<Attachment, TuiRuntimeError> {
     match attachment.attachment_type {
         AttachmentKind::Image => {
-            let path = path_from_attachment_url(&attachment.url)?;
-            let data = if async_fs::metadata(&path).await.is_ok() {
-                async_fs::read(&path).await?
-            } else if let Some(data_url) = attachment.upload_data_url.as_deref() {
-                decode_data_url(data_url)?
-            } else {
-                return Err(TuiRuntimeError::PersistedImageMissingContent);
+            let display_path = path_from_attachment_url(&attachment.url)
+                .unwrap_or_else(|_| std::path::PathBuf::from(&attachment.name));
+            let data = match path_from_attachment_url(&attachment.url) {
+                Ok(path) if async_fs::metadata(&path).await.is_ok() => {
+                    async_fs::read(&path).await?
+                }
+                _ if attachment.url.starts_with("/api/sessions/") => {
+                    client
+                        .ok_or(TuiRuntimeError::PersistedImageMissingContent)?
+                        .get_bytes(&attachment.url)
+                        .await?
+                }
+                _ => return Err(TuiRuntimeError::PersistedImageMissingContent),
             };
-            Ok(Attachment::Image { path, data })
+            Ok(Attachment::Image {
+                path: display_path,
+                data,
+            })
         }
         AttachmentKind::File => Ok(Attachment::FileReference {
             path: path_from_attachment_url(&attachment.url)?,
@@ -308,23 +330,17 @@ fn file_name_or_default(path: &std::path::Path, default_name: &str) -> String {
         .map_or_else(|| default_name.to_string(), ToOwned::to_owned)
 }
 
-fn image_data_url(path: &std::path::Path, data: &[u8]) -> String {
-    let mime = mime_guess::from_path(path).first_or_octet_stream();
-    let encoded = base64::engine::general_purpose::STANDARD.encode(data);
-    let mut url = String::from("data:");
-    url.push_str(mime.as_ref());
-    url.push_str(";base64,");
-    url.push_str(encoded.as_str());
-    url
-}
-
-fn decode_data_url(data_url: &str) -> Result<Vec<u8>, TuiRuntimeError> {
-    let Some((_, encoded)) = data_url.split_once(',') else {
-        return Err(TuiRuntimeError::InvalidDataUrl);
-    };
-    base64::engine::general_purpose::STANDARD
-        .decode(encoded)
-        .map_err(TuiRuntimeError::DecodeDataUrl)
+fn urlencoding(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for b in name.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
 }
 
 /// Result of starting the next queued turn.
@@ -462,8 +478,7 @@ impl RuntimeDeps {
             (session.id.clone(), session.history.messages().to_vec())
         };
 
-        app.init_session(&session_id, &messages, model.as_deref())
-            .await;
+        app.init_session(&session_id, &messages).await;
         *worker = None;
 
         let selected_model = SelectedModel::resolve(&app.config, model.as_deref())?;
@@ -508,6 +523,7 @@ impl RuntimeDeps {
             session_id,
             selected_model,
             reasoning_effort,
+            None,
         )
         .map(Some)
     }
@@ -531,14 +547,21 @@ impl RuntimeDeps {
         let sandbox_dir = session.sandbox_dir.clone();
         let session_id = session.id.clone();
         let session_model = session.model.clone();
+        let events_cursor = session.events_cursor.clone();
         let messages: Vec<_> = session.history.messages().to_vec();
 
-        app.init_session(&session_id, &messages, session_model.as_deref())
-            .await;
+        app.init_session(&session_id, &messages).await;
         *worker = None;
 
         let selected_model = SelectedModel::resolve(&app.config, session_model.as_deref())?;
-        self.begin_worker_build(app, sandbox_dir, session_id, selected_model, None)
+        self.begin_worker_build(
+            app,
+            sandbox_dir,
+            session_id,
+            selected_model,
+            None,
+            events_cursor,
+        )
     }
 
     /// Import a foreign agent's global rules and skills: the daemon copies
@@ -676,8 +699,7 @@ impl RuntimeDeps {
             .current()
             .map(|session| session.history.messages().to_vec())
             .unwrap_or_default();
-        app.init_session(&session_id, &messages, model.as_deref())
-            .await;
+        app.init_session(&session_id, &messages).await;
         app.chat.push_notice(&format!(
             "Imported {imported_count} messages from {} session {}",
             source.label(),
@@ -686,7 +708,7 @@ impl RuntimeDeps {
         *worker = None;
 
         let selected_model = SelectedModel::resolve(&app.config, model.as_deref())?;
-        self.begin_worker_build(app, sandbox_dir, session_id, selected_model, None)
+        self.begin_worker_build(app, sandbox_dir, session_id, selected_model, None, None)
     }
 
     /// Starts building a worker for the current session on `model`; the
@@ -713,6 +735,7 @@ impl RuntimeDeps {
             session_id,
             SelectedModel::new(model)?,
             None,
+            None,
         )
     }
 
@@ -730,7 +753,7 @@ impl RuntimeDeps {
         let sandbox_dir = session.sandbox_dir.clone();
         let session_id = session.id.clone();
         let selected_model = SelectedModel::resolve(&app.config, session.model.as_deref())?;
-        self.begin_worker_build(app, sandbox_dir, session_id, selected_model, None)
+        self.begin_worker_build(app, sandbox_dir, session_id, selected_model, None, None)
     }
 
     /// Installs a worker finished by `build` as the current session's worker.
@@ -751,14 +774,14 @@ impl RuntimeDeps {
     ///
     /// # Errors
     /// Returns [`TuiRuntimeError`] when no session is active or the worker fails to start.
-    pub fn start_agent_task(
+    pub async fn start_agent_task(
         &self,
         app: &mut App,
         worker: &AgentWorker,
         msg: PendingMessage,
         title_gen: &mut Option<TitleGenContext>,
     ) -> Result<AgentHandle, TuiRuntimeError> {
-        let turn = Self::show_agent_turn(app, msg, title_gen)?;
+        let turn = Self::show_agent_turn(app, msg, title_gen).await?;
         Ok(worker.send(turn))
     }
 
@@ -767,7 +790,7 @@ impl RuntimeDeps {
     ///
     /// # Errors
     /// Returns [`TuiRuntimeError`] when an attachment cannot be persisted.
-    pub fn show_agent_turn(
+    pub async fn show_agent_turn(
         app: &mut App,
         msg: PendingMessage,
         title_gen: &mut Option<TitleGenContext>,
@@ -783,21 +806,27 @@ impl RuntimeDeps {
             });
         }
 
-        Self::display_remote_turn(app, msg)
+        Self::display_remote_turn(app, msg).await
     }
 
     /// Shows `msg` and builds the turn the daemon will run. The daemon writes
     /// the turn's rows; the in-memory history records the message now so the
     /// chat's history positions stay aligned until the turn's end reloads them.
-    fn display_remote_turn(
+    async fn display_remote_turn(
         app: &mut App,
         msg: PendingMessage,
     ) -> Result<crate::agent::RemoteTurn, TuiRuntimeError> {
-        let attachments = msg
-            .attachments
-            .iter()
-            .map(persisted_attachment_from_tui)
-            .collect::<Result<Vec<_>, _>>()?;
+        let client = app.session_manager.daemon_handle()?;
+        let session_id = app
+            .session_manager
+            .current()
+            .map(|session| session.id.as_str().to_string())
+            .ok_or(TuiRuntimeError::NoActiveSession)?;
+        let mut attachments = Vec::with_capacity(msg.attachments.len());
+        for attachment in &msg.attachments {
+            attachments
+                .push(persisted_attachment_from_tui(&client, &session_id, attachment).await?);
+        }
         if let Some(hidden_context_xml) = msg.hidden_context_xml.as_ref() {
             app.session_manager
                 .record_unpersisted(ChatMessage::hidden_context(hidden_context_xml.to_string()));
@@ -919,18 +948,21 @@ impl RuntimeDeps {
 
         *worker = None;
         let selected_model = SelectedModel::resolve(&app.config, model.as_deref())?;
-        self.begin_worker_build(app, sandbox_dir, session_id, selected_model, None)
+        self.begin_worker_build(app, sandbox_dir, session_id, selected_model, None, None)
     }
 
     /// A worker for `session_id` whose agent runs in the daemon. The model,
     /// reasoning effort and working directory the daemon runs the session
-    /// with are recorded on the session first.
+    /// with are recorded on the session first. `events_cursor` is the
+    /// cursor `GET /api/sessions/{id}` reported when the session loaded —
+    /// the point its event stream resumes from.
     fn begin_remote_worker(
         app: &App,
         client: crate::client::DaemonClient,
         session_id: SessionId,
         model: SelectedModel,
         reasoning_effort: Option<ReasoningEffort>,
+        events_cursor: Option<String>,
     ) -> PendingWorkerBuild {
         let cwd = app.cwd.display().to_string();
         let model_id = model.as_str().to_string();
@@ -954,13 +986,14 @@ impl RuntimeDeps {
                 });
             }
             let _: serde_json::Value = client
-                .put(&format!("/api/sessions/{}", session_id.as_str()), &body)
+                .patch(&format!("/api/sessions/{}", session_id.as_str()), &body)
                 .await
                 .map_err(TuiRuntimeError::from)?;
             Ok(crate::tui::remote::spawn_remote_worker(
                 client,
                 session_id.as_str().to_string(),
                 app_events,
+                events_cursor,
             ))
         });
         PendingWorkerBuild {
@@ -977,6 +1010,7 @@ impl RuntimeDeps {
         session_id: SessionId,
         model: SelectedModel,
         reasoning_effort: Option<ReasoningEffort>,
+        events_cursor: Option<String>,
     ) -> Result<PendingWorkerBuild, TuiRuntimeError> {
         if let Some(client) = self.daemon.clone() {
             return Ok(Self::begin_remote_worker(
@@ -985,6 +1019,7 @@ impl RuntimeDeps {
                 session_id,
                 model,
                 reasoning_effort,
+                events_cursor,
             ));
         }
         Ok(Self::begin_remote_worker(
@@ -995,6 +1030,7 @@ impl RuntimeDeps {
             session_id,
             model,
             reasoning_effort,
+            events_cursor,
         ))
     }
 
@@ -1008,7 +1044,7 @@ impl RuntimeDeps {
         message: PendingMessage,
     ) -> Result<(), TuiRuntimeError> {
         // The local queue mirrors the message for display until the daemon
-        // dispatches it, and the next `session_runtime` snapshot makes it
+        // dispatches it, and the next `runtime.changed` frame makes it
         // authoritative.
         app.queue.enqueue(message.clone());
         self.post_enqueue(app, &message).await
@@ -1034,16 +1070,24 @@ impl RuntimeDeps {
             let body = serde_json::json!({
                 "sessionId": session_id.as_str(),
                 "content": message.content,
-                "attachments": message
-                    .attachments
-                    .iter()
-                    .map(persisted_attachment_from_tui)
-                    .collect::<Result<Vec<_>, _>>()?,
+                "attachments": futures_util::future::try_join_all(
+                    message
+                        .attachments
+                        .iter()
+                        .map(|attachment| {
+                            persisted_attachment_from_tui(
+                                client,
+                                session_id.as_str(),
+                                attachment,
+                            )
+                        }),
+                )
+                .await?,
                 "hiddenContextXml": message.hidden_context_xml.as_ref().map(ToString::to_string),
-                "deliveryMode": message.delivery_mode,
+                "mode": match message.delivery_mode.as_str() { "queue" => "queue", _ => "steer" },
             });
             if let Err(error) = client
-                .post::<_, serde_json::Value>("/api/chat/enqueue", &body)
+                .post::<_, serde_json::Value>(&format!("/api/sessions/{session_id}/turns"), &body)
                 .await
             {
                 app.sync_queue_from_runtime();
@@ -1080,33 +1124,6 @@ impl RuntimeDeps {
         Ok(true)
     }
 
-    /// Push-notify the user that a new open question arrived, through the
-    /// daemon's notification service. Best effort: a rejected or unroutable
-    /// notification is logged, never fatal.
-    pub async fn notify_open_question(&self, session_id: &SessionId, question: &str) {
-        let Some(client) = self.daemon() else {
-            return;
-        };
-        match client
-            .post::<_, serde_json::Value>(
-                "/api/notifications",
-                &serde_json::json!({
-                    "title": "May has a question for you",
-                    "body": question,
-                    "sessionId": session_id.as_str(),
-                }),
-            )
-            .await
-        {
-            Ok(_) => {
-                tracing::debug!("open-question notification delivered");
-            }
-            Err(error) => {
-                tracing::warn!(error = %error, "failed to send open-question notification");
-            }
-        }
-    }
-
     /// Commit the user's answers to an open question; the answer joins the
     /// session queue, which the event loop dispatches. Returns whether this
     /// call committed them: `false` when the question is no longer open.
@@ -1124,8 +1141,8 @@ impl RuntimeDeps {
             return committed_or_not_open(
                 client
                     .post::<_, serde_json::Value>(
-                        "/api/ask-user/respond",
-                        &serde_json::json!({ "id": request_id, "answers": answers_json(answers) }),
+                        &format!("/api/interactions/{request_id}"),
+                        &serde_json::json!({ "kind": "askUser", "answers": answers_json(answers) }),
                     )
                     .await,
             );
@@ -1151,8 +1168,8 @@ impl RuntimeDeps {
         let committed = committed_or_not_open(
             client
                 .post::<_, serde_json::Value>(
-                    "/api/ask-user/respond",
-                    &serde_json::json!({ "id": request_id, "answers": answers_json(answers) }),
+                    &format!("/api/interactions/{request_id}"),
+                    &serde_json::json!({ "kind": "askUser", "answers": answers_json(answers) }),
                 )
                 .await,
         )?;
@@ -1177,8 +1194,8 @@ impl RuntimeDeps {
         if let Some(client) = &self.daemon {
             let _: serde_json::Value = client
                 .post(
-                    "/api/workspace/respond",
-                    &serde_json::json!({ "id": request_id, "approved": approved }),
+                    &format!("/api/interactions/{request_id}"),
+                    &serde_json::json!({ "kind": "workspace", "approved": approved }),
                 )
                 .await?;
             return Ok(ResponseCommit::Committed);
@@ -1202,8 +1219,8 @@ impl RuntimeDeps {
         if let Some(client) = &self.daemon {
             let _: serde_json::Value = client
                 .post(
-                    "/api/permissions/respond",
-                    &serde_json::json!({ "id": request_id, "approved": approved }),
+                    &format!("/api/interactions/{request_id}"),
+                    &serde_json::json!({ "kind": "permission", "approved": approved }),
                 )
                 .await?;
             return Ok(());
@@ -1315,5 +1332,16 @@ impl SelectedModel {
 
     fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::urlencoding;
+
+    #[test]
+    fn an_upload_name_is_query_safe() {
+        assert_eq!(urlencoding("my shot.png"), "my%20shot.png");
+        assert_eq!(urlencoding("a&b=1"), "a%26b%3D1");
     }
 }

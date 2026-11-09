@@ -1,0 +1,25 @@
+May - AI coding assistant
+
+COMMANDS
+{% for command in commands -%}
+  {{ command.name }}{% if !command.args.is_empty() %} {{ command.args }}{% endif %}
+      {{ command.description }}
+{% endfor %}
+SHORTCUTS
+  Enter         Send message
+  ! command     Run a bash command in may's environment
+  Ctrl+v        Paste image
+  Ctrl+b        Show/hide the sidebar (tasks, issues,
+                subagents, jobs; terminals >= 120 cols)
+  Ctrl+c        Quit
+  Up/Down       History / Scroll chat
+  Mouse wheel   Scroll chat
+  g             Top
+  G             Bottom
+  Esc           Clear input
+
+Type a message and press Enter to chat.
+Type @ to attach files.
+Prefix a message with ! to run it as a bash command; its
+masked output is returned to the agent. Never type secrets
+in bash mode — use /secret instead.

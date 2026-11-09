@@ -33,6 +33,10 @@ pub struct TurnFrame {
     pub(crate) data: Arc<str>,
 }
 
+/// Frames kept for late subscribers, bounded so a cursor older than the
+/// buffer hits the gap path and its client resyncs.
+const MAX_KEPT_FRAMES: usize = 1024;
+
 #[derive(Debug)]
 struct SessionChannel {
     /// Kept frames, oldest first, with consecutive indices: those a late
@@ -46,6 +50,9 @@ struct SessionChannel {
     last_index: u64,
     /// Index of the first frame of the latest turn to begin; 0 before any.
     turn_start: u64,
+    /// A turn is publishing frames; set by `begin_turn`, cleared by
+    /// `end_turn`.
+    turn_open: bool,
     /// Index of the last frame each live subscription read, by its id. A
     /// closed subscription has none.
     cursors: HashMap<u64, u64>,
@@ -61,6 +68,7 @@ impl SessionChannel {
             replay_from: 1,
             last_index: 0,
             turn_start: 0,
+            turn_open: false,
             cursors: HashMap::new(),
             next_subscription: 0,
             published: Arc::new(Event::new()),
@@ -77,6 +85,7 @@ impl SessionChannel {
     /// at most this turn and the one before it; one with unread frames from
     /// before the previous turn began is closed and its frames released.
     fn begin_turn(&mut self, session_id: &str) {
+        self.turn_open = true;
         let previous_start = self.turn_start;
         self.turn_start = self.last_index + 1;
         let last_index = self.last_index;
@@ -118,6 +127,25 @@ impl SessionChannel {
         self.frames
             .front()
             .map_or(self.last_index + 1, |frame| frame.index)
+    }
+
+    /// Drops frames past [`MAX_KEPT_FRAMES`] only once every live
+    /// subscription already read them — a lagging one misses nothing — and
+    /// moves the replay start to the oldest frame left so a late
+    /// subscriber's cursor older than the buffer is a gap, not a hole.
+    fn cap(&mut self) {
+        let read = self
+            .cursors
+            .values()
+            .min()
+            .copied()
+            .unwrap_or(self.last_index);
+        while self.frames.len() > MAX_KEPT_FRAMES
+            && self.frames.front().is_some_and(|frame| frame.index <= read)
+        {
+            self.frames.pop_front();
+        }
+        self.replay_from = self.replay_from.max(self.first_kept());
     }
 }
 
@@ -221,6 +249,7 @@ impl TurnHub {
                 kind,
                 data,
             }));
+            channel.cap();
             channel.published.clone()
         });
         published.notify(usize::MAX);
@@ -247,6 +276,7 @@ impl TurnHub {
                     kind,
                     data: data_for(session_id),
                 }));
+                channel.cap();
                 channel.published.clone()
             })
             .collect();
@@ -259,27 +289,55 @@ impl TurnHub {
     /// Ends the session's turn; later subscribers read it from history.
     /// Subscriptions that have not read all of it still receive the rest.
     pub(crate) fn end_turn(&self, session_id: &str) {
-        self.with_session(session_id, SessionChannel::restart_replay);
+        self.with_session(session_id, |channel| {
+            channel.turn_open = false;
+            channel.restart_replay();
+        });
     }
 
-    /// Subscribes to `session_id`. `after` is the index of the last frame
-    /// the subscriber saw; without it the turn in progress replays from its
-    /// start.
-    pub(crate) fn subscribe(
-        self: &Arc<Self>,
-        session_id: &str,
-        after: Option<u64>,
-    ) -> TurnSubscription {
+    /// The index a subscriber naming it as `after` continues from to see a
+    /// turn in progress from its first frame — or the newest index when no
+    /// turn runs, 0 when the session has no frames yet.
+    pub(crate) fn cursor_index(&self, session_id: &str) -> u64 {
+        self.with_session(session_id, |channel| {
+            if channel.turn_open {
+                channel.replay_from - 1
+            } else {
+                channel.last_index
+            }
+        })
+    }
+
+    /// Subscribes at the newest frame: nothing already published replays.
+    pub(crate) fn subscribe_live(self: &Arc<Self>, session_id: &str) -> TurnSubscription {
+        let (id, published) = self.with_session(session_id, |channel| {
+            let id = channel.next_subscription;
+            channel.next_subscription += 1;
+            channel.cursors.insert(id, channel.last_index);
+            (id, channel.published.clone())
+        });
+        TurnSubscription {
+            hub: self.clone(),
+            session_id: session_id.to_string(),
+            id,
+            published,
+            gap: false,
+        }
+    }
+
+    /// Subscribes to `session_id`, continuing from `after`, the index of
+    /// the last frame the subscriber saw. A cursor the channel can no
+    /// longer continue from reports `gap`.
+    pub(crate) fn subscribe(self: &Arc<Self>, session_id: &str, after: u64) -> TurnSubscription {
         let (id, published, gap) = self.with_session(session_id, |channel| {
             let replay_cursor = channel.replay_from - 1;
             // An index this daemon never published names another daemon's
             // frames: none of what came after it is here.
-            let (cursor, gap) = match after {
-                None => (replay_cursor, false),
-                Some(after) if after <= channel.last_index && after + 1 >= channel.first_kept() => {
-                    (after, false)
-                }
-                Some(_) => (replay_cursor, true),
+            let (cursor, gap) = if after <= channel.last_index && after + 1 >= channel.first_kept()
+            {
+                (after, false)
+            } else {
+                (replay_cursor, true)
             };
             let id = channel.next_subscription;
             channel.next_subscription += 1;
@@ -312,18 +370,18 @@ mod tests {
     }
 
     #[test]
-    fn a_late_subscriber_replays_the_turn_and_then_follows_it() {
+    fn a_late_subscriber_follows_the_turn_from_when_it_attaches() {
         let hub = Arc::new(TurnHub::default());
         hub.begin_turn("s");
         hub.publish("s", "session_turn", "start".into());
         hub.publish("s", "session_turn", "text-1".into());
-        let late = hub.subscribe("s", None);
-        assert_eq!(read(&late), ["start", "text-1"]);
+        let late = hub.subscribe_live("s");
+        assert_eq!(read(&late), [""; 0]);
         hub.publish("s", "session_turn", "text-2".into());
         let next = futures_lite::future::block_on(late.next()).expect("the subscription is open");
         assert_eq!(&*next[0].data, "text-2");
         hub.end_turn("s");
-        assert_eq!(read(&hub.subscribe("s", None)), [""; 0]);
+        assert_eq!(read(&hub.subscribe_live("s")), [""; 0]);
     }
 
     #[test]
@@ -333,10 +391,10 @@ mod tests {
         hub.publish("s", "session_turn", "start".into());
         hub.publish("s", "session_turn", "text-1".into());
         hub.publish("s", "session_turn", "text-2".into());
-        let back = hub.subscribe("s", Some(2));
+        let back = hub.subscribe("s", 2);
         assert!(!back.gap);
         assert_eq!(read(&back), ["text-2"]);
-        let current = hub.subscribe("s", Some(3));
+        let current = hub.subscribe("s", 3);
         assert!(!current.gap);
         assert_eq!(read(&current), [""; 0]);
     }
@@ -351,7 +409,7 @@ mod tests {
         hub.begin_turn("s");
         hub.publish("s", "session_turn", "next-start".into());
         // The subscriber saw only the first frame: `done` is gone.
-        let back = hub.subscribe("s", Some(1));
+        let back = hub.subscribe("s", 1);
         assert!(back.gap);
         assert_eq!(read(&back), ["next-start"], "the turn in progress, whole");
         // Nothing missed after a turn that ended cleanly.
@@ -359,9 +417,9 @@ mod tests {
         idle.begin_turn("s");
         idle.publish("s", "session_turn", "done".into());
         idle.end_turn("s");
-        assert!(!idle.subscribe("s", Some(1)).gap);
+        assert!(!idle.subscribe("s", 1).gap);
         // An index this daemon never published belongs to another daemon.
-        assert!(idle.subscribe("s", Some(7)).gap);
+        assert!(idle.subscribe("s", 7).gap);
     }
 
     /// A subscriber that falls far behind while following a turn, past the
@@ -370,7 +428,7 @@ mod tests {
     #[test]
     fn a_subscriber_that_falls_behind_across_a_turn_end_misses_nothing() {
         let hub = Arc::new(TurnHub::default());
-        let follower = hub.subscribe("s", None);
+        let follower = hub.subscribe_live("s");
         let mut expected = Vec::new();
         for turn in 0..2 {
             hub.begin_turn("s");
@@ -384,23 +442,23 @@ mod tests {
             }
         }
         assert_eq!(read(&follower), expected);
-        // Read frames of the ended turn are released; the turn in progress
-        // stays for late subscribers.
-        let late = hub.subscribe("s", None);
-        assert_eq!(read(&late).len(), 5_000);
+        // Read frames of the ended turn are released; a subscriber
+        // attaching now sees only frames published after it.
+        let late = hub.subscribe_live("s");
+        assert_eq!(read(&late), [""; 0]);
     }
 
     /// A subscription that goes away releases what it held.
     #[test]
     fn a_dropped_subscription_releases_its_frames() {
         let hub = Arc::new(TurnHub::default());
-        let follower = hub.subscribe("s", None);
+        let follower = hub.subscribe_live("s");
         hub.begin_turn("s");
         hub.publish("s", "session_turn", "start".into());
         hub.end_turn("s");
-        assert!(!hub.subscribe("s", Some(0)).gap, "held for the follower");
+        assert!(!hub.subscribe("s", 0).gap, "held for the follower");
         drop(follower);
-        assert!(hub.subscribe("s", Some(0)).gap, "released with it");
+        assert!(hub.subscribe("s", 0).gap, "released with it");
     }
 
     /// A subscriber that never reads holds back at most the turn in
@@ -409,7 +467,7 @@ mod tests {
     #[test]
     fn a_subscriber_two_turns_behind_is_closed() {
         let hub = Arc::new(TurnHub::default());
-        let stalled = hub.subscribe("s", None);
+        let stalled = hub.subscribe_live("s");
         let mut starts = Vec::new();
         for turn in 0..3 {
             hub.begin_turn("s");

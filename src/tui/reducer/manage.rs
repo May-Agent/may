@@ -243,7 +243,6 @@ pub fn handle_quit_confirm_key(app: &mut App, code: KeyCode) -> Option<SendActio
     match code {
         KeyCode::Char('s' | 'S') => {
             app.mode = crate::tui::state::AppMode::Chat;
-            app.restore_aborted_draft();
             Some(SendAction::StopAgentAndQuit)
         }
         KeyCode::Enter | KeyCode::Char('l' | 'L') => {

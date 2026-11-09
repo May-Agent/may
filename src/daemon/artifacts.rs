@@ -134,14 +134,6 @@ pub(super) async fn collect_session_artifacts(
     Ok(entries)
 }
 
-pub(super) fn artifacts_signature(entries: &[ArtifactEntry]) -> String {
-    entries
-        .iter()
-        .map(|e| format!("{}:{}:{}", e.path, e.fingerprint, e.is_html))
-        .collect::<Vec<_>>()
-        .join("|")
-}
-
 pub(super) async fn resolve_scoped_path(
     scope_root: &Path,
     relative_path: PathBuf,
@@ -1399,13 +1391,15 @@ pub(super) async fn get_slidev_static_asset(
 /// `session_artifacts` topic notification covers a burst of writes.
 const ARTIFACT_WATCH_DEBOUNCE: Duration = Duration::from_millis(300);
 
-/// Whether `path` lies under a session's `artifacts/` directory, in either
-/// layout (`~/.may/sessions/<id>` or `~/.may/profiles/<pid>/sessions/<id>`).
-fn is_session_artifacts_path(path: &Path) -> bool {
+/// The session owning `path` when it lies under `sessions/<id>/artifacts/`,
+/// in either layout (`~/.may/sessions/<id>` or
+/// `~/.may/profiles/<pid>/sessions/<id>`).
+fn session_artifacts_owner(path: &Path) -> Option<String> {
     let components: Vec<_> = path.components().collect();
     components
         .windows(3)
-        .any(|window| window[0].as_os_str() == "sessions" && window[2].as_os_str() == "artifacts")
+        .find(|window| window[0].as_os_str() == "sessions" && window[2].as_os_str() == "artifacts")
+        .and_then(|window| window[1].as_os_str().to_str().map(str::to_owned))
 }
 
 /// Watches the session roots and publishes `session_artifacts` on the UI
@@ -1443,14 +1437,18 @@ pub(super) fn spawn_artifact_watcher(state: &Arc<DaemonState>) {
 
         let quiet = tokio::time::sleep(ARTIFACT_WATCH_DEBOUNCE);
         tokio::pin!(quiet);
-        let mut dirty = false;
+        let mut dirty = std::collections::BTreeSet::new();
         loop {
             tokio::select! {
                 maybe_event = watch_rx.recv() => {
                     match maybe_event {
                         Some(Ok(event)) => {
-                            if event.paths.iter().any(|path| is_session_artifacts_path(path)) {
-                                dirty = true;
+                            let owners = event
+                                .paths
+                                .iter()
+                                .filter_map(|path| session_artifacts_owner(path));
+                            if owners.clone().next().is_some() {
+                                dirty.extend(owners);
                                 quiet.as_mut().reset(
                                     tokio::time::Instant::now() + ARTIFACT_WATCH_DEBOUNCE,
                                 );
@@ -1462,9 +1460,13 @@ pub(super) fn spawn_artifact_watcher(state: &Arc<DaemonState>) {
                         None => break,
                     }
                 }
-                () = &mut quiet, if dirty => {
-                    dirty = false;
-                    bus.publish(crate::ui_event_bus::UiEventTopics::SESSION_ARTIFACTS);
+                () = &mut quiet, if !dirty.is_empty() => {
+                    for session_id in std::mem::take(&mut dirty) {
+                        bus.publish_session_change(
+                            &session_id,
+                            crate::daemon::session_events::SessionChange::Artifacts,
+                        );
+                    }
                 }
             }
         }

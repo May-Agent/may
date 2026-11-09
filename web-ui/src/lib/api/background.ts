@@ -5,7 +5,7 @@ export type BackgroundJobStatus =
   | { state: 'running' }
   | { state: 'completed'; exit_code: number }
   | { state: 'failed'; error: string }
-  | { state: 'killed' };
+  | { state: 'killed'; cause: { kind: 'user' } | { kind: 'memory_runaway'; footprint_bytes: number; capacity_bytes: number; domain: 'machine' | 'container' } };
 
 /** One background terminal job of a session (`WireJob`). */
 export interface BackgroundJob {
@@ -32,7 +32,7 @@ export interface SubagentRun {
 
 /**
  * A session's background work: `GET /api/sessions/{id}/background` and the
- * `session_background` event of `/api/events`.
+ * stream's `job.*`/`subagent.*` deltas on `/api/sessions/{id}/events`.
  */
 export interface SessionBackground {
   sessionId: string;

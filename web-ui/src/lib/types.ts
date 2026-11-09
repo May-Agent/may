@@ -16,7 +16,8 @@ export type ApiErrorCode =
   | 'container_runtime_unavailable'
   | 'managed_podman_approval_required'
   | 'location_unavailable'
-  | 'github_unauthenticated';
+  | 'github_unauthenticated'
+  | 'repo_declined';
 
 /** Semantic variant of a tool call — server-assigned, never re-inferred client-side. */
 export type ToolVariant =
@@ -29,7 +30,6 @@ export type ToolVariant =
   | 'web_fetch'
   | 'ask'
   | 'session'
-  | 'notify'
   | 'task'
   | 'compact'
   | 'generic';
@@ -50,21 +50,12 @@ export interface ApiAttachment {
   name: string;
   type: AttachmentKind;
   url: string;
-  uploadDataUrl?: string | null;
   textContent?: string | null;
 }
 
 export type TerminalCommandMode = 'default' | 'sandboxed' | 'unsafe' | 'ssh';
 export type TerminalExecutionStatus = 'running' | 'done' | 'failed' | 'stopped';
 
-export interface ApiTerminalExecution {
-  id: string;
-  description: string;
-  input: string;
-  output?: string | null;
-  status: TerminalExecutionStatus;
-  mode: TerminalCommandMode;
-}
 
 export interface RequestStats {
   providerId?: string | null;
@@ -99,7 +90,6 @@ export interface ApiMessage {
   isStreaming?: boolean | null;
   isThinking?: boolean | null;
   toolEvent?: unknown;
-  terminalExecutions?: ApiTerminalExecution[];
   stats?: RequestStats | null;
 }
 
@@ -190,12 +180,13 @@ export interface ApiSession {
   title: string;
   lastModified: string;
   preview: string;
-  messages?: ApiMessage[];
   profileId: string | null;
   model: string;
   reasoningEffort?: string | null;
   runtime: SessionRuntimeSummary;
   repo?: string | null;
+  /** Cursor the session's event stream resumes from. */
+  cursor?: string;
 }
 
 export interface ChatRequestPayload {
@@ -206,7 +197,7 @@ export interface ChatRequestPayload {
   deliveryMode?: PendingUserMessageMode;
 }
 
-// ── Turn events: `session_turn` frames on /api/events ───────
+// ── Turn events: `session_turn` frames on the session stream ─
 
 export interface SseStart {
   kind: 'start';
@@ -302,18 +293,33 @@ export interface SseToolEnd {
   summary?: ToolSummary;
 }
 
-export interface SseTodoItem {
+/** A section of `tasks.md` that holds rows. */
+export type TaskSection = 'roots' | 'doing' | 'queued';
+
+/** An issue or pull request a row names. */
+export interface TaskReference {
+  /** `owner/repo` when the row writes one. */
+  repository: string | null;
+  number: number;
+  pullRequest: boolean;
+}
+
+/** One row of `Roots`, `Doing` or `Queued`, parsed by the daemon. */
+export interface TaskRow {
+  section: TaskSection;
+  /** Row text; continuation lines are joined by newlines. */
   text: string;
-  checked: boolean;
+  /** Payload of the row's `BLOCKING <what>` mark. */
+  blocking: string | null;
+  references: TaskReference[];
 }
 
 export interface SseTodoUpdate {
   kind: 'todo_update';
   seq: number;
   turnId: string;
-  items: SseTodoItem[];
-  total: number;
-  completed: number;
+  /** All rows of the document; empty once every row is deleted. */
+  rows: TaskRow[];
 }
 
 export interface SseError {
@@ -398,6 +404,19 @@ export interface SseRetract {
   turnId: string;
 }
 
+/**
+ * The turn was stopped before any tool call or response text: the daemon
+ * withdrew it, so its message left the conversation. The client that sent
+ * the message puts it back into its composer.
+ */
+export interface SseWithdrawn {
+  kind: 'withdrawn';
+  seq: number;
+  turnId: string;
+  content: string;
+  attachments: ApiAttachment[];
+}
+
 export type ChatStreamEvent =
   | SseStart
   | SseText
@@ -415,7 +434,8 @@ export type ChatStreamEvent =
   | SsePing
   | SseSpeed
   | SseHold
-  | SseRetract;
+  | SseRetract
+  | SseWithdrawn;
 
 // ── UI event stream /api/events ─────────────────────────────
 
@@ -485,15 +505,13 @@ export type UiEvent =
   | { kind: 'browser_status'; payload: BrowserStatusPayload }
   | { kind: 'browser_lifecycle'; payload: BrowserLifecycleEvent }
   | { kind: 'profile_sessions'; payload: ProfileSessionsPayload }
-  | { kind: 'session_runtime'; payload: SessionRuntimePayload }
   | { kind: 'session_runtimes'; payload: SessionRuntimesPayload }
   | { kind: 'container_prepare'; payload: unknown }
   | { kind: 'remote_access'; payload: { status: RemoteAccessStatusResponse } }
   | { kind: 'sleep'; payload: SleepStatus }
   | { kind: 'request_logs'; payload: RequestLogsResponse }
   | { kind: 'notification_mailbox'; payload: unknown }
-  | { kind: 'network_access_logs'; payload: NetworkAccessLogsResponse }
-  | { kind: 'session_artifacts'; payload: SessionArtifactsPayload };
+  | { kind: 'network_access_logs'; payload: NetworkAccessLogsResponse };
 
 // ── Artifacts ──────────────────────────────────────────────
 
@@ -506,11 +524,6 @@ export interface ArtifactEntry {
 }
 
 export interface SessionArtifactsResponse {
-  artifacts: ArtifactEntry[];
-}
-
-export interface SessionArtifactsPayload {
-  sessionId: string;
   artifacts: ArtifactEntry[];
 }
 
@@ -528,6 +541,8 @@ export interface ArtifactDiagnosticsResponse {
 export interface SessionTasksPayload {
   content: string;
   planState: SessionPlanState;
+  /** Parsed rows of `content`; set by the daemon, ignored when saving. */
+  rows?: TaskRow[];
 }
 
 export interface SessionPlanStateRequest {

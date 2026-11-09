@@ -4,6 +4,7 @@ import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 import { useTranslation } from '@/lib/i18n';
 import type { ApiAttachment, AttachmentKind } from '@/lib/types';
+import { uploadAttachment } from '@/lib/api/artifacts';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import { ModelPicker } from './ModelPicker';
 import { ThinkingPicker } from './ThinkingPicker';
@@ -16,6 +17,9 @@ interface ComposerProps {
   sessionId: string;
   currentModel: string;
   currentReasoningEffort: string | null | undefined;
+  /** A message the daemon withdrew; its text and attachments return to the input. */
+  restored?: { content: string; attachments: ApiAttachment[] } | null;
+  onRestored?: () => void;
 }
 
 function detectKind(mime: string): AttachmentKind {
@@ -28,26 +32,13 @@ function detectKind(mime: string): AttachmentKind {
   return 'file';
 }
 
-async function fileToAttachment(file: File): Promise<ApiAttachment> {
+async function fileToAttachment(sessionId: string, file: File): Promise<ApiAttachment> {
+  const record = await uploadAttachment(sessionId, file);
   const kind = detectKind(file.type || '');
-  const reader = new FileReader();
-  const dataUrl = await new Promise<string>((resolve, reject) => {
-    reader.onerror = () => reject(reader.error);
-    reader.onload = () => resolve(reader.result as string);
-    reader.readAsDataURL(file);
-  });
-  let textContent: string | null = null;
   if (kind === 'text' && file.size < 256 * 1024) {
-    textContent = await file.text();
+    record.textContent = await file.text();
   }
-  return {
-    id: `att-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
-    name: file.name,
-    type: kind,
-    url: dataUrl,
-    uploadDataUrl: dataUrl,
-    textContent,
-  };
+  return record;
 }
 
 export function Composer({
@@ -58,6 +49,8 @@ export function Composer({
   sessionId,
   currentModel,
   currentReasoningEffort,
+  restored,
+  onRestored,
 }: ComposerProps) {
   const [value, setValue] = useState('');
   const [attachments, setAttachments] = useState<ApiAttachment[]>([]);
@@ -65,6 +58,18 @@ export function Composer({
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const { t } = useTranslation();
+
+  // A withdrawn message returns to the input (state adjusted while
+  // rendering, once per withdrawal), then the store drops it.
+  const [takenBack, setTakenBack] = useState(restored);
+  if (restored && restored !== takenBack) {
+    setTakenBack(restored);
+    setValue(restored.content);
+    setAttachments(restored.attachments);
+  }
+  useEffect(() => {
+    if (restored) onRestored?.();
+  }, [restored, onRestored]);
 
   useEffect(() => {
     const el = textareaRef.current;
@@ -85,7 +90,7 @@ export function Composer({
 
   const addFiles = async (files: FileList | File[]) => {
     const list = Array.from(files);
-    const mapped = await Promise.all(list.map(fileToAttachment));
+    const mapped = await Promise.all(list.map((file) => fileToAttachment(sessionId, file)));
     setAttachments((prev) => [...prev, ...mapped]);
   };
 

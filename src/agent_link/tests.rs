@@ -37,6 +37,7 @@ impl Host {
             ),
             runtime_service: runtime_service.clone(),
             cache_lifetime: super::CacheLifetimes::new(|_| CacheLifetime::default()),
+            forks: super::ForkHosts::default(),
         };
         Self {
             may_dir,

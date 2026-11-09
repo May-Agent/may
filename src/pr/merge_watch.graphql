@@ -1,0 +1,41 @@
+query($owner: String!, $name: String!, $number: Int!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      state
+      mergeQueueEntry { position }
+      timelineItems(last: 1, itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT]) {
+        totalCount
+        nodes {
+          __typename
+          ... on RemovedFromMergeQueueEvent { reason }
+        }
+      }
+      commits(last: 1) {
+        nodes {
+          commit {
+            statusCheckRollup {
+              contexts(first: 100, after: $after) {
+                pageInfo { hasNextPage endCursor }
+                nodes {
+                  __typename
+                  ... on CheckRun {
+                    name
+                    detailsUrl
+                    conclusion
+                    isRequired(pullRequestNumber: $number)
+                  }
+                  ... on StatusContext {
+                    context
+                    targetUrl
+                    state
+                    isRequired(pullRequestNumber: $number)
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

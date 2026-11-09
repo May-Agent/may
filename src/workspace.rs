@@ -50,7 +50,13 @@ pub struct WorkspaceConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectConfig {
     /// A directory inside the project (typically the main checkout root).
-    pub path: PathBuf,
+    /// Absent for a GitHub repository trusted without any local checkout
+    /// ([`Self::repository`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+    /// The GitHub repository of an entry that has no checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<GitHubRepository>,
     /// Issue backend for this project; absent means local may issues.
     #[serde(default)]
     pub issues: ProjectIssues,
@@ -67,7 +73,16 @@ impl ProjectConfig {
     /// Whether this entry's path belongs to the repository `identity`.
     #[must_use]
     pub fn has_identity(&self, identity: &Path) -> bool {
-        crate::issue::repository_identity(&self.path).is_ok_and(|k| k == identity)
+        self.path.as_deref().is_some_and(|path| {
+            crate::issue::repository_identity(path).is_ok_and(|k| k == identity)
+        })
+    }
+
+    /// Whether this entry covers the GitHub repository `owner_repo`, through
+    /// its own `repository` or its checkout's `origin`.
+    #[must_use]
+    pub fn covers_github(&self, owner_repo: &GitHubRepository) -> bool {
+        self.github_repository().as_ref() == Some(owner_repo)
     }
 
     /// The GitHub repository this project publishes to, independent of its
@@ -75,7 +90,11 @@ impl ProjectConfig {
     /// GitHub issue backend names (a project whose origin is not GitHub).
     #[must_use]
     pub fn github_repository(&self) -> Option<GitHubRepository> {
-        if let crate::trust::RepoKind::Github { owner_repo } = crate::trust::repo_kind(&self.path)
+        if let Some(repository) = &self.repository {
+            return Some(repository.clone());
+        }
+        if let Some(path) = &self.path
+            && let crate::trust::RepoKind::Github { owner_repo } = crate::trust::repo_kind(path)
             && let Ok(repository) = owner_repo.parse()
         {
             return Some(repository);
@@ -97,6 +116,10 @@ pub struct ProjectPr {
     /// `"may"` or `"github"`; absent detects GitHub remotes automatically.
     #[serde(default)]
     pub backend: Option<String>,
+    /// Best-effort `git pull` of every recorded local checkout after a PR
+    /// merges; absent means on.
+    #[serde(default)]
+    pub pull_sync: Option<bool>,
     /// Screen published text (PR title/body) before it leaves the machine.
     #[serde(default)]
     pub screen: Option<bool>,
@@ -106,6 +129,14 @@ pub struct ProjectPr {
     /// Merge waits for an explicit user approval (#322 wires the UI).
     #[serde(default)]
     pub require_review: Option<bool>,
+}
+
+impl ProjectPr {
+    /// Whether recorded local checkouts are pulled after a PR merges.
+    #[must_use]
+    pub fn pulls_after_merge(&self) -> bool {
+        self.pull_sync != Some(false)
+    }
 }
 
 /// Issue backend selected for a project.
@@ -241,16 +272,26 @@ impl WorkspaceConfig {
         self.projects.iter().find(|p| p.has_identity(identity))
     }
 
+    /// The `[[projects]]` entry for a GitHub repository, whether it holds a
+    /// checkout or only the repository.
+    #[must_use]
+    pub fn project_for_github(&self, owner_repo: &GitHubRepository) -> Option<&ProjectConfig> {
+        self.projects.iter().find(|p| p.covers_github(owner_repo))
+    }
+
     fn check_projects_unique(&self) -> Result<(), WorkspaceConfigError> {
         let mut seen: Vec<(PathBuf, &ProjectConfig)> = Vec::new();
         for project in &self.projects {
-            let identity = match crate::issue::repository_identity(&project.path) {
+            let Some(project_path) = project.path.as_deref() else {
+                continue;
+            };
+            let identity = match crate::issue::repository_identity(project_path) {
                 Ok(identity) => identity,
                 Err(error) => {
                     // Every lookup treats this entry as a non-match; this is
                     // the one place a load reports why.
                     tracing::warn!(
-                        path = %project.path.display(),
+                        path = %project_path.display(),
                         %error,
                         "project entry no longer resolves to a repository; it matches nothing"
                     );
@@ -260,12 +301,12 @@ impl WorkspaceConfig {
             let paths = seen
                 .iter()
                 .filter(|(i, _)| *i == identity)
-                .map(|(_, p)| p.path.display().to_string())
+                .filter_map(|(_, p)| p.path.as_deref().map(|path| path.display().to_string()))
                 .collect::<Vec<_>>();
             if !paths.is_empty() {
                 let paths = paths
                     .into_iter()
-                    .chain([project.path.display().to_string()])
+                    .chain([project_path.display().to_string()])
                     .collect::<Vec<_>>()
                     .join(", ");
                 return Err(WorkspaceConfigError::DuplicateProject {

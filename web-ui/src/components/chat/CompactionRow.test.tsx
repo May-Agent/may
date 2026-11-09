@@ -7,8 +7,8 @@ const STARTED = {
   text: 'Compaction started in the background. Keep working: the summary replaces the older conversation at a later step.',
 };
 const REFUSED = {
-  kind: 'text',
-  text: 'Nothing was started: the context holds fewer than 5000 tokens, too little for compaction to pay off. Carry on with the work.',
+  kind: 'error',
+  message: 'Nothing was started: the context holds fewer than 5000 tokens, too little for compaction to pay off. Carry on with the work.',
 };
 
 describe('CompactionRow', () => {

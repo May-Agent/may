@@ -71,7 +71,7 @@ function makeConfig(): UiFullConfig {
       webhookMaxBodyBytes: 10485760,
       allowedLogins: [],
     },
-    sandbox: { commandPriority: 'low' },
+    sandbox: { commandPriority: 'low', jobPoolSize: 6 },
     stream: { codec: 'auto' },
   };
 }

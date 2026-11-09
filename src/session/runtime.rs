@@ -612,9 +612,6 @@ pub struct PersistedAttachment {
     pub attachment_type: AttachmentKind,
     /// Content URL or local path.
     pub url: String,
-    /// Inline data URL for uploaded content, when stored.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub upload_data_url: Option<String>,
     /// Extracted text content for text-like attachments.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_content: Option<String>,

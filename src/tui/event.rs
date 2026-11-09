@@ -129,11 +129,22 @@ pub enum AppEvent {
         /// Row id of the user message the turn answers.
         message_id: i32,
     },
+    /// The daemon withdrew the latest turn: it was stopped before any tool
+    /// call or response text, so its message left the conversation.
+    TurnWithdrawn {
+        /// The withdrawn message text.
+        content: String,
+        /// Whether this client sent it and gets it back in its input.
+        own: bool,
+    },
     /// The daemon dropped turn frames this client missed: the session's
     /// history must be reloaded.
     HistoryStale,
     /// The user's global sleep state, from the `sleep` event.
     Sleep(crate::sleep::SleepStatus),
+    /// A popup of some session waits on the user, from the
+    /// `user_notification` event.
+    UserNotification(Box<crate::notification::UserNotification>),
     /// A `session_suggestion` frame arrived: `text` is the new ghost text,
     /// `None` clears it.
     PromptSuggestion {
@@ -155,6 +166,21 @@ pub enum AppEvent {
         summary: Option<String>,
         /// The suggested next step, when the recap named one.
         next_action: Option<String>,
+    },
+    /// A `session_warning` frame arrived: shown to the user in the stream.
+    Warning {
+        /// Session the warning belongs to.
+        session_id: String,
+        /// The warning text.
+        message: String,
+    },
+    /// A usage frame carried the context window the daemon resolved for the
+    /// session's model.
+    ContextWindow {
+        /// Session the window belongs to.
+        session_id: String,
+        /// The window in tokens.
+        window: u32,
     },
     /// A kill request finished; `true` when the job accepted it.
     JobKilled {
@@ -232,10 +258,14 @@ impl AppEvent {
             Self::SessionRuntime(_) => "session_runtime",
             Self::IndexCoverage(_) => "index_coverage",
             Self::TurnStarted { .. } => "turn_started",
+            Self::TurnWithdrawn { .. } => "turn_withdrawn",
             Self::HistoryStale => "history_stale",
             Self::Sleep(_) => "sleep",
+            Self::UserNotification(_) => "user_notification",
             Self::PromptSuggestion { .. } => "prompt_suggestion",
             Self::Recap { .. } => "recap",
+            Self::Warning { .. } => "warning",
+            Self::ContextWindow { .. } => "context_window",
             Self::JobKilled { .. } => "job_killed",
             Self::JobDetailLoaded { .. } => "job_detail_loaded",
             Self::TerminalOutputs(_) => "terminal_outputs",

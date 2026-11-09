@@ -5,7 +5,7 @@ use aither_core::llm::model::Parameters;
 
 use super::{
     AgentEnvironment, RuntimeSystemContext, build_agents_md_blocks, build_capabilities,
-    build_environment, build_work, tag,
+    build_efficiency, build_environment, build_work, tag,
 };
 
 #[test]
@@ -407,6 +407,11 @@ fn the_environment_names_paths_relative_to_the_session_and_the_real_home() {
         terminal.contains(&format!("means {}/outputs/", dir.path().display())),
         "{terminal}"
     );
+    assert_eq!(
+        terminal.contains("`grep`, `awk` and `find` fail in scripts"),
+        cfg!(not(windows)),
+        "only the managed bash refuses them: {terminal}"
+    );
 }
 
 fn container_environment() -> AgentEnvironment {
@@ -478,6 +483,25 @@ fn native_repo_clones_keep_the_host_path() {
 }
 
 #[test]
+fn the_wake_alert_says_how_the_sleep_ended() {
+    use crate::sleep::WakeCause;
+    use askama::Template;
+
+    let off = super::WakeAlert {
+        cause: WakeCause::SleepOff,
+    }
+    .render()
+    .expect("wake alert renders");
+    assert!(off.contains("they ran /sleep off"), "{off}");
+    let wrote = super::WakeAlert {
+        cause: WakeCause::UserWrote,
+    }
+    .render()
+    .expect("wake alert renders");
+    assert!(wrote.contains("they came back and wrote"), "{wrote}");
+}
+
+#[test]
 #[should_panic(expected = "outside the session directory")]
 fn container_clone_outside_the_session_directory_panics() {
     let dir = tempdir().expect("temp dir should be created");
@@ -487,4 +511,19 @@ fn container_clone_outside_the_session_directory_panics() {
         source: "x".to_string(),
     };
     let _ = super::build_repo_clones_context(&[stray], &container_environment(), &session_paths);
+}
+
+#[test]
+fn the_efficiency_section_says_when_to_hand_exploration_to_explore() {
+    let prompt = build_efficiency(&[]);
+    assert!(
+        prompt.contains(
+            "When answering means reading across many files and only the conclusion matters"
+        ),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("`explore --prompt-file <path>`"),
+        "{prompt}"
+    );
 }

@@ -153,6 +153,10 @@ pub struct CommentedIssue {
 /// A related issue in compact form.
 #[derive(Debug, Clone)]
 pub struct RelatedIssue {
+    /// `owner/repo` the issue lives in, which a GitHub relation may take
+    /// outside the store's own repository; `None` in the may backend, whose
+    /// relations stay inside its one repository.
+    pub repository: Option<String>,
     /// Issue number within the repository.
     pub number: i64,
     /// Issue title.
@@ -184,6 +188,16 @@ pub struct IssueDetail {
     pub created_at: String,
     /// Last update timestamp (ISO 8601).
     pub updated_at: String,
+}
+
+/// What deciding whether an issue's work can go on needs of it: its state
+/// and what blocks it, without its body, comments or sub-issues.
+#[derive(Debug, Clone)]
+pub struct IssueStatus {
+    /// Issue state.
+    pub state: IssueState,
+    /// Issues this issue is blocked by.
+    pub blocked_by: Vec<RelatedIssue>,
 }
 
 /// Error type for issue-backend operations.
@@ -309,6 +323,9 @@ pub trait IssueStore: Send + Sync + fmt::Debug {
     /// Fetch one issue with labels, comments and relations.
     fn get(&self, number: i64) -> impl Future<Output = Result<IssueDetail, IssueError>> + Send;
 
+    /// Fetch one issue's state and blockers only.
+    fn status(&self, number: i64) -> impl Future<Output = Result<IssueStatus, IssueError>> + Send;
+
     /// List issues, newest first.
     fn list(
         &self,
@@ -423,6 +440,13 @@ impl IssueStore for ResolvedIssueStore {
         }
     }
 
+    async fn status(&self, number: i64) -> Result<IssueStatus, IssueError> {
+        match self {
+            Self::May(store) => store.status(number).await,
+            Self::GitHub(store) => store.status(number).await,
+        }
+    }
+
     async fn list(
         &self,
         state: IssueListState,
@@ -511,6 +535,56 @@ pub fn resolve_issue_store(
     )))
 }
 
+/// Resolve the issue store of a session bound to `binding`.
+///
+/// A GitHub binding uses the GitHub store when its project keeps issues on
+/// GitHub and the local store otherwise; a local binding always uses the
+/// local store, keyed by its repository identity. Without a binding the
+/// working directory decides ([`resolve_issue_store`]).
+///
+/// # Errors
+/// Returns [`IssueError::WorkspaceConfig`] when the workspace config cannot
+/// be loaded and [`IssueError::Identity`] when an unbound session's identity
+/// cannot be resolved.
+pub fn resolve_bound_issue_store(
+    binding: Option<&crate::session::RepoBinding>,
+    cwd: &Path,
+    workspace_config_path: &Path,
+    db: ChatDb,
+) -> Result<ResolvedIssueStore, IssueError> {
+    use crate::session::RepoBinding;
+    match binding {
+        None => resolve_issue_store(cwd, workspace_config_path, db),
+        Some(RepoBinding::Local(identity)) => Ok(ResolvedIssueStore::May(MayIssueStore::new(
+            db,
+            identity.display().to_string(),
+        ))),
+        Some(RepoBinding::Github(repository)) => {
+            let config = crate::workspace::WorkspaceConfig::load(workspace_config_path)?;
+            if let Some(crate::workspace::ProjectIssues::Github { repository }) = config
+                .project_for_github(repository)
+                .map(|project| &project.issues)
+            {
+                return Ok(ResolvedIssueStore::GitHub(GitHubIssueStore::new(
+                    repository.clone(),
+                    GhCliTokenSource,
+                )));
+            }
+            // Issues kept internal have one key per repository, whatever
+            // directory the session runs in: the identity of the project's
+            // checkout when the workspace names one, else the repository.
+            let key = match config
+                .project_for_github(repository)
+                .and_then(|project| project.path.as_deref())
+            {
+                Some(path) => repository_identity(path)?.display().to_string(),
+                None => format!("github:{repository}"),
+            };
+            Ok(ResolvedIssueStore::May(MayIssueStore::new(db, key)))
+        }
+    }
+}
+
 /// The GitHub repository the workspace config assigns the project with
 /// `identity`, or `None` when the project has no entry or keeps its issues
 /// locally.
@@ -573,13 +647,54 @@ mod tests {
 
     fn github_project(path: std::path::PathBuf, repository: &str) -> ProjectConfig {
         ProjectConfig {
-            path,
+            path: Some(path),
+            repository: None,
             issues: ProjectIssues::Github {
                 repository: repository.parse().expect("owner/repo"),
             },
             checks: None,
             pr: crate::workspace::ProjectPr::default(),
         }
+    }
+
+    /// A prs-only repository's May issues have one key, whether the session
+    /// runs in the project's checkout or in no directory at all.
+    #[tokio::test]
+    async fn internal_issues_of_a_github_binding_share_one_key() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = dir.path().join("repo");
+        git2::Repository::init(&repo).expect("git init");
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).expect("elsewhere");
+        let binding = crate::session::RepoBinding::parse("github:owner/repo").expect("binding");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db");
+        let config_path = dir.path().join("workspace.toml");
+        let key = |cwd: &std::path::Path| {
+            super::IssueStore::search_key(
+                &super::resolve_bound_issue_store(Some(&binding), cwd, &config_path, db.clone())
+                    .expect("store"),
+            )
+        };
+
+        let config = WorkspaceConfig {
+            projects: vec![ProjectConfig {
+                path: Some(repo.clone()),
+                repository: Some("owner/repo".parse().expect("owner/repo")),
+                issues: ProjectIssues::May,
+                checks: None,
+                pr: crate::workspace::ProjectPr::default(),
+            }],
+            ..WorkspaceConfig::default()
+        };
+        config.save(&config_path).expect("save workspace config");
+        assert_eq!(key(&repo), key(&elsewhere));
+
+        WorkspaceConfig::default()
+            .save(&config_path)
+            .expect("save workspace config");
+        assert_eq!(key(&repo), key(&elsewhere));
     }
 
     /// A trusted project whose directory was deleted matches nothing: the

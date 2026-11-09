@@ -26,6 +26,8 @@ import { useSessionsStore } from '@/lib/stores/sessions';
 import { outputsPreviewUrl } from '@/lib/api/artifacts';
 import { extractTerminalResult, type OutputStream } from '@/lib/terminalResult';
 import { CompactionRow } from './CompactionRow';
+import { searchFetchLabel } from '@/lib/hostedLabel';
+import { SearchRow } from './SearchRow';
 
 SyntaxHighlighter.registerLanguage('bash', bash);
 
@@ -43,7 +45,6 @@ const VARIANT_ICON: Record<ToolVariant, typeof Wrench> = {
   web_fetch: Globe,
   ask: HelpCircle,
   session: MessageSquare,
-  notify: MessageSquare,
   task: Sparkles,
   compact: Sparkles,
   generic: Wrench,
@@ -59,7 +60,6 @@ const VARIANT_LABEL_KEY: Record<ToolVariant, MessageKey> = {
   web_fetch: 'tools.webFetch',
   ask: 'tools.ask',
   session: 'tools.session',
-  notify: 'tools.notify',
   task: 'tools.task',
   compact: 'tools.compact',
   generic: 'tools.generic',
@@ -95,9 +95,8 @@ function pickPrimaryLabel(tool: TurnToolState, fallback: string): string {
       return fallback;
     }
     case 'web_search':
-      return s.query ? `Searched "${s.query}"` : fallback;
     case 'web_fetch':
-      return s.url ?? fallback;
+      return searchFetchLabel(tool.variant, s, fallback) ?? fallback;
     case 'browser': {
       if (s.action && s.target) return `${s.action} ${s.target}`;
       return s.action || s.target || fallback;
@@ -309,7 +308,14 @@ function selectDetails(tool: TurnToolState, primary: string) {
 }
 
 export const ToolCard = memo(function ToolCard({ tool }: ToolCardProps) {
+  const { t } = useTranslation();
   if (tool.variant === 'compact') return <CompactionRow tool={tool} />;
+  const rowLabel = searchFetchLabel(
+    tool.variant,
+    tool.summary,
+    t(VARIANT_LABEL_KEY[tool.variant] ?? 'tools.generic'),
+  );
+  if (rowLabel !== null) return <SearchRow tool={tool} label={rowLabel} />;
   return <ExpandableToolCard tool={tool} />;
 });
 

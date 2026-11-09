@@ -1,0 +1,1 @@
+Nothing was asked: "{{ recipient }}" is idle and its prompt cache has gone cold, so answering would pay for its whole prompt again.

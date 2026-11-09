@@ -119,6 +119,58 @@ pub struct Session {
     pub persisted: bool,
     /// Repository the session is bound to, when one was named at launch.
     pub repo: Option<String>,
+    /// The host directory the session works in; `None` for a repo-less chat
+    /// and for a session started directly on a GitHub repository.
+    pub cwd: Option<PathBuf>,
+    /// Cursor `GET /api/sessions/{id}` reported at load, for the session
+    /// events stream to continue from. `None` for a new session.
+    pub events_cursor: Option<String>,
+}
+
+/// How a client starts its sessions.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SessionLaunch {
+    /// In the directory the client runs in; its repository, if any, binds
+    /// the session once its trust is decided.
+    #[default]
+    Checkout,
+    /// A repo-less chat: no directory and no repository, parity with the web
+    /// UI's new chat. Every session this client creates is one.
+    RepoLess,
+    /// Directly on a repository: `owner/repo` needs no local checkout, a
+    /// path binds that checkout's repository. Consumed by the first session.
+    Repo(String),
+}
+
+impl SessionLaunch {
+    /// The directory a session started this way works in, given the client's
+    /// own directory `client_cwd`.
+    #[must_use]
+    pub fn cwd(&self, client_cwd: &Path) -> Option<PathBuf> {
+        match self {
+            Self::Checkout => Some(client_cwd.to_path_buf()),
+            Self::RepoLess => None,
+            Self::Repo(spec) => std::fs::canonicalize(spec)
+                .ok()
+                .filter(|path| path.is_dir()),
+        }
+    }
+
+    /// The repository binding spec sent to the daemon: `owner/repo` as given,
+    /// a path as the client's canonical absolute path, since the daemon
+    /// resolves it from its own directory.
+    #[must_use]
+    pub fn repo(&self) -> Option<String> {
+        match self {
+            Self::Repo(spec) => Some(
+                std::fs::canonicalize(spec)
+                    .ok()
+                    .filter(|path| path.is_dir())
+                    .map_or_else(|| spec.clone(), |path| path.display().to_string()),
+            ),
+            Self::Checkout | Self::RepoLess => None,
+        }
+    }
 }
 
 impl Session {
@@ -475,8 +527,10 @@ pub struct SessionManager {
     current: Option<Session>,
     /// The currently active profile ID (sessions are created within this profile).
     current_profile_id: Option<String>,
-    /// Repository spec the next created session binds to; taken once.
-    pending_repo: Option<String>,
+    /// How sessions are started.
+    launch: SessionLaunch,
+    /// A repository start for the next session only.
+    once: Option<SessionLaunch>,
 }
 
 impl SessionManager {
@@ -505,16 +559,35 @@ impl SessionManager {
             daemon: None,
             current: None,
             current_profile_id: None,
-            pending_repo: None,
+            launch: SessionLaunch::default(),
+            once: None,
         };
         Ok(manager)
     }
 
-    /// Bind the next created session to a repository spec
-    /// (`owner/repo` or a local path); consumed by the first session
-    /// created after the call.
-    pub fn set_pending_repo(&mut self, repo: Option<String>) {
-        self.pending_repo = repo;
+    /// Choose how this client starts sessions. A [`SessionLaunch::Repo`]
+    /// start applies to the next session created and then gives way to the
+    /// way sessions were started before it.
+    pub fn set_launch(&mut self, launch: SessionLaunch) {
+        match launch {
+            SessionLaunch::Repo(_) => self.once = Some(launch),
+            base => {
+                self.once = None;
+                self.launch = base;
+            }
+        }
+    }
+
+    /// How the next session will be started.
+    #[must_use]
+    pub fn launch(&self) -> &SessionLaunch {
+        self.once.as_ref().unwrap_or(&self.launch)
+    }
+
+    /// The directory the next session works in, given the client's own.
+    #[must_use]
+    pub fn launch_cwd(&self, client_cwd: &Path) -> Option<PathBuf> {
+        self.launch().cwd(client_cwd)
     }
 
     /// Connect the manager to the daemon that owns session persistence.
@@ -577,6 +650,10 @@ impl SessionManager {
     ) -> Result<&Session, SessionError> {
         let id = SessionId::new();
         let now = Timestamp::now();
+        let client_cwd = std::env::current_dir()?;
+        let launch = self.once.take().unwrap_or_else(|| self.launch.clone());
+        let cwd = launch.cwd(&client_cwd);
+        let repo = launch.repo();
 
         // Don't create directories yet - defer until first message
         let sandbox_dir = self.store.sandbox_dir(id.as_str(), profile_id.as_deref());
@@ -590,7 +667,9 @@ impl SessionManager {
             created_at: now,
             updated_at: now,
             persisted: false,
-            repo: self.pending_repo.take(),
+            repo,
+            cwd,
+            events_cursor: None,
         };
 
         self.current = Some(session);
@@ -604,7 +683,7 @@ impl SessionManager {
     /// # Errors
     /// Returns [`SessionError::NoActiveSession`] when no session is active, or [`SessionError`] on persistence failure.
     pub async fn ensure_persisted(&mut self) -> Result<(), SessionError> {
-        let (session_id, _title, model, profile_id, already_persisted) = {
+        let (session_id, _title, model, profile_id, already_persisted, cwd) = {
             let session = self.current.as_ref().ok_or(SessionError::NoActiveSession)?;
             (
                 session.id.as_str().to_string(),
@@ -612,13 +691,14 @@ impl SessionManager {
                 session.model.clone(),
                 session.profile_id.clone(),
                 session.persisted,
+                session.cwd.clone(),
             )
         };
 
         if !already_persisted {
             // The session works where this client runs, not where the
-            // daemon happened to be started.
-            let cwd = std::env::current_dir()?;
+            // daemon happened to be started; a repo-less chat or a GitHub
+            // start works in neither.
             // The daemon creates the session's row and directory layout.
             let _: crate::client::WireSession = self
                 .daemon()?
@@ -628,7 +708,7 @@ impl SessionManager {
                         id: Some(session_id.clone()),
                         model: model.clone(),
                         profile_id: profile_id.clone(),
-                        cwd: Some(cwd.display().to_string()),
+                        cwd: cwd.map(|cwd| cwd.display().to_string()),
                         repo: self.current.as_ref().and_then(|s| s.repo.clone()),
                     },
                 )
@@ -660,10 +740,13 @@ impl SessionManager {
         let Some(session_id) = self.current.as_ref().map(|session| session.id.clone()) else {
             return Ok(());
         };
-        let messages: Vec<ChatMessage> = self
-            .daemon()?
-            .get(&format!("/api/sessions/{}/history", session_id.as_str()))
-            .await?;
+        let messages: Vec<ChatMessage> = super::chat_messages_from_transcript(
+            &self
+                .daemon()?
+                .get_transcript(session_id.as_str())
+                .await?
+                .entries,
+        );
         if let Some(session) = self.current.as_mut()
             && session.id == session_id
         {
@@ -696,9 +779,9 @@ impl SessionManager {
             .unwrap_or_else(|_| Timestamp::now());
         let created_at = updated_at;
 
-        let messages: Vec<ChatMessage> = daemon
-            .get(&format!("/api/sessions/{}/history", id.as_str()))
-            .await?;
+        let messages: Vec<ChatMessage> = super::chat_messages_from_transcript(
+            &daemon.get_transcript(id.as_str()).await?.entries,
+        );
         let history = ChatHistory::default();
         let sandbox_dir = self.store.sandbox_dir(id.as_str(), profile_id.as_deref());
         let session = Session {
@@ -712,6 +795,8 @@ impl SessionManager {
             updated_at,
             persisted: true,
             repo: None,
+            cwd: None,
+            events_cursor: api.cursor,
         };
         *self.current.insert(session).history.messages_mut() = messages;
 
@@ -745,6 +830,10 @@ impl SessionManager {
     /// [`SessionError::NotFound`] when `prompt_index` does not point at a
     /// user message or the persisted rows diverge from the in-memory
     /// history, or [`SessionError`] on persistence failure.
+    ///
+    /// # Panics
+    /// Panics when the stored user row lacks its id; persisted history
+    /// rows always carry it.
     pub async fn rewind_to_prompt(
         &mut self,
         prompt_index: usize,
@@ -773,10 +862,14 @@ impl SessionManager {
             cut -= 1;
         }
 
+        let entry_id = session.history.messages()[prompt_index]
+            .id
+            .expect("stored rows carry their id")
+            .to_string();
         let user_message_id: i64 = daemon
             .post(
-                &format!("/api/sessions/{session_id}/rewind"),
-                &crate::client::RewindRequest { index: cut },
+                &format!("/api/sessions/{session_id}/actions/rewind"),
+                &crate::client::RewindRequest { entry_id },
             )
             .await?;
         session.history.messages_mut().truncate(cut);
@@ -832,7 +925,7 @@ impl SessionManager {
         session.history.metadata.title = Some(title.clone());
 
         let _: crate::client::WireSession = daemon
-            .put(
+            .patch(
                 &format!("/api/sessions/{}", session.id.as_str()),
                 &crate::client::UpdateSessionRequest {
                     title: Some(title),
@@ -856,7 +949,7 @@ impl SessionManager {
         session.history.metadata.model = Some(model.clone());
 
         let _: crate::client::WireSession = daemon
-            .put(
+            .patch(
                 &format!("/api/sessions/{}", session.id.as_str()),
                 &crate::client::UpdateSessionRequest {
                     model: Some(model),
@@ -912,5 +1005,81 @@ impl SessionManager {
             .delete(&format!("/api/sessions/{id}"))
             .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod launch_tests {
+    use super::*;
+
+    async fn manager() -> (tempfile::TempDir, SessionManager) {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = SessionManager::at(tmp.path().join("may")).await.unwrap();
+        (tmp, manager)
+    }
+
+    #[test]
+    fn a_launch_decides_the_directory_a_session_works_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let client = Path::new("/work/client");
+        assert_eq!(
+            SessionLaunch::Checkout.cwd(client),
+            Some(client.to_path_buf())
+        );
+        assert_eq!(SessionLaunch::RepoLess.cwd(client), None);
+        // `owner/repo` needs no checkout.
+        assert_eq!(SessionLaunch::Repo("acme/app".into()).cwd(client), None);
+        let path = tmp.path().canonicalize().unwrap();
+        assert_eq!(
+            SessionLaunch::Repo(path.display().to_string()).cwd(client),
+            Some(path)
+        );
+    }
+
+    #[test]
+    fn a_launch_sends_the_daemon_a_canonical_path_or_the_repository_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().canonicalize().unwrap();
+        let dotted = path.join("inner").join("..");
+        std::fs::create_dir(path.join("inner")).unwrap();
+        assert_eq!(
+            SessionLaunch::Repo(dotted.display().to_string()).repo(),
+            Some(path.display().to_string())
+        );
+        assert_eq!(
+            SessionLaunch::Repo("acme/app".into()).repo(),
+            Some("acme/app".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_repo_less_launch_creates_sessions_with_no_directory_or_repository() {
+        let (_tmp, mut manager) = manager().await;
+        manager.set_launch(SessionLaunch::RepoLess);
+        for _ in 0..2 {
+            let session = manager.create_session().unwrap();
+            assert_eq!(session.cwd, None);
+            assert_eq!(session.repo, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_repo_start_binds_one_session_and_then_gives_way() {
+        let (_tmp, mut manager) = manager().await;
+        manager.set_launch(SessionLaunch::RepoLess);
+        manager.set_launch(SessionLaunch::Repo("acme/app".into()));
+        let first = manager.create_session().unwrap();
+        assert_eq!(first.repo.as_deref(), Some("acme/app"));
+        assert_eq!(first.cwd, None);
+        let second = manager.create_session().unwrap();
+        assert_eq!(second.repo, None);
+        assert_eq!(second.cwd, None, "the repo-less launch resumes");
+    }
+
+    #[tokio::test]
+    async fn the_default_launch_works_in_the_clients_directory() {
+        let (_tmp, mut manager) = manager().await;
+        let session = manager.create_session().unwrap();
+        assert_eq!(session.cwd, Some(std::env::current_dir().unwrap()));
     }
 }

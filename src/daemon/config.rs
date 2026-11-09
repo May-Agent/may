@@ -23,11 +23,11 @@ use super::model_resolution::persist_last_model;
 use super::state::DaemonState;
 use super::types::{
     ApiHealth, CopilotAuthEvent, CopilotAuthStatus, CopilotStartResponse, CopilotStatusResponse,
-    LastModelRequest, McpCreateRequest, MemoryPayload, MemorySaveRequest, SkillInfoDto,
-    SkillInstallRequest, SseHeartbeat, SshServerRequest, UiAppearanceConfig, UiBrowserConfig,
-    UiConfigResponse, UiFullConfig, UiModelsConfig, UiNativeToolsConfig, UiPreferencesConfig,
-    UiProviderConfig, UiRecapConfig, UiRemoteAccessConfig, UiSandboxConfig, UiSessionsConfig,
-    UiStreamConfig, UiSuggestionsConfig,
+    JobPoolRequest, LastModelRequest, McpCreateRequest, MemoryPayload, MemorySaveRequest,
+    SkillInfoDto, SkillInstallRequest, SseHeartbeat, SshServerRequest, UiAppearanceConfig,
+    UiBrowserConfig, UiConfigResponse, UiFullConfig, UiModelsConfig, UiNativeToolsConfig,
+    UiPreferencesConfig, UiProviderConfig, UiRecapConfig, UiRemoteAccessConfig, UiSandboxConfig,
+    UiSessionsConfig, UiStreamConfig, UiSuggestionsConfig,
 };
 use crate::computer::proto::{AgentRequest, AgentResponse};
 
@@ -85,6 +85,7 @@ pub(super) fn build_ui_config_response(config: &MayConfig) -> UiConfigResponse {
         max_iterations: config.max_iterations,
         ui_font: config.appearance.font.clone(),
         ui_theme: config.appearance.theme.clone(),
+        timezone: config.time.user_timezone().to_string(),
         full_config: build_ui_full_config(config),
     }
 }
@@ -170,6 +171,10 @@ pub(super) fn build_ui_full_config(config: &MayConfig) -> UiFullConfig {
         remote_access: UiRemoteAccessConfig::from(&config.remote_access),
         sandbox: UiSandboxConfig {
             command_priority: config.sandbox.command_priority,
+            job_pool_size: config
+                .sandbox
+                .job_pool_size
+                .map(std::num::NonZeroUsize::get),
         },
         stream: UiStreamConfig {
             codec: config.stream.codec,
@@ -321,6 +326,7 @@ async fn run_save_full_config(state: Arc<DaemonState>, req: UiFullConfig) -> Sky
         }
     }
 
+    let job_pool_size = parse_job_pool_size(req.sandbox.job_pool_size)?;
     let updated = state.update_config(|config| {
         config.provider = provider_map_from_ui(&config.provider, &req.providers);
         config.models.advanced = parse_selector_list(&req.models.advanced);
@@ -357,6 +363,7 @@ async fn run_save_full_config(state: Arc<DaemonState>, req: UiFullConfig) -> Sky
         });
         config.max_iterations = req.max_iterations;
         config.sandbox.command_priority = req.sandbox.command_priority;
+        config.sandbox.job_pool_size = job_pool_size;
         config.stream.codec = codec;
         config.browser.enabled = req.browser.enabled;
         config.browser.backend = req.browser.backend;
@@ -410,6 +417,7 @@ async fn run_save_full_config(state: Arc<DaemonState>, req: UiFullConfig) -> Sky
         .map_err(bad_request_error)?;
 
     updated.save().await.map_err(internal_error)?;
+    state.job_server.resize(updated.sandbox.job_pool_size());
     if let Some(previous_browser_manager) = previous_browser_manager
         && !next_browser_manager
             .as_ref()
@@ -430,6 +438,27 @@ async fn run_save_full_config(state: Arc<DaemonState>, req: UiFullConfig) -> Sky
         .map_err(internal_error)?;
     state.notify_ui_events(UiEventTopics::CONFIG | UiEventTopics::BROWSER_STATUS);
     Ok(ApiHealth { ok: true })
+}
+
+fn parse_job_pool_size(size: Option<usize>) -> SkyResult<Option<std::num::NonZeroUsize>> {
+    size.map(|size| {
+        std::num::NonZeroUsize::new(size)
+            .ok_or_else(|| bad_request_error("the jobserver pool needs at least one token"))
+    })
+    .transpose()
+}
+
+/// Sets the machine-wide jobserver pool size and resizes the running pool.
+pub(super) async fn set_job_pool(
+    Json(req): Json<JobPoolRequest>,
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<ApiHealth>> {
+    let size = parse_job_pool_size(req.size)?;
+    let updated = state.update_config(|config| config.sandbox.job_pool_size = size);
+    updated.save().await.map_err(internal_error)?;
+    state.job_server.resize(updated.sandbox.job_pool_size());
+    state.notify_ui_events(UiEventTopics::CONFIG);
+    Ok(Json(ApiHealth { ok: true }))
 }
 
 /// Logins trimmed, with blanks and repeats dropped, in their given order.

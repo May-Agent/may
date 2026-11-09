@@ -78,6 +78,17 @@ pub enum TuiEvent {
     /// The text streamed so far is discarded: the attempt failed and the
     /// prompt is resubmitted.
     Retract,
+    /// The daemon withdrew the turn: it was stopped before any tool call or
+    /// response text, so its message left the conversation.
+    Withdrawn {
+        /// The withdrawn message text.
+        content: String,
+        /// Whether this client sent it and gets it back in its input.
+        own: bool,
+    },
+    /// The user declined, at the session's repository question, to work
+    /// where the session starts: the turn did not run, and nothing failed.
+    Declined(String),
     /// Agent stream completed (ready for next prompt).
     Complete,
     /// Agent encountered a fatal error.
@@ -777,8 +788,8 @@ async fn next_command(
             IdleStep::Command(command) => return command,
             IdleStep::Background(wake) => {
                 // The wake is recorded in the agent's context; a wake that
-                // needs the model asks the host for a run.
-                if wake.needs_model
+                // starts a run asks the host for one.
+                if wake.starts_run
                     && let Some(background) = background_wakes
                 {
                     let _ = background.wakes.try_send(wake);
@@ -1015,6 +1026,9 @@ async fn run_agent_prompt(
         }
         WorkOutcome::Finished(Ok(ControlFlow::Break(PromptStop::Stopped)))
         | WorkOutcome::Cancelled => {
+            // The user stopped the run: background completions wait for
+            // their next input.
+            agent.interrupt();
             // Completion after cancel lets the TUI know processing stopped.
             let _ = event_tx.send(TuiEvent::Complete).await;
             return WorkOutcome::Cancelled;

@@ -445,6 +445,7 @@ pub(super) fn render_preferences_section(frame: &mut Frame, area: Rect, app: &Ap
         "Max iterations",
         "Warn on model change",
         "Show decode speed",
+        "Job pool size",
     ];
     let pref_values: Vec<String> = vec![
         if config.max_iterations == 0 {
@@ -454,6 +455,10 @@ pub(super) fn render_preferences_section(frame: &mut Frame, area: Rect, app: &Ap
         },
         config.preferences.warn_on_model_change.to_string(),
         config.preferences.show_decode_speed.to_string(),
+        config.sandbox.job_pool_size.map_or_else(
+            || format!("auto ({})", crate::jobserver::default_pool_size()),
+            |size| size.to_string(),
+        ),
     ];
 
     let mut items: Vec<ListItem> = pref_names
@@ -474,19 +479,23 @@ pub(super) fn render_preferences_section(frame: &mut Frame, area: Rect, app: &Ap
         })
         .collect();
 
-    // If in text edit mode for max_iterations
+    // If in text edit mode for the selected row
     if let Some((input, cursor)) = state.edit_text()
-        && state.selected == 0
+        && let Some(name) = pref_names.get(state.selected)
     {
         let cursor_pos = char_to_byte_idx(input, cursor);
         let display = format!("{}{}", &input[..cursor_pos], &input[cursor_pos..]);
-        items[0] = ListItem::new(format!("  Max iterations:        {display}"))
+        items[state.selected] = ListItem::new(format!("> {name:<25} {display}"))
             .style(Style::default().fg(Color::Yellow));
 
         // IME anchor at the caret inside the edited row.
         let caret_x =
-            area.x + 26 + u16::try_from(display_width_prefix(input, cursor)).unwrap_or(u16::MAX);
-        frame.set_cursor_position((caret_x.min(area.right().saturating_sub(2)), area.y + 1));
+            area.x + 29 + u16::try_from(display_width_prefix(input, cursor)).unwrap_or(u16::MAX);
+        let row = u16::try_from(state.selected).unwrap_or(u16::MAX);
+        frame.set_cursor_position((
+            caret_x.min(area.right().saturating_sub(2)),
+            area.y + 1 + row,
+        ));
     }
 
     let list = List::new(items).block(

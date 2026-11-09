@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use aither_agent::{AgentEvent, TimedEvent};
+use aither_core::LanguageModel as _;
 use aither_core::llm::Usage;
 
 use super::request_ledger::RequestLedger;
@@ -60,6 +61,8 @@ pub(super) struct TurnEvents<'t, 's, S> {
     /// `Some` while a model call is in its reasoning phase: the instant the
     /// phase began, measured as user-perceived wait.
     pub(super) reasoning_phase: Option<Instant>,
+    /// The model's context window, sent to clients with each usage.
+    pub(super) context_window: Option<u32>,
     /// The provider and model the turn's requests go to.
     pub(super) provider_id: &'t str,
     pub(super) model: &'t str,
@@ -70,6 +73,8 @@ pub(super) struct TurnEvents<'t, 's, S> {
     pub(super) usage: Usage,
     pub(super) ledger: RequestLedger<'t>,
     pub(super) decode_meter: DecodeMeter,
+    /// The agent's model, whose vocabulary counts the streamed text.
+    pub(super) counting_model: crate::agent::ProviderLlm,
     pub(super) last_speed_emit: Option<Instant>,
     /// The current text segment, flushed on tool calls.
     pub(super) segment_text: String,
@@ -83,6 +88,9 @@ pub(super) struct TurnEvents<'t, 's, S> {
     /// The whole assistant text.
     pub(super) full_text: String,
     pub(super) reasoning_text: String,
+    /// How much of `reasoning_text` belongs to model responses that finished:
+    /// what follows is the response in flight, which a retry discards.
+    pub(super) reasoning_floor: usize,
     pub(super) terminal_snapshot: TerminalStateSnapshot,
     pub(super) saw_tool_activity: bool,
     pub(super) tool_arguments_by_id: HashMap<String, String>,
@@ -95,6 +103,28 @@ pub(super) struct TurnEvents<'t, 's, S> {
     pub(super) first_agent_event_seen: bool,
     pub(super) first_visible_tool_seen: bool,
     pub(super) first_text_seen: bool,
+}
+
+impl<S: ChatSink> TurnEvents<'_, '_, S> {
+    /// Feeds streamed model output to the decode meter: counted with the
+    /// model's vocabulary where it has one, estimated from its bytes
+    /// otherwise.
+    fn note_decoded(&mut self, text: &str) {
+        match self.counting_model.count_text(text) {
+            Some(tokens) => self.decode_meter.note_counted(tokens),
+            None => self.decode_meter.note_output(text.len()),
+        }
+    }
+
+    /// Whether the turn did anything beyond thinking: it started a tool
+    /// call or produced response text.
+    pub(super) const fn took_action(&self) -> bool {
+        self.saw_tool_activity
+            || self.first_visible_tool_seen
+            || self.first_text_seen
+            || !self.terminal_snapshot.executions.is_empty()
+            || !self.full_text.is_empty()
+    }
 }
 
 /// How long `provider_id` keeps the conversation's prompt cache warm.
@@ -165,7 +195,7 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                 "client disconnected during reasoning end",
             ));
         }
-        self.sink.on_agent_event(Ok(&event));
+        self.sink.on_agent_event(Ok(&event), self.context_window);
         match self.event(at, event).await {
             Ok(ControlFlow::Continue(())) => {}
             Ok(ControlFlow::Break(stop)) => return ControlFlow::Break(stop),
@@ -229,6 +259,21 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
         }
     }
 
+    /// Forgets what the response in flight streamed so far: its text, its
+    /// reasoning and the tool calls it began to stream. The replacement
+    /// starts a reasoning phase of its own.
+    fn discard_attempt(&mut self) {
+        let kept = self.full_text.len().saturating_sub(self.segment_text.len());
+        self.full_text.truncate(kept);
+        self.segment_text.clear();
+        self.segment_at = None;
+        self.segment_translation = None;
+        self.reasoning_text.truncate(self.reasoning_floor);
+        self.pending_tool_streams.clear();
+        self.reasoning_phase = self.reasoning_display.then(Instant::now);
+        self.decode_meter.note_boundary();
+    }
+
     async fn emit_speed(&mut self, stopped: &'static str) -> ControlFlow<TurnStop> {
         if emit_speed(self.sink, &self.decode_meter, &mut self.last_speed_emit).await {
             ControlFlow::Continue(())
@@ -253,7 +298,7 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                         "client disconnected during reasoning stream",
                     )));
                 }
-                self.decode_meter.note_output(text.len());
+                self.note_decoded(&text);
                 Ok(self
                     .emit_speed("client disconnected during reasoning stream")
                     .await)
@@ -274,7 +319,7 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                         "client disconnected during text stream",
                     )));
                 }
-                self.decode_meter.note_output(text.len());
+                self.note_decoded(&text);
                 Ok(self
                     .emit_speed("client disconnected during text stream")
                     .await)
@@ -329,7 +374,7 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                     fragment = %arguments_fragment,
                     "incoming ToolCallDelta from aither"
                 );
-                self.decode_meter.note_output(arguments_fragment.len());
+                self.note_decoded(&arguments_fragment);
                 if let ControlFlow::Break(stop) = self.emit_speed(TOOL_STREAM).await {
                     return Ok(ControlFlow::Break(stop));
                 }
@@ -479,9 +524,9 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                 enforce_issue_ownership(self.state, self.session_id, &mut self.tasks_accepted)
                     .await;
                 // Check if tasks.md changed after tool execution.
-                if let Some(checklist) =
+                if let Some(rows) =
                     check_tasks_update(self.session_paths, &mut self.last_todo_hash).await
-                    && !self.sink.on_todo_update(&checklist).await
+                    && !self.sink.on_todo_update(rows).await
                 {
                     return Ok(ControlFlow::Break(TurnStop::Cancelled(
                         "client disconnected during todo update",
@@ -519,11 +564,40 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
             }
             // A reply without tool calls that the run follows with another
             // reply is stored as a message of its own.
-            AgentEvent::TurnComplete {
-                has_tool_calls: false,
+            AgentEvent::TurnComplete { has_tool_calls, .. } => {
+                if !has_tool_calls {
+                    self.flush_segment();
+                }
+                self.reasoning_floor = self.reasoning_text.len();
+                Ok(ControlFlow::Continue(()))
+            }
+            // The response stream broke after it opened and the same request
+            // is sent again: what streamed since it was sent is the broken
+            // attempt's, which neither the conversation nor the stored turn
+            // keeps. Clients drop what they rendered of it and show the wait.
+            AgentEvent::ResponseRetry {
+                error,
+                retry,
+                delay,
                 ..
             } => {
-                self.flush_segment();
+                self.discard_attempt();
+                let until = jiff::Timestamp::now()
+                    .checked_add(delay)
+                    .expect("a retry delay is far below the timestamp range");
+                if !self.sink.on_retract().await
+                    || !self
+                        .sink
+                        .on_hold(
+                            crate::client::HoldReason::Retry { until, retry },
+                            &error.to_string(),
+                        )
+                        .await
+                {
+                    return Ok(ControlFlow::Break(TurnStop::Cancelled(
+                        "client disconnected during a response retry",
+                    )));
+                }
                 Ok(ControlFlow::Continue(()))
             }
             AgentEvent::BackgroundTaskCompleted { .. } => {

@@ -10,6 +10,7 @@ import {
   createSession,
   deleteSession,
   getSession,
+  getTranscript,
   listSessions,
   updateSession,
   unarchiveSession,
@@ -17,6 +18,7 @@ import {
   type UpdateSessionPatch,
 } from '../api/sessions';
 import { putSessionTasks } from '../api/tasks';
+import { foldTranscript } from '../transcript';
 import { useConfigStore } from './config';
 
 const DRAFT_PREFIX = 'draft_';
@@ -102,6 +104,8 @@ interface SessionsState {
 
   appendMessage: (sessionId: string, msg: ApiMessage) => void;
   replaceMessage: (sessionId: string, msg: ApiMessage) => void;
+  /** Drop the latest user message whose text is `content`: a withdrawn turn's. */
+  withdrawUserMessage: (sessionId: string, content: string) => void;
   /**
    * A turn ended: the oldest not-yet-stored user message takes the id the
    * daemon stored it under, and the reply, when the turn stored one, joins
@@ -154,12 +158,13 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
     set({ loading: true, error: null });
     try {
       const session = await getSession(id);
+      const transcript = foldTranscript((await getTranscript(id)).entries);
       if (generation !== activeRequestGeneration) return;
       set({
         active: session,
         messages: {
           ...get().messages,
-          [id]: mergePendingLocal(session.messages ?? [], get().messages[id] ?? []),
+          [id]: mergePendingLocal(transcript, get().messages[id] ?? []),
         },
         loading: false,
       });
@@ -174,6 +179,7 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
     const generation = ++activeRequestGeneration;
     try {
       const session = await getSession(id);
+      const transcript = foldTranscript((await getTranscript(id)).entries);
       if (generation !== activeRequestGeneration) return;
       set((prev) => {
         if (prev.active?.id !== id) return prev;
@@ -181,7 +187,7 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
           active: session,
           messages: {
             ...prev.messages,
-            [id]: mergePendingLocal(session.messages ?? [], prev.messages[id] ?? []),
+            [id]: mergePendingLocal(transcript, prev.messages[id] ?? []),
           },
         };
       });
@@ -198,7 +204,6 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
       title: 'New Chat',
       lastModified: new Date().toISOString(),
       preview: '',
-      messages: [],
       profileId: profileId ?? null,
       model: useConfigStore.getState().config?.fullConfig.lastModel ?? '',
       reasoningEffort: null,
@@ -382,6 +387,17 @@ export const useSessionsStore = create<SessionsState>((set, get) => ({
         [sessionId]: [...(prev.messages[sessionId] ?? []), msg],
       },
     }));
+  },
+
+  withdrawUserMessage(sessionId, content) {
+    set((prev) => {
+      const messages = prev.messages[sessionId] ?? [];
+      const at = messages.findLastIndex((m) => m.role === 'user' && m.content === content);
+      if (at < 0) return prev;
+      return {
+        messages: { ...prev.messages, [sessionId]: messages.filter((_, i) => i !== at) },
+      };
+    });
   },
 
   replaceMessage(sessionId, msg) {
