@@ -496,9 +496,18 @@ impl MayAgent {
             // Keychain secrets (`/secret`) land as env vars in every spawned
             // command; the store is re-read per call, so additions take
             // effect without rebuilding the agent.
-            .with_env_source(crate::secrets::SessionEnv::new(
-                crate::secrets::SecretStore::new(&config.may_dir),
-                config.session_id.as_str(),
+            // `MAY_TASKS` names the session's `tasks.md` as the commands see
+            // it: a container mounts the sandbox directory as its workspace.
+            .with_env_source(super::command_env::CommandEnv::new(
+                crate::secrets::SessionEnv::new(
+                    crate::secrets::SecretStore::new(&config.may_dir),
+                    config.session_id.as_str(),
+                ),
+                if is_container {
+                    crate::container::lifecycle::container_workspace_path(crate::tasks_md::FILE)
+                } else {
+                    session_paths.tasks_path().display().to_string()
+                },
             ));
         // The pool reaches only local commands: aither fails container and
         // SSH executions while a pool is configured, so those sessions run

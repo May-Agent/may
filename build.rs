@@ -84,9 +84,14 @@ fn emit_image_refs(heel_lib_version: &str) {
     let manifest =
         fs::read(TOOL_DISTRIBUTION_MANIFEST).expect("tool distribution manifest must be readable");
     let base_ref = image_ref::base_image_ref(base_dir).expect("base context must be readable");
-    let workspace_ref =
-        image_ref::workspace_image_ref(workspace_dir, &base_ref, &manifest, heel_lib_version)
-            .expect("workspace context must be readable");
+    let workspace_ref = image_ref::workspace_image_ref(
+        workspace_dir,
+        &base_ref,
+        &manifest,
+        Path::new("."),
+        heel_lib_version,
+    )
+    .expect("workspace context and tasks sources must be readable");
     println!("cargo:rustc-env=MAY_BASE_IMAGE={base_ref}");
     println!("cargo:rustc-env=MAY_WORKSPACE_IMAGE={workspace_ref}");
 
@@ -94,6 +99,7 @@ fn emit_image_refs(heel_lib_version: &str) {
         PathBuf::from(TOOL_DISTRIBUTION_MANIFEST),
         workspace_dir.to_path_buf(),
     ];
+    inputs.extend(image_ref::TASKS_SOURCES.iter().map(PathBuf::from));
     inputs.extend(
         image_ref::workspace_hash_inputs(workspace_dir)
             .expect("workspace context must be readable")

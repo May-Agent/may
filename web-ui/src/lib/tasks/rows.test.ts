@@ -2,9 +2,10 @@ import { describe, expect, test } from 'bun:test';
 import { openCount, openGroups, referenceLabel, rootReferences } from './rows';
 import type { TaskRow } from '../types';
 
-const row = (section: TaskRow['section'], text: string, extra: Partial<TaskRow> = {}): TaskRow => ({
+const row = (section: TaskRow['section'], title: string, extra: Partial<TaskRow> = {}): TaskRow => ({
   section,
-  text,
+  title,
+  detail: '',
   blocking: null,
   references: [],
   ...extra,
@@ -20,7 +21,7 @@ describe('task rows', () => {
   ];
 
   test('open work is grouped Doing before Queued, without roots', () => {
-    expect(openGroups(rows).map((g) => [g.section, g.rows.map((r) => r.text)])).toEqual([
+    expect(openGroups(rows).map((g) => [g.section, g.rows.map((r) => r.title)])).toEqual([
       ['doing', ['write report']],
       ['queued', ['ship it']],
     ]);

@@ -10,4 +10,5 @@
 
 # CI-generated container workspace context
 container/workspace/heel
+container/workspace/tasks
 container/workspace/tools/
