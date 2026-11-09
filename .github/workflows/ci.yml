@@ -132,6 +132,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       # Full debuginfo for this dependency tree overflows the hosted runner's disk;
       # line tables keep test backtraces readable.
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
@@ -146,6 +147,7 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 40
     env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       # See test-ubuntu.
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
