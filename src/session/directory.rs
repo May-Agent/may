@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use crate::db::entity::sessions;
 
-use super::{MayHomePaths, SessionStore};
+use super::{MayHomePaths, RepoBinding, SessionStore};
 
 /// The directory a session runs in, resolved from its row alone.
 ///
@@ -28,7 +28,12 @@ impl SessionDirectory {
         if let Some(cwd) = session.cwd.as_deref() {
             return Self::Checkout(PathBuf::from(cwd));
         }
-        if let Some(checkout) = session.repo.as_deref().and_then(local_checkout) {
+        if let Some(checkout) = session
+            .repo
+            .as_deref()
+            .and_then(|stored| RepoBinding::parse(stored).ok())
+            .and_then(|binding| binding.checkout())
+        {
             return Self::Checkout(checkout);
         }
         Self::Sandbox(
@@ -60,18 +65,6 @@ impl SessionDirectory {
             Self::Checkout(path) => Some(path),
             Self::Sandbox(_) => None,
         }
-    }
-}
-
-/// The checkout a `local:<repository identity>` binding names. The identity
-/// is the git common directory: `<checkout>/.git` for a worktree-bearing
-/// repository, the directory itself for a bare or non-git one.
-fn local_checkout(binding: &str) -> Option<PathBuf> {
-    let identity = PathBuf::from(binding.strip_prefix("local:")?);
-    if identity.file_name().is_some_and(|name| name == ".git") {
-        identity.parent().map(Path::to_path_buf)
-    } else {
-        Some(identity)
     }
 }
 

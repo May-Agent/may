@@ -54,6 +54,13 @@ pub enum RepoCloneError {
     /// The clone path exists but is not a real directory.
     #[error("clone path {0} exists and is not a directory")]
     Conflict(PathBuf),
+    /// The checkout's work in progress cannot be committed without an author.
+    #[error(
+        "the checkout's work in progress cannot be committed: git has no author; \
+         set it with `git config --global user.name \"<name>\"` and \
+         `git config --global user.email \"<email>\"`"
+    )]
+    GitIdentity,
     /// A script in the session's terminal sandbox did not exit cleanly.
     #[error("`{script}` in the sandbox: {reason}")]
     Sandbox {
@@ -247,6 +254,9 @@ pub struct CloneRecord {
     pub source: String,
     /// Whether the clone came from a local checkout.
     pub local: bool,
+    /// The work-in-progress commit the clone's work stacks on, when it was
+    /// based on its checkout as it stood.
+    pub base_sha: Option<String>,
 }
 
 impl TryFrom<RepoCloneRow> for CloneRecord {
@@ -258,6 +268,7 @@ impl TryFrom<RepoCloneRow> for CloneRecord {
             dir: CloneDir::try_from(row.dir)?,
             source: row.source,
             local: row.local,
+            base_sha: row.base_sha,
         })
     }
 }
@@ -418,16 +429,83 @@ impl SessionRepos {
         }))
     }
 
+    /// Ensure the session's clone of the repository `binding` names exists
+    /// and return its path; `None` when the repository's trust binds no
+    /// clone. A GitHub binding clones the remote and reads no local
+    /// checkout, so it works with none present; a local binding clones its
+    /// checkout.
+    ///
+    /// # Errors
+    /// Fails when git fails, the checkout's identity cannot be read, or the
+    /// registry cannot be read or written.
+    pub async fn ensure_clone_of_binding(
+        &self,
+        binding: &crate::session::RepoBinding,
+        config: &crate::workspace::WorkspaceConfig,
+        staging: &Path,
+    ) -> Result<Option<PathBuf>, RepoCloneError> {
+        match binding {
+            crate::session::RepoBinding::Github(repository) => {
+                let owner_repo = repository.to_string();
+                // Matching a project reads its checkout's remote: off the
+                // executor.
+                let publishes = {
+                    let (config, owner_repo) = (config.clone(), owner_repo.clone());
+                    blocking::unblock(move || crate::trust::trust_for_github(&config, &owner_repo))
+                        .await
+                }
+                .is_some_and(crate::trust::TrustLevel::publishes_to_github);
+                if !publishes {
+                    return Ok(None);
+                }
+                let url = format!("https://github.com/{owner_repo}.git");
+                Ok(Some(
+                    self.ensure_remote_clone(&url, &owner_repo, staging).await?,
+                ))
+            }
+            // A local binding is the checkout's own repository: its clone is
+            // always local, whatever the trust level would pick for a
+            // session that only meets the checkout. `local` trust writes the
+            // checkout and binds no clone.
+            crate::session::RepoBinding::Local(identity) => {
+                let Some(checkout) = binding.checkout() else {
+                    return Ok(None);
+                };
+                let clones = {
+                    let (config, identity, checkout) =
+                        (config.clone(), identity.clone(), checkout.clone());
+                    blocking::unblock(move || {
+                        crate::trust::trust_for(&config, &identity, &checkout)
+                    })
+                    .await
+                }
+                .is_some_and(crate::trust::TrustLevel::clones_work);
+                if !clones {
+                    return Ok(None);
+                }
+                Ok(Some(
+                    self.ensure_local_clone(&checkout, identity, staging)
+                        .await?,
+                ))
+            }
+        }
+    }
+
     /// Run `git clone <args> <staged>` in a fresh directory under `staging`,
     /// then move the finished clone to `repos/<dir>`. The clone is never
     /// agent-writable while host git works on it, so nothing the agent writes
     /// into it runs on the host.
+    ///
+    /// With `wip_of`, the checkout's uncommitted and untracked files become
+    /// one commit on top of the clone's HEAD, whose id is returned.
     async fn clone_staged(
         &self,
         args: Vec<String>,
         staging: &Path,
         dir: &CloneDir,
-    ) -> Result<(), RepoCloneError> {
+        wip_of: Option<&Path>,
+    ) -> Result<Option<String>, RepoCloneError> {
+        let wip_of = wip_of.map(Path::to_path_buf);
         let staging = staging.to_path_buf();
         let session_root = self.session_root.clone();
         let dir = dir.clone();
@@ -443,9 +521,15 @@ impl SessionRepos {
             let staged_arg = staged.to_string_lossy();
             command.push(&staged_arg);
             host.output(None, &command)?;
+            // The clone is still host-owned here, so nothing the agent
+            // writes can run on the host.
+            let base = wip_of
+                .map(|checkout| wip::commit_onto(&host, &checkout, &staged))
+                .transpose()?
+                .flatten();
             std::fs::create_dir_all(&session_root)?;
             confined::install_clone(&session_root, &staged, &dir)?;
-            Ok(())
+            Ok(base)
         })
         .await
     }
@@ -457,6 +541,7 @@ impl SessionRepos {
         dir: &CloneDir,
         source: String,
         local: bool,
+        base_sha: Option<String>,
     ) -> Result<(), RepoCloneError> {
         self.db
             .insert_repo_clone(
@@ -466,6 +551,7 @@ impl SessionRepos {
                     dir: dir.0.clone(),
                     source,
                     local,
+                    base_sha,
                 },
             )
             .await?;
@@ -488,6 +574,33 @@ impl SessionRepos {
         repo_key: &Path,
         staging: &Path,
     ) -> Result<PathBuf, RepoCloneError> {
+        self.local_clone(checkout, repo_key, staging, false).await
+    }
+
+    /// Like [`Self::ensure_local_clone`], for a session that works on top of
+    /// the checkout as it stands: the checkout's uncommitted changes and
+    /// untracked files become one base commit in the clone, recorded as the
+    /// clone's base, and the session's work stacks on it.
+    ///
+    /// # Errors
+    /// Fails as [`Self::ensure_local_clone`] does, or when the base commit
+    /// cannot be made.
+    pub async fn ensure_wip_clone(
+        &self,
+        checkout: &Path,
+        repo_key: &Path,
+        staging: &Path,
+    ) -> Result<PathBuf, RepoCloneError> {
+        self.local_clone(checkout, repo_key, staging, true).await
+    }
+
+    async fn local_clone(
+        &self,
+        checkout: &Path,
+        repo_key: &Path,
+        staging: &Path,
+        with_wip: bool,
+    ) -> Result<PathBuf, RepoCloneError> {
         let key = repo_key.to_string_lossy().into_owned();
         if let Some(dir) = self.clone_for(&key).await? {
             return Ok(dir);
@@ -502,27 +615,31 @@ impl SessionRepos {
                 &clone_dir,
                 checkout.to_string_lossy().into_owned(),
                 true,
+                None,
             )
             .await?;
             return Ok(dir);
         }
         // Objects are copied: the sandbox runs as the user's uid, so a
         // hardlinked object made writable would change the source's inode.
-        self.clone_staged(
-            vec![
-                "--local".to_string(),
-                "--no-hardlinks".to_string(),
-                checkout.to_string_lossy().into_owned(),
-            ],
-            staging,
-            &clone_dir,
-        )
-        .await?;
+        let base = self
+            .clone_staged(
+                vec![
+                    "--local".to_string(),
+                    "--no-hardlinks".to_string(),
+                    checkout.to_string_lossy().into_owned(),
+                ],
+                staging,
+                &clone_dir,
+                with_wip.then_some(checkout),
+            )
+            .await?;
         self.register(
             key,
             &clone_dir,
             checkout.to_string_lossy().into_owned(),
             true,
+            base,
         )
         .await?;
         Ok(dir)
@@ -540,28 +657,72 @@ impl SessionRepos {
         repo_key: &str,
         staging: &Path,
     ) -> Result<PathBuf, RepoCloneError> {
+        self.remote_clone(url, repo_key, staging, None).await
+    }
+
+    /// Like [`Self::ensure_remote_clone`], for a session that works on top of
+    /// `checkout` as it stands: the checkout's uncommitted changes and
+    /// untracked files become one base commit on the remote's HEAD, recorded
+    /// as the clone's base. The clone stays remote-sourced, so the session
+    /// keeps its GitHub binding.
+    ///
+    /// # Errors
+    /// Fails as [`Self::ensure_remote_clone`] does, or when the base commit
+    /// cannot be made.
+    pub async fn ensure_remote_wip_clone(
+        &self,
+        url: &str,
+        repo_key: &str,
+        staging: &Path,
+        checkout: &Path,
+    ) -> Result<PathBuf, RepoCloneError> {
+        self.remote_clone(url, repo_key, staging, Some(checkout))
+            .await
+    }
+
+    async fn remote_clone(
+        &self,
+        url: &str,
+        repo_key: &str,
+        staging: &Path,
+        wip_of: Option<&Path>,
+    ) -> Result<PathBuf, RepoCloneError> {
         if let Some(dir) = self.clone_for(repo_key).await? {
             return Ok(dir);
         }
         let clone_dir = CloneDir::for_repo_key(repo_key);
         let dir = self.path(&clone_dir);
         if real_dir_exists(&dir)? {
-            self.register(repo_key.to_string(), &clone_dir, url.to_string(), false)
-                .await?;
+            self.register(
+                repo_key.to_string(),
+                &clone_dir,
+                url.to_string(),
+                false,
+                None,
+            )
+            .await?;
             return Ok(dir);
         }
-        self.clone_staged(
-            vec![
-                "--origin".to_string(),
-                "upstream".to_string(),
-                url.to_string(),
-            ],
-            staging,
+        let base = self
+            .clone_staged(
+                vec![
+                    "--origin".to_string(),
+                    "upstream".to_string(),
+                    url.to_string(),
+                ],
+                staging,
+                &clone_dir,
+                wip_of,
+            )
+            .await?;
+        self.register(
+            repo_key.to_string(),
             &clone_dir,
+            url.to_string(),
+            false,
+            base,
         )
         .await?;
-        self.register(repo_key.to_string(), &clone_dir, url.to_string(), false)
-            .await?;
         Ok(dir)
     }
 
@@ -631,6 +792,8 @@ fn real_dir_exists(path: &Path) -> Result<bool, RepoCloneError> {
 /// is host-owned but everything in it is agent-writable, so each step runs
 /// relative to an open handle and never follows a symlink: a `repos` or
 /// clone directory swapped for a link is refused or unlinked, never entered.
+mod wip;
+
 mod confined {
     use std::ffi::CStr;
     use std::io;
@@ -1407,6 +1570,7 @@ mod tests {
                     dir: "../escape".into(),
                     source: "s".into(),
                     local: true,
+                    base_sha: None,
                 },
             )
             .await

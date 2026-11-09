@@ -28,6 +28,9 @@ use crate::issue::github::{GhCliTokenSource, GitHubRest, GitHubTokenSource};
 use crate::repo_clone::{CloneRecord, CloneSandbox, SessionRepos, uncommitted_changes};
 
 pub(crate) mod merge_watch;
+mod pull_sync;
+
+use pull_sync::SyncedCheckout;
 
 /// Error type for `pr` operations.
 #[derive(Debug, thiserror::Error)]
@@ -262,6 +265,45 @@ impl PrStore {
             }
             return Err(PrError::Resolve(format!("no session clone named {name}")));
         }
+        // The repository the cwd sits in, when it has a clone.
+        let cwd_key = crate::repo_search::worktree_root(&self.context.cwd)
+            .and_then(|worktree| {
+                crate::repo_clone::CloneSource::of(&worktree, &self.context.workspace_config)
+                    .ok()
+                    .flatten()
+            })
+            .map(|source| source.key());
+        if let Some(record) = cwd_key
+            .as_deref()
+            .and_then(|key| clones.iter().find(|c| c.repo_key == key))
+        {
+            return Ok(Resolved {
+                dir: repos.path(&record.dir),
+                record: record.clone(),
+            });
+        }
+        // The session's own binding names its repository, checkout or not.
+        if let Some(binding) = self.session_binding().await? {
+            if let Some(record) = clones.iter().find(|c| c.repo_key == binding.clone_key()) {
+                return Ok(Resolved {
+                    dir: repos.path(&record.dir),
+                    record: record.clone(),
+                });
+            }
+            let dir = repos
+                .ensure_clone_of_binding(
+                    &binding,
+                    &self.context.workspace_config,
+                    &self.context.scratch_root,
+                )
+                .await?
+                .ok_or_else(|| {
+                    PrError::Resolve(
+                        "repository trust is undecided or binds no clone — run `repo trust set <full|prs-only|local-branch>`".to_string(),
+                    )
+                })?;
+            return Self::registered(repos, dir).await;
+        }
         if let [record] = clones.as_slice() {
             return Ok(Resolved {
                 dir: repos.path(&record.dir),
@@ -304,6 +346,20 @@ impl PrStore {
             .ok_or_else(|| {
                 PrError::Resolve("trust binds no clone for this repository".to_string())
             })?;
+        Self::registered(repos, dir).await
+    }
+
+    /// The repository the session is bound to, when it has a binding.
+    async fn session_binding(&self) -> Result<Option<crate::session::RepoBinding>, PrError> {
+        let row = self.db()?.get_session(&self.context.session_id).await?;
+        row.and_then(|row| row.repo)
+            .map(|stored| crate::session::RepoBinding::parse(&stored))
+            .transpose()
+            .map_err(|error| PrError::Resolve(error.to_string()))
+    }
+
+    /// The registry record of the clone in `dir`.
+    async fn registered(repos: &SessionRepos, dir: PathBuf) -> Result<Resolved, PrError> {
         let record = repos
             .clones()
             .await?
@@ -347,6 +403,7 @@ impl PrStore {
         if resolved.record.local && head_sha == base_sha {
             return Err(PrError::State("no committed work in the clone".to_string()));
         }
+        self.check_pinned_backend(&resolved.record)?;
         let (backend, github_repo) = Self::backend_for(&resolved.record);
         let subjects = self
             .commit_subjects(&resolved, &base_sha, &head_sha)
@@ -499,10 +556,11 @@ impl PrStore {
         let result = blocking::unblock({
             let checkout = resolved.record.source.clone();
             let refname = pr.branch.clone();
+            let base = pr.base_sha.clone();
             let sha = head_sha.clone();
             let number = pr.number;
             let host = self.context.signing.host().clone();
-            move || land(&host, &checkout, &refname, &sha, number, &lock)
+            move || land(&host, &checkout, &refname, &base, &sha, number, &lock)
         })
         .await;
         let now = jiff::Timestamp::now().to_string();
@@ -526,6 +584,7 @@ impl PrStore {
                     clone_dir: resolved.record.dir.as_str(),
                     clone,
                     remote_branch: RemoteBranch::Local,
+                    pull_sync: Vec::new(),
                 }
                 .render()
                 .expect("the merge result renders"))
@@ -801,6 +860,21 @@ impl PrStore {
         github_owner_repo(&record.source).map_or(("may", None), |repo| ("github", Some(repo)))
     }
 
+    /// `[[projects]] pr.backend = "may"` pins landing to the checkout. A
+    /// clone made from the remote has no checkout to land into, so the pin
+    /// and the clone disagree and the PR is refused.
+    fn check_pinned_backend(&self, record: &CloneRecord) -> Result<(), PrError> {
+        let pinned = self
+            .project_for_record(record)
+            .and_then(|project| project.pr.backend.as_deref());
+        if !record.local && pinned == Some("may") {
+            return Err(PrError::Resolve(
+                "this project pins pr.backend to \"may\" but the session clone comes from the GitHub remote; re-run `repo trust set` to settle one backend".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// The `[[projects]]` entry covering this record, by repository
     /// identity for local clones and by `owner/repo` for remote ones.
     fn project_for_record(&self, record: &CloneRecord) -> Option<&crate::workspace::ProjectConfig> {
@@ -980,7 +1054,7 @@ impl PrStore {
                 self.event(pr, "merged", Some(head_sha)).await;
                 self.record_queue_wait(pr).await;
                 self.task_event(pr, aither_agent::WorkEvent::PullRequestMerged);
-                self.pull_sync(&owner_repo).await;
+                let pull_sync = self.pull_sync(&resolved.record, &owner_repo).await;
                 let clone = self.retire_clone(resolved, head_sha).await?;
                 let remote_branch = self.delete_remote_branch(&owner_repo, &pr.branch).await;
                 Ok(PrMerged {
@@ -989,6 +1063,7 @@ impl PrStore {
                     clone_dir: resolved.record.dir.as_str(),
                     clone,
                     remote_branch,
+                    pull_sync,
                 }
                 .render()
                 .expect("the merge result renders"))
@@ -1086,25 +1161,24 @@ impl PrStore {
         }
     }
 
-    /// Best-effort `git pull --ff-only` on the cwd's checkout when it
-    /// tracks the merged remote — a sync target, never a blocker.
-    async fn pull_sync(&self, owner_repo: &str) {
-        let Some(worktree) = crate::repo_search::worktree_root(&self.context.cwd) else {
-            return;
+    /// Best-effort `git pull --ff-only` on every local checkout recorded
+    /// for the merged repository — sync targets, never blockers.
+    /// `[[projects]] pr.pull_sync = false` turns it off. What happened to
+    /// each checkout is returned for the merge report.
+    async fn pull_sync(&self, record: &CloneRecord, owner_repo: &str) -> Vec<SyncedCheckout> {
+        let disabled = self
+            .project_for_record(record)
+            .is_some_and(|project| !project.pr.pulls_after_merge());
+        let Some(db) = self.context.db.as_ref().filter(|_| !disabled) else {
+            return Vec::new();
         };
-        let owner_repo = owner_repo.to_string();
-        let host = self.context.signing.host().clone();
-        let synced = blocking::unblock(move || {
-            let url = host_git(&host, Some(&worktree), &["remote", "get-url", "origin"]).ok()?;
-            if github_owner_repo(&url).as_deref() != Some(owner_repo.as_str()) {
-                return None;
-            }
-            host_git(&host, Some(&worktree), &["pull", "--ff-only"]).ok()
-        })
-        .await;
-        if synced.is_none() {
-            tracing::warn!("post-merge pull sync skipped or failed");
-        }
+        let checkouts = pull_sync::recorded_checkouts(db, owner_repo).await;
+        pull_sync::sync(
+            self.context.signing.host(),
+            checkouts,
+            pull_sync::PULL_TIMEOUT,
+        )
+        .await
     }
 
     fn check_command(&self, record: &CloneRecord) -> Option<String> {
@@ -1115,7 +1189,11 @@ impl PrStore {
     }
 
     async fn base_sha(&self, resolved: &Resolved) -> Result<String, PrError> {
-        if resolved.record.local {
+        if let Some(base) = &resolved.record.base_sha {
+            // The clone was based on its checkout's work in progress: the
+            // session's work starts after that commit.
+            Ok(base.clone())
+        } else if resolved.record.local {
             blocking::unblock({
                 let src = resolved.record.source.clone();
                 let host = self.context.signing.host().clone();
@@ -1571,13 +1649,35 @@ async fn drop_ref(host: &HostGit, checkout: &str, refname: &str) {
     .await;
 }
 
-/// The serialized land of the PR's pinned commit `sha`: merge-tree
-/// preflight, checkout-overlap check, merge, then the ref is dropped. Runs
-/// inside `blocking::unblock` under the per-repo lock.
+/// One entry of `git status --porcelain=v1 -z`: two status letters, a space
+/// and the path.
+struct PorcelainStatus<'a> {
+    /// The entry renames or copies a path; the next entry is its origin.
+    renamed: bool,
+    path: &'a str,
+}
+
+impl<'a> PorcelainStatus<'a> {
+    fn parse(entry: &'a str) -> Self {
+        let mut chars = entry.chars();
+        let (index, worktree) = (chars.next(), chars.next());
+        let separator = chars.next();
+        assert_eq!(separator, Some(' '), "porcelain entry {entry:?}");
+        Self {
+            renamed: matches!(index, Some('R' | 'C')) || matches!(worktree, Some('R' | 'C')),
+            path: chars.as_str(),
+        }
+    }
+}
+
+/// The serialized land of the PR's pinned commit `sha`, whose work starts at
+/// `base`: merge-tree preflight, checkout-overlap check, merge, then the ref
+/// is dropped. Runs inside `blocking::unblock` under the per-repo lock.
 fn land(
     host: &HostGit,
     checkout: &str,
     refname: &str,
+    base: &str,
     sha: &str,
     number: i64,
     lock: &Mutex<()>,
@@ -1604,15 +1704,30 @@ fn land(
         Err(err) => return Err(format!("merge conflicts: {err}")),
     }
     // Do not overwrite the user's uncommitted files: dirty checkout paths
-    // must not intersect the PR's touched paths.
-    let dirty = git(Some(checkout_path), &["status", "--porcelain"])
-        .map_err(|e| e.to_string())?
-        .lines()
-        .map(|l| l[3..].trim().to_string())
-        .collect::<std::collections::HashSet<_>>();
+    // must not intersect the paths the PR's own work touched. A clone based
+    // on the checkout's work in progress holds those files in its base
+    // commit, so the diff starts at the PR's base, not at the checkout's HEAD.
+    let dirty = git(
+        Some(checkout_path),
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    )
+    .map_err(|e| e.to_string())?
+    .split('\0')
+    .filter(|entry| !entry.is_empty())
+    .scan(false, |skip_origin, entry| {
+        // A rename lists its origin as a bare path entry after the entry.
+        if std::mem::take(skip_origin) {
+            return Some(None);
+        }
+        let status = PorcelainStatus::parse(entry);
+        *skip_origin = status.renamed;
+        Some(Some(status.path.to_string()))
+    })
+    .flatten()
+    .collect::<std::collections::HashSet<_>>();
     let touched = git(
         Some(checkout_path),
-        &["diff", "--name-only", &format!("{head}..{sha}")],
+        &["diff", "--name-only", &format!("{base}..{sha}")],
     )
     .map_err(|e| e.to_string())?
     .lines()
@@ -1685,6 +1800,8 @@ struct PrMerged<'a> {
     clone_dir: &'a str,
     clone: CloneFate,
     remote_branch: RemoteBranch,
+    /// What became of each local checkout's post-merge pull.
+    pull_sync: Vec<SyncedCheckout>,
 }
 
 /// What became of the session clone a PR landed from.
@@ -1936,7 +2053,8 @@ mod tests {
             self.user.identify(&clone);
             let projects = checks
                 .map(|c| ProjectConfig {
-                    path: self.checkout.clone(),
+                    path: Some(self.checkout.clone()),
+                    repository: None,
                     issues: ProjectIssues::default(),
                     checks: Some(c.to_string()),
                     pr: ProjectPr::default(),
@@ -1978,6 +2096,7 @@ mod tests {
                         dir: "r-00000000".to_string(),
                         source: url.to_string(),
                         local: false,
+                        base_sha: None,
                     },
                 )
                 .await
@@ -2136,6 +2255,71 @@ mod tests {
         std::fs::write(dir.join(name), name).unwrap();
         git(Some(dir), &["add", "."]).unwrap();
         git(Some(dir), &["commit", "-m", name]).unwrap();
+    }
+
+    /// A PR whose clone started from the checkout's work in progress touches
+    /// the checkout's uncommitted files only through its base commit: the
+    /// overlap check compares the dirty files with the PR's own work.
+    #[test]
+    fn the_overlap_check_ignores_the_work_in_progress_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().canonicalize().unwrap();
+        git(Some(&repo), &["init", "-q", "-b", "main"]).unwrap();
+        git(Some(&repo), &["config", "user.name", "t"]).unwrap();
+        git(Some(&repo), &["config", "user.email", "t@t"]).unwrap();
+        git(Some(&repo), &["config", "commit.gpgsign", "false"]).unwrap();
+        commit_file(&repo, "a.txt");
+        git(Some(&repo), &["checkout", "-q", "-b", "side"]).unwrap();
+        std::fs::write(repo.join("wip.txt"), "wip").unwrap();
+        git(Some(&repo), &["add", "."]).unwrap();
+        git(Some(&repo), &["commit", "-qm", "wip"]).unwrap();
+        let base = git(Some(&repo), &["rev-parse", "HEAD"]).unwrap();
+        commit_file(&repo, "work.txt");
+        let sha = git(Some(&repo), &["rev-parse", "HEAD"]).unwrap();
+        git(Some(&repo), &["update-ref", "refs/may/pr/1", &sha]).unwrap();
+        git(Some(&repo), &["checkout", "-q", "main"]).unwrap();
+        // The checkout holds the same uncommitted file the base commit has.
+        std::fs::write(repo.join("wip.txt"), "wip").unwrap();
+
+        let host = crate::host_git::HostGit::from_file("/dev/null");
+        let lock = Mutex::new(());
+        let outcome = super::land(
+            &host,
+            repo.to_str().unwrap(),
+            "refs/may/pr/1",
+            &base,
+            &sha,
+            1,
+            &lock,
+        );
+        let error = outcome.unwrap_err();
+        assert!(
+            !error.contains("uncommitted changes in PR paths"),
+            "the base commit's files are not the PR's: {error}"
+        );
+
+        std::fs::write(repo.join("work.txt"), "dirty").unwrap();
+        let overlap = super::land(
+            &host,
+            repo.to_str().unwrap(),
+            "refs/may/pr/1",
+            &base,
+            &sha,
+            1,
+            &lock,
+        )
+        .unwrap_err();
+        assert!(overlap.contains("work.txt"), "{overlap}");
+    }
+
+    #[test]
+    fn a_porcelain_entry_splits_into_its_status_and_path() {
+        let entry = super::PorcelainStatus::parse("R  new name.txt");
+        assert!(entry.renamed);
+        assert_eq!(entry.path, "new name.txt");
+        let entry = super::PorcelainStatus::parse("?? 文件/日本語.txt");
+        assert!(!entry.renamed);
+        assert_eq!(entry.path, "文件/日本語.txt");
     }
 
     /// Without `--title`, a single commit titles the PR and is its body.
@@ -2539,6 +2723,187 @@ mod tests {
             *screened.lock().unwrap(),
             vec!["a title".to_string(), "- a subject\n".to_string()]
         );
+    }
+
+    /// A store whose cwd is no repository at all, for session `id`.
+    async fn store_without_checkout(
+        fx: &Fixture,
+        id: &str,
+        workspace_config: WorkspaceConfig,
+    ) -> PrStore {
+        let elsewhere = fx.tmp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        PrStore::new(
+            PrContext {
+                db: Some(fx.db.clone()),
+                session_id: id.to_string(),
+                session_root: fx.session_root(id),
+                scratch_root: fx.scratch_root(),
+                cwd: elsewhere,
+                workspace_config,
+                screen: None,
+                signing: fx.signing(id),
+                github_api: PrContext::default_github_api(),
+                task_events: None,
+                ci: None,
+                publish: None,
+            },
+            fx.sandbox(id).await,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_github_bound_session_resolves_its_clone_with_no_checkout() {
+        let fx = Fixture::new().await;
+        let config_path = fx.tmp.path().join("remote-workspace.toml");
+        crate::trust::persist_github(&config_path, "o/r", crate::trust::TrustLevel::Full).unwrap();
+        let config = WorkspaceConfig::load(&config_path).unwrap();
+        fx.db.create_session("s1", None, None).await.unwrap();
+        fx.db
+            .set_session_repo("s1", Some("github:o/r"))
+            .await
+            .unwrap();
+        let store = store_without_checkout(&fx, "s1", config).await;
+        // Stand in for the network clone: an existing directory is adopted.
+        let seeded = store
+            .repos()
+            .unwrap()
+            .path(&crate::repo_clone::CloneDir::for_repo_key("o/r"));
+        std::fs::create_dir_all(&seeded).unwrap();
+
+        let resolved = store.resolve(None).await.unwrap();
+
+        assert_eq!(resolved.dir, seeded);
+        assert!(!resolved.record.local);
+        assert_eq!(
+            PrStore::backend_for(&resolved.record),
+            ("github", Some("o/r".to_string()))
+        );
+        let project = store.project_for_record(&resolved.record).unwrap();
+        assert!(project.path.is_none(), "the project has no checkout");
+        assert!(matches!(project.issues, ProjectIssues::Github { .. }));
+    }
+
+    #[tokio::test]
+    async fn an_unbound_session_without_a_checkout_cannot_resolve() {
+        let fx = Fixture::new().await;
+        fx.db.create_session("s1", None, None).await.unwrap();
+        let store = store_without_checkout(&fx, "s1", WorkspaceConfig::default()).await;
+        let Err(error) = store.resolve(None).await else {
+            panic!("resolved without a repository");
+        };
+        assert!(
+            error.to_string().contains("not inside a repository"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_several_clones_the_cwds_repository_is_chosen() {
+        let fx = Fixture::new().await;
+        add_github_origin(&fx);
+        let config = crate::trust::config_at(
+            fx.tmp.path(),
+            &fx.checkout,
+            crate::trust::TrustLevel::LocalBranch,
+        );
+        let store = trusted_store(&fx, "s1", config, PrContext::default_github_api(), None).await;
+        let first = store.resolve(None).await.unwrap();
+        // A second clone, of another repository, joins the session.
+        let other = store
+            .repos()
+            .unwrap()
+            .path(&crate::repo_clone::CloneDir::for_repo_key("x/y"));
+        std::fs::create_dir_all(&other).unwrap();
+        fx.db
+            .insert_repo_clone(
+                "s1",
+                &crate::db::RepoCloneRow {
+                    repo_key: "x/y".to_string(),
+                    dir: crate::repo_clone::CloneDir::for_repo_key("x/y")
+                        .as_str()
+                        .to_string(),
+                    source: "https://github.com/x/y.git".to_string(),
+                    local: false,
+                    base_sha: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let resolved = store.resolve(None).await.unwrap();
+
+        assert_eq!(resolved.dir, first.dir);
+        assert!(resolved.record.local);
+        let named = store.resolve(Some("x/y")).await.unwrap();
+        assert_eq!(named.dir, other);
+    }
+
+    #[tokio::test]
+    async fn a_pin_to_the_may_backend_refuses_a_clone_of_the_remote() {
+        let fx = Fixture::new().await;
+        let record = crate::repo_clone::CloneRecord {
+            repo_key: "o/r".to_string(),
+            dir: crate::repo_clone::CloneDir::for_repo_key("o/r"),
+            source: "https://github.com/o/r.git".to_string(),
+            local: false,
+            base_sha: None,
+        };
+        let project = |backend: &str| WorkspaceConfig {
+            workdirs: Vec::new(),
+            projects: vec![ProjectConfig {
+                path: None,
+                repository: Some("o/r".parse().unwrap()),
+                issues: ProjectIssues::May,
+                checks: None,
+                pr: ProjectPr {
+                    backend: Some(backend.to_string()),
+                    ..ProjectPr::default()
+                },
+            }],
+        };
+        let pinned = store_without_checkout(&fx, "s1", project("may")).await;
+        assert!(pinned.check_pinned_backend(&record).is_err());
+        let github = store_without_checkout(&fx, "s2", project("github")).await;
+        assert!(github.check_pinned_backend(&record).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_project_turns_the_post_merge_pull_off() {
+        let fx = Fixture::new().await;
+        let record = crate::repo_clone::CloneRecord {
+            repo_key: "o/r".to_string(),
+            dir: crate::repo_clone::CloneDir::for_repo_key("o/r"),
+            source: "https://github.com/o/r.git".to_string(),
+            local: false,
+            base_sha: None,
+        };
+        let project = |pull_sync: Option<bool>| WorkspaceConfig {
+            workdirs: Vec::new(),
+            projects: vec![ProjectConfig {
+                path: None,
+                repository: Some("o/r".parse().unwrap()),
+                issues: ProjectIssues::May,
+                checks: None,
+                pr: ProjectPr {
+                    pull_sync,
+                    ..ProjectPr::default()
+                },
+            }],
+        };
+        // A recorded checkout of o/r whose pull would be visible if it ran.
+        let checkout = fx.tmp.path().join("recorded");
+        git(None, &["init", "-q", &checkout.to_string_lossy()]).unwrap();
+        git(
+            Some(&checkout),
+            &["remote", "add", "origin", "https://github.com/o/r.git"],
+        )
+        .unwrap();
+        fx.db.touch_repo_usage(&checkout).await.unwrap();
+
+        let off = store_without_checkout(&fx, "s1", project(Some(false))).await;
+        let synced = off.pull_sync(&record, "o/r").await;
+        assert_eq!(synced.len(), 0);
     }
 
     #[test]
@@ -3104,6 +3469,7 @@ mod tests {
                 clone_dir: "r-1a2b3c4d",
                 clone,
                 remote_branch,
+                pull_sync: Vec::new(),
             }
             .render()
             .unwrap()
