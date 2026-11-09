@@ -153,7 +153,7 @@ May is a terminal-based AI assistant built as an application layer on the **aith
 - Workdirs: User-approved directories with read/write (stored in the profile's `workspace.toml`, `~/.may/profiles/<profile>/workspace.toml`)
 
 **`src/bundle/`** - Embedded resources
-- Skills in `skills/` are embedded with `include_dir!`; subagent types (`explore`, `plan`, `research`, `fork`) are aither built-ins, not files
+- Skills in `skills/` are embedded with `include_dir!`; the subagent definitions in `subagents/` are embedded the same way and handed to the subagent tool (`Bundle::subagent_definitions`), while `fork` is built in
 - Written (overwriting) to `~/.may/skills/` at startup, copied into each profile's `skills/`, and linked into the session sandbox as `skills`; container sessions mount it
 
 ### Session Storage Format
