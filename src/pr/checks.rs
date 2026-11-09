@@ -132,8 +132,8 @@ impl CheckView {
     }
 }
 
-/// How the checks stand as a whole.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How the checks stand as a whole; stored as its `snake_case` name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, skyzen::Column)]
 pub enum Rollup {
     /// Some check is queued or running, and none has failed.
     Pending,
@@ -141,18 +141,6 @@ pub enum Rollup {
     Passed,
     /// Some check failed.
     Failed,
-}
-
-impl Rollup {
-    /// The name the database stores.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Passed => "passed",
-            Self::Failed => "failed",
-        }
-    }
 }
 
 /// The checks on a PR's head commit: required ones when any exist (they are

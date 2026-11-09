@@ -8,12 +8,12 @@
 use super::{ChatDb, ChatDbError, query};
 
 /// One `pr_check_state` row: the checks as the last poll found them.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, skyzen::FromRow)]
+#[derive(Debug, Clone, PartialEq, Eq, skyzen::FromRow)]
 pub struct PrCheckState {
     /// The commit the checks ran on.
     pub head_sha: String,
-    /// `pending`, `passed` or `failed`.
-    pub rollup: String,
+    /// How the checks stood.
+    pub rollup: crate::pr::checks::Rollup,
     /// Whether the last poll could not read the checks.
     pub unreadable: bool,
 }
@@ -56,7 +56,7 @@ impl ChatDb {
             "INSERT INTO pr_check_state (pr_id, head_sha, rollup, unreadable) VALUES (?, ?, ?, ?) ON CONFLICT(pr_id) DO UPDATE SET head_sha = excluded.head_sha, rollup = excluded.rollup, unreadable = excluded.unreadable",
             pr_id,
             state.head_sha.as_str(),
-            state.rollup.as_str(),
+            skyzen_services::ColumnEnum::token(&state.rollup),
             state.unreadable
         )
         .execute()
@@ -127,10 +127,12 @@ mod tests {
         (dir, db)
     }
 
-    fn state(head: &str, rollup: &str) -> PrCheckState {
+    use crate::pr::checks::Rollup;
+
+    fn state(head: &str, rollup: Rollup) -> PrCheckState {
         PrCheckState {
             head_sha: head.to_string(),
-            rollup: rollup.to_string(),
+            rollup,
             unreadable: false,
         }
     }
@@ -139,15 +141,15 @@ mod tests {
     async fn a_stored_alert_is_told_once_and_the_state_is_replaced() {
         let (_dir, db) = open().await;
         assert_eq!(db.pr_check_state(1).await.unwrap(), None);
-        db.store_pr_check_state(1, "s", &state("a", "failed"), Some("测试 failed"))
+        db.store_pr_check_state(1, "s", &state("a", Rollup::Failed), Some("测试 failed"))
             .await
             .unwrap();
-        db.store_pr_check_state(1, "s", &state("a", "failed"), None)
+        db.store_pr_check_state(1, "s", &state("a", Rollup::Failed), None)
             .await
             .unwrap();
         assert_eq!(
             db.pr_check_state(1).await.unwrap(),
-            Some(state("a", "failed"))
+            Some(state("a", Rollup::Failed))
         );
         assert_eq!(db.take_pr_check_alerts("s").await.unwrap(), ["测试 failed"]);
         assert_eq!(

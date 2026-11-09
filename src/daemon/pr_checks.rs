@@ -74,11 +74,11 @@ fn advance(
     match read {
         Ok(report) => {
             let rollup = report.rollup();
-            let moved = previous
-                .is_none_or(|p| p.head_sha != report.head_sha || p.rollup != rollup.as_str());
+            let moved =
+                previous.is_none_or(|p| p.head_sha != report.head_sha || p.rollup != rollup);
             let state = PrCheckState {
                 head_sha: report.head_sha.clone(),
-                rollup: rollup.as_str().to_string(),
+                rollup,
                 unreadable: false,
             };
             let event = if moved {
@@ -94,7 +94,7 @@ fn advance(
                 unreadable: true,
                 ..previous.cloned().unwrap_or_else(|| PrCheckState {
                     head_sha: String::new(),
-                    rollup: "pending".to_string(),
+                    rollup: crate::pr::checks::Rollup::Pending,
                     unreadable: true,
                 })
             };
