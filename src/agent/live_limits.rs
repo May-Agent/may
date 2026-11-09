@@ -4,6 +4,7 @@
 use aither_agent::DiskThresholds;
 
 use crate::config::MayConfig;
+use crate::tasks_md::schema::LineLimit;
 
 /// The handles agents are built with whose values follow the config.
 ///
@@ -12,6 +13,7 @@ use crate::config::MayConfig;
 #[derive(Debug, Clone)]
 pub struct LiveLimits {
     disk: DiskThresholds,
+    tasks_lines: LineLimit,
 }
 
 impl LiveLimits {
@@ -20,6 +22,7 @@ impl LiveLimits {
     pub fn of(config: &MayConfig) -> Self {
         let limits = Self {
             disk: DiskThresholds::default(),
+            tasks_lines: LineLimit::default(),
         };
         limits.apply(config);
         limits
@@ -33,6 +36,13 @@ impl LiveLimits {
             disk.red_free_bytes,
             disk.final_free_bytes,
         );
+        self.tasks_lines.set(config.tasks.line_limit);
+    }
+
+    /// The lines an agent's `tasks.md` may hold.
+    #[must_use]
+    pub fn tasks_lines(&self) -> LineLimit {
+        self.tasks_lines.clone()
     }
 
     /// The thresholds the disk watch of every agent judges free space by.
@@ -83,6 +93,18 @@ mod tests {
         assert_eq!(built_with.level(4 * GIB), DiskPressure::Yellow);
         assert_eq!(built_with.level(GIB + 1), DiskPressure::Red);
         assert_eq!(built_with.level(GIB - 1), DiskPressure::Final);
+    }
+
+    #[test]
+    fn a_config_change_moves_the_tasks_line_limit_agents_were_built_with() {
+        let mut config = MayConfig::default();
+        let limits = LiveLimits::of(&config);
+        let built_with = limits.tasks_lines();
+        assert_eq!(built_with.get(), 60);
+
+        config.tasks.line_limit = 90;
+        limits.apply(&config);
+        assert_eq!(built_with.get(), 90);
     }
 
     #[test]

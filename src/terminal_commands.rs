@@ -112,6 +112,8 @@ pub struct SharedTerminalCommandConfig<LLM> {
     /// and key commits in the sandbox are signed with, and runs every host
     /// git `pr` needs.
     pub git: crate::host_git::HostGit,
+    /// Lines a `tasks.md` may hold, the main agent's and every subagent's.
+    pub tasks_line_limit: crate::tasks_md::schema::LineLimit,
     /// Daemon handles for the `computer` command — present when the
     /// session may own a virtual desktop (macOS, local environment).
     #[cfg(target_os = "macos")]
@@ -466,7 +468,9 @@ where
         // Each subagent keeps its own `tasks.md` under the main agent's schema
         // and stop rule, and reads May's wording.
         .with_working_document(
-            Some(crate::tasks_md::schema::document_spec()),
+            Some(crate::tasks_md::schema::document_spec(
+                &config.tasks_line_limit,
+            )),
             Some(aither_agent::AnyStopHook::new(
                 crate::tasks_md::schema::TasksStopHook,
             )),
@@ -590,8 +594,6 @@ mod tests {
 
     use super::*;
 
-    #[derive(Clone)]
-    struct MockLlm;
     /// The store a registry built in `session_dir` stores outputs in.
     async fn outputs(session_dir: &std::path::Path) -> aither_sandbox::OutputStore {
         aither_sandbox::OutputStore::new(
@@ -602,6 +604,8 @@ mod tests {
         .expect("the outputs directory is created")
     }
 
+    #[derive(Clone)]
+    struct MockLlm;
 
     #[derive(Debug)]
     struct MockError;
@@ -714,6 +718,7 @@ mod tests {
                 languages: None,
                 acp: None,
                 git: crate::host_git::HostGit::from_file("/dev/null"),
+                tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
             },
         )
         .await
@@ -775,6 +780,7 @@ mod tests {
                 languages: None,
                 acp: None,
                 git: crate::host_git::HostGit::from_file("/dev/null"),
+                tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
             },
         )
         .await
@@ -836,6 +842,7 @@ mod tests {
                 languages: None,
                 acp: None,
                 git: crate::host_git::HostGit::from_file("/dev/null"),
+                tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
             },
         )
         .await
@@ -891,6 +898,7 @@ mod tests {
                 languages: None,
                 acp: None,
                 git: crate::host_git::HostGit::from_file("/dev/null"),
+                tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
             },
         )
         .await
@@ -942,6 +950,7 @@ mod tests {
                 languages: None,
                 acp: None,
                 git: crate::host_git::HostGit::from_file("/dev/null"),
+                tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
             },
         )
         .await
@@ -1114,6 +1123,7 @@ mod tests {
                 languages: None,
                 acp: None,
                 git: crate::host_git::HostGit::from_file("/dev/null"),
+                tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
             },
         )
         .await
@@ -1197,6 +1207,7 @@ mod tests {
                 languages: None,
                 acp: None,
                 git: crate::host_git::HostGit::from_file("/dev/null"),
+                tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
             },
         )
         .await
@@ -1249,6 +1260,7 @@ mod tests {
                 languages: None,
                 acp: None,
                 git: crate::host_git::HostGit::from_file("/dev/null"),
+                tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
             },
         )
         .await
@@ -1305,6 +1317,7 @@ mod tests {
                 languages: None,
                 acp: None,
                 git,
+                tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
             },
         )
         .await?;

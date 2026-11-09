@@ -801,6 +801,7 @@ impl MayAgent {
                 languages: Some(language_guard.clone()),
                 acp,
                 git: crate::host_git::HostGit::inherit(),
+                tasks_line_limit: config.limits.tasks_lines(),
                 #[cfg(target_os = "macos")]
                 computer: config.computer.clone(),
                 rules_import: config.rules_import.clone(),
@@ -810,18 +811,17 @@ impl MayAgent {
         for (name, description) in &shared_terminal_commands.descriptions {
             builder = builder.tool_description(name.clone(), description.clone());
         }
-        // The agent's sandbox, where it keeps `tasks.md`.
-        let home_dir = PathBuf::from(builder.sandbox_dir().as_ref());
         builder = builder
             .fork_source(shared_terminal_commands.fork_source.clone())
             // `tasks.md` follows what the commands above record, and reads
             // the state of the issues and PRs its rows name. Its subagents
             // keep their own under the same schema and stop rule.
-            .working_document(crate::tasks_md::schema::document_spec())
+            .working_document(crate::tasks_md::schema::document_spec(
+                &config.limits.tasks_lines(),
+            ))
             .stop_hook(aither_agent::AnyStopHook::new(
                 crate::tasks_md::schema::TasksStopHook,
             ))
-            .context_source(crate::tasks_md::schema::TasksLineLimit::new(&home_dir))
             .work_events(task_events)
             .work_tracker(super::work_tracker::MayWorkTracker::new(
                 issue_store.clone(),

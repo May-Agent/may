@@ -2,25 +2,65 @@
 //! it, the stop rule that keeps a run going while open rows remain, and the
 //! line limit past which it must be rewritten.
 
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use aither_agent::{
-    Block, ContextSource, DocumentRow, DocumentSchema, DocumentSpec, ParsedDocument, StopDecision,
-    StopHook, TurnBoundaryContext,
+    DocumentRow, DocumentSchema, DocumentSpec, ParsedDocument, StopDecision, StopHook,
+    TurnBoundaryContext,
 };
 use askama::Template;
 
 use super::{FILE, LineViolation, TasksFile, Violation};
 
-/// Lines `tasks.md` may hold; an edit that takes it past them earns one
+/// Lines `tasks.md` may hold unless `[tasks] line_limit` says otherwise.
+pub const DEFAULT_LINE_LIMIT: usize = 60;
+
+/// Lines `tasks.md` may hold; an edit that leaves it past them earns an
 /// alert asking for a rewrite.
-pub const LINE_LIMIT: usize = 60;
+///
+/// A clone shares the limit, so the daemon keeps one, hands it to every
+/// document it opens and sets it from each config change.
+#[derive(Debug, Clone)]
+pub struct LineLimit(Arc<AtomicUsize>);
+
+impl LineLimit {
+    /// A limit of `lines` lines.
+    #[must_use]
+    pub fn new(lines: usize) -> Self {
+        Self(Arc::new(AtomicUsize::new(lines)))
+    }
+
+    /// Moves every holder of this limit to `lines`.
+    pub fn set(&self, lines: usize) {
+        self.0.store(lines, Ordering::Relaxed);
+    }
+
+    /// The lines a document may hold now.
+    #[must_use]
+    pub fn get(&self) -> usize {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+impl Default for LineLimit {
+    fn default() -> Self {
+        Self::new(DEFAULT_LINE_LIMIT)
+    }
+}
 
 /// The `tasks.md` every agent with a sandbox keeps, a subagent's in its own
 /// space.
 #[must_use]
-pub fn document_spec() -> DocumentSpec {
-    DocumentSpec::new(FILE, TasksSchema)
+pub fn document_spec(limit: &LineLimit) -> DocumentSpec {
+    DocumentSpec::new(
+        FILE,
+        TasksSchema {
+            limit: limit.clone(),
+        },
+    )
 }
 
 /// The `tasks.md` of `sandbox_dir` as an agent watches it, taking the
@@ -30,15 +70,21 @@ pub(crate) fn working_document(
     sandbox_dir: &Path,
     events: aither_agent::WorkEvents,
 ) -> aither_agent::WorkingDocument {
-    aither_agent::WorkingDocument::new(&document_spec(), sandbox_dir, events)
+    aither_agent::WorkingDocument::new(&document_spec(&LineLimit::default()), sandbox_dir, events)
         .with_notices(crate::agent::notices::may_notices())
 }
 
 /// Reads `tasks.md`: rows of `Doing` and `Queued` are open work, `Roots`
 /// rows name the roots, a `BLOCKING <what>` mark is what a row waits on, and
 /// every violation of the format is a problem.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct TasksSchema;
+///
+/// A document past its line limit is a problem too. aither reads and parses
+/// the document as each turn ends, so the limit costs no read of its own, in
+/// a subagent's `tasks.md` as in the main agent's.
+#[derive(Debug, Clone, Default)]
+pub struct TasksSchema {
+    limit: LineLimit,
+}
 
 #[derive(Template)]
 #[template(path = "tasks_violation.txt", escape = "none")]
@@ -75,6 +121,17 @@ impl DocumentSchema for TasksSchema {
         }
         for violation in file.violations() {
             document.push_problem(problem(violation));
+        }
+        let limit = self.limit.get();
+        if file.lines() > limit {
+            document.push_problem(
+                OverLimitTemplate {
+                    lines: file.lines(),
+                    limit,
+                }
+                .render()
+                .expect("the tasks.md line limit template renders typed input"),
+            );
         }
         document
     }
@@ -120,67 +177,15 @@ struct OverLimitTemplate {
     limit: usize,
 }
 
-/// Alerts once when a turn leaves `tasks.md` past [`LINE_LIMIT`] lines, and
-/// again only after it came back under the limit and crossed it anew.
-#[derive(Debug)]
-pub struct TasksLineLimit {
-    path: PathBuf,
-    over_limit: bool,
-}
-
-impl TasksLineLimit {
-    /// Watches the `tasks.md` of `sandbox_dir`.
-    #[must_use]
-    pub fn new(sandbox_dir: &Path) -> Self {
-        Self {
-            path: sandbox_dir.join(FILE),
-            over_limit: false,
-        }
-    }
-
-    /// The alert for a document of `lines` lines, once per crossing.
-    fn observe(&mut self, lines: usize) -> Option<Block> {
-        if lines <= LINE_LIMIT {
-            self.over_limit = false;
-            return None;
-        }
-        if self.over_limit {
-            return None;
-        }
-        self.over_limit = true;
-        Some(Block::new(
-            "tasks_alert",
-            OverLimitTemplate {
-                lines,
-                limit: LINE_LIMIT,
-            }
-            .render()
-            .expect("the tasks.md line limit template renders typed input"),
-        ))
-    }
-}
-
-impl ContextSource for TasksLineLimit {
-    async fn on_tool_turn_end(&mut self) -> Option<Block> {
-        let lines = match async_fs::read_to_string(&self.path).await {
-            Ok(content) => TasksFile::parse(&content).lines(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-            Err(error) => {
-                tracing::warn!(path = %self.path.display(), %error, "failed to read tasks.md for its line limit");
-                return None;
-            }
-        };
-        self.observe(lines)
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
     use super::*;
 
     #[test]
     fn rows_marks_roots_and_violations_reach_the_parsed_document() {
-        let document = TasksSchema.parse(
+        let document = TasksSchema::default().parse(
             "## Roots\n- May-Agent/may#764\n## Doing\n- #12 wire it BLOCKING req-7\n- [ ] ticked\n## Queued\n- PR #13 land\n## Notes\n- #99 not a row\n",
         );
         let rows: Vec<_> = document
@@ -212,7 +217,7 @@ mod tests {
 
     #[test]
     fn every_violation_reads_as_a_sentence() {
-        let document = TasksSchema.parse("stray\n## Plans\n## Doing\nplain\n## Doing\n");
+        let document = TasksSchema::default().parse("stray\n## Plans\n## Doing\nplain\n## Doing\n");
         assert_eq!(
             document.problems(),
             [
@@ -224,17 +229,44 @@ mod tests {
         );
     }
 
+    /// A document of `lines` lines, one `Notes` row each after the heading.
+    fn document_of(lines: usize) -> String {
+        let mut content = String::from("## Notes\n");
+        for number in 1..lines {
+            _ = writeln!(content, "- note {number}");
+        }
+        content
+    }
+
     #[test]
-    fn the_line_limit_alerts_once_per_crossing() {
-        let mut limit = TasksLineLimit::new(Path::new("/nonexistent"));
-        assert!(limit.observe(LINE_LIMIT).is_none());
-        let alert = limit.observe(LINE_LIMIT + 5).expect("the crossing alerts");
+    fn a_document_past_the_line_limit_is_a_problem() {
+        let schema = TasksSchema::default();
         assert_eq!(
-            alert.content(),
-            "<tasks_alert>\ntasks.md has 65 lines, more than its limit of 60. Rewrite it to hold only current state: delete finished rows and stale notes, and merge duplicates.\n</tasks_alert>"
+            schema
+                .parse(&document_of(DEFAULT_LINE_LIMIT))
+                .problems()
+                .len(),
+            0
         );
-        assert!(limit.observe(LINE_LIMIT + 9).is_none(), "said once");
-        assert!(limit.observe(3).is_none());
-        assert!(limit.observe(LINE_LIMIT + 1).is_some(), "a new crossing");
+        assert_eq!(
+            schema
+                .parse(&document_of(DEFAULT_LINE_LIMIT + 5))
+                .problems(),
+            [
+                "tasks.md has 65 lines, more than its limit of 60. Rewrite it to hold only current state: delete finished rows and stale notes, and merge duplicates."
+            ]
+        );
+    }
+
+    #[test]
+    fn the_line_limit_follows_the_handle_every_spec_was_made_with() {
+        let limit = LineLimit::default();
+        let schema = TasksSchema {
+            limit: limit.clone(),
+        };
+        let content = document_of(40);
+        assert_eq!(schema.parse(&content).problems().len(), 0);
+        limit.set(30);
+        assert_eq!(schema.parse(&content).problems().len(), 1);
     }
 }

@@ -47,6 +47,7 @@ Anthropic and Google use their own wire formats; every other type speaks the Ope
 - `[issue_approval]`: what publishing asks of the user, each `none`, `auto` (prompt approved if unanswered) or `required` (denied if unanswered). Defaults: `external_issue`, `external_pull_request`, `external_comment` = required; `bug` = none; `feature` = auto; `performance` = none. Owned repositories and comments on issues or PRs the user or agent opened are never prompted.
 - `[sandbox] command_priority`: `normal` (default), `low` (nice 10) or `lowest` (nice 19, background I/O) for local and container commands; SSH is unaffected.
 - `[host_load]`: when the agent is told the host is under memory pressure or load: `memory_threshold` (`warning` default or `critical`), `load_threshold`, and durations `start_after`, `end_after`, `poll_interval`, `high_load_foreground_wait` written as `"30s"`, `"1m"`; defaults come from aither. A change reaches a session at its next turn.
+- `[tasks]`: `line_limit` (default 60), the lines an agent's `tasks.md`, a subagent's included, may hold before the agent is asked to rewrite it. A change applies to running sessions at once.
 - `[disk]`: free bytes of the home environment's volume below which the agent is told the disk is low: `yellow_free_bytes` (default 10 GiB), `red_free_bytes` (5 GiB) and `final_free_bytes` (3 GiB). A change applies to running sessions at once.
 
 ## Connections

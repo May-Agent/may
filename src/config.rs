@@ -1294,6 +1294,9 @@ pub struct MayConfig {
     /// When free disk space counts as low.
     #[serde(default)]
     pub disk: DiskSettings,
+    /// How long an agent's `tasks.md` may grow.
+    #[serde(default)]
+    pub tasks: TasksSettings,
     /// How long `/connect` waits on a candidate ACP agent.
     #[serde(default)]
     pub acp: AcpSettings,
@@ -1498,12 +1501,12 @@ pub struct ContextConfig {
     /// Tokens before the pause point at which the agent is told once to save
     /// its work and call `compact` itself.
     pub warn_distance: usize,
-}
-
-impl Default for ContextConfig {
     /// Tokens before the warn point from which a model that counts through a
     /// provider endpoint is asked for an exact count.
     pub count_distance: usize,
+}
+
+impl Default for ContextConfig {
     fn default() -> Self {
         let policy = aither_agent::ContextPolicy::default();
         Self {
@@ -1511,10 +1514,10 @@ impl Default for ContextConfig {
             compact_ceiling: policy.compact_ceiling,
             start_distance: policy.start_distance,
             warn_distance: policy.warn_distance,
+            count_distance: policy.count_distance,
         }
     }
 }
-            count_distance: policy.count_distance,
 
 impl ContextConfig {
     /// The aither policy these thresholds configure; every other threshold
@@ -1526,10 +1529,10 @@ impl ContextConfig {
             compact_ceiling: self.compact_ceiling,
             start_distance: self.start_distance,
             warn_distance: self.warn_distance,
+            count_distance: self.count_distance,
             ..aither_agent::ContextPolicy::default()
         }
     }
-            count_distance: self.count_distance,
 }
 
 /// `[time]` section: the timezone the agent talks to the user in.
@@ -1713,6 +1716,23 @@ impl Default for DiskSettings {
     }
 }
 
+/// `[tasks]` section: the `tasks.md` every agent keeps, a subagent's in its
+/// own space. A change applies to running sessions at once.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct TasksSettings {
+    /// Lines `tasks.md` may hold before the agent is asked to rewrite it.
+    pub line_limit: usize,
+}
+
+impl Default for TasksSettings {
+    fn default() -> Self {
+        Self {
+            line_limit: crate::tasks_md::schema::DEFAULT_LINE_LIMIT,
+        }
+    }
+}
+
 /// Serde for a [`Duration`] written as human text (`"30s"`, `"2m"`).
 mod duration_text {
     use std::time::Duration;
@@ -1770,6 +1790,7 @@ impl Default for MayConfig {
             time: TimeConfig::default(),
             host_load: HostLoadSettings::default(),
             disk: DiskSettings::default(),
+            tasks: TasksSettings::default(),
             acp: AcpSettings::default(),
             last_model: None,
             last_effort: None,

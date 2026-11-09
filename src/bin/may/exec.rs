@@ -494,7 +494,7 @@ async fn build_exec_terminal_tool(
 
 async fn build_exec_registry<LLM>(
     context: &ExecSessionContext,
-    _may_config: &MayConfig,
+    may_config: &MayConfig,
     llm: LLM,
     tool_dispatchers: &may_agent::tool_dispatch::ToolDispatchers,
     environment: &may_agent::AgentEnvironment,
@@ -560,6 +560,9 @@ where
             languages: None,
             acp: None,
             git: may_agent::host_git::HostGit::inherit(),
+            tasks_line_limit: may_agent::tasks_md::schema::LineLimit::new(
+                may_config.tasks.line_limit,
+            ),
         },
     )
     .await
