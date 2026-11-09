@@ -258,7 +258,7 @@ fn global_rules_are_reread_each_sync() {
 
 fn render_capabilities(commands: &[(String, String)], parameters: &Parameters) -> String {
     let dir = tempdir().expect("temp dir should be created");
-    tokio_test::block_on(build_capabilities(commands, parameters, dir.path()))
+    tokio_test::block_on(build_capabilities(commands, &[], parameters, dir.path()))
         .expect("capabilities render")
 }
 
@@ -526,4 +526,36 @@ fn the_efficiency_section_says_when_to_hand_exploration_to_explore() {
         prompt.contains("`explore --prompt-file <path>`"),
         "{prompt}"
     );
+}
+
+#[test]
+fn the_capabilities_section_carries_each_core_commands_usage() {
+    let core = [
+        crate::terminal_commands::CoreCommandUsage {
+            name: "ask_user".to_string(),
+            usage: "Ask the user\n\nUsage:\n  ask_user <question>\n".to_string(),
+        },
+        crate::terminal_commands::CoreCommandUsage {
+            name: "tasks".to_string(),
+            usage: "Usage: tasks <subcommand>\n".to_string(),
+        },
+    ];
+    let dir = tempdir().expect("temp dir should be created");
+    let prompt = tokio_test::block_on(build_capabilities(
+        &[],
+        &core,
+        &Parameters::default(),
+        dir.path(),
+    ))
+    .expect("capabilities render");
+    for command in &core {
+        assert!(
+            prompt.contains(&format!(
+                "<usage command=\"{}\">\n{}\n</usage>",
+                command.name,
+                command.usage.trim()
+            )),
+            "{prompt}"
+        );
+    }
 }

@@ -641,6 +641,9 @@ pub fn run(path: &Path, args: &[String]) -> Result<String, Error> {
         path: path.display().to_string(),
         source,
     };
+    if matches!(args, [flag] if flag == "--help" || flag == "-h") {
+        return Ok(usage());
+    }
     let op = parse(args).map_err(Error::Usage)?;
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
