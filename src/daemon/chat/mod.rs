@@ -1979,6 +1979,7 @@ fn run_agent_loop<'a>(
                     Instant::now(),
                 ),
                 decode_meter: DecodeMeter::default(),
+                counting_model: agent.counting_model(),
                 last_speed_emit: None,
                 segment_text: String::new(),
                 segment_at: None,

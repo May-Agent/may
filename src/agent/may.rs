@@ -1361,6 +1361,13 @@ impl MayAgent {
         self.inner.cache_warmth()
     }
 
+    /// The agent's model, which counts streamed text in tokens
+    /// ([`LanguageModel::count_text`]) while a run holds the agent.
+    #[must_use]
+    pub fn counting_model(&self) -> ProviderLlm {
+        self.btw_llm.llm.clone()
+    }
+
     /// Stop every terminal task that is still running for this agent.
     pub async fn kill_running_terminal_jobs(&self) -> usize {
         self.inner.kill_running_terminal_jobs().await

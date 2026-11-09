@@ -22,8 +22,10 @@ const OUTPUT_GAP: Duration = Duration::from_secs(2);
 /// per model call, separated by prefill and tool execution. Decode time is
 /// accumulated across bursts so pauses between calls don't dilute the rate.
 ///
-/// Tokens are estimated from output bytes until a `Usage` report provides an
-/// exact completion count for the calls it covers.
+/// Tokens are counted with the model's own vocabulary where it has one
+/// ([`note_counted`](Self::note_counted)) and estimated from output bytes
+/// otherwise, until a `Usage` report provides an exact completion count for
+/// the calls it covers.
 #[derive(Debug, Default)]
 pub struct DecodeMeter {
     /// Start of the current output burst; `None` between bursts.
@@ -34,8 +36,11 @@ pub struct DecodeMeter {
     elapsed: Duration,
     /// Exact completion tokens reported by `Usage` events.
     exact_tokens: u64,
-    /// Output bytes streamed since the last `Usage` report.
+    /// Output bytes streamed since the last `Usage` report that no
+    /// vocabulary counted.
     in_flight_bytes: u64,
+    /// Tokens the model's vocabulary counted since the last `Usage` report.
+    in_flight_counted: u64,
 }
 
 impl DecodeMeter {
@@ -53,6 +58,22 @@ impl DecodeMeter {
         if bytes == 0 {
             return;
         }
+        self.note_arrival();
+        self.in_flight_bytes += bytes as u64;
+    }
+
+    /// Record newly streamed model output the model's vocabulary counted as
+    /// `tokens`.
+    pub fn note_counted(&mut self, tokens: u32) {
+        if tokens == 0 {
+            return;
+        }
+        self.note_arrival();
+        self.in_flight_counted += u64::from(tokens);
+    }
+
+    /// Open or extend the burst for a chunk arriving now.
+    fn note_arrival(&mut self) {
         let now = Instant::now();
         if let Some(last) = self.last_output_at
             && now.duration_since(last) > OUTPUT_GAP
@@ -62,7 +83,6 @@ impl DecodeMeter {
         }
         self.burst_start.get_or_insert(now);
         self.last_output_at = Some(now);
-        self.in_flight_bytes += bytes as u64;
     }
 
     /// Close the current burst: the model stopped generating (tool-call
@@ -88,15 +108,22 @@ impl DecodeMeter {
     /// Fold an exact completion-token report into the measurement, dropping
     /// the in-flight estimate it supersedes.
     pub fn note_usage(&mut self, completion_tokens: Option<u32>) {
-        let estimated = self.in_flight_bytes / BYTES_PER_TOKEN;
-        self.exact_tokens += completion_tokens.map_or(estimated, u64::from);
+        let in_flight = self.in_flight_tokens();
+        self.exact_tokens += completion_tokens.map_or(in_flight, u64::from);
         self.in_flight_bytes = 0;
+        self.in_flight_counted = 0;
     }
 
-    /// Decoded tokens so far: exact counts plus the in-flight estimate.
+    /// Tokens streamed since the last `Usage` report: the vocabulary's
+    /// counts plus the byte estimate of the rest.
+    const fn in_flight_tokens(&self) -> u64 {
+        self.in_flight_counted + self.in_flight_bytes / BYTES_PER_TOKEN
+    }
+
+    /// Decoded tokens so far: exact counts plus the in-flight tokens.
     #[must_use]
     pub const fn tokens(&self) -> u64 {
-        self.exact_tokens + self.in_flight_bytes / BYTES_PER_TOKEN
+        self.exact_tokens + self.in_flight_tokens()
     }
 
     /// Current decode rate in tokens per second, or `None` before enough
@@ -128,6 +155,21 @@ mod tests {
         let mut meter = DecodeMeter::default();
         meter.note_output(400);
         assert_eq!(meter.tokens(), 100);
+    }
+
+    #[test]
+    fn counted_tokens_are_taken_as_counted() {
+        let mut meter = DecodeMeter::default();
+        // 400 bytes would estimate 100 tokens; the vocabulary said 37.
+        meter.note_counted(37);
+        assert_eq!(meter.tokens(), 37);
+        meter.note_output(40);
+        assert_eq!(meter.tokens(), 47);
+        meter.note_usage(None);
+        assert_eq!(meter.tokens(), 47);
+        meter.note_counted(3);
+        meter.note_usage(Some(60));
+        assert_eq!(meter.tokens(), 107);
     }
 
     #[test]
