@@ -556,10 +556,11 @@ impl PrStore {
         let result = blocking::unblock({
             let checkout = resolved.record.source.clone();
             let refname = pr.branch.clone();
+            let base = pr.base_sha.clone();
             let sha = head_sha.clone();
             let number = pr.number;
             let host = self.context.signing.host().clone();
-            move || land(&host, &checkout, &refname, &sha, number, &lock)
+            move || land(&host, &checkout, &refname, &base, &sha, number, &lock)
         })
         .await;
         let now = jiff::Timestamp::now().to_string();
@@ -1643,13 +1644,35 @@ async fn drop_ref(host: &HostGit, checkout: &str, refname: &str) {
     .await;
 }
 
-/// The serialized land of the PR's pinned commit `sha`: merge-tree
-/// preflight, checkout-overlap check, merge, then the ref is dropped. Runs
-/// inside `blocking::unblock` under the per-repo lock.
+/// One entry of `git status --porcelain=v1 -z`: two status letters, a space
+/// and the path.
+struct PorcelainStatus<'a> {
+    /// The entry renames or copies a path; the next entry is its origin.
+    renamed: bool,
+    path: &'a str,
+}
+
+impl<'a> PorcelainStatus<'a> {
+    fn parse(entry: &'a str) -> Self {
+        let mut chars = entry.chars();
+        let (index, worktree) = (chars.next(), chars.next());
+        let separator = chars.next();
+        assert_eq!(separator, Some(' '), "porcelain entry {entry:?}");
+        Self {
+            renamed: matches!(index, Some('R' | 'C')) || matches!(worktree, Some('R' | 'C')),
+            path: chars.as_str(),
+        }
+    }
+}
+
+/// The serialized land of the PR's pinned commit `sha`, whose work starts at
+/// `base`: merge-tree preflight, checkout-overlap check, merge, then the ref
+/// is dropped. Runs inside `blocking::unblock` under the per-repo lock.
 fn land(
     host: &HostGit,
     checkout: &str,
     refname: &str,
+    base: &str,
     sha: &str,
     number: i64,
     lock: &Mutex<()>,
@@ -1676,15 +1699,30 @@ fn land(
         Err(err) => return Err(format!("merge conflicts: {err}")),
     }
     // Do not overwrite the user's uncommitted files: dirty checkout paths
-    // must not intersect the PR's touched paths.
-    let dirty = git(Some(checkout_path), &["status", "--porcelain"])
-        .map_err(|e| e.to_string())?
-        .lines()
-        .map(|l| l[3..].trim().to_string())
-        .collect::<std::collections::HashSet<_>>();
+    // must not intersect the paths the PR's own work touched. A clone based
+    // on the checkout's work in progress holds those files in its base
+    // commit, so the diff starts at the PR's base, not at the checkout's HEAD.
+    let dirty = git(
+        Some(checkout_path),
+        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
+    )
+    .map_err(|e| e.to_string())?
+    .split('\0')
+    .filter(|entry| !entry.is_empty())
+    .scan(false, |skip_origin, entry| {
+        // A rename lists its origin as a bare path entry after the entry.
+        if std::mem::take(skip_origin) {
+            return Some(None);
+        }
+        let status = PorcelainStatus::parse(entry);
+        *skip_origin = status.renamed;
+        Some(Some(status.path.to_string()))
+    })
+    .flatten()
+    .collect::<std::collections::HashSet<_>>();
     let touched = git(
         Some(checkout_path),
-        &["diff", "--name-only", &format!("{head}..{sha}")],
+        &["diff", "--name-only", &format!("{base}..{sha}")],
     )
     .map_err(|e| e.to_string())?
     .lines()
@@ -2212,6 +2250,71 @@ mod tests {
         std::fs::write(dir.join(name), name).unwrap();
         git(Some(dir), &["add", "."]).unwrap();
         git(Some(dir), &["commit", "-m", name]).unwrap();
+    }
+
+    /// A PR whose clone started from the checkout's work in progress touches
+    /// the checkout's uncommitted files only through its base commit: the
+    /// overlap check compares the dirty files with the PR's own work.
+    #[test]
+    fn the_overlap_check_ignores_the_work_in_progress_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().canonicalize().unwrap();
+        git(Some(&repo), &["init", "-q", "-b", "main"]).unwrap();
+        git(Some(&repo), &["config", "user.name", "t"]).unwrap();
+        git(Some(&repo), &["config", "user.email", "t@t"]).unwrap();
+        git(Some(&repo), &["config", "commit.gpgsign", "false"]).unwrap();
+        commit_file(&repo, "a.txt");
+        git(Some(&repo), &["checkout", "-q", "-b", "side"]).unwrap();
+        std::fs::write(repo.join("wip.txt"), "wip").unwrap();
+        git(Some(&repo), &["add", "."]).unwrap();
+        git(Some(&repo), &["commit", "-qm", "wip"]).unwrap();
+        let base = git(Some(&repo), &["rev-parse", "HEAD"]).unwrap();
+        commit_file(&repo, "work.txt");
+        let sha = git(Some(&repo), &["rev-parse", "HEAD"]).unwrap();
+        git(Some(&repo), &["update-ref", "refs/may/pr/1", &sha]).unwrap();
+        git(Some(&repo), &["checkout", "-q", "main"]).unwrap();
+        // The checkout holds the same uncommitted file the base commit has.
+        std::fs::write(repo.join("wip.txt"), "wip").unwrap();
+
+        let host = crate::host_git::HostGit::from_file("/dev/null");
+        let lock = Mutex::new(());
+        let outcome = super::land(
+            &host,
+            repo.to_str().unwrap(),
+            "refs/may/pr/1",
+            &base,
+            &sha,
+            1,
+            &lock,
+        );
+        let error = outcome.unwrap_err();
+        assert!(
+            !error.contains("uncommitted changes in PR paths"),
+            "the base commit's files are not the PR's: {error}"
+        );
+
+        std::fs::write(repo.join("work.txt"), "dirty").unwrap();
+        let overlap = super::land(
+            &host,
+            repo.to_str().unwrap(),
+            "refs/may/pr/1",
+            &base,
+            &sha,
+            1,
+            &lock,
+        )
+        .unwrap_err();
+        assert!(overlap.contains("work.txt"), "{overlap}");
+    }
+
+    #[test]
+    fn a_porcelain_entry_splits_into_its_status_and_path() {
+        let entry = super::PorcelainStatus::parse("R  new name.txt");
+        assert!(entry.renamed);
+        assert_eq!(entry.path, "new name.txt");
+        let entry = super::PorcelainStatus::parse("?? 文件/日本語.txt");
+        assert!(!entry.renamed);
+        assert_eq!(entry.path, "文件/日本語.txt");
     }
 
     /// Without `--title`, a single commit titles the PR and is its body.
