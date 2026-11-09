@@ -190,6 +190,7 @@ export const zhHant: Messages = {
     ask: '請教助理',
     session: '回顧對話',
     task: '委派任務',
+    compact: '壓縮對話',
     generic: '處理中',
     output: '結果',
     escalated: '已提升權限',

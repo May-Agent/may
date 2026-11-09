@@ -5,12 +5,13 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Clear, Paragraph},
 };
 use unicode_width::UnicodeWidthStr;
 
 use super::super::super::app::App;
 use super::super::super::state::{McpAddMode, SkillAddMode, SshAddMode};
+use super::super::band::panel;
 
 pub(super) fn render_mcp_popup(frame: &mut Frame, area: Rect, app: &App) {
     let popup_area = area;
@@ -161,10 +162,7 @@ pub(super) fn render_mcp_popup(frame: &mut Frame, area: Rect, app: &App) {
 
     let widget = Paragraph::new(content)
         .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Magenta))
-                .title(title)
+            panel(Some(Span::raw(title)), Color::Magenta, app.band_bg)
                 .title_alignment(ratatui::layout::Alignment::Center),
         )
         .alignment(ratatui::layout::Alignment::Left);
@@ -296,10 +294,7 @@ pub(super) fn render_ssh_popup(frame: &mut Frame, area: Rect, app: &App) {
 
     let widget = Paragraph::new(content)
         .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Magenta))
-                .title(title)
+            panel(Some(Span::raw(title)), Color::Magenta, app.band_bg)
                 .title_alignment(ratatui::layout::Alignment::Center),
         )
         .alignment(ratatui::layout::Alignment::Left);
@@ -333,10 +328,7 @@ pub(super) fn render_skill_popup(frame: &mut Frame, area: Rect, app: &App) {
     };
 
     // Render the border block
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Magenta))
-        .title(title)
+    let block = panel(Some(Span::raw(title)), Color::Magenta, app.band_bg)
         .title_alignment(ratatui::layout::Alignment::Center);
     let inner_area = block.inner(popup_area);
     frame.render_widget(block, popup_area);

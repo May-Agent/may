@@ -31,6 +31,7 @@ export type ToolVariant =
   | 'ask'
   | 'session'
   | 'task'
+  | 'compact'
   | 'generic';
 
 export type MessageRole = 'user' | 'assistant' | 'system';

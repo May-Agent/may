@@ -714,11 +714,11 @@ mod tests {
         chat.collapse_thinking();
         chat.push_thinking("second body");
         chat.fold_turn_work(4);
-        assert_eq!(rows(&chat, 60)[2], "✦ Worked for 4s ▸");
-        click(&mut chat, 2, 60);
-        let grouped = rows(&chat, 60);
-        assert_eq!(grouped[3], "◐ Thought for 0ms ▸", "{grouped:?}");
+        assert_eq!(rows(&chat, 60)[3], "✦ Worked for 4s ▸");
         click(&mut chat, 3, 60);
+        let grouped = rows(&chat, 60);
+        assert_eq!(grouped[4], "◐ Thought for 0ms ▸", "{grouped:?}");
+        click(&mut chat, 4, 60);
         let open = rows(&chat, 60);
         assert!(open.iter().any(|l| l.contains("first body")), "{open:?}");
         assert!(!open.iter().any(|l| l.contains("second body")), "{open:?}");
@@ -735,8 +735,8 @@ mod tests {
             !folded.iter().any(|l| l.contains("Worked for")),
             "{folded:?}"
         );
-        assert_eq!(folded[2], "◐ Thought for 0ms ▸");
-        click(&mut chat, 2, 60);
+        assert_eq!(folded[3], "◐ Thought for 0ms ▸");
+        click(&mut chat, 3, 60);
         let open = rows(&chat, 60);
         assert!(open.iter().any(|l| l.contains("only body")), "{open:?}");
     }

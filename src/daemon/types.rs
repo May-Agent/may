@@ -66,6 +66,7 @@ pub enum ToolVariant {
     Ask,
     Session,
     Task,
+    Compact,
     Generic,
 }
 
@@ -85,6 +86,7 @@ impl ToolVariant {
             "ask" => Self::Ask,
             "session" => Self::Session,
             "task" => Self::Task,
+            "compact" => Self::Compact,
             _ => Self::Generic,
         }
     }

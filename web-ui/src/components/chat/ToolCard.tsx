@@ -27,6 +27,7 @@ import { outputsPreviewUrl } from '@/lib/api/artifacts';
 import { extractTerminalResult, type OutputStream } from '@/lib/terminalResult';
 import { recognisesAny } from '@/lib/commandReading';
 import { CommandReadingView } from './CommandReadingView';
+import { CompactionRow } from './CompactionRow';
 import { searchFetchLabel } from '@/lib/hostedLabel';
 import { SearchRow } from './SearchRow';
 
@@ -47,6 +48,7 @@ const VARIANT_ICON: Record<ToolVariant, typeof Wrench> = {
   ask: HelpCircle,
   session: MessageSquare,
   task: Sparkles,
+  compact: Sparkles,
   generic: Wrench,
 };
 
@@ -61,6 +63,7 @@ const VARIANT_LABEL_KEY: Record<ToolVariant, MessageKey> = {
   ask: 'tools.ask',
   session: 'tools.session',
   task: 'tools.task',
+  compact: 'tools.compact',
   generic: 'tools.generic',
 };
 
@@ -311,6 +314,7 @@ function selectDetails(tool: TurnToolState, primary: string) {
 
 export const ToolCard = memo(function ToolCard({ tool }: ToolCardProps) {
   const { t } = useTranslation();
+  if (tool.variant === 'compact') return <CompactionRow tool={tool} />;
   const rowLabel = searchFetchLabel(
     tool.variant,
     tool.summary,

@@ -134,6 +134,8 @@ pub fn project_tool_summary(arguments_raw: &str, variant: ToolVariant) -> ToolSu
             target: pick(&value, "target").or_else(|| pick(&value, "url")),
             ..ToolSummary::default()
         },
+        // A compaction takes no arguments.
+        ToolVariant::Compact => ToolSummary::default(),
         ToolVariant::Task | ToolVariant::Ask | ToolVariant::Session | ToolVariant::Generic => {
             ToolSummary {
                 description: pick(&value, "description"),

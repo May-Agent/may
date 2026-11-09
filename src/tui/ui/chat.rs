@@ -11,12 +11,13 @@ use askama::Template as _;
 use crate::agent::cache_miss::CacheMissCause;
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Clear, Paragraph},
 };
 
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use super::super::agent_event_adapter::COMPACT_TOOL;
 use super::super::queue::Attachment;
 use super::band;
 use super::chat_layout::{self, ChatLayout};
@@ -924,6 +925,26 @@ impl ChatStream {
             .zip(self.revisions.splice(start..end, []))
             .partition(|(element, _)| matches!(element, ChatElement::Error { .. }));
         let mut at = start;
+        // The previous turn left no result of its own (it was interrupted,
+        // resumed by a background command or ended on a question): its row
+        // takes this turn's work, so no two rows stand next to each other.
+        let mut folded = folded;
+        if let Some(index) = start.checked_sub(1)
+            && !folded.is_empty()
+            && let ChatElement::WorkedFor {
+                seconds: total,
+                elements,
+                ..
+            } = &mut self.elements[index]
+        {
+            *total += seconds;
+            elements.extend(
+                std::mem::take(&mut folded)
+                    .into_iter()
+                    .map(|(element, _)| element),
+            );
+            self.touch(index);
+        }
         // A single item is its own row: a group around it hides nothing.
         if let [_] = folded.as_slice() {
             for (element, revision) in folded {
@@ -1186,6 +1207,14 @@ impl ChatStream {
                             image: None,
                         });
                     }
+                }
+                ToolDisplay::Action {
+                    status: s, chip, ..
+                } if chip == COMPACT_TOOL => {
+                    // A compaction is a status row with nothing to expand, so
+                    // its result text is not kept; a refusal arrives as a
+                    // failed status from the tool's typed error.
+                    *s = status;
                 }
                 ToolDisplay::Action {
                     status: s,
@@ -2390,6 +2419,9 @@ pub(super) fn element_lines(
             attachments,
             ..
         } => {
+            // The block's own top padding row, shaded with the rest of the
+            // message: it never depends on what precedes the message.
+            lines.push(Line::from(""));
             // User message with > prefix
             for (i, line) in content.lines().enumerate() {
                 if i == 0 {
@@ -2904,19 +2936,6 @@ fn render_impl(
     // span's rows clamp to the window.
     if let Some(bg) = band_bg {
         let mut spans = layout.user_rows_in(top, view_height);
-        // A blank row right above a user message is its top padding —
-        // fold it in so the block breathes like the band's own padding.
-        for span in &mut spans {
-            if span.0 <= top {
-                continue;
-            }
-            let y = area.y + u16::try_from(top_padding + span.0 - 1 - top).unwrap_or(u16::MAX);
-            let blank =
-                (area.x..area.x + area.width).all(|x| frame.buffer_mut()[(x, y)].symbol() == " ");
-            if blank {
-                span.0 -= 1;
-            }
-        }
         if let Some(start) = band_start {
             let first = element_rows + tail_starts.get(start).copied().unwrap_or(0);
             spans.push((first, element_rows + tail_rows));
@@ -3733,6 +3752,7 @@ fn semantic_headline(name: &str, summary: &str) -> (String, String) {
             },
         ),
         "webfetch" | "web_fetch" => ("Fetched".to_string(), summary.to_string()),
+        COMPACT_TOOL => ("Compaction".to_string(), String::new()),
         _ => (format!("[{name}]"), summary.to_string()),
     }
 }
@@ -4087,7 +4107,13 @@ fn diff_row(row: &DiffLine, selection_style: Style) -> Line<'static> {
 }
 
 /// Render full-screen tool detail view.
-pub fn render_tool_fullscreen(frame: &mut Frame, area: Rect, display: &ToolDisplay, scroll: usize) {
+pub fn render_tool_fullscreen(
+    frame: &mut Frame,
+    area: Rect,
+    display: &ToolDisplay,
+    scroll: usize,
+    bg: Option<Color>,
+) {
     // Guard against zero-dimension areas to prevent overflow
     if area.width < 3 || area.height < 3 {
         return;
@@ -4144,7 +4170,7 @@ pub fn render_tool_fullscreen(frame: &mut Frame, area: Rect, display: &ToolDispl
         && !detail.is_empty()
     {
         lines.push(Line::from(Span::styled(
-            "─── Detail ───",
+            "Detail",
             Style::default().fg(Color::Blue),
         )));
         for line in detail {
@@ -4174,7 +4200,7 @@ pub fn render_tool_fullscreen(frame: &mut Frame, area: Rect, display: &ToolDispl
     } else {
         for (i, call) in terminal_calls.iter().enumerate() {
             lines.push(Line::from(Span::styled(
-                format!("─── Command {} ───", i + 1),
+                format!("Command {}", i + 1),
                 Style::default().fg(Color::Blue),
             )));
             lines.push(Line::from(""));
@@ -4223,17 +4249,16 @@ pub fn render_tool_fullscreen(frame: &mut Frame, area: Rect, display: &ToolDispl
         Style::default().fg(Color::DarkGray),
     )));
 
-    // Calculate safe scroll value (account for borders: 2 lines)
+    // Calculate safe scroll value (account for the title row and bottom padding: 2 lines)
     let inner_height = area.height.saturating_sub(2);
     let scroll_y = safe_scroll(scroll, lines.len(), inner_height);
 
     let paragraph = super::wrap::WrappedParagraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Tool Details")
-                .border_style(Style::default().fg(Color::Cyan)),
-        )
+        .block(super::band::panel(
+            Some(Span::raw("Tool Details")),
+            Color::Cyan,
+            bg,
+        ))
         .scroll(scroll_y);
 
     frame.render_widget(paragraph, area);
@@ -4912,6 +4937,11 @@ mod tests {
             crate::tui::ui::test_screen::buffer_screen(&truth),
             "the terminal shows something other than the rendered frame"
         );
+        assert_eq!(
+            terminal.backend().backgrounds(),
+            crate::tui::ui::test_screen::buffer_backgrounds(&truth),
+            "the terminal paints backgrounds other than the rendered frame's"
+        );
         truth
     }
 
@@ -4950,6 +4980,68 @@ mod tests {
         let whole_screen = draw_unified(&mut fresh, &whole, &mut fresh_layout, usize::MAX);
 
         assert_eq!(streamed_screen, whole_screen);
+    }
+
+    /// Cells of `buf` with a background, as `(x, y)`.
+    fn cells_with_background(buf: &ratatui::buffer::Buffer) -> Vec<(u16, u16)> {
+        let area = buf.area;
+        let mut found = Vec::new();
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                if buf[(x, y)].bg != ratatui::style::Color::Reset {
+                    found.push((x, y));
+                }
+            }
+        }
+        found
+    }
+
+    const CODE_REPLY: &str = "## 改动说明\n\n- 新增 `ContextBudget` 并在每次 `message_delta` 到达时调用 `calibrate`，路径是 `/Users/lexoliu/Coding/aither`，这一行足够长以便换行。\n- 另一项 `calibrate` 之后接中文，再接 English words 和 `a b` 以及更多的内容让它再换一行\n\n结尾段落包含 `message_delta`。";
+
+    /// A reply of CJK and Latin prose with wrapped inline code, streamed
+    /// in, resized and scrolled: every frame's screen, backgrounds
+    /// included, is what the frame rendered, and no cell carries a
+    /// background.
+    #[test]
+    fn inline_code_reply_leaves_no_stray_cells_across_frames() {
+        use crate::tui::ui::test_screen::ScreenBackend as TestBackend;
+        use ratatui::Terminal;
+
+        for width in [30u16, 41, 48, 57, 80] {
+            let mut chat = ChatStream::new();
+            chat.push_user("说明", Vec::new(), 0);
+            let mut terminal = Terminal::new(TestBackend::new(width, 14)).unwrap();
+            let mut layout = super::ChatLayout::default();
+            let mut rest = CODE_REPLY;
+            while !rest.is_empty() {
+                let split = rest.char_indices().nth(5).map_or(rest.len(), |(i, _)| i);
+                let (chunk, tail) = rest.split_at(split);
+                chat.push_text(chunk);
+                let frame = draw_unified(&mut terminal, &chat, &mut layout, usize::MAX);
+                let stray = cells_with_background(&frame);
+                assert!(stray.is_empty(), "w={width} after {chunk:?}: {stray:?}");
+                rest = tail;
+            }
+            chat.end_text();
+            for scroll in [0, 3, 1, usize::MAX, 2] {
+                let frame = draw_unified(&mut terminal, &chat, &mut layout, scroll);
+                assert!(
+                    cells_with_background(&frame).is_empty(),
+                    "w={width} scroll={scroll}"
+                );
+            }
+            for resized in [width + 7, width.saturating_sub(9).max(12), width] {
+                terminal.backend_mut().resize(resized, 14);
+                terminal
+                    .resize(ratatui::layout::Rect::new(0, 0, resized, 14))
+                    .unwrap();
+                let frame = draw_unified(&mut terminal, &chat, &mut layout, usize::MAX);
+                assert!(
+                    cells_with_background(&frame).is_empty(),
+                    "w={width} resized={resized}"
+                );
+            }
+        }
     }
 
     /// A three-column table of CJK cells and a long inline code span,
@@ -5642,12 +5734,12 @@ mod tests {
         chat.push_user("look", vec![image_attachment()], 0);
 
         let supported = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, true);
-        assert_eq!(supported.len(), 2 + IMAGE_HEIGHT); // "> look" + header + blanks + trailing ""
+        assert_eq!(supported.len(), 3 + IMAGE_HEIGHT); // padding + "> look" + header + blanks + trailing ""
 
         let unsupported =
             build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
-        assert_eq!(unsupported.len(), 3); // "> look" + "[image]" + trailing ""
-        assert_eq!(unsupported[1], "[image]");
+        assert_eq!(unsupported.len(), 4); // padding + "> look" + "[image]" + trailing ""
+        assert_eq!(unsupported[2], "[image]");
     }
 
     #[test]
@@ -6256,6 +6348,107 @@ mod tests {
         ));
     }
 
+    fn work_turn(chat: &mut ChatStream, label: &str) {
+        chat.push_thinking(&format!("{label} thought"));
+        chat.push_tool(
+            format!("tool-{label}"),
+            ToolDisplay::Terminal {
+                description: String::new(),
+                command: format!("echo {label}"),
+                mode: TerminalExecutionMode::Default,
+                status: ToolStatus::Done,
+                output: None,
+                diffs: Vec::new(),
+                pinned: None,
+            },
+        );
+    }
+
+    fn worked_rows(chat: &ChatStream) -> Vec<(u64, usize)> {
+        let mut adjacent = false;
+        let mut previous_was_row = false;
+        let mut rows = Vec::new();
+        for element in &chat.elements {
+            if let ChatElement::WorkedFor {
+                seconds, elements, ..
+            } = element
+            {
+                adjacent |= previous_was_row;
+                previous_was_row = true;
+                rows.push((*seconds, elements.len()));
+            } else {
+                previous_was_row = false;
+            }
+        }
+        assert!(!adjacent, "two Worked for rows are adjacent: {rows:?}");
+        rows
+    }
+
+    /// Turns that end without a reply of their own (interrupted, resumed
+    /// by a background command, ended on a question) fold into one row
+    /// that the next result follows.
+    #[test]
+    fn resultless_turns_fold_into_one_row_before_the_next_result() {
+        // An interrupted turn, a background-resumed turn (no user message)
+        // and a turn ending on a question, then a normal turn.
+        let mut chat = ChatStream::new();
+        chat.push_user("実行して 运行 실행", Vec::new(), 0);
+        work_turn(&mut chat, "a");
+        chat.fold_turn_work(1800);
+        work_turn(&mut chat, "b");
+        chat.fold_turn_work(250);
+        work_turn(&mut chat, "c");
+        chat.fold_turn_work(5);
+        work_turn(&mut chat, "d");
+        chat.push_text("done 完成 완료");
+        chat.end_text();
+        chat.fold_turn_work(10);
+
+        assert_eq!(worked_rows(&chat), vec![(1800 + 250 + 5 + 10, 8)]);
+        assert!(matches!(
+            chat.elements.last(),
+            Some(ChatElement::AssistantText { .. })
+        ));
+
+        chat.toggle_expanded("work-0");
+        let open = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
+        for label in ["a", "b", "c", "d"] {
+            assert!(
+                open.iter().any(|l| l.contains(&format!("{label} thought"))
+                    || l.contains(&format!("echo {label}"))),
+                "{label} missing: {open:?}"
+            );
+        }
+    }
+
+    /// An interrupted run ends on its marker; the earlier resultless
+    /// turn folds with the interrupted turn's work ahead of it.
+    #[test]
+    fn interrupted_turn_after_resultless_turn_shares_one_row() {
+        let mut chat = ChatStream::new();
+        chat.push_user("hi", Vec::new(), 0);
+        work_turn(&mut chat, "a");
+        chat.fold_turn_work(1821);
+        work_turn(&mut chat, "b");
+        chat.push_text("\n\n[Interrupted]");
+        chat.end_text();
+        chat.fold_turn_work(250);
+        assert_eq!(worked_rows(&chat), vec![(2071, 4)]);
+    }
+
+    /// A turn with its own user message keeps its own row.
+    #[test]
+    fn separate_user_turns_keep_separate_rows() {
+        let mut chat = ChatStream::new();
+        chat.push_user("one", Vec::new(), 0);
+        work_turn(&mut chat, "a");
+        chat.fold_turn_work(3);
+        chat.push_user("two", Vec::new(), 1);
+        work_turn(&mut chat, "b");
+        chat.fold_turn_work(4);
+        assert_eq!(worked_rows(&chat), vec![(3, 2), (4, 2)]);
+    }
+
     #[test]
     fn worked_for_folds_turn_and_toggles() {
         let mut chat = ChatStream::new();
@@ -6718,6 +6911,52 @@ mod tests {
         assert!(row_has_no_band(&frame.buf, reply));
     }
 
+    /// Every context that can precede a user message leaves it one shaded
+    /// row above and one below (#911): assistant prose with its own
+    /// paragraphs, and a folded "Worked for" group.
+    #[test]
+    fn a_user_message_after_assistant_prose_is_padded_on_both_sides() {
+        let mut chat = ChatStream::new();
+        chat.push_user("first", Vec::new(), 0);
+        chat.push_thinking("plan");
+        chat.push_text(
+            "swe-2 的 reasoning 是这样的。\n\nSecond paragraph of the reply with `code`.",
+        );
+        chat.fold_turn_work(1821);
+        chat.push_user("swe-2 应该有 reasoning 的", Vec::new(), 1);
+        chat.push_thinking("plan");
+        chat.push_text("ok");
+        chat.fold_turn_work(1821);
+        let frame = draw_band(&chat, 80, 30, "draft", &[]);
+        let user = (0..30)
+            .find(|&y| row_text(&frame.buf, y).contains("> swe-2"))
+            .expect("user message row");
+        assert_eq!(row_text(&frame.buf, user - 1).trim(), "");
+        assert!(row_has_band(&frame.buf, user - 1), "padding row above");
+        assert!(row_has_band(&frame.buf, user + 1), "padding row below");
+        assert!(row_has_no_band(&frame.buf, user - 2));
+    }
+
+    /// The padding rows belong to the message, so a row that is not blank
+    /// above it (an error line ends without a separator) is no exception.
+    #[test]
+    fn a_user_message_after_a_non_blank_row_is_still_padded() {
+        let mut chat = ChatStream::new();
+        chat.push_user("first", Vec::new(), 0);
+        chat.push_error("boom");
+        chat.push_user("second", Vec::new(), 1);
+        let frame = draw_band(&chat, 80, 30, "draft", &[]);
+        let user = (0..30)
+            .find(|&y| row_text(&frame.buf, y).contains("> second"))
+            .expect("user message row");
+        assert!(row_has_band(&frame.buf, user - 1), "padding row above");
+        assert!(row_has_band(&frame.buf, user + 1), "padding row below");
+        assert!(
+            row_text(&frame.buf, user - 2).contains("boom")
+                || row_text(&frame.buf, user - 3).contains("boom")
+        );
+    }
+
     /// Scrolled up, the band's tail sits below the window; painting its
     /// unclamped rows indexed outside the buffer and panicked (#871).
     #[test]
@@ -6888,5 +7127,46 @@ mod tests {
                 .collect();
             println!("{line}");
         }
+    }
+
+    fn compact_row(status: ToolStatus, result: Option<&str>) -> (Vec<String>, usize) {
+        let mut chat = ChatStream::new();
+        chat.push_tool(
+            "c1".to_string(),
+            ToolDisplay::Action {
+                chip: "compact".to_string(),
+                task_id: None,
+                summary: String::new(),
+                detail: Vec::new(),
+                status: ToolStatus::Running,
+                output: None,
+                pinned: None,
+            },
+        );
+        chat.update_tool_with_output("c1", status, result);
+        rows_and_regions(&chat)
+    }
+
+    /// A compaction is one status row: a tick when it started, a cross
+    /// with the refusal when the tool returned its typed error, and nothing
+    /// to expand either way.
+    #[test]
+    fn a_compaction_is_a_one_line_status_row() {
+        let (rows, regions) = compact_row(
+            ToolStatus::Done,
+            Some("Compaction started in the background."),
+        );
+        assert_eq!(rows, ["  ✓ Compaction"]);
+        assert_eq!(regions, 0);
+
+        let (rows, regions) = compact_row(
+            ToolStatus::Failed("Nothing was started: the context is too small.".to_string()),
+            None,
+        );
+        assert_eq!(
+            rows,
+            ["  ✗ Compaction — failed: Nothing was started: the context is too small."]
+        );
+        assert_eq!(regions, 0);
     }
 }

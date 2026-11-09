@@ -4249,10 +4249,15 @@ impl App {
                 summary,
                 arguments,
             } => ToolDisplay::Action {
+                // A compaction takes no arguments and has nothing to expand.
+                detail: if name == super::agent_event_adapter::COMPACT_TOOL {
+                    Vec::new()
+                } else {
+                    pretty_arguments(&arguments)
+                },
                 chip: name,
                 task_id: None,
                 summary,
-                detail: pretty_arguments(&arguments),
                 status: super::ui::chat::ToolStatus::Running,
                 output: None,
                 pinned: None,
@@ -4851,6 +4856,105 @@ mod tests {
         crate::tui::ui::test_screen::buffer_screen(frame.buffer)
     }
 
+    const BLOCK_BG: ratatui::style::Color = ratatui::style::Color::Rgb(40, 40, 48);
+    const BOX_DRAWING: [char; 8] = ['┌', '┐', '└', '┘', '─', '│', '╭', '╯'];
+
+    /// Draws `app` at `width`×`height`, returning the buffer.
+    fn draw_buffer(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                .expect("terminal");
+        terminal
+            .draw(|frame| crate::tui::ui::render(frame, app))
+            .expect("draw")
+            .buffer
+            .clone()
+    }
+
+    fn row_of(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect()
+    }
+
+    /// The jobs panel and the command list are filled blocks: the title is
+    /// the block's first row, no box-drawing character appears, and every
+    /// cell of the block carries the block colour.
+    #[tokio::test]
+    async fn popups_are_filled_blocks_without_borders() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        app.band_bg = Some(BLOCK_BG);
+
+        app.mode = crate::tui::AppMode::Jobs;
+        let buffer = draw_buffer(&mut app, 100, 30);
+        let title = (0..30)
+            .find(|&y| row_of(&buffer, y).contains("Jobs & subagents"))
+            .expect("the panel title row");
+        let panel_rows = title..title + 6;
+        for y in panel_rows {
+            let row = row_of(&buffer, y);
+            assert!(!row.contains(BOX_DRAWING), "row {y}: {row:?}");
+            assert!(
+                (1..99).all(|x| buffer[(x, y)].bg == BLOCK_BG),
+                "row {y} is filled: {row:?}"
+            );
+        }
+        assert!(
+            row_of(&buffer, title).trim_start().starts_with("Jobs"),
+            "the title is inside the block"
+        );
+
+        app.mode = crate::tui::AppMode::Chat;
+        app.completion.start_slash("");
+        let buffer = draw_buffer(&mut app, 100, 30);
+        let title = (0..30)
+            .find(|&y| row_of(&buffer, y).contains("Commands"))
+            .expect("the list title row");
+        let help = (title..30)
+            .find(|&y| row_of(&buffer, y).contains("/help"))
+            .expect("a command row");
+        for y in title..=help {
+            let row = row_of(&buffer, y);
+            assert!(!row.contains(BOX_DRAWING), "row {y}: {row:?}");
+        }
+        assert!(
+            (title..=help)
+                .any(|y| (1..99).any(|x| buffer[(x, y)].bg == ratatui::style::Color::Blue)),
+            "the selected row is shown by its background"
+        );
+    }
+
+    /// The sidebar is one block: no divider column, its whole area filled
+    /// with the block colour, which the chat beside it does not use.
+    #[tokio::test]
+    async fn the_sidebar_is_a_filled_block_without_a_divider() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        app.band_bg = Some(BLOCK_BG);
+        let (width, height) = (160u16, 30u16);
+        assert!(app.sidebar.visible_at(width));
+        let buffer = draw_buffer(&mut app, width, height);
+        let sidebar_width = crate::tui::sidebar::SidebarState::width_for(width);
+        let left = width - sidebar_width;
+        for y in 0..height {
+            assert!(
+                (left..width).all(|x| buffer[(x, y)].bg == BLOCK_BG),
+                "sidebar row {y} is filled"
+            );
+            assert!(
+                (left..width).all(|x| !BOX_DRAWING
+                    .contains(&buffer[(x, y)].symbol().chars().next().unwrap_or(' '))),
+                "no divider on row {y}: {:?}",
+                row_of(&buffer, y)
+            );
+        }
+        // Inner padding: the first column of the block stays empty.
+        assert!((0..height).all(|y| buffer[(left, y)].symbol() == " "));
+        // The chat beside it is not painted with the block colour.
+        assert_ne!(buffer[(left - 1, 0)].bg, BLOCK_BG);
+    }
+
     #[tokio::test]
     async fn a_working_session_reads_working_in_the_session_list() {
         let dir = tempfile::tempdir().expect("dir");
@@ -5281,6 +5385,65 @@ mod tests {
         assert!(matches!(
             app.chat.elements().last(),
             Some(ChatElement::Recap { summary, next_action: None }) if summary == "Where it stands."
+        ));
+    }
+
+    #[tokio::test]
+    async fn rebuilt_history_never_stacks_worked_for_rows() {
+        use crate::ChatMessage;
+        use crate::session::ToolEventRecord;
+
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        let at = |second: i64| jiff::Timestamp::from_second(1_800_000_000 + second).expect("time");
+        let call = |id: &str, script: &str, second: i64| {
+            let start = ToolEventRecord::Start {
+                id: id.to_string(),
+                name: "terminal".to_string(),
+                arguments: serde_json::json!({ "description": script, "script": script })
+                    .to_string(),
+            };
+            let end = ToolEventRecord::End {
+                id: id.to_string(),
+                name: "terminal".to_string(),
+                result: aither_core::llm::ToolResult::text("done"),
+            };
+            [
+                ChatMessage::tool(
+                    id,
+                    serde_json::to_string(&start).expect("start"),
+                    at(second),
+                ),
+                ChatMessage::tool(
+                    id,
+                    serde_json::to_string(&end).expect("end"),
+                    at(second + 1),
+                ),
+            ]
+        };
+        // An interrupted turn with no reply, then a normal turn.
+        let rows: Vec<ChatMessage> = std::iter::once(ChatMessage::user("実行 运行 실행"))
+            .chain(call("terminal:0#a", "one", 2))
+            .chain(call("terminal:0#b", "two", 4))
+            .chain([ChatMessage::user("next")])
+            .chain(call("terminal:0#c", "three", 32))
+            .chain(call("terminal:0#d", "four", 40))
+            .chain([ChatMessage::assistant("done 完成 완료", at(50))])
+            .collect();
+        app.render_history(&rows).await;
+
+        let mut previous_row = false;
+        let mut rows_seen = 0;
+        for element in app.chat.elements() {
+            let is_row = matches!(element, ChatElement::WorkedFor { .. });
+            assert!(!(is_row && previous_row), "adjacent rows");
+            previous_row = is_row;
+            rows_seen += usize::from(is_row);
+        }
+        assert_eq!(rows_seen, 2);
+        assert!(matches!(
+            app.chat.elements().last(),
+            Some(ChatElement::AssistantText { .. })
         ));
     }
 
