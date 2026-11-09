@@ -1024,14 +1024,36 @@ pub(crate) mod test_sandbox {
             Self::with_registry(session_root, builder).await
         }
 
+        /// A terminal whose commands see the environment `env` supplies.
+        pub async fn with_env(
+            session_root: &Path,
+            env: impl aither_sandbox::TerminalEnvSource + 'static,
+        ) -> Self {
+            Self::configured(session_root, ToolRegistryBuilder::new(), |terminal| {
+                terminal.with_env_source(env)
+            })
+            .await
+        }
+
         async fn with_registry(session_root: &Path, builder: ToolRegistryBuilder) -> Self {
+            Self::configured(session_root, builder, |terminal| terminal).await
+        }
+
+        async fn configured(
+            session_root: &Path,
+            builder: ToolRegistryBuilder,
+            configure: impl FnOnce(
+                TerminalTool<SandboxedOnly, TokioGlobal>,
+            ) -> TerminalTool<SandboxedOnly, TokioGlobal>,
+        ) -> Self {
             let distribution =
                 crate::tools::embedded_distribution().expect("embedded distribution validates");
             let cache = tool_cache();
             std::fs::create_dir_all(&cache).unwrap();
             let terminal = TerminalTool::new_exact(session_root, SandboxedOnly, TokioGlobal)
                 .await
-                .expect("the terminal starts")
+                .expect("the terminal starts");
+            let terminal = configure(terminal)
                 .initialize_tools(&distribution, &cache)
                 .await
                 .expect("the baseline tools prepare");

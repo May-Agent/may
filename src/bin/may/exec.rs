@@ -60,6 +60,10 @@ pub enum ExecError {
     CompileNetworkPolicy(aither_sandbox::NetworkPolicyError),
     #[error("failed to create terminal tool: {0}")]
     CreateTerminalTool(aither_sandbox::TerminalError),
+    #[error("failed to start the May daemon: {0}")]
+    StartDaemon(may_agent::daemon::lifecycle::LifecycleError),
+    #[error("failed to connect to the daemon's jobserver pool: {0}")]
+    ConnectJobserver(aither_sandbox::JobserverError),
     #[error("failed to initialize baseline tools: {0}")]
     InitializeBaselineTools(#[from] aither_sandbox::ToolRuntimeError),
     #[error("failed to initialize tool dispatch runtime: {0}")]
@@ -438,7 +442,28 @@ async fn build_exec_terminal_tool(
                     may_agent::container::lifecycle::workspace_mount(&context.sandbox_dir),
                 ),
             ),
-        may_agent::AgentEnvironment::Local => terminal_tool.with_shell_sessions(shell_sessions),
+        may_agent::AgentEnvironment::Local if ssh_available => {
+            terminal_tool.with_shell_sessions(shell_sessions)
+        }
+        // Local commands draw their jobs from the daemon's machine-wide
+        // pool, as the daemon's own sessions do; the daemon is started on
+        // demand, since the pool is its.
+        may_agent::AgentEnvironment::Local => {
+            may_agent::daemon::lifecycle::ensure_running(
+                &may_agent::daemon::DaemonPaths::new(context.may_dir.clone()),
+                |line| {
+                    let _ = writeln!(io::stderr(), "[may] {line}");
+                },
+            )
+            .await
+            .map_err(ExecError::StartDaemon)?;
+            let connection = may_agent::jobserver::connect_running(&context.may_dir)
+                .map_err(ExecError::ConnectJobserver)?;
+            terminal_tool
+                .with_shell_sessions(shell_sessions)
+                .with_jobserver_pool(connection.pool, connection.fifo_dir)
+                .map_err(ExecError::CreateTerminalTool)?
+        }
     };
 
     let tools_dir = may_agent::MayHomePaths::new(context.may_dir.clone()).tools_dir();

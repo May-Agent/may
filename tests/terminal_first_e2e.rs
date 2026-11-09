@@ -1311,6 +1311,12 @@ impl Drop for TestHarness {
     /// Deletes the home, then sweeps the relocated-home agents whose plists
     /// went with it, so a run leaves none loaded.
     fn drop(&mut self) {
+        // A `may exec` of the test started a daemon in this home; it is
+        // gone with the home.
+        let _ = std::process::Command::new(may_binary_path())
+            .args(["daemon", "stop"])
+            .env("HOME", &self.home_path)
+            .output();
         let _ = std::fs::remove_dir_all(&self.home_path);
         let swept = may_agent::repo_search::sweep_stale_relocated_agents();
         if !std::thread::panicking() {
@@ -1397,6 +1403,14 @@ impl TestHarness {
         // Aux generation would fire an unscripted request per completed
         // turn into the mock provider and starve the scripted responses.
         config.suggestions.enabled = false;
+        // A port of its own, so a daemon a `may exec` of the test starts
+        // meets no other.
+        config.daemon.port = Some(
+            std::net::TcpListener::bind("127.0.0.1:0")
+                .and_then(|listener| listener.local_addr())
+                .expect("a free port should be found")
+                .port(),
+        );
         config.context = context;
         config.provider.insert(
             TEST_PROVIDER_ID.to_string(),
@@ -3208,8 +3222,8 @@ async fn ui_chat_tasks_file_is_the_canonical_todo_document() {
     assert_eq!(
         rows(updates[0]),
         Some(serde_json::json!([
-            { "section": "doing", "text": "write report", "blocking": null, "references": [] },
-            { "section": "queued", "text": "ship it", "blocking": null, "references": [] },
+            { "section": "doing", "title": "write report", "detail": "", "blocking": null, "references": [] },
+            { "section": "queued", "title": "ship it", "detail": "", "blocking": null, "references": [] },
         ])),
         "todo_update should carry the parsed tasks.md rows: {:?}",
         updates[0]
@@ -6007,6 +6021,87 @@ async fn a_failed_compaction_shows_its_cleanup_and_rerun() {
     );
     server.stop().await;
     environment.release(&harness, &session_id).await;
+}
+
+/// A command run through `may exec` draws its jobs from the daemon's
+/// machine-wide pool: it can take every token of the pool, and no more.
+#[tokio::test]
+#[serial]
+async fn exec_commands_draw_from_the_daemons_job_pool() {
+    const POOL: i64 = 3;
+    let mock = MockOpenAiServer::spawn(MockChatScenario::SlowText {
+        chunks: vec!["unused".to_string()],
+        delay: Duration::from_millis(10),
+    })
+    .await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    prepare_oneshot_home(&harness).await;
+    let session = harness.create_session().await;
+    let config_path = harness.home_path().join(".may/config.toml");
+    let mut config: toml::Table = toml::from_str(
+        &tokio::fs::read_to_string(&config_path)
+            .await
+            .expect("test config should be readable"),
+    )
+    .expect("test config should parse");
+    let sandbox = config
+        .entry("sandbox")
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+        .as_table_mut()
+        .expect("sandbox is a table");
+    sandbox.insert("job_pool_size".into(), toml::Value::Integer(POOL));
+    tokio::fs::write(
+        &config_path,
+        toml::to_string(&config).expect("test config should serialize"),
+    )
+    .await
+    .expect("test config should be written");
+
+    // The sandbox reads only the session's own files.
+    let probe = session.sandbox_dir.join("tmp/job_probe.py");
+    tokio::fs::write(&probe, include_str!("fixtures/job_probe.py"))
+        .await
+        .expect("probe should be written");
+    let report = session.sandbox_dir.join("tmp/held");
+    let binary = may_binary_path();
+    let output = Command::new(&binary)
+        .arg("exec")
+        .arg("--session")
+        .arg(&session.id)
+        .arg("--mode")
+        .arg("sandboxed")
+        .arg("--timeout")
+        .arg("20")
+        .arg("--")
+        .arg(format!(
+            "python3 {} {} & probe=$!; while [ ! -e {} ]; do sleep 0.1; done; cat {}; kill $probe",
+            probe.display(),
+            report.display(),
+            report.display(),
+            report.display(),
+        ))
+        .env("HOME", harness.home_path())
+        .env("HEEL_BIN", heel_bin())
+        .output()
+        .await
+        .expect("may exec should run");
+    let stop = Command::new(&binary)
+        .args(["daemon", "stop"])
+        .env("HOME", harness.home_path())
+        .output()
+        .await
+        .expect("may daemon stop should run");
+    assert!(stop.status.success(), "daemon stop failed");
+    assert!(
+        output.status.success(),
+        "exec failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        POOL.to_string(),
+        "the command drew exactly the daemon pool's tokens"
+    );
 }
 
 /// `explore` runs the bundled explore subagent on the fast model and returns
