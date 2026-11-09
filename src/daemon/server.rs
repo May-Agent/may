@@ -189,11 +189,7 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
                 lease_handle.spawn(task);
             })),
     );
-    runtime_service
-        .runs()
-        .recover_after_restart()
-        .await
-        .context("failed to reconcile persisted session runtime state after restart")?;
+    recover_persisted_runs_after_restart(&runtime_service, &db_for_archive).await?;
     let remote_access_manager = Arc::new(super::remote_access::RemoteAccessManager::new(
         ui_event_bus.clone(),
     ));
@@ -952,11 +948,29 @@ fn build_provider_models_response(
     ProviderModelsResponse { providers }
 }
 
+/// Settles what a daemon that exited left running: session runtimes and
+/// scheduled-task runs. The two touch separate tables, so they run together.
+async fn recover_persisted_runs_after_restart(
+    runtime_service: &crate::session::SessionRuntimeService,
+    db: &crate::db::ChatDb,
+) -> anyhow::Result<()> {
+    let (sessions, task_runs) = futures_lite::future::zip(
+        runtime_service.runs().recover_after_restart(),
+        db.recover_task_runs_after_restart(),
+    )
+    .await;
+    sessions.context("failed to reconcile persisted session runtime state after restart")?;
+    task_runs.context("failed to reconcile persisted scheduled-task runs after restart")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(not(feature = "ui"))]
     use super::DaemonMode;
-    use super::{build_models_response, build_provider_models_response};
+    use super::{
+        build_models_response, build_provider_models_response, recover_persisted_runs_after_restart,
+    };
     use crate::config::MayConfig;
     use crate::models::FetchedModel;
 
@@ -968,6 +982,64 @@ mod tests {
             abilities: abilities.iter().map(ToString::to_string).collect(),
             provider_id: "relay".to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn startup_recovery_interrupts_running_task_runs() {
+        use crate::db::{ChatDb, CreateScheduledTaskParams};
+        use crate::session::SessionRuntimeService;
+        use crate::task_trigger::PersistedTaskTrigger;
+        use crate::ui_event_bus::UiEventBus;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db opens");
+        db.create_scheduled_task(CreateScheduledTaskParams {
+            id: "task-1",
+            profile_id: "profile-1",
+            session_id: Some("session-1"),
+            name: "Demo task",
+            trigger: &PersistedTaskTrigger::Event {
+                event_name: "chat.turn.completed".to_string(),
+            },
+            cron_expression: None,
+            run_at: None,
+            script_path: None,
+            script_inline: Some("echo hi"),
+            needs_network: false,
+            timeout_secs: 60,
+        })
+        .await
+        .expect("task persists");
+        let task = db
+            .get_scheduled_task("task-1")
+            .await
+            .expect("task lookup")
+            .expect("task exists");
+        db.start_task_run("run-1", &task, "event")
+            .await
+            .expect("run persists");
+        assert_eq!(
+            db.task_run_status("run-1")
+                .await
+                .expect("status")
+                .as_deref(),
+            Some("running")
+        );
+
+        let service = SessionRuntimeService::new(db.clone(), UiEventBus::new());
+        recover_persisted_runs_after_restart(&service, &db)
+            .await
+            .expect("startup recovery succeeds");
+
+        assert_eq!(
+            db.task_run_status("run-1")
+                .await
+                .expect("status")
+                .as_deref(),
+            Some("interrupted")
+        );
     }
 
     #[test]
