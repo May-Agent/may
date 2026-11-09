@@ -147,6 +147,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
     env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       REF: ${{ needs.refs.outputs.workspace }}
       BASE: ${{ needs.refs.outputs.base }}
     steps:

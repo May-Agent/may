@@ -23,7 +23,17 @@ const EMBEDDED_DISTRIBUTION_SHA256: &str =
 /// # Errors
 /// Fails when the embedded manifest does not validate.
 pub fn embedded_distribution() -> Result<ToolDistribution, ToolRuntimeError> {
-    ToolDistribution::from_json(EMBEDDED_DISTRIBUTION)
+    ToolDistribution::from_json(EMBEDDED_DISTRIBUTION).map(authenticated)
+}
+
+/// Downloads GitHub release artifacts with the `GITHUB_TOKEN` environment
+/// variable when it is set and non-empty (CI sets it to the job's token),
+/// the same source the managed heel download reads.
+fn authenticated(distribution: ToolDistribution) -> ToolDistribution {
+    match std::env::var("GITHUB_TOKEN") {
+        Ok(token) if !token.is_empty() => distribution.with_github_token(token),
+        _ => distribution,
+    }
 }
 
 /// May's own host-program pins: the repo-search daemon release whose
@@ -40,7 +50,7 @@ const HOST_PROGRAMS_SHA256: &str =
 /// # Errors
 /// Fails when the embedded manifest does not validate.
 pub fn host_program_distribution() -> Result<ToolDistribution, ToolRuntimeError> {
-    ToolDistribution::from_json(HOST_PROGRAMS)
+    ToolDistribution::from_json(HOST_PROGRAMS).map(authenticated)
 }
 
 #[cfg(test)]
