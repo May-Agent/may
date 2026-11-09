@@ -11,7 +11,7 @@ use askama::Template as _;
 use crate::agent::cache_miss::CacheMissCause;
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Clear, Paragraph},
 };
 
 use ratatui::Frame;
@@ -2369,6 +2369,9 @@ pub(super) fn element_lines(
             attachments,
             ..
         } => {
+            // The block's own top padding row, shaded with the rest of the
+            // message: it never depends on what precedes the message.
+            lines.push(Line::from(""));
             // User message with > prefix
             for (i, line) in content.lines().enumerate() {
                 if i == 0 {
@@ -2883,19 +2886,6 @@ fn render_impl(
     // span's rows clamp to the window.
     if let Some(bg) = band_bg {
         let mut spans = layout.user_rows_in(top, view_height);
-        // A blank row right above a user message is its top padding —
-        // fold it in so the block breathes like the band's own padding.
-        for span in &mut spans {
-            if span.0 <= top {
-                continue;
-            }
-            let y = area.y + u16::try_from(top_padding + span.0 - 1 - top).unwrap_or(u16::MAX);
-            let blank =
-                (area.x..area.x + area.width).all(|x| frame.buffer_mut()[(x, y)].symbol() == " ");
-            if blank {
-                span.0 -= 1;
-            }
-        }
         if let Some(start) = band_start {
             let first = element_rows + tail_starts.get(start).copied().unwrap_or(0);
             spans.push((first, element_rows + tail_rows));
@@ -3879,7 +3869,13 @@ fn render_tool_inline_at<'a>(
 }
 
 /// Render full-screen tool detail view.
-pub fn render_tool_fullscreen(frame: &mut Frame, area: Rect, display: &ToolDisplay, scroll: usize) {
+pub fn render_tool_fullscreen(
+    frame: &mut Frame,
+    area: Rect,
+    display: &ToolDisplay,
+    scroll: usize,
+    bg: Option<Color>,
+) {
     // Guard against zero-dimension areas to prevent overflow
     if area.width < 3 || area.height < 3 {
         return;
@@ -3936,7 +3932,7 @@ pub fn render_tool_fullscreen(frame: &mut Frame, area: Rect, display: &ToolDispl
         && !detail.is_empty()
     {
         lines.push(Line::from(Span::styled(
-            "─── Detail ───",
+            "Detail",
             Style::default().fg(Color::Blue),
         )));
         for line in detail {
@@ -3966,7 +3962,7 @@ pub fn render_tool_fullscreen(frame: &mut Frame, area: Rect, display: &ToolDispl
     } else {
         for (i, call) in terminal_calls.iter().enumerate() {
             lines.push(Line::from(Span::styled(
-                format!("─── Command {} ───", i + 1),
+                format!("Command {}", i + 1),
                 Style::default().fg(Color::Blue),
             )));
             lines.push(Line::from(""));
@@ -4015,17 +4011,16 @@ pub fn render_tool_fullscreen(frame: &mut Frame, area: Rect, display: &ToolDispl
         Style::default().fg(Color::DarkGray),
     )));
 
-    // Calculate safe scroll value (account for borders: 2 lines)
+    // Calculate safe scroll value (account for the title row and bottom padding: 2 lines)
     let inner_height = area.height.saturating_sub(2);
     let scroll_y = safe_scroll(scroll, lines.len(), inner_height);
 
     let paragraph = super::wrap::WrappedParagraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Tool Details")
-                .border_style(Style::default().fg(Color::Cyan)),
-        )
+        .block(super::band::panel(
+            Some(Span::raw("Tool Details")),
+            Color::Cyan,
+            bg,
+        ))
         .scroll(scroll_y);
 
     frame.render_widget(paragraph, area);
@@ -5367,12 +5362,12 @@ mod tests {
         chat.push_user("look", vec![image_attachment()], 0);
 
         let supported = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, true);
-        assert_eq!(supported.len(), 2 + IMAGE_HEIGHT); // "> look" + header + blanks + trailing ""
+        assert_eq!(supported.len(), 3 + IMAGE_HEIGHT); // padding + "> look" + header + blanks + trailing ""
 
         let unsupported =
             build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
-        assert_eq!(unsupported.len(), 3); // "> look" + "[image]" + trailing ""
-        assert_eq!(unsupported[1], "[image]");
+        assert_eq!(unsupported.len(), 4); // padding + "> look" + "[image]" + trailing ""
+        assert_eq!(unsupported[2], "[image]");
     }
 
     #[test]
@@ -6439,6 +6434,52 @@ mod tests {
             .find(|&y| row_text(&frame.buf, y).contains("first reply"))
             .expect("reply row");
         assert!(row_has_no_band(&frame.buf, reply));
+    }
+
+    /// Every context that can precede a user message leaves it one shaded
+    /// row above and one below (#911): assistant prose with its own
+    /// paragraphs, and a folded "Worked for" group.
+    #[test]
+    fn a_user_message_after_assistant_prose_is_padded_on_both_sides() {
+        let mut chat = ChatStream::new();
+        chat.push_user("first", Vec::new(), 0);
+        chat.push_thinking("plan");
+        chat.push_text(
+            "swe-2 的 reasoning 是这样的。\n\nSecond paragraph of the reply with `code`.",
+        );
+        chat.fold_turn_work(1821);
+        chat.push_user("swe-2 应该有 reasoning 的", Vec::new(), 1);
+        chat.push_thinking("plan");
+        chat.push_text("ok");
+        chat.fold_turn_work(1821);
+        let frame = draw_band(&chat, 80, 30, "draft", &[]);
+        let user = (0..30)
+            .find(|&y| row_text(&frame.buf, y).contains("> swe-2"))
+            .expect("user message row");
+        assert_eq!(row_text(&frame.buf, user - 1).trim(), "");
+        assert!(row_has_band(&frame.buf, user - 1), "padding row above");
+        assert!(row_has_band(&frame.buf, user + 1), "padding row below");
+        assert!(row_has_no_band(&frame.buf, user - 2));
+    }
+
+    /// The padding rows belong to the message, so a row that is not blank
+    /// above it (an error line ends without a separator) is no exception.
+    #[test]
+    fn a_user_message_after_a_non_blank_row_is_still_padded() {
+        let mut chat = ChatStream::new();
+        chat.push_user("first", Vec::new(), 0);
+        chat.push_error("boom");
+        chat.push_user("second", Vec::new(), 1);
+        let frame = draw_band(&chat, 80, 30, "draft", &[]);
+        let user = (0..30)
+            .find(|&y| row_text(&frame.buf, y).contains("> second"))
+            .expect("user message row");
+        assert!(row_has_band(&frame.buf, user - 1), "padding row above");
+        assert!(row_has_band(&frame.buf, user + 1), "padding row below");
+        assert!(
+            row_text(&frame.buf, user - 2).contains("boom")
+                || row_text(&frame.buf, user - 3).contains("boom")
+        );
     }
 
     /// Scrolled up, the band's tail sits below the window; painting its

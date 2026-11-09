@@ -5,10 +5,11 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
+    widgets::{Clear, List, ListItem, Paragraph},
 };
 use unicode_width::UnicodeWidthStr;
 
+use super::super::band::panel;
 use jiff::Timestamp;
 
 use super::super::super::app::App;
@@ -46,10 +47,7 @@ pub(super) fn render_session_popup(frame: &mut Frame, area: Rect, app: &App) {
         )
     };
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(title)
+    let block = panel(Some(Span::raw(title)), Color::Cyan, app.band_bg)
         .title_alignment(ratatui::layout::Alignment::Left);
     let inner_area = block.inner(popup_area);
     frame.render_widget(block, popup_area);
@@ -185,11 +183,8 @@ pub(super) fn render_session_popup(frame: &mut Frame, area: Rect, app: &App) {
 
                 if prev_section != Some(section) {
                     if prev_section.is_some() {
-                        // Separator between sections
-                        session_lines.push(Line::from(Span::styled(
-                            "  ────────────────────────",
-                            Style::default().fg(Color::DarkGray),
-                        )));
+                        // Blank row between sections
+                        session_lines.push(Line::from(""));
                     }
                     // Section header
                     let header = match section {
@@ -457,10 +452,7 @@ pub(super) fn render_profile_select_popup(frame: &mut Frame, area: Rect, app: &A
     let popup_area = area;
     frame.render_widget(Clear, popup_area);
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title("Switch Profile")
+    let block = panel(Some(Span::raw("Switch Profile")), Color::Cyan, app.band_bg)
         .title_alignment(ratatui::layout::Alignment::Left);
     let inner_area = block.inner(popup_area);
     frame.render_widget(block, popup_area);
@@ -561,12 +553,14 @@ pub(super) fn render_file_picker_popup(frame: &mut Frame, area: Rect, app: &App)
         Style::default().fg(Color::White)
     };
 
-    let search_input = Paragraph::new(input_text).style(input_style).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title(format!("Select File ({} matches)", picker.match_count())),
-    );
+    let search_input = Paragraph::new(input_text).style(input_style).block(panel(
+        Some(Span::raw(format!(
+            "Select File ({} matches)",
+            picker.match_count()
+        ))),
+        Color::Cyan,
+        app.band_bg,
+    ));
 
     frame.render_widget(search_input, chunks[0]);
     let caret_x =
@@ -593,18 +587,18 @@ pub(super) fn render_file_picker_popup(frame: &mut Frame, area: Rect, app: &App)
         })
         .collect();
 
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(ratatui::widgets::BorderType::Plain)
-            .border_style(Style::default().fg(Color::Cyan)),
-    );
+    let list = List::new(items).block(panel(None::<Span>, Color::Cyan, app.band_bg));
 
     frame.render_widget(list, chunks[1]);
 }
 
 /// Render the `/resume-claude` session picker.
-pub(super) fn render_resume_picker(frame: &mut Frame, area: Rect, state: &ResumePickerState) {
+pub(super) fn render_resume_picker(
+    frame: &mut Frame,
+    area: Rect,
+    state: &ResumePickerState,
+    bg: Option<Color>,
+) {
     frame.render_widget(Clear, area);
 
     let filtered = state.filtered();
@@ -620,10 +614,7 @@ pub(super) fn render_resume_picker(frame: &mut Frame, area: Rect, state: &Resume
         )
     };
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(title)
+    let block = panel(Some(Span::raw(title)), Color::Cyan, bg)
         .title_alignment(ratatui::layout::Alignment::Left);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -798,6 +789,7 @@ pub(super) fn render_connect_picker(
     area: Rect,
     state: &ConnectState,
     spinner_frame: usize,
+    bg: Option<Color>,
 ) {
     frame.render_widget(Clear, area);
     let dim = Style::default().fg(Color::DarkGray);
@@ -895,10 +887,7 @@ pub(super) fn render_connect_picker(
             )
         }
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(title);
+    let block = panel(Some(Span::raw(title)), Color::Cyan, bg);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let chunks = Layout::default()

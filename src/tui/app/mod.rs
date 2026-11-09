@@ -4839,6 +4839,105 @@ mod tests {
         crate::tui::ui::test_screen::buffer_screen(frame.buffer)
     }
 
+    const BLOCK_BG: ratatui::style::Color = ratatui::style::Color::Rgb(40, 40, 48);
+    const BOX_DRAWING: [char; 8] = ['┌', '┐', '└', '┘', '─', '│', '╭', '╯'];
+
+    /// Draws `app` at `width`×`height`, returning the buffer.
+    fn draw_buffer(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                .expect("terminal");
+        terminal
+            .draw(|frame| crate::tui::ui::render(frame, app))
+            .expect("draw")
+            .buffer
+            .clone()
+    }
+
+    fn row_of(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer[(x, y)].symbol())
+            .collect()
+    }
+
+    /// The jobs panel and the command list are filled blocks: the title is
+    /// the block's first row, no box-drawing character appears, and every
+    /// cell of the block carries the block colour.
+    #[tokio::test]
+    async fn popups_are_filled_blocks_without_borders() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        app.band_bg = Some(BLOCK_BG);
+
+        app.mode = crate::tui::AppMode::Jobs;
+        let buffer = draw_buffer(&mut app, 100, 30);
+        let title = (0..30)
+            .find(|&y| row_of(&buffer, y).contains("Jobs & subagents"))
+            .expect("the panel title row");
+        let panel_rows = title..title + 6;
+        for y in panel_rows {
+            let row = row_of(&buffer, y);
+            assert!(!row.contains(BOX_DRAWING), "row {y}: {row:?}");
+            assert!(
+                (1..99).all(|x| buffer[(x, y)].bg == BLOCK_BG),
+                "row {y} is filled: {row:?}"
+            );
+        }
+        assert!(
+            row_of(&buffer, title).trim_start().starts_with("Jobs"),
+            "the title is inside the block"
+        );
+
+        app.mode = crate::tui::AppMode::Chat;
+        app.completion.start_slash("");
+        let buffer = draw_buffer(&mut app, 100, 30);
+        let title = (0..30)
+            .find(|&y| row_of(&buffer, y).contains("Commands"))
+            .expect("the list title row");
+        let help = (title..30)
+            .find(|&y| row_of(&buffer, y).contains("/help"))
+            .expect("a command row");
+        for y in title..=help {
+            let row = row_of(&buffer, y);
+            assert!(!row.contains(BOX_DRAWING), "row {y}: {row:?}");
+        }
+        assert!(
+            (title..=help)
+                .any(|y| (1..99).any(|x| buffer[(x, y)].bg == ratatui::style::Color::Blue)),
+            "the selected row is shown by its background"
+        );
+    }
+
+    /// The sidebar is one block: no divider column, its whole area filled
+    /// with the block colour, which the chat beside it does not use.
+    #[tokio::test]
+    async fn the_sidebar_is_a_filled_block_without_a_divider() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        app.band_bg = Some(BLOCK_BG);
+        let (width, height) = (160u16, 30u16);
+        assert!(app.sidebar.visible_at(width));
+        let buffer = draw_buffer(&mut app, width, height);
+        let sidebar_width = crate::tui::sidebar::SidebarState::width_for(width);
+        let left = width - sidebar_width;
+        for y in 0..height {
+            assert!(
+                (left..width).all(|x| buffer[(x, y)].bg == BLOCK_BG),
+                "sidebar row {y} is filled"
+            );
+            assert!(
+                (left..width).all(|x| !BOX_DRAWING
+                    .contains(&buffer[(x, y)].symbol().chars().next().unwrap_or(' '))),
+                "no divider on row {y}: {:?}",
+                row_of(&buffer, y)
+            );
+        }
+        // Inner padding: the first column of the block stays empty.
+        assert!((0..height).all(|y| buffer[(left, y)].symbol() == " "));
+        // The chat beside it is not painted with the block colour.
+        assert_ne!(buffer[(left - 1, 0)].bg, BLOCK_BG);
+    }
+
     #[tokio::test]
     async fn a_working_session_reads_working_in_the_session_list() {
         let dir = tempfile::tempdir().expect("dir");
