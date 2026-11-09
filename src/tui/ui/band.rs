@@ -4,7 +4,9 @@
 use std::time::Duration;
 
 use ratatui::layout::Rect;
-use ratatui::style::Color;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Padding};
 use terminal_colorsaurus::{QueryOptions, color_palette};
 
 /// Columns of padding on each side of the band, and of margin around the
@@ -40,6 +42,34 @@ pub const fn inset(area: Rect) -> Rect {
         x: area.x + pad,
         width: area.width - 2 * pad,
         ..area
+    }
+}
+
+/// A filled block for a popup, panel or sidebar: `bg` behind every cell, one
+/// column of padding on each side and one row at the bottom. The title, when
+/// given, is the block's first row in the `accent` colour; without one the
+/// block also pads its top row. The chrome costs two rows and two columns
+/// either way, so a layout sized for it never changes with the title.
+///
+/// `bg` is the terminal-derived band colour; `None` (the terminal did not
+/// report its colours) leaves the terminal's own background.
+#[must_use]
+pub fn panel<'a>(
+    title: Option<impl Into<Line<'a>>>,
+    accent: Color,
+    bg: Option<Color>,
+) -> Block<'a> {
+    let base = bg.map_or_else(Style::default, |bg| Style::default().bg(bg));
+    let block = Block::new().style(base);
+    match title {
+        Some(title) => {
+            let mut title: Line<'a> = title.into();
+            title.spans.insert(0, Span::raw(" "));
+            block
+                .padding(Padding::new(1, 1, 0, 1))
+                .title(title.style(Style::default().fg(accent).add_modifier(Modifier::BOLD)))
+        }
+        None => block.padding(Padding::new(1, 1, 1, 1)),
     }
 }
 

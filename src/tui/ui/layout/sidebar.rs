@@ -4,10 +4,11 @@
 
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Clear, Paragraph},
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use super::super::band::panel;
 use super::super::chat::{format_elapsed, format_number};
 use crate::task_rows::{TaskRow, TaskSection};
 use crate::tui::app::App;
@@ -208,16 +209,9 @@ fn pr_icon(pr: &crate::client::WirePr) -> (&'static str, Style) {
 /// Render the sidebar into `area`.
 pub(super) fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::LEFT)
-        .border_style(Style::default().fg(Color::DarkGray));
+    let block = panel(None::<Span>, Color::Reset, app.band_bg);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let inner = Rect {
-        x: inner.x + 1,
-        width: inner.width.saturating_sub(1),
-        ..inner
-    };
     let width = usize::from(inner.width);
     if width < 8 || inner.height == 0 {
         return;

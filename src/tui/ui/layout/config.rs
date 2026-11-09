@@ -5,11 +5,12 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
+    widgets::{Clear, List, ListItem, Paragraph},
 };
 
 use super::super::super::app::App;
 use super::super::super::state::{ConfigEditMode, ConfigSection};
+use super::super::band::panel;
 use super::{centered_rect, char_to_byte_idx, display_width_prefix};
 
 pub(super) fn render_config_screen(frame: &mut Frame, area: Rect, app: &App) {
@@ -178,12 +179,11 @@ pub(super) fn render_providers_section(frame: &mut Frame, area: Rect, app: &App)
             })
             .collect();
 
-        let list = List::new(list_items).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan))
-                .title("Select Provider Type"),
-        );
+        let list = List::new(list_items).block(panel(
+            Some(Span::raw("Select Provider Type")),
+            Color::Cyan,
+            app.band_bg,
+        ));
         frame.render_widget(list, popup_area);
         return;
     }
@@ -242,14 +242,12 @@ pub(super) fn render_providers_section(frame: &mut Frame, area: Rect, app: &App)
             } else {
                 Style::default().fg(Color::White)
             };
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_style(if is_focused {
-                    Style::default().fg(Color::Yellow)
-                } else {
-                    Style::default().fg(Color::Gray)
-                })
-                .title(label);
+            let accent = if is_focused {
+                Color::Yellow
+            } else {
+                Color::Gray
+            };
+            let block = panel(Some(Span::raw(label)), accent, app.band_bg);
             let paragraph = Paragraph::new(display).style(style).block(block);
             frame.render_widget(paragraph, area);
         };
@@ -306,11 +304,12 @@ pub(super) fn render_providers_section(frame: &mut Frame, area: Rect, app: &App)
                 .alignment(ratatui::layout::Alignment::Center);
         frame.render_widget(instructions, chunks[3]);
 
-        // Draw border around the popup
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title("Add Custom Provider");
+        // Fill the popup behind the fields
+        let block = panel(
+            Some(Span::raw("Add Custom Provider")),
+            Color::Cyan,
+            app.band_bg,
+        );
         frame.render_widget(block, popup_area);
         return;
     }
@@ -332,12 +331,11 @@ pub(super) fn render_providers_section(frame: &mut Frame, area: Rect, app: &App)
         }
     }
 
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title("Manage LLM providers"),
-    );
+    let list = List::new(items).block(panel(
+        Some(Span::raw("Manage LLM providers")),
+        Color::Cyan,
+        app.band_bg,
+    ));
     frame.render_widget(list, area);
 }
 
@@ -427,12 +425,11 @@ pub(super) fn render_models_section(frame: &mut Frame, area: Rect, app: &App) {
         }
     }
 
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title("Configure model preferences by tier"),
-    );
+    let list = List::new(items).block(panel(
+        Some(Span::raw("Configure model preferences by tier")),
+        Color::Cyan,
+        app.band_bg,
+    ));
     frame.render_widget(list, area);
 }
 
@@ -498,11 +495,10 @@ pub(super) fn render_preferences_section(frame: &mut Frame, area: Rect, app: &Ap
         ));
     }
 
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title("General preferences"),
-    );
+    let list = List::new(items).block(panel(
+        Some(Span::raw("General preferences")),
+        Color::Cyan,
+        app.band_bg,
+    ));
     frame.render_widget(list, area);
 }

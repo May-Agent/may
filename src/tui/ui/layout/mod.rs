@@ -17,10 +17,11 @@ use self::popups::{render_mcp_popup, render_skill_popup, render_ssh_popup};
 use ratatui::{
     buffer::CellDiffOption,
     prelude::*,
-    widgets::{Block, Borders, Clear, LineGauge, List, ListItem, Paragraph},
+    widgets::{Block, Clear, LineGauge, List, ListItem, Paragraph},
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use super::band::panel;
 use super::wrap::WrappedParagraph;
 
 use ratatui::Frame;
@@ -425,10 +426,10 @@ fn confirm_body_rows(text: &str, width: u16) -> usize {
 fn render_sheet(frame: &mut Frame, sheet: Rect, app: &App) {
     frame.render_widget(Clear, sheet);
     match &app.mode {
-        AppMode::AskUser(state) => render_ask_user(frame, sheet, state),
+        AppMode::AskUser(state) => render_ask_user(frame, sheet, state, app.band_bg),
         AppMode::SessionSelect => render_session_popup(frame, sheet, app),
         AppMode::FilePicker => render_file_picker_popup(frame, sheet, app),
-        AppMode::Help => render_help_popup(frame, sheet, app.help_scroll),
+        AppMode::Help => render_help_popup(frame, sheet, app.help_scroll, app.band_bg),
         AppMode::ToolDetail => render_tool_detail_popup(frame, sheet, app),
         AppMode::ModelSelect => render_model_select_popup(frame, sheet, app),
         AppMode::EffortSelect => render_effort_select_popup(frame, sheet, app),
@@ -436,20 +437,24 @@ fn render_sheet(frame: &mut Frame, sheet: Rect, app: &App) {
         AppMode::SshManage => render_ssh_popup(frame, sheet, app),
         AppMode::SkillManage => render_skill_popup(frame, sheet, app),
         AppMode::ProfileSelect => render_profile_select_popup(frame, sheet, app),
-        AppMode::Rewind(state) => render_rewind_popup(frame, sheet, state),
-        AppMode::ResumePicker(state) => render_resume_picker(frame, sheet, state),
-        AppMode::Connect(state) => render_connect_picker(frame, sheet, state, app.spinner_frame),
-        AppMode::Jobs => render_jobs_panel(frame, sheet, app),
-        AppMode::JobDetail(state) => render_job_detail(frame, sheet, state),
-        AppMode::Btw(state) => render_btw_popup(frame, sheet, state),
-        AppMode::Progress(state) => render_progress_popup(frame, sheet, state),
-        AppMode::PermissionConfirm(state) => render_permission_confirm(frame, sheet, state),
-        AppMode::WorkspaceConfirm(state) => {
-            render_workspace_confirm(frame, sheet, &state.path, &state.reason);
+        AppMode::Rewind(state) => render_rewind_popup(frame, sheet, state, app.band_bg),
+        AppMode::ResumePicker(state) => render_resume_picker(frame, sheet, state, app.band_bg),
+        AppMode::Connect(state) => {
+            render_connect_picker(frame, sheet, state, app.spinner_frame, app.band_bg);
         }
-        AppMode::QuitConfirm(_) => render_quit_confirm(frame, sheet),
+        AppMode::Jobs => render_jobs_panel(frame, sheet, app),
+        AppMode::JobDetail(state) => render_job_detail(frame, sheet, state, app.band_bg),
+        AppMode::Btw(state) => render_btw_popup(frame, sheet, state, app.band_bg),
+        AppMode::Progress(state) => render_progress_popup(frame, sheet, state, app.band_bg),
+        AppMode::PermissionConfirm(state) => {
+            render_permission_confirm(frame, sheet, state, app.band_bg);
+        }
+        AppMode::WorkspaceConfirm(state) => {
+            render_workspace_confirm(frame, sheet, &state.path, &state.reason, app.band_bg);
+        }
+        AppMode::QuitConfirm(_) => render_quit_confirm(frame, sheet, app.band_bg),
         mode @ (AppMode::LaunchGrant(_) | AppMode::RepoTrust(_)) if is_gate_sheet(mode) => {
-            render_gate_sheet(frame, sheet, mode);
+            render_gate_sheet(frame, sheet, mode, app.band_bg);
         }
         _ => {}
     }
@@ -466,11 +471,8 @@ const IMAGE_VIEW_TITLE: &str = " Image (Esc or click outside to close) ";
 /// Near-black veil painted over `Color::Reset` backgrounds.
 const IMAGE_VIEW_VEIL: Color = Color::Rgb(10, 10, 12);
 
-fn image_view_frame() -> Block<'static> {
-    Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(IMAGE_VIEW_TITLE)
+fn image_view_frame(bg: Option<Color>) -> Block<'static> {
+    panel(Some(Span::raw(IMAGE_VIEW_TITLE)), Color::Cyan, bg)
 }
 
 /// Largest rect the image can occupy: the screen minus the overlay margin,
@@ -480,7 +482,7 @@ fn image_view_max_content(area: Rect) -> Rect {
         horizontal: IMAGE_VIEW_MARGIN,
         vertical: IMAGE_VIEW_MARGIN,
     });
-    let inner = image_view_frame().inner(popup);
+    let inner = image_view_frame(None).inner(popup);
     Rect {
         x: inner.x,
         y: inner.y,
@@ -600,7 +602,7 @@ fn render_image_view(frame: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
-    let block = image_view_frame();
+    let block = image_view_frame(app.band_bg);
     let inner = block.inner(popup);
     if inner.width == 0 || inner.height < 2 {
         app.image_view_area = None;
@@ -711,18 +713,17 @@ fn help_text() -> String {
 }
 
 /// Render the help sheet; `scroll` rows of it are scrolled off the top.
-fn render_help_popup(frame: &mut Frame, area: Rect, scroll: u16) {
+fn render_help_popup(frame: &mut Frame, area: Rect, scroll: u16, bg: Option<Color>) {
     let text = help_text();
     let max_scroll = u16::try_from(text.lines().count())
         .unwrap_or(u16::MAX)
         .saturating_sub(area.height.saturating_sub(2));
     let help = WrappedParagraph::new(text.as_str())
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan))
-                .title("Help (↑↓ scroll · ? or Esc to close)"),
-        )
+        .block(panel(
+            Some(Span::raw("Help (↑↓ scroll · ? or Esc to close)")),
+            Color::Cyan,
+            bg,
+        ))
         .style(Style::default().fg(Color::White))
         .scroll(scroll.min(max_scroll));
 
@@ -737,7 +738,13 @@ fn render_tool_detail_popup(frame: &mut Frame, area: Rect, app: &App) {
     if let Some(ref tool_id) = app.selected_tool
         && let Some(display) = app.chat.get_tool(tool_id)
     {
-        chat::render_tool_fullscreen(frame, popup_area, display, app.tool_detail_scroll);
+        chat::render_tool_fullscreen(
+            frame,
+            popup_area,
+            display,
+            app.tool_detail_scroll,
+            app.band_bg,
+        );
     }
 }
 
@@ -760,16 +767,17 @@ fn render_tier_model_picker(frame: &mut Frame, area: Rect, app: &App) {
     let popup_y = area.y + (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(popup_x, popup_y, popup_width, popup_height);
 
-    // Clear the popup area
+    // Clear the popup area, then fill it: the sections draw over the fill.
     frame.render_widget(Clear, popup_area);
+    let block = panel(
+        Some(Span::raw(format!(" Select {tier_name} Model "))),
+        Color::Cyan,
+        app.band_bg,
+    );
+    let inner_area = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
 
     // Layout: Search + List
-    let inner_area = Rect::new(
-        popup_area.x + 1,
-        popup_area.y + 1,
-        popup_area.width.saturating_sub(2),
-        popup_area.height.saturating_sub(2),
-    );
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -785,12 +793,11 @@ fn render_tier_model_picker(frame: &mut Frame, area: Rect, app: &App) {
         app.tier_picker_query.clone()
     };
     let search = Paragraph::new(search_display)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray))
-                .title(" Search "),
-        )
+        .block(panel(
+            Some(Span::raw(" Search ")),
+            Color::DarkGray,
+            app.band_bg,
+        ))
         .style(if app.tier_picker_query.is_empty() {
             Style::default().fg(Color::DarkGray)
         } else {
@@ -810,12 +817,11 @@ fn render_tier_model_picker(frame: &mut Frame, area: Rect, app: &App) {
         let loading = Paragraph::new("Loading models...")
             .style(Style::default().fg(Color::Yellow))
             .alignment(ratatui::layout::Alignment::Center)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(Color::DarkGray))
-                    .title(" Models "),
-            );
+            .block(panel(
+                Some(Span::raw(" Models ")),
+                Color::DarkGray,
+                app.band_bg,
+            ));
         frame.render_widget(loading, chunks[1]);
     } else {
         // Show visible window of models (scrolling)
@@ -866,22 +872,9 @@ fn render_tier_model_picker(frame: &mut Frame, area: Rect, app: &App) {
             format!(" {tier_name} (no models) ")
         };
 
-        let list = List::new(items).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan))
-                .title(title),
-        );
+        let list = List::new(items).block(panel(Some(Span::raw(title)), Color::Cyan, app.band_bg));
         frame.render_widget(list, chunks[1]);
     }
-
-    // Draw popup border
-    let title = format!(" Select {tier_name} Model ");
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(title);
-    frame.render_widget(block, popup_area);
 }
 
 /// Render model select popup (anchored near input area): a search line, the
@@ -906,10 +899,7 @@ fn render_model_select_popup(frame: &mut Frame, area: Rect, app: &App) {
         title
     };
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(title);
+    let block = panel(Some(Span::raw(title)), Color::Cyan, app.band_bg);
     let inner_area = block.inner(popup_area);
     frame.render_widget(block, popup_area);
 
@@ -1017,7 +1007,7 @@ fn render_model_select_popup(frame: &mut Frame, area: Rect, app: &App) {
 /// changes the turn each started produced, plus a trailing `(current)`
 /// entry. Rewind is conversation-only — landed code is undone through a
 /// revert PR, never through the picker.
-fn render_rewind_popup(frame: &mut Frame, area: Rect, state: &RewindState) {
+fn render_rewind_popup(frame: &mut Frame, area: Rect, state: &RewindState, bg: Option<Color>) {
     let popup_area = area;
 
     let selected_style = Style::default()
@@ -1059,12 +1049,11 @@ fn render_rewind_popup(frame: &mut Frame, area: Rect, state: &RewindState) {
         },
     ))));
 
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title("Rewind to before… (Enter select, Esc cancel)"),
-    );
+    let list = List::new(items).block(panel(
+        Some(Span::raw("Rewind to before… (Enter select, Esc cancel)")),
+        Color::Cyan,
+        bg,
+    ));
     frame.render_widget(list, popup_area);
 }
 
@@ -1177,17 +1166,12 @@ fn render_jobs_panel(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         "Jobs & subagents (↑↓ select · Enter open · x stop · r refresh · Esc close)"
     };
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title(title),
-    );
+    let list = List::new(items).block(panel(Some(Span::raw(title)), Color::Cyan, app.band_bg));
     frame.render_widget(list, panel_area);
 }
 
 /// Job/subagent detail: bottom drawer with live stats or buffered output.
-fn render_job_detail(frame: &mut Frame, area: Rect, state: &JobDetailState) {
+fn render_job_detail(frame: &mut Frame, area: Rect, state: &JobDetailState, bg: Option<Color>) {
     let (title, body): (String, Vec<Line<'_>>) = match state.target {
         JobDetailTarget::Job(pid) => {
             let title = state.job.as_ref().map_or_else(
@@ -1288,19 +1272,20 @@ fn render_job_detail(frame: &mut Frame, area: Rect, state: &JobDetailState) {
     let scroll = state.scroll.min(body.len().saturating_sub(inner_height));
     let scroll = u16::try_from(scroll).unwrap_or(u16::MAX);
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(format!(
+    let block = panel(
+        Some(Span::raw(format!(
             "{title} (Esc back · ↑↓ scroll · x stop · r refresh)"
-        ));
+        ))),
+        Color::Cyan,
+        bg,
+    );
     frame.render_widget(
         Paragraph::new(body).block(block).scroll((scroll, 0)),
         panel_area,
     );
 }
 
-fn render_btw_popup(frame: &mut Frame, area: Rect, state: &BtwState) {
+fn render_btw_popup(frame: &mut Frame, area: Rect, state: &BtwState, bg: Option<Color>) {
     let awaiting_question = !state.loading && !state.done;
     let popup_area = area;
 
@@ -1309,10 +1294,7 @@ fn render_btw_popup(frame: &mut Frame, area: Rect, state: &BtwState) {
     } else {
         "btw — side question"
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(title);
+    let block = panel(Some(Span::raw(title)), Color::Cyan, bg);
     let inner = block.inner(popup_area);
     frame.render_widget(block, popup_area);
 
@@ -1391,11 +1373,12 @@ fn progress_groups(report: &crate::daemon::ProgressReport) -> [(&'static str, &[
     ]
 }
 
-fn render_progress_popup(frame: &mut Frame, area: Rect, state: &ProgressState) {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title("progress (not in history)");
+fn render_progress_popup(frame: &mut Frame, area: Rect, state: &ProgressState, bg: Option<Color>) {
+    let block = panel(
+        Some(Span::raw("progress (not in history)")),
+        Color::Cyan,
+        bg,
+    );
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let [bar_area, body_area] =
@@ -1593,11 +1576,12 @@ fn render_copilot_auth_screen(frame: &mut Frame, area: Rect, app: &App) {
 
     let widget = Paragraph::new(content)
         .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Magenta))
-                .title(" GitHub Copilot Authentication ")
-                .title_alignment(ratatui::layout::Alignment::Center),
+            panel(
+                Some(Span::raw(" GitHub Copilot Authentication ")),
+                Color::Magenta,
+                app.band_bg,
+            )
+            .title_alignment(ratatui::layout::Alignment::Center),
         )
         .alignment(ratatui::layout::Alignment::Left);
 
@@ -1747,11 +1731,12 @@ fn render_chatgpt_auth_screen(frame: &mut Frame, area: Rect, app: &App) {
 
     let widget = Paragraph::new(content)
         .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Magenta))
-                .title(" ChatGPT Authentication ")
-                .title_alignment(ratatui::layout::Alignment::Center),
+            panel(
+                Some(Span::raw(" ChatGPT Authentication ")),
+                Color::Magenta,
+                app.band_bg,
+            )
+            .title_alignment(ratatui::layout::Alignment::Center),
         )
         .alignment(ratatui::layout::Alignment::Left);
 
@@ -1812,11 +1797,12 @@ fn render_login_screen(frame: &mut Frame, area: Rect, app: &App) {
 
     let widget = Paragraph::new(content)
         .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Magenta))
-                .title(" Sign in to a provider ")
-                .title_alignment(ratatui::layout::Alignment::Center),
+            panel(
+                Some(Span::raw(" Sign in to a provider ")),
+                Color::Magenta,
+                app.band_bg,
+            )
+            .title_alignment(ratatui::layout::Alignment::Center),
         )
         .alignment(ratatui::layout::Alignment::Left);
 
@@ -1936,11 +1922,12 @@ fn render_grok_auth_screen(frame: &mut Frame, area: Rect, app: &App) {
 
     let widget = Paragraph::new(content)
         .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Magenta))
-                .title(" xAI Grok Authentication ")
-                .title_alignment(ratatui::layout::Alignment::Center),
+            panel(
+                Some(Span::raw(" xAI Grok Authentication ")),
+                Color::Magenta,
+                app.band_bg,
+            )
+            .title_alignment(ratatui::layout::Alignment::Center),
         )
         .alignment(ratatui::layout::Alignment::Left);
 
@@ -2084,11 +2071,12 @@ fn render_openrouter_auth_screen(frame: &mut Frame, area: Rect, app: &App) {
 
     let widget = Paragraph::new(content)
         .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Magenta))
-                .title(" OpenRouter Sign-in ")
-                .title_alignment(ratatui::layout::Alignment::Center),
+            panel(
+                Some(Span::raw(" OpenRouter Sign-in ")),
+                Color::Magenta,
+                app.band_bg,
+            )
+            .title_alignment(ratatui::layout::Alignment::Center),
         )
         .alignment(ratatui::layout::Alignment::Left);
 
@@ -2096,7 +2084,13 @@ fn render_openrouter_auth_screen(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 /// Render the workspace access confirmation as a bottom sheet.
-fn render_workspace_confirm(frame: &mut Frame, area: Rect, path: &str, reason: &str) {
+fn render_workspace_confirm(
+    frame: &mut Frame,
+    area: Rect,
+    path: &str,
+    reason: &str,
+    bg: Option<Color>,
+) {
     let content = vec![
         Line::from(Span::styled(
             "The agent is requesting access to:",
@@ -2124,12 +2118,11 @@ fn render_workspace_confirm(frame: &mut Frame, area: Rect, path: &str, reason: &
         ]),
     ];
 
-    let widget = WrappedParagraph::new(content).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow))
-            .title(" Workspace Access Request "),
-    );
+    let widget = WrappedParagraph::new(content).block(panel(
+        Some(Span::raw(" Workspace Access Request ")),
+        Color::Yellow,
+        bg,
+    ));
 
     frame.render_widget(widget, area);
 }
@@ -2249,7 +2242,7 @@ fn gate_sheet_rows(mode: &AppMode) -> usize {
 
 /// The launch gate as a bottom sheet: `/permission` re-asks the launch
 /// decision over the running session instead of owning the frame.
-fn render_gate_sheet(frame: &mut Frame, area: Rect, mode: &AppMode) {
+fn render_gate_sheet(frame: &mut Frame, area: Rect, mode: &AppMode, bg: Option<Color>) {
     let Some(lines) = gate_lines(mode) else {
         return;
     };
@@ -2258,18 +2251,13 @@ fn render_gate_sheet(frame: &mut Frame, area: Rect, mode: &AppMode) {
         _ => " Repository Trust ",
     };
     frame.render_widget(
-        Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow))
-                .title(title),
-        ),
+        Paragraph::new(lines).block(panel(Some(Span::raw(title)), Color::Yellow, bg)),
         area,
     );
 }
 
 /// Render the quit confirmation for a session whose agent still runs.
-fn render_quit_confirm(frame: &mut Frame, area: Rect) {
+fn render_quit_confirm(frame: &mut Frame, area: Rect, bg: Option<Color>) {
     let content = vec![
         Line::from(Span::styled(
             "The agent is still running in this session.",
@@ -2297,12 +2285,8 @@ fn render_quit_confirm(frame: &mut Frame, area: Rect) {
         ]),
     ];
 
-    let widget = WrappedParagraph::new(content).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow))
-            .title(" Quit "),
-    );
+    let widget =
+        WrappedParagraph::new(content).block(panel(Some(Span::raw(" Quit ")), Color::Yellow, bg));
 
     frame.render_widget(widget, area);
 }
@@ -2311,6 +2295,7 @@ fn render_permission_confirm(
     frame: &mut Frame,
     area: Rect,
     state: &crate::tui::state::PermissionConfirmState,
+    bg: Option<Color>,
 ) {
     let content = vec![
         Line::from(Span::styled(
@@ -2339,12 +2324,11 @@ fn render_permission_confirm(
         ]),
     ];
 
-    let widget = WrappedParagraph::new(content).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::LightRed))
-            .title(" Permission Request "),
-    );
+    let widget = WrappedParagraph::new(content).block(panel(
+        Some(Span::raw(" Permission Request ")),
+        Color::LightRed,
+        bg,
+    ));
     frame.render_widget(widget, area);
 }
 
@@ -2381,6 +2365,7 @@ fn render_secret_question(
     question: &crate::ask_user::Question,
     qs: &crate::tui::state::AskUserQuestionState,
     secret: &crate::session::PersistedSecretRequest,
+    bg: Option<Color>,
 ) {
     let scope = match secret.scope {
         crate::secrets::SecretScope::Global => "global",
@@ -2396,11 +2381,7 @@ fn render_secret_question(
     } else {
         format!(" Secret {} ", secret.name)
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(title)
-        .title_alignment(Alignment::Center);
+    let block = panel(Some(Span::raw(title)), Color::Cyan, bg).title_alignment(Alignment::Center);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let chunks = Layout::default()
@@ -2460,7 +2441,7 @@ fn render_secret_question(
 }
 
 /// Render the `AskUser` dialog as a bottom sheet.
-fn render_ask_user(frame: &mut Frame, area: Rect, state: &AskUserState) {
+fn render_ask_user(frame: &mut Frame, area: Rect, state: &AskUserState, bg: Option<Color>) {
     let Some(question) = state.current() else {
         return;
     };
@@ -2468,7 +2449,7 @@ fn render_ask_user(frame: &mut Frame, area: Rect, state: &AskUserState) {
         return;
     };
     if let Some(secret) = state.current_secret() {
-        render_secret_question(frame, area, state, question, qs, secret);
+        render_secret_question(frame, area, state, question, qs, secret, bg);
         return;
     }
 
@@ -2510,11 +2491,7 @@ fn render_ask_user(frame: &mut Frame, area: Rect, state: &AskUserState) {
         Line::from(" Single Choice ")
     };
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(border_title)
-        .title_alignment(Alignment::Center);
+    let block = panel(Some(border_title), Color::Cyan, bg).title_alignment(Alignment::Center);
     let inner = block.inner(overlay);
     frame.render_widget(block, overlay);
 
@@ -2716,12 +2693,7 @@ fn render_completion_overlay(frame: &mut Frame, area: Rect, app: &App) {
         CompletionMode::None => "",
     };
 
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title(title),
-    );
+    let list = List::new(items).block(panel(Some(Span::raw(title)), Color::Cyan, app.band_bg));
 
     frame.render_widget(list, overlay_area);
 }
@@ -3184,7 +3156,7 @@ mod tests {
         let mut terminal = Terminal::new(ScreenBackend::new(60, 20)).unwrap();
         terminal
             .draw(|frame| {
-                super::render_gate_sheet(frame, Rect::new(0, 4, 60, 16), &mode);
+                super::render_gate_sheet(frame, Rect::new(0, 4, 60, 16), &mode, None);
             })
             .unwrap();
         let shown = terminal.backend().screen();
@@ -3377,6 +3349,7 @@ mod tests {
                     area,
                     "/工作区/项目/源代码目录",
                     OVERFLOWING_CJK,
+                    None,
                 );
             });
         }
@@ -3400,7 +3373,7 @@ mod tests {
                 let (chunk, tail) = rest.split_at(split);
                 state.answer.push_str(chunk);
                 draw_checked(&mut terminal, area, |frame, area| {
-                    super::render_btw_popup(frame, area, &state);
+                    super::render_btw_popup(frame, area, &state, None);
                 });
                 rest = tail;
             }
@@ -3409,7 +3382,7 @@ mod tests {
             for scroll in [1, 3, 0] {
                 state.scroll = scroll;
                 draw_checked(&mut terminal, area, |frame, area| {
-                    super::render_btw_popup(frame, area, &state);
+                    super::render_btw_popup(frame, area, &state, None);
                 });
             }
         }
@@ -3431,7 +3404,7 @@ mod tests {
         };
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(60, 16)).unwrap();
         terminal
-            .draw(|frame| super::render_progress_popup(frame, frame.area(), &state))
+            .draw(|frame| super::render_progress_popup(frame, frame.area(), &state, None))
             .unwrap();
         let buffer = terminal.backend().buffer();
         let rows: Vec<String> = (0..buffer.area.height)
@@ -3489,7 +3462,7 @@ mod tests {
         for width in 12u16..=44 {
             let mut terminal = Terminal::new(ScreenBackend::new(width, 16)).unwrap();
             draw_checked(&mut terminal, Rect::new(0, 0, width, 16), |frame, area| {
-                super::render_ask_user(frame, area, &state);
+                super::render_ask_user(frame, area, &state, None);
             });
         }
     }
@@ -3514,7 +3487,7 @@ mod tests {
             let mut terminal = Terminal::new(ScreenBackend::new(width, 18)).unwrap();
             for scroll in [0, 2, 5] {
                 draw_checked(&mut terminal, Rect::new(0, 0, width, 18), |frame, area| {
-                    super::super::chat::render_tool_fullscreen(frame, area, &display, scroll);
+                    super::super::chat::render_tool_fullscreen(frame, area, &display, scroll, None);
                 });
             }
         }

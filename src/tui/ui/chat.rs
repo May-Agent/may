@@ -11,7 +11,7 @@ use askama::Template as _;
 use crate::agent::cache_miss::CacheMissCause;
 use ratatui::{
     prelude::*,
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Clear, Paragraph},
 };
 
 use ratatui::Frame;
@@ -3870,7 +3870,13 @@ fn render_tool_inline_at<'a>(
 }
 
 /// Render full-screen tool detail view.
-pub fn render_tool_fullscreen(frame: &mut Frame, area: Rect, display: &ToolDisplay, scroll: usize) {
+pub fn render_tool_fullscreen(
+    frame: &mut Frame,
+    area: Rect,
+    display: &ToolDisplay,
+    scroll: usize,
+    bg: Option<Color>,
+) {
     // Guard against zero-dimension areas to prevent overflow
     if area.width < 3 || area.height < 3 {
         return;
@@ -3927,7 +3933,7 @@ pub fn render_tool_fullscreen(frame: &mut Frame, area: Rect, display: &ToolDispl
         && !detail.is_empty()
     {
         lines.push(Line::from(Span::styled(
-            "─── Detail ───",
+            "Detail",
             Style::default().fg(Color::Blue),
         )));
         for line in detail {
@@ -3957,7 +3963,7 @@ pub fn render_tool_fullscreen(frame: &mut Frame, area: Rect, display: &ToolDispl
     } else {
         for (i, call) in terminal_calls.iter().enumerate() {
             lines.push(Line::from(Span::styled(
-                format!("─── Command {} ───", i + 1),
+                format!("Command {}", i + 1),
                 Style::default().fg(Color::Blue),
             )));
             lines.push(Line::from(""));
@@ -4006,17 +4012,16 @@ pub fn render_tool_fullscreen(frame: &mut Frame, area: Rect, display: &ToolDispl
         Style::default().fg(Color::DarkGray),
     )));
 
-    // Calculate safe scroll value (account for borders: 2 lines)
+    // Calculate safe scroll value (account for the title row and bottom padding: 2 lines)
     let inner_height = area.height.saturating_sub(2);
     let scroll_y = safe_scroll(scroll, lines.len(), inner_height);
 
     let paragraph = super::wrap::WrappedParagraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Tool Details")
-                .border_style(Style::default().fg(Color::Cyan)),
-        )
+        .block(super::band::panel(
+            Some(Span::raw("Tool Details")),
+            Color::Cyan,
+            bg,
+        ))
         .scroll(scroll_y);
 
     frame.render_widget(paragraph, area);
