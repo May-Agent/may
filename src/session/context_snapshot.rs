@@ -222,7 +222,12 @@ mod tests {
         let second = context.push(answer.clone());
         assert_eq!((first, second), (0, 1));
         let fork_point = context.fork_point();
-        context.apply_handoff(Handoff::new("summary"), fork_point, 0);
+        context.apply_handoff(
+            Handoff::new("summary"),
+            fork_point,
+            0,
+            &std::collections::HashSet::new(),
+        );
         assert!(
             context.checkpoint().items().is_empty(),
             "the handoff covers every item"

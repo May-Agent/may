@@ -106,7 +106,7 @@ Work on a git repository happens in a clone inside the session, and `pr` lands i
 
 ## Context and compaction
 
-The conversation is compacted into a handoff document in the background when you call the native `compact` tool, when usage passes the context policy's `compact_at` threshold, when the session has been idle until the provider's prompt cache (default one hour, the provider's `cache_lifetime` setting) is about to expire, or when the user runs `/compact`. The idle session's agent is kept between turns and reused unless something it was built from changed, so detached commands keep running. `/context` and `/btw` are answered without disturbing the conversation.
+The conversation is compacted into a handoff document in the background when you call the native `compact` tool, when usage nears the window less the context policy's `handoff_reserve`, when the session has been idle until the provider's prompt cache (default one hour, the provider's `cache_lifetime` setting) is about to expire, or when the user runs `/compact`. The idle session's agent is kept between turns and reused unless something it was built from changed, so detached commands keep running. `/context` and `/btw` are answered without disturbing the conversation.
 
 ## Defects to know
 

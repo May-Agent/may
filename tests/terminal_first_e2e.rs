@@ -3473,7 +3473,8 @@ fn is_compaction_request(request: &Value) -> bool {
 }
 
 /// A user turn long enough to put the main agent's context between the
-/// refusal point (90% of the 80% compaction point) and the compaction point.
+/// refusal point (90% of the pause point, the window less the handoff
+/// reserve) and the pause point.
 fn near_compaction_user_turn() -> String {
     format!(
         "Run the fork probe. {}",
@@ -3481,7 +3482,7 @@ fn near_compaction_user_turn() -> String {
     )
 }
 
-const FORK_FILLER_REPEATS: usize = 30_000;
+const FORK_FILLER_REPEATS: usize = 32_500;
 
 #[tokio::test]
 #[serial]
@@ -5769,10 +5770,11 @@ const COMPACTION_PROBE_FILLER_REPEATS: usize = 10_000;
 /// the run pauses for it at `40k - safe_buffer`.
 fn compaction_probe_context(start_distance: usize, safe_buffer: usize) -> ContextConfig {
     ContextConfig {
-        compact_at: 0.8,
-        compact_ceiling: 40_000,
-        start_distance,
-        safe_buffer,
+        // The pause point is the ceiling; compaction starts `start_distance`
+        // before the 40k point, which is `start_distance - safe_buffer`
+        // before the pause point.
+        compact_ceiling: 40_000 - safe_buffer,
+        start_distance: start_distance.saturating_sub(safe_buffer),
         ..ContextConfig::default()
     }
 }

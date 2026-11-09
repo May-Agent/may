@@ -482,7 +482,13 @@ mod tests {
         ));
         let mut builder = ToolRegistryBuilder::new();
         builder.configure_tool(AskUserTool::new(runtime, "session"));
-        (builder.build(dir.path().join("outputs")), db)
+        let outputs = aither_sandbox::OutputStore::new(
+            dir.path().join("outputs"),
+            aither_core::AnyIdAllocator::default(),
+        )
+        .await
+        .expect("the outputs directory is created");
+        (builder.build(outputs), db)
     }
 
     /// The single-question form takes the question as its positional

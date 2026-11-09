@@ -456,29 +456,27 @@ where
 
     // A subagent runs on the model of its definition's tier: the models `ask`
     // offers.
-    let mut subagent_tool = SubagentTool::new(
-        UsageObservedModel::new(subagent_flagship),
-        Bundle::subagents_dir(&config.may_dir),
-    )
-    .with_request_parameters(config.request_parameters.clone())
-    .with_balanced_model(UsageObservedModel::new(balanced.llm), balanced.parameters)
-    .with_fast_model(UsageObservedModel::new(fast_llm), fast.parameters)
-    .with_runs(config.subagent_runs)
-    .with_work_events(config.task_events.clone())
-    // Each subagent keeps its own `tasks.md` under the main agent's schema
-    // and stop rule, and reads May's wording.
-    .with_working_document(
-        Some(crate::tasks_md::schema::document_spec()),
-        Some(aither_agent::AnyStopHook::new(
-            crate::tasks_md::schema::TasksStopHook,
-        )),
-    )
-    .with_notices(crate::agent::notices::may_notices())
-    .with_base_dir(&config.sandbox_dir)
-    .with_file_mounts([
-        SubagentFileMount::new(PathBuf::from("."), config.sandbox_dir.clone()),
-        SubagentFileMount::new(PathBuf::from("skills"), config.sandbox_dir.join("skills")),
-    ]);
+    let mut subagent_tool = SubagentTool::new(UsageObservedModel::new(subagent_flagship))
+        .with_definitions(Bundle::subagent_definitions())
+        .with_request_parameters(config.request_parameters.clone())
+        .with_balanced_model(UsageObservedModel::new(balanced.llm), balanced.parameters)
+        .with_fast_model(UsageObservedModel::new(fast_llm), fast.parameters)
+        .with_runs(config.subagent_runs)
+        .with_work_events(config.task_events.clone())
+        // Each subagent keeps its own `tasks.md` under the main agent's schema
+        // and stop rule, and reads May's wording.
+        .with_working_document(
+            Some(crate::tasks_md::schema::document_spec()),
+            Some(aither_agent::AnyStopHook::new(
+                crate::tasks_md::schema::TasksStopHook,
+            )),
+        )
+        .with_notices(crate::agent::notices::may_notices())
+        .with_base_dir(&config.sandbox_dir)
+        .with_file_mounts([
+            SubagentFileMount::new(PathBuf::from("."), config.sandbox_dir.clone()),
+            SubagentFileMount::new(PathBuf::from("skills"), config.sandbox_dir.join("skills")),
+        ]);
     if let Some(guard) = &config.languages {
         subagent_tool = subagent_tool.with_languages(guard.clone());
     }
@@ -594,6 +592,16 @@ mod tests {
 
     #[derive(Clone)]
     struct MockLlm;
+    /// The store a registry built in `session_dir` stores outputs in.
+    async fn outputs(session_dir: &std::path::Path) -> aither_sandbox::OutputStore {
+        aither_sandbox::OutputStore::new(
+            session_dir.join("outputs"),
+            aither_core::AnyIdAllocator::default(),
+        )
+        .await
+        .expect("the outputs directory is created")
+    }
+
 
     #[derive(Debug)]
     struct MockError;
@@ -712,7 +720,7 @@ mod tests {
         .expect("commands should register")
         .descriptions;
 
-        let registry = builder.build(session_dir.join("outputs"));
+        let registry = builder.build(outputs(&session_dir).await);
         assert!(registry.is_tool_configured("ask_user"));
         assert!(registry.is_tool_configured("imagine"));
         assert!(
@@ -773,7 +781,7 @@ mod tests {
         .expect("commands should register")
         .descriptions;
 
-        let registry = builder.build(session_dir.join("outputs"));
+        let registry = builder.build(outputs(&session_dir).await);
         assert!(!registry.is_tool_configured("ask_user"));
         assert!(!registry.is_tool_configured("imagine"));
         assert!(
@@ -834,7 +842,7 @@ mod tests {
         .expect("commands should register")
         .descriptions;
 
-        let registry = builder.build(session_dir.join("outputs"));
+        let registry = builder.build(outputs(&session_dir).await);
         assert!(!registry.is_tool_configured("websearch"));
         assert!(!descriptions.iter().any(|(name, _)| name == "websearch"));
         assert!(registry.is_tool_configured("webfetch"));
@@ -889,7 +897,7 @@ mod tests {
         .expect("commands should register")
         .descriptions;
 
-        let registry = builder.build(session_dir.join("outputs"));
+        let registry = builder.build(outputs(&session_dir).await);
         assert!(!registry.is_tool_configured("webfetch"));
         assert!(!descriptions.iter().any(|(name, _)| name == "webfetch"));
     }
@@ -938,7 +946,7 @@ mod tests {
         )
         .await
         .expect("commands should register");
-        let main = builder.build(session_dir.join("outputs"));
+        let main = builder.build(outputs(&session_dir).await);
         let subagent = main.for_subagent(None, None);
 
         // A subagent's terminal has no `subagent` command.
@@ -1110,7 +1118,7 @@ mod tests {
         )
         .await
         .expect("commands should register");
-        let main = builder.build(session_dir.join("outputs"));
+        let main = builder.build(outputs(&session_dir).await);
         let subagent = main.for_subagent(None, None);
 
         assert!(!main.is_reserved("agent"));
@@ -1193,7 +1201,7 @@ mod tests {
         )
         .await
         .expect("commands should register");
-        let main = builder.build(session_dir.join("outputs"));
+        let main = builder.build(outputs(&session_dir).await);
         let subagent = main.for_subagent(None, None);
 
         assert!(main.is_tool_configured("task"));
@@ -1247,7 +1255,7 @@ mod tests {
         .expect("commands should register")
         .descriptions;
 
-        let registry = builder.build(session_dir.join("outputs"));
+        let registry = builder.build(outputs(&session_dir).await);
         assert!(!registry.is_tool_configured("websearch"));
         assert!(registry.is_tool_configured("webfetch"));
         assert!(!descriptions.iter().any(|(name, _)| name == "websearch"));
@@ -1320,7 +1328,7 @@ mod tests {
         .await
         .expect("commands should register");
 
-        let registry = builder.build(session_dir.join("outputs"));
+        let registry = builder.build(outputs(&session_dir).await);
         assert!(registry.is_tool_configured(crate::commit_signing::SIGN_COMMAND));
         assert!(
             !commands
@@ -1350,7 +1358,7 @@ mod tests {
 
         assert!(
             builder
-                .build(session_dir.join("outputs"))
+                .build(outputs(&session_dir).await)
                 .is_tool_configured(crate::commit_signing::SIGN_COMMAND)
         );
         let program = std::process::Command::new("git")

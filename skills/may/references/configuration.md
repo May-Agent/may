@@ -36,7 +36,7 @@ Anthropic and Google use their own wire formats; every other type speaks the Ope
 ## Agent behaviour
 
 - `max_iterations`: iterations per query, 0 (default) is unlimited.
-- `[context]`: auto-compaction. The point is `min(window * compact_at, compact_ceiling)` tokens; defaults `compact_at = 0.8`, `compact_ceiling = 400000`, `start_distance = 50000` (background compaction starts that many tokens before the point), `safe_buffer = 5000` (the agent pauses to let compaction finish), `warn_distance = 80000` (the agent is told once to save its work and compact).
+- `[context]`: auto-compaction. The agent pauses to let compaction finish at `min(window - handoff_reserve, compact_ceiling)` tokens; defaults `handoff_reserve = 20000` (tokens kept free for the compaction request and the handoff, whatever the window), `compact_ceiling = 400000`, `start_distance = 50000` (background compaction starts that many tokens before that point), `warn_distance = 80000` (the agent is told once to save its work and compact), `count_distance = 30000` (a model that counts through a provider endpoint is asked for an exact count within that many tokens of the warn point).
 - `[language]`: `communication` (language of replies, questions and recaps; unset follows the user's messages) and `working` (language written for others such as issue text; English when unset). Values are an English or native name or an ISO 639-3 code; an unknown name is rejected.
 - `[time] timezone`: IANA name; unset follows the host.
 - `[suggestions] enabled` (default true): a completed turn schedules a suggested next prompt shown as ghost text; Tab accepts it in the TUI.

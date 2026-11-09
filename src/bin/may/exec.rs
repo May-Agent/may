@@ -485,6 +485,7 @@ async fn build_exec_terminal_tool(
         resolved_provider.llm,
         &tool_dispatchers,
         environment,
+        terminal_tool.output_store().clone(),
     ))
     .await?;
     let terminal_tool = terminal_tool.with_registry(registry);
@@ -497,6 +498,7 @@ async fn build_exec_registry<LLM>(
     llm: LLM,
     tool_dispatchers: &may_agent::tool_dispatch::ToolDispatchers,
     environment: &may_agent::AgentEnvironment,
+    outputs: aither_sandbox::OutputStore,
 ) -> Result<Arc<aither_sandbox::ToolRegistry>, ExecError>
 where
     LLM: aither_core::LanguageModel + Clone + 'static,
@@ -562,9 +564,7 @@ where
     )
     .await
     .map_err(ExecError::RegisterCommands)?;
-    Ok(Arc::new(builder.build(
-        SessionPaths::new(context.sandbox_dir.clone()).outputs_dir(),
-    )))
+    Ok(Arc::new(builder.build(outputs)))
 }
 
 /// Resolves `server_id` among the SSH servers attached to the session's profile.

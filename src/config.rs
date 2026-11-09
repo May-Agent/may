@@ -811,7 +811,7 @@ pub fn check_acp_agent_name(name: &str) -> Result<(), ConfigError> {
         Err(_) => return reject("a name holds only ASCII letters, digits, `-` and `_`"),
         Ok(()) => {}
     }
-    if aither_agent::BUNDLED_SUBAGENTS
+    if crate::bundle::Bundle::subagent_definitions()
         .iter()
         .any(|bundled| bundled.name == name)
     {
@@ -1480,40 +1480,41 @@ impl LanguageConfig {
 
 /// `[context]` section: when a session's conversation is compacted.
 ///
-/// The auto-compact point is `min(window * compact_at, compact_ceiling)`
+/// The pause point is `min(window - handoff_reserve, compact_ceiling)`
 /// tokens; the distances are token counts before it. aither applies them, and
 /// a change reaches running sessions at their next turn.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct ContextConfig {
-    /// Fraction of the model window at which the conversation is compacted.
-    pub compact_at: f32,
+    /// Tokens kept free below the window for the compaction request and the
+    /// handoff the model writes; it does not grow with the window.
+    pub handoff_reserve: usize,
     /// Most tokens the conversation may hold before it is compacted,
     /// whatever the window.
     pub compact_ceiling: usize,
-    /// Tokens before the auto-compact point at which compaction starts in
-    /// the background while the run keeps streaming.
+    /// Tokens before the pause point at which compaction starts in the
+    /// background while the run keeps streaming.
     pub start_distance: usize,
-    /// Tokens before the auto-compact point at which the agent pauses to
-    /// finish compaction.
-    pub safe_buffer: usize,
-    /// Tokens before the auto-compact point at which the agent is told once
-    /// to save its work and call `compact` itself.
+    /// Tokens before the pause point at which the agent is told once to save
+    /// its work and call `compact` itself.
     pub warn_distance: usize,
 }
 
 impl Default for ContextConfig {
+    /// Tokens before the warn point from which a model that counts through a
+    /// provider endpoint is asked for an exact count.
+    pub count_distance: usize,
     fn default() -> Self {
         let policy = aither_agent::ContextPolicy::default();
         Self {
-            compact_at: policy.compact_at,
+            handoff_reserve: policy.handoff_reserve,
             compact_ceiling: policy.compact_ceiling,
             start_distance: policy.start_distance,
-            safe_buffer: policy.safe_buffer,
             warn_distance: policy.warn_distance,
         }
     }
 }
+            count_distance: policy.count_distance,
 
 impl ContextConfig {
     /// The aither policy these thresholds configure; every other threshold
@@ -1521,14 +1522,14 @@ impl ContextConfig {
     #[must_use]
     pub fn policy(&self) -> aither_agent::ContextPolicy {
         aither_agent::ContextPolicy {
-            compact_at: self.compact_at,
+            handoff_reserve: self.handoff_reserve,
             compact_ceiling: self.compact_ceiling,
             start_distance: self.start_distance,
-            safe_buffer: self.safe_buffer,
             warn_distance: self.warn_distance,
             ..aither_agent::ContextPolicy::default()
         }
     }
+            count_distance: self.count_distance,
 }
 
 /// `[time]` section: the timezone the agent talks to the user in.

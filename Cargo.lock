@@ -5,11 +5,11 @@ version = 4
 [[package]]
 name = "acpsub"
 version = "0.2.0"
-source = "git+https://github.com/lexoliu/acpsub?branch=dev#7c40537a67d2a99586c8cb1687cd616c391d798e"
+source = "git+https://github.com/lexoliu/acpsub?branch=dev#ad89045ad5cd663f9904edff385bbd7d923ae212"
 dependencies = [
  "aither-acp",
- "aither-core 0.22.0",
- "aither-mcp 0.22.0",
+ "aither-core 0.24.0",
+ "aither-mcp 0.24.0",
  "async-net",
  "async-process",
  "dirs",
@@ -144,13 +144,13 @@ dependencies = [
 
 [[package]]
 name = "aither-acp"
-version = "0.22.0"
+version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9139e4e89a6f46b55fc3f5ffa82d582bbfba4d2b0ed93ab8ecc916200d49820b"
+checksum = "914ef275a936ceafc91e6193ecec784f91ba6d48034673dd43d3ad375e438c4d"
 dependencies = [
- "aither-agent 0.22.0",
- "aither-core 0.22.0",
- "aither-mcp 0.22.0",
+ "aither-agent 0.24.0",
+ "aither-core 0.24.0",
+ "aither-mcp 0.24.0",
  "async-channel",
  "async-process",
  "executor-core",
@@ -165,15 +165,15 @@ dependencies = [
 
 [[package]]
 name = "aither-agent"
-version = "0.22.0"
+version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "58b0c5e4d19e31d0065f41201da74a88597b640b626fb49e2e626a0dae420484"
+checksum = "92250ea2940e0683254aee3a7af2fa8a25a2ed4b379e85f42d998f0c3abd9ec8"
 dependencies = [
  "aho-corasick",
- "aither-attachments 0.22.0",
- "aither-core 0.22.0",
- "aither-mcp 0.22.0",
- "aither-sandbox 0.22.0",
+ "aither-attachments 0.24.0",
+ "aither-core 0.24.0",
+ "aither-mcp 0.24.0",
+ "aither-sandbox 0.24.0",
  "anyhow",
  "arc-swap",
  "askama 0.16.1",
@@ -211,16 +211,16 @@ dependencies = [
 
 [[package]]
 name = "aither-agent"
-version = "0.23.0"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "567387502284985ecd55f973a566fe8aacd1e0536e9286f53f83347719a16260"
+checksum = "95b8a5d04693ec93736cec45cf0f828dad2e1358c999affc6eddba169d764e32"
 dependencies = [
  "aho-corasick",
- "aither-attachments 0.23.0",
+ "aither-attachments 0.25.0",
  "aither-connectivity",
- "aither-core 0.23.0",
- "aither-mcp 0.23.0",
- "aither-sandbox 0.23.0",
+ "aither-core 0.25.0",
+ "aither-mcp 0.25.0",
+ "aither-sandbox 0.25.0",
  "aither-skills",
  "aither-webfetch",
  "anyhow",
@@ -261,9 +261,9 @@ dependencies = [
 
 [[package]]
 name = "aither-attachments"
-version = "0.22.0"
+version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c1815c916dcd2f32ba6cecdf9e8cb7d83342778d8a8e98cef44b23db4f8cbdc"
+checksum = "9d53149f2d772c11bdf70abbdaa390b48844c7146b60627d099e9c0bc39f43a3"
 dependencies = [
  "async-fs",
  "const-hex",
@@ -275,9 +275,9 @@ dependencies = [
 
 [[package]]
 name = "aither-attachments"
-version = "0.23.0"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "487dbe574dea67925628a91986b7b63ef8065634f8b536f0a11d5c46a23361f6"
+checksum = "fca6721b2cd3ab574d4df0d0cadace56e61260bcee7ea520a9f42e92efc736f6"
 dependencies = [
  "async-fs",
  "const-hex",
@@ -289,12 +289,12 @@ dependencies = [
 
 [[package]]
 name = "aither-browser"
-version = "0.23.0"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b04e8bb2c25f3e90b47b0bdd9585d6ebc51245a2e78e51fd2a25cb1921d2b5c8"
+checksum = "0c925c441d05ec31963ddf61ed86a094ca374fb4ac4d679a61c062bf9583f97b"
 dependencies = [
- "aither-agent 0.23.0",
- "aither-core 0.23.0",
+ "aither-agent 0.25.0",
+ "aither-core 0.25.0",
  "askama 0.16.1",
  "schemars",
  "serde",
@@ -303,11 +303,11 @@ dependencies = [
 
 [[package]]
 name = "aither-claude"
-version = "0.23.0"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8fd049e21d9f5d48cb4d5724449e137a8a06210803e015eba4a9ff39f6e5555f"
+checksum = "4aa0f1b5e21db7ab4ae63e281bb7410cb62b64225664a52f2bc241725a10b8c3"
 dependencies = [
- "aither-core 0.23.0",
+ "aither-core 0.25.0",
  "aither-models",
  "async-fs",
  "async-stream",
@@ -322,14 +322,14 @@ dependencies = [
 
 [[package]]
 name = "aither-cloud"
-version = "0.23.0"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3bfc8c9c1243c36a29f6e25ed897567ba6479ef9530a1e874f070f1e92e8dd9d"
+checksum = "bce6e431f5cbf0208d0aa92c5d08f5694a086183453d5e3f89e4fbda7eee63a5"
 dependencies = [
  "aither-claude",
  "aither-codex",
  "aither-copilot",
- "aither-core 0.23.0",
+ "aither-core 0.25.0",
  "aither-gemini",
  "aither-openai",
  "async-stream",
@@ -340,11 +340,11 @@ dependencies = [
 
 [[package]]
 name = "aither-codex"
-version = "0.23.0"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae3c9ae5c22a0dfbb561a1f358fa17527502534263dc376134b0d104a5f8e8af"
+checksum = "0ca570322eb9c8479ffcd299d6d66cd21029e888abb3430727c39b30f7890667"
 dependencies = [
- "aither-core 0.23.0",
+ "aither-core 0.25.0",
  "aither-models",
  "aither-openai",
  "async-io",
@@ -365,9 +365,9 @@ dependencies = [
 
 [[package]]
 name = "aither-connectivity"
-version = "0.23.0"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d0278930b04c81c8198da56e1dc5d41ad86c6aed46fa66d25a7c75c34ee89c19"
+checksum = "eb10c4d21591637ef72f2c326adf4f55198faf1ad82a459def9e0f187d965624"
 dependencies = [
  "async-broadcast",
  "async-channel",
@@ -391,11 +391,11 @@ dependencies = [
 
 [[package]]
 name = "aither-copilot"
-version = "0.23.0"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a757c6e2477a60d7b475871a66842bc08fc1993c0b09b3a651567bec6cb262a7"
+checksum = "32d69a0afab9569c21f658a15f7ee01aa9e9e8ac0aa1e112195de0ffd6713723"
 dependencies = [
- "aither-core 0.23.0",
+ "aither-core 0.25.0",
  "aither-models",
  "async-fs",
  "async-stream",
@@ -412,11 +412,11 @@ dependencies = [
 
 [[package]]
 name = "aither-core"
-version = "0.22.0"
+version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51eb183f6754cc69fbff1c9aeb63bf2e2f639f847e77bcd938517b447a137b20"
+checksum = "87702a6af93b3b9a2e2294d32f50e20244f546d2e92240a85f772f040860d339"
 dependencies = [
- "aither-derive 0.22.0",
+ "aither-derive 0.24.0",
  "anyhow",
  "askama 0.16.1",
  "futures-core",
@@ -425,28 +425,34 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "thiserror 2.0.21",
  "url",
 ]
 
 [[package]]
 name = "aither-core"
-version = "0.23.0"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ed8325098d7929ccfdc3470aaa0b57aab3af78923dd447089325a45d409e287"
+checksum = "7019bb254a853140d8c582184f32d414cfd178bb5c540f821ab981ff21a4b515"
 dependencies = [
- "aither-derive 0.23.0",
+ "aither-derive 0.25.0",
  "anyhow",
  "askama 0.16.1",
  "async-channel",
  "async-io",
+ "base64 0.22.1",
  "futures-core",
  "futures-lite",
  "gloo-timers 0.4.0",
  "httpdate",
+ "image",
  "mime",
+ "num-traits",
  "schemars",
  "serde",
  "serde_json",
+ "thiserror 2.0.21",
+ "tiktoken",
  "url",
  "wasm-bindgen-futures",
  "zenwave",
@@ -454,9 +460,9 @@ dependencies = [
 
 [[package]]
 name = "aither-derive"
-version = "0.22.0"
+version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "285139458b727374d8c7ffe7c9d8cc4372322af2bf5e0e2388923586ed33a5bc"
+checksum = "bda7eebf5563de2d5e71da34e5e132f7e35963c06ac9372cf51800ae55087893"
 dependencies = [
  "convert_case 0.12.0",
  "proc-macro2",
@@ -466,9 +472,9 @@ dependencies = [
 
 [[package]]
 name = "aither-derive"
-version = "0.23.0"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3d309cbed23539c30d7e72ce7514b27f54d21fd2c7eccf60636267285ddd97e"
+checksum = "bca23da0696ca36c7959f7f5338f362b4360c9ee4f1f933adfc08353c8b68bbd"
 dependencies = [
  "convert_case 0.12.0",
  "proc-macro2",
@@ -478,12 +484,12 @@ dependencies = [
 
 [[package]]
 name = "aither-gemini"
-version = "0.23.0"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca29c903b54be5ff0017f728522ca116c4042738cac2ec6ee8d6f080cfea0080"
+checksum = "cdb49535347082ab9e7c9398847a6a3463625259dc2e7e8c31450ac1d496a73f"
 dependencies = [
- "aither-attachments 0.23.0",
- "aither-core 0.23.0",
+ "aither-attachments 0.25.0",
+ "aither-core 0.25.0",
  "aither-models",
  "async-fs",
  "async-stream",
@@ -502,12 +508,12 @@ dependencies = [
 
 [[package]]
 name = "aither-mcp"
-version = "0.22.0"
+version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c955853a94b45140e3dc22022408ff6cfd6bda823cb84d92fa3ec4e3e2396bf3"
+checksum = "0859d347adab65e73f22379877c67a3f5eaa122fc9cfbb1629050d7fb5f951d4"
 dependencies = [
- "aither-core 0.22.0",
- "aither-sandbox 0.22.0",
+ "aither-core 0.24.0",
+ "aither-sandbox 0.24.0",
  "arc-swap",
  "askama 0.16.1",
  "async-channel",
@@ -527,12 +533,12 @@ dependencies = [
 
 [[package]]
 name = "aither-mcp"
-version = "0.23.0"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "17273caf9948ac509f674ba6281cb2238e4619ff0d6106a5b45bab7c67c94e6b"
+checksum = "d021a8dada89bdc30b48dd180a457daf5d4a15e8e9839526b4fec261612d4679"
 dependencies = [
- "aither-core 0.23.0",
- "aither-sandbox 0.23.0",
+ "aither-core 0.25.0",
+ "aither-sandbox 0.25.0",
  "arc-swap",
  "askama 0.16.1",
  "async-channel",
@@ -552,27 +558,28 @@ dependencies = [
 
 [[package]]
 name = "aither-models"
-version = "0.23.0"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "12284bfb6362d6da0ccf8dc536d607252b88f9cb13b781fc4d4a450598b66930"
+checksum = "b32729cdda5e2cd72916eac72b74a69e8755c8dbc5836560b9d3a2d2adb0c632"
 dependencies = [
- "aither-core 0.23.0",
+ "aither-core 0.25.0",
  "serde",
  "serde_json",
 ]
 
 [[package]]
 name = "aither-openai"
-version = "0.23.0"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "27ddf7e7d948b09cfa45abb5fee2c68b0305b58743b8a7942665738608234ddc"
+checksum = "e3c31c12fb786b460bcafd8879c44b37372c29315adccaf02e9b056fedd44787"
 dependencies = [
- "aither-attachments 0.23.0",
- "aither-core 0.23.0",
+ "aither-attachments 0.25.0",
+ "aither-core 0.25.0",
  "aither-models",
  "async-fs",
  "async-stream",
  "base64 0.23.1",
+ "blocking",
  "futures-core",
  "futures-lite",
  "mime_guess",
@@ -586,11 +593,11 @@ dependencies = [
 
 [[package]]
 name = "aither-sandbox"
-version = "0.22.0"
+version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8272b1b0b29a56f2757782b5757f9c60a3d33802a85c035d04a2113da0b7392d"
+checksum = "07dd6e75d5f9601874ccc0ac2207a44ce6a8aa4864150a5609f63214c5faee89"
 dependencies = [
- "aither-core 0.22.0",
+ "aither-core 0.24.0",
  "anyhow",
  "arc-swap",
  "askama 0.16.1",
@@ -611,7 +618,6 @@ dependencies = [
  "globset",
  "heel",
  "hex",
- "human-hash",
  "image",
  "jiff",
  "libc",
@@ -641,12 +647,12 @@ dependencies = [
 
 [[package]]
 name = "aither-sandbox"
-version = "0.23.0"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06655ba40f564c84941178643fdb4be783d0795440811263a63c281a004ffb06"
+checksum = "963c9d9bc133092a8aff874d656a8357d73b8df063ac7ec5a85bf0e1c933905c"
 dependencies = [
  "aither-connectivity",
- "aither-core 0.23.0",
+ "aither-core 0.25.0",
  "anyhow",
  "arc-swap",
  "askama 0.16.1",
@@ -667,7 +673,6 @@ dependencies = [
  "globset",
  "heel",
  "hex",
- "human-hash",
  "image",
  "jiff",
  "libc",
@@ -703,18 +708,18 @@ dependencies = [
 
 [[package]]
 name = "aither-sed"
-version = "0.23.0"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a67e156387cad8524310c73acde8d0c9a5c74015256db740eacc10dbdf4cb61"
+checksum = "7985e3b41789ed1a98680b49ea7049c75fc78c60a5da60cd083b95374fb735c1"
 dependencies = [
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "aither-skills"
-version = "0.23.0"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c1e9cdeadb504f9fb535a00c6636fb7b46f1e524985064ccbfee5944c175737"
+checksum = "978d7599bf803d1ebb1d288e6fbbdbcd7c5e843b3b07711737ceede661e25b4f"
 dependencies = [
  "async-fs",
  "futures-lite",
@@ -725,11 +730,11 @@ dependencies = [
 
 [[package]]
 name = "aither-webfetch"
-version = "0.23.0"
+version = "0.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cc0e1b2cdc57d022b728b19ac4bfd8d4e35aee89f63da15f7bf45bc3725508e0"
+checksum = "93e6f1ad061c2aa95cabd39d3d464dec8fa4d5909465b3769c161861939b3b6f"
 dependencies = [
- "aither-core 0.23.0",
+ "aither-core 0.25.0",
  "anyhow",
  "async-net",
  "dom_smoothie",
@@ -4191,9 +4196,9 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "heel"
-version = "0.9.0"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9e8401f187045391a6494252c29da3663475e5819acd098e505ecd129455bd8"
+checksum = "c39ba724ff8c7e06342ef658b1154901d08eb58c84a60649b01de0177002c66a"
 dependencies = [
  "askama 0.12.1",
  "async-channel",
@@ -4503,15 +4508,6 @@ name = "httpdate"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
-
-[[package]]
-name = "human-hash"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee5afc14f104d821c7dae9cabe97a19510b62532bf7d506ef14fab73c4bbf4fa"
-dependencies = [
- "uuid",
-]
 
 [[package]]
 name = "humansize"
@@ -5722,16 +5718,17 @@ dependencies = [
  "acpsub",
  "ahash",
  "aither-acp",
- "aither-agent 0.23.0",
+ "aither-agent 0.25.0",
  "aither-browser",
  "aither-cloud",
  "aither-codex",
  "aither-connectivity",
  "aither-copilot",
- "aither-core 0.23.0",
- "aither-mcp 0.23.0",
+ "aither-core 0.25.0",
+ "aither-mcp 0.25.0",
  "aither-models",
- "aither-sandbox 0.23.0",
+ "aither-openai",
+ "aither-sandbox 0.25.0",
  "aither-sed",
  "anyhow",
  "arboard",
@@ -8748,6 +8745,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
+name = "ruzstd"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "69e4ce4a039f42bf25920b95667e4d789e98749ab11bbb8d2c2936f788421bb5"
+dependencies = [
+ "twox-hash",
+]
+
+[[package]]
 name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10287,6 +10293,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "tiktoken"
+version = "4.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "40ba662e4a36f3db9561d09f1ba085f719aaf393b7dbd71e23a2e16b8e4e4e19"
+dependencies = [
+ "regex",
+ "rustc-hash",
+ "ruzstd",
+]
+
+[[package]]
 name = "time"
 version = "0.3.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10740,6 +10757,12 @@ dependencies = [
  "tokio-util",
  "webrtc-util",
 ]
+
+[[package]]
+name = "twox-hash"
+version = "2.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86a801b3cea342a06d468c8710662aa29e5e05e4f5c0d62f00bbb7f2ad7941c2"
 
 [[package]]
 name = "typed-path"

@@ -437,10 +437,13 @@ mod tests {
     async fn registry_with_job(pid: u32, task_id: &str) -> JobRegistry {
         let (registry, service) = aither_sandbox::job_registry_channel();
         tokio::spawn(service.serve());
+        let task_id = aither_core::AnyIdAllocator::new(aither_core::WordAllocator::new([task_id]))
+            .lease()
+            .expect("the allocator holds the word");
         registry
             .register(
                 pid,
-                task_id,
+                &task_id,
                 "key",
                 "sleep 30",
                 TerminalMode::Sandboxed,
@@ -453,9 +456,9 @@ mod tests {
     #[tokio::test]
     async fn earlier_agents_jobs_stay_listed_while_they_run() {
         let backgrounds = SessionBackgrounds::default();
-        let old = registry_with_job(10, "t-old").await;
+        let old = registry_with_job(10, "river").await;
         backgrounds.add_job_registry("s", old.clone());
-        let new = registry_with_job(11, "t-new").await;
+        let new = registry_with_job(11, "maple").await;
         backgrounds.add_job_registry("s", new);
 
         let pids: Vec<u32> = backgrounds
@@ -475,7 +478,7 @@ mod tests {
             .map(|job| job.pid)
             .collect();
         assert_eq!(pids, vec![10, 11], "its completion is still owed");
-        drop(old.owe_completion("t-old", Ok(0)).await);
+        drop(old.owe_completion("river", Ok(0)).await);
         let pids: Vec<u32> = backgrounds
             .jobs("s")
             .await
@@ -493,7 +496,7 @@ mod tests {
     #[tokio::test]
     async fn a_finished_job_reads_as_resuming_until_its_completion_is_taken() {
         let backgrounds = SessionBackgrounds::default();
-        let registry = registry_with_job(20, "t-owed").await;
+        let registry = registry_with_job(20, "ember").await;
         backgrounds.add_job_registry("s", registry.clone());
         assert!(backgrounds.snapshot("s").await.will_resume(), "it runs");
 
@@ -503,7 +506,7 @@ mod tests {
         assert!(snapshot.resuming, "{snapshot:?}");
 
         let owed = registry
-            .owe_completion("t-owed", Ok(0))
+            .owe_completion("ember", Ok(0))
             .await
             .expect("the job is registered");
         assert!(backgrounds.snapshot("s").await.resuming);

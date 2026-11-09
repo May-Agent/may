@@ -1422,7 +1422,7 @@ impl TaskRuntime {
                     .then(|| crate::container::lifecycle::workspace_mount(workspace.clone())),
             ));
         }
-        let registry = Arc::new(commands.build(workspace.join("outputs")));
+        let registry = Arc::new(commands.build(terminal_tool.output_store().clone()));
         let terminal_tool = match &self.connectivity {
             Some(connectivity) => terminal_tool.with_connectivity(connectivity),
             None => terminal_tool,

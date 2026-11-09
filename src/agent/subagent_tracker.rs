@@ -303,7 +303,8 @@ where
         let subagent = args.subagent().map_or_else(
             || {
                 args.id
-                    .map_or_else(|| "resume".to_string(), |id| format!("resume #{id}"))
+                    .as_deref()
+                    .map_or_else(|| "resume".to_string(), |id| format!("resume {id}"))
             },
             ToString::to_string,
         );
