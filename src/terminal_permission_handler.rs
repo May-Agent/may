@@ -1,18 +1,32 @@
 use std::sync::Arc;
 
 use aither_sandbox::permission::{NoopPermissionHandler, PermissionError, PermissionHandler};
-use aither_sandbox::{ScriptLanguage, TerminalMode};
+use aither_sandbox::{CommandRole, ScriptLanguage, SshServer, TerminalMode};
 
 use crate::agent::PermissionApprover;
+use crate::agent::ssh_authorizer::MaySshAuthorizer;
 use crate::db::{NetworkAccessLogParams, NetworkAccessMode, NetworkAccessSource};
 use crate::network_policy::CompiledNetworkPolicy;
 use crate::session::SessionRuntimeService;
 use crate::ui_event_bus::UiEventTopics;
 
+/// How the first command on an SSH server is decided.
+#[derive(Debug, Clone)]
+enum SshLocations {
+    /// No server is approved.
+    Deny,
+    /// Every server is approved.
+    Allow,
+    /// The session's user is asked; a subagent's request goes through the
+    /// same session, so the main agent's user answers for it.
+    Ask(Arc<MaySshAuthorizer>),
+}
+
 /// Permission handler for terminal commands: routes approval requests to
 /// the interactive approver and enforces the session's network policy.
 #[derive(Debug, Clone)]
 pub struct TerminalPermissionHandler {
+    ssh: SshLocations,
     approver: Option<PermissionApprover>,
     runtime_service: Option<Arc<SessionRuntimeService>>,
     session_id: Option<String>,
@@ -37,6 +51,7 @@ impl TerminalPermissionHandler {
             .and_then(PermissionApprover::session_id)
             .map(str::to_string);
         Self {
+            ssh: SshLocations::Deny,
             approver,
             runtime_service,
             session_id,
@@ -44,6 +59,14 @@ impl TerminalPermissionHandler {
             profile_id,
             source: NetworkAccessSource::Chat,
         }
+    }
+
+    /// Ask the user through `authorizer` before the first command on an SSH
+    /// server.
+    #[must_use]
+    pub fn with_ssh_authorizer(mut self, authorizer: Arc<MaySshAuthorizer>) -> Self {
+        self.ssh = SshLocations::Ask(authorizer);
+        self
     }
 
     /// Create the handler used for one-shot `may exec` runs.
@@ -55,6 +78,7 @@ impl TerminalPermissionHandler {
         profile_id: Option<String>,
     ) -> Self {
         Self {
+            ssh: SshLocations::Allow,
             approver: None,
             runtime_service: Some(runtime_service),
             session_id: Some(session_id),
@@ -165,6 +189,7 @@ impl PermissionHandler for TerminalPermissionHandler {
 
     fn for_subagent(&self) -> Option<Self> {
         self.approver.as_ref().map(|approver| Self {
+            ssh: self.ssh.clone(),
             approver: Some(approver.clone().for_subagent()),
             runtime_service: self.runtime_service.clone(),
             session_id: self.session_id.clone(),
@@ -172,6 +197,28 @@ impl PermissionHandler for TerminalPermissionHandler {
             profile_id: self.profile_id.clone(),
             source: self.source,
         })
+    }
+
+    async fn check_location(
+        &self,
+        server: &SshServer,
+        _role: CommandRole,
+    ) -> Result<bool, PermissionError> {
+        match &self.ssh {
+            SshLocations::Deny => Ok(false),
+            SshLocations::Allow => Ok(true),
+            SshLocations::Ask(authorizer) => authorizer.authorize_connect(&server.target).await,
+        }
+    }
+
+    async fn will_wait_for_location(&self, _server: &SshServer, _role: CommandRole) -> bool {
+        match &self.ssh {
+            SshLocations::Deny | SshLocations::Allow => false,
+            SshLocations::Ask(authorizer) => authorizer.will_ask().await.unwrap_or_else(|error| {
+                tracing::warn!(%error, "failed to read the session yolo switch");
+                false
+            }),
+        }
     }
 
     async fn will_wait_for_approval(

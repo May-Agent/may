@@ -471,7 +471,7 @@ impl MockScenarioState {
                         "background": false,
                         "description": "Take a step",
                         "script": format!("echo COMPACTION-STEP-{}", self.probe_steps),
-                        "mode": "sandboxed",
+                        "mode": "default",
                         "raw": true,
                         "timeout": 30,
                         "max_lines": 20
@@ -532,7 +532,7 @@ impl MockScenarioState {
                                 &serde_json::json!({
                                     "description": "Run the MCP probe command",
                                     "script": command,
-                                    "mode": "sandboxed",
+                                    "mode": "default",
                                     "raw": true,
                                     "timeout": 30,
                                     "max_lines": 50
@@ -595,7 +595,7 @@ impl MockScenarioState {
                                 "background": true,
                                 "description": "Ask the terminal for the user's name",
                                 "script": "printf 'cwd=%s\\n' \"$(pwd -P)\"; printf 'name? '; read name; printf 'hello %s\\n' \"$name\"",
-                                "mode": "sandboxed",
+                                "mode": "default",
                                 "raw": true,
                                 "timeout": 60,
                                 "max_lines": 50
@@ -627,7 +627,7 @@ impl MockScenarioState {
                                 &serde_json::json!({
                                     "description": "Send a name through terminal IPC",
                                     "script": script,
-                                    "mode": "sandboxed",
+                                    "mode": "default",
                                     "raw": true,
                                     "timeout": 10,
                                     "max_lines": 50
@@ -664,7 +664,7 @@ impl MockScenarioState {
                                 &serde_json::json!({
                                     "description": "Read the reply through terminal IPC",
                                     "script": script,
-                                    "mode": "sandboxed",
+                                    "mode": "default",
                                     "raw": true,
                                     "timeout": 10,
                                     "max_lines": 50
@@ -711,7 +711,7 @@ impl MockScenarioState {
                             &serde_json::json!({
                                 "description": "Ask the user which database to use",
                                 "script": ASK_USER_SCRIPT,
-                                "mode": "sandboxed",
+                                "mode": "default",
                                 "raw": true,
                                 "timeout": 10,
                                 "max_lines": 50
@@ -736,7 +736,7 @@ impl MockScenarioState {
                                 &serde_json::json!({
                                     "description": "Run the probe script",
                                     "script": script,
-                                    "mode": "sandboxed",
+                                    "mode": "default",
                                     "raw": true,
                                     "timeout": 30,
                                     "max_lines": 50
@@ -766,7 +766,7 @@ impl MockScenarioState {
                             &serde_json::json!({
                                 "description": "Start a long job",
                                 "script": script,
-                                "mode": "sandboxed",
+                                "mode": "default",
                                 "background": true,
                                 "timeout": 600,
                             }),
@@ -813,7 +813,7 @@ impl MockScenarioState {
                                 &serde_json::json!({
                                     "description": "Record the plan in tasks.md",
                                     "script": script,
-                                    "mode": "sandboxed",
+                                    "mode": "default",
                                     "raw": true,
                                     "timeout": 10,
                                     "max_lines": 50
@@ -870,7 +870,7 @@ impl MockScenarioState {
                             "background": background,
                             "description": "Run the subagent authority probe",
                             "script": script,
-                            "mode": "sandboxed",
+                            "mode": "default",
                             "raw": true,
                             "timeout": 120,
                             "max_lines": 200
@@ -944,7 +944,7 @@ impl MockScenarioState {
                             "background": background,
                             "description": "Run the fork probe",
                             "script": script,
-                            "mode": "sandboxed",
+                            "mode": "default",
                             "raw": true,
                             "timeout": 120,
                             "max_lines": 200
@@ -2534,7 +2534,7 @@ async fn exec_uses_session_directory_and_exposes_ipc_command_help() {
         .arg("--session")
         .arg(&session.id)
         .arg("--mode")
-        .arg("sandboxed")
+        .arg("default")
         .arg("--")
         .arg("pwd")
         .env("HOME", harness.home_path())
@@ -2561,7 +2561,7 @@ async fn exec_uses_session_directory_and_exposes_ipc_command_help() {
         .arg("--session")
         .arg(&session.id)
         .arg("--mode")
-        .arg("sandboxed")
+        .arg("default")
         .arg("--")
         .arg(
             "for d in tmp data files outputs artifacts; do test -d \"$d\" || exit 10; done; test -e skills; test -e subagents; session --help >/dev/null; ask --help >/dev/null; search --help >/dev/null; webfetch --help >/dev/null; task --help >/dev/null; printf ready",
@@ -2592,7 +2592,7 @@ async fn commit_in_sandbox(harness: &TestHarness) -> std::process::Output {
         .arg("--session")
         .arg(&session.id)
         .arg("--mode")
-        .arg("sandboxed")
+        .arg("default")
         .arg("--")
         .arg(
             "git init -q -b main repo && cd repo && echo x > f && git add f \
@@ -2904,7 +2904,7 @@ async fn issue_changes_are_recorded_and_gh_credentials_are_unreadable_from_the_s
     let created = exec_script(
         &harness,
         &session,
-        "sandboxed",
+        "default",
         &bin,
         work.path(),
         "issue create bug 'from exec' --body body && issue comment 1 hello && issue close 1",
@@ -2919,7 +2919,7 @@ async fn issue_changes_are_recorded_and_gh_credentials_are_unreadable_from_the_s
     let provenance = exec_script(
         &harness,
         &session,
-        "sandboxed",
+        "default",
         &bin,
         work.path(),
         "issue provenance 1; issue view 1",
@@ -2942,7 +2942,7 @@ async fn issue_changes_are_recorded_and_gh_credentials_are_unreadable_from_the_s
     let credentials = exec_script(
         &harness,
         &session,
-        "sandboxed",
+        "default",
         &bin,
         work.path(),
         "cat ~/.config/gh/hosts.yml",
@@ -2958,7 +2958,7 @@ async fn issue_changes_are_recorded_and_gh_credentials_are_unreadable_from_the_s
     let sandboxed_gh = exec_script(
         &harness,
         &session,
-        "sandboxed",
+        "default",
         &bin,
         work.path(),
         "gh issue create --title t",
@@ -3018,7 +3018,7 @@ async fn exec_large_output_is_previewed_and_saved_to_outputs_file() {
         .arg("--session")
         .arg(&session.id)
         .arg("--mode")
-        .arg("sandboxed")
+        .arg("default")
         .arg("--")
         .arg("perl -e 'print \"x\" x 60000'")
         .env("HOME", harness.home_path())
@@ -4658,7 +4658,7 @@ async fn exec_applies_local_command_priority() {
                 .arg("--session")
                 .arg(&session_id)
                 .arg("--mode")
-                .arg("sandboxed")
+                .arg("default")
                 .arg("--")
                 .arg(&script)
                 .env("HOME", &home)
@@ -6180,7 +6180,7 @@ async fn tokens_held_by_exec_probe(
         .arg("--session")
         .arg(session_id)
         .arg("--mode")
-        .arg("sandboxed")
+        .arg("default")
         .arg("--timeout")
         .arg("20")
         .arg("--")

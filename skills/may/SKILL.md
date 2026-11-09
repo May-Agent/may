@@ -30,8 +30,8 @@ What the user sees and sets. Read the file for the area a question touches.
 - The working directory persists after a successful `cd`. It is reset to the session directory, with a "Commands now run in ..." alert naming the reason, when the last command failed, ended through `exit` or a signal, ended outside readable paths, or the directory vanished. Detached jobs never carry a directory.
 - `~` and `$HOME` are the session directory, in every mode. Use absolute paths for host locations.
 - Output over 16,000 bytes is stored under `outputs/` and you receive a head and tail preview with the file path; read the slice you need from the file. Source code may be shown folded and JSON as tab-separated text, only when output is cut. `raw: true` returns the exact bytes. `max_lines` (default 200, at most 800) sets the inline line budget.
-- Modes: `default` and `sandboxed` run in the heel sandbox and need no approval; `unsafe` runs on the host and needs the user's approval per script (unanswered requests are denied after 30 minutes for the main agent, 3 minutes for a subagent); `ssh` runs on a configured SSH server.
-- Network: sandboxed commands reach the network. The `TerminalArgs` text that says `sandboxed` denies network is out of date: the domain check in `permission.rs` always allows, and only the user's `[preferences.network_policy]` setting (restricted, allow list, deny list) can narrow it.
+- Modes: `default` runs in the heel sandbox and needs no approval; `unsafe` runs on the host and needs the user's approval per script (unanswered requests are denied after 30 minutes for the main agent, 3 minutes for a subagent). `location: "<name>"` runs the command on a configured SSH server instead of the home environment; the first command on a server asks the user.
+- Network: sandboxed commands reach the network; only the user's `[preferences.network_policy]` setting (restricted, allow list, deny list) can narrow it.
 - Writes are limited to the session directory, directories the user approved (`request_workspace`) and the memories directory. `TMPDIR` is the session's `tmp/`.
 
 ## Session directory
@@ -112,5 +112,4 @@ The conversation is compacted into a handoff document in the background when you
 ## Defects to know
 
 - `ask_user` positional form fails (above).
-- The terminal's `sandboxed` mode text claims the network is denied; it is not.
 - The "descendants were killed" alert points to a `terminal_background` command that does not exist; use `background: true`.

@@ -723,9 +723,7 @@ pub enum TerminalExecutionStatus {
 #[serde(rename_all = "lowercase")]
 pub enum TerminalCommandMode {
     Default,
-    Sandboxed,
     Unsafe,
-    Ssh,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]

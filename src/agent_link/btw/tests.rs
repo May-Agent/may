@@ -270,7 +270,7 @@ async fn the_fork_cannot_write() {
                 arguments: serde_json::json!({
                     "description": "record the branch",
                     "script": script,
-                    "mode": "sandboxed",
+                    "mode": "default",
                     "timeout": 30,
                 }),
             }
@@ -342,7 +342,7 @@ async fn a_side_request_reads_the_context_of_a_running_turn() {
             arguments: serde_json::json!({
                 "description": TURN_MARKER,
                 "script": "echo working",
-                "mode": "sandboxed",
+                "mode": "default",
                 "timeout": 30,
             }),
         })

@@ -342,9 +342,7 @@ mod tests {
     fn parse_tool_start_uses_actual_execution_mode() {
         for (mode_json, expected) in [
             ("default", TerminalExecutionMode::Default),
-            ("sandboxed", TerminalExecutionMode::Sandboxed),
             ("unsafe", TerminalExecutionMode::Unsafe),
-            ("ssh", TerminalExecutionMode::Ssh),
         ] {
             let args = format!(
                 r#"{{"description":"say hi","script":"echo hi","mode":"{mode_json}","timeout":5}}"#

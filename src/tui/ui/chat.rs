@@ -3608,8 +3608,6 @@ fn format_status_usage(
 const fn terminal_mode_marker(mode: TerminalExecutionMode) -> &'static str {
     match mode {
         TerminalExecutionMode::Default | TerminalExecutionMode::Unsafe => "",
-        TerminalExecutionMode::Sandboxed => "[sandbox] ",
-        TerminalExecutionMode::Ssh => "[ssh] ",
     }
 }
 
@@ -4785,23 +4783,16 @@ mod tests {
     #[test]
     fn terminal_mode_marker_covers_every_backend() {
         assert_eq!(terminal_mode_marker(TerminalExecutionMode::Default), "");
-        assert_eq!(
-            terminal_mode_marker(TerminalExecutionMode::Sandboxed),
-            "[sandbox] "
-        );
         // Unsafe carries no text marker — the red status icon marks it.
         assert_eq!(terminal_mode_marker(TerminalExecutionMode::Unsafe), "");
-        assert_eq!(terminal_mode_marker(TerminalExecutionMode::Ssh), "[ssh] ");
     }
 
     #[test]
     fn inline_terminal_renders_mode_marker() {
         for (mode, marker, icon_fg) in [
             (TerminalExecutionMode::Default, "", Color::Green),
-            (TerminalExecutionMode::Sandboxed, "[sandbox] ", Color::Green),
             // Unsafe: no text marker — the status icon turns red instead.
             (TerminalExecutionMode::Unsafe, "", Color::Red),
-            (TerminalExecutionMode::Ssh, "[ssh] ", Color::Green),
         ] {
             let display = ToolDisplay::Terminal {
                 description: String::new(),

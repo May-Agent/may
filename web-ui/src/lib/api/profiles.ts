@@ -21,7 +21,7 @@ export interface ProfileInfo {
   pinnedLimit: number;
   sortOrder: number;
   /** SSH server names attached to this profile; reachable via the terminal
-   *  tool with `mode: 'ssh'` + `ssh_server_id: <name>`. */
+   *  tool with `location: <name>`. */
   remoteAttachments: string[];
   createdAt?: string;
   updatedAt?: string;

@@ -105,8 +105,8 @@ pub enum MayAgentError {
 ///
 /// Only `Local` and `Container` are valid home environments. SSH servers
 /// attached to the profile are surfaced through `MayAgentConfig::ssh_servers`
-/// and reached per-command via the `terminal` tool's `mode: "ssh"` +
-/// `ssh_server_id: <name>` parameters. There is no remote-home variant: remote
+/// and reached per-command via the `terminal` tool's `location: <name>`
+/// parameter. There is no remote-home variant: remote
 /// is a per-invocation routing choice, not a session-level environment.
 #[derive(Debug)]
 pub enum AgentEnvironment {
@@ -206,7 +206,7 @@ pub struct MayAgentConfig {
     pub ask_user_broker: AskUserBroker,
     /// Image generation provider and model.
     pub image_generator: Option<ImageGeneratorConfig>,
-    /// Preconfigured SSH servers available for `terminal` ssh mode.
+    /// Preconfigured SSH servers a `terminal` command names as its `location`.
     pub ssh_servers: Vec<crate::config::SshServerConfig>,
     /// Optional web UI permission approver.
     pub permission_approver: Option<PermissionApprover>,
@@ -480,7 +480,12 @@ impl MayAgent {
                     config.permission_approver.clone(),
                     config.network_policy.clone(),
                     config.profile_id.clone(),
-                ),
+                )
+                .with_ssh_authorizer(super::ssh_authorizer::MaySshAuthorizer::new(
+                    config.session_id.as_str().to_string(),
+                    config.ask_user_broker.clone(),
+                    config.db.clone(),
+                )),
                 executor,
             )
             .await
@@ -714,7 +719,6 @@ impl MayAgent {
             .clone()
             .zip(config.permission_approver.clone())
             .map(|(live, approver)| super::publish_approval::PublishGate::new(live, approver));
-        let ssh_authorizer_broker = config.ask_user_broker.clone();
         let imagine_config = ImagineCommandConfig {
             generator: config.image_generator.clone(),
             artifacts_dir: session_paths.artifacts_dir(),
@@ -933,11 +937,6 @@ impl MayAgent {
             // per-command routing capability on top of it.
             .shell_runtime_availability(tool_environment_key.availability())
             .ssh_servers(ssh_servers)
-            .ssh_authorizer(super::ssh_authorizer::MaySshAuthorizer::new(
-                config.session_id.as_str().to_string(),
-                ssh_authorizer_broker,
-                config.db.clone(),
-            ))
             .agent_kind(AgentKind::Chatbot)
             .max_iterations(effective_max_iterations);
         if let Some(source) = &config.host_reader {

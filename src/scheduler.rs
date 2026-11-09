@@ -419,14 +419,16 @@ impl PermissionHandler for SchedulerPermissionHandler {
                 mode: NetworkAccessMode::Network,
                 domain,
                 port,
-                allowed: true,
+                allowed: self.allow_network,
                 reason,
             })
             .await;
         if let Some(ui_event_bus) = self.ui_event_bus.as_ref() {
             ui_event_bus.publish(UiEventTopics::NETWORK_ACCESS_LOGS);
         }
-        true
+        // A task that does not need the network runs in the sandbox with
+        // every connection refused.
+        self.allow_network
     }
 }
 
@@ -1320,14 +1322,7 @@ impl TaskRuntime {
                 }),
             )
             .await?;
-        run_terminal_command(
-            &terminal_tool,
-            local_task_execution_mode(task.needs_network),
-            None,
-            command,
-            timeout,
-        )
-        .await
+        run_terminal_command(&terminal_tool, command, timeout).await
     }
 
     async fn validate_local(
@@ -1347,15 +1342,9 @@ impl TaskRuntime {
             )
             .await?;
 
-        run_terminal_command(
-            &terminal_tool,
-            local_task_execution_mode(false),
-            None,
-            build_validation_command(script),
-            timeout,
-        )
-        .await
-        .map(|_| ())
+        run_terminal_command(&terminal_tool, build_validation_command(script), timeout)
+            .await
+            .map(|_| ())
     }
 
     /// Builds a terminal over `shell_sessions`, grants `workspace` read-write
@@ -1464,7 +1453,6 @@ impl TaskRuntime {
                 ShellSessionRegistry::new(ShellRuntimeAvailability {
                     local: true,
                     container: false,
-                    ssh: false,
                 }),
                 wake,
             )
@@ -1562,7 +1550,6 @@ impl TaskRuntime {
                 ShellSessionRegistry::new(ShellRuntimeAvailability {
                     local: false,
                     container: true,
-                    ssh: false,
                 })
                 .with_container_runtime(container_runtime),
                 task.map(|task| WakeScope {
@@ -1585,14 +1572,7 @@ impl TaskRuntime {
             self.container_terminal_tool(profile, NetworkAccessSource::TaskContainer, Some(task)),
         )
         .await?;
-        let result = run_terminal_command(
-            &terminal_tool,
-            TerminalExecutionMode::Default,
-            None,
-            command,
-            timeout,
-        )
-        .await;
+        let result = run_terminal_command(&terminal_tool, command, timeout).await;
         container_manager.touch_activity(&container_id);
         result
     }
@@ -1646,25 +1626,11 @@ impl TaskRuntime {
                 None,
             ))
             .await?;
-        let result = run_terminal_command(
-            &terminal_tool,
-            TerminalExecutionMode::Default,
-            None,
-            command,
-            timeout,
-        )
-        .await
-        .map(|_| ());
+        let result = run_terminal_command(&terminal_tool, command, timeout)
+            .await
+            .map(|_| ());
         container_manager.touch_activity(&container_id);
         result
-    }
-}
-
-const fn local_task_execution_mode(needs_network: bool) -> TerminalExecutionMode {
-    if needs_network {
-        TerminalExecutionMode::Default
-    } else {
-        TerminalExecutionMode::Sandboxed
     }
 }
 
@@ -1723,8 +1689,6 @@ impl TaskTimeout {
 /// for its final result; the foreground window does not apply to it.
 async fn run_terminal_command(
     terminal_tool: &TerminalTool<SchedulerPermissionHandler, DefaultExecutor, Configured>,
-    mode: TerminalExecutionMode,
-    ssh_server_id: Option<String>,
     script: String,
     timeout: TaskTimeout,
 ) -> Result<String, String> {
@@ -1733,8 +1697,8 @@ async fn run_terminal_command(
             description: "run the scheduled task script".to_string(),
             script,
             language: aither_sandbox::ScriptLanguage::Shell,
-            mode,
-            ssh_server_id,
+            mode: TerminalExecutionMode::Default,
+            location: None,
             expect: OutputFormat::Text,
             resolution: aither_sandbox::MediaResolution::Auto,
             max_lines: 800,
@@ -1845,26 +1809,40 @@ mod tests {
 
     use super::{
         SchedulerPermissionHandler, TaskFilePlacement, TaskRuntime, TaskScript, TaskTimeout,
-        local_task_execution_mode, run_terminal_command, task_execution_command,
-        task_file_validation_command,
+        run_terminal_command, task_execution_command, task_file_validation_command,
     };
-    use aither_sandbox::{Configured, TerminalExecutionMode, TerminalTool};
+    use aither_sandbox::{Configured, TerminalTool};
     use executor_core::DefaultExecutor;
     use tempfile::tempdir;
 
     use crate::db::{ChatDb, CreateScheduledTaskParams, NetworkAccessSource};
     use crate::task_trigger::PersistedTaskTrigger;
 
-    #[test]
-    fn local_tasks_respect_needs_network_flag() {
-        assert_eq!(
-            local_task_execution_mode(true),
-            TerminalExecutionMode::Default
-        );
-        assert_eq!(
-            local_task_execution_mode(false),
-            TerminalExecutionMode::Sandboxed
-        );
+    #[tokio::test]
+    async fn local_tasks_respect_needs_network_flag() {
+        let dir = tempdir().expect("temp dir should be created");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db opens");
+        for allow_network in [true, false] {
+            let handler = SchedulerPermissionHandler {
+                db: db.clone(),
+                ui_event_bus: None,
+                profile_id: "profile".to_string(),
+                source: NetworkAccessSource::TaskLocal,
+                allow_network,
+                network_policy: None,
+            };
+            assert_eq!(
+                aither_sandbox::permission::PermissionHandler::check_domain(
+                    &handler,
+                    "example.com",
+                    443
+                )
+                .await,
+                allow_network
+            );
+        }
     }
 
     #[tokio::test]
@@ -2208,8 +2186,6 @@ mod tests {
 
         let output = run_terminal_command(
             &terminal,
-            TerminalExecutionMode::Sandboxed,
-            None,
             format!("sleep {runtime_secs}; echo finished"),
             TaskTimeout::new(runtime_secs + 60).expect("timeout is within the cap"),
         )
@@ -2226,8 +2202,6 @@ mod tests {
 
         let error = run_terminal_command(
             &terminal,
-            TerminalExecutionMode::Sandboxed,
-            None,
             "sleep 60; echo finished".to_string(),
             TaskTimeout::new(2).expect("timeout is within the cap"),
         )
