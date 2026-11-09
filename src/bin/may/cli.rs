@@ -83,7 +83,6 @@ pub struct ExecArgs {
     pub timeout: u64,
     pub raw: bool,
     pub max_lines: u32,
-    pub allow_runtime_install: bool,
 }
 
 /// Parsed `may browser` invocation.
@@ -142,7 +141,7 @@ impl RestArgs {
 
 impl ExecArgs {
     pub const fn help_text() -> &'static str {
-        "Usage: may exec --session <id> [--ssh-server <id>] [--timeout <sec>] [--max-lines <n>] [--raw] [--allow-runtime-install] [--] <command...>\n\nExec runs a terminal command in the session home environment. Use --ssh-server to target an attached SSH environment, and container profile sessions execute inside the configured container environment."
+        "Usage: may exec --session <id> [--ssh-server <id>] [--timeout <sec>] [--max-lines <n>] [--raw] [--] <command...>\n\nExec runs a terminal command in the session home environment. Use --ssh-server to target an attached SSH environment, and container profile sessions execute inside the configured container environment."
     }
 }
 
@@ -330,7 +329,6 @@ fn parse_exec_args(args: &[String]) -> ExecArgs {
     let mut timeout = 300;
     let mut raw = false;
     let mut max_lines = 200;
-    let mut allow_runtime_install = false;
     let mut literal_script = false;
     let mut index = 0;
 
@@ -387,10 +385,6 @@ fn parse_exec_args(args: &[String]) -> ExecArgs {
                     .unwrap_or_else(|_| panic!("invalid --max-lines '{next}'"));
                 index += 2;
             }
-            "--allow-runtime-install" => {
-                allow_runtime_install = true;
-                index += 1;
-            }
             "--raw" => {
                 raw = true;
                 index += 1;
@@ -414,7 +408,6 @@ fn parse_exec_args(args: &[String]) -> ExecArgs {
         timeout,
         raw,
         max_lines,
-        allow_runtime_install,
     }
 }
 
@@ -470,10 +463,8 @@ pub fn parse_reasoning_effort(value: &str) -> ReasoningEffort {
 fn parse_terminal_execution_mode(value: &str) -> TerminalExecutionMode {
     match value.trim().to_ascii_lowercase().as_str() {
         "default" => TerminalExecutionMode::Default,
-        "sandboxed" => TerminalExecutionMode::Sandboxed,
         "unsafe" => TerminalExecutionMode::Unsafe,
-        "ssh" => TerminalExecutionMode::Ssh,
-        _ => panic!("invalid --mode '{value}'; expected one of: default, sandboxed, unsafe, ssh"),
+        _ => panic!("invalid --mode '{value}'; expected one of: default, unsafe"),
     }
 }
 
@@ -614,7 +605,7 @@ mod tests {
                 "--session",
                 "session-123",
                 "--mode",
-                "sandboxed",
+                "default",
                 "--timeout",
                 "5",
                 "--max-lines",
@@ -626,38 +617,13 @@ mod tests {
             CliMode::Exec(ExecArgs {
                 session_id: "session-123".to_string(),
                 script: "pwd".to_string(),
-                mode: Some(TerminalExecutionMode::Sandboxed),
+                mode: Some(TerminalExecutionMode::Default),
                 ssh_server_id: None,
                 timeout: 5,
                 raw: true,
                 max_lines: 42,
-                allow_runtime_install: false,
             })
         );
-    }
-
-    #[test]
-    fn exec_runtime_install_requires_explicit_consent() {
-        for (flags, expected) in [
-            (vec!["may", "exec", "--session", "test", "pwd"], false),
-            (
-                vec![
-                    "may",
-                    "exec",
-                    "--session",
-                    "test",
-                    "--allow-runtime-install",
-                    "pwd",
-                ],
-                true,
-            ),
-        ] {
-            let CliMode::Exec(parsed) = parse_cli_mode(&args(&flags)) else {
-                panic!("expected exec");
-            };
-            assert_eq!(parsed.allow_runtime_install, expected);
-            assert_eq!(parsed.script, "pwd");
-        }
     }
 
     #[test]

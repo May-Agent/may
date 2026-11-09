@@ -53,7 +53,9 @@ export interface ApiAttachment {
   textContent?: string | null;
 }
 
-export type TerminalCommandMode = 'default' | 'sandboxed' | 'unsafe' | 'ssh';
+export type TerminalCommandMode = 'default' | 'unsafe';
+/** Scope of a permission request; `ssh` is still a wire value of it. */
+export type PermissionRequestMode = TerminalCommandMode | 'ssh';
 export type TerminalExecutionStatus = 'running' | 'done' | 'failed' | 'stopped';
 
 

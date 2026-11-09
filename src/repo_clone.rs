@@ -981,21 +981,6 @@ pub(crate) mod test_sandbox {
         }
     }
 
-    /// The build's shared baseline-tool cache, the one the terminal E2E
-    /// suite keeps at `CARGO_TARGET_TMPDIR/may-tools`: a unit test binary
-    /// lives in `<target>/<profile>/deps/`. `MAY_TEST_CACHE` names the
-    /// directory that holds it instead, as it does for the E2E suite.
-    fn tool_cache() -> PathBuf {
-        if let Some(root) = std::env::var_os("MAY_TEST_CACHE") {
-            return PathBuf::from(root).join("may-tools");
-        }
-        let exe = std::env::current_exe().expect("the test binary has a path");
-        exe.ancestors()
-            .nth(3)
-            .unwrap_or_else(|| panic!("{} is not under <target>/<profile>/deps", exe.display()))
-            .join("tmp/may-tools")
-    }
-
     /// A session terminal working in `session_root`, as May builds one: the
     /// root is its only writable place. Dropping it ends its sandbox.
     pub struct TestTerminal {
@@ -1048,7 +1033,7 @@ pub(crate) mod test_sandbox {
         ) -> Self {
             let distribution =
                 crate::tools::embedded_distribution().expect("embedded distribution validates");
-            let cache = tool_cache();
+            let cache = crate::tools::test_tool_cache();
             std::fs::create_dir_all(&cache).unwrap();
             let terminal = TerminalTool::new_exact(session_root, SandboxedOnly, TokioGlobal)
                 .await

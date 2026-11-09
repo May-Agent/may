@@ -63,10 +63,9 @@ fn main() {
     );
 }
 
-/// The `heel` binary that executes sandbox IPC commands is provisioned
-/// separately from the `heel` library that generates those commands' shims,
-/// and the two must share a version: the library is pinned by `Cargo.lock`,
-/// so the managed-binary download requests the matching release tag.
+/// The version of the `heel` library `Cargo.lock` pins, which the
+/// distribution's `heel` binary must share; the workspace image is named by
+/// it and a test checks the binary's pin against it.
 fn emit_heel_lib_version() -> String {
     let lockfile = fs::read_to_string("Cargo.lock").expect("Cargo.lock must be readable");
     let version =

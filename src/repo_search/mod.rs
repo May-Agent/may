@@ -109,7 +109,7 @@ impl RepoSearch {
         self.inner
             .prepared
             .get_or_try_init(|| async {
-                let distribution = crate::tools::host_program_distribution()?;
+                let distribution = crate::tools::embedded_distribution()?;
                 let path = distribution
                     .prepare_host_program(
                         HostProgram::RepoSearch,

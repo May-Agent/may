@@ -16,6 +16,9 @@ pub enum ToolStartKind {
         script: String,
         /// Requested execution backend for the command.
         mode: TerminalExecutionMode,
+        /// Name of the SSH server the command runs on; `None` for the home
+        /// environment.
+        location: Option<String>,
     },
     /// A `terminal_input` invocation: text written to a background task's
     /// stdin. The task id is kept for the frontend to resolve into a
@@ -119,6 +122,7 @@ pub fn parse_tool_start(name: &str, arguments: &str) -> ToolStartKind {
                 description: args.description,
                 script: args.script,
                 mode: args.mode,
+                location: location_name(args.location.as_deref()),
             }
         }
         "terminal_input" => {
@@ -173,6 +177,7 @@ pub fn parse_tool_start_partial(name: &str, arguments: &str) -> ToolStartKind {
                 .get("mode")
                 .and_then(|mode| serde_json::from_value(mode.clone()).ok())
                 .unwrap_or_default(),
+            location: location_name(value.get("location").and_then(serde_json::Value::as_str)),
         },
         "terminal_input" => ToolStartKind::Stdin {
             task_id: pick(&value, "task_id"),
@@ -192,6 +197,15 @@ pub fn parse_tool_start_partial(name: &str, arguments: &str) -> ToolStartKind {
             arguments: repaired,
         },
     }
+}
+
+/// The SSH server a `location` argument names; an omitted, empty or blank
+/// value is the home environment.
+fn location_name(location: Option<&str>) -> Option<String> {
+    location
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
 }
 
 /// String field `key` of a repaired arguments object, empty when it has
@@ -342,9 +356,7 @@ mod tests {
     fn parse_tool_start_uses_actual_execution_mode() {
         for (mode_json, expected) in [
             ("default", TerminalExecutionMode::Default),
-            ("sandboxed", TerminalExecutionMode::Sandboxed),
             ("unsafe", TerminalExecutionMode::Unsafe),
-            ("ssh", TerminalExecutionMode::Ssh),
         ] {
             let args = format!(
                 r#"{{"description":"say hi","script":"echo hi","mode":"{mode_json}","timeout":5}}"#
@@ -363,6 +375,34 @@ mod tests {
                 }
                 _ => panic!("expected terminal start event"),
             }
+        }
+    }
+
+    #[test]
+    fn parse_tool_start_reads_location() {
+        for (arguments, expected) in [
+            (
+                r#"{"description":"d","script":"ls","timeout":5,"location":"build-box"}"#,
+                Some("build-box"),
+            ),
+            (
+                r#"{"description":"d","script":"ls","timeout":5,"location":""}"#,
+                None,
+            ),
+            (r#"{"description":"d","script":"ls","timeout":5}"#, None),
+        ] {
+            let expected = expected.map(str::to_string);
+            let ToolStartKind::Terminal { location, .. } = parse_tool_start("terminal", arguments)
+            else {
+                panic!("expected terminal start event");
+            };
+            assert_eq!(location, expected);
+            let ToolStartKind::Terminal { location, .. } =
+                parse_tool_start_partial("terminal", arguments)
+            else {
+                panic!("expected terminal start kind");
+            };
+            assert_eq!(location, expected);
         }
     }
 

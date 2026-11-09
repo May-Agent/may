@@ -11,9 +11,7 @@ use super::types::{
 const fn parse_terminal_mode(mode: TerminalExecutionMode) -> TerminalCommandMode {
     match mode {
         TerminalExecutionMode::Default => TerminalCommandMode::Default,
-        TerminalExecutionMode::Sandboxed => TerminalCommandMode::Sandboxed,
         TerminalExecutionMode::Unsafe => TerminalCommandMode::Unsafe,
-        TerminalExecutionMode::Ssh => TerminalCommandMode::Ssh,
     }
 }
 

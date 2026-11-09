@@ -2,7 +2,7 @@
 
 Every client is a front end of the one daemon; a turn started in one is visible in all, and closing a client — a web UI window, or a TUI that crashes or loses its terminal — does not stop it.
 
-When the daemon itself exits unexpectedly (a crash or a kill, not `may daemon stop` or a rebuild's replacement), its next start ends every process the exited daemon left running and tells each interrupted session — one with a turn in flight or background commands or subagent runs alive — that the daemon exited and all its background commands are gone. A session whose prompt cache is still warm starts again at once with that alert; one whose cache went cold waits, and the alert arrives with the user's next message.
+When the daemon itself exits unexpectedly (a crash or a kill, not `may daemon stop` or a rebuild's replacement), its next start ends every process the exited daemon left running and tells each interrupted session — one with a turn in flight or background commands or subagent runs alive — that the daemon exited and all its background commands are gone. A session whose prompt cache is still warm starts again at once with that alert; one whose cache went cold waits, and the alert arrives with the user's next message. A turn's input is stored when the turn starts but the agent's context is checkpointed later, so the agent rebuilt after the exit also gets the user messages and hidden context stored after its last checkpoint, and sees what the cut-off turn was answering.
 
 ## Command line (`may`)
 

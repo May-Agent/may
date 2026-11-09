@@ -8,7 +8,7 @@
 //! test's own directory, through the same download, digest, staging and
 //! version-probe path.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use aither_sandbox::{ManagedTool, ToolDistribution, ToolTarget};
 use askama::Template;
@@ -88,12 +88,67 @@ fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
+/// The build's shared baseline-tool cache, the one the terminal E2E suite
+/// keeps at `CARGO_TARGET_TMPDIR/may-tools`: a unit test binary lives in
+/// `<target>/<profile>/deps/`. `MAY_TEST_CACHE` names the directory that
+/// holds it instead, as it does for the E2E suite.
+///
+/// # Panics
+/// Panics when the test binary is not under `<target>/<profile>/deps`.
+pub fn test_tool_cache() -> PathBuf {
+    if let Some(root) = std::env::var_os("MAY_TEST_CACHE") {
+        return PathBuf::from(root).join("may-tools");
+    }
+    let exe = std::env::current_exe().expect("the test binary has a path");
+    exe.ancestors()
+        .nth(3)
+        .unwrap_or_else(|| panic!("{} is not under <target>/<profile>/deps", exe.display()))
+        .join("tmp/may-tools")
+}
+
+/// The distribution's pinned `heel` for this machine, prepared once into
+/// [`test_tool_cache`] and verified against the linked library, as an
+/// embedder takes it.
+///
+/// # Panics
+/// Panics when the distribution cannot provide it.
+pub async fn test_heel() -> heel::HeelBinary {
+    super::prepare_heel(
+        &super::embedded_distribution().expect("the embedded distribution validates"),
+        &test_tool_cache(),
+    )
+    .await
+    .expect("the distribution provides heel")
+}
+
+/// The pinned `heel` entry for this machine, fetched from the prepared copy
+/// of [`test_heel`] instead of its release, which it is byte for byte.
+async fn heel_pin(target: &ToolTarget) -> serde_json::Value {
+    let heel = test_heel().await;
+    let pins: serde_json::Value =
+        serde_json::from_slice(super::HOST_PROGRAMS).expect("the host programs are JSON");
+    let mut pin = pins["host_programs"]
+        .as_array()
+        .expect("the host programs are a list")
+        .iter()
+        .find(|program| {
+            program["tool"] == "heel"
+                && program["target"]["os"] == target.os()
+                && program["target"]["arch"] == target.arch()
+        })
+        .expect("heel is pinned for this platform")
+        .clone();
+    pin["url"] =
+        serde_json::json!(url::Url::from_file_path(heel.as_path()).expect("absolute heel path"));
+    pin
+}
+
 /// A distribution of one script per tool the native platform requires, written
-/// under `dir`; keep `dir` alive while it is used.
+/// under `dir`, and the pinned `heel`; keep `dir` alive while it is used.
 ///
 /// # Panics
 /// Panics when `dir` is not writable or the platform is unsupported.
-pub fn fixture_distribution(dir: &Path) -> ToolDistribution {
+pub async fn fixture_distribution(dir: &Path) -> ToolDistribution {
     std::fs::create_dir_all(dir).expect("fixture directory");
     let target = ToolTarget::native().expect("supported platform");
     let target_json = serde_json::json!({"os": target.os(), "arch": target.arch()});
@@ -128,7 +183,7 @@ pub fn fixture_distribution(dir: &Path) -> ToolDistribution {
         .collect();
     let manifest = serde_json::json!({
         "artifacts": artifacts,
-        "host_programs": [],
+        "host_programs": [heel_pin(&target).await],
         "python": python,
     });
     ToolDistribution::from_json(manifest.to_string().as_bytes())

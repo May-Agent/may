@@ -3679,6 +3679,7 @@ mod tests {
             description: "运行测试".to_string(),
             command: "cargo test --workspace".to_string(),
             mode: aither_sandbox::TerminalExecutionMode::Default,
+            location: None,
             reading: None,
             status: ToolStatus::Done,
             output: Some(output),
