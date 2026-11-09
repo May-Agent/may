@@ -101,10 +101,17 @@ pub struct StartedDaemon {
 /// worker, tool dispatchers, auto-archive, container auto-stop, remote
 /// access) and returns the router to serve.
 ///
+/// After an unexpected exit of the previous daemon, it ends every process
+/// the exited one left in its process session, and the sessions it
+/// interrupted are told (see [`super::chat::restart_interrupted_sessions`]).
+///
 /// # Errors
 /// Fails when configuration, persistence or a required service cannot be
 /// initialized.
-pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
+pub async fn start(
+    mode: DaemonMode,
+    process_session: super::process_session::ProcessSession,
+) -> anyhow::Result<StartedDaemon> {
     #[cfg(not(feature = "ui"))]
     mode.ensure_supported()?;
 
@@ -175,6 +182,22 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
 
     let (_session_store, db_for_archive, default_profile_id) =
         crate::session::initialize_session_persistence(&may_dir).await?;
+    let previous_daemon = db_for_archive
+        .record_daemon_start(process_session.id())
+        .await
+        .context("failed to record the daemon's start")?;
+    if let crate::db::PreviousDaemon::Exited {
+        process_session: exited,
+    } = previous_daemon
+    {
+        let killed = blocking::unblock(move || super::process_session::end_exited_session(exited))
+            .await
+            .context("failed to end the processes of the daemon that exited unexpectedly")?;
+        tracing::warn!(
+            killed,
+            "the previous daemon exited unexpectedly; ended the processes it left"
+        );
+    }
     let (title_generation_queue, title_generation_rx) =
         crate::daemon::state::TitleGenerationQueue::new();
     let ui_event_bus = crate::ui_event_bus::UiEventBus::new();
@@ -193,7 +216,8 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
             lease_handle.spawn(task);
         })),
     );
-    recover_persisted_runs_after_restart(&runtime_service, &db_for_archive).await?;
+    recover_persisted_runs_after_restart(&runtime_service, &db_for_archive, previous_daemon)
+        .await?;
     let remote_access_manager = Arc::new(super::remote_access::RemoteAccessManager::new(
         ui_event_bus.clone(),
     ));
@@ -347,6 +371,9 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
 
     state.ensure_session_publisher();
 
+    super::chat::restart_interrupted_sessions(&state)
+        .await
+        .context("failed to restart the sessions an unexpected exit interrupted")?;
     super::chat::resume_pending_follow_up_runs(state.clone())
         .await
         .context("failed to resume persisted pending session runs")?;
@@ -959,9 +986,10 @@ fn build_provider_models_response(
 async fn recover_persisted_runs_after_restart(
     runtime_service: &crate::session::SessionRuntimeService,
     db: &crate::db::ChatDb,
+    previous: crate::db::PreviousDaemon,
 ) -> anyhow::Result<()> {
     let (sessions, task_runs) = futures_lite::future::zip(
-        runtime_service.runs().recover_after_restart(),
+        runtime_service.runs().recover_after_restart(previous),
         db.recover_task_runs_after_restart(),
     )
     .await;
@@ -1039,7 +1067,7 @@ mod tests {
             UiEventBus::new(),
             crate::session::MayHomePaths::new(dir.path().join("home")),
         );
-        recover_persisted_runs_after_restart(&service, &db)
+        recover_persisted_runs_after_restart(&service, &db, crate::db::PreviousDaemon::Stopped)
             .await
             .expect("startup recovery succeeds");
 

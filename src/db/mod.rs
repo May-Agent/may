@@ -6,6 +6,7 @@ mod cache_misses;
 mod ci;
 mod common;
 mod context_snapshot;
+mod daemon_exit;
 pub mod entity;
 mod issue;
 mod issue_provenance;
@@ -46,6 +47,7 @@ pub use common::{
     UpdateProfileParams, UpdateScheduledTaskParams,
 };
 pub use context_snapshot::ContextDebugSnapshotWrite;
+pub use daemon_exit::PreviousDaemon;
 pub use issue_provenance::{IssueProvenanceRecord, NewIssueProvenance, UserMessageAt};
 pub use issue_search::IssueSearchDoc;
 pub use message::MessageMeta;
@@ -739,7 +741,7 @@ mod tests {
                 .expect("previous takeover owner should be cleared")
         );
 
-        db.recover_session_runtimes_after_restart()
+        db.recover_session_runtimes_after_restart(super::PreviousDaemon::Stopped)
             .await
             .expect("runtime recovery should clear stale takeover ownership");
         assert_eq!(
@@ -1135,7 +1137,7 @@ mod tests {
         .await
         .expect("waiting workspace should persist");
 
-        db.recover_session_runtimes_after_restart()
+        db.recover_session_runtimes_after_restart(super::PreviousDaemon::Stopped)
             .await
             .expect("runtime recovery should succeed");
 
@@ -1530,7 +1532,7 @@ mod tests {
             .expect("claim")
             .expect("message waits in the queue");
 
-        db.recover_session_runtimes_after_restart()
+        db.recover_session_runtimes_after_restart(super::PreviousDaemon::Stopped)
             .await
             .expect("recovery");
         let fence2 = RunFence {

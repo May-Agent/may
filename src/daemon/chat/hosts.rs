@@ -94,6 +94,32 @@ impl ParkedAgents {
         });
     }
 
+    /// Stops the background work of `session_id`'s idle agent, if it has
+    /// one: its terminal jobs are killed and its subagent runs cancelled,
+    /// and their completions wait for the user's next input instead of
+    /// starting a turn. The agent stays parked, its prompt cache warm.
+    pub(crate) async fn stop_background(&self, state: &Arc<DaemonState>, session_id: &str) {
+        let Some(parked) = self.workers().remove(session_id) else {
+            return;
+        };
+        let (reply, agent) = async_channel::bounded(1);
+        parked.worker.release(reply);
+        let Ok(mut agent) = agent.recv().await else {
+            return;
+        };
+        agent.interrupt();
+        let killed = agent.kill_running_terminal_jobs().await;
+        let cancelled = agent.subagent_runs().cancel_all();
+        tracing::info!(%session_id, killed, cancelled, "stopped the idle agent's background work");
+        self.park(
+            state,
+            session_id,
+            agent,
+            parked.build_key,
+            crate::session::RunReleased::already_released(),
+        );
+    }
+
     /// Stops `session_id`'s idle agent, if any.
     pub(crate) fn evict(&self, session_id: &str) {
         let parked = self.workers().remove(session_id);

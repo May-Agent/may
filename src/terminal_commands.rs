@@ -123,6 +123,18 @@ pub struct SharedTerminalCommandConfig<LLM> {
     pub rules_import: Option<crate::rules_import::RulesImport>,
 }
 
+/// A core command and the usage its `--help` prints.
+///
+/// Every session relies on a core command, so the system prompt carries its
+/// usage and the model need not run `--help` first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoreCommandUsage {
+    /// The command's name.
+    pub name: String,
+    /// The text `<name> --help` prints.
+    pub usage: String,
+}
+
 /// What [`register_shared_terminal_commands`] installed.
 #[derive(Debug, Default)]
 pub struct SharedTerminalCommands {
@@ -130,6 +142,9 @@ pub struct SharedTerminalCommands {
     /// name, in registration order; the command table lists them ahead of the
     /// MCP connections' commands, which it reads from the connections.
     pub descriptions: Vec<(String, String)>,
+    /// The core commands whose usage the system prompt carries, in prompt
+    /// order.
+    pub usages: Vec<CoreCommandUsage>,
     /// Where the main agent publishes its requests for the `subagent` command's
     /// `fork` kind; the main agent's builder must be given it.
     pub fork_source: aither_agent::ForkSource,
@@ -170,6 +185,7 @@ where
     LLM: LanguageModel + Clone + 'static,
 {
     let mut descriptions = Vec::new();
+    let mut usages = Vec::new();
     crate::command_policy::register(
         builder,
         crate::command_policy::runs_managed_bash(matches!(
@@ -356,6 +372,10 @@ where
             ask_user = ask_user.with_languages(guard.clone());
         }
         describe_tool(&mut descriptions, &ask_user);
+        usages.push(CoreCommandUsage {
+            name: ask_user.name().to_string(),
+            usage: tool_usage(&ask_user),
+        });
         // The user's answers are decisions the summary must not paraphrase.
         builder.kept_through_compaction(|kept| {
             kept.main_only(|reserved| reserved.configure_tool(ask_user));
@@ -507,6 +527,10 @@ where
     let subagent_tracker = config.subagent_tracker;
     let fork_source = subagent_tool.fork_source();
     describe_tool(&mut descriptions, &subagent_tool);
+    usages.push(CoreCommandUsage {
+        name: "subagent".to_string(),
+        usage: tool_usage(&subagent_tool),
+    });
     describe_arguments::<ExploreArgs>(&mut descriptions, "explore");
     let subagent_tool = Arc::new(subagent_tool);
     // Built for the main agent's terminal alone: a subagent has no `subagent`
@@ -535,11 +559,25 @@ where
         builder.command_set(connection);
     }
 
+    usages.push(CoreCommandUsage {
+        name: "tasks".to_string(),
+        usage: crate::tasks_md::edit::usage(),
+    });
+
     Ok(SharedTerminalCommands {
         descriptions,
+        usages,
         fork_source,
         fork_launcher,
     })
+}
+
+/// The usage `--help` prints for `tool`'s command: the text aither's registry
+/// builds from the schema of the tool's own arguments.
+fn tool_usage<T: Tool>(_tool: &T) -> String {
+    aither_sandbox::schema_to_help(
+        &serde_json::to_value(schemars::schema_for!(T::Arguments)).expect("a schema serializes"),
+    )
 }
 
 /// What the sandboxed `gh` command answers with.
@@ -741,13 +779,27 @@ mod tests {
             },
         )
         .await
-        .expect("commands should register")
-        .descriptions;
+        .expect("commands should register");
+        let usages = descriptions.usages;
+        let descriptions = descriptions.descriptions;
 
         let registry = builder
             .build(crate::test_support::test_output_store(session_dir.join("outputs")).await);
         assert!(registry.is_tool_configured("ask_user"));
         assert!(registry.is_tool_configured("imagine"));
+        let names: Vec<_> = usages.iter().map(|usage| usage.name.as_str()).collect();
+        assert_eq!(names, ["ask_user", "subagent", "tasks"]);
+        // `subagent` is bound to a terminal, which this registry lacks; its
+        // usage comes from its tool's arguments the same way.
+        assert_eq!(
+            registry.tool_help("ask_user").as_deref(),
+            Some(usages[0].usage.as_str()),
+            "the prompt's usage of `ask_user` is what its --help prints"
+        );
+        let tasks_help =
+            crate::tasks_md::edit::run(std::path::Path::new("unused"), &["--help".to_string()])
+                .expect("tasks --help prints the usage");
+        assert_eq!(usages[2].usage, tasks_help);
         assert!(
             descriptions
                 .iter()

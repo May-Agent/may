@@ -28,6 +28,7 @@ use crate::config::{SshServerConfig, TimeZoneName};
 use crate::network_policy::{CompiledNetworkPolicy, NetworkPolicyMode};
 use crate::session::{SessionPaths, SessionPlanState};
 use crate::skill::SkillManager;
+use crate::terminal_commands::CoreCommandUsage;
 use crate::workspace::{Workspace as MayWorkspace, WorkspaceDir as MayWorkspaceDir};
 
 /// The slots of the blocks May writes, and the order of the whole prompt.
@@ -758,6 +759,7 @@ struct CapabilitiesTemplate {
     has_browser_command: bool,
     skills: Vec<CatalogSkill>,
     subagents: Vec<CatalogSubagent>,
+    core_commands: Vec<CoreCommandUsage>,
 }
 
 /// The capabilities section: how commands run, the skills and the
@@ -769,6 +771,7 @@ struct CapabilitiesTemplate {
 /// Fails when the skills directory cannot be read.
 pub async fn build_capabilities(
     commands: &[(String, String)],
+    core_commands: &[CoreCommandUsage],
     request_parameters: &Parameters,
     skills_dir: &Path,
 ) -> Result<String, MayAgentError> {
@@ -807,6 +810,7 @@ pub async fn build_capabilities(
         has_browser_command,
         skills,
         subagents,
+        core_commands: core_commands.to_vec(),
     }
     .render()
     .map_err(|error| MayAgentError::Sandbox(format!("failed to render capabilities: {error}")))

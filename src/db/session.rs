@@ -1424,11 +1424,30 @@ impl ChatDb {
     /// so anything still marked owned or running belongs to a process that
     /// is gone.
     ///
+    /// After an unexpected exit (`previous`), every session it interrupted —
+    /// a run still owned, or background work alive — is owed the alert that
+    /// the daemon exited. Background work dies with its daemon either way,
+    /// so its record is cleared.
+    ///
     /// # Errors
     /// Returns [`ChatDbError`] on storage failure.
-    pub async fn recover_session_runtimes_after_restart(&self) -> Result<(), ChatDbError> {
+    pub async fn recover_session_runtimes_after_restart(
+        &self,
+        previous: super::PreviousDaemon,
+    ) -> Result<(), ChatDbError> {
         const STALE: &str = "(SELECT session_id FROM session_runtimes WHERE run_id IS NOT NULL OR state = 'running')";
         let mut tx = self.db.begin().await?;
+        if let super::PreviousDaemon::Exited { .. } = previous {
+            let sql = "INSERT OR IGNORE INTO session_daemon_exit_alerts (session_id, created_at) SELECT session_id, ? FROM {STALE} UNION SELECT session_id, ? FROM session_background_live"
+                .replace("{STALE}", STALE);
+            let now = jiff::Timestamp::now().to_string();
+            query!(tx, sql.as_str(), now.as_str(), now.as_str())
+                .execute()
+                .await?;
+        }
+        query!(tx, "DELETE FROM session_background_live")
+            .execute()
+            .await?;
         for sql in [
             "DELETE FROM session_pending_permissions WHERE session_id IN {STALE}",
             "DELETE FROM session_pending_workspace WHERE session_id IN {STALE}",

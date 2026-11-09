@@ -192,6 +192,19 @@ impl SessionBackgrounds {
         }
     }
 
+    /// Kills every running job of `session_id`'s agents and cancels its
+    /// subagent runs; returns how many it stopped.
+    pub(crate) async fn stop_all(&self, session_id: &str) -> usize {
+        let mut stopped = 0;
+        for (_, registry) in self.registries(session_id) {
+            stopped += registry.kill_running().await;
+        }
+        stopped
+            + self
+                .subagents_of(session_id)
+                .map_or(0, |handles| handles.runs.cancel_all())
+    }
+
     /// The sessions with background work: a command or subagent run in
     /// flight, or a wake being served.
     pub async fn busy_sessions(&self) -> std::collections::BTreeSet<String> {
@@ -231,6 +244,8 @@ pub fn spawn_watcher(state: Arc<DaemonState>, bus: UiEventBus) {
     state.tokio_handle.clone().spawn(async move {
         let mut last: HashMap<String, Vec<(u64, String)>> = HashMap::new();
         let mut last_busy = std::collections::BTreeSet::new();
+        // Startup cleared the record, so it starts empty.
+        let mut persisted = std::collections::BTreeSet::new();
         loop {
             tokio::time::sleep(WATCH_INTERVAL).await;
             let mut changed = std::collections::BTreeSet::new();
@@ -260,11 +275,21 @@ pub fn spawn_watcher(state: Arc<DaemonState>, bus: UiEventBus) {
                     );
                 }
             }
-            // The session lists mark the sessions with background work.
+            // The session lists mark the sessions with background work, and
+            // the record tells the next daemon which sessions an unexpected
+            // exit interrupted.
             if busy != last_busy {
                 bus.publish(UiEventTopics::PROFILE_SESSIONS);
-                last_busy = busy;
             }
+            if busy != persisted {
+                match state.db().set_sessions_with_background(&busy).await {
+                    Ok(()) => persisted.clone_from(&busy),
+                    Err(error) => {
+                        tracing::error!(%error, "failed to record the sessions with background work");
+                    }
+                }
+            }
+            last_busy = busy;
         }
     });
 }
