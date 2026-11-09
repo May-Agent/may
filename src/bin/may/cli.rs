@@ -31,8 +31,10 @@ pub enum CliMode {
 /// Parsed `may` / `may chat` / `may --repo` TUI invocation.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TuiArgs {
-    /// Repository the session binds to (`owner/repo` or a local path).
-    pub repo: Option<String>,
+    /// How the TUI starts its sessions: in the launch directory (`may`), as
+    /// repo-less chats (`may chat`), or on a repository (`may --repo
+    /// <owner/repo or path>`).
+    pub launch: may_agent::session::SessionLaunch,
 }
 
 /// Parsed `may resume` invocation.
@@ -199,9 +201,15 @@ pub fn parse_cli_mode(args: &[String]) -> CliMode {
             Some("--help" | "-h") => CliMode::Help(ExecArgs::help_text()),
             _ => CliMode::Exec(parse_exec_args(&args[2..])),
         },
-        Some("chat") | None => CliMode::Tui(TuiArgs::default()),
+        None => CliMode::Tui(TuiArgs::default()),
+        Some("chat") => CliMode::Tui(TuiArgs {
+            launch: may_agent::session::SessionLaunch::RepoLess,
+        }),
         Some("--repo") => CliMode::Tui(TuiArgs {
-            repo: args.get(2).cloned(),
+            launch: args.get(2).cloned().map_or_else(
+                may_agent::session::SessionLaunch::default,
+                may_agent::session::SessionLaunch::Repo,
+            ),
         }),
         Some(_) => CliMode::OneShot(parse_oneshot_args(&args[1..])),
     }
@@ -487,6 +495,28 @@ mod tests {
         assert_eq!(
             parse_cli_mode(&args(&["may"])),
             CliMode::Tui(TuiArgs::default())
+        );
+    }
+
+    #[test]
+    fn parse_cli_mode_chat_is_a_repo_less_tui() {
+        use may_agent::session::SessionLaunch;
+        assert_eq!(
+            parse_cli_mode(&args(&["may", "chat"])),
+            CliMode::Tui(TuiArgs {
+                launch: SessionLaunch::RepoLess
+            })
+        );
+    }
+
+    #[test]
+    fn parse_cli_mode_repo_starts_on_a_repository() {
+        use may_agent::session::SessionLaunch;
+        assert_eq!(
+            parse_cli_mode(&args(&["may", "--repo", "acme/app"])),
+            CliMode::Tui(TuiArgs {
+                launch: SessionLaunch::Repo("acme/app".to_string())
+            })
         );
     }
 

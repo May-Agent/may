@@ -133,7 +133,8 @@ mod tests {
         let config_path = dir.path().join("workspace.toml");
         WorkspaceConfig {
             projects: vec![ProjectConfig {
-                path: configured.clone(),
+                path: Some(configured.clone()),
+                repository: None,
                 issues: ProjectIssues::Github {
                     repository: "owner/repo".parse().expect("owner/repo"),
                 },

@@ -93,6 +93,12 @@ pub enum MayAgentError {
     /// Terminal command registration error.
     #[error("terminal command error: {0}")]
     Commands(#[from] crate::terminal_commands::TerminalCommandsError),
+    /// The session's row could not be read.
+    #[error("cannot read the session's repository binding: {0}")]
+    SessionRow(#[from] crate::db::ChatDbError),
+    /// The session's stored repository binding is malformed.
+    #[error(transparent)]
+    Binding(#[from] crate::session::BindingError),
 }
 
 /// Execution environment for a `MayAgent`.
@@ -259,6 +265,8 @@ pub struct MayAgentConfig {
     /// The rules this session imports, for a session `/import-claude` or
     /// `/import-codex` opened.
     pub rules_import: Option<crate::rules_import::RulesImport>,
+    /// The daemon's live limits, shared by every agent it builds.
+    pub limits: super::LiveLimits,
 }
 
 /// Session-scoped inputs for [`MayAgent::from_config_with_model_and_permissions`].
@@ -336,6 +344,8 @@ pub struct MayAgentSessionInput<'a> {
     /// The rules this session imports, for a session `/import-claude` or
     /// `/import-codex` opened.
     pub rules_import: Option<crate::rules_import::RulesImport>,
+    /// The daemon's live limits, shared by every agent it builds.
+    pub limits: super::LiveLimits,
     /// The model's context window as the daemon resolved it (provider
     /// report, then the model table); the agent compacts against it.
     pub model_context_window: Option<u32>,
@@ -596,27 +606,47 @@ impl MayAgent {
             config.db.clone(),
         );
         let mut repo_clones = Vec::new();
-        if let Some(worktree) = crate::repo_search::worktree_root(&config.cwd) {
-            // The first-contact trust decision picks the binding: full and
-            // prs-only clone the GitHub remote, local-branch clones the
-            // checkout locally; `local` writes the checkout; undecided binds
-            // nothing — the launch gate asks before the session starts.
-            match session_repos
-                .ensure_clone_of(
-                    &worktree,
-                    &workspace.config,
-                    &crate::session::MayHomePaths::new(config.may_dir.clone()).repo_staging_dir(),
-                )
-                .await
-            {
-                Ok(Some(clone_path)) => repo_clones.push(RepoCloneEntry {
-                    clone_path,
-                    source: crate::fs_utils::display_path(&worktree),
-                }),
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::warn!(%error, "failed to create session repo clone");
-                }
+        let staging = crate::session::MayHomePaths::new(config.may_dir.clone()).repo_staging_dir();
+        // The session's repository binding names the clone; a GitHub binding
+        // needs no checkout at all. Without one, the launch directory's
+        // repository decides.
+        let binding = config
+            .db
+            .get_session(config.session_id.as_str())
+            .await?
+            .and_then(|row| row.repo)
+            .map(|stored| crate::session::RepoBinding::parse(&stored))
+            .transpose()?;
+        let worktree = crate::repo_search::worktree_root(&config.cwd);
+        // The first-contact trust decision picks the clone: full and
+        // prs-only clone the GitHub remote, local-branch clones the checkout
+        // locally; `local` writes the checkout; undecided binds nothing — the
+        // session gate asks before the first turn.
+        let made = match (&binding, &worktree) {
+            (Some(binding), _) => {
+                session_repos
+                    .ensure_clone_of_binding(binding, &workspace.config, &staging)
+                    .await
+            }
+            (None, Some(worktree)) => {
+                session_repos
+                    .ensure_clone_of(worktree, &workspace.config, &staging)
+                    .await
+            }
+            (None, None) => Ok(None),
+        };
+        match made {
+            Ok(Some(clone_path)) => repo_clones.push(RepoCloneEntry {
+                clone_path,
+                source: match (&binding, &worktree) {
+                    (_, Some(worktree)) => crate::fs_utils::display_path(worktree),
+                    (Some(binding), None) => binding.clone_key(),
+                    (None, None) => unreachable!("a clone needs a binding or a checkout"),
+                },
+            }),
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(%error, "failed to create session repo clone");
             }
         }
         if let Some(repo_clones) =
@@ -661,7 +691,8 @@ impl MayAgent {
         let ask_balanced = config.ask_models.balanced.clone();
         let ask_fast = config.ask_models.fast.clone();
 
-        let issue_store = crate::issue::resolve_issue_store(
+        let issue_store = crate::issue::resolve_bound_issue_store(
+            binding.as_ref(),
             &config.cwd,
             &session_paths.workspace_config(),
             config.db.clone(),
@@ -736,6 +767,7 @@ impl MayAgent {
         let language_guard = aither_agent::LanguageGuard::new(config.languages);
         let mut builder = TerminalAgentBuilder::new(llm, terminal_tool)
             .system_layout(tag::layout())
+            .notices(super::notices::may_notices())
             .languages(language_guard.clone())
             .hook(context_snapshot_hook)
             .hook(pending_steer_hook)
@@ -815,6 +847,7 @@ impl MayAgent {
                 languages: Some(language_guard.clone()),
                 acp,
                 git: crate::host_git::HostGit::inherit(),
+                tasks_line_limit: config.limits.tasks_lines(),
                 #[cfg(target_os = "macos")]
                 computer: config.computer.clone(),
                 rules_import: config.rules_import.clone(),
@@ -827,15 +860,15 @@ impl MayAgent {
         builder = builder
             .fork_source(shared_terminal_commands.fork_source.clone())
             // `tasks.md` follows what the commands above record, and reads
-            // the state of the issues and PRs its rows name.
-            .work_events(task_events)
-            .working_document(aither_agent::DocumentSpec::new(
-                "tasks.md",
-                crate::task_rows::TasksSchema,
+            // the state of the issues and PRs its rows name. Its subagents
+            // keep their own under the same schema and stop rule.
+            .working_document(crate::tasks_md::schema::document_spec(
+                &config.limits.tasks_lines(),
             ))
             .stop_hook(aither_agent::AnyStopHook::new(
-                crate::task_rows::HoldOpenTasks,
+                crate::tasks_md::schema::TasksStopHook,
             ))
+            .work_events(task_events)
             .work_tracker(super::work_tracker::MayWorkTracker::new(
                 issue_store.clone(),
                 config.db.clone(),
@@ -879,6 +912,7 @@ impl MayAgent {
             );
         builder = builder
             .host_load(config.host_load.clone())
+            .disk_thresholds(config.limits.disk())
             // Shell runtime depends on the home environment. SSH remains a
             // per-command routing capability on top of it.
             .shell_runtime_availability(tool_environment_key.availability())
@@ -994,6 +1028,7 @@ impl MayAgent {
             background_jobs,
             connectivity,
             rules_import,
+            limits,
             model_context_window,
         } = input;
         let selector = super::provider::parse_model_selector(model)?;
@@ -1100,6 +1135,7 @@ impl MayAgent {
             prompt_cache_epoch,
             db,
             rules_import,
+            limits,
         })
     }
 
@@ -1369,6 +1405,19 @@ impl MayAgent {
         self.inner.cache_warmth()
     }
 
+    /// The agent's model, which counts streamed text in tokens
+    /// ([`LanguageModel::count_text`]) while a run holds the agent.
+    #[must_use]
+    pub fn counting_model(&self) -> ProviderLlm {
+        self.btw_llm.llm.clone()
+    }
+
+    /// Marks the agent interrupted because the user stopped its run: no
+    /// background completion starts a run until the user's next input.
+    pub const fn interrupt(&mut self) {
+        self.inner.interrupt();
+    }
+
     /// Stop every terminal task that is still running for this agent.
     pub async fn kill_running_terminal_jobs(&self) -> usize {
         self.inner.kill_running_terminal_jobs().await
@@ -1497,7 +1546,7 @@ pub async fn generate_session_title(
 /// Rendered markdown of the context's active handoff, if any — the text
 /// `AGENTS.md` links are extracted from.
 fn handoff_markdown(context: &aither_agent::Context) -> Option<String> {
-    Some(context.handoff()?.text().to_string())
+    context.handoff().map(|handoff| handoff.text().to_string())
 }
 
 fn truncate_at_char_boundary(input: &str, max_chars: usize) -> &str {

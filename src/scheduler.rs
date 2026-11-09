@@ -13,9 +13,9 @@ use std::sync::Arc;
 use aither_core::llm::CommandOutcome;
 use aither_sandbox::{
     AnyContainerExec, BollardContainerExec, CompletedCommand, Configured, ContainerLaunchSpec,
-    ContainerShellRuntime, JobStatus, OutputFormat, OutputStore, PermissionHandler, ScriptLanguage,
-    ShellRuntimeAvailability, ShellSessionRegistry, TerminalArgs, TerminalExecutionMode,
-    TerminalMode, TerminalTool, ToolRegistryBuilder, permission::PermissionError,
+    ContainerShellRuntime, JobStatus, OutputFormat, PermissionHandler, ShellRuntimeAvailability,
+    ShellSessionRegistry, TerminalArgs, TerminalExecutionMode, TerminalMode, TerminalTool,
+    ToolRegistryBuilder, permission::PermissionError,
 };
 use arc_swap::ArcSwap;
 use askama::Template;
@@ -397,7 +397,7 @@ impl PermissionHandler for SchedulerPermissionHandler {
         &self,
         _mode: TerminalMode,
         _script: &str,
-        _language: ScriptLanguage,
+        _language: aither_sandbox::ScriptLanguage,
     ) -> impl Future<Output = Result<bool, PermissionError>> + Send {
         std::future::ready(Ok(true))
     }
@@ -1406,6 +1406,10 @@ impl TaskRuntime {
         )
         .await?;
         let mut commands = ToolRegistryBuilder::new();
+        crate::command_policy::register(
+            &mut commands,
+            crate::command_policy::runs_managed_bash(shell_sessions.availability().container),
+        );
         if let Some(scope) = wake {
             commands.configure_tool(crate::task_wake::WakeTool::new(
                 self.session_prompts.clone(),
@@ -1418,16 +1422,7 @@ impl TaskRuntime {
                     .then(|| crate::container::lifecycle::workspace_mount(workspace.clone())),
             ));
         }
-        let registry = Arc::new(
-            commands.build(
-                OutputStore::new(
-                    workspace.join("outputs"),
-                    aither_core::ids::AnyIdAllocator::default(),
-                )
-                .await
-                .map_err(|error| error.to_string())?,
-            ),
-        );
+        let registry = Arc::new(commands.build(terminal_tool.output_store().clone()));
         let terminal_tool = match &self.connectivity {
             Some(connectivity) => terminal_tool.with_connectivity(connectivity),
             None => terminal_tool,
@@ -1736,8 +1731,8 @@ async fn run_terminal_command(
     let started = terminal_tool
         .run_background(TerminalArgs {
             description: "run the scheduled task script".to_string(),
-            language: ScriptLanguage::Shell,
             script,
+            language: aither_sandbox::ScriptLanguage::Shell,
             mode,
             ssh_server_id,
             expect: OutputFormat::Text,

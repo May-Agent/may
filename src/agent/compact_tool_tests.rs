@@ -348,11 +348,10 @@ async fn crossing_the_warning_distance_raises_one_alert_in_a_session() {
     let model = ScriptedModel::spawn(say_done).await;
     // Auto-compact point 40k tokens, warning at 30k, background fork at 38k.
     let context = ContextConfig {
-        compact_at: 0.8,
         compact_ceiling: 40_000,
         start_distance: 2_000,
-        safe_buffer: 1_000,
         warn_distance: 10_000,
+        ..ContextConfig::default()
     };
     let mut session = Box::pin(Session::start(&config_for(&model, context))).await;
 

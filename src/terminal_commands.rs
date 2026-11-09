@@ -112,6 +112,8 @@ pub struct SharedTerminalCommandConfig<LLM> {
     /// and key commits in the sandbox are signed with, and runs every host
     /// git `pr` needs.
     pub git: crate::host_git::HostGit,
+    /// Lines a `tasks.md` may hold, the main agent's and every subagent's.
+    pub tasks_line_limit: crate::tasks_md::schema::LineLimit,
     /// Daemon handles for the `computer` command — present when the
     /// session may own a virtual desktop (macOS, local environment).
     #[cfg(target_os = "macos")]
@@ -151,7 +153,8 @@ pub enum TerminalCommandsError {
     Signing(#[from] crate::commit_signing::SigningError),
 }
 
-/// Register every shared IPC command on the terminal tool's command registry.
+/// Register every shared IPC command on the terminal tool's command registry,
+/// and May's command policies on every script its terminals run.
 ///
 /// # Errors
 /// Returns the registry error when a command fails to register.
@@ -167,6 +170,13 @@ where
     LLM: LanguageModel + Clone + 'static,
 {
     let mut descriptions = Vec::new();
+    crate::command_policy::register(
+        builder,
+        crate::command_policy::runs_managed_bash(matches!(
+            config.task_runtime,
+            TaskRuntimeKind::Container
+        )),
+    );
 
     if !config.request_parameters.hosted_web_fetch() {
         register_tool_with_description(builder, &mut descriptions, WebFetchTool::new());
@@ -466,12 +476,23 @@ where
     // A subagent runs on the model of its definition's tier: the models `ask`
     // offers.
     let mut subagent_tool = SubagentTool::new(UsageObservedModel::new(subagent_flagship))
-        .with_definitions(crate::bundle::bundled_subagents())
+        .with_definitions(crate::bundle::Bundle::subagent_definitions())
         .with_request_parameters(config.request_parameters.clone())
         .with_balanced_model(UsageObservedModel::new(balanced.llm), balanced.parameters)
         .with_fast_model(UsageObservedModel::new(fast_llm), fast.parameters)
         .with_runs(config.subagent_runs)
         .with_work_events(config.task_events.clone())
+        // Each subagent keeps its own `tasks.md` under the main agent's schema
+        // and stop rule, and reads May's wording.
+        .with_working_document(
+            Some(crate::tasks_md::schema::document_spec(
+                &config.tasks_line_limit,
+            )),
+            Some(aither_agent::AnyStopHook::new(
+                crate::tasks_md::schema::TasksStopHook,
+            )),
+        )
+        .with_notices(crate::agent::notices::may_notices())
         .with_base_dir(&config.sandbox_dir)
         .with_file_mounts([
             SubagentFileMount::new(PathBuf::from("."), config.sandbox_dir.clone()),
@@ -715,6 +736,7 @@ mod tests {
                 languages: None,
                 acp: None,
                 git: crate::host_git::HostGit::from_file("/dev/null"),
+                tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
             },
         )
         .await
@@ -777,6 +799,7 @@ mod tests {
                 languages: None,
                 acp: None,
                 git: crate::host_git::HostGit::from_file("/dev/null"),
+                tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
             },
         )
         .await
@@ -839,6 +862,7 @@ mod tests {
                 languages: None,
                 acp: None,
                 git: crate::host_git::HostGit::from_file("/dev/null"),
+                tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
             },
         )
         .await
@@ -895,6 +919,7 @@ mod tests {
                 languages: None,
                 acp: None,
                 git: crate::host_git::HostGit::from_file("/dev/null"),
+                tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
             },
         )
         .await
@@ -947,6 +972,7 @@ mod tests {
                 languages: None,
                 acp: None,
                 git: crate::host_git::HostGit::from_file("/dev/null"),
+                tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
             },
         )
         .await
@@ -1120,6 +1146,7 @@ mod tests {
                 languages: None,
                 acp: None,
                 git: crate::host_git::HostGit::from_file("/dev/null"),
+                tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
             },
         )
         .await
@@ -1204,6 +1231,7 @@ mod tests {
                 languages: None,
                 acp: None,
                 git: crate::host_git::HostGit::from_file("/dev/null"),
+                tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
             },
         )
         .await
@@ -1257,6 +1285,7 @@ mod tests {
                 languages: None,
                 acp: None,
                 git: crate::host_git::HostGit::from_file("/dev/null"),
+                tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
             },
         )
         .await
@@ -1314,6 +1343,7 @@ mod tests {
                 languages: None,
                 acp: None,
                 git,
+                tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
             },
         )
         .await?;

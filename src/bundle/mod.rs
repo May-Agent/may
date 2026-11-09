@@ -1,12 +1,12 @@
 //! Bundled resources extraction.
 //!
 //! Skills are embedded in the binary and extracted
-//! to the canonical May home on first run, beside aither's bundled subagent
-//! definitions.
+//! to the canonical May home on first run. The subagent definitions are
+//! embedded too and handed to the subagent tool.
 //! Local/heel session sandboxes get symlinks pointing to their home-scoped resources.
 //! Container sessions use mount points managed by container lifecycle code.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use async_fs;
 
@@ -16,34 +16,8 @@ use crate::session::SessionPaths;
 
 // Embed the skills directory at compile time
 static SKILLS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/skills");
-
-// The subagent definitions may ships: aither 0.24 left bundled subagents to
-// the embedder.
+// The subagent definitions, one TOML file each.
 static SUBAGENTS_DIR: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/subagents");
-
-/// The names of the bundled subagent types, in catalog order.
-pub const BUNDLED_SUBAGENT_NAMES: [&str; 6] =
-    ["explore", "research", "audit", "review", "plan", "general"];
-
-/// The bundled subagent definitions, parsed once per call site.
-///
-/// # Panics
-///
-/// Panics when a bundled definition is invalid.
-#[must_use]
-pub fn bundled_subagents() -> Vec<aither_agent::SubagentDefinition> {
-    BUNDLED_SUBAGENT_NAMES
-        .iter()
-        .map(|name| {
-            let file = SUBAGENTS_DIR
-                .get_file(format!("{name}.toml"))
-                .unwrap_or_else(|| panic!("bundled subagent {name} is embedded"));
-            let source = file.contents_utf8().expect("subagent TOML is UTF-8");
-            aither_agent::SubagentDefinition::parse(source)
-                .unwrap_or_else(|error| panic!("bundled subagent '{name}': {error}"))
-        })
-        .collect()
-}
 
 /// Bundle extraction error.
 #[derive(Debug, thiserror::Error)]
@@ -72,15 +46,28 @@ impl Bundle {
         // Built-in resources must stay in lockstep with the running binary.
         // Always overwrite bundled content to avoid stale skills after upgrades.
         Self::extract_dir_overwrite(&SKILLS_DIR, &skills_dir).await?;
-        Self::extract_dir_overwrite(&SUBAGENTS_DIR, &Self::subagents_dir(may_dir)).await?;
 
         Ok(())
     }
 
-    /// The global subagents directory: the definitions `subagent <name>` runs.
+    /// The subagents May ships: the definitions `subagent <name>` runs.
+    ///
+    /// # Panics
+    ///
+    /// Panics when an embedded definition is invalid, which a test rules out.
     #[must_use]
-    pub fn subagents_dir(may_dir: &Path) -> PathBuf {
-        may_dir.join("subagents")
+    pub fn subagent_definitions() -> Vec<aither_agent::SubagentDefinition> {
+        SUBAGENTS_DIR
+            .files()
+            .map(|file| {
+                let path = file.path().display();
+                let source = file
+                    .contents_utf8()
+                    .unwrap_or_else(|| panic!("subagent definition {path} is not UTF-8"));
+                aither_agent::SubagentDefinition::parse(source)
+                    .unwrap_or_else(|error| panic!("subagent definition {path}: {error}"))
+            })
+            .collect()
     }
 
     /// Create symlinks in a local/heel session sandbox pointing to its home-scoped resources.
@@ -190,7 +177,7 @@ impl Bundle {
 mod tests {
     use include_dir::{Dir, DirEntry};
 
-    use super::SKILLS_DIR;
+    use super::{Bundle, SKILLS_DIR, SUBAGENTS_DIR};
 
     fn collect_dirs<'a>(dir: &'a Dir<'a>, found: &mut Vec<&'a std::path::Path>) {
         for entry in dir.entries() {
@@ -221,6 +208,16 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 4);
+    }
+
+    #[test]
+    fn every_bundled_subagent_definition_parses() {
+        let names: Vec<_> = Bundle::subagent_definitions()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
+        assert_eq!(names.len(), SUBAGENTS_DIR.files().count());
+        assert!(names.iter().any(|name| name == "explore"));
     }
 
     #[test]

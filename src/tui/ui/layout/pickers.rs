@@ -163,6 +163,7 @@ pub(super) fn render_session_popup(frame: &mut Frame, area: Rect, app: &App) {
 
         // Track section transitions for rendering headers
         let mut prev_section: Option<&str> = None;
+        let mut prev_repo: Option<&str> = None;
 
         for (display_idx, (_original_idx, summary)) in filtered
             .iter()
@@ -217,6 +218,27 @@ pub(super) fn render_session_popup(frame: &mut Frame, area: Rect, app: &App) {
                             .add_modifier(ratatui::style::Modifier::BOLD),
                     )));
                     prev_section = Some(section);
+                    prev_repo = None;
+                }
+                // Regular sessions run in project groups: a header names the
+                // project, GitHub ones by `owner/repo` and local ones by path.
+                if section == "regular" && summary.repo.as_deref() != prev_repo {
+                    if let Some(repo) = summary.repo.as_deref() {
+                        let github = repo.starts_with("github:");
+                        session_lines.push(Line::from(vec![
+                            Span::styled(
+                                if github { "  GitHub " } else { "  " },
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                            Span::styled(
+                                crate::session::project_label(repo),
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(ratatui::style::Modifier::BOLD),
+                            ),
+                        ]));
+                    }
+                    prev_repo = summary.repo.as_deref();
                 }
             }
 

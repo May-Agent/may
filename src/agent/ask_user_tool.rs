@@ -259,15 +259,13 @@ impl Tool for AskUserTool {
         if questions.is_empty() {
             return Err(AskUserToolError::NoQuestion.into());
         }
-        if let Some(guard) = &self.languages
-            && let Err(refusal) = guard.check_question(questions.iter().flat_map(|question| {
-                std::iter::once(question.question.as_str())
-                    .chain(question.option.iter().map(String::as_str))
-            }))
-        {
-            return Ok(ToolResult::error(
-                aither_agent::AnyNotices::default().language_refusal(&refusal),
-            ));
+        if let Some(guard) = &self.languages {
+            guard
+                .check_question(questions.iter().flat_map(|question| {
+                    std::iter::once(question.question.as_str())
+                        .chain(question.option.iter().map(String::as_str))
+                }))
+                .map_err(super::notices::language_refused)?;
         }
         let request = PersistedAskUserRequest {
             id: crate::id::new(),

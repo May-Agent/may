@@ -183,11 +183,8 @@ async fn an_answer_is_recorded_on_the_session_tasks_inbox() {
         format!("## Doing\n- pick a db BLOCKING {asked}\n"),
     )
     .expect("tasks.md");
-    let mut tasks = aither_agent::WorkingDocument::new(
-        &aither_agent::DocumentSpec::new("tasks.md", crate::task_rows::TasksSchema),
-        sandbox.path(),
-        service.task_events("session"),
-    );
+    let mut tasks =
+        crate::tasks_md::schema::working_document(sandbox.path(), service.task_events("session"));
     aither_agent::ContextSource::on_request(&mut tasks, false).await;
     let alert = aither_agent::ContextSource::on_tool_turn_end(&mut tasks)
         .await
