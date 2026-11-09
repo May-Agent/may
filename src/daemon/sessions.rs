@@ -600,6 +600,13 @@ pub(super) fn resolve_repo_binding(spec: Option<&str>) -> Result<Option<String>,
     let Some(spec) = spec.map(str::trim).filter(|s| !s.is_empty()) else {
         return Ok(None);
     };
+    // The stored `local:<identity>` form is the daemon's own identity format
+    // for a local repository, which clients echo back from a session's group.
+    if spec.starts_with("local:") {
+        return crate::session::RepoBinding::parse(spec)
+            .map(|binding| Some(binding.to_stored()))
+            .map_err(|error| error.to_string());
+    }
     let github = spec.strip_prefix("github:").unwrap_or(spec);
     let looks_like_github = {
         let mut parts = github.split('/');
