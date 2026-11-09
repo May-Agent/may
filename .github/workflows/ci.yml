@@ -115,9 +115,15 @@ jobs:
         if: runner.os == 'Linux' && runner.arch == 'X64'
         run: sudo apt-get update && sudo apt-get install -y nasm
       - name: cargo clippy (default features)
-        run: cargo clippy --locked --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets --timings -- -D warnings
       - name: cargo clippy (ui)
-        run: cargo clippy --locked --all-targets --features ui -- -D warnings
+        run: cargo clippy --locked --all-targets --features ui --timings -- -D warnings
+      - name: Upload cargo timings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-timings-clippy
+          path: target/cargo-timings/
 
   test-ubuntu:
     name: test (ubuntu-latest)
