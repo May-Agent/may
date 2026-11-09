@@ -5,8 +5,10 @@
 //! best-effort fast-forward `git pull`. A failure — dirty tree, divergence,
 //! no network — is reported and logged, and never blocks the session.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+use futures_util::StreamExt as _;
 
 use crate::host_git::HostGit;
 
@@ -48,30 +50,52 @@ pub async fn recorded_checkouts(db: &crate::db::ChatDb, owner_repo: &str) -> Vec
     .await
 }
 
-/// Fast-forward every checkout in `checkouts`, concurrently, each bounded by
-/// [`PULL_TIMEOUT`]. Failures are logged and returned; nothing is raised.
+/// How many checkouts are pulled at once; each pull is a network round trip,
+/// not CPU work, so the bound only keeps a long registry from opening
+/// hundreds of connections.
+const PULL_CONCURRENCY: usize = 8;
+
+/// Fast-forward every checkout in `checkouts`, at most [`PULL_CONCURRENCY`]
+/// at a time, each bounded by [`PULL_TIMEOUT`]; results come back in the
+/// order of `checkouts`. Failures are logged and returned; nothing is raised.
 pub async fn sync(host: &HostGit, checkouts: Vec<PathBuf>) -> Vec<SyncedCheckout> {
-    futures_util::future::join_all(checkouts.into_iter().map(|checkout| {
-        let host = host.clone();
-        async move {
-            let path = checkout.display().to_string();
-            let pull = blocking::unblock(move || {
-                host.output(Some(&checkout), &["pull", "--ff-only"])
-                    .map(drop)
-                    .map_err(|error| error.to_string())
-            });
-            let timed_out = async {
-                async_io::Timer::after(PULL_TIMEOUT).await;
-                Err(format!("git pull did not finish in {PULL_TIMEOUT:?}"))
-            };
-            let failure = futures_lite::future::or(pull, timed_out).await.err();
-            if let Some(reason) = &failure {
-                tracing::warn!(checkout = %path, %reason, "post-merge pull sync failed");
-            }
-            SyncedCheckout { path, failure }
+    futures_util::stream::iter(checkouts.into_iter().map(|checkout| async move {
+        let path = checkout.display().to_string();
+        let failure = pull(host, &checkout).await.err();
+        if let Some(reason) = &failure {
+            tracing::warn!(checkout = %path, %reason, "post-merge pull sync failed");
         }
+        SyncedCheckout { path, failure }
     }))
+    .buffered(PULL_CONCURRENCY)
+    .collect()
     .await
+}
+
+/// `git pull --ff-only` in `checkout`, as a child process that is killed when
+/// [`PULL_TIMEOUT`] passes.
+async fn pull(host: &HostGit, checkout: &Path) -> Result<(), String> {
+    let mut command = async_process::Command::from(host.command());
+    command
+        .arg("-C")
+        .arg(checkout)
+        .args(["pull", "--ff-only"])
+        .stdin(async_process::Stdio::null())
+        .kill_on_drop(true);
+    // Dropping the losing future drops the child, which kills it.
+    let run = async {
+        let output = command.output().await.map_err(|error| error.to_string())?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        }
+    };
+    let timed_out = async {
+        async_io::Timer::after(PULL_TIMEOUT).await;
+        Err(format!("git pull did not finish in {PULL_TIMEOUT:?}"))
+    };
+    futures_lite::future::or(run, timed_out).await
 }
 
 #[cfg(test)]

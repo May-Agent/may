@@ -5553,6 +5553,7 @@ dependencies = [
  "async-io",
  "async-lock",
  "async-net",
+ "async-process",
  "async-stream",
  "async-trait",
  "base64 0.22.1",
