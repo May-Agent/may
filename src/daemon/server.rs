@@ -269,6 +269,7 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
     let container_prepare = super::state::ContainerPrepareTracker::new(ui_event_bus.clone());
     let (search_index_wake_tx, search_index_wake) = async_channel::bounded(1);
 
+    let live_limits = crate::agent::LiveLimits::of(&config);
     let config = Arc::new(arc_swap::ArcSwap::from_pointee(config));
     let acp_host = Arc::new(crate::agent::acp_subagent::AcpHosts::new(
         config.clone(),
@@ -289,6 +290,7 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
         tool_dispatchers,
         fetched_models_cache: super::state::RefreshableCache::new(Duration::from_secs(20)),
         config: config.clone(),
+        live_limits,
         ui_event_bus: ui_event_bus.clone(),
         container_prepare,
         container_manager,

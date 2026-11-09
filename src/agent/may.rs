@@ -259,6 +259,8 @@ pub struct MayAgentConfig {
     /// The rules this session imports, for a session `/import-claude` or
     /// `/import-codex` opened.
     pub rules_import: Option<crate::rules_import::RulesImport>,
+    /// The daemon's live limits, shared by every agent it builds.
+    pub limits: super::LiveLimits,
 }
 
 /// Session-scoped inputs for [`MayAgent::from_config_with_model_and_permissions`].
@@ -336,6 +338,8 @@ pub struct MayAgentSessionInput<'a> {
     /// The rules this session imports, for a session `/import-claude` or
     /// `/import-codex` opened.
     pub rules_import: Option<crate::rules_import::RulesImport>,
+    /// The daemon's live limits, shared by every agent it builds.
+    pub limits: super::LiveLimits,
     /// The model's context window as the daemon resolved it (provider
     /// report, then the model table); the agent compacts against it.
     pub model_context_window: Option<u32>,
@@ -860,6 +864,7 @@ impl MayAgent {
             );
         builder = builder
             .host_load(config.host_load.clone())
+            .disk_thresholds(config.limits.disk())
             // Shell runtime depends on the home environment. SSH remains a
             // per-command routing capability on top of it.
             .shell_runtime_availability(tool_environment_key.availability())
@@ -975,6 +980,7 @@ impl MayAgent {
             background_jobs,
             connectivity,
             rules_import,
+            limits,
             model_context_window,
         } = input;
         let selector = super::provider::parse_model_selector(model)?;
@@ -1081,6 +1087,7 @@ impl MayAgent {
             prompt_cache_epoch,
             db,
             rules_import,
+            limits,
         })
     }
 

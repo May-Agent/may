@@ -3733,6 +3733,7 @@ fn build_session_agent<'a>(
                 background_jobs: aither_agent::BackgroundJobPolicy::Detach,
                 connectivity: state.connectivity.clone(),
                 rules_import: ctx.rules_import.clone(),
+                limits: state.live_limits.clone(),
                 model_context_window,
             },
         )

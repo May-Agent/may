@@ -1291,6 +1291,9 @@ pub struct MayConfig {
     /// When host memory pressure and machine load count as high.
     #[serde(default)]
     pub host_load: HostLoadSettings,
+    /// When free disk space counts as low.
+    #[serde(default)]
+    pub disk: DiskSettings,
     /// How long `/connect` waits on a candidate ACP agent.
     #[serde(default)]
     pub acp: AcpSettings,
@@ -1679,6 +1682,36 @@ impl HostLoadSettings {
     }
 }
 
+/// `[disk]` section: how little free space the home environment's volume may
+/// have before the agent is told, in bytes.
+///
+/// The defaults are aither's: yellow below 10 GiB free, red below 5 GiB and
+/// final below 3 GiB. A change applies to running sessions at once.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct DiskSettings {
+    /// Free bytes below which the disk is at the yellow level.
+    pub yellow_free_bytes: u64,
+    /// Free bytes below which the disk is at the red level.
+    pub red_free_bytes: u64,
+    /// Free bytes below which the disk is at the final level.
+    pub final_free_bytes: u64,
+}
+
+impl DiskSettings {
+    const GIB: u64 = 1024 * 1024 * 1024;
+}
+
+impl Default for DiskSettings {
+    fn default() -> Self {
+        Self {
+            yellow_free_bytes: 10 * Self::GIB,
+            red_free_bytes: 5 * Self::GIB,
+            final_free_bytes: 3 * Self::GIB,
+        }
+    }
+}
+
 /// Serde for a [`Duration`] written as human text (`"30s"`, `"2m"`).
 mod duration_text {
     use std::time::Duration;
@@ -1735,6 +1768,7 @@ impl Default for MayConfig {
             context: ContextConfig::default(),
             time: TimeConfig::default(),
             host_load: HostLoadSettings::default(),
+            disk: DiskSettings::default(),
             acp: AcpSettings::default(),
             last_model: None,
             last_effort: None,
