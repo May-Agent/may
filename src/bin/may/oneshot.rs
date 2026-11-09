@@ -256,7 +256,7 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
     runtime_deps
         .daemon()
         .ok_or_else(|| anyhow::anyhow!("the May daemon is not attached"))?
-        .put::<_, serde_json::Value>(
+        .patch::<_, serde_json::Value>(
             &format!("/api/sessions/{}", session_id.as_str()),
             &may_agent::client::UpdateSessionRequest {
                 non_interactive: Some(true),
@@ -304,19 +304,21 @@ pub async fn run_oneshot(args: OneShotArgs) -> anyhow::Result<()> {
         anyhow::bail!("the session is already running in another May process");
     }
     let prompt = build_oneshot_prompt_with_mentions(&app, &args.prompt).await?;
-    let handle = runtime_deps.start_agent_task(
-        &mut app,
-        worker,
-        PendingMessage {
-            content: prompt.content,
-            hidden_context_xml: prompt.hidden_context_xml,
-            attachments: Vec::new(),
-            queued_at: Timestamp::now(),
-            delivery_mode: may_agent::session::PendingUserMessageMode::Steer,
-            display: None,
-        },
-        &mut pending_title_gen,
-    )?;
+    let handle = runtime_deps
+        .start_agent_task(
+            &mut app,
+            worker,
+            PendingMessage {
+                content: prompt.content,
+                hidden_context_xml: prompt.hidden_context_xml,
+                attachments: Vec::new(),
+                queued_at: Timestamp::now(),
+                delivery_mode: may_agent::session::PendingUserMessageMode::Steer,
+                display: None,
+            },
+            &mut pending_title_gen,
+        )
+        .await?;
     let mut agent_handle = Some(handle);
 
     while let Some(handle) = agent_handle.as_ref() {

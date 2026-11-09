@@ -14,10 +14,10 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use aither_agent::AgentOptions as _;
-use aither_core::llm::{AgentIdentity, SubagentIdentity, Tool, ToolContext, ToolResult};
+use aither_core::llm::{AgentIdentity, Message, SubagentIdentity, Tool, ToolContext, ToolResult};
 use aither_sandbox::{
     AnyCommandGate, CommandGate, GateDecision, SubagentGrant, TerminalBinding, TerminalToolFactory,
 };
@@ -25,8 +25,8 @@ use askama::Template;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use super::{AgentLinkError, AgentMessaging, AttributeText, UntrustedText, status_name};
-use crate::agent::ProviderLlm;
+use super::{Activity, AgentLinkError, AgentMessaging, AttributeText, UntrustedText, status_name};
+use crate::agent::{ModelSlot, ProviderLlm};
 
 /// The subagent name a btw fork's tool calls carry.
 const BTW_FORK: &str = "btw";
@@ -39,7 +39,96 @@ struct ForkHost {
     source: aither_agent::ForkSource,
     /// The session's own model; the fork's request carries the parameters
     /// and prompt-cache identity of the request it forks.
-    llm: ProviderLlm,
+    model: ModelSlot<ProviderLlm>,
+    /// The terminal the session's agent launches forks' terminals from.
+    launcher: ForkLauncher,
+    /// The session's communication and working languages.
+    languages: aither_agent::Languages,
+}
+
+/// The terminal launcher of a session's main agent, filled when the agent's
+/// terminal is built.
+#[derive(Debug, Clone, Default)]
+pub struct ForkLauncher(Arc<OnceLock<TerminalToolFactory>>);
+
+impl ForkLauncher {
+    fn set(&self, launcher: &TerminalToolFactory) {
+        // A terminal bound later belongs to the same agent; the first
+        // launcher stays.
+        let _ = self.0.set(launcher.clone());
+    }
+}
+
+/// What a fork does with its context.
+enum ForkTask<'a> {
+    /// Answers `prompt`.
+    Answer(&'a str),
+    /// Reads the messages its next request would carry.
+    ReadContext,
+}
+
+enum ForkOutcome {
+    Answer(String),
+    Context {
+        messages: Vec<Message>,
+        cache_epoch: u32,
+    },
+}
+
+impl ForkHost {
+    /// Runs `task` on a read-only fork of `snapshot` whose terminal is
+    /// launched from `launcher`, then removes the fork's space.
+    async fn run_fork(
+        &self,
+        snapshot: &aither_agent::ForkSnapshot,
+        launcher: &TerminalToolFactory,
+        task: ForkTask<'_>,
+    ) -> Result<ForkOutcome, AgentLinkError> {
+        let terminal = launcher
+            .create(
+                SubagentGrant::new(),
+                None,
+                Some(AnyCommandGate::new(ReadOnlyFork)),
+                None,
+            )
+            .await
+            .map_err(|error| AgentLinkError::Fork(error.to_string()))?;
+        let space = terminal.working_dir().clone();
+        let mut fork = aither_agent::AgentBuilder::new(self.model.llm.clone())
+            .forked_from(snapshot, terminal)
+            .identity(AgentIdentity::Subagent(SubagentIdentity::new(
+                BTW_FORK, None,
+            )))
+            .build();
+        let outcome = match task {
+            ForkTask::Answer(prompt) => fork.query(prompt).await.map(ForkOutcome::Answer),
+            ForkTask::ReadContext => {
+                fork.snapshot_context_window()
+                    .await
+                    .map(|window| ForkOutcome::Context {
+                        messages: window.messages,
+                        cache_epoch: window.metrics.prompt_cache_epoch,
+                    })
+            }
+        };
+        drop(fork);
+        // The fork's space held nothing anyone reads again.
+        if let Err(error) = async_fs::remove_dir_all(&space).await {
+            tracing::warn!(space = %space.display(), %error, "failed to remove a btw fork's space");
+        }
+        outcome.map_err(|error| AgentLinkError::Fork(error.to_string()))
+    }
+}
+
+/// A live session agent's context for a side request, read from a fork.
+#[derive(Debug)]
+pub struct SideContext {
+    /// The messages the agent's next request would carry.
+    pub messages: Vec<Message>,
+    /// The agent's model under the prompt-cache key its requests carry.
+    pub model: ModelSlot<ProviderLlm>,
+    /// The agent's communication and working languages.
+    pub languages: aither_agent::Languages,
 }
 
 /// The fork source and model of every session agent the daemon hosts.
@@ -70,11 +159,21 @@ impl ForkHosts {
         &self,
         session_id: &str,
         source: aither_agent::ForkSource,
-        llm: ProviderLlm,
+        model: ModelSlot<ProviderLlm>,
+        launcher: ForkLauncher,
+        languages: aither_agent::Languages,
     ) -> ForkRegistration {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.hosts()
-            .insert(session_id.to_string(), ForkHost { id, source, llm });
+        self.hosts().insert(
+            session_id.to_string(),
+            ForkHost {
+                id,
+                source,
+                model,
+                launcher,
+                languages,
+            },
+        );
         ForkRegistration {
             hosts: self.clone(),
             session_id: session_id.to_string(),
@@ -210,33 +309,68 @@ impl AgentMessaging {
         .render()
         .expect("btw question template must render");
 
-        let terminal = launcher
-            .create(
-                SubagentGrant::new(),
-                None,
-                Some(AnyCommandGate::new(ReadOnlyFork)),
-                None,
-            )
-            .await
-            .map_err(|error| AgentLinkError::Fork(error.to_string()))?;
-        let space = terminal.working_dir().clone();
-        let mut fork = aither_agent::AgentBuilder::new(host.llm)
-            .forked_from(&snapshot, terminal)
-            .identity(AgentIdentity::Subagent(SubagentIdentity::new(
-                BTW_FORK, None,
-            )))
-            .build();
-        let answer = fork.query(&prompt).await;
-        drop(fork);
-        // The fork's space held nothing anyone reads again.
-        if let Err(error) = async_fs::remove_dir_all(&space).await {
-            tracing::warn!(space = %space.display(), %error, "failed to remove a btw fork's space");
-        }
+        let ForkOutcome::Answer(answer) = host
+            .run_fork(&snapshot, launcher, ForkTask::Answer(&prompt))
+            .await?
+        else {
+            unreachable!("an answering fork gives an answer");
+        };
         Ok(BtwAnswer {
             recipient: recipient.name.clone(),
             recipient_id: recipient.session_id.clone(),
-            answer: answer.map_err(|error| AgentLinkError::Fork(error.to_string()))?,
+            answer,
         })
+    }
+
+    /// The context of `session_id`'s live agent for a side request (`/btw`,
+    /// `/progress`), read from a read-only fork of the request it sent last,
+    /// so it holds what the agent's context holds now, working or idle,
+    /// without touching the agent. `None` when the session has no live
+    /// agent that has sent a request; the caller then reads the idle agent.
+    /// An idle agent with a cold prompt cache, or one about to compact, is
+    /// refused.
+    ///
+    /// # Errors
+    /// See [`AgentLinkError`].
+    pub async fn side_context(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SideContext>, AgentLinkError> {
+        let Some(host) = self.forks.get(session_id) else {
+            return Ok(None);
+        };
+        let Some(snapshot) = host.source.latest() else {
+            return Ok(None);
+        };
+        let Some(launcher) = host.launcher.0.get().cloned() else {
+            return Ok(None);
+        };
+        let name = status_name(&self.runtime_service, session_id).await?;
+        let activity = if self.runtime_service.get(session_id).await?.state.is_idle() {
+            Activity::Idle
+        } else {
+            Activity::Running
+        };
+        if self.is_cold(session_id, activity).await? {
+            return Err(AgentLinkError::ColdBtwRecipient(name));
+        }
+        if !snapshot.allows_fork() {
+            return Err(AgentLinkError::NearCompaction(name));
+        }
+        let ForkOutcome::Context {
+            messages,
+            cache_epoch,
+        } = host
+            .run_fork(&snapshot, &launcher, ForkTask::ReadContext)
+            .await?
+        else {
+            unreachable!("a context-reading fork gives its context");
+        };
+        Ok(Some(SideContext {
+            messages,
+            model: crate::agent::side_slot(&host.model, session_id, cache_epoch),
+            languages: host.languages,
+        }))
     }
 }
 
@@ -261,6 +395,7 @@ pub struct BtwCommand {
     messaging: AgentMessaging,
     session_id: String,
     languages: Option<aither_agent::LanguageGuard>,
+    fork_launcher: Option<ForkLauncher>,
 }
 
 impl BtwCommand {
@@ -271,7 +406,16 @@ impl BtwCommand {
             messaging,
             session_id,
             languages: None,
+            fork_launcher: None,
         }
+    }
+
+    /// Hand the launcher of the terminal serving this command to
+    /// `launcher`, for the forks answering the session's side requests.
+    #[must_use]
+    pub fn with_fork_launcher(mut self, launcher: ForkLauncher) -> Self {
+        self.fork_launcher = Some(launcher);
+        self
     }
 
     /// Refuse a question outside the working language `guard` enforces.
@@ -285,6 +429,9 @@ impl BtwCommand {
     /// launched from that terminal.
     #[must_use]
     pub fn for_terminal(&self, binding: &TerminalBinding) -> BtwTool {
+        if let Some(launcher) = &self.fork_launcher {
+            launcher.set(binding.launcher());
+        }
         BtwTool {
             command: self.clone(),
             launcher: binding.launcher().clone(),
@@ -317,7 +464,9 @@ impl Tool for BtwTool {
             return Err(AgentLinkError::EmptyQuestion.into());
         }
         if let Some(guard) = &self.command.languages {
-            guard.check_working(question, aither_agent::WorkingText::Internal)?;
+            guard
+                .check_working(question, aither_agent::WorkingText::Internal)
+                .map_err(crate::agent::notices::language_refused)?;
         }
         let answer = self
             .command

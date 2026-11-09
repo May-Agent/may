@@ -1,6 +1,6 @@
 # Where May's parts live
 
-Paths are relative to the May source checkout. `aither-sandbox` and `aither-agent` are the framework crates May builds on (version 0.14.1); their sources are in the cargo registry.
+Paths are relative to the May source checkout. `aither-sandbox` and `aither-agent` are the framework crates May builds on (version 0.25.0); their sources are in the cargo registry.
 
 ## Daemon and clients
 
@@ -23,7 +23,8 @@ Paths are relative to the May source checkout. `aither-sandbox` and `aither-agen
 ## Terminal and sandbox
 
 - `aither-sandbox/src/terminal.rs`: `TerminalArgs`, `DEFAULT_FOREGROUND_WAIT` (10 s), `DEFAULT_TIMEOUT_CAP`, `DEFAULT_LONG_JOB_ALERT_AFTER` (40 min), session environment (`HOME`, `TMPDIR`).
-- `aither-sandbox/src/stdin_watch.rs` (stdin-blocked detection), `poll_guard.rs` (refused `sleep` and unchanged re-reads), `output.rs` (`INLINE_OUTPUT_LIMIT` 16,000 bytes), `monitor.rs`, `builtin/terminal.rs` (`terminal_read`, `terminal_input`, `terminal_kill`), `command.rs` (IPC command bridge and argument parsing).
+- `src/command_policy/`: the scripts refused before they run (kills by name, unparsable shell, a foreground `sleep`, unchanged re-reads, host `grep`/`awk`/`find` and unsupported `sed`); `src/tasks_md/`: the `tasks.md` format, its schema, stop rule and line limit; `src/agent/notices.rs`: May's wording of aither's alerts.
+- `aither-sandbox/src/stdin_watch.rs` (stdin-blocked detection), `output.rs` (`INLINE_OUTPUT_LIMIT` 16,000 bytes), `monitor.rs`, `builtin/terminal.rs` (`terminal_read`, `terminal_input`, `terminal_kill`), `command.rs` (IPC command bridge and argument parsing).
 - `aither-agent/templates/job_alert.txt`: alert wording, including the working-directory reset reasons.
 - `src/agent/permission.rs`: approval for `unsafe` mode (30 min main, 3 min subagent); `src/terminal_permission_handler.rs`: network policy and audit log; `src/agent/runtime_context.rs` and `templates/prompt/`: the session system prompt, one template per section (`tag::layout` orders them), external content last.
 
@@ -44,6 +45,7 @@ Paths are relative to the May source checkout. `aither-sandbox` and `aither-agen
 - `src/terminal_commands.rs`: `PrContext` construction and `configure_terminal_bound_tool("pr", …)`.
 - `src/workspace.rs`: `ProjectConfig.checks` and `ProjectPr` (`backend`, `screen`, `auto_merge`, `require_review`).
 - `src/db/pr.rs` and `prs` / `pr_events` in `src/db/sql/chat_schema.sql`: PR rows and the event trail.
+- `src/ci/`: CI durations. `record.rs` (`Recorder`: GitHub jobs and steps through `github.rs`, baselines, local checks, queue wait, the finding), `timing.rs` (median, p90, trend, the two thresholds), `logs.rs` (cargo test, nextest and bun test log parsers), `report.rs` (the alert, warning and `ci` templates in `templates/ci_*.txt`). `pr/merge_watch.rs` `Observing` fires the recorder when a PR's checks finish. Tables `ci_jobs`, `ci_steps`, `ci_tests`, `ci_baselines`, `ci_pr_runs`, `ci_findings` in `src/db/ci.rs`. `src/agent/ci_alert.rs` hands a finding to the agent once; `src/agent/ci_tool.rs` is the `ci` command; the warning rides `/api/events` as `session_warning` (`daemon/events.rs`). The `ci-optimise` skill is in `skills/ci-optimise/`.
 - `src/agent/permission.rs`: `for_subagent` and `SUBAGENT_APPROVAL_TIMEOUT` (no parent-approval step). `aither-agent/src/specialized/task.rs`: `worktrees` and `commit_worktrees` grants.
 
 ## Search

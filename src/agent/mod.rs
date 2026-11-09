@@ -7,6 +7,8 @@ mod agents_md;
 pub(crate) mod ask_user_tool;
 pub(crate) mod browser_tool;
 pub mod cache_miss;
+pub(crate) mod ci_alert;
+pub(crate) mod ci_tool;
 #[cfg(test)]
 mod compact_tool_tests;
 #[cfg(test)]
@@ -26,8 +28,11 @@ pub(crate) mod imagine;
 pub(crate) mod issue_tool;
 #[cfg(test)]
 mod live_content_tests;
+mod live_limits;
 mod live_settings;
 mod may;
+/// The text May's agents read for aither's alerts, notices and refusals.
+pub mod notices;
 #[cfg(test)]
 mod open_questions_tests;
 pub(crate) mod permission;
@@ -68,7 +73,9 @@ pub use context_dump::ContextDump;
 pub use context_report::{ContextCategory, ContextCategoryRow, ContextReport};
 pub use environment::{ResolveAgentEnvironmentError, resolve_agent_environment_for_session};
 pub use imagine::ImageGeneratorConfig;
+pub use live_limits::LiveLimits;
 pub use live_settings::AgentLiveSettings;
+pub(crate) use may::side_slot;
 pub use may::{
     AgentEnvironment, MayAgent, MayAgentConfig, MayAgentError, MayAgentSessionInput,
     generate_session_title,

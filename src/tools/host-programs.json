@@ -14,7 +14,8 @@
         "format": "tar_xz",
         "executable": "repo-search-aarch64-apple-darwin/search"
       },
-      "executable_sha256": "c4aed794ad9fc19a23b8c80ac767faf11b577a6afdb53d00b9bc1bb69613cfc4"
+      "executable_sha256": "c4aed794ad9fc19a23b8c80ac767faf11b577a6afdb53d00b9bc1bb69613cfc4",
+      "size": 5794384
     },
     {
       "tool": "repo_search",
@@ -29,7 +30,8 @@
         "format": "tar_xz",
         "executable": "repo-search-aarch64-unknown-linux-gnu/search"
       },
-      "executable_sha256": "ad46d20332ddeb4eb69fc62ca3ef43b6f76a821c16cdb37c85f16d49cd6d5c27"
+      "executable_sha256": "ad46d20332ddeb4eb69fc62ca3ef43b6f76a821c16cdb37c85f16d49cd6d5c27",
+      "size": 12855076
     },
     {
       "tool": "repo_search",
@@ -44,7 +46,8 @@
         "format": "tar_xz",
         "executable": "repo-search-x86_64-unknown-linux-gnu/search"
       },
-      "executable_sha256": "031f400d85a1f2f34c242a92f8e388e1e55fecb4aebb93070b3cc05799642e00"
+      "executable_sha256": "031f400d85a1f2f34c242a92f8e388e1e55fecb4aebb93070b3cc05799642e00",
+      "size": 14700200
     }
   ]
 }

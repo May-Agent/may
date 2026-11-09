@@ -259,6 +259,8 @@ pub struct MayAgentConfig {
     /// The rules this session imports, for a session `/import-claude` or
     /// `/import-codex` opened.
     pub rules_import: Option<crate::rules_import::RulesImport>,
+    /// The daemon's live limits, shared by every agent it builds.
+    pub limits: super::LiveLimits,
 }
 
 /// Session-scoped inputs for [`MayAgent::from_config_with_model_and_permissions`].
@@ -336,6 +338,8 @@ pub struct MayAgentSessionInput<'a> {
     /// The rules this session imports, for a session `/import-claude` or
     /// `/import-codex` opened.
     pub rules_import: Option<crate::rules_import::RulesImport>,
+    /// The daemon's live limits, shared by every agent it builds.
+    pub limits: super::LiveLimits,
     /// The model's context window as the daemon resolved it (provider
     /// report, then the model table); the agent compacts against it.
     pub model_context_window: Option<u32>,
@@ -383,6 +387,21 @@ pub struct MayAgent {
 /// from.
 fn session_prompt_cache(session_id: &str, epoch: u32) -> PromptCache {
     PromptCache::new(session_id).with_epoch(epoch)
+}
+
+/// `model` for a side request of `session_id`'s agent at prompt-cache
+/// `epoch`: its requests carry the key the agent's own take, so the provider
+/// places both on the same cache shard.
+pub fn side_slot(
+    model: &ModelSlot<ProviderLlm>,
+    session_id: &str,
+    epoch: u32,
+) -> ModelSlot<ProviderLlm> {
+    let mut slot = model.clone();
+    slot.parameters = slot
+        .parameters
+        .prompt_cache_key(session_prompt_cache(session_id, epoch).key());
+    slot
 }
 
 impl std::fmt::Debug for MayAgent {
@@ -725,6 +744,7 @@ impl MayAgent {
         let language_guard = aither_agent::LanguageGuard::new(config.languages);
         let mut builder = TerminalAgentBuilder::new(llm, terminal_tool)
             .system_layout(tag::layout())
+            .notices(super::notices::may_notices())
             .languages(language_guard.clone())
             .hook(context_snapshot_hook)
             .hook(pending_steer_hook)
@@ -746,6 +766,10 @@ impl MayAgent {
                     runtime.clone(),
                     config.session_id.as_str(),
                 ))
+                .context_source(super::ci_alert::CiAlertContext::new(
+                    runtime.db(),
+                    config.session_id.as_str(),
+                ))
                 .blocker_resolver(super::ask_user_tool::AskUserBlockerResolver::new(
                     runtime,
                     config.session_id.as_str(),
@@ -762,7 +786,7 @@ impl MayAgent {
         // committed between agent builds still reach `tasks.md`.
         let task_events = hook_runtime
             .as_ref()
-            .map_or_else(aither_agent::TaskEvents::new, |runtime| {
+            .map_or_else(aither_agent::WorkEvents::new, |runtime| {
                 runtime.task_events(config.session_id.as_str())
             });
         let shared_terminal_commands = Box::pin(register_shared_terminal_commands(
@@ -800,6 +824,7 @@ impl MayAgent {
                 languages: Some(language_guard.clone()),
                 acp,
                 git: crate::host_git::HostGit::inherit(),
+                tasks_line_limit: config.limits.tasks_lines(),
                 #[cfg(target_os = "macos")]
                 computer: config.computer.clone(),
                 rules_import: config.rules_import.clone(),
@@ -812,8 +837,15 @@ impl MayAgent {
         builder = builder
             .fork_source(shared_terminal_commands.fork_source.clone())
             // `tasks.md` follows what the commands above record, and reads
-            // the state of the issues and PRs its rows name.
-            .task_events(task_events)
+            // the state of the issues and PRs its rows name. Its subagents
+            // keep their own under the same schema and stop rule.
+            .working_document(crate::tasks_md::schema::document_spec(
+                &config.limits.tasks_lines(),
+            ))
+            .stop_hook(aither_agent::AnyStopHook::new(
+                crate::tasks_md::schema::TasksStopHook,
+            ))
+            .work_events(task_events)
             .work_tracker(super::work_tracker::MayWorkTracker::new(
                 issue_store.clone(),
                 config.db.clone(),
@@ -827,7 +859,9 @@ impl MayAgent {
             messaging.forks.register(
                 config.session_id.as_str(),
                 shared_terminal_commands.fork_source.clone(),
-                btw_llm.llm.clone(),
+                btw_llm.clone(),
+                shared_terminal_commands.fork_launcher.clone(),
+                config.languages,
             )
         });
         if is_container {
@@ -855,6 +889,7 @@ impl MayAgent {
             );
         builder = builder
             .host_load(config.host_load.clone())
+            .disk_thresholds(config.limits.disk())
             // Shell runtime depends on the home environment. SSH remains a
             // per-command routing capability on top of it.
             .shell_runtime_availability(tool_environment_key.availability())
@@ -970,6 +1005,7 @@ impl MayAgent {
             background_jobs,
             connectivity,
             rules_import,
+            limits,
             model_context_window,
         } = input;
         let selector = super::provider::parse_model_selector(model)?;
@@ -1076,6 +1112,7 @@ impl MayAgent {
             prompt_cache_epoch,
             db,
             rules_import,
+            limits,
         })
     }
 
@@ -1302,11 +1339,7 @@ impl MayAgent {
             .await?
             .metrics
             .prompt_cache_epoch;
-        let mut slot = self.btw_llm.clone();
-        slot.parameters = slot
-            .parameters
-            .prompt_cache_key(session_prompt_cache(self.session_id.as_str(), epoch).key());
-        Ok(slot)
+        Ok(side_slot(&self.btw_llm, self.session_id.as_str(), epoch))
     }
 
     /// The language guard the agent was built with; its commands and the
@@ -1347,6 +1380,19 @@ impl MayAgent {
     #[must_use]
     pub fn cache_warmth(&self) -> aither_agent::CacheWarmth {
         self.inner.cache_warmth()
+    }
+
+    /// The agent's model, which counts streamed text in tokens
+    /// ([`LanguageModel::count_text`]) while a run holds the agent.
+    #[must_use]
+    pub fn counting_model(&self) -> ProviderLlm {
+        self.btw_llm.llm.clone()
+    }
+
+    /// Marks the agent interrupted because the user stopped its run: no
+    /// background completion starts a run until the user's next input.
+    pub const fn interrupt(&mut self) {
+        self.inner.interrupt();
     }
 
     /// Stop every terminal task that is still running for this agent.
@@ -1477,10 +1523,7 @@ pub async fn generate_session_title(
 /// Rendered markdown of the context's active handoff, if any — the text
 /// `AGENTS.md` links are extracted from.
 fn handoff_markdown(context: &aither_agent::Context) -> Option<String> {
-    match context.handoff()? {
-        aither_agent::Handoff::Text(text) => Some(text.clone()),
-        aither_agent::Handoff::Document(document) => Some(document.render_markdown()),
-    }
+    context.handoff().map(|handoff| handoff.text().to_string())
 }
 
 fn truncate_at_char_boundary(input: &str, max_chars: usize) -> &str {

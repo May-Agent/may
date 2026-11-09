@@ -397,6 +397,7 @@ impl PermissionHandler for SchedulerPermissionHandler {
         &self,
         _mode: TerminalMode,
         _script: &str,
+        _language: aither_sandbox::ScriptLanguage,
     ) -> impl Future<Output = Result<bool, PermissionError>> + Send {
         std::future::ready(Ok(true))
     }
@@ -1405,6 +1406,10 @@ impl TaskRuntime {
         )
         .await?;
         let mut commands = ToolRegistryBuilder::new();
+        crate::command_policy::register(
+            &mut commands,
+            crate::command_policy::runs_managed_bash(shell_sessions.availability().container),
+        );
         if let Some(scope) = wake {
             commands.configure_tool(crate::task_wake::WakeTool::new(
                 self.session_prompts.clone(),
@@ -1417,7 +1422,7 @@ impl TaskRuntime {
                     .then(|| crate::container::lifecycle::workspace_mount(workspace.clone())),
             ));
         }
-        let registry = Arc::new(commands.build(workspace.join("outputs")));
+        let registry = Arc::new(commands.build(terminal_tool.output_store().clone()));
         let terminal_tool = match &self.connectivity {
             Some(connectivity) => terminal_tool.with_connectivity(connectivity),
             None => terminal_tool,
@@ -1727,6 +1732,7 @@ async fn run_terminal_command(
         .run_background(TerminalArgs {
             description: "run the scheduled task script".to_string(),
             script,
+            language: aither_sandbox::ScriptLanguage::Shell,
             mode,
             ssh_server_id,
             expect: OutputFormat::Text,

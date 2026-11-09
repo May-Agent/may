@@ -423,6 +423,8 @@ pub struct DaemonState {
     pub(crate) tool_dispatchers: UiToolDispatchers,
     pub(crate) fetched_models_cache: RefreshableCache<Vec<crate::models::FetchedModel>>,
     pub(crate) config: Arc<ArcSwap<MayConfig>>,
+    /// The limits every agent is built with, moved by each config change.
+    pub(crate) live_limits: crate::agent::LiveLimits,
     pub(crate) ui_event_bus: UiEventBus,
     pub(crate) container_prepare: ContainerPrepareTracker,
     pub(crate) container_manager: Option<Arc<crate::container::lifecycle::ContainerManager>>,
@@ -485,6 +487,16 @@ pub struct DaemonState {
     /// agent and terminal the daemon builds watches, and the turn runner
     /// waits on after a network failure.
     pub(crate) connectivity: aither_connectivity::Connectivity,
+    /// Epoch of the session-event cursors, fixed at daemon start (ns): a
+    /// cursor another daemon minted fails its epoch check and resyncs.
+    pub(crate) session_events_epoch: u64,
+    /// Producers' side of the session-change channel; the dispatcher on the
+    /// receiver recomputes and diffs each piece.
+    pub(crate) session_change_tx: super::session_events::SessionChangeSender,
+    pub(crate) session_change_rx: super::session_events::SessionChangeReceiver,
+    /// The dispatcher spawns once, when the daemon starts or the first
+    /// session stream attaches.
+    pub(crate) session_publisher_once: std::sync::Once,
 }
 
 impl DaemonState {
@@ -561,6 +573,33 @@ impl DaemonState {
 
     pub(crate) fn browser_lifecycle_subscribe(&self) -> broadcast::Receiver<BrowserLifecycleEvent> {
         self.browser_lifecycle_tx.subscribe()
+    }
+
+    /// Queues `kind` for the session's diff publisher, which recomputes
+    /// the piece and emits `*.upserted` / `*.removed` / `*.changed` frames
+    /// on `/api/sessions/{id}/events` for the real differences.
+    pub(crate) fn publish_session_change(
+        &self,
+        session_id: &str,
+        kind: super::session_events::SessionChange,
+    ) {
+        super::session_events::notify_change(&self.session_change_tx, session_id, kind);
+    }
+
+    /// Starts the session-change dispatcher when it has not started yet.
+    pub(crate) fn ensure_session_publisher(self: &Arc<Self>) {
+        self.session_publisher_once.call_once(|| {
+            super::session_events::spawn(self.clone(), self.session_change_rx.clone());
+        });
+    }
+
+    /// The cursor `GET /api/sessions/{id}` reports: epoch plus the index a
+    /// subscriber naming it as `after` continues from.
+    pub(crate) fn session_cursor(&self, session_id: &str) -> String {
+        super::session_events::format_cursor(
+            self.session_events_epoch,
+            self.turn_hub.cursor_index(session_id),
+        )
     }
 }
 
@@ -666,13 +705,6 @@ pub enum AskUserRespondError {
 pub struct UiQuestionAnswer {
     pub(crate) section: String,
     pub(crate) answer: UiAnswerInput,
-}
-
-#[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct AskUserRespondRequest {
-    pub(crate) id: String,
-    pub(crate) answers: Vec<UiQuestionAnswer>,
 }
 
 /// What resolving a question did.
@@ -1285,6 +1317,8 @@ impl DaemonState {
     ) -> anyhow::Result<Self> {
         let db = crate::db::ChatDb::open(&may_dir.join("history.db")).await?;
         let ui_event_bus = crate::ui_event_bus::UiEventBus::new();
+        let (session_change_tx, session_change_rx) = async_channel::unbounded();
+        ui_event_bus.set_session_changes(session_change_tx.clone());
         let lease_handle = tokio::runtime::Handle::current();
         let runtime_service = std::sync::Arc::new(
             crate::session::SessionRuntimeService::new(db.clone(), ui_event_bus.clone())
@@ -1317,6 +1351,7 @@ impl DaemonState {
             .await?
             .with_secret_store(SecretStore::in_memory(may_dir)),
         );
+        let live_limits = crate::agent::LiveLimits::of(&config);
         let config = std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(config));
         Ok(Self {
             acp_host: std::sync::Arc::new(crate::agent::acp_subagent::AcpHosts::new(
@@ -1345,6 +1380,7 @@ impl DaemonState {
             tool_dispatchers,
             fetched_models_cache: RefreshableCache::new(Duration::from_secs(20)),
             config,
+            live_limits,
             ui_event_bus: ui_event_bus.clone(),
             container_prepare: ContainerPrepareTracker::new(ui_event_bus.clone()),
             container_manager: None,
@@ -1388,6 +1424,14 @@ impl DaemonState {
             session_background: super::chat::SessionBackgrounds::default(),
             tunnels: std::sync::Arc::new(super::tunnel::TunnelRegistry::new()),
             connectivity,
+            session_events_epoch: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |duration| {
+                    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+                }),
+            session_change_tx,
+            session_change_rx,
+            session_publisher_once: std::sync::Once::new(),
         })
     }
 }

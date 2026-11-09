@@ -1,0 +1,31 @@
+2026-11-06T10:14:03.1234567Z     Blocking waiting for file lock on package cache
+2026-11-06T10:14:03.1234567Z     Blocking waiting for file lock on package cache
+2026-11-06T10:14:03.1234567Z     Blocking waiting for file lock on package cache
+2026-11-06T10:14:03.1234567Z     Blocking waiting for file lock on package cache
+2026-11-06T10:14:03.1234567Z     Blocking waiting for file lock on package cache
+2026-11-06T10:14:03.1234567Z    Compiling sample v0.1.0 (/private/tmp/cifix/rs)
+2026-11-06T10:14:03.1234567Z     Finished `test` profile [unoptimized + debuginfo] target(s) in 0.78s
+2026-11-06T10:14:03.1234567Z      Running unittests src/lib.rs (/tmp/cifix/rs/target/debug/deps/sample-314ae4d95fb45ff7)
+2026-11-06T10:14:03.1234567Z 
+2026-11-06T10:14:03.1234567Z running 3 tests
+2026-11-06T10:14:03.1234567Z test tests::fast_parse ... ok
+2026-11-06T10:14:03.1234567Z test tests::medium_render ... ok
+2026-11-06T10:14:03.1234567Z test tests::slow_index_rebuild has been running for over 60 seconds
+2026-11-06T10:14:03.1234567Z test tests::slow_index_rebuild ... ok
+2026-11-06T10:14:03.1234567Z 
+2026-11-06T10:14:03.1234567Z test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 62.00s
+2026-11-06T10:14:03.1234567Z 
+2026-11-06T10:14:03.1234567Z      Running tests/integration.rs (/tmp/cifix/rs/target/debug/deps/integration-0f23523614509c6b)
+2026-11-06T10:14:03.1234567Z 
+2026-11-06T10:14:03.1234567Z running 2 tests
+2026-11-06T10:14:03.1234567Z test roundtrip ... ok
+2026-11-06T10:14:03.1234567Z test cold_start ... ok
+2026-11-06T10:14:03.1234567Z 
+2026-11-06T10:14:03.1234567Z test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.10s
+2026-11-06T10:14:03.1234567Z 
+2026-11-06T10:14:03.1234567Z    Doc-tests sample
+2026-11-06T10:14:03.1234567Z 
+2026-11-06T10:14:03.1234567Z running 0 tests
+2026-11-06T10:14:03.1234567Z 
+2026-11-06T10:14:03.1234567Z test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+2026-11-06T10:14:03.1234567Z 

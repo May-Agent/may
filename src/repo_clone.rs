@@ -812,6 +812,7 @@ pub(crate) mod test_sandbox {
             &self,
             mode: TerminalMode,
             _script: &str,
+            _language: aither_sandbox::ScriptLanguage,
         ) -> impl Future<Output = Result<bool, PermissionError>> + Send {
             std::future::ready(Ok(matches!(mode, TerminalMode::Sandboxed)))
         }
@@ -870,10 +871,9 @@ pub(crate) mod test_sandbox {
                 .expect("the terminal starts")
                 .initialize_tools(&distribution, &cache)
                 .await
-                .expect("the baseline tools prepare")
-                .with_registry(std::sync::Arc::new(
-                    builder.build(session_root.join("outputs")),
-                ));
+                .expect("the baseline tools prepare");
+            let registry = builder.build(terminal.output_store().clone());
+            let terminal = terminal.with_registry(std::sync::Arc::new(registry));
             Self { terminal }
         }
 

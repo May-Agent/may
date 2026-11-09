@@ -1,5 +1,6 @@
-import type { ApiSession, ApiMessage } from '../types';
-import { apiDelete, apiGet, apiPost } from './client';
+import type { TranscriptPage } from '../transcript';
+import type { ApiSession } from '../types';
+import { apiDelete, apiGet, apiPatch, apiPost } from './client';
 
 export interface SessionListResponse {
   items: Array<{
@@ -15,16 +16,12 @@ export function listSessions(): Promise<SessionListResponse> {
   return apiGet<SessionListResponse>('/sessions');
 }
 
+export function getTranscript(id: string): Promise<TranscriptPage> {
+  return apiGet<TranscriptPage>(`/sessions/${id}/transcript`);
+}
+
 export function getSession(id: string): Promise<ApiSession> {
   return apiGet<ApiSession>(`/sessions/${encodeURIComponent(id)}`);
-}
-
-export interface SessionMessagesResponse {
-  items: ApiMessage[];
-}
-
-export function getSessionMessages(id: string): Promise<SessionMessagesResponse> {
-  return apiGet<SessionMessagesResponse>(`/sessions/${encodeURIComponent(id)}/messages`);
 }
 
 export function createSession(payload?: {
@@ -53,7 +50,7 @@ export async function updateSession(
   patch: UpdateSessionPatch,
 ): Promise<ApiSession> {
   const res = await fetch(`/api/sessions/${encodeURIComponent(id)}`, {
-    method: 'PUT',
+    method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(patch),
   });
@@ -66,21 +63,21 @@ export function deleteSession(id: string): Promise<void> {
 }
 
 export function archiveSession(id: string): Promise<void> {
-  return apiPost<void>(`/sessions/${encodeURIComponent(id)}/archive`, {});
+  return apiPatch<void>(`/sessions/${encodeURIComponent(id)}`, { archived: true });
 }
 
 export function unarchiveSession(id: string): Promise<void> {
-  return apiPost<void>(`/sessions/${encodeURIComponent(id)}/unarchive`, {});
+  return apiPatch<void>(`/sessions/${encodeURIComponent(id)}`, { archived: false });
 }
 
 export function pinSession(id: string): Promise<void> {
-  return apiPost<void>(`/sessions/${encodeURIComponent(id)}/pin`, {});
+  return apiPatch<void>(`/sessions/${encodeURIComponent(id)}`, { pinned: true });
 }
 
 export function unpinSession(id: string): Promise<void> {
-  return apiPost<void>(`/sessions/${encodeURIComponent(id)}/unpin`, {});
+  return apiPatch<void>(`/sessions/${encodeURIComponent(id)}`, { pinned: false });
 }
 
 export function moveSessionToFolder(id: string, folderId: string | null): Promise<void> {
-  return apiPost<void>(`/sessions/${encodeURIComponent(id)}/move-to-folder`, { folderId });
+  return apiPatch<void>(`/sessions/${encodeURIComponent(id)}`, { folderId });
 }

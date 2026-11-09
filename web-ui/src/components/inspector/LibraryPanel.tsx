@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Loader2 } from 'lucide-react';
-import { openUiEventStream } from '@/lib/api/events';
+import { listArtifacts } from '@/lib/api/artifacts';
+import { applyArtifactDelta, watchSessionEvents } from '@/lib/api/sessionEvents';
 import { useTranslation } from '@/lib/i18n';
 import type { ArtifactEntry } from '@/lib/types';
 import { ArtifactsDrawer } from '@/components/chat/ArtifactsDrawer';
@@ -14,24 +15,24 @@ export function LibraryPanel({ sessionId }: { sessionId: string }) {
 
   useEffect(() => {
     let cancelled = false;
-    const controller = new AbortController();
-    (async () => {
-      try {
-        const handle = await openUiEventStream(['session_artifacts'], {
-          sessionId,
-          abort: controller.signal,
-        });
-        for await (const evt of handle.events) {
-          if (cancelled) break;
-          if (evt.kind === 'session_artifacts') setEntries(evt.payload.artifacts);
-        }
-      } catch {
+    listArtifacts(sessionId)
+      .then((res) => {
+        if (!cancelled) setEntries(res.artifacts);
+      })
+      .catch(() => {
         if (!cancelled) setEntries([]);
-      }
-    })();
+      });
+    const unwatch = watchSessionEvents(sessionId, undefined, (kind, data) => {
+      if (cancelled) return;
+      setEntries((prev) => {
+        if (prev === null) return prev;
+        const next = [...prev];
+        return applyArtifactDelta(next, kind, data) ? next : prev;
+      });
+    });
     return () => {
       cancelled = true;
-      controller.abort();
+      unwatch();
     };
   }, [sessionId]);
 

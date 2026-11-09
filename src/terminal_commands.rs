@@ -22,7 +22,6 @@ use crate::agent::session_tool::SessionTool;
 use crate::agent::subagent_tracker::{SubagentTracker, TrackedSubagentTool, UsageObservedModel};
 use crate::agent::task_tool::{TaskBroker, TaskRuntimeKind, TaskTool};
 use crate::agent::{ImageGeneratorConfig, ModelSlot};
-use crate::bundle::Bundle;
 use crate::issue::provenance::IssueProvenance;
 use crate::issue::search::IssueSearch;
 use crate::mcp::load_active_mcp_connections;
@@ -94,7 +93,7 @@ pub struct SharedTerminalCommandConfig<LLM> {
     pub issue_store: crate::issue::ResolvedIssueStore,
     /// The main agent's `tasks.md` inbox: `issue`, `pr`, `ask_user` and
     /// `subagent` record the state changes its rows track on it.
-    pub task_events: aither_agent::TaskEvents,
+    pub task_events: aither_agent::WorkEvents,
     /// Asks the user before an issue, PR or comment is published, when the
     /// session can ask; `None` publishes without asking.
     pub publish_gate: Option<crate::agent::publish_approval::PublishGate>,
@@ -113,6 +112,8 @@ pub struct SharedTerminalCommandConfig<LLM> {
     /// and key commits in the sandbox are signed with, and runs every host
     /// git `pr` needs.
     pub git: crate::host_git::HostGit,
+    /// Lines a `tasks.md` may hold, the main agent's and every subagent's.
+    pub tasks_line_limit: crate::tasks_md::schema::LineLimit,
     /// Daemon handles for the `computer` command — present when the
     /// session may own a virtual desktop (macOS, local environment).
     #[cfg(target_os = "macos")]
@@ -132,6 +133,9 @@ pub struct SharedTerminalCommands {
     /// Where the main agent publishes its requests for the `subagent` command's
     /// `fork` kind; the main agent's builder must be given it.
     pub fork_source: aither_agent::ForkSource,
+    /// Receives the main agent's terminal launcher, which the read-only
+    /// forks answering side requests run their terminal on.
+    pub fork_launcher: crate::agent_link::ForkLauncher,
 }
 
 /// Why the shared terminal commands could not be registered.
@@ -149,7 +153,8 @@ pub enum TerminalCommandsError {
     Signing(#[from] crate::commit_signing::SigningError),
 }
 
-/// Register every shared IPC command on the terminal tool's command registry.
+/// Register every shared IPC command on the terminal tool's command registry,
+/// and May's command policies on every script its terminals run.
 ///
 /// # Errors
 /// Returns the registry error when a command fails to register.
@@ -165,6 +170,13 @@ where
     LLM: LanguageModel + Clone + 'static,
 {
     let mut descriptions = Vec::new();
+    crate::command_policy::register(
+        builder,
+        crate::command_policy::runs_managed_bash(matches!(
+            config.task_runtime,
+            TaskRuntimeKind::Container
+        )),
+    );
 
     if !config.request_parameters.hosted_web_fetch() {
         register_tool_with_description(builder, &mut descriptions, WebFetchTool::new());
@@ -239,7 +251,8 @@ where
         issue_tool = issue_tool.with_languages(guard.clone());
     }
     if let Some(runtime) = config.ask_user.clone() {
-        issue_tool = issue_tool.with_changes(IssueChangeNotifier::new(runtime));
+        issue_tool =
+            issue_tool.with_changes(IssueChangeNotifier::new(runtime, config.session_id.clone()));
     }
     let mut subagent_issue_tool = SubagentIssueTool::new(config.issue_store, provenance)
         .with_search(issue_search)
@@ -300,7 +313,18 @@ where
         github_api: crate::pr::PrContext::default_github_api(),
         task_events: Some(config.task_events.clone()),
         publish: config.publish_gate.clone(),
+        ci: config.ask_user.as_ref().map(|runtime| crate::pr::CiWatch {
+            may_dir: config.may_dir.clone(),
+            ui_events: runtime.ui_events(),
+        }),
     };
+    let ci_tool = crate::agent::ci_tool::CiTool::new(
+        config.db.clone(),
+        config.session_id.clone(),
+        config.may_dir.clone(),
+    );
+    describe_tool(&mut descriptions, &ci_tool);
+    builder.configure_tool(ci_tool);
     let mut pr_command = PrCommand::new(pr_context);
     if let Some(guard) = &config.languages {
         pr_command = pr_command.with_languages(guard.clone());
@@ -363,9 +387,11 @@ where
         );
     }
 
+    let fork_launcher = crate::agent_link::ForkLauncher::default();
     if let Some(messaging) = config.agent_messaging {
         let mut btw =
-            crate::agent_link::BtwCommand::new(messaging.clone(), config.session_id.clone());
+            crate::agent_link::BtwCommand::new(messaging.clone(), config.session_id.clone())
+                .with_fork_launcher(fork_launcher.clone());
         if let Some(guard) = &config.languages {
             btw = btw.with_languages(guard.clone());
         }
@@ -449,20 +475,29 @@ where
 
     // A subagent runs on the model of its definition's tier: the models `ask`
     // offers.
-    let mut subagent_tool = SubagentTool::new(
-        UsageObservedModel::new(subagent_flagship),
-        Bundle::subagents_dir(&config.may_dir),
-    )
-    .with_request_parameters(config.request_parameters.clone())
-    .with_balanced_model(UsageObservedModel::new(balanced.llm), balanced.parameters)
-    .with_fast_model(UsageObservedModel::new(fast_llm), fast.parameters)
-    .with_runs(config.subagent_runs)
-    .with_task_events(config.task_events.clone())
-    .with_base_dir(&config.sandbox_dir)
-    .with_file_mounts([
-        SubagentFileMount::new(PathBuf::from("."), config.sandbox_dir.clone()),
-        SubagentFileMount::new(PathBuf::from("skills"), config.sandbox_dir.join("skills")),
-    ]);
+    let mut subagent_tool = SubagentTool::new(UsageObservedModel::new(subagent_flagship))
+        .with_definitions(crate::bundle::Bundle::subagent_definitions())
+        .with_request_parameters(config.request_parameters.clone())
+        .with_balanced_model(UsageObservedModel::new(balanced.llm), balanced.parameters)
+        .with_fast_model(UsageObservedModel::new(fast_llm), fast.parameters)
+        .with_runs(config.subagent_runs)
+        .with_work_events(config.task_events.clone())
+        // Each subagent keeps its own `tasks.md` under the main agent's schema
+        // and stop rule, and reads May's wording.
+        .with_working_document(
+            Some(crate::tasks_md::schema::document_spec(
+                &config.tasks_line_limit,
+            )),
+            Some(aither_agent::AnyStopHook::new(
+                crate::tasks_md::schema::TasksStopHook,
+            )),
+        )
+        .with_notices(crate::agent::notices::may_notices())
+        .with_base_dir(&config.sandbox_dir)
+        .with_file_mounts([
+            SubagentFileMount::new(PathBuf::from("."), config.sandbox_dir.clone()),
+            SubagentFileMount::new(PathBuf::from("skills"), config.sandbox_dir.join("skills")),
+        ]);
     if let Some(guard) = &config.languages {
         subagent_tool = subagent_tool.with_languages(guard.clone());
     }
@@ -503,6 +538,7 @@ where
     Ok(SharedTerminalCommands {
         descriptions,
         fork_source,
+        fork_launcher,
     })
 }
 
@@ -693,20 +729,22 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
-                task_events: aither_agent::TaskEvents::new(),
+                task_events: aither_agent::WorkEvents::new(),
                 publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
                 languages: None,
                 acp: None,
                 git: crate::host_git::HostGit::from_file("/dev/null"),
+                tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
             },
         )
         .await
         .expect("commands should register")
         .descriptions;
 
-        let registry = builder.build(session_dir.join("outputs"));
+        let registry = builder
+            .build(crate::test_support::test_output_store(session_dir.join("outputs")).await);
         assert!(registry.is_tool_configured("ask_user"));
         assert!(registry.is_tool_configured("imagine"));
         assert!(
@@ -754,20 +792,22 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
-                task_events: aither_agent::TaskEvents::new(),
+                task_events: aither_agent::WorkEvents::new(),
                 publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
                 languages: None,
                 acp: None,
                 git: crate::host_git::HostGit::from_file("/dev/null"),
+                tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
             },
         )
         .await
         .expect("commands should register")
         .descriptions;
 
-        let registry = builder.build(session_dir.join("outputs"));
+        let registry = builder
+            .build(crate::test_support::test_output_store(session_dir.join("outputs")).await);
         assert!(!registry.is_tool_configured("ask_user"));
         assert!(!registry.is_tool_configured("imagine"));
         assert!(
@@ -815,20 +855,22 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
-                task_events: aither_agent::TaskEvents::new(),
+                task_events: aither_agent::WorkEvents::new(),
                 publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
                 languages: None,
                 acp: None,
                 git: crate::host_git::HostGit::from_file("/dev/null"),
+                tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
             },
         )
         .await
         .expect("commands should register")
         .descriptions;
 
-        let registry = builder.build(session_dir.join("outputs"));
+        let registry = builder
+            .build(crate::test_support::test_output_store(session_dir.join("outputs")).await);
         assert!(!registry.is_tool_configured("websearch"));
         assert!(!descriptions.iter().any(|(name, _)| name == "websearch"));
         assert!(registry.is_tool_configured("webfetch"));
@@ -870,20 +912,22 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters,
                 issue_store: test_issue_store(temp.path()).await,
-                task_events: aither_agent::TaskEvents::new(),
+                task_events: aither_agent::WorkEvents::new(),
                 publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
                 languages: None,
                 acp: None,
                 git: crate::host_git::HostGit::from_file("/dev/null"),
+                tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
             },
         )
         .await
         .expect("commands should register")
         .descriptions;
 
-        let registry = builder.build(session_dir.join("outputs"));
+        let registry = builder
+            .build(crate::test_support::test_output_store(session_dir.join("outputs")).await);
         assert!(!registry.is_tool_configured("webfetch"));
         assert!(!descriptions.iter().any(|(name, _)| name == "webfetch"));
     }
@@ -921,18 +965,20 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
-                task_events: aither_agent::TaskEvents::new(),
+                task_events: aither_agent::WorkEvents::new(),
                 publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
                 languages: None,
                 acp: None,
                 git: crate::host_git::HostGit::from_file("/dev/null"),
+                tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
             },
         )
         .await
         .expect("commands should register");
-        let main = builder.build(session_dir.join("outputs"));
+        let main = builder
+            .build(crate::test_support::test_output_store(session_dir.join("outputs")).await);
         let subagent = main.for_subagent(None, None);
 
         // A subagent's terminal has no `subagent` command.
@@ -1093,18 +1139,20 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store,
-                task_events: aither_agent::TaskEvents::new(),
+                task_events: aither_agent::WorkEvents::new(),
                 publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: Some(messaging),
                 languages: None,
                 acp: None,
                 git: crate::host_git::HostGit::from_file("/dev/null"),
+                tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
             },
         )
         .await
         .expect("commands should register");
-        let main = builder.build(session_dir.join("outputs"));
+        let main = builder
+            .build(crate::test_support::test_output_store(session_dir.join("outputs")).await);
         let subagent = main.for_subagent(None, None);
 
         assert!(!main.is_reserved("agent"));
@@ -1176,18 +1224,20 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
-                task_events: aither_agent::TaskEvents::new(),
+                task_events: aither_agent::WorkEvents::new(),
                 publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
                 languages: None,
                 acp: None,
                 git: crate::host_git::HostGit::from_file("/dev/null"),
+                tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
             },
         )
         .await
         .expect("commands should register");
-        let main = builder.build(session_dir.join("outputs"));
+        let main = builder
+            .build(crate::test_support::test_output_store(session_dir.join("outputs")).await);
         let subagent = main.for_subagent(None, None);
 
         assert!(main.is_tool_configured("task"));
@@ -1228,20 +1278,22 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp.path()).await,
-                task_events: aither_agent::TaskEvents::new(),
+                task_events: aither_agent::WorkEvents::new(),
                 publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
                 languages: None,
                 acp: None,
                 git: crate::host_git::HostGit::from_file("/dev/null"),
+                tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
             },
         )
         .await
         .expect("commands should register")
         .descriptions;
 
-        let registry = builder.build(session_dir.join("outputs"));
+        let registry = builder
+            .build(crate::test_support::test_output_store(session_dir.join("outputs")).await);
         assert!(!registry.is_tool_configured("websearch"));
         assert!(registry.is_tool_configured("webfetch"));
         assert!(!descriptions.iter().any(|(name, _)| name == "websearch"));
@@ -1284,13 +1336,14 @@ mod tests {
                 subagent_tracker: SubagentTracker::default(),
                 request_parameters: Parameters::default(),
                 issue_store: test_issue_store(temp).await,
-                task_events: aither_agent::TaskEvents::new(),
+                task_events: aither_agent::WorkEvents::new(),
                 publish_gate: None,
                 workspace_config: crate::workspace::WorkspaceConfig::default(),
                 agent_messaging: None,
                 languages: None,
                 acp: None,
                 git,
+                tasks_line_limit: crate::tasks_md::schema::LineLimit::default(),
             },
         )
         .await?;
@@ -1314,7 +1367,8 @@ mod tests {
         .await
         .expect("commands should register");
 
-        let registry = builder.build(session_dir.join("outputs"));
+        let registry = builder
+            .build(crate::test_support::test_output_store(session_dir.join("outputs")).await);
         assert!(registry.is_tool_configured(crate::commit_signing::SIGN_COMMAND));
         assert!(
             !commands
@@ -1344,7 +1398,7 @@ mod tests {
 
         assert!(
             builder
-                .build(session_dir.join("outputs"))
+                .build(crate::test_support::test_output_store(session_dir.join("outputs")).await)
                 .is_tool_configured(crate::commit_signing::SIGN_COMMAND)
         );
         let program = std::process::Command::new("git")

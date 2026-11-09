@@ -87,6 +87,18 @@ export async function apiPut<T>(path: string, body?: unknown, init?: RequestInit
   }
 }
 
+export async function apiPatch<T>(path: string, body?: unknown): Promise<T> {
+  const res = await fetch(`/api${path}`, {
+    method: 'PATCH',
+    headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (!res.ok) throw await decodeError(res);
+  if (res.status === 204) return undefined as T;
+  const text = await res.text();
+  return text.length === 0 ? (undefined as T) : (JSON.parse(text) as T);
+}
+
 export async function apiDelete<T>(path: string): Promise<T> {
   const res = await fetch(`/api${path}`, { method: 'DELETE' });
   if (!res.ok) throw await decodeError(res);

@@ -65,7 +65,7 @@ impl Clock for SystemClock {
 }
 
 /// What the watch reads from GitHub.
-pub(super) trait Upstream {
+pub trait Upstream {
     /// The PR as GitHub reports it now.
     fn snapshot(&self) -> impl Future<Output = Result<Snapshot, PrError>> + Send;
     /// How long the repository's checks usually take.
@@ -75,7 +75,7 @@ pub(super) trait Upstream {
 /// The PR's state on GitHub.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub(super) enum PullRequestState {
+pub enum PullRequestState {
     Open,
     Closed,
     Merged,
@@ -84,7 +84,7 @@ pub(super) enum PullRequestState {
 /// How a finished check run ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub(super) enum CheckConclusion {
+pub enum CheckConclusion {
     Success,
     Failure,
     TimedOut,
@@ -97,9 +97,13 @@ pub(super) enum CheckConclusion {
 /// The state of a commit status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub(super) enum StatusState {
+pub enum StatusState {
     Failure,
     Error,
+    Pending,
+    Success,
+    /// `EXPECTED` — GitHub waits on a required status it has not seen.
+    Expected,
     #[serde(other)]
     Other,
 }
@@ -107,7 +111,7 @@ pub(super) enum StatusState {
 /// One check on the PR's head commit.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "__typename")]
-pub(super) enum CheckContext {
+pub enum CheckContext {
     CheckRun {
         name: String,
         #[serde(rename = "detailsUrl")]
@@ -128,9 +132,9 @@ pub(super) enum CheckContext {
 
 /// A required check that failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct FailedCheck {
-    pub(super) name: String,
-    pub(super) url: Option<String>,
+pub struct FailedCheck {
+    pub(crate) name: String,
+    pub(crate) url: Option<String>,
 }
 
 impl CheckContext {
@@ -167,21 +171,100 @@ impl CheckContext {
 
 /// What the watch decides on, read from one GitHub response.
 #[derive(Debug, Clone)]
-pub(super) struct Snapshot {
-    pub(super) state: PullRequestState,
+pub struct Snapshot {
+    pub(crate) state: PullRequestState,
     /// The PR's place in the merge queue, `None` when it is not queued.
-    pub(super) queue_position: Option<u32>,
+    pub(crate) queue_position: Option<u32>,
     /// How many times the PR has been removed from a merge queue.
-    pub(super) removals: usize,
+    pub(crate) removals: usize,
     /// The reason GitHub gave for the latest removal.
-    pub(super) last_removal: Option<String>,
-    pub(super) checks: Vec<CheckContext>,
+    pub(crate) last_removal: Option<String>,
+    pub(crate) checks: Vec<CheckContext>,
 }
 
 impl Snapshot {
-    fn failed_check(&self) -> Option<FailedCheck> {
+    pub(crate) fn failed_check(&self) -> Option<FailedCheck> {
         self.checks.iter().find_map(CheckContext::failed_required)
     }
+
+    /// The rollup counts of the PR's checks: required contexts when any
+    /// exist (they are what merge waits on), every context otherwise.
+    /// Re-ran checks share a name; the last report wins.
+    pub(crate) fn check_summary(&self) -> CheckSummary {
+        let mut latest: std::collections::HashMap<&str, (bool, CheckOutcome)> =
+            std::collections::HashMap::new();
+        for check in &self.checks {
+            let (name, required, outcome) = match check {
+                CheckContext::CheckRun {
+                    name,
+                    conclusion,
+                    is_required,
+                    ..
+                } => (
+                    name.as_str(),
+                    *is_required,
+                    match conclusion {
+                        None => CheckOutcome::Pending,
+                        Some(CheckConclusion::Success | CheckConclusion::Other) => {
+                            // Neutral and skipped deserialize as Other and
+                            // pass GitHub's rollup the same way.
+                            CheckOutcome::Passed
+                        }
+                        Some(_) => CheckOutcome::Failed,
+                    },
+                ),
+                CheckContext::StatusContext {
+                    context,
+                    state,
+                    is_required,
+                    ..
+                } => (
+                    context.as_str(),
+                    *is_required,
+                    match state {
+                        StatusState::Success => CheckOutcome::Passed,
+                        StatusState::Failure | StatusState::Error => CheckOutcome::Failed,
+                        StatusState::Pending | StatusState::Expected | StatusState::Other => {
+                            CheckOutcome::Pending
+                        }
+                    },
+                ),
+            };
+            latest.insert(name, (required, outcome));
+        }
+        let required_present = latest.values().any(|(required, _)| *required);
+        let mut summary = CheckSummary::default();
+        for (required, outcome) in latest.values() {
+            if required_present && !required {
+                continue;
+            }
+            match outcome {
+                CheckOutcome::Pending => summary.pending += 1,
+                CheckOutcome::Passed => summary.passed += 1,
+                CheckOutcome::Failed => summary.failed += 1,
+            }
+        }
+        summary
+    }
+}
+
+/// How a concluded check ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckOutcome {
+    Pending,
+    Passed,
+    Failed,
+}
+
+/// How many of the PR's checks sit in each state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CheckSummary {
+    /// Still running or not yet reported.
+    pub(crate) pending: u32,
+    /// Concluded successfully (neutral and skipped included).
+    pub(crate) passed: u32,
+    /// Failed, timed out, cancelled or errored.
+    pub(crate) failed: u32,
 }
 
 /// Why the watch ended without a merge.
@@ -272,11 +355,68 @@ pub(super) async fn watch<U: Upstream + Sync, C: Clock + Sync>(
     }
 }
 
+/// Told once, the first time every check run of the PR has concluded.
+pub trait ChecksObserver: Sync {
+    /// The PR's checks have finished.
+    fn finished(&self) -> impl Future<Output = ()> + Send;
+}
+
+/// An [`Upstream`] that tells `observer` when the PR's checks finish.
+pub(super) struct Observing<'a, U, O> {
+    upstream: &'a U,
+    observer: &'a O,
+    told: std::sync::atomic::AtomicBool,
+}
+
+impl<'a, U: Sync, O: ChecksObserver> Observing<'a, U, O> {
+    pub(super) const fn new(upstream: &'a U, observer: &'a O) -> Self {
+        Self {
+            upstream,
+            observer,
+            told: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Tells the observer now unless it was told already: the watch ended
+    /// before a snapshot showed the checks finished.
+    pub(super) async fn tell_if_unheard(&self) {
+        if !self.told.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            self.observer.finished().await;
+        }
+    }
+}
+
+impl Snapshot {
+    /// Whether the PR has check runs and every one has concluded.
+    fn checks_finished(&self) -> bool {
+        let mut runs = self.checks.iter().filter_map(|check| match check {
+            CheckContext::CheckRun { conclusion, .. } => Some(conclusion.is_some()),
+            CheckContext::StatusContext { .. } => None,
+        });
+        let first = runs.next();
+        first == Some(true) && runs.all(|concluded| concluded)
+    }
+}
+
+impl<U: Upstream + Sync, O: ChecksObserver> Upstream for Observing<'_, U, O> {
+    async fn snapshot(&self) -> Result<Snapshot, PrError> {
+        let snapshot = self.upstream.snapshot().await?;
+        if snapshot.checks_finished() {
+            self.tell_if_unheard().await;
+        }
+        Ok(snapshot)
+    }
+
+    fn expected_checks(&self) -> impl Future<Output = Result<Duration, PrError>> + Send {
+        self.upstream.expected_checks()
+    }
+}
+
 /// GitHub through its API, for one PR.
-pub(super) struct GithubPr<'a, T> {
-    pub(super) api: &'a GitHubRest<T>,
-    pub(super) owner_repo: &'a str,
-    pub(super) number: i64,
+pub struct GithubPr<'a, T> {
+    pub(crate) api: &'a GitHubRest<T>,
+    pub(crate) owner_repo: &'a str,
+    pub(crate) number: i64,
 }
 
 impl<T: GitHubTokenSource + Sync> GithubPr<'_, T> {
@@ -660,6 +800,43 @@ mod tests {
         (outcome, clock, readers)
     }
 
+    struct Counter(std::sync::atomic::AtomicUsize);
+
+    impl ChecksObserver for Counter {
+        fn finished(&self) -> impl Future<Output = ()> + Send {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(())
+        }
+    }
+
+    #[test]
+    fn the_observer_is_told_once_when_every_check_run_has_concluded() {
+        let mut running = snapshot(PullRequestState::Open, None);
+        running.checks.push(CheckContext::CheckRun {
+            name: "test".to_string(),
+            details_url: None,
+            conclusion: None,
+            is_required: true,
+        });
+        let steps = vec![
+            (Duration::ZERO, running),
+            (minutes(2), snapshot(PullRequestState::Open, Some(1))),
+            (minutes(30), snapshot(PullRequestState::Merged, None)),
+        ];
+        let clock = VirtualClock::new();
+        let script = Script {
+            clock: &clock,
+            steps,
+            readers: Mutex::new(Vec::new()),
+        };
+        let counter = Counter(std::sync::atomic::AtomicUsize::new(0));
+        let observing = Observing::new(&script, &counter);
+        let outcome =
+            futures_lite::future::block_on(watch(&observing, &clock, 0, EXPECTED)).unwrap();
+        futures_lite::future::block_on(observing.tell_if_unheard());
+        assert_eq!(outcome, Outcome::Merged);
+        assert_eq!(counter.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
     #[test]
     fn a_pr_landing_after_thirty_minutes_in_the_merge_queue_is_merged() {
         let steps = vec![
@@ -876,5 +1053,70 @@ mod tests {
             runs.workflow_runs[0].duration(),
             Some(Duration::from_secs(750))
         );
+    }
+
+    fn check_run(name: &str, conclusion: Option<CheckConclusion>, required: bool) -> CheckContext {
+        CheckContext::CheckRun {
+            name: name.to_string(),
+            details_url: None,
+            conclusion,
+            is_required: required,
+        }
+    }
+
+    fn status_context(context: &str, state: StatusState, required: bool) -> CheckContext {
+        CheckContext::StatusContext {
+            context: context.to_string(),
+            target_url: None,
+            state,
+            is_required: required,
+        }
+    }
+
+    #[test]
+    fn the_check_summary_counts_each_context_once_with_the_last_report_winning() {
+        let mut snap = snapshot(PullRequestState::Open, None);
+        snap.checks = vec![
+            check_run("fmt", Some(CheckConclusion::Success), true),
+            // A re-run: the earlier failure is superseded by the pass.
+            check_run("clippy", Some(CheckConclusion::Failure), true),
+            check_run("clippy", Some(CheckConclusion::Success), true),
+            check_run("test", None, true),
+        ];
+        let summary = snap.check_summary();
+        assert_eq!((summary.passed, summary.pending, summary.failed), (2, 1, 0));
+    }
+
+    #[test]
+    fn the_check_summary_ignores_non_required_contexts_when_required_exist() {
+        let mut snap = snapshot(PullRequestState::Open, None);
+        snap.checks = vec![
+            check_run("fmt", Some(CheckConclusion::Success), true),
+            check_run("coverage", Some(CheckConclusion::Failure), false),
+        ];
+        let summary = snap.check_summary();
+        assert_eq!((summary.passed, summary.pending, summary.failed), (1, 0, 0));
+        // With nothing required, every context counts.
+        snap.checks = vec![
+            check_run("coverage", Some(CheckConclusion::Failure), false),
+            status_context("ci/test", StatusState::Pending, false),
+        ];
+        let summary = snap.check_summary();
+        assert_eq!((summary.passed, summary.pending, summary.failed), (0, 1, 1));
+    }
+
+    #[test]
+    fn the_check_summary_maps_neutral_and_status_states() {
+        let mut snap = snapshot(PullRequestState::Open, None);
+        snap.checks = vec![
+            // Neutral and skipped both deserialize as Other and count as
+            // passed, matching GitHub's rollup.
+            check_run("fmt", Some(CheckConclusion::Other), true),
+            check_run("clippy", Some(CheckConclusion::TimedOut), true),
+            status_context("ci/test", StatusState::Expected, true),
+            status_context("ci/web", StatusState::Error, true),
+        ];
+        let summary = snap.check_summary();
+        assert_eq!((summary.passed, summary.pending, summary.failed), (1, 1, 2));
     }
 }
