@@ -283,6 +283,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     if let Some(sidebar) = sidebar_area {
         sidebar::render_sidebar(frame, sidebar, app);
+    } else {
+        app.sidebar.area = Rect::default();
+        app.sidebar.view = crate::tui::sidebar::SidebarView::default();
     }
     if let Some(sheet) = sheet_area {
         render_sheet(frame, sheet, app);
