@@ -4844,6 +4844,52 @@ mod tests {
         crate::tui::ui::test_screen::buffer_screen(frame.buffer)
     }
 
+    /// The Preferences tab lists the jobserver pool size (automatic until
+    /// set), Enter opens it for editing, and text that is not a positive
+    /// number leaves the edit open without changing the setting.
+    #[tokio::test]
+    async fn preferences_list_and_edit_the_job_pool_size() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        app.mode = crate::tui::AppMode::Config;
+        app.config_state.section = crate::tui::state::ConfigSection::Preferences;
+        app.config_state.selected = 3;
+
+        let auto = format!("auto ({})", crate::jobserver::default_pool_size());
+        let screen = session_screen(&mut app).join("\n");
+        assert!(screen.contains("Job pool size"), "{screen}");
+        assert!(screen.contains(&auto), "{screen}");
+
+        app.config.sandbox.job_pool_size = std::num::NonZeroUsize::new(6);
+        let screen = session_screen(&mut app).join("\n");
+        assert!(!screen.contains("auto ("), "{screen}");
+        assert!(
+            screen
+                .lines()
+                .any(|line| line.contains("Job pool size") && line.contains('6')),
+            "{screen}"
+        );
+
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE)
+            .expect("enter");
+        assert_eq!(
+            app.config_state.edit_text().map(|(text, _)| text),
+            Some("6")
+        );
+
+        app.handle_key(KeyCode::Backspace, KeyModifiers::NONE)
+            .expect("backspace");
+        app.handle_key(KeyCode::Char('0'), KeyModifiers::NONE)
+            .expect("zero");
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE)
+            .expect("save");
+        assert!(app.config_state.is_editing(), "zero is refused");
+        assert_eq!(
+            app.config.sandbox.job_pool_size,
+            std::num::NonZeroUsize::new(6)
+        );
+    }
+
     const BLOCK_BG: ratatui::style::Color = ratatui::style::Color::Rgb(40, 40, 48);
     const BOX_DRAWING: [char; 8] = ['┌', '┐', '└', '┘', '─', '│', '╭', '╯'];
 
