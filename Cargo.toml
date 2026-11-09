@@ -12,9 +12,10 @@ publish = false
 name = "may"
 path = "src/bin/may/main.rs"
 
-[[bin]]
-name = "tasks"
-path = "src/bin/tasks/main.rs"
+[workspace]
+members = [".", "tasks"]
+# `cargo build` also builds the `tasks` binary that sits beside `may`.
+default-members = [".", "tasks"]
 
 [features]
 default = []
@@ -22,6 +23,9 @@ ui = []
 gstreamer = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
 
 [dependencies]
+# The `tasks.md` parser and the `tasks` command; the container image tag is
+# derived from this crate's directory.
+may-tasks = { path = "tasks" }
 libc = "0.2.191"
 # Aither framework
 aither-core = { version = "0.27.0" }

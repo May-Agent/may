@@ -42,7 +42,7 @@ fn refs() -> Result<(), Box<dyn std::error::Error>> {
 fn build_tasks() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let status = std::process::Command::new(cargo)
-        .args(["build", "--locked", "--bin", "tasks"])
+        .args(["build", "--locked", "-p", "may-tasks", "--bin", "tasks"])
         .status()?;
     if !status.success() {
         return Err(format!("building the tasks binary failed: {status}").into());

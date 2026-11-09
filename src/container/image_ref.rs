@@ -23,19 +23,31 @@ pub const WORKSPACE_IMAGE_REPOSITORY: &str = "ghcr.io/may-agent/may-workspace";
 /// staging rewrites must not move the reference.
 const GENERATED_WORKSPACE_ENTRIES: &[&str] = &["heel", "tasks", "tools"];
 
-/// The files, relative to the repository, the `tasks` binary the workspace
-/// image carries is built from; a change to one moves the workspace
-/// reference.
-pub const TASKS_SOURCES: &[&str] = &[
-    "src/bin/tasks/main.rs",
-    "src/tasks_md/mod.rs",
-    "src/tasks_md/edit.rs",
-    "src/tasks_md/schema.rs",
-    "templates/tasks_command_usage.txt",
-    "templates/tasks_command_refused.txt",
-    "templates/tasks_command_done.txt",
-    "templates/tasks_violation.txt",
-];
+/// The directory, relative to the repository, of the `tasks` crate.
+///
+/// The crate depends on no path outside it, so its directory and the lockfile
+/// are everything the binary the workspace image carries is built from.
+pub const TASKS_CRATE: &str = "tasks";
+
+/// The lockfile, relative to the repository, that pins the crate's
+/// dependencies.
+pub const TASKS_LOCKFILE: &str = "Cargo.lock";
+
+/// The files, relative to the repository, the `tasks` binary is built from.
+///
+/// Every file under [`TASKS_CRATE`] and the lockfile, sorted; a change to one
+/// moves the workspace reference.
+///
+/// # Errors
+/// Returns an IO error when the crate cannot be read.
+pub fn tasks_sources(repository: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut sources: Vec<PathBuf> = context_files(&repository.join(TASKS_CRATE))?
+        .into_iter()
+        .map(|relative| Path::new(TASKS_CRATE).join(relative))
+        .collect();
+    sources.push(PathBuf::from(TASKS_LOCKFILE));
+    Ok(sources)
+}
 
 /// The `<repository>:<content tag>` reference of the base image whose build
 /// context is `context_dir`: every file under the context, by sorted
@@ -79,8 +91,8 @@ pub fn workspace_image_ref(
     feed(&mut hasher, b"tool-distribution");
     feed(&mut hasher, tool_distribution);
     feed(&mut hasher, b"tasks-sources");
-    for relative in TASKS_SOURCES {
-        feed_file(&mut hasher, repository, Path::new(relative))?;
+    for relative in tasks_sources(repository)? {
+        feed_file(&mut hasher, repository, &relative)?;
     }
     feed(&mut hasher, b"heel-lib-version");
     feed(&mut hasher, heel_lib_version.as_bytes());
@@ -194,11 +206,14 @@ mod tests {
         let context = tempfile::tempdir().expect("context");
         write_context(context.path());
         let repository = tempfile::tempdir().expect("repository");
-        for source in TASKS_SOURCES {
-            let path = repository.path().join(source);
-            fs::create_dir_all(path.parent().unwrap()).unwrap();
-            fs::write(path, "source").unwrap();
-        }
+        fs::create_dir_all(repository.path().join("tasks").join("src")).unwrap();
+        fs::write(repository.path().join("tasks").join("Cargo.toml"), "source").unwrap();
+        fs::write(
+            repository.path().join("tasks").join("src").join("lib.rs"),
+            "source",
+        )
+        .unwrap();
+        fs::write(repository.path().join("Cargo.lock"), "source").unwrap();
         let fixture = || {
             workspace_image_ref(
                 context.path(),
@@ -225,10 +240,21 @@ mod tests {
         }
 
         // The sources of the `tasks` binary are inputs too.
-        let source = repository.path().join(TASKS_SOURCES[1]);
-        fs::write(&source, "edited").unwrap();
+        for source in [
+            repository.path().join("tasks").join("src").join("lib.rs"),
+            repository.path().join("Cargo.lock"),
+        ] {
+            fs::write(&source, "edited").unwrap();
+            assert_ne!(fixture(), before);
+            fs::write(&source, "source").unwrap();
+            assert_eq!(fixture(), before);
+        }
+        // A file added to the crate is an input too.
+        let added = repository.path().join("tasks").join("templates");
+        fs::create_dir_all(&added).unwrap();
+        fs::write(added.join("new.txt"), "source").unwrap();
         assert_ne!(fixture(), before);
-        fs::write(&source, "source").unwrap();
+        fs::remove_dir_all(&added).unwrap();
         assert_eq!(fixture(), before);
 
         fs::write(context.path().join("Dockerfile"), "FROM scratch\nRUN x\n").unwrap();
@@ -245,5 +271,55 @@ mod tests {
             workspace_hash_inputs(context.path()).unwrap(),
             vec![PathBuf::from("Dockerfile"), PathBuf::from("entrypoint.sh")]
         );
+    }
+
+    /// The tag inputs are the `tasks` crate's whole directory plus the
+    /// lockfile, and the crate reaches no path outside its directory, so the
+    /// tag moves with anything the binary is built from.
+    #[test]
+    fn tasks_tag_inputs_cover_the_binarys_sources() {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let sources = tasks_sources(repository).unwrap();
+
+        let mut on_disk = Vec::new();
+        collect(
+            &repository.join(TASKS_CRATE),
+            &repository.join(TASKS_CRATE),
+            &mut on_disk,
+        )
+        .unwrap();
+        assert!(on_disk.len() > 1);
+        for file in on_disk {
+            assert!(
+                sources.contains(&Path::new(TASKS_CRATE).join(&file)),
+                "{file:?}"
+            );
+        }
+        assert!(sources.contains(&PathBuf::from(TASKS_LOCKFILE)));
+        assert!(repository.join(TASKS_LOCKFILE).is_file());
+
+        let manifest = fs::read_to_string(repository.join(TASKS_CRATE).join("Cargo.toml")).unwrap();
+        let manifest: toml::Table = manifest.parse().unwrap();
+        for table in ["dependencies", "dev-dependencies", "build-dependencies"] {
+            for (name, dependency) in manifest
+                .get(table)
+                .and_then(toml::Value::as_table)
+                .into_iter()
+                .flatten()
+            {
+                let Some(path) = dependency.get("path").and_then(toml::Value::as_str) else {
+                    continue;
+                };
+                assert!(
+                    !path.starts_with("..") && !Path::new(path).is_absolute(),
+                    "{name} reaches {path}, outside {TASKS_CRATE}/, so the tag would not cover it"
+                );
+            }
+        }
+        assert!(
+            manifest.get("target").is_none(),
+            "target tables are not scanned"
+        );
+        assert!(manifest.get("workspace").is_none());
     }
 }
