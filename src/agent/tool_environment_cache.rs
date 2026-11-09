@@ -84,7 +84,6 @@ impl ToolEnvironmentKey {
         ShellRuntimeAvailability {
             local: self.home == HomeBackend::Local,
             container: matches!(self.home, HomeBackend::Container { .. }),
-            ssh: !self.ssh_servers.is_empty(),
         }
     }
 }
@@ -402,7 +401,6 @@ mod tests {
         ShellSessionRegistry::new(ShellRuntimeAvailability {
             local: true,
             container: false,
-            ssh: false,
         })
     }
 
@@ -484,9 +482,9 @@ mod tests {
         let container =
             ToolEnvironmentKey::new(HomeBackend::container("c1", &route("10.0.0.1")), &[a])
                 .availability();
-        assert!(!container.local && container.container && container.ssh);
+        assert!(!container.local && container.container);
         let local = local_key(&[]).availability();
-        assert!(local.local && !local.container && !local.ssh);
+        assert!(local.local && !local.container);
     }
 
     #[tokio::test]

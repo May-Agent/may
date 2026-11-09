@@ -194,6 +194,7 @@ export const zhHant: Messages = {
     generic: '處理中',
     output: '結果',
     escalated: '已提升權限',
+    sshLocation: 'SSH',
     viewFullOutput: '檢視完整輸出',
   },
   runtime: {
@@ -296,7 +297,6 @@ export const zhHant: Messages = {
       command: '操作內容',
       mode: '安全等級',
       modeDefault: '標準',
-      modeSandboxed: '隔離',
       modeUnsafe: '提升權限',
       modeRemote: '遠端',
       showScript: '顯示原始腳本',

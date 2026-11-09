@@ -614,6 +614,7 @@ pub async fn try_connection(
     name: &str,
     agent: &AcpAgentConfig,
     limit: std::time::Duration,
+    heel: heel::HeelBinary,
 ) -> Result<(), TrialError> {
     let scratch = blocking::unblock(tempfile::tempdir).await?;
     let work = scratch.path().join("work");
@@ -621,7 +622,7 @@ pub async fn try_connection(
     let host = trial_host(
         &BTreeMap::from([(name.to_string(), agent.clone())]),
         &scratch.path().join("acp"),
-        SessionSandbox::scratch(&work),
+        SessionSandbox::scratch(&work, heel),
     )?;
     let mut spec = SessionSpec::new(name, work);
     spec.model.clone_from(&agent.model);
@@ -673,6 +674,7 @@ pub async fn probe_agent(
     command: &str,
     args: &[String],
     limit: std::time::Duration,
+    heel: heel::HeelBinary,
 ) -> Result<AgentIdentity, ProbeError> {
     let launch = launch_config(command, args, &BTreeMap::new());
     let scratch = blocking::unblock(tempfile::tempdir)
@@ -680,6 +682,7 @@ pub async fn probe_agent(
         .map_err(ProbeError::Scratch)?;
     let cell = Arc::new(ArcSwap::from_pointee(SessionSandbox::scratch(
         scratch.path(),
+        heel,
     )));
     let services = Services {
         executor: SandboxExecutor::new(cell.clone(), Arc::default()),
@@ -791,12 +794,13 @@ mod tests {
 
     /// A session sandbox rooted in `root` that reads the fake agent's script
     /// and the `readable` directories and writes the `writable` ones.
-    fn sandbox(
+    async fn sandbox(
         root: &Path,
         readable: Vec<PathBuf>,
         writable: Vec<PathBuf>,
         approver: Option<PermissionApprover>,
     ) -> SessionSandbox<SessionPolicy> {
+        let heel = crate::tools::test_heel().await;
         let grants = aither_sandbox::TerminalGrants::new();
         grants.add_readable(fixtures_dir());
         for path in readable {
@@ -816,6 +820,7 @@ mod tests {
             aither_sandbox::ProcessPriority::default(),
             approver,
             job_broker(root),
+            heel,
         )
     }
 
@@ -850,17 +855,16 @@ mod tests {
     }
 
     /// The agents of a session that may write everything under `may_dir`.
-    fn agents(may_dir: &Path, connected: BTreeMap<String, AcpAgentConfig>) -> AcpAgents {
+    async fn agents(may_dir: &Path, connected: BTreeMap<String, AcpAgentConfig>) -> AcpAgents {
+        let sandbox = sandbox(
+            &may_dir.join("session"),
+            Vec::new(),
+            vec![may_dir.to_path_buf()],
+            None,
+        )
+        .await;
         hosts(may_dir, connected)
-            .agents(
-                "session",
-                sandbox(
-                    &may_dir.join("session"),
-                    Vec::new(),
-                    vec![may_dir.to_path_buf()],
-                    None,
-                ),
-            )
+            .agents("session", sandbox)
             .expect("host")
     }
 
@@ -925,7 +929,8 @@ mod tests {
                 Vec::new(),
                 vec![granted.clone()],
                 None,
-            ),
+            )
+            .await,
             &granted,
             &format!(
                 "RUN sh -c 'echo in > {}; echo out > {}'",
@@ -998,7 +1003,7 @@ mod tests {
         let reply = fake_turn_with(
             connection,
             dir.path(),
-            sandbox(&dir.path().join("session"), Vec::new(), Vec::new(), None),
+            sandbox(&dir.path().join("session"), Vec::new(), Vec::new(), None).await,
             &work,
             "say something",
         )
@@ -1044,7 +1049,8 @@ mod tests {
                     Vec::new(),
                     vec![work.clone()],
                     approver,
-                ),
+                )
+                .await,
                 &work,
                 "PERMISSION",
             )
@@ -1073,7 +1079,8 @@ mod tests {
                 Vec::new(),
                 vec![work.clone()],
                 None,
-            ),
+            )
+            .await,
             &work,
             &format!("RUN cat {}", secret.display()),
         )
@@ -1128,7 +1135,7 @@ mod tests {
         let reply = fake_turn_with(
             connection,
             dir.path(),
-            sandbox(&session, Vec::new(), Vec::new(), None),
+            sandbox(&session, Vec::new(), Vec::new(), None).await,
             &work,
             "say something",
         )
@@ -1162,23 +1169,24 @@ mod tests {
         std::fs::create_dir_all(&work).expect("work dir");
         let file = work.join("notes.txt");
         std::fs::write(&file, "readable by the agent itself").expect("file");
-        let session = || {
+        let session = async || {
             sandbox(
                 &dir.path().join("session"),
                 Vec::new(),
                 vec![work.clone()],
                 None,
             )
+            .await
         };
 
-        let caps = fake_turn(dir.path(), session(), &work, "CAPS").await;
+        let caps = fake_turn(dir.path(), session().await, &work, "CAPS").await;
         assert!(
             caps.contains("caps:read=false,write=false"),
             "initialize advertises no fs capability: {caps}"
         );
         let read = fake_turn(
             dir.path(),
-            session(),
+            session().await,
             &work,
             &format!("READ {}", file.display()),
         )
@@ -1207,7 +1215,8 @@ mod tests {
                     Vec::new(),
                     vec![work.clone()],
                     None,
-                ),
+                )
+                .await,
             )
             .expect("host");
         let backend = AcpSubagent {
@@ -1279,7 +1288,8 @@ mod tests {
         let acp = agents(
             dir.path(),
             BTreeMap::from([("fake".to_string(), fake_connection())]),
-        );
+        )
+        .await;
         let tool = acp
             .register(SubagentTool::new(NoLlm).with_base_dir(dir.path()))
             .expect("the name is free");
@@ -1333,7 +1343,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn worktree_grants_are_refused() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let acp = agents(dir.path(), BTreeMap::new());
+        let acp = agents(dir.path(), BTreeMap::new()).await;
         let backend = AcpSubagent {
             host: acp.host,
             runtime: acp.runtime,
@@ -1368,7 +1378,8 @@ mod tests {
         let acp = agents(
             dir.path(),
             BTreeMap::from([("explore".to_string(), fake_connection())]),
-        );
+        )
+        .await;
         let error = acp
             .register(SubagentTool::new(NoLlm))
             .map(|_| ())

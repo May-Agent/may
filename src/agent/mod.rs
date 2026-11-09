@@ -55,7 +55,7 @@ mod runtime_context;
 mod secret_redaction_tests;
 /// Session tool registration for the agent.
 pub mod session_tool;
-/// Authorization for `terminal` ssh-mode targets.
+/// Authorization for the SSH servers `terminal` commands name.
 pub mod ssh_authorizer;
 /// Live tracking of `subagent` command invocations.
 pub mod subagent_spaces;

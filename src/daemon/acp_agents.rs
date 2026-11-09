@@ -52,6 +52,8 @@ pub(super) enum ConnectError {
     TrialTimedOut(Duration),
     #[error("the trial session could not be prepared: {0}")]
     Scratch(std::io::Error),
+    #[error("the sandbox's heel could not be prepared: {0}")]
+    Heel(aither_sandbox::ToolRuntimeError),
     #[error("the connection could not be saved: {0}")]
     Save(ConfigError),
 }
@@ -73,7 +75,7 @@ pub fn connected_dto(config: &MayConfig) -> Vec<ConnectedAcpAgent> {
 
 /// The known agents installed on `PATH` that answer ACP `initialize`, each
 /// probe running concurrently under [`PROBE_LIMIT`].
-async fn detect(config: &MayConfig) -> Vec<DetectedAcpAgent> {
+async fn detect(config: &MayConfig, heel: &heel::HeelBinary) -> Vec<DetectedAcpAgent> {
     let installed: Vec<KnownAcpAgent> = blocking::unblock(|| {
         KNOWN_ACP_AGENTS
             .iter()
@@ -85,7 +87,7 @@ async fn detect(config: &MayConfig) -> Vec<DetectedAcpAgent> {
     futures_util::stream::iter(installed)
         .map(|known: KnownAcpAgent| async move {
             let args: Vec<String> = known.args.iter().map(ToString::to_string).collect();
-            match probe_agent(known.command, &args, PROBE_LIMIT).await {
+            match probe_agent(known.command, &args, PROBE_LIMIT, heel.clone()).await {
                 Ok(AgentIdentity { name, version }) => {
                     let connected_as = config
                         .acp_agents
@@ -117,7 +119,8 @@ pub(super) async fn list_acp_agents(
     State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<AcpAgentsResponse>> {
     let config = state.config_snapshot();
-    let detected = detect(&config).await;
+    let heel = state.heel().await.map_err(internal_error)?;
+    let detected = detect(&config, &heel).await;
     Ok(Json(AcpAgentsResponse {
         connected: connected_dto(&config),
         detected,
@@ -135,7 +138,8 @@ pub(super) async fn connect(
     if command.is_empty() {
         return Err(ConnectError::EmptyCommand);
     }
-    let identity = probe_agent(&command, &request.args, PROBE_LIMIT)
+    let heel = state.heel().await.map_err(ConnectError::Heel)?;
+    let identity = probe_agent(&command, &request.args, PROBE_LIMIT, heel.clone())
         .await
         .map_err(|source| ConnectError::NotAcp {
             command: command.clone(),
@@ -151,7 +155,15 @@ pub(super) async fn connect(
         grants: Vec::new(),
     };
     let trial_limit = state.config_snapshot().acp.trial_limit;
-    match try_connection(&state.tokio_handle, &request.name, &agent, trial_limit).await {
+    match try_connection(
+        &state.tokio_handle,
+        &request.name,
+        &agent,
+        trial_limit,
+        heel,
+    )
+    .await
+    {
         Ok(()) => {}
         Err(TrialError::TimedOut(limit)) => return Err(ConnectError::TrialTimedOut(limit)),
         Err(TrialError::Scratch(error)) => return Err(ConnectError::Scratch(error)),
@@ -204,7 +216,7 @@ pub(super) async fn connect_acp_agent(
             *response.status_mut() = StatusCode::UNPROCESSABLE_ENTITY;
             Ok(response)
         }
-        Err(error @ (ConnectError::Scratch(_) | ConnectError::Save(_))) => {
+        Err(error @ (ConnectError::Scratch(_) | ConnectError::Heel(_) | ConnectError::Save(_))) => {
             Err(super::error::internal_error_message(error.to_string()))
         }
         Err(error) => Err(bad_request_error(error)),
@@ -290,9 +302,15 @@ mod tests {
             grants: Vec::new(),
         };
         let started = std::time::Instant::now();
-        let error = try_connection(&tokio::runtime::Handle::current(), "fake", &agent, limit)
-            .await
-            .expect_err("times out");
+        let error = try_connection(
+            &tokio::runtime::Handle::current(),
+            "fake",
+            &agent,
+            limit,
+            crate::tools::test_heel().await,
+        )
+        .await
+        .expect_err("times out");
         let elapsed = started.elapsed();
         assert!(
             matches!(error, TrialError::TimedOut(l) if l == limit),

@@ -545,6 +545,16 @@ impl DaemonState {
         self.config.load_full()
     }
 
+    /// The tool distribution's `heel`, prepared in the home's tools
+    /// directory, which runs the sandboxes of ACP probes and trials.
+    pub(crate) async fn heel(&self) -> Result<heel::HeelBinary, aither_sandbox::ToolRuntimeError> {
+        crate::tools::prepare_heel(
+            &self.tool_distribution,
+            &crate::session::MayHomePaths::new(self.may_dir.clone()).tools_dir(),
+        )
+        .await
+    }
+
     pub(crate) fn update_config<R>(&self, update: impl FnOnce(&mut MayConfig) -> R) -> MayConfig {
         let mut config = (*self.config.load_full()).clone();
         let _ = update(&mut config);
@@ -1335,9 +1345,9 @@ impl DaemonState {
         );
         let (title_generation_queue, _rx) = TitleGenerationQueue::new();
         let (tool_dispatchers, _queues) = tool_dispatch_channels();
-        let tool_distribution = std::sync::Arc::new(crate::tools::fixture_distribution(
-            &may_dir.join("tool-fixtures"),
-        ));
+        let tool_distribution = std::sync::Arc::new(
+            crate::tools::fixture_distribution(&may_dir.join("tool-fixtures")).await,
+        );
         let (search_index_wake_tx, search_index_wake) = async_channel::bounded(1);
         let (browser_lifecycle_tx, _) = tokio::sync::broadcast::channel(4);
         let notification_manager = std::sync::Arc::new(

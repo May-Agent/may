@@ -3815,6 +3815,7 @@ impl App {
                 description: String::new(),
                 command: format!("! {masked}"),
                 mode: aither_sandbox::TerminalExecutionMode::Unsafe,
+                location: None,
                 reading: None,
                 status: super::ui::chat::ToolStatus::Running,
                 output: None,
@@ -4268,10 +4269,12 @@ impl App {
                 description,
                 script,
                 mode,
+                location,
             } => ToolDisplay::Terminal {
                 description,
                 command: script,
                 mode,
+                location,
                 // The daemon's reading arrives right after the start.
                 reading: None,
                 status: super::ui::chat::ToolStatus::Running,

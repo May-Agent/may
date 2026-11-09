@@ -379,9 +379,6 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
     };
     let paths = DaemonPaths::user()?;
     let _instance = acquire_single_instance(&paths)?;
-    // heel executes the sandboxed commands this process runs; configure the
-    // managed binary before any spawned task can reach a sandbox.
-    crate::configure_heel_binary().await;
 
     // Agents of relocated homes whose runs were killed before they could
     // retire them, swept before the daemon answers so a client never sees
