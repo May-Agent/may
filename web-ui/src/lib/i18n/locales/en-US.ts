@@ -584,6 +584,23 @@ export const enUS = {
     killConfirmBody: 'The process is killed. Output written so far is kept.',
     stopping: 'Stopping…',
     loadFailed: 'Couldn’t load: {message}',
+    pullRequests: 'Pull requests',
+    prProgress: '{finished} of {total} checks finished',
+    prRollup: {
+      unknown: 'Checks not read yet',
+      merging: 'In the merge queue',
+      running: 'Checks running',
+      failed: 'A check failed',
+      passed: 'All checks passed',
+    },
+    prCheck: {
+      queued: 'Queued',
+      running: 'Running',
+      passed: 'Passed',
+      failed: 'Failed',
+    },
+    prCheckDetail: 'Open {name} on GitHub',
+    prChecksUnreadable: 'The checks could not be read from GitHub: {message}',
   },
   sleep: {
     asleep: 'You are asleep: agents keep working and collect their questions. Send /sleep off to end it.',

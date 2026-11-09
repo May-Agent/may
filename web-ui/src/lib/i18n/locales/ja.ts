@@ -586,6 +586,23 @@ export const ja: Messages = {
     killConfirmBody: 'プロセスを終了します。書き込み済みの出力は残ります。',
     stopping: '停止中…',
     loadFailed: '読み込めませんでした：{message}',
+    pullRequests: 'プルリクエスト',
+    prProgress: '{total} 件中 {finished} 件のチェックが完了',
+    prRollup: {
+      unknown: 'チェックは未取得です',
+      merging: 'マージキューに入っています',
+      running: 'チェック実行中',
+      failed: 'チェックが失敗しました',
+      passed: 'すべてのチェックが成功しました',
+    },
+    prCheck: {
+      queued: '待機中',
+      running: '実行中',
+      passed: '成功',
+      failed: '失敗',
+    },
+    prCheckDetail: 'GitHub で {name} を開く',
+    prChecksUnreadable: 'GitHub からチェックを取得できませんでした：{message}',
   },
   sleep: {
     asleep: '就寝中です。エージェントは作業を続け、質問をためておきます。/sleep off で終了します。',
