@@ -283,6 +283,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     if let Some(sidebar) = sidebar_area {
         sidebar::render_sidebar(frame, sidebar, app);
+    } else {
+        app.sidebar.area = Rect::default();
+        app.sidebar.view = crate::tui::sidebar::SidebarView::default();
     }
     if let Some(sheet) = sheet_area {
         render_sheet(frame, sheet, app);
@@ -335,7 +338,11 @@ fn sheet_height(app: &App, column: Rect) -> Option<u16> {
         |percent: u16| u16::try_from(u32::from(full) * u32::from(percent) / 100).unwrap_or(full);
     let rows = |count: usize| u16::try_from(count).unwrap_or(u16::MAX);
     let (wanted, cap) = match &app.mode {
-        AppMode::AskUser(state) => (ask_user_rows(state, column.width), pct(60)),
+        AppMode::AskUser(state) => (
+            ask_user_rows(state, column.width)
+                .saturating_add(blocked_rows(&blocked_titles(app, &state.request_id))),
+            pct(60),
+        ),
         AppMode::SessionSelect => (
             rows(app.filtered_sessions().len() * 2 + 10).max(14),
             pct(70),
@@ -376,7 +383,12 @@ fn sheet_height(app: &App, column: Rect) -> Option<u16> {
         AppMode::Btw(state) => (if !state.loading && !state.done { 5 } else { 14 }, pct(60)),
         AppMode::Progress(_) => (16, pct(60)),
         AppMode::PermissionConfirm(state) => (
-            rows(confirm_body_rows(state.request.script.as_str(), column.width) + 8),
+            rows(
+                state.shown_reading().map_or_else(
+                    || confirm_body_rows(state.request.script.as_str(), column.width),
+                    |reading| chat::reading_lines(reading, Style::default()).len(),
+                ) + 9,
+            ),
             pct(70),
         ),
         AppMode::WorkspaceConfirm(state) => (
@@ -426,7 +438,13 @@ fn confirm_body_rows(text: &str, width: u16) -> usize {
 fn render_sheet(frame: &mut Frame, sheet: Rect, app: &App) {
     frame.render_widget(Clear, sheet);
     match &app.mode {
-        AppMode::AskUser(state) => render_ask_user(frame, sheet, state, app.band_bg),
+        AppMode::AskUser(state) => render_ask_user(
+            frame,
+            sheet,
+            state,
+            &blocked_titles(app, &state.request_id),
+            app.band_bg,
+        ),
         AppMode::SessionSelect => render_session_popup(frame, sheet, app),
         AppMode::FilePicker => render_file_picker_popup(frame, sheet, app),
         AppMode::Help => render_help_popup(frame, sheet, app.help_scroll, app.band_bg),
@@ -2297,7 +2315,7 @@ fn render_permission_confirm(
     state: &crate::tui::state::PermissionConfirmState,
     bg: Option<Color>,
 ) {
-    let content = vec![
+    let mut content = vec![
         Line::from(Span::styled(
             "The agent is requesting elevated terminal access:",
             Style::default().fg(Color::White),
@@ -2309,20 +2327,49 @@ fn render_permission_confirm(
                 .add_modifier(ratatui::style::Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from(Span::styled("Script:", Style::default().fg(Color::White))),
-        Line::from(Span::styled(
+    ];
+    if let Some(reading) = state.shown_reading() {
+        content.push(Line::from(Span::styled(
+            "It will:",
+            Style::default().fg(Color::White),
+        )));
+        content.extend(chat::reading_lines(reading, Style::default()));
+    } else {
+        content.push(Line::from(Span::styled(
+            "Script:",
+            Style::default().fg(Color::White),
+        )));
+        content.push(Line::from(Span::styled(
             format!("  {}", state.request.script.as_str()),
             Style::default().fg(Color::Yellow),
-        )),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("[Y/Enter] ", Style::default().fg(Color::Green)),
-            Span::styled("Approve", Style::default().fg(Color::White)),
-            Span::raw("    "),
-            Span::styled("[N/Esc] ", Style::default().fg(Color::Red)),
-            Span::styled("Deny", Style::default().fg(Color::White)),
-        ]),
+        )));
+    }
+    content.push(Line::from(""));
+    let mut keys = vec![
+        Span::styled("[Y/Enter] ", Style::default().fg(Color::Green)),
+        Span::styled("Approve", Style::default().fg(Color::White)),
+        Span::raw("    "),
+        Span::styled("[N/Esc] ", Style::default().fg(Color::Red)),
+        Span::styled("Deny", Style::default().fg(Color::White)),
     ];
+    if state
+        .request
+        .reading
+        .as_ref()
+        .is_some_and(crate::command_reading::CommandReading::recognises_any)
+    {
+        keys.push(Span::raw("    "));
+        keys.push(Span::styled("[S] ", Style::default().fg(Color::Yellow)));
+        keys.push(Span::styled(
+            if state.show_script {
+                "Reading"
+            } else {
+                "Raw script"
+            },
+            Style::default().fg(Color::White),
+        ));
+    }
+    content.push(Line::from(keys));
 
     let widget = WrappedParagraph::new(content).block(panel(
         Some(Span::raw(" Permission Request ")),
@@ -2330,6 +2377,63 @@ fn render_permission_confirm(
         bg,
     ));
     frame.render_widget(widget, area);
+}
+
+/// Blocked rows an `AskUser` sheet lists before it sums up the rest.
+const BLOCKED_LISTED: usize = 3;
+
+/// The titles of the `tasks.md` rows marked `BLOCKING <request_id>`, as the
+/// sidebar last loaded them.
+fn blocked_titles<'a>(app: &'a App, request_id: &str) -> Vec<&'a str> {
+    app.sidebar
+        .tasks
+        .iter()
+        .flatten()
+        .filter(|row| row.blocking.as_deref() == Some(request_id))
+        .map(|row| row.title.as_str())
+        .collect()
+}
+
+/// Rows the blocked-row list of an `AskUser` sheet takes.
+fn blocked_rows(blocked: &[&str]) -> u16 {
+    let shown = blocked.len().min(BLOCKED_LISTED) + usize::from(blocked.len() > BLOCKED_LISTED);
+    u16::try_from(shown).unwrap_or(u16::MAX)
+}
+
+/// Draws the rows an open question blocks at the foot of `inner` and returns
+/// the area left above them.
+fn render_blocked(frame: &mut Frame, inner: Rect, blocked: &[&str]) -> Rect {
+    let height = blocked_rows(blocked).min(inner.height);
+    if height == 0 {
+        return inner;
+    }
+    let mut lines: Vec<Line> = blocked
+        .iter()
+        .take(BLOCKED_LISTED)
+        .map(|title| {
+            Line::from(vec![
+                Span::styled("BLOCKS ", Style::default().fg(Color::Yellow)),
+                Span::styled(*title, Style::default().fg(Color::White)),
+            ])
+        })
+        .collect();
+    if blocked.len() > BLOCKED_LISTED {
+        lines.push(Line::from(Span::styled(
+            format!("BLOCKS +{} more", blocked.len() - BLOCKED_LISTED),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    let body = Rect {
+        height: inner.height - height,
+        ..inner
+    };
+    let footer = Rect {
+        y: inner.y + body.height,
+        height,
+        ..inner
+    };
+    frame.render_widget(Paragraph::new(lines), footer);
+    body
 }
 
 /// Rows the question text of the `AskUser` sheet takes at `width`.
@@ -2364,9 +2468,12 @@ fn render_secret_question(
     state: &AskUserState,
     question: &crate::ask_user::Question,
     qs: &crate::tui::state::AskUserQuestionState,
-    secret: &crate::session::PersistedSecretRequest,
+    blocked: &[&str],
     bg: Option<Color>,
 ) {
+    let Some(secret) = state.current_secret() else {
+        return;
+    };
     let scope = match secret.scope {
         crate::secrets::SecretScope::Global => "global",
         crate::secrets::SecretScope::Session => "this session",
@@ -2384,6 +2491,7 @@ fn render_secret_question(
     let block = panel(Some(Span::raw(title)), Color::Cyan, bg).title_alignment(Alignment::Center);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    let inner = render_blocked(frame, inner, blocked);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -2441,15 +2549,21 @@ fn render_secret_question(
 }
 
 /// Render the `AskUser` dialog as a bottom sheet.
-fn render_ask_user(frame: &mut Frame, area: Rect, state: &AskUserState, bg: Option<Color>) {
+fn render_ask_user(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AskUserState,
+    blocked: &[&str],
+    bg: Option<Color>,
+) {
     let Some(question) = state.current() else {
         return;
     };
     let Some(qs) = state.current_state() else {
         return;
     };
-    if let Some(secret) = state.current_secret() {
-        render_secret_question(frame, area, state, question, qs, secret, bg);
+    if state.current_secret().is_some() {
+        render_secret_question(frame, area, state, question, qs, blocked, bg);
         return;
     }
 
@@ -2494,6 +2608,7 @@ fn render_ask_user(frame: &mut Frame, area: Rect, state: &AskUserState, bg: Opti
     let block = panel(Some(border_title), Color::Cyan, bg).title_alignment(Alignment::Center);
     let inner = block.inner(overlay);
     frame.render_widget(block, overlay);
+    let inner = render_blocked(frame, inner, blocked);
 
     // Layout inner: question + items + optional custom input + help
     let mut constraints = vec![
@@ -3462,9 +3577,95 @@ mod tests {
         for width in 12u16..=44 {
             let mut terminal = Terminal::new(ScreenBackend::new(width, 16)).unwrap();
             draw_checked(&mut terminal, Rect::new(0, 0, width, 16), |frame, area| {
-                super::render_ask_user(frame, area, &state, None);
+                super::render_ask_user(frame, area, &state, &[], None);
             });
         }
+    }
+
+    /// The rows a question blocks are listed under it, CJK titles included,
+    /// and the list stays inside the sheet at every width.
+    #[test]
+    fn ask_user_lists_the_rows_it_blocks() {
+        let state = AskUserState::for_open_question(crate::session::PersistedAskUserRequest {
+            id: "q1".to_string(),
+            questions: vec![crate::session::PersistedAskUserQuestion {
+                section: String::new(),
+                question: "选哪个数据库?".to_string(),
+                option: vec!["PostgreSQL".to_string(), "SQLite".to_string()],
+                multi_select: false,
+                secret: None,
+            }],
+        });
+        let blocked = ["迁移数据库", "データベース設計", "스키마 문서", "extra row"];
+        let mut terminal = Terminal::new(ScreenBackend::new(40, 14)).unwrap();
+        draw_checked(&mut terminal, Rect::new(0, 0, 40, 14), |frame, area| {
+            super::render_ask_user(frame, area, &state, &blocked, None);
+        });
+        let text: String = terminal
+            .backend()
+            .screen()
+            .join("\n")
+            .split_whitespace()
+            .collect();
+        for needle in [
+            "BLOCKS迁移数据库",
+            "BLOCKSデータベース設計",
+            "BLOCKS스키마문서",
+            "BLOCKS+1more",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?}:\n{text}");
+        }
+        for width in 12u16..=44 {
+            let mut terminal = Terminal::new(ScreenBackend::new(width, 14)).unwrap();
+            draw_checked(&mut terminal, Rect::new(0, 0, width, 14), |frame, area| {
+                super::render_ask_user(frame, area, &state, &blocked, None);
+            });
+        }
+    }
+
+    fn permission_screen(state: &crate::tui::state::PermissionConfirmState) -> Vec<String> {
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(70, 20)).unwrap();
+        terminal
+            .draw(|frame| super::render_permission_confirm(frame, frame.area(), state, None))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// An `unsafe` approval for an edit shows the file and its diff, and the
+    /// raw script one key away.
+    #[test]
+    fn the_approval_prompt_for_an_edit_shows_the_file_and_diff() {
+        let script = "apply_patch <<'P'\n*** Begin Patch\n*** Update File: src/a.rs\n@@\n-old\n+new\n*** End Patch\nP\n";
+        let mut state = crate::tui::state::PermissionConfirmState {
+            request_id: "r".to_string(),
+            request: crate::session::PersistedPermissionRequestPayload::new(
+                crate::PermissionRequestMode::Unsafe,
+                script.to_string(),
+                None,
+                None,
+            ),
+            show_script: false,
+        };
+        let screen = permission_screen(&state).join("\n");
+        assert!(screen.contains("~ src/a.rs"), "{screen}");
+        assert!(screen.contains("- old"), "{screen}");
+        assert!(screen.contains("+ new"), "{screen}");
+        assert!(screen.contains("[S] Raw script"), "{screen}");
+        assert!(!screen.contains("*** Begin Patch"), "{screen}");
+        state.show_script = true;
+        let screen = permission_screen(&state).join("\n");
+        assert!(screen.contains("*** Begin Patch"), "{screen}");
+        assert!(screen.contains("[S] Reading"), "{screen}");
     }
 
     /// The full-screen tool details view wraps a command's CJK output
@@ -3478,6 +3679,8 @@ mod tests {
             description: "运行测试".to_string(),
             command: "cargo test --workspace".to_string(),
             mode: aither_sandbox::TerminalExecutionMode::Default,
+            location: None,
+            reading: None,
             status: ToolStatus::Done,
             output: Some(output),
             diffs: Vec::new(),

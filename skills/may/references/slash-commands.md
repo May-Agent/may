@@ -15,7 +15,7 @@ Typing `/` in the TUI input opens a palette filtered as you type. Enter on a pal
 - `/resume-claude` opens a picker of Claude Code sessions; `/resume-claude <query>` and `/resume-codex <query>` import a transcript into a new session (`src/session/import/`).
 - `/import-claude` and `/import-codex` import that tool's global rules and skills: skills are copied, and a session opens that rewrites the rules into `~/.may/AGENTS.md`; when the tool has no rules file only the skills are copied.
 - `/sandbox` opens the session sandbox directory in the system file manager (`open`, `xdg-open` or `explorer`).
-- `/quit` exits; when the session's agent is busy a dialog first asks what happens to the run. Ctrl+C clears the input and a second Ctrl+C quits; Ctrl+Q quits.
+- `/quit` exits; when the session's agent is working — a run in flight, or background commands or subagent runs alive — a dialog first asks whether to keep it running in the background or stop it. Ctrl+C clears the input and a second Ctrl+C quits; Ctrl+Q quits.
 
 ## Model and conversation
 

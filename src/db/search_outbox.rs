@@ -7,8 +7,8 @@
 use skyzen_services::Db as SkyDb;
 
 use super::{
-    ChatDb, ChatDbError, SqliteTableInfoRow,
-    db_sql::{self, SEARCH_OUTBOX_BACKFILL, SEARCH_OUTBOX_SCHEMA},
+    ChatDb, ChatDbError,
+    db_sql::{self, SEARCH_OUTBOX_SCHEMA},
     query,
 };
 
@@ -64,18 +64,10 @@ pub struct IndexedMessageRow {
 }
 
 impl ChatDb {
-    /// Creates the outbox and its triggers. On the first run it also queues
-    /// every existing message, so the collection starts complete.
+    /// Creates the outbox and its triggers.
     pub(super) async fn ensure_search_outbox(db: &SkyDb) -> Result<(), ChatDbError> {
-        let existed = !query!(db, "PRAGMA table_info(search_outbox)")
-            .fetch_all::<SqliteTableInfoRow>()
-            .await?
-            .is_empty();
         for statement in db_sql::blocks(SEARCH_OUTBOX_SCHEMA) {
             query!(db, statement).execute().await?;
-        }
-        if !existed {
-            query!(db, SEARCH_OUTBOX_BACKFILL).execute().await?;
         }
         Ok(())
     }

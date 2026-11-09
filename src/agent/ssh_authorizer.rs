@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use aither_sandbox::{SshAuthorizationError, SshSessionAuthorizer};
+use aither_sandbox::permission::PermissionError;
 use askama::Template;
 
 use crate::PermissionHistoryMode;
@@ -54,14 +54,7 @@ struct SshConnectPermission<'a> {
     target: &'a str,
 }
 
-#[derive(Template)]
-#[template(path = "ssh_install_permission.txt", escape = "none")]
-struct SshInstallPermission<'a> {
-    target: &'a str,
-    details: &'a str,
-}
-
-/// Authorizes `terminal` ssh-mode targets by asking the user through the
+/// Authorizes the SSH servers `terminal` commands name by asking the user through the
 /// ask-user broker.
 #[derive(Debug)]
 pub struct MaySshAuthorizer {
@@ -84,26 +77,52 @@ impl MaySshAuthorizer {
         })
     }
 
+    /// Whether [`Self::authorize_connect`] will wait for the user: a yolo
+    /// session answers at once.
+    ///
+    /// # Errors
+    /// Returns [`PermissionError`] when the yolo switch cannot be read.
+    pub async fn will_ask(&self) -> Result<bool, PermissionError> {
+        Ok(!self
+            .db
+            .session_yolo(&self.session_id)
+            .await
+            .map_err(anyhow::Error::from)
+            .map_err(PermissionError::Internal)?)
+    }
+
+    /// Ask whether commands may run on the server at `target`.
+    ///
+    /// # Errors
+    /// Returns [`PermissionError`] when the question cannot be put or the
+    /// yolo grant cannot be recorded.
+    pub async fn authorize_connect(&self, target: &str) -> Result<bool, PermissionError> {
+        self.ask_permission(SshConnectPermission { target }, "Allow")
+            .await
+    }
+
     /// Ask a yes/no permission question via the `AskUser` UI.
     async fn ask_permission<T: Template + Send>(
         &self,
         question: T,
         allow_label: &str,
-    ) -> Result<bool, SshAuthorizationError> {
+    ) -> Result<bool, PermissionError> {
         let question = question
             .render()
-            .map_err(|error| SshAuthorizationError::Prompt(error.to_string()))?;
+            .map_err(anyhow::Error::from)
+            .map_err(PermissionError::Internal)?;
         // A yolo session grants at once and records it like a user approval.
-        if self
-            .db
-            .session_yolo(&self.session_id)
-            .await
-            .map_err(|error| SshAuthorizationError::Prompt(error.to_string()))?
-        {
+        if !self.will_ask().await? {
             self.db
-                .append_granted_permission(&self.session_id, PermissionHistoryMode::Ssh, &question)
+                .append_granted_permission(
+                    &self.session_id,
+                    PermissionHistoryMode::Ssh,
+                    &question,
+                    None,
+                )
                 .await
-                .map_err(|error| SshAuthorizationError::Prompt(error.to_string()))?;
+                .map_err(anyhow::Error::from)
+                .map_err(PermissionError::Internal)?;
             return Ok(true);
         }
         let choice = PermissionChoice::new(allow_label);
@@ -120,23 +139,7 @@ impl MaySshAuthorizer {
                 request: args,
             })
             .await
-            .map_err(|error| SshAuthorizationError::Prompt(error.to_string()))?;
+            .map_err(PermissionError::Internal)?;
         Ok(choice.allows(&response))
-    }
-}
-
-impl SshSessionAuthorizer for MaySshAuthorizer {
-    async fn authorize_connect(&self, target: &str) -> Result<bool, SshAuthorizationError> {
-        self.ask_permission(SshConnectPermission { target }, "Allow")
-            .await
-    }
-
-    async fn authorize_runtime_install(
-        &self,
-        target: &str,
-        details: &str,
-    ) -> Result<bool, SshAuthorizationError> {
-        self.ask_permission(SshInstallPermission { target, details }, "Install")
-            .await
     }
 }

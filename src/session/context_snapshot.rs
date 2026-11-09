@@ -14,6 +14,8 @@ pub struct PersistedContextSnapshot {
     /// Highest transcript `seq` the checkpoint covers; restore appends only
     /// entries after it.
     pub applied_seq: i64,
+    /// When the snapshot was written, as an ISO timestamp.
+    pub updated_at: String,
 }
 
 /// Convert a stored snapshot row into a [`PersistedContextSnapshot`].
@@ -24,6 +26,7 @@ pub fn parse_persisted_context_snapshot(
     PersistedContextSnapshot {
         checkpoint: snapshot.checkpoint,
         applied_seq: snapshot.applied_seq,
+        updated_at: snapshot.updated_at,
     }
 }
 

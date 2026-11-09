@@ -33,8 +33,8 @@ use askama::Template;
 use event_listener::Event;
 use executor_core::DefaultExecutor;
 use heel::{
-    Access, Audited, DenyAll, DomainRequest, Grant, NetworkAuditLog, NetworkPolicy, ResolvedPath,
-    Sandbox, SandboxConfig, SecurityConfig, StdioConfig,
+    Access, Audited, DenyAll, DomainRequest, Grant, HeelBinary, NetworkAuditLog, NetworkPolicy,
+    ResolvedPath, Sandbox, SandboxConfig, SecurityConfig, StdioConfig,
 };
 
 use crate::agent::PermissionApprover;
@@ -84,6 +84,8 @@ pub struct SessionSandbox<N> {
     /// The machine-wide jobserver pool the agent's commands draw jobs from;
     /// a scratch sandbox has none.
     jobs: Option<JobBroker>,
+    /// The tool distribution's `heel`, which runs the sandbox's supervisor.
+    heel: HeelBinary,
 }
 
 impl<N> std::fmt::Debug for SessionSandbox<N> {
@@ -96,8 +98,10 @@ impl<N> std::fmt::Debug for SessionSandbox<N> {
 }
 
 impl SessionSandbox<SessionPolicy> {
-    /// The sandbox of a session whose terminal has `grants`.
+    /// The sandbox of a session whose terminal has `grants`, its supervisor
+    /// run by `heel`.
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn for_session(
         root: PathBuf,
         grants: TerminalGrants,
@@ -106,11 +110,13 @@ impl SessionSandbox<SessionPolicy> {
         priority: ProcessPriority,
         approver: Option<PermissionApprover>,
         jobs: JobBroker,
+        heel: HeelBinary,
     ) -> Self {
         Self {
             root,
             launch_dir: None,
             jobs: Some(jobs),
+            heel,
             grants,
             network: Audited::new(
                 SessionNetwork {
@@ -129,7 +135,7 @@ impl SessionSandbox<DenyAll> {
     /// with no network and answering no permission request: a command under
     /// probe or trial belongs to no session.
     #[must_use]
-    pub fn scratch(root: &Path) -> Self {
+    pub fn scratch(root: &Path, heel: HeelBinary) -> Self {
         Self {
             root: root.to_path_buf(),
             launch_dir: Some(root.to_path_buf()),
@@ -138,6 +144,7 @@ impl SessionSandbox<DenyAll> {
             priority: ProcessPriority::default(),
             approver: None,
             jobs: None,
+            heel,
         }
     }
 }
@@ -223,7 +230,8 @@ impl<N: NetworkPolicy + Clone> SessionSandbox<N> {
             .security(SecurityConfig::interactive())
             // The session's own commands run their build outputs.
             .executable_working_dir(true)
-            .priority(self.priority);
+            .priority(self.priority)
+            .heel_binary(self.heel.clone());
         #[cfg(target_os = "linux")]
         let config = config.supervised_spawn(true);
         let sandbox = Sandbox::with_config_and_executor(config.build(), DefaultExecutor)
@@ -800,10 +808,11 @@ mod tests {
         (dir, server)
     }
 
-    fn session_sandbox(
+    async fn session_sandbox(
         root: &Path,
         server: &crate::jobserver::JobServer,
     ) -> SessionSandbox<SessionPolicy> {
+        let heel = crate::tools::test_heel().await;
         let grants = TerminalGrants::new();
         grants.add_readable(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures"));
         std::fs::create_dir_all(root).expect("session dir");
@@ -815,6 +824,7 @@ mod tests {
             ProcessPriority::default(),
             None,
             server.broker().expect("pool broker"),
+            heel,
         )
     }
 
@@ -826,7 +836,7 @@ mod tests {
         let (_pool_dir, server) = pool(SIZE).await;
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().join("session");
-        let sandbox = session_sandbox(&root, &server);
+        let sandbox = session_sandbox(&root, &server).await;
         let report = root.join("tmp/held");
         let executor = SandboxExecutor::new(
             Arc::new(ArcSwap::from_pointee(sandbox)),
@@ -871,7 +881,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_scratch_sandbox_agent_reports_its_exit_status() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let sandbox = SessionSandbox::scratch(dir.path());
+        let sandbox = SessionSandbox::scratch(dir.path(), crate::tools::test_heel().await);
         let status = exit_status_after(sandbox, dir.path(), Ending::StdinCloses)
             .await
             .unwrap_or_else(|error| panic!("scratch sandbox: {error}"));
@@ -881,7 +891,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_killed_scratch_sandbox_agent_reports_its_exit_status() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let sandbox = SessionSandbox::scratch(dir.path());
+        let sandbox = SessionSandbox::scratch(dir.path(), crate::tools::test_heel().await);
         let status = exit_status_after(sandbox, dir.path(), Ending::Killed)
             .await
             .unwrap_or_else(|error| panic!("killed in the scratch sandbox: {error}"));
@@ -896,7 +906,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().join("session");
         let (_pool_dir, server) = pool(1).await;
-        let status = exit_status_after(session_sandbox(&root, &server), &root, Ending::Killed)
+        let sandbox = session_sandbox(&root, &server).await;
+        let status = exit_status_after(sandbox, &root, Ending::Killed)
             .await
             .unwrap_or_else(|error| panic!("killed in a session sandbox: {error}"));
         assert!(
@@ -910,7 +921,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().join("session");
         let (_pool_dir, server) = pool(1).await;
-        let status = exit_status_after(session_sandbox(&root, &server), &root, Ending::StdinCloses)
+        let sandbox = session_sandbox(&root, &server).await;
+        let status = exit_status_after(sandbox, &root, Ending::StdinCloses)
             .await
             .unwrap_or_else(|error| panic!("session sandbox: {error}"));
         assert!(status.success(), "session sandbox exit status: {status:?}");

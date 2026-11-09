@@ -53,7 +53,9 @@ export interface ApiAttachment {
   textContent?: string | null;
 }
 
-export type TerminalCommandMode = 'default' | 'sandboxed' | 'unsafe' | 'ssh';
+export type TerminalCommandMode = 'default' | 'unsafe';
+/** Scope of a permission request; `ssh` is still a wire value of it. */
+export type PermissionRequestMode = TerminalCommandMode | 'ssh';
 export type TerminalExecutionStatus = 'running' | 'done' | 'failed' | 'stopped';
 
 
@@ -137,6 +139,55 @@ export interface PersistedPermissionRequest {
   mode: string;
   script: string;
   sessionId?: string | null;
+  /** How the daemon read the script; absent for a request with no script. */
+  reading?: CommandReading | null;
+}
+
+export type DiffOp = 'context' | 'added' | 'removed';
+
+export interface DiffLine {
+  op: DiffOp;
+  text: string;
+  old?: number | null;
+  new?: number | null;
+}
+
+export interface DiffHunk {
+  anchor?: string | null;
+  lines: DiffLine[];
+}
+
+export type FileChange =
+  | { kind: 'add'; lines: DiffLine[] }
+  | { kind: 'delete' }
+  | { kind: 'update'; movedTo?: string | null; hunks: DiffHunk[] };
+
+export interface FileEdit {
+  path: string;
+  change: FileChange;
+}
+
+/** What one command of a terminal script does, as the daemon read it. */
+export type CommandIntent =
+  | { kind: 'edit'; files: FileEdit[] }
+  | { kind: 'read'; path: string; range: unknown }
+  | { kind: 'search'; tool: string; pattern?: string | null; paths: string[] }
+  | { kind: 'list'; tool: string; paths: string[] }
+  | { kind: 'git'; subcommand?: string | null }
+  | { kind: 'build'; tool: string; subcommand?: string | null; target?: string | null }
+  | { kind: 'unknown'; source: string };
+
+export type StepLink = 'start' | 'pipe' | 'and' | 'or' | 'then';
+
+export interface CommandStep {
+  link: StepLink;
+  intent: CommandIntent;
+  /** The command in plain words; the source text for an unknown one. */
+  line: string;
+}
+
+export interface CommandReading {
+  steps: CommandStep[];
 }
 
 export interface PersistedWorkspaceRequest {
@@ -257,6 +308,8 @@ export interface ToolSummary {
   action?: string | null;
   target?: string | null;
   prompt?: string | null;
+  /** How the daemon read a terminal call's script, once the call is complete. */
+  reading?: CommandReading | null;
 }
 
 export interface SseToolStart {

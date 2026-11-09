@@ -31,9 +31,8 @@ runs:
       run: |
         chmod -R u+w target/tmp 2>/dev/null || true
         rm -rf target/tmp
-    - uses: ./.github/actions/install-heel
-    # The pinned tool artifacts, their prepared runtimes and the container
-    # heel the tests download from GitHub releases on a miss.
+    # The pinned tool artifacts, their prepared runtimes and heel, which the
+    # tests download from GitHub releases on a miss.
     - id: downloads
       uses: ./.github/actions/restore-test-downloads
     # rav1e's x86_64 assembly is built with nasm.
@@ -61,7 +60,7 @@ runs:
     # push only builds, to seed dev's caches; it still tests when the test
     # downloads missed, since the tests are what fetch them.
     - name: cargo test
-      if: github.event_name != 'push' || steps.downloads.outputs.tools-hit != 'true' || steps.downloads.outputs.heel-hit != 'true'
+      if: github.event_name != 'push' || steps.downloads.outputs.tools-hit != 'true'
       shell: bash
       run: cargo test --locked --all-targets --timings
     - name: Upload cargo timings
@@ -75,8 +74,3 @@ runs:
       with:
         path: ${{ steps.downloads.outputs.tools-path }}
         key: ${{ steps.downloads.outputs.tools-key }}
-    - if: success() && steps.downloads.outputs.heel-hit != 'true' && github.ref == 'refs/heads/dev'
-      uses: actions/cache/save@v4
-      with:
-        path: ${{ steps.downloads.outputs.heel-path }}
-        key: ${{ steps.downloads.outputs.heel-key }}

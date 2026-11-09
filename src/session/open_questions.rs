@@ -4,11 +4,13 @@
 //! The answer reaches the agent as a steer message through the session
 //! queue: at the next turn boundary when a run is active, otherwise as the
 //! start of a new run. It carries the request id, each question and the full
-//! answer, so the agent can clear the matching `BLOCKING` marks.
+//! answer, and names the rows of `tasks.md` whose `BLOCKING` mark the harness
+//! removed.
 
 use askama::Template;
 
 use crate::ask_user::{AnswerValue, QuestionAnswer};
+use crate::tasks_md::edit::Unblocked;
 use crate::xml::XmlBlock;
 
 use super::{
@@ -51,6 +53,7 @@ struct DeliveredAnswer<'a> {
 struct AnswerDelivery<'a> {
     request_id: &'a str,
     entries: Vec<DeliveredAnswer<'a>>,
+    unblocked: &'a [Unblocked],
 }
 
 /// Check that `answers` answer each question of `request`, in order, each
@@ -86,7 +89,7 @@ pub fn check_answers(
 }
 
 /// The steer message that tells the agent `answers` to `request`, which it
-/// knows by `word`.
+/// knows by `word`, and the rows of `tasks.md` the answer unblocked.
 ///
 /// # Panics
 /// Panics if the answers were not checked with [`check_answers`], or the
@@ -96,6 +99,7 @@ pub fn answer_delivery(
     request: &PersistedAskUserRequest,
     word: &str,
     answers: &[QuestionAnswer],
+    unblocked: &[Unblocked],
 ) -> PendingUserMessage {
     assert_eq!(
         request.questions.len(),
@@ -113,6 +117,7 @@ pub fn answer_delivery(
                 answer: answer.answer.to_string(),
             })
             .collect(),
+        unblocked,
     }
     .render()
     .expect("answer delivery template must render");

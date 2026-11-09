@@ -1,29 +1,28 @@
 import { useState } from 'react';
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
-import type { PersistedPermissionRequest, TerminalCommandMode } from '@/lib/types';
+import type { PermissionRequestMode, PersistedPermissionRequest } from '@/lib/types';
 import { respondPermission } from '@/lib/api/interactions';
 import { useTranslation, type MessageKey } from '@/lib/i18n';
-import { ShieldAlert, ShieldCheck, Shield } from 'lucide-react';
+import { ShieldAlert, Shield } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { recognisesAny } from '@/lib/commandReading';
+import { PermissionBody } from './PermissionBody';
 
-const MODE_LABEL: Record<TerminalCommandMode, MessageKey> = {
+const MODE_LABEL: Record<PermissionRequestMode, MessageKey> = {
   default: 'modals.permission.modeDefault',
-  sandboxed: 'modals.permission.modeSandboxed',
   unsafe: 'modals.permission.modeUnsafe',
   ssh: 'modals.permission.modeRemote',
 };
 
-const MODE_ICON: Record<TerminalCommandMode, typeof Shield> = {
+const MODE_ICON: Record<PermissionRequestMode, typeof Shield> = {
   default: Shield,
-  sandboxed: ShieldCheck,
   unsafe: ShieldAlert,
   ssh: Shield,
 };
 
-const MODE_CLASS: Record<TerminalCommandMode, string> = {
+const MODE_CLASS: Record<PermissionRequestMode, string> = {
   default: 'text-muted-foreground',
-  sandboxed: 'text-muted-foreground',
   unsafe: 'text-destructive',
   ssh: 'text-muted-foreground',
 };
@@ -35,8 +34,9 @@ interface PermissionModalProps {
 export function PermissionModal({ request }: PermissionModalProps) {
   const { t } = useTranslation();
   const [busy, setBusy] = useState(false);
+  const [showScript, setShowScript] = useState(false);
   if (!request) return null;
-  const mode = request.mode as TerminalCommandMode;
+  const mode = request.mode as PermissionRequestMode;
   const ModeIcon = MODE_ICON[mode] ?? Shield;
   const modeLabelKey = MODE_LABEL[mode] ?? MODE_LABEL.default;
   const modeColorClass = MODE_CLASS[mode] ?? MODE_CLASS.default;
@@ -61,9 +61,16 @@ export function PermissionModal({ request }: PermissionModalProps) {
           <div className="text-xs uppercase tracking-wider text-muted-foreground">
             {t('modals.permission.command')}
           </div>
-          <pre className="rounded-md border border-border bg-muted/40 px-3 py-2 text-xs font-mono whitespace-pre-wrap break-all">
-            {request.script}
-          </pre>
+          <PermissionBody request={request} showScript={showScript} />
+          {recognisesAny(request.reading) && (
+            <button
+              type="button"
+              className="text-xs text-muted-foreground underline-offset-2 hover:underline"
+              onClick={() => setShowScript((shown) => !shown)}
+            >
+              {t(showScript ? 'modals.permission.showReading' : 'modals.permission.showScript')}
+            </button>
+          )}
           <div className={cn('flex items-center gap-1.5 text-xs', modeColorClass)}>
             <ModeIcon className="size-3.5" />
             <span className="text-muted-foreground">{t('modals.permission.mode')}:</span>

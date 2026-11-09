@@ -482,6 +482,9 @@ pub struct DaemonState {
     pub(crate) recap_schedules: super::chat::RecapSchedules,
     /// Each session's background jobs and subagent runs, across turns.
     pub(crate) session_background: super::chat::SessionBackgrounds,
+    /// The live checks of every in-flight GitHub PR, as the poller last read
+    /// them.
+    pub(crate) pr_checks: super::pr_checks::PrChecksCache,
     pub(crate) tunnels: Arc<super::tunnel::TunnelRegistry>,
     /// The machine's reachability and sleep/wake state: the one source every
     /// agent and terminal the daemon builds watches, and the turn runner
@@ -540,6 +543,16 @@ impl DaemonState {
 
     pub(crate) fn config_snapshot(&self) -> Arc<MayConfig> {
         self.config.load_full()
+    }
+
+    /// The tool distribution's `heel`, prepared in the home's tools
+    /// directory, which runs the sandboxes of ACP probes and trials.
+    pub(crate) async fn heel(&self) -> Result<heel::HeelBinary, aither_sandbox::ToolRuntimeError> {
+        crate::tools::prepare_heel(
+            &self.tool_distribution,
+            &crate::session::MayHomePaths::new(self.may_dir.clone()).tools_dir(),
+        )
+        .await
     }
 
     pub(crate) fn update_config<R>(&self, update: impl FnOnce(&mut MayConfig) -> R) -> MayConfig {
@@ -1321,16 +1334,20 @@ impl DaemonState {
         ui_event_bus.set_session_changes(session_change_tx.clone());
         let lease_handle = tokio::runtime::Handle::current();
         let runtime_service = std::sync::Arc::new(
-            crate::session::SessionRuntimeService::new(db.clone(), ui_event_bus.clone())
-                .with_spawner(std::sync::Arc::new(move |task| {
-                    lease_handle.spawn(task);
-                })),
+            crate::session::SessionRuntimeService::new(
+                db.clone(),
+                ui_event_bus.clone(),
+                crate::session::MayHomePaths::new(may_dir.to_path_buf()),
+            )
+            .with_spawner(std::sync::Arc::new(move |task| {
+                lease_handle.spawn(task);
+            })),
         );
         let (title_generation_queue, _rx) = TitleGenerationQueue::new();
         let (tool_dispatchers, _queues) = tool_dispatch_channels();
-        let tool_distribution = std::sync::Arc::new(crate::tools::fixture_distribution(
-            &may_dir.join("tool-fixtures"),
-        ));
+        let tool_distribution = std::sync::Arc::new(
+            crate::tools::fixture_distribution(&may_dir.join("tool-fixtures")).await,
+        );
         let (search_index_wake_tx, search_index_wake) = async_channel::bounded(1);
         let (browser_lifecycle_tx, _) = tokio::sync::broadcast::channel(4);
         let notification_manager = std::sync::Arc::new(
@@ -1422,6 +1439,7 @@ impl DaemonState {
             aux_tasks: super::chat::AuxTasks::default(),
             recap_schedules: super::chat::RecapSchedules::default(),
             session_background: super::chat::SessionBackgrounds::default(),
+            pr_checks: super::pr_checks::PrChecksCache::default(),
             tunnels: std::sync::Arc::new(super::tunnel::TunnelRegistry::new()),
             connectivity,
             session_events_epoch: std::time::SystemTime::now()

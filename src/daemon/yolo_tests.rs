@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use aither_agent::workspace_request::RequestWorkspaceArgs;
 use aither_sandbox::permission::{PermissionError, PermissionHandler};
-use aither_sandbox::{ScriptLanguage, SshSessionAuthorizer, TerminalMode};
+use aither_sandbox::{CommandRole, ScriptLanguage, SshServer, TerminalMode};
 use tempfile::TempDir;
 
 use super::state::WorkspaceApprover;
@@ -17,6 +17,7 @@ use crate::agent::ssh_authorizer::MaySshAuthorizer;
 use crate::db::{ChatDb, CreateScheduledTaskParams};
 use crate::session::SessionRuntimeService;
 use crate::task_trigger::PersistedTaskTrigger;
+use crate::terminal_permission_handler::TerminalPermissionHandler;
 use crate::ui_event_bus::UiEventBus;
 
 struct Fixture {
@@ -34,9 +35,10 @@ impl Fixture {
         db.create_session("session", Some("Session"), Some("test-model"))
             .await
             .expect("create session");
+        let home = crate::session::MayHomePaths::new(dir.path().join("home"));
         Self {
             _dir: dir,
-            runtime: Arc::new(SessionRuntimeService::new(db, UiEventBus::new())),
+            runtime: Arc::new(SessionRuntimeService::new(db, UiEventBus::new(), home)),
         }
     }
 
@@ -151,11 +153,22 @@ async fn ssh_connect_is_granted_without_asking_in_a_yolo_session() {
     fixture.yolo(true).await;
     // Nothing drains the queue: asking would hang.
     let (broker, _queue) = crate::ask_user::channel();
-    let authorizer = MaySshAuthorizer::new("session", broker, fixture.runtime.db());
+    let handler = TerminalPermissionHandler::for_agent(None, None, None).with_ssh_authorizer(
+        MaySshAuthorizer::new("session", broker, fixture.runtime.db()),
+    );
+    let server = SshServer {
+        name: "build".to_string(),
+        target: "user@host".to_string(),
+    };
+    assert!(
+        !handler
+            .will_wait_for_location(&server, CommandRole::Main)
+            .await
+    );
 
     let granted = tokio::time::timeout(
         Duration::from_secs(10),
-        authorizer.authorize_connect("user@host"),
+        handler.check_location(&server, CommandRole::Main),
     )
     .await
     .expect("did not ask")

@@ -32,7 +32,7 @@ async fn bounded<T>(what: &str, future: impl Future<Output = T>) -> T {
 }
 
 struct Fixture {
-    _dir: TempDir,
+    dir: TempDir,
     service: Arc<SessionRuntimeService>,
 }
 
@@ -49,9 +49,10 @@ impl Fixture {
                 .expect("create session");
         }
         let bus = UiEventBus::new();
+        let home = crate::session::MayHomePaths::new(dir.path().join("home"));
         Self {
-            _dir: dir,
-            service: Arc::new(SessionRuntimeService::new(db, bus)),
+            dir,
+            service: Arc::new(SessionRuntimeService::new(db, bus, home)),
         }
     }
 }
@@ -159,12 +160,12 @@ async fn stop_in_each_waiting_state_ends_idle_with_the_run_released() {
                         "session",
                         Some(PersistedPermissionRequest {
                             id: "permission".to_string(),
-                            request: PersistedPermissionRequestPayload {
-                                mode: PermissionRequestMode::Default,
-                                script: "echo hi".to_string(),
-                                session_id: Some("session".to_string()),
-                                agent_id: None,
-                            },
+                            request: PersistedPermissionRequestPayload::new(
+                                PermissionRequestMode::Default,
+                                "echo hi".to_string(),
+                                Some("session".to_string()),
+                                None,
+                            ),
                         }),
                     )
                     .await
@@ -345,12 +346,12 @@ async fn recovery_settles_sessions_a_dead_run_left_owned() {
             "stale",
             Some(PersistedPermissionRequest {
                 id: "permission".to_string(),
-                request: PersistedPermissionRequestPayload {
-                    mode: PermissionRequestMode::Default,
-                    script: "echo hi".to_string(),
-                    session_id: Some("stale".to_string()),
-                    agent_id: None,
-                },
+                request: PersistedPermissionRequestPayload::new(
+                    PermissionRequestMode::Default,
+                    "echo hi".to_string(),
+                    Some("stale".to_string()),
+                    None,
+                ),
             }),
         )
         .await
@@ -364,10 +365,14 @@ async fn recovery_settles_sessions_a_dead_run_left_owned() {
 
     // Recovery runs at daemon start, before any run exists; the forgotten
     // guard is not in this registry either, so forget it too.
-    let fresh = SessionRuntimeService::new(service.db(), UiEventBus::new());
+    let fresh = SessionRuntimeService::new(
+        service.db(),
+        UiEventBus::new(),
+        crate::session::MayHomePaths::new(fixture.dir.path().join("home")),
+    );
     fresh
         .runs()
-        .recover_after_restart()
+        .recover_after_restart(crate::db::PreviousDaemon::Stopped)
         .await
         .expect("recovery");
 

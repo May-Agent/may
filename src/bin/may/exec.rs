@@ -97,33 +97,7 @@ struct ExecSessionContext {
     profile_container_preferences: Option<may_agent::profile::ContainerProfilePreferences>,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ExecSshAuthorizer {
-    allow_runtime_install: bool,
-}
-
-impl aither_sandbox::SshSessionAuthorizer for ExecSshAuthorizer {
-    fn authorize_connect(
-        &self,
-        _target: &str,
-    ) -> impl std::future::Future<Output = Result<bool, aither_sandbox::SshAuthorizationError>> + Send
-    {
-        std::future::ready(Ok(true))
-    }
-
-    fn authorize_runtime_install(
-        &self,
-        _target: &str,
-        _details: &str,
-    ) -> impl std::future::Future<Output = Result<bool, aither_sandbox::SshAuthorizationError>> + Send
-    {
-        std::future::ready(Ok(self.allow_runtime_install))
-    }
-}
-
 pub async fn run_exec(args: ExecArgs) -> Result<i32, ExecError> {
-    // `exec` runs a sandbox in-process; the daemon configures its own heel.
-    may_agent::configure_heel_binary().await;
     let context = load_exec_session_context(&args.session_id).await?;
     let config_path = context.may_dir.join("config.toml");
     let may_config = MayConfig::load_from(&config_path)
@@ -150,7 +124,6 @@ pub async fn run_exec(args: ExecArgs) -> Result<i32, ExecError> {
         &may_config,
         &model,
         args.ssh_server_id.as_deref(),
-        args.allow_runtime_install,
         tool_distribution,
     ))
     .await?;
@@ -163,7 +136,7 @@ pub async fn run_exec(args: ExecArgs) -> Result<i32, ExecError> {
             script: args.script,
             language: aither_sandbox::ScriptLanguage::Shell,
             mode: shell_mode,
-            ssh_server_id: args.ssh_server_id,
+            location: args.ssh_server_id,
             expect: OutputFormat::Text,
             resolution: aither_sandbox::MediaResolution::Auto,
             max_lines: args.max_lines,
@@ -368,7 +341,6 @@ async fn build_exec_terminal_tool(
     may_config: &MayConfig,
     model: &may_agent::ModelSelector,
     ssh_server_id: Option<&str>,
-    allow_runtime_install: bool,
     tool_distribution: Arc<aither_sandbox::ToolDistribution>,
 ) -> Result<
     TerminalTool<
@@ -384,32 +356,28 @@ async fn build_exec_terminal_tool(
         Some(server_id) => Some(resolve_targeted_ssh_server(context, may_config, server_id).await?),
         None => None,
     };
-    let ssh_available = ssh_server.is_some();
-    let mut shell_sessions = aither_sandbox::ShellSessionRegistry::new(match environment {
+    let shell_sessions = aither_sandbox::ShellSessionRegistry::new(match environment {
         may_agent::AgentEnvironment::Container { .. } => ShellRuntimeAvailability {
             local: false,
             container: true,
-            ssh: ssh_available,
         },
         may_agent::AgentEnvironment::Local => ShellRuntimeAvailability {
             local: true,
             container: false,
-            ssh: ssh_available,
         },
     });
 
+    let ssh_available = ssh_server.is_some();
     if let Some(ssh_server) = ssh_server {
-        shell_sessions = shell_sessions
-            .with_ssh_servers(vec![ssh_server])
-            .map_err(ExecError::ConfigureSshServers)?
-            .with_ssh_authorizer(Arc::new(ExecSshAuthorizer {
-                allow_runtime_install,
-            }));
+        shell_sessions
+            .add_ssh_server(ssh_server)
+            .map_err(|error| ExecError::ConfigureSshServers(error.to_string()))?;
     }
 
     let runtime_service = std::sync::Arc::new(may_agent::session::SessionRuntimeService::new(
         context.db.clone(),
         may_agent::ui_event_bus::UiEventBus::new(),
+        may_agent::MayHomePaths::new(context.may_dir.clone()),
     ));
     let network_policy = may_config
         .preferences
@@ -653,9 +621,6 @@ const fn select_exec_mode(
 ) -> TerminalExecutionMode {
     if let Some(mode) = args.mode {
         return mode;
-    }
-    if args.ssh_server_id.is_some() {
-        return TerminalExecutionMode::Ssh;
     }
     TerminalExecutionMode::Default
 }

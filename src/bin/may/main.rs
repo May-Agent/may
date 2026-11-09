@@ -1118,7 +1118,7 @@ where
 
         let Some(event) = event else {
             tracing::warn!("All channels closed, exiting");
-            agent_left_running = agent_handle.is_some() || app.agent_busy();
+            agent_left_running = agent_handle.is_some() || app.agent_working();
             break;
         };
         if matches!(&event, Event::Terminal(e) if matches!(**e, AppEvent::Tick)) {
@@ -1222,6 +1222,9 @@ where
                     }
                     TuiEvent::ReasoningEnd { seconds } => {
                         app.chat.finish_thinking(seconds);
+                    }
+                    TuiEvent::ToolReading { call_id, reading } => {
+                        app.chat.set_tool_reading(&call_id, reading);
                     }
                     TuiEvent::Hold { reason, .. } => match reason {
                         HoldReason::Retry { until, retry } => {
@@ -1432,7 +1435,7 @@ where
                 let dispatched = async {
                 match app.handle_event(*terminal_event)? {
                     Some(SendAction::Quit) => {
-                        agent_left_running = agent_handle.is_some() || app.agent_busy();
+                        agent_left_running = agent_handle.is_some() || app.agent_working();
                         return Ok(LoopFlow::Quit);
                     }
                     Some(SendAction::StopAgentAndQuit) => {

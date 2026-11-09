@@ -258,7 +258,7 @@ fn global_rules_are_reread_each_sync() {
 
 fn render_capabilities(commands: &[(String, String)], parameters: &Parameters) -> String {
     let dir = tempdir().expect("temp dir should be created");
-    tokio_test::block_on(build_capabilities(commands, parameters, dir.path()))
+    tokio_test::block_on(build_capabilities(commands, &[], parameters, dir.path()))
         .expect("capabilities render")
 }
 
@@ -525,5 +525,56 @@ fn the_efficiency_section_says_when_to_hand_exploration_to_explore() {
     assert!(
         prompt.contains("`explore --prompt-file <path>`"),
         "{prompt}"
+    );
+}
+
+#[test]
+fn the_capabilities_section_carries_each_core_commands_usage() {
+    let core = [
+        crate::terminal_commands::CoreCommandUsage {
+            name: "ask_user".to_string(),
+            usage: "Ask the user\n\nUsage:\n  ask_user <question>\n".to_string(),
+        },
+        crate::terminal_commands::CoreCommandUsage {
+            name: "tasks".to_string(),
+            usage: "Usage: tasks <subcommand>\n".to_string(),
+        },
+    ];
+    let dir = tempdir().expect("temp dir should be created");
+    let prompt = tokio_test::block_on(build_capabilities(
+        &[],
+        &core,
+        &Parameters::default(),
+        dir.path(),
+    ))
+    .expect("capabilities render");
+    for command in &core {
+        assert!(
+            prompt.contains(&format!(
+                "<usage command=\"{}\">\n{}\n</usage>",
+                command.name,
+                command.usage.trim()
+            )),
+            "{prompt}"
+        );
+    }
+}
+
+#[test]
+fn a_blocked_step_runs_in_unsafe_mode_without_asking_first() {
+    let prompt = super::build_permissions(&AgentEnvironment::Local, Vec::new(), None);
+    assert!(
+        prompt
+            .contains("When the sandbox blocks a step of the work, run that step in `unsafe` mode"),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("never ask through `ask_user` whether you may use `unsafe`"),
+        "{prompt}"
+    );
+    let harness = super::build_harness();
+    assert!(
+        harness.contains("Get past it as the permissions section says"),
+        "{harness}"
     );
 }

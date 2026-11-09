@@ -27,7 +27,9 @@ import type { ApiSession, SessionPlanState } from '@/lib/types';
 import { shortcutAria, shortcutLabel } from '@/lib/shortcuts';
 import { cn } from '@/lib/utils';
 import { openCount, rootReferences } from '@/lib/tasks/rows';
+import { livePrs } from '@/lib/inspector/prChecks';
 import { ReferenceLabel, TaskRowsView } from './TaskRowsView';
+import { PullRequestsView } from './PullRequestsView';
 import { PlanEditorSheet } from './PlanEditorSheet';
 import { LibraryPanel } from './LibraryPanel';
 
@@ -138,6 +140,7 @@ function DetailsPanel({ session }: { session: ApiSession }) {
   const jobs = useMemo(() => orderJobs(entry.background?.jobs ?? []), [entry.background]);
   const runningJobs = jobs.filter(isJobRunning);
   const finishedJobs = jobs.filter((job) => !isJobRunning(job));
+  const livePullRequests = useMemo(() => livePrs(entry.prs ?? []), [entry.prs]);
   const subagents = entry.background?.subagents ?? [];
   const backgroundFailed = entry.backgroundError !== null && !entry.background;
 
@@ -235,6 +238,12 @@ function DetailsPanel({ session }: { session: ApiSession }) {
           </>
         )}
       </Section>
+
+      {livePullRequests.length > 0 && (
+        <Section title={t('inspector.pullRequests')} meta={String(livePullRequests.length)}>
+          <PullRequestsView prs={livePullRequests} />
+        </Section>
+      )}
 
       <Section
         title={t('inspector.subagents')}

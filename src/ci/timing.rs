@@ -174,6 +174,7 @@ mod tests {
         let tight = Limits::from(CiConfig {
             max_job_minutes: 1,
             baseline_multiple: 1.5,
+            ..CiConfig::default()
         });
         assert_eq!(judge(Duration::from_secs(90), None, tight).len(), 1);
         let baseline = Some(Duration::from_secs(30));

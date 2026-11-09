@@ -9,8 +9,7 @@
 //! [`ProfileEnvironment::Container`]. Remote SSH servers are attached
 //! separately via the `profile_remote_servers` junction table and referenced
 //! through [`ProfileInfo::remote_attachments`]; the agent reaches them by
-//! invoking the `terminal` tool with `mode: "ssh"` and
-//! `ssh_server_id: <name>`.
+//! invoking the `terminal` tool with `location: <name>`.
 
 use crate::db::ChatDb;
 use crate::db::entity::profiles;
@@ -252,7 +251,7 @@ impl AsRef<ProfileEnvironment> for HomeEnvironment {
 /// Only `Local` and `Container` are valid home environments. SSH servers are
 /// attached via the `profile_remote_servers` junction table and exposed on
 /// [`ProfileInfo::remote_attachments`]; agents reach them by invoking the
-/// `terminal` tool with `mode: "ssh"` and `ssh_server_id: <name>` rather than
+/// `terminal` tool with `location: <name>` rather than
 /// by treating the whole profile as remote.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -448,7 +447,6 @@ mod tests {
             environment: environment.to_string(),
             container_id: None,
             persona: None,
-            remote_ssh_server_id: None,
             location_aware: false,
             pinned_limit: 10,
             sort_order: 0,
@@ -466,13 +464,5 @@ mod tests {
         assert!(matches!(info.environment.kind(), ProfileEnvironment::Local));
         assert_eq!(info.environment.as_db_str(), "local");
         assert_eq!(info.remote_attachments, [] as [std::string::String; 0]);
-    }
-
-    #[test]
-    fn profile_info_rejects_legacy_remote_environment() {
-        let error = ProfileInfo::from_db_parts(make_profile_model("remote"), None, Vec::new())
-            .expect_err("legacy remote environment must not deserialize");
-        let message = error.to_string();
-        assert!(message.contains("remote"), "unexpected error: {message}");
     }
 }

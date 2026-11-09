@@ -46,6 +46,8 @@ const DOUBLE_ESC_WINDOW: std::time::Duration = std::time::Duration::from_millis(
 
 /// Two clicks at the same spot within this window select the word under
 /// the cursor.
+/// Rows one `Alt+Up`/`Alt+Down` press scrolls the sidebar.
+const SIDEBAR_KEY_STEP_LINES: usize = 3;
 const DOUBLE_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// How long a transient status notice (e.g. "Copied selection") stays on
@@ -1813,7 +1815,15 @@ impl App {
                             // A stored call carries the arguments schema of
                             // the build that ran it, so it is read field by
                             // field rather than against today's schema.
-                            self.show_tool_start(id, parse_tool_start_partial(&name, &arguments));
+                            self.show_tool_start(
+                                id.clone(),
+                                parse_tool_start_partial(&name, &arguments),
+                            );
+                            // The daemon read the script when it served the
+                            // history; the client does not parse it again.
+                            if let Some(reading) = msg.reading.clone() {
+                                self.chat.set_tool_reading(&id, reading);
+                            }
                         }
                         Ok(crate::session::ToolEventRecord::End { id, result, .. }) => {
                             self.show_tool_end(&id, &result);
@@ -1987,6 +1997,7 @@ impl App {
         self.mode = AppMode::PermissionConfirm(crate::tui::state::PermissionConfirmState {
             request_id: request.id.clone(),
             request: request.request.clone(),
+            show_script: false,
         });
     }
 
@@ -2105,11 +2116,30 @@ impl App {
         self.processing || !self.session_runtime.state.is_idle()
     }
 
-    /// Answer a quit request: quits at once when no run is in flight, and
-    /// asks first what happens to a busy session's agent. A quit request
-    /// repeated while the dialog is up leaves the agent running.
+    /// Whether the current session's agent has background work alive: a
+    /// terminal job still running or a subagent run in flight.
+    #[must_use]
+    pub fn agent_has_background_work(&self) -> bool {
+        !self.subagents.is_empty()
+            || self
+                .jobs
+                .iter()
+                .any(|job| job.status == aither_sandbox::JobStatus::Running)
+    }
+
+    /// Whether the current session's agent is working: a run in flight or
+    /// background work alive.
+    #[must_use]
+    pub fn agent_working(&self) -> bool {
+        self.agent_busy() || self.agent_has_background_work()
+    }
+
+    /// Answer a quit request: quits at once when the agent is not working,
+    /// and asks first what happens to a working agent — a run in flight or
+    /// background work alive. A quit request repeated while the dialog is up
+    /// leaves the agent running.
     fn request_quit(&mut self) -> Option<SendAction> {
-        if matches!(self.mode, AppMode::QuitConfirm(_)) || !self.agent_busy() {
+        if matches!(self.mode, AppMode::QuitConfirm(_)) || !self.agent_working() {
             return Some(SendAction::Quit);
         }
         self.quit_pending = false;
@@ -2365,6 +2395,24 @@ impl App {
         if self.new_year.animating() {
             self.new_year.stop();
             return Ok(None);
+        }
+        // Alt+Up/Down scroll the sidebar, Alt+E opens every section and detail.
+        if modifiers.contains(KeyModifiers::ALT) && matches!(self.mode, AppMode::Chat) {
+            match code {
+                KeyCode::Up => {
+                    self.sidebar.scroll_up(SIDEBAR_KEY_STEP_LINES);
+                    return Ok(None);
+                }
+                KeyCode::Down => {
+                    self.sidebar.scroll_down(SIDEBAR_KEY_STEP_LINES);
+                    return Ok(None);
+                }
+                KeyCode::Char('e') => {
+                    self.sidebar.toggle_expand_all();
+                    return Ok(None);
+                }
+                _ => {}
+            }
         }
         // Global shortcuts
         if modifiers.contains(KeyModifiers::CONTROL) {
@@ -3172,6 +3220,30 @@ impl App {
             _ => return Ok(None),
         }
 
+        // Over the sidebar the wheel scrolls it while it overflows, and a
+        // click folds or expands the row under the pointer.
+        let over_sidebar = self
+            .sidebar
+            .area
+            .contains(ratatui::layout::Position::new(mouse.column, mouse.row));
+        if over_sidebar {
+            match mouse.kind {
+                MouseEventKind::ScrollUp if self.sidebar.scrollable() => {
+                    self.sidebar.scroll_up(SCROLL_STEP_LINES);
+                    return Ok(None);
+                }
+                MouseEventKind::ScrollDown if self.sidebar.scrollable() => {
+                    self.sidebar.scroll_down(SCROLL_STEP_LINES);
+                    return Ok(None);
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    self.sidebar.click(mouse.row);
+                    return Ok(None);
+                }
+                _ => {}
+            }
+        }
+
         // Clicks and drags outside the chat column (the sidebar) select
         // nothing; the wheel scrolls the chat anywhere.
         let in_chat = self.chat_area.is_empty()
@@ -3751,6 +3823,8 @@ impl App {
                 description: String::new(),
                 command: format!("! {masked}"),
                 mode: aither_sandbox::TerminalExecutionMode::Unsafe,
+                location: None,
+                reading: None,
                 status: super::ui::chat::ToolStatus::Running,
                 output: None,
                 diffs: Vec::new(),
@@ -4203,10 +4277,14 @@ impl App {
                 description,
                 script,
                 mode,
+                location,
             } => ToolDisplay::Terminal {
                 description,
                 command: script,
                 mode,
+                location,
+                // The daemon's reading arrives right after the start.
+                reading: None,
                 status: super::ui::chat::ToolStatus::Running,
                 output: None,
                 diffs: Vec::new(),
@@ -4853,6 +4931,52 @@ mod tests {
         crate::tui::ui::test_screen::buffer_screen(frame.buffer)
     }
 
+    /// The Preferences tab lists the jobserver pool size (automatic until
+    /// set), Enter opens it for editing, and text that is not a positive
+    /// number leaves the edit open without changing the setting.
+    #[tokio::test]
+    async fn preferences_list_and_edit_the_job_pool_size() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        app.mode = crate::tui::AppMode::Config;
+        app.config_state.section = crate::tui::state::ConfigSection::Preferences;
+        app.config_state.selected = 3;
+
+        let auto = format!("auto ({})", crate::jobserver::default_pool_size());
+        let screen = session_screen(&mut app).join("\n");
+        assert!(screen.contains("Job pool size"), "{screen}");
+        assert!(screen.contains(&auto), "{screen}");
+
+        app.config.sandbox.job_pool_size = std::num::NonZeroUsize::new(6);
+        let screen = session_screen(&mut app).join("\n");
+        assert!(!screen.contains("auto ("), "{screen}");
+        assert!(
+            screen
+                .lines()
+                .any(|line| line.contains("Job pool size") && line.contains('6')),
+            "{screen}"
+        );
+
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE)
+            .expect("enter");
+        assert_eq!(
+            app.config_state.edit_text().map(|(text, _)| text),
+            Some("6")
+        );
+
+        app.handle_key(KeyCode::Backspace, KeyModifiers::NONE)
+            .expect("backspace");
+        app.handle_key(KeyCode::Char('0'), KeyModifiers::NONE)
+            .expect("zero");
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE)
+            .expect("save");
+        assert!(app.config_state.is_editing(), "zero is refused");
+        assert_eq!(
+            app.config.sandbox.job_pool_size,
+            std::num::NonZeroUsize::new(6)
+        );
+    }
+
     const BLOCK_BG: ratatui::style::Color = ratatui::style::Color::Rgb(40, 40, 48);
     const BOX_DRAWING: [char; 8] = ['┌', '┐', '└', '┘', '─', '│', '╭', '╯'];
 
@@ -4950,6 +5074,139 @@ mod tests {
         assert!((0..height).all(|y| buffer[(left, y)].symbol() == " "));
         // The chat beside it is not painted with the block colour.
         assert_ne!(buffer[(left - 1, 0)].bg, BLOCK_BG);
+    }
+
+    fn sidebar_screen(app: &mut App, width: u16, height: u16) -> String {
+        let buffer = draw_buffer(app, width, height);
+        let left = width - crate::tui::sidebar::SidebarState::width_for(width);
+        (0..height)
+            .map(|y| {
+                // A wide glyph owns the cell after it too.
+                let mut row = String::new();
+                let mut x = left;
+                while x < width {
+                    let symbol = buffer[(x, y)].symbol();
+                    row.push_str(symbol);
+                    x += u16::try_from(unicode_width::UnicodeWidthStr::width(symbol).max(1))
+                        .expect("width");
+                }
+                row
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn doing(app: &mut App, rows: &[String]) {
+        let content = format!("## Doing\n{}\n", rows.join("\n"));
+        app.sidebar.set_tasks("s", Some(&content));
+    }
+
+    /// Content taller than the window scrolls, with a marker for what is off
+    /// screen, and every entry is reachable.
+    #[tokio::test]
+    async fn an_overflowing_sidebar_scrolls_and_says_what_is_off_screen() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        let rows: Vec<String> = (0..40).map(|n| format!("- task number {n}")).collect();
+        doing(&mut app, &rows);
+
+        let first = sidebar_screen(&mut app, 160, 20);
+        assert!(first.contains("task number 0"), "{first}");
+        assert!(!first.contains("task number 39"), "{first}");
+        assert!(first.contains('↓'), "more below is marked: {first}");
+        assert!(!first.contains('↑'), "nothing above yet: {first}");
+        assert!(app.sidebar.scrollable());
+
+        app.sidebar.scroll_down(usize::MAX);
+        let last = sidebar_screen(&mut app, 160, 20);
+        assert!(last.contains("task number 39"), "{last}");
+        assert!(!last.contains("task number 0\n"), "{last}");
+        assert!(last.contains('↑'), "more above is marked: {last}");
+        assert!(!last.contains('↓'), "nothing below at the end: {last}");
+
+        app.sidebar.scroll_up(usize::MAX);
+        assert!(sidebar_screen(&mut app, 160, 20).contains("task number 0"));
+    }
+
+    /// The wheel over the sidebar scrolls it, not the chat.
+    #[tokio::test]
+    async fn the_wheel_over_the_sidebar_scrolls_the_sidebar() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        let rows: Vec<String> = (0..40).map(|n| format!("- task number {n}")).collect();
+        doing(&mut app, &rows);
+        let _ = draw_buffer(&mut app, 160, 20);
+        let wheel = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollDown,
+            column: 150,
+            row: 5,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        app.handle_mouse(wheel).expect("mouse");
+        assert_eq!(app.sidebar.scroll, 3);
+    }
+
+    /// A task row with a detail shows it once clicked; a folded section hides
+    /// its rows.
+    #[tokio::test]
+    async fn clicking_expands_a_task_detail_and_folds_a_section() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        doing(
+            &mut app,
+            &["- 实现侧边栏滚动\n  详细说明在这里".to_string()],
+        );
+        let (width, height) = (160u16, 20u16);
+
+        let folded = sidebar_screen(&mut app, width, height);
+        assert!(folded.contains("实现侧边栏滚动"), "{folded}");
+        assert!(!folded.contains("详细说明在这里"), "{folded}");
+
+        let click = |row| crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            column: 150,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        let row_of_text = |screen: &str, needle: &str| {
+            u16::try_from(
+                screen
+                    .lines()
+                    .position(|line| line.contains(needle))
+                    .expect("row on screen"),
+            )
+            .expect("row")
+        };
+        app.handle_mouse(click(row_of_text(&folded, "实现侧边栏滚动")))
+            .expect("mouse");
+        let open = sidebar_screen(&mut app, width, height);
+        assert!(open.contains("详细说明在这里"), "{open}");
+
+        app.handle_mouse(click(row_of_text(&open, "Doing")))
+            .expect("mouse");
+        let closed = sidebar_screen(&mut app, width, height);
+        assert!(closed.contains("▸ Doing"), "{closed}");
+        assert!(!closed.contains("实现侧边栏滚动"), "{closed}");
+    }
+
+    /// `… N more` lists the rest; CJK titles keep their width.
+    #[tokio::test]
+    async fn expand_all_reveals_every_detail_and_keeps_cjk_rows_whole() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        let rows: Vec<String> = (0..3)
+            .map(|n| format!("- 任务{n}：渲染终端界面とレイアウト한국어\n  第{n}个细节"))
+            .collect();
+        doing(&mut app, &rows);
+        let before = sidebar_screen(&mut app, 160, 30);
+        assert!(!before.contains("第1个细节"), "{before}");
+        app.handle_key(KeyCode::Char('e'), KeyModifiers::ALT)
+            .expect("key");
+        let after = sidebar_screen(&mut app, 160, 30);
+        for n in 0..3 {
+            assert!(after.contains(&format!("第{n}个细节")), "{after}");
+        }
+        assert!(after.contains("任务0"), "{after}");
     }
 
     #[tokio::test]
@@ -5262,6 +5519,44 @@ mod tests {
         ));
     }
 
+    /// A reload shows an edit's diff from the reading the daemon served with
+    /// the history; the client does not parse the script again.
+    #[tokio::test]
+    async fn a_reloaded_edit_shows_the_reading_the_daemon_served() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        let script =
+            "apply_patch <<'P'\n*** Begin Patch\n*** Add File: b.txt\n+one\n*** End Patch\nP\n";
+        let arguments = serde_json::json!({ "description": "add b", "script": script }).to_string();
+        let start = crate::session::ToolEventRecord::Start {
+            id: "c1".to_string(),
+            name: "terminal".to_string(),
+            arguments: arguments.clone(),
+        };
+        let mut served = crate::ChatMessage::user(serde_json::to_string(&start).expect("start"));
+        served.role = MessageRole::Tool;
+        // As the daemon attaches it when it serves the history.
+        served.reading = Some(crate::command_reading::CommandReading::of(script));
+        app.render_history(&[crate::ChatMessage::user("hi"), served])
+            .await;
+        let Some(ChatElement::ToolCall {
+            display: crate::tui::ui::chat::ToolDisplay::Terminal { reading, .. },
+            ..
+        }) = app
+            .chat
+            .elements()
+            .iter()
+            .find(|element| matches!(element, ChatElement::ToolCall { .. }))
+        else {
+            panic!("the stored call is shown");
+        };
+        assert!(
+            reading
+                .as_ref()
+                .is_some_and(crate::command_reading::CommandReading::recognises_any)
+        );
+    }
+
     #[tokio::test]
     async fn the_status_window_is_the_one_the_daemon_sent() {
         let dir = tempfile::tempdir().expect("dir");
@@ -5549,12 +5844,12 @@ mod tests {
         let runtime = crate::client::SessionRuntimeSnapshot {
             waiting_permission: id.map(|id| crate::client::PermissionPollItem {
                 id: id.to_string(),
-                request: crate::session::PersistedPermissionRequestPayload {
-                    mode: crate::PermissionRequestMode::Unsafe,
-                    script: "rm -rf build".to_string(),
-                    session_id: None,
-                    agent_id: None,
-                },
+                request: crate::session::PersistedPermissionRequestPayload::new(
+                    crate::PermissionRequestMode::Unsafe,
+                    "rm -rf build".to_string(),
+                    None,
+                    None,
+                ),
             }),
             ..Default::default()
         };
@@ -5783,5 +6078,59 @@ mod tests {
         assert!(screen.contains("Effort"), "{screen}");
         assert!(screen.contains("▲"), "{screen}");
         assert!(screen.contains("Esc to cancel"), "{screen}");
+    }
+
+    fn background_job(status: aither_sandbox::JobStatus) -> aither_sandbox::JobInfo {
+        aither_sandbox::JobInfo {
+            pid: 4242,
+            task_id: "brisk-otter".to_string(),
+            execution_key: "key".to_string(),
+            script: "sleep 300".to_string(),
+            language: aither_sandbox::ScriptLanguage::Shell,
+            mode: aither_sandbox::TerminalMode::Sandboxed,
+            started_at: std::time::Instant::now(),
+            status,
+            output_path: None,
+            place: aither_sandbox::JobPlace::Host,
+        }
+    }
+
+    /// With no turn in flight, quitting asks first while a background command
+    /// still runs, and quits at once once it finished.
+    #[tokio::test]
+    async fn quitting_asks_while_only_a_background_command_runs() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        assert!(!app.agent_busy(), "no turn is in flight");
+
+        app.handle_event(AppEvent::BackgroundLoaded {
+            jobs: vec![background_job(aither_sandbox::JobStatus::Running)],
+            subagents: Vec::new(),
+        })
+        .expect("background event");
+        assert!(app.request_quit().is_none(), "the quit waits for an answer");
+        assert!(matches!(app.mode, crate::tui::AppMode::QuitConfirm(_)));
+        let screen = session_screen(&mut app).join("\n");
+        assert!(
+            screen.contains("Keep it running in the background"),
+            "{screen}"
+        );
+        assert!(screen.contains("Stop the agent, then quit"), "{screen}");
+        assert!(matches!(
+            app.handle_event(AppEvent::Key(KeyCode::Char('s'), KeyModifiers::NONE))
+                .expect("key event"),
+            Some(SendAction::StopAgentAndQuit)
+        ));
+
+        app.mode = crate::tui::AppMode::Chat;
+        app.handle_event(AppEvent::BackgroundLoaded {
+            jobs: vec![background_job(aither_sandbox::JobStatus::Completed {
+                exit_code: 0,
+                delivery: aither_sandbox::Delivery::Taken,
+            })],
+            subagents: Vec::new(),
+        })
+        .expect("background event");
+        assert!(matches!(app.request_quit(), Some(SendAction::Quit)));
     }
 }

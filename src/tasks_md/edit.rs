@@ -624,6 +624,140 @@ pub fn apply(content: &str, op: &Op) -> Result<Applied, Refusal> {
     })
 }
 
+/// A row an answered question held up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unblocked {
+    /// The row's number, as [`numbered`] shows it.
+    pub number: usize,
+    /// Its title, after the mark is gone.
+    pub title: String,
+}
+
+/// `content` with every `BLOCKING <request_id>` mark removed, and the rows
+/// that held.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cleared {
+    /// The document after it; `content` itself when no mark named the id.
+    pub content: String,
+    /// The rows whose mark is gone, in document order: pending again.
+    pub rows: Vec<Unblocked>,
+}
+
+/// The line without its trailing `BLOCKING <request_id>` mark, markdown
+/// around the mark included; `None` when the line's tail is not exactly the
+/// mark.
+fn without_mark(line: &str, request_id: &str) -> Option<String> {
+    let at = line.find("BLOCKING")?;
+    if !words(&line[at..]).eq(["BLOCKING", request_id]) {
+        return None;
+    }
+    Some(
+        line[..at]
+            .trim_end_matches(|c: char| c.is_whitespace() || "([*`:,;-\u{2014}".contains(c))
+            .to_string(),
+    )
+}
+
+/// Removes the `BLOCKING <request_id>` mark of every row it marks, so those
+/// rows are pending again.
+///
+/// A row whose mark is not the tail of one of its lines keeps it, and is not
+/// among the rows returned.
+///
+/// # Errors
+/// Fails with [`Refusal::Malformed`] when the result would break the format
+/// or change a row that carried no such mark; nothing is to be written then.
+pub fn clear_question(content: &str, request_id: &str) -> Result<Cleared, Refusal> {
+    let old = TasksFile::parse(content);
+    let mut lines: Vec<String> = content.lines().map(ToString::to_string).collect();
+    // Back to front, so a row's line numbers hold while an earlier one is
+    // rewritten.
+    for row in old
+        .rows()
+        .iter()
+        .rev()
+        .filter(|row| row.blocking_mark() == Some(request_id))
+    {
+        let Some(title) = without_mark(row.title(), request_id)
+            .map(|title| title.trim().to_string())
+            .filter(|title| !title.is_empty())
+            .or_else(|| (!is_blocking_line(row.title())).then(|| row.title().to_string()))
+        else {
+            continue;
+        };
+        let details: Vec<String> = row
+            .details()
+            .filter_map(|line| {
+                without_mark(line, request_id).map_or_else(
+                    || Some(line.to_string()),
+                    |rest| Some(rest.trim().to_string()).filter(|rest| !rest.is_empty()),
+                )
+            })
+            .collect();
+        replace_row(&mut lines, row, &title, &details);
+    }
+    let mut written = lines.join("\n");
+    written.push('\n');
+    let new = TasksFile::parse(&written);
+    let kept = new.rows().len() == old.rows().len()
+        && old.rows().iter().zip(new.rows()).all(|(before, after)| {
+            before.section() == after.section()
+                && (before.blocking_mark() == Some(request_id) || before.text() == after.text())
+        });
+    if new.violations().len() > old.violations().len() || !kept {
+        return Err(Refusal::Malformed(
+            new.violations().iter().map(violation_sentence).collect(),
+        ));
+    }
+    let rows: Vec<Unblocked> = old
+        .rows()
+        .iter()
+        .zip(new.rows())
+        .enumerate()
+        .filter(|(_, (before, after))| {
+            before.blocking_mark() == Some(request_id) && after.blocking_mark() != Some(request_id)
+        })
+        .map(|(index, (_, after))| Unblocked {
+            number: index + 1,
+            title: after.title().to_string(),
+        })
+        .collect();
+    Ok(Cleared {
+        content: if rows.is_empty() {
+            content.to_string()
+        } else {
+            written
+        },
+        rows,
+    })
+}
+
+/// [`clear_question`] on the file at `path`, written back whole when a mark
+/// went; an absent file has none.
+///
+/// # Errors
+/// Fails when the file cannot be read or written, or the result would be
+/// malformed.
+pub fn clear_question_in(path: &Path, request_id: &str) -> Result<Vec<Unblocked>, Error> {
+    let io = |source| Error::Io {
+        path: path.display().to_string(),
+        source,
+    };
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(io(error)),
+    };
+    let cleared = clear_question(&content, request_id).map_err(Error::Refused)?;
+    if cleared.content != content {
+        let directory = path.parent().unwrap_or_else(|| Path::new("."));
+        let mut staged = tempfile::NamedTempFile::new_in(directory).map_err(io)?;
+        staged.write_all(cleared.content.as_bytes()).map_err(io)?;
+        staged.persist(path).map_err(|error| io(error.error))?;
+    }
+    Ok(cleared.rows)
+}
+
 /// Runs the command on the file at `path`: reads it (an absent file is an
 /// empty document), applies the arguments' operation and, when it changed
 /// the document, writes it back whole.
@@ -641,6 +775,9 @@ pub fn run(path: &Path, args: &[String]) -> Result<String, Error> {
         path: path.display().to_string(),
         source,
     };
+    if matches!(args, [flag] if flag == "--help" || flag == "-h") {
+        return Ok(usage());
+    }
     let op = parse(args).map_err(Error::Usage)?;
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,

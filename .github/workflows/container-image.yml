@@ -1,37 +1,32 @@
 name: Container image
 
+# CI calls this workflow ahead of the tests that pull its image, for every
+# pull request, merge group and dev push that selects the tests, so the only
+# standalone trigger left is a push to main. The caller's concurrency group
+# cancels a superseded pull request run, called jobs included.
 on:
+  workflow_call:
   push:
-    branches: [dev, main]
+    branches: [main]
     paths:
       - 'container/**'
       - 'src/tools/*.json'
       - 'src/container/image_ref.rs'
+      - 'src/bin/tasks/**'
+      - 'src/tasks_md/**'
+      - 'templates/tasks_*.txt'
       - 'build.rs'
       - 'Cargo.lock'
       - 'examples/container_image.rs'
       - '.github/workflows/container-image.yml'
-  pull_request:
-    branches: [dev, main]
-    paths:
-      - 'container/**'
-      - 'src/tools/*.json'
-      - 'src/container/image_ref.rs'
-      - 'build.rs'
-      - 'Cargo.lock'
-      - 'examples/container_image.rs'
-      - '.github/workflows/container-image.yml'
-
-concurrency:
-  group: container-image-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
   packages: write
 
 # Fork pull requests cannot push to GHCR; they build each image for its
-# platform only to prove it compiles.
+# platform only to prove it compiles. Called from CI, `github.event` is the
+# caller's event, so this reads the same there.
 env:
   CAN_PUSH: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
 
@@ -147,6 +142,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
     env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       REF: ${{ needs.refs.outputs.workspace }}
       BASE: ${{ needs.refs.outputs.base }}
     steps:

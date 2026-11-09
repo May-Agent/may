@@ -108,8 +108,8 @@ pub enum MayAgentError {
 ///
 /// Only `Local` and `Container` are valid home environments. SSH servers
 /// attached to the profile are surfaced through `MayAgentConfig::ssh_servers`
-/// and reached per-command via the `terminal` tool's `mode: "ssh"` +
-/// `ssh_server_id: <name>` parameters. There is no remote-home variant: remote
+/// and reached per-command via the `terminal` tool's `location: <name>`
+/// parameter. There is no remote-home variant: remote
 /// is a per-invocation routing choice, not a session-level environment.
 #[derive(Debug)]
 pub enum AgentEnvironment {
@@ -209,7 +209,7 @@ pub struct MayAgentConfig {
     pub ask_user_broker: AskUserBroker,
     /// Image generation provider and model.
     pub image_generator: Option<ImageGeneratorConfig>,
-    /// Preconfigured SSH servers available for `terminal` ssh mode.
+    /// Preconfigured SSH servers a `terminal` command names as its `location`.
     pub ssh_servers: Vec<crate::config::SshServerConfig>,
     /// Optional web UI permission approver.
     pub permission_approver: Option<PermissionApprover>,
@@ -490,7 +490,12 @@ impl MayAgent {
                     config.permission_approver.clone(),
                     config.network_policy.clone(),
                     config.profile_id.clone(),
-                ),
+                )
+                .with_ssh_authorizer(super::ssh_authorizer::MaySshAuthorizer::new(
+                    config.session_id.as_str().to_string(),
+                    config.ask_user_broker.clone(),
+                    config.db.clone(),
+                )),
                 executor,
             )
             .await
@@ -526,12 +531,13 @@ impl MayAgent {
                     session_paths.tasks_path().display().to_string()
                 },
             ));
-        // The pool reaches only local commands: aither fails container and
-        // SSH executions while a pool is configured, so those sessions run
-        // without one until aither brokers tokens into them.
-        let terminal_tool = if is_container || !config.ssh_servers.is_empty() {
-            terminal_tool
-        } else {
+        // Local and container commands draw from the pool: a container
+        // command's fifo is made in the container's kernel and brokered by
+        // aither's relay over its exec, so it works on VM-backed runtimes
+        // too. An SSH server is another machine, and aither fails SSH
+        // executions while a pool is configured, so a session with SSH
+        // servers runs without one.
+        let terminal_tool = if config.ssh_servers.is_empty() {
             let connection = config
                 .job_server
                 .connect()
@@ -539,6 +545,8 @@ impl MayAgent {
             terminal_tool
                 .with_jobserver_pool(connection.pool, connection.fifo_dir)
                 .map_err(|e| MayAgentError::Sandbox(e.to_string()))?
+        } else {
+            terminal_tool
         };
         let job_registry = terminal_tool.job_registry();
         let subagents = config.subagents.clone().unwrap_or_default();
@@ -722,7 +730,6 @@ impl MayAgent {
             .clone()
             .zip(config.permission_approver.clone())
             .map(|(live, approver)| super::publish_approval::PublishGate::new(live, approver));
-        let ssh_authorizer_broker = config.ask_user_broker.clone();
         let imagine_config = ImagineCommandConfig {
             generator: config.image_generator.clone(),
             artifacts_dir: session_paths.artifacts_dir(),
@@ -757,7 +764,13 @@ impl MayAgent {
         // terminal commands run in; a container session has no host sandbox
         // to give them, so it offers none.
         let acp = match config.acp.as_ref() {
-            Some(hosts) if !is_container => Some(
+            Some(hosts) if !is_container => Some({
+                let heel = crate::tools::prepare_heel(
+                    &config.tool_distribution,
+                    &crate::session::MayHomePaths::new(config.may_dir.clone()).tools_dir(),
+                )
+                .await
+                .map_err(|e| MayAgentError::Sandbox(e.to_string()))?;
                 hosts
                     .agents(
                         config.session_id.as_str(),
@@ -776,10 +789,11 @@ impl MayAgent {
                                 .job_server
                                 .broker()
                                 .map_err(|e| MayAgentError::Sandbox(e.to_string()))?,
+                            heel,
                         ),
                     )
-                    .map_err(|e| MayAgentError::Sandbox(e.to_string()))?,
-            ),
+                    .map_err(|e| MayAgentError::Sandbox(e.to_string()))?
+            }),
             Some(_) => {
                 tracing::warn!(
                     "connected ACP agents are not offered in container sessions: they would run on the host"
@@ -920,6 +934,7 @@ impl MayAgent {
         // above.
         let capabilities = build_capabilities(
             builder.tool_descriptions(),
+            &shared_terminal_commands.usages,
             &config.request_parameters,
             &skills_dir,
         )
@@ -941,11 +956,6 @@ impl MayAgent {
             // per-command routing capability on top of it.
             .shell_runtime_availability(tool_environment_key.availability())
             .ssh_servers(ssh_servers)
-            .ssh_authorizer(super::ssh_authorizer::MaySshAuthorizer::new(
-                config.session_id.as_str().to_string(),
-                ssh_authorizer_broker,
-                config.db.clone(),
-            ))
             .agent_kind(AgentKind::Chatbot)
             .max_iterations(effective_max_iterations);
         if let Some(source) = &config.host_reader {

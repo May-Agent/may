@@ -1,13 +1,11 @@
 use std::str::FromStr;
 use std::sync::Arc;
 
-use futures_util::StreamExt;
 use skyzen::routing::Params;
 use skyzen::utils::{Json, State};
 use skyzen::{Error as SkyError, Result as SkyResult, StatusCode};
 
 use crate::db::ProfileEnvironmentKind;
-use crate::pr::merge_watch::Upstream;
 use crate::session::{MayHomePaths, SandboxResourceLayout, SessionStore, list_summaries_from_db};
 use crate::ui_event_bus::UiEventTopics;
 use aither_core::llm::{Message as LlmMessage, Role as LlmRole};
@@ -348,30 +346,29 @@ pub(super) async fn get_session_prs(
     State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<Vec<ApiPr>>> {
     let id = params.get("id").map_err(bad_request_error)?.to_string();
-    let rows = state
-        .db()
-        .list_session_prs(&id)
-        .await
-        .map_err(internal_error)?;
-    // Live checks ride the same payload: every open GitHub PR gets one
-    // GraphQL snapshot of its head rollup, best-effort — a slow or dead
-    // GitHub must not hold up the list itself. `buffered` keeps the row
-    // order so each summary zips back onto its own PR.
-    let mut check_reads = Vec::with_capacity(rows.len());
-    for row in &rows {
-        check_reads.push(pr_check_summary(&state, row));
-    }
-    let summaries = futures_util::stream::iter(check_reads)
-        .buffered(4)
-        .collect::<Vec<_>>()
-        .await;
+    Ok(Json(
+        session_prs(&state, &id).await.map_err(internal_error)?,
+    ))
+}
+
+/// The session's PRs with their events and the live checks the daemon's
+/// poller last read (see `pr_checks`), newest first.
+pub(super) async fn session_prs(
+    state: &DaemonState,
+    session_id: &str,
+) -> Result<Vec<ApiPr>, crate::db::ChatDbError> {
+    let rows = state.db().list_session_prs(session_id).await?;
     let mut prs = Vec::with_capacity(rows.len());
-    for (row, summary) in rows.into_iter().zip(summaries) {
+    for row in rows {
+        let (checks, checks_error) = match state.pr_checks.get(row.id) {
+            Some(Ok(report)) => (Some(super::types::ApiPrChecks::of(&report)), None),
+            Some(Err(error)) => (None, Some(error)),
+            None => (None, None),
+        };
         let events = state
             .db()
             .pr_events(row.id)
-            .await
-            .map_err(internal_error)?
+            .await?
             .into_iter()
             .map(|e| ApiPrEvent {
                 kind: e.kind,
@@ -390,45 +387,12 @@ pub(super) async fn get_session_prs(
             created_at: row.created_at,
             updated_at: row.updated_at,
             merged_at: row.merged_at,
-            checks: summary.map(|s| super::types::ApiPrChecks {
-                pending: s.pending,
-                passed: s.passed,
-                failed: s.failed,
-            }),
+            checks,
+            checks_error,
             events,
         });
     }
-    Ok(Json(prs))
-}
-
-/// One GraphQL snapshot of a live GitHub PR's check rollup; `None` for
-/// local/may-backend PRs, landed states, and failed reads.
-async fn pr_check_summary(
-    state: &DaemonState,
-    row: &crate::db::PrRow,
-) -> Option<crate::pr::merge_watch::CheckSummary> {
-    let live = row.backend == "github"
-        && matches!(row.state.as_str(), "open" | "checks_pending" | "merging")
-        && row.external_number.is_some();
-    if !live {
-        return None;
-    }
-    let repo_key = state
-        .db()
-        .repo_key_of_project(row.project_id)
-        .await
-        .ok()
-        .flatten()?;
-    let github = crate::pr::merge_watch::GithubPr {
-        api: &state.github_api,
-        owner_repo: &repo_key,
-        number: row.external_number?,
-    };
-    github
-        .snapshot()
-        .await
-        .ok()
-        .map(|snapshot| snapshot.check_summary())
+    Ok(prs)
 }
 
 /// Atomically set the plan state for a session without touching task content.

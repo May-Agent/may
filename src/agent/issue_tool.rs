@@ -1469,8 +1469,11 @@ mod tests {
         let mut events = bus.subscribe();
         let (changes_tx, changes_rx) = async_channel::unbounded();
         bus.set_session_changes(changes_tx);
-        let runtime =
-            std::sync::Arc::new(crate::session::SessionRuntimeService::new(db.clone(), bus));
+        let runtime = std::sync::Arc::new(crate::session::SessionRuntimeService::new(
+            db.clone(),
+            bus,
+            crate::session::MayHomePaths::new(dir.path().join("home")),
+        ));
         let provenance = IssueProvenance::new(db.clone(), "test".to_string());
         let store = crate::issue::MayIssueStore::new(db, "test".to_string());
         let seed = store.create("seed", "body", &[]).await.expect("seed issue");

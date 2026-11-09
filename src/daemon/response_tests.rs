@@ -35,7 +35,7 @@ async fn bounded<T>(what: &str, future: impl Future<Output = T>) -> T {
 }
 
 struct Fixture {
-    _dir: TempDir,
+    dir: TempDir,
     runtime: Arc<SessionRuntimeService>,
     events: broadcast::Receiver<UiEventTopics>,
 }
@@ -52,9 +52,10 @@ impl Fixture {
             .expect("create session");
         let bus = UiEventBus::new();
         let events = bus.subscribe();
+        let home = crate::session::MayHomePaths::new(dir.path().join("home"));
         Self {
-            _dir: dir,
-            runtime: Arc::new(SessionRuntimeService::new(db, bus)),
+            dir,
+            runtime: Arc::new(SessionRuntimeService::new(db, bus, home)),
             events,
         }
     }
@@ -611,7 +612,11 @@ async fn an_answer_to_an_unknown_question_is_not_found() {
 /// A second process sharing the database: its own service over the same
 /// database file, with its own run registry.
 fn other_process(fixture: &Fixture) -> SessionRuntimeService {
-    SessionRuntimeService::new(fixture.runtime.db(), UiEventBus::new())
+    SessionRuntimeService::new(
+        fixture.runtime.db(),
+        UiEventBus::new(),
+        crate::session::MayHomePaths::new(fixture.dir.path().join("home")),
+    )
 }
 
 async fn resume_from(process: &SessionRuntimeService) -> super::chat::WaitingTurnResume {
@@ -981,7 +986,11 @@ async fn forgetting_terminal_grants_removes_the_handle() {
     let db = ChatDb::open(&dir.path().join("history.db"))
         .await
         .expect("open database");
-    let runtime = SessionRuntimeService::new(db, UiEventBus::new());
+    let runtime = SessionRuntimeService::new(
+        db,
+        UiEventBus::new(),
+        crate::session::MayHomePaths::new(dir.path().join("home")),
+    );
     runtime.set_terminal_grants("session", aither_sandbox::TerminalGrants::new());
     assert!(runtime.terminal_grants("session").is_some());
     runtime.forget_terminal_grants("session");

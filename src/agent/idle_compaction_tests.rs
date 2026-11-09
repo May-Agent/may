@@ -301,7 +301,7 @@ impl SessionParts {
         }
     }
 
-    pub(super) fn input(&self) -> MayAgentSessionInput<'static> {
+    pub(super) async fn input(&self) -> MayAgentSessionInput<'static> {
         let cwd = self.dir.join("cwd");
         std::fs::create_dir_all(&cwd).expect("create cwd");
         MayAgentSessionInput {
@@ -335,9 +335,9 @@ impl SessionParts {
             acp_host: None,
             register_skills_broker: None,
             environment: AgentEnvironment::Local,
-            tool_distribution: Arc::new(crate::tools::fixture_distribution(
-                &self.dir.join(".may/tool-fixtures"),
-            )),
+            tool_distribution: Arc::new(
+                crate::tools::fixture_distribution(&self.dir.join(".may/tool-fixtures")).await,
+            ),
             tool_environments: self.tool_environments.clone(),
             job_server: self.job_server.clone(),
             provider_attempt: 0,
@@ -430,6 +430,7 @@ impl Session {
             parts.runtime = Some(Arc::new(crate::session::SessionRuntimeService::new(
                 parts.db.clone(),
                 crate::ui_event_bus::UiEventBus::new(),
+                crate::session::MayHomePaths::new(temp.path().join("home")),
             )));
         }
         let clock = ManualClock::new();
@@ -451,7 +452,7 @@ impl Session {
         clock: &ManualClock,
         prompt_cache_epoch: u32,
     ) -> MayAgent {
-        let mut input = parts.input();
+        let mut input = parts.input().await;
         input.prompt_cache_epoch = prompt_cache_epoch;
         let mut agent_config: MayAgentConfig = MayAgent::session_config(config, input)
             .await

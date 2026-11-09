@@ -520,6 +520,15 @@ pub enum SessionAgentBody {
         /// Seconds the phase lasted. Sub-second phases keep the fraction.
         seconds: f64,
     },
+    /// The daemon read the script of the terminal call `call_id`; sent right
+    /// after the call's start event, so a client renders the reading the
+    /// daemon computed instead of parsing the script again.
+    ToolReading {
+        /// The call the reading belongs to.
+        call_id: String,
+        /// How the daemon read the script.
+        reading: crate::command_reading::CommandReading,
+    },
     /// The run is parked.
     Hold {
         /// What the run waits for.
@@ -1004,12 +1013,27 @@ pub struct WirePr {
     /// Live check rollup of the PR's head, when the daemon read one.
     #[serde(default)]
     pub checks: Option<WirePrChecks>,
+    /// Why the daemon's last read of the checks failed, when it did.
+    #[serde(default)]
+    pub checks_error: Option<String>,
     /// Latest update timestamp.
     pub updated_at: String,
 }
 
-/// How many of a PR's checks sit in each state — the rollup GitHub shows.
-#[derive(Debug, Clone, Copy, serde::Deserialize)]
+/// The PR list the daemon pushes as `prs.changed` when a PR or its checks
+/// change.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrsChangedFrame {
+    /// Session the PRs belong to.
+    pub session_id: String,
+    /// The session's PRs as they stand now.
+    pub prs: Vec<WirePr>,
+}
+
+/// How many of a PR's checks sit in each state — the rollup GitHub shows —
+/// and each check.
+#[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WirePrChecks {
     /// Still running or not yet reported.
@@ -1018,6 +1042,53 @@ pub struct WirePrChecks {
     pub passed: u32,
     /// Failed, timed out, cancelled or errored.
     pub failed: u32,
+    /// Each check, in GitHub's order.
+    #[serde(default)]
+    pub items: Vec<WirePrCheck>,
+}
+
+impl WirePrChecks {
+    /// Checks that concluded, passed or failed.
+    #[must_use]
+    pub const fn finished(&self) -> u32 {
+        self.passed + self.failed
+    }
+
+    /// Every check.
+    #[must_use]
+    pub const fn total(&self) -> u32 {
+        self.passed + self.failed + self.pending
+    }
+}
+
+/// One check of a PR's head commit.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WirePrCheck {
+    /// Check run or status context name.
+    pub name: String,
+    /// `queued`, `running`, `passed` or `failed`.
+    pub state: String,
+    /// When it started; absent while queued.
+    #[serde(default)]
+    pub started_at: Option<jiff::Timestamp>,
+    /// When it concluded.
+    #[serde(default)]
+    pub finished_at: Option<jiff::Timestamp>,
+    /// Where GitHub shows the check, with its detail and log.
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+impl WirePrCheck {
+    /// Seconds the check has run (while running) or took (concluded) as of
+    /// `now`.
+    #[must_use]
+    pub fn duration_secs(&self, now: jiff::Timestamp) -> Option<u64> {
+        let started = self.started_at?;
+        let end = self.finished_at.unwrap_or(now);
+        u64::try_from(end.duration_since(started).as_secs()).ok()
+    }
 }
 
 #[cfg(test)]
@@ -1041,6 +1112,26 @@ mod tests {
         assert!(matches!(
             timed.event,
             AgentEvent::ToolCallEnd { ref id, ref result, .. } if id == "t1" && *result == ToolResult::text("done")
+        ));
+    }
+
+    #[test]
+    fn a_tool_reading_frame_survives_the_round_trip() {
+        use super::SessionAgentBody;
+        let body = SessionAgentBody::ToolReading {
+            call_id: "t1".to_string(),
+            reading: crate::command_reading::CommandReading::of("cat a.rs"),
+        };
+        let json = serde_json::to_string(&body).expect("serialize");
+        assert!(
+            json.contains("\"toolReading\"") || json.contains("tool_reading"),
+            "{json}"
+        );
+        let back: SessionAgentBody = serde_json::from_str(&json).expect("deserialize");
+        assert!(matches!(
+            back,
+            SessionAgentBody::ToolReading { ref call_id, ref reading }
+                if call_id == "t1" && reading.recognises_any()
         ));
     }
 

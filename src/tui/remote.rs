@@ -401,6 +401,12 @@ fn stream_app_event(kind: &str, data: &str, state: &mut StreamState) -> Option<A
                 upsert(&mut state.issues, frame.issue, |issue| issue.number);
                 state.issues_event(&session_id)
             }),
+        "prs.changed" => serde_json::from_str::<crate::client::PrsChangedFrame>(data)
+            .ok()
+            .map(|frame| AppEvent::SidebarPrs {
+                session_id: frame.session_id,
+                prs: frame.prs,
+            }),
         "issue.removed" => serde_json::from_str::<crate::client::IssueRemovedFrame>(data)
             .ok()
             .map(|frame| {
@@ -614,6 +620,14 @@ async fn forward_agent_frame(
         SessionAgentBody::ReasoningEnd { seconds } => {
             if let Some(turn) = current.as_mut() {
                 let _ = turn.events.send(TuiEvent::ReasoningEnd { seconds }).await;
+            }
+        }
+        SessionAgentBody::ToolReading { call_id, reading } => {
+            if let Some(turn) = current.as_mut() {
+                let _ = turn
+                    .events
+                    .send(TuiEvent::ToolReading { call_id, reading })
+                    .await;
             }
         }
         SessionAgentBody::Hold { reason, message } => {

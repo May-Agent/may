@@ -339,6 +339,19 @@ impl ChatDb {
         Ok(())
     }
 
+    /// Status of one task run, for tests that check what recovery did.
+    #[cfg(test)]
+    pub(crate) async fn task_run_status(&self, id: &str) -> Result<Option<String>, ChatDbError> {
+        let rows = query!(
+            self.db,
+            "SELECT status AS value FROM scheduled_task_runs WHERE id = ?",
+            id
+        )
+        .fetch_all::<super::common::StringValueRow>()
+        .await?;
+        Ok(rows.into_iter().next().map(|row| row.value))
+    }
+
     /// List enabled and approved tasks.
     ///
     /// Due-ness is resolved by the scheduler runtime because it depends on

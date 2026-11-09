@@ -24,7 +24,9 @@ import { parsePartialJson, projectField } from '@/lib/stream/partialJson';
 import { useTranslation, type MessageKey } from '@/lib/i18n';
 import { useSessionsStore } from '@/lib/stores/sessions';
 import { outputsPreviewUrl } from '@/lib/api/artifacts';
-import { extractTerminalResult, type OutputStream } from '@/lib/terminalResult';
+import { extractTerminalResult, terminalLocation, type OutputStream } from '@/lib/terminalResult';
+import { recognisesAny } from '@/lib/commandReading';
+import { CommandReadingView } from './CommandReadingView';
 import { CompactionRow } from './CompactionRow';
 import { searchFetchLabel } from '@/lib/hostedLabel';
 import { SearchRow } from './SearchRow';
@@ -226,13 +228,18 @@ function TerminalDetails({
   const script = tool.summary?.script ?? '';
   const mode = projectField(tool.argumentsRaw, 'mode');
   const escalated = mode === 'unsafe';
+  const location = terminalLocation(tool.argumentsRaw);
   const terminal = extractTerminalResult(tool.result);
   const scriptRedundant = script.length > 0 && firstLine(script) === primary;
-  const showScript = script.length > 0 && !scriptRedundant;
+  const reading = tool.summary?.reading;
+  const readingShown = recognisesAny(reading);
+  const showScript = script.length > 0 && !scriptRedundant && !readingShown;
   const hasOutput =
     terminal !== null &&
     (terminal.stdout !== null || terminal.stderr !== null || terminal.exitCode !== null);
-  if (!showScript && !escalated && !hasOutput) return null;
+  if (!showScript && !readingShown && !escalated && location === null && !hasOutput) {
+    return null;
+  }
   const failed =
     terminal !== null && terminal.exitCode !== null && terminal.exitCode !== 0;
 
@@ -241,7 +248,13 @@ function TerminalDetails({
 
   return (
     <div className="space-y-2">
+      {readingShown && <CommandReadingView reading={reading} />}
       {showScript && <ShellBlock script={script} />}
+      {location !== null && (
+        <div className="text-[11px] text-muted-foreground">
+          [{t('tools.sshLocation')} {location}]
+        </div>
+      )}
       {escalated && (
         <div className="text-[11px] text-destructive">
           {t('tools.escalated')}

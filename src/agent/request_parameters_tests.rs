@@ -148,7 +148,7 @@ async fn bodies(stub: &StubModel) -> Vec<Value> {
 async fn a_claude_turn_carries_cache_breakpoints() {
     let stub = ClaudeStub::spawn().await;
     let parts = SessionParts::new(tempfile::tempdir().expect("tempdir").keep()).await;
-    let mut input = parts.input();
+    let mut input = parts.input().await;
     input.model = CLAUDE_SELECTOR;
     let mut agent = Box::pin(MayAgent::from_config_with_model_and_permissions(
         &claude_config(&stub),
@@ -214,7 +214,7 @@ async fn a_rebuilt_agent_continues_the_prompt_cache_key() {
     let stub = StubModel::spawn(SESSION_MODEL).await;
     let config = saved_config(&stub, None);
     let parts = SessionParts::new(tempfile::tempdir().expect("tempdir").keep()).await;
-    let mut input = parts.input();
+    let mut input = parts.input().await;
     input.prompt_cache_epoch = 3;
     let mut agent = Box::pin(MayAgent::from_config_with_model_and_permissions(
         &config, input,

@@ -1,7 +1,8 @@
 import { useMemo, useState } from 'react';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
-import type { PersistedAskUserRequest } from '@/lib/types';
+import type { PersistedAskUserRequest, TaskRow } from '@/lib/types';
+import { rowsBlockedBy } from '@/lib/tasks/rows';
 import { respondAskUser } from '@/lib/api/interactions';
 import { useTranslation } from '@/lib/i18n';
 import { cn } from '@/lib/utils';
@@ -168,8 +169,33 @@ export function AskUserModal({ request }: { request: PersistedAskUserRequest | n
   );
 }
 
+/** The `tasks.md` rows an open question holds up. */
+export function BlockedRows({ rows }: { rows: readonly TaskRow[] }) {
+  const { t } = useTranslation();
+  if (rows.length === 0) return null;
+  return (
+    <div data-blocked-rows className="mt-2 text-xs text-muted-foreground">
+      <span className="uppercase tracking-wider">{t('modals.askUser.blocks')}</span>
+      <ul className="mt-1 space-y-0.5">
+        {rows.map((row, index) => (
+          <li key={`${index}:${row.title}`} className="truncate text-foreground">
+            {row.title}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 /** Questions the agent asked that are neither answered nor withdrawn; no run waits on them. */
-export function OpenQuestions({ requests }: { requests: PersistedAskUserRequest[] }) {
+export function OpenQuestions({
+  requests,
+  rows = [],
+}: {
+  requests: PersistedAskUserRequest[];
+  /** The rows of the session's `tasks.md`. */
+  rows?: readonly TaskRow[];
+}) {
   const { t } = useTranslation();
   if (requests.length === 0) return null;
   return (
@@ -184,6 +210,7 @@ export function OpenQuestions({ requests }: { requests: PersistedAskUserRequest[
           className="rounded-lg border border-border bg-background p-4 shadow-lg"
         >
           <h2 className="text-sm font-semibold">{t('modals.askUser.openTitle')}</h2>
+          <BlockedRows rows={rowsBlockedBy(rows, request.id)} />
           <AskUserForm request={request} />
         </section>
       ))}

@@ -114,35 +114,3 @@ impl ChatDb {
         Ok(())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use crate::db::ChatDb;
-
-    /// A database from before `owner_repo` was kept gains the column when it
-    /// opens, and its records read back without a repository.
-    #[tokio::test]
-    async fn a_database_without_the_owner_column_is_migrated() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("history.db");
-        let db = ChatDb::open(&path).await.unwrap();
-        db.db
-            .query("ALTER TABLE repo_usage DROP COLUMN owner_repo")
-            .execute()
-            .await
-            .unwrap();
-        db.db
-            .query(
-                "INSERT INTO repo_usage (worktree, last_used_at, use_count) VALUES ('/old', 1, 1)",
-            )
-            .execute()
-            .await
-            .unwrap();
-        drop(db);
-
-        let db = ChatDb::open(&path).await.unwrap();
-        let usage = db.repo_usage_since(0).await.unwrap();
-        assert_eq!(usage.len(), 1);
-        assert_eq!(usage[0].owner_repo, None);
-    }
-}

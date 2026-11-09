@@ -9,6 +9,7 @@ import {
   type SessionTurnFrame,
 } from '../api/sessionEvents';
 import { getSessionBackground, type SessionBackground } from '../api/background';
+import type { ApiPr } from '../api/prs';
 import {
   applyEvent,
   emptyTurn,
@@ -252,6 +253,11 @@ export const useTurnStore = create<TurnSliceState>((set, get) => {
         case 'reset':
           resync(sessionId);
           return;
+        case 'prs.changed': {
+          const { prs } = data as unknown as { prs: ApiPr[] };
+          useInspectorStore.getState().applyPrs(sessionId, prs);
+          return;
+        }
         default:
           if (applyBackgroundDelta(background, kind, data)) emitBackground();
       }
@@ -273,6 +279,7 @@ export const useTurnStore = create<TurnSliceState>((set, get) => {
         // The REST read failed; deltas still apply on the empty snapshot.
       }
       if (closed) return;
+      void useInspectorStore.getState().loadPrs(sessionId);
       unwatch = watchSessionEvents(sessionId, cursor, (kind, data) => onEvent(kind, data));
     })();
     return () => {
