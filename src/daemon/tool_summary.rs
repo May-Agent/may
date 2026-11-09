@@ -13,6 +13,7 @@
 use partial_json_fixer::fix_json;
 use serde_json::Value;
 
+use crate::command_reading::CommandReading;
 use crate::daemon::types::ToolVariant;
 
 /// Per-variant subset of tool arguments shown in the UI summary chip.
@@ -40,13 +41,18 @@ pub struct ToolSummary {
     pub target: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
+    /// How May reads a `terminal` call's script. Present once the call's
+    /// arguments are complete, so a half-streamed script is never read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reading: Option<CommandReading>,
 }
 
 impl ToolSummary {
     /// Returns `true` iff at least one field is populated.
     #[must_use]
     pub const fn has_any(&self) -> bool {
-        self.description.is_some()
+        self.reading.is_some()
+            || self.description.is_some()
             || self.script.is_some()
             || self.query.is_some()
             || self.url.is_some()
@@ -83,23 +89,38 @@ pub fn project_tool_summary(arguments_raw: &str, variant: ToolVariant) -> ToolSu
     // tree); the single serde parse then performs JSON unescaping. This
     // replaces the previous repair-parse → re-serialize → re-parse round
     // trip, which did three full passes per streamed delta.
-    let value: Value = match serde_json::from_str(&fix_json(trimmed)) {
-        Ok(v) => v,
-        Err(_) => return ToolSummary::default(),
+    let (value, complete): (Value, bool) = match serde_json::from_str(trimmed) {
+        Ok(v) => (v, true),
+        Err(_) => match serde_json::from_str(&fix_json(trimmed)) {
+            Ok(v) => (v, false),
+            Err(_) => return ToolSummary::default(),
+        },
     };
     if !value.is_object() {
         return ToolSummary::default();
     }
 
     match variant {
-        ToolVariant::Terminal
-        | ToolVariant::TerminalInput
-        | ToolVariant::TerminalRead
-        | ToolVariant::TerminalKill => ToolSummary {
-            description: pick(&value, "description"),
-            script: pick(&value, "script"),
-            ..ToolSummary::default()
-        },
+        ToolVariant::Terminal => {
+            let script = pick(&value, "script");
+            let reading = script
+                .as_deref()
+                .filter(|_| complete)
+                .map(CommandReading::of);
+            ToolSummary {
+                description: pick(&value, "description"),
+                script,
+                reading,
+                ..ToolSummary::default()
+            }
+        }
+        ToolVariant::TerminalInput | ToolVariant::TerminalRead | ToolVariant::TerminalKill => {
+            ToolSummary {
+                description: pick(&value, "description"),
+                script: pick(&value, "script"),
+                ..ToolSummary::default()
+            }
+        }
         ToolVariant::WebSearch => ToolSummary {
             query: pick(&value, "query"),
             ..ToolSummary::default()
@@ -167,6 +188,22 @@ mod tests {
             Some("Get current local time")
         );
         assert_eq!(final_summary.script.as_deref(), Some("date +%s"));
+    }
+
+    #[test]
+    fn a_terminal_call_is_read_only_once_its_arguments_are_complete() {
+        let streaming = "{\"description\":\"x\",\"script\":\"cat a.rs";
+        assert!(
+            project_tool_summary(streaming, ToolVariant::Terminal)
+                .reading
+                .is_none()
+        );
+        let complete = "{\"description\":\"x\",\"script\":\"cat a.rs\"}";
+        let summary = project_tool_summary(complete, ToolVariant::Terminal);
+        let reading = summary.reading.expect("complete arguments are read");
+        assert_eq!(reading.steps[0].line, "Read a.rs");
+        let other = project_tool_summary(complete, ToolVariant::TerminalInput);
+        assert!(other.reading.is_none());
     }
 
     #[test]

@@ -355,6 +355,7 @@ mod tests {
                     description,
                     script,
                     mode,
+                    ..
                 } => {
                     assert_eq!(description, "say hi");
                     assert_eq!(script, "echo hi");
@@ -375,6 +376,7 @@ mod tests {
                 description,
                 script,
                 mode,
+                ..
             } => {
                 assert_eq!(description, "serve");
                 assert_eq!(script, "bun dev");
@@ -457,6 +459,7 @@ mod tests {
                 description,
                 script,
                 mode,
+                ..
             } = parse_tool_start_partial("terminal", frame)
             else {
                 panic!("expected terminal start kind");

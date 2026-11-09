@@ -108,6 +108,7 @@ impl TurnPersister {
                 reasoning: Vec::new(),
                 tool_calls: Vec::new(),
                 translation: msg.translation.clone(),
+                reading: None,
                 thinking: msg.thinking.clone(),
             };
             let row = db

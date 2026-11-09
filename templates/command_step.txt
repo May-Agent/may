@@ -1,0 +1,27 @@
+{%- match intent -%}
+{%- when Intent::Edit { files } -%}
+{%- if files.len() == 1 -%}Edit {{ files[0].path }}{%- else -%}Edit {{ files.len() }} files{%- endif -%}
+{%- when Intent::Read { path, range } -%}
+{%- match range -%}
+{%- when ReadRange::Whole -%}Read {{ path }}
+{%- when ReadRange::Head { lines } -%}Read the first {{ lines }} lines of {{ path }}
+{%- when ReadRange::Tail { lines } -%}Read the last {{ lines }} lines of {{ path }}
+{%- when ReadRange::Lines { start, end } -%}Read lines {{ start }} to {{ end }} of {{ path }}
+{%- endmatch -%}
+{%- when Intent::Search { tool, pattern, paths } -%}
+{%- if let Some(pattern) = pattern -%}
+{%- if tool.finds_files() -%}Find files matching "{{ pattern }}"{%- else -%}Search for "{{ pattern }}"{%- endif -%}
+{%- else -%}List files{%- endif -%}
+{%- if !paths.is_empty() %} in {{ paths|join(", ") }}{%- endif -%}
+{%- when Intent::List { tool, paths } -%}
+{%- if tool.is_tree() -%}Show the tree of{%- else -%}List{%- endif -%}
+{%- if paths.is_empty() %} the current directory{%- else %} {{ paths|join(", ") }}{%- endif -%}
+{%- when Intent::Git { subcommand } -%}
+Run git{%- if let Some(subcommand) = subcommand %} {{ subcommand }}{%- endif -%}
+{%- when Intent::Build { tool, subcommand, target } -%}
+Run {{ tool.name() -}}
+{%- if let Some(subcommand) = subcommand %} {{ subcommand }}{%- endif -%}
+{%- if let Some(target) = target %} {{ target }}{%- endif -%}
+{%- when Intent::Unknown { source } -%}
+{{ source }}
+{%- endmatch -%}
