@@ -96,7 +96,7 @@ May is a terminal-based AI assistant built as an application layer on the **aith
 - **aither-sandbox**: `TerminalTool`/`TerminalMode` (legacy names for terminal-command execution), `PermissionHandler` trait, the `monitor` tool, background jobs, stdin watch, output overflow
 - **aither-models**: Model metadata database for tier lookups
 - **aither-mcp**, **aither-browser**, **aither-acp**, **aither-connectivity**: MCP servers as terminal commands, the managed browser, ACP agents as subagent types, connectivity checks
-- **heel**: Native sandbox for isolated command execution (managed binary configured in `src/heel/`)
+- **heel**: Native sandbox for isolated command execution; its binary is a host program of May's tool distribution (`src/tools/host-programs.json`), pinned at the linked library's version
 
 ### Module Structure
 
@@ -112,7 +112,7 @@ May is a terminal-based AI assistant built as an application layer on the **aith
 
 **`src/agent/notices.rs`** - `MayNotices`, May's wording of aither's alerts, notices and refusals, `tasks.md` alerts included
 
-**Other top-level modules** - `agent_link` (main agents on one machine exchange messages), `computer` (a virtual desktop per session), `container` (container sandbox), `db` (SQLite persistence: `~/.may/history.db`), `issue` (May and GitHub issue backends), `pr` (session-owned PRs), `repo_clone` (per-session repository clones), `profile` (profiles), `memory` (profile memory extraction), `mcp`, `notification` (web push), `scheduler` and `task_trigger` (scheduled tasks), `skill` (skill management), `heel` (managed sandbox binary), `cache_lifetime` (provider prompt-cache lifetime)
+**Other top-level modules** - `agent_link` (main agents on one machine exchange messages), `computer` (a virtual desktop per session), `container` (container sandbox), `db` (SQLite persistence: `~/.may/history.db`), `issue` (May and GitHub issue backends), `pr` (session-owned PRs), `repo_clone` (per-session repository clones), `profile` (profiles), `memory` (profile memory extraction), `mcp`, `notification` (web push), `scheduler` and `task_trigger` (scheduled tasks), `skill` (skill management), `tools` (the pinned tool distribution, `heel` and repo-search included), `cache_lifetime` (provider prompt-cache lifetime)
 
 **`src/daemon/`** - The resident daemon and its API
 - `mod.rs`: `run_daemon`, single-instance lock, listeners, auto-index

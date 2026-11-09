@@ -44,7 +44,7 @@ pub(super) fn terminal(script: &'static str) -> Step {
             "background": false,
             "description": "Take a step",
             "script": script,
-            "mode": "sandboxed",
+            "mode": "default",
             "raw": true,
             "timeout": 30,
             "max_lines": 20

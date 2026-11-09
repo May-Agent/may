@@ -1142,19 +1142,52 @@ pub(super) fn spawn_follow_up_runs(state: Arc<DaemonState>, session_id: String) 
                 return;
             }
         };
-        dispatch_follow_ups(state, guard).await;
+        log_follow_ups(state, guard).await;
     });
 }
 
 /// Continue a run that [`SessionRunGuard::finish`] re-acquired for pending work.
 fn spawn_continued_run(state: Arc<DaemonState>, guard: SessionRunGuard) {
     let tokio_handle = state.tokio_handle.clone();
-    tokio_handle.spawn(dispatch_follow_ups(state, guard));
+    tokio_handle.spawn(log_follow_ups(state, guard));
+}
+
+/// Why [`dispatch_follow_ups`] stopped before the queue drained.
+#[derive(Debug, thiserror::Error)]
+enum FollowUpError {
+    #[error("failed to load next pending message: {0}")]
+    Next(crate::db::ChatDbError),
+    #[error("follow-up run failed: {0}")]
+    Turn(ChatCollectError),
+    #[error("failed to release session run after follow-up dispatch: {0}")]
+    Release(crate::db::ChatDbError),
+}
+
+/// [`dispatch_follow_ups`] for a spawned task, which has no caller to
+/// report to.
+async fn log_follow_ups(state: Arc<DaemonState>, guard: SessionRunGuard) {
+    let session_id = guard.session_id().to_string();
+    match dispatch_follow_ups(state, guard).await {
+        Ok(()) => {}
+        Err(error @ FollowUpError::Release(_)) => {
+            tracing::error!(session_id = %session_id, %error, "follow-up dispatch stopped");
+        }
+        Err(error) => {
+            tracing::warn!(session_id = %session_id, %error, "follow-up dispatch stopped");
+        }
+    }
 }
 
 /// Run the session's pending messages one after another under `guard`,
 /// until the queue is empty and finishing the guard finds no new work.
-async fn dispatch_follow_ups(state: Arc<DaemonState>, mut guard: SessionRunGuard) {
+///
+/// # Errors
+/// Returns why it stopped early; a failed load or turn first releases the
+/// run as failed.
+async fn dispatch_follow_ups(
+    state: Arc<DaemonState>,
+    mut guard: SessionRunGuard,
+) -> Result<(), FollowUpError> {
     let session_id = guard.session_id().to_string();
     // Whether the newest turn ran to completion, so the session is idle
     // once the queue drains.
@@ -1167,9 +1200,8 @@ async fn dispatch_follow_ups(state: Arc<DaemonState>, mut guard: SessionRunGuard
         {
             Ok(next) => next,
             Err(error) => {
-                tracing::warn!(session_id = %session_id, error = %error, "failed to load next pending message");
                 finish_failed_run(guard).await;
-                return;
+                return Err(FollowUpError::Next(error));
             }
         };
         let Some(next) = next else {
@@ -1182,12 +1214,9 @@ async fn dispatch_follow_ups(state: Arc<DaemonState>, mut guard: SessionRunGuard
                     if last_turn_completed {
                         session_became_idle(&state, &session_id);
                     }
-                    return;
+                    return Ok(());
                 }
-                Err(error) => {
-                    tracing::error!(session_id = %session_id, error = %error, "failed to release session run after follow-up dispatch");
-                    return;
-                }
+                Err(error) => return Err(FollowUpError::Release(error)),
             }
         };
 
@@ -1210,9 +1239,8 @@ async fn dispatch_follow_ups(state: Arc<DaemonState>, mut guard: SessionRunGuard
         {
             Ok(end) => last_turn_completed = end == TurnEnd::Completed,
             Err(error) => {
-                tracing::warn!(session_id = %session_id, error = %error, "follow-up run failed");
                 finish_failed_run(guard).await;
-                return;
+                return Err(FollowUpError::Turn(error));
             }
         }
     }
@@ -3183,6 +3211,7 @@ enum AgentLoopError {
     EmptyAssistantResponse,
 }
 
+#[derive(Debug)]
 enum ChatCollectError {
     Preparation(UiChatPreparationError),
     Sky(skyzen::Error),
@@ -5155,7 +5184,9 @@ mod tests {
             .acquire("session")
             .await
             .expect("acquire run");
-        super::dispatch_follow_ups(state.clone(), guard).await;
+        super::dispatch_follow_ups(state.clone(), guard)
+            .await
+            .expect("both queued turns run");
 
         assert_eq!(stored_assistant_texts(&state).await, ["one", "two"]);
         assert!(
@@ -5552,7 +5583,7 @@ mod tests {
         assert!(runtime.has_pending_messages(), "/sleep waits for the turn");
 
         // The running turn ends and the session takes the pending message.
-        tokio::spawn(super::dispatch_follow_ups(state.clone(), guard));
+        tokio::spawn(super::log_follow_ups(state.clone(), guard));
         let body = body_containing(&provider, "/sleep").await;
         assert_greeting_requirements(&body);
     }

@@ -8,7 +8,7 @@ A profile groups sessions and sets where their agents run. Three exist from the 
 - Environment: `local` (the host) or `container` (agents run in a container; its mounts are listed in the profile preferences with host path, container path and `read_only` or `read_write` access).
 - Persona: free text added to the system prompt for sessions in that profile.
 - Location awareness: whether the user's inferred city is given to the agent.
-- Attached SSH servers, chosen from `ssh_servers` in the config; the agent reaches them through the terminal in `ssh` mode. A name no longer configured is skipped with a warning.
+- Attached SSH servers, chosen from `ssh_servers` in the config; the agent reaches them through the terminal's `location`. A name no longer configured is skipped with a warning.
 - A pinned limit (10 by default) on pinned sessions plus folders.
 - Per-profile files under `~/.may/profiles/<id>/`: `workspace.toml` (approved directories and repository trust), memories, skills and the session directories.
 

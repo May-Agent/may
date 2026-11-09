@@ -471,7 +471,7 @@ impl MockScenarioState {
                         "background": false,
                         "description": "Take a step",
                         "script": format!("echo COMPACTION-STEP-{}", self.probe_steps),
-                        "mode": "sandboxed",
+                        "mode": "default",
                         "raw": true,
                         "timeout": 30,
                         "max_lines": 20
@@ -532,7 +532,7 @@ impl MockScenarioState {
                                 &serde_json::json!({
                                     "description": "Run the MCP probe command",
                                     "script": command,
-                                    "mode": "sandboxed",
+                                    "mode": "default",
                                     "raw": true,
                                     "timeout": 30,
                                     "max_lines": 50
@@ -595,7 +595,7 @@ impl MockScenarioState {
                                 "background": true,
                                 "description": "Ask the terminal for the user's name",
                                 "script": "printf 'cwd=%s\\n' \"$(pwd -P)\"; printf 'name? '; read name; printf 'hello %s\\n' \"$name\"",
-                                "mode": "sandboxed",
+                                "mode": "default",
                                 "raw": true,
                                 "timeout": 60,
                                 "max_lines": 50
@@ -627,7 +627,7 @@ impl MockScenarioState {
                                 &serde_json::json!({
                                     "description": "Send a name through terminal IPC",
                                     "script": script,
-                                    "mode": "sandboxed",
+                                    "mode": "default",
                                     "raw": true,
                                     "timeout": 10,
                                     "max_lines": 50
@@ -664,7 +664,7 @@ impl MockScenarioState {
                                 &serde_json::json!({
                                     "description": "Read the reply through terminal IPC",
                                     "script": script,
-                                    "mode": "sandboxed",
+                                    "mode": "default",
                                     "raw": true,
                                     "timeout": 10,
                                     "max_lines": 50
@@ -711,7 +711,7 @@ impl MockScenarioState {
                             &serde_json::json!({
                                 "description": "Ask the user which database to use",
                                 "script": ASK_USER_SCRIPT,
-                                "mode": "sandboxed",
+                                "mode": "default",
                                 "raw": true,
                                 "timeout": 10,
                                 "max_lines": 50
@@ -736,7 +736,7 @@ impl MockScenarioState {
                                 &serde_json::json!({
                                     "description": "Run the probe script",
                                     "script": script,
-                                    "mode": "sandboxed",
+                                    "mode": "default",
                                     "raw": true,
                                     "timeout": 30,
                                     "max_lines": 50
@@ -766,7 +766,7 @@ impl MockScenarioState {
                             &serde_json::json!({
                                 "description": "Start a long job",
                                 "script": script,
-                                "mode": "sandboxed",
+                                "mode": "default",
                                 "background": true,
                                 "timeout": 600,
                             }),
@@ -813,7 +813,7 @@ impl MockScenarioState {
                                 &serde_json::json!({
                                     "description": "Record the plan in tasks.md",
                                     "script": script,
-                                    "mode": "sandboxed",
+                                    "mode": "default",
                                     "raw": true,
                                     "timeout": 10,
                                     "max_lines": 50
@@ -870,7 +870,7 @@ impl MockScenarioState {
                             "background": background,
                             "description": "Run the subagent authority probe",
                             "script": script,
-                            "mode": "sandboxed",
+                            "mode": "default",
                             "raw": true,
                             "timeout": 120,
                             "max_lines": 200
@@ -944,7 +944,7 @@ impl MockScenarioState {
                             "background": background,
                             "description": "Run the fork probe",
                             "script": script,
-                            "mode": "sandboxed",
+                            "mode": "default",
                             "raw": true,
                             "timeout": 120,
                             "max_lines": 200
@@ -1443,7 +1443,6 @@ impl TestHarness {
         )
         .expect("host gitconfig should be written");
 
-        seed_container_heel(&may_dir).await;
         futures_lite::future::zip(
             share_and_warm_tool_cache(&may_dir),
             warm_may_binary(&home_path),
@@ -1507,13 +1506,6 @@ impl TestHarness {
 
     fn home_path(&self) -> &Path {
         &self.home_path
-    }
-
-    /// The managed container heel's release state, as stored.
-    async fn container_heel_state(&self) -> String {
-        async_fs::read_to_string(self.may_dir.join("state/container-heel-release.json"))
-            .await
-            .expect("container heel release state should be readable")
     }
 }
 
@@ -1592,7 +1584,6 @@ impl RunningDaemon {
             .stdin(Stdio::null())
             .stdout(StdStdio::from(log_file))
             .stderr(StdStdio::from(log_file_err));
-        command.env("HEEL_BIN", heel_bin());
         for (key, value) in extra_env {
             command.env(key, value);
         }
@@ -1709,70 +1700,6 @@ fn may_binary_path() -> PathBuf {
     candidate
 }
 
-/// Release of heel whose Linux binary the harness stages as the container heel.
-const CONTAINER_HEEL_RELEASE_TAG: &str = "heel-v0.9.0";
-
-/// A pinned Linux heel release asset and the SHA-256 of its published bytes.
-struct PinnedHeelAsset {
-    name: &'static str,
-    sha256: &'static str,
-}
-
-// The container heel asset for this architecture, mirroring the product's
-// `linux_heel_asset_for_current_arch` (crate-private in `src/heel/release.rs`).
-#[cfg(target_arch = "x86_64")]
-const CONTAINER_HEEL_ASSET: PinnedHeelAsset = PinnedHeelAsset {
-    name: "heel-x86_64-unknown-linux-gnu",
-    sha256: "d42181f9f566e2578fd90a6c11f25158377aa3089ded3cc75d3fe09cd20fe453",
-};
-#[cfg(target_arch = "aarch64")]
-const CONTAINER_HEEL_ASSET: PinnedHeelAsset = PinnedHeelAsset {
-    name: "heel-aarch64-unknown-linux-gnu",
-    sha256: "be5e276a0325845f890c6f7ded19bda0919ae4fa5e7d6c7665cee2d4973267b6",
-};
-
-/// Stages the pinned container heel in the test home exactly as the product's
-/// managed install leaves it — `container/heel/bin/heel` plus a
-/// `state/container-heel-release.json` checked just now — so the server's
-/// recent-check fast path never queries the GitHub release API.
-async fn seed_container_heel(may_dir: &Path) {
-    let source = pinned_container_heel().await;
-    let binary_path = may_dir
-        .join("container")
-        .join("heel")
-        .join("bin")
-        .join("heel");
-    async_fs::create_dir_all(binary_path.parent().expect("binary path has a parent"))
-        .await
-        .expect("container heel bin dir should be created");
-    async_fs::copy(&source, &binary_path)
-        .await
-        .expect("pinned container heel should copy into the test home");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        async_fs::set_permissions(&binary_path, std::fs::Permissions::from_mode(0o755))
-            .await
-            .expect("container heel should be made executable");
-    }
-    // The product's `ManagedHeelState` is crate-private; this is its serde shape.
-    let state = serde_json::json!({
-        "release_tag": CONTAINER_HEEL_RELEASE_TAG,
-        "asset_name": CONTAINER_HEEL_ASSET.name,
-        "last_checked_at": jiff::Timestamp::now(),
-    });
-    let state_path = may_dir.join("state").join("container-heel-release.json");
-    async_fs::create_dir_all(state_path.parent().expect("state path has a parent"))
-        .await
-        .expect("container heel state dir should be created");
-    async_fs::write(
-        &state_path,
-        serde_json::to_vec(&state).expect("container heel release state should serialize"),
-    )
-    .await
-    .expect("container heel release state should be written");
-}
-
 /// Directory holding the downloads every test run shares. `MAY_TEST_CACHE`
 /// names it so CI can restore it from the Actions cache; unset, it is the
 /// build's test scratch directory.
@@ -1781,76 +1708,11 @@ fn shared_download_root() -> PathBuf {
         .map_or_else(|| PathBuf::from(env!("CARGO_TARGET_TMPDIR")), PathBuf::from)
 }
 
-/// The pinned container heel in the shared test-tmp cache, downloaded from
-/// its release on first use. Its SHA-256 is verified every time it is handed
-/// out, whether freshly downloaded or reused.
-async fn pinned_container_heel() -> PathBuf {
-    let cache_dir = shared_download_root()
-        .join("container-heel")
-        .join(CONTAINER_HEEL_RELEASE_TAG);
-    let cached = cache_dir.join(CONTAINER_HEEL_ASSET.name);
-    match async_fs::read(&cached).await {
-        Ok(bytes) => {
-            verify_container_heel(bytes, &cached.display().to_string()).await;
-            return cached;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => panic!(
-            "cached container heel {} should be readable: {error}",
-            cached.display()
-        ),
-    }
-
-    let url = format!(
-        "https://github.com/May-Agent/heel/releases/download/{CONTAINER_HEEL_RELEASE_TAG}/{}",
-        CONTAINER_HEEL_ASSET.name
-    );
-    let bytes = reqwest::get(&url)
-        .await
-        .and_then(reqwest::Response::error_for_status)
-        .unwrap_or_else(|error| panic!("pinned container heel download {url} failed: {error}"))
-        .bytes()
-        .await
-        .unwrap_or_else(|error| panic!("pinned container heel body from {url} failed: {error}"));
-    let bytes = verify_container_heel(bytes.to_vec(), &url).await;
-
-    async_fs::create_dir_all(&cache_dir)
-        .await
-        .expect("container heel cache dir should be created");
-    // Concurrent test binaries may download at once: each writes its own
-    // temporary file and renames it into place atomically.
-    let staging = tempfile::NamedTempFile::new_in(&cache_dir)
-        .expect("container heel staging file should be created");
-    async_fs::write(staging.path(), bytes)
-        .await
-        .expect("container heel staging file should be written");
-    staging
-        .persist(&cached)
-        .expect("container heel should move into the cache");
-    cached
-}
-
-/// Panics unless `bytes` hash to the pinned digest; returns them on success.
-async fn verify_container_heel(bytes: Vec<u8>, origin: &str) -> Vec<u8> {
-    use sha2::{Digest, Sha256};
-
-    let (bytes, actual) = blocking::unblock(move || {
-        let digest = format!("{:x}", Sha256::digest(&bytes));
-        (bytes, digest)
-    })
-    .await;
-    assert_eq!(
-        actual, CONTAINER_HEEL_ASSET.sha256,
-        "container heel {} from {origin} has SHA-256 {actual}, expected {}",
-        CONTAINER_HEEL_ASSET.name, CONTAINER_HEEL_ASSET.sha256
-    );
-    bytes
-}
-
 /// Points the test home's tool cache at one cache shared by every test run
-/// and prepares the host's baseline tools in it through the embedded
-/// distribution, so the first hash-verified download happens here instead of
-/// inside a server's readiness deadline. Later runs reuse the cached artifacts.
+/// and prepares the host's baseline tools and `heel` in it through the
+/// embedded distribution, so the first hash-verified download happens here
+/// instead of inside a server's readiness deadline. Later runs reuse the
+/// cached artifacts.
 async fn share_and_warm_tool_cache(may_dir: &Path) {
     let shared = shared_download_root().join("may-tools");
     tokio::fs::create_dir_all(&shared)
@@ -1865,31 +1727,23 @@ async fn share_and_warm_tool_cache(may_dir: &Path) {
     tokio::fs::symlink_dir(&shared, home_paths.tools_dir())
         .await
         .expect("test home tool cache should link to the shared cache");
-    let bundle = may_agent::tools::embedded_distribution()
-        .expect("embedded distribution should validate")
-        .load(
+    let distribution =
+        may_agent::tools::embedded_distribution().expect("embedded distribution should validate");
+    let tools_dir = home_paths.tools_dir();
+    let (bundle, heel) = futures_lite::future::zip(
+        distribution.load(
             &ToolTarget::native().expect("test host should have a tool target"),
             &home_paths.tool_artifacts_dir(),
-        )
-        .await
-        .expect("baseline tool artifacts should download and verify");
+        ),
+        may_agent::tools::prepare_heel(&distribution, &tools_dir),
+    )
+    .await;
+    heel.expect("the distribution's heel should download and verify");
+    let bundle = bundle.expect("baseline tool artifacts should download and verify");
     bundle
         .prepare_local(&home_paths.tool_runtimes_dir())
         .await
         .expect("baseline tools should prepare");
-}
-
-/// The host heel binary the E2E suite runs commands under. `HEEL_BIN` is its
-/// only source; the suite never probes the developer's machine for one.
-fn heel_bin() -> String {
-    let path = std::env::var("HEEL_BIN").unwrap_or_else(|_| {
-        panic!("HEEL_BIN must name a prebuilt host heel binary for the terminal E2E suite")
-    });
-    assert!(
-        Path::new(&path).is_file(),
-        "HEEL_BIN={path} must name an existing heel binary file"
-    );
-    path
 }
 
 /// The daemon's shutdown drains runs for up to 30 s and settles cancelled
@@ -2527,19 +2381,17 @@ async fn exec_uses_session_directory_and_exposes_ipc_command_help() {
     let harness = TestHarness::new(&mock.base_url()).await;
     let session = harness.create_session().await;
     let binary = may_binary_path();
-    let heel_bin = heel_bin();
 
     let pwd_output = Command::new(&binary)
         .arg("exec")
         .arg("--session")
         .arg(&session.id)
         .arg("--mode")
-        .arg("sandboxed")
+        .arg("default")
         .arg("--")
         .arg("pwd")
         .env("HOME", harness.home_path())
         .envs(hermetic_git_env(harness.home_path()))
-        .env("HEEL_BIN", &heel_bin)
         .output()
         .await
         .expect("may exec pwd should run");
@@ -2561,14 +2413,13 @@ async fn exec_uses_session_directory_and_exposes_ipc_command_help() {
         .arg("--session")
         .arg(&session.id)
         .arg("--mode")
-        .arg("sandboxed")
+        .arg("default")
         .arg("--")
         .arg(
             "for d in tmp data files outputs artifacts; do test -d \"$d\" || exit 10; done; test -e skills; test -e subagents; session --help >/dev/null; ask --help >/dev/null; search --help >/dev/null; webfetch --help >/dev/null; task --help >/dev/null; printf ready",
         )
         .env("HOME", harness.home_path())
         .envs(hermetic_git_env(harness.home_path()))
-        .env("HEEL_BIN", &heel_bin)
         .output()
         .await
         .expect("may exec layout/help probe should run");
@@ -2592,7 +2443,7 @@ async fn commit_in_sandbox(harness: &TestHarness) -> std::process::Output {
         .arg("--session")
         .arg(&session.id)
         .arg("--mode")
-        .arg("sandboxed")
+        .arg("default")
         .arg("--")
         .arg(
             "git init -q -b main repo && cd repo && echo x > f && git add f \
@@ -2601,7 +2452,6 @@ async fn commit_in_sandbox(harness: &TestHarness) -> std::process::Output {
         )
         .env("HOME", harness.home_path())
         .envs(hermetic_git_env(harness.home_path()))
-        .env("HEEL_BIN", heel_bin())
         .output()
         .await
         .expect("may exec commit should run")
@@ -2863,7 +2713,6 @@ async fn exec_script(
         .env("HOME", harness.home_path())
         .envs(hermetic_git_env(harness.home_path()))
         .env("PATH", path)
-        .env("HEEL_BIN", heel_bin())
         .output()
         .await
         .expect("may exec should run")
@@ -2904,7 +2753,7 @@ async fn issue_changes_are_recorded_and_gh_credentials_are_unreadable_from_the_s
     let created = exec_script(
         &harness,
         &session,
-        "sandboxed",
+        "default",
         &bin,
         work.path(),
         "issue create bug 'from exec' --body body && issue comment 1 hello && issue close 1",
@@ -2919,7 +2768,7 @@ async fn issue_changes_are_recorded_and_gh_credentials_are_unreadable_from_the_s
     let provenance = exec_script(
         &harness,
         &session,
-        "sandboxed",
+        "default",
         &bin,
         work.path(),
         "issue provenance 1; issue view 1",
@@ -2942,7 +2791,7 @@ async fn issue_changes_are_recorded_and_gh_credentials_are_unreadable_from_the_s
     let credentials = exec_script(
         &harness,
         &session,
-        "sandboxed",
+        "default",
         &bin,
         work.path(),
         "cat ~/.config/gh/hosts.yml",
@@ -2958,7 +2807,7 @@ async fn issue_changes_are_recorded_and_gh_credentials_are_unreadable_from_the_s
     let sandboxed_gh = exec_script(
         &harness,
         &session,
-        "sandboxed",
+        "default",
         &bin,
         work.path(),
         "gh issue create --title t",
@@ -3011,19 +2860,17 @@ async fn exec_large_output_is_previewed_and_saved_to_outputs_file() {
     let harness = TestHarness::new(&mock.base_url()).await;
     let session = harness.create_session().await;
     let binary = may_binary_path();
-    let heel_bin = heel_bin();
 
     let output = Command::new(binary)
         .arg("exec")
         .arg("--session")
         .arg(&session.id)
         .arg("--mode")
-        .arg("sandboxed")
+        .arg("default")
         .arg("--")
         .arg("perl -e 'print \"x\" x 60000'")
         .env("HOME", harness.home_path())
         .envs(hermetic_git_env(harness.home_path()))
-        .env("HEEL_BIN", &heel_bin)
         .output()
         .await
         .expect("may exec large output probe should run");
@@ -3057,7 +2904,6 @@ async fn exec_large_output_is_previewed_and_saved_to_outputs_file() {
 #[serial]
 async fn ui_session_crud_round_trip_matches_api_contract() {
     let harness = TestHarness::new("http://127.0.0.1:9/v1").await;
-    let seeded_heel_state = harness.container_heel_state().await;
     let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
     let client = reqwest::Client::new();
 
@@ -3068,14 +2914,6 @@ async fn ui_session_crud_round_trip_matches_api_contract() {
         .await
         .expect("create session request should succeed");
     let create_response = expect_status(&server.log, create_response, StatusCode::OK).await;
-    // A profile-less session lands in the local-environment fallback
-    // profile; any release-API check would rewrite the state's timestamp,
-    // so an untouched state proves nothing reached for container assets.
-    assert_eq!(
-        harness.container_heel_state().await,
-        seeded_heel_state,
-        "local session creation must not touch the container heel state"
-    );
     let created: Value = create_response
         .json()
         .await
@@ -4585,7 +4423,6 @@ const IO_BACKGROUND: i32 = 3 << 13; // IOPRIO_PRIO_VALUE(IOPRIO_CLASS_IDLE, 0)
 #[tokio::test]
 #[serial]
 async fn exec_applies_local_command_priority() {
-    let heel_bin = heel_bin();
     let probe = priority_probe_command().await;
 
     // Host baseline first, through a shell exactly as the sandbox runs it: an
@@ -4650,7 +4487,6 @@ async fn exec_applies_local_command_priority() {
         let script = probe.clone();
         let session_id = session.id.clone();
         let home = harness.home_path().to_path_buf();
-        let heel = heel_bin.clone();
         let binary_path = binary.clone();
         let output = blocking::unblock(move || {
             std::process::Command::new(&binary_path)
@@ -4658,12 +4494,11 @@ async fn exec_applies_local_command_priority() {
                 .arg("--session")
                 .arg(&session_id)
                 .arg("--mode")
-                .arg("sandboxed")
+                .arg("default")
                 .arg("--")
                 .arg(&script)
                 .env("HOME", &home)
                 .envs(hermetic_git_env(&home))
-                .env("HEEL_BIN", &heel)
                 .output()
         })
         .await
@@ -5157,7 +4992,6 @@ async fn oneshot_run_follows_the_turn_a_background_command_resumes() {
     let output = Command::new(&binary)
         .arg("start the job")
         .env("HOME", harness.home_path())
-        .env("HEEL_BIN", heel_bin())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -5227,7 +5061,6 @@ async fn oneshot_run_starts_the_daemon_and_streams_its_turn() {
         .arg("say hi")
         .env("HOME", harness.home_path())
         .envs(hermetic_git_env(harness.home_path()))
-        .env("HEEL_BIN", heel_bin())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -5288,7 +5121,6 @@ async fn oneshot_run_prints_a_burst_turn_through_its_end() {
         .arg("stream a long reply")
         .env("HOME", harness.home_path())
         .envs(hermetic_git_env(harness.home_path()))
-        .env("HEEL_BIN", heel_bin())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -6180,7 +6012,7 @@ async fn tokens_held_by_exec_probe(
         .arg("--session")
         .arg(session_id)
         .arg("--mode")
-        .arg("sandboxed")
+        .arg("default")
         .arg("--timeout")
         .arg("20")
         .arg("--")
@@ -6192,7 +6024,6 @@ async fn tokens_held_by_exec_probe(
             report.display(),
         ))
         .env("HOME", harness.home_path())
-        .env("HEEL_BIN", heel_bin())
         .output()
         .await
         .expect("may exec should run");

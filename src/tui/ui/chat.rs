@@ -151,6 +151,9 @@ pub enum ToolDisplay {
         command: String,
         /// Requested execution backend.
         mode: TerminalExecutionMode,
+        /// Name of the SSH server the command runs on; `None` for the home
+        /// environment.
+        location: Option<String>,
         /// How May reads the script; `None` while the script streams in
         /// and for `!` bash calls.
         reading: Option<CommandReading>,
@@ -3608,9 +3611,13 @@ fn format_status_usage(
 const fn terminal_mode_marker(mode: TerminalExecutionMode) -> &'static str {
     match mode {
         TerminalExecutionMode::Default | TerminalExecutionMode::Unsafe => "",
-        TerminalExecutionMode::Sandboxed => "[sandbox] ",
-        TerminalExecutionMode::Ssh => "[ssh] ",
     }
+}
+
+/// Marker prefix naming the SSH server a command runs on; empty for the
+/// home environment.
+fn terminal_location_marker(location: Option<&str>) -> String {
+    location.map_or_else(String::new, |name| format!("[ssh {name}] "))
 }
 
 /// The icon prefixing a call's headline — spinner while running, tick on
@@ -3668,14 +3675,23 @@ fn tool_header_line(
             description,
             command,
             mode,
+            location,
             diffs,
             ..
         } => {
+            let location_marker = terminal_location_marker(location.as_deref());
             if description.is_empty() {
                 // A `!` bash call headlines its command, highlighted like
                 // the expanded body.
                 spans.push(Span::styled(
                     terminal_mode_marker(*mode),
+                    Style::default()
+                        .fg(Color::Red)
+                        .bold()
+                        .patch(selection_style),
+                ));
+                spans.push(Span::styled(
+                    location_marker,
                     Style::default()
                         .fg(Color::Red)
                         .bold()
@@ -3689,6 +3705,15 @@ fn tool_header_line(
                         .map(|span| Span::styled(span.content, span.style.patch(selection_style))),
                 );
             } else {
+                if !location_marker.is_empty() {
+                    spans.push(Span::styled(
+                        location_marker,
+                        Style::default()
+                            .fg(Color::Red)
+                            .bold()
+                            .patch(selection_style),
+                    ));
+                }
                 spans.push(Span::styled(description.clone(), selection_style));
             }
             // File changes the call caused, as a compact badge: which
@@ -3851,12 +3876,17 @@ fn render_tool_inline_at<'a>(
         ToolDisplay::Terminal {
             command,
             mode,
+            location,
             status,
             output,
             reading,
             ..
         } => {
-            let mode_prefix = terminal_mode_marker(*mode);
+            let mode_prefix = format!(
+                "{}{}",
+                terminal_mode_marker(*mode),
+                terminal_location_marker(location.as_deref())
+            );
             // A script May recognises shows as what it does; one it does
             // not shows as the script, as before.
             let recognised = reading.as_ref().filter(|reading| reading.recognises_any());
@@ -4149,12 +4179,18 @@ pub fn render_tool_fullscreen(
             description,
             command,
             mode,
+            location,
             ..
         } => {
+            let marker = format!(
+                "{}{}",
+                terminal_mode_marker(*mode),
+                terminal_location_marker(location.as_deref())
+            );
             if description.is_empty() {
-                format!("{}$ {command}", terminal_mode_marker(*mode))
+                format!("{marker}$ {command}")
             } else {
-                format!("{description} — {}$ {command}", terminal_mode_marker(*mode))
+                format!("{description} — {marker}$ {command}")
             }
         }
         ToolDisplay::Action { chip, summary, .. } => {
@@ -4581,6 +4617,7 @@ mod tests {
                 description: String::new(),
                 command: "echo hi".to_string(),
                 mode: TerminalExecutionMode::Default,
+                location: None,
                 reading: None,
                 status: ToolStatus::Running,
                 output: None,
@@ -4628,6 +4665,7 @@ mod tests {
                 description: String::new(),
                 command: command.to_string(),
                 mode: TerminalExecutionMode::Default,
+                location: None,
                 reading: None,
                 status: ToolStatus::Running,
                 output: None,
@@ -4675,6 +4713,7 @@ mod tests {
                 description: String::new(),
                 command: command.to_string(),
                 mode: TerminalExecutionMode::Default,
+                location: None,
                 reading: None,
                 status: ToolStatus::Running,
                 output: None,
@@ -4727,6 +4766,7 @@ mod tests {
                 description: String::new(),
                 command: "ech".to_string(),
                 mode: TerminalExecutionMode::Default,
+                location: None,
                 reading: None,
                 status: ToolStatus::Running,
                 output: None,
@@ -4756,6 +4796,7 @@ mod tests {
                 description: "greet".to_string(),
                 command: "echo hi".to_string(),
                 mode: TerminalExecutionMode::Default,
+                location: None,
                 reading: None,
                 status: ToolStatus::Running,
                 output: None,
@@ -4785,28 +4826,53 @@ mod tests {
     #[test]
     fn terminal_mode_marker_covers_every_backend() {
         assert_eq!(terminal_mode_marker(TerminalExecutionMode::Default), "");
-        assert_eq!(
-            terminal_mode_marker(TerminalExecutionMode::Sandboxed),
-            "[sandbox] "
-        );
         // Unsafe carries no text marker — the red status icon marks it.
         assert_eq!(terminal_mode_marker(TerminalExecutionMode::Unsafe), "");
-        assert_eq!(terminal_mode_marker(TerminalExecutionMode::Ssh), "[ssh] ");
+    }
+
+    #[test]
+    fn inline_terminal_renders_ssh_location_marker() {
+        for (location, description, expected) in [
+            (Some("build-box"), "", "▸ ✓ [ssh build-box] $ uname"),
+            (None, "", "▸ ✓ $ uname"),
+            (Some("build-box"), "kernel", "▸ ✓ [ssh build-box] kernel"),
+            (None, "kernel", "▸ ✓ kernel"),
+        ] {
+            let display = ToolDisplay::Terminal {
+                description: description.to_string(),
+                command: "uname".to_string(),
+                mode: TerminalExecutionMode::Default,
+                location: location.map(str::to_string),
+                reading: None,
+                status: ToolStatus::Done,
+                output: None,
+                diffs: Vec::new(),
+                pinned: None,
+            };
+            let mut lines: Vec<Line> = Vec::new();
+            let mut positions = Vec::new();
+            render_tool_inline(&mut lines, &display, false, true, &mut positions);
+            let rendered: String = lines[0]
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect();
+            assert_eq!(rendered, expected);
+        }
     }
 
     #[test]
     fn inline_terminal_renders_mode_marker() {
         for (mode, marker, icon_fg) in [
             (TerminalExecutionMode::Default, "", Color::Green),
-            (TerminalExecutionMode::Sandboxed, "[sandbox] ", Color::Green),
             // Unsafe: no text marker — the status icon turns red instead.
             (TerminalExecutionMode::Unsafe, "", Color::Red),
-            (TerminalExecutionMode::Ssh, "[ssh] ", Color::Green),
         ] {
             let display = ToolDisplay::Terminal {
                 description: String::new(),
                 command: "echo hi".to_string(),
                 mode,
+                location: None,
                 reading: None,
                 status: ToolStatus::Done,
                 output: None,
@@ -4832,6 +4898,7 @@ mod tests {
             description: String::new(),
             command: command.to_string(),
             mode: TerminalExecutionMode::Default,
+            location: None,
             reading: None,
             status: ToolStatus::Done,
             output: None,
@@ -4858,6 +4925,7 @@ mod tests {
                 description: String::new(),
                 command: "terminal {…}".to_string(),
                 mode: TerminalExecutionMode::Default,
+                location: None,
                 reading: None,
                 status: ToolStatus::Done,
                 output: Some(
@@ -5395,6 +5463,7 @@ mod tests {
             description: "work".to_string(),
             command: script.to_string(),
             mode: TerminalExecutionMode::Default,
+            location: None,
             reading: Some(crate::command_reading::CommandReading::of(script)),
             status: ToolStatus::Running,
             output: None,
@@ -6378,6 +6447,7 @@ mod tests {
                 description: String::new(),
                 command: format!("echo {label}"),
                 mode: TerminalExecutionMode::Default,
+                location: None,
                 status: ToolStatus::Done,
                 output: None,
                 diffs: Vec::new(),
@@ -6483,6 +6553,7 @@ mod tests {
                 description: String::new(),
                 command: "echo hi".to_string(),
                 mode: TerminalExecutionMode::Default,
+                location: None,
                 reading: None,
                 status: ToolStatus::Done,
                 output: None,
@@ -6529,6 +6600,7 @@ mod tests {
                 description: "run inner".to_string(),
                 command: "echo inner".to_string(),
                 mode: TerminalExecutionMode::Default,
+                location: None,
                 reading: None,
                 status: ToolStatus::Done,
                 output: None,

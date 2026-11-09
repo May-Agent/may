@@ -9,8 +9,7 @@
 //! [`ProfileEnvironment::Container`]. Remote SSH servers are attached
 //! separately via the `profile_remote_servers` junction table and referenced
 //! through [`ProfileInfo::remote_attachments`]; the agent reaches them by
-//! invoking the `terminal` tool with `mode: "ssh"` and
-//! `ssh_server_id: <name>`.
+//! invoking the `terminal` tool with `location: <name>`.
 
 use crate::db::ChatDb;
 use crate::db::entity::profiles;
@@ -252,7 +251,7 @@ impl AsRef<ProfileEnvironment> for HomeEnvironment {
 /// Only `Local` and `Container` are valid home environments. SSH servers are
 /// attached via the `profile_remote_servers` junction table and exposed on
 /// [`ProfileInfo::remote_attachments`]; agents reach them by invoking the
-/// `terminal` tool with `mode: "ssh"` and `ssh_server_id: <name>` rather than
+/// `terminal` tool with `location: <name>` rather than
 /// by treating the whole profile as remote.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
 #[serde(tag = "type", rename_all = "lowercase")]

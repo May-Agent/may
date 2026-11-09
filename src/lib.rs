@@ -47,7 +47,6 @@ mod file_tracker;
 mod fs_utils;
 /// xAI Grok subscription OAuth flow.
 pub mod grok;
-mod heel;
 /// The one way git runs on the host.
 pub mod host_git;
 mod id;
@@ -145,7 +144,6 @@ pub use agent::{
 };
 pub use config::MayConfig;
 pub use db::ChatDb;
-pub use heel::configure_heel_binary;
 pub use mcp::{MayMcpServerConfig, McpConfig, McpManager, McpServerInfo};
 pub use model_selector::{ModelSelector, ModelSelectorParseError};
 pub use profile::{HomeEnvironment, PinnedItem, ProfileEnvironment, ProfileInfo, ProfileSessions};
