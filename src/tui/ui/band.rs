@@ -45,8 +45,10 @@ pub const fn inset(area: Rect) -> Rect {
     }
 }
 
-/// A filled block for a popup, panel or sidebar: `bg` behind every cell, one
-/// column of padding on each side and one row at the bottom. The title, when
+/// A filled block for a popup, panel or sidebar.
+///
+/// `bg` is behind every cell, with one column of padding on each side and
+/// one row at the bottom. The title, when
 /// given, is the block's first row in the `accent` colour; without one the
 /// block also pads its top row. The chrome costs two rows and two columns
 /// either way, so a layout sized for it never changes with the title.
