@@ -1321,11 +1321,14 @@ impl DaemonState {
         ui_event_bus.set_session_changes(session_change_tx.clone());
         let lease_handle = tokio::runtime::Handle::current();
         let runtime_service = std::sync::Arc::new(
-            crate::session::SessionRuntimeService::new(db.clone(), ui_event_bus.clone())
-                .with_home(crate::session::MayHomePaths::new(may_dir.to_path_buf()))
-                .with_spawner(std::sync::Arc::new(move |task| {
-                    lease_handle.spawn(task);
-                })),
+            crate::session::SessionRuntimeService::new(
+                db.clone(),
+                ui_event_bus.clone(),
+                crate::session::MayHomePaths::new(may_dir.to_path_buf()),
+            )
+            .with_spawner(std::sync::Arc::new(move |task| {
+                lease_handle.spawn(task);
+            })),
         );
         let (title_generation_queue, _rx) = TitleGenerationQueue::new();
         let (tool_dispatchers, _queues) = tool_dispatch_channels();

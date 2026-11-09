@@ -430,6 +430,7 @@ impl Session {
             parts.runtime = Some(Arc::new(crate::session::SessionRuntimeService::new(
                 parts.db.clone(),
                 crate::ui_event_bus::UiEventBus::new(),
+                crate::session::MayHomePaths::new(temp.path().join("home")),
             )));
         }
         let clock = ManualClock::new();

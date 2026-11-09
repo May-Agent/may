@@ -40,7 +40,11 @@ impl Fixture {
                 .await
                 .expect("create session");
         }
-        let runtime = Arc::new(SessionRuntimeService::new(db, UiEventBus::new()));
+        let runtime = Arc::new(SessionRuntimeService::new(
+            db,
+            UiEventBus::new(),
+            crate::session::MayHomePaths::new(dir.path().join("home")),
+        ));
         let store = SecretStore::in_memory(dir.path());
         let approver = AskUserApprover::new()
             .with_runtime_service(runtime.clone())

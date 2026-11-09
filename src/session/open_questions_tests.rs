@@ -57,23 +57,25 @@ impl Fixture {
     /// start opens it.
     async fn service(&self) -> Arc<SessionRuntimeService> {
         let db = ChatDb::open(&self.path).await.expect("open handle");
-        Arc::new(SessionRuntimeService::new(db, UiEventBus::new()))
+        Arc::new(SessionRuntimeService::new(
+            db,
+            UiEventBus::new(),
+            self.home(),
+        ))
     }
-}
 
-impl Fixture {
-    /// A runtime service whose sessions live under a May home in the
-    /// fixture's directory, and the `tasks.md` path of "session".
+    /// The May home the fixture's sessions live under.
+    fn home(&self) -> crate::session::MayHomePaths {
+        crate::session::MayHomePaths::new(self.dir.path().join("home"))
+    }
+
+    /// A runtime service and the `tasks.md` path of "session", whose
+    /// directory exists.
     async fn service_with_home(&self) -> (Arc<SessionRuntimeService>, std::path::PathBuf) {
-        let db = ChatDb::open(&self.path).await.expect("open handle");
-        let home = crate::session::MayHomePaths::new(self.dir.path().join("home"));
-        let tasks = home.session_paths("session").tasks_path();
+        let tasks = self.home().session_paths("session").tasks_path();
         std::fs::create_dir_all(tasks.parent().expect("a session directory"))
             .expect("session directory");
-        (
-            Arc::new(SessionRuntimeService::new(db, UiEventBus::new()).with_home(home)),
-            tasks,
-        )
+        (self.service().await, tasks)
     }
 }
 

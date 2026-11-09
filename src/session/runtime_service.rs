@@ -84,8 +84,9 @@ pub struct SessionRuntimeService {
     db: ChatDb,
     ui_event_bus: UiEventBus,
     runs: SessionRuns,
-    /// The May home the session directories are under; see [`Self::with_home`].
-    home: Option<super::MayHomePaths>,
+    /// The May home the session directories are under; an answered
+    /// question's marks are removed from the `tasks.md` there.
+    home: super::MayHomePaths,
     /// Agent id → owning session, for every agent the daemon has seen:
     /// the address map agent-to-agent messaging routes through.
     agents: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
@@ -115,15 +116,16 @@ impl std::fmt::Debug for SessionRuntimeService {
 }
 
 impl SessionRuntimeService {
-    /// Create the service over `db`, publishing change events on `ui_event_bus`.
+    /// Create the service over `db`, publishing change events on
+    /// `ui_event_bus`, with the sessions' directories under `home`.
     #[must_use]
-    pub fn new(db: ChatDb, ui_event_bus: UiEventBus) -> Self {
+    pub fn new(db: ChatDb, ui_event_bus: UiEventBus, home: super::MayHomePaths) -> Self {
         let runs = SessionRuns::new(db.clone(), ui_event_bus.clone());
         Self {
             db,
             ui_event_bus,
             runs,
-            home: None,
+            home,
             agents: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             terminal_grants: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
@@ -183,15 +185,6 @@ impl SessionRuntimeService {
     #[must_use]
     pub fn subscribe_user_waits(&self) -> tokio::sync::broadcast::Receiver<UserWait> {
         self.user_waits.subscribe()
-    }
-
-    /// Resolve session directories under `home`, so an answered question's
-    /// marks are removed from the session's `tasks.md`. Without it a service
-    /// has no session directories to edit.
-    #[must_use]
-    pub fn with_home(mut self, home: super::MayHomePaths) -> Self {
-        self.home = Some(home);
-        self
     }
 
     /// Spawn the background tasks of run leases with `spawner`; see
@@ -721,19 +714,19 @@ impl SessionRuntimeService {
         // The rows of the session's `tasks.md` that wait on the question: the
         // reminder names them, and their marks go once the answer is
         // committed. A prompt a run blocks on marks no row.
-        let tasks_path = match (&self.home, pending.blocking) {
-            (Some(home), false) => {
-                let session = self.db.get_session(&pending.session_id).await?;
-                let paths = session.and_then(|session| session.profile_id).map_or_else(
-                    || home.session_paths(&pending.session_id),
-                    |profile| {
-                        home.profile_home(&profile)
-                            .session_paths(&pending.session_id)
-                    },
-                );
-                Some(paths.tasks_path())
-            }
-            _ => None,
+        let tasks_path = if pending.blocking {
+            None
+        } else {
+            let session = self.db.get_session(&pending.session_id).await?;
+            let paths = session.and_then(|session| session.profile_id).map_or_else(
+                || self.home.session_paths(&pending.session_id),
+                |profile| {
+                    self.home
+                        .profile_home(&profile)
+                        .session_paths(&pending.session_id)
+                },
+            );
+            Some(paths.tasks_path())
         };
         let unblocked = match &tasks_path {
             Some(path) => unblocked_rows(path, request_id).await,
