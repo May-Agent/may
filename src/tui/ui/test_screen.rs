@@ -12,6 +12,7 @@ use std::convert::Infallible;
 use ratatui::backend::{Backend, ClearType, TestBackend, WindowSize};
 use ratatui::buffer::{Buffer, Cell};
 use ratatui::layout::{Position, Size};
+use ratatui::style::Color;
 use unicode_width::UnicodeWidthStr;
 
 /// Marker the model shows for a cell holding a graphics escape sequence.
@@ -30,6 +31,9 @@ enum Slot {
 pub struct ScreenBackend {
     inner: TestBackend,
     grid: Vec<Vec<Slot>>,
+    /// Background of each column: a wide glyph paints its own background
+    /// over both of its columns, and a column a write erased is blank.
+    backgrounds: Vec<Vec<Color>>,
 }
 
 fn glyph(cell: &Cell) -> (String, usize) {
@@ -50,7 +54,14 @@ impl ScreenBackend {
                 vec![Slot::Lead(" ".to_string(), 1); usize::from(width)];
                 usize::from(height)
             ],
+            backgrounds: vec![vec![Color::Reset; usize::from(width)]; usize::from(height)],
         }
+    }
+
+    /// Background of each column of each row, as the terminal paints it.
+    #[must_use]
+    pub fn backgrounds(&self) -> &[Vec<Color>] {
+        &self.backgrounds
     }
 
     /// Resize the screen (blanking it, as the next draw repaints all).
@@ -58,6 +69,7 @@ impl ScreenBackend {
         self.inner.resize(width, height);
         self.grid =
             vec![vec![Slot::Lead(" ".to_string(), 1); usize::from(width)]; usize::from(height)];
+        self.backgrounds = vec![vec![Color::Reset; usize::from(width)]; usize::from(height)];
     }
 
     fn erase(&mut self, x: usize, y: usize) {
@@ -73,6 +85,7 @@ impl ScreenBackend {
         };
         for col in lead..(lead + width).min(row.len()) {
             row[col] = Slot::Lead(" ".to_string(), 1);
+            self.backgrounds[y][col] = Color::Reset;
         }
     }
 
@@ -86,6 +99,9 @@ impl ScreenBackend {
         self.grid[y][x] = Slot::Lead(symbol, width);
         for col in x + 1..x + width {
             self.grid[y][col] = Slot::Cont;
+        }
+        for col in x..x + width {
+            self.backgrounds[y][col] = cell.bg;
         }
     }
 
@@ -105,6 +121,28 @@ impl ScreenBackend {
             })
             .collect()
     }
+}
+
+/// Background of each column of each row of a rendered frame buffer, as
+/// [`ScreenBackend::backgrounds`] reports it: a wide glyph's background
+/// covers both of its columns.
+#[must_use]
+pub fn buffer_backgrounds(buf: &Buffer) -> Vec<Vec<Color>> {
+    let area = buf.area;
+    (area.top()..area.bottom())
+        .map(|y| {
+            let mut row = Vec::new();
+            let mut x = area.left();
+            while x < area.right() {
+                let cell = &buf[(x, y)];
+                let (_, width) = glyph(cell);
+                let width = width.min(usize::from(area.right() - x));
+                row.extend(std::iter::repeat_n(cell.bg, width));
+                x += u16::try_from(width).unwrap_or(1);
+            }
+            row
+        })
+        .collect()
 }
 
 /// Visible text of each row of a rendered frame buffer, as [`ScreenBackend::screen`]
@@ -161,6 +199,9 @@ impl Backend for ScreenBackend {
             for slot in row.iter_mut() {
                 *slot = Slot::Lead(" ".to_string(), 1);
             }
+        }
+        for row in &mut self.backgrounds {
+            row.fill(Color::Reset);
         }
         self.inner.clear()
     }
