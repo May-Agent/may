@@ -3883,6 +3883,17 @@ impl App {
             }
             return None;
         }
+        // `/new <owner/repo|path>` starts the next session directly on that
+        // repository, like `may --repo`; plain `/new` is handled by the menu.
+        if attachments.is_empty()
+            && let Some(rest) = trimmed.strip_prefix(SlashCommand::New.name())
+            && rest.starts_with(char::is_whitespace)
+            && !rest.trim().is_empty()
+        {
+            self.session_manager
+                .set_launch(crate::session::SessionLaunch::Repo(rest.trim().to_string()));
+            return Some(SendAction::NewSession);
+        }
         // `/progress` is a side request too: never a message to the agent.
         if attachments.is_empty()
             && let Some(rest) = trimmed.strip_prefix(SlashCommand::Progress.name())
