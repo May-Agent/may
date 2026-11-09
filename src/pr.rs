@@ -1173,7 +1173,12 @@ impl PrStore {
             return Vec::new();
         };
         let checkouts = pull_sync::recorded_checkouts(db, owner_repo).await;
-        pull_sync::sync(self.context.signing.host(), checkouts).await
+        pull_sync::sync(
+            self.context.signing.host(),
+            checkouts,
+            pull_sync::PULL_TIMEOUT,
+        )
+        .await
     }
 
     fn check_command(&self, record: &CloneRecord) -> Option<String> {
