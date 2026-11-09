@@ -5821,6 +5821,7 @@ dependencies = [
  "skyzen",
  "skyzen-core",
  "skyzen-services",
+ "smol-hyper",
  "streamdown-parser",
  "subtle",
  "syntect",

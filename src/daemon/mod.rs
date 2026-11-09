@@ -48,6 +48,7 @@ mod session_directory_tests;
 pub(crate) mod session_events;
 #[cfg(test)]
 mod session_events_tests;
+mod session_ids;
 mod sessions;
 mod sleep;
 mod state;

@@ -64,6 +64,8 @@ pub enum ExecError {
     SessionIds(may_agent::db::ChatDbError),
     #[error("failed to start the May daemon: {0}")]
     StartDaemon(may_agent::daemon::lifecycle::LifecycleError),
+    #[error("failed to connect to the daemon for the session's ids: {0}")]
+    ConnectDaemonIds(std::io::Error),
     #[error("failed to connect to the daemon's jobserver pool: {0}")]
     ConnectJobserver(aither_sandbox::JobserverError),
     #[error("failed to initialize baseline tools: {0}")]
@@ -225,9 +227,25 @@ pub async fn run_exec(args: ExecArgs) -> Result<i32, ExecError> {
 
 async fn load_exec_session_context(session_id: &str) -> Result<ExecSessionContext, ExecError> {
     let may_dir = MayConfig::may_dir().map_err(ExecError::MissingHomeDirectory)?;
+    // The daemon owns the session's model-facing ids and the machine's job
+    // pool, so it is started on demand; every id exec leases comes from the
+    // daemon's pool of the session.
+    let daemon = may_agent::daemon::DaemonPaths::new(may_dir.clone());
+    // Persistence comes first, as for every client, so the daemon a run
+    // starts never migrates the database alongside it.
     let (store, db, _default_profile_id) = initialize_session_persistence(&may_dir)
         .await
         .map_err(ExecError::InitializeSession)?;
+    may_agent::daemon::lifecycle::ensure_running(&daemon, |line| {
+        let _ = writeln!(io::stderr(), "[may] {line}");
+    })
+    .await
+    .map_err(ExecError::StartDaemon)?;
+    let db = db.lease_ids_from(
+        may_agent::client::ids::DaemonIds::connect(&daemon.socket())
+            .await
+            .map_err(ExecError::ConnectDaemonIds)?,
+    );
     let session_row = db
         .get_session(session_id)
         .await
@@ -454,17 +472,8 @@ async fn build_exec_terminal_tool(
             terminal_tool.with_shell_sessions(shell_sessions)
         }
         // Local commands draw their jobs from the daemon's machine-wide
-        // pool, as the daemon's own sessions do; the daemon is started on
-        // demand, since the pool is its.
+        // pool, as the daemon's own sessions do.
         may_agent::AgentEnvironment::Local => {
-            may_agent::daemon::lifecycle::ensure_running(
-                &may_agent::daemon::DaemonPaths::new(context.may_dir.clone()),
-                |line| {
-                    let _ = writeln!(io::stderr(), "[may] {line}");
-                },
-            )
-            .await
-            .map_err(ExecError::StartDaemon)?;
             let connection = may_agent::jobserver::connect_running(&context.may_dir)
                 .map_err(ExecError::ConnectJobserver)?;
             terminal_tool

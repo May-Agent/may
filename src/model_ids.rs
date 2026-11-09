@@ -60,15 +60,50 @@ pub fn draw_session_name(rng: &mut fastrand::Rng) -> String {
     name
 }
 
+/// Where a pool holds the leases of the ids the database keeps (open
+/// questions, scheduled tasks), which outlive whatever leased them.
+pub trait StoredIds: Send + Sync + 'static {
+    /// Keeps `lease` for an id the database now stores, until
+    /// [`release`](Self::release) names its word.
+    fn keep(&self, lease: IdLease);
+
+    /// Ends the lease of the stored id `word`: what it named left the
+    /// database.
+    fn release(&self, word: &str);
+}
+
+/// The stored ids' leases of a pool this process owns, by word.
+#[derive(Debug, Default)]
+struct HeldStoredIds(Mutex<HashMap<String, IdLease>>);
+
+impl HeldStoredIds {
+    fn leases(&self) -> std::sync::MutexGuard<'_, HashMap<String, IdLease>> {
+        self.0.lock().expect("session id leases lock poisoned")
+    }
+}
+
+impl StoredIds for HeldStoredIds {
+    fn keep(&self, lease: IdLease) {
+        self.leases().insert(lease.to_string(), lease);
+    }
+
+    fn release(&self, word: &str) {
+        let released = self.leases().remove(word);
+        drop(released);
+    }
+}
+
 /// The model-facing ids of one session.
 ///
 /// It is the pool the session's terminals, subagents, questions, tunnels and
 /// scheduled tasks lease their words from, and holds the leases of the ones
-/// the database keeps (open questions, scheduled tasks).
+/// the database keeps (open questions, scheduled tasks). The daemon owns
+/// every session's pool ([`restore`](Self::restore)); another process leases
+/// from the daemon's ([`new`](Self::new) over
+/// [`DaemonIds`](crate::client::ids::DaemonIds)).
 pub struct SessionIds {
     ids: AnyIdAllocator,
-    /// Leases of the session's stored ids, by word.
-    stored: Mutex<HashMap<String, IdLease>>,
+    stored: Box<dyn StoredIds>,
 }
 
 impl std::fmt::Debug for SessionIds {
@@ -86,15 +121,20 @@ impl SessionIds {
     /// stored ids share one.
     pub fn restore(stored: impl IntoIterator<Item = String>) -> Result<Self, WordUnavailable> {
         let ids = AnyIdAllocator::new(WordAllocator::new(WORDS.lines()));
-        let mut leases = HashMap::new();
+        let held = HeldStoredIds::default();
         for word in stored {
-            let lease = ids.claim(&word)?;
-            leases.insert(word, lease);
+            held.keep(ids.claim(&word)?);
         }
-        Ok(Self {
+        Ok(Self::new(ids, held))
+    }
+
+    /// A pool leasing from `ids` and keeping stored ids' leases in `stored`.
+    #[must_use]
+    pub fn new(ids: AnyIdAllocator, stored: impl StoredIds) -> Self {
+        Self {
             ids,
-            stored: Mutex::new(leases),
-        })
+            stored: Box::new(stored),
+        }
     }
 
     /// The allocator the session's terminals lease from.
@@ -114,18 +154,13 @@ impl SessionIds {
     /// Keeps `lease` for an id the database now stores, until
     /// [`release`](Self::release) names its word.
     pub fn keep(&self, lease: IdLease) {
-        self.stored_ids().insert(lease.to_string(), lease);
+        self.stored.keep(lease);
     }
 
     /// Ends the lease of the stored id `word`: what it named left the
     /// database.
     pub fn release(&self, word: &str) {
-        let released = self.stored_ids().remove(word);
-        drop(released);
-    }
-
-    fn stored_ids(&self) -> std::sync::MutexGuard<'_, HashMap<String, IdLease>> {
-        self.stored.lock().expect("session id leases lock poisoned")
+        self.stored.release(word);
     }
 }
 

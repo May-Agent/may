@@ -508,6 +508,12 @@ fn api_routes() -> Route {
                         "/artifacts/runtime/preview".at(get_artifact_runtime_preview),
                         "/artifacts/diagnostics".post(report_artifact_diagnostics),
                     )),
+                    Route::new((
+                        "/ids".post(super::session_ids::lease_session_id),
+                        "/ids/{word}".delete(super::session_ids::release_session_id),
+                        "/ids/{word}/keep".post(super::session_ids::keep_session_id),
+                        "/stored-ids/{word}".delete(super::session_ids::release_stored_session_id),
+                    )),
                 ))),
             ))),
             "/profiles".route(Route::new((

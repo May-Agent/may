@@ -5,7 +5,9 @@
 //! session is created under it, and the row is never deleted, so no name is
 //! issued twice. A session's pool is built the first time something of the
 //! session leases from it, with the words of the ids the database keeps for
-//! the session (open questions, scheduled tasks) leased again.
+//! the session (open questions, scheduled tasks) leased again. Only the
+//! daemon builds pools: a database another process opens
+//! ([`ChatDb::lease_ids_from`]) leases from the daemon's.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -17,11 +19,28 @@ use super::{ChatDb, ChatDbError, query};
 
 /// Each session's pool, by session id.
 #[derive(Debug, Clone, Default)]
-pub(super) struct SessionPools(Arc<Mutex<HashMap<String, Arc<SessionIds>>>>);
+pub(super) struct SessionPools {
+    pools: Arc<Mutex<HashMap<String, Arc<SessionIds>>>>,
+    /// The daemon whose pools this process leases from, when it is not the
+    /// daemon itself.
+    daemon: Option<crate::client::ids::DaemonIds>,
+}
 
 impl SessionPools {
     fn pools(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<SessionIds>>> {
-        self.0.lock().expect("session id pools lock poisoned")
+        self.pools.lock().expect("session id pools lock poisoned")
+    }
+
+    /// The pool of `session_id` leasing from `daemon`, built on first use.
+    fn leased_from(
+        &self,
+        daemon: &crate::client::ids::DaemonIds,
+        session_id: &str,
+    ) -> Arc<SessionIds> {
+        self.pools()
+            .entry(session_id.to_string())
+            .or_insert_with(|| Arc::new(daemon.session(session_id)))
+            .clone()
     }
 }
 
@@ -94,6 +113,9 @@ impl ChatDb {
     /// for the session share a word or one is not a pool word; storage
     /// failures otherwise.
     pub async fn session_ids(&self, session_id: &str) -> Result<Arc<SessionIds>, ChatDbError> {
+        if let Some(daemon) = &self.session_pools.daemon {
+            return Ok(self.session_pools.leased_from(daemon, session_id));
+        }
         if let Some(ids) = self.session_pools.pools().get(session_id) {
             return Ok(ids.clone());
         }
@@ -115,9 +137,28 @@ impl ChatDb {
             .clone())
     }
 
+    /// This database's per-session ids leased from `daemon`'s pools, for a
+    /// process that is not the daemon: the daemon owns every session's pool,
+    /// so an id this process leases is never one the daemon leased.
+    #[must_use]
+    pub fn lease_ids_from(mut self, daemon: crate::client::ids::DaemonIds) -> Self {
+        self.session_pools = SessionPools {
+            pools: Arc::default(),
+            daemon: Some(daemon),
+        };
+        self
+    }
+
     /// Ends the lease of `session_id`'s stored id `word`, once the database
-    /// no longer keeps it. A pool not built yet holds no lease.
+    /// no longer keeps it. A pool of this process not built yet holds no
+    /// lease; the daemon's always might.
     pub(super) fn release_session_word(&self, session_id: &str, word: &str) {
+        if let Some(daemon) = &self.session_pools.daemon {
+            self.session_pools
+                .leased_from(daemon, session_id)
+                .release(word);
+            return;
+        }
         let ids = self.session_pools.pools().get(session_id).cloned();
         if let Some(ids) = ids {
             ids.release(word);

@@ -23,7 +23,7 @@ use super::types::{
     SessionContextWindowSnapshotResponse, SessionTasksPayload,
 };
 
-fn session_not_found_error(session_id: &str) -> SkyError {
+pub(super) fn session_not_found_error(session_id: &str) -> SkyError {
     SkyError::msg(format!("Session {session_id} not found")).set_status(StatusCode::NOT_FOUND)
 }
 

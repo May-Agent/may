@@ -7,6 +7,7 @@
 
 pub mod acp;
 pub mod background;
+pub mod ids;
 mod sse;
 mod wire;
 
