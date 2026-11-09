@@ -41,21 +41,48 @@ struct SessionBackground {
 }
 
 /// A background wake of a session being served; the session reads as
-/// resuming until this drops.
+/// resuming until this drops. It holds the completions the wake recorded,
+/// whose jobs read as owed a turn until the turn the wake starts settles
+/// them ([`Self::settle`]).
 #[must_use]
-pub struct ResumePending(Arc<std::sync::atomic::AtomicUsize>);
+pub struct ResumePending {
+    resuming: Arc<std::sync::atomic::AtomicUsize>,
+    completions: Vec<aither_sandbox::PendingCompletion>,
+}
+
+impl ResumePending {
+    /// Settles the wake once the turn it started released the session: its
+    /// completions are taken, returning once their registries recorded it,
+    /// and the session stops reading as resuming.
+    pub(crate) async fn settle(mut self) {
+        futures_util::future::join_all(
+            std::mem::take(&mut self.completions)
+                .into_iter()
+                .map(aither_sandbox::PendingCompletion::take),
+        )
+        .await;
+    }
+}
 
 impl Drop for ResumePending {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        self.resuming
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
     }
 }
+
+/// A request that the watcher bring the record of the sessions with
+/// background work up to date; it replies once the record is written.
+type RecordRequest = async_channel::Sender<()>;
 
 /// Background work of every session the daemon ran.
 #[derive(Default)]
 pub struct SessionBackgrounds {
     sessions: Mutex<HashMap<String, SessionBackground>>,
     next_registry: std::sync::atomic::AtomicU64,
+    /// Where the watcher, the record's one writer, takes requests to bring
+    /// it up to date; set once the watcher runs.
+    record: std::sync::OnceLock<async_channel::Sender<RecordRequest>>,
 }
 
 impl std::fmt::Debug for SessionBackgrounds {
@@ -92,16 +119,24 @@ impl SessionBackgrounds {
             .push((id, registry));
     }
 
-    /// Marks `session_id` as resuming until the guard drops.
-    pub(crate) fn resume_pending(&self, session_id: &str) -> ResumePending {
-        let counter = self
+    /// Marks `session_id` as resuming until the guard drops, which holds the
+    /// `completions` of the wake being served.
+    pub(crate) fn resume_pending(
+        &self,
+        session_id: &str,
+        completions: Vec<aither_sandbox::PendingCompletion>,
+    ) -> ResumePending {
+        let resuming = self
             .sessions()
             .entry(session_id.to_string())
             .or_default()
             .resuming
             .clone();
-        counter.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        ResumePending(counter)
+        resuming.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        ResumePending {
+            resuming,
+            completions,
+        }
     }
 
     fn resuming(&self, session_id: &str) -> bool {
@@ -220,6 +255,49 @@ impl SessionBackgrounds {
     fn session_ids(&self) -> Vec<String> {
         self.sessions().keys().cloned().collect()
     }
+
+    /// Brings the persisted record of the sessions with background work up
+    /// to date with the work alive now, and returns once it is written. A
+    /// run that released its session calls this before its clients hear the
+    /// turn end, so a daemon killed after that end never finds the finished
+    /// session recorded as interrupted. Before the watcher runs nothing is
+    /// recorded, so there is nothing to bring up to date.
+    pub(crate) async fn record_now(&self) {
+        let Some(requests) = self.record.get() else {
+            return;
+        };
+        let (reply, written) = async_channel::bounded(1);
+        // Either end closes only when the daemon shuts down.
+        if requests.send(reply).await.is_ok() {
+            let _ = written.recv().await;
+        }
+    }
+}
+
+/// What woke the background watcher.
+enum WatcherWake {
+    /// The once-a-second check is due.
+    Tick,
+    /// A run asked for the record to be brought up to date.
+    Record(RecordRequest),
+}
+
+/// Writes `busy` as the record of the sessions with background work when
+/// it differs from what was `persisted`.
+async fn write_record(
+    state: &DaemonState,
+    busy: &std::collections::BTreeSet<String>,
+    persisted: &mut std::collections::BTreeSet<String>,
+) {
+    if busy == persisted {
+        return;
+    }
+    match state.db().set_sessions_with_background(busy).await {
+        Ok(()) => persisted.clone_from(busy),
+        Err(error) => {
+            tracing::error!(%error, "failed to record the sessions with background work");
+        }
+    }
 }
 
 /// What a client sees of a session's background work, without the clocks:
@@ -239,15 +317,47 @@ fn shape(snapshot: &SessionBackgroundSnapshot) -> Vec<(u64, String)> {
 }
 
 /// Publishes `session_background` once a second while some session has
-/// background work, and once more when it changed.
+/// background work, and once more when it changed. It is the one writer of
+/// the record of the sessions with background work: it updates the record
+/// on each check, and at once when a run asks through
+/// [`SessionBackgrounds::record_now`].
+///
+/// # Panics
+/// Panics when a watcher already runs for this daemon.
 pub fn spawn_watcher(state: Arc<DaemonState>, bus: UiEventBus) {
+    let (requests, record_requests) = async_channel::unbounded::<RecordRequest>();
+    assert!(
+        state.session_background.record.set(requests).is_ok(),
+        "one background watcher runs per daemon"
+    );
     state.tokio_handle.clone().spawn(async move {
         let mut last: HashMap<String, Vec<(u64, String)>> = HashMap::new();
         let mut last_busy = std::collections::BTreeSet::new();
         // Startup cleared the record, so it starts empty.
         let mut persisted = std::collections::BTreeSet::new();
+        let mut next_tick = std::time::Instant::now() + WATCH_INTERVAL;
         loop {
-            tokio::time::sleep(WATCH_INTERVAL).await;
+            let wake = futures_lite::future::or(
+                async {
+                    async_io::Timer::at(next_tick).await;
+                    WatcherWake::Tick
+                },
+                async {
+                    // The sender lives in the daemon state this task holds.
+                    match record_requests.recv().await {
+                        Ok(reply) => WatcherWake::Record(reply),
+                        Err(_) => std::future::pending().await,
+                    }
+                },
+            )
+            .await;
+            if let WatcherWake::Record(reply) = wake {
+                let busy = state.session_background.busy_sessions().await;
+                write_record(&state, &busy, &mut persisted).await;
+                let _ = reply.try_send(());
+                continue;
+            }
+            next_tick = std::time::Instant::now() + WATCH_INTERVAL;
             let mut changed = std::collections::BTreeSet::new();
             let mut busy = std::collections::BTreeSet::new();
             for session_id in state.session_background.session_ids() {
@@ -281,14 +391,7 @@ pub fn spawn_watcher(state: Arc<DaemonState>, bus: UiEventBus) {
             if busy != last_busy {
                 bus.publish(UiEventTopics::PROFILE_SESSIONS);
             }
-            if busy != persisted {
-                match state.db().set_sessions_with_background(&busy).await {
-                    Ok(()) => persisted.clone_from(&busy),
-                    Err(error) => {
-                        tracing::error!(%error, "failed to record the sessions with background work");
-                    }
-                }
-            }
+            write_record(&state, &busy, &mut persisted).await;
             last_busy = busy;
         }
     });

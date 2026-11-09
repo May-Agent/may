@@ -6466,6 +6466,87 @@ async fn an_unexpected_exit_leaves_a_cold_session_for_the_next_message() {
     environment.release(&harness, &session_id).await;
 }
 
+/// A daemon killed the moment a turn reported `done` was not running that
+/// session: the next start neither restarts it nor owes it the alert. The
+/// finished turn is one a background job's completion started: from the
+/// job's start until that turn ends the session has background work, so the
+/// daemon records it as busy throughout, and `done` must follow that record
+/// being brought up to date. The next daemon settles the sessions an exit
+/// interrupted before it serves anyone, so the follow-up message is admitted
+/// only when nothing restarted, and it carries no alert.
+#[tokio::test]
+#[serial]
+async fn a_daemon_killed_right_after_done_does_not_restart_the_finished_session() {
+    let mock =
+        MockOpenAiServer::spawn(MockChatScenario::StartsBackgroundJob(FINISHING_JOB_SCRIPT)).await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
+    let client = reqwest::Client::new();
+    let environment = ChatEnvironment::Local
+        .prepare(&harness, &client, &server)
+        .await;
+    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+
+    let turn = send_turn(
+        &client,
+        &server.base_url,
+        &serde_json::json!({ "sessionId": session_id, "content": "start the job" }),
+    )
+    .await
+    .expect("turn request should succeed");
+    let turn = expect_status(&server.log, turn, StatusCode::OK).await;
+    let events = collect_turn_events(turn, "the turn starting the job", &server.log).await;
+    assert!(
+        events.iter().any(|(kind, _)| kind == "done"),
+        "the turn should end while its job runs; events: {events:?}"
+    );
+    let stream = client
+        .get(format!(
+            "{}/api/sessions/{session_id}/events",
+            server.base_url
+        ))
+        .send()
+        .await
+        .expect("event stream should open");
+    let resumed = collect_turn_events(stream, "the resumed turn", &server.log).await;
+    assert!(
+        resumed.iter().any(|(kind, _)| kind == "done"),
+        "the job's completion should resume the session; events: {resumed:?}; server logs:\n{}",
+        server.log.contents().await
+    );
+    server.kill().await;
+    let seen = mock.agent_requests().await.len();
+
+    let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
+    let turn = send_turn(
+        &client,
+        &server.base_url,
+        &serde_json::json!({ "sessionId": session_id, "content": "anything new?" }),
+    )
+    .await
+    .expect("turn request should succeed");
+    let turn = expect_status(&server.log, turn, StatusCode::OK).await;
+    let events = collect_turn_events(turn, "the turn after the kill", &server.log).await;
+    assert!(
+        events.iter().any(|(kind, _)| kind == "done"),
+        "events: {events:?}"
+    );
+    let requests = mock.agent_requests().await;
+    assert_eq!(
+        requests.len(),
+        seen + 1,
+        "only the user's message ran after the restart; server logs:\n{}",
+        strip_ansi_escapes(&server.log.contents().await)
+    );
+    assert!(
+        !mentions_daemon_exit(&requests[seen]),
+        "a finished session is owed no alert: {:?}",
+        message_texts(&requests[seen])
+    );
+    server.stop().await;
+    environment.release(&harness, &session_id).await;
+}
+
 /// A daemon stopped through its shutdown path owes no session the alert:
 /// nothing starts at the next start, and the next message carries none.
 #[tokio::test]
