@@ -3505,7 +3505,7 @@ mod tests {
         use ratatui::backend::TestBackend;
         let mut terminal = Terminal::new(TestBackend::new(70, 20)).unwrap();
         terminal
-            .draw(|frame| super::render_permission_confirm(frame, frame.area(), state))
+            .draw(|frame| super::render_permission_confirm(frame, frame.area(), state, None))
             .unwrap();
         let buffer = terminal.backend().buffer().clone();
         (0..buffer.area.height)

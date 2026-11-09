@@ -6360,6 +6360,7 @@ mod tests {
                 output: None,
                 diffs: Vec::new(),
                 pinned: None,
+                reading: None,
             },
         );
     }
