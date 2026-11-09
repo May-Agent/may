@@ -34,7 +34,7 @@ export async function enqueueMessage(payload: ChatRequestPayload): Promise<void>
 
 export async function stopSession(sessionId: string): Promise<void> {
   const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/turns/current`, {
-    method: 'POST',
+    method: 'DELETE',
   });
   if (!res.ok) throw new ApiError('internal_error', 'stop failed', res.status);
 }

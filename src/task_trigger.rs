@@ -112,15 +112,6 @@ impl WebhookSignature {
     }
 }
 
-/// Whether `token` has the shape [`new_webhook_token`] produces: 256 bits, URL-safe base64.
-#[must_use]
-pub fn is_strong_webhook_token(token: &str) -> bool {
-    use base64::Engine as _;
-    base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(token)
-        .is_ok_and(|bytes| bytes.len() == WEBHOOK_TOKEN_BYTES)
-}
-
 /// Whether two webhook tokens are equal, in time independent of where they differ.
 #[must_use]
 pub fn webhook_tokens_match(stored: &str, presented: &str) -> bool {
@@ -968,10 +959,7 @@ mod tests {
         let first = super::new_webhook_token();
         let second = super::new_webhook_token();
         assert_ne!(first, second);
-        assert!(super::is_strong_webhook_token(&first));
         assert_eq!(first.len(), 43);
-        assert!(!super::is_strong_webhook_token("quiet-brave-mint-otter"));
-        assert!(!super::is_strong_webhook_token(""));
     }
 
     #[test]

@@ -35,9 +35,10 @@ impl Fixture {
         db.create_session("session", Some("Session"), Some("test-model"))
             .await
             .expect("create session");
+        let home = crate::session::MayHomePaths::new(dir.path().join("home"));
         Self {
             _dir: dir,
-            runtime: Arc::new(SessionRuntimeService::new(db, UiEventBus::new())),
+            runtime: Arc::new(SessionRuntimeService::new(db, UiEventBus::new(), home)),
         }
     }
 

@@ -184,10 +184,14 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
     // lease tasks are spawned on its handle.
     let lease_handle = tokio::runtime::Handle::current();
     let runtime_service = Arc::new(
-        crate::session::SessionRuntimeService::new(db_for_archive.clone(), ui_event_bus.clone())
-            .with_spawner(Arc::new(move |task| {
-                lease_handle.spawn(task);
-            })),
+        crate::session::SessionRuntimeService::new(
+            db_for_archive.clone(),
+            ui_event_bus.clone(),
+            crate::session::MayHomePaths::new(may_dir.clone()),
+        )
+        .with_spawner(Arc::new(move |task| {
+            lease_handle.spawn(task);
+        })),
     );
     runtime_service
         .runs()
@@ -332,6 +336,7 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
         aux_tasks: super::chat::AuxTasks::default(),
         recap_schedules: super::chat::RecapSchedules::default(),
         session_background: super::chat::SessionBackgrounds::default(),
+        pr_checks: super::pr_checks::PrChecksCache::default(),
         tunnels: Arc::new(super::tunnel::TunnelRegistry::new()),
         connectivity,
         session_events_epoch: std::time::SystemTime::now()
@@ -363,6 +368,7 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
     let scheduler = crate::scheduler::TaskScheduler::new(task_runtime);
     let _scheduler = scheduler.spawn();
     super::artifacts::spawn_artifact_watcher(&state);
+    super::pr_checks::spawn(state.clone());
     // The tailscale-serve listener trusts Serve's identity header; a direct
     // non-loopback bind trusts only the peer's `WhoIs`-resolved login.
     let remote_router = build_router(

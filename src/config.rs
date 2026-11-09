@@ -92,11 +92,6 @@ pub enum ConfigError {
     /// Failed to serialize config.
     #[error("Failed to serialize config: {0}")]
     Serialize(#[from] toml::ser::Error),
-    /// Legacy `[playwright]` config section found; it must be renamed to `[browser]`.
-    #[error(
-        "legacy config section `[playwright]` is no longer supported; rename it to `[browser]`"
-    )]
-    LegacyPlaywrightSection,
     /// Invalid browser config.
     #[error("invalid browser config: {0}")]
     InvalidBrowserConfig(String),
@@ -1433,6 +1428,9 @@ pub struct CiConfig {
     /// A job is abnormally long when it runs past this multiple of its
     /// baseline, the median of its last successful runs on the base branch.
     pub baseline_multiple: f64,
+    /// Seconds between two reads of the checks of each in-flight GitHub PR
+    /// (the alerts and the sidebars' per-check view). Read on every tick.
+    pub pr_poll_seconds: u64,
 }
 
 impl CiConfig {
@@ -1452,6 +1450,11 @@ impl CiConfig {
                 "ci.baseline_multiple must be a number above 1".to_string(),
             ));
         }
+        if self.pr_poll_seconds == 0 {
+            return Err(ConfigError::InvalidCiConfig(
+                "ci.pr_poll_seconds must be above 0".to_string(),
+            ));
+        }
         Ok(())
     }
 }
@@ -1461,6 +1464,7 @@ impl Default for CiConfig {
         Self {
             max_job_minutes: 40,
             baseline_multiple: 2.0,
+            pr_poll_seconds: 60,
         }
     }
 }
@@ -1902,7 +1906,6 @@ impl MayConfig {
     pub async fn load_from(path: &Path) -> Result<Self, ConfigError> {
         match async_fs::read_to_string(path).await {
             Ok(content) => {
-                reject_legacy_config_sections(&content)?;
                 let config: Self = toml::from_str(&content)?;
                 config.validate()?;
                 Ok(config)
@@ -2148,14 +2151,6 @@ impl MayConfig {
         models.dedup_by(|a, b| a.selector == b.selector);
         models
     }
-}
-
-fn reject_legacy_config_sections(content: &str) -> Result<(), ConfigError> {
-    let document = toml::from_str::<toml::Value>(content).map_err(ConfigError::Parse)?;
-    if document.get("playwright").is_some() {
-        return Err(ConfigError::LegacyPlaywrightSection);
-    }
-    Ok(())
 }
 
 /// An available model from a configured provider.

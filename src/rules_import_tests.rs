@@ -86,6 +86,7 @@ async fn import_session(rules: &[u8]) -> ImportSession {
     let runtime = Arc::new(crate::session::SessionRuntimeService::new(
         db.clone(),
         crate::ui_event_bus::UiEventBus::new(),
+        crate::session::MayHomePaths::new(may_dir.clone()),
     ));
     let sandbox = temp.path().join("sandbox");
     std::fs::create_dir_all(&sandbox).expect("sandbox");

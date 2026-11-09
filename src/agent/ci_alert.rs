@@ -1,14 +1,15 @@
-//! The system alert a session's agent gets when a PR's checks finished with
-//! an abnormally long job.
+//! The system alerts a session's agent gets about its PRs' checks: a finished
+//! run with an abnormally long job, and a change of the live rollup (a
+//! failure, every check passed, the checks unreadable).
 //!
-//! The finding is stored when the checks finish, with its text rendered from
-//! the alert template. This source hands each stored finding to the agent
-//! once, at the next request or the end of the tool turn that waited on the
-//! checks, whichever comes first.
+//! Each alert is stored when it happens, with its text rendered from its
+//! template. This source hands each stored alert to the agent once, at the
+//! next request or the end of the tool turn that waited on the checks,
+//! whichever comes first.
 
 use aither_agent::{Block, ContextSource};
 
-use crate::db::ChatDb;
+use crate::db::{ChatDb, ChatDbError};
 
 const TAG: &str = "ci_alert";
 
@@ -30,12 +31,22 @@ impl CiAlertContext {
     }
 
     async fn take(&self) -> Option<Block> {
-        match self.db.take_ci_alerts(&self.session_id).await {
-            Ok(alerts) if alerts.is_empty() => None,
-            Ok(alerts) => Some(Block::new(TAG, alerts.join("\n\n"))),
+        let (findings, checks) = futures_lite::future::zip(
+            self.db.take_ci_alerts(&self.session_id),
+            self.db.take_pr_check_alerts(&self.session_id),
+        )
+        .await;
+        let mut alerts = Vec::new();
+        self.collect(&mut alerts, findings);
+        self.collect(&mut alerts, checks);
+        (!alerts.is_empty()).then(|| Block::new(TAG, alerts.join("\n\n")))
+    }
+
+    fn collect(&self, alerts: &mut Vec<String>, taken: Result<Vec<String>, ChatDbError>) {
+        match taken {
+            Ok(taken) => alerts.extend(taken),
             Err(error) => {
                 tracing::error!(session_id = %self.session_id, %error, "failed to load CI alerts");
-                None
             }
         }
     }

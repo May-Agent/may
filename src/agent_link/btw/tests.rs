@@ -44,7 +44,11 @@ impl Host {
         let db = ChatDb::open(&may_dir.path().join("history.db"))
             .await
             .expect("history.db opens");
-        let runtime_service = Arc::new(SessionRuntimeService::new(db, UiEventBus::new()));
+        let runtime_service = Arc::new(SessionRuntimeService::new(
+            db,
+            UiEventBus::new(),
+            crate::session::MayHomePaths::new(may_dir.path().join("home")),
+        ));
         let messaging = AgentMessaging {
             directory: AgentDirectory::new(
                 runtime_service.clone(),

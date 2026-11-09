@@ -2058,47 +2058,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn opening_the_database_replaces_weak_webhook_tokens() {
-        let dir = tempdir().expect("temp dir should be created");
-        let path = dir.path().join("history.db");
-        let db = ChatDb::open(&path).await.expect("db should initialize");
-        let profile_id = db
-            .ensure_default_profiles()
-            .await
-            .expect("default profiles should exist");
-        let trigger = PersistedTaskTrigger::Webhook {
-            token: "quiet-brave-mint-otter".to_string(),
-            signature: None,
-        };
-        db.create_scheduled_task(CreateScheduledTaskParams {
-            id: "old",
-            profile_id: profile_id.as_str(),
-            session_id: None,
-            name: "old",
-            trigger: &trigger,
-            cron_expression: None,
-            run_at: None,
-            script_path: None,
-            script_inline: Some("echo hi"),
-            needs_network: false,
-            timeout_secs: 60,
-        })
-        .await
-        .expect("task should persist");
-        drop(db);
-
-        let db = ChatDb::open(&path).await.expect("db should reopen");
-        let task = db
-            .get_scheduled_task("old")
-            .await
-            .expect("task should load")
-            .expect("task should exist");
-        assert!(crate::task_trigger::is_strong_webhook_token(
-            &task.trigger_type
-        ));
-    }
-
-    #[tokio::test]
     async fn local_terminal_fails_before_exec_without_prepared_tools() {
         // Terminal construction spawns its job registry on the global
         // executor, which the `may` binary installs at startup.
@@ -2298,6 +2257,7 @@ mod tests {
             let runtime_service = Arc::new(crate::session::SessionRuntimeService::new(
                 db.clone(),
                 crate::ui_event_bus::UiEventBus::new(),
+                crate::session::MayHomePaths::new(may_dir.clone()),
             ));
             let (wake_tx, wakes) = async_channel::unbounded();
             let runtime = TaskRuntime::load(

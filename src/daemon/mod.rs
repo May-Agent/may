@@ -37,6 +37,7 @@ mod local_url_mapper;
 mod message_mapping;
 mod model_resolution;
 mod notifications;
+mod pr_checks;
 mod profiles;
 mod remote_access;
 mod rules_import;
@@ -297,30 +298,6 @@ fn acquire_single_instance(paths: &DaemonPaths) -> anyhow::Result<SingleInstance
     Ok(SingleInstance { _lock: lock })
 }
 
-/// Removes the `LanceDB` session index May kept before search moved to
-/// repo-search.
-fn remove_legacy_search_index(may_dir: &Path) {
-    for name in [
-        "session_index.lancedb",
-        "session_index.meta.json",
-        "session_index.semantic.redb",
-    ] {
-        let path = may_dir.join(name);
-        let removed = if path.is_dir() {
-            std::fs::remove_dir_all(&path)
-        } else {
-            std::fs::remove_file(&path)
-        };
-        match removed {
-            Ok(()) => tracing::info!(path = %path.display(), "removed the legacy session index"),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                tracing::warn!(path = %path.display(), %error, "failed to remove the legacy session index");
-            }
-        }
-    }
-}
-
 fn bind_unix(path: &Path) -> anyhow::Result<tokio::net::UnixListener> {
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -394,7 +371,6 @@ impl ExtraListeners {
 pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
     let paths = DaemonPaths::user()?;
     let _instance = acquire_single_instance(&paths)?;
-    remove_legacy_search_index(paths.root());
 
     // Agents of relocated homes whose runs were killed before they could
     // retire them, swept before the daemon answers so a client never sees

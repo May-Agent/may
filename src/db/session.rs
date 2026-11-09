@@ -690,7 +690,7 @@ impl ChatDb {
         for (ordinal, attachment) in message.attachments.iter().enumerate() {
             query!(
                 tx,
-                "INSERT INTO session_pending_message_attachments (message_id, ordinal, attachment_id, name, attachment_type, url, upload_data_url, text_content) VALUES (?, ?, ?, ?, ?, ?, NULL, ?)",
+                "INSERT INTO session_pending_message_attachments (message_id, ordinal, attachment_id, name, attachment_type, url, text_content) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 message_id,
                 i64::try_from(ordinal).map_err(|error| overflow_error("pending attachment ordinal", &error))?,
                 attachment.id.as_str(),
@@ -1753,82 +1753,6 @@ mod tests {
         for table in &deleted {
             assert_eq!(count(&db, table).await, 0, "`{table}` after delete all");
         }
-        assert_eq!(count(&db, "sessions").await, 0);
-    }
-
-    /// A long-lived database made by an older build keeps its tables with
-    /// foreign keys onto `sessions` (`legacy_session_fk_schema.sql`, read from
-    /// a real history database). Opening it drops the two tables current code
-    /// no longer reads, and sessions that ran a turn then delete.
-    #[tokio::test]
-    async fn legacy_foreign_keys_do_not_block_session_delete() {
-        const LEGACY_SCHEMA: &str = include_str!("testdata/legacy_session_fk_schema.sql");
-        let dir = tempdir().expect("temp dir should be created");
-        let path = dir.path().join("history.db");
-        let raw = ChatDb::connect(&path).await.expect("raw db should connect");
-        // The legacy definitions come first, so the current schema's
-        // `CREATE TABLE IF NOT EXISTS` leaves them as they are.
-        for statement in super::super::db_sql::statements(LEGACY_SCHEMA) {
-            query!(raw, statement)
-                .execute()
-                .await
-                .expect("legacy statement should run");
-        }
-        ChatDb::initialize_schema(&raw)
-            .await
-            .expect("schema should initialize");
-        for id in ["session-a", "session-b"] {
-            for sql in [
-                "INSERT INTO sessions (id, message_count, pinned, archived, created_at, updated_at) VALUES (?, 0, 0, 0, 't', 't')",
-                "INSERT INTO session_pending_messages (session_id, delivery_mode, content, attachments_json, created_at) VALUES (?, 'queue', 'c', '[]', 't')",
-                "INSERT INTO session_pending_ask_user (request_id, session_id, questions_json, created_at) VALUES (?, ?, '[]', 't')",
-                "INSERT INTO messages (session_id, role, content) VALUES (?, 'user', 'c')",
-                "INSERT INTO session_runtimes (session_id, state, browser_takeover_active, browser_takeover_alert_pending, updated_at) VALUES (?, 'idle', 0, 0, 't')",
-                "INSERT INTO session_plans (session_id, plan_state, updated_at) VALUES (?, 'none', 't')",
-                "INSERT INTO session_pending_permissions (request_id, session_id, mode, script, created_at) VALUES (?, ?, 'm', 's', '2026-01-01T00:00:00Z')",
-                "INSERT INTO session_pending_workspace (request_id, session_id, path, reason, created_at) VALUES (?, ?, 'p', 'r', '2026-01-01T00:00:00Z')",
-            ] {
-                if sql.matches('?').count() == 2 {
-                    query!(raw, sql, id, id).execute().await
-                } else {
-                    query!(raw, sql, id).execute().await
-                }
-                .expect("legacy row should insert");
-            }
-        }
-        // The constraint is enforced: deleting the row alone is the reported 787.
-        query!(raw, "DELETE FROM sessions WHERE id = 'session-b'")
-            .execute()
-            .await
-            .expect_err("a bare sessions delete must hit the foreign key");
-        drop(raw);
-
-        let db = ChatDb::open(&path).await.expect("legacy db should open");
-        for table in ["session_pending_messages", "session_pending_ask_user"] {
-            let tables = query!(
-                db.db,
-                "SELECT name AS tbl FROM sqlite_master WHERE type = 'table' AND name = ?",
-                table
-            )
-            .fetch_all::<TableRow>()
-            .await
-            .expect("tables should list");
-            assert!(tables.is_empty(), "`{table}` should be dropped on open");
-            assert!(!deleted_tables().contains(&table));
-            assert!(!RETAINED_ON_DELETE.contains(&table));
-        }
-
-        db.delete_session("session-a")
-            .await
-            .expect("delete should succeed");
-        assert_eq!(count(&db, "session_runtimes").await, 1);
-        assert_eq!(count(&db, "messages").await, 1);
-        let removed = db
-            .delete_all_sessions()
-            .await
-            .expect("delete all should succeed");
-        assert_eq!(removed, 1);
-        assert_eq!(count(&db, "session_runtimes").await, 0);
         assert_eq!(count(&db, "sessions").await, 0);
     }
 

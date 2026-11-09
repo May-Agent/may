@@ -95,7 +95,14 @@ pub fn task_rows(content: &str) -> Vec<TaskRow> {
                 }
             },
             title: row.title().to_string(),
-            detail: row.details().collect::<Vec<_>>().join("\n"),
+            // The mark is carried by `blocking`.
+            detail: row
+                .details()
+                .filter(|line| {
+                    !aither_agent::working_document::words(line).any(|w| w == "BLOCKING")
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
             blocking: row.blocking_mark().map(ToString::to_string),
             references: row.references().iter().map(TaskReference::from).collect(),
         })
@@ -132,12 +139,7 @@ mod tests {
                     "second line",
                     None
                 ),
-                (
-                    TaskSection::Doing,
-                    "Ask about scope",
-                    "BLOCKING q42",
-                    Some("q42")
-                ),
+                (TaskSection::Doing, "Ask about scope", "", Some("q42")),
                 (TaskSection::Queued, "Ship PR #13", "", None),
             ]
         );
