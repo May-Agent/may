@@ -1,6 +1,11 @@
 //! The right sidebar: session title, task tree with linked issues, file
 //! changes per tracked workspace, running subagents and background
 //! terminal jobs.
+//!
+//! The title stays put; everything below it is one column that scrolls
+//! (mouse wheel, `Alt+Up`/`Alt+Down`). Each section folds under its heading,
+//! a truncated list shows all its entries from its `… N more` row, and a task
+//! row with a detail line expands to show it.
 
 use ratatui::{
     prelude::*,
@@ -12,9 +17,9 @@ use super::super::band::panel;
 use super::super::chat::{format_elapsed, format_number};
 use crate::task_rows::{TaskRow, TaskSection};
 use crate::tui::app::App;
-use crate::tui::sidebar::IssueBrief;
+use crate::tui::sidebar::{IssueBrief, SidebarHit, SidebarSection, SidebarState, task_key};
 
-/// Rows kept for each background section when tasks compete for space.
+/// Entries a background section lists before its `… N more` row.
 const BACKGROUND_ROWS: usize = 6;
 
 /// `text` cut to `width` display columns, with `…` when it was cut.
@@ -73,15 +78,6 @@ fn wrap_hanging(text: &str, width: usize, indent: usize) -> Vec<String> {
     rows
 }
 
-fn heading(text: String) -> Line<'static> {
-    Line::from(Span::styled(
-        text,
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    ))
-}
-
 fn dim(text: String) -> Line<'static> {
     Line::from(Span::styled(text, Style::default().fg(Color::DarkGray)))
 }
@@ -119,51 +115,134 @@ fn home_label(path: &std::path::Path) -> String {
     path.display().to_string()
 }
 
-/// Rows of the task tree, plus the row of the first open task.
-/// The open work grouped under its section's heading, plus the line of the
-/// first row of `Doing` (or of the first section when nothing is doing).
-/// Roots are not listed here: the issues they name appear under "Issues".
-fn task_rows(rows: &[TaskRow], width: usize) -> (Vec<Line<'static>>, Option<usize>) {
-    let mut lines = Vec::new();
-    let mut first_open = None;
-    for (section, title) in [
-        (TaskSection::Doing, "Doing"),
-        (TaskSection::Queued, "Queued"),
+/// The scrolling part of the sidebar: its lines, and the click target of
+/// each line that has one.
+#[derive(Default)]
+struct Body {
+    lines: Vec<Line<'static>>,
+    hits: Vec<(usize, SidebarHit)>,
+}
+
+impl Body {
+    fn push(&mut self, line: Line<'static>) {
+        self.lines.push(line);
+    }
+
+    fn push_hit(&mut self, line: Line<'static>, hit: SidebarHit) {
+        self.hits.push((self.lines.len(), hit));
+        self.lines.push(line);
+    }
+
+    /// A blank line, except at the top of the body.
+    fn gap(&mut self) {
+        if !self.lines.is_empty() {
+            self.lines.push(Line::from(""));
+        }
+    }
+
+    /// A section heading with its fold marker; `true` when the section is
+    /// open and its entries follow.
+    fn heading(&mut self, state: &SidebarState, section: SidebarSection, text: &str) -> bool {
+        let open = !state.is_collapsed(section);
+        let marker = if open { "▾" } else { "▸" };
+        self.push_hit(
+            Line::from(Span::styled(
+                format!("{marker} {text}"),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            SidebarHit::Heading(section),
+        );
+        open
+    }
+
+    /// The entries of a capped list: all of them when `section` lists all,
+    /// else the first [`BACKGROUND_ROWS`] and a `… N more` row.
+    fn capped<T>(
+        &mut self,
+        state: &SidebarState,
+        section: SidebarSection,
+        entries: impl ExactSizeIterator<Item = T>,
+        mut row: impl FnMut(&mut Self, T),
+    ) {
+        let total = entries.len();
+        let all = state.lists_all(section);
+        for entry in entries.take(if all { total } else { BACKGROUND_ROWS }) {
+            row(self, entry);
+        }
+        if total > BACKGROUND_ROWS {
+            let text = if all {
+                "  show fewer".to_string()
+            } else {
+                format!("  … {} more", total - BACKGROUND_ROWS)
+            };
+            self.push_hit(dim(text), SidebarHit::More(section));
+        }
+    }
+}
+
+/// The open work grouped under its section's heading. Roots are not listed
+/// here: the issues they name appear under "Issues".
+///
+/// A row is its title; its detail lines are shown once the row is expanded.
+fn task_rows(body: &mut Body, state: &SidebarState, rows: &[TaskRow], width: usize) {
+    for (section, title, id) in [
+        (TaskSection::Doing, "Doing", SidebarSection::Doing),
+        (TaskSection::Queued, "Queued", SidebarSection::Queued),
     ] {
-        let mut section_rows = rows.iter().filter(|row| row.section == section).peekable();
-        if section_rows.peek().is_none() {
+        let section_rows: Vec<&TaskRow> =
+            rows.iter().filter(|row| row.section == section).collect();
+        if section_rows.is_empty() {
             continue;
         }
-        if !lines.is_empty() {
-            lines.push(Line::from(""));
+        body.gap();
+        if !body.heading(state, id, title) {
+            continue;
         }
-        lines.push(heading(title.to_string()));
         for row in section_rows {
-            if first_open.is_none() {
-                first_open = Some(lines.len());
-            }
             let (marker, marker_style) = if row.blocking.is_some() {
                 ("⏸ ", Style::default().fg(Color::Red))
             } else {
                 ("○ ", Style::default().fg(Color::Yellow))
             };
-            let mut text = row.title.split_whitespace().collect::<Vec<_>>().join(" ");
+            let key = task_key(row);
+            let mut text = key.clone();
             if let Some(what) = &row.blocking {
                 text = format!("{text} (blocked: {what})");
             }
-            for (index, part) in wrap_hanging(&text, width.saturating_sub(2), 0)
-                .into_iter()
-                .enumerate()
-            {
+            let detail: Vec<String> = row
+                .detail
+                .lines()
+                .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
+                .filter(|line| !line.is_empty())
+                .collect();
+            let shown = !detail.is_empty() && state.shows_detail(&key);
+            let fold = match (detail.is_empty(), shown) {
+                (true, _) => "",
+                (false, true) => " ▾",
+                (false, false) => " ▸",
+            };
+            let hit = || SidebarHit::Task(key.clone());
+            let parts = wrap_hanging(&format!("{text}{fold}"), width.saturating_sub(2), 0);
+            for (index, part) in parts.into_iter().enumerate() {
                 let lead = if index == 0 { marker } else { "  " };
-                lines.push(Line::from(vec![
-                    Span::styled(lead, marker_style),
-                    Span::raw(part),
-                ]));
+                let line = Line::from(vec![Span::styled(lead, marker_style), Span::raw(part)]);
+                if detail.is_empty() {
+                    body.push(line);
+                } else {
+                    body.push_hit(line, hit());
+                }
+            }
+            if shown {
+                for line in &detail {
+                    for part in wrap_hanging(line, width.saturating_sub(4), 0) {
+                        body.push_hit(dim(format!("    {part}")), hit());
+                    }
+                }
             }
         }
     }
-    (lines, first_open)
 }
 
 fn issue_row(issue: &IssueBrief, width: usize) -> Line<'static> {
@@ -206,113 +285,127 @@ fn pr_icon(pr: &crate::client::WirePr) -> (&'static str, Style) {
     }
 }
 
-/// Render the sidebar into `area`.
-pub(super) fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
-    frame.render_widget(Clear, area);
-    let block = panel(None::<Span>, Color::Reset, app.band_bg);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    let width = usize::from(inner.width);
-    if width < 8 || inner.height == 0 {
+fn pr_row(pr: &crate::client::WirePr, width: usize) -> Line<'static> {
+    let (icon, icon_style) = pr_icon(pr);
+    let number = format!("#{} ", pr.number);
+    let title_width = width.saturating_sub(number.width() + icon.width() + 1);
+    let title = truncate(&pr.title, title_width);
+    let pad = width.saturating_sub(number.width() + title.width() + icon.width());
+    Line::from(vec![
+        Span::styled(number, Style::default().fg(Color::Magenta)),
+        Span::raw(title),
+        Span::raw(" ".repeat(pad.max(1))),
+        Span::styled(icon, icon_style),
+    ])
+}
+
+fn changes(body: &mut Body, app: &App, width: usize) {
+    let state = &app.sidebar;
+    let total: usize = app.file_status.iter().map(|d| d.changes.len()).sum();
+    body.gap();
+    if !body.heading(
+        state,
+        SidebarSection::Changes,
+        &format!("Changes ({total})"),
+    ) {
         return;
     }
-
-    let mut head: Vec<Line<'static>> = Vec::new();
-    let title = app
-        .sidebar
-        .title
-        .clone()
-        .or_else(|| {
-            app.session_manager
-                .current()
-                .and_then(|session| session.title.clone())
-        })
-        .unwrap_or_else(|| "New session".to_string());
-    for row in wrap_hanging(&title, width, 0).into_iter().take(2) {
-        head.push(Line::from(Span::styled(
-            row,
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
+    // Rows are capped across roots; a root's name line is not counted.
+    let all = state.lists_all(SidebarSection::Changes);
+    let mut rows_left = if all { usize::MAX } else { BACKGROUND_ROWS };
+    let mut hidden = 0usize;
+    for root in &app.file_status {
+        if rows_left == 0 {
+            hidden += root.changes.len();
+            continue;
+        }
+        let root_name = root.label.clone().unwrap_or_else(|| home_label(&root.root));
+        body.push(dim(format!(
+            " {}",
+            truncate(&root_name, width.saturating_sub(1))
         )));
-    }
-    head.push(Line::from(""));
-
-    // Background sections, bounded so tasks always get room too.
-    let mut background: Vec<Line<'static>> = Vec::new();
-    if app.sidebar_file_changes && !app.file_status.is_empty() {
-        let total: usize = app.file_status.iter().map(|d| d.changes.len()).sum();
-        background.push(Line::from(""));
-        background.push(heading(format!("Changes ({total})")));
-        let mut rows_left = BACKGROUND_ROWS;
-        let mut hidden = 0usize;
-        for root in &app.file_status {
+        for stat in &root.changes {
             if rows_left == 0 {
-                hidden += root.changes.len();
+                hidden += 1;
                 continue;
             }
-            let root_name = root.label.clone().unwrap_or_else(|| home_label(&root.root));
-            background.push(dim(format!(
-                " {}",
-                truncate(&root_name, width.saturating_sub(1))
-            )));
-            for stat in &root.changes {
-                if rows_left == 0 {
-                    hidden += 1;
-                    continue;
-                }
-                rows_left -= 1;
-                let adds = format!("+{}", stat.additions);
-                let dels = format!("−{}", stat.deletions);
-                let name = truncate_tail(
-                    &stat.path.to_string_lossy(),
-                    width.saturating_sub(adds.width() + dels.width() + 4),
-                );
-                background.push(Line::from(vec![
-                    Span::raw("  "),
-                    Span::raw(name),
-                    Span::styled(format!(" {adds}"), Style::default().fg(Color::Green)),
-                    Span::styled(format!(" {dels}"), Style::default().fg(Color::Red)),
-                ]));
-            }
-        }
-        if hidden > 0 {
-            background.push(dim(format!("  … {hidden} more")));
+            rows_left -= 1;
+            let adds = format!("+{}", stat.additions);
+            let dels = format!("−{}", stat.deletions);
+            let name = truncate_tail(
+                &stat.path.to_string_lossy(),
+                width.saturating_sub(adds.width() + dels.width() + 4),
+            );
+            body.push(Line::from(vec![
+                Span::raw("  "),
+                Span::raw(name),
+                Span::styled(format!(" {adds}"), Style::default().fg(Color::Green)),
+                Span::styled(format!(" {dels}"), Style::default().fg(Color::Red)),
+            ]));
         }
     }
-    if !app.subagents.is_empty() {
-        background.push(Line::from(""));
-        background.push(heading(format!("Subagents ({})", app.subagents.len())));
-        for run in app.subagents.iter().take(BACKGROUND_ROWS) {
+    if hidden > 0 {
+        body.push_hit(
+            dim(format!("  … {hidden} more")),
+            SidebarHit::More(SidebarSection::Changes),
+        );
+    } else if all && total > BACKGROUND_ROWS {
+        body.push_hit(
+            dim("  show fewer".to_string()),
+            SidebarHit::More(SidebarSection::Changes),
+        );
+    }
+}
+
+fn subagents(body: &mut Body, app: &App, width: usize) {
+    body.gap();
+    if !body.heading(
+        &app.sidebar,
+        SidebarSection::Subagents,
+        &format!("Subagents ({})", app.subagents.len()),
+    ) {
+        return;
+    }
+    body.capped(
+        &app.sidebar,
+        SidebarSection::Subagents,
+        app.subagents.iter(),
+        |body, run| {
             let stats = format!(
                 " {} · {} tok",
                 format_elapsed(run.elapsed_secs()),
                 format_number(usize::try_from(run.total_tokens()).unwrap_or(usize::MAX)),
             );
             let name = truncate(&run.agent, width.saturating_sub(stats.width() + 2));
-            background.push(Line::from(vec![
+            body.push(Line::from(vec![
                 Span::styled("◉ ", Style::default().fg(Color::Magenta)),
                 Span::raw(name),
                 Span::styled(stats, Style::default().fg(Color::DarkGray)),
             ]));
-        }
-        if app.subagents.len() > BACKGROUND_ROWS {
-            background.push(dim(format!(
-                "  … {} more",
-                app.subagents.len() - BACKGROUND_ROWS
-            )));
-        }
+        },
+    );
+}
+
+fn jobs(body: &mut Body, app: &App, width: usize) {
+    let mut jobs: Vec<&aither_sandbox::JobInfo> = app.jobs.iter().collect();
+    jobs.sort_by_key(|job| !matches!(job.status, aither_sandbox::JobStatus::Running));
+    let running = jobs
+        .iter()
+        .filter(|job| matches!(job.status, aither_sandbox::JobStatus::Running))
+        .count();
+    body.gap();
+    if !body.heading(
+        &app.sidebar,
+        SidebarSection::Jobs,
+        &format!("Jobs ({running} running)"),
+    ) {
+        return;
     }
-    if !app.jobs.is_empty() {
-        let mut jobs: Vec<&aither_sandbox::JobInfo> = app.jobs.iter().collect();
-        jobs.sort_by_key(|job| !matches!(job.status, aither_sandbox::JobStatus::Running));
-        let running = jobs
-            .iter()
-            .filter(|job| matches!(job.status, aither_sandbox::JobStatus::Running))
-            .count();
-        background.push(Line::from(""));
-        background.push(heading(format!("Jobs ({running} running)")));
-        for job in jobs.iter().take(BACKGROUND_ROWS) {
+    body.capped(
+        &app.sidebar,
+        SidebarSection::Jobs,
+        jobs.into_iter(),
+        |body, job| {
             let (icon, icon_style, status) = match &job.status {
                 aither_sandbox::JobStatus::Running => (
                     "● ",
@@ -343,90 +436,142 @@ pub(super) fn render_sidebar(frame: &mut Frame, area: Rect, app: &App) {
             let status = format!(" {status}");
             let script = job.script.lines().next().unwrap_or("").trim();
             let script = truncate(script, width.saturating_sub(status.width() + 2));
-            background.push(Line::from(vec![
+            body.push(Line::from(vec![
                 Span::styled(icon, icon_style),
                 Span::raw(script),
                 Span::styled(status, Style::default().fg(Color::DarkGray)),
             ]));
-        }
-        if jobs.len() > BACKGROUND_ROWS {
-            background.push(dim(format!("  … {} more", jobs.len() - BACKGROUND_ROWS)));
-        }
-    }
+        },
+    );
+}
 
-    // Tasks and their linked issues fill what is left.
-    let mut tasks: Vec<Line<'static>> = Vec::new();
-    let mut first_open = None;
-    match &app.sidebar.tasks {
+/// Everything below the title, whole: the draw path windows it.
+fn build_body(app: &App, width: usize) -> Body {
+    let state = &app.sidebar;
+    let mut body = Body::default();
+    match &state.tasks {
         Some(rows) if rows.iter().any(|row| row.section.is_open_work()) => {
-            let (lines, open) = task_rows(rows, width);
-            first_open = open;
-            tasks.extend(lines);
+            task_rows(&mut body, state, rows, width);
         }
         _ => {
-            tasks.push(heading("Tasks".to_string()));
-            tasks.push(dim("No tasks yet".to_string()));
+            body.push(Line::from(Span::styled(
+                "Tasks".to_string(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            body.push(dim("No tasks yet".to_string()));
         }
     }
-    if !app.sidebar.issues.is_empty() {
-        tasks.push(Line::from(""));
-        tasks.push(heading("Issues".to_string()));
-        tasks.extend(
-            app.sidebar
-                .issues
-                .iter()
-                .map(|issue| issue_row(issue, width)),
-        );
+    if !state.issues.is_empty() {
+        body.gap();
+        if body.heading(state, SidebarSection::Issues, "Issues") {
+            for issue in &state.issues {
+                body.push(issue_row(issue, width));
+            }
+        }
     }
-    let live_prs: Vec<_> = app
-        .sidebar
+    let live_prs: Vec<_> = state
         .prs
         .iter()
         .filter(|pr| matches!(pr.state.as_str(), "open" | "checks_pending" | "merging"))
         .collect();
     if !live_prs.is_empty() {
-        tasks.push(Line::from(""));
-        tasks.push(heading("Pull requests".to_string()));
-        for pr in live_prs {
-            let (icon, icon_style) = pr_icon(pr);
-            let number = format!("#{} ", pr.number);
-            let title_width = width.saturating_sub(number.width() + icon.width() + 1);
-            let title = truncate(&pr.title, title_width);
-            let pad = width.saturating_sub(number.width() + title.width() + icon.width());
-            tasks.push(Line::from(vec![
-                Span::styled(number, Style::default().fg(Color::Magenta)),
-                Span::raw(title),
-                Span::raw(" ".repeat(pad.max(1))),
-                Span::styled(icon, icon_style),
-            ]));
+        body.gap();
+        if body.heading(state, SidebarSection::PullRequests, "Pull requests") {
+            for pr in live_prs {
+                body.push(pr_row(pr, width));
+            }
         }
     }
+    if app.sidebar_file_changes && !app.file_status.is_empty() {
+        changes(&mut body, app, width);
+    }
+    if !app.subagents.is_empty() {
+        subagents(&mut body, app, width);
+    }
+    if !app.jobs.is_empty() {
+        jobs(&mut body, app, width);
+    }
+    body
+}
 
+/// The dim row under an overflowing body saying how much lies off screen.
+fn overflow_row(above: usize, below: usize) -> Line<'static> {
+    let mut parts = Vec::new();
+    if above > 0 {
+        parts.push(format!("↑ {above}"));
+    }
+    if below > 0 {
+        parts.push(format!("↓ {below}"));
+    }
+    dim(parts.join("  "))
+}
+
+/// Render the sidebar into `area`.
+pub(super) fn render_sidebar(frame: &mut Frame, area: Rect, app: &mut App) {
+    frame.render_widget(Clear, area);
+    let block = panel(None::<Span>, Color::Reset, app.band_bg);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    app.sidebar.area = area;
+    app.sidebar.view.hits.clear();
+    app.sidebar.view.max_scroll = 0;
+    let width = usize::from(inner.width);
+    if width < 8 || inner.height == 0 {
+        return;
+    }
+
+    let mut head: Vec<Line<'static>> = Vec::new();
+    let title = app
+        .sidebar
+        .title
+        .clone()
+        .or_else(|| {
+            app.session_manager
+                .current()
+                .and_then(|session| session.title.clone())
+        })
+        .unwrap_or_else(|| "New session".to_string());
+    for row in wrap_hanging(&title, width, 0).into_iter().take(2) {
+        head.push(Line::from(Span::styled(
+            row,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
+    head.push(Line::from(""));
+
+    let body = build_body(app, width);
     let height = usize::from(inner.height);
-    let budget = height
-        .saturating_sub(head.len())
-        .saturating_sub(background.len());
-    if tasks.len() > budget && budget > 1 {
-        // Keep the heading, and scroll the list so the first open task
-        // (the one in progress) stays in view.
-        let body = budget - 1;
-        let start = first_open.map_or(1, |row| row.saturating_sub(2).max(1));
-        let start = start.min(tasks.len().saturating_sub(body));
-        let hidden_after = tasks.len().saturating_sub(start + body);
-        let mut window: Vec<Line<'static>> = Vec::with_capacity(budget);
-        window.push(tasks[0].clone());
-        window.extend(tasks.iter().skip(start).take(body).cloned());
-        if hidden_after > 0
-            && let Some(last) = window.last_mut()
-        {
-            *last = dim(format!("  … {} more", hidden_after + 1));
+    let room = height.saturating_sub(head.len());
+    // A body that does not fit gives its last row to the overflow marker.
+    let overflows = body.lines.len() > room;
+    let rows = if overflows {
+        room.saturating_sub(1)
+    } else {
+        room
+    };
+    let max_scroll = body.lines.len().saturating_sub(rows);
+    let scroll = app.sidebar.scroll.min(max_scroll);
+    app.sidebar.scroll = scroll;
+    app.sidebar.view.max_scroll = max_scroll;
+
+    let top = inner.y + u16::try_from(head.len()).unwrap_or(u16::MAX);
+    for (index, hit) in body.hits {
+        if (scroll..scroll + rows).contains(&index) {
+            let y = top + u16::try_from(index - scroll).unwrap_or(u16::MAX);
+            app.sidebar.view.hits.push((y, hit));
         }
-        tasks = window;
     }
 
+    let hidden_below = body.lines.len().saturating_sub(scroll + rows);
     let mut lines = head;
-    lines.extend(tasks);
-    lines.extend(background);
+    lines.extend(body.lines.into_iter().skip(scroll).take(rows));
+    if overflows {
+        lines.push(overflow_row(scroll, hidden_below));
+    }
     lines.truncate(height);
     frame.render_widget(Paragraph::new(lines), inner);
 }
@@ -450,24 +595,49 @@ mod tests {
     }
 
     #[test]
-    fn the_sidebar_shows_each_rows_title_and_not_its_detail() {
+    fn the_sidebar_shows_each_rows_title_and_its_detail_once_expanded() {
+        use crate::tui::sidebar::SidebarState;
+
         let rows = crate::task_rows::task_rows(
-            "## Doing\n- wire the command\n  the detail never shows\n- ask scope\n  BLOCKING q9\n\n## Queued\n- 写文档 ドキュメント 문서\n  詳細は表示しない\n",
+            "## Doing\n- wire the command\n  the detail shows on expansion\n- ask scope\n  BLOCKING q9\n\n## Queued\n- 写文档 ドキュメント 문서\n  詳細を表示する\n- plain\n",
         );
-        let (lines, first_open) = super::task_rows(&rows, 60);
-        let shown: Vec<String> = lines.iter().map(ToString::to_string).collect();
+        let render = |state: &SidebarState| -> Vec<String> {
+            let mut body = super::Body::default();
+            super::task_rows(&mut body, state, &rows, 60);
+            body.lines.iter().map(ToString::to_string).collect()
+        };
+
+        let mut state = SidebarState::default();
         assert_eq!(
-            shown,
+            render(&state),
             vec![
-                "Doing",
-                "○ wire the command",
-                "⏸ ask scope (blocked: q9)",
+                "▾ Doing",
+                "○ wire the command ▸",
+                "⏸ ask scope (blocked: q9) ▸",
                 "",
-                "Queued",
-                "○ 写文档 ドキュメント 문서",
+                "▾ Queued",
+                "○ 写文档 ドキュメント 문서 ▸",
+                "○ plain",
             ]
         );
-        assert_eq!(first_open, Some(1));
+
+        // The title is the expansion key.
+        state
+            .detailed
+            .insert("写文档 ドキュメント 문서".to_string());
+        assert_eq!(
+            render(&state),
+            vec![
+                "▾ Doing",
+                "○ wire the command ▸",
+                "⏸ ask scope (blocked: q9) ▸",
+                "",
+                "▾ Queued",
+                "○ 写文档 ドキュメント 문서 ▾",
+                "    詳細を表示する",
+                "○ plain",
+            ]
+        );
     }
 
     #[test]

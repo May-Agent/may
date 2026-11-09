@@ -46,6 +46,8 @@ const DOUBLE_ESC_WINDOW: std::time::Duration = std::time::Duration::from_millis(
 
 /// Two clicks at the same spot within this window select the word under
 /// the cursor.
+/// Rows one `Alt+Up`/`Alt+Down` press scrolls the sidebar.
+const SIDEBAR_KEY_STEP_LINES: usize = 3;
 const DOUBLE_CLICK_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// How long a transient status notice (e.g. "Copied selection") stays on
@@ -2358,6 +2360,24 @@ impl App {
             self.new_year.stop();
             return Ok(None);
         }
+        // Alt+Up/Down scroll the sidebar, Alt+E opens every section and detail.
+        if modifiers.contains(KeyModifiers::ALT) && matches!(self.mode, AppMode::Chat) {
+            match code {
+                KeyCode::Up => {
+                    self.sidebar.scroll_up(SIDEBAR_KEY_STEP_LINES);
+                    return Ok(None);
+                }
+                KeyCode::Down => {
+                    self.sidebar.scroll_down(SIDEBAR_KEY_STEP_LINES);
+                    return Ok(None);
+                }
+                KeyCode::Char('e') => {
+                    self.sidebar.toggle_expand_all();
+                    return Ok(None);
+                }
+                _ => {}
+            }
+        }
         // Global shortcuts
         if modifiers.contains(KeyModifiers::CONTROL) {
             match code {
@@ -3162,6 +3182,30 @@ impl App {
                 return Ok(None);
             }
             _ => return Ok(None),
+        }
+
+        // Over the sidebar the wheel scrolls it while it overflows, and a
+        // click folds or expands the row under the pointer.
+        let over_sidebar = self
+            .sidebar
+            .area
+            .contains(ratatui::layout::Position::new(mouse.column, mouse.row));
+        if over_sidebar {
+            match mouse.kind {
+                MouseEventKind::ScrollUp if self.sidebar.scrollable() => {
+                    self.sidebar.scroll_up(SCROLL_STEP_LINES);
+                    return Ok(None);
+                }
+                MouseEventKind::ScrollDown if self.sidebar.scrollable() => {
+                    self.sidebar.scroll_down(SCROLL_STEP_LINES);
+                    return Ok(None);
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    self.sidebar.click(mouse.row);
+                    return Ok(None);
+                }
+                _ => {}
+            }
         }
 
         // Clicks and drags outside the chat column (the sidebar) select
@@ -4988,6 +5032,139 @@ mod tests {
         assert!((0..height).all(|y| buffer[(left, y)].symbol() == " "));
         // The chat beside it is not painted with the block colour.
         assert_ne!(buffer[(left - 1, 0)].bg, BLOCK_BG);
+    }
+
+    fn sidebar_screen(app: &mut App, width: u16, height: u16) -> String {
+        let buffer = draw_buffer(app, width, height);
+        let left = width - crate::tui::sidebar::SidebarState::width_for(width);
+        (0..height)
+            .map(|y| {
+                // A wide glyph owns the cell after it too.
+                let mut row = String::new();
+                let mut x = left;
+                while x < width {
+                    let symbol = buffer[(x, y)].symbol();
+                    row.push_str(symbol);
+                    x += u16::try_from(unicode_width::UnicodeWidthStr::width(symbol).max(1))
+                        .expect("width");
+                }
+                row
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn doing(app: &mut App, rows: &[String]) {
+        let content = format!("## Doing\n{}\n", rows.join("\n"));
+        app.sidebar.set_tasks("s", Some(&content));
+    }
+
+    /// Content taller than the window scrolls, with a marker for what is off
+    /// screen, and every entry is reachable.
+    #[tokio::test]
+    async fn an_overflowing_sidebar_scrolls_and_says_what_is_off_screen() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        let rows: Vec<String> = (0..40).map(|n| format!("- task number {n}")).collect();
+        doing(&mut app, &rows);
+
+        let first = sidebar_screen(&mut app, 160, 20);
+        assert!(first.contains("task number 0"), "{first}");
+        assert!(!first.contains("task number 39"), "{first}");
+        assert!(first.contains('↓'), "more below is marked: {first}");
+        assert!(!first.contains('↑'), "nothing above yet: {first}");
+        assert!(app.sidebar.scrollable());
+
+        app.sidebar.scroll_down(usize::MAX);
+        let last = sidebar_screen(&mut app, 160, 20);
+        assert!(last.contains("task number 39"), "{last}");
+        assert!(!last.contains("task number 0\n"), "{last}");
+        assert!(last.contains('↑'), "more above is marked: {last}");
+        assert!(!last.contains('↓'), "nothing below at the end: {last}");
+
+        app.sidebar.scroll_up(usize::MAX);
+        assert!(sidebar_screen(&mut app, 160, 20).contains("task number 0"));
+    }
+
+    /// The wheel over the sidebar scrolls it, not the chat.
+    #[tokio::test]
+    async fn the_wheel_over_the_sidebar_scrolls_the_sidebar() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        let rows: Vec<String> = (0..40).map(|n| format!("- task number {n}")).collect();
+        doing(&mut app, &rows);
+        let _ = draw_buffer(&mut app, 160, 20);
+        let wheel = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollDown,
+            column: 150,
+            row: 5,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        app.handle_mouse(wheel).expect("mouse");
+        assert_eq!(app.sidebar.scroll, 3);
+    }
+
+    /// A task row with a detail shows it once clicked; a folded section hides
+    /// its rows.
+    #[tokio::test]
+    async fn clicking_expands_a_task_detail_and_folds_a_section() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        doing(
+            &mut app,
+            &["- 实现侧边栏滚动\n  详细说明在这里".to_string()],
+        );
+        let (width, height) = (160u16, 20u16);
+
+        let folded = sidebar_screen(&mut app, width, height);
+        assert!(folded.contains("实现侧边栏滚动"), "{folded}");
+        assert!(!folded.contains("详细说明在这里"), "{folded}");
+
+        let click = |row| crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left),
+            column: 150,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        let row_of_text = |screen: &str, needle: &str| {
+            u16::try_from(
+                screen
+                    .lines()
+                    .position(|line| line.contains(needle))
+                    .expect("row on screen"),
+            )
+            .expect("row")
+        };
+        app.handle_mouse(click(row_of_text(&folded, "实现侧边栏滚动")))
+            .expect("mouse");
+        let open = sidebar_screen(&mut app, width, height);
+        assert!(open.contains("详细说明在这里"), "{open}");
+
+        app.handle_mouse(click(row_of_text(&open, "Doing")))
+            .expect("mouse");
+        let closed = sidebar_screen(&mut app, width, height);
+        assert!(closed.contains("▸ Doing"), "{closed}");
+        assert!(!closed.contains("实现侧边栏滚动"), "{closed}");
+    }
+
+    /// `… N more` lists the rest; CJK titles keep their width.
+    #[tokio::test]
+    async fn expand_all_reveals_every_detail_and_keeps_cjk_rows_whole() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        let rows: Vec<String> = (0..3)
+            .map(|n| format!("- 任务{n}：渲染终端界面とレイアウト한국어\n  第{n}个细节"))
+            .collect();
+        doing(&mut app, &rows);
+        let before = sidebar_screen(&mut app, 160, 30);
+        assert!(!before.contains("第1个细节"), "{before}");
+        app.handle_key(KeyCode::Char('e'), KeyModifiers::ALT)
+            .expect("key");
+        let after = sidebar_screen(&mut app, 160, 30);
+        for n in 0..3 {
+            assert!(after.contains(&format!("第{n}个细节")), "{after}");
+        }
+        assert!(after.contains("任务0"), "{after}");
     }
 
     #[tokio::test]
