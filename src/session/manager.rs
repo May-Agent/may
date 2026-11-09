@@ -156,11 +156,18 @@ impl SessionLaunch {
         }
     }
 
-    /// The repository binding spec sent to the daemon.
+    /// The repository binding spec sent to the daemon: `owner/repo` as given,
+    /// a path as the client's canonical absolute path, since the daemon
+    /// resolves it from its own directory.
     #[must_use]
     pub fn repo(&self) -> Option<String> {
         match self {
-            Self::Repo(spec) => Some(spec.clone()),
+            Self::Repo(spec) => Some(
+                std::fs::canonicalize(spec)
+                    .ok()
+                    .filter(|path| path.is_dir())
+                    .map_or_else(|| spec.clone(), |path| path.display().to_string()),
+            ),
             Self::Checkout | Self::RepoLess => None,
         }
     }
@@ -1026,6 +1033,22 @@ mod launch_tests {
         assert_eq!(
             SessionLaunch::Repo(path.display().to_string()).cwd(client),
             Some(path)
+        );
+    }
+
+    #[test]
+    fn a_launch_sends_the_daemon_a_canonical_path_or_the_repository_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().canonicalize().unwrap();
+        let dotted = path.join("inner").join("..");
+        std::fs::create_dir(path.join("inner")).unwrap();
+        assert_eq!(
+            SessionLaunch::Repo(dotted.display().to_string()).repo(),
+            Some(path.display().to_string())
+        );
+        assert_eq!(
+            SessionLaunch::Repo("acme/app".into()).repo(),
+            Some("acme/app".to_string())
         );
     }
 
