@@ -1,1 +1,0 @@
-tasks.md still has rows under Doing or Queued that nothing blocks; continue with them.

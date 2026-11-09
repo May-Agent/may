@@ -4,6 +4,7 @@ import {
   Archive,
   ChevronDown,
   ChevronRight,
+  Folder,
   Github,
   Loader2,
   PanelLeftClose,
@@ -23,7 +24,7 @@ import { isWorking } from '@/lib/sessionLists';
 import { useNewChat } from '@/lib/useNewChat';
 import { shortcutAria, shortcutLabel } from '@/lib/shortcuts';
 import { FolderNode, SessionNode } from './SessionNode';
-import { githubBinding, repoLabel } from '@/lib/repo';
+import { githubBinding, groupByRepo, parseRepo, repoLabel } from '@/lib/repo';
 import { NewChatRepoDialog } from './NewChatRepoDialog';
 import { ProfileSwitcher } from './ProfileSwitcher';
 import { NotificationBell } from './NotificationBell';
@@ -64,24 +65,10 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
 
   // Sessions bound to a repository cluster under a collapsible group
   // header; repo-less sessions stay flat above the groups.
-  const [regularNoRepo, repoGroups] = useMemo(() => {
-    const regular = scoped?.regular ?? [];
-    const flat: typeof regular = [];
-    const groups = new Map<string, typeof regular>();
-    for (const item of regular) {
-      if (item.repo) {
-        const list = groups.get(item.repo) ?? [];
-        list.push(item);
-        groups.set(item.repo, list);
-      } else {
-        flat.push(item);
-      }
-    }
-    const sorted = [...groups.entries()].sort(([a], [b]) =>
-      repoLabel(a).localeCompare(repoLabel(b)),
-    );
-    return [flat, sorted] as const;
-  }, [scoped]);
+  const { flat: regularNoRepo, groups: repoGroups } = useMemo(
+    () => groupByRepo(scoped?.regular ?? []),
+    [scoped],
+  );
 
   return (
     <aside
@@ -247,7 +234,13 @@ export function Sidebar({ inSheet = false }: { inSheet?: boolean }) {
                     />
                   ))}
                   {repoGroups.map(([repo, items]) => (
-                    <RepoGroup key={repo} repo={repo} count={items.length}>
+                    <RepoGroup
+                      key={repo}
+                      repo={repo}
+                      count={items.length}
+                      disabled={!canCreate}
+                      onNewChat={() => void startNewChat({ repo })}
+                    >
                       {items.map((item) => (
                         <SessionNode
                           key={item.id}
@@ -322,30 +315,57 @@ function Section({ label, children }: SectionProps) {
 interface RepoGroupProps {
   repo: string;
   count: number;
+  disabled: boolean;
+  /** Start a new chat bound to this project. */
+  onNewChat: () => void;
   children: React.ReactNode;
 }
 
-/** Collapsible header binding the sessions of one repository together. */
-function RepoGroup({ repo, count, children }: RepoGroupProps) {
+/**
+ * Collapsible header binding the sessions of one repository together: the
+ * GitHub logo and `owner/repo` for a GitHub project (never a path), the
+ * checkout's path for a local one, and a button for a new chat under it.
+ */
+function RepoGroup({ repo, count, disabled, onNewChat, children }: RepoGroupProps) {
+  const { t } = useTranslation();
   const [open, setOpen] = useState(true);
+  const label = repoLabel(repo);
+  const github = parseRepo(repo).kind === 'github';
   return (
     <li>
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        className="flex h-7 w-full items-center gap-1 rounded-md px-2 text-xs font-medium text-muted-foreground hover:text-foreground touch:h-11"
-        aria-expanded={open}
-      >
-        {open ? (
-          <ChevronDown className="size-3.5" aria-hidden />
-        ) : (
-          <ChevronRight className="size-3.5" aria-hidden />
-        )}
-        <span className="truncate" title={repo}>
-          {repoLabel(repo)}
-        </span>
-        <span className="ml-auto font-normal tabular-nums">{count}</span>
-      </button>
+      <div className="group/repo flex h-7 items-center rounded-md text-xs font-medium text-muted-foreground hover:text-foreground touch:h-11">
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          className="flex h-full min-w-0 flex-1 items-center gap-1 px-2"
+          aria-expanded={open}
+        >
+          {open ? (
+            <ChevronDown className="size-3.5 shrink-0" aria-hidden />
+          ) : (
+            <ChevronRight className="size-3.5 shrink-0" aria-hidden />
+          )}
+          {github ? (
+            <Github className="size-3.5 shrink-0" aria-hidden />
+          ) : (
+            <Folder className="size-3.5 shrink-0" aria-hidden />
+          )}
+          <span className="truncate" title={label}>
+            {label}
+          </span>
+          <span className="ml-auto font-normal tabular-nums">{count}</span>
+        </button>
+        <button
+          type="button"
+          onClick={onNewChat}
+          disabled={disabled}
+          aria-label={t('sidebar.newChatInRepo', { repo: label })}
+          title={t('sidebar.newChatInRepo', { repo: label })}
+          className="mr-1 flex size-5 shrink-0 items-center justify-center rounded hover:bg-accent disabled:opacity-50 touch:size-9"
+        >
+          <Plus className="size-3.5" aria-hidden />
+        </button>
+      </div>
       {open && <ul className="space-y-px">{children}</ul>}
     </li>
   );

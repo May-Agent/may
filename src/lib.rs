@@ -24,6 +24,8 @@ pub mod ci;
 pub mod client;
 /// Configuration loading and types.
 pub mod command_output;
+/// May's rules on what a terminal script may run.
+pub mod command_policy;
 /// One virtual desktop per session — computer use.
 pub mod computer;
 pub mod config;
@@ -82,6 +84,8 @@ pub mod prompt_mentions;
 mod quota;
 /// Per-session repository clones inside the session sandbox.
 pub mod repo_clone;
+pub mod repo_gate;
+pub mod repo_preflight;
 /// repo-search daemon: code, session and issue search.
 pub mod repo_search;
 /// `/import-claude` and `/import-codex`: another agent's global rules and
@@ -107,6 +111,8 @@ pub mod task_rows;
 pub mod task_trigger;
 /// The command a scheduled task's run uses to prompt its session.
 pub mod task_wake;
+/// `tasks.md`: its format and the harness that keeps it current.
+pub mod tasks_md;
 /// Terminal commands exposed to the agent.
 pub mod terminal_commands;
 /// Permission handling for terminal command execution.
@@ -161,7 +167,7 @@ mod test_support {
     pub async fn test_output_store(
         dir: impl Into<std::path::PathBuf>,
     ) -> aither_sandbox::OutputStore {
-        aither_sandbox::OutputStore::new(dir, aither_core::ids::AnyIdAllocator::default())
+        aither_sandbox::OutputStore::new(dir, aither_core::AnyIdAllocator::default())
             .await
             .expect("outputs store")
     }

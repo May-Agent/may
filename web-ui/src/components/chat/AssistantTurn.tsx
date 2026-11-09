@@ -113,10 +113,18 @@ export function AssistantTurn({
         </div>
       )}
       {turn.error && (
-        <div className="flex items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+        <div
+          className={
+            turn.error.code === 'repo_declined'
+              ? 'flex items-start gap-2 rounded-lg border border-border bg-muted/40 px-3 py-2 text-sm text-muted-foreground'
+              : 'flex items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/5 px-3 py-2 text-sm text-destructive'
+          }
+        >
           <AlertCircle className="mt-0.5 size-4 shrink-0" />
           <div>
-            <div className="font-medium">{turn.error.code}</div>
+            {turn.error.code !== 'repo_declined' && (
+              <div className="font-medium">{turn.error.code}</div>
+            )}
             <div className="text-xs opacity-80">{turn.error.message}</div>
           </div>
         </div>

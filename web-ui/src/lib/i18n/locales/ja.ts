@@ -54,6 +54,7 @@ export const ja: Messages = {
       all: 'あなたのリポジトリ',
       unauthenticated: 'このマシンでは GitHub にサインインしていません。`gh auth login` を実行してから一覧を開き直してください。',
     },
+    newChatInRepo: '{repo} で新規チャット',
     sessions: 'セッション',
     noSessions: 'セッションはまだありません',
     noSessionsInProfile: 'このプロファイルではまだチャットが始まっていません。',

@@ -90,10 +90,8 @@ pub struct ContextReport {
     pub autocompact_buffer_tokens: usize,
     /// Tokens at which a background compaction starts.
     pub compact_start_tokens: usize,
-    /// Tokens at which the agent pauses to finish the compaction.
-    pub compact_pause_tokens: usize,
-    /// Tokens at which the conversation is auto-compacted:
-    /// `min(window * compact_at, compact_ceiling)`.
+    /// Tokens at which the agent pauses to finish the compaction:
+    /// `min(window - handoff_reserve, compact_ceiling)`.
     pub compact_tokens: usize,
 }
 
@@ -234,7 +232,7 @@ impl ContextReport {
         let window = usize::try_from(metrics.context_window).expect("a u32 window fits usize");
         // Everything above the auto-compact point is the autocompact buffer
         // from the user's perspective.
-        let compact_tokens = policy.compact_point(metrics.context_window);
+        let compact_tokens = policy.pause_point(metrics.context_window);
         let autocompact_buffer = window.saturating_sub(compact_tokens);
 
         Self {
@@ -247,7 +245,6 @@ impl ContextReport {
             free_tokens: window.saturating_sub(used_tokens + autocompact_buffer),
             autocompact_buffer_tokens: autocompact_buffer,
             compact_start_tokens: policy.start_point(metrics.context_window),
-            compact_pause_tokens: policy.pause_point(metrics.context_window),
             compact_tokens,
         }
     }
@@ -504,11 +501,11 @@ mod tests {
             report.used_tokens + report.free_tokens + report.autocompact_buffer_tokens,
             report.window_tokens
         );
-        // Default policy on a 200k window: 0.8 of it, below the 400k ceiling.
-        assert_eq!(report.compact_tokens, 160_000);
-        assert_eq!(report.autocompact_buffer_tokens, 40_000);
-        assert_eq!(report.compact_start_tokens, 110_000);
-        assert_eq!(report.compact_pause_tokens, 155_000);
+        // Default policy on a 200k window: the window less the 20k handoff
+        // reserve, below the 400k ceiling.
+        assert_eq!(report.compact_tokens, 180_000);
+        assert_eq!(report.autocompact_buffer_tokens, 20_000);
+        assert_eq!(report.compact_start_tokens, 130_000);
     }
 
     #[test]
@@ -526,7 +523,6 @@ mod tests {
         );
         assert_eq!(report.compact_tokens, 400_000);
         assert_eq!(report.compact_start_tokens, 350_000);
-        assert_eq!(report.compact_pause_tokens, 395_000);
         assert_eq!(report.autocompact_buffer_tokens, 600_000);
     }
 
@@ -535,7 +531,6 @@ mod tests {
         let policy = crate::config::ContextConfig {
             compact_ceiling: 100_000,
             start_distance: 20_000,
-            safe_buffer: 1_000,
             ..crate::config::ContextConfig::default()
         }
         .policy();
@@ -550,7 +545,6 @@ mod tests {
         );
         assert_eq!(report.compact_tokens, 100_000);
         assert_eq!(report.compact_start_tokens, 80_000);
-        assert_eq!(report.compact_pause_tokens, 99_000);
         assert_eq!(report.phase, ContextWindowPhase::Compacting);
     }
 }

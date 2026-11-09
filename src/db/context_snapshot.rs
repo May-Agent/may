@@ -24,7 +24,9 @@ use super::{ChatDb, ChatDbError, query};
 /// 2 = every `AgentCheckpoint` before context items carried their commit time.
 /// 3 = every `AgentCheckpoint` before it carried what the conversation holds
 /// of `tasks.md`.
-/// 4 = the current `AgentCheckpoint` shape, with its `tasks` field.
+/// 4 = every `AgentCheckpoint` before its handoff became rendered text and
+/// its `tasks` field became the working document's `document`.
+/// 5 = the current `AgentCheckpoint` shape, with its `document` field.
 pub(super) const CONTEXT_SNAPSHOT_FORMAT: i64 = 5;
 
 /// Inputs for [`ChatDb::upsert_context_debug_snapshot`].

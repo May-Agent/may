@@ -2082,9 +2082,8 @@ fn context_report_lines(report: &ContextReport) -> Vec<Line<'static>> {
     ]));
     lines.push(Line::from(vec![Span::styled(
         format!(
-            "  compaction starts at {} · pauses at {} · auto-compacts at {}",
+            "  compaction starts at {} · pauses at {}",
             format_number(report.compact_start_tokens),
-            format_number(report.compact_pause_tokens),
             format_number(report.compact_tokens),
         ),
         dim,
@@ -3537,7 +3536,7 @@ fn format_status_usage(
             warn: None,
         };
     };
-    let compact = policy.compact_point(u32::try_from(window).unwrap_or(u32::MAX));
+    let compact = policy.pause_point(u32::try_from(window).unwrap_or(u32::MAX));
     if compact == 0 {
         return StatusUsage {
             usage: used,
@@ -4199,7 +4198,7 @@ mod tests {
     fn status_usage_is_used_over_autocompact_window() {
         let window = 200_000_u64;
         let policy = aither_agent::ContextPolicy::default();
-        let compact = policy.compact_point(u32::try_from(window).unwrap());
+        let compact = policy.pause_point(u32::try_from(window).unwrap());
         let used = compact / 4;
         let line = format_status_usage(u64::try_from(used).unwrap(), Some(window), &policy);
         #[allow(clippy::cast_precision_loss)]
@@ -4219,7 +4218,7 @@ mod tests {
     fn status_usage_warns_within_ten_percent_of_autocompact() {
         let window = 200_000_u64;
         let policy = aither_agent::ContextPolicy::default();
-        let compact = policy.compact_point(u32::try_from(window).unwrap());
+        let compact = policy.pause_point(u32::try_from(window).unwrap());
         let used = compact - compact / 20;
         let line = format_status_usage(u64::try_from(used).unwrap(), Some(window), &policy);
         assert_eq!(line.warn.as_deref(), Some("5% to auto-compact"));
@@ -4229,7 +4228,7 @@ mod tests {
     fn status_usage_omits_warn_at_ten_percent_remaining() {
         let window = 200_000_u64;
         let policy = aither_agent::ContextPolicy::default();
-        let compact = policy.compact_point(u32::try_from(window).unwrap());
+        let compact = policy.pause_point(u32::try_from(window).unwrap());
         let used = compact - compact / 10;
         let line = format_status_usage(u64::try_from(used).unwrap(), Some(window), &policy);
         assert!(line.warn.is_none());
@@ -4239,7 +4238,7 @@ mod tests {
     fn status_usage_warns_at_zero_headroom() {
         let window = 200_000_u64;
         let policy = aither_agent::ContextPolicy::default();
-        let compact = policy.compact_point(u32::try_from(window).unwrap());
+        let compact = policy.pause_point(u32::try_from(window).unwrap());
         let line = format_status_usage(u64::try_from(compact).unwrap(), Some(window), &policy);
         assert_eq!(line.warn.as_deref(), Some("0% to auto-compact"));
     }

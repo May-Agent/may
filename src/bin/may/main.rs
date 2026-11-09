@@ -245,9 +245,9 @@ async fn async_main() -> anyhow::Result<()> {
         CliMode::Resume(args) => Some(args.clone()),
         _ => None,
     };
-    let tui_repo = match &cli_mode {
-        CliMode::Tui(args) => args.repo.clone(),
-        _ => None,
+    let tui_launch = match &cli_mode {
+        CliMode::Tui(args) => args.launch.clone(),
+        _ => may_agent::session::SessionLaunch::default(),
     };
     match cli_mode {
         CliMode::Help(help_text) => {
@@ -335,7 +335,7 @@ async fn async_main() -> anyhow::Result<()> {
         band_bg,
         log_ring,
         resume,
-        tui_repo,
+        tui_launch,
     )
     .await;
 
@@ -391,7 +391,7 @@ async fn run_app<B: Backend>(
     band_bg: Option<ratatui::style::Color>,
     log_ring: may_agent::log_ring::LogRingHandle,
     resume: Option<cli::ResumeArgs>,
-    tui_repo: Option<String>,
+    tui_launch: may_agent::session::SessionLaunch,
 ) -> anyhow::Result<Option<ExitSummary>>
 where
     B::Error: Send + Sync + 'static,
@@ -399,7 +399,7 @@ where
     let mut events = EventHandler::new();
     let mut app = App::new(events.sender(), image_support).await?;
     app.band_bg = band_bg;
-    app.session_manager.set_pending_repo(tui_repo);
+    app.session_manager.set_launch(tui_launch);
     let mut worker: Option<AgentWorker> = None;
 
     tracing::info!("=== MAY STARTUP - channels created ===");
@@ -630,14 +630,20 @@ struct RepoTrust {
 
 /// The launch gate for a session that will run in `profile_id`: a repository
 /// launch asks for its trust level, any other launch asks for the
-/// write-grant. Both read and persist that profile's `workspace.toml`.
+/// write-grant. Both read and persist that profile's `workspace.toml`. A
+/// session that works in no directory — a repo-less chat, or a start on
+/// `owner/repo` — has no launch gate here; the daemon asks the repository's
+/// trust when the session starts.
 fn startup_gate_check(
     app: &App,
     profile_id: Option<&str>,
 ) -> Result<Option<StartupGate>, may_agent::workspace::WorkspaceConfigError> {
+    let Some(dir) = app.session_manager.launch_cwd(&app.cwd) else {
+        return Ok(None);
+    };
     gate_check(
         app.session_manager.may_dir(),
-        &app.cwd,
+        &dir,
         profile_id,
         &app.profiles,
     )
@@ -1276,6 +1282,18 @@ where
                                 &mut pending_title_gen,
                                 &assistant_response,
                                 RunOutcome::Completed,
+                            )
+                            .await;
+                    }
+                    TuiEvent::Declined(message) => {
+                        app.chat.push_notice(&message);
+                        runtime_deps
+                            .finish_agent_task(
+                                app,
+                                &mut agent_handle,
+                                &mut pending_title_gen,
+                                &assistant_response,
+                                RunOutcome::Cancelled,
                             )
                             .await;
                     }

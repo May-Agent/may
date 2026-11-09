@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use aither_agent::{AgentEvent, TimedEvent};
+use aither_core::LanguageModel as _;
 use aither_core::llm::Usage;
 
 use super::request_ledger::RequestLedger;
@@ -72,6 +73,8 @@ pub(super) struct TurnEvents<'t, 's, S> {
     pub(super) usage: Usage,
     pub(super) ledger: RequestLedger<'t>,
     pub(super) decode_meter: DecodeMeter,
+    /// The agent's model, whose vocabulary counts the streamed text.
+    pub(super) counting_model: crate::agent::ProviderLlm,
     pub(super) last_speed_emit: Option<Instant>,
     /// The current text segment, flushed on tool calls.
     pub(super) segment_text: String,
@@ -103,6 +106,16 @@ pub(super) struct TurnEvents<'t, 's, S> {
 }
 
 impl<S: ChatSink> TurnEvents<'_, '_, S> {
+    /// Feeds streamed model output to the decode meter: counted with the
+    /// model's vocabulary where it has one, estimated from its bytes
+    /// otherwise.
+    fn note_decoded(&mut self, text: &str) {
+        match self.counting_model.count_text(text) {
+            Some(tokens) => self.decode_meter.note_counted(tokens),
+            None => self.decode_meter.note_output(text.len()),
+        }
+    }
+
     /// Whether the turn did anything beyond thinking: it started a tool
     /// call or produced response text.
     pub(super) const fn took_action(&self) -> bool {
@@ -285,7 +298,7 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                         "client disconnected during reasoning stream",
                     )));
                 }
-                self.decode_meter.note_output(text.len());
+                self.note_decoded(&text);
                 Ok(self
                     .emit_speed("client disconnected during reasoning stream")
                     .await)
@@ -306,7 +319,7 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                         "client disconnected during text stream",
                     )));
                 }
-                self.decode_meter.note_output(text.len());
+                self.note_decoded(&text);
                 Ok(self
                     .emit_speed("client disconnected during text stream")
                     .await)
@@ -361,7 +374,7 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                     fragment = %arguments_fragment,
                     "incoming ToolCallDelta from aither"
                 );
-                self.decode_meter.note_output(arguments_fragment.len());
+                self.note_decoded(&arguments_fragment);
                 if let ControlFlow::Break(stop) = self.emit_speed(TOOL_STREAM).await {
                     return Ok(ControlFlow::Break(stop));
                 }

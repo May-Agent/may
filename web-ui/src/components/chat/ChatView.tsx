@@ -1,5 +1,5 @@
 import { Fragment, useCallback, useEffect, useRef, useState } from 'react';
-import { AlertCircle, AlertTriangle, ArrowDown, Loader2, Moon, RotateCw, X } from 'lucide-react';
+import { AlertCircle, AlertTriangle, ArrowDown, Info, Loader2, Moon, RotateCw, X } from 'lucide-react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { toast } from 'sonner';
 import { isDraftSessionId, useSessionsStore } from '@/lib/stores/sessions';
@@ -364,11 +364,24 @@ interface TurnErrorCardProps {
 
 function TurnErrorCard({ code, message, retryable, onRetry, onDismiss }: TurnErrorCardProps) {
   const { t } = useTranslation();
+  // Declining the session's repository question is the user's choice, not a failure.
+  const declined = code === 'repo_declined';
   return (
-    <div className="flex items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/5 px-3 py-2.5 text-sm text-destructive">
-      <AlertCircle className="mt-0.5 size-4 shrink-0" />
+    <div
+      className={cn(
+        'flex items-start gap-2 rounded-lg border px-3 py-2.5 text-sm',
+        declined
+          ? 'border-border bg-muted/40 text-muted-foreground'
+          : 'border-destructive/40 bg-destructive/5 text-destructive',
+      )}
+    >
+      {declined ? (
+        <Info className="mt-0.5 size-4 shrink-0" />
+      ) : (
+        <AlertCircle className="mt-0.5 size-4 shrink-0" />
+      )}
       <div className="flex-1 min-w-0">
-        <div className="font-medium">{humanizeErrorCode(code)}</div>
+        {!declined && <div className="font-medium">{humanizeErrorCode(code)}</div>}
         <div className="text-xs opacity-80 break-words">{message}</div>
       </div>
       <div className="flex items-center gap-1 shrink-0">

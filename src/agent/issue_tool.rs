@@ -544,11 +544,9 @@ where
     ) -> aither_core::Result<Self::Res> {
         if let Some(guard) = &self.languages {
             for text in arguments.published_texts() {
-                if let Err(refusal) = guard.check_working(text, aither_agent::WorkingText::Public) {
-                    return Ok(ToolResult::error(
-                        aither_agent::AnyNotices::default().language_refusal(&refusal),
-                    ));
-                }
+                guard
+                    .check_working(text, aither_agent::WorkingText::Public)
+                    .map_err(super::notices::language_refused)?;
             }
         }
         if let Some(gate) = &self.publish {
@@ -1421,11 +1419,7 @@ mod tests {
         std::fs::create_dir_all(&sandbox).expect("sandbox");
         std::fs::write(sandbox.join("tasks.md"), "## Doing\n- #1 the login bug\n")
             .expect("tasks.md");
-        let mut tasks = aither_agent::WorkingDocument::new(
-            &aither_agent::DocumentSpec::new("tasks.md", crate::task_rows::TasksSchema),
-            &sandbox,
-            events,
-        );
+        let mut tasks = crate::tasks_md::schema::working_document(&sandbox, events);
         tasks.on_request(false).await;
 
         let created = tool

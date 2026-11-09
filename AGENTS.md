@@ -106,6 +106,12 @@ May is a terminal-based AI assistant built as an application layer on the **aith
 
 **`src/terminal_commands.rs`** - `register_shared_terminal_commands`, which registers every IPC command; `src/terminal_permission_handler.rs` applies the network policy and audit log
 
+**`src/command_policy/`** - aither command policies that refuse a terminal script before it runs (kill by name, foreground `sleep`, unchanged re-reads and, in the managed bash, host `grep`/`awk`/`find` and `sed` forms `aither_sed::supports` rejects); `register` installs them
+
+**`src/tasks_md/`** - `tasks.md` as an aither working document: the parser, `schema.rs` with the schema, the stop rule and the line limit
+
+**`src/agent/notices.rs`** - `MayNotices`, May's wording of aither's alerts, notices and refusals, `tasks.md` alerts included
+
 **Other top-level modules** - `agent_link` (main agents on one machine exchange messages), `computer` (a virtual desktop per session), `container` (container sandbox), `db` (SQLite persistence: `~/.may/history.db`), `issue` (May and GitHub issue backends), `pr` (session-owned PRs), `repo_clone` (per-session repository clones), `profile` (profiles), `memory` (profile memory extraction), `mcp`, `notification` (web push), `scheduler` and `task_trigger` (scheduled tasks), `skill` (skill management), `heel` (managed sandbox binary), `cache_lifetime` (provider prompt-cache lifetime)
 
 **`src/daemon/`** - The resident daemon and its API
@@ -148,7 +154,7 @@ May is a terminal-based AI assistant built as an application layer on the **aith
 - Workdirs: User-approved directories with read/write (stored in the profile's `workspace.toml`, `~/.may/profiles/<profile>/workspace.toml`)
 
 **`src/bundle/`** - Embedded resources
-- Skills in `skills/` are embedded with `include_dir!`; subagent definitions (`audit`, `explore`, `general`, `plan`, `research`, `review`) live in `subagents/*.toml`, embedded and parsed by `bundle::bundled_subagents()`
+- Skills in `skills/` are embedded with `include_dir!`; the subagent definitions in `subagents/` are embedded the same way and handed to the subagent tool (`Bundle::subagent_definitions`), while `fork` is built in
 - Written (overwriting) to `~/.may/skills/` at startup, copied into each profile's `skills/`, and linked into the session sandbox as `skills`; container sessions mount it
 
 ### Session Storage Format

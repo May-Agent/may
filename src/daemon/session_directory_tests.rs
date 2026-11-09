@@ -97,6 +97,15 @@ async fn a_session_without_a_directory_runs_in_its_sandbox() {
     );
 }
 
+#[test]
+fn the_stored_local_form_is_accepted_as_a_repo_spec() {
+    assert_eq!(
+        resolve_repo_binding(Some("local:/work/app/.git")),
+        Ok(Some("local:/work/app/.git".to_string()))
+    );
+    assert!(resolve_repo_binding(Some("local:")).is_err());
+}
+
 #[tokio::test]
 async fn a_repo_bound_session_without_a_directory_runs_in_the_checkout() {
     let host = Host::new().await;
