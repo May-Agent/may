@@ -338,7 +338,11 @@ fn sheet_height(app: &App, column: Rect) -> Option<u16> {
         |percent: u16| u16::try_from(u32::from(full) * u32::from(percent) / 100).unwrap_or(full);
     let rows = |count: usize| u16::try_from(count).unwrap_or(u16::MAX);
     let (wanted, cap) = match &app.mode {
-        AppMode::AskUser(state) => (ask_user_rows(state, column.width), pct(60)),
+        AppMode::AskUser(state) => (
+            ask_user_rows(state, column.width)
+                .saturating_add(blocked_rows(&blocked_titles(app, &state.request_id))),
+            pct(60),
+        ),
         AppMode::SessionSelect => (
             rows(app.filtered_sessions().len() * 2 + 10).max(14),
             pct(70),
@@ -434,7 +438,13 @@ fn confirm_body_rows(text: &str, width: u16) -> usize {
 fn render_sheet(frame: &mut Frame, sheet: Rect, app: &App) {
     frame.render_widget(Clear, sheet);
     match &app.mode {
-        AppMode::AskUser(state) => render_ask_user(frame, sheet, state, app.band_bg),
+        AppMode::AskUser(state) => render_ask_user(
+            frame,
+            sheet,
+            state,
+            &blocked_titles(app, &state.request_id),
+            app.band_bg,
+        ),
         AppMode::SessionSelect => render_session_popup(frame, sheet, app),
         AppMode::FilePicker => render_file_picker_popup(frame, sheet, app),
         AppMode::Help => render_help_popup(frame, sheet, app.help_scroll, app.band_bg),
@@ -2369,6 +2379,63 @@ fn render_permission_confirm(
     frame.render_widget(widget, area);
 }
 
+/// Blocked rows an `AskUser` sheet lists before it sums up the rest.
+const BLOCKED_LISTED: usize = 3;
+
+/// The titles of the `tasks.md` rows marked `BLOCKING <request_id>`, as the
+/// sidebar last loaded them.
+fn blocked_titles<'a>(app: &'a App, request_id: &str) -> Vec<&'a str> {
+    app.sidebar
+        .tasks
+        .iter()
+        .flatten()
+        .filter(|row| row.blocking.as_deref() == Some(request_id))
+        .map(|row| row.title.as_str())
+        .collect()
+}
+
+/// Rows the blocked-row list of an `AskUser` sheet takes.
+fn blocked_rows(blocked: &[&str]) -> u16 {
+    let shown = blocked.len().min(BLOCKED_LISTED) + usize::from(blocked.len() > BLOCKED_LISTED);
+    u16::try_from(shown).unwrap_or(u16::MAX)
+}
+
+/// Draws the rows an open question blocks at the foot of `inner` and returns
+/// the area left above them.
+fn render_blocked(frame: &mut Frame, inner: Rect, blocked: &[&str]) -> Rect {
+    let height = blocked_rows(blocked).min(inner.height);
+    if height == 0 {
+        return inner;
+    }
+    let mut lines: Vec<Line> = blocked
+        .iter()
+        .take(BLOCKED_LISTED)
+        .map(|title| {
+            Line::from(vec![
+                Span::styled("BLOCKS ", Style::default().fg(Color::Yellow)),
+                Span::styled(*title, Style::default().fg(Color::White)),
+            ])
+        })
+        .collect();
+    if blocked.len() > BLOCKED_LISTED {
+        lines.push(Line::from(Span::styled(
+            format!("BLOCKS +{} more", blocked.len() - BLOCKED_LISTED),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    let body = Rect {
+        height: inner.height - height,
+        ..inner
+    };
+    let footer = Rect {
+        y: inner.y + body.height,
+        height,
+        ..inner
+    };
+    frame.render_widget(Paragraph::new(lines), footer);
+    body
+}
+
 /// Rows the question text of the `AskUser` sheet takes at `width`.
 fn ask_question_rows(question: &str, width: u16) -> u16 {
     let inner = usize::from(width.saturating_sub(2)).max(1);
@@ -2401,9 +2468,12 @@ fn render_secret_question(
     state: &AskUserState,
     question: &crate::ask_user::Question,
     qs: &crate::tui::state::AskUserQuestionState,
-    secret: &crate::session::PersistedSecretRequest,
+    blocked: &[&str],
     bg: Option<Color>,
 ) {
+    let Some(secret) = state.current_secret() else {
+        return;
+    };
     let scope = match secret.scope {
         crate::secrets::SecretScope::Global => "global",
         crate::secrets::SecretScope::Session => "this session",
@@ -2421,6 +2491,7 @@ fn render_secret_question(
     let block = panel(Some(Span::raw(title)), Color::Cyan, bg).title_alignment(Alignment::Center);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    let inner = render_blocked(frame, inner, blocked);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -2478,15 +2549,21 @@ fn render_secret_question(
 }
 
 /// Render the `AskUser` dialog as a bottom sheet.
-fn render_ask_user(frame: &mut Frame, area: Rect, state: &AskUserState, bg: Option<Color>) {
+fn render_ask_user(
+    frame: &mut Frame,
+    area: Rect,
+    state: &AskUserState,
+    blocked: &[&str],
+    bg: Option<Color>,
+) {
     let Some(question) = state.current() else {
         return;
     };
     let Some(qs) = state.current_state() else {
         return;
     };
-    if let Some(secret) = state.current_secret() {
-        render_secret_question(frame, area, state, question, qs, secret, bg);
+    if state.current_secret().is_some() {
+        render_secret_question(frame, area, state, question, qs, blocked, bg);
         return;
     }
 
@@ -2531,6 +2608,7 @@ fn render_ask_user(frame: &mut Frame, area: Rect, state: &AskUserState, bg: Opti
     let block = panel(Some(border_title), Color::Cyan, bg).title_alignment(Alignment::Center);
     let inner = block.inner(overlay);
     frame.render_widget(block, overlay);
+    let inner = render_blocked(frame, inner, blocked);
 
     // Layout inner: question + items + optional custom input + help
     let mut constraints = vec![
@@ -3499,7 +3577,48 @@ mod tests {
         for width in 12u16..=44 {
             let mut terminal = Terminal::new(ScreenBackend::new(width, 16)).unwrap();
             draw_checked(&mut terminal, Rect::new(0, 0, width, 16), |frame, area| {
-                super::render_ask_user(frame, area, &state, None);
+                super::render_ask_user(frame, area, &state, &[], None);
+            });
+        }
+    }
+
+    /// The rows a question blocks are listed under it, CJK titles included,
+    /// and the list stays inside the sheet at every width.
+    #[test]
+    fn ask_user_lists_the_rows_it_blocks() {
+        let state = AskUserState::for_open_question(crate::session::PersistedAskUserRequest {
+            id: "q1".to_string(),
+            questions: vec![crate::session::PersistedAskUserQuestion {
+                section: String::new(),
+                question: "选哪个数据库?".to_string(),
+                option: vec!["PostgreSQL".to_string(), "SQLite".to_string()],
+                multi_select: false,
+                secret: None,
+            }],
+        });
+        let blocked = ["迁移数据库", "データベース設計", "스키마 문서", "extra row"];
+        let mut terminal = Terminal::new(ScreenBackend::new(40, 14)).unwrap();
+        draw_checked(&mut terminal, Rect::new(0, 0, 40, 14), |frame, area| {
+            super::render_ask_user(frame, area, &state, &blocked, None);
+        });
+        let text: String = terminal
+            .backend()
+            .screen()
+            .join("\n")
+            .split_whitespace()
+            .collect();
+        for needle in [
+            "BLOCKS迁移数据库",
+            "BLOCKSデータベース設計",
+            "BLOCKS스키마문서",
+            "BLOCKS+1more",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?}:\n{text}");
+        }
+        for width in 12u16..=44 {
+            let mut terminal = Terminal::new(ScreenBackend::new(width, 14)).unwrap();
+            draw_checked(&mut terminal, Rect::new(0, 0, width, 14), |frame, area| {
+                super::render_ask_user(frame, area, &state, &blocked, None);
             });
         }
     }

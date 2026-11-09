@@ -481,6 +481,8 @@ pub struct ApiPr {
     /// Live check rollup of the PR's head, queried from GitHub for an open
     /// GitHub PR; `None` for other backends and landed states.
     pub(crate) checks: Option<ApiPrChecks>,
+    /// Why the last read of the checks failed, when it did.
+    pub(crate) checks_error: Option<String>,
     /// Recent transition events, oldest first.
     pub(crate) events: Vec<ApiPrEvent>,
 }
@@ -495,6 +497,51 @@ pub struct ApiPrChecks {
     pub(crate) passed: u32,
     /// Failed, timed out, cancelled or errored.
     pub(crate) failed: u32,
+    /// Each check with its state, in GitHub's order.
+    pub(crate) items: Vec<ApiPrCheck>,
+}
+
+/// One check of a PR's head commit.
+#[derive(Debug, serde::Serialize, serde::Deserialize, skyzen::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiPrCheck {
+    /// Check run or status context name.
+    pub(crate) name: String,
+    /// `queued`, `running`, `passed` or `failed`.
+    pub(crate) state: String,
+    /// When it started, RFC 3339; absent while queued.
+    pub(crate) started_at: Option<String>,
+    /// When it concluded, RFC 3339.
+    pub(crate) finished_at: Option<String>,
+    /// Where GitHub shows the check (its detail and log).
+    pub(crate) url: Option<String>,
+}
+
+/// What the daemon last read of a PR's checks: the report, or why GitHub
+/// could not be read.
+pub type PrChecksRead = Result<crate::pr::checks::ChecksReport, String>;
+
+impl ApiPrChecks {
+    /// The wire form of `report`.
+    pub(crate) fn of(report: &crate::pr::checks::ChecksReport) -> Self {
+        let summary = report.summary();
+        Self {
+            pending: summary.pending,
+            passed: summary.passed,
+            failed: summary.failed,
+            items: report
+                .checks
+                .iter()
+                .map(|check| ApiPrCheck {
+                    name: check.name.clone(),
+                    state: check.state.as_str().to_string(),
+                    started_at: check.started().map(|t| t.to_string()),
+                    finished_at: check.finished().map(|t| t.to_string()),
+                    url: check.url.clone(),
+                })
+                .collect(),
+        }
+    }
 }
 
 /// One `pr_events` row over the wire.

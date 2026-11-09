@@ -6,6 +6,7 @@ import {
   type SessionBackground,
 } from '../api/background';
 import { getSessionTasks } from '../api/tasks';
+import { getSessionPrs, type ApiPr } from '../api/prs';
 import { isDraftSessionId, useSessionsStore } from './sessions';
 import {
   NO_STOP_REQUESTS,
@@ -29,6 +30,8 @@ export interface InspectorEntry {
   tasksError: string | null;
   background: SessionBackground | null;
   backgroundError: string | null;
+  /** The session's PRs with their live checks; `null` until loaded. */
+  prs: ApiPr[] | null;
   stopping: StopRequests;
 }
 
@@ -38,6 +41,7 @@ export const EMPTY_INSPECTOR_ENTRY: InspectorEntry = {
   tasksError: null,
   background: null,
   backgroundError: null,
+  prs: null,
   stopping: NO_STOP_REQUESTS,
 };
 
@@ -58,6 +62,9 @@ interface InspectorState {
   loadBackground: (sessionId: string) => Promise<void>;
   /** Apply a session background snapshot. */
   applyBackground: (snapshot: SessionBackground) => void;
+  loadPrs: (sessionId: string) => Promise<void>;
+  /** Replace the session's PR list (a `prs.changed` frame). */
+  applyPrs: (sessionId: string, prs: ApiPr[]) => void;
   killJob: (sessionId: string, pid: number) => Promise<void>;
   stopSubagent: (sessionId: string, runId: number) => Promise<void>;
 }
@@ -154,6 +161,19 @@ export const useInspectorStore = create<InspectorState>((set, get) => {
         backgroundError: null,
         stopping: settleStopRequests(prev.stopping, snapshot),
       }));
+    },
+
+    async loadPrs(sessionId) {
+      if (isDraftSessionId(sessionId)) return;
+      try {
+        get().applyPrs(sessionId, await getSessionPrs(sessionId));
+      } catch (err) {
+        console.warn('session PRs failed to load', message(err));
+      }
+    },
+
+    applyPrs(sessionId, prs) {
+      patch(sessionId, () => ({ prs }));
     },
 
     async killJob(sessionId, pid) {

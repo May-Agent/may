@@ -672,6 +672,7 @@ mod tests {
         Arc::new(crate::session::SessionRuntimeService::new(
             db,
             crate::ui_event_bus::UiEventBus::new(),
+            crate::session::MayHomePaths::new(dir.join("home")),
         ))
     }
 
@@ -1090,6 +1091,7 @@ mod tests {
         let runtime_service = std::sync::Arc::new(crate::session::SessionRuntimeService::new(
             db,
             crate::ui_event_bus::UiEventBus::new(),
+            crate::session::MayHomePaths::new(temp.path().join("home")),
         ));
         // The peer is a second session the daemon sees; the wake callback
         // stands in for the daemon dispatching its queued message.

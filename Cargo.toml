@@ -44,7 +44,7 @@ aither-openai = { version = "0.26.0", default-features = false, features = ["tok
 aither-sed = { version = "0.26.0", default-features = false }
 # Names acpsub's `TurnEnd::Stopped` reason, so it is the aither-acp acpsub
 # builds on.
-aither-acp = { version = "0.24.0" }
+aither-acp = { version = "0.26.0" }
 # The sandbox ACP agents and their terminal commands run in; the version
 # aither-sandbox builds its own sandboxes with.
 heel = { version = "0.9.1", default-features = false }

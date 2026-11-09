@@ -201,3 +201,32 @@ fn the_document_the_model_reads_numbers_every_row() {
         "# Plan\n\n## Roots\n1. May-Agent/may#912\n\n## Doing\n2. wire the command\n  detail one\n3. write tests\n\n## Queued\n4. document it\n\n## Notes\nfree text\n\n## Decisions\n> \"use files\"\n"
     );
 }
+
+#[test]
+fn clear_question_removes_marks_on_detail_and_title_lines_and_names_the_rows() {
+    let content = "## Doing\n- one\n  BLOCKING q1\n- two (BLOCKING: q1)\n- 三 `BLOCKING` `q1`\n- four\n  BLOCKING q2\n  next: x\n- five BLOCKING q1 until friday\n";
+    let cleared = clear_question(content, "q1").expect("clears");
+    assert_eq!(
+        cleared.content,
+        "## Doing\n- one\n- two\n- 三\n- four\n  BLOCKING q2\n  next: x\n- five BLOCKING q1 until friday\n"
+    );
+    assert_eq!(
+        cleared.rows,
+        vec![
+            Unblocked {
+                number: 1,
+                title: "one".to_string()
+            },
+            Unblocked {
+                number: 2,
+                title: "two".to_string()
+            },
+            Unblocked {
+                number: 3,
+                title: "三".to_string()
+            },
+        ]
+    );
+    let none = clear_question(content, "q9").expect("clears");
+    assert_eq!((none.content.as_str(), none.rows.len()), (content, 0));
+}

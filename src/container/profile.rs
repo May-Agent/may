@@ -65,7 +65,6 @@ mod tests {
             environment: "container".to_string(),
             container_id: None,
             persona: None,
-            remote_ssh_server_id: None,
             location_aware: false,
             pinned_limit: 10,
             sort_order: 0,

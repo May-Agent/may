@@ -390,6 +390,7 @@ async fn build_exec_terminal_tool(
     let runtime_service = std::sync::Arc::new(may_agent::session::SessionRuntimeService::new(
         context.db.clone(),
         may_agent::ui_event_bus::UiEventBus::new(),
+        may_agent::MayHomePaths::new(context.may_dir.clone()),
     ));
     let network_policy = may_config
         .preferences

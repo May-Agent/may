@@ -70,6 +70,44 @@ pub fn slowest(timings: &[TestTiming], limit: usize) -> Vec<&TestTiming> {
     sorted
 }
 
+/// Longest line an excerpt keeps, in bytes (cut at a character boundary).
+const EXCERPT_LINE_BYTES: usize = 240;
+
+/// The lines of a failed job's log that say what went wrong: GitHub's
+/// `##[error]` annotations and the compiler, test-runner and panic lines
+/// before them. The first `limit` distinct ones, in log order.
+#[must_use]
+pub fn error_lines(log: &str, limit: usize) -> Vec<String> {
+    const MARKERS: [&str; 7] = [
+        "##[error]",
+        "error:",
+        "error[",
+        "FAILED",
+        "panicked at",
+        "Error:",
+        "AssertionError",
+    ];
+    let mut found: Vec<String> = Vec::new();
+    for line in log.lines().map(clean) {
+        let line = line.trim();
+        if MARKERS.iter().any(|marker| line.contains(marker)) && !found.iter().any(|l| l == line) {
+            found.push(truncate(line).to_string());
+            if found.len() == limit {
+                break;
+            }
+        }
+    }
+    found
+}
+
+fn truncate(line: &str) -> &str {
+    let mut end = EXCERPT_LINE_BYTES.min(line.len());
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    &line[..end]
+}
+
 /// `line` without ANSI colour and without GitHub's leading timestamp.
 fn clean(line: &str) -> String {
     let bytes = line.as_bytes();
@@ -260,6 +298,25 @@ mod tests {
     const CARGO: &str = include_str!("../../tests/fixtures/ci/cargo_test.log");
     const NEXTEST: &str = include_str!("../../tests/fixtures/ci/nextest.log");
     const BUN: &str = include_str!("../../tests/fixtures/ci/bun_test.log");
+
+    #[test]
+    fn the_error_lines_of_a_failed_log_are_the_first_distinct_ones() {
+        let log = "2026-11-09T10:00:00.1Z compiling\n\
+                   2026-11-09T10:00:01.2Z \u{1b}[31merror[E0308]\u{1b}[0m: 类型不匹配 型の不一致 타입 불일치\n\
+                   2026-11-09T10:00:02.3Z error[E0308]: 类型不匹配 型の不一致 타입 불일치\n\
+                   2026-11-09T10:00:03.4Z test a::b ... FAILED\n\
+                   2026-11-09T10:00:04.5Z ##[error]Process completed with exit code 101.\n";
+        assert_eq!(
+            error_lines(log, 2),
+            [
+                "error[E0308]: 类型不匹配 型の不一致 타입 불일치",
+                "test a::b ... FAILED"
+            ]
+        );
+        assert_eq!(error_lines("all fine\n", 5), [] as [String; 0]);
+        let wide = format!("error: {}", "测".repeat(200));
+        assert!(error_lines(&wide, 1)[0].len() <= EXCERPT_LINE_BYTES);
+    }
 
     fn find<'a>(timings: &'a [TestTiming], kind: TestKind, name: &str) -> &'a TestTiming {
         timings

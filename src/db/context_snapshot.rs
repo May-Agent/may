@@ -16,17 +16,8 @@ use super::{ChatDb, ChatDbError, query};
 /// The blob is produced by `rmp_serde::to_vec_named` and decoded into a type
 /// marked `deny_unknown_fields`, so any aither upgrade that changes the
 /// checkpoint's serialized shape makes every older blob undecodable. Bump this
-/// constant whenever that shape changes; rows written under a different
-/// version are invalidated when the database is opened.
-///
-/// 1 = every blob written before versioning existed (the pre-0.7 and 0.7
-/// shapes alike, which are indistinguishable without a recorded version).
-/// 2 = every `AgentCheckpoint` before context items carried their commit time.
-/// 3 = every `AgentCheckpoint` before it carried what the conversation holds
-/// of `tasks.md`.
-/// 4 = every `AgentCheckpoint` before its handoff became rendered text and
-/// its `tasks` field became the working document's `document`.
-/// 5 = the current `AgentCheckpoint` shape, with its `document` field.
+/// constant whenever that shape changes; a row written under a different
+/// version fails to load.
 pub(super) const CONTEXT_SNAPSHOT_FORMAT: i64 = 5;
 
 /// Inputs for [`ChatDb::upsert_context_debug_snapshot`].
@@ -560,61 +551,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_unversioned_snapshot_is_invalidated_on_open() {
-        let dir = tempdir().expect("temp dir should be created");
-        let db_path = dir.path().join("history.db");
-        let session_id = "session-legacy";
-
-        // Seed a database whose snapshot table predates format versioning,
-        // holding a pre-0.7-style blob (current shape plus `todo_items`).
-        let raw = ChatDb::connect(&db_path)
-            .await
-            .expect("raw db should connect");
-        raw.query("CREATE TABLE session_context_snapshots (session_id TEXT PRIMARY KEY, checkpoint_blob BLOB NOT NULL, applied_seq INTEGER NOT NULL, updated_at TEXT NOT NULL)")
-            .execute()
-            .await
-            .expect("legacy table should be created");
-        let mut legacy_json =
-            serde_json::to_value(representative_checkpoint()).expect("checkpoint should serialize");
-        legacy_json
-            .as_object_mut()
-            .expect("checkpoint serializes to an object")
-            .insert("todo_items".to_string(), serde_json::json!([]));
-        let legacy_blob = rmp_serde::to_vec_named(&legacy_json).expect("legacy blob should encode");
-        // The seeded blob must actually be undecodable today, otherwise the
-        // test proves nothing about the migration.
-        assert!(
-            rmp_serde::from_slice::<aither_agent::AgentCheckpoint>(&legacy_blob).is_err(),
-            "seeded legacy blob must fail to decode"
-        );
-        raw.query("INSERT INTO session_context_snapshots (session_id, checkpoint_blob, applied_seq, updated_at) VALUES (?, ?, 0, ?)")
-            .bind(session_id)
-            .bind(legacy_blob)
-            .bind(jiff::Timestamp::now().to_string())
-            .execute()
-            .await
-            .expect("legacy snapshot should be inserted");
-        drop(raw);
-
-        let db = ChatDb::open(&db_path)
-            .await
-            .expect("db should initialize successfully");
-        let snapshot = db
-            .get_session_context_snapshot(session_id)
-            .await
-            .expect("get should succeed");
-        assert!(snapshot.is_none(), "legacy snapshot must be invalidated");
-
-        // The chat-preparation path failed at this load step before the
-        // migration; with the row invalidated it now falls back to history
-        // replay.
-        let loaded = crate::session::load_persisted_context_snapshot(&db, session_id)
-            .await
-            .expect("snapshot load must succeed");
-        assert!(loaded.is_none());
-    }
-
-    #[tokio::test]
     async fn corrupt_current_format_blob_is_an_error() {
         let dir = tempdir().expect("temp dir should be created");
         let db_path = dir.path().join("history.db");
@@ -814,58 +750,5 @@ mod tests {
         let decoded = decode(&entries[0]);
         assert_eq!(decoded, message);
         assert_eq!(decoded.attachments().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn an_old_layout_snapshot_migrates_keeping_its_checkpoint() {
-        let dir = tempdir().expect("temp dir should be created");
-        let db_path = dir.path().join("history.db");
-        let raw = ChatDb::connect(&db_path).await.expect("raw db");
-        raw.query(
-            "CREATE TABLE session_context_snapshots (session_id TEXT PRIMARY KEY, checkpoint_blob BLOB NOT NULL, last_message_db_id INTEGER, updated_at TEXT NOT NULL, format_version INTEGER NOT NULL)",
-        )
-        .execute()
-        .await
-        .expect("old-layout table");
-        let mut context = aither_agent::Context::default();
-        context.push(aither_core::llm::Message::user("question"));
-        context.push(aither_core::llm::Message::assistant("the answer"));
-        let mut checkpoint = representative_checkpoint();
-        checkpoint.context = context.checkpoint();
-        let blob = rmp_serde::to_vec_named(&checkpoint).expect("blob");
-        raw.query(
-            "INSERT INTO session_context_snapshots (session_id, checkpoint_blob, last_message_db_id, updated_at, format_version) VALUES (?, ?, 42, ?, ?)",
-        )
-        .bind("session-old")
-        .bind(blob)
-        .bind(jiff::Timestamp::now().to_string())
-        .bind(CONTEXT_SNAPSHOT_FORMAT)
-        .execute()
-        .await
-        .expect("old row");
-        drop(raw);
-
-        let db = ChatDb::open(&db_path).await.expect("db opens");
-        let stored = db
-            .get_session_context_snapshot("session-old")
-            .await
-            .expect("get")
-            .expect("the migration keeps the checkpoint");
-        let items = stored.checkpoint.context.items();
-        assert_eq!(items.len(), 2, "the checkpoint survives the migration");
-        assert_eq!(
-            stored.applied_seq,
-            i64::try_from(items.last().expect("items").seq()).expect("seq"),
-            "applied_seq is the checkpoint's own last seq"
-        );
-        let entries = db
-            .transcript_entries_after("session-old", -1)
-            .await
-            .expect("transcript");
-        assert_eq!(entries.len(), 2);
-        assert_eq!(
-            decode(&entries[1]),
-            aither_core::llm::Message::assistant("the answer")
-        );
     }
 }
