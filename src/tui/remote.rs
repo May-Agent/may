@@ -401,6 +401,12 @@ fn stream_app_event(kind: &str, data: &str, state: &mut StreamState) -> Option<A
                 upsert(&mut state.issues, frame.issue, |issue| issue.number);
                 state.issues_event(&session_id)
             }),
+        "prs.changed" => serde_json::from_str::<crate::client::PrsChangedFrame>(data)
+            .ok()
+            .map(|frame| AppEvent::SidebarPrs {
+                session_id: frame.session_id,
+                prs: frame.prs,
+            }),
         "issue.removed" => serde_json::from_str::<crate::client::IssueRemovedFrame>(data)
             .ok()
             .map(|frame| {
