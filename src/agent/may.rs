@@ -259,6 +259,8 @@ pub struct MayAgentConfig {
     /// The rules this session imports, for a session `/import-claude` or
     /// `/import-codex` opened.
     pub rules_import: Option<crate::rules_import::RulesImport>,
+    /// The daemon's live limits, shared by every agent it builds.
+    pub limits: super::LiveLimits,
 }
 
 /// Session-scoped inputs for [`MayAgent::from_config_with_model_and_permissions`].
@@ -336,6 +338,8 @@ pub struct MayAgentSessionInput<'a> {
     /// The rules this session imports, for a session `/import-claude` or
     /// `/import-codex` opened.
     pub rules_import: Option<crate::rules_import::RulesImport>,
+    /// The daemon's live limits, shared by every agent it builds.
+    pub limits: super::LiveLimits,
     /// The model's context window as the daemon resolved it (provider
     /// report, then the model table); the agent compacts against it.
     pub model_context_window: Option<u32>,
@@ -736,6 +740,7 @@ impl MayAgent {
         let language_guard = aither_agent::LanguageGuard::new(config.languages);
         let mut builder = TerminalAgentBuilder::new(llm, terminal_tool)
             .system_layout(tag::layout())
+            .notices(super::notices::may_notices())
             .languages(language_guard.clone())
             .hook(context_snapshot_hook)
             .hook(pending_steer_hook)
@@ -815,6 +820,7 @@ impl MayAgent {
                 languages: Some(language_guard.clone()),
                 acp,
                 git: crate::host_git::HostGit::inherit(),
+                tasks_line_limit: config.limits.tasks_lines(),
                 #[cfg(target_os = "macos")]
                 computer: config.computer.clone(),
                 rules_import: config.rules_import.clone(),
@@ -827,15 +833,15 @@ impl MayAgent {
         builder = builder
             .fork_source(shared_terminal_commands.fork_source.clone())
             // `tasks.md` follows what the commands above record, and reads
-            // the state of the issues and PRs its rows name.
-            .work_events(task_events)
-            .working_document(aither_agent::DocumentSpec::new(
-                "tasks.md",
-                crate::task_rows::TasksSchema,
+            // the state of the issues and PRs its rows name. Its subagents
+            // keep their own under the same schema and stop rule.
+            .working_document(crate::tasks_md::schema::document_spec(
+                &config.limits.tasks_lines(),
             ))
             .stop_hook(aither_agent::AnyStopHook::new(
-                crate::task_rows::HoldOpenTasks,
+                crate::tasks_md::schema::TasksStopHook,
             ))
+            .work_events(task_events)
             .work_tracker(super::work_tracker::MayWorkTracker::new(
                 issue_store.clone(),
                 config.db.clone(),
@@ -879,6 +885,7 @@ impl MayAgent {
             );
         builder = builder
             .host_load(config.host_load.clone())
+            .disk_thresholds(config.limits.disk())
             // Shell runtime depends on the home environment. SSH remains a
             // per-command routing capability on top of it.
             .shell_runtime_availability(tool_environment_key.availability())
@@ -994,6 +1001,7 @@ impl MayAgent {
             background_jobs,
             connectivity,
             rules_import,
+            limits,
             model_context_window,
         } = input;
         let selector = super::provider::parse_model_selector(model)?;
@@ -1100,6 +1108,7 @@ impl MayAgent {
             prompt_cache_epoch,
             db,
             rules_import,
+            limits,
         })
     }
 
@@ -1369,6 +1378,19 @@ impl MayAgent {
         self.inner.cache_warmth()
     }
 
+    /// The agent's model, which counts streamed text in tokens
+    /// ([`LanguageModel::count_text`]) while a run holds the agent.
+    #[must_use]
+    pub fn counting_model(&self) -> ProviderLlm {
+        self.btw_llm.llm.clone()
+    }
+
+    /// Marks the agent interrupted because the user stopped its run: no
+    /// background completion starts a run until the user's next input.
+    pub const fn interrupt(&mut self) {
+        self.inner.interrupt();
+    }
+
     /// Stop every terminal task that is still running for this agent.
     pub async fn kill_running_terminal_jobs(&self) -> usize {
         self.inner.kill_running_terminal_jobs().await
@@ -1497,7 +1519,7 @@ pub async fn generate_session_title(
 /// Rendered markdown of the context's active handoff, if any — the text
 /// `AGENTS.md` links are extracted from.
 fn handoff_markdown(context: &aither_agent::Context) -> Option<String> {
-    Some(context.handoff()?.text().to_string())
+    context.handoff().map(|handoff| handoff.text().to_string())
 }
 
 fn truncate_at_char_boundary(input: &str, max_chars: usize) -> &str {

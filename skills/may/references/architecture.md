@@ -1,6 +1,6 @@
 # Where May's parts live
 
-Paths are relative to the May source checkout. `aither-sandbox` and `aither-agent` are the framework crates May builds on (version 0.14.1); their sources are in the cargo registry.
+Paths are relative to the May source checkout. `aither-sandbox` and `aither-agent` are the framework crates May builds on (version 0.25.0); their sources are in the cargo registry.
 
 ## Daemon and clients
 
@@ -23,7 +23,8 @@ Paths are relative to the May source checkout. `aither-sandbox` and `aither-agen
 ## Terminal and sandbox
 
 - `aither-sandbox/src/terminal.rs`: `TerminalArgs`, `DEFAULT_FOREGROUND_WAIT` (10 s), `DEFAULT_TIMEOUT_CAP`, `DEFAULT_LONG_JOB_ALERT_AFTER` (40 min), session environment (`HOME`, `TMPDIR`).
-- `aither-sandbox/src/stdin_watch.rs` (stdin-blocked detection), `poll_guard.rs` (refused `sleep` and unchanged re-reads), `output.rs` (`INLINE_OUTPUT_LIMIT` 16,000 bytes), `monitor.rs`, `builtin/terminal.rs` (`terminal_read`, `terminal_input`, `terminal_kill`), `command.rs` (IPC command bridge and argument parsing).
+- `src/command_policy/`: the scripts refused before they run (kills by name, unparsable shell, a foreground `sleep`, unchanged re-reads, host `grep`/`awk`/`find` and unsupported `sed`); `src/tasks_md/`: the `tasks.md` format, its schema, stop rule and line limit; `src/agent/notices.rs`: May's wording of aither's alerts.
+- `aither-sandbox/src/stdin_watch.rs` (stdin-blocked detection), `output.rs` (`INLINE_OUTPUT_LIMIT` 16,000 bytes), `monitor.rs`, `builtin/terminal.rs` (`terminal_read`, `terminal_input`, `terminal_kill`), `command.rs` (IPC command bridge and argument parsing).
 - `aither-agent/templates/job_alert.txt`: alert wording, including the working-directory reset reasons.
 - `src/agent/permission.rs`: approval for `unsafe` mode (30 min main, 3 min subagent); `src/terminal_permission_handler.rs`: network policy and audit log; `src/agent/runtime_context.rs` and `templates/prompt/`: the session system prompt, one template per section (`tag::layout` orders them), external content last.
 

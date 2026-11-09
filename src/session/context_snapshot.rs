@@ -164,6 +164,7 @@ pub async fn persist_agent_context_snapshot(
 mod tests {
     use aither_agent::{
         AgentCheckpoint, Context, ContextWindowMetrics, ContextWindowPhase, ContextWindowSnapshot,
+        Handoff,
     };
     use aither_core::llm::Message;
 
@@ -222,7 +223,7 @@ mod tests {
         assert_eq!((first, second), (0, 1));
         let fork_point = context.fork_point();
         context.apply_handoff(
-            aither_agent::Handoff::new(""),
+            Handoff::new("summary"),
             fork_point,
             0,
             &std::collections::HashSet::new(),

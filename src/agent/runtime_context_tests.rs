@@ -407,6 +407,11 @@ fn the_environment_names_paths_relative_to_the_session_and_the_real_home() {
         terminal.contains(&format!("means {}/outputs/", dir.path().display())),
         "{terminal}"
     );
+    assert_eq!(
+        terminal.contains("`grep`, `awk` and `find` fail in scripts"),
+        cfg!(not(windows)),
+        "only the managed bash refuses them: {terminal}"
+    );
 }
 
 fn container_environment() -> AgentEnvironment {

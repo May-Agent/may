@@ -871,10 +871,9 @@ pub(crate) mod test_sandbox {
                 .expect("the terminal starts")
                 .initialize_tools(&distribution, &cache)
                 .await
-                .expect("the baseline tools prepare")
-                .with_registry(std::sync::Arc::new(builder.build(
-                    crate::test_support::test_output_store(session_root.join("outputs")).await,
-                )));
+                .expect("the baseline tools prepare");
+            let registry = builder.build(terminal.output_store().clone());
+            let terminal = terminal.with_registry(std::sync::Arc::new(registry));
             Self { terminal }
         }
 

@@ -814,7 +814,10 @@ pub fn check_acp_agent_name(name: &str) -> Result<(), ConfigError> {
         Err(_) => return reject("a name holds only ASCII letters, digits, `-` and `_`"),
         Ok(()) => {}
     }
-    if crate::bundle::BUNDLED_SUBAGENT_NAMES.contains(&name) {
+    if crate::bundle::Bundle::subagent_definitions()
+        .iter()
+        .any(|bundled| bundled.name == name)
+    {
         return reject("the name belongs to a built-in subagent type");
     }
     Ok(())
@@ -1294,6 +1297,12 @@ pub struct MayConfig {
     /// When host memory pressure and machine load count as high.
     #[serde(default)]
     pub host_load: HostLoadSettings,
+    /// When free disk space counts as low.
+    #[serde(default)]
+    pub disk: DiskSettings,
+    /// How long an agent's `tasks.md` may grow.
+    #[serde(default)]
+    pub tasks: TasksSettings,
     /// How long `/connect` waits on a candidate ACP agent.
     #[serde(default)]
     pub acp: AcpSettings,
@@ -1523,37 +1532,38 @@ impl LanguageConfig {
 
 /// `[context]` section: when a session's conversation is compacted.
 ///
-/// The auto-compact point is `min(window * compact_at, compact_ceiling)`
+/// The pause point is `min(window - handoff_reserve, compact_ceiling)`
 /// tokens; the distances are token counts before it. aither applies them, and
 /// a change reaches running sessions at their next turn.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct ContextConfig {
-    /// Fraction of the model window at which the conversation is compacted.
-    pub compact_at: f32,
+    /// Tokens kept free below the window for the compaction request and the
+    /// handoff the model writes; it does not grow with the window.
+    pub handoff_reserve: usize,
     /// Most tokens the conversation may hold before it is compacted,
     /// whatever the window.
     pub compact_ceiling: usize,
-    /// Tokens before the auto-compact point at which compaction starts in
-    /// the background while the run keeps streaming.
+    /// Tokens before the pause point at which compaction starts in the
+    /// background while the run keeps streaming.
     pub start_distance: usize,
-    /// Tokens before the auto-compact point at which the agent pauses to
-    /// finish compaction.
-    pub safe_buffer: usize,
-    /// Tokens before the auto-compact point at which the agent is told once
-    /// to save its work and call `compact` itself.
+    /// Tokens before the pause point at which the agent is told once to save
+    /// its work and call `compact` itself.
     pub warn_distance: usize,
+    /// Tokens before the warn point from which a model that counts through a
+    /// provider endpoint is asked for an exact count.
+    pub count_distance: usize,
 }
 
 impl Default for ContextConfig {
     fn default() -> Self {
         let policy = aither_agent::ContextPolicy::default();
         Self {
-            compact_at: policy.compact_at,
+            handoff_reserve: policy.handoff_reserve,
             compact_ceiling: policy.compact_ceiling,
             start_distance: policy.start_distance,
-            safe_buffer: policy.safe_buffer,
             warn_distance: policy.warn_distance,
+            count_distance: policy.count_distance,
         }
     }
 }
@@ -1564,11 +1574,11 @@ impl ContextConfig {
     #[must_use]
     pub fn policy(&self) -> aither_agent::ContextPolicy {
         aither_agent::ContextPolicy {
-            compact_at: self.compact_at,
+            handoff_reserve: self.handoff_reserve,
             compact_ceiling: self.compact_ceiling,
             start_distance: self.start_distance,
-            safe_buffer: self.safe_buffer,
             warn_distance: self.warn_distance,
+            count_distance: self.count_distance,
             ..aither_agent::ContextPolicy::default()
         }
     }
@@ -1725,6 +1735,53 @@ impl HostLoadSettings {
     }
 }
 
+/// `[disk]` section: how little free space the home environment's volume may
+/// have before the agent is told, in bytes.
+///
+/// The defaults are aither's: yellow below 10 GiB free, red below 5 GiB and
+/// final below 3 GiB. A change applies to running sessions at once.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct DiskSettings {
+    /// Free bytes below which the disk is at the yellow level.
+    pub yellow_free_bytes: u64,
+    /// Free bytes below which the disk is at the red level.
+    pub red_free_bytes: u64,
+    /// Free bytes below which the disk is at the final level.
+    pub final_free_bytes: u64,
+}
+
+impl DiskSettings {
+    const GIB: u64 = 1024 * 1024 * 1024;
+}
+
+impl Default for DiskSettings {
+    fn default() -> Self {
+        Self {
+            yellow_free_bytes: 10 * Self::GIB,
+            red_free_bytes: 5 * Self::GIB,
+            final_free_bytes: 3 * Self::GIB,
+        }
+    }
+}
+
+/// `[tasks]` section: the `tasks.md` every agent keeps, a subagent's in its
+/// own space. A change applies to running sessions at once.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct TasksSettings {
+    /// Lines `tasks.md` may hold before the agent is asked to rewrite it.
+    pub line_limit: usize,
+}
+
+impl Default for TasksSettings {
+    fn default() -> Self {
+        Self {
+            line_limit: crate::tasks_md::schema::DEFAULT_LINE_LIMIT,
+        }
+    }
+}
+
 /// Serde for a [`Duration`] written as human text (`"30s"`, `"2m"`).
 mod duration_text {
     use std::time::Duration;
@@ -1782,6 +1839,8 @@ impl Default for MayConfig {
             context: ContextConfig::default(),
             time: TimeConfig::default(),
             host_load: HostLoadSettings::default(),
+            disk: DiskSettings::default(),
+            tasks: TasksSettings::default(),
             acp: AcpSettings::default(),
             last_model: None,
             last_effort: None,

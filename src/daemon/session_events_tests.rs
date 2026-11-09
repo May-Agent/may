@@ -329,7 +329,7 @@ async fn a_job_added_then_removed_upserts_then_removes() {
     state
         .session_background
         .add_job_registry(SESSION, registry.clone());
-    let task_id = aither_core::ids::AnyIdAllocator::default()
+    let task_id = aither_core::AnyIdAllocator::default()
         .lease()
         .expect("a free task id");
     let task_id_word = task_id.to_string();

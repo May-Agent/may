@@ -2012,6 +2012,7 @@ fn run_agent_loop<'a>(
                     Instant::now(),
                 ),
                 decode_meter: DecodeMeter::default(),
+                counting_model: agent.counting_model(),
                 last_speed_emit: None,
                 segment_text: String::new(),
                 segment_at: None,
@@ -2298,6 +2299,10 @@ fn run_agent_loop<'a>(
             }
 
             if let Some(reason) = cancellation_reason {
+                if reason == USER_CANCELLED {
+                    // Background completions wait for the user's next input.
+                    agent.interrupt();
+                }
                 // A user stop before any tool call or response text
                 // withdraws the turn. A message taken from the queue is not
                 // withdrawn: no client holds it to put back.
@@ -3764,6 +3769,7 @@ fn build_session_agent<'a>(
                 background_jobs: aither_agent::BackgroundJobPolicy::Detach,
                 connectivity: state.connectivity.clone(),
                 rules_import: ctx.rules_import.clone(),
+                limits: state.live_limits.clone(),
                 model_context_window,
             },
         )

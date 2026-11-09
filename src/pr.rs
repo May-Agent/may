@@ -2294,11 +2294,7 @@ mod tests {
             "## Doing\n- #3 work, PR #1 open\n",
         )
         .unwrap();
-        let mut tasks = aither_agent::WorkingDocument::new(
-            &aither_agent::DocumentSpec::new("tasks.md", crate::task_rows::TasksSchema),
-            sandbox.path(),
-            events,
-        );
+        let mut tasks = crate::tasks_md::schema::working_document(sandbox.path(), events);
         tasks.on_request(false).await;
 
         commit_file(&clone, "work.txt");

@@ -48,8 +48,6 @@ pub enum ExecError {
     RegisterCommands(may_agent::TerminalCommandsError),
     #[error("failed to read the current working directory: {0}")]
     CurrentDir(std::io::Error),
-    #[error("failed to create the session outputs store: {0}")]
-    Outputs(std::io::Error),
     #[error("failed to resolve the session issue backend: {0}")]
     ResolveIssueBackend(may_agent::issue::IssueError),
     #[error("failed to load workspace config: {0}")]
@@ -154,8 +152,8 @@ pub async fn run_exec(args: ExecArgs) -> Result<i32, ExecError> {
     let started = terminal_tool
         .run_background(TerminalArgs {
             description: "execute the requested shell command".to_string(),
-            language: aither_sandbox::ScriptLanguage::Shell,
             script: args.script,
+            language: aither_sandbox::ScriptLanguage::Shell,
             mode: shell_mode,
             ssh_server_id: args.ssh_server_id,
             expect: OutputFormat::Text,
@@ -487,6 +485,7 @@ async fn build_exec_terminal_tool(
         resolved_provider.llm,
         &tool_dispatchers,
         environment,
+        terminal_tool.output_store().clone(),
     ))
     .await?;
     let terminal_tool = terminal_tool.with_registry(registry);
@@ -495,10 +494,11 @@ async fn build_exec_terminal_tool(
 
 async fn build_exec_registry<LLM>(
     context: &ExecSessionContext,
-    _may_config: &MayConfig,
+    may_config: &MayConfig,
     llm: LLM,
     tool_dispatchers: &may_agent::tool_dispatch::ToolDispatchers,
     environment: &may_agent::AgentEnvironment,
+    outputs: aither_sandbox::OutputStore,
 ) -> Result<Arc<aither_sandbox::ToolRegistry>, ExecError>
 where
     LLM: aither_core::LanguageModel + Clone + 'static,
@@ -560,20 +560,14 @@ where
             languages: None,
             acp: None,
             git: may_agent::host_git::HostGit::inherit(),
+            tasks_line_limit: may_agent::tasks_md::schema::LineLimit::new(
+                may_config.tasks.line_limit,
+            ),
         },
     )
     .await
     .map_err(ExecError::RegisterCommands)?;
-    Ok(Arc::new(
-        builder.build(
-            aither_sandbox::OutputStore::new(
-                SessionPaths::new(context.sandbox_dir.clone()).outputs_dir(),
-                aither_core::ids::AnyIdAllocator::default(),
-            )
-            .await
-            .map_err(ExecError::Outputs)?,
-        ),
-    ))
+    Ok(Arc::new(builder.build(outputs)))
 }
 
 /// Resolves `server_id` among the SSH servers attached to the session's profile.
