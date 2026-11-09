@@ -93,6 +93,12 @@ pub enum MayAgentError {
     /// Terminal command registration error.
     #[error("terminal command error: {0}")]
     Commands(#[from] crate::terminal_commands::TerminalCommandsError),
+    /// The session's row could not be read.
+    #[error("cannot read the session's repository binding: {0}")]
+    SessionRow(#[from] crate::db::ChatDbError),
+    /// The session's stored repository binding is malformed.
+    #[error(transparent)]
+    Binding(#[from] crate::session::BindingError),
 }
 
 /// Execution environment for a `MayAgent`.
@@ -600,15 +606,13 @@ impl MayAgent {
         // The session's repository binding names the clone; a GitHub binding
         // needs no checkout at all. Without one, the launch directory's
         // repository decides.
-        let binding = match config.db.get_session(config.session_id.as_str()).await {
-            Ok(row) => row
-                .and_then(|row| row.repo)
-                .and_then(|stored| crate::session::RepoBinding::parse(&stored).ok()),
-            Err(error) => {
-                tracing::warn!(%error, "failed to read the session's repository binding");
-                None
-            }
-        };
+        let binding = config
+            .db
+            .get_session(config.session_id.as_str())
+            .await?
+            .and_then(|row| row.repo)
+            .map(|stored| crate::session::RepoBinding::parse(&stored))
+            .transpose()?;
         let worktree = crate::repo_search::worktree_root(&config.cwd);
         // The first-contact trust decision picks the clone: full and
         // prs-only clone the GitHub remote, local-branch clones the checkout
