@@ -1748,6 +1748,7 @@ impl App {
     /// only when its reply is stored; until then it may still be running.
     async fn render_history(&mut self, messages: &[ChatMessage]) {
         self.chat = ChatStream::new().with_tunnel_base(tunnel_base(&self.config));
+        self.chat.push_welcome(self.cwd_label());
         let mut turn = HistoryTurn::default();
         for (history_index, msg) in messages.iter().enumerate() {
             if msg.role == MessageRole::User {
@@ -5478,7 +5479,9 @@ mod tests {
                 })
                 .collect()
         };
-        let elements = app.chat.elements();
+        let all = app.chat.elements();
+        assert!(matches!(&all[0], ChatElement::Welcome { .. }));
+        let elements = &all[1..];
         assert_eq!(elements.len(), 6, "{elements:#?}");
         assert!(matches!(&elements[0], ChatElement::UserMessage { .. }));
         let ChatElement::WorkedFor {
