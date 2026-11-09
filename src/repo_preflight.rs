@@ -99,6 +99,9 @@ pub enum PreflightError {
     /// The remote named no commit for its default branch.
     #[error("the remote of {0} reported no HEAD")]
     NoRemoteHead(String),
+    /// The remote could not be read: offline, or no access.
+    #[error("the remote cannot be reached: {0}")]
+    RemoteUnreachable(HostGitError),
 }
 
 /// Inspect `checkout` against the `origin` remote. Reads the remote with
@@ -120,11 +123,10 @@ pub fn inspect_against(
     checkout: &Path,
     remote: &str,
 ) -> Result<CheckoutState, PreflightError> {
-    let dirty = !host
-        .output(Some(checkout), &["status", "--porcelain"])?
-        .trim()
-        .is_empty();
-    let listing = host.output(Some(checkout), &["ls-remote", remote, "HEAD"])?;
+    let dirty = is_dirty(host, checkout)?;
+    let listing = host
+        .output(Some(checkout), &["ls-remote", remote, "HEAD"])
+        .map_err(PreflightError::RemoteUnreachable)?;
     let remote_head = listing
         .split_whitespace()
         .next()
@@ -142,6 +144,17 @@ pub fn inspect_against(
         Remote::Diverged
     };
     Ok(CheckoutState { dirty, remote })
+}
+
+/// Whether `checkout` has uncommitted changes or untracked files.
+///
+/// # Errors
+/// Fails when git cannot read the checkout.
+pub fn is_dirty(host: &HostGit, checkout: &Path) -> Result<bool, PreflightError> {
+    Ok(!host
+        .output(Some(checkout), &["status", "--porcelain"])?
+        .trim()
+        .is_empty())
 }
 
 fn known_commit(host: &HostGit, dir: &Path, sha: &str) -> bool {
@@ -177,6 +190,52 @@ struct QuestionText<'a> {
 #[template(path = "repo_preflight_checkout_option.txt", escape = "none")]
 struct CheckoutOption {
     loses_github: bool,
+}
+
+#[derive(Template)]
+#[template(path = "repo_preflight_offline_question.txt", escape = "none")]
+struct OfflineQuestionText<'a> {
+    checkout: &'a str,
+    owner_repo: &'a str,
+    dirty: bool,
+}
+
+#[derive(Template)]
+#[template(path = "repo_preflight_offline_option.txt", escape = "none")]
+struct OfflineOption {
+    dirty: bool,
+}
+
+/// The question a session start asks when `checkout`'s remote cannot be
+/// reached: continue on the checkout as it is, or not at all. The answer is
+/// read with [`Choice::of_answer`].
+///
+/// # Panics
+/// Never: the templates render for every input.
+#[must_use]
+pub fn offline_question(checkout: &Path, owner_repo: &str, dirty: bool) -> Question {
+    let checkout = checkout.display().to_string();
+    Question {
+        section: "checkout-state".to_string(),
+        question: OfflineQuestionText {
+            checkout: &checkout,
+            owner_repo,
+            dirty,
+        }
+        .render()
+        .expect("the offline question renders")
+        .trim()
+        .to_string(),
+        option: vec![
+            OfflineOption { dirty }
+                .render()
+                .expect("the offline option renders")
+                .trim()
+                .to_string(),
+            "exit — Do not work in this directory".to_string(),
+        ],
+        multi_select: false,
+    }
 }
 
 /// The question a session start asks about `checkout`.

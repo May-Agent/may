@@ -54,6 +54,13 @@ pub enum RepoCloneError {
     /// The clone path exists but is not a real directory.
     #[error("clone path {0} exists and is not a directory")]
     Conflict(PathBuf),
+    /// The checkout's work in progress cannot be committed without an author.
+    #[error(
+        "the checkout's work in progress cannot be committed: git has no author; \
+         set it with `git config --global user.name \"<name>\"` and \
+         `git config --global user.email \"<email>\"`"
+    )]
+    GitIdentity,
     /// A script in the session's terminal sandbox did not exit cleanly.
     #[error("`{script}` in the sandbox: {reason}")]
     Sandbox {
@@ -440,8 +447,14 @@ impl SessionRepos {
         match binding {
             crate::session::RepoBinding::Github(repository) => {
                 let owner_repo = repository.to_string();
-                let publishes = crate::trust::trust_for_github(config, &owner_repo)
-                    .is_some_and(crate::trust::TrustLevel::publishes_to_github);
+                // Matching a project reads its checkout's remote: off the
+                // executor.
+                let publishes = {
+                    let (config, owner_repo) = (config.clone(), owner_repo.clone());
+                    blocking::unblock(move || crate::trust::trust_for_github(&config, &owner_repo))
+                        .await
+                }
+                .is_some_and(crate::trust::TrustLevel::publishes_to_github);
                 if !publishes {
                     return Ok(None);
                 }
@@ -458,8 +471,15 @@ impl SessionRepos {
                 let Some(checkout) = binding.checkout() else {
                     return Ok(None);
                 };
-                let clones = crate::trust::trust_for(config, identity, &checkout)
-                    .is_some_and(crate::trust::TrustLevel::clones_work);
+                let clones = {
+                    let (config, identity, checkout) =
+                        (config.clone(), identity.clone(), checkout.clone());
+                    blocking::unblock(move || {
+                        crate::trust::trust_for(&config, &identity, &checkout)
+                    })
+                    .await
+                }
+                .is_some_and(crate::trust::TrustLevel::clones_work);
                 if !clones {
                     return Ok(None);
                 }
@@ -637,6 +657,36 @@ impl SessionRepos {
         repo_key: &str,
         staging: &Path,
     ) -> Result<PathBuf, RepoCloneError> {
+        self.remote_clone(url, repo_key, staging, None).await
+    }
+
+    /// Like [`Self::ensure_remote_clone`], for a session that works on top of
+    /// `checkout` as it stands: the checkout's uncommitted changes and
+    /// untracked files become one base commit on the remote's HEAD, recorded
+    /// as the clone's base. The clone stays remote-sourced, so the session
+    /// keeps its GitHub binding.
+    ///
+    /// # Errors
+    /// Fails as [`Self::ensure_remote_clone`] does, or when the base commit
+    /// cannot be made.
+    pub async fn ensure_remote_wip_clone(
+        &self,
+        url: &str,
+        repo_key: &str,
+        staging: &Path,
+        checkout: &Path,
+    ) -> Result<PathBuf, RepoCloneError> {
+        self.remote_clone(url, repo_key, staging, Some(checkout))
+            .await
+    }
+
+    async fn remote_clone(
+        &self,
+        url: &str,
+        repo_key: &str,
+        staging: &Path,
+        wip_of: Option<&Path>,
+    ) -> Result<PathBuf, RepoCloneError> {
         if let Some(dir) = self.clone_for(repo_key).await? {
             return Ok(dir);
         }
@@ -653,23 +703,24 @@ impl SessionRepos {
             .await?;
             return Ok(dir);
         }
-        self.clone_staged(
-            vec![
-                "--origin".to_string(),
-                "upstream".to_string(),
-                url.to_string(),
-            ],
-            staging,
-            &clone_dir,
-            None,
-        )
-        .await?;
+        let base = self
+            .clone_staged(
+                vec![
+                    "--origin".to_string(),
+                    "upstream".to_string(),
+                    url.to_string(),
+                ],
+                staging,
+                &clone_dir,
+                wip_of,
+            )
+            .await?;
         self.register(
             repo_key.to_string(),
             &clone_dir,
             url.to_string(),
             false,
-            None,
+            base,
         )
         .await?;
         Ok(dir)

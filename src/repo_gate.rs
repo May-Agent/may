@@ -129,7 +129,12 @@ impl<A: Asker + Sync> RepoGate<'_, A> {
         config: &WorkspaceConfig,
         owner_repo: &str,
     ) -> Result<Verdict, GateError> {
-        if crate::trust::trust_for_github(config, owner_repo).is_some() {
+        // Matching a project reads its checkout's remote: off the executor.
+        let decided = {
+            let (config, owner_repo) = (config.clone(), owner_repo.to_string());
+            blocking::unblock(move || crate::trust::trust_for_github(&config, &owner_repo)).await
+        };
+        if decided.is_some() {
             return Ok(Verdict::Proceed);
         }
         let answers = self
@@ -152,16 +157,15 @@ impl<A: Asker + Sync> RepoGate<'_, A> {
         config: &WorkspaceConfig,
         cwd: PathBuf,
     ) -> Result<Verdict, GateError> {
+        let config = config.clone();
         let found = blocking::unblock(move || {
             let worktree = crate::repo_search::worktree_root(&cwd)?;
             let identity = crate::issue::repository_identity(&worktree).ok()?;
-            Some((worktree, identity))
+            let level = crate::trust::trust_for(&config, &identity, &worktree)?;
+            Some((worktree, identity, level))
         })
         .await;
-        let Some((worktree, identity)) = found else {
-            return Ok(Verdict::Proceed);
-        };
-        let Some(level) = crate::trust::trust_for(config, &identity, &worktree) else {
+        let Some((worktree, identity, level)) = found else {
             return Ok(Verdict::Proceed);
         };
         if level.publishes_to_github()
@@ -202,7 +206,7 @@ impl<A: Asker + Sync> RepoGate<'_, A> {
         {
             return Ok(None);
         }
-        let state = {
+        let inspected = {
             let (host, worktree, remote) = (
                 self.host.clone(),
                 worktree.to_path_buf(),
@@ -211,7 +215,17 @@ impl<A: Asker + Sync> RepoGate<'_, A> {
             blocking::unblock(move || {
                 crate::repo_preflight::inspect_against(&host, &worktree, &remote)
             })
-            .await?
+            .await
+        };
+        let state = match inspected {
+            Ok(state) => state,
+            Err(PreflightError::RemoteUnreachable(_)) => {
+                return self
+                    .offline(session_id, &repos, worktree, identity, &owner_repo)
+                    .await
+                    .map(Some);
+            }
+            Err(error) => return Err(error.into()),
         };
         if !state.needs_choice() {
             return Ok(None);
@@ -235,7 +249,7 @@ impl<A: Asker + Sync> RepoGate<'_, A> {
                     .await?;
                 Ok(Some(Verdict::Proceed))
             }
-            Some(Choice::Checkout) => {
+            Some(Choice::Checkout) if state.loses_github() => {
                 repos
                     .ensure_wip_clone(worktree, identity, self.staging)
                     .await?;
@@ -243,7 +257,69 @@ impl<A: Asker + Sync> RepoGate<'_, A> {
                     .await?;
                 Ok(Some(Verdict::Proceed))
             }
+            // Only stale-and-dirty gives up GitHub: any other checkout is the
+            // remote's history plus, at most, its uncommitted work, so the
+            // work-in-progress commit goes on a clone of the remote.
+            Some(Choice::Checkout) => {
+                let url = {
+                    let (host, worktree, remote) = (
+                        self.host.clone(),
+                        worktree.to_path_buf(),
+                        self.remote.to_string(),
+                    );
+                    blocking::unblock(move || {
+                        host.output(Some(&worktree), &["ls-remote", "--get-url", &remote])
+                    })
+                    .await
+                    .map_err(|error| GateError::Identity(error.to_string()))?
+                };
+                repos
+                    .ensure_remote_wip_clone(url.trim(), &owner_repo, self.staging, worktree)
+                    .await?;
+                let repository = owner_repo.parse().map_err(
+                    |error: crate::workspace::GitHubRepositoryError| {
+                        GateError::Identity(error.to_string())
+                    },
+                )?;
+                self.bind(session_id, &RepoBinding::Github(repository))
+                    .await?;
+                Ok(Some(Verdict::Proceed))
+            }
             Some(Choice::Exit) | None => Ok(Some(Verdict::Exit)),
+        }
+    }
+
+    /// The remote cannot be reached, so the checkout's state against it is
+    /// unknown: the user chooses to continue on the checkout as it stands
+    /// (a local binding on its work in progress) or to exit.
+    async fn offline(
+        &self,
+        session_id: &str,
+        repos: &SessionRepos,
+        worktree: &Path,
+        identity: &Path,
+        owner_repo: &str,
+    ) -> Result<Verdict, GateError> {
+        let dirty = {
+            let (host, worktree) = (self.host.clone(), worktree.to_path_buf());
+            blocking::unblock(move || crate::repo_preflight::is_dirty(&host, &worktree)).await?
+        };
+        let answers = self
+            .asker
+            .ask(crate::repo_preflight::offline_question(
+                worktree, owner_repo, dirty,
+            ))
+            .await?;
+        match answers.first().and_then(Choice::of_answer) {
+            Some(Choice::Checkout) => {
+                repos
+                    .ensure_wip_clone(worktree, identity, self.staging)
+                    .await?;
+                self.bind(session_id, &RepoBinding::Local(identity.to_path_buf()))
+                    .await?;
+                Ok(Verdict::Proceed)
+            }
+            Some(Choice::Remote | Choice::Exit) | None => Ok(Verdict::Exit),
         }
     }
 
@@ -497,6 +573,54 @@ mod tests {
             "uncommitted"
         );
         assert_eq!(git(&clone, &["status", "--porcelain"]), "");
+    }
+
+    #[tokio::test]
+    async fn a_dirty_current_checkout_keeps_github_on_a_remote_clone_with_the_wip_base() {
+        let fx = Fixture::new().await;
+        std::fs::write(fx.checkout.join("wip.txt"), "uncommitted").unwrap();
+        fx.start_in_checkout().await;
+        fx.trust(TrustLevel::Full);
+        let asker = Scripted::answering("checkout — Base on this checkout");
+        assert_eq!(fx.run(&asker).await, Verdict::Proceed);
+        assert_eq!(fx.binding().await.as_deref(), Some("github:acme/app"));
+        let repos = SessionRepos::new(&fx.root().join("session"), "s", fx.db.clone());
+        let record = repos.clones().await.unwrap().remove(0);
+        assert!(!record.local, "the clone is sourced from the remote");
+        let base = record.base_sha.expect("a work-in-progress base commit");
+        let clone = repos.path(&record.dir);
+        assert_eq!(git(&clone, &["rev-parse", "HEAD"]), base);
+        assert_eq!(
+            std::fs::read_to_string(clone.join("wip.txt")).unwrap(),
+            "uncommitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_remote_asks_and_the_checkout_option_binds_locally() {
+        let fx = Fixture::new().await;
+        std::fs::write(fx.checkout.join("wip.txt"), "offline").unwrap();
+        fx.start_in_checkout().await;
+        fx.trust(TrustLevel::Full);
+        std::fs::remove_dir_all(&fx.origin).unwrap();
+        let asker = Scripted::answering("checkout — Work on this checkout as it stands");
+        assert_eq!(fx.run(&asker).await, Verdict::Proceed);
+        assert_eq!(asker.asked(), 1);
+        assert!(fx.binding().await.unwrap().starts_with("local:"));
+        let repos = SessionRepos::new(&fx.root().join("session"), "s", fx.db.clone());
+        let record = repos.clones().await.unwrap().remove(0);
+        assert!(record.local && record.base_sha.is_some());
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_remote_can_end_the_start() {
+        let fx = Fixture::new().await;
+        fx.start_in_checkout().await;
+        fx.trust(TrustLevel::Full);
+        std::fs::remove_dir_all(&fx.origin).unwrap();
+        let asker = Scripted::answering("exit — Do not work in this directory");
+        assert_eq!(fx.run(&asker).await, Verdict::Exit);
+        assert_eq!(fx.binding().await, None);
     }
 
     #[tokio::test]
