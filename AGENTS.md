@@ -27,6 +27,7 @@ cargo run --bin may -- daemon install    # launchd agent / systemd user unit
 
 - It listens on the unix socket `~/.may/daemon.sock` (mode 0600, used by the TUI and one-shot runs) and on TCP `127.0.0.1:8787` (`[daemon] port`) — the local listener, trusting the machine's own user. A second remote listener on `127.0.0.1:0` serves the same routes behind an identity layer; `[daemon] listen` adds more addresses applied live; a non-loopback one is served directly and identifies each peer through tailscaled's `WhoIs`.
 - `~/.may/daemon.lock` keeps it single-instance. Every client starts it on demand and replaces it when its build id differs from the client's, so after a rebuild the next `cargo run` restarts it.
+- Any `may` invocation outside the test harness, `--version` included, runs with `HOME` set to a fresh temporary directory: a client run against the real `~/.may` replaces the user's running daemon.
 - Remote access is `tailscale serve` in front of the remote listener (`[remote_access]`): every remote request needs a trusted identity — a listed `Tailscale-User-Login` today — or gets a 401. The one public entry is `[remote_access] funnel`: `tailscale funnel --set-path` exposes `/api/tasks/webhook` through a separate loopback listener whose router holds the webhook route alone (`build_webhook_router`); deliveries authenticate by token and signature.
 
 ## Fast Web UI + Rust API Iteration Workflow
