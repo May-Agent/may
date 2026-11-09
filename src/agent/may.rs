@@ -971,9 +971,12 @@ impl MayAgent {
                 .map_err(|e| MayAgentError::Sandbox(e.to_string()))?
                 .bin_dir()
                 .clone();
-            managed_tools
-                .set(bin)
-                .expect("the managed tools directory is set once");
+            managed_tools.set(bin).map_err(|bin| {
+                MayAgentError::Sandbox(format!(
+                    "the managed tools directory was already set: {}",
+                    bin.display()
+                ))
+            })?;
         }
         let named_commands = builder
             .tool_descriptions()

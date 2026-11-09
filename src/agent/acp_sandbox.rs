@@ -178,14 +178,12 @@ impl<N> SessionSandbox<N> {
     /// the tools before it can start a connection, so none is a bug.
     fn managed_bin(&self, process: &Process) -> io::Result<Option<PathBuf>> {
         match (process, &self.tools) {
-            (Process::Terminal, Some(tools)) => tools
-                .get()
-                .map(|bin| canonical(bin).map(Some))
-                .unwrap_or_else(|| {
-                    Err(io::Error::other(
-                        "the session's managed tools are not prepared",
-                    ))
-                }),
+            (Process::Terminal, Some(tools)) => match tools.get() {
+                Some(bin) => canonical(bin).map(Some),
+                None => Err(io::Error::other(
+                    "the session's managed tools are not prepared",
+                )),
+            },
             _ => Ok(None),
         }
     }
