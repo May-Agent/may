@@ -2267,6 +2267,10 @@ fn run_agent_loop<'a>(
             }
 
             if let Some(reason) = cancellation_reason {
+                if reason == USER_CANCELLED {
+                    // Background completions wait for the user's next input.
+                    agent.interrupt();
+                }
                 // A user stop before any tool call or response text
                 // withdraws the turn. A message taken from the queue is not
                 // withdrawn: no client holds it to put back.

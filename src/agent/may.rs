@@ -1368,6 +1368,12 @@ impl MayAgent {
         self.btw_llm.llm.clone()
     }
 
+    /// Marks the agent interrupted because the user stopped its run: no
+    /// background completion starts a run until the user's next input.
+    pub const fn interrupt(&mut self) {
+        self.inner.interrupt();
+    }
+
     /// Stop every terminal task that is still running for this agent.
     pub async fn kill_running_terminal_jobs(&self) -> usize {
         self.inner.kill_running_terminal_jobs().await

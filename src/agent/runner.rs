@@ -1023,6 +1023,9 @@ async fn run_agent_prompt(
         }
         WorkOutcome::Finished(Ok(ControlFlow::Break(PromptStop::Stopped)))
         | WorkOutcome::Cancelled => {
+            // The user stopped the run: background completions wait for
+            // their next input.
+            agent.interrupt();
             // Completion after cancel lets the TUI know processing stopped.
             let _ = event_tx.send(TuiEvent::Complete).await;
             return WorkOutcome::Cancelled;
