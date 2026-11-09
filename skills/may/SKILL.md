@@ -62,6 +62,7 @@ Everything except the native tools (`terminal`, `terminal_read`, `terminal_input
 - `session search|inspect|messages|list` finds and reads past sessions.
 - `issue` (create, view, list, search, edit, comment, close, label, blocked-by, sub-issue) on the May backend by default or GitHub when the project is configured so.
 - `pr open|merge|list|show|close|adopt` lands work from the session's clone. One open PR per session and repository; `open` merges as soon as checks pass unless `--hold`; a failed check or conflict rejects it, so fix in the clone, `pr update <n>` and `pr merge <n>` again. `repo trust set full|prs-only|local-branch|local` sets how far May may go for a repository, and `repo clone` gives the session its clone of another repository.
+- `ci stats|slow <pr>|queue` reports the CI durations recorded when a session PR's checks finish: per-job latest, median and p90, a PR's or run's jobs, steps and tests against their baselines, and merge-queue wait against run time.
 - `task` creates scheduled tasks (time, event or webhook triggers) that need the user's approval; `tunnel` exposes a local port; `browser` drives the May-managed browser; `webfetch` reads a URL (not present when the provider hosts fetching); `ask` asks a smaller model about content; `imagine` generates images; `agent list|send <name> <prompt-file>` messages other main agents on this machine; `register-skills` registers a local skills directory; MCP servers the user connected appear as commands.
 - Web search is a tool the model provider runs; there is no `websearch` command.
 

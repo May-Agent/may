@@ -1300,7 +1300,7 @@ mod tests {
                 SubagentArgs {
                     name: "resume".to_string(),
                     prompt_file: prompt.to_string_lossy().into_owned(),
-                    id: Some(id),
+                    id: Some(id.clone()),
                     agent: None,
                     worktrees: Vec::new(),
                     commit_worktrees: Vec::new(),

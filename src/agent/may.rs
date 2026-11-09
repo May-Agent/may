@@ -389,6 +389,21 @@ fn session_prompt_cache(session_id: &str, epoch: u32) -> PromptCache {
     PromptCache::new(session_id).with_epoch(epoch)
 }
 
+/// `model` for a side request of `session_id`'s agent at prompt-cache
+/// `epoch`: its requests carry the key the agent's own take, so the provider
+/// places both on the same cache shard.
+pub fn side_slot(
+    model: &ModelSlot<ProviderLlm>,
+    session_id: &str,
+    epoch: u32,
+) -> ModelSlot<ProviderLlm> {
+    let mut slot = model.clone();
+    slot.parameters = slot
+        .parameters
+        .prompt_cache_key(session_prompt_cache(session_id, epoch).key());
+    slot
+}
+
 impl std::fmt::Debug for MayAgent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MayAgent")
@@ -747,6 +762,10 @@ impl MayAgent {
                     runtime.clone(),
                     config.session_id.as_str(),
                 ))
+                .context_source(super::ci_alert::CiAlertContext::new(
+                    runtime.db(),
+                    config.session_id.as_str(),
+                ))
                 .blocker_resolver(super::ask_user_tool::AskUserBlockerResolver::new(
                     runtime,
                     config.session_id.as_str(),
@@ -836,7 +855,9 @@ impl MayAgent {
             messaging.forks.register(
                 config.session_id.as_str(),
                 shared_terminal_commands.fork_source.clone(),
-                btw_llm.llm.clone(),
+                btw_llm.clone(),
+                shared_terminal_commands.fork_launcher.clone(),
+                config.languages,
             )
         });
         if is_container {
@@ -1314,11 +1335,7 @@ impl MayAgent {
             .await?
             .metrics
             .prompt_cache_epoch;
-        let mut slot = self.btw_llm.clone();
-        slot.parameters = slot
-            .parameters
-            .prompt_cache_key(session_prompt_cache(self.session_id.as_str(), epoch).key());
-        Ok(slot)
+        Ok(side_slot(&self.btw_llm, self.session_id.as_str(), epoch))
     }
 
     /// The language guard the agent was built with; its commands and the

@@ -66,6 +66,22 @@ impl ChatDb {
         .map(|row| row.value))
     }
 
+    /// The `repo_key` of the `issue_projects` row `project_id` belongs to,
+    /// when it exists.
+    pub(crate) async fn repo_key_of_project(
+        &self,
+        project_id: i64,
+    ) -> Result<Option<String>, ChatDbError> {
+        Ok(query!(
+            self.db,
+            "SELECT repo_key AS value FROM issue_projects WHERE id = ?",
+            project_id
+        )
+        .fetch_optional::<super::common::StringValueRow>()
+        .await?
+        .map(|row| row.value))
+    }
+
     async fn issue_row(&self, project_id: i64, number: i64) -> Result<Option<Model>, ChatDbError> {
         Ok(query!(
             self.db,

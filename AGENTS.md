@@ -27,6 +27,7 @@ cargo run --bin may -- daemon install    # launchd agent / systemd user unit
 
 - It listens on the unix socket `~/.may/daemon.sock` (mode 0600, used by the TUI and one-shot runs) and on TCP `127.0.0.1:8787` (`[daemon] port`) — the local listener, trusting the machine's own user. A second remote listener on `127.0.0.1:0` serves the same routes behind an identity layer; `[daemon] listen` adds more addresses applied live; a non-loopback one is served directly and identifies each peer through tailscaled's `WhoIs`.
 - `~/.may/daemon.lock` keeps it single-instance. Every client starts it on demand and replaces it when its build id differs from the client's, so after a rebuild the next `cargo run` restarts it.
+- Any `may` invocation outside the test harness, `--version` included, runs with `HOME` set to a fresh temporary directory: a client run against the real `~/.may` replaces the user's running daemon.
 - Remote access is `tailscale serve` in front of the remote listener (`[remote_access]`): every remote request needs a trusted identity — a listed `Tailscale-User-Login` today — or gets a 401. The one public entry is `[remote_access] funnel`: `tailscale funnel --set-path` exposes `/api/tasks/webhook` through a separate loopback listener whose router holds the webhook route alone (`build_webhook_router`); deliveries authenticate by token and signature.
 
 ## Fast Web UI + Rust API Iteration Workflow
@@ -118,7 +119,7 @@ May is a terminal-based AI assistant built as an application layer on the **aith
 - `serve.rs`: hyper accept loops (unix socket, TCP) calling skyzen's `Router::go`
 - `lifecycle.rs`: `ensure_running` (auto-spawn, build-id replacement), service install/uninstall, stop
 - `server.rs`: `start` builds `DaemonState`, the REST/SSE router and background workers
-- `chat/mod.rs`: the one turn runner (`run_agent_loop`); `chat/hub.rs` `TurnHub` fans a session's turn out as `session_turn` / `session_agent` events, with replay of the turn in progress for late subscribers
+- `chat/mod.rs`: the one turn runner (`run_agent_loop`); `chat/hub.rs` `TurnHub` numbers a session's events (`session_turn`, `session_agent`, deltas) for `/api/sessions/{id}/events`; a subscriber continues after its cursor
 - `chat/hosts.rs`: the session's idle agent between turns: the next turn continues with it unless what it was built from changed (`agent_build_key`), so the prompt cache stays warm and detached background commands keep running; it answers `/compact`, `/context`, `/btw`, and a detached command that finishes resumes the session (`start_background_turn`)
 - `chat/background.rs`: each session's terminal jobs and subagent runs across agent rebuilds; REST under `/api/sessions/{id}/background|jobs|subagents`, pushed as `session_background`
 - `remote_access.rs`: Tailscale serve
@@ -165,7 +166,7 @@ Do not treat `.txt` or `.md` files as the canonical session persistence layer.
 
 ### Event Loop Architecture
 
-Turns run in the daemon. A client sends with `POST /api/sessions/{id}/messages` (it returns at once) and follows the turn on `/api/events?topics=session_agent,session_turn&sessionId=…`; every attached client sees the same events.
+Turns run in the daemon. A client sends with `POST /api/sessions/{id}/turns` (it returns at once) and follows the turn on `/api/sessions/{id}/events`; every attached client sees the same events.
 
 ```
 TUI main loop:

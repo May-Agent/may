@@ -27,7 +27,7 @@ use crate::issue::IssueError;
 use crate::issue::github::{GhCliTokenSource, GitHubRest, GitHubTokenSource};
 use crate::repo_clone::{CloneRecord, CloneSandbox, SessionRepos, uncommitted_changes};
 
-mod merge_watch;
+pub(crate) mod merge_watch;
 
 /// Error type for `pr` operations.
 #[derive(Debug, thiserror::Error)]
@@ -106,6 +106,19 @@ pub struct PrContext {
     /// Asks the user before a PR is opened on a repository they do not own;
     /// `None` publishes without asking.
     pub publish: Option<crate::agent::publish_approval::PublishGate>,
+    /// Records the durations of the PR's checks, when the session keeps
+    /// them; `None` records nothing.
+    pub ci: Option<CiWatch>,
+}
+
+/// What recording a PR's CI durations needs beyond the database.
+#[derive(Clone, Debug)]
+pub struct CiWatch {
+    /// The May home, whose `config.toml` holds the `[ci]` thresholds, read
+    /// each time a PR's checks finish.
+    pub may_dir: PathBuf,
+    /// Where a finding's warning is announced to the clients.
+    pub ui_events: crate::ui_event_bus::UiEventBus,
 }
 
 /// Token source for the GitHub backend's REST client.
@@ -154,6 +167,22 @@ impl std::fmt::Debug for PrContext {
         f.debug_struct("PrContext")
             .field("session_id", &self.session_id)
             .finish_non_exhaustive()
+    }
+}
+
+/// Records a GitHub PR's check durations when its checks finish.
+struct CiObserver<'a> {
+    store: &'a PrStore,
+    pr: &'a crate::db::PrRow,
+    owner_repo: &'a str,
+    head_sha: &'a str,
+}
+
+impl merge_watch::ChecksObserver for CiObserver<'_> {
+    async fn finished(&self) {
+        self.store
+            .observe_github_checks(self.pr, self.owner_repo, self.head_sha)
+            .await;
     }
 }
 
@@ -718,6 +747,34 @@ impl PrStore {
         if let Some(sha) = &pr.merge_commit_sha {
             let _ = std::fmt::Write::write_fmt(&mut out, format_args!("\nmerge {sha}"));
         }
+        // The live check rollup for a GitHub PR still in flight — one
+        // snapshot, best-effort, skipped for the may backend and for
+        // states GitHub no longer reports checks on.
+        if pr.backend == "github"
+            && matches!(pr.state.as_str(), "open" | "checks_pending" | "merging")
+            && let (Some(owner_repo), Some(external)) = (
+                github_owner_repo(&resolved.record.source),
+                pr.external_number,
+            )
+        {
+            let github = merge_watch::GithubPr {
+                api: &self.context.github_api,
+                owner_repo: &owner_repo,
+                number: external,
+            };
+            if let Ok(summary) = merge_watch::Upstream::snapshot(&github)
+                .await
+                .map(|snapshot| snapshot.check_summary())
+            {
+                let _ = std::fmt::Write::write_fmt(
+                    &mut out,
+                    format_args!(
+                        "\nchecks {} passed · {} pending · {} failed",
+                        summary.passed, summary.pending, summary.failed
+                    ),
+                );
+            }
+        }
         for e in events {
             let _ = std::fmt::Write::write_fmt(
                 &mut out,
@@ -898,13 +955,22 @@ impl PrStore {
         })
         .await
         .map_err(PrError::Gh)?;
+        // The checks are timed the moment they finish, not when the PR lands.
+        let observer = CiObserver {
+            store: self,
+            pr,
+            owner_repo: &owner_repo,
+            head_sha,
+        };
+        let watching = merge_watch::Observing::new(&github, &observer);
         let outcome = merge_watch::watch(
-            &github,
+            &watching,
             &merge_watch::SystemClock::new(),
             before.removals,
             expected,
         )
         .await?;
+        watching.tell_if_unheard().await;
         let now = jiff::Timestamp::now().to_string();
         match outcome {
             merge_watch::Outcome::Merged => {
@@ -912,6 +978,7 @@ impl PrStore {
                     .update_pr(pr.id, "merged", Some(head_sha), None, Some(now.as_str()))
                     .await?;
                 self.event(pr, "merged", Some(head_sha)).await;
+                self.record_queue_wait(pr).await;
                 self.task_event(pr, aither_agent::WorkEvent::PullRequestMerged);
                 self.pull_sync(&owner_repo).await;
                 let clone = self.retire_clone(resolved, head_sha).await?;
@@ -1170,7 +1237,14 @@ impl PrStore {
         .render()
         .expect("the check clone script renders");
         let result = match self.sandbox.run(root, &prepare).await {
-            Ok(_) => self.sandbox.run(&root.join(&target), cmd).await.map(drop),
+            Ok(_) => {
+                let started = jiff::Timestamp::now();
+                let clock = std::time::Instant::now();
+                let ran = self.sandbox.run(&root.join(&target), cmd).await.map(drop);
+                self.observe_local_check(pr, sha, cmd, started, clock.elapsed(), ran.is_ok())
+                    .await;
+                ran
+            }
             Err(error) => Err(error),
         }
         .map_err(|e| e.to_string());
@@ -1247,6 +1321,99 @@ impl PrStore {
             let _ = db
                 .add_pr_event(pr.id, kind, &self.context.session_id, "main", None, detail)
                 .await;
+        }
+    }
+
+    /// The `[ci]` thresholds as they are now. `None` when the session keeps
+    /// no CI durations or its config cannot be read, which is reported.
+    async fn ci_limits(&self) -> Option<(&CiWatch, crate::ci::timing::Limits)> {
+        let watch = self.context.ci.as_ref()?;
+        match crate::config::MayConfig::load_from(&watch.may_dir.join("config.toml")).await {
+            Ok(config) => Some((watch, config.ci.into())),
+            Err(error) => {
+                tracing::error!(%error, "the [ci] settings could not be read, so this PR's CI durations are not recorded");
+                None
+            }
+        }
+    }
+
+    /// Records the GitHub checks of `head_sha` and warns the user about an
+    /// abnormally long job. A recording failure is reported, never fatal: the
+    /// PR lands or fails on its checks, not on their timing.
+    async fn observe_github_checks(&self, pr: &crate::db::PrRow, owner_repo: &str, head_sha: &str) {
+        let (Some((watch, limits)), Ok(db), Some(external)) =
+            (self.ci_limits().await, self.db(), pr.external_number)
+        else {
+            return;
+        };
+        let actions = crate::ci::github::GhActions::new(owner_repo, external);
+        let recorder = crate::ci::record::Recorder {
+            db,
+            actions: &actions,
+            limits,
+        };
+        match recorder.observe_github(pr, head_sha).await {
+            Ok(Some(_)) => {
+                watch.ui_events.publish_session_change(
+                    &pr.session_id,
+                    crate::daemon::session_events::SessionChange::Warning,
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::error!(%error, pr = pr.number, "recording the PR's CI durations failed");
+            }
+        }
+    }
+
+    /// Records a local check that took `duration` and warns the user when it
+    /// ran abnormally long.
+    async fn observe_local_check(
+        &self,
+        pr: &crate::db::PrRow,
+        head_sha: &str,
+        command: &str,
+        started: jiff::Timestamp,
+        duration: std::time::Duration,
+        success: bool,
+    ) {
+        let (Some((watch, limits)), Ok(db)) = (self.ci_limits().await, self.db()) else {
+            return;
+        };
+        let recorder = crate::ci::record::Recorder {
+            db,
+            actions: &(),
+            limits,
+        };
+        match recorder
+            .observe_local(pr, head_sha, command, started, duration, success)
+            .await
+        {
+            Ok(Some(_)) => {
+                watch.ui_events.publish_session_change(
+                    &pr.session_id,
+                    crate::daemon::session_events::SessionChange::Warning,
+                );
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::error!(%error, pr = pr.number, "recording the local check's duration failed");
+            }
+        }
+    }
+
+    /// Records the PR's merge-queue wait against its run time.
+    async fn record_queue_wait(&self, pr: &crate::db::PrRow) {
+        let (Some((_, limits)), Ok(db)) = (self.ci_limits().await, self.db()) else {
+            return;
+        };
+        let recorder = crate::ci::record::Recorder {
+            db,
+            actions: &(),
+            limits,
+        };
+        if let Err(error) = recorder.record_queue_wait(pr).await {
+            tracing::error!(%error, pr = pr.number, "recording the merge-queue wait failed");
         }
     }
 }
@@ -1594,7 +1761,7 @@ struct RemoveCheckClone {
 }
 
 /// `gh` with the same error contract as [`git`].
-fn gh(args: &[&str]) -> Result<String, PrError> {
+pub(crate) fn gh(args: &[&str]) -> Result<String, PrError> {
     let output = std::process::Command::new("gh")
         .args(args)
         .output()
@@ -1791,6 +1958,7 @@ mod tests {
                     signing: self.signing(id),
                     github_api: PrContext::default_github_api(),
                     task_events: None,
+                    ci: None,
                     publish: None,
                 },
                 self.sandbox(id).await,
@@ -1854,6 +2022,7 @@ mod tests {
                         base,
                     ),
                     task_events: None,
+                    ci: None,
                     publish: None,
                 },
                 self.sandbox(id).await,
@@ -2243,6 +2412,7 @@ mod tests {
                 signing: fx.signing(id),
                 github_api,
                 task_events: None,
+                ci: None,
                 publish: None,
             },
             fx.sandbox(id).await,

@@ -5,7 +5,7 @@ use aither_core::llm::model::Parameters;
 
 use super::{
     AgentEnvironment, RuntimeSystemContext, build_agents_md_blocks, build_capabilities,
-    build_environment, build_work, tag,
+    build_efficiency, build_environment, build_work, tag,
 };
 
 #[test]
@@ -511,4 +511,19 @@ fn container_clone_outside_the_session_directory_panics() {
         source: "x".to_string(),
     };
     let _ = super::build_repo_clones_context(&[stray], &container_environment(), &session_paths);
+}
+
+#[test]
+fn the_efficiency_section_says_when_to_hand_exploration_to_explore() {
+    let prompt = build_efficiency(&[]);
+    assert!(
+        prompt.contains(
+            "When answering means reading across many files and only the conclusion matters"
+        ),
+        "{prompt}"
+    );
+    assert!(
+        prompt.contains("`explore --prompt-file <path>`"),
+        "{prompt}"
+    );
 }

@@ -7,6 +7,8 @@ mod agents_md;
 pub(crate) mod ask_user_tool;
 pub(crate) mod browser_tool;
 pub mod cache_miss;
+pub(crate) mod ci_alert;
+pub(crate) mod ci_tool;
 #[cfg(test)]
 mod compact_tool_tests;
 #[cfg(test)]
@@ -16,6 +18,7 @@ pub mod computer_tool;
 mod context_dump;
 mod context_report;
 mod environment;
+pub(crate) mod explore_tool;
 mod hooks;
 #[cfg(test)]
 mod host_load_tests;
@@ -72,6 +75,7 @@ pub use environment::{ResolveAgentEnvironmentError, resolve_agent_environment_fo
 pub use imagine::ImageGeneratorConfig;
 pub use live_limits::LiveLimits;
 pub use live_settings::AgentLiveSettings;
+pub(crate) use may::side_slot;
 pub use may::{
     AgentEnvironment, MayAgent, MayAgentConfig, MayAgentError, MayAgentSessionInput,
     generate_session_title,

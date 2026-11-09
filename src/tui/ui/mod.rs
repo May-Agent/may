@@ -1,5 +1,6 @@
 //! UI components for the TUI.
 
+pub mod band;
 pub mod chat;
 pub mod chat_layout;
 pub mod file_picker;

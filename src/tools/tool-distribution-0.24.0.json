@@ -402,14 +402,14 @@
     },
     {
       "tool": "apply_patch",
-      "version": "0.23.0",
+      "version": "0.24.0",
       "target": {
         "os": "macos",
         "arch": "aarch64"
       },
-      "url": "https://github.com/May-Agent/aither/releases/download/patch-v0.23.0/apply_patch-0.23.0-aarch64-apple-darwin.tar.gz",
-      "sha256": "953385bade65c8042398e00427c829fa46d05cc52c0b7448d588fd91a5650627",
-      "size": 39579,
+      "url": "https://github.com/May-Agent/aither/releases/download/patch-v0.24.0/apply_patch-0.24.0-aarch64-apple-darwin.tar.gz",
+      "sha256": "513142b974da6f0896fbd7885b943c4e023bea24a3884e3a1160aea9e0268360",
+      "size": 39581,
       "encoding": {
         "format": "tar_gzip",
         "executable": "apply_patch"
@@ -417,14 +417,14 @@
     },
     {
       "tool": "apply_patch",
-      "version": "0.23.0",
+      "version": "0.24.0",
       "target": {
         "os": "windows",
         "arch": "aarch64"
       },
-      "url": "https://github.com/May-Agent/aither/releases/download/patch-v0.23.0/apply_patch-0.23.0-aarch64-pc-windows-msvc.tar.gz",
-      "sha256": "8c1f1234460f47710edfa8a2102985cc3ea35cc82f9a91edbd83987a265dbee9",
-      "size": 47203,
+      "url": "https://github.com/May-Agent/aither/releases/download/patch-v0.24.0/apply_patch-0.24.0-aarch64-pc-windows-msvc.tar.gz",
+      "sha256": "c46c45e7d916064260ce8ad1bf8cce7a31d5413b8179f43d6bfe829b7bfef575",
+      "size": 47201,
       "encoding": {
         "format": "tar_gzip",
         "executable": "apply_patch.exe"
@@ -432,14 +432,14 @@
     },
     {
       "tool": "apply_patch",
-      "version": "0.23.0",
+      "version": "0.24.0",
       "target": {
         "os": "linux",
         "arch": "aarch64"
       },
-      "url": "https://github.com/May-Agent/aither/releases/download/patch-v0.23.0/apply_patch-0.23.0-aarch64-unknown-linux-musl.tar.gz",
-      "sha256": "fa1dba7596a00042611361b1c3df472dbb1194f793f48939bb77b3c96a7d8ef8",
-      "size": 57960,
+      "url": "https://github.com/May-Agent/aither/releases/download/patch-v0.24.0/apply_patch-0.24.0-aarch64-unknown-linux-musl.tar.gz",
+      "sha256": "dc60959a073af2389b75202a5bfd64db3f04d07880230f47fba36fca3e0d51a4",
+      "size": 57963,
       "encoding": {
         "format": "tar_gzip",
         "executable": "apply_patch"
@@ -447,14 +447,14 @@
     },
     {
       "tool": "apply_patch",
-      "version": "0.23.0",
+      "version": "0.24.0",
       "target": {
         "os": "windows",
         "arch": "x86_64"
       },
-      "url": "https://github.com/May-Agent/aither/releases/download/patch-v0.23.0/apply_patch-0.23.0-x86_64-pc-windows-msvc.tar.gz",
-      "sha256": "66732d2c97deeaa52bfe323a9d270a68b299468ce9ea480319eddca5ccba3c4f",
-      "size": 48504,
+      "url": "https://github.com/May-Agent/aither/releases/download/patch-v0.24.0/apply_patch-0.24.0-x86_64-pc-windows-msvc.tar.gz",
+      "sha256": "3beae6d0cef02bc89e936b237aaab6dbdfbff164d5d9458adcd56e6f16dbbaa6",
+      "size": 48508,
       "encoding": {
         "format": "tar_gzip",
         "executable": "apply_patch.exe"
@@ -462,14 +462,14 @@
     },
     {
       "tool": "apply_patch",
-      "version": "0.23.0",
+      "version": "0.24.0",
       "target": {
         "os": "linux",
         "arch": "x86_64"
       },
-      "url": "https://github.com/May-Agent/aither/releases/download/patch-v0.23.0/apply_patch-0.23.0-x86_64-unknown-linux-musl.tar.gz",
-      "sha256": "4dba5be33421df94b342690106f409983534669f294bae54f9228d33a18bb732",
-      "size": 55626,
+      "url": "https://github.com/May-Agent/aither/releases/download/patch-v0.24.0/apply_patch-0.24.0-x86_64-unknown-linux-musl.tar.gz",
+      "sha256": "f4d609470b48c0dba63efe8d0583246c4d34e28b73e654662f5e0373468b013c",
+      "size": 55634,
       "encoding": {
         "format": "tar_gzip",
         "executable": "apply_patch"
@@ -477,14 +477,14 @@
     },
     {
       "tool": "aither-sed",
-      "version": "0.23.0",
+      "version": "0.24.0",
       "target": {
         "os": "macos",
         "arch": "aarch64"
       },
-      "url": "https://github.com/May-Agent/aither/releases/download/patch-v0.23.0/aither-sed-0.23.0-aarch64-apple-darwin.tar.gz",
-      "sha256": "16f51992458a5cb405ff47d7a35c48e7ec4cfe9612a10435dbbd1bdbe5c3cb78",
-      "size": 23097,
+      "url": "https://github.com/May-Agent/aither/releases/download/patch-v0.24.0/aither-sed-0.24.0-aarch64-apple-darwin.tar.gz",
+      "sha256": "5350a86559a5ba9e9b656fd55783bac9a9c3934688e437c2d9758bf6d4919dc6",
+      "size": 23086,
       "encoding": {
         "format": "tar_gzip",
         "executable": "aither-sed"
@@ -492,14 +492,14 @@
     },
     {
       "tool": "aither-sed",
-      "version": "0.23.0",
+      "version": "0.24.0",
       "target": {
         "os": "linux",
         "arch": "aarch64"
       },
-      "url": "https://github.com/May-Agent/aither/releases/download/patch-v0.23.0/aither-sed-0.23.0-aarch64-unknown-linux-musl.tar.gz",
-      "sha256": "5ce978d77015e066a8f2d33d336c3b475e4d348aaede9c8625c5d3fda27f94df",
-      "size": 37468,
+      "url": "https://github.com/May-Agent/aither/releases/download/patch-v0.24.0/aither-sed-0.24.0-aarch64-unknown-linux-musl.tar.gz",
+      "sha256": "38291616d2cb14e7495d9a6183ea050f2580e7e9abcf3b698525c6eb1de9d6e7",
+      "size": 37469,
       "encoding": {
         "format": "tar_gzip",
         "executable": "aither-sed"
@@ -507,14 +507,14 @@
     },
     {
       "tool": "aither-sed",
-      "version": "0.23.0",
+      "version": "0.24.0",
       "target": {
         "os": "linux",
         "arch": "x86_64"
       },
-      "url": "https://github.com/May-Agent/aither/releases/download/patch-v0.23.0/aither-sed-0.23.0-x86_64-unknown-linux-musl.tar.gz",
-      "sha256": "040cb03f79603e70d28a5c4b479be97e2a03b59a610b518eb587daf9996064e1",
-      "size": 35768,
+      "url": "https://github.com/May-Agent/aither/releases/download/patch-v0.24.0/aither-sed-0.24.0-x86_64-unknown-linux-musl.tar.gz",
+      "sha256": "b8b4339b405c2d7d53f0af8b5fec182d51e562ac0c3942f47d7082aa8f63a032",
+      "size": 35765,
       "encoding": {
         "format": "tar_gzip",
         "executable": "aither-sed"
@@ -527,9 +527,9 @@
         "os": "macos",
         "arch": "aarch64"
       },
-      "url": "https://github.com/May-Agent/aither/releases/download/patch-v0.23.0/bash-5.3.20-aarch64-apple-darwin.tar.gz",
-      "sha256": "8cd91d6ae578ac13fc7a486c976bcc7586f24658f111a292452716532d44916a",
-      "size": 519357,
+      "url": "https://github.com/May-Agent/aither/releases/download/patch-v0.24.0/bash-5.3.20-aarch64-apple-darwin.tar.gz",
+      "sha256": "07b49e55b50199b44fda9a15e5ed426746273abb588cba020557cb52834d476c",
+      "size": 519355,
       "encoding": {
         "format": "tar_gzip",
         "executable": "bash"
@@ -542,8 +542,8 @@
         "os": "linux",
         "arch": "aarch64"
       },
-      "url": "https://github.com/May-Agent/aither/releases/download/patch-v0.23.0/bash-5.3.20-aarch64-unknown-linux-musl.tar.gz",
-      "sha256": "1258685330cbfab1070414fa5c23651f77d4b3245254f32dc3f1494ecf5542a3",
+      "url": "https://github.com/May-Agent/aither/releases/download/patch-v0.24.0/bash-5.3.20-aarch64-unknown-linux-musl.tar.gz",
+      "sha256": "0cfa24664dbdfd7398961882ad30c339a9d60f0ed89155e222eea817d2c8fff4",
       "size": 791333,
       "encoding": {
         "format": "tar_gzip",
@@ -557,8 +557,8 @@
         "os": "linux",
         "arch": "x86_64"
       },
-      "url": "https://github.com/May-Agent/aither/releases/download/patch-v0.23.0/bash-5.3.20-x86_64-unknown-linux-musl.tar.gz",
-      "sha256": "b3b2ae94ebcfb954a4bf2d36156538d275f74766c66e7a37060fc8911ae92070",
+      "url": "https://github.com/May-Agent/aither/releases/download/patch-v0.24.0/bash-5.3.20-x86_64-unknown-linux-musl.tar.gz",
+      "sha256": "f0daed3763a8ab69c11fe05ad105e989171fb5a5ccaf8715092338ce8ecdb043",
       "size": 788216,
       "encoding": {
         "format": "tar_gzip",

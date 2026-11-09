@@ -356,7 +356,6 @@ pub(super) struct PendingMessageAttachmentRow {
     pub(super) name: String,
     pub(super) attachment_type: String,
     pub(super) url: String,
-    pub(super) upload_data_url: Option<String>,
     pub(super) text_content: Option<String>,
 }
 

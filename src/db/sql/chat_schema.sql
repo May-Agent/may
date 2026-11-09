@@ -97,3 +97,12 @@ CREATE TABLE IF NOT EXISTS prompt_cache_routes (session_id TEXT NOT NULL, provid
 CREATE TABLE IF NOT EXISTS cache_misses (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, timestamp TEXT NOT NULL, model TEXT NOT NULL, provider_id TEXT NOT NULL, cause TEXT NOT NULL, missed_tokens INTEGER NOT NULL, read_tokens INTEGER NOT NULL, gap_ms INTEGER NOT NULL, diverged_kind TEXT, diverged_index INTEGER, compacted BOOLEAN NOT NULL, reassembled BOOLEAN NOT NULL, agent_rebuilt BOOLEAN NOT NULL, model_switched BOOLEAN NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_cache_misses_session_timestamp ON cache_misses(session_id, timestamp);
 CREATE TABLE IF NOT EXISTS sleep_log (id INTEGER PRIMARY KEY AUTOINCREMENT, slept_at_ms INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS ci_jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL, pr_id INTEGER NOT NULL, session_id TEXT NOT NULL, source TEXT NOT NULL, external_id INTEGER NOT NULL, run_id INTEGER NOT NULL, workflow TEXT NOT NULL, name TEXT NOT NULL, conclusion TEXT NOT NULL, started_at_ms INTEGER NOT NULL, duration_secs INTEGER NOT NULL, recorded_at_ms INTEGER NOT NULL, UNIQUE (project_id, source, external_id));
+CREATE INDEX IF NOT EXISTS idx_ci_jobs_pr ON ci_jobs(pr_id);
+CREATE INDEX IF NOT EXISTS idx_ci_jobs_name ON ci_jobs(project_id, workflow, name, started_at_ms);
+CREATE TABLE IF NOT EXISTS ci_steps (job_id INTEGER NOT NULL, ordinal INTEGER NOT NULL, name TEXT NOT NULL, duration_secs INTEGER NOT NULL, PRIMARY KEY (job_id, ordinal));
+CREATE TABLE IF NOT EXISTS ci_tests (job_id INTEGER NOT NULL, ordinal INTEGER NOT NULL, kind TEXT NOT NULL, name TEXT NOT NULL, duration_ms INTEGER NOT NULL, PRIMARY KEY (job_id, ordinal));
+CREATE TABLE IF NOT EXISTS ci_baselines (project_id INTEGER NOT NULL, workflow TEXT NOT NULL, name TEXT NOT NULL, median_secs INTEGER NOT NULL, samples INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL, PRIMARY KEY (project_id, workflow, name));
+CREATE TABLE IF NOT EXISTS ci_pr_runs (pr_id INTEGER PRIMARY KEY, queue_wait_secs INTEGER NOT NULL, run_secs INTEGER NOT NULL, recorded_at_ms INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS ci_findings (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, pr_id INTEGER NOT NULL, head_sha TEXT NOT NULL, warning TEXT NOT NULL, alert TEXT NOT NULL, alerted BOOLEAN NOT NULL DEFAULT 0, created_at_ms INTEGER NOT NULL, UNIQUE (pr_id, head_sha));
+CREATE INDEX IF NOT EXISTS idx_ci_findings_session ON ci_findings(session_id, id);

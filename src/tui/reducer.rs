@@ -28,6 +28,11 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             // cadence bounds how long an expired notice can linger.
             StatusNotice::clear_expired(&mut app.status, std::time::Instant::now());
             app.sync_profile_follow();
+            if app.new_year.check_due(std::time::Instant::now()) {
+                let zone = crate::tui::new_year::user_zone(&app.config.time);
+                app.new_year.set_date(jiff::Timestamp::now(), &zone);
+            }
+            app.new_year.tick();
             if app.processing
                 || app.index_loading
                 || (matches!(app.mode, AppMode::SessionSelect)
@@ -43,7 +48,7 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
                 // output + file-diff previews.
                 app.poll_live_output();
             }
-            // The jobs list and subagent runs arrive as `session_background`
+            // The jobs list and subagent runs arrive as `BackgroundLoaded`
             // events while anything runs; nothing to poll for them here.
             // Same cadence for an open job/subagent detail view.
             if let AppMode::JobDetail(state) = &app.mode
@@ -346,6 +351,20 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
                 } else {
                     app.chat.push_notice("Recap failed — try again");
                 }
+            }
+            Ok(None)
+        }
+        AppEvent::Warning {
+            session_id,
+            message,
+        } => {
+            if app
+                .session_manager
+                .current()
+                .is_some_and(|session| session.id.as_str() == session_id)
+            {
+                app.chat.push_warning(&message);
+                app.scroll = usize::MAX;
             }
             Ok(None)
         }

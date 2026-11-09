@@ -1,6 +1,6 @@
 # Where May's parts live
 
-Paths are relative to the May source checkout. `aither-sandbox` and `aither-agent` are the framework crates May builds on (version 0.23.0); their sources are in the cargo registry.
+Paths are relative to the May source checkout. `aither-sandbox` and `aither-agent` are the framework crates May builds on (version 0.25.0); their sources are in the cargo registry.
 
 ## Daemon and clients
 
@@ -31,7 +31,7 @@ Paths are relative to the May source checkout. `aither-sandbox` and `aither-agen
 ## Commands, skills, subagents
 
 - `src/terminal_commands.rs`: `register_shared_terminal_commands`, the list of IPC commands.
-- Command implementations: `src/agent/ask_user_tool.rs`, `issue_tool.rs`, `pr_tool.rs` (store in `src/pr.rs`), `repo_tool.rs`, `session_tool.rs`, `task_tool.rs`, `tunnel_tool.rs`, `browser_tool.rs`, `register_tool.rs`, `imagine.rs`; `src/repo_search/code_search.rs` (`search`); `src/agent_link.rs` (`agent`); `src/issue/` (May and GitHub backends).
+- Command implementations: `src/agent/ask_user_tool.rs`, `issue_tool.rs`, `pr_tool.rs` (store in `src/pr.rs`), `repo_tool.rs`, `session_tool.rs`, `task_tool.rs`, `tunnel_tool.rs`, `browser_tool.rs`, `register_tool.rs`, `imagine.rs`, `explore_tool.rs` (`explore`: the bundled read-only `explore` subagent on the fast model); `src/repo_search/code_search.rs` (`search`); `src/agent_link.rs` (`agent`); `src/issue/` (May and GitHub backends).
 - `src/skill.rs`: `SkillManager` (list, install from GitHub, register local). `src/bundle/mod.rs`: bundled skills embedded with `include_dir!` from `skills/` and written to `~/.may/skills`.
 - `aither-agent/src/specialized/task.rs`: `subagent` arguments; `aither-agent/subagents/*.toml`: the bundled definitions, written to `~/.may/subagents/`.
 - `src/memory.rs`: profile memory extraction; `templates/prompt/work.md`: the memory directory rule.
@@ -45,6 +45,7 @@ Paths are relative to the May source checkout. `aither-sandbox` and `aither-agen
 - `src/terminal_commands.rs`: `PrContext` construction and `configure_terminal_bound_tool("pr", …)`.
 - `src/workspace.rs`: `ProjectConfig.checks` and `ProjectPr` (`backend`, `screen`, `auto_merge`, `require_review`).
 - `src/db/pr.rs` and `prs` / `pr_events` in `src/db/sql/chat_schema.sql`: PR rows and the event trail.
+- `src/ci/`: CI durations. `record.rs` (`Recorder`: GitHub jobs and steps through `github.rs`, baselines, local checks, queue wait, the finding), `timing.rs` (median, p90, trend, the two thresholds), `logs.rs` (cargo test, nextest and bun test log parsers), `report.rs` (the alert, warning and `ci` templates in `templates/ci_*.txt`). `pr/merge_watch.rs` `Observing` fires the recorder when a PR's checks finish. Tables `ci_jobs`, `ci_steps`, `ci_tests`, `ci_baselines`, `ci_pr_runs`, `ci_findings` in `src/db/ci.rs`. `src/agent/ci_alert.rs` hands a finding to the agent once; `src/agent/ci_tool.rs` is the `ci` command; the warning rides `/api/events` as `session_warning` (`daemon/events.rs`). The `ci-optimise` skill is in `skills/ci-optimise/`.
 - `src/agent/permission.rs`: `for_subagent` and `SUBAGENT_APPROVAL_TIMEOUT` (no parent-approval step). `aither-agent/src/specialized/task.rs`: `worktrees` and `commit_worktrees` grants.
 
 ## Search

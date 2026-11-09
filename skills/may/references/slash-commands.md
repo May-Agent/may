@@ -25,7 +25,7 @@ Typing `/` in the TUI input opens a palette filtered as you type. Enter on a pal
 - `/recap` generates a catch-up summary card for the session. Refused while a turn runs ("run /recap when it finishes"); an empty session answers "nothing to recap". An idle session also gets one automatically (`[recap]`).
 - `/context` shows context-window usage; `/context dump` writes the verbatim assembled context to a file in the session (`outputs/context-dump.md`).
 - `/usage` shows the session's API usage: time spent in requests against the session's age, cost, a per-model breakdown, and prompt-cache misses by cause.
-- `/btw` opens an overlay for a side question: one lightweight answer with no tools, built from the most recent chat, never written into the conversation, and the main agent keeps running. Esc or q closes it. It needs a started session.
+- `/btw` opens an overlay for a side question: one lightweight answer with no tools, never written into the conversation, and the main agent keeps running. While the agent has a live context (idle or mid-turn) the answer comes from a read-only fork of that context; it is refused when the prompt cache has gone cold or the context is about to compact. `/progress` works the same way. Esc or q closes it. It needs a started session.
 
 ## Work in flight
 

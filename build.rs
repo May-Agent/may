@@ -9,7 +9,7 @@ use std::process::Command;
 mod image_ref;
 
 /// The pinned tool-distribution manifest the workspace image stages.
-const TOOL_DISTRIBUTION_MANIFEST: &str = "src/tools/tool-distribution-0.23.0.json";
+const TOOL_DISTRIBUTION_MANIFEST: &str = "src/tools/tool-distribution-0.24.0.json";
 
 fn main() {
     println!("cargo:rerun-if-env-changed=MAY_SKIP_WEB_UI_BUILD");
@@ -32,6 +32,17 @@ fn main() {
     assert!(
         Path::new("web-ui").exists(),
         "web-ui directory not found; cannot embed frontend assets"
+    );
+
+    let status = Command::new("bun")
+        .args(["install", "--frozen-lockfile"])
+        .current_dir("web-ui")
+        .status()
+        .unwrap_or_else(|err| panic!("failed to run bun install for web-ui: {err}"));
+
+    assert!(
+        status.success(),
+        "bun install --frozen-lockfile failed in web-ui; cannot embed dist assets"
     );
 
     let status = Command::new("bun")

@@ -114,11 +114,12 @@ impl SessionRuns {
         self.live.lock().expect("session runs map is poisoned")
     }
 
-    fn publish_runtime_change(&self) {
-        self.ui_event_bus.publish(
-            UiEventTopics::SESSION_RUNTIME
-                | UiEventTopics::SESSION_RUNTIMES
-                | UiEventTopics::PROFILE_SESSIONS,
+    fn publish_runtime_change(&self, session_id: &str) {
+        self.ui_event_bus
+            .publish(UiEventTopics::SESSION_RUNTIMES | UiEventTopics::PROFILE_SESSIONS);
+        self.ui_event_bus.publish_session_change(
+            session_id,
+            crate::daemon::session_events::SessionChange::Runtime,
         );
     }
 
@@ -175,7 +176,7 @@ impl SessionRuns {
                 return Err(AcquireError::Storage(error));
             }
         }
-        self.publish_runtime_change();
+        self.publish_runtime_change(&guard.fence.session_id);
         Ok(guard)
     }
 
@@ -342,7 +343,7 @@ impl SessionRunGuard {
                 "session run ended after another run took the session"
             );
         }
-        self.runs.publish_runtime_change();
+        self.runs.publish_runtime_change(&self.fence.session_id);
         Ok(held)
     }
 
@@ -407,7 +408,7 @@ impl Drop for SessionRunGuard {
         (self.runs.spawner)(Box::pin(async move {
             let _released_tx = released_tx;
             match runs.db.finish_session_run(&fence).await {
-                Ok(_) => runs.publish_runtime_change(),
+                Ok(_) => runs.publish_runtime_change(&fence.session_id),
                 Err(error) => tracing::error!(
                     session_id = %fence.session_id,
                     error = %error,

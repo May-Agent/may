@@ -257,10 +257,13 @@ pub struct App {
     pub pending_paste_results: std::collections::VecDeque<PendingPaste>,
     /// Pending attachment jobs (clipboard read / download)
     pub pending_attachment_jobs: usize,
-    /// Cumulative token usage for current session
+    /// Latest request's token usage; `prompt_tokens` is the status bar's
+    /// context footprint since every request resends the whole context
     pub usage: Option<aither_core::llm::Usage>,
     /// Decode-speed measurement for the streaming response
     pub decode_meter: crate::decode_meter::DecodeMeter,
+    /// New Year greeting and fireworks
+    pub new_year: crate::tui::new_year::NewYearState,
     /// Spinner animation frame for the activity indicator above the status bar
     pub spinner_frame: usize,
     /// What the in-flight run is doing (thinking vs. producing output)
@@ -319,6 +322,9 @@ pub struct App {
     pub event_tx: EventSender,
     /// Terminal image rendering support (None if terminal doesn't support graphics)
     pub image_support: Option<super::ui::image::TerminalImageSupport>,
+    /// Background of the input band, queried from the terminal at startup;
+    /// `None` keeps the terminal's default background.
+    pub band_bg: Option<ratatui::style::Color>,
     /// Image cache: URL -> fetched image state (for terminal image rendering)
     pub image_cache: ahash::AHashMap<String, super::ui::image::ImageState>,
     /// URLs currently being fetched (to avoid duplicate requests)
@@ -688,6 +694,7 @@ impl App {
             pending_attachment_jobs: 0,
             usage: None,
             decode_meter: crate::decode_meter::DecodeMeter::default(),
+            new_year: crate::tui::new_year::NewYearState::default(),
             spinner_frame: 0,
             activity_phase: crate::tui::ui::chat::ActivityPhase::Thinking,
             context_window: None,
@@ -732,6 +739,7 @@ impl App {
             btw_daemon: None,
             sidebar: super::sidebar::SidebarState::default(),
             chat_area: ratatui::layout::Rect::default(),
+            band_bg: None,
             jobs: Vec::new(),
             jobs_selected: 0,
             subagents: Vec::new(),
@@ -1119,7 +1127,7 @@ impl App {
         ) else {
             return;
         };
-        let path = crate::client::session_path(session.id.as_str(), "/btw");
+        let path = crate::client::session_path(session.id.as_str(), "/actions/btw");
         if let AppMode::Btw(state) = &mut self.mode {
             state.loading = true;
         }
@@ -1154,7 +1162,7 @@ impl App {
                 .push_notice("No model available for /progress — start a session first");
             return;
         };
-        let path = crate::client::session_path(session.id.as_str(), "/progress");
+        let path = crate::client::session_path(session.id.as_str(), "/actions/progress");
         self.mode = AppMode::Progress(super::state::ProgressState {
             loading: true,
             ..super::state::ProgressState::default()
@@ -1749,14 +1757,20 @@ impl App {
             turn.note(msg);
             match msg.role {
                 MessageRole::User => {
-                    let restored = futures_util::future::join_all(msg.attachments.iter().map(
-                        |att| async move {
-                            super::runtime::tui_attachment_from_persisted(att.clone())
+                    let daemon = self.session_manager.daemon_handle().ok();
+                    let restored =
+                        futures_util::future::join_all(msg.attachments.iter().map(|att| {
+                            let daemon = daemon.clone();
+                            async move {
+                                super::runtime::tui_attachment_from_persisted(
+                                    daemon.as_ref(),
+                                    att.clone(),
+                                )
                                 .await
                                 .map_err(|error| (att.name.clone(), error))
-                        },
-                    ))
-                    .await;
+                            }
+                        }))
+                        .await;
                     let mut attachments = Vec::with_capacity(restored.len());
                     for result in restored {
                         match result {
@@ -2338,6 +2352,11 @@ impl App {
         code: KeyCode,
         modifiers: KeyModifiers,
     ) -> AppResult<Option<SendAction>> {
+        // Any key ends the fireworks and is spent on that.
+        if self.new_year.animating() {
+            self.new_year.stop();
+            return Ok(None);
+        }
         // Global shortcuts
         if modifiers.contains(KeyModifiers::CONTROL) {
             match code {
@@ -2371,6 +2390,13 @@ impl App {
                     return Ok(None);
                 }
                 KeyCode::Left => return Ok(Some(SendAction::OpenQuestions)),
+                // Ctrl+F plays the New Year fireworks while the greeting shows.
+                KeyCode::Char('f')
+                    if matches!(self.mode, AppMode::Chat) && self.new_year.greeting() =>
+                {
+                    self.new_year.start();
+                    return Ok(None);
+                }
                 // Ctrl+B shows/hides the right sidebar (wide terminals only).
                 KeyCode::Char('b') => {
                     self.sidebar.enabled = !self.sidebar.enabled;
@@ -2408,6 +2434,19 @@ impl App {
         // Ctrl+V.
         if modifiers.contains(KeyModifiers::SUPER) && matches!(code, KeyCode::Char('v' | 'V')) {
             self.handle_paste();
+            return Ok(None);
+        }
+
+        // Cmd+Enter (Ctrl where Cmd cannot reach the app) opens the link
+        // under the pointer, as the same-modified click does.
+        if matches!(self.mode, AppMode::Chat)
+            && super::ui::links::dispatch_enter(
+                self.link_opener.as_ref(),
+                code,
+                modifiers,
+                self.hovered_link().as_ref(),
+            )
+        {
             return Ok(None);
         }
 
@@ -3096,6 +3135,13 @@ impl App {
         const SCROLL_STEP_LINES: usize = 3;
 
         self.hover = None;
+        // Any click ends the fireworks and is spent on that.
+        if self.new_year.animating() {
+            if matches!(mouse.kind, MouseEventKind::Down(_)) {
+                self.new_year.stop();
+            }
+            return Ok(None);
+        }
         match &self.mode {
             AppMode::Chat => {}
             AppMode::ImageView(_) => {
@@ -3144,6 +3190,13 @@ impl App {
             MouseEventKind::ScrollDown => self.scroll_chat_down(SCROLL_STEP_LINES),
             MouseEventKind::Down(MouseButton::Left) => {
                 let point = self.mouse_to_selection_point(mouse);
+                if let Some(p) = point
+                    && self.chat_layout.greeting_row() == Some(p.line)
+                {
+                    self.new_year.start();
+                    self.selection = None;
+                    return Ok(None);
+                }
                 // A click inside the composer moves the input caret to the
                 // hit cell instead of starting a text selection.
                 if let Some(p) = point
@@ -3810,6 +3863,31 @@ impl App {
         {
             return self.open_model_select(rest.trim());
         }
+        // `/btw` opens the side-question overlay and `/btw <question>`
+        // asks it at once — either way the line is a command, never a
+        // message to the agent.
+        if attachments.is_empty()
+            && let Some(rest) = trimmed.strip_prefix(SlashCommand::Btw.name())
+            && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+        {
+            let question = rest.trim();
+            self.open_btw();
+            if !question.is_empty()
+                && let AppMode::Btw(state) = &mut self.mode
+            {
+                state.input = question.to_string();
+                self.submit_btw();
+            }
+            return None;
+        }
+        // `/progress` is a side request too: never a message to the agent.
+        if attachments.is_empty()
+            && let Some(rest) = trimmed.strip_prefix(SlashCommand::Progress.name())
+            && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+        {
+            self.open_progress();
+            return None;
+        }
 
         self.sent_hidden_context = self.rewind_notice.take();
         let msg = PendingMessage {
@@ -4300,12 +4378,7 @@ impl App {
                     }
                     AgentEvent::Usage(u) => {
                         self.decode_meter.note_usage(u.completion_tokens);
-                        // Accumulate token usage
-                        if let Some(ref mut usage) = self.usage {
-                            usage.accumulate(&u);
-                        } else {
-                            self.usage = Some(u);
-                        }
+                        self.usage = Some(u);
                     }
                     AgentEvent::CompactionRecovery {
                         error,
@@ -4360,8 +4433,8 @@ impl App {
         )
     }
 
-    /// Mirror the daemon's pending-message queue from the last
-    /// `session_runtime` snapshot, so an enqueued message keeps a
+    /// Mirror the daemon's pending-message queue from the last runtime
+    /// snapshot, so an enqueued message keeps a
     /// `[steer]`/`[queue]` preview until the turn it starts renders it.
     pub fn sync_queue_from_runtime(&mut self) {
         let runtime = &self.session_runtime;
@@ -4697,7 +4770,10 @@ fn btw_message(role: &str, content: impl Into<String>) -> crate::daemon::BtwMess
 #[cfg(test)]
 mod tests {
     use super::utf8_complete_len;
-    use super::{App, AppEvent, KeyCode, KeyModifiers, MayConfig, MessageRole, SendAction};
+    use super::{
+        AgentEvent, App, AppEvent, KeyCode, KeyModifiers, MayConfig, MessageRole, SendAction,
+        TimedEvent,
+    };
     use crate::session::SessionManager;
     use crate::tui::ui::chat::ChatElement;
 
@@ -4847,6 +4923,25 @@ mod tests {
             .expect("key");
         press(&mut app, KeyCode::Char('b'));
         assert_eq!(app.input, "Ab", "plain and shifted characters still type");
+    }
+
+    /// An Enter carrying Ctrl or Cmd is a link-open request, not a submit:
+    /// with no link under the pointer it does nothing.
+    #[tokio::test]
+    async fn a_modified_enter_never_sends() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        for c in "draft".chars() {
+            press(&mut app, KeyCode::Char(c));
+        }
+        for modifier in [KeyModifiers::SUPER, KeyModifiers::CONTROL] {
+            assert!(
+                app.handle_key(KeyCode::Enter, modifier)
+                    .expect("key")
+                    .is_none()
+            );
+        }
+        assert_eq!(app.input, "draft", "a modified Enter sends nothing");
     }
 
     #[tokio::test]
@@ -5083,6 +5178,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn usage_events_keep_the_latest_request_not_their_sum() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        let usage = |prompt_tokens| {
+            Ok(TimedEvent {
+                at: "2026-11-07T00:00:00Z".parse().expect("time"),
+                event: AgentEvent::Usage(aither_core::llm::Usage {
+                    prompt_tokens: Some(prompt_tokens),
+                    ..aither_core::llm::Usage::default()
+                }),
+            })
+        };
+        app.handle_agent_event(usage(40_000)).await;
+        app.handle_agent_event(usage(45_000)).await;
+        assert_eq!(
+            app.usage.and_then(|u| u.prompt_tokens),
+            Some(45_000),
+            "each request resends the whole context, so prompt_tokens is \
+             the latest request's footprint, not a running total"
+        );
+    }
+
+    #[tokio::test]
     async fn a_stored_recap_row_is_restored_as_a_card_when_history_reloads() {
         let dir = tempfile::tempdir().expect("dir");
         let (mut app, _id) = app_with_session(dir.path()).await;
@@ -5305,6 +5423,131 @@ mod tests {
             app.mode,
             crate::tui::AppMode::PermissionConfirm(_)
         ));
+    }
+
+    /// The screen as rows of text.
+    fn draw_rows(
+        terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>,
+        app: &mut App,
+    ) -> Vec<String> {
+        terminal
+            .draw(|frame| crate::tui::ui::render(frame, app))
+            .expect("draw");
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn set_date(app: &mut App, date: &str, zone: &str) {
+        let zone = jiff::tz::TimeZone::get(zone).expect("zone");
+        let now = date
+            .parse::<jiff::civil::DateTime>()
+            .expect("datetime")
+            .to_zoned(zone.clone())
+            .expect("zoned")
+            .timestamp();
+        app.new_year.set_date(now, &zone);
+    }
+
+    #[tokio::test]
+    async fn the_greeting_sits_above_the_input_only_on_new_year_days() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        for zone in ["America/New_York", "Asia/Tokyo"] {
+            for (date, shown) in [
+                ("2026-12-30T12:00:00", false),
+                ("2026-12-31T12:00:00", true),
+                ("2027-01-01T12:00:00", true),
+                ("2027-01-02T12:00:00", false),
+            ] {
+                set_date(&mut app, date, zone);
+                let rows = draw_rows(&mut terminal, &mut app);
+                let greeting = rows
+                    .iter()
+                    .position(|row| row.contains(crate::tui::new_year::GREETING));
+                assert_eq!(greeting.is_some(), shown, "{date} in {zone}");
+                if greeting.is_some() {
+                    assert!(app.chat_layout.greeting_row().is_some());
+                } else {
+                    assert_eq!(app.chat_layout.greeting_row(), None);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fireworks_start_and_end_early_leave_the_chat_as_it_was() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        app.chat.push_user("hello", Vec::new(), 0);
+        app.input = "draft".to_string();
+        app.cursor = 5;
+        app.input_char_count = 5;
+        set_date(&mut app, "2026-12-31T12:00:00", "America/New_York");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).expect("terminal");
+        let before = draw_rows(&mut terminal, &mut app);
+        let scroll = app.scroll;
+
+        // Ctrl+F starts them; the animation paints over the chat.
+        app.handle_key(KeyCode::Char('f'), KeyModifiers::CONTROL)
+            .expect("key");
+        assert!(app.new_year.animating());
+        for _ in 0..10 {
+            app.new_year.tick();
+        }
+        assert_ne!(draw_rows(&mut terminal, &mut app), before, "sparks drawn");
+
+        // Any key ends them early and is not typed.
+        press(&mut app, KeyCode::Char('x'));
+        assert!(!app.new_year.animating());
+        assert_eq!(app.input, "draft");
+        assert_eq!(app.scroll, scroll);
+        assert_eq!(draw_rows(&mut terminal, &mut app), before);
+
+        // A click on the greeting starts them; a click anywhere ends them.
+        let row = app.chat_layout.greeting_row().expect("greeting row");
+        let area = app.chat_area;
+        let screen_row = area.y
+            + u16::try_from(row + app.chat_layout.top_padding() - app.effective_scroll())
+                .expect("row");
+        let click = |kind| crossterm::event::MouseEvent {
+            kind,
+            column: area.x + 2,
+            row: screen_row,
+            modifiers: KeyModifiers::NONE,
+        };
+        let down = crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left);
+        app.handle_mouse(click(down)).expect("mouse");
+        assert!(app.new_year.animating(), "clicking the greeting plays them");
+        app.handle_mouse(click(down)).expect("mouse");
+        assert!(!app.new_year.animating());
+        assert_eq!(draw_rows(&mut terminal, &mut app), before);
+
+        // They end by themselves.
+        app.new_year.start();
+        for _ in 0..crate::tui::new_year::Fireworks::FRAMES {
+            app.new_year.tick();
+        }
+        assert!(!app.new_year.animating());
+        assert_eq!(draw_rows(&mut terminal, &mut app), before);
+    }
+
+    #[tokio::test]
+    async fn ctrl_f_does_nothing_off_new_year_days() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        set_date(&mut app, "2026-12-30T12:00:00", "Asia/Tokyo");
+        app.handle_key(KeyCode::Char('f'), KeyModifiers::CONTROL)
+            .expect("key");
+        assert!(!app.new_year.animating());
     }
 
     async fn effort_app(dir: &std::path::Path) -> App {

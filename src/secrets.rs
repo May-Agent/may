@@ -677,6 +677,7 @@ impl Redactions {
                 Message::User { content, .. }
                 | Message::System { content }
                 | Message::Tool { content, .. } => self.redact_in_place(content),
+                Message::Configuration { .. } => {}
                 Message::Assistant {
                     content,
                     tool_calls,
@@ -687,7 +688,6 @@ impl Redactions {
                         self.redact_json(&mut call.arguments);
                     }
                 }
-                Message::Configuration { .. } => {}
             }
         }
     }

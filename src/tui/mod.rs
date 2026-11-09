@@ -20,6 +20,8 @@ pub mod event;
 pub mod file_diff;
 /// Persistent input history.
 pub mod history;
+/// New Year greeting and fireworks.
+pub mod new_year;
 /// Jank instrumentation (frame/loop timing for stall reports).
 pub mod perf;
 /// Pending message and attachment types.

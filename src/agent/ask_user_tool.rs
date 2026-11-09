@@ -482,13 +482,10 @@ mod tests {
         ));
         let mut builder = ToolRegistryBuilder::new();
         builder.configure_tool(AskUserTool::new(runtime, "session"));
-        let outputs = aither_sandbox::OutputStore::new(
-            dir.path().join("outputs"),
-            aither_core::AnyIdAllocator::default(),
+        (
+            builder.build(crate::test_support::test_output_store(dir.path().join("outputs")).await),
+            db,
         )
-        .await
-        .expect("the outputs directory is created");
-        (builder.build(outputs), db)
     }
 
     /// The single-question form takes the question as its positional

@@ -442,6 +442,18 @@ pub struct SuggestionFrame {
     pub text: Option<String>,
 }
 
+/// One frame of the `session_warning` event kind: something the user should
+/// know about the session's work, shown in the message stream and never
+/// part of the agent's context.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WarningFrame {
+    /// Session the warning belongs to.
+    pub session_id: String,
+    /// The warning text.
+    pub message: String,
+}
+
 /// One frame of the `session_recap` event kind.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -564,13 +576,78 @@ pub struct SessionIndexSnapshot {
 
 /// One `session_issues` event: the issues the session's tasks link, as the
 /// issue store reports them now.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionIssuesFrame {
     /// Session the issues are linked from.
     pub session_id: String,
     /// One brief per linked issue.
     pub issues: Vec<crate::tui::sidebar::IssueBrief>,
+}
+
+/// One `job.upserted` event: a job new to or changed in the session's
+/// background snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobUpsertedFrame {
+    /// Session the job belongs to.
+    pub session_id: String,
+    /// The job as it stands now.
+    pub job: super::background::WireJob,
+}
+
+/// One `job.removed` event: a job gone from the session's background
+/// snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobRemovedFrame {
+    /// Session the job belonged to.
+    pub session_id: String,
+    /// The removed job's pid.
+    pub pid: u32,
+}
+
+/// One `subagent.upserted` event: a subagent run new to or changed in the
+/// session's background snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentUpsertedFrame {
+    /// Session the run belongs to.
+    pub session_id: String,
+    /// The run as it stands now.
+    pub subagent: super::background::WireSubagentRun,
+}
+
+/// One `subagent.removed` event: a subagent run gone from the session's
+/// background snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentRemovedFrame {
+    /// Session the run belonged to.
+    pub session_id: String,
+    /// The removed run's id.
+    pub run_id: u64,
+}
+
+/// One `issue.upserted` event: a linked issue new to or changed in the
+/// session's list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IssueUpsertedFrame {
+    /// Session the issue is linked from.
+    pub session_id: String,
+    /// The issue as it stands now.
+    pub issue: crate::tui::sidebar::IssueBrief,
+}
+
+/// One `issue.removed` event: a linked issue gone from the session's list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IssueRemovedFrame {
+    /// Session the issue was linked from.
+    pub session_id: String,
+    /// The removed issue's number.
+    pub key: i64,
 }
 
 /// How much of a worktree index carries a vector.
@@ -754,8 +831,119 @@ pub struct UpdateSessionRequest {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RewindRequest {
-    /// Index into the session's stored message list where the cut starts.
-    pub index: usize,
+    /// Transcript entry id of the user message where the cut starts.
+    pub entry_id: String,
+}
+
+/// `GET /api/sessions/{id}/transcript` response: a page of folded
+/// transcript entries; `hasMore`/`cursor` are unused by the TUI today.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WireTranscriptPage {
+    /// Entries, oldest first.
+    pub entries: Vec<WireTranscriptEntry>,
+}
+
+/// One transcript entry; `kind` tags the variant.
+#[derive(Debug, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum WireTranscriptEntry {
+    /// User prompt.
+    User {
+        /// Stored row id of the entry's first row, as a decimal string.
+        id: String,
+        /// RFC3339 timestamp.
+        timestamp: Option<String>,
+        /// Prompt text.
+        text: String,
+        /// Attachments, as the daemon records them.
+        attachments: Vec<crate::session::PersistedAttachment>,
+    },
+    /// Assistant reply.
+    Assistant {
+        /// Stored row id.
+        id: String,
+        /// RFC3339 timestamp.
+        timestamp: Option<String>,
+        /// Reply text.
+        text: String,
+        /// Thinking transcript, when present.
+        thinking: Option<String>,
+        /// Display translation, when present.
+        translation: Option<crate::session::history::MessageTranslation>,
+        /// Token stats, when present.
+        stats: Option<crate::session::ChatMessageStats>,
+    },
+    /// Tool call, merged from its start and end rows.
+    ToolCall {
+        /// Stored row id of the call's start record.
+        id: String,
+        /// RFC3339 timestamp.
+        timestamp: Option<String>,
+        /// Tool call id.
+        call_id: String,
+        /// Tool name.
+        name: String,
+        /// Raw JSON arguments.
+        arguments: String,
+        /// `running`, `done` or `stopped`.
+        status: String,
+        /// Stored result, when finished.
+        result: Option<aither_core::llm::ToolResult>,
+    },
+    /// An agent question or permission/workspace request.
+    InteractionRequest {
+        /// Stored row id.
+        id: String,
+        /// RFC3339 timestamp.
+        timestamp: Option<String>,
+        /// `askUser`, `permission` or `workspace`.
+        interaction: String,
+        /// Stored content.
+        content: String,
+    },
+    /// The user's answer to an interaction request.
+    InteractionResponse {
+        /// Stored row id.
+        id: String,
+        /// RFC3339 timestamp.
+        timestamp: Option<String>,
+        /// `askUser`, `permission` or `workspace`.
+        interaction: String,
+        /// Stored content.
+        content: String,
+    },
+    /// Hidden per-turn context.
+    HiddenContext {
+        /// Stored row id.
+        id: String,
+        /// RFC3339 timestamp.
+        timestamp: Option<String>,
+        /// Stored content.
+        text: String,
+    },
+    /// Daemon-generated catch-up summary.
+    Recap {
+        /// Stored row id.
+        id: String,
+        /// RFC3339 timestamp.
+        timestamp: Option<String>,
+        /// Stored content.
+        content: String,
+    },
+    /// System row.
+    System {
+        /// Stored row id.
+        id: String,
+        /// RFC3339 timestamp.
+        timestamp: Option<String>,
+        /// Stored content.
+        text: String,
+    },
 }
 
 /// One `GET /api/sessions/{id}` response, the fields a client session needs.
@@ -778,6 +966,10 @@ pub struct WireSession {
     /// Repository binding, if any.
     #[serde(default)]
     pub repo: Option<String>,
+    /// `?after=` cursor for `/api/sessions/{id}/events`; present on
+    /// `GET /api/sessions/{id}` only.
+    #[serde(default)]
+    pub cursor: Option<String>,
 }
 
 /// One session PR over the wire, mirroring the daemon's `ApiPr`.
@@ -801,8 +993,23 @@ pub struct WirePr {
     /// Whether the PR merges itself once checks pass.
     #[serde(default)]
     pub auto_merge: bool,
+    /// Live check rollup of the PR's head, when the daemon read one.
+    #[serde(default)]
+    pub checks: Option<WirePrChecks>,
     /// Latest update timestamp.
     pub updated_at: String,
+}
+
+/// How many of a PR's checks sit in each state — the rollup GitHub shows.
+#[derive(Debug, Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WirePrChecks {
+    /// Still running or not yet reported.
+    pub pending: u32,
+    /// Concluded successfully.
+    pub passed: u32,
+    /// Failed, timed out, cancelled or errored.
+    pub failed: u32,
 }
 
 #[cfg(test)]

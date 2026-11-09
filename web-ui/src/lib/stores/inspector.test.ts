@@ -226,12 +226,16 @@ describe('inspector store', () => {
     expect(entry.stopping.subagents).toEqual([]);
   });
 
-  test('session_background frames on the turn stream reach the inspector', async () => {
+  test('job deltas on the session stream reach the inspector', async () => {
     let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
-    let topics = '';
     installFetch((url) => {
-      if (url.startsWith('/api/events?')) {
-        topics = new URLSearchParams(url.slice(url.indexOf('?') + 1)).get('topics') ?? '';
+      if (url === '/api/sessions/A/background') {
+        return new Response(
+          JSON.stringify({ sessionId: 'A', jobs: [], subagents: [] }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } },
+        );
+      }
+      if (url.startsWith('/api/sessions/A/events')) {
         return new Response(
           new ReadableStream<Uint8Array>({
             start(c) {
@@ -245,20 +249,16 @@ describe('inspector store', () => {
     });
     const unwatch = useTurnStore.getState().watch('A');
     await settle();
-    expect(topics.split(',')).toEqual(['session_turn', 'session_background']);
-    const send = (sessionId: string, jobs: BackgroundJob[]) =>
+    const send = (kind: string, data: Record<string, unknown>) =>
       controller!.enqueue(
-        encoder.encode(
-          `event: session_background\ndata: ${JSON.stringify(snapshot(sessionId, jobs))}\n\n`,
-        ),
+        encoder.encode(`event: ${kind}\ndata: ${JSON.stringify(data)}\n\n`),
       );
-    send('A', [job(1, 'running')]);
-    // A frame for another session is ignored.
-    send('B', [job(2, 'running')]);
+    send('job.upserted', { sessionId: 'A', job: job(1, 'running') });
+    send('job.removed', { sessionId: 'A', pid: 1 });
+    send('job.upserted', { sessionId: 'A', job: job(2, 'running') });
     await settle();
     unwatch();
     const { sessions } = useInspectorStore.getState();
-    expect(sessions.A.background?.jobs.map((j) => j.pid)).toEqual([1]);
-    expect(sessions.B).toBeUndefined();
+    expect(sessions.A.background?.jobs.map((j) => j.pid)).toEqual([2]);
   });
 });

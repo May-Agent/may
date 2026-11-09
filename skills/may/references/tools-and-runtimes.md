@@ -8,7 +8,7 @@ Before a script runs, May refuses it when the script's own shell would run `grep
 
 ## What May provides
 
-May embeds a hash-pinned tool distribution (`src/tools/tool-distribution-0.23.0.json`, the byte-exact release asset of aither's `patch-v0.23.0`). Artifacts are downloaded on first use from their upstream release URLs and verified against their SHA-256 before anything runs them.
+May embeds a hash-pinned tool distribution (`src/tools/tool-distribution-0.24.0.json`, the byte-exact release asset of aither's `patch-v0.24.0`). Artifacts are downloaded on first use from their upstream release URLs and verified against their SHA-256 before anything runs them.
 
 | command | what | version |
 | --- | --- | --- |
@@ -17,8 +17,8 @@ May embeds a hash-pinned tool distribution (`src/tools/tool-distribution-0.23.0.
 | `ast-grep` | syntax-aware search | 0.45.3 |
 | `fd` | file finder | 10.5.0 |
 | `jq` | JSON | 1.8.2 |
-| `apply_patch` | contextual multi-file editing | 0.23.0 |
-| `aither-sed` | decides which `sed` forms scripts may use (line ranges); the host `sed` runs them | 0.23.0 |
+| `apply_patch` | contextual multi-file editing | 0.24.0 |
+| `aither-sed` | decides which `sed` forms scripts may use (line ranges); the host `sed` runs them | 0.25.0 |
 | `xargs` | uutils findutils | 0.11.0 |
 | coreutils (`ls`, `cat`, `cp`, `mv`, `rm`, `mkdir`, `head`, `sort`, `date`, `env`, `sha256sum`, `stat`, and the rest of the uutils utilities) | uutils coreutils multicall binary, each name a symlink to it; not `grep`, `sed`, `awk`, `find` | 0.12.0 |
 | `uv` | Python package and project manager | 0.13.7 |

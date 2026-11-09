@@ -51,7 +51,7 @@ impl Host {
     async fn bash_runs_in(&self, id: &str, dir: &Path) -> bool {
         let status = self
             .post(
-                &format!("/api/sessions/{id}/bash"),
+                &format!("/api/sessions/{id}/actions/bash"),
                 r#"{"command":"touch ran-here"}"#,
             )
             .await;

@@ -68,6 +68,10 @@ const fn default_list_state() -> IssueListState {
 /// - `issue edit <number> [--title t] [--body b] [--state open|closed]`
 /// - `issue comment <number> <body>` — on a repository the user does not own,
 ///   waits for the user's approval unless the user opened the issue
+///
+/// `--body`/`<body>` take the text literally: a `\n` in it stays a literal
+/// backslash-n. Write real newlines with `printf`, `$'...\n...'` or a
+/// heredoc.
 /// - `issue close <number>` (reopen with `edit --state open`)
 /// - `issue label <number> [--add name ...] [--remove name ...]`
 /// - `issue blocked-by <number> [--add n ...] [--remove n ...]` — the issue
@@ -83,7 +87,8 @@ pub enum IssueArgs {
         kind: IssueKind,
         /// Issue title.
         title: String,
-        /// Issue body (markdown).
+        /// Issue body (markdown). Literal: a `\n` in it stays a backslash-n;
+        /// pass real newlines (`printf`, `$'...\n...'`, heredoc).
         #[serde(default)]
         body: Option<String>,
         /// Labels to apply.
@@ -156,7 +161,8 @@ pub enum IssueArgs {
         /// New title.
         #[serde(default)]
         title: Option<String>,
-        /// New body.
+        /// New body. Literal: a `\n` in it stays a backslash-n; pass real
+        /// newlines (`printf`, `$'...\n...'`, heredoc).
         #[serde(default)]
         body: Option<String>,
         /// New state (`open` reopens, `closed` closes).
@@ -167,7 +173,8 @@ pub enum IssueArgs {
     Comment {
         /// Issue number.
         number: i64,
-        /// Comment body.
+        /// Comment body. Literal: a `\n` in it stays a backslash-n; pass real
+        /// newlines (`printf`, `$'...\n...'`, heredoc).
         body: String,
     },
     /// Close an issue.
@@ -298,18 +305,29 @@ struct IssueSearchText<'a> {
 /// Tells connected clients that an issue changed, so the issues they show
 /// are looked up again.
 #[derive(Clone)]
-pub struct IssueChangeNotifier(std::sync::Arc<crate::session::SessionRuntimeService>);
+pub struct IssueChangeNotifier {
+    runtime: std::sync::Arc<crate::session::SessionRuntimeService>,
+    session_id: String,
+}
 
 impl IssueChangeNotifier {
     /// Publish through the daemon's runtime service.
     #[must_use]
-    pub const fn new(runtime: std::sync::Arc<crate::session::SessionRuntimeService>) -> Self {
-        Self(runtime)
+    pub fn new(
+        runtime: std::sync::Arc<crate::session::SessionRuntimeService>,
+        session_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            runtime,
+            session_id: session_id.into(),
+        }
     }
 
     fn notify(&self) {
-        self.0
-            .publish_ui_events(crate::ui_event_bus::UiEventTopics::SESSION_ISSUES);
+        self.runtime.publish_session_change(
+            &self.session_id,
+            crate::daemon::session_events::SessionChange::Issues,
+        );
     }
 }
 
@@ -1449,13 +1467,15 @@ mod tests {
             .expect("chat db should open");
         let bus = crate::ui_event_bus::UiEventBus::new();
         let mut events = bus.subscribe();
+        let (changes_tx, changes_rx) = async_channel::unbounded();
+        bus.set_session_changes(changes_tx);
         let runtime =
             std::sync::Arc::new(crate::session::SessionRuntimeService::new(db.clone(), bus));
         let provenance = IssueProvenance::new(db.clone(), "test".to_string());
         let store = crate::issue::MayIssueStore::new(db, "test".to_string());
         let seed = store.create("seed", "body", &[]).await.expect("seed issue");
-        let tool =
-            IssueTool::new(store, provenance).with_changes(IssueChangeNotifier::new(runtime));
+        let tool = IssueTool::new(store, provenance)
+            .with_changes(IssueChangeNotifier::new(runtime, "test"));
 
         tool.call(
             IssueArgs::View {
@@ -1479,9 +1499,14 @@ mod tests {
         )
         .await
         .expect("rename");
+        assert!(events.try_recv().is_err(), "the topics bus is quiet");
+        let notice = changes_rx
+            .try_recv()
+            .expect("the rename is announced to the session stream");
+        assert_eq!(notice.session_id, "test");
         assert_eq!(
-            events.try_recv().expect("the rename is announced"),
-            crate::ui_event_bus::UiEventTopics::SESSION_ISSUES
+            notice.kind,
+            crate::daemon::session_events::SessionChange::Issues
         );
     }
 
