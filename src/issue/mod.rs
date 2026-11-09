@@ -570,12 +570,16 @@ pub fn resolve_bound_issue_store(
                     GhCliTokenSource,
                 )));
             }
-            // Issues kept internal stay under the checkout's identity when
-            // there is one, so they do not move when a session is bound.
-            let key = repository_identity(cwd).map_or_else(
-                |_| format!("github:{repository}"),
-                |i| i.display().to_string(),
-            );
+            // Issues kept internal have one key per repository, whatever
+            // directory the session runs in: the identity of the project's
+            // checkout when the workspace names one, else the repository.
+            let key = match config
+                .project_for_github(repository)
+                .and_then(|project| project.path.as_deref())
+            {
+                Some(path) => repository_identity(path)?.display().to_string(),
+                None => format!("github:{repository}"),
+            };
             Ok(ResolvedIssueStore::May(MayIssueStore::new(db, key)))
         }
     }
@@ -651,6 +655,46 @@ mod tests {
             checks: None,
             pr: crate::workspace::ProjectPr::default(),
         }
+    }
+
+    /// A prs-only repository's May issues have one key, whether the session
+    /// runs in the project's checkout or in no directory at all.
+    #[tokio::test]
+    async fn internal_issues_of_a_github_binding_share_one_key() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let repo = dir.path().join("repo");
+        git2::Repository::init(&repo).expect("git init");
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).expect("elsewhere");
+        let binding = crate::session::RepoBinding::parse("github:owner/repo").expect("binding");
+        let db = ChatDb::open(&dir.path().join("history.db"))
+            .await
+            .expect("db");
+        let config_path = dir.path().join("workspace.toml");
+        let key = |cwd: &std::path::Path| {
+            super::IssueStore::search_key(
+                &super::resolve_bound_issue_store(Some(&binding), cwd, &config_path, db.clone())
+                    .expect("store"),
+            )
+        };
+
+        let config = WorkspaceConfig {
+            projects: vec![ProjectConfig {
+                path: Some(repo.clone()),
+                repository: Some("owner/repo".parse().expect("owner/repo")),
+                issues: ProjectIssues::May,
+                checks: None,
+                pr: crate::workspace::ProjectPr::default(),
+            }],
+            ..WorkspaceConfig::default()
+        };
+        config.save(&config_path).expect("save workspace config");
+        assert_eq!(key(&repo), key(&elsewhere));
+
+        WorkspaceConfig::default()
+            .save(&config_path)
+            .expect("save workspace config");
+        assert_eq!(key(&repo), key(&elsewhere));
     }
 
     /// A trusted project whose directory was deleted matches nothing: the
