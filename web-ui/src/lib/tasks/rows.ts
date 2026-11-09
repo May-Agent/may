@@ -45,6 +45,11 @@ export function referenceLabel(reference: TaskReference): string {
   return reference.pullRequest ? `PR ${text}` : text;
 }
 
+/** The rows whose `BLOCKING` mark names the `ask_user` question `requestId`. */
+export function rowsBlockedBy(rows: readonly TaskRow[], requestId: string): TaskRow[] {
+  return rows.filter((row) => row.blocking === requestId);
+}
+
 /** Number of rows that are open work. */
 export function openCount(rows: readonly TaskRow[]): number {
   return rows.filter((row) => OPEN_SECTIONS.includes(row.section)).length;

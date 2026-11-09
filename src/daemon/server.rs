@@ -185,6 +185,7 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
     let lease_handle = tokio::runtime::Handle::current();
     let runtime_service = Arc::new(
         crate::session::SessionRuntimeService::new(db_for_archive.clone(), ui_event_bus.clone())
+            .with_home(crate::session::MayHomePaths::new(may_dir.clone()))
             .with_spawner(Arc::new(move |task| {
                 lease_handle.spawn(task);
             })),

@@ -37,7 +37,7 @@ async fn bounded<T>(what: &str, future: impl Future<Output = T>) -> T {
 }
 
 struct Fixture {
-    _dir: TempDir,
+    dir: TempDir,
     path: std::path::PathBuf,
 }
 
@@ -50,7 +50,7 @@ impl Fixture {
         db.create_session("session", Some("Session"), Some("test-model"))
             .await
             .expect("create session");
-        Self { _dir: dir, path }
+        Self { dir, path }
     }
 
     /// A runtime service over a fresh connection to the file, as a process
@@ -59,6 +59,108 @@ impl Fixture {
         let db = ChatDb::open(&self.path).await.expect("open handle");
         Arc::new(SessionRuntimeService::new(db, UiEventBus::new()))
     }
+}
+
+impl Fixture {
+    /// A runtime service whose sessions live under a May home in the
+    /// fixture's directory, and the `tasks.md` path of "session".
+    async fn service_with_home(&self) -> (Arc<SessionRuntimeService>, std::path::PathBuf) {
+        let db = ChatDb::open(&self.path).await.expect("open handle");
+        let home = crate::session::MayHomePaths::new(self.dir.path().join("home"));
+        let tasks = home.session_paths("session").tasks_path();
+        std::fs::create_dir_all(tasks.parent().expect("a session directory"))
+            .expect("session directory");
+        (
+            Arc::new(SessionRuntimeService::new(db, UiEventBus::new()).with_home(home)),
+            tasks,
+        )
+    }
+}
+
+/// The text the answer queued for the agent.
+async fn queued_reminder(service: &SessionRuntimeService) -> String {
+    service
+        .get("session")
+        .await
+        .expect("runtime loads")
+        .pending_immediate
+        .expect("the answer is queued")
+        .hidden_context_xml
+        .expect("hidden context")
+        .to_string()
+}
+
+/// Answering a question removes every mark naming it from `tasks.md`, leaves
+/// other marks, names the rows it unblocked in the reminder and raises no
+/// dead-blocker alert; a question blocking no row says so.
+#[tokio::test]
+async fn an_answer_clears_the_marks_naming_it_and_names_the_rows() {
+    let fixture = Fixture::new().await;
+    let (service, tasks) = fixture.service_with_home().await;
+    let blocking = ask(&service, which_database()).await;
+    let other = ask(&service, which_database()).await;
+    std::fs::write(
+        &tasks,
+        format!(
+            "## Doing\n- 迁移数据库\n  BLOCKING {blocking}\n- データベース設計 BLOCKING {blocking}\n- 문서\n  BLOCKING {other}\n\n## Queued\n- tests\n"
+        ),
+    )
+    .expect("tasks.md");
+
+    service
+        .answer_ask_user(&blocking, &[selected("", "SQLite")])
+        .await
+        .expect("the answer commits");
+
+    assert_eq!(
+        std::fs::read_to_string(&tasks).expect("tasks.md"),
+        format!(
+            "## Doing\n- 迁移数据库\n- データベース設計\n- 문서\n  BLOCKING {other}\n\n## Queued\n- tests\n"
+        )
+    );
+    let reminder = queued_reminder(&service).await;
+    assert!(
+        reminder.contains(&format!(
+            "no longer marks these rows BLOCKING {blocking}; they are pending again:\n1. 迁移数据库\n2. データベース設計\nContinue"
+        )),
+        "{reminder}"
+    );
+    assert!(!reminder.contains("\n\n"), "{reminder:?}");
+
+    // The document no longer names the question: no alert.
+    let mut document = crate::tasks_md::schema::working_document(
+        tasks.parent().expect("a session directory"),
+        service.task_events("session"),
+    );
+    aither_agent::ContextSource::on_request(&mut document, false).await;
+    let alert = aither_agent::ContextSource::on_tool_turn_end(&mut document).await;
+    assert!(
+        alert.is_none(),
+        "{:?}",
+        alert.map(|a| a.content().to_string())
+    );
+}
+
+/// A question that blocks no row edits nothing and says so.
+#[tokio::test]
+async fn an_answer_to_a_question_that_blocks_nothing_edits_nothing() {
+    let fixture = Fixture::new().await;
+    let (service, tasks) = fixture.service_with_home().await;
+    let id = ask(&service, which_database()).await;
+    let document = "## Doing\n- wire it\n  BLOCKING waiting on review\n";
+    std::fs::write(&tasks, document).expect("tasks.md");
+
+    service
+        .answer_ask_user(&id, &[selected("", "SQLite")])
+        .await
+        .expect("the answer commits");
+
+    assert_eq!(std::fs::read_to_string(&tasks).expect("tasks.md"), document);
+    let reminder = queued_reminder(&service).await;
+    assert!(
+        reminder.contains(&format!("No row of tasks.md was marked BLOCKING {id}.")),
+        "{reminder}"
+    );
 }
 
 fn which_database() -> AskUserArgs {

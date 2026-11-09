@@ -309,6 +309,7 @@ export const enUS = {
       other: 'Other',
       failed: 'Could not send the answer. The question may no longer be open.',
       openTitle: 'May asked a question',
+      blocks: 'Blocks',
       secretLabel: 'Secret value',
       secretHintGlobal: 'Stored as {name} for every session. May never sees the value.',
       secretHintSession: 'Stored as {name} for this session only. May never sees the value.',

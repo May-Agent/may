@@ -1322,6 +1322,7 @@ impl DaemonState {
         let lease_handle = tokio::runtime::Handle::current();
         let runtime_service = std::sync::Arc::new(
             crate::session::SessionRuntimeService::new(db.clone(), ui_event_bus.clone())
+                .with_home(crate::session::MayHomePaths::new(may_dir.to_path_buf()))
                 .with_spawner(std::sync::Arc::new(move |task| {
                     lease_handle.spawn(task);
                 })),
