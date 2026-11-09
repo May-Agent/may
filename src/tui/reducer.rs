@@ -27,6 +27,7 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             // Sweep a transient status notice whose deadline passed; the tick
             // cadence bounds how long an expired notice can linger.
             StatusNotice::clear_expired(&mut app.status, std::time::Instant::now());
+            app.compaction.clear_expired(std::time::Instant::now());
             app.sync_profile_follow();
             if app.new_year.check_due(std::time::Instant::now()) {
                 let zone = crate::tui::new_year::user_zone(&app.config.time);

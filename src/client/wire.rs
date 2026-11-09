@@ -234,6 +234,21 @@ pub enum WireAgentEvent {
         /// Long tool outputs the cleanup moved to files.
         outputs_spilled: usize,
     },
+    /// The run checkpointed after a turn or at its end; `phase` says whether
+    /// a compaction is in flight.
+    Checkpoint {
+        /// The run.
+        run_id: String,
+        /// Whether the checkpoint is the run's last rather than a turn
+        /// boundary.
+        stop: bool,
+        /// The turn.
+        turn: usize,
+        /// Lifecycle phase of the context window.
+        phase: aither_agent::ContextWindowPhase,
+        /// Recent messages held in memory.
+        message_count: usize,
+    },
     /// The agent failed.
     Error {
         /// The failure.
@@ -321,6 +336,19 @@ impl WireAgentEvent {
                 final_text: final_text.clone(),
                 turns: *turns,
             },
+            AgentEvent::Checkpoint {
+                run_id,
+                reason,
+                turn,
+                phase,
+                message_count,
+            } => Self::Checkpoint {
+                run_id: run_id.clone(),
+                stop: *reason == aither_agent::CheckpointReason::Stop,
+                turn: *turn,
+                phase: *phase,
+                message_count: *message_count,
+            },
             AgentEvent::CompactionRecovery {
                 error,
                 alerts_removed,
@@ -382,6 +410,23 @@ impl WireAgentEvent {
                 has_tool_calls,
             },
             Self::Complete { final_text, turns } => AgentEvent::Complete { final_text, turns },
+            Self::Checkpoint {
+                run_id,
+                stop,
+                turn,
+                phase,
+                message_count,
+            } => AgentEvent::Checkpoint {
+                run_id,
+                reason: if stop {
+                    aither_agent::CheckpointReason::Stop
+                } else {
+                    aither_agent::CheckpointReason::TurnBoundary
+                },
+                turn,
+                phase,
+                message_count,
+            },
             Self::CompactionRecovery {
                 error,
                 alerts_removed,

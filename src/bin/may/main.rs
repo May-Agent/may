@@ -1126,6 +1126,7 @@ where
             // that ends them so no spark stays on screen.
             needs_draw = app.processing
                 || app.new_year.animating()
+                || app.compaction.is_holding()
                 || last_draw.elapsed() >= std::time::Duration::from_secs(1);
         }
         let event_kind = match &event {
@@ -1265,15 +1266,18 @@ where
                     }
                     TuiEvent::Compacted(result) => match result {
                         Ok(Some(stats)) => {
+                            app.compaction.finish(std::time::Instant::now());
                             app.set_status(format!(
                                 "Compacted {} messages",
                                 stats.messages_compacted
                             ));
                         }
                         Ok(None) => {
+                            app.compaction.cancel();
                             app.set_status("Nothing to compact");
                         }
                         Err(err) => {
+                            app.compaction.cancel();
                             app.chat.push_error(&format!("Compaction failed: {err}"));
                         }
                     },
@@ -1911,6 +1915,7 @@ where
                             if let Some(w) = worker.as_ref() {
                                 app.processing = true;
                                 app.set_status("Compacting conversation...");
+                                app.compaction.start();
                                 agent_handle = Some(w.compact(focus));
                             }
                         } else {
