@@ -195,22 +195,42 @@ fn boot_out_relocated(
     if daemon == LABEL && server == SERVER_LABEL {
         return Ok(Vec::new());
     }
+    let launch = |error: repo_search_client::launcher::install::LaunchctlError| {
+        RepoSearchError::Launch(error.to_string())
+    };
     let mut removed = Vec::new();
     for label in [server, daemon] {
         let service = format!("{domain}/{label}");
-        if launchctl
-            .service(&service)
-            .map_err(|error| RepoSearchError::Launch(error.to_string()))?
-            .is_some()
-        {
-            launchctl
-                .bootout(&service)
-                .map_err(|error| RepoSearchError::Launch(error.to_string()))?;
+        if launchctl.service(&service).map_err(launch)?.is_some() {
+            launchctl.bootout(&service).map_err(launch)?;
             removed.push(service);
+        }
+    }
+    // `bootout` returns once launchd has signalled the job, not once the
+    // process exited: a server stopping mid-load stays registered, in state
+    // `SIGTERMed`, until it exits or launchd's exit timeout kills it.
+    let deadline = std::time::Instant::now() + BOOTOUT_SETTLE;
+    for service in &removed {
+        while launchctl.service(service).map_err(launch)?.is_some() {
+            if std::time::Instant::now() >= deadline {
+                return Err(RepoSearchError::Launch(format!(
+                    "{service} is still registered {BOOTOUT_SETTLE:?} after its bootout"
+                )));
+            }
+            std::thread::sleep(BOOTOUT_POLL);
         }
     }
     Ok(removed)
 }
+
+/// How long a booted-out agent may stay registered while its process stops:
+/// twice the 5 s exit timeout launchd applies before it kills the process.
+#[cfg(target_os = "macos")]
+const BOOTOUT_SETTLE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The interval at which a booted-out agent's registration is rechecked.
+#[cfg(target_os = "macos")]
+const BOOTOUT_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Boots out every relocated-home repo-search agent whose plist no longer
 /// exists, returning the services it removed.
