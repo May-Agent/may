@@ -1891,9 +1891,7 @@ mod tests {
         let runtime = TaskRuntime::load(
             db.clone(),
             may_dir.clone(),
-            Arc::new(crate::tools::fixture_distribution(
-                &may_dir.join("tool-fixtures"),
-            )),
+            Arc::new(crate::tools::fixture_distribution(&may_dir.join("tool-fixtures")).await),
         )
         .await
         .expect("task runtime should load");
@@ -1991,9 +1989,7 @@ mod tests {
         let runtime = TaskRuntime::load(
             db,
             may_dir.clone(),
-            Arc::new(crate::tools::fixture_distribution(
-                &may_dir.join("tool-fixtures"),
-            )),
+            Arc::new(crate::tools::fixture_distribution(&may_dir.join("tool-fixtures")).await),
         )
         .await
         .expect("task runtime should load");
@@ -2155,9 +2151,7 @@ mod tests {
         let runtime = TaskRuntime::load(
             db,
             may_dir.clone(),
-            Arc::new(crate::tools::fixture_distribution(
-                &may_dir.join("tool-fixtures"),
-            )),
+            Arc::new(crate::tools::fixture_distribution(&may_dir.join("tool-fixtures")).await),
         )
         .await
         .expect("task runtime should load");
@@ -2309,9 +2303,7 @@ mod tests {
             let runtime = TaskRuntime::load(
                 db,
                 may_dir.clone(),
-                Arc::new(crate::tools::fixture_distribution(
-                    &may_dir.join("tool-fixtures"),
-                )),
+                Arc::new(crate::tools::fixture_distribution(&may_dir.join("tool-fixtures")).await),
             )
             .await
             .expect("task runtime should load")

@@ -94,8 +94,6 @@ struct ExecSessionContext {
 }
 
 pub async fn run_exec(args: ExecArgs) -> Result<i32, ExecError> {
-    // `exec` runs a sandbox in-process; the daemon configures its own heel.
-    may_agent::configure_heel_binary().await;
     let context = load_exec_session_context(&args.session_id).await?;
     let config_path = context.may_dir.join("config.toml");
     let may_config = MayConfig::load_from(&config_path)

@@ -753,7 +753,13 @@ impl MayAgent {
         // terminal commands run in; a container session has no host sandbox
         // to give them, so it offers none.
         let acp = match config.acp.as_ref() {
-            Some(hosts) if !is_container => Some(
+            Some(hosts) if !is_container => Some({
+                let heel = crate::tools::prepare_heel(
+                    &config.tool_distribution,
+                    &crate::session::MayHomePaths::new(config.may_dir.clone()).tools_dir(),
+                )
+                .await
+                .map_err(|e| MayAgentError::Sandbox(e.to_string()))?;
                 hosts
                     .agents(
                         config.session_id.as_str(),
@@ -772,10 +778,11 @@ impl MayAgent {
                                 .job_server
                                 .broker()
                                 .map_err(|e| MayAgentError::Sandbox(e.to_string()))?,
+                            heel,
                         ),
                     )
-                    .map_err(|e| MayAgentError::Sandbox(e.to_string()))?,
-            ),
+                    .map_err(|e| MayAgentError::Sandbox(e.to_string()))?
+            }),
             Some(_) => {
                 tracing::warn!(
                     "connected ACP agents are not offered in container sessions: they would run on the host"
