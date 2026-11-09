@@ -194,6 +194,7 @@ export const ja: Messages = {
     generic: '処理中',
     output: '結果',
     escalated: '権限を昇格',
+    sshLocation: 'SSH',
     viewFullOutput: '完全な出力を表示',
   },
   runtime: {
@@ -296,7 +297,6 @@ export const ja: Messages = {
       command: '操作内容',
       mode: '安全レベル',
       modeDefault: '標準',
-      modeSandboxed: '隔離',
       modeUnsafe: '権限昇格',
       modeRemote: 'リモート',
       showScript: '生のスクリプトを表示',

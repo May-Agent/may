@@ -192,6 +192,7 @@ export const enUS = {
     generic: 'Working',
     output: 'Output',
     escalated: 'Elevated permissions',
+    sshLocation: 'SSH',
     viewFullOutput: 'View full output',
   },
   runtime: {
@@ -294,7 +295,6 @@ export const enUS = {
       command: 'Action',
       mode: 'Safety level',
       modeDefault: 'Standard',
-      modeSandboxed: 'Isolated',
       modeUnsafe: 'Elevated',
       modeRemote: 'Remote',
       showScript: 'Show raw script',
