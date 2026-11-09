@@ -1034,7 +1034,11 @@ mod tests {
             Some("running")
         );
 
-        let service = SessionRuntimeService::new(db.clone(), UiEventBus::new());
+        let service = SessionRuntimeService::new(
+            db.clone(),
+            UiEventBus::new(),
+            crate::session::MayHomePaths::new(dir.path().join("home")),
+        );
         recover_persisted_runs_after_restart(&service, &db)
             .await
             .expect("startup recovery succeeds");
