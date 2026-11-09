@@ -185,8 +185,7 @@ impl Body {
 /// The open work grouped under its section's heading. Roots are not listed
 /// here: the issues they name appear under "Issues".
 ///
-/// A row is its first line; later lines are its detail, shown once the row is
-/// expanded.
+/// A row is its title; its detail lines are shown once the row is expanded.
 fn task_rows(body: &mut Body, state: &SidebarState, rows: &[TaskRow], width: usize) {
     for (section, title, id) in [
         (TaskSection::Doing, "Doing", SidebarSection::Doing),
@@ -213,9 +212,8 @@ fn task_rows(body: &mut Body, state: &SidebarState, rows: &[TaskRow], width: usi
                 text = format!("{text} (blocked: {what})");
             }
             let detail: Vec<String> = row
-                .text
+                .detail
                 .lines()
-                .skip(1)
                 .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
                 .filter(|line| !line.is_empty())
                 .collect();
@@ -594,6 +592,52 @@ mod tests {
             vec!["修复图", "片渲染", "问题"]
         );
         assert_eq!(wrap_hanging("", 6, 0), vec![""]);
+    }
+
+    #[test]
+    fn the_sidebar_shows_each_rows_title_and_its_detail_once_expanded() {
+        use crate::tui::sidebar::SidebarState;
+
+        let rows = crate::task_rows::task_rows(
+            "## Doing\n- wire the command\n  the detail shows on expansion\n- ask scope\n  BLOCKING q9\n\n## Queued\n- 写文档 ドキュメント 문서\n  詳細を表示する\n- plain\n",
+        );
+        let render = |state: &SidebarState| -> Vec<String> {
+            let mut body = super::Body::default();
+            super::task_rows(&mut body, state, &rows, 60);
+            body.lines.iter().map(ToString::to_string).collect()
+        };
+
+        let mut state = SidebarState::default();
+        assert_eq!(
+            render(&state),
+            vec![
+                "▾ Doing",
+                "○ wire the command ▸",
+                "⏸ ask scope (blocked: q9) ▸",
+                "",
+                "▾ Queued",
+                "○ 写文档 ドキュメント 문서 ▸",
+                "○ plain",
+            ]
+        );
+
+        // The title is the expansion key.
+        state
+            .detailed
+            .insert("写文档 ドキュメント 문서".to_string());
+        assert_eq!(
+            render(&state),
+            vec![
+                "▾ Doing",
+                "○ wire the command ▸",
+                "⏸ ask scope (blocked: q9) ▸",
+                "",
+                "▾ Queued",
+                "○ 写文档 ドキュメント 문서 ▾",
+                "    詳細を表示する",
+                "○ plain",
+            ]
+        );
     }
 
     #[test]

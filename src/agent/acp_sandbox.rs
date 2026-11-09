@@ -27,7 +27,7 @@ use acpsub::{
 };
 use aither_acp::{PermissionOption, PermissionOptionKind, RequestPermissionOutcome};
 use aither_sandbox::permission::PermissionHandler as TerminalPermissions;
-use aither_sandbox::{ProcessPriority, TerminalGrants, TerminalMode};
+use aither_sandbox::{CommandFifo, JobBroker, ProcessPriority, TerminalGrants, TerminalMode};
 use arc_swap::ArcSwap;
 use askama::Template;
 use event_listener::Event;
@@ -81,6 +81,9 @@ pub struct SessionSandbox<N> {
     /// Asks the user about the agent's permission requests; without it every
     /// request is refused.
     approver: Option<PermissionApprover>,
+    /// The machine-wide jobserver pool the agent's commands draw jobs from;
+    /// a scratch sandbox has none.
+    jobs: Option<JobBroker>,
 }
 
 impl<N> std::fmt::Debug for SessionSandbox<N> {
@@ -102,10 +105,12 @@ impl SessionSandbox<SessionPolicy> {
         audit: NetworkAuditLog,
         priority: ProcessPriority,
         approver: Option<PermissionApprover>,
+        jobs: JobBroker,
     ) -> Self {
         Self {
             root,
             launch_dir: None,
+            jobs: Some(jobs),
             grants,
             network: Audited::new(
                 SessionNetwork {
@@ -132,6 +137,7 @@ impl SessionSandbox<DenyAll> {
             network: DenyAll,
             priority: ProcessPriority::default(),
             approver: None,
+            jobs: None,
         }
     }
 }
@@ -156,8 +162,17 @@ impl<N: NetworkPolicy + Clone> SessionSandbox<N> {
         &self,
         spec: &SpawnSpec,
         process: &Process,
-    ) -> io::Result<(AcpChild, Sandbox<N>)> {
+    ) -> io::Result<(AcpChild, Sandbox<N>, Option<CommandFifo>)> {
         let snapshot = self.grants.snapshot();
+        // A command the agent runs draws its jobs from the machine-wide
+        // pool through a fifo of its own; the agent itself starts none.
+        let job_fifo = match (&self.jobs, process) {
+            (Some(jobs), Process::Terminal) => {
+                Some(jobs.open_fifo().await.map_err(io::Error::other)?)
+            }
+            _ => None,
+        };
+        let fifo_path = job_fifo.as_ref().map(|fifo| fifo.path().to_path_buf());
         let root = canonical(&self.root)?;
         let cwd = self.launch_dir.as_deref().unwrap_or(&spec.cwd);
         // The program starts by the path `PATH` gives, so a link starts under
@@ -177,6 +192,8 @@ impl<N: NetworkPolicy + Clone> SessionSandbox<N> {
             .chain(std::iter::once((&target, Access::EXEC)))
             .chain(links.iter().map(|path| (path, Access::READ)))
             .chain(scripts.iter().map(|path| (path, Access::READ)))
+            // The command writes the tokens it is done with back to its fifo.
+            .chain(fifo_path.iter().map(|path| (path, Access::WRITE)))
             // The host toolchains the session's own commands build with.
             .chain(
                 toolchains
@@ -223,6 +240,7 @@ impl<N: NetworkPolicy + Clone> SessionSandbox<N> {
             .args(&spec.args)
             .envs(environment)
             .envs(&spec.env)
+            .envs(job_fifo.iter().flat_map(CommandFifo::environment))
             .current_dir(cwd)
             .stdin(if process.pipes_stdin() {
                 StdioConfig::Piped
@@ -240,7 +258,7 @@ impl<N: NetworkPolicy + Clone> SessionSandbox<N> {
         #[cfg(not(target_os = "linux"))]
         let child = command.spawn().await;
         let child = child.map_err(io::Error::other)?;
-        Ok((child, sandbox))
+        Ok((child, sandbox, job_fifo))
     }
 }
 
@@ -431,7 +449,11 @@ struct Exit {
 impl SandboxProcess {
     /// Reaps `child` on the blocking pool and publishes its status. The
     /// sandbox ends its processes when dropped, so it lives until then.
-    fn reap<N: NetworkPolicy>(mut child: AcpChild, sandbox: Sandbox<N>) -> Self {
+    fn reap<N: NetworkPolicy>(
+        mut child: AcpChild,
+        sandbox: Sandbox<N>,
+        job_fifo: Option<CommandFifo>,
+    ) -> Self {
         #[cfg(target_os = "linux")]
         let tree = child.tree_control();
         #[cfg(not(target_os = "linux"))]
@@ -441,6 +463,9 @@ impl SandboxProcess {
         let published = exit.clone();
         blocking::unblock(move || {
             let _sandbox = sandbox;
+            // Released once the command exits; the broker takes its tokens
+            // back when the whole process tree has let go of the fifo.
+            let _job_fifo = job_fifo;
             let status = futures_lite::future::block_on(exit_status(&mut child));
             if let Err(error) = &status {
                 tracing::error!(%error, process = %described, "waiting for an ACP process failed");
@@ -562,7 +587,7 @@ impl<N: NetworkPolicy + Clone> Executor for SandboxExecutor<N> {
         let process = Process::Agent {
             state: self.state_dirs(&spec)?,
         };
-        let (mut child, sandbox) = self.cell.load_full().launch(&spec, &process).await?;
+        let (mut child, sandbox, job_fifo) = self.cell.load_full().launch(&spec, &process).await?;
         let stdin = pipe(child.take_stdin(), "stdin")?;
         let stdout = pipe(child.take_stdout(), "stdout")?;
         let stderr = pipe(child.take_stderr(), "stderr")?;
@@ -570,12 +595,12 @@ impl<N: NetworkPolicy + Clone> Executor for SandboxExecutor<N> {
             stdin,
             stdout,
             stderr,
-            control: SandboxProcess::reap(child, sandbox),
+            control: SandboxProcess::reap(child, sandbox, job_fifo),
         })
     }
 
     async fn spawn_terminal(&self, spec: SpawnSpec) -> io::Result<TerminalProcess<Self>> {
-        let (mut child, sandbox) = self
+        let (mut child, sandbox, job_fifo) = self
             .cell
             .load_full()
             .launch(&spec, &Process::Terminal)
@@ -585,7 +610,7 @@ impl<N: NetworkPolicy + Clone> Executor for SandboxExecutor<N> {
         Ok(TerminalProcess {
             stdout,
             stderr,
-            control: SandboxProcess::reap(child, sandbox),
+            control: SandboxProcess::reap(child, sandbox, job_fifo),
         })
     }
 }
@@ -762,7 +787,23 @@ mod tests {
             .map_err(|error| format!("waiting for the agent failed: {error} ({error:?})"))
     }
 
-    fn session_sandbox(root: &Path) -> SessionSandbox<SessionPolicy> {
+    /// A pool of `size` tokens in a directory of its own.
+    async fn pool(size: usize) -> (tempfile::TempDir, crate::jobserver::JobServer) {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let dir = tempfile::tempdir().expect("pool dir");
+        let server = crate::jobserver::JobServer::start(
+            dir.path(),
+            std::num::NonZeroUsize::new(size).expect("a pool has tokens"),
+        )
+        .await
+        .expect("pool starts");
+        (dir, server)
+    }
+
+    fn session_sandbox(
+        root: &Path,
+        server: &crate::jobserver::JobServer,
+    ) -> SessionSandbox<SessionPolicy> {
         let grants = TerminalGrants::new();
         grants.add_readable(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures"));
         std::fs::create_dir_all(root).expect("session dir");
@@ -773,7 +814,58 @@ mod tests {
             NetworkAuditLog::rolling_daily(root.join("audit"), 1).expect("audit log"),
             ProcessPriority::default(),
             None,
+            server.broker().expect("pool broker"),
         )
+    }
+
+    /// A command the agent runs through ACP holds the pool's tokens while it
+    /// runs and gives them back when it ends.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_acp_terminal_command_draws_from_the_shared_pool() {
+        const SIZE: usize = 3;
+        let (_pool_dir, server) = pool(SIZE).await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().join("session");
+        let sandbox = session_sandbox(&root, &server);
+        let report = root.join("tmp/held");
+        let executor = SandboxExecutor::new(
+            Arc::new(ArcSwap::from_pointee(sandbox)),
+            Arc::<ArcSwap<MayConfig>>::default(),
+        );
+        assert_eq!(server.tokens_in_pool(), SIZE);
+        let mut spec = fake_agent_spec(&root);
+        spec.args = vec![
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/job_probe.py")
+                .to_string_lossy()
+                .into_owned(),
+            report.to_string_lossy().into_owned(),
+        ];
+        let command = executor.spawn_terminal(spec).await.expect("command starts");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let held = loop {
+            if let Ok(held) = std::fs::read_to_string(&report) {
+                break held;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the command never reported its tokens"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert_eq!(held, SIZE.to_string(), "the command drew every token");
+        assert_eq!(server.tokens_in_pool(), 0, "they left the shared pool");
+
+        command.control.kill();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while server.tokens_in_pool() != SIZE {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the tokens did not return to the pool"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -803,7 +895,8 @@ mod tests {
     async fn a_killed_session_sandbox_agent_reports_its_exit_status() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().join("session");
-        let status = exit_status_after(session_sandbox(&root), &root, Ending::Killed)
+        let (_pool_dir, server) = pool(1).await;
+        let status = exit_status_after(session_sandbox(&root, &server), &root, Ending::Killed)
             .await
             .unwrap_or_else(|error| panic!("killed in a session sandbox: {error}"));
         assert!(
@@ -816,7 +909,8 @@ mod tests {
     async fn a_session_sandbox_agent_reports_its_exit_status() {
         let dir = tempfile::tempdir().expect("temp dir");
         let root = dir.path().join("session");
-        let status = exit_status_after(session_sandbox(&root), &root, Ending::StdinCloses)
+        let (_pool_dir, server) = pool(1).await;
+        let status = exit_status_after(session_sandbox(&root, &server), &root, Ending::StdinCloses)
             .await
             .unwrap_or_else(|error| panic!("session sandbox: {error}"));
         assert!(status.success(), "session sandbox exit status: {status:?}");

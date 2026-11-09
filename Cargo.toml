@@ -12,6 +12,10 @@ publish = false
 name = "may"
 path = "src/bin/may/main.rs"
 
+[[bin]]
+name = "tasks"
+path = "src/bin/tasks/main.rs"
+
 [features]
 default = []
 ui = []

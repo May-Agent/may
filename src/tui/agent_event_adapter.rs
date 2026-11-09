@@ -99,6 +99,9 @@ pub enum ToolEndKind {
     Error(String),
 }
 
+/// Name of the native `compact` tool.
+pub const COMPACT_TOOL: &str = "compact";
+
 /// Parse tool-call start payload into a minimal start event.
 ///
 /// # Panics

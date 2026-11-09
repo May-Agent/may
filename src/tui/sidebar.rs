@@ -23,16 +23,10 @@ const ALL_SECTIONS: [SidebarSection; 7] = [
     SidebarSection::Jobs,
 ];
 
-/// The key a task row's detail state is kept under: its first line.
+/// The key a task row's detail state is kept under: its title.
 #[must_use]
 pub fn task_key(row: &TaskRow) -> String {
-    row.text
-        .lines()
-        .next()
-        .unwrap_or("")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    row.title.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Terminal width from which the sidebar is shown.

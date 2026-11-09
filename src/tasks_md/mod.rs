@@ -9,17 +9,29 @@
 //! naming a section outside a fenced code block. A `# ` title may precede
 //! them.
 //!
+//! A row is a short title line, which the sidebars show, plus optional
+//! indented detail lines.
+//!
 //! [`schema`] reads it for the harness: the rows, their `BLOCKING` marks,
 //! the roots and the format's violations, the stop rule that keeps a run
-//! going while open rows remain, and the line limit.
+//! going while open rows remain, and the line limit. [`edit`] is the `tasks`
+//! command's editing of the file, which refuses at write time what the
+//! parser reports as a violation.
 
+pub mod edit;
 pub mod schema;
+
+use std::fmt::Write as _;
 
 use aither_agent::WorkRef;
 use aither_agent::working_document::words;
 
 /// The file the document lives in, relative to the session sandbox.
 pub const FILE: &str = "tasks.md";
+
+/// The environment variable every sandboxed command finds the session's
+/// `tasks.md` path in.
+pub const ENV: &str = "MAY_TASKS";
 
 /// A section of `tasks.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +86,7 @@ impl Section {
 pub struct Row {
     section: Section,
     line: usize,
+    last_line: usize,
     text: String,
 }
 
@@ -90,11 +103,29 @@ impl Row {
         self.line
     }
 
+    /// The number of its last line, from 1: its first line's when it has no
+    /// detail.
+    #[must_use]
+    pub const fn last_line(&self) -> usize {
+        self.last_line
+    }
+
     /// Its text without the `- ` marker, continuation lines joined by
     /// newlines.
     #[must_use]
     pub fn text(&self) -> &str {
         &self.text
+    }
+
+    /// Its first line, without the `- ` marker.
+    #[must_use]
+    pub fn title(&self) -> &str {
+        self.text.lines().next().unwrap_or_default()
+    }
+
+    /// Its detail lines, trimmed, in order.
+    pub fn details(&self) -> impl Iterator<Item = &str> {
+        self.text.lines().skip(1)
     }
 
     /// The issues and pull requests it names, in order.
@@ -145,6 +176,19 @@ pub struct TasksFile {
     rows: Vec<Row>,
     violations: Vec<LineViolation>,
     lines: usize,
+    spans: Vec<SectionSpan>,
+}
+
+/// Where a section is in the document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SectionSpan {
+    /// The section.
+    pub section: Section,
+    /// The number of its heading line, from 1.
+    pub heading: usize,
+    /// The number of its last non-blank line: the heading's when it has no
+    /// content.
+    pub last_line: usize,
 }
 
 impl TasksFile {
@@ -168,14 +212,19 @@ impl TasksFile {
             if free_text {
                 match (fence, Fence::of(line)) {
                     (None, Some(opening)) => {
+                        file.touch(number);
                         fence = Some((opening.marker, opening.length));
                         continue;
                     }
                     (Some((marker, length)), Some(closing)) if closing.closes(marker, length) => {
+                        file.touch(number);
                         fence = None;
                         continue;
                     }
-                    (Some(_), _) => continue,
+                    (Some(_), _) => {
+                        file.touch(number);
+                        continue;
+                    }
                     (None, None) => {}
                 }
             }
@@ -189,6 +238,7 @@ impl TasksFile {
                     .find(|candidate| candidate.heading() == heading);
                 // Free text holds any other `## ` line as its own text.
                 if free_text && named.is_none() {
+                    file.touch(number);
                     continue;
                 }
                 section = named;
@@ -198,6 +248,11 @@ impl TasksFile {
                         file.violate(number, Violation::RepeatedSection(found));
                     }
                     seen.push(found);
+                    file.spans.push(SectionSpan {
+                        section: found,
+                        heading: number,
+                        last_line: number,
+                    });
                 } else {
                     file.violate(number, Violation::UnknownSection(heading.to_string()));
                 }
@@ -206,6 +261,7 @@ impl TasksFile {
             if in_unknown {
                 continue;
             }
+            file.touch(number);
             match section {
                 None => {
                     if !titled && seen.is_empty() && line.starts_with("# ") {
@@ -219,6 +275,13 @@ impl TasksFile {
             }
         }
         file
+    }
+
+    /// Records `number` as the last line of the section it is in.
+    fn touch(&mut self, number: usize) {
+        if let Some(span) = self.spans.last_mut() {
+            span.last_line = number;
+        }
     }
 
     fn violate(&mut self, line: usize, violation: Violation) {
@@ -239,6 +302,7 @@ impl TasksFile {
             self.rows.push(Row {
                 section,
                 line: number,
+                last_line: number,
                 text: text.to_string(),
             });
             return;
@@ -247,6 +311,7 @@ impl TasksFile {
             && self.rows.last().is_some_and(|row| row.section == section);
         match self.rows.last_mut() {
             Some(row) if continues => {
+                row.last_line = number;
                 row.text.push('\n');
                 row.text.push_str(line.trim());
             }
@@ -264,6 +329,13 @@ impl TasksFile {
     #[must_use]
     pub fn violations(&self) -> &[LineViolation] {
         &self.violations
+    }
+
+    /// Where each section is, in document order; a repeated section appears
+    /// again.
+    #[must_use]
+    pub fn spans(&self) -> &[SectionSpan] {
+        &self.spans
     }
 
     /// The number of lines the document has.
@@ -288,6 +360,27 @@ impl TasksFile {
         }
         roots
     }
+}
+
+/// `content` as the model reads it: each row's `- ` marker replaced by the
+/// row's number, counted from 1 over every row in document order, which is
+/// what the `tasks` command addresses a row by.
+#[must_use]
+pub fn numbered(content: &str) -> String {
+    let file = TasksFile::parse(content);
+    let mut starts = file.rows().iter().map(Row::line).enumerate().peekable();
+    let mut out = String::with_capacity(content.len());
+    for (index, line) in content.lines().enumerate() {
+        match starts.next_if(|(_, start)| *start == index + 1) {
+            Some((row, _)) => {
+                let text = line.strip_prefix("- ").or_else(|| line.strip_prefix("* "));
+                _ = write!(out, "{}. {}", row + 1, text.unwrap_or(line));
+            }
+            None => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// A code fence line: three or more backticks or tildes, indented by at
@@ -360,6 +453,24 @@ mod tests {
         assert_eq!(file.rows()[2].blocking_mark(), Some("req-7"));
         assert_eq!(file.roots(), vec![WorkRef::issue(129)]);
         assert_eq!(file.lines(), 19);
+    }
+
+    #[test]
+    fn a_row_is_a_title_and_detail_lines_with_a_span() {
+        let file = TasksFile::parse(WELL_FORMED);
+        let row = &file.rows()[1];
+        assert_eq!(row.title(), "#130 wire the backend, PR #12 open");
+        assert_eq!(
+            row.details().collect::<Vec<_>>(),
+            vec!["next: answer review"]
+        );
+        assert_eq!((row.line(), row.last_line()), (7, 8));
+        let doing = file
+            .spans()
+            .iter()
+            .find(|span| span.section == Section::Doing)
+            .expect("the document has a Doing section");
+        assert_eq!((doing.heading, doing.last_line), (6, 9));
     }
 
     #[test]

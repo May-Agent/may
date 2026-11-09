@@ -188,6 +188,7 @@ export const enUS = {
     ask: 'Consulting a helper',
     session: 'Recalling history',
     task: 'Delegating a task',
+    compact: 'Compaction',
     generic: 'Working',
     output: 'Output',
     escalated: 'Elevated permissions',

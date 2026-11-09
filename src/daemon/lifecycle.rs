@@ -99,8 +99,35 @@ struct LaunchdPlist<'a> {
 
 /// The calling process's environment as text. A launchd job starts with
 /// launchd's default environment, so the daemon is given the client's.
+///
+/// Its `PATH` leads with the directory of this executable, so the `tasks`
+/// binary installed beside `may` is on the `PATH` of every sandboxed command.
 fn environment() -> Result<Vec<(String, String)>, LifecycleError> {
-    text_environment(std::env::vars_os())
+    let mut environment = text_environment(std::env::vars_os())?;
+    let path = path_with_executable_dir()?;
+    match environment.iter_mut().find(|(name, _)| name == "PATH") {
+        Some((_, value)) => *value = path,
+        None => environment.push(("PATH".to_string(), path)),
+    }
+    Ok(environment)
+}
+
+/// The calling process's `PATH` led by the directory of its executable.
+fn path_with_executable_dir() -> Result<String, LifecycleError> {
+    let executable = current_exe()?;
+    let directory = executable
+        .parent()
+        .ok_or_else(|| std::io::Error::other("the executable has no directory"))?
+        .to_path_buf();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let joined =
+        std::env::join_paths(std::iter::once(directory).chain(std::env::split_paths(&path)))
+            .map_err(std::io::Error::other)?;
+    joined
+        .into_string()
+        .map_err(|_| LifecycleError::NonUnicodeEnvironment {
+            name: "PATH".to_string(),
+        })
 }
 
 fn text_environment(
@@ -321,6 +348,7 @@ fn spawn(paths: &DaemonPaths) -> Result<std::process::Child, LifecycleError> {
     let mut command = std::process::Command::new(current_exe()?);
     command
         .arg("daemon")
+        .env("PATH", path_with_executable_dir()?)
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log)
@@ -640,8 +668,8 @@ mod launchd_job_tests {
     use std::ffi::OsString;
 
     use super::{
-        LifecycleError, job_exit, on_demand_plist, require_gui_domain, text_environment,
-        write_private,
+        LifecycleError, current_exe, environment, job_exit, on_demand_plist,
+        path_with_executable_dir, require_gui_domain, text_environment, write_private,
     };
 
     #[test]
@@ -649,6 +677,25 @@ mod launchd_job_tests {
         let plist = on_demand_plist("/bin/may", "/home/.may/daemon.log", &[]).expect("renders");
         assert!(plist.contains("com.github.may-agent.may.on-demand"));
         assert!(plist.contains("<key>KeepAlive</key>\n  <false/>"));
+    }
+
+    #[test]
+    fn the_daemon_path_leads_with_the_executable_directory() {
+        let executable = current_exe().expect("the test binary has a path");
+        let directory = executable.parent().expect("the binary has a directory");
+        let path = path_with_executable_dir().expect("the path is text");
+        assert_eq!(
+            std::env::split_paths(&path).next().as_deref(),
+            Some(directory)
+        );
+        let environment = environment().expect("the environment is text");
+        assert_eq!(
+            environment
+                .iter()
+                .filter(|(name, _)| name == "PATH")
+                .count(),
+            1
+        );
     }
 
     #[test]

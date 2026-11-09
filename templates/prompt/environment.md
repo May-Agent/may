@@ -13,7 +13,7 @@ Session directory: {{ session_dir }}. The terminal starts there.
 - outputs/: the full output of commands whose result was cut or folded
 - data/: state that lasts the session
 - skills/: the skill library, read-only
-- tasks.md: your task list
+- tasks.md: your task list, at $MAY_TASKS
 {% if let Some(dir) = launch_dir %}Launch directory: {{ dir }}.
 {% endif %}{% if !modalities.is_empty() %}You can take these inputs directly: {{ modalities|join(", ") }}.
 {% endif %}{% if let Some(remote) = remote %}

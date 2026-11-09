@@ -17,6 +17,7 @@ use ratatui::{
 use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use super::super::agent_event_adapter::COMPACT_TOOL;
 use super::super::queue::Attachment;
 use super::band;
 use super::chat_layout::{self, ChatLayout};
@@ -918,6 +919,26 @@ impl ChatStream {
             .zip(self.revisions.splice(start..end, []))
             .partition(|(element, _)| matches!(element, ChatElement::Error { .. }));
         let mut at = start;
+        // The previous turn left no result of its own (it was interrupted,
+        // resumed by a background command or ended on a question): its row
+        // takes this turn's work, so no two rows stand next to each other.
+        let mut folded = folded;
+        if let Some(index) = start.checked_sub(1)
+            && !folded.is_empty()
+            && let ChatElement::WorkedFor {
+                seconds: total,
+                elements,
+                ..
+            } = &mut self.elements[index]
+        {
+            *total += seconds;
+            elements.extend(
+                std::mem::take(&mut folded)
+                    .into_iter()
+                    .map(|(element, _)| element),
+            );
+            self.touch(index);
+        }
         // A single item is its own row: a group around it hides nothing.
         if let [_] = folded.as_slice() {
             for (element, revision) in folded {
@@ -1165,6 +1186,14 @@ impl ChatStream {
                             image: None,
                         });
                     }
+                }
+                ToolDisplay::Action {
+                    status: s, chip, ..
+                } if chip == COMPACT_TOOL => {
+                    // A compaction is a status row with nothing to expand, so
+                    // its result text is not kept; a refusal arrives as a
+                    // failed status from the tool's typed error.
+                    *s = status;
                 }
                 ToolDisplay::Action {
                     status: s,
@@ -2503,7 +2532,7 @@ pub(super) fn element_lines(
             let roots: Vec<&str> = rows
                 .iter()
                 .filter(|row| row.section == TaskSection::Roots)
-                .filter_map(|row| row.text.lines().next())
+                .map(|row| row.title.as_str())
                 .collect();
             if !roots.is_empty() {
                 lines.push(Line::from(vec![
@@ -2524,7 +2553,7 @@ pub(super) fn element_lines(
                     Style::default().fg(Color::DarkGray),
                 )));
                 for row in section_rows {
-                    let text = row.text.split_whitespace().collect::<Vec<_>>().join(" ");
+                    let text = row.title.split_whitespace().collect::<Vec<_>>().join(" ");
                     match &row.blocking {
                         Some(what) => lines.push(Line::from(vec![
                             Span::styled("    ⏸ ", Style::default().fg(Color::Red)),
@@ -3702,6 +3731,7 @@ fn semantic_headline(name: &str, summary: &str) -> (String, String) {
             },
         ),
         "webfetch" | "web_fetch" => ("Fetched".to_string(), summary.to_string()),
+        COMPACT_TOOL => ("Compaction".to_string(), String::new()),
         _ => (format!("[{name}]"), summary.to_string()),
     }
 }
@@ -5976,6 +6006,107 @@ mod tests {
         ));
     }
 
+    fn work_turn(chat: &mut ChatStream, label: &str) {
+        chat.push_thinking(&format!("{label} thought"));
+        chat.push_tool(
+            format!("tool-{label}"),
+            ToolDisplay::Terminal {
+                description: String::new(),
+                command: format!("echo {label}"),
+                mode: TerminalExecutionMode::Default,
+                status: ToolStatus::Done,
+                output: None,
+                diffs: Vec::new(),
+                pinned: None,
+            },
+        );
+    }
+
+    fn worked_rows(chat: &ChatStream) -> Vec<(u64, usize)> {
+        let mut adjacent = false;
+        let mut previous_was_row = false;
+        let mut rows = Vec::new();
+        for element in &chat.elements {
+            if let ChatElement::WorkedFor {
+                seconds, elements, ..
+            } = element
+            {
+                adjacent |= previous_was_row;
+                previous_was_row = true;
+                rows.push((*seconds, elements.len()));
+            } else {
+                previous_was_row = false;
+            }
+        }
+        assert!(!adjacent, "two Worked for rows are adjacent: {rows:?}");
+        rows
+    }
+
+    /// Turns that end without a reply of their own (interrupted, resumed
+    /// by a background command, ended on a question) fold into one row
+    /// that the next result follows.
+    #[test]
+    fn resultless_turns_fold_into_one_row_before_the_next_result() {
+        // An interrupted turn, a background-resumed turn (no user message)
+        // and a turn ending on a question, then a normal turn.
+        let mut chat = ChatStream::new();
+        chat.push_user("実行して 运行 실행", Vec::new(), 0);
+        work_turn(&mut chat, "a");
+        chat.fold_turn_work(1800);
+        work_turn(&mut chat, "b");
+        chat.fold_turn_work(250);
+        work_turn(&mut chat, "c");
+        chat.fold_turn_work(5);
+        work_turn(&mut chat, "d");
+        chat.push_text("done 完成 완료");
+        chat.end_text();
+        chat.fold_turn_work(10);
+
+        assert_eq!(worked_rows(&chat), vec![(1800 + 250 + 5 + 10, 8)]);
+        assert!(matches!(
+            chat.elements.last(),
+            Some(ChatElement::AssistantText { .. })
+        ));
+
+        chat.toggle_expanded("work-0");
+        let open = build_plain_wrapped_lines_unified(&chat, 80, None, None, None, None, false);
+        for label in ["a", "b", "c", "d"] {
+            assert!(
+                open.iter().any(|l| l.contains(&format!("{label} thought"))
+                    || l.contains(&format!("echo {label}"))),
+                "{label} missing: {open:?}"
+            );
+        }
+    }
+
+    /// An interrupted run ends on its marker; the earlier resultless
+    /// turn folds with the interrupted turn's work ahead of it.
+    #[test]
+    fn interrupted_turn_after_resultless_turn_shares_one_row() {
+        let mut chat = ChatStream::new();
+        chat.push_user("hi", Vec::new(), 0);
+        work_turn(&mut chat, "a");
+        chat.fold_turn_work(1821);
+        work_turn(&mut chat, "b");
+        chat.push_text("\n\n[Interrupted]");
+        chat.end_text();
+        chat.fold_turn_work(250);
+        assert_eq!(worked_rows(&chat), vec![(2071, 4)]);
+    }
+
+    /// A turn with its own user message keeps its own row.
+    #[test]
+    fn separate_user_turns_keep_separate_rows() {
+        let mut chat = ChatStream::new();
+        chat.push_user("one", Vec::new(), 0);
+        work_turn(&mut chat, "a");
+        chat.fold_turn_work(3);
+        chat.push_user("two", Vec::new(), 1);
+        work_turn(&mut chat, "b");
+        chat.fold_turn_work(4);
+        assert_eq!(worked_rows(&chat), vec![(3, 2), (4, 2)]);
+    }
+
     #[test]
     fn worked_for_folds_turn_and_toggles() {
         let mut chat = ChatStream::new();
@@ -6652,5 +6783,46 @@ mod tests {
                 .collect();
             println!("{line}");
         }
+    }
+
+    fn compact_row(status: ToolStatus, result: Option<&str>) -> (Vec<String>, usize) {
+        let mut chat = ChatStream::new();
+        chat.push_tool(
+            "c1".to_string(),
+            ToolDisplay::Action {
+                chip: "compact".to_string(),
+                task_id: None,
+                summary: String::new(),
+                detail: Vec::new(),
+                status: ToolStatus::Running,
+                output: None,
+                pinned: None,
+            },
+        );
+        chat.update_tool_with_output("c1", status, result);
+        rows_and_regions(&chat)
+    }
+
+    /// A compaction is one status row: a tick when it started, a cross
+    /// with the refusal when the tool returned its typed error, and nothing
+    /// to expand either way.
+    #[test]
+    fn a_compaction_is_a_one_line_status_row() {
+        let (rows, regions) = compact_row(
+            ToolStatus::Done,
+            Some("Compaction started in the background."),
+        );
+        assert_eq!(rows, ["  ✓ Compaction"]);
+        assert_eq!(regions, 0);
+
+        let (rows, regions) = compact_row(
+            ToolStatus::Failed("Nothing was started: the context is too small.".to_string()),
+            None,
+        );
+        assert_eq!(
+            rows,
+            ["  ✗ Compaction — failed: Nothing was started: the context is too small."]
+        );
+        assert_eq!(regions, 0);
     }
 }

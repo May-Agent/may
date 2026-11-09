@@ -68,9 +68,11 @@ impl From<&WorkRef> for TaskReference {
 pub struct TaskRow {
     /// The section it is in.
     pub section: TaskSection,
-    /// Its text without the `- ` marker; continuation lines are joined by
-    /// newlines.
-    pub text: String,
+    /// Its title: the first line without the `- ` marker. The sidebars show
+    /// this alone.
+    pub title: String,
+    /// Its detail lines joined by newlines; empty when it has none.
+    pub detail: String,
     /// The payload of its `BLOCKING <what>` mark.
     pub blocking: Option<String>,
     /// The issues and pull requests it names, in order.
@@ -92,7 +94,8 @@ pub fn task_rows(content: &str) -> Vec<TaskRow> {
                     unreachable!("tasks.md has rows only in row sections")
                 }
             },
-            text: row.text().to_string(),
+            title: row.title().to_string(),
+            detail: row.details().collect::<Vec<_>>().join("\n"),
             blocking: row.blocking_mark().map(ToString::to_string),
             references: row.references().iter().map(TaskReference::from).collect(),
         })
@@ -103,30 +106,39 @@ pub fn task_rows(content: &str) -> Vec<TaskRow> {
 mod tests {
     use super::*;
 
-    const DOCUMENT: &str = "# Session\n\n## Roots\n- May-Agent/may#746\n\n## Doing\n- Fix the parser (#12)\n  second line\n- Ask about scope BLOCKING q42\n\n## Queued\n- Ship PR #13\n\n## Notes\n- not a row #99\n";
+    const DOCUMENT: &str = "# Session\n\n## Roots\n- May-Agent/may#746\n\n## Doing\n- Fix the parser (#12)\n  second line\n- Ask about scope\n  BLOCKING q42\n\n## Queued\n- Ship PR #13\n\n## Notes\n- not a row #99\n";
 
     #[test]
     fn rows_keep_section_text_blocking_and_references() {
         let rows = task_rows(DOCUMENT);
         let summary: Vec<_> = rows
             .iter()
-            .map(|row| (row.section, row.text.as_str(), row.blocking.as_deref()))
+            .map(|row| {
+                (
+                    row.section,
+                    row.title.as_str(),
+                    row.detail.as_str(),
+                    row.blocking.as_deref(),
+                )
+            })
             .collect();
         assert_eq!(
             summary,
             vec![
-                (TaskSection::Roots, "May-Agent/may#746", None),
+                (TaskSection::Roots, "May-Agent/may#746", "", None),
                 (
                     TaskSection::Doing,
-                    "Fix the parser (#12)\nsecond line",
+                    "Fix the parser (#12)",
+                    "second line",
                     None
                 ),
                 (
                     TaskSection::Doing,
-                    "Ask about scope BLOCKING q42",
+                    "Ask about scope",
+                    "BLOCKING q42",
                     Some("q42")
                 ),
-                (TaskSection::Queued, "Ship PR #13", None),
+                (TaskSection::Queued, "Ship PR #13", "", None),
             ]
         );
         assert_eq!(

@@ -32,7 +32,7 @@ function TaskRowItem({ row }: { row: TaskRow }) {
     <li className="flex items-start gap-2 py-[3px]">
       <RowGlyph blocked={blocked} />
       <div className="min-w-0 flex-1">
-        <span className="whitespace-pre-line text-[13px] leading-5">{row.text}</span>
+        <span className="whitespace-pre-line text-[13px] leading-5">{row.title}</span>
         {blocked && (
           <div className="text-xs text-foreground/80">
             {t('inspector.blocked', { what: row.blocking ?? '' })}

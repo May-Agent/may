@@ -4281,10 +4281,15 @@ impl App {
                 summary,
                 arguments,
             } => ToolDisplay::Action {
+                // A compaction takes no arguments and has nothing to expand.
+                detail: if name == super::agent_event_adapter::COMPACT_TOOL {
+                    Vec::new()
+                } else {
+                    pretty_arguments(&arguments)
+                },
                 chip: name,
                 task_id: None,
                 summary,
-                detail: pretty_arguments(&arguments),
                 status: super::ui::chat::ToolStatus::Running,
                 output: None,
                 pinned: None,
@@ -5507,6 +5512,65 @@ mod tests {
         assert!(matches!(
             app.chat.elements().last(),
             Some(ChatElement::Recap { summary, next_action: None }) if summary == "Where it stands."
+        ));
+    }
+
+    #[tokio::test]
+    async fn rebuilt_history_never_stacks_worked_for_rows() {
+        use crate::ChatMessage;
+        use crate::session::ToolEventRecord;
+
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        let at = |second: i64| jiff::Timestamp::from_second(1_800_000_000 + second).expect("time");
+        let call = |id: &str, script: &str, second: i64| {
+            let start = ToolEventRecord::Start {
+                id: id.to_string(),
+                name: "terminal".to_string(),
+                arguments: serde_json::json!({ "description": script, "script": script })
+                    .to_string(),
+            };
+            let end = ToolEventRecord::End {
+                id: id.to_string(),
+                name: "terminal".to_string(),
+                result: aither_core::llm::ToolResult::text("done"),
+            };
+            [
+                ChatMessage::tool(
+                    id,
+                    serde_json::to_string(&start).expect("start"),
+                    at(second),
+                ),
+                ChatMessage::tool(
+                    id,
+                    serde_json::to_string(&end).expect("end"),
+                    at(second + 1),
+                ),
+            ]
+        };
+        // An interrupted turn with no reply, then a normal turn.
+        let rows: Vec<ChatMessage> = std::iter::once(ChatMessage::user("実行 运行 실행"))
+            .chain(call("terminal:0#a", "one", 2))
+            .chain(call("terminal:0#b", "two", 4))
+            .chain([ChatMessage::user("next")])
+            .chain(call("terminal:0#c", "three", 32))
+            .chain(call("terminal:0#d", "four", 40))
+            .chain([ChatMessage::assistant("done 完成 완료", at(50))])
+            .collect();
+        app.render_history(&rows).await;
+
+        let mut previous_row = false;
+        let mut rows_seen = 0;
+        for element in app.chat.elements() {
+            let is_row = matches!(element, ChatElement::WorkedFor { .. });
+            assert!(!(is_row && previous_row), "adjacent rows");
+            previous_row = is_row;
+            rows_seen += usize::from(is_row);
+        }
+        assert_eq!(rows_seen, 2);
+        assert!(matches!(
+            app.chat.elements().last(),
+            Some(ChatElement::AssistantText { .. })
         ));
     }
 
