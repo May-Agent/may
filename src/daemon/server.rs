@@ -184,10 +184,14 @@ pub async fn start(mode: DaemonMode) -> anyhow::Result<StartedDaemon> {
     // lease tasks are spawned on its handle.
     let lease_handle = tokio::runtime::Handle::current();
     let runtime_service = Arc::new(
-        crate::session::SessionRuntimeService::new(db_for_archive.clone(), ui_event_bus.clone())
-            .with_spawner(Arc::new(move |task| {
-                lease_handle.spawn(task);
-            })),
+        crate::session::SessionRuntimeService::new(
+            db_for_archive.clone(),
+            ui_event_bus.clone(),
+            crate::session::MayHomePaths::new(may_dir.clone()),
+        )
+        .with_spawner(Arc::new(move |task| {
+            lease_handle.spawn(task);
+        })),
     );
     runtime_service
         .runs()

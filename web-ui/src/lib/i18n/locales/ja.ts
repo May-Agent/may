@@ -313,6 +313,7 @@ export const ja: Messages = {
       other: 'その他',
       failed: '回答を送信できませんでした。質問はすでに閉じられている可能性があります。',
       openTitle: 'May からの質問',
+      blocks: '保留中のタスク',
       secretLabel: 'シークレットの値',
       secretHintGlobal: '{name} としてすべてのセッションに保存されます。May は値を見ません。',
       secretHintSession: '{name} としてこのセッションにのみ保存されます。May は値を見ません。',

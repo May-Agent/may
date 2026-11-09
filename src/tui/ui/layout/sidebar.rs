@@ -613,7 +613,8 @@ mod tests {
             vec![
                 "▾ Doing",
                 "○ wire the command ▸",
-                "⏸ ask scope (blocked: q9) ▸",
+                // Its BLOCKING line is the title's mark, so nothing is left to expand.
+                "⏸ ask scope (blocked: q9)",
                 "",
                 "▾ Queued",
                 "○ 写文档 ドキュメント 문서 ▸",
@@ -630,7 +631,7 @@ mod tests {
             vec![
                 "▾ Doing",
                 "○ wire the command ▸",
-                "⏸ ask scope (blocked: q9) ▸",
+                "⏸ ask scope (blocked: q9)",
                 "",
                 "▾ Queued",
                 "○ 写文档 ドキュメント 문서 ▾",

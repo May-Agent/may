@@ -479,6 +479,7 @@ mod tests {
         let runtime = Arc::new(crate::session::SessionRuntimeService::new(
             db.clone(),
             crate::ui_event_bus::UiEventBus::new(),
+            crate::session::MayHomePaths::new(dir.path().join("home")),
         ));
         let mut builder = ToolRegistryBuilder::new();
         builder.configure_tool(AskUserTool::new(runtime, "session"));

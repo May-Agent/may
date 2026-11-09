@@ -33,7 +33,11 @@ impl Host {
         let db = ChatDb::open(&may_dir.path().join("history.db"))
             .await
             .expect("history.db opens");
-        let runtime = Arc::new(SessionRuntimeService::new(db.clone(), UiEventBus::new()));
+        let runtime = Arc::new(SessionRuntimeService::new(
+            db.clone(),
+            UiEventBus::new(),
+            crate::session::MayHomePaths::new(may_dir.path().to_path_buf()),
+        ));
         for (id, title) in [("a1", "alpha"), ("b1", "beta")] {
             db.create_session(id, Some(title), None)
                 .await
