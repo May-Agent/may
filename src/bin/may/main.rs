@@ -1285,6 +1285,18 @@ where
                             )
                             .await;
                     }
+                    TuiEvent::Declined(message) => {
+                        app.chat.push_notice(&message);
+                        runtime_deps
+                            .finish_agent_task(
+                                app,
+                                &mut agent_handle,
+                                &mut pending_title_gen,
+                                &assistant_response,
+                                RunOutcome::Cancelled,
+                            )
+                            .await;
+                    }
                     TuiEvent::Error(err) => {
                         app.chat.push_error(&err);
                         runtime_deps

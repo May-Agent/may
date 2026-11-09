@@ -86,6 +86,9 @@ pub enum TuiEvent {
         /// Whether this client sent it and gets it back in its input.
         own: bool,
     },
+    /// The user declined, at the session's repository question, to work
+    /// where the session starts: the turn did not run, and nothing failed.
+    Declined(String),
     /// Agent stream completed (ready for next prompt).
     Complete,
     /// Agent encountered a fatal error.

@@ -16,7 +16,8 @@ export type ApiErrorCode =
   | 'container_runtime_unavailable'
   | 'managed_podman_approval_required'
   | 'location_unavailable'
-  | 'github_unauthenticated';
+  | 'github_unauthenticated'
+  | 'repo_declined';
 
 /** Semantic variant of a tool call — server-assigned, never re-inferred client-side. */
 export type ToolVariant =

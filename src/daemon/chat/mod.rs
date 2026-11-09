@@ -2999,6 +2999,7 @@ impl UiChatPreparationError {
             Self::EnsureContainerImage(_) => ApiErrorCode::ContainerPullFailed,
             Self::StartContainer(_) => ApiErrorCode::ContainerStartFailed,
             Self::LoadLocation(_) => ApiErrorCode::LocationUnavailable,
+            Self::RepoGateDeclined => ApiErrorCode::RepoDeclined,
             Self::LoadSession(_)
             | Self::LoadHistory(_)
             | Self::LoadProfile(_)
@@ -3018,7 +3019,6 @@ impl UiChatPreparationError {
             | Self::PersistContextDebugSnapshot(_)
             | Self::HistoryReplay(_)
             | Self::RepoGate(_)
-            | Self::RepoGateDeclined
             | Self::NothingToResume => ApiErrorCode::InternalError,
         }
     }

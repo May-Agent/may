@@ -671,7 +671,14 @@ async fn forward_turn_error(data: &str, current: &mut Option<ForwardedTurn>) {
         .and_then(serde_json::Value::as_str)
         .unwrap_or("the turn failed in the May daemon")
         .to_string();
-    let _ = turn.events.send(TuiEvent::Error(message)).await;
+    let declined =
+        frame.data.get("code").and_then(serde_json::Value::as_str) == Some("repo_declined");
+    let event = if declined {
+        TuiEvent::Declined(message)
+    } else {
+        TuiEvent::Error(message)
+    };
+    let _ = turn.events.send(event).await;
 }
 
 async fn wait_attached(shared: &Shared) -> bool {
