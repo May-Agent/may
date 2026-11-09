@@ -233,52 +233,79 @@ pub fn persist_github(
     owner_repo: &str,
     level: TrustLevel,
 ) -> Result<(), WorkspaceConfigError> {
-    let invalid = |message: String| {
-        WorkspaceConfigError::Read(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            message,
-        ))
-    };
     if !level.publishes_to_github() {
-        return Err(invalid(format!(
+        return Err(invalid_input(format!(
             "{} needs a local checkout; {owner_repo} has none",
             level.as_str()
         )));
     }
     let repository = owner_repo
         .parse::<GitHubRepository>()
-        .map_err(|e| invalid(e.to_string()))?;
+        .map_err(|e| invalid_input(e.to_string()))?;
     let mut config = WorkspaceConfig::load(config_path)?;
-    let issues = if level == TrustLevel::Full {
-        ProjectIssues::Github {
-            repository: repository.clone(),
-        }
-    } else {
-        ProjectIssues::May
+    let decision = Decision {
+        issues: if level == TrustLevel::Full {
+            ProjectIssues::Github {
+                repository: repository.clone(),
+            }
+        } else {
+            ProjectIssues::May
+        },
+        backend: Some("github".to_string()),
+        screen: (level == TrustLevel::PrsOnly).then_some(true),
     };
-    let screen = (level == TrustLevel::PrsOnly).then_some(true);
-    if let Some(entry) = config
-        .projects
-        .iter_mut()
-        .find(|p| p.covers_github(&repository))
-    {
-        entry.issues = issues;
-        entry.pr.backend = Some("github".to_string());
-        entry.pr.screen = screen;
-    } else {
-        config.projects.push(ProjectConfig {
-            path: None,
-            repository: Some(repository),
-            issues,
-            checks: None,
-            pr: ProjectPr {
-                backend: Some("github".to_string()),
-                screen,
-                ..ProjectPr::default()
-            },
-        });
-    }
+    decision.store(
+        &mut config,
+        |p| p.covers_github(&repository),
+        None,
+        Some(repository.clone()),
+    );
     config.save(config_path)
+}
+
+fn invalid_input(message: String) -> WorkspaceConfigError {
+    WorkspaceConfigError::Read(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        message,
+    ))
+}
+
+/// The fields of a project entry a trust decision owns.
+struct Decision {
+    issues: ProjectIssues,
+    backend: Option<String>,
+    screen: Option<bool>,
+}
+
+impl Decision {
+    /// Write the decision into the project `matches` picks, or push a new
+    /// entry at `path` for `repository` when none matches. The rest of an
+    /// existing entry stays.
+    fn store(
+        self,
+        config: &mut WorkspaceConfig,
+        matches: impl Fn(&ProjectConfig) -> bool,
+        path: Option<PathBuf>,
+        repository: Option<GitHubRepository>,
+    ) {
+        if let Some(entry) = config.projects.iter_mut().find(|p| matches(p)) {
+            entry.issues = self.issues;
+            entry.pr.backend = self.backend;
+            entry.pr.screen = self.screen;
+        } else {
+            config.projects.push(ProjectConfig {
+                path,
+                repository,
+                issues: self.issues,
+                checks: None,
+                pr: ProjectPr {
+                    backend: self.backend,
+                    screen: self.screen,
+                    ..ProjectPr::default()
+                },
+            });
+        }
+    }
 }
 
 /// Persist a trust decision to `workspace.toml`.
@@ -297,20 +324,14 @@ pub fn persist(
     kind: Option<&RepoKind>,
     level: TrustLevel,
 ) -> Result<(), WorkspaceConfigError> {
-    let invalid = |message: String| {
-        WorkspaceConfigError::Read(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            message,
-        ))
-    };
     let mut config = WorkspaceConfig::load(config_path)?;
     let identity = crate::issue::repository_identity(worktree)
-        .map_err(|e| invalid(format!("repository identity: {e}")))?;
+        .map_err(|e| invalid_input(format!("repository identity: {e}")))?;
     let issues = match (kind, level) {
         (Some(RepoKind::Github { owner_repo }), TrustLevel::Full) => ProjectIssues::Github {
             repository: owner_repo
                 .parse::<GitHubRepository>()
-                .map_err(|e| invalid(e.to_string()))?,
+                .map_err(|e| invalid_input(e.to_string()))?,
         },
         _ => ProjectIssues::May,
     };
@@ -337,27 +358,17 @@ pub fn persist(
     if let Some(index) = adopted {
         config.projects[index].path = Some(worktree.to_path_buf());
     }
-    if let Some(entry) = config
-        .projects
-        .iter_mut()
-        .find(|p| p.has_identity(&identity))
-    {
-        entry.issues = issues;
-        entry.pr.backend = backend;
-        entry.pr.screen = screen;
-    } else {
-        config.projects.push(ProjectConfig {
-            path: Some(worktree.to_path_buf()),
-            repository: None,
-            issues,
-            checks: None,
-            pr: ProjectPr {
-                backend,
-                screen,
-                ..ProjectPr::default()
-            },
-        });
+    Decision {
+        issues,
+        backend,
+        screen,
     }
+    .store(
+        &mut config,
+        |p| p.has_identity(&identity),
+        Some(worktree.to_path_buf()),
+        None,
+    );
     if level == TrustLevel::Local {
         config.add_workdir(worktree.to_path_buf(), Some("direct checkout".to_string()));
     } else {
