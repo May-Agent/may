@@ -1,6 +1,7 @@
 //! Database entity definitions.
 
 pub mod cache_misses;
+pub mod daemon_runs;
 pub mod folders;
 pub mod issues;
 pub mod messages;

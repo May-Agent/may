@@ -95,6 +95,9 @@ CREATE TABLE IF NOT EXISTS prompt_cache_routes (session_id TEXT NOT NULL, provid
 CREATE TABLE IF NOT EXISTS cache_misses (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, timestamp TEXT NOT NULL, model TEXT NOT NULL, provider_id TEXT NOT NULL, cause TEXT NOT NULL, missed_tokens INTEGER NOT NULL, read_tokens INTEGER NOT NULL, gap_ms INTEGER NOT NULL, diverged_kind TEXT, diverged_index INTEGER, compacted BOOLEAN NOT NULL, reassembled BOOLEAN NOT NULL, agent_rebuilt BOOLEAN NOT NULL, model_switched BOOLEAN NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_cache_misses_session_timestamp ON cache_misses(session_id, timestamp);
 CREATE TABLE IF NOT EXISTS sleep_log (id INTEGER PRIMARY KEY AUTOINCREMENT, slept_at_ms INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS daemon_runs (id INTEGER PRIMARY KEY CHECK (id = 1), process_session INTEGER NOT NULL, stopped BOOLEAN NOT NULL, started_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS session_background_live (session_id TEXT PRIMARY KEY, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS session_daemon_exit_alerts (session_id TEXT PRIMARY KEY, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS ci_jobs (id INTEGER PRIMARY KEY AUTOINCREMENT, project_id INTEGER NOT NULL, pr_id INTEGER NOT NULL, session_id TEXT NOT NULL, source TEXT NOT NULL, external_id INTEGER NOT NULL, run_id INTEGER NOT NULL, workflow TEXT NOT NULL, name TEXT NOT NULL, conclusion TEXT NOT NULL, started_at_ms INTEGER NOT NULL, duration_secs INTEGER NOT NULL, recorded_at_ms INTEGER NOT NULL, UNIQUE (project_id, source, external_id));
 CREATE INDEX IF NOT EXISTS idx_ci_jobs_pr ON ci_jobs(pr_id);
 CREATE INDEX IF NOT EXISTS idx_ci_jobs_name ON ci_jobs(project_id, workflow, name, started_at_ms);

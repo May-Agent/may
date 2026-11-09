@@ -372,7 +372,7 @@ async fn recovery_settles_sessions_a_dead_run_left_owned() {
     );
     fresh
         .runs()
-        .recover_after_restart()
+        .recover_after_restart(crate::db::PreviousDaemon::Stopped)
         .await
         .expect("recovery");
 

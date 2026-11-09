@@ -230,8 +230,13 @@ impl SessionRuns {
     ///
     /// # Errors
     /// Returns [`ChatDbError`] on storage failure.
-    pub async fn recover_after_restart(&self) -> Result<(), ChatDbError> {
-        self.db.recover_session_runtimes_after_restart().await
+    pub async fn recover_after_restart(
+        &self,
+        previous: crate::db::PreviousDaemon,
+    ) -> Result<(), ChatDbError> {
+        self.db
+            .recover_session_runtimes_after_restart(previous)
+            .await
     }
 }
 
