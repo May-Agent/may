@@ -64,6 +64,19 @@ jobs:
             git diff --name-only "${range}" | tee /dev/stderr | .github/scripts/ci-scope.sh | tee -a "${GITHUB_OUTPUT}"
           fi
 
+  # The container tests in test-ubuntu pull the workspace image, whose tag is a
+  # content hash of its inputs; it is built and pushed here first, and skipped
+  # when that tag already exists. Same scope gate as the tests.
+  container-image:
+    needs: scope
+    if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test == 'true') }}
+    uses: ./.github/workflows/container-image.yml
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+
   fmt:
     needs: scope
     if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.fmt == 'true') }}
@@ -127,7 +140,9 @@ jobs:
 
   test-ubuntu:
     name: test (ubuntu-latest)
-    needs: scope
+    # Not gated on the image's result: a failed image fails the run on its own,
+    # and a skipped required check would report success.
+    needs: [scope, container-image]
     if: ${{ !cancelled() && (needs.scope.result != 'success' || needs.scope.outputs.test == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 40

@@ -272,14 +272,46 @@ mod tests {
 
         let mut silent = fake_agent(Some("a"), Some("default"));
         silent.args = vec!["--silent-after-initialize".to_string()];
-        let started = std::time::Instant::now();
         let error = connect(&state, silent).await.expect_err("times out");
         assert!(
             matches!(error, ConnectError::TrialTimedOut(limit) if limit == Duration::from_millis(1500)),
             "{error}"
         );
-        assert!(started.elapsed() < Duration::from_secs(8));
         assert!(state.config_snapshot().acp_agents.is_empty());
+    }
+
+    /// The trial returns at its limit plus the time to kill the agent's tree
+    /// and remove the scratch directory (measured at a few milliseconds). The
+    /// margin leaves room for a loaded test run and stays far below the
+    /// seconds a probe or sandbox start can take, which `connect` spends
+    /// before the trial and the limit does not cover.
+    const TRIAL_MARGIN: Duration = Duration::from_millis(750);
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_trial_with_a_silent_agent_returns_within_its_limit_and_margin() {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let limit = Duration::from_millis(1500);
+        let silent = fake_agent(Some("a"), Some("default"));
+        let agent = AcpAgentConfig {
+            command: silent.command,
+            args: vec!["--silent-after-initialize".to_string()],
+            env: BTreeMap::new(),
+            model: silent.model,
+            mode: silent.mode,
+            description: String::new(),
+            grants: Vec::new(),
+        };
+        let started = std::time::Instant::now();
+        let error = try_connection(&tokio::runtime::Handle::current(), "fake", &agent, limit)
+            .await
+            .expect_err("times out");
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(error, TrialError::TimedOut(l) if l == limit),
+            "{error}"
+        );
+        assert!(elapsed >= limit, "{elapsed:?}");
+        assert!(elapsed < limit + TRIAL_MARGIN, "{elapsed:?}");
     }
 
     fn choice(error: ConnectError) -> (AcpChoice, Vec<String>) {

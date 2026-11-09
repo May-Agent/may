@@ -1294,6 +1294,67 @@ fn browser_takeover_alert() -> String {
         .expect("browser takeover reminder must render")
 }
 
+#[derive(Template)]
+#[template(path = "reminder_daemon_exit.txt", escape = "none")]
+struct DaemonExitReminder;
+
+fn daemon_exit_alert() -> String {
+    DaemonExitReminder
+        .render()
+        .expect("daemon exit reminder must render")
+}
+
+/// Starts again the sessions an unexpected daemon exit interrupted whose
+/// prompt cache is still warm: each gets a queued turn carrying the
+/// daemon-exit alert, which [`resume_pending_follow_up_runs`] dispatches. A
+/// session whose cache went cold keeps the alert owed, and its next turn —
+/// the user's next message — carries it.
+///
+/// Runs at daemon start, before any client is served.
+///
+/// # Errors
+/// Returns [`crate::db::ChatDbError`] on storage failure.
+pub(super) async fn restart_interrupted_sessions(
+    state: &Arc<DaemonState>,
+) -> Result<(), crate::db::ChatDbError> {
+    let db = state.db();
+    for session_id in db.sessions_owed_daemon_exit_alert().await? {
+        let cold = db
+            .prompt_cache_is_cold(&session_id, jiff::Timestamp::now(), |provider_id| {
+                turn_events::provider_cache_lifetime(state, provider_id)
+            })
+            .await?;
+        if cold {
+            tracing::info!(%session_id, "an interrupted session's cache is cold; it starts with the user's next message");
+            continue;
+        }
+        let alert = crate::XmlBlock::parse(daemon_exit_alert())
+            .expect("the daemon exit reminder is one well-formed block");
+        let pending = PendingUserMessage {
+            id: None,
+            state: PendingMessageState::default(),
+            error: None,
+            content: String::new(),
+            attachments: Vec::new(),
+            hidden_context_xml: Some(alert),
+            created_at: jiff::Timestamp::now().to_string(),
+            delivery_mode: crate::session::PendingUserMessageMode::Queue,
+        };
+        state
+            .runtime_service
+            .enqueue(
+                &session_id,
+                pending,
+                crate::session::PendingUserMessageMode::Queue,
+            )
+            .await?;
+        // The queued turn carries the alert now.
+        db.take_daemon_exit_alert(&session_id).await?;
+        tracing::info!(%session_id, "an interrupted session's cache is warm; it starts again");
+    }
+    Ok(())
+}
+
 fn resume_waiting_turn_reminder(
     request_kind: ResumeRequestKind,
     resolution: ResumeResolution,
@@ -1511,7 +1572,21 @@ async fn stop_session_run_impl(
         .runtime_service
         .runs()
         .cancel(&session_id, CancelReason::User);
-    tracing::info!(session_id = %session_id, cancelled, "received session stop request");
+    // Stopping the agent ends its background work too: the idle agent's
+    // jobs first, so their completions wait for the user's next input
+    // instead of starting a turn, then every job and subagent run left.
+    state
+        .parked_agents
+        .stop_background(&state, &session_id)
+        .await;
+    let stopped = state.session_background.stop_all(&session_id).await;
+    tracing::info!(session_id = %session_id, cancelled, stopped, "received session stop request");
+    if stopped > 0 {
+        state.publish_session_change(
+            &session_id,
+            crate::daemon::session_events::SessionChange::Background,
+        );
+    }
 
     let runtime = state
         .runtime_service
@@ -1557,8 +1632,8 @@ pub(super) async fn post_turn(
     }
 }
 
-/// `DELETE /api/sessions/{id}/turns/current`: stops the session's running
-/// turn, if any.
+/// `DELETE /api/sessions/{id}/turns/current`: stops the session's agent:
+/// its running turn, if any, and its background commands and subagent runs.
 pub(super) async fn delete_current_turn(
     params: skyzen::routing::Params,
     state: State<Arc<DaemonState>>,
@@ -1885,9 +1960,8 @@ fn run_agent_loop<'a>(
         let mut turn_hidden_context_xml: Option<String> = None;
         // The stored user message, from the first attempt.
         let mut turn_user_message_id: Option<i32> = None;
-        // Whether the turn consumed the pending takeover-ended alert, which
-        // a withdrawal gives back.
-        let mut turn_consumed_takeover_alert = false;
+        // The pending alerts the turn consumed, which a withdrawal gives back.
+        let mut turn_consumed_alerts = ConsumedAlerts::default();
         // The largest history row id before this turn persists anything. A
         // retry that resubmits the prompt rebuilds context only up to it,
         // so the rows the turn itself wrote are not fed back alongside the
@@ -1936,7 +2010,7 @@ fn run_agent_loop<'a>(
                 provider_candidate_count,
                 build_key,
                 user_message_id,
-                takeover_alert_consumed,
+                consumed_alerts,
                 reasoning_effort,
                 cwd,
             } = match prepare_agent_for_request(
@@ -1996,7 +2070,7 @@ fn run_agent_loop<'a>(
             if user_message_id.is_some() {
                 turn_user_message_id = user_message_id;
             }
-            turn_consumed_takeover_alert |= takeover_alert_consumed;
+            turn_consumed_alerts.merge(consumed_alerts);
             sink.on_prepared(turn_user_message_id);
             if let Some(hidden_context_xml) = hidden_context_xml {
                 turn_hidden_context_xml = Some(hidden_context_xml);
@@ -2362,12 +2436,9 @@ fn run_agent_loop<'a>(
                     state.notify_ui_events(UiEventTopics::PROFILE_SESSIONS);
                     // The alert's row went with the turn; the model has yet
                     // to see it, so the next turn delivers it.
-                    if turn_consumed_takeover_alert {
-                        state
-                            .runtime_service
-                            .restore_browser_takeover_alert_pending(session_id.as_str())
-                            .await?;
-                    }
+                    turn_consumed_alerts
+                        .restore(state, session_id.as_str())
+                        .await?;
                     sink.on_withdrawn(&req.content, &req.attachments).await;
                     record_request_log(state, ledger.interrupted(Instant::now(), reason)).await;
                     return Err(AgentLoopError::Cancelled(reason));
@@ -2817,11 +2888,46 @@ fn enqueue_event_triggered_tasks(
 
 // ── Agent preparation: typed intermediate structs ─────────
 
+/// The pending one-shot alerts a turn's preparation consumed.
+#[derive(Debug, Default, Clone, Copy)]
+struct ConsumedAlerts {
+    /// The browser takeover-ended alert.
+    browser_takeover: bool,
+    /// The alert that the daemon exited unexpectedly.
+    daemon_exit: bool,
+}
+
+impl ConsumedAlerts {
+    const fn merge(&mut self, other: Self) {
+        self.browser_takeover |= other.browser_takeover;
+        self.daemon_exit |= other.daemon_exit;
+    }
+
+    /// Owes `session_id` the consumed alerts again: the turn that carried
+    /// them was withdrawn before the model saw them.
+    async fn restore(
+        self,
+        state: &DaemonState,
+        session_id: &str,
+    ) -> Result<(), crate::db::ChatDbError> {
+        if self.browser_takeover {
+            state
+                .runtime_service
+                .restore_browser_takeover_alert_pending(session_id)
+                .await?;
+        }
+        if self.daemon_exit {
+            state.db().restore_daemon_exit_alert(session_id).await?;
+        }
+        Ok(())
+    }
+}
+
 struct SessionContext {
     /// Row id of the user message this turn stored, when it stored one.
     user_message_id: Option<i32>,
-    /// Whether preparing the turn consumed the pending takeover-ended alert.
-    takeover_alert_consumed: bool,
+    /// The pending alerts preparing the turn consumed.
+    consumed_alerts: ConsumedAlerts,
     session_id: SessionId,
     current_model: String,
     provider_candidate_count: usize,
@@ -2865,8 +2971,8 @@ struct PreparedAgent {
     build_key: u64,
     /// Row id of the user message this turn stored, when it stored one.
     user_message_id: Option<i32>,
-    /// Whether preparing the turn consumed the pending takeover-ended alert.
-    takeover_alert_consumed: bool,
+    /// The pending alerts preparing the turn consumed.
+    consumed_alerts: ConsumedAlerts,
     /// Reasoning effort resolved for this turn's requests.
     reasoning_effort: Option<aither_core::llm::model::ReasoningEffort>,
     /// Where the agent's terminal commands run.
@@ -3261,6 +3367,24 @@ async fn resolve_session_context(
         .await
         .map_err(UiChatPreparationError::PersistHiddenContext)?;
     }
+    let daemon_exit_alert_consumed = persist_user_message
+        && db
+            .take_daemon_exit_alert(session_id.as_str())
+            .await
+            .map_err(UiChatPreparationError::PersistHiddenContext)?;
+    if daemon_exit_alert_consumed {
+        push_hidden_context_part(
+            &db,
+            fence,
+            &history,
+            &mut hidden_context_parts,
+            daemon_exit_alert(),
+            persist_user_message,
+            &mut hidden_commit_entry,
+        )
+        .await
+        .map_err(UiChatPreparationError::PersistHiddenContext)?;
+    }
 
     if let Some(hidden_context_xml) = req
         .hidden_context_xml
@@ -3388,7 +3512,10 @@ async fn resolve_session_context(
 
     Ok(SessionContext {
         user_message_id,
-        takeover_alert_consumed,
+        consumed_alerts: ConsumedAlerts {
+            browser_takeover: takeover_alert_consumed,
+            daemon_exit: daemon_exit_alert_consumed,
+        },
         session_id,
         current_model,
         provider_candidate_count,
@@ -3806,7 +3933,7 @@ fn prepare_agent_for_request<'a>(
             provider_candidate_count: ctx.provider_candidate_count,
             build_key,
             user_message_id: ctx.user_message_id,
-            takeover_alert_consumed: ctx.takeover_alert_consumed,
+            consumed_alerts: ctx.consumed_alerts,
             reasoning_effort: ctx.reasoning_effort,
             cwd: ctx.cwd,
         })
@@ -5636,7 +5763,7 @@ mod tests {
                 == 0,
             "a delivered entry leaves the queue"
         );
-        db.recover_session_runtimes_after_restart()
+        db.recover_session_runtimes_after_restart(crate::db::PreviousDaemon::Stopped)
             .await
             .expect("daemon start resets claims");
         let guard = state

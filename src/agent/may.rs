@@ -923,6 +923,7 @@ impl MayAgent {
         // above.
         let capabilities = build_capabilities(
             builder.tool_descriptions(),
+            &shared_terminal_commands.usages,
             &config.request_parameters,
             &skills_dir,
         )

@@ -2108,11 +2108,30 @@ impl App {
         self.processing || !self.session_runtime.state.is_idle()
     }
 
-    /// Answer a quit request: quits at once when no run is in flight, and
-    /// asks first what happens to a busy session's agent. A quit request
-    /// repeated while the dialog is up leaves the agent running.
+    /// Whether the current session's agent has background work alive: a
+    /// terminal job still running or a subagent run in flight.
+    #[must_use]
+    pub fn agent_has_background_work(&self) -> bool {
+        !self.subagents.is_empty()
+            || self
+                .jobs
+                .iter()
+                .any(|job| job.status == aither_sandbox::JobStatus::Running)
+    }
+
+    /// Whether the current session's agent is working: a run in flight or
+    /// background work alive.
+    #[must_use]
+    pub fn agent_working(&self) -> bool {
+        self.agent_busy() || self.agent_has_background_work()
+    }
+
+    /// Answer a quit request: quits at once when the agent is not working,
+    /// and asks first what happens to a working agent — a run in flight or
+    /// background work alive. A quit request repeated while the dialog is up
+    /// leaves the agent running.
     fn request_quit(&mut self) -> Option<SendAction> {
-        if matches!(self.mode, AppMode::QuitConfirm(_)) || !self.agent_busy() {
+        if matches!(self.mode, AppMode::QuitConfirm(_)) || !self.agent_working() {
             return Some(SendAction::Quit);
         }
         self.quit_pending = false;
@@ -6051,5 +6070,59 @@ mod tests {
         assert!(screen.contains("Effort"), "{screen}");
         assert!(screen.contains("▲"), "{screen}");
         assert!(screen.contains("Esc to cancel"), "{screen}");
+    }
+
+    fn background_job(status: aither_sandbox::JobStatus) -> aither_sandbox::JobInfo {
+        aither_sandbox::JobInfo {
+            pid: 4242,
+            task_id: "brisk-otter".to_string(),
+            execution_key: "key".to_string(),
+            script: "sleep 300".to_string(),
+            language: aither_sandbox::ScriptLanguage::Shell,
+            mode: aither_sandbox::TerminalMode::Sandboxed,
+            started_at: std::time::Instant::now(),
+            status,
+            output_path: None,
+            place: aither_sandbox::JobPlace::Host,
+        }
+    }
+
+    /// With no turn in flight, quitting asks first while a background command
+    /// still runs, and quits at once once it finished.
+    #[tokio::test]
+    async fn quitting_asks_while_only_a_background_command_runs() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (mut app, _id) = app_with_session(dir.path()).await;
+        assert!(!app.agent_busy(), "no turn is in flight");
+
+        app.handle_event(AppEvent::BackgroundLoaded {
+            jobs: vec![background_job(aither_sandbox::JobStatus::Running)],
+            subagents: Vec::new(),
+        })
+        .expect("background event");
+        assert!(app.request_quit().is_none(), "the quit waits for an answer");
+        assert!(matches!(app.mode, crate::tui::AppMode::QuitConfirm(_)));
+        let screen = session_screen(&mut app).join("\n");
+        assert!(
+            screen.contains("Keep it running in the background"),
+            "{screen}"
+        );
+        assert!(screen.contains("Stop the agent, then quit"), "{screen}");
+        assert!(matches!(
+            app.handle_event(AppEvent::Key(KeyCode::Char('s'), KeyModifiers::NONE))
+                .expect("key event"),
+            Some(SendAction::StopAgentAndQuit)
+        ));
+
+        app.mode = crate::tui::AppMode::Chat;
+        app.handle_event(AppEvent::BackgroundLoaded {
+            jobs: vec![background_job(aither_sandbox::JobStatus::Completed {
+                exit_code: 0,
+                delivery: aither_sandbox::Delivery::Taken,
+            })],
+            subagents: Vec::new(),
+        })
+        .expect("background event");
+        assert!(matches!(app.request_quit(), Some(SendAction::Quit)));
     }
 }

@@ -6080,3 +6080,268 @@ async fn explore_runs_read_only_on_the_fast_model() {
     assert!(!files.0.contains_key("workspace.txt"));
     assert_eq!(files.get("tasks.before"), "## Notes\noriginal\n");
 }
+
+/// What the alert that the daemon exited unexpectedly opens with.
+const DAEMON_EXIT_ALERT: &str = "The May daemon exited unexpectedly";
+/// How long the daemon's background watcher takes, at most, to record the
+/// sessions with background work.
+const BACKGROUND_RECORD_DELAY: Duration = Duration::from_secs(3);
+
+fn mentions_daemon_exit(request: &Value) -> bool {
+    message_texts(request)
+        .iter()
+        .any(|text| text.contains(DAEMON_EXIT_ALERT))
+}
+
+/// Whether process `pid` or any process of the group it leads is alive.
+fn process_tree_alive(pid: u32) -> bool {
+    let pid = rustix::process::Pid::from_raw(pid.cast_signed()).expect("a nonzero pid");
+    rustix::process::test_kill_process(pid).is_ok()
+        || rustix::process::test_kill_process_group(pid).is_ok()
+}
+
+/// Waits until the mock received more than `seen` agent requests and
+/// returns the newest.
+async fn next_agent_request(mock: &MockOpenAiServer, seen: usize, log: &ServerLog) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let requests = mock.agent_requests().await;
+        if requests.len() > seen {
+            return requests.last().expect("a request").clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no agent request after the first {seen}; server logs:\n{}",
+            strip_ansi_escapes(&log.contents().await)
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Starts the session's background job with one turn and returns the job's
+/// pid once the daemon has had time to record the session's background work.
+async fn start_background_job(
+    client: &reqwest::Client,
+    server: &RunningDaemon,
+    session_id: &str,
+) -> u32 {
+    let turn = send_turn(
+        client,
+        &server.base_url,
+        &serde_json::json!({ "sessionId": session_id, "content": "start the job" }),
+    )
+    .await
+    .expect("turn request should succeed");
+    let turn = expect_status(&server.log, turn, StatusCode::OK).await;
+    let events = collect_turn_events(turn, "the background-job turn", &server.log).await;
+    assert!(
+        events.iter().any(|(kind, _)| kind == "done"),
+        "the turn should end while its job runs; events: {events:?}"
+    );
+    let background = background_of(client, server, session_id).await;
+    let job = background_job(&background, BACKGROUND_JOB_SCRIPT)
+        .filter(|job| job.pointer("/status/state").and_then(Value::as_str) == Some("running"))
+        .unwrap_or_else(|| panic!("the job outlives its turn: {background}"));
+    let pid = job
+        .get("pid")
+        .and_then(Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok())
+        .expect("the job has a pid");
+    sleep(BACKGROUND_RECORD_DELAY).await;
+    pid
+}
+
+/// A daemon killed outright while a session's background command runs:
+/// the next daemon start ends the command, and since the session's prompt
+/// cache is warm its agent starts again at once with the alert.
+#[tokio::test]
+#[serial]
+async fn an_unexpected_exit_kills_background_commands_and_restarts_a_warm_session() {
+    let mock =
+        MockOpenAiServer::spawn(MockChatScenario::StartsBackgroundJob(BACKGROUND_JOB_SCRIPT)).await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
+    let client = reqwest::Client::new();
+    let environment = ChatEnvironment::Local
+        .prepare(&harness, &client, &server)
+        .await;
+    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+    let pid = start_background_job(&client, &server, &session_id).await;
+    let seen = mock.agent_requests().await.len();
+
+    server.kill().await;
+    #[cfg(target_os = "macos")]
+    assert!(
+        process_tree_alive(pid),
+        "the job outlives the daemon that started it until the next start ends it"
+    );
+
+    let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while process_tree_alive(pid) {
+        assert!(
+            Instant::now() < deadline,
+            "the next daemon start should end the exited daemon's job {pid}; server logs:\n{}",
+            strip_ansi_escapes(&server.log.contents().await)
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+    let restarted = next_agent_request(&mock, seen, &server.log).await;
+    assert!(
+        mentions_daemon_exit(&restarted),
+        "the restarted turn carries the alert: {:?}",
+        message_texts(&restarted)
+    );
+    wait_for_runtime_state_clear(&client, &server, &session_id, Duration::from_secs(30)).await;
+    server.stop().await;
+    environment.release(&harness, &session_id).await;
+}
+
+/// A daemon killed outright during a turn of a session whose prompt cache
+/// has since gone cold: nothing runs at the next start, and the user's next
+/// message carries the alert.
+#[tokio::test]
+#[serial]
+async fn an_unexpected_exit_leaves_a_cold_session_for_the_next_message() {
+    // Agent request 1, the second turn's, is held so the daemon dies in it.
+    let gate = RequestGate::holding(1);
+    let mock = MockOpenAiServer::spawn_gated(
+        MockChatScenario::CachedTextEveryTurn { cached: vec![500] },
+        Some(gate.clone()),
+    )
+    .await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    let config_path = harness.may_dir.join("config.toml");
+    let mut config = MayConfig::load_from(&config_path)
+        .await
+        .expect("test config should load");
+    config
+        .set_provider_cache_lifetime(TEST_PROVIDER_ID, "2s")
+        .expect("a valid cache lifetime");
+    config
+        .save_to(&config_path)
+        .await
+        .expect("test config should be written");
+    let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
+    let client = reqwest::Client::new();
+    let environment = ChatEnvironment::Local
+        .prepare(&harness, &client, &server)
+        .await;
+    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+
+    let turn = send_turn(
+        &client,
+        &server.base_url,
+        &serde_json::json!({ "sessionId": session_id, "content": "first question" }),
+    )
+    .await
+    .expect("turn request should succeed");
+    let turn = expect_status(&server.log, turn, StatusCode::OK).await;
+    let events = collect_turn_events(turn, "the first turn", &server.log).await;
+    assert!(
+        events.iter().any(|(kind, _)| kind == "done"),
+        "events: {events:?}"
+    );
+    let turn = send_turn(
+        &client,
+        &server.base_url,
+        &serde_json::json!({ "sessionId": session_id, "content": "second question" }),
+    )
+    .await
+    .expect("turn request should succeed");
+    expect_status(&server.log, turn, StatusCode::OK).await;
+    tokio::time::timeout(Duration::from_secs(60), gate.arrived.notified())
+        .await
+        .unwrap_or_else(|_| panic!("the second turn never asked the model"));
+    server.kill().await;
+    let seen = mock.agent_requests().await.len();
+
+    // Past the cache lifetime the session is cold.
+    sleep(Duration::from_secs(3)).await;
+    let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
+    sleep(Duration::from_secs(4)).await;
+    assert_eq!(
+        mock.agent_requests().await.len(),
+        seen,
+        "a cold session starts nothing until the user writes; server logs:\n{}",
+        strip_ansi_escapes(&server.log.contents().await)
+    );
+    let runtime = get_runtime(&client, &server, &session_id).await;
+    assert!(runtime_is_idle(&runtime), "{runtime}");
+
+    let turn = send_turn(
+        &client,
+        &server.base_url,
+        &serde_json::json!({ "sessionId": session_id, "content": "third question" }),
+    )
+    .await
+    .expect("turn request should succeed");
+    let turn = expect_status(&server.log, turn, StatusCode::OK).await;
+    let events = collect_turn_events(turn, "the turn after the restart", &server.log).await;
+    assert!(
+        events.iter().any(|(kind, _)| kind == "done"),
+        "events: {events:?}"
+    );
+    let requests = mock.agent_requests().await;
+    let next = &requests[seen];
+    let texts = message_texts(next);
+    assert!(
+        mentions_daemon_exit(next),
+        "the alert rides along: {texts:?}"
+    );
+    assert!(
+        texts.iter().any(|text| text.contains("third question")),
+        "with the user's message: {texts:?}"
+    );
+    server.stop().await;
+    environment.release(&harness, &session_id).await;
+}
+
+/// A daemon stopped through its shutdown path owes no session the alert:
+/// nothing starts at the next start, and the next message carries none.
+#[tokio::test]
+#[serial]
+async fn a_graceful_stop_does_not_alert() {
+    let mock =
+        MockOpenAiServer::spawn(MockChatScenario::StartsBackgroundJob(BACKGROUND_JOB_SCRIPT)).await;
+    let harness = TestHarness::new(&mock.base_url()).await;
+    let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
+    let client = reqwest::Client::new();
+    let environment = ChatEnvironment::Local
+        .prepare(&harness, &client, &server)
+        .await;
+    let session_id = create_session_via_api(&client, &server, environment.profile_id()).await;
+    start_background_job(&client, &server, &session_id).await;
+    let seen = mock.agent_requests().await.len();
+
+    server.stop().await;
+    let server = RunningDaemon::spawn(harness.home_path(), &[]).await;
+    sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        mock.agent_requests().await.len(),
+        seen,
+        "nothing restarts after a graceful stop"
+    );
+
+    let turn = send_turn(
+        &client,
+        &server.base_url,
+        &serde_json::json!({ "sessionId": session_id, "content": "anything new?" }),
+    )
+    .await
+    .expect("turn request should succeed");
+    let turn = expect_status(&server.log, turn, StatusCode::OK).await;
+    let events = collect_turn_events(turn, "the turn after the stop", &server.log).await;
+    assert!(
+        events.iter().any(|(kind, _)| kind == "done"),
+        "events: {events:?}"
+    );
+    let next = &mock.agent_requests().await[seen];
+    assert!(
+        !mentions_daemon_exit(next),
+        "no alert after a graceful stop: {:?}",
+        message_texts(next)
+    );
+    server.stop().await;
+    environment.release(&harness, &session_id).await;
+}
