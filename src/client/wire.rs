@@ -234,21 +234,6 @@ pub enum WireAgentEvent {
         /// Long tool outputs the cleanup moved to files.
         outputs_spilled: usize,
     },
-    /// The run checkpointed after a turn or at its end; `phase` says whether
-    /// a compaction is in flight.
-    Checkpoint {
-        /// The run.
-        run_id: String,
-        /// Whether the checkpoint is the run's last rather than a turn
-        /// boundary.
-        stop: bool,
-        /// The turn.
-        turn: usize,
-        /// Lifecycle phase of the context window.
-        phase: aither_agent::ContextWindowPhase,
-        /// Recent messages held in memory.
-        message_count: usize,
-    },
     /// The agent failed.
     Error {
         /// The failure.
@@ -336,19 +321,6 @@ impl WireAgentEvent {
                 final_text: final_text.clone(),
                 turns: *turns,
             },
-            AgentEvent::Checkpoint {
-                run_id,
-                reason,
-                turn,
-                phase,
-                message_count,
-            } => Self::Checkpoint {
-                run_id: run_id.clone(),
-                stop: *reason == aither_agent::CheckpointReason::Stop,
-                turn: *turn,
-                phase: *phase,
-                message_count: *message_count,
-            },
             AgentEvent::CompactionRecovery {
                 error,
                 alerts_removed,
@@ -410,23 +382,6 @@ impl WireAgentEvent {
                 has_tool_calls,
             },
             Self::Complete { final_text, turns } => AgentEvent::Complete { final_text, turns },
-            Self::Checkpoint {
-                run_id,
-                stop,
-                turn,
-                phase,
-                message_count,
-            } => AgentEvent::Checkpoint {
-                run_id,
-                reason: if stop {
-                    aither_agent::CheckpointReason::Stop
-                } else {
-                    aither_agent::CheckpointReason::TurnBoundary
-                },
-                turn,
-                phase,
-                message_count,
-            },
             Self::CompactionRecovery {
                 error,
                 alerts_removed,
@@ -440,6 +395,52 @@ impl WireAgentEvent {
         };
         Ok(TimedEvent { at, event })
     }
+}
+
+/// How far a compaction of a session has got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionPhase {
+    /// A compaction began.
+    Started,
+    /// The compaction replaced the context with its handoff.
+    Applied,
+    /// There was no conversation to compact.
+    NothingToCompact,
+    /// The compaction failed; the failure is reported where it was asked
+    /// for, and the context is as it was.
+    Failed,
+    /// A newer compaction superseded this one before it landed.
+    Discarded,
+}
+
+impl CompactionPhase {
+    /// The phase a compaction event reports, or `None` for any other event.
+    #[must_use]
+    pub const fn from_event(event: &AgentEvent) -> Option<Self> {
+        use aither_agent::CompactionOutcome;
+        Some(match event {
+            AgentEvent::CompactionStarted => Self::Started,
+            AgentEvent::CompactionFinished { outcome } => match outcome {
+                CompactionOutcome::Applied(_) => Self::Applied,
+                CompactionOutcome::NothingToCompact => Self::NothingToCompact,
+                CompactionOutcome::Failed(_) => Self::Failed,
+                CompactionOutcome::Discarded => Self::Discarded,
+            },
+            _ => return None,
+        })
+    }
+}
+
+/// One frame of the `session_compaction` event kind. Compactions run
+/// between turns as well as in them, so the frame belongs to no turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionCompactionFrame {
+    /// Session being compacted.
+    pub session_id: String,
+    /// Where the compaction stands.
+    pub phase: CompactionPhase,
 }
 
 /// How a daemon run ended.

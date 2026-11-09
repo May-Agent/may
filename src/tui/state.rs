@@ -851,27 +851,25 @@ pub enum CompactionMeter {
 }
 
 impl CompactionMeter {
-    /// A compaction started.
-    pub const fn start(&mut self) {
-        *self = Self::Compacting;
-    }
-
-    /// The compaction finished at `now`.
-    pub fn finish(&mut self, now: std::time::Instant) {
-        *self = Self::Compacted {
-            until: now + COMPACTED_HOLD,
+    /// Follow the compaction to `phase`, reported at `now`. Only a compaction
+    /// that replaced the context reads `Compacted`; any other end returns the
+    /// meter to the usage figure.
+    pub fn apply(&mut self, phase: crate::client::CompactionPhase, now: std::time::Instant) {
+        use crate::client::CompactionPhase;
+        *self = match phase {
+            CompactionPhase::Started => Self::Compacting,
+            CompactionPhase::Applied => Self::Compacted {
+                until: now + COMPACTED_HOLD,
+            },
+            CompactionPhase::NothingToCompact
+            | CompactionPhase::Failed
+            | CompactionPhase::Discarded => Self::Idle,
         };
     }
 
-    /// The compaction ended without changing the context.
+    /// Return to the usage figure, as when the session changes.
     pub const fn cancel(&mut self) {
         *self = Self::Idle;
-    }
-
-    /// Whether a compaction is running.
-    #[must_use]
-    pub const fn is_compacting(self) -> bool {
-        matches!(self, Self::Compacting)
     }
 
     /// Whether `Compacted` is on screen, so ticks redraw until it clears.

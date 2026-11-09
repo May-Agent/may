@@ -379,6 +379,16 @@ pub fn reduce_event(app: &mut App, event: AppEvent) -> AppResult<Option<SendActi
             }
             Ok(None)
         }
+        AppEvent::Compaction { session_id, phase } => {
+            if app
+                .session_manager
+                .current()
+                .is_some_and(|session| session.id.as_str() == session_id)
+            {
+                app.compaction.apply(phase, std::time::Instant::now());
+            }
+            Ok(None)
+        }
         AppEvent::Status(message) => {
             app.set_status(message);
             Ok(None)

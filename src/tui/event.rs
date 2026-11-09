@@ -182,6 +182,14 @@ pub enum AppEvent {
         /// The window in tokens.
         window: u32,
     },
+    /// A `session_compaction` frame arrived: the session's compaction
+    /// started or ended.
+    Compaction {
+        /// Session being compacted.
+        session_id: String,
+        /// Where the compaction stands.
+        phase: crate::client::CompactionPhase,
+    },
     /// A kill request finished; `true` when the job accepted it.
     JobKilled {
         /// Process ID the kill targeted.
@@ -266,6 +274,7 @@ impl AppEvent {
             Self::Recap { .. } => "recap",
             Self::Warning { .. } => "warning",
             Self::ContextWindow { .. } => "context_window",
+            Self::Compaction { .. } => "compaction",
             Self::JobKilled { .. } => "job_killed",
             Self::JobDetailLoaded { .. } => "job_detail_loaded",
             Self::TerminalOutputs(_) => "terminal_outputs",

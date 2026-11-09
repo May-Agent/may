@@ -4491,7 +4491,6 @@ impl App {
                         self.chat
                             .push_compaction_recovery(&error, alerts_removed, outputs_spilled);
                     }
-                    AgentEvent::Checkpoint { phase, .. } => self.observe_context_phase(phase),
                     // Lifecycle events are used for runtime coordination, not rendered.
                     _ => {}
                 }
@@ -4629,22 +4628,6 @@ impl App {
             self.context_window = None;
         }
         self.current_model = Some(model.to_string());
-    }
-
-    /// Follow the context window's phase at a checkpoint: a compaction in
-    /// flight puts `Compacting` on the meter, and its end shows `Compacted`.
-    /// A window at its pause point is no finished compaction.
-    fn observe_context_phase(&mut self, phase: aither_agent::ContextWindowPhase) {
-        use aither_agent::ContextWindowPhase;
-        match phase {
-            ContextWindowPhase::Compacting => self.compaction.start(),
-            ContextWindowPhase::Exhausted => self.compaction.cancel(),
-            ContextWindowPhase::Stable | ContextWindowPhase::ReassemblyDue => {
-                if self.compaction.is_compacting() {
-                    self.compaction.finish(std::time::Instant::now());
-                }
-            }
-        }
     }
 
     /// Get context usage information for display.
@@ -5615,29 +5598,26 @@ mod tests {
 
     #[tokio::test]
     async fn the_context_meter_follows_a_compaction_and_returns_to_the_usage() {
+        use crate::client::CompactionPhase;
         use crate::tui::state::{COMPACTED_HOLD, CompactionMeter};
         let dir = tempfile::tempdir().expect("dir");
-        let (mut app, _id) = app_with_session(dir.path()).await;
-        let checkpoint = |phase| {
-            Ok(TimedEvent {
-                at: "2026-11-07T00:00:00Z".parse().expect("time"),
-                event: AgentEvent::checkpoint(
-                    "run",
-                    aither_agent::CheckpointReason::TurnBoundary,
-                    1,
-                    phase,
-                    0,
-                ),
-            })
+        let (mut app, id) = app_with_session(dir.path()).await;
+        let frame = |session_id: &str, phase| AppEvent::Compaction {
+            session_id: session_id.to_string(),
+            phase,
         };
         assert_eq!(app.compaction, CompactionMeter::Idle);
 
-        app.handle_agent_event(checkpoint(aither_agent::ContextWindowPhase::Compacting))
-            .await;
+        app.handle_event(frame("another-session", CompactionPhase::Started))
+            .expect("frame");
+        assert_eq!(app.compaction, CompactionMeter::Idle, "another session");
+
+        app.handle_event(frame(&id, CompactionPhase::Started))
+            .expect("frame");
         assert_eq!(app.compaction, CompactionMeter::Compacting);
 
-        app.handle_agent_event(checkpoint(aither_agent::ContextWindowPhase::Stable))
-            .await;
+        app.handle_event(frame(&id, CompactionPhase::Applied))
+            .expect("frame");
         let CompactionMeter::Compacted { until } = app.compaction else {
             panic!(
                 "a finished compaction reads Compacted: {:?}",
@@ -5652,19 +5632,18 @@ mod tests {
         app.compaction.clear_expired(until);
         assert_eq!(app.compaction, CompactionMeter::Idle);
 
-        // A manual compaction goes through the same states.
-        app.compaction.start();
-        let now = std::time::Instant::now();
-        app.compaction.finish(now);
-        assert_eq!(
-            app.compaction,
-            CompactionMeter::Compacted {
-                until: now + COMPACTED_HOLD
-            }
-        );
-        app.compaction.start();
-        app.compaction.cancel();
-        assert_eq!(app.compaction, CompactionMeter::Idle);
+        // A compaction that changed nothing restores the usage figure.
+        for ended in [
+            CompactionPhase::NothingToCompact,
+            CompactionPhase::Failed,
+            CompactionPhase::Discarded,
+        ] {
+            app.handle_event(frame(&id, CompactionPhase::Started))
+                .expect("frame");
+            assert_eq!(app.compaction, CompactionMeter::Compacting);
+            app.handle_event(frame(&id, ended)).expect("frame");
+            assert_eq!(app.compaction, CompactionMeter::Idle, "{ended:?}");
+        }
     }
 
     #[tokio::test]

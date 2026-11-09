@@ -391,6 +391,11 @@ impl ChatSink for HubSink {
         event: Result<&aither_agent::AgentEvent, &aither_agent::AgentError>,
         context_window: Option<u32>,
     ) {
+        if let Ok(event) = event
+            && let Some(phase) = crate::client::CompactionPhase::from_event(event)
+        {
+            hosts::publish_compaction(&self.hub, &self.session_id, phase);
+        }
         if let Some(event) = crate::client::WireAgentEvent::from_agent(event, context_window) {
             self.publish_agent(crate::client::SessionAgentBody::Agent { event });
         }

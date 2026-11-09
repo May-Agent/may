@@ -15,6 +15,7 @@ use aither_sandbox::{AnyContainerExec, ContainerShellRuntime, SshServer, Termina
 use executor_core::DefaultExecutor;
 
 use super::agents_md;
+use super::compaction_report::CompactionReporter;
 use super::context_dump::ContextDump;
 use super::hooks::{ContextSnapshotHook, PendingSteerHook, SecretRedactionHook};
 use super::imagine::{ImageGeneratorConfig, resolve_image_generator_config};
@@ -1464,15 +1465,36 @@ impl MayAgent {
 
     /// Compacts the idle session once it is due; see
     /// [`Agent::compact_when_idle`].
+    #[cfg(test)]
     pub(crate) async fn compact_when_idle(&mut self) -> Result<Option<CompactResult>, AgentError> {
-        Box::pin(self.inner.compact_when_idle()).await
+        self.compact_when_idle_reporting(&CompactionReporter::silent())
+            .await
     }
 
+    /// [`Self::compact_when_idle`], reporting its progress to `reporter`.
+    pub(crate) async fn compact_when_idle_reporting(
+        &mut self,
+        reporter: &CompactionReporter,
+    ) -> Result<Option<CompactResult>, AgentError> {
+        reporter.drive(self.inner.compact_when_idle()).await
+    }
+
+    /// Compacts the conversation, reporting its progress to `reporter`.
+    pub(crate) async fn compact_reporting(
+        &mut self,
+        focus: Option<&str>,
+        reporter: &CompactionReporter,
+    ) -> Result<Option<CompactResult>, AgentError> {
+        reporter.drive(self.inner.compact(focus)).await
+    }
+
+    #[cfg(test)]
     pub(crate) async fn compact(
         &mut self,
         focus: Option<&str>,
     ) -> Result<Option<CompactResult>, AgentError> {
-        Box::pin(self.inner.compact(focus)).await
+        self.compact_reporting(focus, &CompactionReporter::silent())
+            .await
     }
 
     pub(crate) fn restore_checkpoint(
