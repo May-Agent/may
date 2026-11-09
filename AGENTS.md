@@ -108,7 +108,9 @@ May is a terminal-based AI assistant built as an application layer on the **aith
 
 **`src/command_policy/`** - aither command policies that refuse a terminal script before it runs (kill by name, foreground `sleep`, unchanged re-reads and, in the managed bash, host `grep`/`awk`/`find` and `sed` forms `aither_sed::supports` rejects); `register` installs them
 
-**`src/tasks_md/`** - `tasks.md` as an aither working document: the parser, `schema.rs` with the schema, the stop rule and the line limit, and `edit.rs`, the `tasks` command. `tasks` is the ordinary program `src/bin/tasks` (not an IPC command) that edits the file `MAY_TASKS` names; it is installed beside `may`, the daemon puts that directory first on its `PATH`, and the container image carries it at `/usr/local/bin/tasks`. `cargo run --bin may` does not build it: `cargo build` does
+**`tasks/`** - the `may-tasks` crate: the `tasks.md` parser, `edit.rs` and the `tasks` binary, the ordinary program (not an IPC command) that edits the file `MAY_TASKS` names; it links no `may-agent` code, and the container image tag hashes this directory and `Cargo.lock`. It is installed beside `may`, the daemon puts that directory first on its `PATH`, and the container image carries it at `/usr/local/bin/tasks`. `cargo run --bin may` does not build it: `cargo build` does
+
+**`src/tasks_md/`** - re-exports `may-tasks` and holds `schema.rs`: `tasks.md` as an aither working document with the schema, the stop rule and the line limit
 
 **`src/agent/notices.rs`** - `MayNotices`, May's wording of aither's alerts, notices and refusals, `tasks.md` alerts included
 
