@@ -302,9 +302,15 @@ mod tests {
             grants: Vec::new(),
         };
         let started = std::time::Instant::now();
-        let error = try_connection(&tokio::runtime::Handle::current(), "fake", &agent, limit)
-            .await
-            .expect_err("times out");
+        let error = try_connection(
+            &tokio::runtime::Handle::current(),
+            "fake",
+            &agent,
+            limit,
+            crate::tools::test_heel().await,
+        )
+        .await
+        .expect_err("times out");
         let elapsed = started.elapsed();
         assert!(
             matches!(error, TrialError::TimedOut(l) if l == limit),
