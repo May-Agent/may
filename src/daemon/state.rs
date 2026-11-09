@@ -482,6 +482,9 @@ pub struct DaemonState {
     pub(crate) recap_schedules: super::chat::RecapSchedules,
     /// Each session's background jobs and subagent runs, across turns.
     pub(crate) session_background: super::chat::SessionBackgrounds,
+    /// The live checks of every in-flight GitHub PR, as the poller last read
+    /// them.
+    pub(crate) pr_checks: super::pr_checks::PrChecksCache,
     pub(crate) tunnels: Arc<super::tunnel::TunnelRegistry>,
     /// The machine's reachability and sleep/wake state: the one source every
     /// agent and terminal the daemon builds watches, and the turn runner
@@ -1422,6 +1425,7 @@ impl DaemonState {
             aux_tasks: super::chat::AuxTasks::default(),
             recap_schedules: super::chat::RecapSchedules::default(),
             session_background: super::chat::SessionBackgrounds::default(),
+            pr_checks: super::pr_checks::PrChecksCache::default(),
             tunnels: std::sync::Arc::new(super::tunnel::TunnelRegistry::new()),
             connectivity,
             session_events_epoch: std::time::SystemTime::now()

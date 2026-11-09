@@ -116,6 +116,11 @@ pub enum CheckContext {
         name: String,
         #[serde(rename = "detailsUrl")]
         details_url: Option<String>,
+        status: Option<RunStatus>,
+        #[serde(rename = "startedAt")]
+        started_at: Option<jiff::Timestamp>,
+        #[serde(rename = "completedAt")]
+        completed_at: Option<jiff::Timestamp>,
         conclusion: Option<CheckConclusion>,
         #[serde(rename = "isRequired")]
         is_required: bool,
@@ -125,9 +130,21 @@ pub enum CheckContext {
         #[serde(rename = "targetUrl")]
         target_url: Option<String>,
         state: StatusState,
+        #[serde(rename = "createdAt")]
+        created_at: Option<jiff::Timestamp>,
         #[serde(rename = "isRequired")]
         is_required: bool,
     },
+}
+
+/// Where a check run is in its lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum RunStatus {
+    InProgress,
+    Completed,
+    #[serde(other)]
+    Queued,
 }
 
 /// A required check that failed.
@@ -151,6 +168,7 @@ impl CheckContext {
                         | CheckConclusion::StartupFailure,
                     ),
                 is_required: true,
+                ..
             } => Some(FailedCheck {
                 name: name.clone(),
                 url: details_url.clone(),
@@ -160,6 +178,7 @@ impl CheckContext {
                 target_url,
                 state: StatusState::Failure | StatusState::Error,
                 is_required: true,
+                ..
             } => Some(FailedCheck {
                 name: context.clone(),
                 url: target_url.clone(),
@@ -179,6 +198,8 @@ pub struct Snapshot {
     pub(crate) removals: usize,
     /// The reason GitHub gave for the latest removal.
     pub(crate) last_removal: Option<String>,
+    /// The commit the checks ran on.
+    pub(crate) head_sha: String,
     pub(crate) checks: Vec<CheckContext>,
 }
 
@@ -186,74 +207,6 @@ impl Snapshot {
     pub(crate) fn failed_check(&self) -> Option<FailedCheck> {
         self.checks.iter().find_map(CheckContext::failed_required)
     }
-
-    /// The rollup counts of the PR's checks: required contexts when any
-    /// exist (they are what merge waits on), every context otherwise.
-    /// Re-ran checks share a name; the last report wins.
-    pub(crate) fn check_summary(&self) -> CheckSummary {
-        let mut latest: std::collections::HashMap<&str, (bool, CheckOutcome)> =
-            std::collections::HashMap::new();
-        for check in &self.checks {
-            let (name, required, outcome) = match check {
-                CheckContext::CheckRun {
-                    name,
-                    conclusion,
-                    is_required,
-                    ..
-                } => (
-                    name.as_str(),
-                    *is_required,
-                    match conclusion {
-                        None => CheckOutcome::Pending,
-                        Some(CheckConclusion::Success | CheckConclusion::Other) => {
-                            // Neutral and skipped deserialize as Other and
-                            // pass GitHub's rollup the same way.
-                            CheckOutcome::Passed
-                        }
-                        Some(_) => CheckOutcome::Failed,
-                    },
-                ),
-                CheckContext::StatusContext {
-                    context,
-                    state,
-                    is_required,
-                    ..
-                } => (
-                    context.as_str(),
-                    *is_required,
-                    match state {
-                        StatusState::Success => CheckOutcome::Passed,
-                        StatusState::Failure | StatusState::Error => CheckOutcome::Failed,
-                        StatusState::Pending | StatusState::Expected | StatusState::Other => {
-                            CheckOutcome::Pending
-                        }
-                    },
-                ),
-            };
-            latest.insert(name, (required, outcome));
-        }
-        let required_present = latest.values().any(|(required, _)| *required);
-        let mut summary = CheckSummary::default();
-        for (required, outcome) in latest.values() {
-            if required_present && !required {
-                continue;
-            }
-            match outcome {
-                CheckOutcome::Pending => summary.pending += 1,
-                CheckOutcome::Passed => summary.passed += 1,
-                CheckOutcome::Failed => summary.failed += 1,
-            }
-        }
-        summary
-    }
-}
-
-/// How a concluded check ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CheckOutcome {
-    Pending,
-    Passed,
-    Failed,
 }
 
 /// How many of the PR's checks sit in each state.
@@ -635,6 +588,7 @@ struct GraphCommitNode {
 
 #[derive(Deserialize)]
 struct GraphCommit {
+    oid: String,
     #[serde(rename = "statusCheckRollup")]
     status_check_rollup: Option<GraphRollup>,
 }
@@ -674,12 +628,13 @@ impl GraphResponse {
             .data
             .and_then(|data| data.repository.pull_request)
             .ok_or_else(|| PrError::Gh(format!("GitHub has no PR #{number}")))?;
-        let contexts = pr
-            .commits
-            .nodes
-            .into_iter()
-            .next()
-            .and_then(|node| node.commit.status_check_rollup)
+        let commit = pr.commits.nodes.into_iter().next().map(|node| node.commit);
+        let head_sha = commit
+            .as_ref()
+            .map(|commit| commit.oid.clone())
+            .ok_or_else(|| PrError::Gh(format!("GitHub reports no commit for PR #{number}")))?;
+        let contexts = commit
+            .and_then(|commit| commit.status_check_rollup)
             .map(|rollup| rollup.contexts);
         let next = contexts
             .as_ref()
@@ -696,6 +651,7 @@ impl GraphResponse {
                 .into_iter()
                 .next_back()
                 .and_then(|node| node.reason),
+            head_sha,
             checks,
         };
         Ok((snapshot, next))
@@ -779,9 +735,13 @@ mod tests {
             queue_position: position,
             removals: 0,
             last_removal: None,
+            head_sha: "abc123".to_string(),
             checks: vec![CheckContext::CheckRun {
                 name: "clippy".to_string(),
                 details_url: Some("https://github.com/o/r/actions/runs/1/job/2".to_string()),
+                status: Some(RunStatus::Completed),
+                started_at: None,
+                completed_at: None,
                 conclusion: Some(CheckConclusion::Success),
                 is_required: true,
             }],
@@ -815,6 +775,9 @@ mod tests {
         running.checks.push(CheckContext::CheckRun {
             name: "test".to_string(),
             details_url: None,
+            status: Some(RunStatus::InProgress),
+            started_at: None,
+            completed_at: None,
             conclusion: None,
             is_required: true,
         });
@@ -861,6 +824,9 @@ mod tests {
         failing.checks.push(CheckContext::CheckRun {
             name: "test (ubuntu-latest)".to_string(),
             details_url: Some("https://github.com/o/r/actions/runs/9/job/8".to_string()),
+            status: Some(RunStatus::Completed),
+            started_at: None,
+            completed_at: None,
             conclusion: Some(CheckConclusion::Failure),
             is_required: true,
         });
@@ -868,6 +834,9 @@ mod tests {
         failing.checks.push(CheckContext::CheckRun {
             name: "docs".to_string(),
             details_url: None,
+            status: Some(RunStatus::Completed),
+            started_at: None,
+            completed_at: None,
             conclusion: Some(CheckConclusion::Failure),
             is_required: false,
         });
@@ -959,7 +928,7 @@ mod tests {
             "mergeQueueEntry":{{"position":2}},
             "timelineItems":{{"totalCount":1,"nodes":[
                 {{"__typename":"RemovedFromMergeQueueEvent","reason":"merge conflict"}}]}},
-            "commits":{{"nodes":[{{"commit":{{"statusCheckRollup":{{"contexts":{{
+            "commits":{{"nodes":[{{"commit":{{"oid":"abc123","statusCheckRollup":{{"contexts":{{
                 "pageInfo":{page_info},"nodes":[{checks}]}}}}}}}}]}}}}}}}}}}"#
         );
         serde_json::from_str(&answer).unwrap()
@@ -1059,6 +1028,13 @@ mod tests {
         CheckContext::CheckRun {
             name: name.to_string(),
             details_url: None,
+            status: Some(if conclusion.is_some() {
+                RunStatus::Completed
+            } else {
+                RunStatus::InProgress
+            }),
+            started_at: None,
+            completed_at: None,
             conclusion,
             is_required: required,
         }
@@ -1069,6 +1045,7 @@ mod tests {
             context: context.to_string(),
             target_url: None,
             state,
+            created_at: None,
             is_required: required,
         }
     }
@@ -1083,7 +1060,7 @@ mod tests {
             check_run("clippy", Some(CheckConclusion::Success), true),
             check_run("test", None, true),
         ];
-        let summary = snap.check_summary();
+        let summary = crate::pr::checks::ChecksReport::of(&snap).summary();
         assert_eq!((summary.passed, summary.pending, summary.failed), (2, 1, 0));
     }
 
@@ -1094,14 +1071,14 @@ mod tests {
             check_run("fmt", Some(CheckConclusion::Success), true),
             check_run("coverage", Some(CheckConclusion::Failure), false),
         ];
-        let summary = snap.check_summary();
+        let summary = crate::pr::checks::ChecksReport::of(&snap).summary();
         assert_eq!((summary.passed, summary.pending, summary.failed), (1, 0, 0));
         // With nothing required, every context counts.
         snap.checks = vec![
             check_run("coverage", Some(CheckConclusion::Failure), false),
             status_context("ci/test", StatusState::Pending, false),
         ];
-        let summary = snap.check_summary();
+        let summary = crate::pr::checks::ChecksReport::of(&snap).summary();
         assert_eq!((summary.passed, summary.pending, summary.failed), (0, 1, 1));
     }
 
@@ -1116,7 +1093,7 @@ mod tests {
             status_context("ci/test", StatusState::Expected, true),
             status_context("ci/web", StatusState::Error, true),
         ];
-        let summary = snap.check_summary();
+        let summary = crate::pr::checks::ChecksReport::of(&snap).summary();
         assert_eq!((summary.passed, summary.pending, summary.failed), (1, 1, 2));
     }
 }

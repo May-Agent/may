@@ -51,15 +51,18 @@ pub enum SessionChange {
     Issues,
     /// New `ci_findings` rows.
     Warning,
+    /// The session's PRs, their states and live checks.
+    Prs,
 }
 
 impl SessionChange {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Runtime,
         Self::Background,
         Self::Artifacts,
         Self::Issues,
         Self::Warning,
+        Self::Prs,
     ];
 
     const fn bit(self) -> u8 {
@@ -214,6 +217,8 @@ struct Published {
     issues: Vec<IssueBrief>,
     /// Highest `ci_findings.id` sent as `warning`.
     warning_id: i64,
+    /// JSON of the last `prs.changed` payload's `prs` value.
+    prs: Option<String>,
 }
 
 async fn run(state: Arc<DaemonState>, rx: SessionChangeReceiver) {
@@ -442,6 +447,35 @@ async fn publish_piece(
                 );
             }
             published.issues = issues;
+        }
+        SessionChange::Prs => {
+            let prs = match super::sessions::session_prs(state, session_id).await {
+                Ok(prs) => prs,
+                Err(error) => {
+                    tracing::warn!(session_id, %error, "failed to load the session's PRs");
+                    return;
+                }
+            };
+            let json = serde_json::to_string(&prs).expect("PRs serialize");
+            if published.prs.as_deref() == Some(json.as_str()) {
+                return;
+            }
+            #[derive(Serialize)]
+            #[serde(rename_all = "camelCase")]
+            struct PrsChanged<'a> {
+                session_id: &'a str,
+                prs: &'a [super::types::ApiPr],
+            }
+            publish(
+                state,
+                session_id,
+                "prs.changed",
+                &PrsChanged {
+                    session_id,
+                    prs: &prs,
+                },
+            );
+            published.prs = Some(json);
         }
         SessionChange::Warning => {
             let epoch_ms =
