@@ -487,6 +487,33 @@ impl ChatHistory {
         self.messages.len()
     }
 
+    /// The input messages stored after `since`: the user messages and hidden
+    /// context a run's agent was given, in order, as aither messages.
+    ///
+    /// An agent restored from a checkpoint older than these rows never saw
+    /// them. Everything a run produces (replies, tool events) is left out: its
+    /// checkpoints carry what it committed.
+    ///
+    /// # Errors
+    /// Returns [`HistoryReplayError`] when a stored user message carries an
+    /// attachment that cannot be replayed.
+    pub fn input_messages_after(
+        &self,
+        since: Timestamp,
+    ) -> Result<Vec<aither_core::llm::Message>, HistoryReplayError> {
+        self.messages
+            .iter()
+            .filter(|message| message.timestamp.is_some_and(|stored| stored > since))
+            .filter_map(|message| match message.role {
+                MessageRole::User => Some(replay_user_message(message)),
+                MessageRole::HiddenContext => {
+                    Some(Ok(aither_core::llm::Message::system(&message.content)))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Convert to aither messages.
     ///
     /// Rebuild durable LLM history from persisted chat messages.
@@ -722,6 +749,30 @@ mod tests {
             messages[0].content(),
             "<system-reminder>notice</system-reminder>"
         );
+    }
+
+    #[test]
+    fn input_after_a_snapshot_is_the_user_and_hidden_rows_stored_later() {
+        let mut history = ChatHistory::new();
+        let mut checkpointed = ChatMessage::user("answered");
+        checkpointed.timestamp = Some("2026-01-01T00:00:00Z".parse().unwrap());
+        history.messages_mut().push(checkpointed);
+        let mut reply = ChatMessage::assistant("reply", "2026-01-01T00:00:01Z".parse().unwrap());
+        reply.timestamp = Some("2026-01-01T00:00:03Z".parse().unwrap());
+        history.messages_mut().push(reply);
+        let mut hidden = ChatMessage::hidden_context("<note/>");
+        hidden.timestamp = Some("2026-01-01T00:00:04Z".parse().unwrap());
+        history.messages_mut().push(hidden);
+        let mut interrupted = ChatMessage::user("interrupted");
+        interrupted.timestamp = Some("2026-01-01T00:00:05Z".parse().unwrap());
+        history.messages_mut().push(interrupted);
+
+        let since = "2026-01-01T00:00:02Z".parse().unwrap();
+        let messages = history.input_messages_after(since).unwrap();
+        assert_eq!(messages.len(), 2, "only later input rows: {messages:?}");
+        assert_eq!(messages[0].role(), Role::System);
+        assert_eq!(messages[1].role(), Role::User);
+        assert_eq!(messages[1].content(), "interrupted");
     }
 
     #[test]

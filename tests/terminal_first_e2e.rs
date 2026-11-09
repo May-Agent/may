@@ -6462,6 +6462,17 @@ async fn an_unexpected_exit_leaves_a_cold_session_for_the_next_message() {
         texts.iter().any(|text| text.contains("third question")),
         "with the user's message: {texts:?}"
     );
+    // The daemon died before the second turn's first checkpoint: the rebuilt
+    // agent still has the message that turn was answering, ahead of the new one.
+    let interrupted = texts
+        .iter()
+        .position(|text| text.contains("second question"))
+        .unwrap_or_else(|| panic!("the interrupted turn's message is in context: {texts:?}"));
+    let latest = texts
+        .iter()
+        .position(|text| text.contains("third question"))
+        .expect("the new message");
+    assert!(interrupted < latest, "in order: {texts:?}");
     server.stop().await;
     environment.release(&harness, &session_id).await;
 }
