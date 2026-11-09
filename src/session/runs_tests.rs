@@ -367,7 +367,7 @@ async fn recovery_settles_sessions_a_dead_run_left_owned() {
     let fresh = SessionRuntimeService::new(service.db(), UiEventBus::new());
     fresh
         .runs()
-        .recover_after_restart()
+        .recover_after_restart(crate::db::PreviousDaemon::Stopped)
         .await
         .expect("recovery");
 

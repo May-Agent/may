@@ -37,6 +37,7 @@ mod local_url_mapper;
 mod message_mapping;
 mod model_resolution;
 mod notifications;
+mod process_session;
 mod profiles;
 mod remote_access;
 mod rules_import;
@@ -392,6 +393,13 @@ impl ExtraListeners {
 /// Fails when another daemon holds the lock, or when the server cannot be
 /// started or its socket bound.
 pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
+    // Everything the daemon starts shares the session it leads, so a daemon
+    // started after an unexpected exit can end what the exited one left.
+    let Some(process_session) = process_session::ProcessSession::lead()
+        .context("failed to give the daemon a process session of its own")?
+    else {
+        return process_session::run_in_own_session().await;
+    };
     let paths = DaemonPaths::user()?;
     let _instance = acquire_single_instance(&paths)?;
     // heel executes the sandboxed commands this process runs; configure the
@@ -412,7 +420,7 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
         Err(error) => tracing::warn!(%error, "could not sweep stale repo-search agents"),
     }
 
-    let started = crate::daemon::start(options.mode).await?;
+    let started = crate::daemon::start(options.mode, process_session).await?;
     let state = started.state;
     let router = Arc::new(started.router);
     let remote_router = Arc::new(started.remote_router);
@@ -517,6 +525,12 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
     while state.runtime_service.runs().live_count() > 0 && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+    // The next daemon tells this stop from an unexpected exit by this record.
+    state
+        .db()
+        .record_daemon_stop()
+        .await
+        .context("failed to record the daemon's stop")?;
     match repo_search.retire().await {
         Ok(removed) => {
             for service in removed {

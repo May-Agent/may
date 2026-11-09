@@ -351,10 +351,15 @@ fn spawn(paths: &DaemonPaths) -> Result<std::process::Child, LifecycleError> {
         .env("PATH", path_with_executable_dir()?)
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
-        .stderr(log)
-        // Its own process group: the daemon outlives the terminal that
-        // started it, and a Ctrl+C there does not reach it.
-        .process_group(0);
+        .stderr(log);
+    // Its own process session: the daemon outlives the terminal that started
+    // it, a Ctrl+C there does not reach it, and it leads the session every
+    // process it starts shares.
+    // SAFETY: `setsid` is async-signal-safe and touches no memory of the
+    // parent; the child is not a process-group leader before it runs.
+    unsafe {
+        command.pre_exec(|| rustix::process::setsid().map(drop).map_err(Into::into));
+    }
     Ok(command.spawn()?)
 }
 

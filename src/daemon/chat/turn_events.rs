@@ -150,7 +150,7 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
 }
 
 /// How long `provider_id` keeps the conversation's prompt cache warm.
-fn provider_cache_lifetime(
+pub(super) fn provider_cache_lifetime(
     state: &Arc<DaemonState>,
     provider_id: &str,
 ) -> crate::cache_lifetime::CacheLifetime {

@@ -5,6 +5,7 @@ Paths are relative to the May source checkout. `aither-sandbox` and `aither-agen
 ## Daemon and clients
 
 - `src/daemon/mod.rs`: `run_daemon` (listeners, single-instance lock `acquire_single_instance`, `SHUTDOWN_GRACE` 30 s, extra `[daemon] listen` listeners in `ExtraListeners::reconcile`).
+- `src/daemon/process_session.rs`: the daemon leads a process session of its own (a daemon that leads a process group, under launchd or in a shell's foreground, runs itself as a child in one and supervises it); `end_exited_session` ends what an unexpectedly exited daemon left in its session. `src/db/daemon_exit.rs` records each start and graceful stop (`daemon_runs`) and the sessions with background work; `chat::restart_interrupted_sessions` restarts warm interrupted sessions with the `reminder_daemon_exit.txt` alert, which a cold one gets with its next turn.
 - `src/daemon/lifecycle.rs`: `ensure_running` (build-id comparison, start timeout 60 s), launchd and systemd install.
 - `src/daemon/serve.rs`, `server.rs`, `events.rs` (the `/api/events` stream), `remote_access.rs` (Tailscale serve).
 - `src/daemon/chat/mod.rs`: `run_agent_loop`, the one turn runner. `chat/hub.rs` fans turns out; `chat/hosts.rs` keeps each session's idle agent and answers `/compact`, `/context`, `/btw`; `chat/background.rs` tracks terminal jobs and subagent runs.
