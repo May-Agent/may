@@ -592,6 +592,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "aither-patch"
+version = "0.26.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e3782a78ac6c7f458c0e480159d5bcbaa09b78aba64580f930b157d77f81e3d"
+dependencies = [
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "aither-sandbox"
 version = "0.24.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4620,7 +4629,7 @@ dependencies = [
  "tokio",
  "tower-service",
  "tracing",
- "windows-registry 0.5.3",
+ "windows-registry 0.6.1",
 ]
 
 [[package]]
@@ -4650,7 +4659,7 @@ dependencies = [
  "js-sys",
  "log",
  "wasm-bindgen",
- "windows-core 0.58.0",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
@@ -5729,6 +5738,7 @@ dependencies = [
  "aither-mcp 0.26.0",
  "aither-models",
  "aither-openai",
+ "aither-patch",
  "aither-sandbox 0.26.0",
  "aither-sed",
  "anyhow",
@@ -5747,6 +5757,7 @@ dependencies = [
  "block2",
  "blocking",
  "bollard",
+ "brush-parser",
  "bytes",
  "chromiumoxide",
  "chromiumoxide_fetcher",
@@ -7827,7 +7838,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -7866,7 +7877,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.5.10",
+ "socket2 0.6.5",
  "tracing",
  "windows-sys 0.61.2",
 ]

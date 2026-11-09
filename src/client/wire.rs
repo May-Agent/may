@@ -520,6 +520,15 @@ pub enum SessionAgentBody {
         /// Seconds the phase lasted. Sub-second phases keep the fraction.
         seconds: f64,
     },
+    /// The daemon read the script of the terminal call `call_id`; sent right
+    /// after the call's start event, so a client renders the reading the
+    /// daemon computed instead of parsing the script again.
+    ToolReading {
+        /// The call the reading belongs to.
+        call_id: String,
+        /// How the daemon read the script.
+        reading: crate::command_reading::CommandReading,
+    },
     /// The run is parked.
     Hold {
         /// What the run waits for.
@@ -1033,6 +1042,26 @@ mod tests {
         assert!(matches!(
             timed.event,
             AgentEvent::ToolCallEnd { ref id, ref result, .. } if id == "t1" && *result == ToolResult::text("done")
+        ));
+    }
+
+    #[test]
+    fn a_tool_reading_frame_survives_the_round_trip() {
+        use super::SessionAgentBody;
+        let body = SessionAgentBody::ToolReading {
+            call_id: "t1".to_string(),
+            reading: crate::command_reading::CommandReading::of("cat a.rs"),
+        };
+        let json = serde_json::to_string(&body).expect("serialize");
+        assert!(
+            json.contains("\"toolReading\"") || json.contains("tool_reading"),
+            "{json}"
+        );
+        let back: SessionAgentBody = serde_json::from_str(&json).expect("deserialize");
+        assert!(matches!(
+            back,
+            SessionAgentBody::ToolReading { ref call_id, ref reading }
+                if call_id == "t1" && reading.recognises_any()
         ));
     }
 

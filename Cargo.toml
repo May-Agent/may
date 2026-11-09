@@ -27,6 +27,9 @@ libc = "0.2.191"
 aither-core = { version = "0.26.0" }
 aither-agent = { version = "0.26.0", features = ["mcp", "webfetch", "skills", "connectivity", "languages"] }
 aither-connectivity = { version = "0.26.0" }
+# The parser the harness applies `apply_patch` with; a call's reading uses it
+# to place each hunk in the file it edits.
+aither-patch = { version = "0.26.0" }
 aither-sandbox = { version = "0.26.0", features = ["code-folding", "connectivity", "jobserver"] }
 aither-cloud = { version = "0.26.0" }
 aither-copilot = { version = "0.26.0" }
@@ -177,6 +180,9 @@ fd-lock = "4.0.4"
 
 # Templating
 askama = "0.16"
+
+# Shell parsing: terminal calls are read before they run
+brush-parser = { version = "0.3.0", default-features = false }
 
 # Embedded resources
 include_dir = "0.7"

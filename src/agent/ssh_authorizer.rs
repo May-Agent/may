@@ -101,7 +101,12 @@ impl MaySshAuthorizer {
             .map_err(|error| SshAuthorizationError::Prompt(error.to_string()))?
         {
             self.db
-                .append_granted_permission(&self.session_id, PermissionHistoryMode::Ssh, &question)
+                .append_granted_permission(
+                    &self.session_id,
+                    PermissionHistoryMode::Ssh,
+                    &question,
+                    None,
+                )
                 .await
                 .map_err(|error| SshAuthorizationError::Prompt(error.to_string()))?;
             return Ok(true);

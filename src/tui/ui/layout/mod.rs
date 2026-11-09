@@ -383,7 +383,12 @@ fn sheet_height(app: &App, column: Rect) -> Option<u16> {
         AppMode::Btw(state) => (if !state.loading && !state.done { 5 } else { 14 }, pct(60)),
         AppMode::Progress(_) => (16, pct(60)),
         AppMode::PermissionConfirm(state) => (
-            rows(confirm_body_rows(state.request.script.as_str(), column.width) + 8),
+            rows(
+                state.shown_reading().map_or_else(
+                    || confirm_body_rows(state.request.script.as_str(), column.width),
+                    |reading| chat::reading_lines(reading, Style::default()).len(),
+                ) + 9,
+            ),
             pct(70),
         ),
         AppMode::WorkspaceConfirm(state) => (
@@ -2310,7 +2315,7 @@ fn render_permission_confirm(
     state: &crate::tui::state::PermissionConfirmState,
     bg: Option<Color>,
 ) {
-    let content = vec![
+    let mut content = vec![
         Line::from(Span::styled(
             "The agent is requesting elevated terminal access:",
             Style::default().fg(Color::White),
@@ -2322,20 +2327,49 @@ fn render_permission_confirm(
                 .add_modifier(ratatui::style::Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from(Span::styled("Script:", Style::default().fg(Color::White))),
-        Line::from(Span::styled(
+    ];
+    if let Some(reading) = state.shown_reading() {
+        content.push(Line::from(Span::styled(
+            "It will:",
+            Style::default().fg(Color::White),
+        )));
+        content.extend(chat::reading_lines(reading, Style::default()));
+    } else {
+        content.push(Line::from(Span::styled(
+            "Script:",
+            Style::default().fg(Color::White),
+        )));
+        content.push(Line::from(Span::styled(
             format!("  {}", state.request.script.as_str()),
             Style::default().fg(Color::Yellow),
-        )),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("[Y/Enter] ", Style::default().fg(Color::Green)),
-            Span::styled("Approve", Style::default().fg(Color::White)),
-            Span::raw("    "),
-            Span::styled("[N/Esc] ", Style::default().fg(Color::Red)),
-            Span::styled("Deny", Style::default().fg(Color::White)),
-        ]),
+        )));
+    }
+    content.push(Line::from(""));
+    let mut keys = vec![
+        Span::styled("[Y/Enter] ", Style::default().fg(Color::Green)),
+        Span::styled("Approve", Style::default().fg(Color::White)),
+        Span::raw("    "),
+        Span::styled("[N/Esc] ", Style::default().fg(Color::Red)),
+        Span::styled("Deny", Style::default().fg(Color::White)),
     ];
+    if state
+        .request
+        .reading
+        .as_ref()
+        .is_some_and(crate::command_reading::CommandReading::recognises_any)
+    {
+        keys.push(Span::raw("    "));
+        keys.push(Span::styled("[S] ", Style::default().fg(Color::Yellow)));
+        keys.push(Span::styled(
+            if state.show_script {
+                "Reading"
+            } else {
+                "Raw script"
+            },
+            Style::default().fg(Color::White),
+        ));
+    }
+    content.push(Line::from(keys));
 
     let widget = WrappedParagraph::new(content).block(panel(
         Some(Span::raw(" Permission Request ")),
@@ -3589,6 +3623,51 @@ mod tests {
         }
     }
 
+    fn permission_screen(state: &crate::tui::state::PermissionConfirmState) -> Vec<String> {
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(70, 20)).unwrap();
+        terminal
+            .draw(|frame| super::render_permission_confirm(frame, frame.area(), state, None))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// An `unsafe` approval for an edit shows the file and its diff, and the
+    /// raw script one key away.
+    #[test]
+    fn the_approval_prompt_for_an_edit_shows_the_file_and_diff() {
+        let script = "apply_patch <<'P'\n*** Begin Patch\n*** Update File: src/a.rs\n@@\n-old\n+new\n*** End Patch\nP\n";
+        let mut state = crate::tui::state::PermissionConfirmState {
+            request_id: "r".to_string(),
+            request: crate::session::PersistedPermissionRequestPayload::new(
+                crate::PermissionRequestMode::Unsafe,
+                script.to_string(),
+                None,
+                None,
+            ),
+            show_script: false,
+        };
+        let screen = permission_screen(&state).join("\n");
+        assert!(screen.contains("~ src/a.rs"), "{screen}");
+        assert!(screen.contains("- old"), "{screen}");
+        assert!(screen.contains("+ new"), "{screen}");
+        assert!(screen.contains("[S] Raw script"), "{screen}");
+        assert!(!screen.contains("*** Begin Patch"), "{screen}");
+        state.show_script = true;
+        let screen = permission_screen(&state).join("\n");
+        assert!(screen.contains("*** Begin Patch"), "{screen}");
+        assert!(screen.contains("[S] Reading"), "{screen}");
+    }
+
     /// The full-screen tool details view wraps a command's CJK output
     /// inside its border at every width and scroll offset.
     #[test]
@@ -3600,6 +3679,7 @@ mod tests {
             description: "运行测试".to_string(),
             command: "cargo test --workspace".to_string(),
             mode: aither_sandbox::TerminalExecutionMode::Default,
+            reading: None,
             status: ToolStatus::Done,
             output: Some(output),
             diffs: Vec::new(),

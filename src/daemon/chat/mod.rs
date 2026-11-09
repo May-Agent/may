@@ -482,6 +482,12 @@ impl ChatSink for HubSink {
         arguments: &str,
         summary: crate::daemon::tool_summary::ToolSummary,
     ) -> bool {
+        if let Some(reading) = &summary.reading {
+            self.publish_agent(crate::client::SessionAgentBody::ToolReading {
+                call_id: id.to_string(),
+                reading: reading.clone(),
+            });
+        }
         let seq = self.next_seq();
         self.publish_turn(
             "tool_start",
@@ -1904,6 +1910,7 @@ fn run_agent_loop<'a>(
                 user_message_id,
                 takeover_alert_consumed,
                 reasoning_effort,
+                cwd,
             } = match prepare_agent_for_request(
                 state,
                 req,
@@ -1996,6 +2003,7 @@ fn run_agent_loop<'a>(
                 session_id: &session_id,
                 assistant_id: assistant_id.as_str(),
                 session_paths: &session_paths,
+                workdir: &cwd,
                 started_at,
                 reasoning_display,
                 reasoning_phase: reasoning_display.then_some(started_at),
@@ -2833,6 +2841,8 @@ struct PreparedAgent {
     takeover_alert_consumed: bool,
     /// Reasoning effort resolved for this turn's requests.
     reasoning_effort: Option<aither_core::llm::model::ReasoningEffort>,
+    /// Where the agent's terminal commands run.
+    cwd: std::path::PathBuf,
 }
 
 struct ToolBrokers {
@@ -3769,6 +3779,7 @@ fn prepare_agent_for_request<'a>(
             user_message_id: ctx.user_message_id,
             takeover_alert_consumed: ctx.takeover_alert_consumed,
             reasoning_effort: ctx.reasoning_effort,
+            cwd: ctx.cwd,
         })
     })
 }
@@ -6137,5 +6148,53 @@ mod tests {
             .await
             .expect("history");
         assert_eq!(user_rows(&history), vec!["hello".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod tool_reading_tests {
+    use std::sync::Arc;
+
+    use super::{ChatSink, HubSink, hub};
+    use crate::client::{SessionAgentBody, SessionAgentFrame};
+    use crate::daemon::tool_summary::{ToolSummary, project_tool_summary};
+    use crate::daemon::types::ToolVariant;
+
+    /// A TUI that attaches while a turn streams replays the reading of a
+    /// call that started before it attached.
+    #[test]
+    fn a_late_subscriber_replays_the_reading_of_a_started_call() {
+        let hub = Arc::new(hub::TurnHub::default());
+        hub.begin_turn("s");
+        let mut sink = HubSink {
+            hub: hub.clone(),
+            session_id: "s".to_string(),
+            content: None,
+            seq: 1,
+            turn_id: "t".to_string(),
+            run_announced: true,
+        };
+        let arguments = r#"{"description":"d","script":"cat a.rs"}"#;
+        let summary: ToolSummary = project_tool_summary(arguments, ToolVariant::Terminal);
+        assert!(futures_lite::future::block_on(
+            sink.on_tool_start("c1", "terminal", arguments, summary)
+        ));
+
+        let late = hub.subscribe("s", 0);
+        let frames = late.take_unread().expect("the subscription is open");
+        let readings: Vec<_> = frames
+            .iter()
+            .filter(|frame| frame.kind == "session_agent")
+            .map(|frame| {
+                serde_json::from_str::<SessionAgentFrame>(&frame.data).expect("an agent frame")
+            })
+            .filter_map(|frame| match frame.body {
+                SessionAgentBody::ToolReading { call_id, reading } => Some((call_id, reading)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(readings.len(), 1);
+        assert_eq!(readings[0].0, "c1");
+        assert_eq!(readings[0].1.steps[0].line, "Read a.rs");
     }
 }

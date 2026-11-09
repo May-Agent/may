@@ -24,8 +24,10 @@ use super::{
     normalize_tool_delta_for_sink, normalize_tool_start_for_sink, project_tool_summary_for_sink,
     record_request_log, record_tool_interval, segment_emitted_at, set_terminal_runtime_state,
 };
+use crate::command_reading::CommandReading;
 use crate::daemon::state::DaemonState;
 use crate::daemon::terminal_parsing::update_terminal_snapshot_from_tool_event;
+use crate::daemon::tool_summary::ToolSummary;
 use crate::daemon::types::{TerminalStateSnapshot, ToolEventRecord};
 use crate::db::ChatDbError;
 use crate::decode_meter::DecodeMeter;
@@ -54,6 +56,9 @@ pub(super) struct TurnEvents<'t, 's, S> {
     pub(super) session_id: &'t SessionId,
     pub(super) assistant_id: &'t str,
     pub(super) session_paths: &'t SessionPaths,
+    /// Where the agent's terminal commands run: the directory a call's
+    /// reading places an edit's hunks in.
+    pub(super) workdir: &'t std::path::Path,
     pub(super) started_at: Instant,
     /// Whether the request asked the provider for reasoning text, which arms
     /// the reasoning phase at every tool-result boundary.
@@ -103,6 +108,23 @@ pub(super) struct TurnEvents<'t, 's, S> {
     pub(super) first_agent_event_seen: bool,
     pub(super) first_visible_tool_seen: bool,
     pub(super) first_text_seen: bool,
+}
+
+/// Reads a call that edits files again in the directory it runs in, so its
+/// hunks carry absolute line numbers. The files are read before the call
+/// runs, so they are still unedited.
+async fn locate_reading(workdir: &std::path::Path, mut summary: ToolSummary) -> ToolSummary {
+    if summary
+        .reading
+        .as_ref()
+        .is_some_and(CommandReading::updates_files)
+        && let Some(script) = summary.script.clone()
+    {
+        let workdir = workdir.to_path_buf();
+        summary.reading =
+            Some(blocking::unblock(move || CommandReading::of_in(&script, &workdir)).await);
+    }
+    summary
 }
 
 impl<S: ChatSink> TurnEvents<'_, '_, S> {
@@ -396,6 +418,7 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                             &name,
                             Some(arguments.as_str()),
                         );
+                        let summary = locate_reading(self.workdir, summary).await;
                         self.sink
                             .on_tool_start(&id, &name, &arguments, summary)
                             .await
@@ -477,6 +500,7 @@ impl<S: ChatSink> TurnEvents<'_, '_, S> {
                         &name,
                         Some(arguments.as_str()),
                     );
+                    let summary = locate_reading(self.workdir, summary).await;
                     if !self
                         .sink
                         .on_tool_start(&id, &name, &arguments, summary)
