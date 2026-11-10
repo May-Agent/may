@@ -3,9 +3,10 @@
 //! A provider request is a cache miss when it reads less from the prompt
 //! cache than the previous request on the same route (session, provider and
 //! model) left there. What the previous request left is what it read plus
-//! what it wrote; a provider that does not report writes is credited only
-//! with what it read. Both are amounts the provider itself reported on its
-//! own increments, so any shortfall is cache the provider no longer served.
+//! what it wrote; a provider that does not report writes is credited with
+//! its whole prompt, since it cached the prompt it read and extended. Both
+//! are amounts the provider itself reported on its own increments, so any
+//! shortfall is cache the provider no longer served.
 //!
 //! The cause comes from the two requests' prompt-prefix hash chains (where
 //! the prefix first changed), the gap between them against the provider's
@@ -29,6 +30,8 @@ pub struct CacheObservation {
     pub cache_read_tokens: u64,
     /// Tokens the request wrote to the cache, when the provider reports it.
     pub cache_write_tokens: Option<u64>,
+    /// Tokens in the request's prompt, `0` when the provider reports none.
+    pub prompt_tokens: u64,
     /// The hash chain of the request's prompt prefix.
     pub chain: PrefixChain,
 }
@@ -41,14 +44,22 @@ impl CacheObservation {
             at_ms,
             cache_read_tokens: usage.cache_read_tokens.map_or(0, u64::from),
             cache_write_tokens: usage.cache_write_tokens.map(u64::from),
+            prompt_tokens: usage.prompt_tokens.map_or(0, u64::from),
             chain,
         }
     }
 
     /// Tokens this request left cached for the next request on its route.
+    ///
+    /// A provider that reports no writes is credited with its whole prompt,
+    /// which it cached up to the provider's block granularity, so the next
+    /// request is held to at least what it read.
     #[must_use]
     pub fn cached_tokens(&self) -> u64 {
-        self.cache_read_tokens + self.cache_write_tokens.unwrap_or(0)
+        self.cache_write_tokens.map_or_else(
+            || self.prompt_tokens.max(self.cache_read_tokens),
+            |written| self.cache_read_tokens + written,
+        )
     }
 }
 
@@ -377,35 +388,58 @@ mod tests {
         assert_eq!(miss.cause, CacheMissCause::PrefixChanged);
     }
 
-    /// A provider that reports no writes is held only to what it read.
+    /// A provider that reports no writes is held to its whole prompt, so each
+    /// of two consecutive requests that read nothing records the loss.
     #[test]
-    fn a_provider_without_write_counts_is_held_to_its_reads() {
+    fn consecutive_zero_read_requests_without_write_counts_each_record_a_miss() {
         let tools = [tool("terminal")];
-        let usage = |read: u32| {
-            let mut usage = Usage::new(30_000, 10);
+        let usage = |prompt: u32, read: u32| {
+            let mut usage = Usage::new(prompt, 10);
             usage.cache_read_tokens = Some(read);
             usage
         };
-        let previous =
-            CacheObservation::new(0, &usage(0), PrefixChain::of(&tools, &conversation(2)));
+        let observe = |at_ms, prompt, read, turns| {
+            CacheObservation::new(
+                at_ms,
+                &usage(prompt, read),
+                PrefixChain::of(&tools, &conversation(turns)),
+            )
+        };
+        let first = observe(0, 30_000, 0, 2);
+        let second = observe(1_000, 31_000, 0, 3);
+        let third = observe(2_000, 32_000, 0, 4);
+        let since = SincePrevious::default();
+        let miss = detect_cache_miss(&first, &second, since, one_hour()).expect("a miss");
+        assert_eq!(miss.missed_tokens, 30_000);
+        let miss = detect_cache_miss(&second, &third, since, one_hour()).expect("a miss");
+        assert_eq!(miss.missed_tokens, 31_000);
+        assert_eq!(miss.cause, CacheMissCause::ProviderDropped);
+    }
+
+    /// A request that read all of the previous prompt is no miss, with or
+    /// without write counts.
+    #[test]
+    fn a_provider_without_write_counts_that_reads_the_prompt_records_no_miss() {
+        let tools = [tool("terminal")];
+        let usage = |prompt: u32, read: u32| {
+            let mut usage = Usage::new(prompt, 10);
+            usage.cache_read_tokens = Some(read);
+            usage
+        };
+        let previous = CacheObservation::new(
+            0,
+            &usage(30_000, 0),
+            PrefixChain::of(&tools, &conversation(2)),
+        );
         let current = CacheObservation::new(
             1_000,
-            &usage(25_600),
+            &usage(31_000, 30_000),
             PrefixChain::of(&tools, &conversation(3)),
         );
         assert_eq!(
             detect_cache_miss(&previous, &current, SincePrevious::default(), one_hour()),
             None
         );
-        let dropped =
-            CacheObservation::new(2_000, &usage(0), PrefixChain::of(&tools, &conversation(4)));
-        let since = SincePrevious {
-            model_switched: true,
-            ..SincePrevious::default()
-        };
-        let miss = detect_cache_miss(&current, &dropped, since, one_hour()).expect("a miss");
-        assert_eq!(miss.missed_tokens, 25_600);
-        assert_eq!(miss.cause, CacheMissCause::ModelSwitched);
     }
 
     #[test]
