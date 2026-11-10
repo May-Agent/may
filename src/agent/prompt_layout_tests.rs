@@ -5,8 +5,10 @@
 use super::idle_compaction_tests::{SESSION_MODEL, Session, StubModel, saved_config};
 
 /// The instruction sections of a fresh local session, in prompt order.
-const SECTIONS: [&str; 14] = [
+const SECTIONS: [&str; 15] = [
     "identity",
+    "harness",
+    "evidence",
     "environment",
     "terminal",
     "prepared_tools",
@@ -15,11 +17,10 @@ const SECTIONS: [&str; 14] = [
     "commands",
     "browser",
     "work",
-    "project_rules",
     "permissions",
-    "harness",
-    "evidence",
     "knowledge_and_time",
+    "session",
+    "project_rules",
 ];
 
 const NOTICE_OPEN: &str = "<external-content-notice>";

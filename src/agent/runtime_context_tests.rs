@@ -270,13 +270,24 @@ fn the_work_section_names_the_issue_backend() {
     });
     assert!(work.contains("`issue` command (may backend)"), "{work}");
 
-    let work = build_work(&crate::issue::IssueBackendInfo {
+    let github = crate::issue::IssueBackendInfo {
         name: "github",
         repository: Some("May-Agent/may".to_string()),
-    });
+    };
+    let work = build_work(&github);
+    assert!(work.contains("`issue` command (github backend)"), "{work}");
+    assert!(!work.contains("May-Agent/may"), "{work}");
+
+    let dir = tempdir().expect("temp dir should be created");
+    let session = super::build_session(
+        &AgentEnvironment::Local,
+        &session_paths(&dir),
+        None,
+        &github,
+    );
     assert!(
-        work.contains("`issue` command (github backend: May-Agent/may)"),
-        "{work}"
+        session.contains("Issue repository: May-Agent/may."),
+        "{session}"
     );
 }
 
@@ -349,23 +360,13 @@ fn session_paths(dir: &tempfile::TempDir) -> crate::session::SessionPaths {
 
 #[test]
 fn remote_hosts_render_only_while_one_is_connected() {
-    let dir = tempdir().expect("temp dir should be created");
-    let paths = session_paths(&dir);
-    let alone = build_environment(
-        "model",
-        &AgentEnvironment::Local,
-        &paths,
-        None,
-        Vec::new(),
-        None,
-    );
+    let alone = build_environment("model", &AgentEnvironment::Local, None, Vec::new());
     assert!(!alone.contains("ssh"), "{alone}");
     assert!(!alone.contains("Remote hosts"), "{alone}");
 
     let connected = build_environment(
         "model",
         &AgentEnvironment::Local,
-        &paths,
         None,
         vec![crate::config::SshServerConfig {
             name: "build-box".to_string(),
@@ -375,7 +376,6 @@ fn remote_hosts_render_only_while_one_is_connected() {
                 arch: "x86_64".to_string(),
             },
         }],
-        None,
     );
     assert!(
         connected.contains("Remote hosts are connected"),
@@ -389,16 +389,7 @@ fn remote_hosts_render_only_while_one_is_connected() {
 
 #[test]
 fn the_environment_names_paths_relative_to_the_session_and_the_real_home() {
-    let dir = tempdir().expect("temp dir should be created");
-    let paths = session_paths(&dir);
-    let environment = build_environment(
-        "model",
-        &AgentEnvironment::Local,
-        &paths,
-        None,
-        Vec::new(),
-        None,
-    );
+    let environment = build_environment("model", &AgentEnvironment::Local, None, Vec::new());
     assert!(environment.contains("\n- tmp/: "), "{environment}");
     assert!(!environment.contains("- /tmp"), "{environment}");
     let home = crate::config::MayConfig::home_dir().expect("home should resolve");
@@ -406,9 +397,9 @@ fn the_environment_names_paths_relative_to_the_session_and_the_real_home() {
         environment.contains(&format!("the user's home is {}", home.display())),
         "{environment}"
     );
-    let terminal = super::build_terminal(&AgentEnvironment::Local, &paths);
+    let terminal = super::build_terminal(&AgentEnvironment::Local);
     assert!(
-        terminal.contains(&format!("means {}/outputs/", dir.path().display())),
+        terminal.contains("means `outputs/…` in the session directory given in `<session>`"),
         "{terminal}"
     );
     assert!(
@@ -584,5 +575,104 @@ fn a_blocked_step_runs_in_unsafe_mode_without_asking_first() {
     assert!(
         harness.contains("Get past it as the permissions section says"),
         "{harness}"
+    );
+}
+
+/// The instruction blocks of a session in prompt order, as the model reads
+/// them.
+fn rendered_instructions(
+    dir: &tempfile::TempDir,
+    launch_dir: &str,
+    clone_source: &str,
+) -> Vec<(aither_agent::InstructionSlot, String)> {
+    let (_memory_dir, memory_path) = test_memory_file();
+    let paths = session_paths(dir);
+    let issues = crate::issue::IssueBackendInfo {
+        name: "may",
+        repository: None,
+    };
+    let clones = super::build_repo_clones_context(
+        &[super::RepoCloneEntry {
+            clone_path: paths.root().join("repos/may"),
+            source: clone_source.to_string(),
+        }],
+        &AgentEnvironment::Local,
+        &paths,
+    )
+    .expect("a clone renders a block");
+    let runtime_context = RuntimeSystemContext::new(memory_path, String::new())
+        .with_instruction(tag::IDENTITY, super::build_identity())
+        .with_instruction(tag::HARNESS, super::build_harness())
+        .with_instruction(tag::EVIDENCE, super::build_evidence())
+        .with_instruction(
+            tag::ENVIRONMENT,
+            build_environment("model", &AgentEnvironment::Local, None, Vec::new()),
+        )
+        .with_instruction(
+            tag::TERMINAL,
+            super::build_terminal(&AgentEnvironment::Local),
+        )
+        .with_instruction(tag::EFFICIENCY, build_efficiency(&[]))
+        .with_instruction(tag::WORK, build_work(&issues))
+        .with_instruction(
+            tag::SESSION,
+            super::build_session(
+                &AgentEnvironment::Local,
+                &paths,
+                Some(launch_dir.to_string()),
+                &issues,
+            ),
+        )
+        .with_instruction(tag::REPO_CLONES, clones);
+    let mut context = test_context();
+    runtime_context.reconcile(&mut context);
+    tag::layout()
+        .instructions()
+        .iter()
+        .filter_map(|slot| {
+            context
+                .instructions()
+                .get(slot)
+                .map(|text| (slot.clone(), text.clone()))
+        })
+        .collect()
+}
+
+#[test]
+fn sessions_differing_only_in_session_values_share_the_prompt_up_to_the_session_tier() {
+    let first_dir = tempdir().expect("temp dir should be created");
+    let second_dir = tempdir().expect("temp dir should be created");
+    let first = rendered_instructions(&first_dir, "/work/alpha", "/work/alpha");
+    let second = rendered_instructions(&second_dir, "/work/beta", "/work/beta");
+
+    let session_tier = [
+        tag::SESSION,
+        tag::REPO_CLONES,
+        tag::PLAN_MODE,
+        tag::PROJECT_RULES,
+    ];
+    let (shared_first, rest_first): (Vec<_>, Vec<_>) = first
+        .iter()
+        .partition(|(slot, _)| !session_tier.contains(slot));
+    let (shared_second, rest_second): (Vec<_>, Vec<_>) = second
+        .iter()
+        .partition(|(slot, _)| !session_tier.contains(slot));
+    assert!(
+        shared_first.len() > 4,
+        "the shared tiers hold the build-wide and configuration sections"
+    );
+    assert_eq!(shared_first, shared_second);
+    assert_ne!(rest_first, rest_second);
+
+    // No session-tier section comes before a shared one in the layout.
+    let order: Vec<_> = first.iter().map(|(slot, _)| slot.clone()).collect();
+    let first_session = order
+        .iter()
+        .position(|slot| session_tier.contains(slot))
+        .expect("the session tier is rendered");
+    assert!(
+        order[first_session..]
+            .iter()
+            .all(|slot| session_tier.contains(slot))
     );
 }
