@@ -146,20 +146,21 @@ pub fn project_tool_summary(arguments_raw: &str, variant: ToolVariant) -> ToolSu
     };
     ToolSummary {
         arguments_error,
-        ..project_fields(value, variant, complete)
+        ..project_fields(&value, variant, complete)
     }
 }
 
-fn project_fields(value: Value, variant: ToolVariant, complete: bool) -> ToolSummary {
+fn project_fields(fields: &Value, variant: ToolVariant, complete: bool) -> ToolSummary {
+    let pick = |key: &str| pick(fields, key);
     match variant {
         ToolVariant::Terminal => {
-            let script = pick(&value, "script");
+            let script = pick("script");
             let reading = script
                 .as_deref()
                 .filter(|_| complete)
                 .map(CommandReading::of);
             ToolSummary {
-                description: pick(&value, "description"),
+                description: pick("description"),
                 script,
                 reading,
                 ..ToolSummary::default()
@@ -167,30 +168,30 @@ fn project_fields(value: Value, variant: ToolVariant, complete: bool) -> ToolSum
         }
         ToolVariant::TerminalInput | ToolVariant::TerminalRead | ToolVariant::TerminalKill => {
             ToolSummary {
-                description: pick(&value, "description"),
-                script: pick(&value, "script"),
+                description: pick("description"),
+                script: pick("script"),
                 ..ToolSummary::default()
             }
         }
         ToolVariant::WebSearch => ToolSummary {
-            query: pick(&value, "query"),
+            query: pick("query"),
             ..ToolSummary::default()
         },
         ToolVariant::WebFetch => ToolSummary {
-            url: pick(&value, "url"),
+            url: pick("url"),
             ..ToolSummary::default()
         },
         ToolVariant::Browser => ToolSummary {
-            action: pick(&value, "action"),
-            target: pick(&value, "target").or_else(|| pick(&value, "url")),
+            action: pick("action"),
+            target: pick("target").or_else(|| pick("url")),
             ..ToolSummary::default()
         },
         // A compaction takes no arguments.
         ToolVariant::Compact => ToolSummary::default(),
         ToolVariant::Task | ToolVariant::Ask | ToolVariant::Session | ToolVariant::Generic => {
             ToolSummary {
-                description: pick(&value, "description"),
-                prompt: pick(&value, "prompt"),
+                description: pick("description"),
+                prompt: pick("prompt"),
                 ..ToolSummary::default()
             }
         }
