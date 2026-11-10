@@ -17,7 +17,7 @@ use skyzen::extract::Query;
 use skyzen::routing::Params;
 use skyzen::utils::{Json, State};
 
-use crate::agent::SubagentHandles;
+use crate::agent::SubagentTracker;
 use crate::client::background::{
     SessionBackgroundSnapshot, WireJob, WireJobDetail, WireSubagentRun, WireTerminalDelta,
 };
@@ -32,7 +32,7 @@ const MAX_READ_BYTES: usize = 64 * 1024;
 
 #[derive(Default)]
 struct SessionBackground {
-    subagents: SubagentHandles,
+    subagents: SubagentTracker,
     /// Job registries of the session's agents, numbered, newest last.
     jobs: Vec<(u64, JobRegistry)>,
     /// Background wakes being served: received from the idle agent and not
@@ -98,8 +98,8 @@ impl SessionBackgrounds {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// The subagent handles `session_id`'s agents are built with.
-    pub(crate) fn subagents(&self, session_id: &str) -> SubagentHandles {
+    /// The subagent tracker `session_id`'s agents are built with.
+    pub(crate) fn subagents(&self, session_id: &str) -> SubagentTracker {
         self.sessions()
             .entry(session_id.to_string())
             .or_default()
@@ -152,7 +152,7 @@ impl SessionBackgrounds {
             .unwrap_or_default()
     }
 
-    fn subagents_of(&self, session_id: &str) -> Option<SubagentHandles> {
+    fn subagents_of(&self, session_id: &str) -> Option<SubagentTracker> {
         self.sessions()
             .get(session_id)
             .map(|session| session.subagents.clone())
@@ -214,7 +214,7 @@ impl SessionBackgrounds {
         let jobs = self.jobs(session_id).await;
         let subagents = self
             .subagents_of(session_id)
-            .map(|handles| handles.tracker.running())
+            .map(|tracker| tracker.running())
             .unwrap_or_default();
         // A finished job whose completion its agent has not taken still owes
         // the session a turn, from the moment the registry records the finish.
@@ -237,7 +237,7 @@ impl SessionBackgrounds {
         stopped
             + self
                 .subagents_of(session_id)
-                .map_or(0, |handles| handles.runs.cancel_all())
+                .map_or(0, |tracker| tracker.runs().cancel_all())
     }
 
     /// The sessions with background work: a command or subagent run in
@@ -525,10 +525,6 @@ pub struct CancelSubagentsResponse {
 }
 
 /// `DELETE /api/sessions/{id}/subagents/{runId}`: stops one subagent run.
-///
-/// The tracker and the `subagent` command's own registry number runs
-/// independently, but record each run back-to-back, so the earliest entry
-/// with the same subagent and prompt is the same invocation.
 pub async fn cancel_subagent(
     params: Params,
     State(state): State<Arc<DaemonState>>,
@@ -539,20 +535,10 @@ pub async fn cancel_subagent(
         .map_err(bad_request_error)?
         .parse()
         .map_err(bad_request_error)?;
-    let Some(handles) = state.session_background.subagents_of(&session_id) else {
+    let Some(tracker) = state.session_background.subagents_of(&session_id) else {
         return Ok(Json(CancelSubagentsResponse { stopped: 0 }));
     };
-    let stopped = handles.tracker.get(run_id).and_then(|run| {
-        let (agent, prompt) = (run.agent, run.prompt);
-        handles
-            .runs
-            .list()
-            .into_iter()
-            .filter(|info| info.subagent == agent && info.prompt == prompt)
-            .min_by_key(|info| info.id)
-            .map(|info| info.id)
-    });
-    let stopped = usize::from(stopped.is_some_and(|id| handles.runs.cancel(id)));
+    let stopped = usize::from(tracker.runs().cancel(run_id));
     Ok(Json(CancelSubagentsResponse { stopped }))
 }
 
@@ -565,7 +551,7 @@ pub async fn cancel_subagents(
     let stopped = state
         .session_background
         .subagents_of(&session_id)
-        .map_or(0, |handles| handles.runs.cancel_all());
+        .map_or(0, |tracker| tracker.runs().cancel_all());
     Ok(Json(CancelSubagentsResponse { stopped }))
 }
 

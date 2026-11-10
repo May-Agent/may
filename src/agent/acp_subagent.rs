@@ -2,8 +2,9 @@
 //!
 //! The daemon owns one [`acpsub::Host`] whose configuration is built from the
 //! live [`MayConfig`] on every load. [`AcpSubagent`] adapts it to aither's
-//! [`ExternalSubagent`], so a connected agent is launched, continued, tracked
-//! and cancelled by the `subagent` command like a built-in type.
+//! the `subagent` command's external agents: [`AcpSession`] is a
+//! [`ChildAgent`], so a connected agent is launched, continued, tracked and
+//! cancelled by the `subagent` command like a built-in type.
 //!
 //! acpsub runs on Tokio. This module is the only place May touches Tokio for
 //! it: every acpsub future is polled inside the daemon runtime's context.
@@ -20,8 +21,8 @@ use acpsub::{
     PermissionPolicy, Services, Session, SessionSpec, TurnEnd, probe_with,
 };
 use aither_acp::StopReason;
-use aither_agent::specialized::{ExternalSession, ExternalStart, ExternalSubagent, SubagentTool};
-use aither_core::LanguageModel;
+use aither_agent::{AgentError, ChildAgent, ChildEvents, RunOutcome};
+use aither_core::llm::tool::CancelSignal;
 use arc_swap::ArcSwap;
 use async_lock::{RwLock, RwLockReadGuardArc};
 use futures_util::StreamExt as _;
@@ -31,6 +32,7 @@ use tokio::runtime::Handle;
 use super::acp_sandbox::{ApprovalPermissions, SandboxExecutor, SessionPolicy, SessionSandbox};
 use crate::config::{AcpAgentConfig, MayConfig};
 use crate::session::MayHomePaths;
+use crate::subagent::{ExternalAgent, ExternalAgents, ExternalStart};
 
 /// An acpsub host whose agents and their commands run in a session sandbox
 /// and whose permission requests go to the session's approver.
@@ -238,16 +240,14 @@ pub struct AcpAgents {
 }
 
 impl AcpAgents {
-    /// Registers every connected agent on `tool` as a subagent type under its
+    /// Every connected agent, for the `subagent` command to run under its
     /// name.
     ///
     /// # Errors
-    /// Returns the config error of a name that cannot be a subagent type;
+    /// Returns the config error of a name that cannot be a subagent name;
     /// nothing is overridden silently.
-    pub fn register<LLM: LanguageModel + Clone + Sync + 'static>(
-        &self,
-        mut tool: SubagentTool<LLM>,
-    ) -> Result<SubagentTool<LLM>, crate::config::ConfigError> {
+    pub fn externals(&self) -> Result<ExternalAgents, crate::config::ConfigError> {
+        let mut agents = BTreeMap::new();
         for (name, connection) in &self.connected {
             crate::config::check_acp_agent_name(name)?;
             let backend = AcpSubagent {
@@ -258,9 +258,15 @@ impl AcpAgents {
                 model: connection.model.clone(),
                 mode: connection.mode.clone(),
             };
-            tool = tool.with_external(name.clone(), connection.description.clone(), backend);
+            agents.insert(
+                name.clone(),
+                ExternalAgent {
+                    description: connection.description.clone(),
+                    backend,
+                },
+            );
         }
-        Ok(tool)
+        Ok(ExternalAgents::new(agents))
     }
 }
 
@@ -424,11 +430,12 @@ pub struct AcpSubagent {
     mode: Option<String>,
 }
 
-impl ExternalSubagent for AcpSubagent {
-    type Session = AcpSession;
-    type Error = AcpError;
-
-    async fn open(&self, start: ExternalStart<'_>) -> Result<AcpSession, AcpError> {
+impl AcpSubagent {
+    /// Opens a session of the agent for a call made with `start`.
+    ///
+    /// # Errors
+    /// Returns why the agent cannot be started for it.
+    pub async fn open(&self, start: ExternalStart<'_>) -> Result<AcpSession, AcpError> {
         if !start.worktrees.is_empty() || !start.commit_worktrees.is_empty() {
             return Err(AcpError::WorktreeGrant {
                 agent: self.agent.clone(),
@@ -460,6 +467,7 @@ impl ExternalSubagent for AcpSubagent {
         let session = in_runtime(&self.runtime, self.host.spawn(spec)).await?;
         drop(retired);
         Ok(AcpSession {
+            agent: self.agent.clone(),
             session: Some(session),
             runtime: self.runtime.clone(),
             lease: self.lease.clone(),
@@ -470,7 +478,9 @@ impl ExternalSubagent for AcpSubagent {
 /// One conversation with a connected agent.
 #[derive(Debug)]
 pub struct AcpSession {
-    /// `None` once [`ExternalSession::close`] took it.
+    /// The agent's name.
+    agent: String,
+    /// `None` once [`AcpSession::close`] took it.
     session: Option<SandboxedSession>,
     runtime: Handle,
     lease: Lease,
@@ -484,15 +494,55 @@ impl AcpSession {
     }
 }
 
-impl ExternalSession for AcpSession {
-    type Error = AcpError;
+/// What a turn waits for.
+enum Turn {
+    Ended(Result<String, AcpError>),
+    Cancelled,
+}
 
-    async fn prompt(&mut self, prompt: &str) -> Result<String, AcpError> {
+impl ChildAgent for AcpSession {
+    /// Runs one turn of the agent. The agent reports no events of its own
+    /// to the parent's stream.
+    async fn run(
+        &mut self,
+        prompt: &str,
+        _events: &ChildEvents,
+        cancel: CancelSignal,
+    ) -> RunOutcome {
+        let turn =
+            futures_lite::future::or(async { Turn::Ended(self.prompt(prompt).await) }, async {
+                cancel.cancelled().await;
+                Turn::Cancelled
+            })
+            .await;
+        match turn {
+            Turn::Ended(Ok(final_text)) => RunOutcome::Completed { final_text },
+            Turn::Ended(Err(error)) => RunOutcome::Failed {
+                error: AgentError::ToolExecution {
+                    name: self.agent.clone(),
+                    error: error.to_string(),
+                },
+            },
+            Turn::Cancelled => {
+                self.cancel().await;
+                RunOutcome::Cancelled
+            }
+        }
+    }
+}
+
+impl AcpSession {
+    /// Runs a turn on `prompt` and returns the agent's reply.
+    ///
+    /// # Errors
+    /// Returns how the turn went wrong.
+    pub async fn prompt(&self, prompt: &str) -> Result<String, AcpError> {
         let outcome = in_runtime(&self.runtime, self.session().prompt(prompt)).await?;
         finished(outcome.reply, outcome.end)
     }
 
-    async fn cancel(&mut self) {
+    /// Asks the agent to stop its turn.
+    pub async fn cancel(&self) {
         // A turn that ended before the cancel arrived is not a failure.
         if let Err(error) = in_runtime(&self.runtime, self.session().cancel()).await
             && !matches!(error, acpsub::Error::NotRunning { .. })
@@ -501,7 +551,8 @@ impl ExternalSession for AcpSession {
         }
     }
 
-    async fn close(mut self) {
+    /// Ends the agent's session.
+    pub async fn close(mut self) {
         let session = self
             .session
             .take()
@@ -510,7 +561,9 @@ impl ExternalSession for AcpSession {
         close_leased(&self.runtime, session, &lease).await;
     }
 
-    fn model(&self) -> Option<String> {
+    /// The model the agent runs, when it says.
+    #[must_use]
+    pub fn model(&self) -> Option<String> {
         self.session().model().map(|model| {
             model
                 .as_str()
@@ -520,7 +573,7 @@ impl ExternalSession for AcpSession {
 }
 
 impl Drop for AcpSession {
-    /// A session dropped without [`ExternalSession::close`] still ends: its
+    /// A session dropped without [`AcpSession::close`] still ends: its
     /// agent process must not outlive it.
     fn drop(&mut self) {
         let Some(session) = self.session.take() else {
@@ -733,43 +786,11 @@ pub fn describe(identity: &AgentIdentity) -> String {
 mod tests {
     use std::time::Duration;
 
-    use aither_agent::specialized::SubagentArgs;
-    use aither_core::llm::tool::{ToolContext, ToolResult};
-    use aither_core::llm::{Event, LLMRequest, Tool, model::Profile};
-    use aither_sandbox::CommandUsage;
-    use futures_lite::Stream;
+    use aither_agent::SubagentRuns;
+    use aither_core::llm::{CallIdentity, ToolCallId};
 
     use super::*;
     use crate::agent::PermissionApprover;
-
-    /// A model that is never asked anything: external subagents bring their own.
-    #[derive(Clone)]
-    struct NoLlm;
-
-    #[derive(Debug, thiserror::Error)]
-    #[error("unused")]
-    struct NoLlmError;
-
-    impl aither_core::llm::Classify for NoLlmError {
-        fn failure(&self) -> aither_core::llm::Failure {
-            aither_core::llm::Failure::permanent()
-        }
-    }
-
-    impl LanguageModel for NoLlm {
-        type Error = NoLlmError;
-
-        fn respond(
-            &self,
-            _request: LLMRequest,
-        ) -> impl Stream<Item = Result<Event, Self::Error>> + Send {
-            futures_lite::stream::empty()
-        }
-
-        fn profile(&self) -> impl Future<Output = Result<Profile, NoLlmError>> + Send {
-            std::future::ready(Ok(Profile::new("none", "test", "none", "none", 1_000)))
-        }
-    }
 
     fn fake_connection() -> AcpAgentConfig {
         AcpAgentConfig {
@@ -1235,13 +1256,10 @@ mod tests {
             working_copies: &[],
         };
         let open = || async {
-            tokio::time::timeout(
-                Duration::from_secs(60),
-                ExternalSubagent::open(&backend, start()),
-            )
-            .await
-            .expect("the agent starts")
-            .expect("the session opens")
+            tokio::time::timeout(Duration::from_secs(60), backend.open(start()))
+                .await
+                .expect("the agent starts")
+                .expect("the session opens")
         };
         let dropped = open().await;
         let kept = open().await;
@@ -1262,9 +1280,10 @@ mod tests {
         );
         // A session closed after the delete leaves nothing behind, and no new
         // one starts for the deleted session.
-        ExternalSession::close(kept).await;
+        kept.close().await;
         assert!(!storage.exists(), "a late close recreated the storage");
-        let refused = ExternalSubagent::open(&backend, start())
+        let refused = backend
+            .open(start())
             .await
             .expect_err("nothing starts for a deleted session");
         assert!(
@@ -1273,72 +1292,58 @@ mod tests {
         );
     }
 
-    async fn call_text(
-        tool: &SubagentTool<NoLlm>,
-        args: SubagentArgs,
-    ) -> aither_core::Result<String> {
-        match Tool::call(tool, args, ToolContext::new()).await? {
-            ToolResult::Text { text } => Ok(text),
-            other => panic!("expected a text result, got {other:?}"),
-        }
-    }
-
     #[tokio::test(flavor = "multi_thread")]
-    async fn the_main_agent_starts_and_resumes_a_connected_agent() {
+    async fn a_connected_agent_runs_as_a_child_and_is_continued_on_its_session() {
         let dir = tempfile::tempdir().expect("temp dir");
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).expect("work dir");
         let acp = agents(
             dir.path(),
             BTreeMap::from([("fake".to_string(), fake_connection())]),
         )
         .await;
-        let tool = acp
-            .register(SubagentTool::new(NoLlm).with_base_dir(dir.path()))
-            .expect("the name is free");
-        assert!(
-            tool.usage().await.contains("- fake: a scripted ACP agent"),
+        let externals = acp.externals().expect("the name is free");
+        let (name, description) = externals.described().next().expect("one connected agent");
+        assert_eq!(
+            (name, description),
+            ("fake", "a scripted ACP agent"),
             "the connected agent is listed with its description"
         );
-        let prompt = dir.path().join("prompt.txt");
-        std::fs::write(&prompt, "say something").expect("prompt file");
-        let start = |prompt: &Path| SubagentArgs {
-            name: "external".to_string(),
-            prompt_file: prompt.to_string_lossy().into_owned(),
-            id: None,
-            agent: Some("fake".to_string()),
-            worktrees: Vec::new(),
-            commit_worktrees: Vec::new(),
-        };
-
-        let text = tokio::time::timeout(Duration::from_secs(60), call_text(&tool, start(&prompt)))
-            .await
-            .expect("the subagent answers")
-            .expect("start succeeds");
-        assert!(text.contains("ab"), "the agent's reply comes back: {text}");
-
-        let id = text
-            .split_once("--id ")
-            .and_then(|(_, rest)| rest.split(|c: char| !c.is_ascii_lowercase()).next())
-            .filter(|word| !word.is_empty())
-            .expect("the result carries the continuation id")
-            .to_string();
-        let again = tokio::time::timeout(
+        let mut session = tokio::time::timeout(
             Duration::from_secs(60),
-            call_text(
-                &tool,
-                SubagentArgs {
-                    name: "resume".to_string(),
-                    prompt_file: prompt.to_string_lossy().into_owned(),
-                    id: Some(id.clone()),
-                    agent: None,
-                    worktrees: Vec::new(),
-                    commit_worktrees: Vec::new(),
-                },
-            ),
+            externals
+                .get("fake")
+                .expect("connected")
+                .backend
+                .open(ExternalStart {
+                    working_dir: &work,
+                    worktrees: &[],
+                    commit_worktrees: &[],
+                    working_copies: &[],
+                }),
         )
         .await
-        .expect("the resumed subagent answers")
-        .expect("resume succeeds");
-        assert!(again.contains("ab"), "{again}");
+        .expect("the agent starts")
+        .expect("the session opens");
+
+        let runs = SubagentRuns::default();
+        let caller =
+            CallIdentity::new(ToolCallId::new("c1"), aither_core::llm::AgentIdentity::Main);
+        for prompt in ["say something", "say it again"] {
+            let run = runs.start(&caller, "fake", prompt);
+            let outcome =
+                tokio::time::timeout(Duration::from_secs(60), run.run(&mut session, prompt))
+                    .await
+                    .expect("the subagent answers");
+            let RunOutcome::Completed { final_text } = outcome else {
+                panic!("the turn completes: {outcome:?}");
+            };
+            assert!(
+                final_text.contains("ab"),
+                "the reply comes back: {final_text}"
+            );
+        }
+        assert!(runs.list().is_empty(), "every run closed its registration");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1355,17 +1360,15 @@ mod tests {
         };
         let grant = [dir.path().join("tree")];
         for (worktrees, commit_worktrees) in [(&grant[..], &[][..]), (&[][..], &grant[..])] {
-            let refused = ExternalSubagent::open(
-                &backend,
-                ExternalStart {
+            let refused = backend
+                .open(ExternalStart {
                     working_dir: dir.path(),
                     worktrees,
                     commit_worktrees,
                     working_copies: &[],
-                },
-            )
-            .await
-            .expect_err("a grant is refused before any process starts");
+                })
+                .await
+                .expect_err("a grant is refused before any process starts");
             assert!(
                 matches!(refused, AcpError::WorktreeGrant { .. }),
                 "{refused}"
@@ -1382,7 +1385,7 @@ mod tests {
         )
         .await;
         let error = acp
-            .register(SubagentTool::new(NoLlm))
+            .externals()
             .map(|_| ())
             .expect_err("the built-in type keeps its name");
         assert!(error.to_string().contains("built-in"), "{error}");
