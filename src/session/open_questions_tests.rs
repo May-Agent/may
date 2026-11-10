@@ -25,10 +25,6 @@ use aither_agent::BlockerResolver;
 /// Upper bound on any single wait in this module.
 const WAIT_BOUND: Duration = Duration::from_secs(20);
 
-fn init_executor() {
-    let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
-}
-
 /// Bound `future` by [`WAIT_BOUND`], naming `what` it waits for on expiry.
 async fn bounded<T>(what: &str, future: impl Future<Output = T>) -> T {
     tokio::time::timeout(WAIT_BOUND, future)
@@ -43,7 +39,7 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
-        init_executor();
+        crate::test_support::install_global_executor();
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("history.db");
         let db = ChatDb::open(&path).await.expect("open database");

@@ -2070,7 +2070,7 @@ mod tests {
     async fn local_terminal_fails_before_exec_without_prepared_tools() {
         // Terminal construction spawns its job registry on the global
         // executor, which the `may` binary installs at startup.
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        crate::test_support::install_global_executor();
         let dir = tempdir().expect("temp dir should be created");
         let may_dir = dir.path().join(".may");
         std::fs::create_dir_all(&may_dir).expect("may dir should be created");
@@ -2108,7 +2108,7 @@ mod tests {
     async fn scheduler_test_terminal(
         dir: &std::path::Path,
     ) -> TerminalTool<SchedulerPermissionHandler, DefaultExecutor, Configured> {
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        crate::test_support::install_global_executor();
         let may_dir = dir.join(".may");
         std::fs::create_dir_all(&may_dir).expect("may dir should be created");
         let workspace = dir.join("workspace");
@@ -2252,7 +2252,7 @@ mod tests {
 
     impl WakeHost {
         async fn new() -> Self {
-            let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+            crate::test_support::install_global_executor();
             let dir = tempdir().expect("temp dir should be created");
             let may_dir = dir.path().join(".may");
             std::fs::create_dir_all(&may_dir).expect("may dir should be created");

@@ -29,7 +29,7 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        crate::test_support::install_global_executor();
         let dir = tempfile::tempdir().expect("temp dir");
         let db = ChatDb::open(&dir.path().join("history.db"))
             .await

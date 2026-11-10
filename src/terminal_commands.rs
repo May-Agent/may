@@ -1143,7 +1143,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_list_and_send_are_refused_to_a_subagent_and_work_for_the_main_agent() {
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        crate::test_support::install_global_executor();
         let temp = tempfile::tempdir().expect("tempdir");
         let session_dir = temp.path().join("sb");
         std::fs::create_dir_all(&session_dir).expect("sandbox dir");

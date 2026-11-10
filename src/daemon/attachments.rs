@@ -960,7 +960,6 @@ mod file_route_tests {
     use crate::daemon::state::DaemonState;
 
     async fn state() -> (Arc<DaemonState>, tempfile::TempDir) {
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
         let dir = tempfile::tempdir().expect("temp dir");
         let state = DaemonState::for_test(dir.path(), MayConfig::default())
             .await

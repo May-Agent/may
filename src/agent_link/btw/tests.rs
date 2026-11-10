@@ -39,7 +39,7 @@ struct Host {
 
 impl Host {
     async fn new() -> Self {
-        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        crate::test_support::install_global_executor();
         let may_dir = tempfile::tempdir().expect("may dir");
         let db = ChatDb::open(&may_dir.path().join("history.db"))
             .await

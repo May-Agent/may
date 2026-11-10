@@ -16,7 +16,6 @@ use crate::ui_event_bus::UiEventTopics;
 const SESSION: &str = "s";
 
 async fn state() -> Arc<DaemonState> {
-    let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
     let dir = tempfile::tempdir().expect("temp dir");
     let state = DaemonState::for_test(dir.path(), MayConfig::default())
         .await
