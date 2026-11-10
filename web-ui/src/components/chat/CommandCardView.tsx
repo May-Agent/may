@@ -69,7 +69,9 @@ function SubagentCardView({ card }: { card: Extract<CommandCard, { kind: 'subage
   const ended = card.finishedAt ? Date.parse(card.finishedAt) : now;
   const status = running
     ? `${t('tools.card.running')} ${elapsedText((now - started) / 1000)}`
-    : `${t('tools.card.done')} ${elapsedText((ended - started) / 1000)}`;
+    : card.state === 'interrupted'
+      ? t('tools.card.interrupted')
+      : `${t('tools.card.done')} ${elapsedText((ended - started) / 1000)}`;
   const result = card.result?.trim() ? card.result : null;
   return (
     <div className="space-y-1" data-testid="card-subagent" data-state={card.state}>

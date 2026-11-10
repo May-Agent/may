@@ -202,6 +202,7 @@ export const enUS = {
       tasksUnblocked: 'Task unblocked',
       tasksEdited: 'Task edited',
       running: 'running',
+      interrupted: 'interrupted',
       done: 'done in',
       fullResult: 'Full result',
       waiting: 'Waiting for an answer',

@@ -107,6 +107,8 @@ pub enum SubagentState {
     Running,
     /// The run returned its result.
     Done,
+    /// The daemon stopped while the run was working; it never returned.
+    Interrupted,
 }
 
 /// A question an `ask_user` card shows.
@@ -190,6 +192,18 @@ impl Card {
                     })
                     .collect(),
             );
+        }
+        self
+    }
+
+    /// This card with a running subagent settled as interrupted. Any other
+    /// card, a finished subagent included, is unchanged.
+    #[must_use]
+    pub fn interrupted(mut self) -> Self {
+        if let Self::Subagent { state, .. } = &mut self
+            && *state == SubagentState::Running
+        {
+            *state = SubagentState::Interrupted;
         }
         self
     }

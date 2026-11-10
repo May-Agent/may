@@ -82,6 +82,37 @@ impl ChatDb {
         .collect()
     }
 
+    /// Settles every stored subagent card still running as interrupted: no
+    /// run survives a daemon exit, so a card left running never ends.
+    /// Returns how many cards changed.
+    ///
+    /// # Errors
+    /// Returns [`ChatDbError`] on storage failure or an unreadable card.
+    pub async fn interrupt_running_subagent_cards(&self) -> Result<usize, ChatDbError> {
+        #[derive(Debug, Clone, serde::Deserialize, skyzen::FromRow)]
+        struct StoredCard {
+            session_id: String,
+            call_id: String,
+            card: String,
+        }
+        let running = query!(
+            self.db,
+            "SELECT session_id, call_id, card FROM message_tool_cards WHERE json_extract(card, '$.kind') = 'subagent' AND json_extract(card, '$.state') = 'running'"
+        )
+        .fetch_all::<StoredCard>()
+        .await?;
+        let settled = running.len();
+        for stored in running {
+            let (_, card) = decode(CardRow {
+                call_id: stored.call_id.clone(),
+                card: stored.card,
+            })?;
+            self.set_tool_card(&stored.session_id, &stored.call_id, &card.interrupted())
+                .await?;
+        }
+        Ok(settled)
+    }
+
     /// The call and card of the `ask_user` question `request_id`, when a
     /// terminal call of the session asked it.
     ///
@@ -107,7 +138,7 @@ impl ChatDb {
 
 #[cfg(test)]
 mod tests {
-    use crate::command_reading::{AskedCard, Card};
+    use crate::command_reading::{AskedCard, Card, SubagentState};
 
     use super::*;
 
@@ -131,6 +162,52 @@ mod tests {
             .await
             .expect("db opens");
         (dir, db)
+    }
+
+    fn subagent(state: SubagentState) -> Card {
+        Card::Subagent {
+            agent: "explorer".to_owned(),
+            title: "Map".to_owned(),
+            state,
+            started_at: jiff::Timestamp::UNIX_EPOCH,
+            finished_at: None,
+            result: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn running_subagent_cards_settle_as_interrupted_and_others_stay() {
+        let (_dir, db) = open().await;
+        db.set_tool_card("s", "run", &subagent(SubagentState::Running))
+            .await
+            .expect("store");
+        db.set_tool_card("t", "run2", &subagent(SubagentState::Running))
+            .await
+            .expect("store");
+        db.set_tool_card("s", "done", &subagent(SubagentState::Done))
+            .await
+            .expect("store");
+        db.set_tool_card("s", "ask", &question("r1"))
+            .await
+            .expect("store");
+
+        assert_eq!(
+            db.interrupt_running_subagent_cards().await.expect("settle"),
+            2
+        );
+
+        let cards = db.tool_cards("s").await.expect("read");
+        assert_eq!(cards["run"], subagent(SubagentState::Interrupted));
+        assert_eq!(cards["done"], subagent(SubagentState::Done));
+        assert_eq!(cards["ask"], question("r1"));
+        assert_eq!(
+            db.tool_cards("t").await.expect("read")["run2"],
+            subagent(SubagentState::Interrupted)
+        );
+        assert_eq!(
+            db.interrupt_running_subagent_cards().await.expect("again"),
+            0
+        );
     }
 
     #[tokio::test]

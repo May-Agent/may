@@ -204,6 +204,7 @@ export const ja: Messages = {
       tasksUnblocked: 'タスクのブロックを解除',
       tasksEdited: 'タスクを編集',
       running: '実行中',
+      interrupted: '中断',
       done: '所要時間',
       fullResult: '完全な結果',
       waiting: '回答待ち',

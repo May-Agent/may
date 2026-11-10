@@ -230,7 +230,7 @@ export type CommandCard =
       kind: 'subagent';
       agent: string;
       title: string;
-      state: 'running' | 'done';
+      state: 'running' | 'done' | 'interrupted';
       startedAt: string;
       finishedAt?: string | null;
       result?: string | null;

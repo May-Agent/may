@@ -17,7 +17,7 @@ const tasks: CommandCard = {
   ],
 };
 
-const subagent = (state: 'running' | 'done'): CommandCard => ({
+const subagent = (state: 'running' | 'done' | 'interrupted'): CommandCard => ({
   kind: 'subagent',
   agent: 'explorer',
   title: 'Map the parser',
@@ -63,6 +63,13 @@ describe('CommandCardView', () => {
     const html = renderToStaticMarkup(<CommandCardView card={subagent('running')} />);
     expect(html).toContain('data-state="running"');
     expect(html).not.toContain('<details');
+  });
+
+  test('an interrupted subagent says so and shows no elapsed time', () => {
+    const html = renderToStaticMarkup(<CommandCardView card={subagent('interrupted')} />);
+    expect(html).toContain('data-state="interrupted"');
+    expect(html).toContain('interrupted');
+    expect(html).not.toContain('running');
   });
 
   test('an ask_user card shows the options, then the answer', () => {

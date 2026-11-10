@@ -4128,6 +4128,7 @@ pub fn card_lines(card: &Card, selection_style: Style, open: bool) -> Vec<Line<'
                     format!("done in {}", elapsed_text(*started_at, *end))
                 }
                 (SubagentState::Done, None) => "done".to_owned(),
+                (SubagentState::Interrupted, _) => "interrupted".to_owned(),
             };
             lines.push(Line::from(vec![
                 Span::styled(
@@ -5781,6 +5782,16 @@ mod tests {
         let open: Vec<String> = rendered_text(&card_lines(&card, Style::default(), true));
         assert_eq!(open[1], "  Found two parsers.");
         assert_eq!(open[2], "  The old one is dead.");
+    }
+
+    #[test]
+    fn an_interrupted_subagent_shows_that_it_never_returned() {
+        let rows = rendered_text(&card_lines(
+            &subagent(SubagentState::Interrupted, None),
+            Style::default(),
+            false,
+        ));
+        assert_eq!(rows, ["  explorer · Map the parser · interrupted"]);
     }
 
     #[test]

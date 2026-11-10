@@ -204,6 +204,7 @@ export const zhHant: Messages = {
       tasksUnblocked: '任務已解除封鎖',
       tasksEdited: '已編輯任務',
       running: '執行中',
+      interrupted: '已中斷',
       done: '耗時',
       fullResult: '完整結果',
       waiting: '等待回答',
