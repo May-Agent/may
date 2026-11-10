@@ -21,6 +21,7 @@ DELETE FROM session_background_live WHERE ? IS NULL OR session_id = ?;
 DELETE FROM session_daemon_exit_alerts WHERE ? IS NULL OR session_id = ?;
 DELETE FROM session_plans WHERE ? IS NULL OR session_id = ?;
 DELETE FROM session_yolo WHERE ? IS NULL OR session_id = ?;
+DELETE FROM message_tool_cards WHERE ? IS NULL OR session_id = ?;
 DELETE FROM session_transcript_entries WHERE ? IS NULL OR session_id = ?;
 DELETE FROM session_context_snapshots WHERE ? IS NULL OR session_id = ?;
 DELETE FROM session_repo_clones WHERE ? IS NULL OR session_id = ?;

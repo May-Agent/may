@@ -3682,6 +3682,7 @@ mod tests {
             mode: aither_sandbox::TerminalExecutionMode::Default,
             location: None,
             reading: None,
+            card: None,
             status: ToolStatus::Done,
             output: Some(output),
             diffs: Vec::new(),

@@ -77,6 +77,13 @@ pub enum TuiEvent {
         /// How the daemon read the call's script.
         reading: crate::command_reading::CommandReading,
     },
+    /// The card of a terminal call that ran one of May's commands changed.
+    ToolCard {
+        /// The call the card belongs to.
+        call_id: String,
+        /// The card; absent when the call has none and shows as a command row.
+        card: Option<crate::command_reading::Card>,
+    },
     /// The daemon parked the run.
     Hold {
         /// What the run waits for.

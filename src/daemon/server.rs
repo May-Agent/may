@@ -995,13 +995,17 @@ async fn recover_persisted_runs_after_restart(
     db: &crate::db::ChatDb,
     previous: crate::db::PreviousDaemon,
 ) -> anyhow::Result<()> {
-    let (sessions, task_runs) = futures_lite::future::zip(
-        runtime_service.runs().recover_after_restart(previous),
-        db.recover_task_runs_after_restart(),
+    let ((sessions, task_runs), cards) = futures_lite::future::zip(
+        futures_lite::future::zip(
+            runtime_service.runs().recover_after_restart(previous),
+            db.recover_task_runs_after_restart(),
+        ),
+        db.interrupt_running_subagent_cards(),
     )
     .await;
     sessions.context("failed to reconcile persisted session runtime state after restart")?;
     task_runs.context("failed to reconcile persisted scheduled-task runs after restart")?;
+    cards.context("failed to settle the subagent cards a stopped daemon left running")?;
     Ok(())
 }
 
@@ -1061,6 +1065,17 @@ mod tests {
         db.start_task_run("run-1", &task, "event")
             .await
             .expect("run persists");
+        let running = crate::command_reading::Card::Subagent {
+            agent: "explorer".to_string(),
+            title: "Map".to_string(),
+            state: crate::command_reading::SubagentState::Running,
+            started_at: jiff::Timestamp::UNIX_EPOCH,
+            finished_at: None,
+            result: None,
+        };
+        db.set_tool_card("session-1", "call-1", &running)
+            .await
+            .expect("card persists");
         assert_eq!(
             db.task_run_status("run-1")
                 .await
@@ -1085,6 +1100,15 @@ mod tests {
                 .as_deref(),
             Some("interrupted")
         );
+        let cards = db.tool_cards("session-1").await.expect("cards");
+        assert_eq!(cards["call-1"], running.interrupted());
+        assert!(matches!(
+            cards["call-1"],
+            crate::command_reading::Card::Subagent {
+                state: crate::command_reading::SubagentState::Interrupted,
+                ..
+            }
+        ));
     }
 
     #[test]
