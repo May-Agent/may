@@ -471,10 +471,11 @@ impl RuntimeDeps {
             .oneshot_model
             .clone()
             .or_else(|| app.config.last_model.as_ref().map(ToString::to_string));
+        let name = app.session_manager.issue_session_name().await?;
         let (session_id, messages) = {
             let session = app
                 .session_manager
-                .create_session_with_model(model.clone())?;
+                .create_session_with_model(name, model.clone())?;
             (session.id.clone(), session.history.messages().to_vec())
         };
 
@@ -642,10 +643,11 @@ impl RuntimeDeps {
             blocking::unblock(move || crate::session::import::import(source, &query_owned)).await?;
 
         let model = imported.model.clone();
+        let name = app.session_manager.issue_session_name().await?;
         let (sandbox_dir, _session_id, imported_count) = {
             let session = app
                 .session_manager
-                .create_session_with_model(model.clone())?;
+                .create_session_with_model(name, model.clone())?;
             (
                 session.sandbox_dir.clone(),
                 session.id.clone(),

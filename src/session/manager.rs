@@ -49,7 +49,10 @@ pub enum SessionError {
     Daemon(#[from] crate::client::DaemonClientError),
 }
 
-/// Unique session identifier (four random words joined by `-`).
+/// A session's name: the id of the session and of the main agent running
+/// it. The daemon's one generator issues it
+/// ([`ChatDb::issue_session_name`](crate::db::ChatDb::issue_session_name));
+/// it never changes and is never issued again.
 #[derive(
     Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, skyzen::ToSchema,
 )]
@@ -57,15 +60,6 @@ pub enum SessionError {
 pub struct SessionId(String);
 
 impl SessionId {
-    /// Create a new random session ID using four words.
-    ///
-    /// # Panics
-    /// Panics if the embedded petname dictionary cannot produce an id.
-    #[must_use]
-    pub fn new() -> Self {
-        Self(crate::id::new_long())
-    }
-
     /// Create from an existing string.
     pub fn from_string(s: impl Into<String>) -> Self {
         Self(s.into())
@@ -75,12 +69,6 @@ impl SessionId {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
-    }
-}
-
-impl Default for SessionId {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -606,26 +594,44 @@ impl SessionManager {
         &self.may_dir
     }
 
-    /// Create a new session in the current profile (lazy - not persisted until first message).
+    /// A session name the daemon's generator issued for a session this
+    /// client is about to create.
+    ///
+    /// # Errors
+    /// Returns [`SessionError`] when the daemon cannot issue one.
+    pub async fn issue_session_name(&self) -> Result<SessionId, SessionError> {
+        let issued: crate::client::IssuedSessionName = self
+            .daemon()?
+            .post("/api/session-names", &serde_json::json!({}))
+            .await?;
+        Ok(SessionId::from_string(issued.name))
+    }
+
+    /// Create a new session named `id` in the current profile (lazy - not
+    /// persisted until first message).
     ///
     /// # Errors
     /// Returns [`SessionError`] when the session cannot be created.
-    pub fn create_session(&mut self) -> Result<&Session, SessionError> {
-        self.create_session_with_model(None)
+    pub fn create_session(&mut self, id: SessionId) -> Result<&Session, SessionError> {
+        self.create_session_with_model(id, None)
     }
 
-    /// Create a new session with a specific model in the current profile.
+    /// Create a new session named `id` with a specific model in the current
+    /// profile.
     ///
     /// # Errors
     /// Returns [`SessionError`] when the session cannot be created.
     pub fn create_session_with_model(
         &mut self,
+        id: SessionId,
         model: Option<String>,
     ) -> Result<&Session, SessionError> {
-        self.create_session_in_profile(model, self.current_profile_id.clone())
+        self.create_session_in_profile(id, model, self.current_profile_id.clone())
     }
 
-    /// Create a new session with a specific model and profile.
+    /// Create a new session named `id`, which
+    /// [`issue_session_name`](Self::issue_session_name) issued, with a
+    /// specific model and profile.
     ///
     /// # Errors
     /// Returns [`SessionError`] when the session cannot be created.
@@ -634,10 +640,10 @@ impl SessionManager {
     /// Panics if the freshly created session cannot be retrieved (internal invariant).
     pub fn create_session_in_profile(
         &mut self,
+        id: SessionId,
         model: Option<String>,
         profile_id: Option<String>,
     ) -> Result<&Session, SessionError> {
-        let id = SessionId::new();
         let now = Timestamp::now();
         let client_cwd = std::env::current_dir()?;
         let launch = self.once.take().unwrap_or_else(|| self.launch.clone());
@@ -1045,8 +1051,10 @@ mod launch_tests {
     async fn a_repo_less_launch_creates_sessions_with_no_directory_or_repository() {
         let (_tmp, mut manager) = manager().await;
         manager.set_launch(SessionLaunch::RepoLess);
-        for _ in 0..2 {
-            let session = manager.create_session().unwrap();
+        for name in ["amber-river", "cedar-stone"] {
+            let session = manager
+                .create_session(SessionId::from_string(name))
+                .unwrap();
             assert_eq!(session.cwd, None);
             assert_eq!(session.repo, None);
         }
@@ -1057,10 +1065,14 @@ mod launch_tests {
         let (_tmp, mut manager) = manager().await;
         manager.set_launch(SessionLaunch::RepoLess);
         manager.set_launch(SessionLaunch::Repo("acme/app".into()));
-        let first = manager.create_session().unwrap();
+        let first = manager
+            .create_session(SessionId::from_string("amber-river"))
+            .unwrap();
         assert_eq!(first.repo.as_deref(), Some("acme/app"));
         assert_eq!(first.cwd, None);
-        let second = manager.create_session().unwrap();
+        let second = manager
+            .create_session(SessionId::from_string("cedar-stone"))
+            .unwrap();
         assert_eq!(second.repo, None);
         assert_eq!(second.cwd, None, "the repo-less launch resumes");
     }
@@ -1068,7 +1080,9 @@ mod launch_tests {
     #[tokio::test]
     async fn the_default_launch_works_in_the_clients_directory() {
         let (_tmp, mut manager) = manager().await;
-        let session = manager.create_session().unwrap();
+        let session = manager
+            .create_session(SessionId::from_string("amber-river"))
+            .unwrap();
         assert_eq!(session.cwd, Some(std::env::current_dir().unwrap()));
     }
 }

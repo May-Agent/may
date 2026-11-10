@@ -1,10 +1,11 @@
 //! Agent tunnels: the `tunnel` command registers an HTTP endpoint the daemon
-//! can reach, and the daemon serves it under `/tunnel/<id>/` on every address
-//! it listens on — so a link works however the user reaches May (localhost,
-//! tailnet, LAN).
+//! can reach, and the daemon serves it under `/tunnel/<session>/<id>/` on
+//! every address it listens on — so a link works however the user reaches
+//! May (localhost, tailnet, LAN).
 //!
 //! Tunnels live in memory and die with the daemon; they are dropped when
-//! their session is deleted.
+//! their session is deleted. Each is named by a word of its session's pool,
+//! which goes back to the pool when the tunnel is dropped.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -42,13 +43,40 @@ pub struct TunnelEntry {
     pub url: url::Url,
 }
 
+/// A tunnel's address: its session and the word of that session's pool
+/// naming it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TunnelKey {
+    pub session_id: String,
+    pub id: String,
+}
+
+impl TunnelKey {
+    /// The key a request's `session` and `id` path parameters name.
+    fn of(params: &Params) -> SkyResult<Self> {
+        Ok(Self {
+            session_id: params
+                .get("session")
+                .map_err(bad_request_error)?
+                .to_string(),
+            id: params.get("id").map_err(bad_request_error)?.to_string(),
+        })
+    }
+
+    /// The path prefix the tunnel is served under, without a trailing `/`.
+    fn prefix(&self) -> String {
+        format!("/tunnel/{}/{}", self.session_id, self.id)
+    }
+}
+
 enum TunnelCommand {
     Register {
+        lease: aither_core::IdLease,
         entry: TunnelEntry,
-        reply: oneshot::Sender<String>,
+        reply: oneshot::Sender<TunnelKey>,
     },
     Resolve {
-        id: String,
+        key: TunnelKey,
         reply: oneshot::Sender<Option<TunnelEntry>>,
     },
     RemoveSession {
@@ -70,25 +98,32 @@ impl fmt::Debug for TunnelRegistry {
 }
 
 impl TunnelRegistry {
+    /// An empty registry. Each tunnel holds the lease of the word naming it
+    /// for as long as it lives.
     pub fn new() -> Self {
         let (command_tx, mut command_rx) = mpsc::unbounded_channel();
         tokio::spawn(async move {
-            let mut entries: HashMap<String, TunnelEntry> = HashMap::new();
+            let mut entries: HashMap<TunnelKey, (aither_core::IdLease, TunnelEntry)> =
+                HashMap::new();
             while let Some(command) = command_rx.recv().await {
                 match command {
-                    TunnelCommand::Register { entry, reply } => {
-                        let mut id = crate::id::new();
-                        while entries.contains_key(&id) {
-                            id = crate::id::new();
-                        }
-                        entries.insert(id.clone(), entry);
-                        let _ = reply.send(id);
+                    TunnelCommand::Register {
+                        lease,
+                        entry,
+                        reply,
+                    } => {
+                        let key = TunnelKey {
+                            session_id: entry.session_id.clone(),
+                            id: lease.to_string(),
+                        };
+                        entries.insert(key.clone(), (lease, entry));
+                        let _ = reply.send(key);
                     }
-                    TunnelCommand::Resolve { id, reply } => {
-                        let _ = reply.send(entries.get(&id).cloned());
+                    TunnelCommand::Resolve { key, reply } => {
+                        let _ = reply.send(entries.get(&key).map(|(_, entry)| entry.clone()));
                     }
                     TunnelCommand::RemoveSession { session_id } => {
-                        entries.retain(|_, entry| entry.session_id != session_id);
+                        entries.retain(|_, (_, entry)| entry.session_id != session_id);
                     }
                     TunnelCommand::RemoveAll => entries.clear(),
                 }
@@ -103,15 +138,21 @@ impl TunnelRegistry {
         reply_rx.await.ok()
     }
 
-    pub async fn register(&self, entry: TunnelEntry) -> String {
-        self.ask(|reply| TunnelCommand::Register { entry, reply })
-            .await
-            .expect("tunnel registry actor is alive for the daemon's lifetime")
+    /// Registers `entry` under the word `lease` holds, a word of the pool of
+    /// the entry's session.
+    pub async fn register(&self, lease: aither_core::IdLease, entry: TunnelEntry) -> TunnelKey {
+        self.ask(|reply| TunnelCommand::Register {
+            lease,
+            entry,
+            reply,
+        })
+        .await
+        .expect("tunnel registry actor is alive for the daemon's lifetime")
     }
 
-    pub async fn resolve(&self, id: &str) -> Option<TunnelEntry> {
+    pub async fn resolve(&self, key: &TunnelKey) -> Option<TunnelEntry> {
         self.ask(|reply| TunnelCommand::Resolve {
-            id: id.to_string(),
+            key: key.clone(),
             reply,
         })
         .await
@@ -202,14 +243,25 @@ pub async fn handle_tunnel_request(
             "container sessions may only tunnel loopback endpoints (localhost/127.x)".to_string(),
         );
     }
-    let id = state
+    let lease = state
+        .db()
+        .session_ids(&request.session_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .lease()
+        .map_err(|error| error.to_string())?;
+    let key = state
         .tunnels
-        .register(TunnelEntry {
-            session_id: request.session_id,
-            url: url.clone(),
-        })
+        .register(
+            lease,
+            TunnelEntry {
+                session_id: request.session_id,
+                url: url.clone(),
+            },
+        )
         .await;
-    let path = format!("/tunnel/{id}/");
+    let path = format!("{}/", key.prefix());
+    let id = key.id;
     let local_url = state.remote_access_manager.local_addr().map_or_else(
         || format!("http://127.0.0.1:{}{path}", super::server::DEFAULT_PORT),
         |addr| format!("http://{addr}{path}"),
@@ -268,10 +320,14 @@ fn upstream_path(base: &url::Url, sub_path: &str, query: Option<&str>) -> String
 }
 
 /// Rewrites a `Location` value back into the tunnel prefix so redirects keep
-/// the client inside `/tunnel/<id>/`.
-fn rewrite_location(id: &str, entry: &TunnelEntry, value: &HeaderValue) -> Option<HeaderValue> {
+/// the client inside `/tunnel/<session>/<id>/`.
+fn rewrite_location(
+    key: &TunnelKey,
+    entry: &TunnelEntry,
+    value: &HeaderValue,
+) -> Option<HeaderValue> {
     let location = value.to_str().ok()?;
-    let prefix = format!("/tunnel/{id}");
+    let prefix = key.prefix();
     let rewritten = if location.starts_with('/') && !location.starts_with("//") {
         format!("{prefix}{location}")
     } else {
@@ -308,7 +364,7 @@ fn skip_response_header(name: &HeaderName) -> bool {
 /// response, with `Location` headers rewritten into the tunnel prefix.
 async fn proxy_http(
     state: &DaemonState,
-    id: &str,
+    key: &TunnelKey,
     entry: &TunnelEntry,
     method: &Method,
     path_and_query: &str,
@@ -361,7 +417,7 @@ async fn proxy_http(
         }
         for value in upstream_headers.get_all(name) {
             let value = if name.as_str().eq_ignore_ascii_case("location") {
-                rewrite_location(id, entry, value).unwrap_or_else(|| value.clone())
+                rewrite_location(key, entry, value).unwrap_or_else(|| value.clone())
             } else {
                 value.clone()
             };
@@ -469,8 +525,8 @@ impl Extractor for MaybeUpgrade {
     }
 }
 
-/// `GET|POST|… /tunnel/{id}/{*path}` — proxies to the registered target, or
-/// upgrades to a WebSocket shuttle when the client asks for one.
+/// `GET|POST|… /tunnel/{session}/{id}/{*path}` — proxies to the registered
+/// target, or upgrades to a WebSocket shuttle when the client asks for one.
 pub(super) async fn tunnel_proxy(
     State(state): State<Arc<DaemonState>>,
     upgrade: MaybeUpgrade,
@@ -480,10 +536,10 @@ pub(super) async fn tunnel_proxy(
     headers: HeaderMap,
     body: Body,
 ) -> SkyResult<TunnelResponse> {
-    let id = params.get("id").map_err(bad_request_error)?.to_string();
+    let key = TunnelKey::of(&params)?;
     let entry = state
         .tunnels
-        .resolve(&id)
+        .resolve(&key)
         .await
         .ok_or_else(|| Error::msg("unknown tunnel").set_status(StatusCode::NOT_FOUND))?;
     let sub_path = params.get("path").ok().unwrap_or_default().to_string();
@@ -499,7 +555,7 @@ pub(super) async fn tunnel_proxy(
     }
     proxy_http(
         &state,
-        &id,
+        &key,
         &entry,
         &method,
         &path_and_query,
@@ -510,7 +566,7 @@ pub(super) async fn tunnel_proxy(
     .map(TunnelResponse::Http)
 }
 
-/// A request whose Referer points into `/tunnel/<id>/` and that routing
+/// A request whose Referer points into `/tunnel/<session>/<id>/` and that routing
 /// answered 404 is re-proxied to that tunnel — covering apps that emit
 /// absolute paths like `/src/main.tsx`.
 #[derive(Clone)]
@@ -524,16 +580,16 @@ impl TunnelRefererFallback {
     }
 }
 
-fn referer_tunnel_id(request: &Request) -> Option<String> {
+fn referer_tunnel_key(request: &Request) -> Option<TunnelKey> {
     let referer = request.headers().get(REFERER)?.to_str().ok()?;
     let url = url::Url::parse(referer).ok()?;
-    let id = url
-        .path()
-        .strip_prefix("/tunnel/")?
-        .split('/')
-        .next()
-        .filter(|id| !id.is_empty())?;
-    Some(id.to_string())
+    let mut segments = url.path().strip_prefix("/tunnel/")?.split('/');
+    let session_id = segments.next().filter(|session| !session.is_empty())?;
+    let id = segments.next().filter(|id| !id.is_empty())?;
+    Some(TunnelKey {
+        session_id: session_id.to_string(),
+        id: id.to_string(),
+    })
 }
 
 impl Middleware for TunnelRefererFallback {
@@ -544,10 +600,10 @@ impl Middleware for TunnelRefererFallback {
     ) -> impl Future<Output = Result<Response, Error>> + Send {
         let state = self.state.clone();
         async move {
-            let Some(id) = referer_tunnel_id(request) else {
+            let Some(key) = referer_tunnel_key(request) else {
                 return next.run(request).await;
             };
-            let Some(entry) = state.tunnels.resolve(&id).await else {
+            let Some(entry) = state.tunnels.resolve(&key).await else {
                 return next.run(request).await;
             };
             let method = request.method().clone();
@@ -565,9 +621,17 @@ impl Middleware for TunnelRefererFallback {
             let path_and_query = uri
                 .path_and_query()
                 .map_or("/", |path_and_query| path_and_query.as_str());
-            proxy_http(&state, &id, &entry, &method, path_and_query, &headers, body)
-                .await
-                .or(response)
+            proxy_http(
+                &state,
+                &key,
+                &entry,
+                &method,
+                path_and_query,
+                &headers,
+                body,
+            )
+            .await
+            .or(response)
         }
     }
 }
@@ -600,14 +664,14 @@ pub(super) async fn get_tunnel(
     params: Params,
     State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<TunnelInfoResponse>> {
-    let id = params.get("id").map_err(bad_request_error)?.to_string();
+    let key = TunnelKey::of(&params)?;
     let entry = state
         .tunnels
-        .resolve(&id)
+        .resolve(&key)
         .await
         .ok_or_else(|| Error::msg("unknown tunnel").set_status(StatusCode::NOT_FOUND))?;
     Ok(Json(TunnelInfoResponse {
-        id,
+        id: key.id,
         target: entry.url.into(),
     }))
 }

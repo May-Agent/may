@@ -141,6 +141,8 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 zenwave = "0.7"
 hyper = { version = "1", features = ["server", "client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+# hyper over futures-io streams, for daemon connections outside tokio
+smol-hyper = { version = "0.1.1", default-features = false }
 http-body-util = "0.1"
 
 # Browser automation (CDP) and WebRTC live streaming
@@ -227,6 +229,8 @@ sha2 = "0.10"
 
 [dev-dependencies]
 serial_test = "3"
+# Checks that every model-facing id word is one o200k_base token.
+tiktoken = { version = "4.1.2", default-features = false, features = ["vocab-o200k_base"] }
 tokio-test = "0.4"
 
 [workspace.lints]

@@ -893,10 +893,18 @@ impl ApiSession {
     }
 }
 
+/// A session name the daemon issued.
+#[derive(Debug, serde::Serialize, skyzen::ToSchema)]
+pub struct IssuedSessionName {
+    /// A name no session was ever named by.
+    pub name: String,
+}
+
 #[derive(Debug, serde::Deserialize, skyzen::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateSessionRequest {
-    /// Session id the caller pre-generated; a fresh one is assigned otherwise.
+    /// Session name `/api/session-names` issued the caller; a fresh one is
+    /// issued otherwise.
     #[serde(default)]
     pub(crate) id: Option<String>,
     #[serde(default)]

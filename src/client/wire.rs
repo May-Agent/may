@@ -837,11 +837,19 @@ pub struct WorkspacePollItem {
     pub session_id: Option<String>,
 }
 
+/// `POST /api/session-names` response body.
+#[derive(Debug, Clone, Deserialize)]
+pub struct IssuedSessionName {
+    /// A session name no session was ever named by.
+    pub name: String,
+}
+
 /// `POST /api/sessions` request body.
 #[derive(Debug, Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateSessionRequest {
-    /// Session id the client pre-generated; the daemon assigns one otherwise.
+    /// Session name the daemon issued to this client through
+    /// `/api/session-names`; the daemon issues one otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     /// Model to bind.

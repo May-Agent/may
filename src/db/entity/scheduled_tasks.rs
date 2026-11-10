@@ -45,6 +45,9 @@ pub struct Model {
     pub webhook_signature_secret: Option<String>,
     /// Lowercase request header the webhook signature arrives in.
     pub webhook_signature_header: Option<String>,
+    /// The word the model knows the task by, from its session's pool; a task
+    /// bound to no session has none.
+    pub word: Option<String>,
 }
 
 impl Model {

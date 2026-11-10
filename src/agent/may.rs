@@ -97,6 +97,9 @@ pub enum MayAgentError {
     /// The session's row could not be read.
     #[error("cannot read the session's repository binding: {0}")]
     SessionRow(#[from] crate::db::ChatDbError),
+    /// The session's pool of model-facing ids could not be built.
+    #[error("cannot restore the session's model-facing ids: {0}")]
+    SessionIds(crate::db::ChatDbError),
     /// The session's stored repository binding is malformed.
     #[error(transparent)]
     Binding(#[from] crate::session::BindingError),
@@ -473,6 +476,13 @@ impl MayAgent {
             .cloned()
             .chain(std::iter::once(memories_dir));
 
+        // Job ids, stored outputs and subagent ids lease from the session's
+        // pool, as its questions, tunnels and tasks do.
+        let session_ids = config
+            .db
+            .session_ids(config.session_id.as_str())
+            .await
+            .map_err(MayAgentError::SessionIds)?;
         // Create the terminal command tool in the sandbox dir.
         let terminal_tool: TerminalTool<TerminalPermissionHandler, DefaultExecutor> =
             TerminalTool::new_exact(
@@ -491,6 +501,7 @@ impl MayAgent {
             )
             .await
             .map_err(|e| MayAgentError::Sandbox(e.to_string()))?
+            .with_id_allocator(session_ids.allocator().clone())
             .with_network_audit_log(network_audit.clone())
             .with_process_priority(config.command_priority.process_priority())
             .with_readable_paths(readable)
@@ -1609,7 +1620,7 @@ pub async fn test_agent(
     let _db = crate::db::ChatDb::open(&temp.path().join("history.db"))
         .await
         .expect("open test db");
-    let session_id = SessionId::new();
+    let session_id = SessionId::from_string("amber-river");
     let inner = Agent::builder(llm.llm.clone())
         .request_parameters(llm.parameters.clone())
         .system_layout(tag::layout())

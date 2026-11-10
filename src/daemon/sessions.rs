@@ -6,9 +6,7 @@ use skyzen::utils::{Json, State};
 use skyzen::{Error as SkyError, Result as SkyResult, StatusCode};
 
 use crate::db::ProfileEnvironmentKind;
-use crate::session::{
-    MayHomePaths, SandboxResourceLayout, SessionId, SessionStore, list_summaries_from_db,
-};
+use crate::session::{MayHomePaths, SandboxResourceLayout, SessionStore, list_summaries_from_db};
 use crate::ui_event_bus::UiEventTopics;
 use aither_core::llm::{Message as LlmMessage, Role as LlmRole};
 
@@ -23,7 +21,7 @@ use super::types::{
     SessionContextWindowSnapshotResponse, SessionTasksPayload,
 };
 
-fn session_not_found_error(session_id: &str) -> SkyError {
+pub(super) fn session_not_found_error(session_id: &str) -> SkyError {
     SkyError::msg(format!("Session {session_id} not found")).set_status(StatusCode::NOT_FOUND)
 }
 
@@ -476,8 +474,24 @@ pub(super) async fn create_session_for_profile(
     profile_id: Option<&str>,
     model: &str,
 ) -> SkyResult<String> {
-    let id = id.map_or_else(|| SessionId::new().to_string(), str::to_string);
     let db = state.db();
+    // Every session is named by the one generator: a name a client brings
+    // is one the daemon issued it and no session took yet.
+    let id = match id {
+        Some(id) => {
+            if !db.session_name_unused(id).await.map_err(internal_error)? {
+                return Err(bad_request_error(
+                    "session name was not issued by this daemon or is already taken",
+                ));
+            }
+            id.to_string()
+        }
+        None => db
+            .issue_session_name()
+            .await
+            .map_err(internal_error)?
+            .to_string(),
+    };
     let layout = match profile_id {
         Some(profile_id) => {
             let profile = db
@@ -504,6 +518,21 @@ pub(super) async fn create_session_for_profile(
         .await
         .map_err(internal_error)?;
     Ok(id)
+}
+
+/// `POST /api/session-names` — issues a session name for a session the
+/// client creates later with `POST /api/sessions`.
+pub(super) async fn issue_session_name(
+    State(state): State<Arc<DaemonState>>,
+) -> SkyResult<Json<super::types::IssuedSessionName>> {
+    let name = state
+        .db()
+        .issue_session_name()
+        .await
+        .map_err(internal_error)?;
+    Ok(Json(super::types::IssuedSessionName {
+        name: name.to_string(),
+    }))
 }
 
 pub(super) async fn create_session(
