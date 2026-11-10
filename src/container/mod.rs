@@ -578,7 +578,8 @@ async fn extract_podman_binary_from_zip(
 
         for index in 0..archive.len() {
             let mut entry = archive.by_index(index).map_err(io::Error::other)?;
-            let Some(file_name) = std::path::Path::new(entry.name())
+            let entry_name = entry.name().map_err(io::Error::other)?;
+            let Some(file_name) = std::path::Path::new(entry_name.as_ref())
                 .file_name()
                 .and_then(|name| name.to_str())
             else {

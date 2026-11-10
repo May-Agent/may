@@ -1699,7 +1699,7 @@ pub mod tests {
     #[cfg(unix)]
     fn run_in_shell(script: &str) -> std::process::Output {
         std::process::Command::new("bash")
-            .args(aither_sandbox::shell_arguments(script))
+            .args(["--noprofile", "--norc", "-c", script])
             .output()
             .expect("bash should run")
     }
