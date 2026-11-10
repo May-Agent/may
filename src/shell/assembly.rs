@@ -6,8 +6,10 @@ use std::sync::Arc;
 
 use aither_connectivity::Connectivity;
 use aither_core::AnyIdAllocator;
+use aither_core::llm::Approver;
 use aither_sandbox::{
-    AnyScriptPolicy, Backend, ContainerShellRuntime, Grants, Interpreter, Sandbox, Shell,
+    Backend, ContainerShellRuntime, DomainApprover, Grants, Interpreter, Sandbox,
+    Shell,
     ShellSessionRegistry, SshServer, SshServerError, TerminalError,
 };
 use heel::HeelBinary;
@@ -17,10 +19,10 @@ use super::{
     shell_tool_settings,
 };
 use crate::agent::command_env::CommandEnv;
+use crate::command_policy::PolicySet;
 use crate::agent::subagent_spaces::SessionSubagentSpaces;
 use crate::ipc::{CommandBridge, CommandRegistry, SessionShell, ShellSlot};
 use crate::jobserver::JobConnection;
-use crate::terminal_permission_handler::TerminalPermissionHandler;
 use crate::tools::{ToolEnvironments, ToolRuntimeError};
 
 /// Why a session's shell could not be assembled.
@@ -51,7 +53,7 @@ pub enum ShellAssemblyError {
 /// The daemon builds one per agent; a one-shot run, a scheduled task and a
 /// repository clone build theirs from the same fields.
 #[derive(Debug)]
-pub struct ShellAssembly {
+pub struct ShellAssembly<P> {
     /// The home environment's prepared tools: where the shell runs, and what
     /// prepares an SSH server when its first command names it.
     pub tools: ToolEnvironments,
@@ -66,44 +68,64 @@ pub struct ShellAssembly {
     /// Where every network decision of a host command is recorded.
     pub audit_log: heel::NetworkAuditLog,
     /// What approves unsandboxed scripts, SSH servers and connections.
-    pub permissions: TerminalPermissionHandler,
-    /// What every command's environment holds beyond the sandbox's own.
-    pub env_source: CommandEnv,
+    pub permissions: P,
+    /// What every command's environment holds beyond the sandbox's own; none
+    /// for a run that carries no session secrets.
+    pub env_source: Option<CommandEnv>,
     /// The handles the config moves while the session runs.
     pub budgets: ShellBudgets,
     /// The languages the shell runs scripts in.
     pub interpreters: Vec<Interpreter>,
     /// May's rules on scripts.
-    pub policies: Vec<AnyScriptPolicy>,
+    pub policies: PolicySet,
     /// The commands scripts call back.
     pub commands: CommandRegistry,
     /// The slot the finished shell is bound into for the commands to reach.
     pub slot: ShellSlot,
     /// The SSH servers of the session.
     pub ssh_servers: Vec<SshServer>,
-    /// The ids every name the model sees is leased from.
-    pub ids: AnyIdAllocator,
-    /// The spaces subagents work in.
-    pub spaces: SessionSubagentSpaces,
-    /// The machine's job pool the commands draw from.
-    pub pool: JobConnection,
+    /// The ids every name the model sees is leased from; a shell given none
+    /// leases from its own.
+    pub ids: Option<AnyIdAllocator>,
+    /// The spaces subagents work in; none for a shell that launches no
+    /// subagent.
+    pub spaces: Option<SessionSubagentSpaces>,
+    /// The machine's job pool the commands draw from; none when the daemon
+    /// runs no pool or the backend cannot reach it.
+    pub pool: Option<JobConnection>,
     /// What tells a connection outage from a failing command.
     pub connectivity: Option<Connectivity>,
 }
 
-impl ShellAssembly {
+impl<P> ShellAssembly<P>
+where
+    P: Approver + DomainApprover + Clone + 'static,
+{
     /// The shell of the session, bound into its slot.
     ///
     /// # Errors
     /// Fails when the environment cannot be prepared, the host `heel` cannot
     /// be verified, a server is invalid or the shell cannot be built.
     pub async fn build(self) -> Result<Arc<SessionShell>, ShellAssemblyError> {
+        self.build_with_sandbox().await.map(|(shell, _)| shell)
+    }
+
+    /// The shell of the session, bound into its slot, and the sandbox it
+    /// spawns in, for processes of the session that are not scripts (a
+    /// connected ACP agent and its commands).
+    ///
+    /// # Errors
+    /// As [`build`](Self::build).
+    pub async fn build_with_sandbox(
+        self,
+    ) -> Result<(Arc<SessionShell>, Sandbox), ShellAssemblyError> {
         let sandbox = self.sandbox().await?;
+        let spawner = sandbox.clone();
         let sessions = ShellSessionRegistry::default();
         for server in &self.ssh_servers {
             sessions.add_ssh_server(server.clone(), self.tools.clone())?;
         }
-        let mut builder = Shell::builder(sandbox)
+        let builder = Shell::builder(sandbox)
             .interpreters(self.interpreters)
             .limits(self.budgets.limits())
             .output(self.budgets.output())
@@ -111,24 +133,29 @@ impl ShellAssembly {
             .tools(shell_tool_settings(&self.budgets))
             .policy(ServerApproval::new(sessions.clone()))
             .ipc(CommandBridge::new(self.commands, self.slot.clone()));
-        for policy in self.policies {
-            builder = builder.policy(policy);
-        }
-        let shell = builder
+        let mut shell = self
+            .policies
+            .apply(builder)
             .build()
             .await?
             .with_approver(self.permissions)
-            .with_shell_sessions(sessions)
-            .with_id_allocator(self.ids)
-            .with_subagent_spaces(self.spaces)
-            .with_jobserver_pool(self.pool.pool, self.pool.fifo_dir)?;
+            .with_shell_sessions(sessions);
+        if let Some(ids) = self.ids {
+            shell = shell.with_id_allocator(ids);
+        }
+        if let Some(spaces) = self.spaces {
+            shell = shell.with_subagent_spaces(spaces);
+        }
+        if let Some(pool) = self.pool {
+            shell = shell.with_jobserver_pool(pool.pool, pool.fifo_dir)?;
+        }
         let shell = match &self.connectivity {
             Some(connectivity) => shell.with_connectivity(connectivity),
             None => shell,
         };
         let shell = Arc::new(shell);
         self.slot.bind(&shell);
-        Ok(shell)
+        Ok((shell, spawner))
     }
 
     async fn sandbox(&self) -> Result<Sandbox, ShellAssemblyError> {
@@ -162,9 +189,12 @@ impl ShellAssembly {
                 .with_audit_log(self.audit_log.clone())
             }
         };
+        let sandbox = match &self.env_source {
+            Some(source) => sandbox.with_env_source(source.clone()),
+            None => sandbox,
+        };
         Ok(sandbox
             .with_grants(self.grants.clone())
-            .with_env_source(self.env_source.clone())
             .with_domain_approver(self.permissions.clone())
             .with_priority(self.priority))
     }

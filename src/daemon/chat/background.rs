@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use aither_sandbox::{JobRegistry, JobStatus};
+use aither_sandbox::{Job, JobInfo, JobRead, JobStatus, Jobs};
 use skyzen::Result as SkyResult;
 use skyzen::extract::Query;
 use skyzen::routing::Params;
@@ -33,8 +33,8 @@ const MAX_READ_BYTES: usize = 64 * 1024;
 #[derive(Default)]
 struct SessionBackground {
     subagents: SubagentTracker,
-    /// Job registries of the session's agents, numbered, newest last.
-    jobs: Vec<(u64, JobRegistry)>,
+    /// Jobs of the session's agents' shells, numbered, newest last.
+    jobs: Vec<(u64, Jobs)>,
     /// Background wakes being served: received from the idle agent and not
     /// yet settled by the turn they start.
     resuming: Arc<std::sync::atomic::AtomicUsize>,
@@ -107,8 +107,8 @@ impl SessionBackgrounds {
             .clone()
     }
 
-    /// Records the job registry of an agent just built for `session_id`.
-    pub(crate) fn add_job_registry(&self, session_id: &str, registry: JobRegistry) {
+    /// Records the jobs of the shell of an agent just built for `session_id`.
+    pub(crate) fn add_jobs(&self, session_id: &str, jobs: Jobs) {
         let id = self
             .next_registry
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -116,7 +116,7 @@ impl SessionBackgrounds {
             .entry(session_id.to_string())
             .or_default()
             .jobs
-            .push((id, registry));
+            .push((id, jobs));
     }
 
     /// Marks `session_id` as resuming until the guard drops, which holds the
@@ -145,7 +145,7 @@ impl SessionBackgrounds {
             .is_some_and(|session| session.resuming.load(std::sync::atomic::Ordering::Acquire) > 0)
     }
 
-    fn registries(&self, session_id: &str) -> Vec<(u64, JobRegistry)> {
+    fn registries(&self, session_id: &str) -> Vec<(u64, Jobs)> {
         self.sessions()
             .get(session_id)
             .map(|session| session.jobs.clone())
@@ -161,7 +161,7 @@ impl SessionBackgrounds {
     /// Jobs of `session_id`: every job of its newest agent, and the ones of
     /// earlier agents that still run or whose completion their agent has
     /// not taken. Earlier registries with neither are dropped.
-    async fn jobs(&self, session_id: &str) -> Vec<aither_sandbox::JobInfo> {
+    async fn jobs(&self, session_id: &str) -> Vec<JobInfo> {
         let registries = self.registries(session_id);
         let Some(((_, newest), older)) = registries.split_last() else {
             return Vec::new();
@@ -189,21 +189,24 @@ impl SessionBackgrounds {
         jobs
     }
 
-    /// The registry that holds job `pid` of `session_id`, newest first.
-    async fn registry_with(&self, session_id: &str, pid: u32) -> Option<JobRegistry> {
-        for (_, registry) in self.registries(session_id).into_iter().rev() {
-            if registry.get(pid).await.is_some() {
-                return Some(registry);
+    /// The job `pid` of `session_id`, newest shell first, with what it holds.
+    async fn job_with(&self, session_id: &str, pid: u32) -> Option<(Job, JobInfo)> {
+        for (_, jobs) in self.registries(session_id).into_iter().rev() {
+            let Some(info) = jobs.list().await.into_iter().find(|job| job.pid == pid) else {
+                continue;
+            };
+            if let Some(job) = jobs.get(&info.task_id).await {
+                return Some((job, info));
             }
         }
         None
     }
 
-    /// The registry that holds task `task_id` of `session_id`, newest first.
-    async fn registry_with_task(&self, session_id: &str, task_id: &str) -> Option<JobRegistry> {
-        for (_, registry) in self.registries(session_id).into_iter().rev() {
-            if registry.get_by_task_id(task_id).await.is_some() {
-                return Some(registry);
+    /// The job `task_id` of `session_id`, newest shell first.
+    async fn job_with_task(&self, session_id: &str, task_id: &str) -> Option<Job> {
+        for (_, jobs) in self.registries(session_id).into_iter().rev() {
+            if let Some(job) = jobs.get(task_id).await {
+                return Some(job);
             }
         }
         None
@@ -231,8 +234,8 @@ impl SessionBackgrounds {
     /// subagent runs; returns how many it stopped.
     pub(crate) async fn stop_all(&self, session_id: &str) -> usize {
         let mut stopped = 0;
-        for (_, registry) in self.registries(session_id) {
-            stopped += registry.kill_running().await;
+        for (_, jobs) in self.registries(session_id) {
+            stopped += jobs.kill_all().await;
         }
         stopped
             + self
@@ -429,24 +432,23 @@ pub async fn get_job(
 ) -> SkyResult<Json<WireJobDetail>> {
     let session_id = session_id_param(&params)?;
     let pid = pid_param(&params)?;
-    let Some(registry) = state
-        .session_background
-        .registry_with(&session_id, pid)
-        .await
-    else {
+    let Some((job, info)) = state.session_background.job_with(&session_id, pid).await else {
         return Ok(Json(WireJobDetail {
             job: None,
             stdout: None,
             stderr: None,
         }));
     };
-    let (job, output) =
-        futures_lite::future::zip(registry.get(pid), registry.terminal_output(pid)).await;
-    let (stdout, stderr) = output.map_or((None, None), |(out, err)| (Some(out), Some(err)));
+    // The shell keeps one buffer per job, in which the two streams are
+    // interleaved as they arrived, so the output is served whole as `stdout`.
+    let stdout = match job.read(0, usize::MAX).await {
+        Ok(JobRead::Delta(delta)) => Some(delta.bytes),
+        Ok(JobRead::Unchanged { .. }) | Err(_) => None,
+    };
     Ok(Json(WireJobDetail {
-        job: job.as_ref().map(WireJob::from),
+        job: Some(WireJob::from(&info)),
         stdout,
-        stderr,
+        stderr: None,
     }))
 }
 
@@ -465,12 +467,8 @@ pub async fn kill_job(
 ) -> SkyResult<Json<KillJobResponse>> {
     let session_id = session_id_param(&params)?;
     let pid = pid_param(&params)?;
-    let ok = match state
-        .session_background
-        .registry_with(&session_id, pid)
-        .await
-    {
-        Some(registry) => registry.kill(pid).await,
+    let ok = match state.session_background.job_with(&session_id, pid).await {
+        Some((job, _)) => job.kill().await,
         None => false,
     };
     if ok {
@@ -500,20 +498,29 @@ pub async fn read_job(
     State(state): State<Arc<DaemonState>>,
 ) -> SkyResult<Json<WireTerminalDelta>> {
     let session_id = session_id_param(&params)?;
-    let registry = state
+    let job = state
         .session_background
-        .registry_with_task(&session_id, &query.task_id)
+        .job_with_task(&session_id, &query.task_id)
         .await
         .ok_or_else(|| bad_request_error("no such job"))?;
-    let delta = registry
-        .terminal_read(&query.task_id, query.cursor, MAX_READ_BYTES)
+    match job
+        .read(query.cursor, MAX_READ_BYTES)
         .await
-        .map_err(bad_request_error)?;
-    Ok(Json(WireTerminalDelta {
-        cursor: delta.cursor,
-        bytes: delta.bytes,
-        status: (&delta.status).into(),
-    }))
+        .map_err(bad_request_error)?
+    {
+        JobRead::Delta(delta) => Ok(Json(WireTerminalDelta {
+            cursor: delta.cursor,
+            bytes: delta.bytes,
+            status: (&delta.status).into(),
+        })),
+        // A client that polls reads what its last read did; the answer is
+        // the job's state with nothing new.
+        JobRead::Unchanged { .. } => Ok(Json(WireTerminalDelta {
+            cursor: query.cursor,
+            bytes: Vec::new(),
+            status: (&job.info().await.status).into(),
+        })),
+    }
 }
 
 /// Answer of the subagent cancel endpoints.

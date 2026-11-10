@@ -26,25 +26,19 @@ use aither_core::llm::tool::CancelSignal;
 use arc_swap::ArcSwap;
 use async_lock::{RwLock, RwLockReadGuardArc};
 use futures_util::StreamExt as _;
-use heel::DenyAll;
 use tokio::runtime::Handle;
 
-use super::acp_sandbox::{ApprovalPermissions, SandboxExecutor, SessionPolicy, SessionSandbox};
+use super::acp_sandbox::{ApprovalPermissions, SandboxExecutor, SessionSandbox};
 use crate::config::{AcpAgentConfig, MayConfig};
 use crate::session::MayHomePaths;
 use crate::subagent::{ExternalAgent, ExternalAgents, ExternalStart};
 
 /// An acpsub host whose agents and their commands run in a session sandbox
 /// and whose permission requests go to the session's approver.
-pub type SandboxedHost = Host<SandboxExecutor<SessionPolicy>, ApprovalPermissions<SessionPolicy>>;
+pub type SandboxedHost = Host<SandboxExecutor, ApprovalPermissions>;
 
 /// A session of a [`SandboxedHost`].
-pub type SandboxedSession =
-    Session<SandboxExecutor<SessionPolicy>, ApprovalPermissions<SessionPolicy>>;
-
-/// A host for a command under trial, which belongs to no session: its
-/// processes have no network and its permission requests no approver.
-pub type ScratchHost = Host<SandboxExecutor<DenyAll>, ApprovalPermissions<DenyAll>>;
+pub type SandboxedSession = Session<SandboxExecutor, ApprovalPermissions>;
 
 /// Whether a session's host is retired, which happens once, when the session
 /// is deleted. Opening and closing an agent session hold it for reading, so
@@ -57,7 +51,7 @@ type Lease = Arc<RwLock<bool>>;
 #[derive(Clone)]
 struct SessionHost {
     host: SandboxedHost,
-    sandbox: Arc<ArcSwap<SessionSandbox<SessionPolicy>>>,
+    sandbox: Arc<ArcSwap<SessionSandbox>>,
     lease: Lease,
 }
 
@@ -106,7 +100,7 @@ impl AcpHosts {
     pub fn agents(
         &self,
         session_id: &str,
-        sandbox: SessionSandbox<SessionPolicy>,
+        sandbox: SessionSandbox,
     ) -> Result<AcpAgents, acpsub::Error> {
         let session = self.session_host(session_id, sandbox)?;
         Ok(AcpAgents {
@@ -122,7 +116,7 @@ impl AcpHosts {
     fn session_host(
         &self,
         session_id: &str,
-        sandbox: SessionSandbox<SessionPolicy>,
+        sandbox: SessionSandbox,
     ) -> Result<SessionHost, acpsub::Error> {
         let mut hosts = self.hosts.lock().expect("the host table is not poisoned");
         if let Some(session) = hosts.get(session_id) {
@@ -279,8 +273,8 @@ impl AcpAgents {
 pub fn trial_host(
     agents: &BTreeMap<String, AcpAgentConfig>,
     storage: &Path,
-    sandbox: SessionSandbox<DenyAll>,
-) -> Result<ScratchHost, acpsub::Error> {
+    sandbox: SessionSandbox,
+) -> Result<SandboxedHost, acpsub::Error> {
     let source = FixedConfig(acpsub_config(agents, storage));
     let cell = Arc::new(ArcSwap::from_pointee(sandbox));
     Host::from_config_with(
@@ -675,7 +669,7 @@ pub async fn try_connection(
     let host = trial_host(
         &BTreeMap::from([(name.to_string(), agent.clone())]),
         &scratch.path().join("acp"),
-        SessionSandbox::scratch(&work, heel),
+        SessionSandbox::scratch(&work, heel)?,
     )?;
     let mut spec = SessionSpec::new(name, work);
     spec.model.clone_from(&agent.model);
@@ -733,10 +727,9 @@ pub async fn probe_agent(
     let scratch = blocking::unblock(tempfile::tempdir)
         .await
         .map_err(ProbeError::Scratch)?;
-    let cell = Arc::new(ArcSwap::from_pointee(SessionSandbox::scratch(
-        scratch.path(),
-        heel,
-    )));
+    let cell = Arc::new(ArcSwap::from_pointee(
+        SessionSandbox::scratch(scratch.path(), heel).map_err(ProbeError::Scratch)?,
+    ));
     let services = Services {
         executor: SandboxExecutor::new(cell.clone(), Arc::default()),
         permissions: ApprovalPermissions::new(cell),
@@ -820,9 +813,9 @@ mod tests {
         readable: Vec<PathBuf>,
         writable: Vec<PathBuf>,
         approver: Option<PermissionApprover>,
-    ) -> SessionSandbox<SessionPolicy> {
-        let heel = crate::tools::test_heel().await;
-        let grants = aither_sandbox::TerminalGrants::new();
+    ) -> SessionSandbox {
+        let sandbox = super::super::acp_sandbox::test_sandbox(root).await;
+        let grants = sandbox.grants();
         grants.add_readable(fixtures_dir());
         for path in readable {
             grants.add_readable(path);
@@ -830,20 +823,7 @@ mod tests {
         for path in writable {
             grants.add_writable(path);
         }
-        std::fs::create_dir_all(root).expect("session dir");
-        SessionSandbox::for_session(
-            root.to_path_buf(),
-            grants,
-            crate::terminal_permission_handler::TerminalPermissionHandler::for_agent(
-                None, None, None,
-            ),
-            heel::NetworkAuditLog::rolling_daily(root.join("audit"), 1).expect("audit log"),
-            aither_sandbox::ProcessPriority::default(),
-            approver,
-            job_broker(root),
-            heel,
-            crate::repo_clone::test_sandbox::managed_tools().await,
-        )
+        SessionSandbox::for_session(sandbox, approver, job_broker(root))
     }
 
     /// A broker over a small pool of its own under `root`.
@@ -894,7 +874,7 @@ mod tests {
     /// and returns the turn's reply.
     async fn fake_turn(
         may_dir: &Path,
-        sandbox: SessionSandbox<SessionPolicy>,
+        sandbox: SessionSandbox,
         cwd: &Path,
         prompt: &str,
     ) -> String {
@@ -905,7 +885,7 @@ mod tests {
     async fn fake_turn_with(
         connection: AcpAgentConfig,
         may_dir: &Path,
-        sandbox: SessionSandbox<SessionPolicy>,
+        sandbox: SessionSandbox,
         cwd: &Path,
         prompt: &str,
     ) -> String {

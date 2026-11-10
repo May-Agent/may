@@ -1,6 +1,6 @@
 //! May's rules on what a terminal script may run, as aither script policies.
 //!
-//! Every script of a shell built with [`policies`] is put to them before it
+//! Every script of a shell built with a [`PolicySet`] is put to them before it
 //! runs: one that kills processes by name or pattern, or is not valid shell
 //! and so cannot be checked for that; a foreground `sleep`; a re-read of
 //! files unchanged since their last read; and, in the managed bash, the host
@@ -17,8 +17,8 @@ use std::time::SystemTime;
 
 use aither_core::llm::tool::CallIdentity;
 use aither_sandbox::{
-    AnyScriptPolicy, ScriptCheck, ScriptDecision, ScriptEnd, ScriptOrigin, ScriptOutcome,
-    ScriptPolicy, ScriptRefusal, ShellCommand, ShellScript,
+    ScriptCheck, ScriptDecision, ScriptEnd, ScriptOrigin, ScriptOutcome, ScriptPolicy,
+    ScriptRefusal, ShellBuilder, ShellCommand, ShellScript,
 };
 use askama::Template;
 
@@ -55,21 +55,35 @@ impl RefusedReads {
     }
 }
 
-/// May's policies for the shell of one agent; `managed_bash` is
-/// [`runs_managed_bash`] of the session, and `refused` the record the
-/// agent's turn boundary reads.
-#[must_use]
-pub fn policies(managed_bash: bool, refused: RefusedReads) -> Vec<AnyScriptPolicy> {
-    let mut policies = vec![
-        AnyScriptPolicy::new(KillByName),
-        AnyScriptPolicy::new(ForegroundSleep),
-        AnyScriptPolicy::new(UnchangedFileReads { refused }),
-        AnyScriptPolicy::new(PythonWithUv),
-    ];
-    if managed_bash {
-        policies.push(AnyScriptPolicy::new(ManagedShellCommands));
+/// What May's policies for the shell of one agent are chosen by.
+#[derive(Debug, Clone, Default)]
+pub struct PolicySet {
+    /// [`runs_managed_bash`] of the session.
+    pub managed_bash: bool,
+    /// The record the agent's turn boundary reads.
+    pub refused: RefusedReads,
+}
+
+impl PolicySet {
+    /// Puts every policy of the set to `builder`'s scripts.
+    #[must_use]
+    pub fn apply<I, L, O, W, T>(
+        self,
+        builder: ShellBuilder<I, L, O, W, T>,
+    ) -> ShellBuilder<I, L, O, W, T> {
+        let builder = builder
+            .policy(KillByName)
+            .policy(ForegroundSleep)
+            .policy(UnchangedFileReads {
+                refused: self.refused,
+            })
+            .policy(PythonWithUv);
+        if self.managed_bash {
+            builder.policy(ManagedShellCommands)
+        } else {
+            builder
+        }
     }
-    policies
 }
 
 fn refuse(template: &impl Template) -> ScriptDecision {
