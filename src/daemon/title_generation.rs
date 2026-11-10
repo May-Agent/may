@@ -30,7 +30,8 @@ pub(super) fn spawn_worker(
 ) {
     tokio::spawn(async move {
         while let Some(task) = queue.recv().await {
-            process_task(state.clone(), task).await;
+            crate::panic_boundary::round("title generation", process_task(state.clone(), task))
+                .await;
         }
     });
 }

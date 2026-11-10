@@ -351,48 +351,52 @@ pub fn spawn_watcher(state: Arc<DaemonState>, bus: UiEventBus) {
                 },
             )
             .await;
-            if let WatcherWake::Record(reply) = wake {
-                let busy = state.session_background.busy_sessions().await;
+            if matches!(wake, WatcherWake::Tick) {
+                next_tick = std::time::Instant::now() + WATCH_INTERVAL;
+            }
+            crate::panic_boundary::round("background watcher", async {
+                if let WatcherWake::Record(reply) = wake {
+                    let busy = state.session_background.busy_sessions().await;
+                    write_record(&state, &busy, &mut persisted).await;
+                    let _ = reply.try_send(());
+                    return;
+                }
+                let mut changed = std::collections::BTreeSet::new();
+                let mut busy = std::collections::BTreeSet::new();
+                for session_id in state.session_background.session_ids() {
+                    let snapshot = state.session_background.snapshot(&session_id).await;
+                    let shape = shape(&snapshot);
+                    if snapshot.will_resume() {
+                        busy.insert(session_id.clone());
+                    }
+                    let running =
+                        snapshot.jobs.iter().any(|job| {
+                            job.status == crate::client::background::WireJobStatus::Running
+                        }) || !snapshot.subagents.is_empty();
+                    // Running work changes every second (elapsed time, tokens).
+                    if running || last.get(&session_id) != Some(&shape) {
+                        changed.insert(session_id.clone());
+                    }
+                    last.insert(session_id, shape);
+                }
+                if !changed.is_empty() {
+                    for session_id in changed {
+                        bus.publish_session_change(
+                            &session_id,
+                            crate::daemon::session_events::SessionChange::Background,
+                        );
+                    }
+                }
+                // The session lists mark the sessions with background work, and
+                // the record tells the next daemon which sessions an unexpected
+                // exit interrupted.
+                if busy != last_busy {
+                    bus.publish(UiEventTopics::PROFILE_SESSIONS);
+                }
                 write_record(&state, &busy, &mut persisted).await;
-                let _ = reply.try_send(());
-                continue;
-            }
-            next_tick = std::time::Instant::now() + WATCH_INTERVAL;
-            let mut changed = std::collections::BTreeSet::new();
-            let mut busy = std::collections::BTreeSet::new();
-            for session_id in state.session_background.session_ids() {
-                let snapshot = state.session_background.snapshot(&session_id).await;
-                let shape = shape(&snapshot);
-                if snapshot.will_resume() {
-                    busy.insert(session_id.clone());
-                }
-                let running = snapshot
-                    .jobs
-                    .iter()
-                    .any(|job| job.status == crate::client::background::WireJobStatus::Running)
-                    || !snapshot.subagents.is_empty();
-                // Running work changes every second (elapsed time, tokens).
-                if running || last.get(&session_id) != Some(&shape) {
-                    changed.insert(session_id.clone());
-                }
-                last.insert(session_id, shape);
-            }
-            if !changed.is_empty() {
-                for session_id in changed {
-                    bus.publish_session_change(
-                        &session_id,
-                        crate::daemon::session_events::SessionChange::Background,
-                    );
-                }
-            }
-            // The session lists mark the sessions with background work, and
-            // the record tells the next daemon which sessions an unexpected
-            // exit interrupted.
-            if busy != last_busy {
-                bus.publish(UiEventTopics::PROFILE_SESSIONS);
-            }
-            write_record(&state, &busy, &mut persisted).await;
-            last_busy = busy;
+                last_busy = busy;
+            })
+            .await;
         }
     });
 }

@@ -446,18 +446,24 @@ pub async fn run_daemon(options: DaemonOptions) -> anyhow::Result<()> {
         loop {
             match config_events.recv().await {
                 Ok(topics) if topics.contains(UiEventTopics::CONFIG) => {
-                    config_state
-                        .live_limits
-                        .apply(&config_state.config_snapshot());
-                    extra
-                        .reconcile(&config_state.config_snapshot().daemon.listen)
-                        .await;
+                    crate::panic_boundary::round("config watcher", async {
+                        config_state
+                            .live_limits
+                            .apply(&config_state.config_snapshot());
+                        extra
+                            .reconcile(&config_state.config_snapshot().daemon.listen)
+                            .await;
+                    })
+                    .await;
                 }
                 // A lagged receiver may have missed the change.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    config_state
-                        .live_limits
-                        .apply(&config_state.config_snapshot());
+                    crate::panic_boundary::round("config watcher", async {
+                        config_state
+                            .live_limits
+                            .apply(&config_state.config_snapshot());
+                    })
+                    .await;
                 }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,

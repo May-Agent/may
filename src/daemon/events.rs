@@ -101,7 +101,7 @@ pub(super) async fn stream_events(
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
 
-    state.tokio_handle.spawn(async move {
+    state.tokio_handle.spawn(crate::panic_boundary::round("event stream", async move {
         let mut signatures = EventSignatures::default();
         let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
         heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -212,7 +212,7 @@ pub(super) async fn stream_events(
             }
         };
         topics.await;
-    });
+    }));
 
     Ok(sse)
 }

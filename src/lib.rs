@@ -77,6 +77,8 @@ pub mod commit_signing;
 pub mod notification;
 /// `OpenRouter` OAuth login flow.
 pub mod openrouter;
+/// Catches a panic at the boundary of the operation that raised it.
+pub mod panic_boundary;
 /// Large pasted text rendered for the model.
 pub mod pasted_text;
 /// `pr` — the session's landing object: numbered, session-owned PRs.

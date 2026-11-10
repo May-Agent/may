@@ -145,41 +145,44 @@ pub(super) async fn stream_session_events(
 
     let (sender, sse) = Sse::channel();
     let epoch = state.session_events_epoch;
-    state.tokio_handle.spawn(async move {
-        if reset {
-            #[derive(Serialize)]
-            #[serde(rename_all = "camelCase")]
-            struct Reset<'a> {
-                session_id: &'a str,
-            }
-            if !send_event(
-                &sender,
-                "reset",
-                &Reset {
-                    session_id: &session_id,
-                },
-            )
-            .await
-            {
-                return;
-            }
-        }
-        while let Some(frames) = subscription.next().await {
-            for frame in frames {
-                let sent = sender
-                    .send(
-                        skyzen::responder::sse::Event::data(&*frame.data)
-                            .event(frame.kind)
-                            .id(format_cursor(epoch, frame.index)),
-                    )
-                    .await
-                    .is_ok();
-                if !sent {
+    state.tokio_handle.spawn(crate::panic_boundary::round(
+        "session event stream",
+        async move {
+            if reset {
+                #[derive(Serialize)]
+                #[serde(rename_all = "camelCase")]
+                struct Reset<'a> {
+                    session_id: &'a str,
+                }
+                if !send_event(
+                    &sender,
+                    "reset",
+                    &Reset {
+                        session_id: &session_id,
+                    },
+                )
+                .await
+                {
                     return;
                 }
             }
-        }
-    });
+            while let Some(frames) = subscription.next().await {
+                for frame in frames {
+                    let sent = sender
+                        .send(
+                            skyzen::responder::sse::Event::data(&*frame.data)
+                                .event(frame.kind)
+                                .id(format_cursor(epoch, frame.index)),
+                        )
+                        .await
+                        .is_ok();
+                    if !sent {
+                        return;
+                    }
+                }
+            }
+        },
+    ));
     Ok(sse)
 }
 
@@ -236,17 +239,23 @@ async fn run(state: Arc<DaemonState>, rx: SessionChangeReceiver) {
                 .or_default()
                 .insert(notice.kind);
         }
-        for (session_id, mut kinds) in pending.drain() {
-            for kind in kinds.take() {
-                publish_piece(
-                    &state,
-                    &session_id,
-                    kind,
-                    published.entry(session_id.clone()).or_default(),
-                )
-                .await;
-            }
-        }
+        Box::pin(crate::panic_boundary::round(
+            "session event dispatcher",
+            async {
+                for (session_id, mut kinds) in pending.drain() {
+                    for kind in kinds.take() {
+                        publish_piece(
+                            &state,
+                            &session_id,
+                            kind,
+                            published.entry(session_id.clone()).or_default(),
+                        )
+                        .await;
+                    }
+                }
+            },
+        ))
+        .await;
     }
 }
 

@@ -1150,7 +1150,10 @@ pub(super) fn spawn_task_wake_dispatcher(
     let tokio_handle = state.tokio_handle.clone();
     tokio_handle.spawn(async move {
         while let Ok(session_id) = wakes.recv().await {
-            spawn_follow_up_runs(state.clone(), session_id);
+            crate::panic_boundary::round("task wake dispatcher", async {
+                spawn_follow_up_runs(state.clone(), session_id);
+            })
+            .await;
         }
     });
 }
@@ -1855,44 +1858,63 @@ pub(super) fn spawn_shared_tool_dispatchers(state: Arc<DaemonState>, queues: UiT
         register_skills,
         tunnel,
     } = queues;
+    let handle = state.tokio_handle.clone();
 
     let task_state = state.clone();
-    let tokio_handle = state.tokio_handle.clone();
-    tokio_handle.spawn(async move {
-        while let Some(request) = task.next().await {
-            let result = Box::pin(handle_task_request(&task_state, request.args.clone())).await;
-            let _ = request.respond(result);
-        }
-    });
+    handle.spawn(dispatch_requests(
+        "task command dispatcher",
+        task,
+        move |args| {
+            let state = task_state.clone();
+            async move { Box::pin(handle_task_request(&state, args)).await }
+        },
+    ));
 
     let browser_state = state.clone();
-    let tokio_handle = state.tokio_handle.clone();
-    tokio_handle.spawn(async move {
-        while let Some(request) = browser.next().await {
-            let result = handle_browser_request(&browser_state, request.args.clone()).await;
-            let _ = request.respond(result);
-        }
-    });
+    handle.spawn(dispatch_requests(
+        "browser command dispatcher",
+        browser,
+        move |args| {
+            let state = browser_state.clone();
+            async move { handle_browser_request(&state, args).await }
+        },
+    ));
 
     let register_skills_state = state.clone();
-    let tokio_handle = state.tokio_handle.clone();
-    tokio_handle.spawn(async move {
-        while let Some(request) = register_skills.next().await {
-            let result =
-                handle_register_skills_request(&register_skills_state, request.args.clone()).await;
-            let _ = request.respond(result);
-        }
-    });
+    handle.spawn(dispatch_requests(
+        "register-skills command dispatcher",
+        register_skills,
+        move |args| {
+            let state = register_skills_state.clone();
+            async move { handle_register_skills_request(&state, args).await }
+        },
+    ));
 
-    let tunnel_state = state;
-    let tokio_handle = tunnel_state.tokio_handle.clone();
-    tokio_handle.spawn(async move {
-        while let Some(request) = tunnel.next().await {
-            let result =
-                super::tunnel::handle_tunnel_request(&tunnel_state, request.args.clone()).await;
+    handle.spawn(dispatch_requests(
+        "tunnel command dispatcher",
+        tunnel,
+        move |args| {
+            let state = state.clone();
+            async move { super::tunnel::handle_tunnel_request(&state, args).await }
+        },
+    ));
+}
+
+/// Answers each request on `queue` with `handler`'s result until the queue
+/// closes. A request whose handler panics is dropped unanswered, so its
+/// caller sees the closed reply channel, and the next request is served.
+async fn dispatch_requests<Args: Clone, Response, Fut: Future<Output = Response>>(
+    worker: &'static str,
+    queue: aither_agent::tool_request::ToolRequestQueue<Args, Response>,
+    handler: impl Fn(Args) -> Fut,
+) {
+    while let Some(request) = queue.next().await {
+        if let Some(result) =
+            crate::panic_boundary::round(worker, handler(request.args.clone())).await
+        {
             let _ = request.respond(result);
         }
-    });
+    }
 }
 
 /// What one attempt's run starts from.
@@ -1959,6 +1981,44 @@ async fn drive_turn<S: ChatSink>(
     }
 }
 
+/// The turn runner: [`run_agent_loop_attempts`] behind the turn's panic
+/// boundary.
+///
+/// A panic ends the turn with an error event carrying its message, so the
+/// caller releases the session as it does for any failed turn.
+fn run_agent_loop<'a>(
+    state: &'a Arc<DaemonState>,
+    req: &'a ChatRequest,
+    sink: &'a mut impl ChatSink,
+    guard: &'a SessionRunGuard,
+    persist_user_message: bool,
+    use_persisted_context_snapshot: bool,
+    kind: &'a TurnKind,
+) -> Pin<Box<impl Future<Output = Result<AgentRunResult, AgentLoopError>> + 'a>> {
+    Box::pin(async move {
+        let turn = run_agent_loop_attempts(
+            state,
+            req,
+            &mut *sink,
+            guard,
+            persist_user_message,
+            use_persisted_context_snapshot,
+            kind,
+        );
+        match crate::panic_boundary::catch(turn).await {
+            Ok(result) => result,
+            Err(panicked) => {
+                let message = panicked.message().to_owned();
+                tracing::error!(session_id = %req.session_id, panic = %message, "a turn panicked");
+                let _ = sink
+                    .on_error(ApiErrorCode::InternalError, &message, false)
+                    .await;
+                Err(AgentLoopError::Panicked(message))
+            }
+        }
+    })
+}
+
 /// Shared agent event loop used by both streaming and non-streaming chat.
 ///
 /// Handles: retry logic, agent event processing, history persistence,
@@ -1968,7 +2028,7 @@ async fn drive_turn<S: ChatSink>(
 /// in a frame that has returned before it is first polled: a caller that
 /// boxed it itself would reserve room for it in its own poll frame, which a
 /// debug build keeps on the stack under every provider request.
-fn run_agent_loop<'a>(
+fn run_agent_loop_attempts<'a>(
     state: &'a Arc<DaemonState>,
     req: &'a ChatRequest,
     sink: &'a mut impl ChatSink,
@@ -2661,11 +2721,17 @@ pub(super) fn watch_aux_settings(state: &Arc<DaemonState>) {
         loop {
             match events.recv().await {
                 Ok(topics) if topics.intersects(UiEventTopics::CONFIG | UiEventTopics::SLEEP) => {
-                    apply_aux_settings(&state);
+                    crate::panic_boundary::round("aux settings", async {
+                        apply_aux_settings(&state);
+                    })
+                    .await;
                 }
                 // A lagged receiver may have missed the change.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                    apply_aux_settings(&state);
+                    crate::panic_boundary::round("aux settings", async {
+                        apply_aux_settings(&state);
+                    })
+                    .await;
                 }
                 Ok(_) => {}
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
@@ -3283,6 +3349,8 @@ enum AgentLoopError {
     BrowserTakeoverPaused(Box<AgentRunResult>),
     #[error("Model returned an empty assistant response")]
     EmptyAssistantResponse,
+    #[error("the turn panicked: {0}")]
+    Panicked(String),
 }
 
 #[derive(Debug)]
@@ -4686,6 +4754,10 @@ mod tests {
         wake_texts: usize,
         /// The message texts the run withdrew.
         withdrawn: Vec<String>,
+        /// Panics when the run starts streaming.
+        panic_on_start: bool,
+        /// The messages of the errors the run reported.
+        errors: Vec<String>,
     }
 
     /// The text of the background event a test resume turn opens with.
@@ -4721,6 +4793,7 @@ mod tests {
             }
         }
         fn on_start(&mut self, _s: &str, _a: &str) -> impl Future<Output = bool> + Send {
+            assert!(!self.panic_on_start, "test panic in the turn runner");
             std::future::ready(true)
         }
         fn on_text(&mut self, _c: &str) -> impl Future<Output = bool> + Send {
@@ -4789,9 +4862,10 @@ mod tests {
         fn on_error(
             &mut self,
             _c: ApiErrorCode,
-            _m: &str,
+            message: &str,
             _r: bool,
         ) -> impl Future<Output = bool> + Send {
+            self.errors.push(message.to_string());
             std::future::ready(true)
         }
     }
@@ -5051,6 +5125,92 @@ mod tests {
             .await
             .expect("session");
         state
+    }
+
+    /// A command whose handler panics fails for its caller alone: the
+    /// dispatcher serves the next command on the same queue.
+    #[tokio::test]
+    async fn a_dispatcher_survives_a_panicking_command() {
+        let (broker, queue) = aither_agent::tool_request::channel::<u32, u32>();
+        let worker = tokio::spawn(super::dispatch_requests(
+            "test dispatcher",
+            queue,
+            |args| async move {
+                assert_ne!(args, 0, "zero is refused");
+                args + 1
+            },
+        ));
+        assert!(broker.request(0).await.is_err());
+        assert_eq!(broker.request(4).await.expect("answered"), 5);
+        worker.abort();
+    }
+
+    /// A panic in the turn runner fails the turn with an error event
+    /// carrying its message, and the session runs its next turn.
+    #[tokio::test]
+    async fn a_panicking_turn_ends_with_an_error_and_the_next_turn_runs() {
+        let _ = executor_core::try_init_global_executor(executor_core::tokio::TokioGlobal);
+        let provider_a = stub_provider(vec![sse_text("done")]).await;
+        let provider_b = stub_provider(Vec::new()).await;
+        let may_dir = tempfile::tempdir().expect("may dir");
+        let state = failover_state(may_dir.path(), &provider_a, &provider_b).await;
+        let req = ChatRequest {
+            session_id: "session".to_string(),
+            content: "hello".to_string(),
+            attachments: Vec::new(),
+            hidden_context_xml: None,
+            delivery_mode: crate::session::PendingUserMessageMode::default(),
+            pending_entry_id: None,
+        };
+
+        let guard = state
+            .runtime_service
+            .runs()
+            .acquire("session")
+            .await
+            .expect("acquire run");
+        let mut sink = TestSink {
+            panic_on_start: true,
+            ..TestSink::default()
+        };
+        let result = run_agent_loop(
+            &state,
+            &req,
+            &mut sink,
+            &guard,
+            true,
+            true,
+            &TurnKind::Prompt,
+        )
+        .await;
+        assert!(
+            matches!(&result, Err(super::AgentLoopError::Panicked(m)) if m == "test panic in the turn runner"),
+            "the panic fails the turn: {result:?}"
+        );
+        assert_eq!(sink.errors, ["test panic in the turn runner"]);
+        guard
+            .finish_idle(crate::session::RunOutcome::Failed)
+            .await
+            .expect("the failed turn releases the session");
+
+        let guard = state
+            .runtime_service
+            .runs()
+            .acquire("session")
+            .await
+            .expect("the session is idle again");
+        let mut sink = TestSink::default();
+        let result = run_agent_loop(
+            &state,
+            &req,
+            &mut sink,
+            &guard,
+            true,
+            true,
+            &TurnKind::Prompt,
+        )
+        .await;
+        assert!(result.is_ok(), "the next turn runs: {result:?}");
     }
 
     /// A first attempt whose provider fails retryably retries with the same

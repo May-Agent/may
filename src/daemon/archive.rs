@@ -86,7 +86,13 @@ pub(super) fn spawn(state: Arc<DaemonState>) {
             let before = cutoff(now, recent_hours);
             let busy = state.session_background.busy_sessions().await;
             let held = clock.held(busy, now, before);
-            match archive_idle(&state.db(), before, &held).await {
+            let Some(swept) =
+                crate::panic_boundary::round("archive", archive_idle(&state.db(), before, &held))
+                    .await
+            else {
+                continue;
+            };
+            match swept {
                 Ok(archived) if archived.is_empty() => {}
                 Ok(archived) => {
                     tracing::info!(count = archived.len(), "archived idle sessions");

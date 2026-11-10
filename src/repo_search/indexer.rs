@@ -30,6 +30,9 @@ pub enum IndexerError {
     /// A document failed to render.
     #[error("failed to render a search document: {0}")]
     Render(#[from] askama::Error),
+    /// The drain panicked.
+    #[error("the drain panicked: {0}")]
+    Panicked(crate::panic_boundary::Panicked),
 }
 
 #[derive(Template)]
@@ -155,7 +158,10 @@ impl<B: CollectionBackend> SearchIndexer<B> {
     pub async fn run(self, wake: async_channel::Receiver<()>, status: IndexerStatus) {
         let mut backoff = DRAIN_INTERVAL;
         loop {
-            match self.drain().await {
+            let drained = crate::panic_boundary::catch(self.drain())
+                .await
+                .unwrap_or_else(|panicked| Err(IndexerError::Panicked(panicked)));
+            match drained {
                 Ok(_) => {
                     backoff = DRAIN_INTERVAL;
                     status.set(None, self.db.search_outbox_len().await.unwrap_or_default());

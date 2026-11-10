@@ -56,14 +56,40 @@ async fn handle(
         .insert(std::sync::Arc::new(executor_core::AnyExecutor::new(
             executor_core::tokio::TokioGlobal,
         )));
-    let response = match router.go(request).await {
-        Ok(response) => response,
-        Err(error) => {
-            skyzen_core::log_endpoint_error(&error, &method, path.as_str());
-            skyzen_core::error_response(&error)
+    let response = answer(&router, request, &method, path.as_str()).await;
+    Ok(response.map(|body| StreamBody::new(body.map_ok(into_frame as fn(_) -> _))))
+}
+
+/// The `500` a panicking handler is answered with.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct HandlerPanicked(crate::panic_boundary::Panicked);
+
+impl skyzen::HttpError for HandlerPanicked {
+    fn status(&self) -> skyzen::StatusCode {
+        skyzen::StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
+/// The router's answer to `request`; a handler that panics is logged with
+/// its message and answered with a `500`, so its connection and the others
+/// keep being served.
+async fn answer(
+    router: &Router,
+    request: skyzen::Request,
+    method: &hyper::Method,
+    path: &str,
+) -> skyzen::Response {
+    let error = match crate::panic_boundary::catch(router.go(request)).await {
+        Ok(Ok(response)) => return response,
+        Ok(Err(error)) => error,
+        Err(panicked) => {
+            tracing::error!(%method, path, panic = %panicked, "a request handler panicked");
+            Box::new(HandlerPanicked(panicked))
         }
     };
-    Ok(response.map(|body| StreamBody::new(body.map_ok(into_frame as fn(_) -> _))))
+    skyzen_core::log_endpoint_error(&*error, method, path);
+    skyzen_core::error_response(&*error)
 }
 
 /// How a TCP listener attributes its peers.
@@ -154,5 +180,41 @@ pub async fn serve_unix(listener: tokio::net::UnixListener, router: Arc<Router>)
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use skyzen::StatusCode;
+    use skyzen::routing::{CreateRouteNode, Route};
+
+    use super::answer;
+
+    async fn boom() -> &'static str {
+        panic!("test panic in a handler")
+    }
+
+    async fn ok() -> &'static str {
+        "fine"
+    }
+
+    async fn get(router: &skyzen::routing::Router, path: &str) -> skyzen::Response {
+        let request: skyzen::Request = hyper::Request::builder()
+            .method("GET")
+            .uri(path)
+            .body(skyzen::Body::empty())
+            .expect("request builds");
+        answer(router, request, &hyper::Method::GET, path).await
+    }
+
+    #[tokio::test]
+    async fn a_panicking_handler_is_answered_with_a_500_and_the_next_request_is_served() {
+        let router = Route::new(("/boom".at(boom), "/ok".at(ok))).build();
+
+        let failed = get(&router, "/boom").await;
+        assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let served = get(&router, "/ok").await;
+        assert_eq!(served.status(), StatusCode::OK);
     }
 }
