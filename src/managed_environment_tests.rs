@@ -61,8 +61,10 @@ async fn the_sandbox_reads_ordinary_paths_and_not_credential_stores() {
     let outside = tempfile::tempdir().expect("a directory outside the session");
     let ordinary = outside.path().join("ordinary.txt");
     std::fs::write(&ordinary, "readable").expect("ordinary file");
+    // A CI runner's home has no `~/.ssh`; the policy denies the path whether
+    // or not it holds keys, so an empty one is enough.
     let ssh = std::env::home_dir().expect("home").join(CREDENTIAL);
-    assert!(ssh.is_dir(), "{} must exist for this test", ssh.display());
+    std::fs::create_dir_all(&ssh).expect("the credential directory exists");
 
     let terminal = TestTerminal::new(session.path()).await;
     let script = format!(
