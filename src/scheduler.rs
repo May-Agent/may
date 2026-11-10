@@ -398,6 +398,7 @@ impl PermissionHandler for SchedulerPermissionHandler {
         _mode: TerminalMode,
         _script: &str,
         _language: aither_sandbox::ScriptLanguage,
+        _location: aither_sandbox::CommandLocation<'_>,
     ) -> impl Future<Output = Result<bool, PermissionError>> + Send {
         std::future::ready(Ok(true))
     }

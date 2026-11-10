@@ -1488,14 +1488,14 @@ impl MayAgent {
     /// Compacts the idle session once it is due; see
     /// [`Agent::compact_when_idle`].
     pub(crate) async fn compact_when_idle(&mut self) -> Result<Option<CompactResult>, AgentError> {
-        Box::pin(self.inner.compact_when_idle()).await
+        compaction_result(self.inner.compact_when_idle()).await
     }
 
     pub(crate) async fn compact(
         &mut self,
         focus: Option<&str>,
     ) -> Result<Option<CompactResult>, AgentError> {
-        Box::pin(self.inner.compact(focus)).await
+        compaction_result(self.inner.compact(focus)).await
     }
 
     pub(crate) fn restore_checkpoint(
@@ -1586,6 +1586,32 @@ pub async fn generate_session_title(
         // Clean up title - remove quotes if present
         let title = title.trim_matches('"').trim_matches('\'').trim();
         Some(title.to_string())
+    }
+}
+
+/// Drives a compaction run to its end and returns the handoff it applied, or
+/// `None` when it applied none.
+async fn compaction_result<F>(run: Run<F>) -> Result<Option<CompactResult>, AgentError>
+where
+    F: Future<Output = Result<(), AgentError>>,
+{
+    let flow = run
+        .drive(
+            None,
+            std::future::pending::<()>(),
+            |applied, timed| async move {
+                std::ops::ControlFlow::Continue(match timed.event {
+                    aither_agent::AgentEvent::CompactionFinished {
+                        outcome: aither_agent::CompactionOutcome::Applied(result),
+                    } => Some(result),
+                    _ => applied,
+                })
+            },
+        )
+        .await?;
+    match flow {
+        std::ops::ControlFlow::Continue(applied) => Ok(applied),
+        std::ops::ControlFlow::Break(()) => unreachable!("a pending stop never completes"),
     }
 }
 
