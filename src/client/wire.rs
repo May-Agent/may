@@ -420,12 +420,13 @@ impl CompactionPhase {
     pub const fn from_event(event: &AgentEvent) -> Option<Self> {
         use aither_agent::CompactionOutcome;
         Some(match event {
-            AgentEvent::CompactionStarted => Self::Started,
-            AgentEvent::CompactionFinished { outcome } => match outcome {
+            AgentEvent::CompactionStarted { .. } => Self::Started,
+            AgentEvent::CompactionEnded { outcome, .. } => match outcome {
                 CompactionOutcome::Applied(_) => Self::Applied,
                 CompactionOutcome::NothingToCompact => Self::NothingToCompact,
                 CompactionOutcome::Failed(_) => Self::Failed,
                 CompactionOutcome::Discarded => Self::Discarded,
+                _ => return None,
             },
             _ => return None,
         })

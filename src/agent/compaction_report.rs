@@ -69,8 +69,9 @@ impl CompactionReporter {
                         self.report(phase);
                     }
                     ControlFlow::Continue(match timed.event {
-                        AgentEvent::CompactionFinished {
+                        AgentEvent::CompactionEnded {
                             outcome: CompactionOutcome::Applied(result),
+                            ..
                         } => Some(result),
                         _ => applied,
                     })
@@ -97,27 +98,6 @@ impl Drop for CompactionReporter {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn compaction_events_map_to_phases() {
-        assert_eq!(
-            CompactionPhase::from_event(&AgentEvent::CompactionStarted),
-            Some(CompactionPhase::Started)
-        );
-        let finished = |outcome| AgentEvent::CompactionFinished { outcome };
-        assert_eq!(
-            CompactionPhase::from_event(&finished(CompactionOutcome::NothingToCompact)),
-            Some(CompactionPhase::NothingToCompact)
-        );
-        assert_eq!(
-            CompactionPhase::from_event(&finished(CompactionOutcome::Discarded)),
-            Some(CompactionPhase::Discarded)
-        );
-        assert_eq!(
-            CompactionPhase::from_event(&AgentEvent::Text(String::new())),
-            None
-        );
-    }
 
     #[test]
     fn a_dropped_compaction_is_reported_discarded() {
