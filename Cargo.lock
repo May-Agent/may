@@ -145,8 +145,7 @@ dependencies = [
 [[package]]
 name = "aither-acp"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "723435e901e66d4e40c133546136eb2c4d81fb595589e1bf0a2d058e51346657"
+source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#984bea4ccf7ddbd08e639d917cdffb7c4c14b0ad"
 dependencies = [
  "aither-agent",
  "aither-core",
@@ -166,39 +165,26 @@ dependencies = [
 [[package]]
 name = "aither-agent"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f43dd3130b42a0418508a4b3dd6bda1c8ca08ca532422d5f3b68cffaaa8fe834"
+source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#984bea4ccf7ddbd08e639d917cdffb7c4c14b0ad"
 dependencies = [
- "aho-corasick",
  "aither-attachments",
  "aither-connectivity",
  "aither-core",
  "aither-mcp",
- "aither-sandbox",
  "aither-skills",
  "aither-webfetch",
  "anyhow",
- "arc-swap",
  "askama 0.16.1",
  "async-channel",
  "async-fs",
  "async-io",
- "async-process",
  "async-stream",
- "basic-toml",
- "blocking",
- "dunce",
- "event-listener",
- "executor-core",
  "futures",
  "futures-core",
  "futures-lite",
  "indexmap",
  "jiff",
- "libc",
- "notify",
  "num-traits",
- "regex",
  "rustix 1.1.6",
  "schemars",
  "serde",
@@ -209,15 +195,13 @@ dependencies = [
  "thiserror 2.0.21",
  "tracing",
  "uuid",
- "whatlang",
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "aither-attachments"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04ed541db8c0dd5536146f5e4e84a0862a9d6968b325bd41d95ef3eae21204dc"
+source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#984bea4ccf7ddbd08e639d917cdffb7c4c14b0ad"
 dependencies = [
  "async-fs",
  "const-hex",
@@ -230,12 +214,11 @@ dependencies = [
 [[package]]
 name = "aither-browser"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "347666ce8eb88011b8b0db0c73efbca808b9fafce901e105d501d32df6282a3f"
+source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#984bea4ccf7ddbd08e639d917cdffb7c4c14b0ad"
 dependencies = [
- "aither-agent",
  "aither-core",
  "askama 0.16.1",
+ "async-channel",
  "schemars",
  "serde",
  "thiserror 2.0.21",
@@ -244,8 +227,7 @@ dependencies = [
 [[package]]
 name = "aither-claude"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c9afe5b4c3c3be098e0edfc1060eb9135d55abc80c6e6c9240f7492c99f116a4"
+source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#984bea4ccf7ddbd08e639d917cdffb7c4c14b0ad"
 dependencies = [
  "aither-core",
  "aither-models",
@@ -263,8 +245,7 @@ dependencies = [
 [[package]]
 name = "aither-cloud"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "933deb4b1d964f343d4e818e265c0a518d09bc500fbe6168c484c401c536ffc3"
+source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#984bea4ccf7ddbd08e639d917cdffb7c4c14b0ad"
 dependencies = [
  "aither-claude",
  "aither-codex",
@@ -281,8 +262,7 @@ dependencies = [
 [[package]]
 name = "aither-codex"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d618a21cbd842126213a2d345ee22eaf04fd4cf0521260be774e8ea886ac4767"
+source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#984bea4ccf7ddbd08e639d917cdffb7c4c14b0ad"
 dependencies = [
  "aither-core",
  "aither-models",
@@ -306,8 +286,7 @@ dependencies = [
 [[package]]
 name = "aither-connectivity"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75ad4297a4e17bbd49578bd9d13d4def4b2435c5e36ae59b0603eb3fdef25ba1"
+source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#984bea4ccf7ddbd08e639d917cdffb7c4c14b0ad"
 dependencies = [
  "async-broadcast",
  "async-channel",
@@ -332,8 +311,7 @@ dependencies = [
 [[package]]
 name = "aither-copilot"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f41fa13e32607a06ce589a10c933694785423100b96b7a9f5bc82598b7b328e"
+source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#984bea4ccf7ddbd08e639d917cdffb7c4c14b0ad"
 dependencies = [
  "aither-core",
  "aither-models",
@@ -353,8 +331,7 @@ dependencies = [
 [[package]]
 name = "aither-core"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f17f9be3acbd6e1ccea333b8d94c6670d170717c4436550ff464303c91c5606"
+source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#984bea4ccf7ddbd08e639d917cdffb7c4c14b0ad"
 dependencies = [
  "aither-derive",
  "anyhow",
@@ -362,6 +339,7 @@ dependencies = [
  "async-channel",
  "async-io",
  "base64 0.22.1",
+ "event-listener",
  "futures-core",
  "futures-lite",
  "gloo-timers 0.4.0",
@@ -382,8 +360,7 @@ dependencies = [
 [[package]]
 name = "aither-derive"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94e784389818b2c7475278c9690fca31596b425948815596037f000e5dae42ed"
+source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#984bea4ccf7ddbd08e639d917cdffb7c4c14b0ad"
 dependencies = [
  "convert_case 0.12.0",
  "proc-macro2",
@@ -394,8 +371,7 @@ dependencies = [
 [[package]]
 name = "aither-gemini"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b5f7e2a8d331ba734ac84e8985d94e554227ba50e88c9beb864a5ce5d2f2a03"
+source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#984bea4ccf7ddbd08e639d917cdffb7c4c14b0ad"
 dependencies = [
  "aither-attachments",
  "aither-core",
@@ -418,11 +394,9 @@ dependencies = [
 [[package]]
 name = "aither-mcp"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "18d9c0dfb12e3bf812ec5ec8e36107a650e8016d93e54407adf1200de03db83d"
+source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#984bea4ccf7ddbd08e639d917cdffb7c4c14b0ad"
 dependencies = [
  "aither-core",
- "aither-sandbox",
  "arc-swap",
  "askama 0.16.1",
  "async-channel",
@@ -433,6 +407,7 @@ dependencies = [
  "futures-lite",
  "futures-util",
  "mime",
+ "schemars",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -443,8 +418,7 @@ dependencies = [
 [[package]]
 name = "aither-models"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29ccf70fbfa9242a17ef943635dfd01157a16e608dae0bffac1c96722448e622"
+source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#984bea4ccf7ddbd08e639d917cdffb7c4c14b0ad"
 dependencies = [
  "aither-core",
  "serde",
@@ -454,8 +428,7 @@ dependencies = [
 [[package]]
 name = "aither-openai"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f8e13d0c8cfd4082cae21a5f4d81ef0bced5dfb52d283768d964e2b9858bb02"
+source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#984bea4ccf7ddbd08e639d917cdffb7c4c14b0ad"
 dependencies = [
  "aither-attachments",
  "aither-core",
@@ -478,8 +451,7 @@ dependencies = [
 [[package]]
 name = "aither-patch"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c25c1c314c6dfeb94c69a54f634a357ff829d6e05d3e03a409a082289e6c61e4"
+source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#984bea4ccf7ddbd08e639d917cdffb7c4c14b0ad"
 dependencies = [
  "thiserror 2.0.21",
 ]
@@ -487,8 +459,7 @@ dependencies = [
 [[package]]
 name = "aither-sandbox"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30388010c57da05f263a44e31f4d1c0db6e864be628a47032ebb91833c4a591a"
+source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#984bea4ccf7ddbd08e639d917cdffb7c4c14b0ad"
 dependencies = [
  "aither-connectivity",
  "aither-core",
@@ -505,52 +476,38 @@ dependencies = [
  "brush-parser",
  "dunce",
  "executor-core",
- "fd-lock",
- "flate2",
  "futures",
  "futures-lite",
  "globset",
  "heel",
- "hex",
  "image",
  "jiff",
  "libc",
- "lzma-rust2 0.24.0",
  "magika",
  "ort",
- "percent-encoding",
  "polling",
  "regex",
- "rmp-serde",
  "rs-tree-sitter-languages",
  "rustix 1.1.6",
  "schemars",
- "semver",
  "serde",
  "serde_json",
- "sha2 0.11.0",
  "shell-words",
- "strsim",
- "tar",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
  "tree-sitter",
  "typed-path",
- "url",
  "uuid",
  "vte",
  "windows-sys 0.61.2",
- "zenwave",
- "zip 9.0.5",
 ]
 
 [[package]]
 name = "aither-sed"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fb6dd952ecbd94721ac0aa73311acc00645292bf03a7f5c1dfcfdda7e930f7da"
+source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#984bea4ccf7ddbd08e639d917cdffb7c4c14b0ad"
 dependencies = [
  "thiserror 2.0.21",
 ]
@@ -558,8 +515,7 @@ dependencies = [
 [[package]]
 name = "aither-skills"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ee2debe43acbf83ce83c338c90bf6dd5d2880c0e80508828e67fca559d80684"
+source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#984bea4ccf7ddbd08e639d917cdffb7c4c14b0ad"
 dependencies = [
  "async-fs",
  "futures-lite",
@@ -571,12 +527,12 @@ dependencies = [
 [[package]]
 name = "aither-webfetch"
 version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c9bd10b5e22842391dccc216ae10b27b7762964bcb05c3c6daaa226c1c9f4338"
+source = "git+https://github.com/May-Agent/aither?branch=feat%2F718-bridge-leaves#984bea4ccf7ddbd08e639d917cdffb7c4c14b0ad"
 dependencies = [
  "aither-core",
  "anyhow",
  "async-net",
+ "dom_query",
  "dom_smoothie",
  "htmd",
  "html-escape 0.3.0",
@@ -732,7 +688,7 @@ dependencies = [
  "objc2-foundation",
  "parking_lot",
  "percent-encoding",
- "windows-sys 0.60.2",
+ "windows-sys 0.59.0",
  "x11rb",
 ]
 
@@ -2444,7 +2400,7 @@ dependencies = [
  "openssl-sys",
  "schannel",
  "socket2 0.6.5",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2460,7 +2416,7 @@ dependencies = [
  "openssl-sys",
  "pkg-config",
  "vcpkg",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2774,7 +2730,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3092,7 +3048,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4459,7 +4415,7 @@ dependencies = [
  "tokio",
  "tower-service",
  "tracing",
- "windows-registry 0.6.1",
+ "windows-registry 0.5.3",
 ]
 
 [[package]]
@@ -5462,15 +5418,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e20f57f9918e5bd7bc58c22cdd70a6afc7375d4dd9683af5f2b34bd3d2bba619"
 
 [[package]]
-name = "lzma-rust2"
-version = "0.24.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "490750560fa7851fbbf5d3ab1a8750f09350ed361ed8aed85b1e1e40587812ee"
-dependencies = [
- "sha2 0.11.0",
-]
-
-[[package]]
 name = "mac_address"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6246,7 +6193,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6923,7 +6870,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7b497d21a8b6fbb4b5a544f8fadb77e801a09ae0add9e411d31c6f89e3c1e90"
 dependencies = [
  "hmac-sha256",
- "lzma-rust2 0.15.8",
+ "lzma-rust2",
  "ureq",
 ]
 
@@ -7680,7 +7627,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -7719,9 +7666,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.5",
+ "socket2 0.5.10",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -8514,7 +8461,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -8573,7 +8520,7 @@ dependencies = [
  "security-framework 3.7.0",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -8788,10 +8735,6 @@ name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
-dependencies = [
- "serde",
- "serde_core",
-]
 
 [[package]]
 name = "serde"
@@ -9987,7 +9930,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.6",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -11525,15 +11468,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "whatlang"
-version = "0.18.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5e8f38b596e2a359b755342473520a99421e43658548c79489ee221b728c107"
-dependencies = [
- "hashbrown 0.15.5",
-]
-
-[[package]]
 name = "which"
 version = "7.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11598,7 +11532,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -12506,20 +12440,6 @@ dependencies = [
  "flate2",
  "indexmap",
  "memchr",
- "typed-path",
-]
-
-[[package]]
-name = "zip"
-version = "9.0.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e04976da629d3b04204ba8105b396a193af8ad2583b2c79bfb3ab8af580a11e"
-dependencies = [
- "crc32fast",
- "flate2",
- "indexmap",
- "memchr",
- "nix 0.31.3",
  "typed-path",
 ]
 

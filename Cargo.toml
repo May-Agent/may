@@ -29,7 +29,7 @@ may-tasks = { path = "tasks" }
 libc = "0.2.191"
 # Aither framework
 aither-core = { version = "0.30.0" }
-aither-agent = { version = "0.30.0", features = ["mcp", "webfetch", "skills", "connectivity", "languages"] }
+aither-agent = { version = "0.30.0", features = ["mcp", "webfetch", "skills", "connectivity", "serde"] }
 aither-connectivity = { version = "0.30.0" }
 # The parser the harness applies `apply_patch` with; a call's reading uses it
 # to place each hunk in the file it edits.
@@ -303,3 +303,21 @@ opt-level = 3
 
 [profile.dev.package.lzma-rust2]
 opt-level = 3
+
+# Temporary: the unreleased aither redesign (May-Agent/aither#593). Replaced
+# by a version bump once it is released.
+[patch.crates-io]
+aither-core = { git = "https://github.com/May-Agent/aither", branch = "feat/718-bridge-leaves" }
+aither-agent = { git = "https://github.com/May-Agent/aither", branch = "feat/718-bridge-leaves" }
+aither-connectivity = { git = "https://github.com/May-Agent/aither", branch = "feat/718-bridge-leaves" }
+aither-patch = { git = "https://github.com/May-Agent/aither", branch = "feat/718-bridge-leaves" }
+aither-sandbox = { git = "https://github.com/May-Agent/aither", branch = "feat/718-bridge-leaves" }
+aither-cloud = { git = "https://github.com/May-Agent/aither", branch = "feat/718-bridge-leaves" }
+aither-copilot = { git = "https://github.com/May-Agent/aither", branch = "feat/718-bridge-leaves" }
+aither-codex = { git = "https://github.com/May-Agent/aither", branch = "feat/718-bridge-leaves" }
+aither-models = { git = "https://github.com/May-Agent/aither", branch = "feat/718-bridge-leaves" }
+aither-mcp = { git = "https://github.com/May-Agent/aither", branch = "feat/718-bridge-leaves" }
+aither-browser = { git = "https://github.com/May-Agent/aither", branch = "feat/718-bridge-leaves" }
+aither-openai = { git = "https://github.com/May-Agent/aither", branch = "feat/718-bridge-leaves" }
+aither-sed = { git = "https://github.com/May-Agent/aither", branch = "feat/718-bridge-leaves" }
+aither-acp = { git = "https://github.com/May-Agent/aither", branch = "feat/718-bridge-leaves" }
